@@ -1,0 +1,75 @@
+[package]
+name = "unity-asset-binary-v2"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
+description = "Unity Asset Binary V2 - Fully Async Binary Processing"
+license = "MIT"
+keywords = ["unity", "binary", "async", "assetbundle", "parser"]
+categories = ["parsing", "game-development", "asynchronous"]
+
+[dependencies]
+# Core v2 dependency
+unity-asset-core-v2 = { path = "../unity-asset-core-v2" }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+pin-project = "1.0"
+bytes = { workspace = true }
+
+# Binary parsing
+binrw = { workspace = true }
+byteorder = "1.5"
+
+# Compression support
+flate2 = { workspace = true }
+lz4_flex = "0.11"
+lzma-rs = "0.3"
+brotli = "3.4"
+
+# Serialization
+serde = { workspace = true }
+indexmap = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Monitoring
+tracing = { workspace = true }
+tracing-futures = { workspace = true }
+
+# Performance utilities
+once_cell = "1.19"
+num_cpus = "1.16"
+
+# Image processing (feature-gated)
+image = { workspace = true, optional = true }
+
+# Audio processing (feature-gated)
+symphonia = { version = "0.5", features = ["all"], optional = true }
+hound = { version = "3.5", optional = true }
+
+# Advanced texture decoding (feature-gated)
+texture2ddecoder = { version = "0.1", optional = true }
+
+[features]
+default = ["texture", "audio", "mesh", "sprite"]
+
+# Core processing features
+texture = ["image"]
+audio = ["symphonia", "hound"]
+mesh = []
+sprite = []
+
+# Advanced features
+texture-advanced = ["texture", "texture2ddecoder"]
+full = ["texture", "audio", "mesh", "sprite", "texture-advanced"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.0"

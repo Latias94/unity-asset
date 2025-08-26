@@ -1,8 +1,14 @@
 [workspace]
 members = [
     "unity-asset-core",
-    "unity-asset-yaml",
+    "unity-asset-yaml", 
     "unity-asset-binary",  # Unity二进制文件解析
+    # V2 异步版本
+    "v2/unity-asset-core-v2",
+    "v2/unity-asset-yaml-v2",
+    "v2/unity-asset-binary-v2",
+    "v2/unity-asset-cli-v2",
+    "v2", # V2集成测试
 ]
 resolver = "2"
 
@@ -23,6 +29,22 @@ lz4_flex = "0.11"
 
 # CLI 工具
 clap = { version = "4.0", features = ["derive"] }
+
+# V2 异步依赖
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# 测试依赖
+tempfile = "3.8"
+tokio-stream = "0.1"
+async-stream = "0.3"
+pin-project = "1.0"
+bytes = "1.0"
+
+# 错误处理和监控
+tracing = "0.1"
+tracing-futures = "0.2"
 
 [package]
 name = "unity_asset"

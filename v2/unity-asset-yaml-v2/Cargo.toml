@@ -1,0 +1,44 @@
+[package]
+name = "unity-asset-yaml-v2"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
+description = "Unity Asset YAML V2 - Async YAML processing"
+license = "MIT"
+keywords = ["unity", "yaml", "async", "parser"]
+categories = ["parsing", "game-development", "asynchronous"]
+
+[dependencies]
+# Core v2 dependency
+unity-asset-core-v2 = { path = "../unity-asset-core-v2" }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+pin-project = "1.0"
+bytes = { workspace = true }
+
+# Serialization and YAML
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+indexmap = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Monitoring
+tracing = { workspace = true }
+tracing-futures = { workspace = true }
+
+# Utilities
+regex = "1.10"
+once_cell = "1.19"
+
+[dev-dependencies]
+tokio-test = "0.4"
+futures-test = "0.3"
+tempfile = "3.0"
