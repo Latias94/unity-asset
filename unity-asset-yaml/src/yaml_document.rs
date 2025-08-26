@@ -7,8 +7,8 @@ use crate::unity_yaml_serializer::UnityYamlSerializer;
 use std::fs;
 use std::path::Path;
 use unity_asset_core::{
-    DocumentFormat, LineEnding, Result, UnityAssetError, UnityClass, UnityDocument,
-    document::DocumentMetadata,
+    document::DocumentMetadata, DocumentFormat, LineEnding, Result, UnityAssetError, UnityClass,
+    UnityDocument,
 };
 
 #[cfg(feature = "async")]

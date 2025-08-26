@@ -1,0 +1,29 @@
+[package]
+name = "unity-asset"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
+description = "A comprehensive Rust library for parsing Unity asset files (YAML and binary formats)"
+license = "MIT"
+repository = "https://github.com/Latias94/unity-asset"
+documentation = "https://docs.rs/unity-asset"
+readme = "../README.md"
+keywords = ["unity", "assets", "parser", "game", "yaml"]
+categories = ["parsing", "game-development"]
+exclude = [
+    "tests/samples/*",
+]
+
+[dependencies]
+# Re-export sub-crates
+unity-asset-core = { path = "../unity-asset-core", version = "0.1.0" }
+unity-asset-yaml = { path = "../unity-asset-yaml", version = "0.1.0" }
+unity-asset-binary = { path = "../unity-asset-binary", version = "0.1.0" }
+
+[features]
+default = []
+async = ["unity-asset-core/async", "unity-asset-yaml/async", "unity-asset-binary/async"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

@@ -1,3 +1,50 @@
-/target
-.idea
-.code
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+.code/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Test outputs
+test_output/
+test_output_*/
+*.tmp
+*.temp
+
+# Documentation build
+/docs/_build/
+/docs/book/
+
+# Logs
+*.log
+
+# Local development
+.env
+.env.local
+
+# Benchmark results
+criterion/
+
+# Coverage reports
+tarpaulin-report.html
+cobertura.xml
+lcov.info
+
+# Reference repositories (keep in repo but ignore changes)
+repo-ref/*/
+!repo-ref/.gitkeep

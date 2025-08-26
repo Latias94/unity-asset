@@ -1,42 +1,45 @@
 [package]
 name = "unity-asset-binary"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
 description = "Unity binary file format parser (AssetBundle, SerializedFile)"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/your-repo/unity-asset-parser"
+license = "MIT"
+repository = "https://github.com/Latias94/unity-asset"
+documentation = "https://docs.rs/unity-asset-binary"
 keywords = ["unity", "binary", "assetbundle", "serialized", "parser"]
 categories = ["parser-implementations", "game-development"]
+exclude = ["tests/samples/*"]
 
 [dependencies]
 # Core dependencies
-unity-asset-core = { path = "../unity-asset-core" }
-serde = { workspace = true, features = ["derive"] }
+unity-asset-core = { path = "../unity-asset-core", version = "0.1.0" }
+serde = { workspace = true }
 thiserror = { workspace = true }
-indexmap = "2.0"
+indexmap = { workspace = true }
 anyhow = { workspace = true }
 
 # Binary parsing
 binrw = { workspace = true }
-byteorder = "1.5"
-regex = "1.10"
+byteorder = { workspace = true }
+regex = { workspace = true }
 
 # Compression support
 flate2 = { workspace = true }
-lz4_flex = "0.11"
+lz4_flex = { workspace = true }
 lzma-rs = "0.3"
 brotli = "3.4"
 
 # Performance and utilities
-once_cell = "1.19"
+once_cell = { workspace = true }
 num_cpus = "1.16"
 
 # Async support (optional)
-tokio = { version = "1.0", features = ["fs", "io-util", "rt", "macros"], optional = true }
-futures = { version = "0.3", optional = true }
-async-trait = { version = "0.1", optional = true }
-tokio-stream = { version = "0.1", optional = true }
-async-stream = { version = "0.3", optional = true }
+tokio = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
+async-stream = { workspace = true, optional = true }
 
 # Image processing
 image = { workspace = true }

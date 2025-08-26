@@ -1,24 +1,26 @@
 [package]
 name = "unity-asset-core"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
-description = "Core data structures and types for Unity asset parsing"
+description = "Core data structures and traits for Unity asset parsing"
 license = "MIT"
+repository = "https://github.com/Latias94/unity-asset"
+documentation = "https://docs.rs/unity-asset-core"
 keywords = ["unity", "assets", "core", "game"]
 categories = ["parsing", "game-development"]
+exclude = ["tests/samples/*"]
 
 [dependencies]
 serde = { workspace = true }
 indexmap = { workspace = true }
 thiserror = { workspace = true }
-
-lazy_static = "1.4"
+lazy_static = { workspace = true }
 
 # Async support (optional)
-tokio = { version = "1.0", features = ["fs", "io-util"], optional = true }
-async-trait = { version = "0.1", optional = true }
-futures = { version = "0.3", optional = true }
+tokio = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

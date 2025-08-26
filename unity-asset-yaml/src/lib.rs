@@ -24,8 +24,8 @@
 
 // Re-export core types
 pub use unity_asset_core::{
-    DocumentFormat, Result, UnityAssetError, UnityClass, UnityClassRegistry, UnityValue,
-    constants::*,
+    constants::*, DocumentFormat, Result, UnityAssetError, UnityClass, UnityClassRegistry,
+    UnityValue,
 };
 
 // Core modules

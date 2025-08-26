@@ -71,8 +71,8 @@
 
 // Re-export from core crate
 pub use unity_asset_core::{
-    DocumentFormat, Result, UnityAssetError, UnityClass, UnityClassRegistry, UnityValue,
-    UnityDocument, constants::*,
+    constants::*, DocumentFormat, Result, UnityAssetError, UnityClass, UnityClassRegistry,
+    UnityDocument, UnityValue,
 };
 
 // Re-export from YAML crate

@@ -1,27 +1,30 @@
 [package]
 name = "unity-asset-yaml"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
 description = "YAML format support for Unity asset parsing"
 license = "MIT"
+repository = "https://github.com/Latias94/unity-asset"
+documentation = "https://docs.rs/unity-asset-yaml"
 keywords = ["unity", "yaml", "parser", "game"]
 categories = ["parsing", "game-development"]
+exclude = ["tests/samples/*"]
 
 [dependencies]
 # Core dependency
-unity-asset-core = { path = "../unity-asset-core" }
+unity-asset-core = { path = "../unity-asset-core", version = "0.1.0" }
 
-# 使用workspace共享的依赖
+# Workspace dependencies
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 indexmap = { workspace = true }
 thiserror = { workspace = true }
 
 # Async support (optional)
-tokio = { version = "1.0", features = ["fs", "io-util", "rt", "macros"], optional = true }
-async-trait = { version = "0.1", optional = true }
-futures = { version = "0.3", optional = true }
+tokio = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
