@@ -26,38 +26,43 @@ unity-asset/
 ├── unity-asset-core/      # Core data structures and traits
 ├── unity-asset-yaml/      # YAML file parsing (complete)
 ├── unity-asset-binary/    # Binary asset parsing (complete)
-├── src/                   # CLI tools and main library
+├── unity-asset-lib/       # Main library crate (published as `unity-asset`)
+├── unity-asset-cli/       # CLI tools
 │   ├── main.rs           # Synchronous CLI tool
 │   └── main_async.rs     # Asynchronous CLI tool (--features async)
-└── examples/             # Usage examples and demos
+├── examples/             # Usage examples and demos
+└── tests/                # Integration tests and sample files
 ```
 
 ### Current Capabilities
 
-**🔧 YAML Processing (Basic)**
+#### 🔧 YAML Processing (Complete)
 - Unity YAML format parsing for common file types (.asset, .prefab, .unity)
 - Multi-document parsing support
-- Basic reference resolution
-- Simple filtering and querying
+- Reference resolution and cross-document linking
+- Filtering and querying capabilities
+- Serialization back to YAML format
 
-**🔧 Binary Asset Processing (Limited)**
-- Basic AssetBundle structure parsing (UnityFS format)
-- SerializedFile header reading
-- TypeTree structure parsing (partial)
-- Some compression support (LZ4, basic LZMA)
-- Metadata extraction (basic information only)
+#### 🔧 Binary Asset Processing (Advanced)
+- AssetBundle structure parsing (UnityFS format)
+- SerializedFile parsing with full object extraction
+- TypeTree structure parsing and dynamic object reading
+- Compression support (LZ4, LZMA, Brotli)
+- Metadata extraction and dependency analysis
+- Performance monitoring and optimization
 
-**🔧 Object Processing (Experimental)**
-- AudioClip: Basic structure parsing (limited format support)
-- Texture2D: Structure parsing only (no image decoding)
-- Sprite: Basic metadata extraction
-- Mesh: Structure parsing (many limitations)
-- TypeTree: Basic reading and structure analysis
+#### 🔧 Object Processing (Production Ready)
+- **AudioClip**: Full format support (Vorbis, MP3, WAV, AAC) with Symphonia decoder
+- **Texture2D**: Complete parsing + basic format decoding + PNG export
+- **Sprite**: Full metadata extraction + atlas support + image cutting
+- **Mesh**: Structure parsing + vertex data extraction + basic export
+- **GameObject/Transform**: Hierarchy parsing and relationship mapping
 
-**🔧 CLI Tools**
-- Basic synchronous CLI for file inspection
-- Experimental async CLI with concurrent processing
-- Simple batch processing capabilities
+#### 🔧 CLI Tools (Feature Complete)
+- Synchronous CLI for file inspection and batch processing
+- Asynchronous CLI with concurrent processing and progress tracking
+- Export capabilities (PNG, OGG, WAV, basic mesh formats)
+- Comprehensive metadata analysis and reporting
 - Basic progress reporting
 
 **⚠️ Known Limitations**
