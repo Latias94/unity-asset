@@ -4,7 +4,9 @@ use crate::error::{BinaryError, Result};
 use crate::object::{ObjectInfo, UnityObject};
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::typetree::TypeTree;
-// Removed unused imports
+
+#[cfg(feature = "async")]
+use futures::stream::StreamExt;
 
 /// Header of a Unity SerializedFile
 #[derive(Debug, Clone)]
@@ -274,6 +276,17 @@ impl SerializedFile {
         Ok(file)
     }
 
+    /// Parse a SerializedFile from binary data asynchronously
+    #[cfg(feature = "async")]
+    pub async fn from_bytes_async(data: Vec<u8>) -> Result<Self> {
+        // For now, use spawn_blocking to run the sync version
+        let result = tokio::task::spawn_blocking(move || Self::from_bytes(data))
+            .await
+            .map_err(|e| BinaryError::format(format!("Task join error: {}", e)))??;
+
+        Ok(result)
+    }
+
     /// Parse the metadata section
     fn parse_metadata(&mut self, reader: &mut BinaryReader) -> Result<()> {
         // Read Unity version (if version >= 7)
@@ -434,6 +447,63 @@ impl SerializedFile {
         }
 
         Ok(objects)
+    }
+
+    /// Get all Unity objects in this file asynchronously with concurrent processing
+    #[cfg(feature = "async")]
+    pub async fn get_objects_async(&self, max_concurrent: usize) -> Result<Vec<UnityObject>> {
+        use futures::stream::{self, StreamExt};
+
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        let data = &self.data;
+        let header = &self.header;
+        let types = &self.types;
+
+        let results: Result<Vec<UnityObject>> = stream::iter(self.objects.iter())
+            .map(|object_info| {
+                let semaphore = semaphore.clone();
+                async move {
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .map_err(|e| BinaryError::format(format!("Semaphore error: {}", e)))?;
+
+                    // Extract object data from the file
+                    let start = (header.data_offset as u64 + object_info.byte_start) as usize;
+                    let end = start + object_info.byte_size as usize;
+
+                    if end > data.len() {
+                        return Err(BinaryError::invalid_data(format!(
+                            "Object data out of bounds: {} > {}",
+                            end,
+                            data.len()
+                        )));
+                    }
+
+                    let mut info = object_info.clone();
+                    info.data = data[start..end].to_vec();
+
+                    // Find type information for this object
+                    if let Some(serialized_type) =
+                        types.iter().find(|t| t.class_id == object_info.type_id)
+                    {
+                        info.type_tree = Some(serialized_type.type_tree.clone());
+                    } else if let Some(serialized_type) =
+                        types.iter().find(|t| t.class_id == object_info.class_id)
+                    {
+                        info.type_tree = Some(serialized_type.type_tree.clone());
+                    }
+
+                    UnityObject::new(info)
+                }
+            })
+            .buffer_unordered(max_concurrent)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect();
+
+        results
     }
 
     /// Get the file name/path

@@ -79,6 +79,11 @@ impl BinaryError {
         Self::InvalidFormat(msg.into())
     }
 
+    /// Create a generic error (for compatibility)
+    pub fn format<S: Into<String>>(msg: S) -> Self {
+        Self::Generic(msg.into())
+    }
+
     /// Create a new unsupported version error
     pub fn unsupported_version<S: Into<String>>(version: S) -> Self {
         Self::UnsupportedVersion(version.into())

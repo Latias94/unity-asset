@@ -66,3 +66,21 @@ unity-asset-binary = { path = "unity-asset-binary" }
 # CLI 相关
 clap = { workspace = true }
 anyhow = { workspace = true }
+
+# 异步支持 (可选)
+tokio = { version = "1.0", features = ["fs", "io-util", "rt-multi-thread", "macros"], optional = true }
+futures = { version = "0.3", optional = true }
+indicatif = { version = "0.17", optional = true }  # 进度条
+
+[features]
+default = []
+async = ["unity-asset-core/async", "unity-asset-yaml/async", "unity-asset-binary/async", "tokio", "futures", "indicatif"]
+
+[[bin]]
+name = "unity_asset"
+path = "src/main.rs"
+
+[[bin]]
+name = "unity_asset_async"
+path = "src/main_async.rs"
+required-features = ["async"]

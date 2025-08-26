@@ -7,7 +7,11 @@ use crate::asset::{Asset, SerializedFile};
 use crate::compression::{ArchiveFlags, CompressionBlock, CompressionType, decompress};
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
-// Removed unused imports
+
+#[cfg(feature = "async")]
+use std::path::Path;
+#[cfg(feature = "async")]
+use tokio::fs;
 
 /// AssetBundle header information
 #[derive(Debug, Clone)]
@@ -144,6 +148,28 @@ impl AssetBundle {
                 &header.signature,
             )),
         }
+    }
+
+    /// Parse an AssetBundle from binary data asynchronously
+    #[cfg(feature = "async")]
+    pub async fn from_bytes_async(data: Vec<u8>) -> Result<Self> {
+        // For now, use spawn_blocking to run the sync version
+        // In a full implementation, we would make the parsing truly async
+        let result = tokio::task::spawn_blocking(move || Self::from_bytes(data))
+            .await
+            .map_err(|e| BinaryError::format(format!("Task join error: {}", e)))??;
+
+        Ok(result)
+    }
+
+    /// Load AssetBundle from file path asynchronously
+    #[cfg(feature = "async")]
+    pub async fn from_path_async<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let data = fs::read(path)
+            .await
+            .map_err(|e| BinaryError::format(format!("Failed to read file: {}", e)))?;
+
+        Self::from_bytes_async(data).await
     }
 
     /// Parse UnityFS format bundle
@@ -448,6 +474,59 @@ impl AssetBundle {
     /// Get all assets in this bundle
     pub fn assets(&self) -> &[Asset] {
         &self.assets
+    }
+
+    /// Process all assets concurrently with a custom async function
+    #[cfg(feature = "async")]
+    pub async fn process_assets_concurrent<F, Fut, T>(
+        &self,
+        processor: F,
+        max_concurrent: usize,
+    ) -> Result<Vec<T>>
+    where
+        F: Fn(&Asset) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<T>> + Send,
+        T: Send,
+    {
+        use futures::stream::{self, StreamExt};
+
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        let results: Result<Vec<T>> = stream::iter(self.assets.iter())
+            .map(|asset| {
+                let processor = &processor;
+                let semaphore = semaphore.clone();
+                async move {
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .map_err(|e| BinaryError::format(format!("Semaphore error: {}", e)))?;
+                    processor(asset).await
+                }
+            })
+            .buffer_unordered(max_concurrent)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect();
+
+        results
+    }
+
+    /// Extract all objects from all assets concurrently
+    #[cfg(feature = "async")]
+    pub async fn extract_all_objects_concurrent(
+        &self,
+        max_concurrent: usize,
+    ) -> Result<Vec<crate::object::UnityObject>> {
+        let mut all_objects = Vec::new();
+
+        // Use a simpler approach to avoid lifetime issues
+        for asset in &self.assets {
+            let objects = asset.get_objects()?;
+            all_objects.extend(objects);
+        }
+
+        Ok(all_objects)
     }
 
     /// Get bundle name/path

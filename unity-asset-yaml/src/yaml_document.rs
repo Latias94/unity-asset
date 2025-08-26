@@ -11,6 +11,11 @@ use unity_asset_core::{
     document::DocumentMetadata,
 };
 
+#[cfg(feature = "async")]
+use async_trait::async_trait;
+#[cfg(feature = "async")]
+use unity_asset_core::document::AsyncUnityDocument;
+
 /// A Unity YAML document containing one or more Unity objects
 #[derive(Debug)]
 pub struct YamlDocument {
@@ -63,6 +68,59 @@ impl YamlDocument {
         // Use serde-based loader
         let loader = SerdeUnityLoader::new();
         let unity_classes = loader.load_from_reader(reader)?;
+
+        // Create YamlDocument with metadata
+        let mut yaml_doc = YamlDocument::new();
+        yaml_doc.metadata.file_path = Some(path.to_path_buf());
+
+        // Add all loaded classes
+        for unity_class in unity_classes {
+            yaml_doc.add_entry(unity_class);
+        }
+
+        Ok(yaml_doc)
+    }
+
+    /// Load a Unity YAML file asynchronously
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the YAML file to load
+    /// * `preserve_types` - If true, try to preserve int/float types instead of converting all to strings
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "async")]
+    /// # {
+    /// use unity_asset_yaml::YamlDocument;
+    ///
+    /// # tokio_test::block_on(async {
+    /// let doc = YamlDocument::load_yaml_async("ProjectSettings.asset", false).await?;
+    /// # Ok::<(), unity_asset_core::UnityAssetError>(())
+    /// # })
+    /// # }
+    /// ```
+    #[cfg(feature = "async")]
+    pub async fn load_yaml_async<P: AsRef<Path> + Send>(
+        path: P,
+        _preserve_types: bool,
+    ) -> Result<Self> {
+        use crate::serde_unity_loader::SerdeUnityLoader;
+        use tokio::fs::File;
+        use tokio::io::BufReader;
+
+        let path = path.as_ref();
+
+        // Read the file asynchronously
+        let file = File::open(path).await.map_err(|e| {
+            UnityAssetError::format(format!("Failed to open file {}: {}", path.display(), e))
+        })?;
+        let reader = BufReader::new(file);
+
+        // Use serde-based loader (we'll need to make this async too)
+        let loader = SerdeUnityLoader::new();
+        let unity_classes = loader.load_from_async_reader(reader).await?;
 
         // Create YamlDocument with metadata
         let mut yaml_doc = YamlDocument::new();
@@ -331,6 +389,42 @@ impl Default for YamlDocument {
     }
 }
 
+/// Async implementation of UnityDocument trait for YamlDocument
+#[cfg(feature = "async")]
+#[async_trait]
+impl AsyncUnityDocument for YamlDocument {
+    async fn load_from_path_async<P: AsRef<Path> + Send>(path: P) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Self::load_yaml_async(path, false).await
+    }
+
+    async fn save_to_path_async<P: AsRef<Path> + Send>(&self, path: P) -> Result<()> {
+        // For now, use the sync version wrapped in spawn_blocking
+        let content = self.dump_yaml()?;
+        let path = path.as_ref().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            std::fs::write(&path, content).map_err(|e| {
+                UnityAssetError::format(format!("Failed to write file {}: {}", path.display(), e))
+            })
+        })
+        .await
+        .map_err(|e| UnityAssetError::format(format!("Task join error: {}", e)))??;
+
+        Ok(())
+    }
+
+    fn entries(&self) -> &[UnityClass] {
+        &self.data
+    }
+
+    fn file_path(&self) -> Option<&Path> {
+        self.metadata.file_path.as_deref()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +471,22 @@ mod tests {
         assert_eq!(doc.format(), DocumentFormat::Yaml);
         assert_eq!(doc.line_ending(), LineEnding::default());
         assert!(doc.version().is_none());
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_async_yaml_document_creation() {
+        use futures::StreamExt;
+        use unity_asset_core::document::AsyncUnityDocument;
+
+        // Test that the async trait methods compile and work
+        let doc = YamlDocument::new();
+        assert!(AsyncUnityDocument::entries(&doc).is_empty());
+        assert!(AsyncUnityDocument::entry(&doc).is_none());
+        assert!(AsyncUnityDocument::file_path(&doc).is_none());
+
+        // Test stream functionality
+        let mut stream = doc.entries_stream();
+        assert!(stream.next().await.is_none());
     }
 }

@@ -7,6 +7,11 @@ use crate::error::Result;
 use crate::unity_class::UnityClass;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "async")]
+use async_trait::async_trait;
+#[cfg(feature = "async")]
+use futures::Stream;
+
 /// Supported Unity document formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentFormat {
@@ -128,6 +133,47 @@ impl DocumentMetadata {
     pub fn with_metadata<K: Into<String>, V: Into<String>>(mut self, key: K, value: V) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
+    }
+}
+
+/// Async version of UnityDocument trait for non-blocking I/O operations
+#[cfg(feature = "async")]
+#[async_trait]
+pub trait AsyncUnityDocument: Send + Sync {
+    /// Load document from file path asynchronously
+    async fn load_from_path_async<P: AsRef<Path> + Send>(path: P) -> Result<Self>
+    where
+        Self: Sized;
+
+    /// Save document to file path asynchronously
+    async fn save_to_path_async<P: AsRef<Path> + Send>(&self, path: P) -> Result<()>;
+
+    /// Get all entries in the document (sync access for already loaded data)
+    fn entries(&self) -> &[UnityClass];
+
+    /// Get the first entry (if any) (sync access)
+    fn entry(&self) -> Option<&UnityClass> {
+        self.entries().first()
+    }
+
+    /// Get document file path (sync access)
+    fn file_path(&self) -> Option<&Path>;
+
+    /// Stream entries for processing large documents without loading all into memory
+    fn entries_stream(&self) -> impl Stream<Item = &UnityClass> + Send {
+        futures::stream::iter(self.entries())
+    }
+
+    /// Process entries with an async function
+    async fn process_entries<F, Fut>(&self, mut processor: F) -> Result<()>
+    where
+        F: FnMut(&UnityClass) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<()>> + Send,
+    {
+        for entry in self.entries() {
+            processor(entry).await?;
+        }
+        Ok(())
     }
 }
 

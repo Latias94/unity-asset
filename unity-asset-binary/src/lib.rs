@@ -111,4 +111,35 @@ mod tests {
         // Basic smoke test
         assert_eq!(2 + 2, 4);
     }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_async_functionality() {
+        // Test that async features compile
+        let dummy_data = vec![0u8; 32];
+
+        // Test AssetBundle async creation (should fail with invalid data, but should compile)
+        match crate::AssetBundle::from_bytes_async(dummy_data.clone()).await {
+            Ok(_) => {
+                // Unexpected success with dummy data
+                panic!("Should not succeed with dummy data");
+            }
+            Err(_) => {
+                // Expected failure with dummy data
+                println!("✅ AssetBundle::from_bytes_async compiles and handles errors correctly");
+            }
+        }
+
+        // Test SerializedFile async creation
+        match crate::SerializedFile::from_bytes_async(dummy_data).await {
+            Ok(_) => {
+                panic!("Should not succeed with dummy data");
+            }
+            Err(_) => {
+                println!(
+                    "✅ SerializedFile::from_bytes_async compiles and handles errors correctly"
+                );
+            }
+        }
+    }
 }

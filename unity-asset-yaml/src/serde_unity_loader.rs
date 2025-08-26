@@ -10,6 +10,9 @@ use serde_yaml::Value;
 use std::io::Read;
 use unity_asset_core::{UnityAssetError, UnityClass, UnityValue};
 
+#[cfg(feature = "async")]
+use tokio::io::{AsyncRead, AsyncReadExt};
+
 /// Unity YAML loader based on serde_yaml
 pub struct SerdeUnityLoader;
 
@@ -56,6 +59,23 @@ impl SerdeUnityLoader {
         use std::io::Cursor;
         let cursor = Cursor::new(yaml_str.as_bytes());
         self.load_from_reader(cursor)
+    }
+
+    /// Load Unity YAML from an async reader
+    #[cfg(feature = "async")]
+    pub async fn load_from_async_reader<R: AsyncRead + Unpin>(
+        &self,
+        mut reader: R,
+    ) -> Result<Vec<UnityClass>> {
+        // Read the entire content first
+        let mut content = String::new();
+        reader
+            .read_to_string(&mut content)
+            .await
+            .map_err(|e| UnityAssetError::parse(format!("Failed to read input: {}", e)))?;
+
+        // Use the existing string processing logic
+        self.load_from_str(&content)
     }
 
     /// Preprocess Unity YAML to handle Unity-specific features
