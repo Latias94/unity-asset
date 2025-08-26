@@ -5,9 +5,6 @@ use crate::object::{ObjectInfo, UnityObject};
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::typetree::TypeTree;
 
-#[cfg(feature = "async")]
-use futures::stream::StreamExt;
-
 /// Header of a Unity SerializedFile
 #[derive(Debug, Clone)]
 pub struct SerializedFileHeader {
@@ -195,8 +192,8 @@ impl FileIdentifier {
     /// Parse FileIdentifier from binary data
     pub fn from_reader(reader: &mut BinaryReader, _version: u32) -> Result<Self> {
         let mut guid = [0u8; 16];
-        for i in 0..16 {
-            guid[i] = reader.read_u8()?;
+        for item in &mut guid {
+            *item = reader.read_u8()?;
         }
 
         let type_ = reader.read_i32()?;

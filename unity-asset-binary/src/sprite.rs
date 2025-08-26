@@ -256,26 +256,26 @@ impl Sprite {
     }
 
     /// Extract rect from UnityValue
-    fn extract_rect(&mut self, value: &UnityValue) -> Result<()> {
+    fn extract_rect(&mut self, _value: &UnityValue) -> Result<()> {
         // Rect is typically a complex object with x, y, width, height
         // This is a simplified implementation
         Ok(())
     }
 
     /// Extract offset from UnityValue
-    fn extract_offset(&mut self, value: &UnityValue) -> Result<()> {
+    fn extract_offset(&mut self, _value: &UnityValue) -> Result<()> {
         // Vector2 with x, y
         Ok(())
     }
 
     /// Extract border from UnityValue
-    fn extract_border(&mut self, value: &UnityValue) -> Result<()> {
+    fn extract_border(&mut self, _value: &UnityValue) -> Result<()> {
         // Vector4 with x, y, z, w
         Ok(())
     }
 
     /// Extract pivot from UnityValue
-    fn extract_pivot(&mut self, value: &UnityValue) -> Result<()> {
+    fn extract_pivot(&mut self, _value: &UnityValue) -> Result<()> {
         // Vector2 with x, y
         Ok(())
     }
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn test_sprite_processor() {
-        let version = UnityVersion::from_str("2020.3.12f1").unwrap();
+        let version = UnityVersion::parse_version("2020.3.12f1").unwrap();
         let processor = SpriteProcessor::new(version);
 
         let features = processor.get_supported_features();

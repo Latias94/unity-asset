@@ -4,7 +4,7 @@
 //! runtime creation and manipulation of Unity objects.
 
 use crate::dynamic_access::{DynamicAccess, DynamicValue};
-use crate::error::{Result, UnityAssetError};
+use crate::error::Result;
 use crate::unity_value::UnityValue;
 use indexmap::IndexMap;
 use std::collections::HashMap;

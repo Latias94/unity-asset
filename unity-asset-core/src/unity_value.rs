@@ -190,8 +190,8 @@ mod tests {
         let int_val: UnityValue = 42i32.into();
         assert_eq!(int_val.as_i64(), Some(42));
 
-        let float_val: UnityValue = 3.14f64.into();
-        assert_eq!(float_val.as_f64(), Some(3.14));
+        let float_val: UnityValue = std::f64::consts::PI.into();
+        assert_eq!(float_val.as_f64(), Some(std::f64::consts::PI));
 
         let string_val: UnityValue = "test".into();
         assert_eq!(string_val.as_str(), Some("test"));

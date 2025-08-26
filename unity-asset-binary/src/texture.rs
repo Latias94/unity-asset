@@ -18,7 +18,7 @@ use texture2ddecoder;
 
 /// Unity texture formats
 #[allow(non_camel_case_types)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[repr(i32)]
 pub enum TextureFormat {
     // Basic formats
@@ -93,13 +93,8 @@ pub enum TextureFormat {
     ETC2_RGBA8Crunched = 65,
 
     // Unknown format
+    #[default]
     Unknown = -1,
-}
-
-impl Default for TextureFormat {
-    fn default() -> Self {
-        TextureFormat::Unknown
-    }
 }
 
 impl From<i32> for TextureFormat {
@@ -339,8 +334,8 @@ impl TextureFormat {
     pub fn calculate_data_size(&self, width: u32, height: u32) -> u32 {
         let info = self.info();
         if info.compressed {
-            let blocks_x = (width + info.block_size.0 - 1) / info.block_size.0;
-            let blocks_y = (height + info.block_size.1 - 1) / info.block_size.1;
+            let blocks_x = width.div_ceil(info.block_size.0);
+            let blocks_y = height.div_ceil(info.block_size.1);
             // For compressed formats, bits_per_pixel is actually bits per block
             // DXT1: 8 bytes per 4x4 block = 64 bits per block
             // DXT5: 16 bytes per 4x4 block = 128 bits per block
@@ -653,7 +648,7 @@ impl Texture2D {
         }
 
         // Validate image data size against expected size
-        let expected_size = match texture.format {
+        let _expected_size = match texture.format {
             TextureFormat::Alpha8 => texture.width * texture.height,
             TextureFormat::RGBA32 => texture.width * texture.height * 4,
             TextureFormat::RGB24 => texture.width * texture.height * 3,
@@ -746,7 +741,7 @@ impl Texture2D {
                         use std::io::{Read, Seek, SeekFrom};
 
                         // Seek to the specified offset
-                        if let Err(_) = file.seek(SeekFrom::Start(self.stream_info.offset)) {
+                        if file.seek(SeekFrom::Start(self.stream_info.offset)).is_err() {
                             continue;
                         }
 
@@ -1434,7 +1429,7 @@ mod tests {
 
     #[test]
     fn test_texture2d_processor() {
-        let version = UnityVersion::from_str("2020.3.12f1").unwrap();
+        let version = UnityVersion::parse_version("2020.3.12f1").unwrap();
         let processor = Texture2DProcessor::new(version);
 
         let supported_formats = processor.get_supported_formats();

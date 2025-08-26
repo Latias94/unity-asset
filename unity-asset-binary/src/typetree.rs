@@ -346,10 +346,7 @@ impl TypeTree {
 
             // If we have a parent, this node is a child
             if let Some(&parent_idx) = level_stack.last() {
-                parent_child_map
-                    .entry(parent_idx)
-                    .or_insert_with(Vec::new)
-                    .push(i);
+                parent_child_map.entry(parent_idx).or_default().push(i);
             }
 
             // Add current node to the stack as a potential parent

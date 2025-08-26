@@ -464,7 +464,7 @@ fn test_texture2d() {
 
                                             // Try to parse the actual Texture2D (like obj.read() in UnityPy)
                                             let version =
-                                                UnityVersion::from_str("2020.3.12f1").unwrap();
+                                                UnityVersion::parse_version("2020.3.12f1").unwrap();
                                             let processor = Texture2DProcessor::new(version);
 
                                             match processor.parse_texture2d(&obj) {
@@ -565,7 +565,7 @@ fn test_texture2d() {
 
                                         // Similar processing as above
                                         let version =
-                                            UnityVersion::from_str("2020.3.12f1").unwrap();
+                                            UnityVersion::parse_version("2020.3.12f1").unwrap();
                                         let processor = Texture2DProcessor::new(version);
 
                                         if let Ok(texture) = processor.parse_texture2d(&obj) {
@@ -649,7 +649,7 @@ fn test_sprite() {
 
                                             // Try to parse the actual Sprite (like obj.read() in UnityPy)
                                             let version =
-                                                UnityVersion::from_str("2020.3.12f1").unwrap();
+                                                UnityVersion::parse_version("2020.3.12f1").unwrap();
                                             let processor = SpriteProcessor::new(version);
 
                                             match processor.parse_sprite(&obj) {
@@ -709,7 +709,7 @@ fn test_sprite() {
 
                                         // Similar processing as above
                                         let version =
-                                            UnityVersion::from_str("2020.3.12f1").unwrap();
+                                            UnityVersion::parse_version("2020.3.12f1").unwrap();
                                         let processor = SpriteProcessor::new(version);
 
                                         if let Ok(sprite) = processor.parse_sprite(&obj) {
@@ -792,7 +792,7 @@ fn test_audioclip() {
 
                                             // Try to parse the actual AudioClip
                                             let version =
-                                                UnityVersion::from_str("2020.3.12f1").unwrap(); // Default version
+                                                UnityVersion::parse_version("2020.3.12f1").unwrap(); // Default version
                                             let processor = AudioClipProcessor::new(version);
 
                                             match processor.parse_audioclip(&obj) {
@@ -982,7 +982,8 @@ fn test_mesh() {
                                         obj.path_id()
                                     );
 
-                                    let version = UnityVersion::from_str("2020.3.12f1").unwrap();
+                                    let version =
+                                        UnityVersion::parse_version("2020.3.12f1").unwrap();
                                     let processor = MeshProcessor::new(version);
 
                                     match processor.parse_mesh(&obj) {
@@ -1101,7 +1102,7 @@ fn test_mesh() {
                                         );
 
                                         let version =
-                                            UnityVersion::from_str("2020.3.12f1").unwrap();
+                                            UnityVersion::parse_version("2020.3.12f1").unwrap();
                                         let processor = MeshProcessor::new(version);
 
                                         if let Ok(mesh) = processor.parse_mesh(&obj) {
@@ -1133,7 +1134,8 @@ fn test_mesh() {
                                         obj.path_id()
                                     );
 
-                                    let version = UnityVersion::from_str("2020.3.12f1").unwrap();
+                                    let version =
+                                        UnityVersion::parse_version("2020.3.12f1").unwrap();
                                     let processor = MeshProcessor::new(version);
 
                                     if let Ok(mesh) = processor.parse_mesh(&obj) {
@@ -1178,7 +1180,7 @@ fn test_mesh() {
 
                                         // Try to parse the actual Mesh (like obj.read() in UnityPy)
                                         let version =
-                                            UnityVersion::from_str("2020.3.12f1").unwrap();
+                                            UnityVersion::parse_version("2020.3.12f1").unwrap();
                                         let processor = MeshProcessor::new(version);
 
                                         match processor.parse_mesh(&obj) {
@@ -1261,7 +1263,8 @@ fn test_mesh() {
                                     );
 
                                     // Similar processing as above
-                                    let version = UnityVersion::from_str("2020.3.12f1").unwrap();
+                                    let version =
+                                        UnityVersion::parse_version("2020.3.12f1").unwrap();
                                     let processor = MeshProcessor::new(version);
 
                                     if let Ok(mesh) = processor.parse_mesh(&obj) {

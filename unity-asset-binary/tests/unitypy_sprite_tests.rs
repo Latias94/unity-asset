@@ -307,7 +307,7 @@ fn test_sprite_processor_version_compat() {
     ];
 
     for version_str in test_versions {
-        let version = UnityVersion::from_str(version_str).unwrap();
+        let version = UnityVersion::parse_version(version_str).unwrap();
         let processor = SpriteProcessor::new(version);
 
         println!("  Testing version {}", version_str);

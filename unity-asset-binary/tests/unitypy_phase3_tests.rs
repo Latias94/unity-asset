@@ -129,7 +129,7 @@ fn test_unity_version_unitypy_compat() {
     ];
 
     for version_str in test_versions {
-        let version = UnityVersion::from_str(version_str).unwrap();
+        let version = UnityVersion::parse_version(version_str).unwrap();
 
         // Test version string round-trip (should match UnityPy behavior)
         assert_eq!(version.to_string(), version_str);
@@ -145,8 +145,8 @@ fn test_unity_version_unitypy_compat() {
     }
 
     // Test version comparison (should match UnityPy ordering)
-    let v1 = UnityVersion::from_str("2020.3.12f1").unwrap();
-    let v2 = UnityVersion::from_str("2021.1.0f1").unwrap();
+    let v1 = UnityVersion::parse_version("2020.3.12f1").unwrap();
+    let v2 = UnityVersion::parse_version("2021.1.0f1").unwrap();
     assert!(v1 < v2);
     assert!(v2.is_gte(&v1));
 

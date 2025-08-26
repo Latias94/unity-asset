@@ -105,7 +105,7 @@ impl ObjectInfo {
         node: &TypeTreeNode,
         properties: &mut HashMap<String, UnityValue>,
     ) -> Result<()> {
-        if node.name.is_empty() || node.name.starts_with("m_") == false {
+        if node.name.is_empty() || !node.name.starts_with("m_") {
             // Skip nodes without proper names or that aren't member variables
             return Ok(());
         }

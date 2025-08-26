@@ -3,7 +3,7 @@
 //! This module provides comprehensive Mesh processing capabilities,
 //! including parsing from Unity objects and data export.
 
-use crate::error::{BinaryError, Result};
+use crate::error::Result;
 use crate::object::UnityObject;
 use crate::reader::BinaryReader;
 use crate::unity_version::UnityVersion;
@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn test_mesh_processor() {
-        let version = UnityVersion::from_str("2020.3.12f1").unwrap();
+        let version = UnityVersion::parse_version("2020.3.12f1").unwrap();
         let processor = MeshProcessor::new(version);
 
         let features = processor.get_supported_features();

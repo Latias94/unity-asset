@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::path::Path;
-use unity_asset_core::{UnityAssetError, UnityDocument, UnityValue};
+use unity_asset_core::{UnityDocument, UnityValue};
 use unity_asset_yaml::{SerdeUnityLoader, YamlDocument};
 
 /// Test inverted scalar loading (equivalent to test_inverted_scalar.py)
@@ -49,7 +49,7 @@ fn test_inverted_scalar_loading() {
                     );
 
                     // Check first item for inverted scalar
-                    if let Some(UnityValue::Object(first_item)) = platform_data.get(0) {
+                    if let Some(UnityValue::Object(first_item)) = platform_data.first() {
                         if let Some(UnityValue::Object(first)) = first_item.get("first") {
                             // The key ": Any" should map to null (inverted scalar)
                             if let Some(any_value) = first.get("Any") {
@@ -213,7 +213,7 @@ fn test_complete_serialization_round_trip() {
         );
 
         // Load original file
-        let original_content = match fs::read_to_string(&fixture_path) {
+        let _original_content = match fs::read_to_string(&fixture_path) {
             Ok(content) => content,
             Err(e) => {
                 println!("  ✗ Failed to read file: {}", e);

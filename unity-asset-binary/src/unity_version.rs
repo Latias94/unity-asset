@@ -9,15 +9,16 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Unity version type (release channel)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 pub enum UnityVersionType {
     /// Alpha release
     A = 0,
-    /// Beta release  
+    /// Beta release
     B = 1,
     /// China release
     C = 2,
     /// Final release
+    #[default]
     F = 3,
     /// Patch release
     P = 4,
@@ -25,12 +26,6 @@ pub enum UnityVersionType {
     X = 5,
     /// Unknown/Custom release
     U = 6,
-}
-
-impl Default for UnityVersionType {
-    fn default() -> Self {
-        UnityVersionType::F
-    }
 }
 
 impl fmt::Display for UnityVersionType {
@@ -108,7 +103,7 @@ impl UnityVersion {
 
     /// Parse Unity version from string
     /// Supports formats like: "2020.3.12f1", "5.6.0", "2018.1.1b2"
-    pub fn from_str(version: &str) -> Result<Self> {
+    pub fn parse_version(version: &str) -> Result<Self> {
         if version.is_empty() {
             return Ok(Self::default());
         }
@@ -207,10 +202,8 @@ impl UnityVersion {
     pub fn get_alignment(&self) -> usize {
         if self.major >= 2022 {
             8 // Unity 2022+ uses 8-byte alignment
-        } else if self.major >= 2019 {
-            4 // Unity 2019-2021 uses 4-byte alignment
         } else {
-            4 // Older versions use 4-byte alignment
+            4 // Unity 2019+ and older versions use 4-byte alignment
         }
     }
 
@@ -318,17 +311,17 @@ impl VersionCompatibility {
     /// Get a list of known Unity versions for testing
     pub fn get_known_versions() -> Vec<UnityVersion> {
         vec![
-            UnityVersion::from_str("3.4.0f5").unwrap(),
-            UnityVersion::from_str("4.7.2f1").unwrap(),
-            UnityVersion::from_str("5.0.0f4").unwrap(),
-            UnityVersion::from_str("5.6.7f1").unwrap(),
-            UnityVersion::from_str("2017.4.40f1").unwrap(),
-            UnityVersion::from_str("2018.4.36f1").unwrap(),
-            UnityVersion::from_str("2019.4.40f1").unwrap(),
-            UnityVersion::from_str("2020.3.48f1").unwrap(),
-            UnityVersion::from_str("2021.3.21f1").unwrap(),
-            UnityVersion::from_str("2022.3.21f1").unwrap(),
-            UnityVersion::from_str("2023.2.20f1").unwrap(),
+            UnityVersion::parse_version("3.4.0f5").unwrap(),
+            UnityVersion::parse_version("4.7.2f1").unwrap(),
+            UnityVersion::parse_version("5.0.0f4").unwrap(),
+            UnityVersion::parse_version("5.6.7f1").unwrap(),
+            UnityVersion::parse_version("2017.4.40f1").unwrap(),
+            UnityVersion::parse_version("2018.4.36f1").unwrap(),
+            UnityVersion::parse_version("2019.4.40f1").unwrap(),
+            UnityVersion::parse_version("2020.3.48f1").unwrap(),
+            UnityVersion::parse_version("2021.3.21f1").unwrap(),
+            UnityVersion::parse_version("2022.3.21f1").unwrap(),
+            UnityVersion::parse_version("2023.2.20f1").unwrap(),
         ]
     }
 }
@@ -350,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_version_parsing() {
-        let version = UnityVersion::from_str("2020.3.12f1").unwrap();
+        let version = UnityVersion::parse_version("2020.3.12f1").unwrap();
         assert_eq!(version.major, 2020);
         assert_eq!(version.minor, 3);
         assert_eq!(version.build, 12);
@@ -360,8 +353,8 @@ mod tests {
 
     #[test]
     fn test_version_comparison() {
-        let v1 = UnityVersion::from_str("2020.3.12f1").unwrap();
-        let v2 = UnityVersion::from_str("2021.1.0f1").unwrap();
+        let v1 = UnityVersion::parse_version("2020.3.12f1").unwrap();
+        let v2 = UnityVersion::parse_version("2021.1.0f1").unwrap();
 
         assert!(v1 < v2);
         assert!(v2.is_gte(&v1));
@@ -370,9 +363,9 @@ mod tests {
 
     #[test]
     fn test_feature_support() {
-        let old_version = UnityVersion::from_str("5.0.0f1").unwrap();
-        let unity_fs_version = UnityVersion::from_str("5.3.0f1").unwrap();
-        let new_version = UnityVersion::from_str("2020.3.12f1").unwrap();
+        let old_version = UnityVersion::parse_version("5.0.0f1").unwrap();
+        let unity_fs_version = UnityVersion::parse_version("5.3.0f1").unwrap();
+        let new_version = UnityVersion::parse_version("2020.3.12f1").unwrap();
 
         assert!(!old_version.supports_feature(UnityFeature::BigIds));
         assert!(new_version.supports_feature(UnityFeature::BigIds));
@@ -385,14 +378,14 @@ mod tests {
 
     #[test]
     fn test_version_display() {
-        let version = UnityVersion::from_str("2020.3.12f1").unwrap();
+        let version = UnityVersion::parse_version("2020.3.12f1").unwrap();
         assert_eq!(version.to_string(), "2020.3.12f1");
     }
 
     #[test]
     fn test_compatibility_check() {
-        let supported = UnityVersion::from_str("2020.3.12f1").unwrap();
-        let unsupported = UnityVersion::from_str("2.0.0f1").unwrap();
+        let supported = UnityVersion::parse_version("2020.3.12f1").unwrap();
+        let unsupported = UnityVersion::parse_version("2.0.0f1").unwrap();
 
         assert!(VersionCompatibility::is_supported(&supported));
         assert!(!VersionCompatibility::is_supported(&unsupported));

@@ -266,7 +266,10 @@ fn test_serialize_special_cases() {
     test_class.set("zero_int".to_string(), UnityValue::Integer(0));
     test_class.set("negative_int".to_string(), UnityValue::Integer(-42));
     test_class.set("zero_float".to_string(), UnityValue::Float(0.0));
-    test_class.set("negative_float".to_string(), UnityValue::Float(-3.14));
+    test_class.set(
+        "negative_float".to_string(),
+        UnityValue::Float(-std::f64::consts::PI),
+    );
 
     // Test empty collections
     test_class.set("empty_array".to_string(), UnityValue::Array(vec![]));

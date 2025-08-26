@@ -44,19 +44,16 @@ impl PythonLikeUnityDocument {
     }
 
     /// Get the first entry (similar to Python's doc.entry)
-    pub fn entry(&self) -> Option<PythonLikeUnityClass> {
-        self.inner
-            .entries()
-            .get(0)
-            .map(|class| PythonLikeUnityClass::new(class))
+    pub fn entry(&self) -> Option<PythonLikeUnityClass<'_>> {
+        self.inner.entries().first().map(PythonLikeUnityClass::new)
     }
 
     /// Get all entries (similar to Python's doc.entries)
-    pub fn entries(&self) -> Vec<PythonLikeUnityClass> {
+    pub fn entries(&self) -> Vec<PythonLikeUnityClass<'_>> {
         self.inner
             .entries()
             .iter()
-            .map(|class| PythonLikeUnityClass::new(class))
+            .map(PythonLikeUnityClass::new)
             .collect()
     }
 
@@ -79,7 +76,7 @@ impl PythonLikeUnityDocument {
         &self,
         class_names: Option<&[&str]>,
         attributes: Option<&[&str]>,
-    ) -> Vec<PythonLikeUnityClass> {
+    ) -> Vec<PythonLikeUnityClass<'_>> {
         self.inner
             .filter(class_names, attributes)
             .iter()
@@ -92,7 +89,7 @@ impl PythonLikeUnityDocument {
         &self,
         class_name: Option<&str>,
         attributes: Option<&[&str]>,
-    ) -> Result<PythonLikeUnityClass> {
+    ) -> Result<PythonLikeUnityClass<'_>> {
         let class = self.inner.get(class_name, attributes)?;
         Ok(PythonLikeUnityClass::new(class))
     }

@@ -516,7 +516,7 @@ impl AssetBundle {
     #[cfg(feature = "async")]
     pub async fn extract_all_objects_concurrent(
         &self,
-        max_concurrent: usize,
+        _max_concurrent: usize,
     ) -> Result<Vec<crate::object::UnityObject>> {
         let mut all_objects = Vec::new();
 
@@ -611,7 +611,7 @@ mod tests {
     fn test_format_support() {
         // Test that we support the expected formats
         let supported_formats = ["UnityFS", "UnityWeb", "UnityRaw"];
-        let unsupported_formats = ["UnityArchive", "InvalidFormat"];
+        let _unsupported_formats = ["UnityArchive", "InvalidFormat"];
 
         for format in supported_formats {
             // Create minimal header data for each format

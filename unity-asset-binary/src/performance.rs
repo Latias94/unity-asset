@@ -152,7 +152,7 @@ pub struct PerformanceStats {
 /// Performance timer for measuring operations
 pub struct PerformanceTimer {
     start: Instant,
-    operation: String,
+    _operation: String,
 }
 
 impl PerformanceTimer {
@@ -160,7 +160,7 @@ impl PerformanceTimer {
     pub fn start(operation: impl Into<String>) -> Self {
         Self {
             start: Instant::now(),
-            operation: operation.into(),
+            _operation: operation.into(),
         }
     }
 
@@ -199,7 +199,7 @@ impl<T> MemoryPool<T> {
     }
 
     /// Get an item from the pool or create a new one
-    pub fn get(&self) -> PooledItem<T> {
+    pub fn get(&self) -> PooledItem<'_, T> {
         let item = {
             let mut pool = self.pool.lock().unwrap();
             pool.pop().unwrap_or_else(|| (self.factory)())

@@ -255,7 +255,7 @@ fn test_texture_processor_version_compat() {
     ];
 
     for (version_str, expected_formats) in test_versions {
-        let version = UnityVersion::from_str(version_str).unwrap();
+        let version = UnityVersion::parse_version(version_str).unwrap();
         let processor = Texture2DProcessor::new(version);
         let supported_formats = processor.get_supported_formats();
 

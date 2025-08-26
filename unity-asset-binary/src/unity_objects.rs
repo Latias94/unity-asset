@@ -323,7 +323,6 @@ impl Default for Transform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unity_asset_core::UnityClass;
 
     #[test]
     fn test_gameobject_creation() {

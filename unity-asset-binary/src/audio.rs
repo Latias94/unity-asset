@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use unity_asset_core::UnityValue;
 
 /// Unity audio compression formats
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[repr(i32)]
 pub enum AudioCompressionFormat {
     PCM = 0,
@@ -26,13 +26,8 @@ pub enum AudioCompressionFormat {
     AAC = 7,
     GCADPCM = 8,
     ATRAC9 = 9,
+    #[default]
     Unknown = -1,
-}
-
-impl Default for AudioCompressionFormat {
-    fn default() -> Self {
-        AudioCompressionFormat::Unknown
-    }
 }
 
 impl From<i32> for AudioCompressionFormat {
@@ -54,9 +49,10 @@ impl From<i32> for AudioCompressionFormat {
 }
 
 /// FMOD sound types (for older Unity versions)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[repr(i32)]
 pub enum FMODSoundType {
+    #[default]
     Unknown = 0,
     ACC = 1,
     AIFF = 2,
@@ -86,13 +82,7 @@ pub enum FMODSoundType {
     BCWAV = 26,
     AT9 = 27,
     VORBIS = 28,
-    MEDIA_FOUNDATION = 29,
-}
-
-impl Default for FMODSoundType {
-    fn default() -> Self {
-        FMODSoundType::Unknown
-    }
+    MediaFoundation = 29,
 }
 
 impl From<i32> for FMODSoundType {
@@ -126,7 +116,7 @@ impl From<i32> for FMODSoundType {
             26 => FMODSoundType::BCWAV,
             27 => FMODSoundType::AT9,
             28 => FMODSoundType::VORBIS,
-            29 => FMODSoundType::MEDIA_FOUNDATION,
+            29 => FMODSoundType::MediaFoundation,
             _ => FMODSoundType::Unknown,
         }
     }
@@ -185,7 +175,7 @@ impl Default for AudioClipMeta {
 }
 
 /// AudioClip object representation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AudioClip {
     pub name: String,
     pub meta: AudioClipMeta,
@@ -197,21 +187,6 @@ pub struct AudioClip {
     // Version-specific fields
     pub stream_info: Option<StreamingInfo>,
     pub ambisonic: Option<bool>,
-}
-
-impl Default for AudioClip {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            meta: AudioClipMeta::default(),
-            source: None,
-            offset: None,
-            size: 0,
-            audio_data: Vec::new(),
-            stream_info: None,
-            ambisonic: None,
-        }
-    }
 }
 
 /// Audio format capabilities
@@ -1257,7 +1232,7 @@ mod tests {
 
     #[test]
     fn test_audioclip_processor() {
-        let version = UnityVersion::from_str("2020.3.12f1").unwrap();
+        let version = UnityVersion::parse_version("2020.3.12f1").unwrap();
         let processor = AudioClipProcessor::new(version);
 
         let formats = processor.get_supported_formats();
@@ -1353,7 +1328,7 @@ mod tests {
         ];
         properties.insert("m_AudioData".to_string(), UnityValue::Array(audio_data));
 
-        let version = UnityVersion::from_str("2020.3.12f1").unwrap();
+        let version = UnityVersion::parse_version("2020.3.12f1").unwrap();
         let clip = AudioClip::from_typetree(&properties, &version).unwrap();
 
         assert_eq!(clip.name, "TestAudio");
@@ -1413,7 +1388,7 @@ mod tests {
         data.extend_from_slice(&(audio_data.len() as i32).to_le_bytes());
         data.extend_from_slice(audio_data);
 
-        let version = UnityVersion::from_str("2020.3.12f1").unwrap();
+        let version = UnityVersion::parse_version("2020.3.12f1").unwrap();
         let clip = AudioClip::from_binary_data(&data, &version).unwrap();
 
         assert_eq!(clip.name, "TestBinary");

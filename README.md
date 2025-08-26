@@ -13,11 +13,11 @@ A Rust implementation of Unity asset parsing, inspired by and learning from [Uni
 - 📖 **Reference Implementation**: Code that others can learn from and build upon
 
 ### What This Project Is NOT
-- �?**UnityPy Replacement**: UnityPy is far more mature and feature-complete
-- �?**Production Tool**: Missing many features needed for real-world usage
-- �?**Complete Solution**: Many Unity asset types are not supported
+- ❌ **UnityPy Replacement**: UnityPy is far more mature and feature-complete
+- ❌ **Production Tool**: Missing many features needed for real-world usage
+- ❌ **Complete Solution**: Many Unity asset types are not supported
 
-## 🏗�?Architecture
+## 🏗️ Architecture
 
 The project uses a workspace structure to organize different parsing capabilities:
 
@@ -27,8 +27,8 @@ unity-asset/
 ├── unity-asset-yaml/      # YAML file parsing (complete)
 ├── unity-asset-binary/    # Binary asset parsing (complete)
 ├── src/                   # CLI tools and main library
-�?  ├── main.rs           # Synchronous CLI tool
-�?  └── main_async.rs     # Asynchronous CLI tool (--features async)
+│   ├── main.rs           # Synchronous CLI tool
+│   └── main_async.rs     # Asynchronous CLI tool (--features async)
 └── examples/             # Usage examples and demos
 ```
 
@@ -103,7 +103,7 @@ We have basic tests for core functionality, but this is not a comprehensive test
 
 If you need a production tool for Unity asset processing, **use UnityPy instead**.
 
-## �?Basic Usage Examples
+## 📝 Basic Usage Examples
 
 ### YAML File Parsing
 
@@ -133,7 +133,7 @@ cargo run --features async --bin unity-asset-async -- \
     parse-yaml -i Assets/ --recursive --progress
 ```
 
-## 🏗�?Architecture
+## 🏗️ Architecture Details
 
 This project is organized as a Rust workspace with separate crates for different concerns:
 
