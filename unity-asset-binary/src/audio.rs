@@ -397,7 +397,7 @@ impl AudioClip {
             }
             UnityValue::String(base64_data) => {
                 // Sometimes audio data is stored as base64
-                use base64::{engine::general_purpose, Engine as _};
+                use base64::{Engine as _, engine::general_purpose};
                 general_purpose::STANDARD.decode(base64_data).map_err(|e| {
                     BinaryError::invalid_data(format!("Invalid base64 audio data: {}", e))
                 })
@@ -1442,7 +1442,7 @@ mod tests {
         assert_eq!(extracted, vec![0x4F, 0x67, 0x67, 0x53]);
 
         // Test base64 format
-        use base64::{engine::general_purpose, Engine as _};
+        use base64::{Engine as _, engine::general_purpose};
         let base64_data = general_purpose::STANDARD.encode(b"OggS\x00\x02");
         let base64_value = UnityValue::String(base64_data);
         let extracted = AudioClip::extract_audio_data(&base64_value).unwrap();

@@ -54,7 +54,7 @@ fn create_mock_gameobject_data() -> Vec<u8> {
     let name = b"TestObject";
     data.extend_from_slice(&(name.len() as u32).to_le_bytes()); // Length
     data.extend_from_slice(name); // String data
-                                  // Align to 4 bytes after string
+    // Align to 4 bytes after string
     while data.len() % 4 != 0 {
         data.push(0);
     }
@@ -172,7 +172,7 @@ fn test_typetree_primitive_types() {
     // Create test data
     let mut data = Vec::new();
     data.push(-42i8 as u8); // SInt8: -42
-                            // Align to 4 bytes for next field
+    // Align to 4 bytes for next field
     while data.len() % 4 != 0 {
         data.push(0);
     }

@@ -8,7 +8,7 @@ use crate::object::UnityObject;
 use crate::reader::BinaryReader;
 use crate::texture::Texture2D;
 use crate::unity_version::UnityVersion;
-use image::{imageops, RgbaImage};
+use image::{RgbaImage, imageops};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use unity_asset_core::UnityValue;

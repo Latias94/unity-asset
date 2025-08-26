@@ -778,7 +778,7 @@ impl Texture2D {
             }
             UnityValue::String(base64_data) => {
                 // Sometimes image data is stored as base64
-                use base64::{engine::general_purpose, Engine as _};
+                use base64::{Engine as _, engine::general_purpose};
                 general_purpose::STANDARD.decode(base64_data).map_err(|e| {
                     BinaryError::invalid_data(format!("Invalid base64 image data: {}", e))
                 })

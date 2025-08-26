@@ -54,22 +54,7 @@ jobs:
           ./target/debug/unity-asset-async --help
         fi
 
-  docs:
-    name: Documentation
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-    
-    - name: Build docs
-      run: cargo doc --all-features --no-deps
-    
-    - name: Deploy docs (main branch only)
-      if: github.ref == 'refs/heads/main'
-      uses: peaceiris/actions-gh-pages@v3
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        publish_dir: ./target/doc
+
 
   security:
     name: Security Audit

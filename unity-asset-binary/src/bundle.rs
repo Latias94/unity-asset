@@ -4,7 +4,7 @@
 //! This module supports the UnityFS format used in modern Unity versions.
 
 use crate::asset::{Asset, SerializedFile};
-use crate::compression::{decompress, ArchiveFlags, CompressionBlock, CompressionType};
+use crate::compression::{ArchiveFlags, CompressionBlock, CompressionType, decompress};
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
 
