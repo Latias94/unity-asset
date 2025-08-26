@@ -1,5 +1,9 @@
 //! Tests for metadata extraction functionality
 
+#![allow(clippy::manual_flatten)]
+#![allow(clippy::absurd_extreme_comparisons)]
+#![allow(unused_comparisons)]
+
 use indexmap::IndexMap;
 use std::fs;
 use std::path::Path;

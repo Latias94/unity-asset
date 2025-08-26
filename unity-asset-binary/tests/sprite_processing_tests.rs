@@ -3,6 +3,10 @@
 //! This file tests the Sprite processing capabilities, including image extraction,
 //! atlas handling, and UnityPy compatibility.
 
+#![allow(unused_imports)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::bool_assert_comparison)]
+
 use std::fs;
 use std::path::Path;
 use unity_asset_binary::{

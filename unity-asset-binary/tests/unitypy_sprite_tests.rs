@@ -3,6 +3,12 @@
 //! This file tests the Sprite processing features against UnityPy's
 //! Sprite handling behavior.
 
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::bool_assert_comparison)]
+
 use std::fs;
 use std::path::Path;
 use unity_asset_binary::{Sprite, SpriteProcessor, Texture2D, TextureFormat, UnityVersion};

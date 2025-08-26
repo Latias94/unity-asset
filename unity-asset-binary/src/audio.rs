@@ -356,6 +356,7 @@ impl AudioClip {
     }
 
     /// Parse AudioClip from raw binary data (fallback method)
+    #[allow(clippy::field_reassign_with_default)]
     pub fn from_binary_data(data: &[u8], version: &UnityVersion) -> Result<Self> {
         let mut reader = BinaryReader::new(data, crate::reader::ByteOrder::Little);
         let mut clip = AudioClip::default();
@@ -1115,8 +1116,10 @@ mod tests {
     #[test]
     fn test_audioclip_format_detection() {
         // Test Ogg Vorbis detection
-        let mut clip = AudioClip::default();
-        clip.audio_data = b"OggS\x00\x02\x00\x00".to_vec();
+        let mut clip = AudioClip {
+            audio_data: b"OggS\x00\x02\x00\x00".to_vec(),
+            ..Default::default()
+        };
         assert_eq!(clip.detect_format(), AudioCompressionFormat::Vorbis);
 
         // Test WAV detection
@@ -1155,19 +1158,21 @@ mod tests {
 
     #[test]
     fn test_audioclip_properties() {
-        let mut clip = AudioClip::default();
-        clip.meta = AudioClipMeta::Modern {
-            load_type: 0,
-            channels: 2,
-            frequency: 44100,
-            bits_per_sample: 16,
-            length: 5.5,
-            is_tracker_format: false,
-            subsound_index: 0,
-            preload_audio_data: true,
-            load_in_background: false,
-            legacy_3d: false,
-            compression_format: AudioCompressionFormat::PCM,
+        let clip = AudioClip {
+            meta: AudioClipMeta::Modern {
+                load_type: 0,
+                channels: 2,
+                frequency: 44100,
+                bits_per_sample: 16,
+                length: 5.5,
+                is_tracker_format: false,
+                subsound_index: 0,
+                preload_audio_data: true,
+                load_in_background: false,
+                legacy_3d: false,
+                compression_format: AudioCompressionFormat::PCM,
+            },
+            ..Default::default()
         };
 
         let properties = clip.get_properties();
@@ -1179,19 +1184,29 @@ mod tests {
     }
 
     #[test]
-    fn test_audioclip_extract_samples() {
+    fn test_audioclip_extract_samples_ogg() {
         // Test Ogg Vorbis extraction
-        let mut clip = AudioClip::default();
-        clip.name = "TestAudio".to_string();
-        clip.audio_data = b"OggS\x00\x02\x00\x00test_ogg_data".to_vec();
+        let clip = AudioClip {
+            name: "TestAudio".to_string(),
+            audio_data: b"OggS\x00\x02\x00\x00test_ogg_data".to_vec(),
+            ..Default::default()
+        };
 
         let samples = clip.extract_samples().unwrap();
         assert_eq!(samples.len(), 1);
         assert!(samples.contains_key("TestAudio.ogg"));
         assert_eq!(samples["TestAudio.ogg"], clip.audio_data);
+    }
 
+    #[test]
+    fn test_audioclip_extract_samples_wav() {
         // Test WAV extraction
-        clip.audio_data = b"RIFF\x24\x08\x00\x00WAVEtest_wav_data".to_vec();
+        let clip = AudioClip {
+            name: "TestAudio".to_string(),
+            audio_data: b"RIFF\x24\x08\x00\x00WAVEtest_wav_data".to_vec(),
+            ..Default::default()
+        };
+
         let samples = clip.extract_samples().unwrap();
         assert_eq!(samples.len(), 1);
         assert!(samples.contains_key("TestAudio.wav"));
@@ -1200,24 +1215,24 @@ mod tests {
 
     #[test]
     fn test_wav_file_creation() {
-        let mut clip = AudioClip::default();
-        clip.name = "TestPCM".to_string();
-        clip.meta = AudioClipMeta::Modern {
-            load_type: 0,
-            channels: 1,
-            frequency: 22050,
-            bits_per_sample: 16,
-            length: 1.0,
-            is_tracker_format: false,
-            subsound_index: 0,
-            preload_audio_data: true,
-            load_in_background: false,
-            legacy_3d: false,
-            compression_format: AudioCompressionFormat::PCM,
+        let clip = AudioClip {
+            name: "TestPCM".to_string(),
+            meta: AudioClipMeta::Modern {
+                load_type: 0,
+                channels: 1,
+                frequency: 22050,
+                bits_per_sample: 16,
+                length: 1.0,
+                is_tracker_format: false,
+                subsound_index: 0,
+                preload_audio_data: true,
+                load_in_background: false,
+                legacy_3d: false,
+                compression_format: AudioCompressionFormat::PCM,
+            },
+            audio_data: vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05],
+            ..Default::default()
         };
-
-        // Raw PCM data (not WAV format)
-        clip.audio_data = vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
 
         let wav_data = clip.create_wav_file().unwrap();
 
@@ -1244,21 +1259,23 @@ mod tests {
 
     #[test]
     fn test_audioclip_info() {
-        let mut clip = AudioClip::default();
-        clip.name = "InfoTest".to_string();
-        clip.audio_data = b"OggS\x00\x02\x00\x00test_data".to_vec();
-        clip.meta = AudioClipMeta::Modern {
-            load_type: 0,
-            channels: 2,
-            frequency: 44100,
-            bits_per_sample: 16,
-            length: 3.5,
-            is_tracker_format: false,
-            subsound_index: 0,
-            preload_audio_data: true,
-            load_in_background: false,
-            legacy_3d: false,
-            compression_format: AudioCompressionFormat::Vorbis,
+        let clip = AudioClip {
+            name: "InfoTest".to_string(),
+            audio_data: b"OggS\x00\x02\x00\x00test_data".to_vec(),
+            meta: AudioClipMeta::Modern {
+                load_type: 0,
+                channels: 2,
+                frequency: 44100,
+                bits_per_sample: 16,
+                length: 3.5,
+                is_tracker_format: false,
+                subsound_index: 0,
+                preload_audio_data: true,
+                load_in_background: false,
+                legacy_3d: false,
+                compression_format: AudioCompressionFormat::Vorbis,
+            },
+            ..Default::default()
         };
 
         let info = clip.get_info();

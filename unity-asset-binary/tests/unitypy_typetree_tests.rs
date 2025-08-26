@@ -3,6 +3,8 @@
 //! This file ports the TypeTree tests from UnityPy's test_typetree.py to Rust
 //! to ensure our TypeTree implementation is compatible.
 
+#![allow(unused_imports)]
+
 use std::collections::HashMap;
 use unity_asset_binary::{TypeTree, TypeTreeNode};
 

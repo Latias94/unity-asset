@@ -3,6 +3,9 @@
 //! These tests use the same sample files as UnityPy to ensure compatibility
 //! and identify areas where our implementation needs improvement.
 
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::manual_flatten)]
+
 use std::fs;
 use std::path::Path;
 use unity_asset_binary::{AssetBundle, SerializedFile};

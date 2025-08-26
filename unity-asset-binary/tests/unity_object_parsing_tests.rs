@@ -1,5 +1,7 @@
 //! Tests for UnityObject parsing into specific Unity types
 
+#![allow(unused_imports)]
+
 use indexmap::IndexMap;
 use unity_asset_binary::{GameObject, ObjectInfo, Transform, UnityObject};
 use unity_asset_core::{UnityClass, UnityValue};

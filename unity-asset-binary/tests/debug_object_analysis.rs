@@ -1,5 +1,7 @@
 //! Debug test to analyze what objects we can actually find in sample files
 
+#![allow(clippy::manual_flatten)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;

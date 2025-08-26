@@ -5,7 +5,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use unity_asset::{UnityDocument, YamlDocument};
+use unity_asset::UnityDocument;
 
 #[derive(Parser)]
 #[command(name = "unity_asset")]

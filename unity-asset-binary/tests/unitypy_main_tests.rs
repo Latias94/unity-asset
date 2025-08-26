@@ -3,6 +3,12 @@
 //! This file ports the core tests from UnityPy's test_main.py to Rust
 //! to ensure compatibility and feature parity.
 
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(clippy::manual_flatten)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::len_zero)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use unity_asset_binary::{

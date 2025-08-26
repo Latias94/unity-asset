@@ -1,5 +1,8 @@
 //! Advanced TypeTree parsing tests
 
+#![allow(unused_imports)]
+#![allow(clippy::approx_constant)]
+
 use indexmap::IndexMap;
 use unity_asset_binary::{BinaryReader, ByteOrder, TypeTree, TypeTreeNode};
 use unity_asset_core::UnityValue;

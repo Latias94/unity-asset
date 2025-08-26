@@ -3,6 +3,13 @@
 //! This file ports the extractor tests from UnityPy's test_extractor.py to Rust
 //! to test asset extraction functionality.
 
+#![allow(unused_imports)]
+#![allow(dead_code)]
+#![allow(clippy::manual_flatten)]
+#![allow(clippy::len_zero)]
+#![allow(clippy::needless_borrow)]
+#![allow(clippy::borrow_deref_ref)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};

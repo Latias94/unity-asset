@@ -515,6 +515,7 @@ impl Texture2D {
     }
 
     /// Parse Texture2D from raw binary data (based on unity-rs implementation)
+    #[allow(clippy::field_reassign_with_default)]
     pub fn from_binary_data(data: &[u8], version: &UnityVersion) -> Result<Self> {
         if data.is_empty() {
             return Err(BinaryError::invalid_data("Empty texture data"));
@@ -901,6 +902,7 @@ impl Texture2D {
     }
 
     /// Decode RGBA32 format (4 bytes per pixel: R, G, B, A)
+    #[allow(dead_code)]
     fn decode_rgba32(&self, width: u32, height: u32) -> Result<RgbaImage> {
         self.decode_rgba32_data(&self.image_data, width, height)
     }
@@ -931,6 +933,7 @@ impl Texture2D {
     }
 
     /// Decode RGB24 format (3 bytes per pixel: R, G, B)
+    #[allow(dead_code)]
     fn decode_rgb24(&self, width: u32, height: u32) -> Result<RgbaImage> {
         self.decode_rgb24_data(&self.image_data, width, height)
     }
@@ -961,6 +964,7 @@ impl Texture2D {
     }
 
     /// Decode ARGB32 format (4 bytes per pixel: A, R, G, B)
+    #[allow(dead_code)]
     fn decode_argb32(&self, width: u32, height: u32) -> Result<RgbaImage> {
         self.decode_argb32_data(&self.image_data, width, height)
     }
@@ -991,6 +995,7 @@ impl Texture2D {
     }
 
     /// Decode Alpha8 format (1 byte per pixel: A)
+    #[allow(dead_code)]
     fn decode_alpha8(&self, width: u32, height: u32) -> Result<RgbaImage> {
         self.decode_alpha8_data(&self.image_data, width, height)
     }
@@ -1452,18 +1457,18 @@ mod tests {
 
     #[test]
     fn test_texture_decode_rgba32() {
-        let mut texture = Texture2D::default();
-        texture.width = 2;
-        texture.height = 2;
-        texture.format = TextureFormat::RGBA32;
-
-        // Create 2x2 RGBA32 test data (4 pixels * 4 bytes each = 16 bytes)
-        texture.image_data = vec![
-            255, 0, 0, 255, // Red pixel
-            0, 255, 0, 255, // Green pixel
-            0, 0, 255, 255, // Blue pixel
-            255, 255, 255, 128, // White with 50% alpha
-        ];
+        let texture = Texture2D {
+            width: 2,
+            height: 2,
+            format: TextureFormat::RGBA32,
+            image_data: vec![
+                255, 0, 0, 255, // Red pixel
+                0, 255, 0, 255, // Green pixel
+                0, 0, 255, 255, // Blue pixel
+                255, 255, 255, 128, // White with 50% alpha
+            ],
+            ..Default::default()
+        };
 
         let image = texture.decode_image().unwrap();
         assert_eq!(image.width(), 2);
@@ -1478,13 +1483,13 @@ mod tests {
 
     #[test]
     fn test_texture_decode_rgb24() {
-        let mut texture = Texture2D::default();
-        texture.width = 1;
-        texture.height = 1;
-        texture.format = TextureFormat::RGB24;
-
-        // Create 1x1 RGB24 test data (1 pixel * 3 bytes = 3 bytes)
-        texture.image_data = vec![128, 64, 192]; // Purple-ish color
+        let texture = Texture2D {
+            width: 1,
+            height: 1,
+            format: TextureFormat::RGB24,
+            image_data: vec![128, 64, 192], // Purple-ish color
+            ..Default::default()
+        };
 
         let image = texture.decode_image().unwrap();
         assert_eq!(image.width(), 1);
@@ -1496,11 +1501,13 @@ mod tests {
 
     #[test]
     fn test_texture_decode_invalid_dimensions() {
-        let mut texture = Texture2D::default();
-        texture.width = 0;
-        texture.height = 0;
-        texture.format = TextureFormat::RGBA32;
-        texture.image_data = vec![255, 0, 0, 255];
+        let texture = Texture2D {
+            width: 0,
+            height: 0,
+            format: TextureFormat::RGBA32,
+            image_data: vec![255, 0, 0, 255],
+            ..Default::default()
+        };
 
         let result = texture.decode_image();
         assert!(result.is_err());
@@ -1508,11 +1515,13 @@ mod tests {
 
     #[test]
     fn test_texture_decode_insufficient_data() {
-        let mut texture = Texture2D::default();
-        texture.width = 2;
-        texture.height = 2;
-        texture.format = TextureFormat::RGBA32;
-        texture.image_data = vec![255, 0, 0]; // Only 3 bytes, need 16
+        let texture = Texture2D {
+            width: 2,
+            height: 2,
+            format: TextureFormat::RGBA32,
+            image_data: vec![255, 0, 0], // Only 3 bytes, need 16
+            ..Default::default()
+        };
 
         let result = texture.decode_image();
         assert!(result.is_err());
@@ -1520,13 +1529,15 @@ mod tests {
 
     #[test]
     fn test_texture_info() {
-        let mut texture = Texture2D::default();
-        texture.name = "TestTexture".to_string();
-        texture.width = 256;
-        texture.height = 256;
-        texture.format = TextureFormat::RGBA32;
-        texture.mip_count = 8;
-        texture.image_data = vec![0; 256 * 256 * 4];
+        let texture = Texture2D {
+            name: "TestTexture".to_string(),
+            width: 256,
+            height: 256,
+            format: TextureFormat::RGBA32,
+            mip_count: 8,
+            image_data: vec![0; 256 * 256 * 4],
+            ..Default::default()
+        };
 
         let info = texture.get_info();
         assert_eq!(info.name, "TestTexture");

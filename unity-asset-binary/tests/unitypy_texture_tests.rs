@@ -3,6 +3,11 @@
 //! This file tests the Phase 4 texture processing features against UnityPy's
 //! Texture2D handling behavior.
 
+#![allow(unused_imports)]
+#![allow(dead_code)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::identity_op)]
+
 use std::fs;
 use std::path::Path;
 use unity_asset_binary::{

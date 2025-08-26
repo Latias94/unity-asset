@@ -247,6 +247,7 @@ impl Mesh {
     }
 
     /// Parse Mesh from raw binary data (fallback method)
+    #[allow(clippy::field_reassign_with_default)]
     pub fn from_binary_data(data: &[u8], _version: &UnityVersion) -> Result<Self> {
         let mut reader = BinaryReader::new(data, crate::reader::ByteOrder::Little);
         let mut mesh = Mesh::default();

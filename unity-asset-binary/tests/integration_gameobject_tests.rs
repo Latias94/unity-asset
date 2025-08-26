@@ -1,5 +1,9 @@
 //! Integration tests for GameObject and Transform parsing in real Unity files
 
+#![allow(unused_imports)]
+#![allow(dead_code)]
+#![allow(clippy::manual_flatten)]
+
 use indexmap::IndexMap;
 use std::fs;
 use std::path::Path;

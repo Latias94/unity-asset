@@ -3,6 +3,11 @@
 //! This file tests the Phase 3 features (metadata extraction, version compatibility,
 //! performance monitoring) against UnityPy's expected behavior.
 
+#![allow(clippy::manual_flatten)]
+#![allow(clippy::len_zero)]
+#![allow(clippy::absurd_extreme_comparisons)]
+#![allow(unused_comparisons)]
+
 use std::fs;
 use std::path::Path;
 use unity_asset_binary::performance::{get_performance_stats, reset_performance_metrics};

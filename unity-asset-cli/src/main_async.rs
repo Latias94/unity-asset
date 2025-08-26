@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use unity_asset::{UnityDocument, YamlDocument};
 
@@ -279,7 +279,7 @@ async fn collect_yaml_files_from_dir(
     Ok(())
 }
 
-fn is_yaml_file(path: &PathBuf) -> bool {
+fn is_yaml_file(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
         matches!(ext, "asset" | "prefab" | "unity" | "meta" | "yaml" | "yml")
     } else {
@@ -387,7 +387,7 @@ async fn extract_command_async(
 #[cfg(feature = "async")]
 async fn extract_single_file(
     file_path: &PathBuf,
-    output_dir: &PathBuf,
+    output_dir: &Path,
     types: &[String],
 ) -> Result<usize> {
     let doc = YamlDocument::load_yaml_async(file_path, false).await?;

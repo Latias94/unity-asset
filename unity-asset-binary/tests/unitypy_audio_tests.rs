@@ -3,6 +3,8 @@
 //! This file tests the AudioClip processing features against UnityPy's
 //! AudioClip handling behavior.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use unity_asset_binary::{
     AudioClip, AudioClipMeta, AudioClipProcessor, AudioCompressionFormat, UnityVersion,
 };
