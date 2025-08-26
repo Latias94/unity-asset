@@ -1,19 +1,12 @@
 [workspace]
 members = [
     "unity-asset-core",
-    "unity-asset-yaml", 
-    "unity-asset-binary",  # Unity二进制文件解析
-    # V2 异步版本
-    "v2/unity-asset-core-v2",
-    "v2/unity-asset-yaml-v2",
-    "v2/unity-asset-binary-v2",
-    "v2/unity-asset-cli-v2",
-    "v2", # V2集成测试
+    "unity-asset-yaml",
+    "unity-asset-binary",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-# 共享依赖版本管理
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 indexmap = { version = "2.0", features = ["serde"] }
@@ -27,22 +20,18 @@ image = "0.25"
 flate2 = "1.0"
 lz4_flex = "0.11"
 
-# CLI 工具
 clap = { version = "4.0", features = ["derive"] }
 
-# V2 异步依赖
 tokio = { version = "1.0", features = ["full"] }
 futures = "0.3"
 async-trait = "0.1"
 
-# 测试依赖
 tempfile = "3.8"
 tokio-stream = "0.1"
 async-stream = "0.3"
 pin-project = "1.0"
 bytes = "1.0"
 
-# 错误处理和监控
 tracing = "0.1"
 tracing-futures = "0.2"
 
@@ -51,26 +40,23 @@ name = "unity_asset"
 version = "0.1.0"
 edition = "2024"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
-description = "A Rust implementation of Unity asset parser, starting with YAML support"
+description = "A Rust implementation of Unity asset parser"
 license = "MIT"
-repository = "https://github.com/yourusername/unity_asset"
+repository = "https://github.com/Latias94/unity-asset"
 keywords = ["unity", "yaml", "parser", "game", "assets"]
 categories = ["parsing", "game-development"]
 
 [dependencies]
-# 重新导出子crate的功能
 unity-asset-core = { path = "unity-asset-core" }
 unity-asset-yaml = { path = "unity-asset-yaml" }
 unity-asset-binary = { path = "unity-asset-binary" }
 
-# CLI 相关
 clap = { workspace = true }
 anyhow = { workspace = true }
 
-# 异步支持 (可选)
 tokio = { version = "1.0", features = ["fs", "io-util", "rt-multi-thread", "macros"], optional = true }
 futures = { version = "0.3", optional = true }
-indicatif = { version = "0.17", optional = true }  # 进度条
+indicatif = { version = "0.18", optional = true }
 
 [features]
 default = []
