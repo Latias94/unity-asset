@@ -94,17 +94,51 @@ impl UnityAsyncDecompressor {
         Ok(Bytes::from(result))
     }
 
-    /// Decompress LZMA data
+    /// Decompress LZMA data (based on V1 implementation with Unity-specific handling)
     async fn decompress_lzma(&self, compressed_data: &[u8]) -> Result<Bytes> {
         let data = compressed_data.to_vec();
 
-        // Run LZMA decompression on thread pool
+        // Run LZMA decompression on thread pool with Unity-specific logic
         let result = task::spawn_blocking(move || {
+            // Unity uses LZMA format, try different approaches (like V1)
+            if data.is_empty() {
+                return Err(UnityAssetError::parse_error(
+                    "LZMA data is empty".to_string(),
+                    0,
+                ));
+            }
+
+            // Try standard LZMA decompression first
             let mut output = Vec::new();
-            lzma_rs::lzma_decompress(&mut std::io::Cursor::new(data), &mut output).map_err(
-                |e| UnityAssetError::parse_error(format!("LZMA decompression failed: {}", e), 0),
-            )?;
-            Ok::<Vec<u8>, UnityAssetError>(output)
+            match lzma_rs::lzma_decompress(&mut std::io::Cursor::new(&data), &mut output) {
+                Ok(_) => Ok(output),
+                Err(e) => {
+                    // If standard LZMA fails, try with properties header (Unity format)
+                    if data.len() >= 13 {
+                        // Unity LZMA format: 5 bytes properties + 8 bytes uncompressed size + compressed data
+                        let compressed_data = &data[13..];
+                        let mut output2 = Vec::new();
+                        match lzma_rs::lzma_decompress(
+                            &mut std::io::Cursor::new(compressed_data),
+                            &mut output2,
+                        ) {
+                            Ok(_) => Ok(output2),
+                            Err(e2) => Err(UnityAssetError::parse_error(
+                                format!(
+                                    "LZMA decompression failed: {} (also tried with header: {})",
+                                    e, e2
+                                ),
+                                0,
+                            )),
+                        }
+                    } else {
+                        Err(UnityAssetError::parse_error(
+                            format!("LZMA decompression failed: {}", e),
+                            0,
+                        ))
+                    }
+                }
+            }
         })
         .await
         .map_err(|e| UnityAssetError::parse_error(format!("Task join error: {}", e), 0))??;
@@ -184,10 +218,47 @@ impl AsyncDecompressor for UnityAsyncDecompressor {
         &self,
         data: AsyncBinaryData,
     ) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
-        // For now, decompress entirely and create a cursor
-        // TODO: Implement true streaming decompression
-        let decompressed = self.decompress(&data).await?;
-        Ok(Box::new(std::io::Cursor::new(decompressed)))
+        // TODO: Implement true streaming decompression for better memory efficiency
+        // Current implementation decompresses entirely in memory, which is not ideal for large files
+        // Future improvements:
+        // - LZ4: Implement block-by-block streaming decompression
+        // - Brotli: Use brotli streaming decoder
+        // - LZMA: Investigate streaming LZMA options
+
+        if let Some(compression_type) = data.compression_type {
+            match compression_type {
+                CompressionType::None => {
+                    // No compression, return direct cursor
+                    Ok(Box::new(std::io::Cursor::new(data.raw_data().clone())))
+                }
+                CompressionType::LZ4 | CompressionType::LZ4HC => {
+                    // TODO: Implement true LZ4 streaming decompression
+                    // For now, decompress entirely for compatibility
+                    let decompressed = self.decompress(&data).await?;
+                    Ok(Box::new(std::io::Cursor::new(decompressed)))
+                }
+                CompressionType::LZMA => {
+                    // TODO: Investigate LZMA streaming options
+                    // LZMA typically requires full decompression, but streaming might be possible
+                    let decompressed = self.decompress(&data).await?;
+                    Ok(Box::new(std::io::Cursor::new(decompressed)))
+                }
+                CompressionType::Brotli => {
+                    // TODO: Use brotli streaming decoder for better memory efficiency
+                    // Brotli supports streaming, but current implementation decompresses fully
+                    let decompressed = self.decompress(&data).await?;
+                    Ok(Box::new(std::io::Cursor::new(decompressed)))
+                }
+                CompressionType::LZHAM => {
+                    return Err(UnityAssetError::unsupported_format(
+                        "LZHAM streaming decompression not supported".to_string(),
+                    ));
+                }
+            }
+        } else {
+            // No compression type specified, assume uncompressed
+            Ok(Box::new(std::io::Cursor::new(data.raw_data().clone())))
+        }
     }
 
     fn estimate_decompressed_size(&self, data: &AsyncBinaryData) -> Option<usize> {

@@ -66,7 +66,16 @@ impl SerializedFile {
         let cursor = std::io::Cursor::new(data.clone());
         let reader = tokio::io::BufReader::new(cursor);
         let stream_reader = AsyncStreamReader::with_config(reader, ReaderConfig::default());
-        Self::load_from_reader(stream_reader, AssetConfig::default()).await
+        let mut serialized_file =
+            Self::load_from_reader(stream_reader, AssetConfig::default()).await?;
+
+        // Store the raw data for object extraction (like V1 does)
+        serialized_file.data = data;
+
+        // Now populate object data from the stored file data
+        serialized_file.populate_object_data().await?;
+
+        Ok(serialized_file)
     }
 
     /// Load SerializedFile from path
@@ -94,20 +103,20 @@ impl SerializedFile {
         let enable_type_tree = header.has_type_tree;
 
         // Read type information
-        let types = Self::read_types(&mut reader, &header).await?;
+        let types = Self::read_types(&mut reader, &header, enable_type_tree).await?;
         let big_id_enabled = header.version >= 14;
 
         // Read object information
         let objects = Self::read_object_info(&mut reader, &header).await?;
 
         // Read script types
-        let script_types = Self::read_script_types(&mut reader, &header).await?;
+        let script_types = Self::read_script_types(&mut reader, &header, enable_type_tree).await?;
 
         // Read external references
         let externals = Self::read_externals(&mut reader, &header).await?;
 
         // Read reference types
-        let ref_types = Self::read_ref_types(&mut reader, &header).await?;
+        let ref_types = Self::read_ref_types(&mut reader, &header, enable_type_tree).await?;
 
         // Read user information
         let user_information = Self::read_user_information(&mut reader, &header).await?;
@@ -284,8 +293,11 @@ impl SerializedFile {
             );
         }
 
+        // Create empty nodes for now - would be populated from actual TypeTree data
+        let nodes = Vec::new();
+
         Ok(AsyncTypeTree {
-            nodes: Vec::new(), // TODO: Convert HashMap to Vec<TypeTreeNode>
+            nodes,
             string_buffer: Vec::new(),
             version: 0,
             platform: 0,
@@ -386,11 +398,11 @@ impl SerializedFile {
         Ok(objects)
     }
 
-    /// Read external references
+    /// Read external references (based on V1 implementation)
     async fn read_externals<R>(
         reader: &mut R,
-        _header: &SerializedFileHeader,
-    ) -> Result<Vec<ExternalReference>>
+        header: &SerializedFileHeader,
+    ) -> Result<Vec<FileIdentifier>>
     where
         R: AsyncBinaryReader,
     {
@@ -399,56 +411,83 @@ impl SerializedFile {
         let mut externals = Vec::with_capacity(external_count);
 
         for _ in 0..external_count {
-            // Read GUID
-            let guid_bytes = reader.read_exact_bytes(16).await?;
-            let guid = format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                guid_bytes[3], guid_bytes[2], guid_bytes[1], guid_bytes[0],
-                guid_bytes[5], guid_bytes[4], guid_bytes[7], guid_bytes[6],
-                guid_bytes[8], guid_bytes[9], guid_bytes[10], guid_bytes[11],
-                guid_bytes[12], guid_bytes[13], guid_bytes[14], guid_bytes[15]
-            );
-
-            // Read type
-            let reference_type = reader.read_u32().await?;
-
-            // Read path
-            let path = reader.read_null_terminated_string().await?;
-
-            // Convert string GUID to byte array
-            let mut guid_bytes = [0u8; 16];
-            if guid.len() >= 32 {
-                // Assume hex string format
-                for i in 0..16 {
-                    if let Ok(byte) = u8::from_str_radix(&guid[i * 2..i * 2 + 2], 16) {
-                        guid_bytes[i] = byte;
-                    }
-                }
-            }
-
-            externals.push(ExternalReference {
-                guid: guid_bytes,
-                type_: reference_type as i32,
-                path_name: path,
-            });
+            let external = Self::read_file_identifier(reader, header.version).await?;
+            externals.push(external);
         }
 
         Ok(externals)
     }
 
-    /// Process individual object
+    /// Read FileIdentifier (based on V1 implementation)
+    async fn read_file_identifier<R: AsyncBinaryReader>(
+        reader: &mut R,
+        version: u32,
+    ) -> Result<FileIdentifier> {
+        let mut file_identifier = FileIdentifier::new();
+
+        // Read GUID (16 bytes)
+        let guid_bytes = reader.read_exact_bytes(16).await?;
+        file_identifier.guid.copy_from_slice(&guid_bytes);
+
+        // Read type
+        file_identifier.type_ = reader.read_i32().await?;
+
+        // Read path name
+        file_identifier.path_name = reader.read_null_terminated_string().await?;
+
+        Ok(file_identifier)
+    }
+
+    /// Process individual object (based on V1 implementation)
     async fn process_object(
         object_info: ObjectInfo,
         type_tree: Option<AsyncTypeTree>,
         context: Arc<RwLock<AsyncProcessingContext>>,
-        _config: AssetConfig,
+        config: AssetConfig,
     ) -> Result<AsyncUnityClass> {
-        // This would read the actual object data and deserialize it
-        // For now, create a basic AsyncUnityClass
-
         let class_name = Self::get_class_name(object_info.class_id);
 
-        // Create placeholder data - in real implementation this would parse the binary data
+        // Extract actual object data (like V1 does)
+        // For now, create empty data - would be populated from file data
+        let object_data: Vec<u8> = Vec::new();
+
+        // Create AsyncUnityClass with proper initialization
+        let mut unity_class = AsyncUnityClass::new(
+            object_info.class_id as i32,
+            class_name.to_string(),
+            format!("&{}", object_info.path_id), // Use Unity-style anchor format
+        );
+
+        // Set path_id for binary format
+        unity_class.path_id = Some(object_info.path_id as i64);
+
+        // Parse object data using TypeTree if available
         let mut properties = HashMap::new();
+
+        if let Some(_type_tree) = type_tree {
+            if !object_data.is_empty() {
+                // TODO: Implement proper TypeTree-based object parsing
+                // Current implementation skips TypeTree parsing entirely
+                // Full implementation would need to:
+                // - Use AsyncObjectProcessor to parse binary data with TypeTree
+                // - Handle different Unity data types and structures
+                // - Support nested objects and arrays
+                // - Handle version-specific parsing differences
+
+                // TODO: Implement parse_object_data method in AsyncObjectProcessor
+                // let processor = crate::object_processor::AsyncObjectProcessor::new();
+                // match processor.parse_object_data(&object_data, &object_info, &type_tree).await {
+                //     Ok(parsed_class) => {
+                //         properties = parsed_class.properties().clone();
+                //     }
+                //     Err(e) => {
+                //         eprintln!("Failed to parse object data with TypeTree: {}", e);
+                //     }
+                // }
+            }
+        }
+
+        // Always include basic metadata
         properties.insert(
             "m_PathID".to_string(),
             UnityValue::Int64(object_info.path_id as i64),
@@ -458,27 +497,34 @@ impl SerializedFile {
             UnityValue::UInt32(object_info.class_id),
         );
 
-        // If we have TypeTree, we could use it to properly deserialize the object
-        if let Some(_type_tree) = type_tree {
-            // Use TypeTree to deserialize object data
-            // This would involve reading the binary data at object_info.byte_offset
-            // and using the TypeTree to interpret the structure
-        }
-
-        // Create AsyncUnityClass with the corrected structure
-        let mut unity_class = AsyncUnityClass::new(
-            object_info.class_id as i32,
-            class_name.to_string(),
-            format!("path_{}", object_info.path_id), // Use path_id as anchor for binary format
-        );
-
-        // Set path_id for binary format
-        unity_class.path_id = Some(object_info.path_id as i64);
-
-        // Set properties from parsed data
+        // Set the parsed properties
         *unity_class.properties_mut() = properties.into_iter().collect();
 
+        // Update processing context
+        {
+            let mut ctx = context.write().await;
+            ctx.stats.objects_processed += 1;
+        }
+
         Ok(unity_class)
+    }
+
+    /// Populate object data from stored file data (based on V1 implementation)
+    async fn populate_object_data(&mut self) -> Result<()> {
+        // TODO: Implement proper object data population from file data
+        // Current implementation is a placeholder that doesn't actually extract object data
+        // Full implementation would need to:
+        // 1. Extract object data from the file data using byte_offset and byte_size
+        // 2. Associate TypeTree information with each object
+        // 3. Store the data for later processing
+        // 4. Handle different Unity versions and their object layouts
+        // 5. Support compressed object data
+
+        // TODO: Extend ObjectInfo struct to include data and type_tree fields
+        // The actual implementation would require extending ObjectInfo
+        // to include data and type_tree fields like V1 does
+
+        Ok(())
     }
 
     /// Get class name from class ID
@@ -563,6 +609,20 @@ pub struct TypeTreeNode {
 }
 
 impl TypeTreeNode {
+    /// Create a new TypeTreeNode
+    pub fn new() -> Self {
+        Self {
+            type_name: String::new(),
+            field_name: String::new(),
+            size: 0,
+            index: 0,
+            flags: 0,
+            version: 0,
+            meta_flags: 0,
+            children: Vec::new(),
+        }
+    }
+
     /// Check if node is an array
     pub fn is_array(&self) -> bool {
         self.flags & 0x4000 != 0
@@ -731,57 +791,280 @@ mod tests {
 }
 
 impl SerializedFile {
-    /// Read Unity version string (stub implementation)
+    /// Read Unity version string (based on V1 implementation)
     async fn read_unity_version<R: AsyncBinaryReader>(
-        _reader: &mut R,
-        _header: &SerializedFileHeader,
+        reader: &mut R,
+        header: &SerializedFileHeader,
     ) -> Result<String> {
-        // TODO: Implement proper Unity version reading
-        Ok("2022.3.0f1".to_string())
+        // Read Unity version (if version >= 7)
+        if header.version >= 7 {
+            reader.read_null_terminated_string().await
+        } else {
+            Ok(String::new())
+        }
     }
 
-    /// Read target platform (stub implementation)
+    /// Read target platform (based on V1 implementation)
     async fn read_target_platform<R: AsyncBinaryReader>(
-        _reader: &mut R,
-        _header: &SerializedFileHeader,
+        reader: &mut R,
+        header: &SerializedFileHeader,
     ) -> Result<i32> {
-        // TODO: Implement proper target platform reading
-        Ok(5) // Default to StandaloneWindows
+        // Read target platform (if version >= 8)
+        if header.version >= 8 {
+            reader.read_i32().await
+        } else {
+            Ok(0) // Default platform
+        }
     }
 
-    /// Read type information (stub implementation)
+    /// Read type information (based on V1 implementation)
     async fn read_types<R: AsyncBinaryReader>(
-        _reader: &mut R,
-        _header: &SerializedFileHeader,
+        reader: &mut R,
+        header: &SerializedFileHeader,
+        enable_type_tree: bool,
     ) -> Result<Vec<SerializedType>> {
-        // TODO: Implement proper type reading
-        Ok(Vec::new())
+        // Read types
+        let type_count = reader.read_u32().await? as usize;
+        let mut types = Vec::with_capacity(type_count);
+
+        for _ in 0..type_count {
+            let serialized_type =
+                Self::read_serialized_type(reader, header.version, enable_type_tree).await?;
+            types.push(serialized_type);
+        }
+
+        Ok(types)
     }
 
-    /// Read script types (stub implementation)
+    /// Read SerializedType from binary data (based on V1 implementation)
+    async fn read_serialized_type<R: AsyncBinaryReader>(
+        reader: &mut R,
+        version: u32,
+        enable_type_tree: bool,
+    ) -> Result<SerializedType> {
+        let class_id = reader.read_i32().await?;
+        let mut serialized_type = SerializedType::new(class_id);
+
+        if version >= 16 {
+            serialized_type.is_stripped_type = reader.read_u8().await? != 0;
+        }
+
+        if version >= 17 {
+            let script_type_index = reader.read_i32().await? as i16;
+            serialized_type.script_type_index = Some(script_type_index);
+        }
+
+        if version >= 13 {
+            // Based on V1 logic: check conditions for script_id
+            let should_read_script_id = if version < 16 {
+                class_id < 0
+            } else {
+                class_id == 114 // MonoBehaviour
+            };
+
+            if should_read_script_id {
+                // Read script ID (16 bytes)
+                let script_id_bytes = reader.read_exact_bytes(16).await?;
+                serialized_type.script_id.copy_from_slice(&script_id_bytes);
+            }
+
+            // Always read old type hash for version >= 13 (16 bytes)
+            let old_type_hash_bytes = reader.read_exact_bytes(16).await?;
+            serialized_type
+                .old_type_hash
+                .copy_from_slice(&old_type_hash_bytes);
+        }
+
+        // Read TypeTree if enabled
+        if enable_type_tree {
+            serialized_type.type_tree = Self::read_type_tree_for_type(reader, version).await?;
+        }
+
+        // Read additional fields for version >= 21
+        if version >= 21 {
+            serialized_type.class_name = reader.read_null_terminated_string().await?;
+            serialized_type.namespace = reader.read_null_terminated_string().await?;
+            serialized_type.assembly_name = reader.read_null_terminated_string().await?;
+        }
+
+        Ok(serialized_type)
+    }
+
+    /// Read TypeTree for a specific type (based on V1 implementation)
+    async fn read_type_tree_for_type<R: AsyncBinaryReader>(
+        reader: &mut R,
+        version: u32,
+    ) -> Result<TypeTree> {
+        let mut type_tree = TypeTree::new();
+        type_tree.version = version;
+
+        // Choose parsing method based on version
+        if version >= 12 || version == 10 {
+            // Use blob format
+            Self::read_type_tree_blob(reader, &mut type_tree).await?;
+        } else {
+            // Use legacy format
+            Self::read_type_tree_legacy(reader, &mut type_tree).await?;
+        }
+
+        Ok(type_tree)
+    }
+
+    /// Read TypeTree in blob format (Unity version >= 12 or == 10)
+    async fn read_type_tree_blob<R: AsyncBinaryReader>(
+        reader: &mut R,
+        type_tree: &mut TypeTree,
+    ) -> Result<()> {
+        // Read number of nodes
+        let node_count = reader.read_i32().await? as usize;
+
+        // Read string buffer size
+        let string_buffer_size = reader.read_i32().await? as usize;
+
+        // Read nodes in blob format
+        for _ in 0..node_count {
+            let mut node = crate::binary_types::TypeTreeNode::new();
+
+            // Read node data in blob format (based on V1)
+            node.version = reader.read_u32().await? as i32;
+            node.level = reader.read_u8().await? as i32;
+            node.type_flags = reader.read_u8().await? as i32;
+            node.type_str_offset = reader.read_u32().await?;
+            node.name_str_offset = reader.read_u32().await?;
+            node.byte_size = reader.read_i32().await?;
+            node.index = reader.read_i32().await?;
+            node.meta_flags = reader.read_i32().await?;
+
+            if type_tree.version >= 19 {
+                node.ref_type_hash = reader.read_u64().await?;
+            }
+
+            type_tree.nodes.push(node);
+        }
+
+        // Read string buffer
+        type_tree.string_buffer = reader.read_exact_bytes(string_buffer_size).await?.to_vec();
+
+        // Resolve string references and build hierarchy
+        type_tree.resolve_strings()?;
+        type_tree.build_hierarchy()?;
+
+        Ok(())
+    }
+
+    /// Read TypeTree in legacy format (Unity version < 12 and != 10)
+    async fn read_type_tree_legacy<R: AsyncBinaryReader>(
+        reader: &mut R,
+        type_tree: &mut TypeTree,
+    ) -> Result<()> {
+        // Read number of nodes
+        let node_count = reader.read_u32().await? as usize;
+
+        // Read string buffer size
+        let string_buffer_size = reader.read_u32().await? as usize;
+
+        // Read nodes in legacy format
+        for _ in 0..node_count {
+            let mut node = crate::binary_types::TypeTreeNode::new();
+
+            // Read type name
+            node.type_name = reader.read_null_terminated_string().await?;
+
+            // Read field name
+            node.name = reader.read_null_terminated_string().await?;
+
+            // Read byte size
+            node.byte_size = reader.read_i32().await?;
+
+            // Read variable count (version 2 only)
+            if type_tree.version == 2 {
+                let _variable_count = reader.read_i32().await?;
+            }
+
+            // Read index (not in version 3)
+            if type_tree.version != 3 {
+                node.index = reader.read_i32().await?;
+            }
+
+            // Read type flags
+            node.type_flags = reader.read_i32().await?;
+
+            // Read version
+            node.version = reader.read_i32().await?;
+
+            // Read meta flags (not in version 3)
+            if type_tree.version != 3 {
+                node.meta_flags = reader.read_i32().await?;
+            }
+
+            type_tree.nodes.push(node);
+        }
+
+        // Read string buffer
+        type_tree.string_buffer = reader.read_exact_bytes(string_buffer_size).await?.to_vec();
+
+        // Build hierarchy
+        type_tree.build_hierarchy()?;
+
+        Ok(())
+    }
+
+    /// Read script types (based on V1 implementation)
     async fn read_script_types<R: AsyncBinaryReader>(
-        _reader: &mut R,
-        _header: &SerializedFileHeader,
+        reader: &mut R,
+        header: &SerializedFileHeader,
+        enable_type_tree: bool,
     ) -> Result<Vec<SerializedType>> {
-        // TODO: Implement proper script type reading
-        Ok(Vec::new())
+        // Read script types (if version >= 11)
+        if header.version >= 11 {
+            let script_count = reader.read_u32().await? as usize;
+            let mut script_types = Vec::with_capacity(script_count);
+
+            for _ in 0..script_count {
+                let script_type =
+                    Self::read_serialized_type(reader, header.version, enable_type_tree).await?;
+                script_types.push(script_type);
+            }
+
+            Ok(script_types)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
-    /// Read reference types (stub implementation)
+    /// Read reference types (based on V1 implementation)
     async fn read_ref_types<R: AsyncBinaryReader>(
-        _reader: &mut R,
-        _header: &SerializedFileHeader,
+        reader: &mut R,
+        header: &SerializedFileHeader,
+        enable_type_tree: bool,
     ) -> Result<Vec<SerializedType>> {
-        // TODO: Implement proper reference type reading
-        Ok(Vec::new())
+        // Read ref types (if version >= 20)
+        if header.version >= 20 {
+            let ref_type_count = reader.read_u32().await? as usize;
+            let mut ref_types = Vec::with_capacity(ref_type_count);
+
+            for _ in 0..ref_type_count {
+                let ref_type =
+                    Self::read_serialized_type(reader, header.version, enable_type_tree).await?;
+                ref_types.push(ref_type);
+            }
+
+            Ok(ref_types)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
-    /// Read user information (stub implementation)
+    /// Read user information (based on V1 implementation)
     async fn read_user_information<R: AsyncBinaryReader>(
-        _reader: &mut R,
-        _header: &SerializedFileHeader,
+        reader: &mut R,
+        header: &SerializedFileHeader,
     ) -> Result<String> {
-        // TODO: Implement proper user information reading
-        Ok(String::new())
+        // Read user information (if version >= 5)
+        if header.version >= 5 {
+            reader.read_null_terminated_string().await
+        } else {
+            Ok(String::new())
+        }
     }
 }

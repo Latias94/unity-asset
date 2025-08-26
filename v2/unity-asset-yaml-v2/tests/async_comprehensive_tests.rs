@@ -6,7 +6,7 @@
 use futures::StreamExt;
 use std::path::Path;
 use unity_asset_core_v2::Result;
-use unity_asset_yaml_v2::{AsyncUnityDocument, YamlDocument, YamlLoader, UnityValue};
+use unity_asset_yaml_v2::{AsyncUnityDocument, UnityValue, YamlDocument, YamlLoader};
 
 /// Test async equivalent of single document Unity file (PlayerSettings)
 #[tokio::test]
@@ -195,9 +195,7 @@ async fn test_async_streaming_multi_doc() {
         return;
     }
 
-    let document = YamlDocument::load_from_path(fixture_path)
-        .await
-        .unwrap();
+    let document = YamlDocument::load_from_path(fixture_path).await.unwrap();
 
     // Test streaming approach - new capability beyond blocking version
     let mut object_stream = document.objects_stream();

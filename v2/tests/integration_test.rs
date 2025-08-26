@@ -6,7 +6,7 @@ use std::path::Path;
 use tokio;
 
 // Import all V2 modules
-use unity_asset_binary_v2::{AssetConfig, AssetBundle, SerializedFile, BundleConfig};
+use unity_asset_binary_v2::{AssetBundle, AssetConfig, BundleConfig, SerializedFile};
 use unity_asset_core_v2::{AsyncUnityClass, Result, UnityValue};
 use unity_asset_yaml_v2::{YamlDocument, YamlLoader};
 

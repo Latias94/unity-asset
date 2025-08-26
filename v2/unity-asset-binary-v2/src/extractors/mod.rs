@@ -8,8 +8,11 @@ pub mod texture;
 #[cfg(feature = "audio")]
 pub mod audio;
 
-// TODO: Implement mesh and sprite extractors
-// #[cfg(feature = "mesh")]
+#[cfg(feature = "mesh")]
+pub mod mesh;
+
+#[cfg(feature = "sprite")]
+pub mod sprite;
 // pub mod mesh;
 
 // #[cfg(feature = "sprite")]

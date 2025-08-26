@@ -131,11 +131,9 @@ async fn test_read_batch() -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
             match extension {
-                "asset" | "prefab" | "unity" | "meta" => {
-                    YamlDocument::load_from_path(&path_clone)
-                        .await
-                        .map(|doc| ("yaml", doc.classes().len()))
-                }
+                "asset" | "prefab" | "unity" | "meta" => YamlDocument::load_from_path(&path_clone)
+                    .await
+                    .map(|doc| ("yaml", doc.classes().len())),
                 "bundle" | "unity3d" | "ab" => AssetBundle::load_from_path(&path_clone)
                     .await
                     .map(|bundle| ("bundle", bundle.assets.len())),

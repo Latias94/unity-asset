@@ -108,10 +108,7 @@ impl YamlLoader {
 
     /// Load YAML document from file path
     #[instrument(skip(self), fields(path = %path.as_ref().display()))]
-    pub async fn load_from_path<P: AsRef<Path> + Send>(
-        &self,
-        path: P,
-    ) -> Result<YamlDocument> {
+    pub async fn load_from_path<P: AsRef<Path> + Send>(&self, path: P) -> Result<YamlDocument> {
         let path = path.as_ref();
         info!("Loading YAML from path: {}", path.display());
 

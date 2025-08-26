@@ -7,9 +7,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::fs as async_fs;
 use unity_asset_binary_v2::{
-    AssetBundle, AsyncAudioClip, AsyncAudioProcessor, AsyncMesh, AsyncMeshProcessor,
-    SerializedFile, AsyncSprite, AsyncSpriteProcessor, AsyncTexture2D,
-    AsyncTexture2DProcessor, AsyncUnityObject, UnityVersion,
+    AssetBundle, AsyncAudioClip, AsyncAudioProcessor, AsyncMesh, AsyncMeshProcessor, AsyncSprite,
+    AsyncSpriteProcessor, AsyncTexture2D, AsyncTexture2DProcessor, AsyncUnityObject,
+    SerializedFile, UnityVersion,
 };
 use unity_asset_core_v2::{Result, UnityAssetError};
 

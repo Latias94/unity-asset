@@ -244,19 +244,58 @@ impl AsyncUnityClass {
 
     /// Get type tree if available (async version)
     pub async fn get_type_tree(&self) -> Option<AsyncTypeTree> {
-        // TODO: Implement async type tree retrieval
-        // For now, return None as placeholder
-        None
+        // TODO: Implement proper async type tree retrieval from SerializedFile
+        // Current implementation creates a basic placeholder type tree
+        // Full implementation would need to:
+        // - Retrieve type tree from associated SerializedFile
+        // - Handle different Unity versions and their type tree formats
+        // - Support lazy loading of type tree data
+        // - Cache type trees for performance
+
+        // For now, create a basic type tree if we have class information
+        if self.class_id > 0 {
+            Some(AsyncTypeTree {
+                class_id: self.class_id,
+                class_name: self.class_name.clone(),
+            })
+        } else {
+            None
+        }
     }
 
     /// Parse object with type tree (async version)
     pub async fn parse_with_typetree(
         &self,
-        _type_tree: &AsyncTypeTree,
+        type_tree: &AsyncTypeTree,
     ) -> Result<HashMap<String, UnityValue>> {
-        // TODO: Implement async type tree parsing
-        // For now, return empty map as placeholder
-        Ok(HashMap::new())
+        // TODO: Implement proper async type tree parsing
+        // Current implementation is a basic placeholder that doesn't actually parse binary data
+        // Full implementation would need to:
+        // - Parse binary object data using type tree structure
+        // - Handle different Unity data types (primitives, arrays, objects)
+        // - Support nested object parsing and references
+        // - Handle version-specific type tree differences
+        // - Implement proper endianness handling
+
+        let mut parsed_properties = HashMap::new();
+
+        // Add basic properties based on type tree information
+        parsed_properties.insert(
+            "m_ClassID".to_string(),
+            UnityValue::Int32(type_tree.class_id),
+        );
+
+        parsed_properties.insert(
+            "m_ClassName".to_string(),
+            UnityValue::String(type_tree.class_name.clone()),
+        );
+
+        // Copy existing properties (this doesn't actually parse from binary data)
+        for (key, value) in &self.properties {
+            parsed_properties.insert(key.clone(), value.clone());
+        }
+
+        Ok(parsed_properties)
     }
 
     /// Get raw binary data (async version)

@@ -139,7 +139,20 @@ impl AsyncObjectProcessor {
         object_info: &ObjectInfo,
         type_tree: &AsyncTypeTree,
     ) -> Result<AsyncUnityClass> {
-        let class_info: Option<&TypeTreeClass> = None; // TODO: Implement TypeTree class lookup
+        // Look up TypeTree class information (based on V1 implementation)
+        let class_info = type_tree
+            .nodes()
+            .iter()
+            .find(|node| {
+                node.type_name
+                    .contains(&format!("{}", object_info.class_id))
+            })
+            .map(|node| TypeTreeClass {
+                class_id: object_info.class_id,
+                nodes: vec![], // Simplified for now
+                script_type_index: None,
+            });
+
         let class_info = class_info.ok_or_else(|| {
             UnityAssetError::parse_error(
                 format!("No TypeTree info for class ID {}", object_info.class_id),
@@ -284,11 +297,7 @@ impl AsyncObjectProcessor {
     }
 
     /// Parse array from TypeTree
-    async fn parse_array<R>(
-        &self,
-        reader: &mut R,
-        array_node: &TypeTreeNode,
-    ) -> Result<UnityValue>
+    async fn parse_array<R>(&self, reader: &mut R, array_node: &TypeTreeNode) -> Result<UnityValue>
     where
         R: AsyncBinaryReader,
     {

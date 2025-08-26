@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use unity_asset_core_v2::Result;
 use unity_asset_yaml_v2::{
-    AsyncUnityDocument, YamlDocument, YamlLoader, DeserializeConfig, LoaderConfig,
-    UnityDeserializer, UnityValue,
+    AsyncUnityDocument, DeserializeConfig, LoaderConfig, UnityDeserializer, UnityValue,
+    YamlDocument, YamlLoader,
 };
 
 /// Test struct for Unity GameObject deserialization
