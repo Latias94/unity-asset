@@ -1,0 +1,73 @@
+[package]
+name = "unity-asset-binary"
+version = "0.1.0"
+edition = "2024"
+description = "Unity binary file format parser (AssetBundle, SerializedFile)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/your-repo/unity-asset-parser"
+keywords = ["unity", "binary", "assetbundle", "serialized", "parser"]
+categories = ["parser-implementations", "game-development"]
+
+[dependencies]
+# Core dependencies
+unity-asset-core = { path = "../unity-asset-core" }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+indexmap = "2.0"
+anyhow = { workspace = true }
+
+# Binary parsing
+binrw = { workspace = true }
+byteorder = "1.5"
+regex = "1.10"
+
+# Compression support
+flate2 = { workspace = true }
+lz4_flex = "0.11"
+lzma-rs = "0.3"
+brotli = "3.4"
+
+# Performance and utilities
+once_cell = "1.19"
+num_cpus = "1.16"
+
+# Async support (default)
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+tokio-stream = "0.1"
+async-stream = "0.3"
+
+# Image processing
+image = { workspace = true }
+
+# Audio processing (optional)
+symphonia = { version = "0.5", features = ["all"], optional = true }
+hound = { version = "3.5", optional = true }
+base64 = "0.21"
+
+# Advanced texture decoding (optional)
+texture2ddecoder = { version = "0.1", optional = true }
+
+# 3D model processing (optional)
+obj = { version = "0.10", optional = true }
+
+[features]
+default = ["texture", "audio", "mesh", "sprite", "texture-advanced"]
+
+# 主要功能模块
+texture = []                                          # 纹理处理 (基础+高级格式)
+audio = ["symphonia", "hound"]                        # 音频处理 (所有格式)
+mesh = []                                             # 网格处理 (基础+导出)
+sprite = []                                           # Sprite处理
+
+# 高级功能 (可选)
+texture-advanced = ["texture2ddecoder"]               # 高级纹理格式 (DXT, ETC, ASTC)
+mesh-export = ["obj"]                                 # 网格导出功能
+
+# 便捷组合
+minimal = []                                          # 仅核心解析功能
+full = ["texture", "audio", "mesh", "sprite", "texture-advanced", "mesh-export"]
+
+[dev-dependencies]
+hex = "0.4"

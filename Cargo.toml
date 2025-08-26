@@ -1,0 +1,46 @@
+[workspace]
+members = [
+    "unity-asset-core",
+    "unity-asset-yaml",
+    "unity-asset-binary",  # Unity二进制文件解析
+]
+resolver = "2"
+
+[workspace.dependencies]
+# 共享依赖版本管理
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+indexmap = { version = "2.0", features = ["serde"] }
+thiserror = "1.0"
+anyhow = "1.0"
+
+# 二进制解析依赖
+binrw = "0.15"
+byteorder = "1.5"
+image = "0.25"
+flate2 = "1.0"
+lz4_flex = "0.11"
+
+# CLI 工具
+clap = { version = "4.0", features = ["derive"] }
+
+[package]
+name = "unity_asset"
+version = "0.1.0"
+edition = "2024"
+authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
+description = "A Rust implementation of Unity asset parser, starting with YAML support"
+license = "MIT"
+repository = "https://github.com/yourusername/unity_asset"
+keywords = ["unity", "yaml", "parser", "game", "assets"]
+categories = ["parsing", "game-development"]
+
+[dependencies]
+# 重新导出子crate的功能
+unity-asset-core = { path = "unity-asset-core" }
+unity-asset-yaml = { path = "unity-asset-yaml" }
+unity-asset-binary = { path = "unity-asset-binary" }
+
+# CLI 相关
+clap = { workspace = true }
+anyhow = { workspace = true }

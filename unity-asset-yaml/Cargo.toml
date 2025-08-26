@@ -1,0 +1,22 @@
+[package]
+name = "unity-asset-yaml"
+version = "0.1.0"
+edition = "2024"
+authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
+description = "YAML format support for Unity asset parsing"
+license = "MIT"
+keywords = ["unity", "yaml", "parser", "game"]
+categories = ["parsing", "game-development"]
+
+[dependencies]
+# Core dependency
+unity-asset-core = { path = "../unity-asset-core" }
+
+# 使用workspace共享的依赖
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+indexmap = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "unity-asset-core"
+version = "0.1.0"
+edition = "2024"
+authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
+description = "Core data structures and types for Unity asset parsing"
+license = "MIT"
+keywords = ["unity", "assets", "core", "game"]
+categories = ["parsing", "game-development"]
+
+[dependencies]
+serde = { workspace = true }
+indexmap = { workspace = true }
+thiserror = { workspace = true }
+
+lazy_static = "1.4"
+
+[dev-dependencies]
+anyhow = { workspace = true }
