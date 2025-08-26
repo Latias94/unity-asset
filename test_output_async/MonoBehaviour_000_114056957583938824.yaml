@@ -1,0 +1,22 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &114056957583938824
+MonoBehaviour:
+  m_ObjectHideFlags: 1
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInternal: {fileID: 100100000}
+  m_GameObject: {fileID: 1158508787625206}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: 
+    fileID: 11500000
+    guid: f88be7789512f4a408c979f0b7dde537
+    type: 3
+  m_Name: {fileID: 0}
+  m_EditorClassIdentifier: {fileID: 0}
+  xIndex: 0
+  yIndex: 0
+  fullBlinkTime: 3
+  fullBlinks: 3
+  interpolation: 4
+  pieceType: 2
