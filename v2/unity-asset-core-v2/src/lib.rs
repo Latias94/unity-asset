@@ -47,7 +47,7 @@ pub use async_traits::{
 };
 pub use error::{ErrorRecovery, Result, RetryConfig, UnityAssetError};
 pub use io::{AsyncFileLoader, AsyncUnityReader, BufferedAsyncReader, ByteOrder, ReadConfig};
-pub use memory::{AsyncMemoryPool, BufferManager, MemoryConfig};
+pub use memory::{MemoryPool, BufferManager, MemoryConfig};
 pub use metrics::{AsyncMetrics, LoadStatistics, PerformanceTracker};
 pub use stream_types::{
     AssetChunkStream, BackPressure, ProcessedObjectStream, StreamConfig, UnityObjectStream,

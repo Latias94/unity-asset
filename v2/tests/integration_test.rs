@@ -6,9 +6,9 @@ use std::path::Path;
 use tokio;
 
 // Import all V2 modules
-use unity_asset_binary_v2::{AssetConfig, AsyncAssetBundle, AsyncSerializedFile, BundleConfig};
+use unity_asset_binary_v2::{AssetConfig, AssetBundle, SerializedFile, BundleConfig};
 use unity_asset_core_v2::{AsyncUnityClass, Result, UnityValue};
-use unity_asset_yaml_v2::{AsyncYamlDocument, AsyncYamlLoader};
+use unity_asset_yaml_v2::{YamlDocument, YamlLoader};
 
 /// Test basic V2 module integration
 #[tokio::test]
@@ -66,7 +66,7 @@ async fn test_yaml_integration() -> Result<()> {
         AsyncUnityClass::new(4, "Transform".to_string(), "100001".to_string()),
     ];
 
-    let doc = AsyncYamlDocument::new(classes, Default::default());
+    let doc = YamlDocument::new(classes, Default::default());
 
     // Test document access
     assert_eq!(doc.classes().len(), 2);

@@ -7,8 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::fs as async_fs;
 use unity_asset_binary_v2::{
-    AsyncAssetBundle, AsyncAudioClip, AsyncAudioProcessor, AsyncMesh, AsyncMeshProcessor,
-    AsyncSerializedFile, AsyncSprite, AsyncSpriteProcessor, AsyncTexture2D,
+    AssetBundle, AsyncAudioClip, AsyncAudioProcessor, AsyncMesh, AsyncMeshProcessor,
+    SerializedFile, AsyncSprite, AsyncSpriteProcessor, AsyncTexture2D,
     AsyncTexture2DProcessor, AsyncUnityObject, UnityVersion,
 };
 use unity_asset_core_v2::{Result, UnityAssetError};
@@ -55,7 +55,7 @@ async fn test_read_single() {
         match async_fs::read(&file_path).await {
             Ok(data) => {
                 // Try to parse as AsyncAssetBundle first
-                match AsyncAssetBundle::from_bytes(data.clone()).await {
+                match AssetBundle::from_bytes(data.clone()).await {
                     Ok(bundle) => {
                         successful_reads += 1;
                         println!("    ✓ Parsed as AsyncAssetBundle");
@@ -88,7 +88,7 @@ async fn test_read_single() {
                     }
                     Err(_) => {
                         // Try as AsyncSerializedFile
-                        match AsyncSerializedFile::from_bytes(data).await {
+                        match SerializedFile::from_bytes(data).await {
                             Ok(asset) => {
                                 successful_reads += 1;
                                 println!("    ✓ Parsed as AsyncSerializedFile");
@@ -155,7 +155,7 @@ async fn test_read_batch() {
                 match async_fs::read(&file_path).await {
                     Ok(data) => {
                         // Try AsyncAssetBundle first
-                        if let Ok(bundle) = AsyncAssetBundle::from_bytes(data.clone()).await {
+                        if let Ok(bundle) = AssetBundle::from_bytes(data.clone()).await {
                             let assets = bundle.assets().await;
                             let mut objects = Vec::new();
                             for asset in assets {
@@ -164,7 +164,7 @@ async fn test_read_batch() {
                                 }
                             }
                             return (1, objects);
-                        } else if let Ok(asset) = AsyncSerializedFile::from_bytes(data).await {
+                        } else if let Ok(asset) = SerializedFile::from_bytes(data).await {
                             if let Ok(objects) = asset.get_objects().await {
                                 return (1, objects);
                             }
@@ -224,7 +224,7 @@ async fn test_save_dict() {
             if path.is_file() {
                 if let Ok(data) = async_fs::read(&path).await {
                     // Try to load as AsyncAssetBundle
-                    if let Ok(bundle) = AsyncAssetBundle::from_bytes(data.clone()).await {
+                    if let Ok(bundle) = AssetBundle::from_bytes(data.clone()).await {
                         let assets = bundle.assets().await;
                         for asset in assets {
                             if let Ok(objects) = asset.get_objects().await {
@@ -326,7 +326,7 @@ async fn test_texture2d() {
             if path.is_file() {
                 if let Ok(data) = async_fs::read(&path).await {
                     // Try to load as AsyncAssetBundle
-                    if let Ok(bundle) = AsyncAssetBundle::from_bytes(data.clone()).await {
+                    if let Ok(bundle) = AssetBundle::from_bytes(data.clone()).await {
                         let assets = bundle.assets().await;
                         for asset in assets {
                             if let Ok(objects) = asset.get_objects().await {
@@ -421,7 +421,7 @@ async fn test_texture2d() {
                         }
                     }
                     // Try to load as AsyncSerializedFile
-                    else if let Ok(asset) = AsyncSerializedFile::from_bytes(data).await {
+                    else if let Ok(asset) = SerializedFile::from_bytes(data).await {
                         if let Ok(objects) = asset.get_objects().await {
                             for obj in objects {
                                 if obj.class_name() == "Texture2D" {
@@ -489,7 +489,7 @@ async fn test_audioclip() {
             if path.is_file() {
                 if let Ok(data) = async_fs::read(&path).await {
                     // Try to load as AsyncAssetBundle
-                    if let Ok(bundle) = AsyncAssetBundle::from_bytes(data.clone()).await {
+                    if let Ok(bundle) = AssetBundle::from_bytes(data.clone()).await {
                         let assets = bundle.assets().await;
                         for asset in assets {
                             if let Ok(objects) = asset.get_objects().await {
@@ -582,7 +582,7 @@ async fn test_audioclip() {
                         }
                     }
                     // Try to load as AsyncSerializedFile
-                    else if let Ok(asset) = AsyncSerializedFile::from_bytes(data).await {
+                    else if let Ok(asset) = SerializedFile::from_bytes(data).await {
                         if let Ok(objects) = asset.get_objects().await {
                             for obj in objects {
                                 if obj.class_name() == "AudioClip" {
@@ -653,7 +653,7 @@ async fn test_read_typetree() {
             if path.is_file() {
                 if let Ok(data) = async_fs::read(&path).await {
                     // Try to load as AsyncAssetBundle
-                    if let Ok(bundle) = AsyncAssetBundle::from_bytes(data.clone()).await {
+                    if let Ok(bundle) = AssetBundle::from_bytes(data.clone()).await {
                         let assets = bundle.assets().await;
                         for asset in assets {
                             if let Ok(objects) = asset.get_objects().await {
@@ -696,7 +696,7 @@ async fn test_read_typetree() {
                         }
                     }
                     // Try to load as AsyncSerializedFile
-                    else if let Ok(asset) = AsyncSerializedFile::from_bytes(data).await {
+                    else if let Ok(asset) = SerializedFile::from_bytes(data).await {
                         if let Ok(objects) = asset.get_objects().await {
                             for obj in objects {
                                 objects_found += 1;
@@ -751,7 +751,7 @@ async fn test_object_type_identification() {
 
     for file_path in sample_files {
         if let Ok(data) = async_fs::read(&file_path).await {
-            if let Ok(bundle) = AsyncAssetBundle::from_bytes(data.clone()).await {
+            if let Ok(bundle) = AssetBundle::from_bytes(data.clone()).await {
                 let assets = bundle.assets().await;
                 for asset in assets {
                     if let Ok(objects) = asset.get_objects().await {
@@ -761,7 +761,7 @@ async fn test_object_type_identification() {
                         }
                     }
                 }
-            } else if let Ok(asset) = AsyncSerializedFile::from_bytes(data).await {
+            } else if let Ok(asset) = SerializedFile::from_bytes(data).await {
                 if let Ok(objects) = asset.get_objects().await {
                     for obj in objects {
                         let class_name = obj.class_name().to_string();
@@ -798,7 +798,7 @@ async fn test_async_performance() {
         let path = file_path.clone();
         let task = tokio::spawn(async move {
             if let Ok(data) = async_fs::read(&path).await {
-                if let Ok(bundle) = AsyncAssetBundle::from_bytes(data.clone()).await {
+                if let Ok(bundle) = AssetBundle::from_bytes(data.clone()).await {
                     let assets = bundle.assets().await;
                     let mut object_count = 0;
                     for asset in assets {
@@ -807,7 +807,7 @@ async fn test_async_performance() {
                         }
                     }
                     return object_count;
-                } else if let Ok(asset) = AsyncSerializedFile::from_bytes(data).await {
+                } else if let Ok(asset) = SerializedFile::from_bytes(data).await {
                     if let Ok(objects) = asset.get_objects().await {
                         return objects.len();
                     }

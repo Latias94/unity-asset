@@ -24,9 +24,9 @@ use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
 use unity_asset_core_v2::{AsyncUnityClass, ObjectMetadata, Result, UnityAssetError, UnityValue};
 
-/// Async SerializedFile processor (aligned with V1 structure)
+/// SerializedFile processor
 #[derive(Debug, Clone)]
-pub struct AsyncSerializedFile {
+pub struct SerializedFile {
     /// File header information
     pub header: SerializedFileHeader,
     /// Unity version string
@@ -59,7 +59,7 @@ pub struct AsyncSerializedFile {
     data: Vec<u8>,
 }
 
-impl AsyncSerializedFile {
+impl SerializedFile {
     /// Create AsyncSerializedFile from bytes data asynchronously
     pub async fn from_bytes(data: Vec<u8>) -> Result<Self> {
         // Create async cursor and reader
@@ -276,7 +276,7 @@ impl AsyncSerializedFile {
 
             types.insert(
                 class_id,
-                AsyncTypeTreeClass {
+                TypeTreeClass {
                     class_id,
                     nodes,
                     script_type_index: None,
@@ -297,7 +297,7 @@ impl AsyncSerializedFile {
     async fn read_type_tree_nodes<R>(
         reader: &mut R,
         _header: &SerializedFileHeader,
-    ) -> Result<Vec<AsyncTypeTreeNode>>
+    ) -> Result<Vec<TypeTreeNode>>
     where
         R: AsyncBinaryReader,
     {
@@ -327,7 +327,7 @@ impl AsyncSerializedFile {
             // Read meta flags
             let meta_flags = reader.read_u32().await?;
 
-            nodes.push(AsyncTypeTreeNode {
+            nodes.push(TypeTreeNode {
                 type_name,
                 field_name,
                 size,
@@ -344,7 +344,7 @@ impl AsyncSerializedFile {
     }
 
     /// Build hierarchical structure for TypeTree nodes
-    fn build_type_tree_hierarchy(nodes: Vec<AsyncTypeTreeNode>) -> Result<Vec<AsyncTypeTreeNode>> {
+    fn build_type_tree_hierarchy(nodes: Vec<TypeTreeNode>) -> Result<Vec<TypeTreeNode>> {
         // This is a simplified version - real implementation would parse the tree structure
         // based on indices and build proper parent-child relationships
         Ok(nodes)
@@ -541,19 +541,17 @@ pub struct SerializedFileHeader {
     pub has_type_tree: bool,
 }
 
-// AsyncTypeTree is now an alias to TypeTree (defined above)
-
 /// TypeTree class definition
 #[derive(Debug, Clone)]
-pub struct AsyncTypeTreeClass {
+pub struct TypeTreeClass {
     pub class_id: u32,
-    pub nodes: Vec<AsyncTypeTreeNode>,
+    pub nodes: Vec<TypeTreeNode>,
     pub script_type_index: Option<u32>,
 }
 
 /// TypeTree node definition
 #[derive(Debug, Clone)]
-pub struct AsyncTypeTreeNode {
+pub struct TypeTreeNode {
     pub type_name: String,
     pub field_name: String,
     pub size: u32,
@@ -561,10 +559,10 @@ pub struct AsyncTypeTreeNode {
     pub flags: u32,
     pub version: u32,
     pub meta_flags: u32,
-    pub children: Vec<AsyncTypeTreeNode>,
+    pub children: Vec<TypeTreeNode>,
 }
 
-impl AsyncTypeTreeNode {
+impl TypeTreeNode {
     /// Check if node is an array
     pub fn is_array(&self) -> bool {
         self.flags & 0x4000 != 0
@@ -609,7 +607,7 @@ pub struct AssetMetadata {
 /// High-level async asset processor
 pub struct AsyncAsset {
     /// Underlying SerializedFile
-    serialized_file: AsyncSerializedFile,
+    serialized_file: SerializedFile,
     /// Asset name
     name: String,
 }
@@ -624,7 +622,7 @@ impl AsyncAsset {
             .unwrap_or("unknown")
             .to_string();
 
-        let serialized_file = AsyncSerializedFile::load_from_path(path).await?;
+        let serialized_file = SerializedFile::load_from_path(path).await?;
 
         Ok(Self {
             serialized_file,
@@ -694,15 +692,15 @@ mod tests {
 
     #[test]
     fn test_class_name_mapping() {
-        assert_eq!(AsyncSerializedFile::get_class_name(1), "GameObject");
-        assert_eq!(AsyncSerializedFile::get_class_name(83), "AudioClip");
-        assert_eq!(AsyncSerializedFile::get_class_name(28), "Texture2D");
-        assert_eq!(AsyncSerializedFile::get_class_name(999), "UnknownClass");
+        assert_eq!(SerializedFile::get_class_name(1), "GameObject");
+        assert_eq!(SerializedFile::get_class_name(83), "AudioClip");
+        assert_eq!(SerializedFile::get_class_name(28), "Texture2D");
+        assert_eq!(SerializedFile::get_class_name(999), "UnknownClass");
     }
 
     #[test]
     fn test_type_tree_node_flags() {
-        let node = AsyncTypeTreeNode {
+        let node = TypeTreeNode {
             type_name: "Test".to_string(),
             field_name: "test".to_string(),
             size: 4,
@@ -732,7 +730,7 @@ mod tests {
     }
 }
 
-impl AsyncSerializedFile {
+impl SerializedFile {
     /// Read Unity version string (stub implementation)
     async fn read_unity_version<R: AsyncBinaryReader>(
         _reader: &mut R,

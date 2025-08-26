@@ -19,7 +19,7 @@ use unity_asset_core_v2::{
     UnityAssetError, UnityValue,
 };
 
-use crate::async_document::AsyncYamlDocument;
+use crate::async_document::YamlDocument;
 
 /// Configuration for YAML loading
 #[derive(Debug, Clone)]
@@ -77,14 +77,14 @@ impl LoaderConfig {
     }
 }
 
-/// Async YAML loader with streaming support
+/// YAML loader with streaming support
 #[derive(Debug)]
-pub struct AsyncYamlLoader {
+pub struct YamlLoader {
     config: LoaderConfig,
     metrics: Arc<AsyncMetrics>,
 }
 
-impl AsyncYamlLoader {
+impl YamlLoader {
     /// Create new loader with default configuration
     pub fn new() -> Self {
         Self {
@@ -111,7 +111,7 @@ impl AsyncYamlLoader {
     pub async fn load_from_path<P: AsRef<Path> + Send>(
         &self,
         path: P,
-    ) -> Result<AsyncYamlDocument> {
+    ) -> Result<YamlDocument> {
         let path = path.as_ref();
         info!("Loading YAML from path: {}", path.display());
 
@@ -138,7 +138,7 @@ impl AsyncYamlLoader {
         &self,
         reader: R,
         file_path: Option<std::path::PathBuf>,
-    ) -> Result<AsyncYamlDocument>
+    ) -> Result<YamlDocument>
     where
         R: AsyncRead + Send + Unpin + 'static,
     {
@@ -171,7 +171,7 @@ impl AsyncYamlLoader {
         &self,
         path: P,
         progress_callback: F,
-    ) -> Result<AsyncYamlDocument>
+    ) -> Result<YamlDocument>
     where
         P: AsRef<Path> + Send,
         F: Fn(LoadProgress) + Send + Sync + 'static,
@@ -235,7 +235,7 @@ impl AsyncYamlLoader {
         &self,
         content: &str,
         file_path: Option<std::path::PathBuf>,
-    ) -> Result<AsyncYamlDocument> {
+    ) -> Result<YamlDocument> {
         // Pre-process Unity YAML format
         let processed_content = self.preprocess_unity_yaml(content).await?;
 
@@ -254,7 +254,7 @@ impl AsyncYamlLoader {
             properties: HashMap::new(),
         };
 
-        Ok(AsyncYamlDocument::new(classes, metadata))
+        Ok(YamlDocument::new(classes, metadata))
     }
 
     /// Pre-process Unity YAML format (based on V1 implementation)
@@ -592,8 +592,8 @@ impl AsyncYamlLoader {
 }
 
 #[async_trait]
-impl AsyncAssetLoader for AsyncYamlLoader {
-    type Output = AsyncYamlDocument;
+impl AsyncAssetLoader for YamlLoader {
+    type Output = YamlDocument;
     type Config = LoaderConfig;
 
     async fn load_asset<P>(&self, path: P, _config: Self::Config) -> Result<Self::Output>
@@ -648,7 +648,7 @@ impl AsyncAssetLoader for AsyncYamlLoader {
     }
 }
 
-impl Clone for AsyncYamlLoader {
+impl Clone for YamlLoader {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
@@ -657,7 +657,7 @@ impl Clone for AsyncYamlLoader {
     }
 }
 
-impl Default for AsyncYamlLoader {
+impl Default for YamlLoader {
     fn default() -> Self {
         Self::new()
     }
@@ -683,7 +683,7 @@ GameObject:
             .await
             .unwrap();
 
-        let loader = AsyncYamlLoader::new();
+        let loader = YamlLoader::new();
         let document = loader.load_from_path(temp_file.path()).await.unwrap();
 
         assert_eq!(document.classes().len(), 1);
@@ -721,7 +721,7 @@ Transform:
             temp_files.push(temp_file);
         }
 
-        let loader = AsyncYamlLoader::new();
+        let loader = YamlLoader::new();
         let paths: Vec<_> = temp_files.iter().map(|f| f.path().to_path_buf()).collect();
 
         let stream = loader.load_assets(paths, LoaderConfig::default()).await;

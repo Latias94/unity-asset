@@ -6,7 +6,7 @@
 use futures::StreamExt;
 use std::path::Path;
 use unity_asset_core_v2::Result;
-use unity_asset_yaml_v2::{AsyncUnityDocument, AsyncYamlDocument, AsyncYamlLoader, UnityValue};
+use unity_asset_yaml_v2::{AsyncUnityDocument, YamlDocument, YamlLoader, UnityValue};
 
 /// Test async equivalent of single document Unity file (PlayerSettings)
 #[tokio::test]
@@ -19,7 +19,7 @@ async fn test_async_single_doc_player_settings() {
     }
 
     // Test with async document loading
-    let result = AsyncYamlDocument::load_from_path(fixture_path).await;
+    let result = YamlDocument::load_from_path(fixture_path).await;
     assert!(
         result.is_ok(),
         "Failed to load SingleDoc.asset: {:?}",
@@ -94,7 +94,7 @@ async fn test_async_multi_doc_prefab() {
         return;
     }
 
-    let result = AsyncYamlDocument::load_from_path(fixture_path).await;
+    let result = YamlDocument::load_from_path(fixture_path).await;
     assert!(
         result.is_ok(),
         "Failed to load MultiDoc.asset: {:?}",
@@ -195,7 +195,7 @@ async fn test_async_streaming_multi_doc() {
         return;
     }
 
-    let document = AsyncYamlDocument::load_from_path(fixture_path)
+    let document = YamlDocument::load_from_path(fixture_path)
         .await
         .unwrap();
 
@@ -240,7 +240,7 @@ async fn test_async_unity_extra_anchor_data() {
     }
 
     // Test with async loading - may handle Unity-specific features better
-    let result = AsyncYamlDocument::load_from_path(fixture_path).await;
+    let result = YamlDocument::load_from_path(fixture_path).await;
 
     match result {
         Ok(document) => {
@@ -294,7 +294,7 @@ async fn test_async_meta_file_without_tags() {
         return;
     }
 
-    let result = AsyncYamlDocument::load_from_path(fixture_path).await;
+    let result = YamlDocument::load_from_path(fixture_path).await;
 
     match result {
         Ok(document) => {
@@ -335,7 +335,7 @@ async fn test_async_meta_file_without_tags() {
 /// Test async loader with all fixture files - comprehensive compatibility
 #[tokio::test]
 async fn test_async_loader_with_all_fixtures() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let fixtures = [
         ("SingleDoc.asset", "PlayerSettings"),
         ("MultiDoc.asset", "Multi-component prefab"),
@@ -416,7 +416,7 @@ async fn test_async_concurrent_fixture_processing() {
         return;
     }
 
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
 
     // Test concurrent loading - major advantage over blocking version
     let start = std::time::Instant::now();
@@ -474,7 +474,7 @@ async fn test_async_progress_tracking() {
         return;
     }
 
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let mut progress_updates = Vec::new();
 
     // Test progress callback functionality

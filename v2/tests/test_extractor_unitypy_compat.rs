@@ -4,9 +4,9 @@
 
 use std::path::Path;
 use tokio;
-use unity_asset_binary_v2::{AsyncAssetBundle, AsyncSerializedFile};
+use unity_asset_binary_v2::{AssetBundle, SerializedFile};
 use unity_asset_core_v2::Result;
-use unity_asset_yaml_v2::AsyncYamlDocument;
+use unity_asset_yaml_v2::YamlDocument;
 
 const SAMPLES_DIR: &str = "tests/samples";
 
@@ -55,7 +55,7 @@ async fn test_extractor() -> Result<()> {
 
             match extension {
                 "asset" | "prefab" | "unity" | "meta" => {
-                    match AsyncYamlDocument::load_from_path(&path).await {
+                    match YamlDocument::load_from_path(&path).await {
                         Ok(doc) => {
                             let classes = doc.classes();
                             total_objects += classes.len();
@@ -68,7 +68,7 @@ async fn test_extractor() -> Result<()> {
 
                                 // Create a single-class document for extraction
                                 let single_class_doc =
-                                    AsyncYamlDocument::new(vec![class.clone()], Default::default());
+                                    YamlDocument::new(vec![class.clone()], Default::default());
 
                                 // Serialize to YAML
                                 let yaml_content = single_class_doc.serialize_to_yaml().await?;
@@ -92,7 +92,7 @@ async fn test_extractor() -> Result<()> {
                     }
                 }
                 "bundle" | "unity3d" | "ab" => {
-                    match AsyncAssetBundle::load_from_path(&path).await {
+                    match AssetBundle::load_from_path(&path).await {
                         Ok(bundle) => {
                             // Extract bundle info
                             let bundle_info = format!(
@@ -152,7 +152,7 @@ async fn test_extractor() -> Result<()> {
                     }
                 }
                 "assets" => {
-                    match AsyncSerializedFile::load_from_path(&path).await {
+                    match SerializedFile::load_from_path(&path).await {
                         Ok(asset) => {
                             total_objects += asset.objects.len();
 
@@ -298,14 +298,14 @@ async fn test_concurrent_extraction() -> Result<()> {
 
             match extension {
                 "asset" | "prefab" | "unity" | "meta" => {
-                    if let Ok(doc) = AsyncYamlDocument::load_from_path(&path_clone).await {
+                    if let Ok(doc) = YamlDocument::load_from_path(&path_clone).await {
                         for (j, class) in doc.classes().iter().enumerate() {
                             let extract_name =
                                 format!("concurrent_{}_{:03}_{}.yaml", i, j, class.class_name());
                             let extract_path = temp_path_clone.join(&extract_name);
 
                             let single_class_doc =
-                                AsyncYamlDocument::new(vec![class.clone()], Default::default());
+                                YamlDocument::new(vec![class.clone()], Default::default());
 
                             if let Ok(yaml_content) = single_class_doc.serialize_to_yaml().await {
                                 if tokio::fs::write(&extract_path, yaml_content).await.is_ok() {
@@ -414,7 +414,7 @@ async fn test_filtered_extraction() -> Result<()> {
             let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
 
             if extension == "asset" || extension == "prefab" || extension == "unity" {
-                if let Ok(doc) = AsyncYamlDocument::load_from_path(&path).await {
+                if let Ok(doc) = YamlDocument::load_from_path(&path).await {
                     for class in doc.classes() {
                         let class_name = class.class_name();
 
@@ -427,7 +427,7 @@ async fn test_filtered_extraction() -> Result<()> {
                             let extract_path = temp_path.join(&extract_name);
 
                             let single_class_doc =
-                                AsyncYamlDocument::new(vec![class.clone()], Default::default());
+                                YamlDocument::new(vec![class.clone()], Default::default());
 
                             if let Ok(yaml_content) = single_class_doc.serialize_to_yaml().await {
                                 tokio::fs::write(&extract_path, yaml_content)

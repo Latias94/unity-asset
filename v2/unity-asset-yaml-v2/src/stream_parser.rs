@@ -13,7 +13,7 @@ use tracing::instrument;
 
 use unity_asset_core_v2::{stream_types::AssetChunk, AsyncUnityClass, Result, UnityAssetError};
 
-use crate::async_loader::AsyncYamlLoader;
+use crate::async_loader::YamlLoader;
 
 /// Stream of YAML objects
 pub type YamlObjectStream = Pin<Box<dyn Stream<Item = Result<AsyncUnityClass>> + Send>>;
@@ -70,7 +70,7 @@ impl StreamParseConfig {
 /// Stream-based YAML parser
 pub struct StreamYamlParser {
     config: StreamParseConfig,
-    loader: AsyncYamlLoader,
+    loader: YamlLoader,
 }
 
 impl StreamYamlParser {
@@ -78,7 +78,7 @@ impl StreamYamlParser {
     pub fn new() -> Self {
         Self {
             config: StreamParseConfig::default(),
-            loader: AsyncYamlLoader::new(),
+            loader: YamlLoader::new(),
         }
     }
 
@@ -86,7 +86,7 @@ impl StreamYamlParser {
     pub fn with_config(config: StreamParseConfig) -> Self {
         Self {
             config,
-            loader: AsyncYamlLoader::new(),
+            loader: YamlLoader::new(),
         }
     }
 
@@ -263,7 +263,7 @@ impl StreamYamlParser {
     /// Parse single document to Unity class
     #[instrument(skip(loader, doc_content))]
     async fn parse_document_to_class(
-        loader: AsyncYamlLoader,
+        loader: YamlLoader,
         doc_content: String,
         doc_index: usize,
     ) -> Result<Option<AsyncUnityClass>> {

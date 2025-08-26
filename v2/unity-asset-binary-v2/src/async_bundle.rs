@@ -6,7 +6,7 @@
 //! - Concurrent bundle processing with backpressure control
 //! - Zero-copy operations where possible
 
-use crate::async_asset::AsyncSerializedFile;
+use crate::async_asset::SerializedFile;
 use crate::binary_types::AsyncBinaryReader;
 use crate::binary_types::*;
 use async_stream::stream;
@@ -39,8 +39,8 @@ pub struct DirectoryNode {
     pub path: String,
 }
 
-/// Async AssetBundle processor (aligned with V1 structure)
-pub struct AsyncAssetBundle {
+/// AssetBundle processor
+pub struct AssetBundle {
     /// Bundle header (compatible with V1)
     pub header: BundleHeader,
     /// Compression blocks information
@@ -50,7 +50,7 @@ pub struct AsyncAssetBundle {
     /// File information (compatible with V1)
     pub files: Vec<BundleFileInfo>,
     /// Loaded assets (SerializedFiles)
-    pub assets: Vec<AsyncSerializedFile>,
+    pub assets: Vec<SerializedFile>,
     /// Raw bundle data
     data: Vec<u8>,
     /// Bundle configuration (async-specific)
@@ -61,7 +61,7 @@ pub struct AsyncAssetBundle {
     semaphore: Arc<Semaphore>,
 }
 
-impl AsyncAssetBundle {
+impl AssetBundle {
     /// Load AssetBundle from bytes data asynchronously
     pub async fn from_bytes(data: Vec<u8>) -> Result<Self> {
         let cursor = std::io::Cursor::new(data.clone());
@@ -134,7 +134,7 @@ impl AsyncAssetBundle {
     }
 
     /// Get all assets from the bundle
-    pub async fn assets(&self) -> Vec<AsyncSerializedFile> {
+    pub async fn assets(&self) -> Vec<SerializedFile> {
         // Return cached assets if available
         if !self.assets.is_empty() {
             return self.assets.clone();
@@ -145,7 +145,7 @@ impl AsyncAssetBundle {
     }
 
     /// Load a SerializedFile asset from a bundle entry
-    async fn load_asset_from_entry(&self, entry: &AsyncBundleEntry) -> Result<AsyncSerializedFile> {
+    async fn load_asset_from_entry(&self, entry: &AsyncBundleEntry) -> Result<SerializedFile> {
         // For now, create a mock SerializedFile
         // TODO: Implement actual asset loading from bundle data
 
@@ -156,11 +156,11 @@ impl AsyncAssetBundle {
         // 3. Parse as SerializedFile
 
         let mock_data = vec![0u8; entry.size as usize];
-        AsyncSerializedFile::from_bytes(mock_data).await
+        SerializedFile::from_bytes(mock_data).await
     }
 
     /// Stream all assets from the bundle concurrently
-    pub fn assets_stream(&self) -> impl Stream<Item = Result<AsyncSerializedFile>> + Send + '_ {
+    pub fn assets_stream(&self) -> impl Stream<Item = Result<SerializedFile>> + Send + '_ {
         let files = self.files.clone();
         let context = Arc::clone(&self.context);
         let semaphore = Arc::clone(&self.semaphore);
@@ -521,7 +521,7 @@ impl AsyncAssetBundle {
         file: BundleFileInfo,
         context: Arc<RwLock<AsyncProcessingContext>>,
         config: BundleConfig,
-    ) -> Result<AsyncSerializedFile> {
+    ) -> Result<SerializedFile> {
         // TODO: Implement actual asset processing from BundleFileInfo
         // For now, return a placeholder error
         Err(UnityAssetError::parse_error(
@@ -817,7 +817,7 @@ impl AsyncBundleProcessor {
     }
 
     /// Process multiple bundles concurrently
-    pub async fn process_bundles<P>(&self, bundle_paths: Vec<P>) -> Result<Vec<AsyncAssetBundle>>
+    pub async fn process_bundles<P>(&self, bundle_paths: Vec<P>) -> Result<Vec<AssetBundle>>
     where
         P: AsRef<Path> + Send + 'static,
     {
@@ -833,7 +833,7 @@ impl AsyncBundleProcessor {
             let config = self.config.clone();
             join_set.spawn(async move {
                 let _permit = permit;
-                AsyncAssetBundle::load_from_path(path).await
+                AssetBundle::load_from_path(path).await
             });
         }
 
@@ -916,7 +916,7 @@ mod tests {
         _file: BundleFileInfo,
         _context: Arc<RwLock<AsyncProcessingContext>>,
         _config: BundleConfig,
-    ) -> Result<AsyncSerializedFile> {
+    ) -> Result<SerializedFile> {
         // TODO: Implement actual asset file processing
         Err(UnityAssetError::parse_error(
             "Asset file processing not yet implemented".to_string(),

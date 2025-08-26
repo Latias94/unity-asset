@@ -4,9 +4,9 @@
 
 use std::path::Path;
 use tokio;
-use unity_asset_binary_v2::{AsyncAssetBundle, AsyncSerializedFile};
+use unity_asset_binary_v2::{AssetBundle, SerializedFile};
 use unity_asset_core_v2::Result;
-use unity_asset_yaml_v2::AsyncYamlDocument;
+use unity_asset_yaml_v2::YamlDocument;
 
 const SAMPLES_DIR: &str = "tests/samples";
 
@@ -37,7 +37,7 @@ async fn test_read_single() -> Result<()> {
             match extension {
                 "asset" | "prefab" | "unity" | "meta" => {
                     // Test YAML loading
-                    match AsyncYamlDocument::load_from_path(&path).await {
+                    match YamlDocument::load_from_path(&path).await {
                         Ok(doc) => {
                             println!("  ✅ YAML loaded: {} classes", doc.classes().len());
                             // Test reading all objects
@@ -51,7 +51,7 @@ async fn test_read_single() -> Result<()> {
                 }
                 "bundle" | "unity3d" | "ab" => {
                     // Test AssetBundle loading
-                    match AsyncAssetBundle::load_from_path(&path).await {
+                    match AssetBundle::load_from_path(&path).await {
                         Ok(bundle) => {
                             println!("  ✅ Bundle loaded: {} assets", bundle.assets.len());
                             // Test reading all objects
@@ -67,7 +67,7 @@ async fn test_read_single() -> Result<()> {
                 }
                 "assets" => {
                     // Test SerializedFile loading
-                    match AsyncSerializedFile::load_from_path(&path).await {
+                    match SerializedFile::load_from_path(&path).await {
                         Ok(asset) => {
                             println!("  ✅ Asset loaded: {} objects", asset.objects.len());
                             // Test reading all objects
@@ -132,14 +132,14 @@ async fn test_read_batch() -> Result<()> {
                 .unwrap_or("");
             match extension {
                 "asset" | "prefab" | "unity" | "meta" => {
-                    AsyncYamlDocument::load_from_path(&path_clone)
+                    YamlDocument::load_from_path(&path_clone)
                         .await
                         .map(|doc| ("yaml", doc.classes().len()))
                 }
-                "bundle" | "unity3d" | "ab" => AsyncAssetBundle::load_from_path(&path_clone)
+                "bundle" | "unity3d" | "ab" => AssetBundle::load_from_path(&path_clone)
                     .await
                     .map(|bundle| ("bundle", bundle.assets.len())),
-                "assets" => AsyncSerializedFile::load_from_path(&path_clone)
+                "assets" => SerializedFile::load_from_path(&path_clone)
                     .await
                     .map(|asset| ("asset", asset.objects.len())),
                 _ => Ok(("unknown", 0)),
@@ -197,7 +197,7 @@ async fn test_save_dict() -> Result<()> {
         if path.extension().and_then(|s| s.to_str()) == Some("asset") {
             println!("📄 Testing TypeTree with: {:?}", path);
 
-            let doc = AsyncYamlDocument::load_from_path(&path).await?;
+            let doc = YamlDocument::load_from_path(&path).await?;
 
             for class in doc.classes() {
                 // Test that we can access properties (equivalent to get_raw_data)
@@ -260,7 +260,7 @@ async fn test_specific_resource_types() -> Result<()> {
 
             match extension {
                 "asset" | "prefab" | "unity" | "meta" => {
-                    if let Ok(doc) = AsyncYamlDocument::load_from_path(&path).await {
+                    if let Ok(doc) = YamlDocument::load_from_path(&path).await {
                         for class in doc.classes() {
                             match class.class_name() {
                                 "Texture2D" => {
@@ -287,7 +287,7 @@ async fn test_specific_resource_types() -> Result<()> {
                     }
                 }
                 "bundle" | "unity3d" | "ab" => {
-                    if let Ok(bundle) = AsyncAssetBundle::load_from_path(&path).await {
+                    if let Ok(bundle) = AssetBundle::load_from_path(&path).await {
                         for asset in &bundle.assets {
                             for obj in &asset.objects {
                                 // Count objects by class_id (would need class_id to name mapping)

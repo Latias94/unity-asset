@@ -5,7 +5,7 @@
 use std::path::Path;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::AsyncYamlDocument;
+use crate::YamlDocument;
 use unity_asset_core_v2::{Result, UnityAssetError};
 
 /// Configuration for YAML writing
@@ -50,7 +50,7 @@ impl AsyncYamlWriter {
     /// Write document to file
     pub async fn write_to_file<P: AsRef<Path> + Send>(
         &self,
-        document: &AsyncYamlDocument,
+        document: &YamlDocument,
         path: P,
     ) -> Result<()> {
         let content = document.serialize_to_yaml().await?;
@@ -63,7 +63,7 @@ impl AsyncYamlWriter {
     /// Write document to writer
     pub async fn write_to_writer<W: AsyncWrite + Unpin + Send>(
         &self,
-        document: &AsyncYamlDocument,
+        document: &YamlDocument,
         mut writer: W,
     ) -> Result<()> {
         let content = document.serialize_to_yaml().await?;

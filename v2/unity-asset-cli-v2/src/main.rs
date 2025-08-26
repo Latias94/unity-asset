@@ -4,9 +4,9 @@
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use unity_asset_binary_v2::{AsyncAssetBundle, AsyncSerializedFile};
+use unity_asset_binary_v2::{AssetBundle, SerializedFile};
 use unity_asset_core_v2::Result;
-use unity_asset_yaml_v2::{AsyncYamlDocument, AsyncYamlLoader};
+use unity_asset_yaml_v2::{YamlDocument, YamlLoader};
 
 #[derive(Parser)]
 #[command(name = "unity-asset-v2")]
@@ -112,7 +112,7 @@ async fn parse_yaml_command(input: PathBuf, format: String, preserve_types: bool
     println!("🔧 Preserve types: {}", preserve_types);
 
     // Load the YAML document asynchronously
-    let doc = AsyncYamlDocument::load_from_path(&input).await?;
+    let doc = YamlDocument::load_from_path(&input).await?;
 
     println!("✅ Successfully loaded YAML document");
     println!("📦 Classes: {}", doc.classes().len());
@@ -174,7 +174,7 @@ async fn parse_binary_command(input: PathBuf, format: String) -> Result<()> {
     match extension {
         "bundle" | "unity3d" | "ab" => {
             // Parse as AssetBundle
-            let bundle = AsyncAssetBundle::load_from_path(&input).await?;
+            let bundle = AssetBundle::load_from_path(&input).await?;
             println!("✅ Successfully loaded AssetBundle");
             println!("📦 Assets: {}", bundle.assets.len());
             println!("🗂️ Files: {}", bundle.files.len());
@@ -204,7 +204,7 @@ async fn parse_binary_command(input: PathBuf, format: String) -> Result<()> {
         }
         "assets" => {
             // Parse as SerializedFile
-            let asset = AsyncSerializedFile::load_from_path(&input).await?;
+            let asset = SerializedFile::load_from_path(&input).await?;
             println!("✅ Successfully loaded SerializedFile");
             println!("📦 Objects: {}", asset.objects.len());
             println!("🏷️ Unity Version: {}", asset.unity_version);
@@ -271,7 +271,7 @@ async fn extract_command(
     match extension {
         "asset" | "prefab" | "unity" | "meta" => {
             // Load as YAML document asynchronously
-            let doc = AsyncYamlDocument::load_from_path(&input).await?;
+            let doc = YamlDocument::load_from_path(&input).await?;
             println!(
                 "✅ Loaded YAML document with {} classes",
                 doc.classes().len()
@@ -307,7 +307,7 @@ async fn extract_command(
 
                     // Create a single-class document
                     let single_class_vec = vec![class];
-                    let single_doc = AsyncYamlDocument::new(single_class_vec, Default::default());
+                    let single_doc = YamlDocument::new(single_class_vec, Default::default());
 
                     // Serialize the class to YAML
                     let yaml_content = single_doc.serialize_to_yaml().await?;
@@ -339,7 +339,7 @@ async fn extract_command(
         }
         "bundle" | "unity3d" | "ab" => {
             // Load as AssetBundle asynchronously
-            let bundle = AsyncAssetBundle::load_from_path(&input).await?;
+            let bundle = AssetBundle::load_from_path(&input).await?;
             println!("✅ Loaded AssetBundle with {} assets", bundle.assets.len());
 
             // Extract assets concurrently

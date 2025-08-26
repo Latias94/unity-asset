@@ -14,13 +14,13 @@
 //! # Quick Start
 //!
 //! ```rust,no_run
-//! use unity_asset_yaml_v2::{AsyncYamlDocument, AsyncUnityDocument};
+//! use unity_asset_yaml_v2::{YamlDocument, AsyncUnityDocument};
 //! use futures::StreamExt;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Load YAML file asynchronously
-//!     let doc = AsyncYamlDocument::load_from_path("GameObject.yaml").await?;
+//!     let doc = YamlDocument::load_from_path("GameObject.yaml").await?;
 //!     
 //!     // Stream through objects
 //!     let mut objects = doc.objects_stream();
@@ -45,8 +45,8 @@ pub mod unity_deserializer;
 pub mod yaml_writer;
 
 // Re-export main YAML types
-pub use async_document::AsyncYamlDocument;
-pub use async_loader::AsyncYamlLoader;
+pub use async_document::YamlDocument;
+pub use async_loader::YamlLoader;
 pub use python_api::AsyncPythonApi;
 pub use stream_parser::{StreamYamlParser, YamlObjectStream};
 pub use unity_deserializer::{DeserializeConfig, UnityDeserializer};
@@ -56,13 +56,13 @@ pub use yaml_writer::{AsyncYamlWriter, WriteConfig};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Initialize async YAML processor with default settings
-pub fn init_async_yaml() -> AsyncYamlLoader {
-    AsyncYamlLoader::new()
+pub fn init_async_yaml() -> YamlLoader {
+    YamlLoader::new()
 }
 
 /// Create async YAML processor with custom configuration
-pub fn init_async_yaml_with_config(config: async_loader::LoaderConfig) -> AsyncYamlLoader {
-    AsyncYamlLoader::with_config(config)
+pub fn init_async_yaml_with_config(config: async_loader::LoaderConfig) -> YamlLoader {
+    YamlLoader::with_config(config)
 }
 
 #[cfg(test)]

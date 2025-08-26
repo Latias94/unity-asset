@@ -2,7 +2,7 @@
 //!
 //! Async Unity object processing with TypeTree-based deserialization and streaming support.
 
-use crate::async_asset::{AsyncTypeTree, AsyncTypeTreeClass, AsyncTypeTreeNode};
+use crate::async_asset::{AsyncTypeTree, TypeTreeClass, TypeTreeNode};
 use crate::binary_types::{AsyncBinaryData, AsyncBinaryReader, StreamPosition};
 use crate::stream_reader::AsyncStreamReader;
 use async_trait::async_trait;
@@ -139,7 +139,7 @@ impl AsyncObjectProcessor {
         object_info: &ObjectInfo,
         type_tree: &AsyncTypeTree,
     ) -> Result<AsyncUnityClass> {
-        let class_info: Option<&AsyncTypeTreeClass> = None; // TODO: Implement TypeTree class lookup
+        let class_info: Option<&TypeTreeClass> = None; // TODO: Implement TypeTree class lookup
         let class_info = class_info.ok_or_else(|| {
             UnityAssetError::parse_error(
                 format!("No TypeTree info for class ID {}", object_info.class_id),
@@ -206,7 +206,7 @@ impl AsyncObjectProcessor {
     async fn parse_type_tree_nodes<R>(
         &self,
         reader: &mut R,
-        nodes: &[AsyncTypeTreeNode],
+        nodes: &[TypeTreeNode],
     ) -> Result<UnityValue>
     where
         R: AsyncBinaryReader,
@@ -223,7 +223,7 @@ impl AsyncObjectProcessor {
     async fn parse_type_tree_node<R>(
         &self,
         reader: &mut R,
-        node: &AsyncTypeTreeNode,
+        node: &TypeTreeNode,
     ) -> Result<UnityValue>
     where
         R: AsyncBinaryReader,
@@ -287,7 +287,7 @@ impl AsyncObjectProcessor {
     async fn parse_array<R>(
         &self,
         reader: &mut R,
-        array_node: &AsyncTypeTreeNode,
+        array_node: &TypeTreeNode,
     ) -> Result<UnityValue>
     where
         R: AsyncBinaryReader,
@@ -312,7 +312,7 @@ impl AsyncObjectProcessor {
     async fn parse_object_from_children<R>(
         &self,
         reader: &mut R,
-        children: &[AsyncTypeTreeNode],
+        children: &[TypeTreeNode],
     ) -> Result<UnityValue>
     where
         R: AsyncBinaryReader,

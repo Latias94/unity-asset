@@ -7,13 +7,13 @@
 use futures::StreamExt;
 use unity_asset_core_v2::{AsyncUnityClass, UnityValue};
 use unity_asset_yaml_v2::{
-    async_loader::LoaderConfig, AsyncUnityDocument, AsyncYamlDocument, AsyncYamlLoader,
+    async_loader::LoaderConfig, AsyncUnityDocument, YamlDocument, YamlLoader,
 };
 
 /// Test async equivalent of SerdeUnityLoader::load_from_str
 #[tokio::test]
 async fn test_async_load_simple_gameobject() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let yaml = r#"
 GameObject:
   m_ObjectHideFlags: 0
@@ -54,7 +54,7 @@ GameObject:
 /// Test async equivalent of loading Transform with nested objects
 #[tokio::test]
 async fn test_async_load_transform_with_nested_objects() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let yaml = r#"
 Transform:
   m_ObjectHideFlags: 0
@@ -96,7 +96,7 @@ Transform:
 /// Test async equivalent of loading MonoBehaviour with arrays
 #[tokio::test]
 async fn test_async_load_monobehaviour_with_arrays() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let yaml = r#"
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -159,7 +159,7 @@ MonoBehaviour:
 /// Test async equivalent of loading multiple documents
 #[tokio::test]
 async fn test_async_load_multiple_documents() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let yaml = r#"
 ---
 GameObject:
@@ -207,7 +207,7 @@ MonoBehaviour:
 "#;
 
     // Test streaming approach (new capability not in blocking version)
-    let document = AsyncYamlDocument::load_from_stream(std::io::Cursor::new(yaml.as_bytes()))
+    let document = YamlDocument::load_from_stream(std::io::Cursor::new(yaml.as_bytes()))
         .await
         .unwrap();
 
@@ -228,7 +228,7 @@ MonoBehaviour:
 /// Test async equivalent of error handling
 #[tokio::test]
 async fn test_async_error_handling() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let invalid_yaml = "invalid: yaml: content: [unclosed";
 
     let result = loader
@@ -245,7 +245,7 @@ async fn test_async_error_handling() {
 /// Test async equivalent of empty YAML handling
 #[tokio::test]
 async fn test_async_empty_yaml() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let empty_yaml = "";
 
     let result = loader
@@ -263,13 +263,13 @@ async fn test_async_empty_yaml() {
 async fn test_async_loader_configuration() {
     // Test different configurations - equivalent to blocking version options
     let config_large = LoaderConfig::for_large_files();
-    let loader_large = AsyncYamlLoader::with_config(config_large);
+    let loader_large = YamlLoader::with_config(config_large);
     assert_eq!(loader_large.config().max_concurrent_loads, 4);
     assert_eq!(loader_large.config().buffer_size, 32768);
     assert!(!loader_large.config().resolve_anchors);
 
     let config_small = LoaderConfig::for_small_files();
-    let loader_small = AsyncYamlLoader::with_config(config_small);
+    let loader_small = YamlLoader::with_config(config_small);
     assert_eq!(loader_small.config().max_concurrent_loads, 16);
     assert!(loader_small.config().preserve_order);
     assert!(loader_small.config().resolve_anchors);
@@ -292,7 +292,7 @@ Transform:
         })
         .collect::<Vec<_>>();
 
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let paths: Vec<_> = temp_files.iter().map(|f| f.path().to_path_buf()).collect();
 
     // Test concurrent loading - this is a major advantage over blocking version
@@ -351,7 +351,7 @@ PlayerSettings:
       useProtectedVideoMemory: 0
 "#;
 
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let result = loader
         .load_from_reader(std::io::Cursor::new(complex_yaml.as_bytes()), None)
         .await;
@@ -411,7 +411,7 @@ GameObject:
     speed: 5.5
 "#;
 
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
 
     // Test async loading performance
     let start = std::time::Instant::now();

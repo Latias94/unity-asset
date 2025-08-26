@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use unity_asset_core_v2::Result;
 use unity_asset_yaml_v2::{
-    AsyncUnityDocument, AsyncYamlDocument, AsyncYamlLoader, DeserializeConfig, LoaderConfig,
+    AsyncUnityDocument, YamlDocument, YamlLoader, DeserializeConfig, LoaderConfig,
     UnityDeserializer, UnityValue,
 };
 
@@ -51,7 +51,7 @@ struct TestQuaternion {
 /// Test async equivalent of loading simple Unity GameObject with serde
 #[tokio::test]
 async fn test_async_serde_load_simple_gameobject() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let yaml = r#"
 GameObject:
   m_ObjectHideFlags: 0
@@ -87,7 +87,7 @@ GameObject:
 /// Test async Transform deserialization with nested objects
 #[tokio::test]
 async fn test_async_serde_load_transform_with_nested_objects() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let yaml = r#"
 Transform:
   m_ObjectHideFlags: 0
@@ -140,7 +140,7 @@ Transform:
 /// Test async serde with custom deserializer configuration
 #[tokio::test]
 async fn test_async_serde_with_custom_config() {
-    let loader = AsyncYamlLoader::with_config(LoaderConfig {
+    let loader = YamlLoader::with_config(LoaderConfig {
         preserve_order: true,
         max_concurrent_loads: 1,
         ..LoaderConfig::default()
@@ -195,7 +195,7 @@ GameObject:
 /// Test async streaming serde deserialization
 #[tokio::test]
 async fn test_async_streaming_serde_deserialization() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let yaml = r#"
 ---
 GameObject:
@@ -315,7 +315,7 @@ async fn test_async_serde_serialization_roundtrip() {
 
     // Create document
     let metadata = unity_asset_core_v2::ObjectMetadata::default();
-    let document = AsyncYamlDocument::new(classes, metadata);
+    let document = YamlDocument::new(classes, metadata);
 
     // Test serialization to YAML
     let yaml_content = document.serialize_to_yaml().await.unwrap();
@@ -324,7 +324,7 @@ async fn test_async_serde_serialization_roundtrip() {
     assert!(yaml_content.contains("TestObject"));
 
     // Test deserialization back
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let result = loader
         .load_from_reader(std::io::Cursor::new(yaml_content.as_bytes()), None)
         .await;
@@ -354,7 +354,7 @@ async fn test_async_serde_serialization_roundtrip() {
 /// Test async serde error handling
 #[tokio::test]
 async fn test_async_serde_error_handling() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
 
     // Test with invalid YAML structure for GameObject
     let invalid_yaml = r#"
@@ -435,7 +435,7 @@ ComplexComponent:
     - {x: 0.0, y: 0.0, z: 1.0}
 "#;
 
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let result = loader
         .load_from_reader(std::io::Cursor::new(complex_yaml.as_bytes()), None)
         .await;
@@ -486,7 +486,7 @@ async fn test_async_concurrent_serde_processing() {
   m_LocalScale: {x: 1, y: 1, z: 1}"#,
     ];
 
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let deserializer = UnityDeserializer::new();
 
     // Process documents concurrently

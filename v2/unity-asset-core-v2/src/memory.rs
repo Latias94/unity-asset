@@ -23,13 +23,13 @@ impl Default for MemoryConfig {
     }
 }
 
-/// Async memory pool
-pub struct AsyncMemoryPool {
+/// Memory pool
+pub struct MemoryPool {
     buffers: Arc<Mutex<Vec<Vec<u8>>>>,
     config: MemoryConfig,
 }
 
-impl AsyncMemoryPool {
+impl MemoryPool {
     pub fn new(config: MemoryConfig) -> Self {
         Self {
             buffers: Arc::new(Mutex::new(Vec::new())),
@@ -57,7 +57,7 @@ impl AsyncMemoryPool {
     }
 }
 
-impl Default for AsyncMemoryPool {
+impl Default for MemoryPool {
     fn default() -> Self {
         Self::new(MemoryConfig::default())
     }
@@ -65,11 +65,11 @@ impl Default for AsyncMemoryPool {
 
 /// Buffer manager
 pub struct BufferManager {
-    pool: AsyncMemoryPool,
+    pool: MemoryPool,
 }
 
 impl BufferManager {
-    pub fn new(pool: AsyncMemoryPool) -> Self {
+    pub fn new(pool: MemoryPool) -> Self {
         Self { pool }
     }
 
@@ -80,6 +80,6 @@ impl BufferManager {
 
 impl Default for BufferManager {
     fn default() -> Self {
-        Self::new(AsyncMemoryPool::default())
+        Self::new(MemoryPool::default())
     }
 }

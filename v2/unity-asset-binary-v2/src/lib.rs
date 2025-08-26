@@ -26,13 +26,13 @@
 //! # Quick Start
 //!
 //! ```rust,no_run
-//! use unity_asset_binary_v2::{AsyncAssetBundle, AsyncBundleProcessor};
+//! use unity_asset_binary_v2::{AssetBundle, AsyncBundleProcessor};
 //! use futures::StreamExt;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Load bundle asynchronously
-//!     let bundle = AsyncAssetBundle::load_from_path("example.bundle").await?;
+//!     let bundle = AssetBundle::load_from_path("example.bundle").await?;
 //!     
 //!     // Process assets concurrently
 //!     let mut asset_stream = bundle.assets_stream();
@@ -81,8 +81,8 @@ pub use extractors::audio::*;
 // pub use extractors::sprite::*;
 
 // Re-export main types
-pub use async_asset::{AssetConfig, AsyncAsset, AsyncSerializedFile};
-pub use async_bundle::{AsyncAssetBundle, AsyncBundleProcessor, BundleConfig};
+pub use async_asset::{AssetConfig, AsyncAsset, SerializedFile};
+pub use async_bundle::{AssetBundle, AsyncBundleProcessor, BundleConfig};
 pub use async_compression::{AsyncDecompressor, CompressionConfig};
 pub use binary_types::*;
 pub use object_processor::{AsyncObjectProcessor, ObjectConfig};

@@ -4,12 +4,12 @@
 
 use futures::StreamExt;
 use unity_asset_core_v2::UnityValue;
-use unity_asset_yaml_v2::{AsyncUnityDocument, AsyncYamlDocument, AsyncYamlLoader};
+use unity_asset_yaml_v2::{AsyncUnityDocument, YamlDocument, YamlLoader};
 
 /// Test basic GameObject loading - mirrors blocking SerdeUnityLoader::load_from_str
 #[tokio::test]
 async fn test_load_simple_gameobject() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let yaml = r#"
 GameObject:
   m_Name: Player
@@ -31,7 +31,7 @@ GameObject:
 /// Test Transform with nested objects - mirrors blocking nested object test
 #[tokio::test]
 async fn test_load_transform_nested() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let yaml = r#"
 Transform:
   m_LocalPosition: {x: 1.5, y: 2.0, z: 0}
@@ -56,7 +56,7 @@ Transform:
 /// Test multiple documents - mirrors blocking multi-doc test
 #[tokio::test]
 async fn test_load_multiple_documents() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let yaml = r#"
 ---
 GameObject:
@@ -93,7 +93,7 @@ GameObject:
   m_Name: Object2
 "#;
 
-    let document = AsyncYamlDocument::load_from_stream(std::io::Cursor::new(yaml.as_bytes()))
+    let document = YamlDocument::load_from_stream(std::io::Cursor::new(yaml.as_bytes()))
         .await
         .unwrap();
 
@@ -112,7 +112,7 @@ GameObject:
 /// Test error handling - mirrors blocking error test
 #[tokio::test]
 async fn test_error_handling() {
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let invalid_yaml = "invalid: yaml: [unclosed";
 
     let result = loader
@@ -139,7 +139,7 @@ async fn test_concurrent_loading() {
         })
         .collect::<Vec<_>>();
 
-    let loader = AsyncYamlLoader::new();
+    let loader = YamlLoader::new();
     let paths: Vec<_> = temp_files.iter().map(|f| f.path().to_path_buf()).collect();
 
     let stream = loader.load_assets(paths, LoaderConfig::default()).await;

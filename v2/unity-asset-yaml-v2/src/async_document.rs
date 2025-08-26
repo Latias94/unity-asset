@@ -14,23 +14,23 @@ use unity_asset_core_v2::{
     UnityValue,
 };
 
-use crate::async_loader::AsyncYamlLoader;
+use crate::async_loader::YamlLoader;
 
 /// Async YAML document with streaming capabilities
 #[derive(Debug, Clone)]
-pub struct AsyncYamlDocument {
+pub struct YamlDocument {
     classes: Vec<AsyncUnityClass>,
     metadata: ObjectMetadata,
-    loader: Arc<AsyncYamlLoader>,
+    loader: Arc<YamlLoader>,
 }
 
-impl AsyncYamlDocument {
+impl YamlDocument {
     /// Create new YAML document
     pub fn new(classes: Vec<AsyncUnityClass>, metadata: ObjectMetadata) -> Self {
         Self {
             classes,
             metadata,
-            loader: Arc::new(AsyncYamlLoader::new()),
+            loader: Arc::new(YamlLoader::new()),
         }
     }
 
@@ -38,7 +38,7 @@ impl AsyncYamlDocument {
     pub fn with_loader(
         classes: Vec<AsyncUnityClass>,
         metadata: ObjectMetadata,
-        loader: AsyncYamlLoader,
+        loader: YamlLoader,
     ) -> Self {
         Self {
             classes,
@@ -247,7 +247,7 @@ impl AsyncYamlDocument {
     }
 
     /// Create filtered copy with only specified class types
-    pub async fn filter_by_types(&self, class_types: &[&str]) -> Result<AsyncYamlDocument> {
+    pub async fn filter_by_types(&self, class_types: &[&str]) -> Result<YamlDocument> {
         let filtered_classes: Vec<AsyncUnityClass> = self
             .classes
             .iter()
@@ -260,7 +260,7 @@ impl AsyncYamlDocument {
             .properties
             .insert("filtered_types".to_string(), class_types.join(","));
 
-        Ok(AsyncYamlDocument::with_loader(
+        Ok(YamlDocument::with_loader(
             filtered_classes,
             new_metadata,
             (*self.loader).clone(),
@@ -268,7 +268,7 @@ impl AsyncYamlDocument {
     }
 
     /// Merge with another document
-    pub async fn merge_with(&self, other: &AsyncYamlDocument) -> Result<AsyncYamlDocument> {
+    pub async fn merge_with(&self, other: &YamlDocument) -> Result<YamlDocument> {
         let mut merged_classes = self.classes.clone();
         merged_classes.extend(other.classes.iter().cloned());
 
@@ -279,7 +279,7 @@ impl AsyncYamlDocument {
         );
         new_metadata.size_bytes += other.metadata.size_bytes;
 
-        Ok(AsyncYamlDocument::with_loader(
+        Ok(YamlDocument::with_loader(
             merged_classes,
             new_metadata,
             (*self.loader).clone(),
@@ -305,14 +305,14 @@ impl AsyncYamlDocument {
 }
 
 #[async_trait]
-impl AsyncUnityDocument for AsyncYamlDocument {
+impl AsyncUnityDocument for YamlDocument {
     /// Load from file path asynchronously
     async fn load_from_path<P>(path: P) -> Result<Self>
     where
         P: AsRef<Path> + Send,
         Self: Sized,
     {
-        let loader = AsyncYamlLoader::new();
+        let loader = YamlLoader::new();
         loader.load_from_path(path).await
     }
 
@@ -322,7 +322,7 @@ impl AsyncUnityDocument for AsyncYamlDocument {
         S: AsyncRead + AsyncSeek + Send + Unpin + 'static,
         Self: Sized,
     {
-        let loader = AsyncYamlLoader::new();
+        let loader = YamlLoader::new();
         loader.load_from_reader(stream, None).await
     }
 
@@ -333,7 +333,7 @@ impl AsyncUnityDocument for AsyncYamlDocument {
         F: Fn(LoadProgress) + Send + Sync + 'static,
         Self: Sized,
     {
-        let loader = AsyncYamlLoader::new();
+        let loader = YamlLoader::new();
         loader.load_with_progress(path, progress_callback).await
     }
 
@@ -435,7 +435,7 @@ mod tests {
         ];
 
         let metadata = ObjectMetadata::default();
-        let doc = AsyncYamlDocument::new(classes, metadata);
+        let doc = YamlDocument::new(classes, metadata);
 
         assert_eq!(doc.class_count(), 2);
         assert!(!doc.is_empty());
@@ -451,7 +451,7 @@ mod tests {
         ];
 
         let metadata = ObjectMetadata::default();
-        let doc = AsyncYamlDocument::new(classes, metadata);
+        let doc = YamlDocument::new(classes, metadata);
 
         let game_objects = doc.classes_by_type("GameObject");
         assert_eq!(game_objects.len(), 2);
@@ -470,7 +470,7 @@ mod tests {
         ];
 
         let metadata = ObjectMetadata::default();
-        let doc = AsyncYamlDocument::new(classes, metadata);
+        let doc = YamlDocument::new(classes, metadata);
 
         let stats = doc.statistics();
         assert_eq!(stats.total_classes, 3);
@@ -492,7 +492,7 @@ mod tests {
         ];
 
         let metadata = ObjectMetadata::default();
-        let doc = AsyncYamlDocument::new(classes, metadata);
+        let doc = YamlDocument::new(classes, metadata);
 
         let mut stream = doc.objects_stream();
         let mut count = 0;
@@ -514,7 +514,7 @@ mod tests {
         ];
 
         let metadata = ObjectMetadata::default();
-        let doc = AsyncYamlDocument::new(classes, metadata);
+        let doc = YamlDocument::new(classes, metadata);
 
         let mut stream = doc.filter_objects_stream(&["GameObject"]);
         let mut count = 0;
@@ -533,8 +533,8 @@ mod tests {
         let classes1 = vec![create_test_class("GameObject", "Player")];
         let classes2 = vec![create_test_class("Transform", "PlayerTransform")];
 
-        let doc1 = AsyncYamlDocument::new(classes1, ObjectMetadata::default());
-        let doc2 = AsyncYamlDocument::new(classes2, ObjectMetadata::default());
+        let doc1 = YamlDocument::new(classes1, ObjectMetadata::default());
+        let doc2 = YamlDocument::new(classes2, ObjectMetadata::default());
 
         let merged = doc1.merge_with(&doc2).await.unwrap();
         assert_eq!(merged.class_count(), 2);
@@ -550,7 +550,7 @@ mod tests {
         ];
 
         let metadata = ObjectMetadata::default();
-        let doc = AsyncYamlDocument::new(classes, metadata);
+        let doc = YamlDocument::new(classes, metadata);
 
         let filtered = doc.filter_by_types(&["GameObject"]).await.unwrap();
         assert_eq!(filtered.class_count(), 2);
