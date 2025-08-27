@@ -17,13 +17,18 @@
 //! use unity_asset_binary::typetree::{TypeTreeParser, TypeTreeBuilder, TypeTreeSerializer};
 //! use unity_asset_binary::reader::BinaryReader;
 //!
+//! // Create mock data for demonstration
+//! let data = vec![0u8; 100];
+//! let object_data = vec![0u8; 50];
+//!
 //! // Parse TypeTree from binary data
 //! let mut reader = BinaryReader::new(&data, unity_asset_binary::reader::ByteOrder::Little);
 //! let tree = TypeTreeParser::from_reader(&mut reader, 19)?;
 //!
 //! // Use TypeTree to parse object data
 //! let serializer = TypeTreeSerializer::new(&tree);
-//! let object_data = serializer.parse_object(&mut object_reader)?;
+//! let mut object_reader = BinaryReader::new(&object_data, unity_asset_binary::reader::ByteOrder::Little);
+//! let parsed_object = serializer.parse_object(&mut object_reader)?;
 //!
 //! // Build TypeTree programmatically
 //! let mut builder = TypeTreeBuilder::new().version(19);

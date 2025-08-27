@@ -24,24 +24,19 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use unity_asset_binary::AssetBundle;
+//! use unity_asset_binary::load_bundle_from_memory;
 //! use std::fs;
 //!
 //! // Load an AssetBundle file
 //! let data = fs::read("example.bundle")?;
-//! let bundle = AssetBundle::from_bytes(data)?;
+//! let bundle = load_bundle_from_memory(data)?;
 //!
 //! // Access contained assets
-//! for asset in bundle.assets() {
-//!     println!("Asset: {}", asset.name());
-//!     // Extract objects from the asset
-//!     let objects = asset.get_objects()?;
-//!     for object in objects {
-//!         if let Some(name) = object.name() {
-//!             println!("  Object: {} ({})", name, object.class_name());
-//!         } else {
-//!             println!("  Object: <unnamed> ({})", object.class_name());
-//!         }
+//! for asset in &bundle.assets {
+//!     println!("Asset with {} objects", asset.object_count());
+//!     // Access objects in the asset
+//!     for object in &asset.objects {
+//!         println!("  Object: {} (type_id: {})", object.path_id, object.type_id);
 //!     }
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())

@@ -33,16 +33,15 @@
 //! ## Binary Asset Processing
 //!
 //! ```rust,no_run
-//! use unity_asset::{AssetBundle, SerializedFile};
+//! use unity_asset::load_bundle_from_memory;
 //!
 //! // Load and parse AssetBundle
 //! let data = std::fs::read("game.bundle")?;
-//! let bundle = AssetBundle::from_bytes(data)?;
+//! let bundle = load_bundle_from_memory(data)?;
 //!
 //! // Process assets
-//! for asset in bundle.assets() {
-//!     let objects = asset.get_objects()?;
-//!     println!("Found {} objects", objects.len());
+//! for asset in &bundle.assets {
+//!     println!("Found asset with {} objects", asset.object_count());
 //! }
 //!
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -79,7 +78,9 @@ pub use unity_asset_core::{
 pub use unity_asset_yaml::YamlDocument;
 
 // Re-export from binary crate
-pub use unity_asset_binary::{AssetBundle, SerializedFile};
+pub use unity_asset_binary::{
+    AssetBundle, SerializedFile, load_bundle, load_bundle_from_memory, load_bundle_with_options,
+};
 
 // Re-export async traits when async feature is enabled
 #[cfg(feature = "async")]

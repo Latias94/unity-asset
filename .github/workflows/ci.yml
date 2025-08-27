@@ -15,16 +15,14 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        rust: [stable, beta]
         features: ["", "async"]
     
     steps:
     - uses: actions/checkout@v4
     
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: ${{ matrix.rust }}
         components: rustfmt, clippy
     
     - name: Cache dependencies
@@ -40,10 +38,20 @@ jobs:
       run: cargo fmt --all -- --check
     
     - name: Run clippy
-      run: cargo clippy --all-targets --features ${{ matrix.features }} -- -D warnings
-    
+      run: |
+        if [ -n "${{ matrix.features }}" ]; then
+          cargo clippy --all-targets --features ${{ matrix.features }} -- -D warnings
+        else
+          cargo clippy --all-targets -- -D warnings
+        fi
+
     - name: Run tests
-      run: cargo test --all --features ${{ matrix.features }}
+      run: |
+        if [ -n "${{ matrix.features }}" ]; then
+          cargo test --all --features ${{ matrix.features }}
+        else
+          cargo test --all
+        fi
     
     - name: Test CLI tools
       run: |
