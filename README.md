@@ -15,7 +15,6 @@ A Rust implementation of Unity asset parsing, inspired by and learning from [Uni
 ### What This Project Is NOT
 - ❌ **UnityPy Replacement**: UnityPy remains the most mature Python solution
 - ❌ **Asset Editor**: This is a read-only parser, not an asset creation/editing tool
-- ❌ **Complete Unity Engine**: Focuses on asset parsing, not runtime functionality
 
 ## 🏗️ Architecture
 
