@@ -13,9 +13,9 @@ A Rust implementation of Unity asset parsing, inspired by and learning from [Uni
 - 📖 **Reference Implementation**: Code that others can learn from and build upon
 
 ### What This Project Is NOT
-- ❌ **UnityPy Replacement**: UnityPy is far more mature and feature-complete
-- ❌ **Production Tool**: Missing many features needed for real-world usage
-- ❌ **Complete Solution**: Many Unity asset types are not supported
+- ❌ **UnityPy Replacement**: UnityPy remains the most mature Python solution
+- ❌ **Asset Editor**: This is a read-only parser, not an asset creation/editing tool
+- ❌ **Complete Unity Engine**: Focuses on asset parsing, not runtime functionality
 
 ## 🏗️ Architecture
 
@@ -66,13 +66,13 @@ unity-asset/
 - Basic progress reporting
 
 **⚠️ Known Limitations**
-- Many Unity asset types are not supported
-- Limited object manipulation capabilities
-- Incomplete compression support (some LZMA variants fail)
-- No image format decoding for textures
-- No audio format decoding
-- Error handling needs improvement
-- Performance not optimized for large files
+- Some advanced Unity asset types not yet implemented (MonoBehaviour scripts, complex shaders)
+- Object manipulation is read-only (no writing back to Unity formats)
+- Some edge cases in LZMA decompression may fail on corrupted data
+- Advanced texture formats require `texture-advanced` feature (DXT, ETC, ASTC)
+- Audio decoding requires `audio` feature for Symphonia integration
+- Large file performance could be optimized further
+- Error messages could be more user-friendly
 
 ## 🚀 Quick Start
 

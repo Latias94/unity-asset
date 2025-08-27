@@ -148,7 +148,7 @@ impl WebFile {
             let file_data = self.extract_file(&file_info.name)?;
 
             // Try to parse as AssetBundle
-            match AssetBundle::from_bytes(file_data) {
+            match crate::bundle::load_bundle_from_memory(file_data) {
                 Ok(bundle) => bundles.push(bundle),
                 Err(_) => {
                     // Not an AssetBundle, skip

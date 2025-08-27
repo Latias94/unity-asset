@@ -1,0 +1,11 @@
+# Rust formatting configuration
+# This ensures consistent formatting across all environments
+
+# General formatting (stable features only)
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"
+remove_nested_parens = true
+use_small_heuristics = "Default"
+reorder_imports = true

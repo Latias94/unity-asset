@@ -91,7 +91,7 @@ impl ObjectInfo {
     ) -> Result<HashMap<String, UnityValue>> {
         let mut properties = HashMap::new();
 
-        if let Some(root) = type_tree.root() {
+        if let Some(root) = type_tree.nodes.first() {
             self.parse_node(reader, root, &mut properties)?;
         }
 
@@ -331,7 +331,8 @@ impl UnityObject {
     ) -> Result<indexmap::IndexMap<String, unity_asset_core::UnityValue>> {
         let mut reader =
             crate::reader::BinaryReader::new(&self.info.data, crate::reader::ByteOrder::Little);
-        typetree.parse_as_dict(&mut reader)
+        let serializer = crate::typetree::TypeTreeSerializer::new(typetree);
+        serializer.parse_object(&mut reader)
     }
 
     /// Get raw object data

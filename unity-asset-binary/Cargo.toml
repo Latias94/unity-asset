@@ -29,6 +29,7 @@ flate2 = { workspace = true }
 lz4_flex = { workspace = true }
 lzma-rs = "0.3"
 brotli = "3.4"
+xz2 = { version = "0.1", optional = true }
 
 # Performance and utilities
 once_cell = { workspace = true }
@@ -69,7 +70,10 @@ sprite = []                                           # Sprite处理
 
 # 高级功能 (可选)
 texture-advanced = ["texture2ddecoder"]               # 高级纹理格式 (DXT, ETC, ASTC)
+audio-advanced = ["symphonia"]                        # 高级音频格式支持
 mesh-export = ["obj"]                                 # 网格导出功能
+brotli = []                                           # Brotli压缩支持
+xz2 = ["dep:xz2"]                                     # XZ2 LZMA压缩支持
 
 # 便捷组合
 minimal = []                                          # 仅核心解析功能

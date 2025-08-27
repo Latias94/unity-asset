@@ -132,10 +132,15 @@ impl UnityVersion {
                 .parse::<u16>()
                 .map_err(|e| BinaryError::invalid_data(format!("Invalid build version: {}", e)))?;
 
-            let type_str = captures.get(4).map(|m| m.as_str()).unwrap_or("f");
+            let type_str = captures.get(4).map(|m| m.as_str()).unwrap_or("");
             let type_number_str = captures.get(5).map(|m| m.as_str()).unwrap_or("0");
 
-            let version_type = UnityVersionType::from_str(type_str)?;
+            // If no type letter is provided, default to "f" (final release)
+            let version_type = if type_str.is_empty() {
+                UnityVersionType::F
+            } else {
+                UnityVersionType::from_str(type_str)?
+            };
             let type_number = if type_number_str.is_empty() {
                 0
             } else {
