@@ -2,12 +2,12 @@
 //!
 //! This module provides functionality for building and validating TypeTree structures.
 
-use crate::error::{BinaryError, Result};
 use super::types::{TypeTree, TypeTreeNode};
+use crate::error::{BinaryError, Result};
 use std::collections::HashMap;
 
 /// TypeTree builder
-/// 
+///
 /// This struct provides methods for building TypeTree structures programmatically,
 /// including validation and optimization.
 pub struct TypeTreeBuilder {
@@ -58,9 +58,9 @@ impl TypeTreeBuilder {
 
         let node_name = node.name.clone();
         let index = self.tree.nodes.len();
-        
+
         self.tree.nodes.push(node);
-        
+
         if !node_name.is_empty() {
             self.node_map.insert(node_name, index);
         }
@@ -87,7 +87,7 @@ impl TypeTreeBuilder {
             self.add_root_node(node)?;
         } else {
             return Err(BinaryError::invalid_data(
-                "Use add_child_to_node for non-root nodes"
+                "Use add_child_to_node for non-root nodes",
             ));
         }
 
@@ -95,10 +95,14 @@ impl TypeTreeBuilder {
     }
 
     /// Add a child node to an existing node
-    pub fn add_child_to_node(&mut self, parent_name: &str, child: TypeTreeNode) -> Result<&mut Self> {
-        let parent_index = self.node_map.get(parent_name)
-            .copied()
-            .ok_or_else(|| BinaryError::generic(format!("Parent node '{}' not found", parent_name)))?;
+    pub fn add_child_to_node(
+        &mut self,
+        parent_name: &str,
+        child: TypeTreeNode,
+    ) -> Result<&mut Self> {
+        let parent_index = self.node_map.get(parent_name).copied().ok_or_else(|| {
+            BinaryError::generic(format!("Parent node '{}' not found", parent_name))
+        })?;
 
         // Validate child level
         let parent_level = self.tree.nodes[parent_index].level;
@@ -116,7 +120,8 @@ impl TypeTreeBuilder {
         // Update node map if child has a name
         if !child_name.is_empty() {
             let child_index = self.tree.nodes[parent_index].children.len() - 1;
-            self.node_map.insert(format!("{}.{}", parent_name, child_name), child_index);
+            self.node_map
+                .insert(format!("{}.{}", parent_name, child_name), child_index);
         }
 
         Ok(self)
@@ -129,9 +134,9 @@ impl TypeTreeBuilder {
         field_name: String,
         type_name: &str,
     ) -> Result<&mut Self> {
-        let parent_index = self.node_map.get(parent_name)
-            .copied()
-            .ok_or_else(|| BinaryError::generic(format!("Parent node '{}' not found", parent_name)))?;
+        let parent_index = self.node_map.get(parent_name).copied().ok_or_else(|| {
+            BinaryError::generic(format!("Parent node '{}' not found", parent_name))
+        })?;
 
         let parent_level = self.tree.nodes[parent_index].level;
         let byte_size = Self::get_primitive_size(type_name)?;
@@ -155,7 +160,12 @@ impl TypeTreeBuilder {
             "SInt32" | "UInt32" | "int" | "unsigned int" | "float" => 4,
             "SInt64" | "UInt64" | "long long" | "unsigned long long" | "double" => 8,
             "string" => -1, // Variable size
-            _ => return Err(BinaryError::invalid_data(format!("Unknown primitive type: {}", type_name))),
+            _ => {
+                return Err(BinaryError::invalid_data(format!(
+                    "Unknown primitive type: {}",
+                    type_name
+                )));
+            }
         };
         Ok(size)
     }
@@ -167,9 +177,9 @@ impl TypeTreeBuilder {
         field_name: String,
         element_type: &str,
     ) -> Result<&mut Self> {
-        let parent_index = self.node_map.get(parent_name)
-            .copied()
-            .ok_or_else(|| BinaryError::generic(format!("Parent node '{}' not found", parent_name)))?;
+        let parent_index = self.node_map.get(parent_name).copied().ok_or_else(|| {
+            BinaryError::generic(format!("Parent node '{}' not found", parent_name))
+        })?;
 
         let parent_level = self.tree.nodes[parent_index].level;
 
@@ -179,7 +189,8 @@ impl TypeTreeBuilder {
         array_node.name = field_name.clone();
         array_node.byte_size = -1; // Variable size
         array_node.level = parent_level + 1;
-        array_node.index = (self.tree.nodes.len() + self.tree.nodes[parent_index].children.len()) as i32;
+        array_node.index =
+            (self.tree.nodes.len() + self.tree.nodes[parent_index].children.len()) as i32;
 
         // Create size node
         let mut size_node = TypeTreeNode::new();
@@ -236,7 +247,7 @@ impl TypeTreeBuilder {
     /// Update the string buffer with all type and field names
     fn update_string_buffer(&mut self) {
         self.tree.string_buffer.clear();
-        
+
         // Collect all unique strings
         let mut strings = std::collections::HashSet::new();
         Self::collect_strings(&self.tree.nodes, &mut strings);

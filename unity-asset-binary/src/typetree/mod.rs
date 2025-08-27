@@ -32,21 +32,19 @@
 //! # Ok::<(), unity_asset_binary::error::BinaryError>(())
 //! ```
 
-pub mod types;
-pub mod parser;
 pub mod builder;
+pub mod parser;
 pub mod serializer;
+pub mod types;
 
 // Re-export main types for easy access
-pub use types::{
-    TypeTree, TypeTreeNode, TypeTreeStatistics, TypeInfo, TypeRegistry
-};
-pub use parser::{TypeTreeParser, ParsingStats};
 pub use builder::{TypeTreeBuilder, TypeTreeValidator, ValidationReport};
+pub use parser::{ParsingStats, TypeTreeParser};
 pub use serializer::TypeTreeSerializer;
+pub use types::{TypeInfo, TypeRegistry, TypeTree, TypeTreeNode, TypeTreeStatistics};
 
 /// Main TypeTree processing facade
-/// 
+///
 /// This struct provides a high-level interface for TypeTree processing,
 /// combining parsing, building, and serialization functionality.
 pub struct TypeTreeProcessor {
@@ -72,31 +70,44 @@ impl TypeTreeProcessor {
     }
 
     /// Parse TypeTree from binary data
-    pub fn parse_from_reader(&mut self, reader: &mut crate::reader::BinaryReader) -> crate::error::Result<()> {
+    pub fn parse_from_reader(
+        &mut self,
+        reader: &mut crate::reader::BinaryReader,
+    ) -> crate::error::Result<()> {
         let tree = if self.version >= 12 || self.version == 10 {
             TypeTreeParser::from_reader_blob(reader, self.version)?
         } else {
             TypeTreeParser::from_reader(reader, self.version)?
         };
-        
+
         self.tree = Some(tree);
         Ok(())
     }
 
     /// Parse object data using the loaded TypeTree
-    pub fn parse_object(&self, reader: &mut crate::reader::BinaryReader) -> crate::error::Result<indexmap::IndexMap<String, unity_asset_core::UnityValue>> {
-        let tree = self.tree.as_ref()
+    pub fn parse_object(
+        &self,
+        reader: &mut crate::reader::BinaryReader,
+    ) -> crate::error::Result<indexmap::IndexMap<String, unity_asset_core::UnityValue>> {
+        let tree = self
+            .tree
+            .as_ref()
             .ok_or_else(|| crate::error::BinaryError::generic("No TypeTree loaded"))?;
-        
+
         let serializer = TypeTreeSerializer::new(tree);
         serializer.parse_object(reader)
     }
 
     /// Serialize object data using the loaded TypeTree
-    pub fn serialize_object(&self, data: &indexmap::IndexMap<String, unity_asset_core::UnityValue>) -> crate::error::Result<Vec<u8>> {
-        let tree = self.tree.as_ref()
+    pub fn serialize_object(
+        &self,
+        data: &indexmap::IndexMap<String, unity_asset_core::UnityValue>,
+    ) -> crate::error::Result<Vec<u8>> {
+        let tree = self
+            .tree
+            .as_ref()
             .ok_or_else(|| crate::error::BinaryError::generic("No TypeTree loaded"))?;
-        
+
         let serializer = TypeTreeSerializer::new(tree);
         serializer.serialize_object(data)
     }
@@ -113,9 +124,11 @@ impl TypeTreeProcessor {
 
     /// Validate the loaded TypeTree
     pub fn validate(&self) -> crate::error::Result<ValidationReport> {
-        let tree = self.tree.as_ref()
+        let tree = self
+            .tree
+            .as_ref()
             .ok_or_else(|| crate::error::BinaryError::generic("No TypeTree loaded"))?;
-        
+
         TypeTreeValidator::validate(tree)
     }
 
@@ -126,7 +139,9 @@ impl TypeTreeProcessor {
 
     /// Get parsing statistics
     pub fn parsing_stats(&self) -> Option<ParsingStats> {
-        self.tree.as_ref().map(|tree| TypeTreeParser::get_parsing_stats(tree))
+        self.tree
+            .as_ref()
+            .map(|tree| TypeTreeParser::get_parsing_stats(tree))
     }
 
     /// Clear the loaded TypeTree
@@ -166,7 +181,7 @@ pub fn create_processor() -> TypeTreeProcessor {
 /// Parse TypeTree from binary data with version detection
 pub fn parse_typetree(data: &[u8], version: u32) -> crate::error::Result<TypeTree> {
     let mut reader = crate::reader::BinaryReader::new(data, crate::reader::ByteOrder::Little);
-    
+
     if version >= 12 || version == 10 {
         TypeTreeParser::from_reader_blob(&mut reader, version)
     } else {
@@ -196,22 +211,20 @@ pub fn serialize_object_with_typetree(
 /// Build a simple TypeTree for common Unity types
 pub fn build_common_typetree(class_name: &str) -> crate::error::Result<TypeTree> {
     let mut builder = TypeTreeBuilder::new().version(19);
-    
+
     match class_name {
         "GameObject" => {
             builder.add_simple_node("GameObject".to_string(), "Base".to_string(), -1, 0)?;
             let tree = builder.tree_mut();
             if let Some(_root) = tree.nodes.get_mut(0) {
-                builder.add_child_to_node("Base", TypeTreeNode::with_info(
-                    "int".to_string(),
-                    "m_InstanceID".to_string(),
-                    4,
-                ))?;
-                builder.add_child_to_node("Base", TypeTreeNode::with_info(
-                    "string".to_string(),
-                    "m_Name".to_string(),
-                    -1,
-                ))?;
+                builder.add_child_to_node(
+                    "Base",
+                    TypeTreeNode::with_info("int".to_string(), "m_InstanceID".to_string(), 4),
+                )?;
+                builder.add_child_to_node(
+                    "Base",
+                    TypeTreeNode::with_info("string".to_string(), "m_Name".to_string(), -1),
+                )?;
             }
         }
         "Transform" => {
@@ -228,7 +241,7 @@ pub fn build_common_typetree(class_name: &str) -> crate::error::Result<TypeTree>
             )));
         }
     }
-    
+
     builder.build()
 }
 
@@ -240,7 +253,7 @@ pub fn validate_typetree(tree: &TypeTree) -> crate::error::Result<ValidationRepo
 /// Get TypeTree information summary
 pub fn get_typetree_info(tree: &TypeTree) -> TypeTreeInfo {
     let stats = tree.statistics();
-    
+
     TypeTreeInfo {
         version: tree.version,
         platform: tree.platform,

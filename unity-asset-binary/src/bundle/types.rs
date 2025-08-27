@@ -2,13 +2,13 @@
 //!
 //! This module defines the core data structures used for bundle processing.
 
-use serde::{Deserialize, Serialize};
+use super::header::BundleHeader;
 use crate::asset::Asset;
 use crate::compression::CompressionBlock;
-use super::header::BundleHeader;
+use serde::{Deserialize, Serialize};
 
 /// Information about a file within the bundle
-/// 
+///
 /// Represents a single file entry in the bundle's directory structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleFileInfo {
@@ -48,7 +48,7 @@ impl BundleFileInfo {
 }
 
 /// Directory node in the bundle
-/// 
+///
 /// Represents a node in the bundle's internal directory structure,
 /// which can be either a file or a directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,7 +108,7 @@ impl DirectoryNode {
 }
 
 /// A Unity AssetBundle
-/// 
+///
 /// This structure represents a complete Unity AssetBundle with all its
 /// metadata, compression information, and contained assets.
 #[derive(Debug)]
@@ -157,11 +157,13 @@ impl AssetBundle {
 
     /// Check if the bundle is compressed
     pub fn is_compressed(&self) -> bool {
-        !self.blocks.is_empty() &&
-        self.blocks.iter().any(|block| {
-            block.compression_type().unwrap_or(crate::compression::CompressionType::None)
-                != crate::compression::CompressionType::None
-        })
+        !self.blocks.is_empty()
+            && self.blocks.iter().any(|block| {
+                block
+                    .compression_type()
+                    .unwrap_or(crate::compression::CompressionType::None)
+                    != crate::compression::CompressionType::None
+            })
     }
 
     /// Get the number of files in the bundle
@@ -198,7 +200,7 @@ impl AssetBundle {
     pub fn extract_file_data(&self, file: &BundleFileInfo) -> crate::error::Result<Vec<u8>> {
         if file.offset + file.size > self.data.len() as u64 {
             return Err(crate::error::BinaryError::invalid_data(
-                "File offset/size exceeds bundle data"
+                "File offset/size exceeds bundle data",
             ));
         }
 
@@ -211,7 +213,7 @@ impl AssetBundle {
     pub fn extract_node_data(&self, node: &DirectoryNode) -> crate::error::Result<Vec<u8>> {
         if node.offset + node.size > self.data.len() as u64 {
             return Err(crate::error::BinaryError::invalid_data(
-                "Node offset/size exceeds bundle data"
+                "Node offset/size exceeds bundle data",
             ));
         }
 
@@ -223,8 +225,9 @@ impl AssetBundle {
     /// Get bundle statistics
     pub fn statistics(&self) -> BundleStatistics {
         let total_compressed_size: u64 = self.blocks.iter().map(|b| b.compressed_size as u64).sum();
-        let total_uncompressed_size: u64 = self.blocks.iter().map(|b| b.uncompressed_size as u64).sum();
-        
+        let total_uncompressed_size: u64 =
+            self.blocks.iter().map(|b| b.uncompressed_size as u64).sum();
+
         BundleStatistics {
             total_size: self.size(),
             header_size: self.header.header_size(),
@@ -250,18 +253,20 @@ impl AssetBundle {
         // Validate files don't exceed bundle size
         for file in &self.files {
             if file.end_offset() > self.size() {
-                return Err(crate::error::BinaryError::invalid_data(
-                    format!("File '{}' exceeds bundle size", file.name)
-                ));
+                return Err(crate::error::BinaryError::invalid_data(format!(
+                    "File '{}' exceeds bundle size",
+                    file.name
+                )));
             }
         }
 
         // Validate nodes don't exceed bundle size
         for node in &self.nodes {
             if node.end_offset() > self.size() {
-                return Err(crate::error::BinaryError::invalid_data(
-                    format!("Node '{}' exceeds bundle size", node.name)
-                ));
+                return Err(crate::error::BinaryError::invalid_data(format!(
+                    "Node '{}' exceeds bundle size",
+                    node.name
+                )));
             }
         }
 

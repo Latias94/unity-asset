@@ -10,7 +10,8 @@
 use std::fs;
 use std::path::Path;
 use unity_asset_binary::{
-    AssetBundle, SerializedFile, Sprite, SpriteInfo, SpriteProcessor, Texture2D, TextureFormat, UnityVersion,
+    AssetBundle, SerializedFile, Sprite, SpriteInfo, SpriteProcessor, Texture2D, TextureFormat,
+    UnityVersion,
 };
 
 /// Test comprehensive sprite image extraction
@@ -82,7 +83,10 @@ fn test_sprite_comprehensive_extraction() {
                 );
 
                 // Verify we got some data
-                assert!(!sprite_image_data.is_empty(), "Sprite image data should not be empty");
+                assert!(
+                    !sprite_image_data.is_empty(),
+                    "Sprite image data should not be empty"
+                );
 
                 // Basic PNG header check
                 if sprite_image_data.len() >= 8 {
@@ -156,10 +160,7 @@ fn test_sprite_render_data_extraction() {
     let processor = SpriteProcessor::new(UnityVersion::default());
     match processor.extract_sprite_image(&sprite, &texture) {
         Ok(rect_image_data) => {
-            println!(
-                "    ✓ Rect extraction: {} bytes",
-                rect_image_data.len()
-            );
+            println!("    ✓ Rect extraction: {} bytes", rect_image_data.len());
             assert!(!rect_image_data.is_empty());
         }
         Err(e) => {
@@ -224,7 +225,10 @@ fn test_sprite_info_extraction() {
     );
     println!("    Pixels to units: {}", sprite.pixels_to_units);
     println!("    Is polygon: {}", sprite.is_polygon);
-    println!("    Texture path ID: {}", sprite.render_data.texture_path_id);
+    println!(
+        "    Texture path ID: {}",
+        sprite.render_data.texture_path_id
+    );
     println!("    Is atlas sprite: {}", sprite.is_atlas_sprite());
 
     // Verify all information

@@ -2,13 +2,13 @@
 //!
 //! This module provides the main parsing logic for Unity SerializedFile structures.
 
+use super::header::SerializedFileHeader;
+use super::types::{FileIdentifier, ObjectInfo, SerializedType, TypeRegistry};
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
-use super::header::SerializedFileHeader;
-use super::types::{SerializedType, FileIdentifier, ObjectInfo, TypeRegistry};
 
 /// SerializedFile parser
-/// 
+///
 /// This struct handles the parsing of Unity SerializedFile structures,
 /// supporting different Unity versions and formats.
 pub struct SerializedFileParser;
@@ -207,7 +207,7 @@ impl SerializedFileParser {
 }
 
 /// Complete SerializedFile structure
-/// 
+///
 /// This structure represents a complete Unity SerializedFile with all its
 /// metadata, type information, and object data.
 #[derive(Debug)]
@@ -266,21 +266,24 @@ impl SerializedFile {
 
     /// Get all objects of a specific type
     pub fn objects_of_type(&self, type_id: i32) -> Vec<&ObjectInfo> {
-        self.objects.iter().filter(|obj| obj.type_id == type_id).collect()
+        self.objects
+            .iter()
+            .filter(|obj| obj.type_id == type_id)
+            .collect()
     }
 
     /// Create a type registry from this file
     pub fn create_type_registry(&self) -> TypeRegistry {
         let mut registry = TypeRegistry::new();
-        
+
         for stype in &self.types {
             registry.add_type(stype.clone());
         }
-        
+
         for script_type in &self.script_types {
             registry.add_type(script_type.clone());
         }
-        
+
         registry
     }
 

@@ -2,27 +2,26 @@
 //!
 //! This module provides functionality for exporting audio to various formats.
 
-use crate::error::{BinaryError, Result};
 use super::types::DecodedAudio;
+use crate::error::{BinaryError, Result};
 use std::path::Path;
 
 /// Audio exporter utility
-/// 
+///
 /// This struct provides methods for exporting decoded audio data to various formats.
 pub struct AudioExporter;
 
 impl AudioExporter {
     /// Export audio as WAV file
-    /// 
+    ///
     /// This is the most common export format, providing uncompressed audio
     /// with full quality preservation.
     pub fn export_wav<P: AsRef<Path>>(audio: &DecodedAudio, path: P) -> Result<()> {
         use std::fs::File;
         use std::io::{BufWriter, Write};
 
-        let file = File::create(path).map_err(|e| {
-            BinaryError::generic(format!("Failed to create WAV file: {}", e))
-        })?;
+        let file = File::create(path)
+            .map_err(|e| BinaryError::generic(format!("Failed to create WAV file: {}", e)))?;
         let mut writer = BufWriter::new(file);
 
         // Convert f32 samples to i16
@@ -33,62 +32,103 @@ impl AudioExporter {
         let file_size = 36 + data_size;
 
         // Write WAV header
-        writer.write_all(b"RIFF").map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
-        writer.write_all(&(file_size as u32).to_le_bytes()).map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
-        writer.write_all(b"WAVE").map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
+        writer
+            .write_all(b"RIFF")
+            .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
+        writer
+            .write_all(&(file_size as u32).to_le_bytes())
+            .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
+        writer
+            .write_all(b"WAVE")
+            .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
 
         // Write format chunk
-        writer.write_all(b"fmt ").map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
-        writer.write_all(&16u32.to_le_bytes()).map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?; // Chunk size
-        writer.write_all(&1u16.to_le_bytes()).map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?; // Audio format (PCM)
-        writer.write_all(&(audio.channels as u16).to_le_bytes()).map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
-        writer.write_all(&audio.sample_rate.to_le_bytes()).map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
-        writer.write_all(&byte_rate.to_le_bytes()).map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
-        writer.write_all(&(block_align as u16).to_le_bytes()).map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
-        writer.write_all(&16u16.to_le_bytes()).map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?; // Bits per sample
+        writer
+            .write_all(b"fmt ")
+            .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
+        writer
+            .write_all(&16u32.to_le_bytes())
+            .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?; // Chunk size
+        writer
+            .write_all(&1u16.to_le_bytes())
+            .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?; // Audio format (PCM)
+        writer
+            .write_all(&(audio.channels as u16).to_le_bytes())
+            .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
+        writer
+            .write_all(&audio.sample_rate.to_le_bytes())
+            .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
+        writer
+            .write_all(&byte_rate.to_le_bytes())
+            .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
+        writer
+            .write_all(&(block_align as u16).to_le_bytes())
+            .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
+        writer
+            .write_all(&16u16.to_le_bytes())
+            .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?; // Bits per sample
 
         // Write data chunk
-        writer.write_all(b"data").map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
-        writer.write_all(&(data_size as u32).to_le_bytes()).map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
+        writer
+            .write_all(b"data")
+            .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
+        writer
+            .write_all(&(data_size as u32).to_le_bytes())
+            .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
 
         // Write sample data
         for sample in i16_samples {
-            writer.write_all(&sample.to_le_bytes()).map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
+            writer
+                .write_all(&sample.to_le_bytes())
+                .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
         }
 
-        writer.flush().map_err(|e| BinaryError::generic(format!("Flush error: {}", e)))?;
+        writer
+            .flush()
+            .map_err(|e| BinaryError::generic(format!("Flush error: {}", e)))?;
         Ok(())
     }
 
     /// Export audio as raw PCM data
-    pub fn export_raw_pcm<P: AsRef<Path>>(audio: &DecodedAudio, path: P, bit_depth: u8) -> Result<()> {
+    pub fn export_raw_pcm<P: AsRef<Path>>(
+        audio: &DecodedAudio,
+        path: P,
+        bit_depth: u8,
+    ) -> Result<()> {
         use std::fs::File;
         use std::io::{BufWriter, Write};
 
-        let file = File::create(path).map_err(|e| {
-            BinaryError::generic(format!("Failed to create PCM file: {}", e))
-        })?;
+        let file = File::create(path)
+            .map_err(|e| BinaryError::generic(format!("Failed to create PCM file: {}", e)))?;
         let mut writer = BufWriter::new(file);
 
         match bit_depth {
             16 => {
                 let i16_samples = audio.to_i16_samples();
                 for sample in i16_samples {
-                    writer.write_all(&sample.to_le_bytes()).map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
+                    writer
+                        .write_all(&sample.to_le_bytes())
+                        .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
                 }
             }
             32 => {
                 let i32_samples = audio.to_i32_samples();
                 for sample in i32_samples {
-                    writer.write_all(&sample.to_le_bytes()).map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
+                    writer
+                        .write_all(&sample.to_le_bytes())
+                        .map_err(|e| BinaryError::generic(format!("Write error: {}", e)))?;
                 }
             }
             _ => {
-                return Err(BinaryError::invalid_data("Unsupported bit depth for PCM export"));
+                return Err(BinaryError::invalid_data(
+                    "Unsupported bit depth for PCM export",
+                ));
             }
         }
 
-        writer.flush().map_err(|e| BinaryError::generic(format!("Flush error: {}", e)))?;
+        writer
+            .flush()
+            .map_err(|e| BinaryError::generic(format!("Flush error: {}", e)))?;
         Ok(())
     }
 
@@ -123,7 +163,8 @@ impl AudioExporter {
 
     /// Create a filename with the given base name and format extension
     pub fn create_filename(base_name: &str, format: &str) -> String {
-        let clean_base = base_name.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-');
+        let clean_base =
+            base_name.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-');
         format!("{}.{}", clean_base, format.to_lowercase())
     }
 
@@ -132,24 +173,24 @@ impl AudioExporter {
         if audio.samples.is_empty() {
             return Err(BinaryError::invalid_data("Audio has no samples"));
         }
-        
+
         if audio.sample_rate == 0 {
             return Err(BinaryError::invalid_data("Invalid sample rate"));
         }
-        
+
         if audio.channels == 0 {
             return Err(BinaryError::invalid_data("Invalid channel count"));
         }
-        
+
         // Check for reasonable limits
         if audio.sample_rate > 192000 {
             return Err(BinaryError::invalid_data("Sample rate too high"));
         }
-        
+
         if audio.channels > 32 {
             return Err(BinaryError::invalid_data("Too many channels"));
         }
-        
+
         Ok(())
     }
 
@@ -217,7 +258,9 @@ impl ExportOptions {
 
         match self.format {
             AudioFormat::Wav => AudioExporter::export_wav(audio_to_export, path),
-            AudioFormat::RawPcm => AudioExporter::export_raw_pcm(audio_to_export, path, self.bit_depth),
+            AudioFormat::RawPcm => {
+                AudioExporter::export_raw_pcm(audio_to_export, path, self.bit_depth)
+            }
         }
     }
 }

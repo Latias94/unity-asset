@@ -2,8 +2,8 @@
 //!
 //! This module defines the core data structures used for audio processing.
 
-use serde::{Deserialize, Serialize};
 use super::formats::AudioCompressionFormat;
+use serde::{Deserialize, Serialize};
 
 /// Streaming info for external audio data
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -58,7 +58,7 @@ impl Default for AudioClipMeta {
 }
 
 /// AudioClip object representation
-/// 
+///
 /// This structure contains all the data needed to represent a Unity AudioClip object.
 /// It includes both metadata and the actual audio data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,7 +116,9 @@ impl AudioClip {
     pub fn compression_format(&self) -> AudioCompressionFormat {
         match &self.meta {
             AudioClipMeta::Legacy { .. } => AudioCompressionFormat::Unknown,
-            AudioClipMeta::Modern { compression_format, .. } => *compression_format,
+            AudioClipMeta::Modern {
+                compression_format, ..
+            } => *compression_format,
         }
     }
 
@@ -158,7 +160,7 @@ impl AudioClip {
     pub fn info(&self) -> AudioInfo {
         let format = self.compression_format();
         let properties = self.properties();
-        
+
         AudioInfo {
             name: self.name.clone(),
             format,
@@ -277,8 +279,13 @@ pub struct AudioAnalysis {
 
 impl AudioAnalysis {
     /// Create analysis from decoded audio
-    pub fn from_decoded(decoded: &DecodedAudio, format: AudioCompressionFormat, file_size: usize) -> Self {
-        let peak_amplitude = decoded.samples
+    pub fn from_decoded(
+        decoded: &DecodedAudio,
+        format: AudioCompressionFormat,
+        file_size: usize,
+    ) -> Self {
+        let peak_amplitude = decoded
+            .samples
             .iter()
             .map(|&s| s.abs())
             .fold(0.0f32, f32::max);

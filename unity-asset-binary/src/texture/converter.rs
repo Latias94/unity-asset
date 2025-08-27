@@ -3,11 +3,11 @@
 //! This module provides the main conversion logic for Unity Texture2D objects.
 //! Inspired by UnityPy/export/Texture2DConverter.py
 
+use super::decoders::TextureDecoder;
+use super::types::Texture2D;
 use crate::error::{BinaryError, Result};
 use crate::object::UnityObject;
 use crate::unity_version::UnityVersion;
-use super::types::Texture2D;
-use super::decoders::TextureDecoder;
 use image::RgbaImage;
 
 /// Main texture converter
@@ -89,8 +89,6 @@ impl Texture2DConverter {
         // Use the texture decoder to decode the image
         self.decoder.decode(texture)
     }
-
-
 }
 
 // Legacy compatibility - alias for the old processor name

@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Sprite render data
-/// 
+///
 /// Contains information about how a sprite is rendered, including texture coordinates
 /// and atlas information.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -23,7 +23,7 @@ pub struct SpriteRenderData {
 }
 
 /// Sprite settings
-/// 
+///
 /// Contains packing and mesh generation settings for sprites.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SpriteSettings {
@@ -34,7 +34,7 @@ pub struct SpriteSettings {
 }
 
 /// Sprite rectangle information
-/// 
+///
 /// Defines the rectangular area of a sprite within its texture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpriteRect {
@@ -56,7 +56,7 @@ impl Default for SpriteRect {
 }
 
 /// Sprite offset information
-/// 
+///
 /// Defines the offset of a sprite from its original position.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpriteOffset {
@@ -71,7 +71,7 @@ impl Default for SpriteOffset {
 }
 
 /// Sprite pivot information
-/// 
+///
 /// Defines the pivot point of a sprite (0,0 to 1,1 normalized coordinates).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpritePivot {
@@ -86,7 +86,7 @@ impl Default for SpritePivot {
 }
 
 /// Sprite border information (for 9-slice sprites)
-/// 
+///
 /// Defines the border sizes for 9-slice sprite rendering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpriteBorder {
@@ -108,7 +108,7 @@ impl Default for SpriteBorder {
 }
 
 /// Comprehensive sprite information
-/// 
+///
 /// Contains all the information needed to fully describe a sprite.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpriteInfo {
@@ -140,7 +140,7 @@ impl Default for SpriteInfo {
 }
 
 /// Sprite object representation
-/// 
+///
 /// Main sprite structure containing all sprite data and metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sprite {

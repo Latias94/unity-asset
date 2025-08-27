@@ -2,16 +2,16 @@
 //!
 //! This module provides the main parsing logic for Unity Sprite objects.
 
+use super::types::*;
 use crate::error::Result;
 use crate::object::UnityObject;
 use crate::reader::BinaryReader;
 use crate::unity_version::UnityVersion;
-use super::types::*;
 use indexmap::IndexMap;
 use unity_asset_core::UnityValue;
 
 /// Sprite parser
-/// 
+///
 /// This struct provides methods for parsing Unity Sprite objects from
 /// various data sources including TypeTree and binary data.
 pub struct SpriteParser {
@@ -210,7 +210,11 @@ impl SpriteParser {
     }
 
     /// Extract render data from UnityValue
-    fn extract_render_data(&self, sprite: &mut Sprite, render_data_value: &UnityValue) -> Result<()> {
+    fn extract_render_data(
+        &self,
+        sprite: &mut Sprite,
+        render_data_value: &UnityValue,
+    ) -> Result<()> {
         if let UnityValue::Object(rd_obj) = render_data_value {
             // Extract texture reference
             if let Some(texture_value) = rd_obj.get("texture") {
@@ -261,7 +265,11 @@ impl SpriteParser {
     }
 
     /// Extract sprite atlas reference from UnityValue
-    fn extract_sprite_atlas(&self, sprite: &mut Sprite, sprite_atlas_value: &UnityValue) -> Result<()> {
+    fn extract_sprite_atlas(
+        &self,
+        sprite: &mut Sprite,
+        sprite_atlas_value: &UnityValue,
+    ) -> Result<()> {
         if let UnityValue::Object(atlas_obj) = sprite_atlas_value {
             if let Some(UnityValue::Integer(path_id)) = atlas_obj.get("m_PathID") {
                 sprite.sprite_atlas_path_id = Some(*path_id);
@@ -271,13 +279,17 @@ impl SpriteParser {
     }
 
     /// Read render data from binary stream
-    fn read_render_data_binary(&self, sprite: &mut Sprite, reader: &mut BinaryReader) -> Result<()> {
+    fn read_render_data_binary(
+        &self,
+        sprite: &mut Sprite,
+        reader: &mut BinaryReader,
+    ) -> Result<()> {
         // This is a simplified implementation
         // The actual structure depends on the Unity version
         if reader.remaining() >= 4 {
             sprite.render_data.texture_path_id = reader.read_i64().unwrap_or(0);
         }
-        
+
         if reader.remaining() >= 16 {
             sprite.render_data.texture_rect_x = reader.read_f32().unwrap_or(0.0);
             sprite.render_data.texture_rect_y = reader.read_f32().unwrap_or(0.0);
@@ -319,16 +331,16 @@ mod tests {
     fn test_extract_rect() {
         let parser = SpriteParser::default();
         let mut sprite = Sprite::default();
-        
+
         let mut rect_obj = IndexMap::new();
         rect_obj.insert("x".to_string(), UnityValue::Float(10.0));
         rect_obj.insert("y".to_string(), UnityValue::Float(20.0));
         rect_obj.insert("width".to_string(), UnityValue::Float(100.0));
         rect_obj.insert("height".to_string(), UnityValue::Float(200.0));
-        
+
         let rect_value = UnityValue::Object(rect_obj);
         parser.extract_rect(&mut sprite, &rect_value).unwrap();
-        
+
         assert_eq!(sprite.rect_x, 10.0);
         assert_eq!(sprite.rect_y, 20.0);
         assert_eq!(sprite.rect_width, 100.0);

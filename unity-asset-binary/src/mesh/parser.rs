@@ -2,16 +2,16 @@
 //!
 //! This module provides the main parsing logic for Unity Mesh objects.
 
+use super::types::*;
 use crate::error::Result;
 use crate::object::UnityObject;
 use crate::reader::BinaryReader;
 use crate::unity_version::UnityVersion;
-use super::types::*;
 use indexmap::IndexMap;
 use unity_asset_core::UnityValue;
 
 /// Mesh parser
-/// 
+///
 /// This struct provides methods for parsing Unity Mesh objects from
 /// various data sources including TypeTree and binary data.
 pub struct MeshParser {
@@ -138,7 +138,9 @@ impl MeshParser {
                     if let Some(UnityValue::Integer(topology)) = sub_mesh_obj.get("topology") {
                         sub_mesh.topology = *topology as i32;
                     }
-                    if let Some(UnityValue::Integer(triangle_count)) = sub_mesh_obj.get("triangleCount") {
+                    if let Some(UnityValue::Integer(triangle_count)) =
+                        sub_mesh_obj.get("triangleCount")
+                    {
                         sub_mesh.triangle_count = *triangle_count as u32;
                     }
 
@@ -177,7 +179,11 @@ impl MeshParser {
     }
 
     /// Extract vertex channels from UnityValue
-    fn extract_vertex_channels(&self, vertex_data: &mut VertexData, value: &UnityValue) -> Result<()> {
+    fn extract_vertex_channels(
+        &self,
+        vertex_data: &mut VertexData,
+        value: &UnityValue,
+    ) -> Result<()> {
         if let UnityValue::Array(channels_array) = value {
             vertex_data.channels.clear();
             for channel_value in channels_array {
@@ -295,7 +301,7 @@ impl MeshParser {
             for bind_pose_value in bind_poses_array {
                 if let UnityValue::Object(matrix_obj) = bind_pose_value {
                     let mut matrix = [0.0f32; 16];
-                    
+
                     // Extract matrix elements (simplified)
                     for i in 0..16 {
                         let key = format!("e{:02}", i);
@@ -303,7 +309,7 @@ impl MeshParser {
                             matrix[i] = *val as f32;
                         }
                     }
-                    
+
                     mesh.bind_pose.push(matrix);
                 }
             }
@@ -342,24 +348,24 @@ mod tests {
     fn test_extract_local_aabb() {
         let parser = MeshParser::default();
         let mut mesh = Mesh::default();
-        
+
         let mut center_obj = IndexMap::new();
         center_obj.insert("x".to_string(), UnityValue::Float(1.0));
         center_obj.insert("y".to_string(), UnityValue::Float(2.0));
         center_obj.insert("z".to_string(), UnityValue::Float(3.0));
-        
+
         let mut extent_obj = IndexMap::new();
         extent_obj.insert("x".to_string(), UnityValue::Float(0.5));
         extent_obj.insert("y".to_string(), UnityValue::Float(1.0));
         extent_obj.insert("z".to_string(), UnityValue::Float(1.5));
-        
+
         let mut aabb_obj = IndexMap::new();
         aabb_obj.insert("m_Center".to_string(), UnityValue::Object(center_obj));
         aabb_obj.insert("m_Extent".to_string(), UnityValue::Object(extent_obj));
-        
+
         let aabb_value = UnityValue::Object(aabb_obj);
         parser.extract_local_aabb(&mut mesh, &aabb_value).unwrap();
-        
+
         assert_eq!(mesh.local_aabb.center_x, 1.0);
         assert_eq!(mesh.local_aabb.center_y, 2.0);
         assert_eq!(mesh.local_aabb.center_z, 3.0);

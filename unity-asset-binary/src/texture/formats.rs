@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Unity texture formats
-/// 
+///
 /// This enum represents all texture formats supported by Unity.
 /// Values match Unity's internal TextureFormat enum.
 #[allow(non_camel_case_types)]

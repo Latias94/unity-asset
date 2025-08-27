@@ -29,21 +29,19 @@
 //! ```
 
 pub mod header;
-pub mod types;
 pub mod parser;
+pub mod types;
 
 // Re-export main types for easy access
-pub use header::{SerializedFileHeader, HeaderFormatInfo, HeaderValidation, validate_header};
-pub use types::{
-    SerializedType, FileIdentifier, ObjectInfo, TypeRegistry, class_ids
-};
-pub use parser::{SerializedFileParser, SerializedFile, ParsingStats, FileStatistics};
+pub use header::{HeaderFormatInfo, HeaderValidation, SerializedFileHeader, validate_header};
+pub use parser::{FileStatistics, ParsingStats, SerializedFile, SerializedFileParser};
+pub use types::{FileIdentifier, ObjectInfo, SerializedType, TypeRegistry, class_ids};
 
 // Legacy compatibility - Asset is an alias for SerializedFile
 pub type Asset = SerializedFile;
 
 /// Main asset processing facade
-/// 
+///
 /// This struct provides a high-level interface for asset processing,
 /// combining parsing and type management functionality.
 pub struct AssetProcessor {
@@ -64,7 +62,10 @@ impl AssetProcessor {
     }
 
     /// Parse SerializedFile from file path
-    pub fn parse_from_file<P: AsRef<std::path::Path>>(&mut self, path: P) -> crate::error::Result<()> {
+    pub fn parse_from_file<P: AsRef<std::path::Path>>(
+        &mut self,
+        path: P,
+    ) -> crate::error::Result<()> {
         let data = std::fs::read(path).map_err(|e| {
             crate::error::BinaryError::generic(format!("Failed to read file: {}", e))
         })?;
@@ -91,7 +92,8 @@ impl AssetProcessor {
 
     /// Get objects of a specific type
     pub fn objects_of_type(&self, type_id: i32) -> Vec<&ObjectInfo> {
-        self.file.as_ref()
+        self.file
+            .as_ref()
             .map(|f| f.objects_of_type(type_id))
             .unwrap_or_default()
     }
@@ -113,7 +115,8 @@ impl AssetProcessor {
 
     /// Validate the loaded file
     pub fn validate(&self) -> crate::error::Result<()> {
-        self.file.as_ref()
+        self.file
+            .as_ref()
             .ok_or_else(|| crate::error::BinaryError::generic("No file loaded"))?
             .validate()
     }
@@ -168,10 +171,11 @@ pub fn parse_serialized_file(data: Vec<u8>) -> crate::error::Result<SerializedFi
 }
 
 /// Parse SerializedFile from file path
-pub fn parse_serialized_file_from_path<P: AsRef<std::path::Path>>(path: P) -> crate::error::Result<SerializedFile> {
-    let data = std::fs::read(path).map_err(|e| {
-        crate::error::BinaryError::generic(format!("Failed to read file: {}", e))
-    })?;
+pub fn parse_serialized_file_from_path<P: AsRef<std::path::Path>>(
+    path: P,
+) -> crate::error::Result<SerializedFile> {
+    let data = std::fs::read(path)
+        .map_err(|e| crate::error::BinaryError::generic(format!("Failed to read file: {}", e)))?;
     SerializedFileParser::from_bytes(data)
 }
 
@@ -183,14 +187,13 @@ pub async fn parse_serialized_file_async(data: Vec<u8>) -> crate::error::Result<
 
 /// Get file information without full parsing
 pub fn get_file_info<P: AsRef<std::path::Path>>(path: P) -> crate::error::Result<AssetFileInfo> {
-    let data = std::fs::read(&path).map_err(|e| {
-        crate::error::BinaryError::generic(format!("Failed to read file: {}", e))
-    })?;
+    let data = std::fs::read(&path)
+        .map_err(|e| crate::error::BinaryError::generic(format!("Failed to read file: {}", e)))?;
 
     // Parse just the header and basic metadata
     let mut reader = crate::reader::BinaryReader::new(&data, crate::reader::ByteOrder::Big);
     let header = SerializedFileHeader::from_reader(&mut reader)?;
-    
+
     reader.set_byte_order(header.byte_order());
 
     // Read Unity version if available
@@ -225,7 +228,7 @@ pub fn is_valid_serialized_file<P: AsRef<std::path::Path>>(path: P) -> bool {
             if data.len() < 20 {
                 return false;
             }
-            
+
             let mut reader = crate::reader::BinaryReader::new(&data, crate::reader::ByteOrder::Big);
             match SerializedFileHeader::from_reader(&mut reader) {
                 Ok(header) => header.is_valid(),
@@ -302,7 +305,7 @@ mod tests {
         assert!(options.enable_type_tree);
         assert!(options.use_big_ids);
         assert!(options.supports_script_types);
-        
+
         let old_options = get_parsing_options(10);
         assert!(!old_options.enable_type_tree);
         assert!(!old_options.use_big_ids);

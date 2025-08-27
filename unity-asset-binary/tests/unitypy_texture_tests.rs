@@ -11,7 +11,8 @@
 use std::fs;
 use std::path::Path;
 use unity_asset_binary::{
-    AssetBundle, SerializedFile, Sprite, SpriteProcessor, Texture2D, Texture2DConverter, TextureFormat, UnityVersion,
+    AssetBundle, SerializedFile, Sprite, SpriteProcessor, Texture2D, Texture2DConverter,
+    TextureFormat, UnityVersion,
 };
 
 const SAMPLES_DIR: &str = "tests/samples";
@@ -296,17 +297,13 @@ fn test_texture_processor_version_compat() {
                     expected_format, format_info.name
                 );
             } else {
-                println!(
-                    "    ! Format {:?} is not yet supported",
-                    expected_format
-                );
+                println!("    ! Format {:?} is not yet supported", expected_format);
             }
         }
 
         println!(
             "  Version {}: {} formats checked",
-            version_str,
-            supported_count
+            version_str, supported_count
         );
     }
 
@@ -585,10 +582,7 @@ fn test_sprite_image_extraction() {
         "    Rect: {}x{} at ({}, {})",
         sprite.rect_width, sprite.rect_height, sprite.rect_x, sprite.rect_y
     );
-    println!(
-        "    Pivot: ({}, {})",
-        sprite.pivot_x, sprite.pivot_y
-    );
+    println!("    Pivot: ({}, {})", sprite.pivot_x, sprite.pivot_y);
     println!("    Pixels to units: {}", sprite.pixels_to_units);
 
     assert_eq!(sprite.name, "TestSprite");

@@ -2,8 +2,8 @@
 //!
 //! This module handles uncompressed texture formats like RGBA32, RGB24, etc.
 
-use crate::error::{BinaryError, Result};
 use super::{Decoder, create_rgba_image, validate_dimensions};
+use crate::error::{BinaryError, Result};
 use crate::texture::formats::TextureFormat;
 use crate::texture::types::Texture2D;
 use image::RgbaImage;
@@ -20,12 +20,13 @@ impl BasicDecoder {
     /// Decode RGBA32 format (R8G8B8A8)
     fn decode_rgba32(&self, data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
         validate_dimensions(width, height)?;
-        
+
         let expected_size = (width * height * 4) as usize;
         if data.len() < expected_size {
             return Err(BinaryError::invalid_data(&format!(
                 "Insufficient data for RGBA32: expected {}, got {}",
-                expected_size, data.len()
+                expected_size,
+                data.len()
             )));
         }
 
@@ -36,12 +37,13 @@ impl BasicDecoder {
     /// Decode RGB24 format (R8G8B8)
     fn decode_rgb24(&self, data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
         validate_dimensions(width, height)?;
-        
+
         let expected_size = (width * height * 3) as usize;
         if data.len() < expected_size {
             return Err(BinaryError::invalid_data(&format!(
                 "Insufficient data for RGB24: expected {}, got {}",
-                expected_size, data.len()
+                expected_size,
+                data.len()
             )));
         }
 
@@ -51,7 +53,7 @@ impl BasicDecoder {
             rgba_data.push(chunk[0]); // R
             rgba_data.push(chunk[1]); // G
             rgba_data.push(chunk[2]); // B
-            rgba_data.push(255);      // A (fully opaque)
+            rgba_data.push(255); // A (fully opaque)
         }
 
         create_rgba_image(rgba_data, width, height)
@@ -60,12 +62,13 @@ impl BasicDecoder {
     /// Decode ARGB32 format (A8R8G8B8)
     fn decode_argb32(&self, data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
         validate_dimensions(width, height)?;
-        
+
         let expected_size = (width * height * 4) as usize;
         if data.len() < expected_size {
             return Err(BinaryError::invalid_data(&format!(
                 "Insufficient data for ARGB32: expected {}, got {}",
-                expected_size, data.len()
+                expected_size,
+                data.len()
             )));
         }
 
@@ -84,12 +87,13 @@ impl BasicDecoder {
     /// Decode BGRA32 format (B8G8R8A8)
     fn decode_bgra32(&self, data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
         validate_dimensions(width, height)?;
-        
+
         let expected_size = (width * height * 4) as usize;
         if data.len() < expected_size {
             return Err(BinaryError::invalid_data(&format!(
                 "Insufficient data for BGRA32: expected {}, got {}",
-                expected_size, data.len()
+                expected_size,
+                data.len()
             )));
         }
 
@@ -108,21 +112,22 @@ impl BasicDecoder {
     /// Decode Alpha8 format (single channel alpha)
     fn decode_alpha8(&self, data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
         validate_dimensions(width, height)?;
-        
+
         let expected_size = (width * height) as usize;
         if data.len() < expected_size {
             return Err(BinaryError::invalid_data(&format!(
                 "Insufficient data for Alpha8: expected {}, got {}",
-                expected_size, data.len()
+                expected_size,
+                data.len()
             )));
         }
 
         // Convert Alpha8 to RGBA32 (white with alpha)
         let mut rgba_data = Vec::with_capacity((width * height * 4) as usize);
         for &alpha in &data[..expected_size] {
-            rgba_data.push(255);  // R (white)
-            rgba_data.push(255);  // G (white)
-            rgba_data.push(255);  // B (white)
+            rgba_data.push(255); // R (white)
+            rgba_data.push(255); // G (white)
+            rgba_data.push(255); // B (white)
             rgba_data.push(alpha); // A (from source)
         }
 
@@ -132,12 +137,13 @@ impl BasicDecoder {
     /// Decode RGBA4444 format (4 bits per channel)
     fn decode_rgba4444(&self, data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
         validate_dimensions(width, height)?;
-        
+
         let expected_size = (width * height * 2) as usize; // 2 bytes per pixel
         if data.len() < expected_size {
             return Err(BinaryError::invalid_data(&format!(
                 "Insufficient data for RGBA4444: expected {}, got {}",
-                expected_size, data.len()
+                expected_size,
+                data.len()
             )));
         }
 
@@ -145,13 +151,13 @@ impl BasicDecoder {
         let mut rgba_data = Vec::with_capacity((width * height * 4) as usize);
         for chunk in data[..expected_size].chunks_exact(2) {
             let pixel = u16::from_le_bytes([chunk[0], chunk[1]]);
-            
+
             // Extract 4-bit channels and expand to 8-bit
             let r = ((pixel >> 12) & 0xF) as u8;
             let g = ((pixel >> 8) & 0xF) as u8;
             let b = ((pixel >> 4) & 0xF) as u8;
             let a = (pixel & 0xF) as u8;
-            
+
             // Expand 4-bit to 8-bit by duplicating bits
             rgba_data.push(r << 4 | r);
             rgba_data.push(g << 4 | g);
@@ -170,7 +176,8 @@ impl BasicDecoder {
         if data.len() < expected_size {
             return Err(BinaryError::invalid_data(&format!(
                 "Insufficient data for ARGB4444: expected {}, got {}",
-                expected_size, data.len()
+                expected_size,
+                data.len()
             )));
         }
 
@@ -198,12 +205,13 @@ impl BasicDecoder {
     /// Decode RGB565 format (5-6-5 bits per channel)
     fn decode_rgb565(&self, data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
         validate_dimensions(width, height)?;
-        
+
         let expected_size = (width * height * 2) as usize; // 2 bytes per pixel
         if data.len() < expected_size {
             return Err(BinaryError::invalid_data(&format!(
                 "Insufficient data for RGB565: expected {}, got {}",
-                expected_size, data.len()
+                expected_size,
+                data.len()
             )));
         }
 
@@ -211,12 +219,12 @@ impl BasicDecoder {
         let mut rgba_data = Vec::with_capacity((width * height * 4) as usize);
         for chunk in data[..expected_size].chunks_exact(2) {
             let pixel = u16::from_le_bytes([chunk[0], chunk[1]]);
-            
+
             // Extract RGB channels
             let r = ((pixel >> 11) & 0x1F) as u8;
             let g = ((pixel >> 5) & 0x3F) as u8;
             let b = (pixel & 0x1F) as u8;
-            
+
             // Expand to 8-bit
             rgba_data.push((r << 3) | (r >> 2)); // 5-bit to 8-bit
             rgba_data.push((g << 2) | (g >> 4)); // 6-bit to 8-bit

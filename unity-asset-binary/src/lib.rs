@@ -76,78 +76,141 @@ pub mod mesh;
 
 // Re-export core types (always available)
 pub use asset::{
-    // Core types
-    SerializedFile, SerializedFileHeader, SerializedType, FileIdentifier, ObjectInfo,
     Asset, // Legacy compatibility alias
+    AssetFileInfo,
     // Processing
-    AssetProcessor, SerializedFileParser, TypeRegistry,
+    AssetProcessor,
+    FileIdentifier,
+    FileStatistics,
     // Information and validation
-    HeaderFormatInfo, HeaderValidation, ParsingStats, FileStatistics,
-    AssetFileInfo, ParsingOptions,
-    // Convenience functions
-    create_processor as create_asset_processor,
-    parse_serialized_file, parse_serialized_file_from_path,
-    get_file_info as get_asset_file_info, is_valid_serialized_file,
-    get_supported_versions as get_supported_asset_versions,
-    is_version_supported as is_asset_version_supported,
-    get_parsing_options as get_asset_parsing_options,
+    HeaderFormatInfo,
+    HeaderValidation,
+    ObjectInfo,
+    ParsingOptions,
+    ParsingStats,
+    // Core types
+    SerializedFile,
+    SerializedFileHeader,
+    SerializedFileParser,
+    SerializedType,
+    TypeRegistry,
     // Constants
     class_ids,
+    // Convenience functions
+    create_processor as create_asset_processor,
+    get_file_info as get_asset_file_info,
+    get_parsing_options as get_asset_parsing_options,
+    get_supported_versions as get_supported_asset_versions,
+    is_valid_serialized_file,
+    is_version_supported as is_asset_version_supported,
+    parse_serialized_file,
+    parse_serialized_file_from_path,
 };
 pub use bundle::{
     // Core types
-    AssetBundle, BundleHeader, BundleFileInfo, DirectoryNode,
-    BundleStatistics, BundleLoadOptions, BundleFormatInfo,
-    // Processing
-    BundleProcessor, BundleParser, BundleLoader, BundleResourceManager,
+    AssetBundle,
     // Compression
-    BundleCompression, CompressionStats, CompressionOptions,
+    BundleCompression,
+    BundleFileInfo,
+    BundleFormatInfo,
+    BundleHeader,
+    BundleInfo,
+    BundleLoadOptions,
+    BundleLoader,
+    BundleParser,
+    // Processing
+    BundleProcessor,
+    BundleResourceManager,
+    BundleStatistics,
+    CompressionOptions,
+    CompressionStats,
+    DirectoryNode,
     // Statistics and info
-    LoaderStatistics, ParsingComplexity, BundleInfo,
+    LoaderStatistics,
+    ParsingComplexity,
     // Convenience functions (with bundle prefix to avoid conflicts)
-    create_processor as create_bundle_processor, load_bundle, load_bundle_from_memory,
-    load_bundle_with_options, get_bundle_info, list_bundle_contents,
-    extract_file_from_bundle, is_valid_bundle,
+    create_processor as create_bundle_processor,
+    extract_file_from_bundle,
+    get_bundle_info,
     get_supported_formats as get_supported_bundle_formats,
+    is_valid_bundle,
+    list_bundle_contents,
+    load_bundle,
+    load_bundle_from_memory,
+    load_bundle_with_options,
 };
 pub use error::{BinaryError, Result};
 
 // Re-export async support
 pub use metadata::{
     // Core metadata types
-    AssetMetadata, FileInfo, ObjectStatistics, ObjectSummary, MemoryUsage,
-    // Dependency types
-    DependencyInfo, ExternalReference, InternalReference, DependencyGraph,
+    AssetMetadata,
+    AssetReference,
     // Relationship types
-    AssetRelationships, GameObjectHierarchy, ComponentRelationship, AssetReference,
-    // Processing
-    MetadataProcessor, MetadataExtractor, DependencyAnalyzer, RelationshipAnalyzer,
-    // Configuration and results
-    ExtractionConfig, ExtractionResult, ExtractionStats, PerformanceMetrics,
+    AssetRelationships,
     // Statistics and options
-    AssetStatistics, ProcessingOptions,
+    AssetStatistics,
+    ComponentRelationship,
+    DependencyAnalyzer,
+    DependencyGraph,
+    // Dependency types
+    DependencyInfo,
+    ExternalReference,
+    // Configuration and results
+    ExtractionConfig,
+    ExtractionResult,
+    ExtractionStats,
+    FileInfo,
+    GameObjectHierarchy,
+    InternalReference,
+    MemoryUsage,
+    MetadataExtractor,
+    // Processing
+    MetadataProcessor,
+    ObjectStatistics,
+    ObjectSummary,
+    PerformanceMetrics,
+    ProcessingOptions,
+    RelationshipAnalyzer,
+    create_comprehensive_processor,
+    create_performance_processor,
     // Convenience functions
     create_processor as create_metadata_processor,
-    create_performance_processor, create_comprehensive_processor,
-    extract_basic_metadata, extract_metadata_with_config,
-    get_asset_statistics, is_extraction_supported, get_recommended_config,
+    extract_basic_metadata,
+    extract_metadata_with_config,
+    get_asset_statistics,
+    get_recommended_config,
+    is_extraction_supported,
 };
 pub use object::{ObjectInfo as UnityObjectInfo, UnityObject};
 pub use reader::{BinaryReader, ByteOrder};
 pub use typetree::{
+    ParsingStats as TypeTreeParsingStats,
+    TypeInfo,
+    TypeRegistry as TypeTreeRegistry,
     // Core types
-    TypeTree, TypeTreeNode, TypeTreeStatistics, TypeInfo, TypeRegistry as TypeTreeRegistry,
-    // Processing
-    TypeTreeProcessor, TypeTreeParser, TypeTreeBuilder, TypeTreeValidator,
-    TypeTreeSerializer, ValidationReport, ParsingStats as TypeTreeParsingStats,
+    TypeTree,
+    TypeTreeBuilder,
     // Information
     TypeTreeInfo,
+    TypeTreeNode,
+    TypeTreeParser,
+    // Processing
+    TypeTreeProcessor,
+    TypeTreeSerializer,
+    TypeTreeStatistics,
+    TypeTreeValidator,
+    ValidationReport,
+    build_common_typetree,
     // Convenience functions
     create_processor as create_typetree_processor,
-    parse_typetree, parse_object_with_typetree, serialize_object_with_typetree,
-    build_common_typetree, validate_typetree, get_typetree_info,
-    is_version_supported as is_typetree_version_supported,
     get_parsing_method as get_typetree_parsing_method,
+    get_typetree_info,
+    is_version_supported as is_typetree_version_supported,
+    parse_object_with_typetree,
+    parse_typetree,
+    serialize_object_with_typetree,
+    validate_typetree,
 };
 pub use unity_objects::{GameObject, ObjectRef, Quaternion, Transform, Vector3};
 pub use unity_version::{UnityFeature, UnityVersion, UnityVersionType, VersionCompatibility};
@@ -156,77 +219,142 @@ pub use webfile::{WebFile, WebFileCompression};
 // Re-export feature-gated types
 #[cfg(feature = "texture")]
 pub use texture::{
+    BasicDecoder,
+    CompressedDecoder,
+    CrunchDecoder,
+    ExportOptions,
+    GLTextureSettings,
+    MobileDecoder,
+    StreamingInfo,
     // Core types
-    Texture2D, TextureFormat, StreamingInfo, GLTextureSettings,
+    Texture2D,
+    Texture2DConverter,
     // Processors and converters
-    Texture2DProcessor, Texture2DConverter, TextureProcessor,
+    Texture2DProcessor,
     // Decoders
-    TextureDecoder, BasicDecoder, CompressedDecoder, MobileDecoder, CrunchDecoder,
+    TextureDecoder,
     // Helpers
-    TextureExporter, TextureSwizzler, ExportOptions,
+    TextureExporter,
+    TextureFormat,
+    TextureProcessor,
+    TextureSwizzler,
     // Convenience functions
-    create_processor, is_format_supported, get_supported_formats,
-    decode_texture_data, export_image,
+    create_processor,
+    decode_texture_data,
+    export_image,
+    get_supported_formats,
+    is_format_supported,
 };
 
 #[cfg(feature = "audio")]
 pub use audio::{
+    AudioAnalysis,
     // Core types
-    AudioClip, AudioClipMeta, AudioCompressionFormat, FMODSoundType, AudioFormatInfo,
-    AudioProperties, AudioInfo, DecodedAudio, AudioAnalysis,
+    AudioClip,
+    AudioClipConverter,
+    AudioClipMeta,
     // Processors and converters
-    AudioClipProcessor, AudioClipConverter, AudioProcessor,
+    AudioClipProcessor,
+    AudioCompressionFormat,
     // Decoder
     AudioDecoder,
     // Export
-    AudioExporter, AudioFormat,
+    AudioExporter,
+    AudioFormat,
+    AudioFormatInfo,
+    AudioInfo,
+    AudioProcessor,
+    AudioProperties,
+    DecodedAudio,
+    FMODSoundType,
     // Convenience functions (with audio prefix to avoid conflicts)
     create_processor as create_audio_processor,
-    is_format_supported as is_audio_format_supported,
+    decode_audio_data,
+    export_audio,
     get_supported_formats as get_supported_audio_formats,
-    decode_audio_data, export_audio,
+    is_format_supported as is_audio_format_supported,
 };
 
 #[cfg(feature = "sprite")]
 pub use sprite::{
+    ProcessingOptions as SpriteProcessingOptions,
     // Core sprite types
-    Sprite, SpriteRenderData, SpriteSettings, SpriteRect, SpriteOffset,
-    SpritePivot, SpriteBorder, SpriteInfo, SpriteAtlas,
-    // Processing
-    SpriteManager, SpriteProcessor, SpriteParser, SpriteStats,
+    Sprite,
+    SpriteAtlas,
+    SpriteBorder,
     // Configuration and results
-    SpriteConfig, SpriteResult, ProcessingOptions as SpriteProcessingOptions,
+    SpriteConfig,
+    SpriteInfo,
+    // Processing
+    SpriteManager,
+    SpriteOffset,
+    SpriteParser,
+    SpritePivot,
+    SpriteProcessor,
+    SpriteRect,
+    SpriteRenderData,
+    SpriteResult,
+    SpriteSettings,
+    SpriteStats,
+    create_full_manager as create_full_sprite_manager,
     // Convenience functions
     create_manager as create_sprite_manager,
     create_performance_manager as create_performance_sprite_manager,
-    create_full_manager as create_full_sprite_manager,
-    parse_sprite, extract_sprite_image, validate_sprite,
-    get_sprite_area, is_nine_slice_sprite, is_atlas_sprite, get_sprite_aspect_ratio,
-    is_sprite_feature_supported, get_recommended_config as get_recommended_sprite_config,
+    extract_sprite_image,
+    get_recommended_config as get_recommended_sprite_config,
+    get_sprite_area,
+    get_sprite_aspect_ratio,
+    is_atlas_sprite,
+    is_nine_slice_sprite,
+    is_sprite_feature_supported,
+    parse_sprite,
+    validate_sprite,
 };
 
 #[cfg(feature = "mesh")]
 pub use mesh::{
-    // Core mesh types
-    Mesh, VertexData, ChannelInfo, SubMesh, AABB,
+    AABB,
+    BlendShape,
+    BlendShapeChannel,
     // Blend shape types
-    BlendShapeData, BlendShapeVertex, BlendShape, BlendShapeChannel,
+    BlendShapeData,
+    BlendShapeVertex,
+    ChannelInfo,
     // Compression types
-    CompressedMesh, PackedFloatVector, PackedIntVector,
-    // Streaming and info
-    StreamingInfo as MeshStreamingInfo, MeshInfo,
-    // Processing
-    MeshManager, MeshProcessor, MeshParser, MeshStats,
+    CompressedMesh,
+    // Core mesh types
+    Mesh,
     // Configuration and results
-    MeshConfig, MeshResult, ProcessingOptions as MeshProcessingOptions,
+    MeshConfig,
+    MeshInfo,
+    // Processing
+    MeshManager,
+    MeshParser,
+    MeshProcessor,
+    MeshResult,
+    MeshStats,
+    PackedFloatVector,
+    PackedIntVector,
+    ProcessingOptions as MeshProcessingOptions,
+    // Streaming and info
+    StreamingInfo as MeshStreamingInfo,
+    SubMesh,
+    VertexData,
+    create_full_manager as create_full_mesh_manager,
     // Convenience functions
     create_manager as create_mesh_manager,
     create_performance_manager as create_performance_mesh_manager,
-    create_full_manager as create_full_mesh_manager,
-    parse_mesh, export_mesh_to_obj, validate_mesh,
-    get_vertex_count, get_triangle_count, has_blend_shapes, is_compressed_mesh,
-    has_streaming_data, get_mesh_bounds, is_mesh_feature_supported,
+    export_mesh_to_obj,
+    get_mesh_bounds,
     get_recommended_config as get_recommended_mesh_config,
+    get_triangle_count,
+    get_vertex_count,
+    has_blend_shapes,
+    has_streaming_data,
+    is_compressed_mesh,
+    is_mesh_feature_supported,
+    parse_mesh,
+    validate_mesh,
 };
 
 #[cfg(test)]

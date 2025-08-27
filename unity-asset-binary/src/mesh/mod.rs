@@ -34,28 +34,39 @@
 //! # Ok::<(), unity_asset_binary::error::BinaryError>(())
 //! ```
 
-pub mod types;
 pub mod parser;
 pub mod processor;
+pub mod types;
 
 // Re-export main types for easy access
-pub use types::{
-    // Core mesh types
-    Mesh, VertexData, ChannelInfo, SubMesh, AABB,
-    // Blend shape types
-    BlendShapeData, BlendShapeVertex, BlendShape, BlendShapeChannel,
-    // Compression types
-    CompressedMesh, PackedFloatVector, PackedIntVector,
-    // Streaming and info
-    StreamingInfo, MeshInfo,
-    // Configuration and results
-    MeshConfig, MeshResult,
-};
 pub use parser::MeshParser;
 pub use processor::{MeshProcessor, MeshStats};
+pub use types::{
+    AABB,
+    BlendShape,
+    BlendShapeChannel,
+    // Blend shape types
+    BlendShapeData,
+    BlendShapeVertex,
+    ChannelInfo,
+    // Compression types
+    CompressedMesh,
+    // Core mesh types
+    Mesh,
+    // Configuration and results
+    MeshConfig,
+    MeshInfo,
+    MeshResult,
+    PackedFloatVector,
+    PackedIntVector,
+    // Streaming and info
+    StreamingInfo,
+    SubMesh,
+    VertexData,
+};
 
 /// Main mesh processing facade
-/// 
+///
 /// This struct provides a high-level interface for mesh processing,
 /// combining parsing and processing functionality.
 pub struct MeshManager {
@@ -78,7 +89,10 @@ impl MeshManager {
     }
 
     /// Process mesh from Unity object
-    pub fn process_mesh(&self, object: &crate::object::UnityObject) -> crate::error::Result<MeshResult> {
+    pub fn process_mesh(
+        &self,
+        object: &crate::object::UnityObject,
+    ) -> crate::error::Result<MeshResult> {
         self.processor.parse_mesh(object)
     }
 
@@ -241,7 +255,10 @@ pub fn get_mesh_bounds(mesh: &Mesh) -> &AABB {
 }
 
 /// Check if Unity version supports mesh feature
-pub fn is_mesh_feature_supported(version: &crate::unity_version::UnityVersion, feature: &str) -> bool {
+pub fn is_mesh_feature_supported(
+    version: &crate::unity_version::UnityVersion,
+    feature: &str,
+) -> bool {
     match feature {
         "basic_mesh" | "sub_meshes" | "vertex_data" => true,
         "blend_shapes" | "compressed_mesh" => version.major >= 5,
@@ -342,19 +359,28 @@ mod tests {
 
     #[test]
     fn test_feature_support() {
-        let version_2020 = crate::unity_version::UnityVersion::parse_version("2020.3.12f1").unwrap();
+        let version_2020 =
+            crate::unity_version::UnityVersion::parse_version("2020.3.12f1").unwrap();
         assert!(is_mesh_feature_supported(&version_2020, "basic_mesh"));
         assert!(is_mesh_feature_supported(&version_2020, "blend_shapes"));
-        assert!(is_mesh_feature_supported(&version_2020, "vertex_attributes"));
+        assert!(is_mesh_feature_supported(
+            &version_2020,
+            "vertex_attributes"
+        ));
 
-        let version_2017 = crate::unity_version::UnityVersion::parse_version("2017.4.40f1").unwrap();
+        let version_2017 =
+            crate::unity_version::UnityVersion::parse_version("2017.4.40f1").unwrap();
         assert!(is_mesh_feature_supported(&version_2017, "streaming_info"));
-        assert!(!is_mesh_feature_supported(&version_2017, "vertex_attributes"));
+        assert!(!is_mesh_feature_supported(
+            &version_2017,
+            "vertex_attributes"
+        ));
     }
 
     #[test]
     fn test_recommended_config() {
-        let version_2020 = crate::unity_version::UnityVersion::parse_version("2020.3.12f1").unwrap();
+        let version_2020 =
+            crate::unity_version::UnityVersion::parse_version("2020.3.12f1").unwrap();
         let config = get_recommended_config(&version_2020);
         assert!(config.extract_vertices);
         assert!(config.process_blend_shapes);

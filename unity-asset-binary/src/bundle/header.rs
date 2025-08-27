@@ -9,7 +9,7 @@ use crate::reader::BinaryReader;
 use serde::{Deserialize, Serialize};
 
 /// AssetBundle header information
-/// 
+///
 /// Contains metadata about the bundle including version, compression settings,
 /// and structural information needed for parsing the bundle contents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,7 +52,7 @@ impl Default for BundleHeader {
 
 impl BundleHeader {
     /// Parse bundle header from binary data
-    /// 
+    ///
     /// This method reads the bundle header from a binary reader,
     /// handling different bundle formats (UnityFS, UnityWeb, etc.).
     pub fn from_reader(reader: &mut BinaryReader) -> Result<Self> {
@@ -89,7 +89,7 @@ impl BundleHeader {
                 header.compressed_blocks_info_size = 0;
                 header.uncompressed_blocks_info_size = 0;
                 header.flags = 0;
-                
+
                 // Skip padding byte for some legacy versions
                 if version < 6 {
                     reader.read_u8()?;
@@ -152,11 +152,28 @@ impl BundleHeader {
             let base_size = match self.signature.as_str() {
                 "UnityFS" => {
                     // Signature + version + unity_version + unity_revision + size + compressed_size + uncompressed_size + flags
-                    self.signature.len() + 1 + 4 + self.unity_version.len() + 1 + self.unity_revision.len() + 1 + 8 + 4 + 4 + 4
+                    self.signature.len()
+                        + 1
+                        + 4
+                        + self.unity_version.len()
+                        + 1
+                        + self.unity_revision.len()
+                        + 1
+                        + 8
+                        + 4
+                        + 4
+                        + 4
                 }
                 "UnityWeb" | "UnityRaw" => {
                     // Signature + version + unity_version + unity_revision + size
-                    self.signature.len() + 1 + 4 + self.unity_version.len() + 1 + self.unity_revision.len() + 1 + 4
+                    self.signature.len()
+                        + 1
+                        + 4
+                        + self.unity_version.len()
+                        + 1
+                        + self.unity_revision.len()
+                        + 1
+                        + 4
                 }
                 _ => 0,
             };
@@ -206,7 +223,10 @@ impl BundleHeader {
         BundleFormatInfo {
             signature: self.signature.clone(),
             version: self.version,
-            is_compressed: self.compression_type().map(|ct| ct != CompressionType::None).unwrap_or(false),
+            is_compressed: self
+                .compression_type()
+                .map(|ct| ct != CompressionType::None)
+                .unwrap_or(false),
             supports_streaming: self.is_unity_fs(),
             has_directory_info: self.is_unity_fs(),
         }
@@ -245,17 +265,17 @@ mod tests {
     #[test]
     fn test_bundle_header_validation() {
         let mut header = BundleHeader::default();
-        
+
         // Empty header should fail validation
         assert!(header.validate().is_err());
-        
+
         // Set minimum required fields
         header.signature = "UnityFS".to_string();
         header.version = 6;
         header.size = 1000;
         header.compressed_blocks_info_size = 100;
         header.uncompressed_blocks_info_size = 200;
-        
+
         // Should now pass validation
         assert!(header.validate().is_ok());
     }
@@ -267,16 +287,16 @@ mod tests {
             version: 6,
             ..Default::default()
         };
-        
+
         assert!(header.is_unity_fs());
         assert!(!header.is_legacy());
-        
+
         let legacy_header = BundleHeader {
             signature: "UnityWeb".to_string(),
             version: 3,
             ..Default::default()
         };
-        
+
         assert!(!legacy_header.is_unity_fs());
         assert!(legacy_header.is_legacy());
     }

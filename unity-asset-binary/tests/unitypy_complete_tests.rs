@@ -10,14 +10,14 @@
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::len_zero)]
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
-use unity_asset_binary::{
-    load_bundle_from_memory, parse_serialized_file, AudioProcessor, MeshProcessor,
-    SpriteProcessor, TextureProcessor, UnityVersion,
-};
 use unity_asset_binary::object::ObjectInfo;
+use unity_asset_binary::{
+    AudioProcessor, MeshProcessor, SpriteProcessor, TextureProcessor, UnityVersion,
+    load_bundle_from_memory, parse_serialized_file,
+};
 
 const SAMPLES_DIR: &str = "tests/samples";
 
@@ -47,7 +47,7 @@ fn get_sample_files() -> Vec<PathBuf> {
 #[test]
 fn test_read_single() {
     println!("=== UnityPy Port: test_read_single ===");
-    
+
     let sample_files = get_sample_files();
     if sample_files.is_empty() {
         println!("⚠ No sample files found in {}", SAMPLES_DIR);
@@ -75,7 +75,7 @@ fn test_read_single() {
                             let objects = &asset.objects;
                             total_objects += objects.len();
                             println!("    Asset objects: {}", objects.len());
-                            
+
                             // Try to read each object (equivalent to obj.read() in UnityPy)
                             for obj in objects {
                                 // In UnityPy, obj.read() parses the object data
@@ -96,7 +96,7 @@ fn test_read_single() {
                                 let objects = &asset.objects;
                                 total_objects += objects.len();
                                 println!("  Objects: {}", objects.len());
-                                
+
                                 // Try to read each object
                                 for obj in objects {
                                     let _type_id = obj.type_id;
@@ -123,15 +123,21 @@ fn test_read_single() {
     println!("  Files processed: {}", sample_files.len());
     println!("  Successful reads: {}", successful_reads);
     println!("  Total objects: {}", total_objects);
-    
+
     if !failed_files.is_empty() {
         println!("  Failed files: {:?}", failed_files);
     }
 
     // We expect at least some files to be readable
-    assert!(successful_reads > 0, "Should successfully read at least one file");
-    println!("  ✓ test_read_single passed - {} out of {} files parsed", 
-        successful_reads, sample_files.len());
+    assert!(
+        successful_reads > 0,
+        "Should successfully read at least one file"
+    );
+    println!(
+        "  ✓ test_read_single passed - {} out of {} files parsed",
+        successful_reads,
+        sample_files.len()
+    );
 }
 
 /// Port of UnityPy's test_read_batch()
@@ -139,7 +145,7 @@ fn test_read_single() {
 #[test]
 fn test_read_batch() {
     println!("=== UnityPy Port: test_read_batch ===");
-    
+
     let samples_path = Path::new(SAMPLES_DIR);
     if !samples_path.exists() {
         println!("⚠ Samples directory not found: {}", SAMPLES_DIR);
@@ -165,7 +171,7 @@ fn test_read_batch() {
                         for asset in &bundle.assets {
                             let objects = &asset.objects;
                             total_objects += objects.len();
-                            
+
                             // Read all objects
                             for obj in objects {
                                 let _type_id = obj.type_id;
@@ -179,7 +185,7 @@ fn test_read_batch() {
                         successful_reads += 1;
                         let objects = &asset.objects;
                         total_objects += objects.len();
-                        
+
                         // Read all objects
                         for obj in objects {
                             let _type_id = obj.type_id;
@@ -200,15 +206,20 @@ fn test_read_batch() {
     println!("  Total files: {}", total_files);
     println!("  Successful reads: {}", successful_reads);
     println!("  Total objects: {}", total_objects);
-    
+
     if !failed_files.is_empty() {
         println!("  Failed files: {:?}", failed_files);
     }
 
     if total_files > 0 {
-        assert!(successful_reads > 0, "Should successfully read at least one file");
-        println!("  ✓ test_read_batch passed - {} out of {} files parsed", 
-            successful_reads, total_files);
+        assert!(
+            successful_reads > 0,
+            "Should successfully read at least one file"
+        );
+        println!(
+            "  ✓ test_read_batch passed - {} out of {} files parsed",
+            successful_reads, total_files
+        );
     } else {
         println!("  ⚠ No files found - test skipped");
     }
@@ -219,7 +230,7 @@ fn test_read_batch() {
 #[test]
 fn test_save_dict() {
     println!("=== UnityPy Port: test_save_dict ===");
-    
+
     let samples_path = Path::new(SAMPLES_DIR);
     if !samples_path.exists() {
         println!("⚠ Samples directory not found - test skipped");
@@ -299,7 +310,9 @@ fn test_save_dict() {
         if successful_roundtrips > 0 {
             println!("  ✓ test_save_dict passed (TypeTree roundtrip simulation)");
         } else {
-            println!("  ⚠ TypeTree dict save not fully implemented yet - test passed with limitations");
+            println!(
+                "  ⚠ TypeTree dict save not fully implemented yet - test passed with limitations"
+            );
         }
     } else {
         println!("  ⚠ No objects found - test skipped");
@@ -338,12 +351,20 @@ fn test_typetree() {
                                 total_typetree_nodes += asset.types.len();
                                 successful_parses += 1;
 
-                                println!("  ✓ {} - TypeTree nodes: {}", file_name, asset.types.len());
+                                println!(
+                                    "  ✓ {} - TypeTree nodes: {}",
+                                    file_name,
+                                    asset.types.len()
+                                );
 
                                 // Validate TypeTree structure
                                 for (i, type_info) in asset.types.iter().enumerate().take(3) {
-                                    println!("    Node {}: Class {} - {} fields",
-                                        i, type_info.class_id, type_info.type_tree.nodes.len());
+                                    println!(
+                                        "    Node {}: Class {} - {} fields",
+                                        i,
+                                        type_info.class_id,
+                                        type_info.type_tree.nodes.len()
+                                    );
                                 }
                             }
                         }
@@ -535,7 +556,10 @@ fn test_parse_unity_version() {
                     println!("  ✓ {} -> {:?}", version_str, actual);
                 } else {
                     failed_parses += 1;
-                    println!("  ✗ {} -> expected {:?}, got {:?}", version_str, expected, actual);
+                    println!(
+                        "  ✗ {} -> expected {:?}, got {:?}",
+                        version_str, expected, actual
+                    );
                 }
             }
             Err(e) => {
@@ -588,8 +612,10 @@ fn test_comparison_with_tuple() {
             let gt_result = version_tuple > *compare_tuple;
 
             successful_comparisons += 1;
-            println!("  ✓ {} vs {:?} - eq: {}, lt: {}, gt: {}",
-                version_str, compare_tuple, eq_result, lt_result, gt_result);
+            println!(
+                "  ✓ {} vs {:?} - eq: {}, lt: {}, gt: {}",
+                version_str, compare_tuple, eq_result, lt_result, gt_result
+            );
         } else {
             failed_comparisons += 1;
             println!("  ✗ Failed to parse version: {}", version_str);
@@ -601,7 +627,10 @@ fn test_comparison_with_tuple() {
     println!("  Successful comparisons: {}", successful_comparisons);
     println!("  Failed comparisons: {}", failed_comparisons);
 
-    assert_eq!(failed_comparisons, 0, "All version comparisons should succeed");
+    assert_eq!(
+        failed_comparisons, 0,
+        "All version comparisons should succeed"
+    );
     println!("  ✓ test_comparison_with_tuple passed");
 }
 
@@ -623,10 +652,25 @@ fn test_comparison_with_unityversion() {
     let mut failed_comparisons = 0;
 
     for (version_str1, version_str2) in &test_cases {
-        match (UnityVersion::parse_version(version_str1), UnityVersion::parse_version(version_str2)) {
+        match (
+            UnityVersion::parse_version(version_str1),
+            UnityVersion::parse_version(version_str2),
+        ) {
             (Ok(v1), Ok(v2)) => {
-                let v1_tuple = (v1.major, v1.minor, v1.build, v1.version_type.to_string(), v1.type_number);
-                let v2_tuple = (v2.major, v2.minor, v2.build, v2.version_type.to_string(), v2.type_number);
+                let v1_tuple = (
+                    v1.major,
+                    v1.minor,
+                    v1.build,
+                    v1.version_type.to_string(),
+                    v1.type_number,
+                );
+                let v2_tuple = (
+                    v2.major,
+                    v2.minor,
+                    v2.build,
+                    v2.version_type.to_string(),
+                    v2.type_number,
+                );
 
                 // Test all comparison operations
                 let eq = v1_tuple == v2_tuple;
@@ -637,12 +681,17 @@ fn test_comparison_with_unityversion() {
                 let ge = v1_tuple >= v2_tuple;
 
                 successful_comparisons += 1;
-                println!("  ✓ {} vs {} - eq:{} ne:{} lt:{} le:{} gt:{} ge:{}",
-                    version_str1, version_str2, eq, ne, lt, le, gt, ge);
+                println!(
+                    "  ✓ {} vs {} - eq:{} ne:{} lt:{} le:{} gt:{} ge:{}",
+                    version_str1, version_str2, eq, ne, lt, le, gt, ge
+                );
             }
             _ => {
                 failed_comparisons += 1;
-                println!("  ✗ Failed to parse versions: {} vs {}", version_str1, version_str2);
+                println!(
+                    "  ✗ Failed to parse versions: {} vs {}",
+                    version_str1, version_str2
+                );
             }
         }
     }
@@ -652,7 +701,10 @@ fn test_comparison_with_unityversion() {
     println!("  Successful comparisons: {}", successful_comparisons);
     println!("  Failed comparisons: {}", failed_comparisons);
 
-    assert_eq!(failed_comparisons, 0, "All version comparisons should succeed");
+    assert_eq!(
+        failed_comparisons, 0,
+        "All version comparisons should succeed"
+    );
     println!("  ✓ test_comparison_with_unityversion passed");
 }
 
@@ -701,7 +753,7 @@ fn test_unitypy_compatibility() {
                         "atlas_test" => 10,
                         "banner_1" => 3,
                         "char_118_yuki.ab" => 36,
-                        "xinzexi_2_n_tex" => 4,  // If this file exists
+                        "xinzexi_2_n_tex" => 4, // If this file exists
                         _ => 0,
                     };
 
@@ -714,9 +766,15 @@ fn test_unitypy_compatibility() {
                     file_result.insert("objects_match".to_string(), objects_match.to_string());
 
                     if objects_match {
-                        println!("  ✓ {} - {} objects (matches expected)", file_name, total_objects);
+                        println!(
+                            "  ✓ {} - {} objects (matches expected)",
+                            file_name, total_objects
+                        );
                     } else {
-                        println!("  ⚠ {} - {} objects (expected {})", file_name, total_objects, expected_objects);
+                        println!(
+                            "  ⚠ {} - {} objects (expected {})",
+                            file_name, total_objects, expected_objects
+                        );
                     }
 
                     // Show object type distribution
@@ -748,11 +806,13 @@ fn test_unitypy_compatibility() {
     }
 
     // Summary
-    let successful_files = compatibility_results.iter()
+    let successful_files = compatibility_results
+        .iter()
         .filter(|r| r.get("status") == Some(&"success".to_string()))
         .count();
 
-    let total_objects: usize = compatibility_results.iter()
+    let total_objects: usize = compatibility_results
+        .iter()
         .filter_map(|r| r.get("total_objects"))
         .filter_map(|s| s.parse::<usize>().ok())
         .sum();
@@ -771,8 +831,14 @@ fn test_unitypy_compatibility() {
 
     // We expect reasonable compatibility with UnityPy
     // Note: Some files use LZMA compression which we haven't fully implemented yet
-    assert!(success_rate >= 50.0, "Should have at least 50% compatibility with UnityPy");
-    assert!(total_objects >= 40, "Should parse at least 40 objects total");
+    assert!(
+        success_rate >= 50.0,
+        "Should have at least 50% compatibility with UnityPy"
+    );
+    assert!(
+        total_objects >= 40,
+        "Should parse at least 40 objects total"
+    );
 
     println!("  ✓ UnityPy compatibility test passed!");
 }
@@ -807,7 +873,8 @@ fn test_object_type_identification() {
     let sample_files = get_sample_files();
     let mut total_objects = 0;
     let mut identified_objects = 0;
-    let mut type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut type_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     for file_path in sample_files {
         let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
@@ -838,26 +905,35 @@ fn test_object_type_identification() {
                             if !class_name.starts_with("Class_") {
                                 identified_objects += 1;
 
-                                println!("    {} (ID:{}, PathID:{})", class_name, object_info.class_id, object_info.path_id);
+                                println!(
+                                    "    {} (ID:{}, PathID:{})",
+                                    class_name, object_info.class_id, object_info.path_id
+                                );
 
                                 // Try to parse the object to get more info
                                 if let Ok(unity_class) = object_info.parse_object() {
                                     if let Some(name_value) = unity_class.get("m_Name") {
-                                        if let unity_asset_core::UnityValue::String(name) = name_value {
+                                        if let unity_asset_core::UnityValue::String(name) =
+                                            name_value
+                                        {
                                             println!("      Name: '{}'", name);
                                         }
                                     }
 
                                     // Show some properties for interesting objects
                                     if class_name == "GameObject" || class_name == "Transform" {
-                                        let prop_names: Vec<_> = unity_class.properties().keys().take(5).collect();
+                                        let prop_names: Vec<_> =
+                                            unity_class.properties().keys().take(5).collect();
                                         if !prop_names.is_empty() {
                                             println!("      Properties: {:?}", prop_names);
                                         }
                                     }
                                 }
                             } else {
-                                println!("    Unknown type: {} (ID:{}, PathID:{})", class_name, object_info.class_id, object_info.path_id);
+                                println!(
+                                    "    Unknown type: {} (ID:{}, PathID:{})",
+                                    class_name, object_info.class_id, object_info.path_id
+                                );
                             }
                         }
                     }
@@ -874,8 +950,10 @@ fn test_object_type_identification() {
     println!("\nObject Type Analysis:");
     println!("  Total objects: {}", total_objects);
     println!("  Identified objects: {}", identified_objects);
-    println!("  Identification rate: {:.1}%",
-             (identified_objects as f64 / total_objects as f64) * 100.0);
+    println!(
+        "  Identification rate: {:.1}%",
+        (identified_objects as f64 / total_objects as f64) * 100.0
+    );
 
     println!("\nObject Type Distribution:");
     let mut sorted_types: Vec<_> = type_counts.iter().collect();
@@ -887,8 +965,11 @@ fn test_object_type_identification() {
 
     // We should identify at least 50% of objects
     let identification_rate = (identified_objects as f64 / total_objects as f64) * 100.0;
-    assert!(identification_rate >= 50.0,
-            "Should identify at least 50% of objects, got {:.1}%", identification_rate);
+    assert!(
+        identification_rate >= 50.0,
+        "Should identify at least 50% of objects, got {:.1}%",
+        identification_rate
+    );
     assert!(total_objects >= 40, "Should find at least 40 objects total");
 
     println!("  ✓ test_object_type_identification passed");

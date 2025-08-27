@@ -2,8 +2,8 @@
 //!
 //! This module defines the core data structures used for texture processing.
 
-use serde::{Deserialize, Serialize};
 use super::formats::TextureFormat;
+use serde::{Deserialize, Serialize};
 
 /// Streaming info for external texture data
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -25,7 +25,7 @@ pub struct GLTextureSettings {
 }
 
 /// Texture2D object representation
-/// 
+///
 /// This structure contains all the data needed to represent a Unity Texture2D object.
 /// It includes both metadata and the actual image data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,7 +115,8 @@ impl Texture2D {
 
     /// Get expected data size based on format and dimensions
     pub fn expected_data_size(&self) -> u32 {
-        self.format.calculate_data_size(self.width as u32, self.height as u32)
+        self.format
+            .calculate_data_size(self.width as u32, self.height as u32)
     }
 
     /// Validate texture data consistency

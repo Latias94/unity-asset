@@ -311,7 +311,7 @@ impl AssetMetadata {
 
     /// Check if the asset has dependencies
     pub fn has_dependencies(&self) -> bool {
-        !self.dependencies.external_references.is_empty() 
+        !self.dependencies.external_references.is_empty()
             || !self.dependencies.internal_references.is_empty()
     }
 

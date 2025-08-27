@@ -6,13 +6,11 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::collections::HashMap;
-use unity_asset_binary::{
-    load_bundle_from_memory, UnityVersion, AudioCompressionFormat,
-};
 use unity_asset_binary::object::ObjectInfo;
+use unity_asset_binary::{AudioCompressionFormat, UnityVersion, load_bundle_from_memory};
 
 const SAMPLES_DIR: &str = "tests/samples";
 
@@ -20,33 +18,39 @@ const SAMPLES_DIR: &str = "tests/samples";
 #[test]
 fn test_comprehensive_compatibility_report() {
     println!("=== Unity Asset Parser - Comprehensive Compatibility Report ===");
-    println!("Generated on: {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+    println!(
+        "Generated on: {}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    );
     println!();
-    
+
     let sample_files = get_sample_files();
     let mut report = CompatibilityReport::new();
-    
+
     // Process all sample files
     for file_path in sample_files {
         let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
         println!("📁 Processing: {}", file_name);
-        
+
         if let Ok(data) = fs::read(&file_path) {
             match load_bundle_from_memory(data) {
                 Ok(bundle) => {
                     report.successful_files += 1;
-                    
+
                     // Analyze bundle structure
                     println!("  ✅ Bundle loaded successfully");
                     println!("  📊 Assets: {}", bundle.assets.len());
-                    
+
                     for asset in &bundle.assets {
                         report.total_assets += 1;
                         println!("    📄 Asset with {} objects", asset.objects.len());
-                        
+
                         for asset_object_info in &asset.objects {
                             report.total_objects += 1;
-                            
+
                             // Convert to our ObjectInfo type
                             let mut object_info = ObjectInfo::new(
                                 asset_object_info.path_id,
@@ -55,14 +59,14 @@ fn test_comprehensive_compatibility_report() {
                                 asset_object_info.type_id,
                             );
                             object_info.data = asset_object_info.data.clone();
-                            
+
                             let class_name = object_info.class_name();
                             *report.object_types.entry(class_name.clone()).or_insert(0) += 1;
-                            
+
                             // Try to parse the object
                             if let Ok(unity_class) = object_info.parse_object() {
                                 report.parsed_objects += 1;
-                                
+
                                 // Analyze specific object types
                                 match class_name.as_str() {
                                     "Texture2D" => {
@@ -94,7 +98,7 @@ fn test_comprehensive_compatibility_report() {
                 Err(e) => {
                     report.failed_files += 1;
                     println!("  ❌ Failed to load: {}", e);
-                    
+
                     // Analyze failure reasons
                     let error_msg = e.to_string();
                     if error_msg.contains("LZMA") {
@@ -112,18 +116,29 @@ fn test_comprehensive_compatibility_report() {
         }
         println!();
     }
-    
+
     // Generate comprehensive report
     generate_report(&report);
-    
+
     // Assertions for quality gates
     let success_rate = (report.successful_files as f64 / report.total_files() as f64) * 100.0;
     let parse_rate = (report.parsed_objects as f64 / report.total_objects as f64) * 100.0;
-    
-    assert!(success_rate >= 60.0, "File success rate should be at least 60%, got {:.1}%", success_rate);
-    assert!(parse_rate >= 90.0, "Object parse rate should be at least 90%, got {:.1}%", parse_rate);
-    assert!(report.total_objects >= 40, "Should process at least 40 objects total");
-    
+
+    assert!(
+        success_rate >= 60.0,
+        "File success rate should be at least 60%, got {:.1}%",
+        success_rate
+    );
+    assert!(
+        parse_rate >= 90.0,
+        "Object parse rate should be at least 90%, got {:.1}%",
+        parse_rate
+    );
+    assert!(
+        report.total_objects >= 40,
+        "Should process at least 40 objects total"
+    );
+
     println!("✅ Comprehensive compatibility report completed successfully!");
 }
 
@@ -154,15 +169,15 @@ struct CompatibilityReport {
     // File statistics
     successful_files: usize,
     failed_files: usize,
-    
+
     // Object statistics
     total_assets: usize,
     total_objects: usize,
     parsed_objects: usize,
-    
+
     // Object type counts
     object_types: HashMap<String, usize>,
-    
+
     // Specific object types
     texture_objects: usize,
     audio_objects: usize,
@@ -170,13 +185,13 @@ struct CompatibilityReport {
     transform_objects: usize,
     sprite_objects: usize,
     sprite_atlas_objects: usize,
-    
+
     // Texture analysis
     texture_formats: HashMap<String, usize>,
-    
+
     // Audio analysis
     audio_formats: HashMap<String, usize>,
-    
+
     // Failure analysis
     lzma_failures: usize,
     data_failures: usize,
@@ -187,7 +202,7 @@ impl CompatibilityReport {
     fn new() -> Self {
         Self::default()
     }
-    
+
     fn total_files(&self) -> usize {
         self.successful_files + self.failed_files
     }
@@ -236,37 +251,43 @@ fn get_texture_format_name(format_id: i32) -> String {
 fn generate_report(report: &CompatibilityReport) {
     println!("📊 === COMPREHENSIVE COMPATIBILITY REPORT ===");
     println!();
-    
+
     // File Processing Summary
     println!("🗂️  FILE PROCESSING SUMMARY");
     println!("   Total files processed: {}", report.total_files());
-    println!("   Successfully loaded: {} ({:.1}%)", 
-             report.successful_files, 
-             (report.successful_files as f64 / report.total_files() as f64) * 100.0);
-    println!("   Failed to load: {} ({:.1}%)", 
-             report.failed_files,
-             (report.failed_files as f64 / report.total_files() as f64) * 100.0);
+    println!(
+        "   Successfully loaded: {} ({:.1}%)",
+        report.successful_files,
+        (report.successful_files as f64 / report.total_files() as f64) * 100.0
+    );
+    println!(
+        "   Failed to load: {} ({:.1}%)",
+        report.failed_files,
+        (report.failed_files as f64 / report.total_files() as f64) * 100.0
+    );
     println!();
-    
+
     // Object Processing Summary
     println!("🎯 OBJECT PROCESSING SUMMARY");
     println!("   Total assets: {}", report.total_assets);
     println!("   Total objects: {}", report.total_objects);
-    println!("   Successfully parsed: {} ({:.1}%)", 
-             report.parsed_objects,
-             (report.parsed_objects as f64 / report.total_objects as f64) * 100.0);
+    println!(
+        "   Successfully parsed: {} ({:.1}%)",
+        report.parsed_objects,
+        (report.parsed_objects as f64 / report.total_objects as f64) * 100.0
+    );
     println!();
-    
+
     // Object Type Distribution
     println!("📋 OBJECT TYPE DISTRIBUTION");
     let mut sorted_types: Vec<_> = report.object_types.iter().collect();
     sorted_types.sort_by(|a, b| b.1.cmp(a.1));
-    
+
     for (type_name, count) in sorted_types.iter().take(10) {
         println!("   {}: {} objects", type_name, count);
     }
     println!();
-    
+
     // Specific Object Analysis
     println!("🔍 SPECIFIC OBJECT ANALYSIS");
     println!("   Texture2D objects: {}", report.texture_objects);
@@ -276,31 +297,31 @@ fn generate_report(report: &CompatibilityReport) {
     println!("   Sprite objects: {}", report.sprite_objects);
     println!("   SpriteAtlas objects: {}", report.sprite_atlas_objects);
     println!();
-    
+
     // Texture Format Analysis
     if !report.texture_formats.is_empty() {
         println!("🖼️  TEXTURE FORMAT ANALYSIS");
         let mut sorted_formats: Vec<_> = report.texture_formats.iter().collect();
         sorted_formats.sort_by(|a, b| b.1.cmp(a.1));
-        
+
         for (format_name, count) in sorted_formats {
             println!("   {}: {} textures", format_name, count);
         }
         println!();
     }
-    
+
     // Audio Format Analysis
     if !report.audio_formats.is_empty() {
         println!("🔊 AUDIO FORMAT ANALYSIS");
         let mut sorted_formats: Vec<_> = report.audio_formats.iter().collect();
         sorted_formats.sort_by(|a, b| b.1.cmp(a.1));
-        
+
         for (format_name, count) in sorted_formats {
             println!("   {}: {} audio clips", format_name, count);
         }
         println!();
     }
-    
+
     // Failure Analysis
     if report.failed_files > 0 {
         println!("❌ FAILURE ANALYSIS");
@@ -309,15 +330,15 @@ fn generate_report(report: &CompatibilityReport) {
         println!("   Other failures: {}", report.other_failures);
         println!();
     }
-    
+
     // Compatibility Assessment
     println!("🏆 COMPATIBILITY ASSESSMENT");
     let file_success_rate = (report.successful_files as f64 / report.total_files() as f64) * 100.0;
     let parse_success_rate = (report.parsed_objects as f64 / report.total_objects as f64) * 100.0;
-    
+
     println!("   File loading success rate: {:.1}%", file_success_rate);
     println!("   Object parsing success rate: {:.1}%", parse_success_rate);
-    
+
     // Overall grade
     let overall_score = (file_success_rate + parse_success_rate) / 2.0;
     let grade = match overall_score {
@@ -327,10 +348,13 @@ fn generate_report(report: &CompatibilityReport) {
         60.0..=69.9 => "C (Acceptable)",
         _ => "D (Needs Improvement)",
     };
-    
-    println!("   Overall compatibility score: {:.1}% ({})", overall_score, grade);
+
+    println!(
+        "   Overall compatibility score: {:.1}% ({})",
+        overall_score, grade
+    );
     println!();
-    
+
     println!("📈 RECOMMENDATIONS");
     if report.lzma_failures > 0 {
         println!("   • Improve LZMA decompression support");
@@ -344,7 +368,7 @@ fn generate_report(report: &CompatibilityReport) {
     if parse_success_rate < 95.0 {
         println!("   • Improve object parsing reliability");
     }
-    
+
     println!("   • Continue expanding Unity version support");
     println!("   • Add more specialized object type handlers");
     println!("   • Implement external resource file support");

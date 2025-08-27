@@ -7,50 +7,49 @@ use image::{ImageFormat, RgbaImage};
 use std::path::Path;
 
 /// Texture exporter utility
-/// 
+///
 /// This struct provides methods for exporting texture data to various image formats.
 pub struct TextureExporter;
 
 impl TextureExporter {
     /// Export texture as PNG
-    /// 
+    ///
     /// This is the most common export format, providing lossless compression
     /// with full alpha channel support.
     pub fn export_png<P: AsRef<Path>>(image: &RgbaImage, path: P) -> Result<()> {
-        image.save_with_format(path, ImageFormat::Png).map_err(|e| {
-            BinaryError::generic(format!("Failed to save PNG: {}", e))
-        })
+        image
+            .save_with_format(path, ImageFormat::Png)
+            .map_err(|e| BinaryError::generic(format!("Failed to save PNG: {}", e)))
     }
 
     /// Export texture as JPEG
-    /// 
+    ///
     /// Note: JPEG does not support alpha channel, so alpha will be lost.
     pub fn export_jpeg<P: AsRef<Path>>(image: &RgbaImage, path: P, quality: u8) -> Result<()> {
         // Convert RGBA to RGB for JPEG (no alpha support)
         let rgb_image = image::DynamicImage::ImageRgba8(image.clone()).to_rgb8();
-        
-        let mut output = std::fs::File::create(path).map_err(|e| {
-            BinaryError::generic(format!("Failed to create output file: {}", e))
-        })?;
-        
+
+        let mut output = std::fs::File::create(path)
+            .map_err(|e| BinaryError::generic(format!("Failed to create output file: {}", e)))?;
+
         let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, quality);
-        encoder.encode_image(&rgb_image).map_err(|e| {
-            BinaryError::generic(format!("Failed to encode JPEG: {}", e))
-        })
+        encoder
+            .encode_image(&rgb_image)
+            .map_err(|e| BinaryError::generic(format!("Failed to encode JPEG: {}", e)))
     }
 
     /// Export texture as BMP
     pub fn export_bmp<P: AsRef<Path>>(image: &RgbaImage, path: P) -> Result<()> {
-        image.save_with_format(path, ImageFormat::Bmp).map_err(|e| {
-            BinaryError::generic(format!("Failed to save BMP: {}", e))
-        })
+        image
+            .save_with_format(path, ImageFormat::Bmp)
+            .map_err(|e| BinaryError::generic(format!("Failed to save BMP: {}", e)))
     }
 
     /// Export texture as TIFF
     pub fn export_tiff<P: AsRef<Path>>(image: &RgbaImage, path: P) -> Result<()> {
-        image.save_with_format(path, ImageFormat::Tiff).map_err(|e| {
-            BinaryError::generic(format!("Failed to save TIFF: {}", e))
-        })
+        image
+            .save_with_format(path, ImageFormat::Tiff)
+            .map_err(|e| BinaryError::generic(format!("Failed to save TIFF: {}", e)))
     }
 
     /// Export texture with automatic format detection based on file extension
@@ -81,7 +80,10 @@ impl TextureExporter {
         format: ImageFormat,
     ) -> Result<()> {
         image.save_with_format(path, format).map_err(|e| {
-            BinaryError::generic(format!("Failed to save image with format {:?}: {}", format, e))
+            BinaryError::generic(format!(
+                "Failed to save image with format {:?}: {}",
+                format, e
+            ))
         })
     }
 
@@ -97,23 +99,26 @@ impl TextureExporter {
 
     /// Create a filename with the given base name and format extension
     pub fn create_filename(base_name: &str, format: &str) -> String {
-        let clean_base = base_name.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-');
+        let clean_base =
+            base_name.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-');
         format!("{}.{}", clean_base, format.to_lowercase())
     }
 
     /// Validate that the image has valid dimensions for export
     pub fn validate_for_export(image: &RgbaImage) -> Result<()> {
         let (width, height) = image.dimensions();
-        
+
         if width == 0 || height == 0 {
             return Err(BinaryError::invalid_data("Image has zero dimensions"));
         }
-        
+
         // Check for reasonable size limits (prevent memory issues)
         if width > 32768 || height > 32768 {
-            return Err(BinaryError::invalid_data("Image dimensions too large for export"));
+            return Err(BinaryError::invalid_data(
+                "Image dimensions too large for export",
+            ));
         }
-        
+
         Ok(())
     }
 
@@ -128,7 +133,7 @@ impl TextureExporter {
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
     pub format: ImageFormat,
-    pub quality: Option<u8>, // For JPEG
+    pub quality: Option<u8>,     // For JPEG
     pub compression: Option<u8>, // For PNG
 }
 

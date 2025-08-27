@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Unity audio compression formats
-/// 
+///
 /// This enum represents all audio compression formats supported by Unity.
 /// Values match Unity's internal AudioCompressionFormat enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -56,7 +56,7 @@ impl From<i32> for AudioCompressionFormat {
 }
 
 /// FMOD sound type enumeration
-/// 
+///
 /// Used for identifying audio format types in FMOD-based Unity versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[repr(i32)]

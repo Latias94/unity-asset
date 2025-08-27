@@ -8,10 +8,8 @@
 
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::{
-    load_bundle_from_memory, TextureProcessor,
-};
 use unity_asset_binary::object::ObjectInfo;
+use unity_asset_binary::{TextureProcessor, load_bundle_from_memory};
 
 const SAMPLES_DIR: &str = "tests/samples";
 
@@ -40,24 +38,24 @@ fn get_sample_files() -> Vec<std::path::PathBuf> {
 #[test]
 fn test_texture_format_detection() {
     println!("=== Texture Format Detection Test ===");
-    
+
     let sample_files = get_sample_files();
     let mut total_objects = 0;
     let mut texture_objects = 0;
     let mut processed_textures = 0;
     let mut texture_formats = std::collections::HashMap::new();
-    
+
     for file_path in sample_files {
         let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
         println!("  Processing file: {}", file_name);
-        
+
         if let Ok(data) = fs::read(&file_path) {
             match load_bundle_from_memory(data) {
                 Ok(bundle) => {
                     for asset in &bundle.assets {
                         for asset_object_info in &asset.objects {
                             total_objects += 1;
-                            
+
                             // Convert to our ObjectInfo type
                             let mut object_info = ObjectInfo::new(
                                 asset_object_info.path_id,
@@ -66,61 +64,86 @@ fn test_texture_format_detection() {
                                 asset_object_info.type_id,
                             );
                             object_info.data = asset_object_info.data.clone();
-                            
+
                             let class_name = object_info.class_name();
-                            
+
                             // Look for Texture2D objects (Class ID 28) or texture-related objects
-                            if object_info.class_id == 28 || class_name == "Texture2D" || 
-                               class_name.contains("Texture") {
+                            if object_info.class_id == 28
+                                || class_name == "Texture2D"
+                                || class_name.contains("Texture")
+                            {
                                 texture_objects += 1;
-                                println!("    Found texture object: {} (ID:{}, PathID:{})", 
-                                        class_name, object_info.class_id, object_info.path_id);
-                                
+                                println!(
+                                    "    Found texture object: {} (ID:{}, PathID:{})",
+                                    class_name, object_info.class_id, object_info.path_id
+                                );
+
                                 // Try to process the texture object
                                 if let Ok(unity_class) = object_info.parse_object() {
                                     processed_textures += 1;
-                                    
+
                                     // Extract texture properties
                                     if let Some(name_value) = unity_class.get("m_Name") {
-                                        if let unity_asset_core::UnityValue::String(name) = name_value {
+                                        if let unity_asset_core::UnityValue::String(name) =
+                                            name_value
+                                        {
                                             println!("      Texture name: '{}'", name);
                                         }
                                     }
-                                    
+
                                     // Check for texture format
                                     if let Some(format_value) = unity_class.get("m_TextureFormat") {
-                                        if let unity_asset_core::UnityValue::Integer(format_id) = format_value {
-                                            let format_name = get_texture_format_name(*format_id as i32);
-                                            println!("      Format: {} (ID: {})", format_name, format_id);
+                                        if let unity_asset_core::UnityValue::Integer(format_id) =
+                                            format_value
+                                        {
+                                            let format_name =
+                                                get_texture_format_name(*format_id as i32);
+                                            println!(
+                                                "      Format: {} (ID: {})",
+                                                format_name, format_id
+                                            );
                                             *texture_formats.entry(format_name).or_insert(0) += 1;
                                         }
                                     }
-                                    
+
                                     // Check for texture dimensions
                                     if let Some(width_value) = unity_class.get("m_Width") {
-                                        if let unity_asset_core::UnityValue::Integer(width) = width_value {
-                                            if let Some(height_value) = unity_class.get("m_Height") {
-                                                if let unity_asset_core::UnityValue::Integer(height) = height_value {
-                                                    println!("      Dimensions: {}x{}", width, height);
+                                        if let unity_asset_core::UnityValue::Integer(width) =
+                                            width_value
+                                        {
+                                            if let Some(height_value) = unity_class.get("m_Height")
+                                            {
+                                                if let unity_asset_core::UnityValue::Integer(
+                                                    height,
+                                                ) = height_value
+                                                {
+                                                    println!(
+                                                        "      Dimensions: {}x{}",
+                                                        width, height
+                                                    );
                                                 }
                                             }
                                         }
                                     }
-                                    
+
                                     // Check for mipmap info
                                     if let Some(mipmap_value) = unity_class.get("m_MipCount") {
-                                        if let unity_asset_core::UnityValue::Integer(mip_count) = mipmap_value {
+                                        if let unity_asset_core::UnityValue::Integer(mip_count) =
+                                            mipmap_value
+                                        {
                                             println!("      Mip levels: {}", mip_count);
                                         }
                                     }
-                                    
+
                                     // Check for texture data size
                                     if let Some(data_size_value) = unity_class.get("m_DataLength") {
-                                        if let unity_asset_core::UnityValue::Integer(data_size) = data_size_value {
+                                        if let unity_asset_core::UnityValue::Integer(data_size) =
+                                            data_size_value
+                                        {
                                             println!("      Data size: {} bytes", data_size);
                                         }
                                     }
-                                    
+
                                     // Check for streaming info
                                     if let Some(stream_value) = unity_class.get("m_StreamData") {
                                         println!("      Has streaming data");
@@ -136,28 +159,31 @@ fn test_texture_format_detection() {
             }
         }
     }
-    
+
     println!("\nTexture Processing Results:");
     println!("  Total objects: {}", total_objects);
     println!("  Texture objects found: {}", texture_objects);
     println!("  Successfully processed: {}", processed_textures);
-    
+
     if texture_objects > 0 {
         let processing_rate = (processed_textures as f64 / texture_objects as f64) * 100.0;
         println!("  Processing success rate: {:.1}%", processing_rate);
-        assert!(processing_rate >= 80.0, "Should process at least 80% of texture objects");
+        assert!(
+            processing_rate >= 80.0,
+            "Should process at least 80% of texture objects"
+        );
     }
-    
+
     if !texture_formats.is_empty() {
         println!("\nTexture Format Distribution:");
         let mut sorted_formats: Vec<_> = texture_formats.iter().collect();
         sorted_formats.sort_by(|a, b| b.1.cmp(a.1));
-        
+
         for (format_name, count) in sorted_formats {
             println!("  {}: {} textures", format_name, count);
         }
     }
-    
+
     println!("  ✓ Texture format detection test completed");
 }
 
@@ -221,16 +247,16 @@ fn get_texture_format_name(format_id: i32) -> String {
 #[test]
 fn test_texture_data_extraction() {
     println!("=== Texture Data Extraction Test ===");
-    
+
     let sample_files = get_sample_files();
     let mut total_textures = 0;
     let mut textures_with_data = 0;
     let mut total_texture_data_size = 0u64;
-    
+
     for file_path in sample_files {
         let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
         println!("  Analyzing file: {}", file_name);
-        
+
         if let Ok(data) = fs::read(&file_path) {
             match load_bundle_from_memory(data) {
                 Ok(bundle) => {
@@ -243,26 +269,31 @@ fn test_texture_data_extraction() {
                                 asset_object_info.type_id,
                             );
                             object_info.data = asset_object_info.data.clone();
-                            
+
                             let class_name = object_info.class_name();
-                            
+
                             if class_name == "Texture2D" {
                                 total_textures += 1;
-                                
+
                                 if let Ok(unity_class) = object_info.parse_object() {
                                     // Check if texture has embedded data
-                                    let has_data = unity_class.get("image data").is_some() ||
-                                                  unity_class.get("m_ImageData").is_some() ||
-                                                  object_info.data.len() > 1024;
-                                    
+                                    let has_data = unity_class.get("image data").is_some()
+                                        || unity_class.get("m_ImageData").is_some()
+                                        || object_info.data.len() > 1024;
+
                                     if has_data {
                                         textures_with_data += 1;
                                         total_texture_data_size += object_info.data.len() as u64;
-                                        
+
                                         if let Some(name_value) = unity_class.get("m_Name") {
-                                            if let unity_asset_core::UnityValue::String(name) = name_value {
-                                                println!("    Texture '{}' has {} bytes of data", 
-                                                        name, object_info.data.len());
+                                            if let unity_asset_core::UnityValue::String(name) =
+                                                name_value
+                                            {
+                                                println!(
+                                                    "    Texture '{}' has {} bytes of data",
+                                                    name,
+                                                    object_info.data.len()
+                                                );
                                             }
                                         }
                                     }
@@ -277,17 +308,20 @@ fn test_texture_data_extraction() {
             }
         }
     }
-    
+
     println!("\nTexture Data Analysis Results:");
     println!("  Total textures: {}", total_textures);
     println!("  Textures with data: {}", textures_with_data);
-    println!("  Total texture data: {} bytes ({:.2} MB)", 
-             total_texture_data_size, total_texture_data_size as f64 / (1024.0 * 1024.0));
-    
+    println!(
+        "  Total texture data: {} bytes ({:.2} MB)",
+        total_texture_data_size,
+        total_texture_data_size as f64 / (1024.0 * 1024.0)
+    );
+
     if total_textures > 0 {
         let data_rate = (textures_with_data as f64 / total_textures as f64) * 100.0;
         println!("  Textures with data: {:.1}%", data_rate);
     }
-    
+
     println!("  ✓ Texture data extraction test completed");
 }

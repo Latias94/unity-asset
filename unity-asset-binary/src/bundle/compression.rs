@@ -3,20 +3,20 @@
 //! This module provides compression and decompression functionality
 //! for Unity AssetBundle blocks, supporting LZ4, LZMA, and Brotli.
 
+use super::header::BundleHeader;
 use crate::compression::{CompressionBlock, CompressionType, decompress};
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
-use super::header::BundleHeader;
 
 /// Bundle compression handler
-/// 
+///
 /// This struct provides methods for handling compressed bundle data,
 /// including block info decompression and data block processing.
 pub struct BundleCompression;
 
 impl BundleCompression {
     /// Decompress blocks info data
-    /// 
+    ///
     /// This method handles the decompression of the blocks information
     /// section of a bundle, which contains metadata about all compression blocks.
     pub fn decompress_blocks_info(
@@ -24,7 +24,7 @@ impl BundleCompression {
         compressed_data: &[u8],
     ) -> Result<Vec<u8>> {
         let compression_type = header.flags & 0x3F; // CompressionTypeMask
-        
+
         match compression_type {
             0 => {
                 // No compression
@@ -59,21 +59,19 @@ impl BundleCompression {
                 #[cfg(not(feature = "brotli"))]
                 {
                     Err(BinaryError::unsupported(
-                        "Brotli compression requires brotli feature"
+                        "Brotli compression requires brotli feature",
                     ))
                 }
             }
-            _ => {
-                Err(BinaryError::unsupported(format!(
-                    "Unknown compression type: {}",
-                    compression_type
-                )))
-            }
+            _ => Err(BinaryError::unsupported(format!(
+                "Unknown compression type: {}",
+                compression_type
+            ))),
         }
     }
 
     /// Parse compression blocks from decompressed blocks info
-    /// 
+    ///
     /// This method parses the compression block metadata from the
     /// decompressed blocks info data.
     pub fn parse_compression_blocks(data: &[u8]) -> Result<Vec<CompressionBlock>> {
@@ -85,7 +83,7 @@ impl BundleCompression {
 
         // Read compression blocks
         let block_count = reader.read_i32()? as usize;
-        
+
         for _ in 0..block_count {
             let uncompressed_size = reader.read_u32()?;
             let compressed_size = reader.read_u32()?;
@@ -99,7 +97,7 @@ impl BundleCompression {
     }
 
     /// Decompress all data blocks
-    /// 
+    ///
     /// This method reads and decompresses all data blocks from the bundle,
     /// returning the complete decompressed data.
     pub fn decompress_data_blocks(
@@ -114,31 +112,52 @@ impl BundleCompression {
         // This matches our fix in read_blocks_info
         let mut data_pos = header.header_size() + header.compressed_blocks_info_size as u64;
 
-        println!("DEBUG: decompress_data_blocks - data starts at position: {}", data_pos);
+        println!(
+            "DEBUG: decompress_data_blocks - data starts at position: {}",
+            data_pos
+        );
 
         // Process each compression block
         for (i, block) in blocks.iter().enumerate() {
             println!("DEBUG: Processing block {} at position {}", i, data_pos);
-            println!("DEBUG: Block - compressed: {}, uncompressed: {}, flags: 0x{:X}",
-                block.compressed_size, block.uncompressed_size, block.flags);
+            println!(
+                "DEBUG: Block - compressed: {}, uncompressed: {}, flags: 0x{:X}",
+                block.compressed_size, block.uncompressed_size, block.flags
+            );
 
             reader.set_position(data_pos)?;
-            println!("DEBUG: Reader position set to {}, remaining: {}", data_pos, reader.remaining());
+            println!(
+                "DEBUG: Reader position set to {}, remaining: {}",
+                data_pos,
+                reader.remaining()
+            );
 
             let compressed_data = reader.read_bytes(block.compressed_size as usize)?;
-            println!("DEBUG: Read {} bytes of compressed data", compressed_data.len());
+            println!(
+                "DEBUG: Read {} bytes of compressed data",
+                compressed_data.len()
+            );
 
             // Check if we have enough data
             if compressed_data.len() != block.compressed_size as usize {
-                println!("DEBUG: WARNING - Size mismatch! Expected {}, got {}",
-                    block.compressed_size, compressed_data.len());
+                println!(
+                    "DEBUG: WARNING - Size mismatch! Expected {}, got {}",
+                    block.compressed_size,
+                    compressed_data.len()
+                );
             }
 
             // Show first few bytes of compressed data for debugging
             let preview_len = 32.min(compressed_data.len());
-            let preview: Vec<String> = compressed_data[..preview_len].iter()
-                .map(|b| format!("{:02X}", b)).collect();
-            println!("DEBUG: First {} bytes of compressed data: {}", preview_len, preview.join(" "));
+            let preview: Vec<String> = compressed_data[..preview_len]
+                .iter()
+                .map(|b| format!("{:02X}", b))
+                .collect();
+            println!(
+                "DEBUG: First {} bytes of compressed data: {}",
+                preview_len,
+                preview.join(" ")
+            );
 
             println!("DEBUG: About to decompress block data...");
             let block_data = match block.decompress(&compressed_data) {
@@ -148,8 +167,11 @@ impl BundleCompression {
                 }
                 Err(e) => {
                     println!("DEBUG: Block decompression failed: {}", e);
-                    println!("DEBUG: Block flags: 0x{:X}, compression type: {:?}",
-                        block.flags, block.compression_type());
+                    println!(
+                        "DEBUG: Block flags: 0x{:X}, compression type: {:?}",
+                        block.flags,
+                        block.compression_type()
+                    );
                     return Err(e);
                 }
             };
@@ -168,7 +190,7 @@ impl BundleCompression {
     pub fn get_compression_stats(blocks: &[CompressionBlock]) -> CompressionStats {
         let total_compressed: u64 = blocks.iter().map(|b| b.compressed_size as u64).sum();
         let total_uncompressed: u64 = blocks.iter().map(|b| b.uncompressed_size as u64).sum();
-        
+
         let compression_ratio = if total_uncompressed > 0 {
             total_compressed as f64 / total_uncompressed as f64
         } else {
@@ -204,19 +226,22 @@ impl BundleCompression {
         for (i, block) in blocks.iter().enumerate() {
             if block.compressed_size == 0 {
                 return Err(BinaryError::invalid_data(format!(
-                    "Block {} has zero compressed size", i
+                    "Block {} has zero compressed size",
+                    i
                 )));
             }
 
             if block.uncompressed_size == 0 {
                 return Err(BinaryError::invalid_data(format!(
-                    "Block {} has zero uncompressed size", i
+                    "Block {} has zero uncompressed size",
+                    i
                 )));
             }
 
             // Sanity check: compressed size shouldn't be much larger than uncompressed
             // (except for very small blocks or incompressible data)
-            if block.compressed_size > block.uncompressed_size * 2 && block.uncompressed_size > 1024 {
+            if block.compressed_size > block.uncompressed_size * 2 && block.uncompressed_size > 1024
+            {
                 return Err(BinaryError::invalid_data(format!(
                     "Block {} has suspicious compression ratio: {}/{}",
                     i, block.compressed_size, block.uncompressed_size
@@ -231,8 +256,12 @@ impl BundleCompression {
     pub fn estimate_memory_usage(blocks: &[CompressionBlock]) -> usize {
         // Estimate peak memory usage during decompression
         let total_uncompressed: usize = blocks.iter().map(|b| b.uncompressed_size as usize).sum();
-        let max_block_size: usize = blocks.iter().map(|b| b.uncompressed_size as usize).max().unwrap_or(0);
-        
+        let max_block_size: usize = blocks
+            .iter()
+            .map(|b| b.uncompressed_size as usize)
+            .max()
+            .unwrap_or(0);
+
         // Peak usage: total output + largest single block for temporary decompression
         total_uncompressed + max_block_size
     }
@@ -240,8 +269,8 @@ impl BundleCompression {
     /// Check if compression type is supported
     pub fn is_compression_supported(compression_type: u32) -> bool {
         match compression_type {
-            0 => true, // None
-            1 => true, // LZMA
+            0 => true,     // None
+            1 => true,     // LZMA
             2 | 3 => true, // LZ4/LZ4HC
             #[cfg(feature = "brotli")]
             4 => true, // Brotli

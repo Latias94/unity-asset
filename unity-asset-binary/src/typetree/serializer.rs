@@ -3,14 +3,14 @@
 //! This module provides functionality for serializing and deserializing
 //! Unity objects using TypeTree information.
 
+use super::types::{TypeTree, TypeTreeNode};
 use crate::error::{BinaryError, Result};
 use crate::reader::BinaryReader;
-use super::types::{TypeTree, TypeTreeNode};
-use unity_asset_core::UnityValue;
 use indexmap::IndexMap;
+use unity_asset_core::UnityValue;
 
 /// TypeTree serializer
-/// 
+///
 /// This struct provides methods for serializing and deserializing Unity objects
 /// using TypeTree structure information.
 pub struct TypeTreeSerializer<'a> {
@@ -183,9 +183,7 @@ impl<'a> TypeTreeSerializer<'a> {
             .children
             .iter()
             .find(|child| child.type_name == "Array")
-            .ok_or_else(|| {
-                BinaryError::invalid_data("Array node not found in array type")
-            })?;
+            .ok_or_else(|| BinaryError::invalid_data("Array node not found in array type"))?;
 
         // Read array size (first child is size)
         let size = reader.read_i32()? as usize;
@@ -200,9 +198,10 @@ impl<'a> TypeTreeSerializer<'a> {
         let mut elements = Vec::with_capacity(size);
 
         // Find the element type (usually the second child of Array node)
-        let element_node = array_node.children.get(1).ok_or_else(|| {
-            BinaryError::invalid_data("Array element type not found")
-        })?;
+        let element_node = array_node
+            .children
+            .get(1)
+            .ok_or_else(|| BinaryError::invalid_data("Array element type not found"))?;
 
         for _ in 0..size {
             let element = self.parse_value_by_type(reader, element_node)?;
@@ -213,12 +212,9 @@ impl<'a> TypeTreeSerializer<'a> {
     }
 
     /// Serialize object data using the TypeTree structure
-    pub fn serialize_object(
-        &self,
-        data: &IndexMap<String, UnityValue>,
-    ) -> Result<Vec<u8>> {
+    pub fn serialize_object(&self, data: &IndexMap<String, UnityValue>) -> Result<Vec<u8>> {
         let mut buffer = Vec::new();
-        
+
         if let Some(root) = self.tree.nodes.first() {
             for child in &root.children {
                 if !child.name.is_empty() {
@@ -313,9 +309,10 @@ impl<'a> TypeTreeSerializer<'a> {
                 if let UnityValue::Array(elements) = value {
                     // Write array size
                     buffer.extend_from_slice(&(elements.len() as i32).to_le_bytes());
-                    
+
                     // Find element type
-                    if let Some(array_node) = node.children.iter().find(|c| c.type_name == "Array") {
+                    if let Some(array_node) = node.children.iter().find(|c| c.type_name == "Array")
+                    {
                         if let Some(element_node) = array_node.children.get(1) {
                             for element in elements {
                                 self.serialize_value(buffer, element, element_node)?;
@@ -358,7 +355,7 @@ impl<'a> TypeTreeSerializer<'a> {
     /// Estimate serialized size
     pub fn estimate_size(&self, data: &IndexMap<String, UnityValue>) -> usize {
         let mut size = 0;
-        
+
         if let Some(root) = self.tree.nodes.first() {
             for child in &root.children {
                 if !child.name.is_empty() {
@@ -389,7 +386,8 @@ impl<'a> TypeTreeSerializer<'a> {
             _ if node.is_array() => {
                 if let UnityValue::Array(elements) = value {
                     let mut size = 4; // Array size
-                    if let Some(array_node) = node.children.iter().find(|c| c.type_name == "Array") {
+                    if let Some(array_node) = node.children.iter().find(|c| c.type_name == "Array")
+                    {
                         if let Some(element_node) = array_node.children.get(1) {
                             for element in elements {
                                 size += self.estimate_value_size(element, element_node);
@@ -436,7 +434,7 @@ mod tests {
     fn test_buffer_alignment() {
         let tree = TypeTree::new();
         let serializer = TypeTreeSerializer::new(&tree);
-        
+
         let mut buffer = vec![1, 2, 3]; // 3 bytes
         serializer.align_buffer(&mut buffer, 4);
         assert_eq!(buffer.len(), 4); // Should be padded to 4 bytes

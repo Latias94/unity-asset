@@ -145,9 +145,9 @@ impl UnityClassIdMap {
             687078895 => Some("SpriteAtlas".to_string()), // This is the unknown class we found
 
             // Additional mappings based on our test results
-            256 => Some("Texture2D".to_string()),  // Class_256 is likely Texture2D
+            256 => Some("Texture2D".to_string()), // Class_256 is likely Texture2D
             512 => Some("SpriteAtlas".to_string()), // Class_512 is likely SpriteAtlas
-            768 => Some("Sprite".to_string()),     // Class_768 is likely Sprite
+            768 => Some("Sprite".to_string()),    // Class_768 is likely Sprite
 
             _ => None,
         }

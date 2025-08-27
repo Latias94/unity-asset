@@ -30,29 +30,27 @@
 //! # Ok::<(), unity_asset_binary::error::BinaryError>(())
 //! ```
 
-pub mod header;
-pub mod types;
 pub mod compression;
-pub mod parser;
+pub mod header;
 pub mod loader;
+pub mod parser;
+pub mod types;
 
 // Re-export main types for easy access
-pub use header::{BundleHeader, BundleFormatInfo};
-pub use types::{
-    AssetBundle, BundleFileInfo, DirectoryNode, BundleStatistics, BundleLoadOptions
-};
-pub use compression::{BundleCompression, CompressionStats, CompressionOptions};
-pub use parser::{BundleParser, ParsingComplexity};
+pub use compression::{BundleCompression, CompressionOptions, CompressionStats};
+pub use header::{BundleFormatInfo, BundleHeader};
 pub use loader::{
-    BundleLoader, BundleResourceManager, LoaderStatistics,
-    load_bundle, load_bundle_from_memory, load_bundle_with_options
+    BundleLoader, BundleResourceManager, LoaderStatistics, load_bundle, load_bundle_from_memory,
+    load_bundle_with_options,
 };
+pub use parser::{BundleParser, ParsingComplexity};
+pub use types::{AssetBundle, BundleFileInfo, BundleLoadOptions, BundleStatistics, DirectoryNode};
 
 #[cfg(feature = "async")]
 pub use loader::load_bundle_async;
 
 /// Main bundle processing facade
-/// 
+///
 /// This struct provides a high-level interface for bundle processing,
 /// combining parsing, loading, and resource management functionality.
 pub struct BundleProcessor {
@@ -75,12 +73,19 @@ impl BundleProcessor {
     }
 
     /// Load and process a bundle from file
-    pub fn process_file<P: AsRef<std::path::Path>>(&mut self, path: P) -> crate::error::Result<&AssetBundle> {
+    pub fn process_file<P: AsRef<std::path::Path>>(
+        &mut self,
+        path: P,
+    ) -> crate::error::Result<&AssetBundle> {
         self.loader.load_from_file(path)
     }
 
     /// Load and process a bundle from memory
-    pub fn process_memory(&mut self, name: String, data: Vec<u8>) -> crate::error::Result<&AssetBundle> {
+    pub fn process_memory(
+        &mut self,
+        name: String,
+        data: Vec<u8>,
+    ) -> crate::error::Result<&AssetBundle> {
         self.loader.load_from_memory(name, data)
     }
 
@@ -96,13 +101,19 @@ impl BundleProcessor {
 
     /// Extract all assets from a bundle
     pub fn extract_all_assets(&self, bundle_name: &str) -> Option<Vec<&crate::asset::Asset>> {
-        self.loader.get_bundle(bundle_name)
+        self.loader
+            .get_bundle(bundle_name)
             .map(|bundle| bundle.assets.iter().collect())
     }
 
     /// Extract assets by type
-    pub fn extract_assets_by_type(&self, bundle_name: &str, _type_id: i32) -> Option<Vec<&crate::asset::Asset>> {
-        self.loader.get_bundle(bundle_name)
+    pub fn extract_assets_by_type(
+        &self,
+        bundle_name: &str,
+        _type_id: i32,
+    ) -> Option<Vec<&crate::asset::Asset>> {
+        self.loader
+            .get_bundle(bundle_name)
             .map(|bundle| bundle.assets.iter().collect()) // TODO: Implement proper type filtering
     }
 
@@ -173,7 +184,9 @@ pub fn get_bundle_info<P: AsRef<std::path::Path>>(path: P) -> crate::error::Resu
     let stats = bundle.statistics();
 
     Ok(BundleInfo {
-        name: path.as_ref().file_name()
+        name: path
+            .as_ref()
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string(),
@@ -189,9 +202,15 @@ pub fn get_bundle_info<P: AsRef<std::path::Path>>(path: P) -> crate::error::Resu
 }
 
 /// Quick function to list bundle contents
-pub fn list_bundle_contents<P: AsRef<std::path::Path>>(path: P) -> crate::error::Result<Vec<String>> {
+pub fn list_bundle_contents<P: AsRef<std::path::Path>>(
+    path: P,
+) -> crate::error::Result<Vec<String>> {
     let bundle = load_bundle(path)?;
-    Ok(bundle.file_names().into_iter().map(|s| s.to_string()).collect())
+    Ok(bundle
+        .file_names()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect())
 }
 
 /// Quick function to extract a specific file from bundle
@@ -200,7 +219,7 @@ pub fn extract_file_from_bundle<P: AsRef<std::path::Path>>(
     file_name: &str,
 ) -> crate::error::Result<Vec<u8>> {
     let bundle = load_bundle(bundle_path)?;
-    
+
     if let Some(file_info) = bundle.find_file(file_name) {
         bundle.extract_file_data(file_info)
     } else {
@@ -218,7 +237,7 @@ pub fn is_valid_bundle<P: AsRef<std::path::Path>>(path: P) -> bool {
             if data.len() < 20 {
                 return false;
             }
-            
+
             // Check for known bundle signatures
             let signature = String::from_utf8_lossy(&data[..8]);
             matches!(signature.as_ref(), "UnityFS\0" | "UnityWeb" | "UnityRaw")
@@ -264,7 +283,7 @@ mod tests {
             asset_count: 10,
             compression_ratio: 0.7,
         };
-        
+
         assert_eq!(info.name, "test");
         assert_eq!(info.format, "UnityFS");
         assert!(info.compressed);

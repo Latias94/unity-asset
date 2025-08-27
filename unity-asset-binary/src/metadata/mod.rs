@@ -32,28 +32,41 @@
 //! # Ok::<(), unity_asset_binary::error::BinaryError>(())
 //! ```
 
-pub mod types;
-pub mod extractor;
 pub mod analyzer;
+pub mod extractor;
+pub mod types;
 
 // Re-export main types for easy access
+pub use analyzer::{DependencyAnalyzer, RelationshipAnalyzer};
+pub use extractor::MetadataExtractor;
 pub use types::{
     // Core metadata types
-    AssetMetadata, FileInfo, ObjectStatistics, ObjectSummary, MemoryUsage,
-    // Dependency types
-    DependencyInfo, ExternalReference, InternalReference, DependencyGraph,
+    AssetMetadata,
+    AssetReference,
     // Relationship types
-    AssetRelationships, GameObjectHierarchy, ComponentRelationship, AssetReference,
+    AssetRelationships,
+    ComponentRelationship,
+    DependencyGraph,
+    // Dependency types
+    DependencyInfo,
+    ExternalReference,
+    ExtractionConfig,
+    ExtractionResult,
+    ExtractionStats,
+    FileInfo,
+    GameObjectHierarchy,
+    InternalReference,
+    MemoryUsage,
+    ObjectStatistics,
+    ObjectSummary,
     // Performance and configuration
-    PerformanceMetrics, ExtractionConfig, ExtractionResult, ExtractionStats,
+    PerformanceMetrics,
     // Constants
     class_ids,
 };
-pub use extractor::MetadataExtractor;
-pub use analyzer::{DependencyAnalyzer, RelationshipAnalyzer};
 
 /// Main metadata processing facade
-/// 
+///
 /// This struct provides a high-level interface for metadata processing,
 /// combining extraction and analysis functionality.
 pub struct MetadataProcessor {
@@ -75,16 +88,27 @@ impl MetadataProcessor {
     /// Create a metadata processor with custom configuration
     pub fn with_config(config: ExtractionConfig) -> Self {
         let enable_advanced = config.include_dependencies || config.include_hierarchy;
-        
+
         Self {
             extractor: MetadataExtractor::with_config(config),
-            dependency_analyzer: if enable_advanced { Some(DependencyAnalyzer::new()) } else { None },
-            relationship_analyzer: if enable_advanced { Some(RelationshipAnalyzer::new()) } else { None },
+            dependency_analyzer: if enable_advanced {
+                Some(DependencyAnalyzer::new())
+            } else {
+                None
+            },
+            relationship_analyzer: if enable_advanced {
+                Some(RelationshipAnalyzer::new())
+            } else {
+                None
+            },
         }
     }
 
     /// Process metadata from a SerializedFile
-    pub fn process_asset(&mut self, asset: &crate::SerializedFile) -> crate::error::Result<ExtractionResult> {
+    pub fn process_asset(
+        &mut self,
+        asset: &crate::SerializedFile,
+    ) -> crate::error::Result<ExtractionResult> {
         let mut result = self.extractor.extract_from_asset(asset)?;
 
         // Enhanced dependency analysis if analyzer is available
@@ -121,7 +145,10 @@ impl MetadataProcessor {
     }
 
     /// Process metadata from an AssetBundle
-    pub fn process_bundle(&mut self, bundle: &crate::AssetBundle) -> crate::error::Result<Vec<ExtractionResult>> {
+    pub fn process_bundle(
+        &mut self,
+        bundle: &crate::AssetBundle,
+    ) -> crate::error::Result<Vec<ExtractionResult>> {
         let mut results = Vec::new();
 
         for asset in &bundle.assets {
@@ -140,9 +167,9 @@ impl MetadataProcessor {
     /// Update the extraction configuration
     pub fn set_config(&mut self, config: ExtractionConfig) {
         let enable_advanced = config.include_dependencies || config.include_hierarchy;
-        
+
         self.extractor.set_config(config);
-        
+
         // Initialize analyzers if needed
         if enable_advanced {
             if self.dependency_analyzer.is_none() {
@@ -208,7 +235,9 @@ pub fn create_comprehensive_processor() -> MetadataProcessor {
 }
 
 /// Extract basic metadata from an asset
-pub fn extract_basic_metadata(asset: &crate::SerializedFile) -> crate::error::Result<AssetMetadata> {
+pub fn extract_basic_metadata(
+    asset: &crate::SerializedFile,
+) -> crate::error::Result<AssetMetadata> {
     let extractor = MetadataExtractor::new();
     let result = extractor.extract_from_asset(asset)?;
     Ok(result.metadata)
@@ -275,7 +304,7 @@ pub fn is_extraction_supported(asset: &crate::SerializedFile) -> bool {
 /// Get recommended extraction configuration for an asset
 pub fn get_recommended_config(asset: &crate::SerializedFile) -> ExtractionConfig {
     let object_count = asset.objects.len();
-    
+
     if object_count > 10000 {
         // Large asset - performance focused
         ExtractionConfig {

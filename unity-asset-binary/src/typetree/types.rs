@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// A node in the Unity TypeTree
-/// 
+///
 /// Each node represents a field or type in the Unity object structure,
 /// forming a tree that describes the complete object layout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,8 +112,17 @@ impl TypeTreeNode {
     pub fn is_numeric(&self) -> bool {
         matches!(
             self.type_name.as_str(),
-            "SInt8" | "UInt8" | "SInt16" | "UInt16" | "SInt32" | "UInt32" 
-            | "SInt64" | "UInt64" | "float" | "double" | "int"
+            "SInt8"
+                | "UInt8"
+                | "SInt16"
+                | "UInt16"
+                | "SInt32"
+                | "UInt32"
+                | "SInt64"
+                | "UInt64"
+                | "float"
+                | "double"
+                | "int"
         )
     }
 
@@ -134,7 +143,10 @@ impl TypeTreeNode {
 
     /// Get all child names
     pub fn child_names(&self) -> Vec<&str> {
-        self.children.iter().map(|child| child.name.as_str()).collect()
+        self.children
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect()
     }
 
     /// Add a child node
@@ -178,7 +190,9 @@ impl TypeTreeNode {
 
         // Validate children
         for (i, child) in self.children.iter().enumerate() {
-            child.validate().map_err(|e| format!("Child {}: {}", i, e))?;
+            child
+                .validate()
+                .map_err(|e| format!("Child {}: {}", i, e))?;
         }
 
         Ok(())
@@ -192,7 +206,7 @@ impl Default for TypeTreeNode {
 }
 
 /// Complete TypeTree structure
-/// 
+///
 /// This structure contains the complete type information for a Unity object,
 /// including all field definitions and their relationships.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,7 +313,8 @@ impl TypeTree {
         }
 
         for (i, node) in self.nodes.iter().enumerate() {
-            node.validate().map_err(|e| format!("Root node {}: {}", i, e))?;
+            node.validate()
+                .map_err(|e| format!("Root node {}: {}", i, e))?;
         }
 
         Ok(())
@@ -315,7 +330,7 @@ impl TypeTree {
         fn count_nodes(node: &TypeTreeNode, depth: i32, stats: &mut (usize, i32, usize, usize)) {
             stats.0 += 1; // total_nodes
             stats.1 = stats.1.max(depth); // max_depth
-            
+
             if node.is_primitive() {
                 stats.2 += 1; // primitive_count
             }

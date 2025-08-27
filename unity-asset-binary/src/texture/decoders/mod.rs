@@ -5,21 +5,21 @@
 
 mod basic;
 mod compressed;
-mod mobile;
 mod crunch;
+mod mobile;
 
 pub use basic::BasicDecoder;
 pub use compressed::CompressedDecoder;
-pub use mobile::MobileDecoder;
 pub use crunch::CrunchDecoder;
+pub use mobile::MobileDecoder;
 
-use crate::error::{BinaryError, Result};
 use super::formats::TextureFormat;
 use super::types::Texture2D;
+use crate::error::{BinaryError, Result};
 use image::RgbaImage;
 
 /// Main texture decoder dispatcher
-/// 
+///
 /// This struct coordinates between different specialized decoders
 /// based on the texture format type.
 pub struct TextureDecoder {
@@ -41,12 +41,14 @@ impl TextureDecoder {
     }
 
     /// Decode texture to RGBA image
-    /// 
+    ///
     /// This method dispatches to the appropriate specialized decoder
     /// based on the texture format.
     pub fn decode(&self, texture: &Texture2D) -> Result<RgbaImage> {
         // Validate texture first
-        texture.validate().map_err(|e| BinaryError::invalid_data(&e))?;
+        texture
+            .validate()
+            .map_err(|e| BinaryError::invalid_data(&e))?;
 
         // Handle Crunch compression first (it can wrap other formats)
         if texture.format.is_crunch_compressed() {
@@ -70,9 +72,9 @@ impl TextureDecoder {
 
     /// Check if a format can be decoded
     pub fn can_decode(&self, format: TextureFormat) -> bool {
-        format.is_basic_format() 
-            || format.is_compressed_format() 
-            || format.is_mobile_format() 
+        format.is_basic_format()
+            || format.is_compressed_format()
+            || format.is_mobile_format()
             || format.is_crunch_compressed()
     }
 
@@ -88,7 +90,6 @@ impl TextureDecoder {
             TextureFormat::RGBA4444,
             TextureFormat::ARGB4444,
             TextureFormat::RGB565,
-            
             // Compressed formats (when texture-advanced feature is enabled)
             #[cfg(feature = "texture-advanced")]
             TextureFormat::DXT1,
@@ -96,7 +97,6 @@ impl TextureDecoder {
             TextureFormat::DXT5,
             #[cfg(feature = "texture-advanced")]
             TextureFormat::BC7,
-            
             // Mobile formats (when texture-advanced feature is enabled)
             #[cfg(feature = "texture-advanced")]
             TextureFormat::ETC2_RGB,
@@ -104,7 +104,6 @@ impl TextureDecoder {
             TextureFormat::ETC2_RGBA8,
             #[cfg(feature = "texture-advanced")]
             TextureFormat::ASTC_RGBA_4x4,
-            
             // Crunch formats (when texture-advanced feature is enabled)
             #[cfg(feature = "texture-advanced")]
             TextureFormat::DXT1Crunched,
@@ -121,15 +120,15 @@ impl Default for TextureDecoder {
 }
 
 /// Common decoder trait
-/// 
+///
 /// This trait defines the interface that all specialized decoders must implement.
 pub trait Decoder {
     /// Decode texture data to RGBA image
     fn decode(&self, texture: &Texture2D) -> Result<RgbaImage>;
-    
+
     /// Check if this decoder can handle the given format
     fn can_decode(&self, format: TextureFormat) -> bool;
-    
+
     /// Get list of formats supported by this decoder
     fn supported_formats(&self) -> Vec<TextureFormat>;
 }
@@ -153,11 +152,11 @@ pub(crate) fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     if width == 0 || height == 0 {
         return Err(BinaryError::invalid_data("Invalid texture dimensions"));
     }
-    
+
     // Reasonable size limits to prevent memory issues
     if width > 16384 || height > 16384 {
         return Err(BinaryError::invalid_data("Texture dimensions too large"));
     }
-    
+
     Ok(())
 }

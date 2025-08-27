@@ -32,23 +32,31 @@
 //! # Ok::<(), unity_asset_binary::error::BinaryError>(())
 //! ```
 
-pub mod types;
 pub mod parser;
 pub mod processor;
+pub mod types;
 
 // Re-export main types for easy access
-pub use types::{
-    // Core sprite types
-    Sprite, SpriteRenderData, SpriteSettings, SpriteRect, SpriteOffset,
-    SpritePivot, SpriteBorder, SpriteInfo, SpriteAtlas,
-    // Configuration and results
-    SpriteConfig, SpriteResult,
-};
 pub use parser::SpriteParser;
 pub use processor::{SpriteProcessor, SpriteStats};
+pub use types::{
+    // Core sprite types
+    Sprite,
+    SpriteAtlas,
+    SpriteBorder,
+    // Configuration and results
+    SpriteConfig,
+    SpriteInfo,
+    SpriteOffset,
+    SpritePivot,
+    SpriteRect,
+    SpriteRenderData,
+    SpriteResult,
+    SpriteSettings,
+};
 
 /// Main sprite processing facade
-/// 
+///
 /// This struct provides a high-level interface for sprite processing,
 /// combining parsing and processing functionality.
 pub struct SpriteManager {
@@ -71,7 +79,10 @@ impl SpriteManager {
     }
 
     /// Process sprite from Unity object
-    pub fn process_sprite(&self, object: &crate::object::UnityObject) -> crate::error::Result<SpriteResult> {
+    pub fn process_sprite(
+        &self,
+        object: &crate::object::UnityObject,
+    ) -> crate::error::Result<SpriteResult> {
         self.processor.parse_sprite(object)
     }
 
@@ -81,11 +92,15 @@ impl SpriteManager {
         sprite_object: &crate::object::UnityObject,
         texture: &crate::texture::Texture2D,
     ) -> crate::error::Result<SpriteResult> {
-        self.processor.process_sprite_with_texture(sprite_object, texture)
+        self.processor
+            .process_sprite_with_texture(sprite_object, texture)
     }
 
     /// Process multiple sprites as an atlas
-    pub fn process_sprite_atlas(&self, sprites: &[&crate::object::UnityObject]) -> crate::error::Result<SpriteAtlas> {
+    pub fn process_sprite_atlas(
+        &self,
+        sprites: &[&crate::object::UnityObject],
+    ) -> crate::error::Result<SpriteAtlas> {
         self.processor.process_sprite_atlas(sprites)
     }
 
@@ -212,7 +227,10 @@ pub fn get_sprite_aspect_ratio(sprite: &Sprite) -> f32 {
 }
 
 /// Check if Unity version supports sprite feature
-pub fn is_sprite_feature_supported(version: &crate::unity_version::UnityVersion, feature: &str) -> bool {
+pub fn is_sprite_feature_supported(
+    version: &crate::unity_version::UnityVersion,
+    feature: &str,
+) -> bool {
     match feature {
         "basic_sprite" | "rect" | "pivot" => true,
         "border" | "pixels_to_units" => version.major >= 5,
@@ -308,19 +326,25 @@ mod tests {
 
     #[test]
     fn test_feature_support() {
-        let version_2020 = crate::unity_version::UnityVersion::parse_version("2020.3.12f1").unwrap();
+        let version_2020 =
+            crate::unity_version::UnityVersion::parse_version("2020.3.12f1").unwrap();
         assert!(is_sprite_feature_supported(&version_2020, "basic_sprite"));
-        assert!(is_sprite_feature_supported(&version_2020, "polygon_sprites"));
+        assert!(is_sprite_feature_supported(
+            &version_2020,
+            "polygon_sprites"
+        ));
         assert!(is_sprite_feature_supported(&version_2020, "sprite_mesh"));
 
-        let version_2017 = crate::unity_version::UnityVersion::parse_version("2017.4.40f1").unwrap();
+        let version_2017 =
+            crate::unity_version::UnityVersion::parse_version("2017.4.40f1").unwrap();
         assert!(is_sprite_feature_supported(&version_2017, "sprite_atlas"));
         assert!(!is_sprite_feature_supported(&version_2017, "sprite_mesh"));
     }
 
     #[test]
     fn test_recommended_config() {
-        let version_2020 = crate::unity_version::UnityVersion::parse_version("2020.3.12f1").unwrap();
+        let version_2020 =
+            crate::unity_version::UnityVersion::parse_version("2020.3.12f1").unwrap();
         let config = get_recommended_config(&version_2020);
         assert!(config.extract_images);
         assert!(config.process_atlas);

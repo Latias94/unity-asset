@@ -3,12 +3,12 @@
 //! This module provides advanced analysis capabilities for Unity assets,
 //! including dependency tracking and relationship mapping.
 
-use crate::error::Result;
 use super::types::*;
+use crate::error::Result;
 use std::collections::{HashMap, HashSet};
 
 /// Dependency analyzer for Unity assets
-/// 
+///
 /// This struct provides methods for analyzing dependencies and relationships
 /// between Unity objects within and across assets.
 pub struct DependencyAnalyzer {
@@ -28,7 +28,10 @@ impl DependencyAnalyzer {
     }
 
     /// Analyze dependencies for a set of objects
-    pub fn analyze_dependencies(&mut self, objects: &[&crate::asset::ObjectInfo]) -> Result<DependencyInfo> {
+    pub fn analyze_dependencies(
+        &mut self,
+        objects: &[&crate::asset::ObjectInfo],
+    ) -> Result<DependencyInfo> {
         let mut external_refs = Vec::new();
         let mut internal_refs = Vec::new();
         let mut all_nodes = HashSet::new();
@@ -42,7 +45,7 @@ impl DependencyAnalyzer {
         // Second pass: analyze each object's dependencies
         for obj in objects {
             let dependencies = self.extract_object_dependencies(obj)?;
-            
+
             for dep_id in dependencies {
                 if all_nodes.contains(&dep_id) {
                     // Internal reference
@@ -67,7 +70,7 @@ impl DependencyAnalyzer {
         let nodes: Vec<i64> = all_nodes.into_iter().collect();
         let root_objects = self.find_root_objects(&nodes, &edges);
         let leaf_objects = self.find_leaf_objects(&nodes, &edges);
-        
+
         let dependency_graph = DependencyGraph {
             nodes,
             edges,
@@ -99,7 +102,8 @@ impl DependencyAnalyzer {
         let dependencies = Vec::new();
 
         // Cache the result
-        self.dependency_cache.insert(obj.path_id, dependencies.clone());
+        self.dependency_cache
+            .insert(obj.path_id, dependencies.clone());
 
         Ok(dependencies)
     }
@@ -107,12 +111,13 @@ impl DependencyAnalyzer {
     /// Find root objects (objects with no incoming dependencies)
     fn find_root_objects(&self, nodes: &[i64], edges: &[(i64, i64)]) -> Vec<i64> {
         let mut has_incoming: HashSet<i64> = HashSet::new();
-        
+
         for (_, to) in edges {
             has_incoming.insert(*to);
         }
 
-        nodes.iter()
+        nodes
+            .iter()
             .filter(|node| !has_incoming.contains(node))
             .copied()
             .collect()
@@ -121,12 +126,13 @@ impl DependencyAnalyzer {
     /// Find leaf objects (objects with no outgoing dependencies)
     fn find_leaf_objects(&self, nodes: &[i64], edges: &[(i64, i64)]) -> Vec<i64> {
         let mut has_outgoing: HashSet<i64> = HashSet::new();
-        
+
         for (from, _) in edges {
             has_outgoing.insert(*from);
         }
 
-        nodes.iter()
+        nodes
+            .iter()
             .filter(|node| !has_outgoing.contains(node))
             .copied()
             .collect()
@@ -216,7 +222,7 @@ impl Default for DependencyAnalyzer {
 }
 
 /// Relationship analyzer for Unity assets
-/// 
+///
 /// This struct provides methods for analyzing relationships between
 /// GameObjects, Components, and other Unity objects.
 pub struct RelationshipAnalyzer {
@@ -233,7 +239,10 @@ impl RelationshipAnalyzer {
     }
 
     /// Analyze relationships for a set of objects
-    pub fn analyze_relationships(&mut self, objects: &[&crate::asset::ObjectInfo]) -> Result<AssetRelationships> {
+    pub fn analyze_relationships(
+        &mut self,
+        objects: &[&crate::asset::ObjectInfo],
+    ) -> Result<AssetRelationships> {
         let mut gameobject_hierarchy = Vec::new();
         let mut component_relationships = Vec::new();
         let mut asset_references = Vec::new();
@@ -298,7 +307,7 @@ impl RelationshipAnalyzer {
     ) -> Result<GameObjectHierarchy> {
         // TODO: Implement proper GameObject hierarchy analysis
         // This would require parsing the GameObject's serialized data
-        
+
         Ok(GameObjectHierarchy {
             gameobject_id: gameobject.path_id,
             name: format!("GameObject_{}", gameobject.path_id),
@@ -316,7 +325,7 @@ impl RelationshipAnalyzer {
         component: &crate::asset::ObjectInfo,
     ) -> Result<ComponentRelationship> {
         // TODO: Implement proper component relationship analysis
-        
+
         Ok(ComponentRelationship {
             component_id: component.path_id,
             component_type: self.get_component_type_name(component.type_id),
@@ -326,12 +335,9 @@ impl RelationshipAnalyzer {
     }
 
     /// Analyze asset reference (simplified implementation)
-    fn analyze_asset_reference(
-        &self,
-        asset: &crate::asset::ObjectInfo,
-    ) -> Result<AssetReference> {
+    fn analyze_asset_reference(&self, asset: &crate::asset::ObjectInfo) -> Result<AssetReference> {
         // TODO: Implement proper asset reference analysis
-        
+
         Ok(AssetReference {
             asset_id: asset.path_id,
             asset_type: self.get_asset_type_name(asset.type_id),
@@ -394,10 +400,10 @@ mod tests {
         let analyzer = DependencyAnalyzer::new();
         let nodes = vec![1, 2, 3, 4];
         let edges = vec![(1, 2), (2, 3), (4, 3)];
-        
+
         let roots = analyzer.find_root_objects(&nodes, &edges);
         let leaves = analyzer.find_leaf_objects(&nodes, &edges);
-        
+
         assert!(roots.contains(&1));
         assert!(roots.contains(&4));
         assert!(leaves.contains(&3));

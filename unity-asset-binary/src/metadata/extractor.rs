@@ -2,14 +2,14 @@
 //!
 //! This module provides the main metadata extraction functionality for Unity assets.
 
+use super::types::*;
 use crate::error::Result;
 use crate::{AssetBundle, SerializedFile};
-use super::types::*;
 use std::collections::HashMap;
 use std::time::Instant;
 
 /// Metadata extractor for Unity assets
-/// 
+///
 /// This struct provides methods for extracting comprehensive metadata
 /// from Unity assets including statistics, dependencies, and relationships.
 pub struct MetadataExtractor {
@@ -60,7 +60,7 @@ impl MetadataExtractor {
         // Add bundle-level performance metrics
         let total_time = start_time.elapsed().as_secs_f64() * 1000.0;
         let asset_count = results.len() as f64;
-        
+
         for result in &mut results {
             result.metadata.performance.parse_time_ms = total_time / asset_count;
         }
@@ -74,11 +74,12 @@ impl MetadataExtractor {
         let mut result = ExtractionResult::new(AssetMetadata::new());
 
         // Get objects to analyze
-        let objects_to_analyze: Vec<&crate::asset::ObjectInfo> = if let Some(max) = self.config.max_objects {
-            asset.objects.iter().take(max).collect()
-        } else {
-            asset.objects.iter().collect()
-        };
+        let objects_to_analyze: Vec<&crate::asset::ObjectInfo> =
+            if let Some(max) = self.config.max_objects {
+                asset.objects.iter().take(max).collect()
+            } else {
+                asset.objects.iter().collect()
+            };
 
         // Extract basic file info
         result.metadata.file_info = self.extract_file_info(asset);
@@ -206,7 +207,10 @@ impl MetadataExtractor {
     }
 
     /// Extract dependency information (simplified implementation)
-    fn extract_dependencies(&self, _objects: &[&crate::asset::ObjectInfo]) -> Result<DependencyInfo> {
+    fn extract_dependencies(
+        &self,
+        _objects: &[&crate::asset::ObjectInfo],
+    ) -> Result<DependencyInfo> {
         // TODO: Implement proper dependency extraction for new ObjectInfo structure
         // This is a placeholder implementation
         Ok(DependencyInfo {
@@ -223,7 +227,10 @@ impl MetadataExtractor {
     }
 
     /// Extract relationship information (simplified implementation)
-    fn extract_relationships(&self, _objects: &[&crate::asset::ObjectInfo]) -> Result<AssetRelationships> {
+    fn extract_relationships(
+        &self,
+        _objects: &[&crate::asset::ObjectInfo],
+    ) -> Result<AssetRelationships> {
         // TODO: Implement proper relationship extraction for new ObjectInfo structure
         // This is a placeholder implementation
         Ok(AssetRelationships {
@@ -234,7 +241,11 @@ impl MetadataExtractor {
     }
 
     /// Extract performance metrics
-    fn extract_performance_metrics(&self, asset: &SerializedFile, parse_time_ms: f64) -> PerformanceMetrics {
+    fn extract_performance_metrics(
+        &self,
+        asset: &SerializedFile,
+        parse_time_ms: f64,
+    ) -> PerformanceMetrics {
         let object_count = asset.objects.len() as f64;
         let object_parse_rate = if parse_time_ms > 0.0 {
             (object_count * 1000.0) / parse_time_ms
@@ -261,7 +272,7 @@ impl MetadataExtractor {
 
         // Simple complexity calculation
         let base_score = object_count * 0.1 + type_count * 0.5 + external_count * 0.3;
-        
+
         // Normalize to 0-100 scale
         (base_score / 100.0).min(100.0)
     }
@@ -317,7 +328,10 @@ mod tests {
         let extractor = MetadataExtractor::new();
         assert_eq!(extractor.get_class_name_from_type_id(1), "GameObject");
         assert_eq!(extractor.get_class_name_from_type_id(28), "Texture2D");
-        assert_eq!(extractor.get_class_name_from_type_id(999), "UnknownType_999");
+        assert_eq!(
+            extractor.get_class_name_from_type_id(999),
+            "UnknownType_999"
+        );
     }
 
     #[test]

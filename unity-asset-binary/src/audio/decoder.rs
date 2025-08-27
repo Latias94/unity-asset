@@ -3,12 +3,12 @@
 //! This module provides audio decoding capabilities using Symphonia
 //! for various audio formats supported by Unity.
 
-use crate::error::{BinaryError, Result};
 use super::formats::AudioCompressionFormat;
 use super::types::{AudioClip, DecodedAudio};
+use crate::error::{BinaryError, Result};
 
 /// Main audio decoder
-/// 
+///
 /// This struct provides methods for decoding various audio formats
 /// using the Symphonia audio library.
 pub struct AudioDecoder;
@@ -24,7 +24,7 @@ impl AudioDecoder {
     pub fn decode(&self, clip: &AudioClip) -> Result<DecodedAudio> {
         use std::io::Cursor;
         use symphonia::core::audio::{AudioBufferRef, Signal};
-        use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+        use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
         use symphonia::core::errors::Error as SymphoniaError;
         use symphonia::core::formats::FormatOptions;
         use symphonia::core::io::MediaSourceStream;
@@ -171,7 +171,8 @@ impl AudioDecoder {
                                 if ch < buf.spec().channels.count() {
                                     let channel_samples = buf.chan(ch);
                                     for &sample in channel_samples {
-                                        let normalized = (sample as f32 - 2147483648.0) / 2147483648.0;
+                                        let normalized =
+                                            (sample as f32 - 2147483648.0) / 2147483648.0;
                                         samples.push(normalized);
                                     }
                                 }
@@ -272,7 +273,7 @@ impl AudioDecoder {
     #[cfg(not(feature = "symphonia"))]
     pub fn decode(&self, _clip: &AudioClip) -> Result<DecodedAudio> {
         Err(BinaryError::unsupported(
-            "Audio decoding requires symphonia feature"
+            "Audio decoding requires symphonia feature",
         ))
     }
 

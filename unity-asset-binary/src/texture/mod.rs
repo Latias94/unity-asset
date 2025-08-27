@@ -32,27 +32,27 @@
 //! // TextureExporter::export_png(&image, "output.png")?;
 //! ```
 
-pub mod formats;
-pub mod types;
 pub mod converter;
 pub mod decoders;
+pub mod formats;
 pub mod helpers;
+pub mod types;
 
 // Re-export main types for easy access
-pub use formats::{TextureFormat, TextureFormatInfo};
-pub use types::{Texture2D, StreamingInfo, GLTextureSettings};
 pub use converter::{Texture2DConverter, Texture2DProcessor}; // Processor is legacy alias
-pub use decoders::{TextureDecoder, Decoder};
+pub use decoders::{Decoder, TextureDecoder};
+pub use formats::{TextureFormat, TextureFormatInfo};
 pub use helpers::{TextureExporter, TextureSwizzler};
+pub use types::{GLTextureSettings, StreamingInfo, Texture2D};
 
 // Re-export decoder types for advanced usage
-pub use decoders::{BasicDecoder, CompressedDecoder, MobileDecoder, CrunchDecoder};
+pub use decoders::{BasicDecoder, CompressedDecoder, CrunchDecoder, MobileDecoder};
 
 // Re-export export options
 pub use helpers::export::ExportOptions;
 
 /// Main texture processing facade
-/// 
+///
 /// This struct provides a high-level interface for texture processing,
 /// combining conversion, decoding, and export functionality.
 pub struct TextureProcessor {
@@ -70,7 +70,10 @@ impl TextureProcessor {
     }
 
     /// Process Unity object to Texture2D
-    pub fn convert_object(&self, obj: &crate::object::UnityObject) -> crate::error::Result<Texture2D> {
+    pub fn convert_object(
+        &self,
+        obj: &crate::object::UnityObject,
+    ) -> crate::error::Result<Texture2D> {
         self.converter.from_unity_object(obj)
     }
 
@@ -141,7 +144,7 @@ pub fn decode_texture_data(
         image_data: data,
         ..Default::default()
     };
-    
+
     let decoder = TextureDecoder::new();
     decoder.decode(&texture)
 }

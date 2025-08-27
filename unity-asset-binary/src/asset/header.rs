@@ -8,7 +8,7 @@ use crate::reader::{BinaryReader, ByteOrder};
 use serde::{Deserialize, Serialize};
 
 /// Header of a Unity SerializedFile
-/// 
+///
 /// Contains metadata about the serialized file including version information,
 /// data layout, and endianness settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,13 +111,13 @@ impl SerializedFileHeader {
 
         if self.data_offset < self.metadata_size {
             return Err(BinaryError::invalid_data(
-                "Data offset cannot be less than metadata size"
+                "Data offset cannot be less than metadata size",
             ));
         }
 
         if self.file_size < self.data_offset {
             return Err(BinaryError::invalid_data(
-                "File size cannot be less than data offset"
+                "File size cannot be less than data offset",
             ));
         }
 
@@ -273,10 +273,10 @@ mod tests {
     #[test]
     fn test_byte_order() {
         let mut header = SerializedFileHeader::default();
-        
+
         header.endian = 0;
         assert_eq!(header.byte_order(), ByteOrder::Little);
-        
+
         header.endian = 1;
         assert_eq!(header.byte_order(), ByteOrder::Big);
     }
@@ -284,16 +284,16 @@ mod tests {
     #[test]
     fn test_version_features() {
         let mut header = SerializedFileHeader::default();
-        
+
         header.version = 6;
         assert!(!header.supports_type_trees());
-        
+
         header.version = 7;
         assert!(header.supports_type_trees());
-        
+
         header.version = 11;
         assert!(header.supports_script_types());
-        
+
         header.version = 22;
         assert!(header.uses_new_object_format());
     }

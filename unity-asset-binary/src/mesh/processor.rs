@@ -3,14 +3,14 @@
 //! This module provides high-level mesh processing functionality including
 //! mesh export and optimization.
 
+use super::parser::MeshParser;
+use super::types::*;
 use crate::error::Result;
 use crate::object::UnityObject;
 use crate::unity_version::UnityVersion;
-use super::types::*;
-use super::parser::MeshParser;
 
 /// Mesh processor
-/// 
+///
 /// This struct provides high-level methods for processing Unity Mesh objects,
 /// including parsing, validation, and export functionality.
 pub struct MeshProcessor {
@@ -66,7 +66,9 @@ impl MeshProcessor {
         }
 
         if mesh.vertex_data.vertex_count == 0 {
-            return Err(crate::error::BinaryError::invalid_data("Mesh has no vertices"));
+            return Err(crate::error::BinaryError::invalid_data(
+                "Mesh has no vertices",
+            ));
         }
 
         // Check submeshes
@@ -130,15 +132,21 @@ impl MeshProcessor {
                     "# SubMesh {}: {} triangles\n",
                     i, sub_mesh.triangle_count
                 ));
-                
+
                 // Would need to parse actual index data here
                 for j in 0..sub_mesh.triangle_count {
                     let base = j * 3 + 1; // OBJ indices are 1-based
                     obj_data.push_str(&format!(
                         "f {}/{}/{} {}/{}/{} {}/{}/{}\n",
-                        base, base, base,
-                        base + 1, base + 1, base + 1,
-                        base + 2, base + 2, base + 2
+                        base,
+                        base,
+                        base,
+                        base + 1,
+                        base + 1,
+                        base + 1,
+                        base + 2,
+                        base + 2,
+                        base + 2
                     ));
                 }
             }
@@ -150,26 +158,26 @@ impl MeshProcessor {
     /// Get mesh statistics
     pub fn get_mesh_stats(&self, meshes: &[&Mesh]) -> MeshStats {
         let mut stats = MeshStats::default();
-        
+
         stats.total_meshes = meshes.len();
-        
+
         for mesh in meshes {
             stats.total_vertices += mesh.vertex_count();
             stats.total_triangles += mesh.triangle_count();
             stats.total_submeshes += mesh.sub_meshes.len() as u32;
-            
+
             if mesh.has_blend_shapes() {
                 stats.meshes_with_blend_shapes += 1;
             }
-            
+
             if mesh.is_compressed() {
                 stats.compressed_meshes += 1;
             }
-            
+
             if mesh.has_streaming_data() {
                 stats.streaming_meshes += 1;
             }
-            
+
             // Track complexity
             let vertex_count = mesh.vertex_count();
             if vertex_count < 1000 {
@@ -180,12 +188,12 @@ impl MeshProcessor {
                 stats.high_poly_meshes += 1;
             }
         }
-        
+
         if !meshes.is_empty() {
             stats.average_vertices = stats.total_vertices as f32 / meshes.len() as f32;
             stats.average_triangles = stats.total_triangles as f32 / meshes.len() as f32;
         }
-        
+
         stats
     }
 
@@ -321,10 +329,10 @@ mod tests {
     fn test_mesh_validation() {
         let processor = MeshProcessor::default();
         let mut mesh = Mesh::default();
-        
+
         // Invalid mesh (no name, no vertices)
         assert!(processor.validate_mesh(&mesh).is_err());
-        
+
         // Valid mesh
         mesh.name = "TestMesh".to_string();
         mesh.vertex_data.vertex_count = 100;
@@ -336,15 +344,21 @@ mod tests {
         let processor = MeshProcessor::default();
         let mut mesh1 = Mesh::default();
         mesh1.vertex_data.vertex_count = 1000;
-        mesh1.sub_meshes.push(SubMesh { triangle_count: 500, ..Default::default() });
-        
+        mesh1.sub_meshes.push(SubMesh {
+            triangle_count: 500,
+            ..Default::default()
+        });
+
         let mut mesh2 = Mesh::default();
         mesh2.vertex_data.vertex_count = 2000;
-        mesh2.sub_meshes.push(SubMesh { triangle_count: 1000, ..Default::default() });
-        
+        mesh2.sub_meshes.push(SubMesh {
+            triangle_count: 1000,
+            ..Default::default()
+        });
+
         let meshes = vec![&mesh1, &mesh2];
         let stats = processor.get_mesh_stats(&meshes);
-        
+
         assert_eq!(stats.total_meshes, 2);
         assert_eq!(stats.total_vertices, 3000);
         assert_eq!(stats.total_triangles, 1500);

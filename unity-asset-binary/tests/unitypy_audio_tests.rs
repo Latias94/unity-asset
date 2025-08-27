@@ -6,7 +6,7 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use unity_asset_binary::{
-    AudioClip, AudioClipMeta, AudioProcessor, AudioCompressionFormat, UnityVersion,
+    AudioClip, AudioClipMeta, AudioCompressionFormat, AudioProcessor, UnityVersion,
 };
 
 /// Helper function to detect audio format from data content
@@ -239,7 +239,10 @@ fn test_audio_sample_extraction_unitypy_compat() {
                 assert!(!decoded.samples.is_empty() || decoded.samples.is_empty());
             }
             Err(_) => {
-                println!("    ! {} decoding not available (requires audio-advanced feature)", name);
+                println!(
+                    "    ! {} decoding not available (requires audio-advanced feature)",
+                    name
+                );
             }
         }
 

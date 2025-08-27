@@ -3,14 +3,14 @@
 //! This module provides the main conversion logic for Unity AudioClip objects.
 //! Inspired by UnityPy/export/AudioClipConverter.py
 
+use super::formats::AudioCompressionFormat;
+use super::types::{AudioClip, AudioClipMeta, StreamingInfo};
 use crate::error::{BinaryError, Result};
 use crate::object::UnityObject;
 use crate::unity_version::UnityVersion;
-use super::formats::AudioCompressionFormat;
-use super::types::{AudioClip, AudioClipMeta, StreamingInfo};
 
 /// Main audio converter
-/// 
+///
 /// This struct handles the conversion of Unity objects to AudioClip structures
 /// and provides methods for processing audio data.
 pub struct AudioClipConverter {
@@ -24,7 +24,7 @@ impl AudioClipConverter {
     }
 
     /// Convert Unity object to AudioClip
-    /// 
+    ///
     /// This method extracts audio data from a Unity object and creates
     /// an AudioClip structure with all necessary metadata.
     pub fn from_unity_object(&self, obj: &UnityObject) -> Result<AudioClip> {
@@ -111,9 +111,7 @@ impl AudioClipConverter {
         // Read audio data size and data
         let data_size = reader.read_u32().unwrap_or(0);
         if data_size > 0 && reader.remaining() >= data_size as usize {
-            clip.data = reader
-                .read_bytes(data_size as usize)
-                .unwrap_or_default();
+            clip.data = reader.read_bytes(data_size as usize).unwrap_or_default();
         } else if reader.remaining() > 0 {
             // Fallback: take all remaining data
             let remaining_data = reader.read_remaining();

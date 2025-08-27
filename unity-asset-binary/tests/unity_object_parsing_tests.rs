@@ -3,7 +3,7 @@
 #![allow(unused_imports)]
 
 use indexmap::IndexMap;
-use unity_asset_binary::{GameObject, UnityObjectInfo, Transform, UnityObject};
+use unity_asset_binary::{GameObject, Transform, UnityObject, UnityObjectInfo};
 use unity_asset_core::{UnityClass, UnityValue};
 
 fn create_mock_gameobject_data() -> Vec<u8> {

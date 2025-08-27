@@ -3,16 +3,16 @@
 //! This module provides high-level sprite processing functionality including
 //! image extraction and sprite atlas handling.
 
+use super::parser::SpriteParser;
+use super::types::*;
 use crate::error::{BinaryError, Result};
 use crate::object::UnityObject;
 use crate::texture::Texture2D;
 use crate::unity_version::UnityVersion;
-use super::types::*;
-use super::parser::SpriteParser;
 use image::{RgbaImage, imageops};
 
 /// Sprite processor
-/// 
+///
 /// This struct provides high-level methods for processing Unity Sprite objects,
 /// including parsing, image extraction, and atlas handling.
 pub struct SpriteProcessor {
@@ -69,23 +69,29 @@ impl SpriteProcessor {
         // Get texture image data using converter
         let converter = crate::texture::Texture2DConverter::new(self.parser.version().clone());
         let texture_image = converter.decode_to_image(texture)?;
-        
+
         // Calculate sprite bounds
         let sprite_rect = sprite.get_rect();
         let texture_width = texture_image.width();
         let texture_height = texture_image.height();
 
         // Validate sprite bounds
-        if sprite_rect.x < 0.0 || sprite_rect.y < 0.0 
+        if sprite_rect.x < 0.0
+            || sprite_rect.y < 0.0
             || sprite_rect.x + sprite_rect.width > texture_width as f32
-            || sprite_rect.y + sprite_rect.height > texture_height as f32 {
-            return Err(BinaryError::invalid_data("Sprite rect is outside texture bounds"));
+            || sprite_rect.y + sprite_rect.height > texture_height as f32
+        {
+            return Err(BinaryError::invalid_data(
+                "Sprite rect is outside texture bounds",
+            ));
         }
 
         // Check size limits
         if let Some((max_width, max_height)) = self.config.max_sprite_size {
             if sprite_rect.width > max_width as f32 || sprite_rect.height > max_height as f32 {
-                return Err(BinaryError::invalid_data("Sprite size exceeds maximum allowed size"));
+                return Err(BinaryError::invalid_data(
+                    "Sprite size exceeds maximum allowed size",
+                ));
             }
         }
 
@@ -99,7 +105,8 @@ impl SpriteProcessor {
         // So we need to flip the Y coordinate
         let flipped_y = texture_height - y - height;
 
-        let sprite_image = imageops::crop_imm(&texture_image, x, flipped_y, width, height).to_image();
+        let sprite_image =
+            imageops::crop_imm(&texture_image, x, flipped_y, width, height).to_image();
 
         // Apply transformations if enabled
         let final_image = if self.config.apply_transformations {
@@ -111,16 +118,18 @@ impl SpriteProcessor {
         // Convert to PNG bytes
         let mut png_data = Vec::new();
         {
-            use image::codecs::png::PngEncoder;
             use image::ImageEncoder;
-            
+            use image::codecs::png::PngEncoder;
+
             let encoder = PngEncoder::new(&mut png_data);
-            encoder.write_image(
-                final_image.as_raw(),
-                final_image.width(),
-                final_image.height(),
-                image::ExtendedColorType::Rgba8,
-            ).map_err(|e| BinaryError::generic(format!("Failed to encode PNG: {}", e)))?;
+            encoder
+                .write_image(
+                    final_image.as_raw(),
+                    final_image.width(),
+                    final_image.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|e| BinaryError::generic(format!("Failed to encode PNG: {}", e)))?;
         }
 
         Ok(png_data)
@@ -170,7 +179,7 @@ impl SpriteProcessor {
             };
 
             atlas.sprites.push(sprite_info);
-            
+
             if sprite.is_atlas_sprite() {
                 atlas.packed_sprites.push(sprite.name);
             }
@@ -235,18 +244,26 @@ impl SpriteProcessor {
         }
 
         if sprite.pixels_to_units <= 0.0 {
-            return Err(BinaryError::invalid_data("Sprite has invalid pixels_to_units"));
+            return Err(BinaryError::invalid_data(
+                "Sprite has invalid pixels_to_units",
+            ));
         }
 
         // Check pivot bounds
-        if sprite.pivot_x < 0.0 || sprite.pivot_x > 1.0 || sprite.pivot_y < 0.0 || sprite.pivot_y > 1.0 {
+        if sprite.pivot_x < 0.0
+            || sprite.pivot_x > 1.0
+            || sprite.pivot_y < 0.0
+            || sprite.pivot_y > 1.0
+        {
             return Err(BinaryError::invalid_data("Sprite pivot is out of bounds"));
         }
 
         // Check size limits if configured
         if let Some((max_width, max_height)) = self.config.max_sprite_size {
             if sprite.rect_width > max_width as f32 || sprite.rect_height > max_height as f32 {
-                return Err(BinaryError::invalid_data("Sprite size exceeds maximum allowed size"));
+                return Err(BinaryError::invalid_data(
+                    "Sprite size exceeds maximum allowed size",
+                ));
             }
         }
 
@@ -256,24 +273,24 @@ impl SpriteProcessor {
     /// Get sprite statistics
     pub fn get_sprite_stats(&self, sprites: &[&Sprite]) -> SpriteStats {
         let mut stats = SpriteStats::default();
-        
+
         stats.total_sprites = sprites.len();
-        
+
         for sprite in sprites {
             stats.total_area += sprite.get_area();
-            
+
             if sprite.has_border() {
                 stats.nine_slice_count += 1;
             }
-            
+
             if sprite.is_polygon {
                 stats.polygon_count += 1;
             }
-            
+
             if sprite.is_atlas_sprite() {
                 stats.atlas_sprite_count += 1;
             }
-            
+
             // Track size distribution
             let area = sprite.get_area();
             if area < 1024.0 {
@@ -284,11 +301,11 @@ impl SpriteProcessor {
                 stats.large_sprites += 1;
             }
         }
-        
+
         if !sprites.is_empty() {
             stats.average_area = stats.total_area / sprites.len() as f32;
         }
-        
+
         stats
     }
 }
@@ -308,9 +325,9 @@ pub struct SpriteStats {
     pub nine_slice_count: usize,
     pub polygon_count: usize,
     pub atlas_sprite_count: usize,
-    pub small_sprites: usize,   // < 32x32
-    pub medium_sprites: usize,  // 32x32 to 128x128
-    pub large_sprites: usize,   // > 128x128
+    pub small_sprites: usize,  // < 32x32
+    pub medium_sprites: usize, // 32x32 to 128x128
+    pub large_sprites: usize,  // > 128x128
 }
 
 #[cfg(test)]
@@ -340,15 +357,15 @@ mod tests {
     fn test_sprite_validation() {
         let processor = SpriteProcessor::default();
         let mut sprite = Sprite::default();
-        
+
         // Invalid sprite (zero dimensions)
         assert!(processor.validate_sprite(&sprite).is_err());
-        
+
         // Valid sprite
         sprite.rect_width = 100.0;
         sprite.rect_height = 100.0;
         assert!(processor.validate_sprite(&sprite).is_ok());
-        
+
         // Invalid pivot
         sprite.pivot_x = 2.0;
         assert!(processor.validate_sprite(&sprite).is_err());

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Type information for Unity objects
-/// 
+///
 /// Contains metadata about Unity object types including class information,
 /// type trees, and script references.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,7 +140,7 @@ impl SerializedType {
 
         if self.is_script_type() && self.script_id == [0; 16] {
             return Err(BinaryError::invalid_data(
-                "Script type must have valid script ID"
+                "Script type must have valid script ID",
             ));
         }
 
@@ -149,7 +149,7 @@ impl SerializedType {
 }
 
 /// External reference to another Unity file
-/// 
+///
 /// Represents a reference to an asset in another Unity file,
 /// used for cross-file asset dependencies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,10 +189,22 @@ impl FileIdentifier {
     pub fn guid_string(&self) -> String {
         format!(
             "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            self.guid[0], self.guid[1], self.guid[2], self.guid[3],
-            self.guid[4], self.guid[5], self.guid[6], self.guid[7],
-            self.guid[8], self.guid[9], self.guid[10], self.guid[11],
-            self.guid[12], self.guid[13], self.guid[14], self.guid[15]
+            self.guid[0],
+            self.guid[1],
+            self.guid[2],
+            self.guid[3],
+            self.guid[4],
+            self.guid[5],
+            self.guid[6],
+            self.guid[7],
+            self.guid[8],
+            self.guid[9],
+            self.guid[10],
+            self.guid[11],
+            self.guid[12],
+            self.guid[13],
+            self.guid[14],
+            self.guid[15]
         )
     }
 }
@@ -208,7 +220,7 @@ impl Default for FileIdentifier {
 }
 
 /// Object information within a SerializedFile
-/// 
+///
 /// Contains metadata about individual Unity objects including
 /// their location, type, and path ID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,7 +278,7 @@ impl ObjectInfo {
 }
 
 /// Type registry for managing SerializedTypes
-/// 
+///
 /// Provides efficient lookup and management of type information
 /// within a SerializedFile.
 #[derive(Debug, Clone, Default)]
@@ -287,12 +299,13 @@ impl TypeRegistry {
     /// Add a type to the registry
     pub fn add_type(&mut self, serialized_type: SerializedType) {
         let class_id = serialized_type.class_id;
-        
+
         // Add to script types if applicable
         if let Some(script_index) = serialized_type.script_type_index {
-            self.script_types.insert(script_index, serialized_type.clone());
+            self.script_types
+                .insert(script_index, serialized_type.clone());
         }
-        
+
         self.types.insert(class_id, serialized_type);
     }
 
@@ -357,7 +370,10 @@ impl TypeRegistry {
 
     /// Get all non-script types
     pub fn non_script_types(&self) -> Vec<&SerializedType> {
-        self.types.values().filter(|t| !t.is_script_type()).collect()
+        self.types
+            .values()
+            .filter(|t| !t.is_script_type())
+            .collect()
     }
 }
 
@@ -403,7 +419,7 @@ mod tests {
     fn test_type_registry() {
         let mut registry = TypeRegistry::new();
         let stype = SerializedType::new(28); // Texture2D
-        
+
         registry.add_type(stype);
         assert!(registry.has_type(28));
         assert_eq!(registry.len(), 1);

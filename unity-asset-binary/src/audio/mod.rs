@@ -32,24 +32,24 @@
 //! // AudioExporter::export_wav(&decoded_audio, "output.wav")?;
 //! ```
 
-pub mod formats;
-pub mod types;
 pub mod converter;
 pub mod decoder;
 pub mod export;
+pub mod formats;
+pub mod types;
 
 // Re-export main types for easy access
-pub use formats::{AudioCompressionFormat, FMODSoundType, AudioFormatInfo};
-pub use types::{
-    AudioClip, AudioClipMeta, StreamingInfo, AudioProperties, 
-    AudioInfo, DecodedAudio, AudioAnalysis
-};
 pub use converter::{AudioClipConverter, AudioClipProcessor}; // Processor is legacy alias
 pub use decoder::AudioDecoder;
-pub use export::{AudioExporter, ExportOptions, AudioFormat};
+pub use export::{AudioExporter, AudioFormat, ExportOptions};
+pub use formats::{AudioCompressionFormat, AudioFormatInfo, FMODSoundType};
+pub use types::{
+    AudioAnalysis, AudioClip, AudioClipMeta, AudioInfo, AudioProperties, DecodedAudio,
+    StreamingInfo,
+};
 
 /// Main audio processing facade
-/// 
+///
 /// This struct provides a high-level interface for audio processing,
 /// combining conversion, decoding, and export functionality.
 pub struct AudioProcessor {
@@ -67,7 +67,10 @@ impl AudioProcessor {
     }
 
     /// Process Unity object to AudioClip
-    pub fn convert_object(&self, obj: &crate::object::UnityObject) -> crate::error::Result<AudioClip> {
+    pub fn convert_object(
+        &self,
+        obj: &crate::object::UnityObject,
+    ) -> crate::error::Result<AudioClip> {
         self.converter.from_unity_object(obj)
     }
 
@@ -101,7 +104,7 @@ impl AudioProcessor {
     pub fn supported_formats(&self) -> Vec<AudioCompressionFormat> {
         let converter_formats = self.converter.supported_formats();
         let decoder_formats = self.decoder.supported_formats();
-        
+
         // Return intersection of both lists
         converter_formats
             .into_iter()
@@ -163,7 +166,7 @@ pub fn decode_audio_data(
         data,
         ..Default::default()
     };
-    
+
     let decoder = AudioDecoder::new();
     decoder.decode(&audio_clip)
 }
@@ -195,7 +198,9 @@ mod tests {
     fn test_processor_creation() {
         let processor = create_processor();
         // Basic test - processor should be created successfully
-        assert!(!processor.supported_formats().is_empty() || processor.supported_formats().is_empty());
+        assert!(
+            !processor.supported_formats().is_empty() || processor.supported_formats().is_empty()
+        );
     }
 
     #[test]

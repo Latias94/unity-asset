@@ -24,7 +24,10 @@ fn test_typetree_basic_functionality() {
     root_node.level = 0;
     tree.add_node(root_node);
 
-    assert!(!tree.is_empty(), "TypeTree should not be empty after adding node");
+    assert!(
+        !tree.is_empty(),
+        "TypeTree should not be empty after adding node"
+    );
     assert_eq!(tree.node_count(), 1, "TypeTree should have 1 node");
 
     // Add more nodes
@@ -43,13 +46,25 @@ fn test_typetree_basic_functionality() {
     assert_eq!(tree.node_count(), 3, "TypeTree should have 3 nodes");
 
     // Test node finding
-    assert!(tree.find_node("m_Name").is_some(), "Should find m_Name node");
-    assert!(tree.find_node("m_IsActive").is_some(), "Should find m_IsActive node");
-    assert!(tree.find_node("nonexistent").is_none(), "Should not find nonexistent node");
+    assert!(
+        tree.find_node("m_Name").is_some(),
+        "Should find m_Name node"
+    );
+    assert!(
+        tree.find_node("m_IsActive").is_some(),
+        "Should find m_IsActive node"
+    );
+    assert!(
+        tree.find_node("nonexistent").is_none(),
+        "Should not find nonexistent node"
+    );
 
     // Test validation
     let validation_result = tree.validate();
-    assert!(validation_result.is_ok(), "TypeTree validation should succeed");
+    assert!(
+        validation_result.is_ok(),
+        "TypeTree validation should succeed"
+    );
 
     // Test statistics
     let stats = tree.statistics();
@@ -87,7 +102,10 @@ fn test_typetree_node_operations() {
     assert_eq!(node_names.len(), 4, "Should have 4 node names");
     assert!(node_names.contains(&""), "Should contain root node");
     assert!(node_names.contains(&"m_Name"), "Should contain m_Name");
-    assert!(node_names.contains(&"m_IsActive"), "Should contain m_IsActive");
+    assert!(
+        node_names.contains(&"m_IsActive"),
+        "Should contain m_IsActive"
+    );
     assert!(node_names.contains(&"m_Layer"), "Should contain m_Layer");
 
     // Test specific node properties
@@ -140,7 +158,10 @@ fn test_typetree_validation() {
     // Test empty tree validation
     let empty_tree = TypeTree::new();
     let validation_result = empty_tree.validate();
-    assert!(validation_result.is_err(), "Empty TypeTree should fail validation");
+    assert!(
+        validation_result.is_err(),
+        "Empty TypeTree should fail validation"
+    );
 
     // Test valid tree
     let mut valid_tree = TypeTree::new();
@@ -150,7 +171,10 @@ fn test_typetree_validation() {
     valid_tree.add_node(root_node);
 
     let validation_result = valid_tree.validate();
-    assert!(validation_result.is_ok(), "Valid TypeTree should pass validation");
+    assert!(
+        validation_result.is_ok(),
+        "Valid TypeTree should pass validation"
+    );
 
     println!("  ✓ TypeTree validation test passed");
 }

@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Vertex data structure
-/// 
+///
 /// Contains information about vertex layout and data for a mesh.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VertexData {
@@ -15,7 +15,7 @@ pub struct VertexData {
 }
 
 /// Channel information for vertex data
-/// 
+///
 /// Describes how vertex attributes are laid out in the vertex buffer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChannelInfo {
@@ -26,7 +26,7 @@ pub struct ChannelInfo {
 }
 
 /// SubMesh data structure
-/// 
+///
 /// Represents a portion of a mesh that uses the same material.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubMesh {
@@ -41,7 +41,7 @@ pub struct SubMesh {
 }
 
 /// Axis-Aligned Bounding Box
-/// 
+///
 /// Defines the spatial bounds of a mesh or submesh.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AABB {
@@ -54,7 +54,7 @@ pub struct AABB {
 }
 
 /// Blend shape data
-/// 
+///
 /// Contains morph target information for mesh animation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BlendShapeData {
@@ -65,7 +65,7 @@ pub struct BlendShapeData {
 }
 
 /// Blend shape vertex
-/// 
+///
 /// Represents a vertex delta for blend shape animation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BlendShapeVertex {
@@ -76,7 +76,7 @@ pub struct BlendShapeVertex {
 }
 
 /// Blend shape
-/// 
+///
 /// Defines a morph target shape.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BlendShape {
@@ -87,7 +87,7 @@ pub struct BlendShape {
 }
 
 /// Blend shape channel
-/// 
+///
 /// Named channel for blend shape animation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BlendShapeChannel {
@@ -98,7 +98,7 @@ pub struct BlendShapeChannel {
 }
 
 /// Streaming info for external mesh data
-/// 
+///
 /// Information about mesh data stored in external files.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamingInfo {
@@ -108,7 +108,7 @@ pub struct StreamingInfo {
 }
 
 /// Compressed mesh data
-/// 
+///
 /// Contains compressed vertex and index data for memory efficiency.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompressedMesh {
@@ -127,7 +127,7 @@ pub struct CompressedMesh {
 }
 
 /// Packed float vector for compressed data
-/// 
+///
 /// Compressed floating-point data with quantization information.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PackedFloatVector {
@@ -139,7 +139,7 @@ pub struct PackedFloatVector {
 }
 
 /// Packed int vector for compressed data
-/// 
+///
 /// Compressed integer data with bit packing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PackedIntVector {
@@ -149,7 +149,7 @@ pub struct PackedIntVector {
 }
 
 /// Mesh object representation
-/// 
+///
 /// Main mesh structure containing all mesh data and metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mesh {

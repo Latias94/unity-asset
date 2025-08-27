@@ -3,8 +3,8 @@
 //! This module handles Crunch-compressed texture formats.
 //! Crunch is Unity's proprietary compression that can wrap other formats like DXT.
 
-use crate::error::{BinaryError, Result};
 use super::{Decoder, create_rgba_image, validate_dimensions};
+use crate::error::{BinaryError, Result};
 use crate::texture::formats::TextureFormat;
 use crate::texture::types::Texture2D;
 use image::RgbaImage;
@@ -22,9 +22,9 @@ impl CrunchDecoder {
     #[cfg(feature = "texture-advanced")]
     fn decompress_crunch(&self, data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
         validate_dimensions(width, height)?;
-        
+
         let mut output = vec![0u32; (width * height) as usize];
-        
+
         match texture2ddecoder::decode_crunch(data, width as usize, height as usize, &mut output) {
             Ok(_) => {
                 // Convert u32 RGBA to u8 RGBA
@@ -71,7 +71,12 @@ impl CrunchDecoder {
 
     /// Decode ETC2 RGBA8 Crunched format
     #[cfg(feature = "texture-advanced")]
-    fn decode_etc2_rgba8_crunched(&self, data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
+    fn decode_etc2_rgba8_crunched(
+        &self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<RgbaImage> {
         let rgba_data = self.decompress_crunch(data, width, height)?;
         create_rgba_image(rgba_data, width, height)
     }
@@ -100,11 +105,13 @@ impl Decoder for CrunchDecoder {
             #[cfg(feature = "texture-advanced")]
             TextureFormat::ETC_RGB4Crunched => self.decode_etc_rgb4_crunched(data, width, height),
             #[cfg(feature = "texture-advanced")]
-            TextureFormat::ETC2_RGBA8Crunched => self.decode_etc2_rgba8_crunched(data, width, height),
-            
+            TextureFormat::ETC2_RGBA8Crunched => {
+                self.decode_etc2_rgba8_crunched(data, width, height)
+            }
+
             #[cfg(not(feature = "texture-advanced"))]
             format if format.is_crunch_compressed() => self.decode_unsupported(format),
-            
+
             _ => Err(BinaryError::unsupported(format!(
                 "Format {:?} is not a Crunch format",
                 texture.format
@@ -117,7 +124,7 @@ impl Decoder for CrunchDecoder {
         {
             format.is_crunch_compressed()
         }
-        
+
         #[cfg(not(feature = "texture-advanced"))]
         {
             false
@@ -134,7 +141,7 @@ impl Decoder for CrunchDecoder {
                 TextureFormat::ETC2_RGBA8Crunched,
             ]
         }
-        
+
         #[cfg(not(feature = "texture-advanced"))]
         {
             vec![]

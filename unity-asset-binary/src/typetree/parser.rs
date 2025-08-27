@@ -3,12 +3,12 @@
 //! This module provides parsing functionality for Unity TypeTree structures,
 //! inspired by UnityPy/classes/TypeTree.py
 
+use super::types::{TypeTree, TypeTreeNode};
 use crate::error::{BinaryError, Result};
 use crate::reader::BinaryReader;
-use super::types::{TypeTree, TypeTreeNode};
 
 /// TypeTree parser
-/// 
+///
 /// This struct handles the parsing of TypeTree structures from binary data,
 /// supporting different Unity versions and formats.
 pub struct TypeTreeParser;
@@ -131,7 +131,7 @@ impl TypeTreeParser {
     fn resolve_node_strings(node: &mut TypeTreeNode, string_buffer: &[u8]) -> Result<()> {
         // Resolve type name
         node.type_name = Self::get_string_from_buffer(string_buffer, node.type_str_offset)?;
-        
+
         // Resolve field name
         node.name = Self::get_string_from_buffer(string_buffer, node.name_str_offset)?;
 
@@ -168,7 +168,7 @@ impl TypeTreeParser {
 
         // Create a working copy of nodes
         let mut nodes = std::mem::take(&mut tree.nodes);
-        
+
         // Build hierarchy using a stack-based approach
         let mut stack: Vec<(i32, usize)> = Vec::new(); // (level, index)
         let mut root_nodes = Vec::new();
@@ -233,7 +233,7 @@ impl TypeTreeParser {
             }
 
             let child_level = nodes[i].level;
-            
+
             if child_level <= current_level {
                 // We've reached a sibling or parent level, stop looking for children
                 break;
@@ -299,7 +299,7 @@ impl TypeTreeParser {
         fn count_nodes(node: &TypeTreeNode, depth: i32, stats: &mut (usize, i32, usize, usize)) {
             stats.0 += 1; // total_nodes
             stats.1 = stats.1.max(depth); // max_depth
-            
+
             if node.is_primitive() {
                 stats.2 += 1; // primitive_count
             }
