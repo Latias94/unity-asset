@@ -91,7 +91,5 @@ git_tag_name = "v{{version}}"          # 主包使用简单的版本标签
 name = "unity-asset-cli"
 # CLI 工具包，无特殊配置
 
-# Changelog 配置
-[changelog]
-# 保护破坏性变更提交，确保它们总是包含在 changelog 中
-protect_breaking_commits = true
+# Changelog 配置通过 cliff.toml 文件处理
+# 不能同时使用 [changelog] 配置段和 changelog_config 路径

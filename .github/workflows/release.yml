@@ -13,35 +13,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 首先运行完整测试
-  test:
-    name: Pre-release Tests
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-      with:
-        components: clippy
-
-    - name: Run full test suite
-      run: |
-        cargo test --all --all-features
-
-    - name: Run clippy on release code (strict)
-      run: |
-        # 对发布的代码进行严格检查
-        cargo clippy --lib --bins --all-features -- -D warnings
-
-    - name: Run clippy on tests (informational)
-      run: |
-        # 测试代码检查，但不阻止发布
-        cargo clippy --tests --all-features || echo "Test code has clippy warnings (non-blocking)"
-
   # Release unpublished packages
   release-plz-release:
     name: Release-plz release
     runs-on: ubuntu-latest
-    needs: test
     if: ${{ github.repository_owner == 'Latias94' }}
     permissions:
       contents: write
@@ -64,7 +39,6 @@ jobs:
   release-plz-pr:
     name: Release-plz PR
     runs-on: ubuntu-latest
-    needs: test
     if: ${{ github.repository_owner == 'Latias94' }}
     permissions:
       contents: write

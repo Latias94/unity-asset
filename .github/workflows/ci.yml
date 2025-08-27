@@ -4,6 +4,7 @@ on:
   push:
     branches: [ main, develop ]
   pull_request:
+    types: [opened, synchronize, reopened]
     branches: [ main ]
 
 env:
@@ -16,27 +17,29 @@ jobs:
     strategy:
       matrix:
         features: ["", "async"]
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt, clippy
-    
+
     - name: Cache dependencies
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-    
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
     - name: Check formatting
       run: cargo fmt --all -- --check
-    
+
     - name: Run clippy (lib and bin only)
       run: |
         if [ -n "${{ matrix.features }}" ]; then
@@ -60,7 +63,7 @@ jobs:
         else
           cargo test --all
         fi
-    
+
     - name: Test CLI tools
       run: |
         cargo build --all
@@ -69,6 +72,30 @@ jobs:
           cargo build --features async -p unity-asset-cli
           ./target/debug/unity-asset-async --help
         fi
+
+  # 只在main分支运行文档检查，避免PR中的噪音
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-doc-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-doc-
+          ${{ runner.os }}-cargo-
+
+    - name: Check documentation
+      run: cargo doc --all --all-features --no-deps
 
 
 
