@@ -1,9 +1,13 @@
-name: Release
+name: Release-plz
+
+permissions:
+  pull-requests: write
+  contents: write
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,7 +22,7 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy
-    
+
     - name: Run full test suite
       run: |
         cargo test --all --all-features
@@ -33,120 +37,52 @@ jobs:
         # 测试代码检查，但不阻止发布
         cargo clippy --tests --all-features || echo "Test code has clippy warnings (non-blocking)"
 
-  # 按依赖顺序发布 crates
-  publish:
-    name: Publish to crates.io
+  # Release unpublished packages
+  release-plz-release:
+    name: Release-plz release
     runs-on: ubuntu-latest
     needs: test
-    if: startsWith(github.ref, 'refs/tags/v')
-    
+    if: ${{ github.repository_owner == 'Latias94' }}
+    permissions:
+      contents: write
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-    
-    - name: Setup cargo credentials
-      run: |
-        mkdir -p ~/.cargo
-        echo '[registry]' > ~/.cargo/credentials
-        echo 'token = "${{ secrets.CARGO_REGISTRY_TOKEN }}"' >> ~/.cargo/credentials
-    
-    - name: Update dependencies for publishing
-      run: |
-        # 提取版本号 (去掉 'v' 前缀)
-        VERSION=${GITHUB_REF#refs/tags/v}
-        echo "Publishing version: $VERSION"
-        
-        # 更新所有 Cargo.toml 中的版本号
-        find . -name "Cargo.toml" -exec sed -i "s/version = \"0.1.0\"/version = \"$VERSION\"/g" {} \;
-        
-        # 将 path 依赖改为 version 依赖 (发布时需要)
-        ./scripts/prepare-for-publish.sh $VERSION
-    
-    - name: Publish unity-asset-core
-      run: |
-        cd unity-asset-core
-        cargo publish --dry-run
-        cargo publish
-        sleep 30  # 等待 crates.io 索引更新
-    
-    - name: Publish unity-asset-yaml
-      run: |
-        cd unity-asset-yaml
-        cargo publish --dry-run
-        cargo publish
-        sleep 30
-    
-    - name: Publish unity-asset-binary
-      run: |
-        cd unity-asset-binary
-        cargo publish --dry-run
-        cargo publish
-        sleep 30
-    
-    - name: Publish unity-asset (main library)
-      run: |
-        cd unity-asset-lib
-        cargo publish --dry-run
-        cargo publish
-        sleep 30
-    
-    - name: Publish unity-asset-cli
-      run: |
-        cd unity-asset-cli
-        cargo publish --dry-run
-        cargo publish
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  # 创建 GitHub Release
-  github-release:
-    name: Create GitHub Release
+  # Create a PR with the new versions and changelog, preparing the next release
+  release-plz-pr:
+    name: Release-plz PR
     runs-on: ubuntu-latest
-    needs: publish
+    needs: test
+    if: ${{ github.repository_owner == 'Latias94' }}
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # 获取完整历史用于生成 changelog
-    
-    - name: Generate changelog
-      id: changelog
-      run: |
-        # 获取上一个 tag
-        PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
-        
-        if [ -z "$PREV_TAG" ]; then
-          # 第一次发布，获取所有提交
-          CHANGELOG=$(git log --pretty=format:"- %s (%h)" --reverse)
-        else
-          # 获取自上次 tag 以来的提交
-          CHANGELOG=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --reverse)
-        fi
-        
-        echo "changelog<<EOF" >> $GITHUB_OUTPUT
-        echo "$CHANGELOG" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
-    
-    - name: Create Release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref }}
-        release_name: Release ${{ github.ref }}
-        body: |
-          ## Changes in this release
-          
-          ${{ steps.changelog.outputs.changelog }}
-          
-          ## Installation
-          
-          ### Library
-          ```toml
-          [dependencies]
-          unity-asset = "${{ github.ref_name }}"
-          ```
-          
-          ### CLI Tools
-          ```bash
-          cargo install unity-asset-cli
-          ```
-        draft: false
-        prerelease: false
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

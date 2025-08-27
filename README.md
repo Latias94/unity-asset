@@ -77,7 +77,7 @@ unity-asset/
 
 ### Installation
 
-**Note**: This project is not yet published to crates.io. To try it out:
+**Note**: This project will be published to crates.io soon. For now, to try it out:
 
 ```bash
 # Clone and build from source
@@ -90,6 +90,19 @@ cargo build --all
 # Try the CLI tools
 cargo run --bin unity-asset -- --help
 cargo run --features async --bin unity-asset-async -- --help
+```
+
+Once published, you'll be able to install it with:
+
+```toml
+# Add to your Cargo.toml
+[dependencies]
+unity-asset = "0.1.0"
+```
+
+```bash
+# Install CLI tools
+cargo install unity-asset-cli
 ```
 
 ### Testing Status

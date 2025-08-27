@@ -46,5 +46,4 @@ cobertura.xml
 lcov.info
 
 # Reference repositories (keep in repo but ignore changes)
-repo-ref/*/
 !repo-ref/.gitkeep

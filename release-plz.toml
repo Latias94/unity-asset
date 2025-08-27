@@ -1,0 +1,97 @@
+# Release-plz configuration for Unity Asset Parser
+# This file configures how release-plz manages releases for our Rust workspace
+
+[workspace]
+# 基础配置
+allow_dirty = false                    # 不允许在脏工作目录中发布
+changelog_update = true                # 启用 CHANGELOG 更新
+changelog_config = "./cliff.toml"      # 使用自定义的 git-cliff 配置
+dependencies_update = true             # 在 release PR 中运行 `cargo update`
+git_release_enable = true              # 启用 GitHub releases
+git_tag_enable = true                  # 启用 git tags
+semver_check = true                    # 启用 API 破坏性变更检查
+
+# PR 配置
+pr_branch_prefix = "release-plz-"      # Release PR 分支前缀
+pr_labels = ["release", "automated"]   # 为 Release PR 添加标签
+pr_draft = false                       # 不创建草稿 PR
+
+# 发布配置
+publish = true                         # 启用发布到 crates.io
+publish_timeout = "10m"                # 设置发布超时时间
+release_always = false                 # 只在合并 release PR 时发布
+
+# Git release 配置
+git_release_name = "v{{version}}"      # Git release 名称格式
+git_release_body = """
+## 🚀 Unity Asset Parser {{version}}
+
+### 📋 Changes in this release
+
+{{ changelog }}
+
+### 📦 Installation
+
+#### Library
+```toml
+[dependencies]
+unity-asset = "{{version}}"
+```
+
+#### CLI Tools
+```bash
+cargo install unity-asset-cli --version {{version}}
+```
+
+### 🔗 Crates.io Links
+
+- [unity-asset](https://crates.io/crates/unity-asset) - Main library
+- [unity-asset-cli](https://crates.io/crates/unity-asset-cli) - CLI tools
+- [unity-asset-core](https://crates.io/crates/unity-asset-core) - Core types
+- [unity-asset-yaml](https://crates.io/crates/unity-asset-yaml) - YAML support
+- [unity-asset-binary](https://crates.io/crates/unity-asset-binary) - Binary support
+
+{% if remote.contributors %}
+### 👥 Contributors
+{% for contributor in remote.contributors %}
+* @{{ contributor.username }}
+{% endfor %}
+{% endif %}
+"""
+
+# Git tag 配置
+git_tag_name = "{{package}}-v{{version}}"  # 每个包独立的 tag
+
+# 包特定配置
+[[package]]
+name = "unity-asset-core"
+# 核心包，无特殊配置，使用默认设置
+
+[[package]]
+name = "unity-asset-yaml"
+# YAML 解析包，无特殊配置
+
+[[package]]
+name = "unity-asset-binary"
+# 二进制解析包，无特殊配置
+
+[[package]]
+name = "unity-asset"
+# 主库包，创建统一的 CHANGELOG
+changelog_path = "./CHANGELOG.md"
+changelog_include = [
+    "unity-asset-core",
+    "unity-asset-yaml", 
+    "unity-asset-binary"
+]
+git_release_enable = true              # 只为主包创建 GitHub release
+git_tag_name = "v{{version}}"          # 主包使用简单的版本标签
+
+[[package]]
+name = "unity-asset-cli"
+# CLI 工具包，无特殊配置
+
+# Changelog 配置
+[changelog]
+# 保护破坏性变更提交，确保它们总是包含在 changelog 中
+protect_breaking_commits = true
