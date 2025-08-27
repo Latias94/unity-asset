@@ -266,6 +266,7 @@ impl SpriteResult {
 
 /// Sprite atlas information
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct SpriteAtlas {
     pub name: String,
     pub texture_path_id: i64,
@@ -273,16 +274,6 @@ pub struct SpriteAtlas {
     pub packed_sprites: Vec<String>,
 }
 
-impl Default for SpriteAtlas {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            texture_path_id: 0,
-            sprites: Vec::new(),
-            packed_sprites: Vec::new(),
-        }
-    }
-}
 
 /// Helper functions for sprite types
 impl Sprite {

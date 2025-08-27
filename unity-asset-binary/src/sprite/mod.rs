@@ -152,7 +152,6 @@ impl Default for SpriteManager {
 }
 
 /// Convenience functions for common operations
-
 /// Create a sprite manager with default settings
 pub fn create_manager(version: crate::unity_version::UnityVersion) -> SpriteManager {
     SpriteManager::new(version)

@@ -257,7 +257,7 @@ fn try_unity_lzma_strategies(data: &[u8], uncompressed_size: usize) -> Result<Ve
 
                 // Check if size is reasonable
                 let size_ratio = output.len() as f64 / uncompressed_size as f64;
-                if size_ratio >= 0.8 && size_ratio <= 1.2 {
+                if (0.8..=1.2).contains(&size_ratio) {
                     // Size is within 20% of expected, probably correct
                     println!(
                         "DEBUG: LZMA output size is reasonable (ratio: {:.2})",
@@ -407,9 +407,9 @@ fn try_unity_lzma_with_header(data: &[u8], expected_size: usize) -> Result<Vec<u
                 );
                 if output.len() == expected_size {
                     return Ok(output);
-                } else if output.len() > 0 {
+                } else if !output.is_empty() {
                     let ratio = output.len() as f64 / expected_size as f64;
-                    if ratio >= 0.8 && ratio <= 1.2 {
+                    if (0.8..=1.2).contains(&ratio) {
                         println!("DEBUG: Size ratio {:.2} is acceptable", ratio);
                         return Ok(output);
                     }
@@ -484,9 +484,9 @@ fn try_unity_raw_lzma(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
                 // Check if size is reasonable
                 if output.len() == expected_size {
                     return Ok(output);
-                } else if output.len() > 0 {
+                } else if !output.is_empty() {
                     let ratio = output.len() as f64 / expected_size as f64;
-                    if ratio >= 0.5 && ratio <= 2.0 {
+                    if (0.5..=2.0).contains(&ratio) {
                         println!(
                             "DEBUG: Size ratio {:.2} is acceptable for offset {}",
                             ratio, offset

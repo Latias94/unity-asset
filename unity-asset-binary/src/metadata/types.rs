@@ -32,6 +32,7 @@ pub struct FileInfo {
 
 /// Object statistics within the asset
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct ObjectStatistics {
     pub total_objects: usize,
     pub objects_by_type: HashMap<String, usize>,
@@ -39,16 +40,6 @@ pub struct ObjectStatistics {
     pub memory_usage: MemoryUsage,
 }
 
-impl Default for ObjectStatistics {
-    fn default() -> Self {
-        Self {
-            total_objects: 0,
-            objects_by_type: HashMap::new(),
-            largest_objects: Vec::new(),
-            memory_usage: MemoryUsage::default(),
-        }
-    }
-}
 
 /// Summary of an individual object
 #[derive(Debug, Clone, Serialize, Deserialize)]

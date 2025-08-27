@@ -62,6 +62,7 @@ impl Default for AudioClipMeta {
 /// This structure contains all the data needed to represent a Unity AudioClip object.
 /// It includes both metadata and the actual audio data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct AudioClip {
     pub name: String,
     pub meta: AudioClipMeta,
@@ -75,20 +76,6 @@ pub struct AudioClip {
     pub ambisonic: Option<bool>,
 }
 
-impl Default for AudioClip {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            meta: AudioClipMeta::default(),
-            source: None,
-            offset: 0,
-            size: 0,
-            stream_info: StreamingInfo::default(),
-            data: Vec::new(),
-            ambisonic: None,
-        }
-    }
-}
 
 impl AudioClip {
     /// Create a new AudioClip with basic parameters

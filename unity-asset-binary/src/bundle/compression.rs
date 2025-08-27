@@ -197,11 +197,7 @@ impl BundleCompression {
             1.0
         };
 
-        let space_saved = if total_uncompressed > total_compressed {
-            total_uncompressed - total_compressed
-        } else {
-            0
-        };
+        let space_saved = total_uncompressed.saturating_sub(total_compressed);
 
         CompressionStats {
             block_count: blocks.len(),

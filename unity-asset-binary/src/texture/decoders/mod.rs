@@ -136,7 +136,7 @@ pub trait Decoder {
 /// Helper function to create RGBA image from raw data
 pub(crate) fn create_rgba_image(data: Vec<u8>, width: u32, height: u32) -> Result<RgbaImage> {
     if data.len() != (width * height * 4) as usize {
-        return Err(BinaryError::invalid_data(&format!(
+        return Err(BinaryError::invalid_data(format!(
             "Invalid data size: expected {}, got {}",
             width * height * 4,
             data.len()

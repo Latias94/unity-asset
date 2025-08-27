@@ -179,7 +179,7 @@ impl AudioClipConverter {
                         use std::io::{Read, Seek, SeekFrom};
 
                         // Seek to the specified offset
-                        if let Err(_) = file.seek(SeekFrom::Start(clip.stream_info.offset)) {
+                        if file.seek(SeekFrom::Start(clip.stream_info.offset)).is_err() {
                             continue; // Try next path
                         }
 

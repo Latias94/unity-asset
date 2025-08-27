@@ -23,7 +23,7 @@ impl BasicDecoder {
 
         let expected_size = (width * height * 4) as usize;
         if data.len() < expected_size {
-            return Err(BinaryError::invalid_data(&format!(
+            return Err(BinaryError::invalid_data(format!(
                 "Insufficient data for RGBA32: expected {}, got {}",
                 expected_size,
                 data.len()
@@ -40,7 +40,7 @@ impl BasicDecoder {
 
         let expected_size = (width * height * 3) as usize;
         if data.len() < expected_size {
-            return Err(BinaryError::invalid_data(&format!(
+            return Err(BinaryError::invalid_data(format!(
                 "Insufficient data for RGB24: expected {}, got {}",
                 expected_size,
                 data.len()
@@ -65,7 +65,7 @@ impl BasicDecoder {
 
         let expected_size = (width * height * 4) as usize;
         if data.len() < expected_size {
-            return Err(BinaryError::invalid_data(&format!(
+            return Err(BinaryError::invalid_data(format!(
                 "Insufficient data for ARGB32: expected {}, got {}",
                 expected_size,
                 data.len()
@@ -90,7 +90,7 @@ impl BasicDecoder {
 
         let expected_size = (width * height * 4) as usize;
         if data.len() < expected_size {
-            return Err(BinaryError::invalid_data(&format!(
+            return Err(BinaryError::invalid_data(format!(
                 "Insufficient data for BGRA32: expected {}, got {}",
                 expected_size,
                 data.len()
@@ -115,7 +115,7 @@ impl BasicDecoder {
 
         let expected_size = (width * height) as usize;
         if data.len() < expected_size {
-            return Err(BinaryError::invalid_data(&format!(
+            return Err(BinaryError::invalid_data(format!(
                 "Insufficient data for Alpha8: expected {}, got {}",
                 expected_size,
                 data.len()
@@ -140,7 +140,7 @@ impl BasicDecoder {
 
         let expected_size = (width * height * 2) as usize; // 2 bytes per pixel
         if data.len() < expected_size {
-            return Err(BinaryError::invalid_data(&format!(
+            return Err(BinaryError::invalid_data(format!(
                 "Insufficient data for RGBA4444: expected {}, got {}",
                 expected_size,
                 data.len()
@@ -174,7 +174,7 @@ impl BasicDecoder {
 
         let expected_size = (width * height * 2) as usize; // 2 bytes per pixel
         if data.len() < expected_size {
-            return Err(BinaryError::invalid_data(&format!(
+            return Err(BinaryError::invalid_data(format!(
                 "Insufficient data for ARGB4444: expected {}, got {}",
                 expected_size,
                 data.len()
@@ -208,7 +208,7 @@ impl BasicDecoder {
 
         let expected_size = (width * height * 2) as usize; // 2 bytes per pixel
         if data.len() < expected_size {
-            return Err(BinaryError::invalid_data(&format!(
+            return Err(BinaryError::invalid_data(format!(
                 "Insufficient data for RGB565: expected {}, got {}",
                 expected_size,
                 data.len()

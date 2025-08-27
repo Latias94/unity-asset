@@ -164,8 +164,8 @@ impl MeshParser {
             }
 
             // Extract data size
-            if let Some(data_size_value) = vertex_data_obj.get("m_DataSize") {
-                if let UnityValue::Array(data_array) = data_size_value {
+            if let Some(data_size_value) = vertex_data_obj.get("m_DataSize")
+                && let UnityValue::Array(data_array) = data_size_value {
                     mesh.vertex_data.data_size.clear();
                     for data_item in data_array {
                         if let UnityValue::Integer(byte_val) = data_item {
@@ -173,7 +173,6 @@ impl MeshParser {
                         }
                     }
                 }
-            }
         }
         Ok(())
     }
@@ -232,8 +231,8 @@ impl MeshParser {
     fn extract_local_aabb(&self, mesh: &mut Mesh, value: &UnityValue) -> Result<()> {
         if let UnityValue::Object(aabb_obj) = value {
             // Extract center
-            if let Some(center_value) = aabb_obj.get("m_Center") {
-                if let UnityValue::Object(center_obj) = center_value {
+            if let Some(center_value) = aabb_obj.get("m_Center")
+                && let UnityValue::Object(center_obj) = center_value {
                     if let Some(UnityValue::Float(x)) = center_obj.get("x") {
                         mesh.local_aabb.center_x = *x as f32;
                     }
@@ -244,11 +243,10 @@ impl MeshParser {
                         mesh.local_aabb.center_z = *z as f32;
                     }
                 }
-            }
 
             // Extract extent
-            if let Some(extent_value) = aabb_obj.get("m_Extent") {
-                if let UnityValue::Object(extent_obj) = extent_value {
+            if let Some(extent_value) = aabb_obj.get("m_Extent")
+                && let UnityValue::Object(extent_obj) = extent_value {
                     if let Some(UnityValue::Float(x)) = extent_obj.get("x") {
                         mesh.local_aabb.extent_x = *x as f32;
                     }
@@ -259,7 +257,6 @@ impl MeshParser {
                         mesh.local_aabb.extent_z = *z as f32;
                     }
                 }
-            }
         }
         Ok(())
     }

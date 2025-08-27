@@ -303,7 +303,7 @@ impl TextureFormat {
                 TextureFormat::ETC2_RGB => 8,
                 TextureFormat::ETC2_RGBA8 => 16,
                 TextureFormat::ASTC_RGBA_4x4 => 16,
-                _ => (info.bits_per_pixel / 8) as u32,
+                _ => info.bits_per_pixel / 8,
             };
             blocks_x * blocks_y * bytes_per_block
         } else {

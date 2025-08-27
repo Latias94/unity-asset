@@ -112,8 +112,8 @@ impl MetadataProcessor {
         let mut result = self.extractor.extract_from_asset(asset)?;
 
         // Enhanced dependency analysis if analyzer is available
-        if let Some(ref mut analyzer) = self.dependency_analyzer {
-            if self.extractor.config().include_dependencies {
+        if let Some(ref mut analyzer) = self.dependency_analyzer
+            && self.extractor.config().include_dependencies {
                 let objects: Vec<&crate::asset::ObjectInfo> = asset.objects.iter().collect();
                 match analyzer.analyze_dependencies(&objects) {
                     Ok(deps) => {
@@ -124,11 +124,10 @@ impl MetadataProcessor {
                     }
                 }
             }
-        }
 
         // Enhanced relationship analysis if analyzer is available
-        if let Some(ref mut analyzer) = self.relationship_analyzer {
-            if self.extractor.config().include_hierarchy {
+        if let Some(ref mut analyzer) = self.relationship_analyzer
+            && self.extractor.config().include_hierarchy {
                 let objects: Vec<&crate::asset::ObjectInfo> = asset.objects.iter().collect();
                 match analyzer.analyze_relationships(&objects) {
                     Ok(rels) => {
@@ -139,7 +138,6 @@ impl MetadataProcessor {
                     }
                 }
             }
-        }
 
         Ok(result)
     }
@@ -204,7 +202,6 @@ impl Default for MetadataProcessor {
 }
 
 /// Convenience functions for common operations
-
 /// Create a metadata processor with default settings
 pub fn create_processor() -> MetadataProcessor {
     MetadataProcessor::default()

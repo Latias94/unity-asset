@@ -167,7 +167,6 @@ pub struct BundleInfo {
 }
 
 /// Convenience functions for common operations
-
 /// Create a bundle processor with default settings
 pub fn create_processor() -> BundleProcessor {
     BundleProcessor::default()

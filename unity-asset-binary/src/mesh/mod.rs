@@ -169,7 +169,6 @@ impl Default for MeshManager {
 }
 
 /// Convenience functions for common operations
-
 /// Create a mesh manager with default settings
 pub fn create_manager(version: crate::unity_version::UnityVersion) -> MeshManager {
     MeshManager::new(version)

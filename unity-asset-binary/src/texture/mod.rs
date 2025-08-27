@@ -111,7 +111,6 @@ impl Default for TextureProcessor {
 }
 
 /// Convenience functions for common operations
-
 /// Create a texture processor with default settings
 pub fn create_processor() -> TextureProcessor {
     TextureProcessor::default()

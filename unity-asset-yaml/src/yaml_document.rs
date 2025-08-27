@@ -265,22 +265,20 @@ impl YamlDocument {
             .iter()
             .filter(|entry| {
                 // Check class name filter
-                if let Some(names) = class_names {
-                    if !names.is_empty() && !names.contains(&entry.class_name.as_str()) {
+                if let Some(names) = class_names
+                    && !names.is_empty() && !names.contains(&entry.class_name.as_str()) {
                         return false;
                     }
-                }
 
                 // Check attribute filter
-                if let Some(attrs) = attributes {
-                    if !attrs.is_empty() {
+                if let Some(attrs) = attributes
+                    && !attrs.is_empty() {
                         for attr in attrs {
                             if !entry.has_property(attr) {
                                 return false;
                             }
                         }
                     }
-                }
 
                 true
             })

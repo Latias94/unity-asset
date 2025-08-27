@@ -67,11 +67,10 @@ impl UnityClassIdMap {
         let key = format!("{}-{}", class_id, class_name);
 
         // Try to read first
-        if let Ok(map) = self.map.read() {
-            if let Some(existing) = map.get(&key) {
+        if let Ok(map) = self.map.read()
+            && let Some(existing) = map.get(&key) {
                 return existing.clone();
             }
-        }
 
         // Need to write
         if let Ok(mut map) = self.map.write() {

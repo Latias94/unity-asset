@@ -333,7 +333,6 @@ pub struct LoaderStatistics {
 }
 
 /// Convenience functions for quick bundle loading
-
 /// Load a single bundle from file
 pub fn load_bundle<P: AsRef<Path>>(path: P) -> Result<AssetBundle> {
     let data = std::fs::read(path)

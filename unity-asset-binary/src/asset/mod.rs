@@ -159,7 +159,6 @@ impl Default for AssetProcessor {
 }
 
 /// Convenience functions for common operations
-
 /// Create an asset processor with default settings
 pub fn create_processor() -> AssetProcessor {
     AssetProcessor::default()
@@ -258,7 +257,7 @@ pub fn get_supported_versions() -> Vec<u32> {
 
 /// Check if a Unity version is supported
 pub fn is_version_supported(version: u32) -> bool {
-    version >= 5 && version <= 50
+    (5..=50).contains(&version)
 }
 
 /// Get recommended parsing options for a Unity version

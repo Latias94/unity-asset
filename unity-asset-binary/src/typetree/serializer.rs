@@ -217,11 +217,10 @@ impl<'a> TypeTreeSerializer<'a> {
 
         if let Some(root) = self.tree.nodes.first() {
             for child in &root.children {
-                if !child.name.is_empty() {
-                    if let Some(value) = data.get(&child.name) {
+                if !child.name.is_empty()
+                    && let Some(value) = data.get(&child.name) {
                         self.serialize_value(&mut buffer, value, child)?;
                     }
-                }
             }
         }
 
@@ -312,24 +311,21 @@ impl<'a> TypeTreeSerializer<'a> {
 
                     // Find element type
                     if let Some(array_node) = node.children.iter().find(|c| c.type_name == "Array")
-                    {
-                        if let Some(element_node) = array_node.children.get(1) {
+                        && let Some(element_node) = array_node.children.get(1) {
                             for element in elements {
                                 self.serialize_value(buffer, element, element_node)?;
                             }
                         }
-                    }
                 }
             }
             _ => {
                 // Complex object
                 if let UnityValue::Object(obj) = value {
                     for child in &node.children {
-                        if !child.name.is_empty() {
-                            if let Some(child_value) = obj.get(&child.name) {
+                        if !child.name.is_empty()
+                            && let Some(child_value) = obj.get(&child.name) {
                                 self.serialize_value(buffer, child_value, child)?;
                             }
-                        }
                     }
                 }
             }
@@ -358,11 +354,10 @@ impl<'a> TypeTreeSerializer<'a> {
 
         if let Some(root) = self.tree.nodes.first() {
             for child in &root.children {
-                if !child.name.is_empty() {
-                    if let Some(value) = data.get(&child.name) {
+                if !child.name.is_empty()
+                    && let Some(value) = data.get(&child.name) {
                         size += self.estimate_value_size(value, child);
                     }
-                }
             }
         }
 
@@ -387,13 +382,11 @@ impl<'a> TypeTreeSerializer<'a> {
                 if let UnityValue::Array(elements) = value {
                     let mut size = 4; // Array size
                     if let Some(array_node) = node.children.iter().find(|c| c.type_name == "Array")
-                    {
-                        if let Some(element_node) = array_node.children.get(1) {
+                        && let Some(element_node) = array_node.children.get(1) {
                             for element in elements {
                                 size += self.estimate_value_size(element, element_node);
                             }
                         }
-                    }
                     size
                 } else {
                     4
@@ -404,11 +397,10 @@ impl<'a> TypeTreeSerializer<'a> {
                 if let UnityValue::Object(obj) = value {
                     let mut size = 0;
                     for child in &node.children {
-                        if !child.name.is_empty() {
-                            if let Some(child_value) = obj.get(&child.name) {
+                        if !child.name.is_empty()
+                            && let Some(child_value) = obj.get(&child.name) {
                                 size += self.estimate_value_size(child_value, child);
                             }
-                        }
                     }
                     size
                 } else {

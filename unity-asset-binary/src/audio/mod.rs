@@ -125,7 +125,6 @@ impl Default for AudioProcessor {
 }
 
 /// Convenience functions for common operations
-
 /// Create an audio processor with default settings
 pub fn create_processor() -> AudioProcessor {
     AudioProcessor::default()

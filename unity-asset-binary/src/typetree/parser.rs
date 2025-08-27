@@ -291,10 +291,7 @@ impl TypeTreeParser {
 
     /// Get parsing statistics
     pub fn get_parsing_stats(tree: &TypeTree) -> ParsingStats {
-        let mut total_nodes = 0;
-        let mut max_depth = 0;
-        let mut primitive_count = 0;
-        let mut array_count = 0;
+        let mut stats = (0usize, 0i32, 0usize, 0usize); // (total_nodes, max_depth, primitive_count, array_count)
 
         fn count_nodes(node: &TypeTreeNode, depth: i32, stats: &mut (usize, i32, usize, usize)) {
             stats.0 += 1; // total_nodes
@@ -312,22 +309,16 @@ impl TypeTreeParser {
             }
         }
 
-        let mut stats = (0, 0, 0, 0);
         for node in &tree.nodes {
             count_nodes(node, 0, &mut stats);
         }
 
-        total_nodes = stats.0;
-        max_depth = stats.1;
-        primitive_count = stats.2;
-        array_count = stats.3;
-
         ParsingStats {
-            total_nodes,
+            total_nodes: stats.0,
             root_nodes: tree.nodes.len(),
-            max_depth,
-            primitive_count,
-            array_count,
+            max_depth: stats.1,
+            primitive_count: stats.2,
+            array_count: stats.3,
             string_buffer_size: tree.string_buffer.len(),
             version: tree.version,
         }

@@ -227,7 +227,7 @@ impl TypeTreeBuilder {
 
     /// Validate the built TypeTree
     pub fn validate(&self) -> Result<()> {
-        self.tree.validate().map_err(|e| BinaryError::generic(e))
+        self.tree.validate().map_err(BinaryError::generic)
     }
 
     /// Build and return the TypeTree

@@ -238,7 +238,7 @@ impl AudioDecoder {
                                 if ch < buf.spec().channels.count() {
                                     let channel_samples = buf.chan(ch);
                                     for &sample in channel_samples {
-                                        let value = sample.inner() as i32;
+                                        let value = sample.inner();
                                         let normalized = value as f32 / 8388608.0;
                                         samples.push(normalized);
                                     }

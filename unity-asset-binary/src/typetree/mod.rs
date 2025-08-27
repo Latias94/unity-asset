@@ -141,7 +141,7 @@ impl TypeTreeProcessor {
     pub fn parsing_stats(&self) -> Option<ParsingStats> {
         self.tree
             .as_ref()
-            .map(|tree| TypeTreeParser::get_parsing_stats(tree))
+            .map(TypeTreeParser::get_parsing_stats)
     }
 
     /// Clear the loaded TypeTree
@@ -172,7 +172,6 @@ impl Default for TypeTreeProcessor {
 }
 
 /// Convenience functions for common operations
-
 /// Create a TypeTree processor with default settings
 pub fn create_processor() -> TypeTreeProcessor {
     TypeTreeProcessor::default()

@@ -217,17 +217,15 @@ impl SpriteParser {
     ) -> Result<()> {
         if let UnityValue::Object(rd_obj) = render_data_value {
             // Extract texture reference
-            if let Some(texture_value) = rd_obj.get("texture") {
-                if let UnityValue::Object(texture_obj) = texture_value {
-                    if let Some(UnityValue::Integer(file_id)) = texture_obj.get("m_FileID") {
+            if let Some(texture_value) = rd_obj.get("texture")
+                && let UnityValue::Object(texture_obj) = texture_value
+                    && let Some(UnityValue::Integer(file_id)) = texture_obj.get("m_FileID") {
                         sprite.render_data.texture_path_id = *file_id;
                     }
-                }
-            }
 
             // Extract texture rect
-            if let Some(texture_rect_value) = rd_obj.get("textureRect") {
-                if let UnityValue::Object(rect_obj) = texture_rect_value {
+            if let Some(texture_rect_value) = rd_obj.get("textureRect")
+                && let UnityValue::Object(rect_obj) = texture_rect_value {
                     if let Some(UnityValue::Float(x)) = rect_obj.get("x") {
                         sprite.render_data.texture_rect_x = *x as f32;
                     }
@@ -241,7 +239,6 @@ impl SpriteParser {
                         sprite.render_data.texture_rect_height = *height as f32;
                     }
                 }
-            }
 
             // Extract other render data fields
             if let Some(UnityValue::Float(downscale)) = rd_obj.get("downscaleMultiplier") {
@@ -270,11 +267,10 @@ impl SpriteParser {
         sprite: &mut Sprite,
         sprite_atlas_value: &UnityValue,
     ) -> Result<()> {
-        if let UnityValue::Object(atlas_obj) = sprite_atlas_value {
-            if let Some(UnityValue::Integer(path_id)) = atlas_obj.get("m_PathID") {
+        if let UnityValue::Object(atlas_obj) = sprite_atlas_value
+            && let Some(UnityValue::Integer(path_id)) = atlas_obj.get("m_PathID") {
                 sprite.sprite_atlas_path_id = Some(*path_id);
             }
-        }
         Ok(())
     }
 

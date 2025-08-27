@@ -40,15 +40,14 @@ impl MeshProcessor {
         let mut result = self.parser.parse_from_unity_object(object)?;
 
         // Apply configuration-based processing
-        if let Some(max_vertices) = self.config.max_vertex_count {
-            if result.mesh.vertex_count() > max_vertices {
+        if let Some(max_vertices) = self.config.max_vertex_count
+            && result.mesh.vertex_count() > max_vertices {
                 result.add_warning(format!(
                     "Mesh has {} vertices, exceeding limit of {}",
                     result.mesh.vertex_count(),
                     max_vertices
                 ));
             }
-        }
 
         // Validate mesh if needed
         if let Err(e) = self.validate_mesh(&result.mesh) {
@@ -82,15 +81,14 @@ impl MeshProcessor {
         }
 
         // Check vertex count limits
-        if let Some(max_vertices) = self.config.max_vertex_count {
-            if mesh.vertex_count() > max_vertices {
+        if let Some(max_vertices) = self.config.max_vertex_count
+            && mesh.vertex_count() > max_vertices {
                 return Err(crate::error::BinaryError::invalid_data(format!(
                     "Mesh vertex count {} exceeds limit {}",
                     mesh.vertex_count(),
                     max_vertices
                 )));
             }
-        }
 
         Ok(())
     }
@@ -104,24 +102,24 @@ impl MeshProcessor {
         obj_data.push_str(&format!("# Mesh: {}\n", mesh.name));
         obj_data.push_str(&format!("# Vertices: {}\n", mesh.vertex_count()));
         obj_data.push_str(&format!("# SubMeshes: {}\n", mesh.sub_meshes.len()));
-        obj_data.push_str("\n");
+        obj_data.push('\n');
 
         // Export vertices (placeholder - would need actual vertex data parsing)
         obj_data.push_str("# Vertices\n");
         for _i in 0..mesh.vertex_count() {
-            obj_data.push_str(&format!("v 0.0 0.0 0.0\n"));
+            obj_data.push_str("v 0.0 0.0 0.0\n");
         }
 
         // Export normals (placeholder)
         obj_data.push_str("\n# Normals\n");
         for _i in 0..mesh.vertex_count() {
-            obj_data.push_str(&format!("vn 0.0 1.0 0.0\n"));
+            obj_data.push_str("vn 0.0 1.0 0.0\n");
         }
 
         // Export UV coordinates (placeholder)
         obj_data.push_str("\n# UV Coordinates\n");
         for _i in 0..mesh.vertex_count() {
-            obj_data.push_str(&format!("vt 0.0 0.0\n"));
+            obj_data.push_str("vt 0.0 0.0\n");
         }
 
         // Export faces (placeholder)
