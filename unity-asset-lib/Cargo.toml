@@ -11,7 +11,13 @@ readme = "../README.md"
 keywords = ["unity", "assets", "parser", "game", "yaml"]
 categories = ["parsing", "game-development"]
 exclude = [
+    "tests/fixtures/*",
     "tests/samples/*",
+    "*.ab",
+    "*.unity",
+    "*.asset",
+    "*.prefab",
+    "*.meta",
 ]
 
 [dependencies]

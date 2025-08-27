@@ -10,7 +10,13 @@ documentation = "https://docs.rs/unity-asset-cli"
 keywords = ["unity", "assets", "cli", "parser", "game"]
 categories = ["command-line-utilities", "parsing", "game-development"]
 exclude = [
+    "tests/fixtures/*",
     "tests/samples/*",
+    "*.ab",
+    "*.unity",
+    "*.asset",
+    "*.prefab",
+    "*.meta",
 ]
 
 [[bin]]
@@ -33,7 +39,7 @@ anyhow = { workspace = true }
 # Async CLI dependencies (optional)
 tokio = { version = "1.0", features = ["fs", "io-util", "rt-multi-thread", "macros"], optional = true }
 futures = { version = "0.3", optional = true }
-indicatif = { version = "0.17", optional = true }
+indicatif = { version = "0.18", optional = true }
 
 [features]
 default = []

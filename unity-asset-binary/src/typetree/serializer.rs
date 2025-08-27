@@ -360,7 +360,7 @@ impl<'a> TypeTreeSerializer<'a> {
                 if !child.name.is_empty()
                     && let Some(value) = data.get(&child.name)
                 {
-                    size += self.estimate_value_size(value, child);
+                    size += Self::estimate_value_size(value, child);
                 }
             }
         }
@@ -369,7 +369,7 @@ impl<'a> TypeTreeSerializer<'a> {
     }
 
     /// Estimate size of a single value
-    fn estimate_value_size(&self, value: &UnityValue, node: &TypeTreeNode) -> usize {
+    fn estimate_value_size(value: &UnityValue, node: &TypeTreeNode) -> usize {
         match node.type_name.as_str() {
             "SInt8" | "UInt8" | "char" | "bool" => 4, // Including alignment
             "SInt16" | "UInt16" | "short" | "unsigned short" => 4, // Including alignment
@@ -389,7 +389,7 @@ impl<'a> TypeTreeSerializer<'a> {
                         && let Some(element_node) = array_node.children.get(1)
                     {
                         for element in elements {
-                            size += self.estimate_value_size(element, element_node);
+                            size += Self::estimate_value_size(element, element_node);
                         }
                     }
                     size
@@ -405,7 +405,7 @@ impl<'a> TypeTreeSerializer<'a> {
                         if !child.name.is_empty()
                             && let Some(child_value) = obj.get(&child.name)
                         {
-                            size += self.estimate_value_size(child_value, child);
+                            size += Self::estimate_value_size(child_value, child);
                         }
                     }
                     size

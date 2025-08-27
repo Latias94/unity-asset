@@ -157,9 +157,10 @@ impl MeshProcessor {
 
     /// Get mesh statistics
     pub fn get_mesh_stats(&self, meshes: &[&Mesh]) -> MeshStats {
-        let mut stats = MeshStats::default();
-
-        stats.total_meshes = meshes.len();
+        let mut stats = MeshStats {
+            total_meshes: meshes.len(),
+            ..Default::default()
+        };
 
         for mesh in meshes {
             stats.total_vertices += mesh.vertex_count();

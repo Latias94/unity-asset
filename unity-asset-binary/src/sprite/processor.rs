@@ -159,8 +159,10 @@ impl SpriteProcessor {
             return Err(BinaryError::unsupported("Atlas processing is disabled"));
         }
 
-        let mut atlas = SpriteAtlas::default();
-        atlas.name = "SpriteAtlas".to_string();
+        let mut atlas = SpriteAtlas {
+            name: "SpriteAtlas".to_string(),
+            ..Default::default()
+        };
 
         for sprite_obj in atlas_sprites {
             let sprite_result = self.parse_sprite(sprite_obj)?;
@@ -272,9 +274,10 @@ impl SpriteProcessor {
 
     /// Get sprite statistics
     pub fn get_sprite_stats(&self, sprites: &[&Sprite]) -> SpriteStats {
-        let mut stats = SpriteStats::default();
-
-        stats.total_sprites = sprites.len();
+        let mut stats = SpriteStats {
+            total_sprites: sprites.len(),
+            ..Default::default()
+        };
 
         for sprite in sprites {
             stats.total_area += sprite.get_area();

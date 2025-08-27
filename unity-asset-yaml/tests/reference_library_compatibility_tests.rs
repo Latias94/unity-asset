@@ -49,22 +49,17 @@ fn test_inverted_scalar_loading() {
                     );
 
                     // Check first item for inverted scalar
-                    if let Some(UnityValue::Object(first_item)) = platform_data.first() {
-                        if let Some(UnityValue::Object(first)) = first_item.get("first") {
-                            // The key ": Any" should map to null (inverted scalar)
-                            if let Some(any_value) = first.get("Any") {
-                                match any_value {
-                                    UnityValue::Null => {
-                                        println!(
-                                            "  ✓ Inverted scalar 'Any:' correctly parsed as null"
-                                        );
-                                    }
-                                    other => {
-                                        println!(
-                                            "  ⚠ Inverted scalar 'Any:' parsed as: {:?}",
-                                            other
-                                        );
-                                    }
+                    if let Some(UnityValue::Object(first_item)) = platform_data.first()
+                        && let Some(UnityValue::Object(first)) = first_item.get("first")
+                    {
+                        // The key ": Any" should map to null (inverted scalar)
+                        if let Some(any_value) = first.get("Any") {
+                            match any_value {
+                                UnityValue::Null => {
+                                    println!("  ✓ Inverted scalar 'Any:' correctly parsed as null");
+                                }
+                                other => {
+                                    println!("  ⚠ Inverted scalar 'Any:' parsed as: {:?}", other);
                                 }
                             }
                         }
@@ -140,32 +135,32 @@ fn test_scalar_value_types() {
                 }
 
                 // Check map types
-                if key.starts_with("map_") {
-                    if let UnityValue::Object(map) = value {
-                        for (map_key, map_value) in map {
-                            if map_key.starts_with("scalar_") {
-                                let parts: Vec<&str> = map_key.split('_').collect();
-                                if parts.len() >= 2 {
-                                    let expected_type = parts[1];
-                                    match (expected_type, map_value) {
-                                        ("int", UnityValue::Integer(_)) => {
-                                            *type_counts.get_mut("int").unwrap() += 1;
-                                            println!("    ✓ {}[{}]: Integer", key, map_key);
-                                        }
-                                        ("str", UnityValue::String(_)) => {
-                                            *type_counts.get_mut("str").unwrap() += 1;
-                                            println!("    ✓ {}[{}]: String", key, map_key);
-                                        }
-                                        ("float", UnityValue::Float(_)) => {
-                                            *type_counts.get_mut("float").unwrap() += 1;
-                                            println!("    ✓ {}[{}]: Float", key, map_key);
-                                        }
-                                        (expected, actual) => {
-                                            println!(
-                                                "    ⚠ {}[{}]: Expected {}, got {:?}",
-                                                key, map_key, expected, actual
-                                            );
-                                        }
+                if key.starts_with("map_")
+                    && let UnityValue::Object(map) = value
+                {
+                    for (map_key, map_value) in map {
+                        if map_key.starts_with("scalar_") {
+                            let parts: Vec<&str> = map_key.split('_').collect();
+                            if parts.len() >= 2 {
+                                let expected_type = parts[1];
+                                match (expected_type, map_value) {
+                                    ("int", UnityValue::Integer(_)) => {
+                                        *type_counts.get_mut("int").unwrap() += 1;
+                                        println!("    ✓ {}[{}]: Integer", key, map_key);
+                                    }
+                                    ("str", UnityValue::String(_)) => {
+                                        *type_counts.get_mut("str").unwrap() += 1;
+                                        println!("    ✓ {}[{}]: String", key, map_key);
+                                    }
+                                    ("float", UnityValue::Float(_)) => {
+                                        *type_counts.get_mut("float").unwrap() += 1;
+                                        println!("    ✓ {}[{}]: Float", key, map_key);
+                                    }
+                                    (expected, actual) => {
+                                        println!(
+                                            "    ⚠ {}[{}]: Expected {}, got {:?}",
+                                            key, map_key, expected, actual
+                                        );
                                     }
                                 }
                             }

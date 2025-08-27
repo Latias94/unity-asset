@@ -94,6 +94,7 @@ impl MeshParser {
     }
 
     /// Parse Mesh from raw binary data (fallback method)
+    #[allow(clippy::field_reassign_with_default)]
     pub fn parse_from_binary_data(&self, data: &[u8]) -> Result<Mesh> {
         let mut reader = BinaryReader::new(data, crate::reader::ByteOrder::Little);
         let mut mesh = Mesh::default();
@@ -303,10 +304,10 @@ impl MeshParser {
                     let mut matrix = [0.0f32; 16];
 
                     // Extract matrix elements (simplified)
-                    for i in 0..16 {
+                    for (i, matrix_element) in matrix.iter_mut().enumerate() {
                         let key = format!("e{:02}", i);
                         if let Some(UnityValue::Float(val)) = matrix_obj.get(&key) {
-                            matrix[i] = *val as f32;
+                            *matrix_element = *val as f32;
                         }
                     }
 

@@ -17,6 +17,8 @@ pub enum CompressionType {
     Lz4Hc = 3,
     /// LZHAM compression
     Lzham = 4,
+    /// Brotli compression (WebGL builds)
+    Brotli = 5,
 }
 
 impl CompressionType {
@@ -28,6 +30,7 @@ impl CompressionType {
             2 => Ok(CompressionType::Lz4),
             3 => Ok(CompressionType::Lz4Hc),
             4 => Ok(CompressionType::Lzham),
+            5 => Ok(CompressionType::Brotli),
             other => Err(BinaryError::unsupported_compression(format!(
                 "Unknown compression type: {}",
                 other
@@ -43,6 +46,7 @@ impl CompressionType {
                 | CompressionType::Lz4
                 | CompressionType::Lz4Hc
                 | CompressionType::Lzma
+                | CompressionType::Brotli
         )
     }
 
@@ -54,6 +58,7 @@ impl CompressionType {
             CompressionType::Lz4 => "LZ4",
             CompressionType::Lz4Hc => "LZ4HC",
             CompressionType::Lzham => "LZHAM",
+            CompressionType::Brotli => "Brotli",
         }
     }
 }
@@ -82,6 +87,10 @@ pub fn decompress(
             Err(BinaryError::unsupported_compression(
                 "LZHAM compression not yet supported",
             ))
+        }
+        CompressionType::Brotli => {
+            // Brotli decompression
+            decompress_brotli(data)
         }
     }
 }
@@ -563,7 +572,7 @@ fn try_xz2_lzma(data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
         match decoder.read_to_end(&mut output) {
             Ok(_) => {
                 let size_ratio = output.len() as f64 / uncompressed_size as f64;
-                if size_ratio >= 0.8 && size_ratio <= 1.2 || output.len() == uncompressed_size {
+                if (0.8..=1.2).contains(&size_ratio) || output.len() == uncompressed_size {
                     return Ok(output);
                 }
             }

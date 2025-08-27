@@ -157,7 +157,7 @@ impl DependencyAnalyzer {
         for &node in &graph.nodes {
             if !visited.contains(&node) {
                 let mut path = Vec::new();
-                self.dfs_detect_cycle(
+                Self::dfs_detect_cycle(
                     node,
                     &adj_list,
                     &mut visited,
@@ -173,7 +173,6 @@ impl DependencyAnalyzer {
 
     /// DFS helper for cycle detection
     fn dfs_detect_cycle(
-        &self,
         node: i64,
         adj_list: &HashMap<i64, Vec<i64>>,
         visited: &mut HashSet<i64>,
@@ -188,7 +187,7 @@ impl DependencyAnalyzer {
         if let Some(neighbors) = adj_list.get(&node) {
             for &neighbor in neighbors {
                 if !visited.contains(&neighbor) {
-                    self.dfs_detect_cycle(neighbor, adj_list, visited, rec_stack, path, cycles);
+                    Self::dfs_detect_cycle(neighbor, adj_list, visited, rec_stack, path, cycles);
                 } else if rec_stack.contains(&neighbor) {
                     // Found a cycle
                     if let Some(cycle_start) = path.iter().position(|&x| x == neighbor) {
@@ -300,10 +299,11 @@ impl RelationshipAnalyzer {
     }
 
     /// Analyze GameObject hierarchy (simplified implementation)
+    #[allow(dead_code)]
     fn analyze_gameobject_hierarchy(
         &mut self,
         gameobject: &crate::asset::ObjectInfo,
-        _transforms: &Vec<&crate::asset::ObjectInfo>,
+        _transforms: &[&crate::asset::ObjectInfo],
     ) -> Result<GameObjectHierarchy> {
         // TODO: Implement proper GameObject hierarchy analysis
         // This would require parsing the GameObject's serialized data

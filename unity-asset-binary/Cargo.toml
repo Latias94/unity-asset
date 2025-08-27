@@ -9,7 +9,15 @@ repository = "https://github.com/Latias94/unity-asset"
 documentation = "https://docs.rs/unity-asset-binary"
 keywords = ["unity", "binary", "assetbundle", "serialized", "parser"]
 categories = ["parser-implementations", "game-development"]
-exclude = ["tests/samples/*"]
+exclude = [
+    "tests/samples/*",
+    "tests/fixtures/*",
+    "*.ab",
+    "*.unity",
+    "*.asset",
+    "*.prefab",
+    "*.meta",
+]
 
 [dependencies]
 # Core dependencies
@@ -48,7 +56,7 @@ image = { workspace = true }
 # Audio processing (optional)
 symphonia = { version = "0.5", features = ["all"], optional = true }
 hound = { version = "3.5", optional = true }
-base64 = "0.21"
+base64 = "0.22"
 
 # Advanced texture decoding (optional)
 texture2ddecoder = { version = "0.1", optional = true }

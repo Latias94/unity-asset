@@ -260,11 +260,13 @@ mod tests {
 
     #[test]
     fn test_header_validation() {
-        let mut header = SerializedFileHeader::default();
-        header.version = 19;
-        header.file_size = 1000;
-        header.data_offset = 100;
-        header.metadata_size = 50;
+        let header = SerializedFileHeader {
+            version: 19,
+            file_size: 1000,
+            data_offset: 100,
+            metadata_size: 50,
+            ..Default::default()
+        };
 
         assert!(header.is_valid());
         assert!(header.validate().is_ok());
@@ -272,16 +274,20 @@ mod tests {
 
     #[test]
     fn test_byte_order() {
-        let mut header = SerializedFileHeader::default();
+        #[allow(clippy::field_reassign_with_default)]
+        {
+            let mut header = SerializedFileHeader::default();
 
-        header.endian = 0;
-        assert_eq!(header.byte_order(), ByteOrder::Little);
+            header.endian = 0;
+            assert_eq!(header.byte_order(), ByteOrder::Little);
 
-        header.endian = 1;
-        assert_eq!(header.byte_order(), ByteOrder::Big);
+            header.endian = 1;
+            assert_eq!(header.byte_order(), ByteOrder::Big);
+        }
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_version_features() {
         let mut header = SerializedFileHeader::default();
 

@@ -30,11 +30,12 @@ impl AudioClipConverter {
     pub fn from_unity_object(&self, obj: &UnityObject) -> Result<AudioClip> {
         // For now, use a simplified approach similar to the texture implementation
         // TODO: Implement proper TypeTree parsing when available
-        self.from_binary_data(&obj.info.data)
+        self.parse_binary_data(&obj.info.data)
     }
 
     /// Parse AudioClip from raw binary data (simplified version)
-    fn from_binary_data(&self, data: &[u8]) -> Result<AudioClip> {
+    #[allow(clippy::field_reassign_with_default)]
+    fn parse_binary_data(&self, data: &[u8]) -> Result<AudioClip> {
         if data.is_empty() {
             return Err(BinaryError::invalid_data("Empty audio data"));
         }

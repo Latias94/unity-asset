@@ -99,6 +99,7 @@ impl SpriteParser {
     }
 
     /// Parse Sprite from raw binary data (fallback method)
+    #[allow(clippy::field_reassign_with_default)]
     pub fn parse_from_binary_data(&self, data: &[u8]) -> Result<Sprite> {
         let mut reader = BinaryReader::new(data, crate::reader::ByteOrder::Little);
         let mut sprite = Sprite::default();

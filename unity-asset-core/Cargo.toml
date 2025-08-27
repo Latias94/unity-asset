@@ -9,7 +9,15 @@ repository = "https://github.com/Latias94/unity-asset"
 documentation = "https://docs.rs/unity-asset-core"
 keywords = ["unity", "assets", "core", "game"]
 categories = ["parsing", "game-development"]
-exclude = ["tests/samples/*"]
+exclude = [
+    "tests/fixtures/*",
+    "tests/samples/*",
+    "*.ab",
+    "*.unity",
+    "*.asset",
+    "*.prefab",
+    "*.meta",
+]
 
 [dependencies]
 serde = { workspace = true }
