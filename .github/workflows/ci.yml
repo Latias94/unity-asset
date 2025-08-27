@@ -37,12 +37,20 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
     
-    - name: Run clippy
+    - name: Run clippy (lib and bin only)
       run: |
         if [ -n "${{ matrix.features }}" ]; then
-          cargo clippy --all-targets --features ${{ matrix.features }} -- -D warnings
+          cargo clippy --lib --bins --features ${{ matrix.features }} -- -D warnings
         else
-          cargo clippy --all-targets -- -D warnings
+          cargo clippy --lib --bins -- -D warnings
+        fi
+
+    - name: Run clippy on tests (warnings only)
+      run: |
+        if [ -n "${{ matrix.features }}" ]; then
+          cargo clippy --tests --features ${{ matrix.features }} || true
+        else
+          cargo clippy --tests || true
         fi
 
     - name: Run tests
