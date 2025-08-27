@@ -68,9 +68,10 @@ impl UnityClassIdMap {
 
         // Try to read first
         if let Ok(map) = self.map.read()
-            && let Some(existing) = map.get(&key) {
-                return existing.clone();
-            }
+            && let Some(existing) = map.get(&key)
+        {
+            return existing.clone();
+        }
 
         // Need to write
         if let Ok(mut map) = self.map.write() {

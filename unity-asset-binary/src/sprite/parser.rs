@@ -219,26 +219,28 @@ impl SpriteParser {
             // Extract texture reference
             if let Some(texture_value) = rd_obj.get("texture")
                 && let UnityValue::Object(texture_obj) = texture_value
-                    && let Some(UnityValue::Integer(file_id)) = texture_obj.get("m_FileID") {
-                        sprite.render_data.texture_path_id = *file_id;
-                    }
+                && let Some(UnityValue::Integer(file_id)) = texture_obj.get("m_FileID")
+            {
+                sprite.render_data.texture_path_id = *file_id;
+            }
 
             // Extract texture rect
             if let Some(texture_rect_value) = rd_obj.get("textureRect")
-                && let UnityValue::Object(rect_obj) = texture_rect_value {
-                    if let Some(UnityValue::Float(x)) = rect_obj.get("x") {
-                        sprite.render_data.texture_rect_x = *x as f32;
-                    }
-                    if let Some(UnityValue::Float(y)) = rect_obj.get("y") {
-                        sprite.render_data.texture_rect_y = *y as f32;
-                    }
-                    if let Some(UnityValue::Float(width)) = rect_obj.get("width") {
-                        sprite.render_data.texture_rect_width = *width as f32;
-                    }
-                    if let Some(UnityValue::Float(height)) = rect_obj.get("height") {
-                        sprite.render_data.texture_rect_height = *height as f32;
-                    }
+                && let UnityValue::Object(rect_obj) = texture_rect_value
+            {
+                if let Some(UnityValue::Float(x)) = rect_obj.get("x") {
+                    sprite.render_data.texture_rect_x = *x as f32;
                 }
+                if let Some(UnityValue::Float(y)) = rect_obj.get("y") {
+                    sprite.render_data.texture_rect_y = *y as f32;
+                }
+                if let Some(UnityValue::Float(width)) = rect_obj.get("width") {
+                    sprite.render_data.texture_rect_width = *width as f32;
+                }
+                if let Some(UnityValue::Float(height)) = rect_obj.get("height") {
+                    sprite.render_data.texture_rect_height = *height as f32;
+                }
+            }
 
             // Extract other render data fields
             if let Some(UnityValue::Float(downscale)) = rd_obj.get("downscaleMultiplier") {
@@ -268,9 +270,10 @@ impl SpriteParser {
         sprite_atlas_value: &UnityValue,
     ) -> Result<()> {
         if let UnityValue::Object(atlas_obj) = sprite_atlas_value
-            && let Some(UnityValue::Integer(path_id)) = atlas_obj.get("m_PathID") {
-                sprite.sprite_atlas_path_id = Some(*path_id);
-            }
+            && let Some(UnityValue::Integer(path_id)) = atlas_obj.get("m_PathID")
+        {
+            sprite.sprite_atlas_path_id = Some(*path_id);
+        }
         Ok(())
     }
 

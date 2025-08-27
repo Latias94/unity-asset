@@ -265,15 +265,13 @@ impl SpriteResult {
 }
 
 /// Sprite atlas information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SpriteAtlas {
     pub name: String,
     pub texture_path_id: i64,
     pub sprites: Vec<SpriteInfo>,
     pub packed_sprites: Vec<String>,
 }
-
 
 /// Helper functions for sprite types
 impl Sprite {

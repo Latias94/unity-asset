@@ -61,8 +61,7 @@ impl Default for AudioClipMeta {
 ///
 /// This structure contains all the data needed to represent a Unity AudioClip object.
 /// It includes both metadata and the actual audio data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AudioClip {
     pub name: String,
     pub meta: AudioClipMeta,
@@ -75,7 +74,6 @@ pub struct AudioClip {
     // Version-specific fields
     pub ambisonic: Option<bool>,
 }
-
 
 impl AudioClip {
     /// Create a new AudioClip with basic parameters

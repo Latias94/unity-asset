@@ -139,9 +139,7 @@ impl TypeTreeProcessor {
 
     /// Get parsing statistics
     pub fn parsing_stats(&self) -> Option<ParsingStats> {
-        self.tree
-            .as_ref()
-            .map(TypeTreeParser::get_parsing_stats)
+        self.tree.as_ref().map(TypeTreeParser::get_parsing_stats)
     }
 
     /// Clear the loaded TypeTree

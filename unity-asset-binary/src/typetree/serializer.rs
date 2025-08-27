@@ -218,9 +218,10 @@ impl<'a> TypeTreeSerializer<'a> {
         if let Some(root) = self.tree.nodes.first() {
             for child in &root.children {
                 if !child.name.is_empty()
-                    && let Some(value) = data.get(&child.name) {
-                        self.serialize_value(&mut buffer, value, child)?;
-                    }
+                    && let Some(value) = data.get(&child.name)
+                {
+                    self.serialize_value(&mut buffer, value, child)?;
+                }
             }
         }
 
@@ -311,11 +312,12 @@ impl<'a> TypeTreeSerializer<'a> {
 
                     // Find element type
                     if let Some(array_node) = node.children.iter().find(|c| c.type_name == "Array")
-                        && let Some(element_node) = array_node.children.get(1) {
-                            for element in elements {
-                                self.serialize_value(buffer, element, element_node)?;
-                            }
+                        && let Some(element_node) = array_node.children.get(1)
+                    {
+                        for element in elements {
+                            self.serialize_value(buffer, element, element_node)?;
                         }
+                    }
                 }
             }
             _ => {
@@ -323,9 +325,10 @@ impl<'a> TypeTreeSerializer<'a> {
                 if let UnityValue::Object(obj) = value {
                     for child in &node.children {
                         if !child.name.is_empty()
-                            && let Some(child_value) = obj.get(&child.name) {
-                                self.serialize_value(buffer, child_value, child)?;
-                            }
+                            && let Some(child_value) = obj.get(&child.name)
+                        {
+                            self.serialize_value(buffer, child_value, child)?;
+                        }
                     }
                 }
             }
@@ -355,9 +358,10 @@ impl<'a> TypeTreeSerializer<'a> {
         if let Some(root) = self.tree.nodes.first() {
             for child in &root.children {
                 if !child.name.is_empty()
-                    && let Some(value) = data.get(&child.name) {
-                        size += self.estimate_value_size(value, child);
-                    }
+                    && let Some(value) = data.get(&child.name)
+                {
+                    size += self.estimate_value_size(value, child);
+                }
             }
         }
 
@@ -382,11 +386,12 @@ impl<'a> TypeTreeSerializer<'a> {
                 if let UnityValue::Array(elements) = value {
                     let mut size = 4; // Array size
                     if let Some(array_node) = node.children.iter().find(|c| c.type_name == "Array")
-                        && let Some(element_node) = array_node.children.get(1) {
-                            for element in elements {
-                                size += self.estimate_value_size(element, element_node);
-                            }
+                        && let Some(element_node) = array_node.children.get(1)
+                    {
+                        for element in elements {
+                            size += self.estimate_value_size(element, element_node);
                         }
+                    }
                     size
                 } else {
                     4
@@ -398,9 +403,10 @@ impl<'a> TypeTreeSerializer<'a> {
                     let mut size = 0;
                     for child in &node.children {
                         if !child.name.is_empty()
-                            && let Some(child_value) = obj.get(&child.name) {
-                                size += self.estimate_value_size(child_value, child);
-                            }
+                            && let Some(child_value) = obj.get(&child.name)
+                        {
+                            size += self.estimate_value_size(child_value, child);
+                        }
                     }
                     size
                 } else {

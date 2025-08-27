@@ -165,14 +165,15 @@ impl MeshParser {
 
             // Extract data size
             if let Some(data_size_value) = vertex_data_obj.get("m_DataSize")
-                && let UnityValue::Array(data_array) = data_size_value {
-                    mesh.vertex_data.data_size.clear();
-                    for data_item in data_array {
-                        if let UnityValue::Integer(byte_val) = data_item {
-                            mesh.vertex_data.data_size.push(*byte_val as u8);
-                        }
+                && let UnityValue::Array(data_array) = data_size_value
+            {
+                mesh.vertex_data.data_size.clear();
+                for data_item in data_array {
+                    if let UnityValue::Integer(byte_val) = data_item {
+                        mesh.vertex_data.data_size.push(*byte_val as u8);
                     }
                 }
+            }
         }
         Ok(())
     }
@@ -232,31 +233,33 @@ impl MeshParser {
         if let UnityValue::Object(aabb_obj) = value {
             // Extract center
             if let Some(center_value) = aabb_obj.get("m_Center")
-                && let UnityValue::Object(center_obj) = center_value {
-                    if let Some(UnityValue::Float(x)) = center_obj.get("x") {
-                        mesh.local_aabb.center_x = *x as f32;
-                    }
-                    if let Some(UnityValue::Float(y)) = center_obj.get("y") {
-                        mesh.local_aabb.center_y = *y as f32;
-                    }
-                    if let Some(UnityValue::Float(z)) = center_obj.get("z") {
-                        mesh.local_aabb.center_z = *z as f32;
-                    }
+                && let UnityValue::Object(center_obj) = center_value
+            {
+                if let Some(UnityValue::Float(x)) = center_obj.get("x") {
+                    mesh.local_aabb.center_x = *x as f32;
                 }
+                if let Some(UnityValue::Float(y)) = center_obj.get("y") {
+                    mesh.local_aabb.center_y = *y as f32;
+                }
+                if let Some(UnityValue::Float(z)) = center_obj.get("z") {
+                    mesh.local_aabb.center_z = *z as f32;
+                }
+            }
 
             // Extract extent
             if let Some(extent_value) = aabb_obj.get("m_Extent")
-                && let UnityValue::Object(extent_obj) = extent_value {
-                    if let Some(UnityValue::Float(x)) = extent_obj.get("x") {
-                        mesh.local_aabb.extent_x = *x as f32;
-                    }
-                    if let Some(UnityValue::Float(y)) = extent_obj.get("y") {
-                        mesh.local_aabb.extent_y = *y as f32;
-                    }
-                    if let Some(UnityValue::Float(z)) = extent_obj.get("z") {
-                        mesh.local_aabb.extent_z = *z as f32;
-                    }
+                && let UnityValue::Object(extent_obj) = extent_value
+            {
+                if let Some(UnityValue::Float(x)) = extent_obj.get("x") {
+                    mesh.local_aabb.extent_x = *x as f32;
                 }
+                if let Some(UnityValue::Float(y)) = extent_obj.get("y") {
+                    mesh.local_aabb.extent_y = *y as f32;
+                }
+                if let Some(UnityValue::Float(z)) = extent_obj.get("z") {
+                    mesh.local_aabb.extent_z = *z as f32;
+                }
+            }
         }
         Ok(())
     }

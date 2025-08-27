@@ -12,8 +12,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Contains metadata about the bundle including version, compression settings,
 /// and structural information needed for parsing the bundle contents.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BundleHeader {
     /// Bundle signature (e.g., "UnityFS", "UnityWeb", "UnityRaw")
     pub signature: String,
@@ -34,7 +33,6 @@ pub struct BundleHeader {
     /// Actual header size (recorded during parsing)
     pub actual_header_size: u64,
 }
-
 
 impl BundleHeader {
     /// Parse bundle header from binary data

@@ -41,13 +41,14 @@ impl MeshProcessor {
 
         // Apply configuration-based processing
         if let Some(max_vertices) = self.config.max_vertex_count
-            && result.mesh.vertex_count() > max_vertices {
-                result.add_warning(format!(
-                    "Mesh has {} vertices, exceeding limit of {}",
-                    result.mesh.vertex_count(),
-                    max_vertices
-                ));
-            }
+            && result.mesh.vertex_count() > max_vertices
+        {
+            result.add_warning(format!(
+                "Mesh has {} vertices, exceeding limit of {}",
+                result.mesh.vertex_count(),
+                max_vertices
+            ));
+        }
 
         // Validate mesh if needed
         if let Err(e) = self.validate_mesh(&result.mesh) {
@@ -82,13 +83,14 @@ impl MeshProcessor {
 
         // Check vertex count limits
         if let Some(max_vertices) = self.config.max_vertex_count
-            && mesh.vertex_count() > max_vertices {
-                return Err(crate::error::BinaryError::invalid_data(format!(
-                    "Mesh vertex count {} exceeds limit {}",
-                    mesh.vertex_count(),
-                    max_vertices
-                )));
-            }
+            && mesh.vertex_count() > max_vertices
+        {
+            return Err(crate::error::BinaryError::invalid_data(format!(
+                "Mesh vertex count {} exceeds limit {}",
+                mesh.vertex_count(),
+                max_vertices
+            )));
+        }
 
         Ok(())
     }

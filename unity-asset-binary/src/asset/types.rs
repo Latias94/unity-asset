@@ -152,8 +152,7 @@ impl SerializedType {
 ///
 /// Represents a reference to an asset in another Unity file,
 /// used for cross-file asset dependencies.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileIdentifier {
     /// GUID of the referenced file
     pub guid: [u8; 16],
@@ -209,7 +208,6 @@ impl FileIdentifier {
         )
     }
 }
-
 
 /// Object information within a SerializedFile
 ///

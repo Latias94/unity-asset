@@ -113,31 +113,33 @@ impl MetadataProcessor {
 
         // Enhanced dependency analysis if analyzer is available
         if let Some(ref mut analyzer) = self.dependency_analyzer
-            && self.extractor.config().include_dependencies {
-                let objects: Vec<&crate::asset::ObjectInfo> = asset.objects.iter().collect();
-                match analyzer.analyze_dependencies(&objects) {
-                    Ok(deps) => {
-                        result.metadata.dependencies = deps;
-                    }
-                    Err(e) => {
-                        result.add_warning(format!("Enhanced dependency analysis failed: {}", e));
-                    }
+            && self.extractor.config().include_dependencies
+        {
+            let objects: Vec<&crate::asset::ObjectInfo> = asset.objects.iter().collect();
+            match analyzer.analyze_dependencies(&objects) {
+                Ok(deps) => {
+                    result.metadata.dependencies = deps;
+                }
+                Err(e) => {
+                    result.add_warning(format!("Enhanced dependency analysis failed: {}", e));
                 }
             }
+        }
 
         // Enhanced relationship analysis if analyzer is available
         if let Some(ref mut analyzer) = self.relationship_analyzer
-            && self.extractor.config().include_hierarchy {
-                let objects: Vec<&crate::asset::ObjectInfo> = asset.objects.iter().collect();
-                match analyzer.analyze_relationships(&objects) {
-                    Ok(rels) => {
-                        result.metadata.relationships = rels;
-                    }
-                    Err(e) => {
-                        result.add_warning(format!("Enhanced relationship analysis failed: {}", e));
-                    }
+            && self.extractor.config().include_hierarchy
+        {
+            let objects: Vec<&crate::asset::ObjectInfo> = asset.objects.iter().collect();
+            match analyzer.analyze_relationships(&objects) {
+                Ok(rels) => {
+                    result.metadata.relationships = rels;
+                }
+                Err(e) => {
+                    result.add_warning(format!("Enhanced relationship analysis failed: {}", e));
                 }
             }
+        }
 
         Ok(result)
     }

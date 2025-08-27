@@ -10,8 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Information about a file within the bundle
 ///
 /// Represents a single file entry in the bundle's directory structure.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BundleFileInfo {
     /// Offset within the bundle data
     pub offset: u64,
@@ -20,7 +19,6 @@ pub struct BundleFileInfo {
     /// File name
     pub name: String,
 }
-
 
 impl BundleFileInfo {
     /// Create a new BundleFileInfo
@@ -43,8 +41,7 @@ impl BundleFileInfo {
 ///
 /// Represents a node in the bundle's internal directory structure,
 /// which can be either a file or a directory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DirectoryNode {
     /// Node name
     pub name: String,
@@ -55,7 +52,6 @@ pub struct DirectoryNode {
     /// Flags (indicates file type, compression, etc.)
     pub flags: u32,
 }
-
 
 impl DirectoryNode {
     /// Create a new DirectoryNode

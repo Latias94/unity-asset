@@ -31,15 +31,13 @@ pub struct FileInfo {
 }
 
 /// Object statistics within the asset
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ObjectStatistics {
     pub total_objects: usize,
     pub objects_by_type: HashMap<String, usize>,
     pub largest_objects: Vec<ObjectSummary>,
     pub memory_usage: MemoryUsage,
 }
-
 
 /// Summary of an individual object
 #[derive(Debug, Clone, Serialize, Deserialize)]

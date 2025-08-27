@@ -189,9 +189,10 @@ impl SerdeUnityLoader {
                                     match key_str.as_str() {
                                         "__unity_class_id__" => {
                                             if let Value::Number(n) = value
-                                                && let Some(id) = n.as_i64() {
-                                                    class_id = id as i32;
-                                                }
+                                                && let Some(id) = n.as_i64()
+                                            {
+                                                class_id = id as i32;
+                                            }
                                         }
                                         "__unity_anchor__" => {
                                             if let Value::String(a) = value {

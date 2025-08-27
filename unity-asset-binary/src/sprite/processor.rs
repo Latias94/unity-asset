@@ -88,11 +88,12 @@ impl SpriteProcessor {
 
         // Check size limits
         if let Some((max_width, max_height)) = self.config.max_sprite_size
-            && (sprite_rect.width > max_width as f32 || sprite_rect.height > max_height as f32) {
-                return Err(BinaryError::invalid_data(
-                    "Sprite size exceeds maximum allowed size",
-                ));
-            }
+            && (sprite_rect.width > max_width as f32 || sprite_rect.height > max_height as f32)
+        {
+            return Err(BinaryError::invalid_data(
+                "Sprite size exceeds maximum allowed size",
+            ));
+        }
 
         // Extract sprite region
         let x = sprite_rect.x as u32;
@@ -259,11 +260,12 @@ impl SpriteProcessor {
 
         // Check size limits if configured
         if let Some((max_width, max_height)) = self.config.max_sprite_size
-            && (sprite.rect_width > max_width as f32 || sprite.rect_height > max_height as f32) {
-                return Err(BinaryError::invalid_data(
-                    "Sprite size exceeds maximum allowed size",
-                ));
-            }
+            && (sprite.rect_width > max_width as f32 || sprite.rect_height > max_height as f32)
+        {
+            return Err(BinaryError::invalid_data(
+                "Sprite size exceeds maximum allowed size",
+            ));
+        }
 
         Ok(())
     }
