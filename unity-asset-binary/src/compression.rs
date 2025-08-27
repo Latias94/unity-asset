@@ -192,15 +192,8 @@ fn decompress_lzma(data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
     // If all strategies failed, try with xz2 crate as fallback
     #[cfg(feature = "xz2")]
     {
-        println!("DEBUG: Trying XZ2 LZMA decompression as fallback");
-        match try_xz2_lzma(data, uncompressed_size) {
-            Ok(result) => {
-                println!("DEBUG: XZ2 LZMA decompression succeeded");
-                return Ok(result);
-            }
-            Err(e) => {
-                println!("DEBUG: XZ2 LZMA decompression failed: {}", e);
-            }
+        if let Ok(result) = try_xz2_lzma(data, uncompressed_size) {
+            return Ok(result);
         }
     }
 
@@ -268,24 +261,14 @@ fn try_unity_lzma_strategies(data: &[u8], uncompressed_size: usize) -> Result<Ve
                 let size_ratio = output.len() as f64 / uncompressed_size as f64;
                 if (0.8..=1.2).contains(&size_ratio) {
                     // Size is within 20% of expected, probably correct
-                    println!(
-                        "DEBUG: LZMA output size is reasonable (ratio: {:.2})",
-                        size_ratio
-                    );
                     return Ok(output);
                 } else if output.len() == uncompressed_size {
                     // Exact match
-                    println!("DEBUG: LZMA output size matches exactly");
                     return Ok(output);
-                } else {
-                    println!(
-                        "DEBUG: LZMA output size mismatch (ratio: {:.2}), trying next strategy",
-                        size_ratio
-                    );
                 }
             }
-            Err(e) => {
-                println!("DEBUG: LZMA strategy '{}' failed: {}", strategy_name, e);
+            Err(_e) => {
+                // Strategy failed, continue to next
             }
         }
     }
@@ -309,22 +292,15 @@ fn try_unity_lzma_with_header(data: &[u8], expected_size: usize) -> Result<Vec<u
     // Bytes 5-12: Uncompressed size (little-endian u64) - optional
     // Rest: Compressed data
 
-    println!("DEBUG: Unity LZMA header analysis (UnityPy style)");
-
     // Parse LZMA properties like UnityPy does
     let props = data[0];
     let dict_size = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
 
     // Calculate LZMA parameters from props (UnityPy algorithm)
-    let lc = props % 9;
+    let _lc = props % 9;
     let remainder = props / 9;
-    let pb = remainder / 5;
-    let lp = remainder % 5;
-
-    println!(
-        "DEBUG: LZMA props: 0x{:02X}, dict_size: {}, lc: {}, pb: {}, lp: {}",
-        props, dict_size, lc, pb, lp
-    );
+    let _pb = remainder / 5;
+    let _lp = remainder % 5;
 
     // Try different data offsets (with and without size header)
     let offsets_to_try = [5, 13]; // 5 = no size header, 13 = with size header
@@ -354,8 +330,8 @@ fn try_unity_lzma_with_header(data: &[u8], expected_size: usize) -> Result<Vec<u
                         return Ok(result);
                     }
                 }
-                Err(e) => {
-                    println!("DEBUG: Unity LZMA with xz2 failed: {}", e);
+                Err(_e) => {
+                    // xz2 failed, continue
                 }
             }
         }
@@ -390,13 +366,12 @@ fn try_unity_lzma_with_header(data: &[u8], expected_size: usize) -> Result<Vec<u
                 } else if !output.is_empty() {
                     let ratio = output.len() as f64 / expected_size as f64;
                     if (0.8..=1.2).contains(&ratio) {
-                        println!("DEBUG: Size ratio {:.2} is acceptable", ratio);
                         return Ok(output);
                     }
                 }
             }
-            Err(e) => {
-                println!("DEBUG: Unity LZMA with UnityPy params failed: {}", e);
+            Err(_e) => {
+                // UnityPy params failed, continue
             }
         }
 
@@ -419,13 +394,12 @@ fn try_unity_lzma_with_header(data: &[u8], expected_size: usize) -> Result<Vec<u
                 } else if !output.is_empty() {
                     let ratio = output.len() as f64 / expected_size as f64;
                     if (0.8..=1.2).contains(&ratio) {
-                        println!("DEBUG: Size ratio {:.2} is acceptable", ratio);
                         return Ok(output);
                     }
                 }
             }
-            Err(e) => {
-                println!("DEBUG: Unity LZMA with lzma_rs failed: {}", e);
+            Err(_e) => {
+                // lzma_rs failed, continue
             }
         }
     }
@@ -457,8 +431,6 @@ fn try_unity_raw_lzma(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
             "Data too short for Unity LZMA".to_string(),
         ));
     }
-
-    println!("DEBUG: Trying Unity raw LZMA approach");
 
     // Unity sometimes stores LZMA data with a custom header format
     // Try to extract the actual LZMA stream from various offsets
@@ -504,8 +476,8 @@ fn try_unity_raw_lzma(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
                     }
                 }
             }
-            Err(e) => {
-                println!("DEBUG: Raw LZMA from offset {} failed: {}", offset, e);
+            Err(_e) => {
+                // Raw LZMA failed, continue
             }
         }
 

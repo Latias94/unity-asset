@@ -98,7 +98,7 @@ impl YamlDocument {
     /// # tokio_test::block_on(async {
     /// let doc = YamlDocument::load_yaml_async("ProjectSettings.asset", false).await?;
     /// # Ok::<(), unity_asset_core::UnityAssetError>(())
-    /// # })
+    /// # }).unwrap();
     /// # }
     /// ```
     #[cfg(feature = "async")]

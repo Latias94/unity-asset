@@ -71,34 +71,16 @@ impl BundleParser {
         // Read blocks info
         Self::read_blocks_info(bundle, reader)?;
 
-        println!(
-            "DEBUG: parse_unity_fs - decompress_blocks: {}, load_assets: {}",
-            options.decompress_blocks, options.load_assets
-        );
-
         // Decompress data blocks if requested OR if we need to load assets
         if options.decompress_blocks || options.load_assets {
-            println!("DEBUG: Will decompress blocks and parse files");
-
-            println!("DEBUG: About to call read_blocks");
             let blocks_data = Self::read_blocks(bundle, reader)?;
-            println!(
-                "DEBUG: read_blocks completed, got {} bytes",
-                blocks_data.len()
-            );
-
-            println!("DEBUG: About to call parse_files");
             Self::parse_files(bundle, &blocks_data)?;
-            println!("DEBUG: parse_files completed");
 
             // Load assets if requested
             if options.load_assets {
-                println!("DEBUG: About to call load_assets");
                 Self::load_assets(bundle)?;
-                println!("DEBUG: load_assets completed");
             }
         } else {
-            println!("DEBUG: Will use lazy directory parsing only");
             // Just parse directory structure without decompressing all data
             Self::parse_directory_lazy(bundle, reader)?;
         }
@@ -158,73 +140,29 @@ impl BundleParser {
 
     /// Read compression blocks information
     fn read_blocks_info(bundle: &mut AssetBundle, reader: &mut BinaryReader) -> Result<()> {
-        println!("DEBUG: read_blocks_info called");
-
         // Apply version-specific alignment
         if bundle.header.version >= 7 {
             reader.align()?;
         }
 
-        // Read blocks info data
-        println!(
-            "DEBUG: Reader position before reading blocks info: {}",
-            reader.position()
-        );
-        println!("DEBUG: Reader remaining: {}", reader.remaining());
-        println!(
-            "DEBUG: Expected blocks info size: {}",
-            bundle.header.compressed_blocks_info_size
-        );
-        println!(
-            "DEBUG: Block info at end: {}",
-            bundle.header.block_info_at_end()
-        );
-
         // TEMPORARY FIX: Always read blocks info from after header, ignore the flag
         // The BLOCK_INFO_AT_END flag seems to be misunderstood - Python UnityPy always reads from header
-        println!("DEBUG: Reading blocks info from after header (ignoring BLOCK_INFO_AT_END flag)");
         let blocks_info_data =
             reader.read_bytes(bundle.header.compressed_blocks_info_size as usize)?;
 
-        println!(
-            "DEBUG: Read {} bytes of blocks info data",
-            blocks_info_data.len()
-        );
-        print!("DEBUG: First 32 bytes of blocks info: ");
-        for byte in blocks_info_data
-            .iter()
-            .take(std::cmp::min(32, blocks_info_data.len()))
-        {
-            print!("{:02X} ", byte);
-        }
-        println!();
-
         // Decompress blocks info
-        println!(
-            "DEBUG: About to decompress blocks info, size: {}",
-            blocks_info_data.len()
-        );
         let uncompressed_data =
             BundleCompression::decompress_blocks_info(&bundle.header, &blocks_info_data)?;
-        println!(
-            "DEBUG: Blocks info decompressed successfully, size: {}",
-            uncompressed_data.len()
-        );
 
         // Parse compression blocks
-        println!("DEBUG: About to parse compression blocks");
         bundle.blocks = BundleCompression::parse_compression_blocks(&uncompressed_data)?;
-        println!("DEBUG: Parsed {} compression blocks", bundle.blocks.len());
 
         // Validate blocks
-        println!("DEBUG: About to validate blocks");
         BundleCompression::validate_blocks(&bundle.blocks)?;
-        println!("DEBUG: Blocks validation completed");
 
         // Parse directory information from the same blocks info data
         Self::parse_directory_from_blocks_info(bundle, &uncompressed_data)?;
 
-        println!("DEBUG: read_blocks_info completed successfully");
         Ok(())
     }
 
@@ -235,45 +173,27 @@ impl BundleParser {
 
     /// Parse files from decompressed block data
     fn parse_files(bundle: &mut AssetBundle, blocks_data: &[u8]) -> Result<()> {
-        println!(
-            "DEBUG: parse_files called with {} bytes of decompressed data",
-            blocks_data.len()
-        );
-
         // Store the decompressed data
         *bundle.data_mut() = blocks_data.to_vec();
 
         // Create file info for each node
         for node in &bundle.nodes {
-            println!(
-                "DEBUG: Creating file info for node: {} (offset: {}, size: {})",
-                node.name, node.offset, node.size
-            );
-
             let file_info = BundleFileInfo::new(node.name.clone(), node.offset, node.size);
             bundle.files.push(file_info);
         }
 
-        println!("DEBUG: Created {} file infos", bundle.files.len());
         Ok(())
     }
 
     /// Parse directory structure without full decompression (lazy loading)
-    fn parse_directory_lazy(bundle: &mut AssetBundle, _reader: &mut BinaryReader) -> Result<()> {
+    fn parse_directory_lazy(_bundle: &mut AssetBundle, _reader: &mut BinaryReader) -> Result<()> {
         // For lazy loading, we only parse the directory structure
         // without decompressing all data blocks
-
-        println!("DEBUG: parse_directory_lazy called");
 
         // The directory information has already been parsed in read_blocks_info()
         // so there's nothing more to do here for lazy loading.
 
         // The directory nodes are already populated in bundle.nodes
-        println!(
-            "DEBUG: parse_directory_lazy completed, nodes: {}",
-            bundle.nodes.len()
-        );
-
         Ok(())
     }
 
@@ -299,16 +219,11 @@ impl BundleParser {
         let node_count = reader.read_i32()? as usize;
 
         // Read directory nodes (UnityFS format)
-        for i in 0..node_count {
+        for _i in 0..node_count {
             let offset = reader.read_i64()? as u64; // UnityFS uses i64 for offset
             let size = reader.read_i64()? as u64; // UnityFS uses i64 for size
             let flags = reader.read_u32()?;
             let name = reader.read_cstring()?;
-
-            println!(
-                "DEBUG: Directory node {}: name='{}', offset={}, size={}, flags=0x{:X}",
-                i, name, offset, size, flags
-            );
 
             let node = DirectoryNode::new(name, offset, size, flags);
             bundle.nodes.push(node);
@@ -374,11 +289,6 @@ impl BundleParser {
 
     /// Load assets from the bundle files
     fn load_assets(bundle: &mut AssetBundle) -> Result<()> {
-        println!(
-            "DEBUG: load_assets called with {} nodes",
-            bundle.nodes.len()
-        );
-
         // Clone the data to avoid borrowing issues
         let bundle_data = bundle.data().to_vec();
         let mut data_reader = BinaryReader::new(&bundle_data, ByteOrder::Big);
@@ -387,23 +297,11 @@ impl BundleParser {
         let nodes = bundle.nodes.clone();
 
         for node in &nodes {
-            println!(
-                "DEBUG: Processing node: {} (is_file: {})",
-                node.name,
-                node.is_file()
-            );
-
             if node.is_file() {
                 // Skip non-asset files (like .resS files)
                 if node.name.ends_with(".resS") || node.name.ends_with(".resource") {
-                    println!("DEBUG: Skipping resource file: {}", node.name);
                     continue;
                 }
-
-                println!(
-                    "DEBUG: Attempting to parse asset file: {} (offset: {}, size: {})",
-                    node.name, node.offset, node.size
-                );
 
                 // Set position to the file's offset in decompressed data
                 data_reader.set_position(node.offset)?;
@@ -411,30 +309,13 @@ impl BundleParser {
                 // Read the file data
                 let file_data = data_reader.read_bytes(node.size as usize)?;
 
-                // Show first 32 bytes of file data for debugging
-                let preview_len = 32.min(file_data.len());
-                let preview: Vec<String> = file_data[..preview_len]
-                    .iter()
-                    .map(|b| format!("{:02X}", b))
-                    .collect();
-                println!(
-                    "DEBUG: File data first {} bytes: {}",
-                    preview_len,
-                    preview.join(" ")
-                );
-
                 // Try to parse as SerializedFile
                 match crate::asset::SerializedFileParser::from_bytes(file_data) {
                     Ok(serialized_file) => {
-                        println!(
-                            "DEBUG: Successfully parsed SerializedFile: {} objects",
-                            serialized_file.objects.len()
-                        );
                         // Add the SerializedFile as an asset
                         bundle.assets.push(serialized_file);
                     }
-                    Err(e) => {
-                        println!("DEBUG: Failed to parse as SerializedFile: {}", e);
+                    Err(_e) => {
                         // If it's not a valid SerializedFile, skip or handle differently
                         // For now, we'll skip non-serialized files
                         continue;
@@ -443,10 +324,6 @@ impl BundleParser {
             }
         }
 
-        println!(
-            "DEBUG: load_assets completed, {} assets loaded",
-            bundle.assets.len()
-        );
         Ok(())
     }
 

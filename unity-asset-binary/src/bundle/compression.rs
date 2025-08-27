@@ -112,75 +112,24 @@ impl BundleCompression {
         // This matches our fix in read_blocks_info
         let mut data_pos = header.header_size() + header.compressed_blocks_info_size as u64;
 
-        println!(
-            "DEBUG: decompress_data_blocks - data starts at position: {}",
-            data_pos
-        );
-
         // Process each compression block
-        for (i, block) in blocks.iter().enumerate() {
-            println!("DEBUG: Processing block {} at position {}", i, data_pos);
-            println!(
-                "DEBUG: Block - compressed: {}, uncompressed: {}, flags: 0x{:X}",
-                block.compressed_size, block.uncompressed_size, block.flags
-            );
-
+        for block in blocks.iter() {
             reader.set_position(data_pos)?;
-            println!(
-                "DEBUG: Reader position set to {}, remaining: {}",
-                data_pos,
-                reader.remaining()
-            );
-
             let compressed_data = reader.read_bytes(block.compressed_size as usize)?;
-            println!(
-                "DEBUG: Read {} bytes of compressed data",
-                compressed_data.len()
-            );
 
             // Check if we have enough data
             if compressed_data.len() != block.compressed_size as usize {
-                println!(
-                    "DEBUG: WARNING - Size mismatch! Expected {}, got {}",
-                    block.compressed_size,
-                    compressed_data.len()
-                );
+                return Err(BinaryError::not_enough_data(
+                    block.compressed_size as usize,
+                    compressed_data.len(),
+                ));
             }
 
-            // Show first few bytes of compressed data for debugging
-            let preview_len = 32.min(compressed_data.len());
-            let preview: Vec<String> = compressed_data[..preview_len]
-                .iter()
-                .map(|b| format!("{:02X}", b))
-                .collect();
-            println!(
-                "DEBUG: First {} bytes of compressed data: {}",
-                preview_len,
-                preview.join(" ")
-            );
-
-            println!("DEBUG: About to decompress block data...");
-            let block_data = match block.decompress(&compressed_data) {
-                Ok(data) => {
-                    println!("DEBUG: Decompressed to {} bytes", data.len());
-                    data
-                }
-                Err(e) => {
-                    println!("DEBUG: Block decompression failed: {}", e);
-                    println!(
-                        "DEBUG: Block flags: 0x{:X}, compression type: {:?}",
-                        block.flags,
-                        block.compression_type()
-                    );
-                    return Err(e);
-                }
-            };
-
+            let block_data = block.decompress(&compressed_data)?;
             decompressed_data.extend_from_slice(&block_data);
 
             // Move to next block position
             data_pos += block.compressed_size as u64;
-            println!("DEBUG: Next block position: {}", data_pos);
         }
 
         Ok(decompressed_data)
