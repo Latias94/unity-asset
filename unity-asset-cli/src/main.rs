@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use unity_asset::UnityDocument;
 use unity_asset::UnityValue;
-use unity_asset::environment::Environment;
+use unity_asset::environment::{BinarySource, Environment};
 use unity_asset_binary::{
     asset::class_ids,
     audio::{AudioClipConverter, AudioProcessor},
@@ -470,17 +470,20 @@ fn export_bundle_command(
 
     std::fs::create_dir_all(&output)?;
 
-    let mut bundle_paths: Vec<PathBuf> = env
+    let mut bundle_sources: Vec<BinarySource> = env
         .binary_sources()
         .into_iter()
-        .filter_map(|(kind, p)| match kind {
-            unity_asset::environment::BinarySourceKind::AssetBundle => Some(p.clone()),
-            _ => None,
+        .filter_map(|(kind, s)| {
+            if kind == unity_asset::environment::BinarySourceKind::AssetBundle {
+                Some(s)
+            } else {
+                None
+            }
         })
         .collect();
-    bundle_paths.sort();
+    bundle_sources.sort();
 
-    if bundle_paths.is_empty() {
+    if bundle_sources.is_empty() {
         println!("⚠ No AssetBundles found in {:?}", input);
         return Ok(());
     }
@@ -489,8 +492,8 @@ fn export_bundle_command(
     let mut skipped = 0usize;
     let pattern_lc = pattern.to_ascii_lowercase();
 
-    for bundle_path in bundle_paths {
-        let entries = env.bundle_container_entries(&bundle_path)?;
+    for bundle_source in bundle_sources {
+        let entries = env.bundle_container_entries_source(&bundle_source)?;
         let mut entries: Vec<_> = entries
             .into_iter()
             .filter(|e| e.asset_path.to_ascii_lowercase().contains(&pattern_lc))
@@ -551,13 +554,13 @@ fn export_bundle_command(
                 let unity_version = match key.source_kind {
                     unity_asset::environment::BinarySourceKind::AssetBundle => env
                         .bundles()
-                        .get(&key.source_path)
+                        .get(&key.source)
                         .and_then(|b| key.asset_index.and_then(|i| b.assets.get(i)))
                         .map(|f| UnityVersion::parse_version(&f.unity_version).unwrap_or_default())
                         .unwrap_or_default(),
                     unity_asset::environment::BinarySourceKind::SerializedFile => env
                         .binary_assets()
-                        .get(&key.source_path)
+                        .get(&key.source)
                         .map(|f| UnityVersion::parse_version(&f.unity_version).unwrap_or_default())
                         .unwrap_or_default(),
                 };
@@ -594,8 +597,8 @@ fn export_bundle_command(
                             if clip.is_streamed()
                                 && key.source_kind == unity_asset::environment::BinarySourceKind::AssetBundle
                             {
-                                match env.read_bundle_stream_data(
-                                    &key.source_path,
+                                match env.read_bundle_stream_data_source(
+                                    &key.source,
                                     &clip.stream_info.path,
                                     clip.stream_info.offset,
                                     clip.stream_info.size,
@@ -626,8 +629,8 @@ fn export_bundle_command(
                                 // If the clip is streamed and we are exporting from a bundle, try to read
                                 // the resource bytes from the bundle or filesystem (UnityPy-like).
                                 if clip.is_streamed() {
-                                    if let Ok(bytes) = env.read_stream_data(
-                                        &key.source_path,
+                                    if let Ok(bytes) = env.read_stream_data_source(
+                                        &key.source,
                                         key.source_kind,
                                         &clip.stream_info.path,
                                         clip.stream_info.offset,
@@ -674,8 +677,8 @@ fn export_bundle_command(
                         let texture_processor = TextureProcessor::new(unity_version);
                         let mut texture = texture_processor.convert_object(&obj)?;
                         if texture.image_data.is_empty() && texture.is_streamed() {
-                            if let Ok(bytes) = env.read_stream_data(
-                                &key.source_path,
+                            if let Ok(bytes) = env.read_stream_data_source(
+                                &key.source,
                                 key.source_kind,
                                 &texture.stream_info.path,
                                 texture.stream_info.offset,
@@ -721,9 +724,9 @@ fn export_bundle_command(
                         let Some(obj_ref) = (match key.source_kind {
                             unity_asset::environment::BinarySourceKind::AssetBundle => key
                                 .asset_index
-                                .and_then(|i| env.find_binary_object_in_bundle_asset(&key.source_path, i, key.path_id)),
+                                .and_then(|i| env.find_binary_object_in_bundle_asset_source(&key.source, i, key.path_id)),
                             unity_asset::environment::BinarySourceKind::SerializedFile => {
-                                env.find_binary_object_in_source(&key.source_path, key.path_id)
+                                env.find_binary_object_in_source_id(&key.source, key.path_id)
                             }
                         }) else {
                             return Ok(None);
@@ -745,8 +748,8 @@ fn export_bundle_command(
                         let texture_processor = TextureProcessor::new(unity_version);
                         let mut texture = texture_processor.convert_object(&texture_obj)?;
                         if texture.image_data.is_empty() && texture.is_streamed() {
-                            if let Ok(bytes) = env.read_stream_data(
-                                &key.source_path,
+                            if let Ok(bytes) = env.read_stream_data_source(
+                                &key.source,
                                 key.source_kind,
                                 &texture.stream_info.path,
                                 texture.stream_info.offset,
@@ -834,29 +837,32 @@ fn list_bundle_command(input: PathBuf, filter: String, verbose: bool) -> Result<
     env.load(&input)?;
 
     let filter_lc = filter.to_ascii_lowercase();
-    let mut bundle_paths: Vec<PathBuf> = env
+    let mut bundle_sources: Vec<BinarySource> = env
         .binary_sources()
         .into_iter()
-        .filter_map(|(kind, p)| match kind {
-            unity_asset::environment::BinarySourceKind::AssetBundle => Some(p.clone()),
-            _ => None,
+        .filter_map(|(kind, s)| {
+            if kind == unity_asset::environment::BinarySourceKind::AssetBundle {
+                Some(s)
+            } else {
+                None
+            }
         })
         .collect();
-    bundle_paths.sort();
+    bundle_sources.sort();
 
-    if bundle_paths.is_empty() {
+    if bundle_sources.is_empty() {
         println!("⚠ No AssetBundles found in {:?}", input);
         return Ok(());
     }
 
-    for bundle_path in bundle_paths {
-        let Some(bundle) = env.bundles().get(&bundle_path) else {
+    for bundle_source in bundle_sources {
+        let Some(bundle) = env.bundles().get(&bundle_source) else {
             continue;
         };
 
         println!(
             "Bundle: {:?} (nodes={}, assets={})",
-            bundle_path,
+            source_label(&bundle_source),
             bundle.nodes.len(),
             bundle.assets.len()
         );
@@ -897,24 +903,27 @@ fn find_object_command(
     let class_name_lc = class_name.to_ascii_lowercase();
     let class_ids = class_id;
 
-    let mut bundle_paths: Vec<PathBuf> = env
+    let mut bundle_sources: Vec<BinarySource> = env
         .binary_sources()
         .into_iter()
-        .filter_map(|(kind, p)| match kind {
-            unity_asset::environment::BinarySourceKind::AssetBundle => Some(p.clone()),
-            _ => None,
+        .filter_map(|(kind, s)| {
+            if kind == unity_asset::environment::BinarySourceKind::AssetBundle {
+                Some(s)
+            } else {
+                None
+            }
         })
         .collect();
-    bundle_paths.sort();
+    bundle_sources.sort();
 
-    if bundle_paths.is_empty() {
+    if bundle_sources.is_empty() {
         println!("⚠ No AssetBundles found in {:?}", input);
         return Ok(());
     }
 
     let mut count = 0usize;
-    for bundle_path in bundle_paths {
-        let mut entries = env.bundle_container_entries(&bundle_path)?;
+    for bundle_source in bundle_sources {
+        let mut entries = env.bundle_container_entries_source(&bundle_source)?;
         entries.sort_by(|a, b| a.asset_path.cmp(&b.asset_path));
 
         for entry in entries {
@@ -959,7 +968,7 @@ fn find_object_command(
                     println!(
                         "{} -> unresolved(bundle={:?}, asset_index={}, file_id={}, path_id={})",
                         entry.asset_path,
-                        entry.bundle_path,
+                        source_label(&entry.bundle_source),
                         entry.asset_index,
                         entry.file_id,
                         entry.path_id
@@ -1000,14 +1009,14 @@ fn lookup_object_type_info(
     match key.source_kind {
         unity_asset::environment::BinarySourceKind::AssetBundle => env
             .bundles()
-            .get(&key.source_path)
+            .get(&key.source)
             .and_then(|b| key.asset_index.and_then(|i| b.assets.get(i)))
             .and_then(|f| f.find_object(key.path_id))
             .map(|info| (info.type_id, info.byte_size))
             .unwrap_or((0, 0)),
         unity_asset::environment::BinarySourceKind::SerializedFile => env
             .binary_assets()
-            .get(&key.source_path)
+            .get(&key.source)
             .and_then(|f| f.find_object(key.path_id))
             .map(|info| (info.type_id, info.byte_size))
             .unwrap_or((0, 0)),
@@ -1052,15 +1061,15 @@ fn inspect_object_command(
             .ok_or_else(|| anyhow::anyhow!("--source is required unless --key is provided"))?;
 
         unity_asset::environment::BinaryObjectKey {
-            source_path: source,
+            source: BinarySource::path(&source),
             source_kind,
             asset_index,
             path_id,
         }
     };
 
-    let resolved_source = resolve_loaded_source_path(&env, key.source_kind, &key.source_path)?;
-    key.source_path = resolved_source.clone();
+    let resolved_source = resolve_loaded_source(&env, key.source_kind, &key.source)?;
+    key.source = resolved_source.clone();
 
     let obj = env.read_binary_object_key(&key)?;
 
@@ -1074,7 +1083,10 @@ fn inspect_object_command(
     );
     println!(
         "Source: {:?} (kind={:?}, asset_index={:?}, path_id={})",
-        resolved_source, key.source_kind, key.asset_index, key.path_id
+        source_label(&resolved_source),
+        key.source_kind,
+        key.asset_index,
+        key.path_id
     );
     println!("Key: {}", key);
 
@@ -1108,11 +1120,11 @@ fn inspect_object_command(
     Ok(())
 }
 
-fn resolve_loaded_source_path(
+fn resolve_loaded_source(
     env: &Environment,
     kind: unity_asset::environment::BinarySourceKind,
-    requested: &PathBuf,
-) -> Result<PathBuf> {
+    requested: &BinarySource,
+) -> Result<BinarySource> {
     let is_loaded = match kind {
         unity_asset::environment::BinarySourceKind::AssetBundle => {
             env.bundles().contains_key(requested)
@@ -1125,14 +1137,30 @@ fn resolve_loaded_source_path(
         return Ok(requested.clone());
     }
 
-    let keys: Vec<&PathBuf> = match kind {
-        unity_asset::environment::BinarySourceKind::AssetBundle => env.bundles().keys().collect(),
-        unity_asset::environment::BinarySourceKind::SerializedFile => {
-            env.binary_assets().keys().collect()
-        }
+    let BinarySource::Path(requested_path) = requested else {
+        anyhow::bail!("Source not found in loaded environment: {:?}", requested);
     };
 
-    let requested_canon = std::fs::canonicalize(requested).ok();
+    let keys: Vec<&PathBuf> = match kind {
+        unity_asset::environment::BinarySourceKind::AssetBundle => env
+            .bundles()
+            .keys()
+            .filter_map(|k| match k {
+                BinarySource::Path(p) => Some(p),
+                _ => None,
+            })
+            .collect(),
+        unity_asset::environment::BinarySourceKind::SerializedFile => env
+            .binary_assets()
+            .keys()
+            .filter_map(|k| match k {
+                BinarySource::Path(p) => Some(p),
+                _ => None,
+            })
+            .collect(),
+    };
+
+    let requested_canon = std::fs::canonicalize(requested_path).ok();
     if let Some(requested_canon) = requested_canon {
         let mut matches = Vec::new();
         for k in &keys {
@@ -1143,17 +1171,17 @@ fn resolve_loaded_source_path(
             }
         }
         if matches.len() == 1 {
-            return Ok(matches[0].clone());
+            return Ok(BinarySource::path(matches[0].clone()));
         }
         if matches.len() > 1 {
             anyhow::bail!(
                 "Ambiguous source path: {:?} matches multiple loaded sources",
-                requested
+                requested_path
             );
         }
     }
 
-    if let Some(file_name) = requested.file_name() {
+    if let Some(file_name) = requested_path.file_name() {
         let mut matches: Vec<PathBuf> = keys
             .iter()
             .filter(|p| p.file_name() == Some(file_name))
@@ -1162,7 +1190,7 @@ fn resolve_loaded_source_path(
         matches.sort();
         matches.dedup();
         if matches.len() == 1 {
-            return Ok(matches[0].clone());
+            return Ok(BinarySource::path(matches[0].clone()));
         }
     }
 
@@ -1171,10 +1199,22 @@ fn resolve_loaded_source_path(
 
     anyhow::bail!(
         "Source not found in loaded environment: {:?} (kind={:?}). Loaded sources:\n- {}",
-        requested,
+        requested_path,
         kind,
         available.join("\n- ")
     )
+}
+
+fn source_label(source: &BinarySource) -> String {
+    match source {
+        BinarySource::Path(p) => p.to_string_lossy().to_string(),
+        BinarySource::WebEntry {
+            web_path,
+            entry_name,
+        } => {
+            format!("{}::{}", web_path.to_string_lossy(), entry_name)
+        }
+    }
 }
 
 fn print_unity_value_tree(

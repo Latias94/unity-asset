@@ -98,9 +98,43 @@ pub mod environment {
     use std::str::FromStr;
     use unity_asset_binary::asset::SerializedFile;
     use unity_asset_binary::bundle::AssetBundle;
+    use unity_asset_binary::file::{UnityFile, load_unity_file_from_memory};
     use unity_asset_binary::object::{ObjectHandle, UnityObject};
+    use unity_asset_binary::webfile::WebFile;
     use unity_asset_core::UnityValue;
     use unity_asset_core::{UnityAssetError, UnityClass, UnityDocument};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    pub enum BinarySource {
+        Path(PathBuf),
+        WebEntry {
+            web_path: PathBuf,
+            entry_name: String,
+        },
+    }
+
+    impl BinarySource {
+        pub fn path<P: AsRef<Path>>(path: P) -> Self {
+            Self::Path(path.as_ref().to_path_buf())
+        }
+
+        fn describe(&self) -> String {
+            match self {
+                BinarySource::Path(p) => p.to_string_lossy().to_string(),
+                BinarySource::WebEntry {
+                    web_path,
+                    entry_name,
+                } => format!("{}::{}", web_path.to_string_lossy(), entry_name),
+            }
+        }
+
+        fn as_path(&self) -> Option<&PathBuf> {
+            match self {
+                BinarySource::Path(p) => Some(p),
+                BinarySource::WebEntry { .. } => None,
+            }
+        }
+    }
 
     /// A reference to a binary object within a `SerializedFile`.
     ///
@@ -108,7 +142,7 @@ pub mod environment {
     /// converted into a parsed `UnityObject` on-demand.
     #[derive(Debug, Clone, Copy)]
     pub struct BinaryObjectRef<'a> {
-        pub source_path: &'a PathBuf,
+        pub source: &'a BinarySource,
         pub source_kind: BinarySourceKind,
         /// Asset index within a bundle. `None` for standalone serialized files.
         pub asset_index: Option<usize>,
@@ -125,7 +159,7 @@ pub mod environment {
         /// Create a globally-unique key for this object reference.
         pub fn key(&self) -> BinaryObjectKey {
             BinaryObjectKey {
-                source_path: self.source_path.clone(),
+                source: self.source.clone(),
                 source_kind: self.source_kind,
                 asset_index: self.asset_index,
                 path_id: self.object.path_id(),
@@ -152,7 +186,7 @@ pub mod environment {
     /// (bundle/asset path) and optional bundle asset index.
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     pub struct BinaryObjectKey {
-        pub source_path: PathBuf,
+        pub source: BinarySource,
         pub source_kind: BinarySourceKind,
         pub asset_index: Option<usize>,
         pub path_id: i64,
@@ -162,11 +196,16 @@ pub mod environment {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             // A copy/paste friendly key format that can be parsed back with `FromStr`.
             //
-            // Format:
+            // bok1 (legacy):
             //   bok1|<kind>|<asset_index_or_dash>|<path_id>|<path_utf8_len>|<path>
             //
-            // The final `<path>` field can contain any characters (including `|`) because it is the
-            // last segment and is length-validated during parsing.
+            // bok2:
+            //   bok2|<kind>|<asset_index_or_dash>|<path_id>|<outer_utf8_len>|<outer>|<entry_utf8_len>|<entry>
+            //
+            // Notes:
+            // - `<outer>` is either the filesystem path or the WebFile path.
+            // - `<entry>` is empty for filesystem paths; otherwise it's the WebFile entry name.
+            // - `<outer>` and `<entry>` can contain `|` because their UTF-8 lengths are encoded.
             let kind = match self.source_kind {
                 BinarySourceKind::SerializedFile => "serialized",
                 BinarySourceKind::AssetBundle => "bundle",
@@ -175,15 +214,24 @@ pub mod environment {
                 .asset_index
                 .map(|i| i.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let path = self.source_path.to_string_lossy();
+
+            let (outer, entry) = match &self.source {
+                BinarySource::Path(p) => (p.to_string_lossy().to_string(), String::new()),
+                BinarySource::WebEntry {
+                    web_path,
+                    entry_name,
+                } => (web_path.to_string_lossy().to_string(), entry_name.clone()),
+            };
             write!(
                 f,
-                "bok1|{}|{}|{}|{}|{}",
+                "bok2|{}|{}|{}|{}|{}|{}|{}",
                 kind,
                 asset_index,
                 self.path_id,
-                path.as_bytes().len(),
-                path
+                outer.as_bytes().len(),
+                outer,
+                entry.as_bytes().len(),
+                entry
             )
         }
     }
@@ -192,65 +240,147 @@ pub mod environment {
         type Err = String;
 
         fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-            let prefix = "bok1|";
-            if !s.starts_with(prefix) {
-                return Err("invalid key prefix (expected: bok1|...)".to_string());
+            if s.starts_with("bok2|") {
+                return parse_bok2(s);
             }
-
-            let mut rest = &s[prefix.len()..];
-            let (kind, r) = split_once(rest, '|').ok_or_else(|| "missing kind".to_string())?;
-            rest = r;
-            let (asset_index, r) =
-                split_once(rest, '|').ok_or_else(|| "missing asset_index".to_string())?;
-            rest = r;
-            let (path_id, r) =
-                split_once(rest, '|').ok_or_else(|| "missing path_id".to_string())?;
-            rest = r;
-            let (path_len, path) =
-                split_once(rest, '|').ok_or_else(|| "missing path_len/path".to_string())?;
-
-            let source_kind = match kind {
-                "bundle" => BinarySourceKind::AssetBundle,
-                "serialized" => BinarySourceKind::SerializedFile,
-                other => return Err(format!("unknown kind: {}", other)),
-            };
-
-            let asset_index = if asset_index == "-" || asset_index.is_empty() {
-                None
-            } else {
-                Some(
-                    asset_index
-                        .parse::<usize>()
-                        .map_err(|e| format!("invalid asset_index: {}", e))?,
-                )
-            };
-
-            let path_id = path_id
-                .parse::<i64>()
-                .map_err(|e| format!("invalid path_id: {}", e))?;
-
-            let expected_len = path_len
-                .parse::<usize>()
-                .map_err(|e| format!("invalid path_len: {}", e))?;
-            if path.as_bytes().len() != expected_len {
-                return Err(format!(
-                    "path length mismatch: expected {} bytes, got {} bytes",
-                    expected_len,
-                    path.as_bytes().len()
-                ));
+            if s.starts_with("bok1|") {
+                return parse_bok1(s);
             }
-
-            if source_kind == BinarySourceKind::AssetBundle && asset_index.is_none() {
-                return Err("asset_index is required for bundle keys".to_string());
-            }
-
-            Ok(Self {
-                source_path: PathBuf::from(path),
-                source_kind,
-                asset_index,
-                path_id,
-            })
+            Err("invalid key prefix (expected: bok1|... or bok2|...)".to_string())
         }
+    }
+
+    fn parse_kind(kind: &str) -> std::result::Result<BinarySourceKind, String> {
+        match kind {
+            "bundle" => Ok(BinarySourceKind::AssetBundle),
+            "serialized" => Ok(BinarySourceKind::SerializedFile),
+            other => Err(format!("unknown kind: {}", other)),
+        }
+    }
+
+    fn parse_asset_index(asset_index: &str) -> std::result::Result<Option<usize>, String> {
+        if asset_index == "-" || asset_index.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            asset_index
+                .parse::<usize>()
+                .map_err(|e| format!("invalid asset_index: {}", e))?,
+        ))
+    }
+
+    fn parse_bok1(s: &str) -> std::result::Result<BinaryObjectKey, String> {
+        let prefix = "bok1|";
+        let mut rest = &s[prefix.len()..];
+        let (kind, r) = split_once(rest, '|').ok_or_else(|| "missing kind".to_string())?;
+        rest = r;
+        let (asset_index, r) =
+            split_once(rest, '|').ok_or_else(|| "missing asset_index".to_string())?;
+        rest = r;
+        let (path_id, r) = split_once(rest, '|').ok_or_else(|| "missing path_id".to_string())?;
+        rest = r;
+        let (path_len, path) =
+            split_once(rest, '|').ok_or_else(|| "missing path_len/path".to_string())?;
+
+        let source_kind = parse_kind(kind)?;
+        let asset_index = parse_asset_index(asset_index)?;
+        let path_id = path_id
+            .parse::<i64>()
+            .map_err(|e| format!("invalid path_id: {}", e))?;
+
+        let expected_len = path_len
+            .parse::<usize>()
+            .map_err(|e| format!("invalid path_len: {}", e))?;
+        if path.as_bytes().len() != expected_len {
+            return Err(format!(
+                "path length mismatch: expected {} bytes, got {} bytes",
+                expected_len,
+                path.as_bytes().len()
+            ));
+        }
+
+        if source_kind == BinarySourceKind::AssetBundle && asset_index.is_none() {
+            return Err("asset_index is required for bundle keys".to_string());
+        }
+
+        Ok(BinaryObjectKey {
+            source: BinarySource::Path(PathBuf::from(path)),
+            source_kind,
+            asset_index,
+            path_id,
+        })
+    }
+
+    fn parse_bok2(s: &str) -> std::result::Result<BinaryObjectKey, String> {
+        let prefix = "bok2|";
+        let mut rest = &s[prefix.len()..];
+
+        let (kind, r) = split_once(rest, '|').ok_or_else(|| "missing kind".to_string())?;
+        rest = r;
+        let (asset_index, r) =
+            split_once(rest, '|').ok_or_else(|| "missing asset_index".to_string())?;
+        rest = r;
+        let (path_id, r) = split_once(rest, '|').ok_or_else(|| "missing path_id".to_string())?;
+        rest = r;
+        let (outer_len, r) =
+            split_once(rest, '|').ok_or_else(|| "missing outer_len".to_string())?;
+        rest = r;
+
+        let source_kind = parse_kind(kind)?;
+        let asset_index = parse_asset_index(asset_index)?;
+        let path_id = path_id
+            .parse::<i64>()
+            .map_err(|e| format!("invalid path_id: {}", e))?;
+
+        let outer_len = outer_len
+            .parse::<usize>()
+            .map_err(|e| format!("invalid outer_len: {}", e))?;
+        if rest.as_bytes().len() < outer_len {
+            return Err("outer is shorter than outer_len".to_string());
+        }
+
+        let outer = rest
+            .get(..outer_len)
+            .ok_or_else(|| "outer_len splits UTF-8 boundary".to_string())?;
+        let rest = rest
+            .get(outer_len..)
+            .ok_or_else(|| "outer_len splits UTF-8 boundary".to_string())?;
+
+        let rest = rest
+            .strip_prefix('|')
+            .ok_or_else(|| "missing entry delimiter".to_string())?;
+        let (entry_len, rest) =
+            split_once(rest, '|').ok_or_else(|| "missing entry_len".to_string())?;
+        let entry_len = entry_len
+            .parse::<usize>()
+            .map_err(|e| format!("invalid entry_len: {}", e))?;
+        if rest.as_bytes().len() != entry_len {
+            return Err(format!(
+                "entry length mismatch: expected {} bytes, got {} bytes",
+                entry_len,
+                rest.as_bytes().len()
+            ));
+        }
+
+        if source_kind == BinarySourceKind::AssetBundle && asset_index.is_none() {
+            return Err("asset_index is required for bundle keys".to_string());
+        }
+
+        let source = if entry_len == 0 {
+            BinarySource::Path(PathBuf::from(outer))
+        } else {
+            BinarySource::WebEntry {
+                web_path: PathBuf::from(outer),
+                entry_name: rest.to_string(),
+            }
+        };
+
+        Ok(BinaryObjectKey {
+            source,
+            source_kind,
+            asset_index,
+            path_id,
+        })
     }
 
     fn split_once<'a>(s: &'a str, delim: char) -> Option<(&'a str, &'a str)> {
@@ -261,7 +391,7 @@ pub mod environment {
     /// A best-effort entry extracted from an AssetBundle `m_Container`.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct BundleContainerEntry {
-        pub bundle_path: PathBuf,
+        pub bundle_source: BinarySource,
         pub asset_index: usize,
         pub asset_path: String,
         pub file_id: i32,
@@ -274,10 +404,11 @@ pub mod environment {
         /// Loaded YAML documents
         yaml_documents: HashMap<PathBuf, YamlDocument>,
         /// Loaded standalone SerializedFiles (e.g. `.assets`)
-        binary_assets: HashMap<PathBuf, SerializedFile>,
+        binary_assets: HashMap<BinarySource, SerializedFile>,
         /// Loaded AssetBundles (e.g. `.bundle`, `.unity3d`, `.ab`)
-        bundles: HashMap<PathBuf, AssetBundle>,
-        bundle_container_cache: RefCell<HashMap<PathBuf, Vec<BundleContainerEntry>>>,
+        bundles: HashMap<BinarySource, AssetBundle>,
+        webfiles: HashMap<PathBuf, WebFile>,
+        bundle_container_cache: RefCell<HashMap<BinarySource, Vec<BundleContainerEntry>>>,
         /// Base path for relative file resolution
         #[allow(dead_code)]
         base_path: PathBuf,
@@ -290,6 +421,7 @@ pub mod environment {
                 yaml_documents: HashMap::new(),
                 binary_assets: HashMap::new(),
                 bundles: HashMap::new(),
+                webfiles: HashMap::new(),
                 bundle_container_cache: RefCell::new(HashMap::new()),
                 base_path: std::env::current_dir().unwrap_or_default(),
             }
@@ -327,12 +459,6 @@ pub mod environment {
                             }
                         }
                     }
-                    Some("assets") => {
-                        self.try_load_serialized_file(path)?;
-                    }
-                    Some("bundle") | Some("unity3d") | Some("ab") => {
-                        self.try_load_bundle(path)?;
-                    }
                     _ => {
                         // Best-effort binary detection for common build outputs.
                         self.try_load_binary(path)?;
@@ -344,48 +470,74 @@ pub mod environment {
         }
 
         fn try_load_binary(&mut self, path: &Path) -> Result<()> {
-            // Try bundle first, then serialized file.
-            if self.try_load_bundle(path).is_ok() {
-                return Ok(());
+            let data = std::fs::read(path).map_err(|e| {
+                UnityAssetError::format(format!("Failed to read file {:?}: {}", path, e))
+            })?;
+            match load_unity_file_from_memory(data) {
+                Ok(UnityFile::AssetBundle(bundle)) => {
+                    let source = BinarySource::path(path);
+                    self.bundles.insert(source.clone(), bundle);
+                    self.bundle_container_cache.borrow_mut().remove(&source);
+                }
+                Ok(UnityFile::SerializedFile(asset)) => {
+                    let source = BinarySource::path(path);
+                    self.binary_assets.insert(source, asset);
+                    self.bundle_container_cache.borrow_mut().clear();
+                }
+                Ok(UnityFile::WebFile(web)) => {
+                    let web_path = path.to_path_buf();
+                    self.webfiles.insert(web_path.clone(), web);
+                    self.load_webfile_entries(&web_path)?;
+                }
+                Err(_) => {}
             }
-            if self.try_load_serialized_file(path).is_ok() {
-                return Ok(());
-            }
+
             Ok(())
         }
 
-        fn try_load_bundle(&mut self, path: &Path) -> Result<()> {
-            let data = std::fs::read(path).map_err(|e| {
-                UnityAssetError::format(format!("Failed to read file {:?}: {}", path, e))
+        fn load_webfile_entries(&mut self, web_path: &PathBuf) -> Result<()> {
+            let web = self.webfiles.get(web_path).ok_or_else(|| {
+                UnityAssetError::format(format!("WebFile not loaded: {:?}", web_path))
             })?;
-            match unity_asset_binary::bundle::load_bundle_from_memory(data) {
-                Ok(bundle) => {
-                    self.bundles.insert(path.to_path_buf(), bundle);
-                    self.bundle_container_cache.borrow_mut().remove(path);
-                    Ok(())
-                }
-                Err(e) => Err(UnityAssetError::format(format!(
-                    "Failed to parse AssetBundle {:?}: {}",
-                    path, e
-                ))),
-            }
-        }
 
-        fn try_load_serialized_file(&mut self, path: &Path) -> Result<()> {
-            let data = std::fs::read(path).map_err(|e| {
-                UnityAssetError::format(format!("Failed to read file {:?}: {}", path, e))
-            })?;
-            match unity_asset_binary::asset::parse_serialized_file(data) {
-                Ok(asset) => {
-                    self.binary_assets.insert(path.to_path_buf(), asset);
-                    self.bundle_container_cache.borrow_mut().clear();
-                    Ok(())
+            let mut entry_names: Vec<String> = web.files.iter().map(|f| f.name.clone()).collect();
+            entry_names.sort();
+            entry_names.dedup();
+
+            for entry_name in entry_names {
+                let bytes = match web.extract_file(&entry_name) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                let Ok(parsed) = load_unity_file_from_memory(bytes) else {
+                    continue;
+                };
+
+                match parsed {
+                    UnityFile::AssetBundle(bundle) => {
+                        let source = BinarySource::WebEntry {
+                            web_path: web_path.clone(),
+                            entry_name,
+                        };
+                        self.bundles.insert(source.clone(), bundle);
+                        self.bundle_container_cache.borrow_mut().remove(&source);
+                    }
+                    UnityFile::SerializedFile(asset) => {
+                        let source = BinarySource::WebEntry {
+                            web_path: web_path.clone(),
+                            entry_name,
+                        };
+                        self.binary_assets.insert(source, asset);
+                        self.bundle_container_cache.borrow_mut().clear();
+                    }
+                    UnityFile::WebFile(_) => {
+                        // Nested WebFiles are uncommon; ignore for now.
+                    }
                 }
-                Err(e) => Err(UnityAssetError::format(format!(
-                    "Failed to parse SerializedFile {:?}: {}",
-                    path, e
-                ))),
             }
+
+            Ok(())
         }
 
         /// Load all supported files from a directory
@@ -461,23 +613,23 @@ pub mod environment {
 
         /// Iterate binary object references across all loaded bundles and standalone serialized files.
         pub fn binary_object_infos(&self) -> impl Iterator<Item = BinaryObjectRef<'_>> {
-            let standalone = self.binary_assets.iter().flat_map(|(path, file)| {
+            let standalone = self.binary_assets.iter().flat_map(|(source, file)| {
                 file.object_handles().map(move |object| BinaryObjectRef {
-                    source_path: path,
+                    source,
                     source_kind: BinarySourceKind::SerializedFile,
                     asset_index: None,
                     object,
                 })
             });
 
-            let bundled = self.bundles.iter().flat_map(|(bundle_path, bundle)| {
+            let bundled = self.bundles.iter().flat_map(|(bundle_source, bundle)| {
                 bundle
                     .assets
                     .iter()
                     .enumerate()
                     .flat_map(move |(asset_index, file)| {
                         file.object_handles().map(move |object| BinaryObjectRef {
-                            source_path: bundle_path,
+                            source: bundle_source,
                             source_kind: BinarySourceKind::AssetBundle,
                             asset_index: Some(asset_index),
                             object,
@@ -489,23 +641,23 @@ pub mod environment {
         }
 
         /// List all loaded binary sources (standalone serialized files + bundles).
-        pub fn binary_sources(&self) -> Vec<(BinarySourceKind, &PathBuf)> {
-            let mut out: Vec<(BinarySourceKind, &PathBuf)> = Vec::new();
+        pub fn binary_sources(&self) -> Vec<(BinarySourceKind, BinarySource)> {
+            let mut out: Vec<(BinarySourceKind, BinarySource)> = Vec::new();
 
-            let mut asset_paths: Vec<&PathBuf> = self.binary_assets.keys().collect();
-            asset_paths.sort();
+            let mut asset_sources: Vec<BinarySource> = self.binary_assets.keys().cloned().collect();
+            asset_sources.sort();
             out.extend(
-                asset_paths
+                asset_sources
                     .into_iter()
-                    .map(|p| (BinarySourceKind::SerializedFile, p)),
+                    .map(|s| (BinarySourceKind::SerializedFile, s)),
             );
 
-            let mut bundle_paths: Vec<&PathBuf> = self.bundles.keys().collect();
-            bundle_paths.sort();
+            let mut bundle_sources: Vec<BinarySource> = self.bundles.keys().cloned().collect();
+            bundle_sources.sort();
             out.extend(
-                bundle_paths
+                bundle_sources
                     .into_iter()
-                    .map(|p| (BinarySourceKind::AssetBundle, p)),
+                    .map(|s| (BinarySourceKind::AssetBundle, s)),
             );
 
             out
@@ -517,13 +669,13 @@ pub mod environment {
         pub fn find_binary_objects(&self, path_id: i64) -> Vec<BinaryObjectRef<'_>> {
             let mut out = Vec::new();
 
-            let mut asset_paths: Vec<&PathBuf> = self.binary_assets.keys().collect();
-            asset_paths.sort();
-            for path in asset_paths {
-                let file = &self.binary_assets[path];
+            let mut asset_sources: Vec<&BinarySource> = self.binary_assets.keys().collect();
+            asset_sources.sort();
+            for source in asset_sources {
+                let file = &self.binary_assets[source];
                 if let Some(object) = file.find_object_handle(path_id) {
                     out.push(BinaryObjectRef {
-                        source_path: path,
+                        source,
                         source_kind: BinarySourceKind::SerializedFile,
                         asset_index: None,
                         object,
@@ -531,14 +683,14 @@ pub mod environment {
                 }
             }
 
-            let mut bundle_paths: Vec<&PathBuf> = self.bundles.keys().collect();
-            bundle_paths.sort();
-            for bundle_path in bundle_paths {
-                let bundle = &self.bundles[bundle_path];
+            let mut bundle_sources: Vec<&BinarySource> = self.bundles.keys().collect();
+            bundle_sources.sort();
+            for bundle_source in bundle_sources {
+                let bundle = &self.bundles[bundle_source];
                 for (asset_index, asset) in bundle.assets.iter().enumerate() {
                     if let Some(object) = asset.find_object_handle(path_id) {
                         out.push(BinaryObjectRef {
-                            source_path: bundle_path,
+                            source: bundle_source,
                             source_kind: BinarySourceKind::AssetBundle,
                             asset_index: Some(asset_index),
                             object,
@@ -561,12 +713,20 @@ pub mod environment {
             source: P,
             path_id: i64,
         ) -> Vec<BinaryObjectRef<'_>> {
-            let source = source.as_ref();
+            let source = BinarySource::path(source.as_ref());
+            self.find_binary_objects_in_source_id(&source, path_id)
+        }
 
+        /// Find binary objects by `path_id` within a specific loaded source (including WebFile entries).
+        pub fn find_binary_objects_in_source_id(
+            &self,
+            source: &BinarySource,
+            path_id: i64,
+        ) -> Vec<BinaryObjectRef<'_>> {
             if let Some((key, file)) = self.binary_assets.get_key_value(source) {
                 if let Some(object) = file.find_object_handle(path_id) {
                     return vec![BinaryObjectRef {
-                        source_path: key,
+                        source: key,
                         source_kind: BinarySourceKind::SerializedFile,
                         asset_index: None,
                         object,
@@ -580,7 +740,7 @@ pub mod environment {
                 for (asset_index, asset) in bundle.assets.iter().enumerate() {
                     if let Some(object) = asset.find_object_handle(path_id) {
                         out.push(BinaryObjectRef {
-                            source_path: key,
+                            source: key,
                             source_kind: BinarySourceKind::AssetBundle,
                             asset_index: Some(asset_index),
                             object,
@@ -604,6 +764,16 @@ pub mod environment {
                 .next()
         }
 
+        pub fn find_binary_object_in_source_id(
+            &self,
+            source: &BinarySource,
+            path_id: i64,
+        ) -> Option<BinaryObjectRef<'_>> {
+            self.find_binary_objects_in_source_id(source, path_id)
+                .into_iter()
+                .next()
+        }
+
         /// Find a binary object by `path_id` within a specific bundle + asset index.
         pub fn find_binary_object_in_bundle_asset<P: AsRef<Path>>(
             &self,
@@ -611,12 +781,21 @@ pub mod environment {
             asset_index: usize,
             path_id: i64,
         ) -> Option<BinaryObjectRef<'_>> {
-            let bundle_path = bundle_path.as_ref();
-            let (key, bundle) = self.bundles.get_key_value(bundle_path)?;
+            let bundle_source = BinarySource::path(bundle_path.as_ref());
+            self.find_binary_object_in_bundle_asset_source(&bundle_source, asset_index, path_id)
+        }
+
+        pub fn find_binary_object_in_bundle_asset_source(
+            &self,
+            bundle_source: &BinarySource,
+            asset_index: usize,
+            path_id: i64,
+        ) -> Option<BinaryObjectRef<'_>> {
+            let (key, bundle) = self.bundles.get_key_value(bundle_source)?;
             let asset = bundle.assets.get(asset_index)?;
             let object = asset.find_object_handle(path_id)?;
             Some(BinaryObjectRef {
-                source_path: key,
+                source: key,
                 source_kind: BinarySourceKind::AssetBundle,
                 asset_index: Some(asset_index),
                 object,
@@ -647,16 +826,17 @@ pub mod environment {
         pub fn read_binary_object_key(&self, key: &BinaryObjectKey) -> Result<UnityObject> {
             match key.source_kind {
                 BinarySourceKind::SerializedFile => {
-                    let file = self.binary_assets.get(&key.source_path).ok_or_else(|| {
+                    let file = self.binary_assets.get(&key.source).ok_or_else(|| {
                         UnityAssetError::format(format!(
-                            "SerializedFile source not loaded: {:?}",
-                            key.source_path
+                            "SerializedFile source not loaded: {}",
+                            key.source.describe()
                         ))
                     })?;
                     let object = file.find_object_handle(key.path_id).ok_or_else(|| {
                         UnityAssetError::format(format!(
-                            "Object not found in SerializedFile {:?}: path_id={}",
-                            key.source_path, key.path_id
+                            "Object not found in SerializedFile {}: path_id={}",
+                            key.source.describe(),
+                            key.path_id
                         ))
                     })?;
                     object.read().map_err(|e| {
@@ -664,10 +844,10 @@ pub mod environment {
                     })
                 }
                 BinarySourceKind::AssetBundle => {
-                    let bundle = self.bundles.get(&key.source_path).ok_or_else(|| {
+                    let bundle = self.bundles.get(&key.source).ok_or_else(|| {
                         UnityAssetError::format(format!(
-                            "AssetBundle source not loaded: {:?}",
-                            key.source_path
+                            "AssetBundle source not loaded: {}",
+                            key.source.describe()
                         ))
                     })?;
                     let asset_index = key.asset_index.ok_or_else(|| {
@@ -678,14 +858,17 @@ pub mod environment {
                     })?;
                     let file = bundle.assets.get(asset_index).ok_or_else(|| {
                         UnityAssetError::format(format!(
-                            "AssetBundle asset index out of range: {:?} asset_index={}",
-                            key.source_path, asset_index
+                            "AssetBundle asset index out of range: {} asset_index={}",
+                            key.source.describe(),
+                            asset_index
                         ))
                     })?;
                     let object = file.find_object_handle(key.path_id).ok_or_else(|| {
                         UnityAssetError::format(format!(
-                            "Object not found in AssetBundle {:?} asset_index={}: path_id={}",
-                            key.source_path, asset_index, key.path_id
+                            "Object not found in AssetBundle {} asset_index={}: path_id={}",
+                            key.source.describe(),
+                            asset_index,
+                            key.path_id
                         ))
                     })?;
                     object.read().map_err(|e| {
@@ -695,23 +878,25 @@ pub mod environment {
             }
         }
 
-        fn find_loaded_serialized_file_by_external_path(
+        fn find_loaded_serialized_source_by_external_path(
             &self,
             external_path: &str,
-        ) -> Option<PathBuf> {
+        ) -> Option<BinarySource> {
             if external_path.is_empty() {
                 return None;
             }
 
             let direct = Path::new(external_path);
-            if self.binary_assets.contains_key(direct) {
-                return Some(direct.to_path_buf());
+            let direct_key = BinarySource::Path(direct.to_path_buf());
+            if self.binary_assets.contains_key(&direct_key) {
+                return Some(direct_key);
             }
 
             if !direct.is_absolute() {
                 let joined = self.base_path.join(direct);
-                if self.binary_assets.contains_key(&joined) {
-                    return Some(joined);
+                let joined_key = BinarySource::Path(joined);
+                if self.binary_assets.contains_key(&joined_key) {
+                    return Some(joined_key);
                 }
             }
 
@@ -721,25 +906,27 @@ pub mod environment {
                 by_name.extend(
                     self.binary_assets
                         .keys()
+                        .filter_map(|k| k.as_path())
                         .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some(name)),
                 );
             }
             by_name.sort();
             if let Some(found) = by_name.first() {
-                return Some((*found).clone());
+                return Some(BinarySource::Path((*found).clone()));
             }
 
             let external_norm = external_path.replace('\\', "/");
             let mut by_suffix: Vec<&PathBuf> = self
                 .binary_assets
                 .keys()
+                .filter_map(|k| k.as_path())
                 .filter(|p| {
                     let p_str = p.to_string_lossy().replace('\\', "/");
                     p_str.ends_with(&external_norm) || external_norm.ends_with(&p_str)
                 })
                 .collect();
             by_suffix.sort();
-            by_suffix.first().cloned().cloned()
+            by_suffix.first().cloned().cloned().map(BinarySource::Path)
         }
 
         /// Resolve a Unity `PPtr` (`fileID`, `pathID`) into a globally-unique object key.
@@ -756,7 +943,7 @@ pub mod environment {
         ) -> Option<BinaryObjectKey> {
             if file_id == 0 {
                 return Some(BinaryObjectKey {
-                    source_path: context.source_path.clone(),
+                    source: context.source.clone(),
                     source_kind: context.source_kind,
                     asset_index: context.asset_index,
                     path_id,
@@ -773,7 +960,7 @@ pub mod environment {
             // Best-effort: if the context object comes from a bundle, resolve external references to other
             // serialized files inside the same bundle.
             if context.source_kind == BinarySourceKind::AssetBundle {
-                if let Some(bundle) = self.bundles.get(context.source_path) {
+                if let Some(bundle) = self.bundles.get(context.source) {
                     let external_norm = external.path.replace('\\', "/");
                     let external_file_name = std::path::Path::new(&external_norm)
                         .file_name()
@@ -804,7 +991,7 @@ pub mod environment {
                         }
                     }) {
                         return Some(BinaryObjectKey {
-                            source_path: context.source_path.clone(),
+                            source: context.source.clone(),
                             source_kind: BinarySourceKind::AssetBundle,
                             asset_index: Some(asset_index),
                             path_id,
@@ -815,9 +1002,9 @@ pub mod environment {
 
             // Fallback: resolve to an already-loaded standalone serialized file on disk.
             let resolved_source =
-                self.find_loaded_serialized_file_by_external_path(&external.path)?;
+                self.find_loaded_serialized_source_by_external_path(&external.path)?;
             Some(BinaryObjectKey {
-                source_path: resolved_source,
+                source: resolved_source,
                 source_kind: BinarySourceKind::SerializedFile,
                 asset_index: None,
                 path_id,
@@ -920,7 +1107,7 @@ pub mod environment {
 
                 let key = self.resolve_binary_pptr(context, file_id, path_id);
                 out.push(BundleContainerEntry {
-                    bundle_path: context.source_path.clone(),
+                    bundle_source: context.source.clone(),
                     asset_index: context.asset_index.unwrap_or(0),
                     asset_path,
                     file_id,
@@ -940,13 +1127,23 @@ pub mod environment {
             &self,
             bundle_path: P,
         ) -> Result<Vec<BundleContainerEntry>> {
-            let bundle_path = bundle_path.as_ref();
-            if let Some(cached) = self.bundle_container_cache.borrow().get(bundle_path) {
+            let bundle_source = BinarySource::path(bundle_path.as_ref());
+            self.bundle_container_entries_source(&bundle_source)
+        }
+
+        pub fn bundle_container_entries_source(
+            &self,
+            bundle_source: &BinarySource,
+        ) -> Result<Vec<BundleContainerEntry>> {
+            if let Some(cached) = self.bundle_container_cache.borrow().get(bundle_source) {
                 return Ok(cached.clone());
             }
 
-            let (key, bundle) = self.bundles.get_key_value(bundle_path).ok_or_else(|| {
-                UnityAssetError::format(format!("AssetBundle source not loaded: {:?}", bundle_path))
+            let (key, bundle) = self.bundles.get_key_value(bundle_source).ok_or_else(|| {
+                UnityAssetError::format(format!(
+                    "AssetBundle source not loaded: {}",
+                    bundle_source.describe()
+                ))
             })?;
 
             let mut out: Vec<BundleContainerEntry> = Vec::new();
@@ -957,7 +1154,7 @@ pub mod environment {
                         continue;
                     }
                     let obj_ref = BinaryObjectRef {
-                        source_path: key,
+                        source: key,
                         source_kind: BinarySourceKind::AssetBundle,
                         asset_index: Some(asset_index),
                         object,
@@ -988,10 +1185,8 @@ pub mod environment {
                                     // Fallback: if external mapping fails, try to locate the object by `path_id`
                                     // within the same bundle. This is best-effort and only used when `file_id`
                                     // can't be resolved.
-                                    let matches = self.find_binary_objects_in_source(
-                                        obj_ref.source_path,
-                                        path_id,
-                                    );
+                                    let matches = self
+                                        .find_binary_objects_in_source_id(obj_ref.source, path_id);
                                     if matches.len() == 1 {
                                         Some(matches[0].key())
                                     } else {
@@ -999,7 +1194,7 @@ pub mod environment {
                                     }
                                 });
                             out.push(BundleContainerEntry {
-                                bundle_path: obj_ref.source_path.clone(),
+                                bundle_source: obj_ref.source.clone(),
                                 asset_index,
                                 asset_path,
                                 file_id,
@@ -1013,18 +1208,18 @@ pub mod environment {
 
             self.bundle_container_cache
                 .borrow_mut()
-                .insert(bundle_path.to_path_buf(), out.clone());
+                .insert(bundle_source.clone(), out.clone());
             Ok(out)
         }
 
         /// Find container entries across all loaded bundles whose `asset_path` contains `pattern`.
         pub fn find_bundle_container_entries(&self, pattern: &str) -> Vec<BundleContainerEntry> {
-            let mut bundle_paths: Vec<&PathBuf> = self.bundles.keys().collect();
-            bundle_paths.sort();
+            let mut bundle_sources: Vec<&BinarySource> = self.bundles.keys().collect();
+            bundle_sources.sort();
 
             let mut out = Vec::new();
-            for bundle_path in bundle_paths {
-                if let Ok(entries) = self.bundle_container_entries(bundle_path) {
+            for bundle_source in bundle_sources {
+                if let Ok(entries) = self.bundle_container_entries_source(bundle_source) {
                     out.extend(
                         entries
                             .into_iter()
@@ -1071,13 +1266,18 @@ pub mod environment {
         }
 
         /// Get loaded standalone SerializedFiles.
-        pub fn binary_assets(&self) -> &HashMap<PathBuf, SerializedFile> {
+        pub fn binary_assets(&self) -> &HashMap<BinarySource, SerializedFile> {
             &self.binary_assets
         }
 
         /// Get loaded AssetBundles.
-        pub fn bundles(&self) -> &HashMap<PathBuf, AssetBundle> {
+        pub fn bundles(&self) -> &HashMap<BinarySource, AssetBundle> {
             &self.bundles
+        }
+
+        /// Get loaded WebFiles (containers).
+        pub fn webfiles(&self) -> &HashMap<PathBuf, WebFile> {
+            &self.webfiles
         }
 
         fn normalize_stream_path(stream_path: &str) -> String {
@@ -1260,15 +1460,29 @@ pub mod environment {
             offset: u64,
             size: u32,
         ) -> Result<Vec<u8>> {
-            let bundle_path = bundle_path.as_ref();
-            let bundle = self.bundles.get(bundle_path).ok_or_else(|| {
-                UnityAssetError::format(format!("AssetBundle source not loaded: {:?}", bundle_path))
+            let bundle_source = BinarySource::path(bundle_path.as_ref());
+            self.read_bundle_stream_data_source(&bundle_source, stream_path, offset, size)
+        }
+
+        pub fn read_bundle_stream_data_source(
+            &self,
+            bundle_source: &BinarySource,
+            stream_path: &str,
+            offset: u64,
+            size: u32,
+        ) -> Result<Vec<u8>> {
+            let bundle = self.bundles.get(bundle_source).ok_or_else(|| {
+                UnityAssetError::format(format!(
+                    "AssetBundle source not loaded: {}",
+                    bundle_source.describe()
+                ))
             })?;
 
             let node = Self::find_bundle_resource_node(bundle, stream_path).ok_or_else(|| {
                 UnityAssetError::format(format!(
-                    "Resource node not found in bundle {:?}: {}",
-                    bundle_path, stream_path
+                    "Resource node not found in bundle {}: {}",
+                    bundle_source.describe(),
+                    stream_path
                 ))
             })?;
 
@@ -1308,6 +1522,105 @@ pub mod environment {
             Ok(data[start..end].to_vec())
         }
 
+        fn find_webfile_resource_entry(web: &WebFile, stream_path: &str) -> Option<String> {
+            let normalized = Self::normalize_stream_path(stream_path);
+            if normalized.is_empty() {
+                return None;
+            }
+
+            let file_name = Path::new(&normalized)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+
+            let mut names: Vec<&String> = web.files.iter().map(|f| &f.name).collect();
+            names.sort();
+
+            for name in &names {
+                let name_norm = name.replace('\\', "/");
+                if name_norm == normalized
+                    || name_norm.ends_with(&normalized)
+                    || normalized.ends_with(&name_norm)
+                {
+                    return Some((*name).clone());
+                }
+
+                if let Some(file_name) = &file_name {
+                    if Path::new(&name_norm).file_name().and_then(|n| n.to_str())
+                        == Some(file_name.as_str())
+                    {
+                        return Some((*name).clone());
+                    }
+                }
+            }
+
+            let cab_prefix = Self::cab_prefix_from_normalized(&normalized);
+            if let Some(cab) = cab_prefix {
+                for name in &names {
+                    let name_norm = name.replace('\\', "/");
+                    let base = Path::new(&name_norm)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&name_norm);
+                    if (name_norm.ends_with(".resS") || name_norm.ends_with(".resource"))
+                        && (name_norm.starts_with(&cab) || base.starts_with(&cab))
+                    {
+                        return Some((*name).clone());
+                    }
+                }
+            }
+
+            None
+        }
+
+        fn read_webfile_stream_data(
+            &self,
+            web_path: &PathBuf,
+            stream_path: &str,
+            offset: u64,
+            size: u32,
+        ) -> Result<Vec<u8>> {
+            let web = self.webfiles.get(web_path).ok_or_else(|| {
+                UnityAssetError::format(format!("WebFile source not loaded: {:?}", web_path))
+            })?;
+
+            let entry_name =
+                Self::find_webfile_resource_entry(web, stream_path).ok_or_else(|| {
+                    UnityAssetError::format(format!(
+                        "Resource entry not found in WebFile {:?}: {}",
+                        web_path, stream_path
+                    ))
+                })?;
+
+            let bytes = web.extract_file(&entry_name).map_err(|e| {
+                UnityAssetError::format(format!(
+                    "Failed to extract WebFile entry {:?} from {:?}: {}",
+                    entry_name, web_path, e
+                ))
+            })?;
+
+            let offset_usize: usize = offset.try_into().map_err(|_| {
+                UnityAssetError::format(format!("Stream offset overflow: {}", offset))
+            })?;
+            let size_usize: usize = size
+                .try_into()
+                .map_err(|_| UnityAssetError::format(format!("Stream size overflow: {}", size)))?;
+
+            if offset_usize.saturating_add(size_usize) > bytes.len() {
+                return Err(UnityAssetError::format(format!(
+                    "Stream range out of bounds in WebFile entry {}: offset={}, size={}, entry_len={}",
+                    entry_name,
+                    offset,
+                    size,
+                    bytes.len()
+                )));
+            }
+
+            let start = offset_usize;
+            let end = start.saturating_add(size_usize);
+            Ok(bytes[start..end].to_vec())
+        }
+
         /// Read streamed resource bytes (best-effort) using the current environment context.
         ///
         /// Resolution strategy:
@@ -1322,20 +1635,41 @@ pub mod environment {
             offset: u64,
             size: u32,
         ) -> Result<Vec<u8>> {
-            let source_path = source_path.as_ref();
+            let source = BinarySource::path(source_path.as_ref());
+            self.read_stream_data_source(&source, source_kind, stream_path, offset, size)
+        }
+
+        pub fn read_stream_data_source(
+            &self,
+            source: &BinarySource,
+            source_kind: BinarySourceKind,
+            stream_path: &str,
+            offset: u64,
+            size: u32,
+        ) -> Result<Vec<u8>> {
             if size == 0 {
                 return Ok(Vec::new());
             }
 
             match source_kind {
                 BinarySourceKind::AssetBundle => self
-                    .read_bundle_stream_data(source_path, stream_path, offset, size)
-                    .or_else(|_| {
-                        self.read_stream_data_from_fs(source_path, stream_path, offset, size)
+                    .read_bundle_stream_data_source(source, stream_path, offset, size)
+                    .or_else(|_| match source {
+                        BinarySource::Path(p) => {
+                            self.read_stream_data_from_fs(p, stream_path, offset, size)
+                        }
+                        BinarySource::WebEntry { web_path, .. } => {
+                            self.read_webfile_stream_data(web_path, stream_path, offset, size)
+                        }
                     }),
-                BinarySourceKind::SerializedFile => {
-                    self.read_stream_data_from_fs(source_path, stream_path, offset, size)
-                }
+                BinarySourceKind::SerializedFile => match source {
+                    BinarySource::Path(p) => {
+                        self.read_stream_data_from_fs(p, stream_path, offset, size)
+                    }
+                    BinarySource::WebEntry { web_path, .. } => {
+                        self.read_webfile_stream_data(web_path, stream_path, offset, size)
+                    }
+                },
             }
         }
 
@@ -1440,7 +1774,7 @@ pub mod environment {
                 .expect("can find object in bundle asset 0");
 
             let key = obj_ref.key();
-            assert_eq!(key.source_path, path);
+            assert_eq!(key.source, BinarySource::path(&path));
             assert_eq!(key.source_kind, BinarySourceKind::AssetBundle);
             assert_eq!(key.asset_index, Some(0));
             assert_eq!(key.path_id, first.path_id);
@@ -1487,7 +1821,10 @@ pub mod environment {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/char_118_yuki.ab");
             env.load_file(&path).unwrap();
 
-            let bundle = env.bundles().get(&path).expect("sample bundle loaded");
+            let bundle = env
+                .bundles()
+                .get(&BinarySource::path(&path))
+                .expect("sample bundle loaded");
             let has_assetbundle_object = bundle
                 .assets
                 .iter()
@@ -1533,7 +1870,7 @@ pub mod environment {
 
             let unity_version = env
                 .bundles()
-                .get(&path)
+                .get(&BinarySource::path(&path))
                 .and_then(|b| key.asset_index.and_then(|i| b.assets.get(i)))
                 .and_then(|f| UnityVersion::parse_version(&f.unity_version).ok())
                 .unwrap_or_default();

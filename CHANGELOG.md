@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/REFACTORING.md`: a UnityPy-aligned fearless refactor roadmap (layering, strict/lenient parsing, decode split, API discipline).
 - UnityPy-style `ObjectHandle` in `unity-asset-binary` to treat objects as lightweight, on-demand readers (`SerializedFile::object_handles` / `SerializedFile::find_object_handle`).
 - `unity-asset-binary::file` unified loader (`load_unity_file` / `load_unity_file_from_memory`) and a layered `unity-asset-binary::formats::*` namespace.
+- `unity-asset` `Environment` can now load WebFiles and treat contained bundles/assets as first-class binary sources (including streamed resource reads from WebFile entries).
 - Optional object data preloading toggle in `SerializedFileParser` to enable future lazy-loading workflows.
 - UnityPy-like `Environment` API in the `unity-asset` crate to load YAML + binary files and iterate objects.
 - `Environment` helpers to find YAML objects by anchor and binary objects by `path_id`.
@@ -45,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - (BREAKING) `SerializedFileParser::from_bytes` now defaults to lazy object data access to avoid copying per-object buffers (use `from_bytes_with_options(data, true)` to restore eager preloading).
 - (BREAKING) `SerializedFileHeader` now stores v22+ `file_size` / `data_offset` as `u64` (no truncation), and rejects negative header values.
 - (BREAKING) `unity-asset-binary` no longer mass re-exports types/functions at the crate root; import from `bundle` / `asset` / `object` / `typetree` (or `formats::*`) instead.
+- (BREAKING) `BinaryObjectKey` now defaults to a `bok2|...` string format to support WebFile entry sources; `bok1|...` is still accepted for parsing.
 - Metadata dependency analysis now scans TypeTree values for PPtr references (`fileID`/`pathID`) to build an object dependency graph.
 - Metadata relationship analysis now builds a best-effort GameObject/Transform hierarchy and GameObject->Component mapping (TypeTree-based).
 - Component relationships now include best-effort per-component dependency lists (derived from the dependency graph).
