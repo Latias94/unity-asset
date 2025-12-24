@@ -193,7 +193,7 @@ fn main() -> Result<()> {
             input,
             format,
             preserve_types,
-        } => parse_yaml_command(input, format, preserve_types),
+        } => parse_yaml_command(input, format, preserve_types, show_warnings),
         Commands::Extract {
             input,
             output,
@@ -285,13 +285,24 @@ fn print_environment_warnings(env: &Environment, show_warnings: bool) {
     }
 }
 
-fn parse_yaml_command(input: PathBuf, format: String, preserve_types: bool) -> Result<()> {
+fn parse_yaml_command(
+    input: PathBuf,
+    format: String,
+    preserve_types: bool,
+    show_warnings: bool,
+) -> Result<()> {
     println!("Parsing YAML file: {:?}", input);
     println!("Output format: {}", format);
     println!("Preserve types: {}", preserve_types);
 
     // Load the YAML document
-    let doc = unity_asset::YamlDocument::load_yaml(&input, preserve_types)?;
+    let (doc, warnings) =
+        unity_asset::YamlDocument::load_yaml_with_warnings(&input, preserve_types)?;
+    if show_warnings {
+        for w in warnings {
+            eprintln!("warning: {}", w);
+        }
+    }
 
     println!("✓ Successfully loaded YAML document");
     println!("  Entries: {}", doc.entries().len());

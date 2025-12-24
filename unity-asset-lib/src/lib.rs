@@ -111,7 +111,15 @@ pub mod environment {
 
     #[derive(Debug, Clone)]
     pub enum EnvironmentWarning {
-        LoadFailed { path: PathBuf, error: String },
+        LoadFailed {
+            path: PathBuf,
+            error: String,
+        },
+        YamlDocumentSkipped {
+            path: PathBuf,
+            doc_index: usize,
+            error: String,
+        },
     }
 
     impl fmt::Display for EnvironmentWarning {
@@ -120,6 +128,17 @@ pub mod environment {
                 EnvironmentWarning::LoadFailed { path, error } => {
                     write!(f, "Failed to load {}: {}", path.to_string_lossy(), error)
                 }
+                EnvironmentWarning::YamlDocumentSkipped {
+                    path,
+                    doc_index,
+                    error,
+                } => write!(
+                    f,
+                    "YAML warning in {} (doc {}): {}",
+                    path.to_string_lossy(),
+                    doc_index,
+                    error
+                ),
             }
         }
     }
@@ -573,8 +592,15 @@ pub mod environment {
             if let Some(ext) = path.extension() {
                 match ext.to_str() {
                     Some("asset") | Some("prefab") | Some("unity") | Some("meta") => {
-                        match YamlDocument::load_yaml(path, false) {
-                            Ok(doc) => {
+                        match YamlDocument::load_yaml_with_warnings(path, false) {
+                            Ok((doc, warnings)) => {
+                                for w in warnings {
+                                    self.push_warning(EnvironmentWarning::YamlDocumentSkipped {
+                                        path: path.to_path_buf(),
+                                        doc_index: w.doc_index,
+                                        error: w.error,
+                                    });
+                                }
                                 self.yaml_documents.insert(path.to_path_buf(), doc);
                             }
                             Err(_) => {

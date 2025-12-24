@@ -53,6 +53,14 @@ impl YamlDocument {
     /// # Ok::<(), unity_asset_core::UnityAssetError>(())
     /// ```
     pub fn load_yaml<P: AsRef<Path>>(path: P, _preserve_types: bool) -> Result<Self> {
+        Ok(Self::load_yaml_with_warnings(path, _preserve_types)?.0)
+    }
+
+    /// Load a Unity YAML file and return non-fatal conversion warnings.
+    pub fn load_yaml_with_warnings<P: AsRef<Path>>(
+        path: P,
+        _preserve_types: bool,
+    ) -> Result<(Self, Vec<crate::serde_unity_loader::SerdeUnityWarning>)> {
         use crate::serde_unity_loader::SerdeUnityLoader;
         use std::fs::File;
         use std::io::BufReader;
@@ -67,7 +75,7 @@ impl YamlDocument {
 
         // Use serde-based loader
         let loader = SerdeUnityLoader::new();
-        let unity_classes = loader.load_from_reader(reader)?;
+        let (unity_classes, warnings) = loader.load_from_reader_detailed(reader)?;
 
         // Create YamlDocument with metadata
         let mut yaml_doc = YamlDocument::new();
@@ -78,7 +86,7 @@ impl YamlDocument {
             yaml_doc.add_entry(unity_class);
         }
 
-        Ok(yaml_doc)
+        Ok((yaml_doc, warnings))
     }
 
     /// Load a Unity YAML file asynchronously
@@ -106,6 +114,16 @@ impl YamlDocument {
         path: P,
         _preserve_types: bool,
     ) -> Result<Self> {
+        Ok(Self::load_yaml_async_with_warnings(path, _preserve_types)
+            .await?
+            .0)
+    }
+
+    #[cfg(feature = "async")]
+    pub async fn load_yaml_async_with_warnings<P: AsRef<Path> + Send>(
+        path: P,
+        _preserve_types: bool,
+    ) -> Result<(Self, Vec<crate::serde_unity_loader::SerdeUnityWarning>)> {
         use crate::serde_unity_loader::SerdeUnityLoader;
         use tokio::fs::File;
         use tokio::io::BufReader;
@@ -120,7 +138,7 @@ impl YamlDocument {
 
         // Use serde-based loader (we'll need to make this async too)
         let loader = SerdeUnityLoader::new();
-        let unity_classes = loader.load_from_async_reader(reader).await?;
+        let (unity_classes, warnings) = loader.load_from_async_reader_detailed(reader).await?;
 
         // Create YamlDocument with metadata
         let mut yaml_doc = YamlDocument::new();
@@ -131,7 +149,7 @@ impl YamlDocument {
             yaml_doc.add_entry(unity_class);
         }
 
-        Ok(yaml_doc)
+        Ok((yaml_doc, warnings))
     }
 
     /// Get the line ending style

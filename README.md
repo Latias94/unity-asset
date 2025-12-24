@@ -131,7 +131,10 @@ If you need a production tool for Unity asset processing, **use UnityPy instead*
 use unity_asset::{YamlDocument, UnityDocument};
 
 // Load a Unity YAML file
-let doc = YamlDocument::load_yaml("ProjectSettings.asset", false)?;
+let (doc, warnings) = YamlDocument::load_yaml_with_warnings("ProjectSettings.asset", false)?;
+for w in warnings {
+    eprintln!("warning: {}", w);
+}
 
 // Get basic information
 println!("Found {} entries", doc.entries().len());

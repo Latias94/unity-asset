@@ -13,6 +13,22 @@ use unity_asset_core::{UnityAssetError, UnityClass, UnityValue};
 #[cfg(feature = "async")]
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+#[derive(Debug, Clone)]
+pub struct SerdeUnityWarning {
+    pub doc_index: usize,
+    pub error: String,
+}
+
+impl std::fmt::Display for SerdeUnityWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to convert document {}: {}",
+            self.doc_index, self.error
+        )
+    }
+}
+
 /// Unity YAML loader based on serde_yaml
 pub struct SerdeUnityLoader;
 
@@ -23,7 +39,14 @@ impl SerdeUnityLoader {
     }
 
     /// Load Unity YAML from a reader
-    pub fn load_from_reader<R: Read>(&self, mut reader: R) -> Result<Vec<UnityClass>> {
+    pub fn load_from_reader<R: Read>(&self, reader: R) -> Result<Vec<UnityClass>> {
+        Ok(self.load_from_reader_detailed(reader)?.0)
+    }
+
+    pub fn load_from_reader_detailed<R: Read>(
+        &self,
+        mut reader: R,
+    ) -> Result<(Vec<UnityClass>, Vec<SerdeUnityWarning>)> {
         // Read the entire content first
         let mut content = String::new();
         reader
@@ -41,17 +64,21 @@ impl SerdeUnityLoader {
 
         // Convert each document to UnityClass
         let mut unity_classes = Vec::new();
+        let mut warnings: Vec<SerdeUnityWarning> = Vec::new();
         for (doc_index, document) in documents.iter().enumerate() {
             match self.convert_document_to_unity_class(document, doc_index) {
                 Ok(unity_class) => unity_classes.push(unity_class),
                 Err(e) => {
                     // Best-effort: keep parsing other documents (no stderr logging from library code).
-                    let _ = e;
+                    warnings.push(SerdeUnityWarning {
+                        doc_index,
+                        error: e.to_string(),
+                    });
                 }
             }
         }
 
-        Ok(unity_classes)
+        Ok((unity_classes, warnings))
     }
 
     /// Load Unity YAML from a string
@@ -76,6 +103,20 @@ impl SerdeUnityLoader {
 
         // Use the existing string processing logic
         self.load_from_str(&content)
+    }
+
+    #[cfg(feature = "async")]
+    pub async fn load_from_async_reader_detailed<R: AsyncRead + Unpin>(
+        &self,
+        mut reader: R,
+    ) -> Result<(Vec<UnityClass>, Vec<SerdeUnityWarning>)> {
+        let mut content = String::new();
+        reader
+            .read_to_string(&mut content)
+            .await
+            .map_err(|e| UnityAssetError::parse(format!("Failed to read input: {}", e)))?;
+
+        self.load_from_reader_detailed(std::io::Cursor::new(content.into_bytes()))
     }
 
     /// Preprocess Unity YAML to handle Unity-specific features
