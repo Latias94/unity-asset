@@ -94,6 +94,12 @@ Rules:
 
 ## Work Plan
 
+## Status (current repository state)
+
+- Phase 0 safety/correctness hardening is implemented (bounded strings, checked header arithmetic, UnityFS flags correctness, UnityWeb size handling).
+- Phase 1 performance improvements are implemented (lazy `path_id` index; reduced avoidable buffer copies).
+- Phase 2 has started: the binary crate exposes a UnityPy-style `ObjectHandle`, and `SerializedFile` can yield object handles for on-demand reads.
+
 ### Phase 0 — Safety & Correctness (mandatory)
 
 - Harden `BinaryReader` string reads with bounds and limits.
@@ -151,4 +157,3 @@ For now, we recommend **breaking release** for Phase 0–2, then stabilize.
 - TypeTree errors are controllable and observable (no stderr logging).
 - Object lookup is near O(1) by default after first query.
 - Clear module boundaries: parsing vs handles vs environment vs decode.
-

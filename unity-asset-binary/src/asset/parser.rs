@@ -3,8 +3,11 @@
 //! This module provides the main parsing logic for Unity SerializedFile structures.
 
 use super::header::SerializedFileHeader;
-use super::types::{FileIdentifier, LocalSerializedObjectIdentifier, ObjectInfo, SerializedType, TypeRegistry};
+use super::types::{
+    FileIdentifier, LocalSerializedObjectIdentifier, ObjectInfo, SerializedType, TypeRegistry,
+};
 use crate::error::{BinaryError, Result};
+use crate::object::ObjectHandle;
 use crate::reader::{BinaryReader, ByteOrder};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,7 +27,10 @@ impl SerializedFileParser {
     }
 
     /// Parse SerializedFile from binary data with options
-    pub fn from_bytes_with_options(data: Vec<u8>, preload_object_data: bool) -> Result<SerializedFile> {
+    pub fn from_bytes_with_options(
+        data: Vec<u8>,
+        preload_object_data: bool,
+    ) -> Result<SerializedFile> {
         let data: Arc<[u8]> = data.into();
         let mut file = SerializedFile {
             header: SerializedFileHeader::default(),
@@ -83,8 +89,8 @@ impl SerializedFileParser {
         let result = tokio::task::spawn_blocking(move || {
             Self::from_bytes_with_options(data, preload_object_data)
         })
-            .await
-            .map_err(|e| BinaryError::generic(format!("Task join error: {}", e)))??;
+        .await
+        .map_err(|e| BinaryError::generic(format!("Task join error: {}", e)))??;
 
         Ok(result)
     }
@@ -116,8 +122,12 @@ impl SerializedFileParser {
         }
         let type_count = type_count as usize;
         for _ in 0..type_count {
-            let serialized_type =
-                SerializedType::from_reader(reader, file.header.version, file.enable_type_tree, false)?;
+            let serialized_type = SerializedType::from_reader(
+                reader,
+                file.header.version,
+                file.enable_type_tree,
+                false,
+            )?;
             file.types.push(serialized_type);
         }
 
@@ -201,7 +211,10 @@ impl SerializedFileParser {
     }
 
     /// Parse object information
-    fn parse_object_info(file: &mut SerializedFile, reader: &mut BinaryReader) -> Result<ObjectInfo> {
+    fn parse_object_info(
+        file: &mut SerializedFile,
+        reader: &mut BinaryReader,
+    ) -> Result<ObjectInfo> {
         let version = file.header.version;
 
         // Path ID
@@ -240,7 +253,10 @@ impl SerializedFileParser {
                 .types
                 .get(idx as usize)
                 .ok_or_else(|| {
-                    BinaryError::invalid_data(format!("Invalid type index in object table: {}", idx))
+                    BinaryError::invalid_data(format!(
+                        "Invalid type index in object table: {}",
+                        idx
+                    ))
                 })?
                 .class_id;
             (class_id, idx)
@@ -272,11 +288,7 @@ impl SerializedFileParser {
         }
 
         Ok(ObjectInfo::new(
-            path_id,
-            byte_start,
-            byte_size,
-            class_id,
-            type_index,
+            path_id, byte_start, byte_size, class_id, type_index,
         ))
     }
 
@@ -365,10 +377,9 @@ impl SerializedFile {
 
     /// Get the raw bytes for an object without requiring preloaded per-object buffers.
     pub fn object_bytes<'a>(&'a self, info: &ObjectInfo) -> Result<&'a [u8]> {
-        let start: usize = info
-            .byte_start
-            .try_into()
-            .map_err(|_| BinaryError::invalid_data(format!("Object byte_start overflow: {}", info.byte_start)))?;
+        let start: usize = info.byte_start.try_into().map_err(|_| {
+            BinaryError::invalid_data(format!("Object byte_start overflow: {}", info.byte_start))
+        })?;
         let end = start.saturating_add(info.byte_size as usize);
         let data = self.data();
         if end > data.len() {
@@ -519,8 +530,10 @@ impl SerializedFile {
                             let s = score(&entries, externals_len);
                             let better = match &best {
                                 None => true,
-                                Some((best_score, best_entries)) => s > *best_score
-                                    || (s == *best_score && entries.len() > best_entries.len()),
+                                Some((best_score, best_entries)) => {
+                                    s > *best_score
+                                        || (s == *best_score && entries.len() > best_entries.len())
+                                }
                             };
                             if better {
                                 best = Some((s, entries));
@@ -540,7 +553,9 @@ impl SerializedFile {
         }
 
         Err(last_err.unwrap_or_else(|| {
-            BinaryError::invalid_data("Failed to parse AssetBundle container (no candidates matched)")
+            BinaryError::invalid_data(
+                "Failed to parse AssetBundle container (no candidates matched)",
+            )
         }))
     }
 
@@ -564,6 +579,19 @@ impl SerializedFile {
             map
         });
         index.get(&path_id).and_then(|idx| self.objects.get(*idx))
+    }
+
+    /// Iterate all objects as lightweight handles.
+    pub fn object_handles(&self) -> impl Iterator<Item = ObjectHandle<'_>> {
+        self.objects
+            .iter()
+            .map(|info| ObjectHandle::new(self, info))
+    }
+
+    /// Find an object by `path_id` and return a lightweight handle.
+    pub fn find_object_handle(&self, path_id: i64) -> Option<ObjectHandle<'_>> {
+        self.find_object(path_id)
+            .map(|info| ObjectHandle::new(self, info))
     }
 
     /// Find type by class ID

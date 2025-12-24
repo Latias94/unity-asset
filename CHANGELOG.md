@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `docs/REFACTORING.md`: a UnityPy-aligned fearless refactor roadmap (layering, strict/lenient parsing, decode split, API discipline).
+- UnityPy-style `ObjectHandle` in `unity-asset-binary` to treat objects as lightweight, on-demand readers (`SerializedFile::object_handles` / `SerializedFile::find_object_handle`).
 - Optional object data preloading toggle in `SerializedFileParser` to enable future lazy-loading workflows.
 - UnityPy-like `Environment` API in the `unity-asset` crate to load YAML + binary files and iterate objects.
 - `Environment` helpers to find YAML objects by anchor and binary objects by `path_id`.

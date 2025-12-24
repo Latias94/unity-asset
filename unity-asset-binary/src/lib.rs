@@ -137,6 +137,7 @@ pub use bundle::{
 pub use error::{BinaryError, Result};
 
 // Re-export async support
+pub use asset::ObjectInfo as UnityObjectInfo;
 pub use metadata::{
     // Core metadata types
     AssetMetadata,
@@ -177,8 +178,7 @@ pub use metadata::{
     get_recommended_config,
     is_extraction_supported,
 };
-pub use asset::ObjectInfo as UnityObjectInfo;
-pub use object::UnityObject;
+pub use object::{ObjectHandle, UnityObject};
 pub use reader::{BinaryReader, ByteOrder};
 pub use typetree::{
     ParsingStats as TypeTreeParsingStats,
