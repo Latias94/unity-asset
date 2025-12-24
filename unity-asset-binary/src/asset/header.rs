@@ -46,9 +46,9 @@ impl SerializedFileHeader {
         } else {
             // For older versions, endian is at the end of metadata
             let current_pos = reader.position();
-            let endian_pos = file_size
-                .checked_sub(metadata_size as u64)
-                .ok_or_else(|| BinaryError::invalid_data("Invalid header: file_size < metadata_size"))?;
+            let endian_pos = file_size.checked_sub(metadata_size as u64).ok_or_else(|| {
+                BinaryError::invalid_data("Invalid header: file_size < metadata_size")
+            })?;
             reader.set_position(endian_pos)?;
             endian = reader.read_u8()?;
             reader.set_position(current_pos)?;

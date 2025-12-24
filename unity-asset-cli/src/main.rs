@@ -5,16 +5,16 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use unity_asset::environment::Environment;
 use unity_asset::UnityDocument;
 use unity_asset::UnityValue;
+use unity_asset::environment::Environment;
 use unity_asset_binary::{
     asset::class_ids,
     audio::{AudioClipConverter, AudioProcessor},
+    object::UnityObject,
     sprite::SpriteProcessor,
     texture::{TextureExporter, TextureProcessor},
     unity_version::UnityVersion,
-    UnityObject,
 };
 
 #[derive(Parser)]
@@ -210,7 +210,15 @@ fn main() -> Result<()> {
             limit,
             include_unresolved,
             verbose,
-        } => find_object_command(input, pattern, class_id, class_name, limit, include_unresolved, verbose),
+        } => find_object_command(
+            input,
+            pattern,
+            class_id,
+            class_name,
+            limit,
+            include_unresolved,
+            verbose,
+        ),
         Commands::InspectObject {
             input,
             key,
@@ -362,8 +370,13 @@ fn sanitize_asset_path(asset_path: &str) -> PathBuf {
             clean.push(if keep { ch } else { '_' });
         }
         if clean.is_empty() || clean == "." || clean == ".." {
-            clean = format!("_{}_",
-                if clean.is_empty() { "empty" } else { clean.as_str() }
+            clean = format!(
+                "_{}_",
+                if clean.is_empty() {
+                    "empty"
+                } else {
+                    clean.as_str()
+                }
             );
         }
         out.push(clean);
@@ -380,17 +393,9 @@ fn magic_based_extension(asset_path: &str, bytes: &[u8]) -> Option<&'static str>
 
     match ext.as_str() {
         "ogg" if bytes.len() >= 4 && &bytes[0..4] == b"OggS" => Some("ogg"),
-        "png"
-            if bytes.len() >= 8 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" =>
-        {
-            Some("png")
-        }
+        "png" if bytes.len() >= 8 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" => Some("png"),
         "jpg" | "jpeg" if bytes.len() >= 3 && &bytes[0..3] == b"\xFF\xD8\xFF" => Some("jpg"),
-        "wav"
-            if bytes.len() >= 12
-                && &bytes[0..4] == b"RIFF"
-                && &bytes[8..12] == b"WAVE" =>
-        {
+        "wav" if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" => {
             Some("wav")
         }
         _ => None,
@@ -863,7 +868,10 @@ fn list_bundle_command(input: PathBuf, filter: String, verbose: bool) -> Result<
                 continue;
             }
             if verbose {
-                println!("  - {} (offset={}, size={}, flags={})", node.name, node.offset, node.size, node.flags);
+                println!(
+                    "  - {} (offset={}, size={}, flags={})",
+                    node.name, node.offset, node.size, node.flags
+                );
             } else {
                 println!("  - {}", node.name);
             }
@@ -916,12 +924,15 @@ fn find_object_command(
                 }
             }
 
-            if !pattern_lc.is_empty() && !entry.asset_path.to_ascii_lowercase().contains(&pattern_lc)
+            if !pattern_lc.is_empty()
+                && !entry.asset_path.to_ascii_lowercase().contains(&pattern_lc)
             {
                 continue;
             }
 
-            if entry.key.is_none() && (!include_unresolved || !class_ids.is_empty() || !class_name_lc.is_empty()) {
+            if entry.key.is_none()
+                && (!include_unresolved || !class_ids.is_empty() || !class_name_lc.is_empty())
+            {
                 continue;
             }
 
@@ -947,7 +958,11 @@ fn find_object_command(
                 } else {
                     println!(
                         "{} -> unresolved(bundle={:?}, asset_index={}, file_id={}, path_id={})",
-                        entry.asset_path, entry.bundle_path, entry.asset_index, entry.file_id, entry.path_id
+                        entry.asset_path,
+                        entry.bundle_path,
+                        entry.asset_index,
+                        entry.file_id,
+                        entry.path_id
                     );
                 }
             } else if let Some(key) = &entry.key {
@@ -960,7 +975,8 @@ fn find_object_command(
                     continue;
                 }
                 if !class_name_lc.is_empty() {
-                    let name = unity_asset::get_class_name(type_id).unwrap_or_else(|| format!("Class_{}", type_id));
+                    let name = unity_asset::get_class_name(type_id)
+                        .unwrap_or_else(|| format!("Class_{}", type_id));
                     if !name.to_ascii_lowercase().contains(&class_name_lc) {
                         continue;
                     }
@@ -1030,10 +1046,10 @@ fn inspect_object_command(
             anyhow::bail!("--asset-index is required when --kind bundle");
         }
 
-        let path_id =
-            path_id.ok_or_else(|| anyhow::anyhow!("--path-id is required unless --key is provided"))?;
-        let source =
-            source.ok_or_else(|| anyhow::anyhow!("--source is required unless --key is provided"))?;
+        let path_id = path_id
+            .ok_or_else(|| anyhow::anyhow!("--path-id is required unless --key is provided"))?;
+        let source = source
+            .ok_or_else(|| anyhow::anyhow!("--source is required unless --key is provided"))?;
 
         unity_asset::environment::BinaryObjectKey {
             source_path: source,
@@ -1098,7 +1114,9 @@ fn resolve_loaded_source_path(
     requested: &PathBuf,
 ) -> Result<PathBuf> {
     let is_loaded = match kind {
-        unity_asset::environment::BinarySourceKind::AssetBundle => env.bundles().contains_key(requested),
+        unity_asset::environment::BinarySourceKind::AssetBundle => {
+            env.bundles().contains_key(requested)
+        }
         unity_asset::environment::BinarySourceKind::SerializedFile => {
             env.binary_assets().contains_key(requested)
         }
@@ -1109,7 +1127,9 @@ fn resolve_loaded_source_path(
 
     let keys: Vec<&PathBuf> = match kind {
         unity_asset::environment::BinarySourceKind::AssetBundle => env.bundles().keys().collect(),
-        unity_asset::environment::BinarySourceKind::SerializedFile => env.binary_assets().keys().collect(),
+        unity_asset::environment::BinarySourceKind::SerializedFile => {
+            env.binary_assets().keys().collect()
+        }
     };
 
     let requested_canon = std::fs::canonicalize(requested).ok();
@@ -1126,7 +1146,10 @@ fn resolve_loaded_source_path(
             return Ok(matches[0].clone());
         }
         if matches.len() > 1 {
-            anyhow::bail!("Ambiguous source path: {:?} matches multiple loaded sources", requested);
+            anyhow::bail!(
+                "Ambiguous source path: {:?} matches multiple loaded sources",
+                requested
+            );
         }
     }
 

@@ -99,6 +99,7 @@ Rules:
 - Phase 0 safety/correctness hardening is implemented (bounded strings, checked header arithmetic, UnityFS flags correctness, UnityWeb size handling).
 - Phase 1 performance improvements are implemented (lazy `path_id` index; reduced avoidable buffer copies).
 - Phase 2 has started: the binary crate exposes a UnityPy-style `ObjectHandle`, and `SerializedFile` can yield object handles for on-demand reads.
+- Phase 2 is in progress: the binary crate now provides a unified `UnityFile` model and a layered `formats::*` namespace; top-level re-exports are being reduced.
 
 ### Phase 0 — Safety & Correctness (mandatory)
 

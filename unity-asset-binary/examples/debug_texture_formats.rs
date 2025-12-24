@@ -2,7 +2,8 @@
 //!
 //! This example helps debug specific texture format issues.
 
-use unity_asset_binary::{Texture2D, Texture2DConverter, TextureFormat, UnityVersion};
+use unity_asset_binary::texture::{Texture2D, Texture2DConverter, TextureFormat};
+use unity_asset_binary::unity_version::UnityVersion;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Debug Texture Format Decoding");

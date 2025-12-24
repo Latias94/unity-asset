@@ -282,7 +282,6 @@ impl AudioClipConverter {
                 legacy_3d,
                 compression_format,
             };
-
         }
 
         clip.size = if clip.is_streamed() {

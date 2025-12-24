@@ -3,8 +3,9 @@
 //! This module provides the main metadata extraction functionality for Unity assets.
 
 use super::types::*;
+use crate::asset::SerializedFile;
+use crate::bundle::AssetBundle;
 use crate::error::Result;
-use crate::{AssetBundle, SerializedFile};
 use std::collections::HashMap;
 use std::time::Instant;
 

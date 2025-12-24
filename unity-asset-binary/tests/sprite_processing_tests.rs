@@ -7,14 +7,15 @@
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::bool_assert_comparison)]
 
+use indexmap::IndexMap;
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::{
-    AssetBundle, SerializedFile, Sprite, SpriteInfo, SpriteProcessor, Texture2D, TextureFormat,
-    UnityVersion,
-};
+use unity_asset_binary::asset::SerializedFile;
+use unity_asset_binary::bundle::AssetBundle;
+use unity_asset_binary::sprite::{Sprite, SpriteInfo, SpriteProcessor};
+use unity_asset_binary::texture::{Texture2D, TextureFormat};
+use unity_asset_binary::unity_version::UnityVersion;
 use unity_asset_core::UnityValue;
-use indexmap::IndexMap;
 
 /// Test comprehensive sprite image extraction
 #[test]
@@ -267,7 +268,7 @@ fn test_sprite_typetree_texture_pptr_uses_path_id() {
     rd.insert("texture".to_string(), UnityValue::Object(texture_pptr));
     props.insert("m_RD".to_string(), UnityValue::Object(rd));
 
-    let obj = unity_asset_binary::UnityObject::from_info_and_class(
+    let obj = unity_asset_binary::object::UnityObject::from_info_and_class(
         unity_asset_binary::asset::ObjectInfo::new(1, 0, 0, 213, -1),
         unity_asset_core::UnityClass::new(213, "Sprite".to_string(), "1".to_string()),
     );

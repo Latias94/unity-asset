@@ -6,7 +6,7 @@
 #![allow(unused_imports)]
 #![allow(clippy::approx_constant)]
 
-use unity_asset_binary::{TypeTree, TypeTreeNode};
+use unity_asset_binary::typetree::{TypeTree, TypeTreeNode};
 
 /// Test basic TypeTree functionality
 #[test]

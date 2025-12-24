@@ -154,9 +154,7 @@ impl<'a> TypeTreeSerializer<'a> {
             }
 
             // String
-            "string" => {
-                UnityValue::String(reader.read_aligned_string()?)
-            }
+            "string" => UnityValue::String(reader.read_aligned_string()?),
 
             // Array types
             _ if !node.children.is_empty()

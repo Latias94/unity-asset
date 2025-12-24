@@ -5,7 +5,9 @@
 
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::{AssetBundle, BinaryError, SerializedFile};
+use unity_asset_binary::asset;
+use unity_asset_binary::bundle;
+use unity_asset_binary::BinaryError;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🎮 Unity Binary Parsing Demo");
@@ -35,7 +37,7 @@ fn demo_assetbundle_parsing() -> Result<(), Box<dyn std::error::Error>> {
 
     let mock_bundle_data = create_mock_assetbundle_data();
 
-    match AssetBundle::from_bytes(mock_bundle_data) {
+    match bundle::load_bundle_from_memory(mock_bundle_data) {
         Ok(bundle) => {
             println!("✓ Successfully parsed AssetBundle");
             println!("  Unity Version: {}", bundle.unity_version());
@@ -78,31 +80,12 @@ fn demo_serialized_file_parsing() -> Result<(), Box<dyn std::error::Error>> {
     // Create a mock SerializedFile for demonstration
     let mock_asset_data = create_mock_serialized_file_data();
 
-    match SerializedFile::from_bytes(mock_asset_data) {
+    match asset::parse_serialized_file(mock_asset_data) {
         Ok(asset) => {
             println!("✓ Successfully parsed SerializedFile");
-            println!("  Unity Version: {}", asset.unity_version());
-            println!("  Target Platform: {}", asset.target_platform());
-            println!("  File Name: {}", asset.name());
-
-            // Try to get objects from the asset
-            match asset.get_objects() {
-                Ok(objects) => {
-                    println!("  Object Count: {}", objects.len());
-                    for (i, object) in objects.iter().enumerate() {
-                        println!(
-                            "    Object {}: {} (Class: {}, ID: {})",
-                            i + 1,
-                            object.name().unwrap_or_else(|| "<unnamed>".to_string()),
-                            object.class_name(),
-                            object.path_id()
-                        );
-                    }
-                }
-                Err(e) => {
-                    println!("  ⚠ Could not extract objects: {}", e);
-                }
-            }
+            println!("  Unity Version: {}", asset.unity_version);
+            println!("  Target Platform: {}", asset.target_platform);
+            println!("  Object Count: {}", asset.objects.len());
         }
         Err(e) => {
             println!(
@@ -131,7 +114,7 @@ fn demo_error_handling() -> Result<(), Box<dyn std::error::Error>> {
     for (description, data) in test_cases {
         println!("  Testing: {}", description);
 
-        match AssetBundle::from_bytes(data.clone()) {
+        match bundle::load_bundle_from_memory(data.clone()) {
             Ok(_) => println!("    ✓ Unexpectedly succeeded"),
             Err(e) => match e {
                 BinaryError::InvalidFormat(msg) => {
@@ -156,7 +139,7 @@ fn demo_error_handling() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Also test SerializedFile parsing
-        match SerializedFile::from_bytes(data) {
+        match asset::parse_serialized_file(data) {
             Ok(_) => println!("    ✓ SerializedFile unexpectedly succeeded"),
             Err(_) => println!("    ✓ SerializedFile correctly failed"),
         }

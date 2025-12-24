@@ -80,8 +80,9 @@ pub use unity_asset_core::get_class_name;
 pub use unity_asset_yaml::YamlDocument;
 
 // Re-export from binary crate
-pub use unity_asset_binary::{
-    AssetBundle, SerializedFile, load_bundle, load_bundle_from_memory, load_bundle_with_options,
+pub use unity_asset_binary::asset::SerializedFile;
+pub use unity_asset_binary::bundle::{
+    AssetBundle, load_bundle, load_bundle_from_memory, load_bundle_with_options,
 };
 
 // Re-export async traits when async feature is enabled
@@ -95,7 +96,9 @@ pub mod environment {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
-    use unity_asset_binary::{AssetBundle, ObjectHandle, SerializedFile, UnityObject};
+    use unity_asset_binary::asset::SerializedFile;
+    use unity_asset_binary::bundle::AssetBundle;
+    use unity_asset_binary::object::{ObjectHandle, UnityObject};
     use unity_asset_core::UnityValue;
     use unity_asset_core::{UnityAssetError, UnityClass, UnityDocument};
 
@@ -355,7 +358,7 @@ pub mod environment {
             let data = std::fs::read(path).map_err(|e| {
                 UnityAssetError::format(format!("Failed to read file {:?}: {}", path, e))
             })?;
-            match unity_asset_binary::load_bundle_from_memory(data) {
+            match unity_asset_binary::bundle::load_bundle_from_memory(data) {
                 Ok(bundle) => {
                     self.bundles.insert(path.to_path_buf(), bundle);
                     self.bundle_container_cache.borrow_mut().remove(path);
@@ -372,7 +375,7 @@ pub mod environment {
             let data = std::fs::read(path).map_err(|e| {
                 UnityAssetError::format(format!("Failed to read file {:?}: {}", path, e))
             })?;
-            match unity_asset_binary::parse_serialized_file(data) {
+            match unity_asset_binary::asset::parse_serialized_file(data) {
                 Ok(asset) => {
                     self.binary_assets.insert(path.to_path_buf(), asset);
                     self.bundle_container_cache.borrow_mut().clear();

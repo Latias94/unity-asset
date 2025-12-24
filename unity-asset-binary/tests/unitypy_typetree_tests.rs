@@ -6,7 +6,7 @@
 #![allow(unused_imports)]
 
 use std::collections::HashMap;
-use unity_asset_binary::{TypeTree, TypeTreeNode};
+use unity_asset_binary::typetree::{TypeTree, TypeTreeNode};
 
 /// Test basic TypeTree node creation (port of test_typetreenode)
 #[test]

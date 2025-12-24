@@ -4,6 +4,7 @@
 //! including dependency tracking and relationship mapping.
 
 use super::types::*;
+use crate::asset::SerializedFile;
 use crate::error::Result;
 use crate::reader::BinaryReader;
 use crate::typetree::{TypeTree, TypeTreeSerializer};
@@ -93,7 +94,7 @@ impl DependencyAnalyzer {
     /// (`fileID`/`pathID` pairs) to build a dependency graph.
     pub fn analyze_dependencies_in_asset(
         &mut self,
-        asset: &crate::SerializedFile,
+        asset: &SerializedFile,
         objects: &[&crate::asset::ObjectInfo],
     ) -> Result<DependencyInfo> {
         let mut external_ref_map: HashMap<(i32, i64), Vec<i64>> = HashMap::new();
@@ -172,16 +173,13 @@ impl DependencyAnalyzer {
     /// Extract dependencies from a single object by parsing its TypeTree and scanning PPtr-like fields.
     fn extract_object_dependencies_in_asset(
         &mut self,
-        asset: &crate::SerializedFile,
+        asset: &SerializedFile,
         obj: &crate::asset::ObjectInfo,
     ) -> Result<ExtractedDependencies> {
         let data = asset.data_arc();
         let file_key = Arc::as_ptr(&data) as *const u8 as usize;
 
-        if let Some(cached) = self
-            .pptr_dependency_cache
-            .get(&(file_key, obj.path_id))
-        {
+        if let Some(cached) = self.pptr_dependency_cache.get(&(file_key, obj.path_id)) {
             return Ok(cached.clone());
         }
 
@@ -317,7 +315,7 @@ impl DependencyAnalyzer {
     /// Get cached TypeTree-based dependencies for an object within an asset.
     pub fn get_cached_dependencies_in_asset(
         &self,
-        asset: &crate::SerializedFile,
+        asset: &SerializedFile,
         object_id: i64,
     ) -> Option<(Vec<i64>, Vec<(i32, i64)>)> {
         let data = asset.data_arc();
@@ -335,7 +333,7 @@ impl Default for DependencyAnalyzer {
 }
 
 fn type_tree_for_object<'a>(
-    asset: &'a crate::SerializedFile,
+    asset: &'a SerializedFile,
     info: &crate::asset::ObjectInfo,
 ) -> Option<&'a TypeTree> {
     if info.type_index >= 0 {
@@ -353,7 +351,7 @@ fn type_tree_for_object<'a>(
 }
 
 fn parse_object_with_typetree(
-    asset: &crate::SerializedFile,
+    asset: &SerializedFile,
     info: &crate::asset::ObjectInfo,
     tree: &TypeTree,
 ) -> Result<indexmap::IndexMap<String, UnityValue>> {
@@ -364,7 +362,7 @@ fn parse_object_with_typetree(
 }
 
 fn resolve_external_file(
-    asset: &crate::SerializedFile,
+    asset: &SerializedFile,
     file_id: i32,
 ) -> (Option<String>, Option<[u8; 16]>) {
     if file_id <= 0 {
@@ -479,11 +477,7 @@ fn extract_internal_path_id(value: &UnityValue) -> Option<i64> {
     match value {
         UnityValue::Object(obj) => {
             let (file_id, path_id) = try_read_pptr(obj)?;
-            if file_id == 0 {
-                Some(path_id)
-            } else {
-                None
-            }
+            if file_id == 0 { Some(path_id) } else { None }
         }
         _ => None,
     }
@@ -604,7 +598,7 @@ impl RelationshipAnalyzer {
     /// - Component relationships (GameObject -> Component)
     pub fn analyze_relationships_in_asset(
         &mut self,
-        asset: &crate::SerializedFile,
+        asset: &SerializedFile,
         objects: &[&crate::asset::ObjectInfo],
     ) -> Result<AssetRelationships> {
         if !asset.enable_type_tree {

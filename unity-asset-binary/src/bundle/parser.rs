@@ -198,27 +198,30 @@ impl BundleParser {
         Self::parse_directory_from_blocks_info(bundle, &uncompressed_data)?;
 
         // Some UnityFS variants require padding/alignment before block data starts.
-        if (bundle.header.flags & crate::compression::ArchiveFlags::BLOCK_INFO_NEEDS_PADDING_AT_START) != 0 {
+        if (bundle.header.flags
+            & crate::compression::ArchiveFlags::BLOCK_INFO_NEEDS_PADDING_AT_START)
+            != 0
+        {
             reader.align_to(16)?;
         }
 
         Ok(())
     }
 
-fn should_probe_legacy_alignment(header: &BundleHeader) -> bool {
-    // UnityPy heuristics: for some older bundle formats (<7) Unity started aligning file contents
-    // (notably from 2019.4+). We only probe alignment when the engine version suggests this.
-    let parsed = match UnityVersion::parse_version(&header.unity_revision)
-        .or_else(|_| UnityVersion::parse_version(&header.unity_version))
-    {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let (major, minor) = (parsed.major, parsed.minor);
+    fn should_probe_legacy_alignment(header: &BundleHeader) -> bool {
+        // UnityPy heuristics: for some older bundle formats (<7) Unity started aligning file contents
+        // (notably from 2019.4+). We only probe alignment when the engine version suggests this.
+        let parsed = match UnityVersion::parse_version(&header.unity_revision)
+            .or_else(|_| UnityVersion::parse_version(&header.unity_version))
+        {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let (major, minor) = (parsed.major, parsed.minor);
 
-    // 2019.4+
-    major > 2019 || (major == 2019 && minor >= 4)
-}
+        // 2019.4+
+        major > 2019 || (major == 2019 && minor >= 4)
+    }
 
     /// Read and decompress all blocks
     fn read_blocks(bundle: &AssetBundle, reader: &mut BinaryReader) -> Result<Vec<u8>> {

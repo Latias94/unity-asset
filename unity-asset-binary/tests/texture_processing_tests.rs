@@ -8,7 +8,9 @@
 
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::{TextureProcessor, UnityObject, load_bundle_from_memory};
+use unity_asset_binary::bundle::load_bundle_from_memory;
+use unity_asset_binary::object::UnityObject;
+use unity_asset_binary::texture::TextureProcessor;
 
 const SAMPLES_DIR: &str = "tests/samples";
 
@@ -86,72 +88,65 @@ fn test_texture_format_detection() {
                                 processed_textures += 1;
                                 let unity_class = unity_object.as_unity_class();
 
-                                    // Extract texture properties
-                                    if let Some(name_value) = unity_class.get("m_Name") {
-                                        if let unity_asset_core::UnityValue::String(name) =
-                                            name_value
-                                        {
-                                            println!("      Texture name: '{}'", name);
-                                        }
+                                // Extract texture properties
+                                if let Some(name_value) = unity_class.get("m_Name") {
+                                    if let unity_asset_core::UnityValue::String(name) = name_value {
+                                        println!("      Texture name: '{}'", name);
                                     }
+                                }
 
-                                    // Check for texture format
-                                    if let Some(format_value) = unity_class.get("m_TextureFormat") {
-                                        if let unity_asset_core::UnityValue::Integer(format_id) =
-                                            format_value
-                                        {
-                                            let format_name =
-                                                get_texture_format_name(*format_id as i32);
-                                            println!(
-                                                "      Format: {} (ID: {})",
-                                                format_name, format_id
-                                            );
-                                            *texture_formats.entry(format_name).or_insert(0) += 1;
-                                        }
+                                // Check for texture format
+                                if let Some(format_value) = unity_class.get("m_TextureFormat") {
+                                    if let unity_asset_core::UnityValue::Integer(format_id) =
+                                        format_value
+                                    {
+                                        let format_name =
+                                            get_texture_format_name(*format_id as i32);
+                                        println!(
+                                            "      Format: {} (ID: {})",
+                                            format_name, format_id
+                                        );
+                                        *texture_formats.entry(format_name).or_insert(0) += 1;
                                     }
+                                }
 
-                                    // Check for texture dimensions
-                                    if let Some(width_value) = unity_class.get("m_Width") {
-                                        if let unity_asset_core::UnityValue::Integer(width) =
-                                            width_value
-                                        {
-                                            if let Some(height_value) = unity_class.get("m_Height")
+                                // Check for texture dimensions
+                                if let Some(width_value) = unity_class.get("m_Width") {
+                                    if let unity_asset_core::UnityValue::Integer(width) =
+                                        width_value
+                                    {
+                                        if let Some(height_value) = unity_class.get("m_Height") {
+                                            if let unity_asset_core::UnityValue::Integer(height) =
+                                                height_value
                                             {
-                                                if let unity_asset_core::UnityValue::Integer(
-                                                    height,
-                                                ) = height_value
-                                                {
-                                                    println!(
-                                                        "      Dimensions: {}x{}",
-                                                        width, height
-                                                    );
-                                                }
+                                                println!("      Dimensions: {}x{}", width, height);
                                             }
                                         }
                                     }
+                                }
 
-                                    // Check for mipmap info
-                                    if let Some(mipmap_value) = unity_class.get("m_MipCount") {
-                                        if let unity_asset_core::UnityValue::Integer(mip_count) =
-                                            mipmap_value
-                                        {
-                                            println!("      Mip levels: {}", mip_count);
-                                        }
+                                // Check for mipmap info
+                                if let Some(mipmap_value) = unity_class.get("m_MipCount") {
+                                    if let unity_asset_core::UnityValue::Integer(mip_count) =
+                                        mipmap_value
+                                    {
+                                        println!("      Mip levels: {}", mip_count);
                                     }
+                                }
 
-                                    // Check for texture data size
-                                    if let Some(data_size_value) = unity_class.get("m_DataLength") {
-                                        if let unity_asset_core::UnityValue::Integer(data_size) =
-                                            data_size_value
-                                        {
-                                            println!("      Data size: {} bytes", data_size);
-                                        }
+                                // Check for texture data size
+                                if let Some(data_size_value) = unity_class.get("m_DataLength") {
+                                    if let unity_asset_core::UnityValue::Integer(data_size) =
+                                        data_size_value
+                                    {
+                                        println!("      Data size: {} bytes", data_size);
                                     }
+                                }
 
-                                    // Check for streaming info
-                                    if let Some(_stream_value) = unity_class.get("m_StreamData") {
-                                        println!("      Has streaming data");
-                                    }
+                                // Check for streaming info
+                                if let Some(_stream_value) = unity_class.get("m_StreamData") {
+                                    println!("      Has streaming data");
+                                }
                             }
                         }
                     }
@@ -296,7 +291,8 @@ fn test_texture_data_extraction() {
                                     total_texture_data_size += raw_len as u64;
 
                                     if let Some(name_value) = unity_class.get("m_Name") {
-                                        if let unity_asset_core::UnityValue::String(name) = name_value
+                                        if let unity_asset_core::UnityValue::String(name) =
+                                            name_value
                                         {
                                             println!(
                                                 "    Texture '{}' has {} bytes of data",

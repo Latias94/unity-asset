@@ -1,11 +1,8 @@
 //! Texture2D TypeTree parsing tests (streamed textures)
 
 use unity_asset_binary::{
-    asset::class_ids,
-    texture::Texture2DConverter,
-    ObjectInfo,
-    UnityObject,
-    UnityVersion,
+    asset::ObjectInfo, asset::class_ids, object::UnityObject, texture::Texture2DConverter,
+    unity_version::UnityVersion,
 };
 use unity_asset_core::{UnityClass, UnityValue};
 
@@ -47,4 +44,3 @@ fn texture2d_converter_parses_streamdata_from_typetree() {
     assert_eq!(tex.stream_info.size, 16);
     assert!(tex.stream_info.path.contains("CAB-abc"));
 }
-

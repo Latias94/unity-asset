@@ -13,9 +13,12 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use unity_asset_binary::asset::parse_serialized_file;
+use unity_asset_binary::bundle::load_bundle_from_memory;
+use unity_asset_binary::object::UnityObject;
+use unity_asset_binary::unity_version::UnityVersion;
 use unity_asset_binary::{
-    AudioProcessor, MeshProcessor, SpriteProcessor, TextureProcessor, UnityObject, UnityVersion,
-    load_bundle_from_memory, parse_serialized_file,
+    audio::AudioProcessor, mesh::MeshProcessor, sprite::SpriteProcessor, texture::TextureProcessor,
 };
 
 const SAMPLES_DIR: &str = "tests/samples";
@@ -926,21 +929,19 @@ fn test_object_type_identification() {
                                 // Try to parse the object to get more info
                                 let unity_class = unity_object.as_unity_class();
                                 if let Some(name_value) = unity_class.get("m_Name") {
-                                        if let unity_asset_core::UnityValue::String(name) =
-                                            name_value
-                                        {
-                                            println!("      Name: '{}'", name);
-                                        }
+                                    if let unity_asset_core::UnityValue::String(name) = name_value {
+                                        println!("      Name: '{}'", name);
                                     }
+                                }
 
-                                    // Show some properties for interesting objects
-                                    if class_name == "GameObject" || class_name == "Transform" {
-                                        let prop_names: Vec<_> =
-                                            unity_class.properties().keys().take(5).collect();
-                                        if !prop_names.is_empty() {
-                                            println!("      Properties: {:?}", prop_names);
-                                        }
+                                // Show some properties for interesting objects
+                                if class_name == "GameObject" || class_name == "Transform" {
+                                    let prop_names: Vec<_> =
+                                        unity_class.properties().keys().take(5).collect();
+                                    if !prop_names.is_empty() {
+                                        println!("      Properties: {:?}", prop_names);
                                     }
+                                }
                             } else {
                                 println!(
                                     "    Unknown type: {} (ID:{}, PathID:{})",

@@ -10,10 +10,11 @@
 
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::{
-    AssetBundle, SerializedFile, Sprite, SpriteProcessor, Texture2D, Texture2DConverter,
-    TextureFormat, UnityVersion,
-};
+use unity_asset_binary::asset::SerializedFile;
+use unity_asset_binary::bundle::AssetBundle;
+use unity_asset_binary::sprite::{Sprite, SpriteProcessor};
+use unity_asset_binary::texture::{Texture2D, Texture2DConverter, TextureFormat};
+use unity_asset_binary::unity_version::UnityVersion;
 
 const SAMPLES_DIR: &str = "tests/samples";
 

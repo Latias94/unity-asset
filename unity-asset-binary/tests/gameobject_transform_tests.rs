@@ -1,7 +1,7 @@
 //! Tests for GameObject and Transform parsing
 
 use indexmap::IndexMap;
-use unity_asset_binary::{GameObject, ObjectRef, Quaternion, Transform, Vector3};
+use unity_asset_binary::unity_objects::{GameObject, ObjectRef, Quaternion, Transform, Vector3};
 use unity_asset_core::UnityValue;
 
 #[test]

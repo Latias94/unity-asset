@@ -8,9 +8,9 @@
 
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::{
-    AudioClip, AudioCompressionFormat, AudioProcessor, UnityObject, load_bundle_from_memory,
-};
+use unity_asset_binary::audio::{AudioClip, AudioCompressionFormat, AudioProcessor};
+use unity_asset_binary::bundle::load_bundle_from_memory;
+use unity_asset_binary::object::UnityObject;
 
 const SAMPLES_DIR: &str = "tests/samples";
 
@@ -188,40 +188,35 @@ fn test_audio_processing_from_files() {
                                 processed_audio += 1;
                                 let unity_class = unity_object.as_unity_class();
 
-                                    // Try to get audio properties
-                                    if let Some(name_value) = unity_class.get("m_Name") {
-                                        if let unity_asset_core::UnityValue::String(name) =
-                                            name_value
-                                        {
-                                            println!("      Audio name: '{}'", name);
-                                        }
+                                // Try to get audio properties
+                                if let Some(name_value) = unity_class.get("m_Name") {
+                                    if let unity_asset_core::UnityValue::String(name) = name_value {
+                                        println!("      Audio name: '{}'", name);
                                     }
+                                }
 
-                                    // Look for audio format information
-                                    if let Some(format_value) =
-                                        unity_class.get("m_CompressionFormat")
+                                // Look for audio format information
+                                if let Some(format_value) = unity_class.get("m_CompressionFormat") {
+                                    if let unity_asset_core::UnityValue::Integer(format_id) =
+                                        format_value
                                     {
-                                        if let unity_asset_core::UnityValue::Integer(format_id) =
-                                            format_value
-                                        {
-                                            let format =
-                                                AudioCompressionFormat::from(*format_id as i32);
-                                            println!(
-                                                "      Format: {:?} ({})",
-                                                format,
-                                                format.info().name
-                                            );
-                                        }
+                                        let format =
+                                            AudioCompressionFormat::from(*format_id as i32);
+                                        println!(
+                                            "      Format: {:?} ({})",
+                                            format,
+                                            format.info().name
+                                        );
                                     }
+                                }
 
-                                    // Look for audio data size
-                                    if let Some(size_value) = unity_class.get("m_Size") {
-                                        if let unity_asset_core::UnityValue::Integer(size) =
-                                            size_value
-                                        {
-                                            println!("      Data size: {} bytes", size);
-                                        }
+                                // Look for audio data size
+                                if let Some(size_value) = unity_class.get("m_Size") {
+                                    if let unity_asset_core::UnityValue::Integer(size) = size_value
+                                    {
+                                        println!("      Data size: {} bytes", size);
                                     }
+                                }
                             }
                         }
                     }
@@ -423,8 +418,8 @@ fn test_advanced_audio_extraction() {
                             if raw_len > 1024 && class_name == "Object" {
                                 let preview_len = 32.min(raw_len);
                                 let data_preview = &unity_object.raw_data()[..preview_len];
-                                let has_audio_signature =
-                                    data_preview.iter().any(|&b| b != 0) && data_preview.len() >= 16;
+                                let has_audio_signature = data_preview.iter().any(|&b| b != 0)
+                                    && data_preview.len() >= 16;
 
                                 if has_audio_signature {
                                     println!(

@@ -9,7 +9,10 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::{AudioCompressionFormat, UnityObject, UnityVersion, load_bundle_from_memory};
+use unity_asset_binary::audio::AudioCompressionFormat;
+use unity_asset_binary::bundle::load_bundle_from_memory;
+use unity_asset_binary::object::UnityObject;
+use unity_asset_binary::unity_version::UnityVersion;
 
 const SAMPLES_DIR: &str = "tests/samples";
 
@@ -44,58 +47,58 @@ fn test_comprehensive_compatibility_report() {
                     println!("  ✅ Bundle loaded successfully");
                     println!("  📊 Assets: {}", bundle.assets.len());
 
-                        for asset in &bundle.assets {
-                            report.total_assets += 1;
-                            println!("    📄 Asset with {} objects", asset.objects.len());
+                    for asset in &bundle.assets {
+                        report.total_assets += 1;
+                        println!("    📄 Asset with {} objects", asset.objects.len());
 
-                            for asset_object_info in &asset.objects {
-                                report.total_objects += 1;
-                                let unity_object =
-                                    UnityObject::from_serialized_file(asset, asset_object_info)
-                                        .unwrap_or_else(|_| {
-                                            let fallback_data = asset
-                                                .object_bytes(asset_object_info)
-                                                .map(|b| b.to_vec())
-                                                .unwrap_or_default();
-                                            UnityObject::from_raw(
-                                                asset_object_info.type_id,
-                                                asset_object_info.path_id,
-                                                fallback_data,
-                                            )
-                                        });
+                        for asset_object_info in &asset.objects {
+                            report.total_objects += 1;
+                            let unity_object =
+                                UnityObject::from_serialized_file(asset, asset_object_info)
+                                    .unwrap_or_else(|_| {
+                                        let fallback_data = asset
+                                            .object_bytes(asset_object_info)
+                                            .map(|b| b.to_vec())
+                                            .unwrap_or_default();
+                                        UnityObject::from_raw(
+                                            asset_object_info.type_id,
+                                            asset_object_info.path_id,
+                                            fallback_data,
+                                        )
+                                    });
 
-                                let class_name = unity_object.class_name().to_string();
-                                *report.object_types.entry(class_name.clone()).or_insert(0) += 1;
-                                report.parsed_objects += 1;
+                            let class_name = unity_object.class_name().to_string();
+                            *report.object_types.entry(class_name.clone()).or_insert(0) += 1;
+                            report.parsed_objects += 1;
 
-                                let unity_class = unity_object.as_unity_class();
+                            let unity_class = unity_object.as_unity_class();
 
-                                match class_name.as_str() {
-                                    "Texture2D" => {
-                                        report.texture_objects += 1;
-                                        analyze_texture(unity_class, &mut report);
-                                    }
-                                    "AudioClip" => {
-                                        report.audio_objects += 1;
-                                        analyze_audio(unity_class, &mut report);
-                                    }
-                                    "GameObject" => {
-                                        report.gameobject_objects += 1;
-                                    }
-                                    "Transform" => {
-                                        report.transform_objects += 1;
-                                    }
-                                    "Sprite" => {
-                                        report.sprite_objects += 1;
-                                    }
-                                    "SpriteAtlas" => {
-                                        report.sprite_atlas_objects += 1;
-                                    }
-                                    _ => {}
+                            match class_name.as_str() {
+                                "Texture2D" => {
+                                    report.texture_objects += 1;
+                                    analyze_texture(unity_class, &mut report);
                                 }
+                                "AudioClip" => {
+                                    report.audio_objects += 1;
+                                    analyze_audio(unity_class, &mut report);
+                                }
+                                "GameObject" => {
+                                    report.gameobject_objects += 1;
+                                }
+                                "Transform" => {
+                                    report.transform_objects += 1;
+                                }
+                                "Sprite" => {
+                                    report.sprite_objects += 1;
+                                }
+                                "SpriteAtlas" => {
+                                    report.sprite_atlas_objects += 1;
+                                }
+                                _ => {}
                             }
                         }
                     }
+                }
                 Err(e) => {
                     report.failed_files += 1;
                     println!("  ❌ Failed to load: {}", e);

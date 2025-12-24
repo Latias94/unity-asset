@@ -11,7 +11,9 @@
 
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::{Sprite, SpriteProcessor, Texture2D, TextureFormat, UnityVersion};
+use unity_asset_binary::sprite::{Sprite, SpriteProcessor};
+use unity_asset_binary::texture::{Texture2D, TextureFormat};
+use unity_asset_binary::unity_version::UnityVersion;
 
 /// Test sprite image extraction compatibility with UnityPy
 ///

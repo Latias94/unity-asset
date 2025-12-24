@@ -50,8 +50,8 @@ pub use types::{
     DependencyGraph,
     // Dependency types
     DependencyInfo,
-    ExternalReference,
     ExternalObjectRef,
+    ExternalReference,
     ExtractionConfig,
     ExtractionResult,
     ExtractionStats,
@@ -66,6 +66,9 @@ pub use types::{
     // Constants
     class_ids,
 };
+
+use crate::asset::SerializedFile;
+use crate::bundle::AssetBundle;
 
 /// Main metadata processing facade
 ///
@@ -216,7 +219,7 @@ impl MetadataProcessor {
     /// Process metadata from a SerializedFile
     pub fn process_asset(
         &mut self,
-        asset: &crate::SerializedFile,
+        asset: &SerializedFile,
     ) -> crate::error::Result<ExtractionResult> {
         let mut result = self.extractor.extract_from_asset(asset)?;
 
@@ -224,11 +227,12 @@ impl MetadataProcessor {
         if let Some(ref mut analyzer) = self.dependency_analyzer
             && self.extractor.config().include_dependencies
         {
-            let objects: Vec<&crate::asset::ObjectInfo> = if let Some(max) = self.extractor.config().max_objects {
-                asset.objects.iter().take(max).collect()
-            } else {
-                asset.objects.iter().collect()
-            };
+            let objects: Vec<&crate::asset::ObjectInfo> =
+                if let Some(max) = self.extractor.config().max_objects {
+                    asset.objects.iter().take(max).collect()
+                } else {
+                    asset.objects.iter().collect()
+                };
 
             match analyzer.analyze_dependencies_in_asset(asset, &objects) {
                 Ok(deps) => {
@@ -259,16 +263,20 @@ impl MetadataProcessor {
         if let Some(ref mut analyzer) = self.relationship_analyzer
             && self.extractor.config().include_hierarchy
         {
-            let objects: Vec<&crate::asset::ObjectInfo> = if let Some(max) = self.extractor.config().max_objects {
-                asset.objects.iter().take(max).collect()
-            } else {
-                asset.objects.iter().collect()
-            };
+            let objects: Vec<&crate::asset::ObjectInfo> =
+                if let Some(max) = self.extractor.config().max_objects {
+                    asset.objects.iter().take(max).collect()
+                } else {
+                    asset.objects.iter().collect()
+                };
 
             match analyzer.analyze_relationships_in_asset(asset, &objects) {
                 Ok(mut rels) => {
                     if self.extractor.config().include_dependencies {
-                        apply_dependency_info_to_relationships(&result.metadata.dependencies, &mut rels);
+                        apply_dependency_info_to_relationships(
+                            &result.metadata.dependencies,
+                            &mut rels,
+                        );
                     }
                     result.metadata.relationships = rels;
                 }
@@ -284,7 +292,7 @@ impl MetadataProcessor {
     /// Process metadata from an AssetBundle
     pub fn process_bundle(
         &mut self,
-        bundle: &crate::AssetBundle,
+        bundle: &AssetBundle,
     ) -> crate::error::Result<Vec<ExtractionResult>> {
         let mut results = Vec::new();
 
@@ -371,9 +379,7 @@ pub fn create_comprehensive_processor() -> MetadataProcessor {
 }
 
 /// Extract basic metadata from an asset
-pub fn extract_basic_metadata(
-    asset: &crate::SerializedFile,
-) -> crate::error::Result<AssetMetadata> {
+pub fn extract_basic_metadata(asset: &SerializedFile) -> crate::error::Result<AssetMetadata> {
     let mut processor = MetadataProcessor::with_config(ExtractionConfig::default());
     let result = processor.process_asset(asset)?;
     Ok(result.metadata)
@@ -381,7 +387,7 @@ pub fn extract_basic_metadata(
 
 /// Extract metadata with custom configuration
 pub fn extract_metadata_with_config(
-    asset: &crate::SerializedFile,
+    asset: &SerializedFile,
     config: ExtractionConfig,
 ) -> crate::error::Result<ExtractionResult> {
     let mut processor = MetadataProcessor::with_config(config);
@@ -389,7 +395,7 @@ pub fn extract_metadata_with_config(
 }
 
 /// Get quick statistics for an asset
-pub fn get_asset_statistics(asset: &crate::SerializedFile) -> AssetStatistics {
+pub fn get_asset_statistics(asset: &SerializedFile) -> AssetStatistics {
     AssetStatistics {
         object_count: asset.objects.len(),
         type_count: asset.types.len(),
@@ -432,13 +438,13 @@ impl Default for ProcessingOptions {
 }
 
 /// Check if metadata extraction is supported for an asset
-pub fn is_extraction_supported(asset: &crate::SerializedFile) -> bool {
+pub fn is_extraction_supported(asset: &SerializedFile) -> bool {
     // Support Unity 5.0+ (version 10+)
     asset.header.version >= 10
 }
 
 /// Get recommended extraction configuration for an asset
-pub fn get_recommended_config(asset: &crate::SerializedFile) -> ExtractionConfig {
+pub fn get_recommended_config(asset: &SerializedFile) -> ExtractionConfig {
     let object_count = asset.objects.len();
 
     if object_count > 10000 {
@@ -535,12 +541,31 @@ mod processor_tests {
 
         apply_dependency_info_to_relationships(&dependencies, &mut relationships);
 
-        assert_eq!(relationships.component_relationships[0].dependencies, vec![1, 2]);
-        assert_eq!(relationships.component_relationships[1].dependencies, vec![3]);
-        assert_eq!(relationships.component_relationships[2].dependencies, Vec::<i64>::new());
+        assert_eq!(
+            relationships.component_relationships[0].dependencies,
+            vec![1, 2]
+        );
+        assert_eq!(
+            relationships.component_relationships[1].dependencies,
+            vec![3]
+        );
+        assert_eq!(
+            relationships.component_relationships[2].dependencies,
+            Vec::<i64>::new()
+        );
 
-        assert_eq!(relationships.component_relationships[0].external_dependencies.len(), 0);
-        assert_eq!(relationships.component_relationships[1].external_dependencies.len(), 1);
+        assert_eq!(
+            relationships.component_relationships[0]
+                .external_dependencies
+                .len(),
+            0
+        );
+        assert_eq!(
+            relationships.component_relationships[1]
+                .external_dependencies
+                .len(),
+            1
+        );
         assert_eq!(
             relationships.component_relationships[1].external_dependencies[0],
             ExternalObjectRef {
@@ -557,7 +582,10 @@ mod processor_tests {
             .find(|r| r.asset_id == 999)
             .expect("external asset reference exists");
         assert_eq!(ext_ref.asset_type, "ExternalObject(file_id=2)");
-        assert_eq!(ext_ref.file_path, Some("library/external.assets".to_string()));
+        assert_eq!(
+            ext_ref.file_path,
+            Some("library/external.assets".to_string())
+        );
         assert_eq!(ext_ref.referenced_by, vec![11]);
 
         let internal_ref_1 = relationships

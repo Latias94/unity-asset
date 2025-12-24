@@ -1,8 +1,8 @@
 //! Texture2D raw parsing tests (streamed textures)
 
+use unity_asset_binary::object::UnityObject;
 use unity_asset_binary::texture::Texture2DConverter;
 use unity_asset_binary::unity_version::UnityVersion;
-use unity_asset_binary::UnityObject;
 
 fn aligned_string_bytes(s: &str) -> Vec<u8> {
     let mut out = Vec::new();
@@ -53,4 +53,3 @@ fn texture2d_raw_parsing_can_extract_streamdata() {
     assert_eq!(tex.stream_info.size, 16);
     assert!(tex.stream_info.path.contains("CAB-abc"));
 }
-

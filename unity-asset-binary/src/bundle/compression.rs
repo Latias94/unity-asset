@@ -105,10 +105,7 @@ impl BundleCompression {
         blocks: &[CompressionBlock],
         reader: &mut BinaryReader,
     ) -> Result<Vec<u8>> {
-        let total_uncompressed: usize = blocks
-            .iter()
-            .map(|b| b.uncompressed_size as usize)
-            .sum();
+        let total_uncompressed: usize = blocks.iter().map(|b| b.uncompressed_size as usize).sum();
         let mut decompressed_data = Vec::with_capacity(total_uncompressed);
 
         // The caller is responsible for positioning `reader` at the start of block data, taking

@@ -3,8 +3,8 @@
 //! This module provides parsing functionality for Unity TypeTree structures,
 //! inspired by UnityPy/classes/TypeTree.py
 
-use super::types::{TypeTree, TypeTreeNode};
 use super::common_strings;
+use super::types::{TypeTree, TypeTreeNode};
 use crate::error::{BinaryError, Result};
 use crate::reader::BinaryReader;
 

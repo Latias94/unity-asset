@@ -80,10 +80,7 @@ impl Texture2DConverter {
             .get("m_TextureDimension")
             .and_then(as_i32)
             .unwrap_or(2);
-        texture.light_map_format = props
-            .get("m_LightmapFormat")
-            .and_then(as_i32)
-            .unwrap_or(0);
+        texture.light_map_format = props.get("m_LightmapFormat").and_then(as_i32).unwrap_or(0);
         texture.color_space = props.get("m_ColorSpace").and_then(as_i32).unwrap_or(0);
         texture.is_readable = props
             .get("m_IsReadable")
@@ -100,9 +97,11 @@ impl Texture2DConverter {
         }
 
         if let Some(UnityValue::Object(settings)) = props.get("m_TextureSettings") {
-            texture.texture_settings.filter_mode = settings.get("m_FilterMode").and_then(as_i32).unwrap_or(0);
+            texture.texture_settings.filter_mode =
+                settings.get("m_FilterMode").and_then(as_i32).unwrap_or(0);
             texture.texture_settings.aniso = settings.get("m_Aniso").and_then(as_i32).unwrap_or(0);
-            texture.texture_settings.mip_bias = settings.get("m_MipBias").and_then(as_f32).unwrap_or(0.0);
+            texture.texture_settings.mip_bias =
+                settings.get("m_MipBias").and_then(as_f32).unwrap_or(0.0);
             texture.texture_settings.wrap_u = settings.get("m_WrapU").and_then(as_i32).unwrap_or(0);
             texture.texture_settings.wrap_v = settings.get("m_WrapV").and_then(as_i32).unwrap_or(0);
             texture.texture_settings.wrap_w = settings.get("m_WrapW").and_then(as_i32).unwrap_or(0);
@@ -140,7 +139,9 @@ impl Texture2DConverter {
         }
 
         if texture.width <= 0 || texture.height <= 0 {
-            return Err(BinaryError::invalid_data("Texture2D typetree missing dimensions"));
+            return Err(BinaryError::invalid_data(
+                "Texture2D typetree missing dimensions",
+            ));
         }
 
         if texture.image_data.is_empty() && !texture.is_streamed() {
