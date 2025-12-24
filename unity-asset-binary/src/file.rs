@@ -61,8 +61,18 @@ fn sniff_bundle(data: &[u8]) -> bool {
     if data.len() < 8 {
         return false;
     }
-    let signature = String::from_utf8_lossy(&data[..8]);
-    matches!(signature.as_ref(), "UnityFS\0" | "UnityWeb" | "UnityRaw")
+    if data.starts_with(b"UnityFS\0") || data.starts_with(b"UnityRaw") {
+        return true;
+    }
+    if data.starts_with(b"UnityWeb") {
+        // WebFile containers use a longer, distinct signature (`UnityWebData*`) but share the same
+        // 8-byte prefix. Avoid mis-classifying uncompressed WebFiles as legacy UnityWeb bundles.
+        if data.starts_with(b"UnityWebData") || data.starts_with(b"TuanjieWebData") {
+            return false;
+        }
+        return true;
+    }
+    false
 }
 
 fn sniff_serialized_file(data: &[u8]) -> bool {
@@ -107,4 +117,15 @@ pub fn load_unity_file<P: AsRef<Path>>(path: P) -> Result<UnityFile> {
         BinaryError::generic(format!("Failed to read file {:?}: {}", path.as_ref(), e))
     })?;
     load_unity_file_from_memory(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sniff_bundle_excludes_uncompressed_webfile() {
+        let data = b"UnityWebData1.0\0";
+        assert!(!sniff_bundle(data));
+    }
 }

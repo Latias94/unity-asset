@@ -101,6 +101,7 @@ Rules:
 - Phase 2 has started: the binary crate exposes a UnityPy-style `ObjectHandle`, and `SerializedFile` can yield object handles for on-demand reads.
 - Phase 2 is in progress: the binary crate now provides a unified `UnityFile` model and a layered `formats::*` namespace; top-level re-exports are being reduced.
 - Phase 2 is in progress: `Environment` is moving toward a UnityPy-like “File → Objects” flow by loading WebFiles and modeling nested sources (keys support WebFile entries).
+- Phase 2 is in progress: close remaining “load loop” gaps (extension-less files should still be detected as bundle/serialized/web), add WebFile-focused integration tests, and unify `BinarySource` formatting via `Display`.
 
 ### Phase 0 — Safety & Correctness (mandatory)
 
@@ -130,6 +131,7 @@ Deliverables:
   - `unity_asset_binary::extractors::*` (optional)
   - `unity_asset_binary::experimental::*`
 - Decide SemVer commitments per module.
+- Make “sources” first-class in the public API: a single `BinarySource` type should be used consistently by library + CLI (printing, parsing, diagnostics).
 
 ### Phase 3 — Decode/Export Separation
 

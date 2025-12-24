@@ -94,6 +94,7 @@ pub mod environment {
     use crate::{Result, YamlDocument};
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::fmt;
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
     use unity_asset_binary::asset::SerializedFile;
@@ -113,19 +114,25 @@ pub mod environment {
         },
     }
 
+    impl fmt::Display for BinarySource {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                BinarySource::Path(p) => write!(f, "{}", p.to_string_lossy()),
+                BinarySource::WebEntry {
+                    web_path,
+                    entry_name,
+                } => write!(f, "{}::{}", web_path.to_string_lossy(), entry_name),
+            }
+        }
+    }
+
     impl BinarySource {
         pub fn path<P: AsRef<Path>>(path: P) -> Self {
             Self::Path(path.as_ref().to_path_buf())
         }
 
-        fn describe(&self) -> String {
-            match self {
-                BinarySource::Path(p) => p.to_string_lossy().to_string(),
-                BinarySource::WebEntry {
-                    web_path,
-                    entry_name,
-                } => format!("{}::{}", web_path.to_string_lossy(), entry_name),
-            }
+        pub fn describe(&self) -> String {
+            self.to_string()
         }
 
         fn as_path(&self) -> Option<&PathBuf> {
@@ -464,6 +471,10 @@ pub mod environment {
                         self.try_load_binary(path)?;
                     }
                 }
+            } else {
+                // Some Unity outputs (especially streamed resources and certain build artifacts)
+                // can be extension-less. Attempt binary detection anyway.
+                self.try_load_binary(path)?;
             }
 
             Ok(())
@@ -1746,7 +1757,10 @@ pub mod environment {
         }
 
         #[test]
-        fn environment_can_find_binary_object_by_path_id() {
+        fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info() {
+            use unity_asset_binary::audio::AudioClipConverter;
+            use unity_asset_binary::unity_version::UnityVersion;
+
             let mut env = Environment::new();
             let path =
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/char_118_yuki.ab");
@@ -1812,14 +1826,6 @@ pub mod environment {
                 env.resolve_binary_pptr(&obj_ref, invalid_file_id, first.path_id)
                     .is_none()
             );
-        }
-
-        #[test]
-        fn environment_can_read_bundle_container_entries() {
-            let mut env = Environment::new();
-            let path =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/char_118_yuki.ab");
-            env.load_file(&path).unwrap();
 
             let bundle = env
                 .bundles()
@@ -1844,17 +1850,6 @@ pub mod environment {
 
             let found = env.find_bundle_container_entries(&entries[0].asset_path);
             assert!(!found.is_empty());
-        }
-
-        #[test]
-        fn environment_can_parse_streamed_audioclip_info_from_raw_bytes() {
-            use unity_asset_binary::audio::AudioClipConverter;
-            use unity_asset_binary::unity_version::UnityVersion;
-
-            let mut env = Environment::new();
-            let path =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/char_118_yuki.ab");
-            env.load_file(&path).unwrap();
 
             let entries = env.bundle_container_entries(&path).unwrap();
             let cn_001 = entries
@@ -1923,31 +1918,123 @@ pub mod environment {
                 )
                 .unwrap();
             assert_eq!(read, b"OggS");
-        }
-
-        #[test]
-        fn environment_stream_data_fs_supports_cab_suffix_files() {
-            let temp = tempfile::tempdir().unwrap();
-            let bundle_src =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/char_118_yuki.ab");
-            let bundle_path = temp.path().join("char_118_yuki.ab");
-            fs::copy(&bundle_src, &bundle_path).unwrap();
-
-            let cab = "8579bc75d50073df38987733a7cb3193";
-            let stream_path = format!("archive:/CAB-{cab}/CAB-{cab}.resource");
 
             // Common on-disk variant: `CAB-<hash>1.resource` (no folder).
+            fs::remove_file(&resource_path).unwrap();
+            fs::remove_dir_all(&resource_dir).unwrap();
+
             let resource_path = temp.path().join(format!("CAB-{cab}1.resource"));
             let mut bytes = vec![0u8; 4096 + 4];
             bytes[4096..4096 + 4].copy_from_slice(b"OggS");
             fs::write(&resource_path, bytes).unwrap();
 
-            let mut env = Environment::new();
-            env.load_file(&bundle_path).unwrap();
-
             let read = env
                 .read_stream_data(
                     &bundle_path,
+                    BinarySourceKind::AssetBundle,
+                    &stream_path,
+                    4096,
+                    4,
+                )
+                .unwrap();
+            assert_eq!(read, b"OggS");
+        }
+
+        fn build_uncompressed_webfile(entries: Vec<(String, Vec<u8>)>) -> Vec<u8> {
+            let signature = b"UnityWebData1.0\0";
+
+            let entry_table_len: usize = entries
+                .iter()
+                .map(|(name, _)| 12usize.saturating_add(name.as_bytes().len()))
+                .sum();
+            let header_len: usize = signature
+                .len()
+                .saturating_add(std::mem::size_of::<i32>())
+                .saturating_add(entry_table_len);
+
+            let head_length_i32: i32 = header_len
+                .try_into()
+                .expect("header_len fits i32 for test webfile");
+
+            let mut out: Vec<u8> = Vec::with_capacity(
+                header_len.saturating_add(entries.iter().map(|(_, b)| b.len()).sum::<usize>()),
+            );
+            out.extend_from_slice(signature);
+            out.extend_from_slice(&head_length_i32.to_le_bytes());
+
+            let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+            let mut cursor = header_len;
+
+            for (name, bytes) in entries {
+                let offset_i32: i32 = cursor.try_into().expect("offset fits i32");
+                let length_i32: i32 = bytes.len().try_into().expect("length fits i32");
+                let name_len_i32: i32 = name.len().try_into().expect("name_len fits i32");
+
+                out.extend_from_slice(&offset_i32.to_le_bytes());
+                out.extend_from_slice(&length_i32.to_le_bytes());
+                out.extend_from_slice(&name_len_i32.to_le_bytes());
+                out.extend_from_slice(name.as_bytes());
+
+                cursor = cursor.saturating_add(bytes.len());
+                payloads.push(bytes);
+            }
+
+            for payload in payloads {
+                out.extend_from_slice(&payload);
+            }
+
+            out
+        }
+
+        #[test]
+        fn environment_loads_extless_webfile_entries_and_reads_resource_bytes() {
+            let sample_bundle_path =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/char_118_yuki.ab");
+            let bundle_bytes = fs::read(&sample_bundle_path).unwrap();
+
+            let cab = "8579bc75d50073df38987733a7cb3193";
+            let resource_name = format!("CAB-{cab}.resource");
+            let mut resource_bytes = vec![0u8; 4096 + 4];
+            resource_bytes[4096..4096 + 4].copy_from_slice(b"OggS");
+
+            let entry_name = "char_118_yuki.ab".to_string();
+            let web_bytes = build_uncompressed_webfile(vec![
+                (entry_name.clone(), bundle_bytes),
+                (resource_name.clone(), resource_bytes),
+            ]);
+
+            let temp = tempfile::tempdir().unwrap();
+            let web_path = temp.path().join("UnityWebData");
+            fs::write(&web_path, web_bytes).unwrap();
+
+            let mut env = Environment::new();
+            env.load_file(&web_path).unwrap();
+            assert!(env.webfiles().contains_key(&web_path));
+
+            let bundle_source = BinarySource::WebEntry {
+                web_path: web_path.clone(),
+                entry_name,
+            };
+            assert!(env.bundles().contains_key(&bundle_source));
+
+            let obj_ref = env
+                .binary_object_infos()
+                .find(|r| {
+                    r.source == &bundle_source && r.source_kind == BinarySourceKind::AssetBundle
+                })
+                .expect("web bundle yields at least one object handle");
+
+            let key = obj_ref.key();
+            assert_eq!(key.source, bundle_source);
+
+            let key_str = key.to_string();
+            let parsed: BinaryObjectKey = key_str.parse().expect("BinaryObjectKey parse");
+            assert_eq!(parsed, key);
+
+            let stream_path = format!("archive:/CAB-{cab}/{resource_name}");
+            let read = env
+                .read_stream_data_source(
+                    &key.source,
                     BinarySourceKind::AssetBundle,
                     &stream_path,
                     4096,

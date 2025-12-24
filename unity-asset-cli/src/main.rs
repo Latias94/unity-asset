@@ -861,8 +861,8 @@ fn list_bundle_command(input: PathBuf, filter: String, verbose: bool) -> Result<
         };
 
         println!(
-            "Bundle: {:?} (nodes={}, assets={})",
-            source_label(&bundle_source),
+            "Bundle: {} (nodes={}, assets={})",
+            bundle_source,
             bundle.nodes.len(),
             bundle.assets.len()
         );
@@ -966,9 +966,9 @@ fn find_object_command(
                     );
                 } else {
                     println!(
-                        "{} -> unresolved(bundle={:?}, asset_index={}, file_id={}, path_id={})",
+                        "{} -> unresolved(bundle={}, asset_index={}, file_id={}, path_id={})",
                         entry.asset_path,
-                        source_label(&entry.bundle_source),
+                        entry.bundle_source,
                         entry.asset_index,
                         entry.file_id,
                         entry.path_id
@@ -1082,11 +1082,8 @@ fn inspect_object_command(
         obj.byte_order()
     );
     println!(
-        "Source: {:?} (kind={:?}, asset_index={:?}, path_id={})",
-        source_label(&resolved_source),
-        key.source_kind,
-        key.asset_index,
-        key.path_id
+        "Source: {} (kind={:?}, asset_index={:?}, path_id={})",
+        resolved_source, key.source_kind, key.asset_index, key.path_id
     );
     println!("Key: {}", key);
 
@@ -1203,18 +1200,6 @@ fn resolve_loaded_source(
         kind,
         available.join("\n- ")
     )
-}
-
-fn source_label(source: &BinarySource) -> String {
-    match source {
-        BinarySource::Path(p) => p.to_string_lossy().to_string(),
-        BinarySource::WebEntry {
-            web_path,
-            entry_name,
-        } => {
-            format!("{}::{}", web_path.to_string_lossy(), entry_name)
-        }
-    }
 }
 
 fn print_unity_value_tree(
