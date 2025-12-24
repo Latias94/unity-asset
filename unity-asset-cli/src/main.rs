@@ -5,9 +5,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::rc::Rc;
 use unity_asset::UnityDocument;
 use unity_asset::UnityValue;
-use unity_asset::environment::{BinarySource, Environment, EnvironmentOptions};
+use unity_asset::environment::{
+    BinaryObjectKey, BinarySource, Environment, EnvironmentOptions, EnvironmentReporter,
+    EnvironmentWarning,
+};
 use unity_asset_binary::{
     asset::class_ids,
     audio::{AudioClipConverter, AudioProcessor},
@@ -268,21 +272,48 @@ fn main() -> Result<()> {
     }
 }
 
-fn build_environment(strict: bool) -> Environment {
-    if strict {
-        Environment::with_options(EnvironmentOptions::strict())
-    } else {
-        Environment::new()
+#[derive(Debug)]
+struct CliReporter {
+    enabled: bool,
+}
+
+impl EnvironmentReporter for CliReporter {
+    fn warn(&self, warning: &EnvironmentWarning) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!("warning: {}", warning);
+    }
+
+    fn typetree_warning(
+        &self,
+        key: &BinaryObjectKey,
+        warning: &unity_asset_binary::typetree::TypeTreeParseWarning,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "warning: typetree key={} field={} error={}",
+            key, warning.field, warning.error
+        );
     }
 }
 
-fn print_environment_warnings(env: &Environment, show_warnings: bool) {
-    if !show_warnings {
-        return;
-    }
-    for w in env.take_warnings() {
-        eprintln!("warning: {}", w);
-    }
+fn build_environment(strict: bool, show_warnings: bool) -> Environment {
+    let mut env = if strict {
+        Environment::with_options(EnvironmentOptions::strict())
+    } else {
+        Environment::new()
+    };
+
+    let reporter: Option<Rc<dyn EnvironmentReporter>> = if show_warnings {
+        Some(Rc::new(CliReporter { enabled: true }))
+    } else {
+        None
+    };
+    env.set_reporter(reporter);
+    env
 }
 
 fn parse_yaml_command(
@@ -518,9 +549,8 @@ fn export_bundle_command(
     strict: bool,
     show_warnings: bool,
 ) -> Result<()> {
-    let mut env = build_environment(strict);
+    let mut env = build_environment(strict, show_warnings);
     env.load(&input)?;
-    print_environment_warnings(&env, show_warnings);
 
     std::fs::create_dir_all(&output)?;
 
@@ -893,9 +923,8 @@ fn list_bundle_command(
     strict: bool,
     show_warnings: bool,
 ) -> Result<()> {
-    let mut env = build_environment(strict);
+    let mut env = build_environment(strict, show_warnings);
     env.load(&input)?;
-    print_environment_warnings(&env, show_warnings);
 
     let filter_lc = filter.to_ascii_lowercase();
     let mut bundle_sources: Vec<BinarySource> = env
@@ -959,9 +988,8 @@ fn find_object_command(
     strict: bool,
     show_warnings: bool,
 ) -> Result<()> {
-    let mut env = build_environment(strict);
+    let mut env = build_environment(strict, show_warnings);
     env.load(&input)?;
-    print_environment_warnings(&env, show_warnings);
 
     let pattern_lc = pattern.to_ascii_lowercase();
     let class_name_lc = class_name.to_ascii_lowercase();
@@ -1101,9 +1129,8 @@ fn inspect_object_command(
     strict: bool,
     show_warnings: bool,
 ) -> Result<()> {
-    let mut env = build_environment(strict);
+    let mut env = build_environment(strict, show_warnings);
     env.load(&input)?;
-    print_environment_warnings(&env, show_warnings);
 
     let mut key = if let Some(key) = key {
         key.parse::<unity_asset::environment::BinaryObjectKey>()
@@ -1139,12 +1166,6 @@ fn inspect_object_command(
     key.source = resolved_source.clone();
 
     let obj = env.read_binary_object_key(&key)?;
-    if show_warnings && !obj.typetree_warnings().is_empty() {
-        eprintln!("TypeTree warnings ({}):", obj.typetree_warnings().len());
-        for w in obj.typetree_warnings() {
-            eprintln!("  - {}: {}", w.field, w.error);
-        }
-    }
 
     println!(
         "Object: {} (class_id={}, byte_size={}, byte_start={}, byte_order={:?})",
