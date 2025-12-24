@@ -96,14 +96,74 @@ pub mod environment {
     use std::collections::HashMap;
     use std::fmt;
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use std::str::FromStr;
     use unity_asset_binary::asset::SerializedFile;
     use unity_asset_binary::bundle::AssetBundle;
     use unity_asset_binary::file::{UnityFile, load_unity_file_from_memory};
     use unity_asset_binary::object::{ObjectHandle, UnityObject};
+    use unity_asset_binary::typetree::{
+        TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseWarning,
+    };
     use unity_asset_binary::webfile::WebFile;
     use unity_asset_core::UnityValue;
     use unity_asset_core::{UnityAssetError, UnityClass, UnityDocument};
+
+    #[derive(Debug, Clone)]
+    pub enum EnvironmentWarning {
+        LoadFailed { path: PathBuf, error: String },
+    }
+
+    impl fmt::Display for EnvironmentWarning {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                EnvironmentWarning::LoadFailed { path, error } => {
+                    write!(f, "Failed to load {}: {}", path.to_string_lossy(), error)
+                }
+            }
+        }
+    }
+
+    pub trait EnvironmentReporter {
+        fn warn(&self, warning: &EnvironmentWarning);
+        fn typetree_warning(&self, _key: &BinaryObjectKey, _warning: &TypeTreeParseWarning) {}
+    }
+
+    #[derive(Debug, Default)]
+    pub struct NoopReporter;
+
+    impl EnvironmentReporter for NoopReporter {
+        fn warn(&self, _warning: &EnvironmentWarning) {}
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct EnvironmentOptions {
+        pub typetree: TypeTreeParseOptions,
+    }
+
+    impl EnvironmentOptions {
+        pub fn strict() -> Self {
+            Self {
+                typetree: TypeTreeParseOptions {
+                    mode: TypeTreeParseMode::Strict,
+                },
+            }
+        }
+
+        pub fn lenient() -> Self {
+            Self {
+                typetree: TypeTreeParseOptions {
+                    mode: TypeTreeParseMode::Lenient,
+                },
+            }
+        }
+    }
+
+    impl Default for EnvironmentOptions {
+        fn default() -> Self {
+            Self::lenient()
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
     pub enum BinarySource {
@@ -147,20 +207,45 @@ pub mod environment {
     ///
     /// This is conceptually similar to UnityPy's `ObjectReader`: it is a lightweight handle that can be
     /// converted into a parsed `UnityObject` on-demand.
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Clone)]
     pub struct BinaryObjectRef<'a> {
         pub source: &'a BinarySource,
         pub source_kind: BinarySourceKind,
         /// Asset index within a bundle. `None` for standalone serialized files.
         pub asset_index: Option<usize>,
         pub object: ObjectHandle<'a>,
+        typetree_options: TypeTreeParseOptions,
+        reporter: Option<Rc<dyn EnvironmentReporter>>,
+    }
+
+    impl<'a> fmt::Debug for BinaryObjectRef<'a> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BinaryObjectRef")
+                .field("source", &self.source)
+                .field("source_kind", &self.source_kind)
+                .field("asset_index", &self.asset_index)
+                .field("path_id", &self.object.path_id())
+                .finish()
+        }
     }
 
     impl<'a> BinaryObjectRef<'a> {
         pub fn read(&self) -> Result<UnityObject> {
-            self.object.read().map_err(|e| {
-                UnityAssetError::format(format!("Failed to parse binary object: {}", e))
-            })
+            let obj = self
+                .object
+                .read_with_options(self.typetree_options)
+                .map_err(|e| {
+                    UnityAssetError::format(format!("Failed to parse binary object: {}", e))
+                })?;
+
+            if let Some(reporter) = &self.reporter {
+                let key = self.key();
+                for w in obj.typetree_warnings() {
+                    reporter.typetree_warning(&key, w);
+                }
+            }
+
+            Ok(obj)
         }
 
         /// Create a globally-unique key for this object reference.
@@ -175,7 +260,7 @@ pub mod environment {
     }
 
     /// A unified object reference across YAML and binary formats.
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone)]
     pub enum EnvironmentObjectRef<'a> {
         Yaml(&'a UnityClass),
         Binary(BinaryObjectRef<'a>),
@@ -416,6 +501,9 @@ pub mod environment {
         bundles: HashMap<BinarySource, AssetBundle>,
         webfiles: HashMap<PathBuf, WebFile>,
         bundle_container_cache: RefCell<HashMap<BinarySource, Vec<BundleContainerEntry>>>,
+        warnings: RefCell<Vec<EnvironmentWarning>>,
+        reporter: Option<Rc<dyn EnvironmentReporter>>,
+        options: EnvironmentOptions,
         /// Base path for relative file resolution
         #[allow(dead_code)]
         base_path: PathBuf,
@@ -424,13 +512,43 @@ pub mod environment {
     impl Environment {
         /// Create a new environment
         pub fn new() -> Self {
+            Self::with_options(EnvironmentOptions::default())
+        }
+
+        pub fn with_options(options: EnvironmentOptions) -> Self {
             Self {
                 yaml_documents: HashMap::new(),
                 binary_assets: HashMap::new(),
                 bundles: HashMap::new(),
                 webfiles: HashMap::new(),
                 bundle_container_cache: RefCell::new(HashMap::new()),
+                warnings: RefCell::new(Vec::new()),
+                reporter: None,
+                options,
                 base_path: std::env::current_dir().unwrap_or_default(),
+            }
+        }
+
+        pub fn set_reporter(&mut self, reporter: Option<Rc<dyn EnvironmentReporter>>) {
+            self.reporter = reporter;
+        }
+
+        pub fn options(&self) -> EnvironmentOptions {
+            self.options
+        }
+
+        pub fn warnings(&self) -> Vec<EnvironmentWarning> {
+            self.warnings.borrow().clone()
+        }
+
+        pub fn take_warnings(&self) -> Vec<EnvironmentWarning> {
+            self.warnings.take()
+        }
+
+        fn push_warning(&self, warning: EnvironmentWarning) {
+            self.warnings.borrow_mut().push(warning.clone());
+            if let Some(reporter) = &self.reporter {
+                reporter.warn(&warning);
             }
         }
 
@@ -603,8 +721,11 @@ pub mod environment {
                 } else if path.is_file() {
                     // Try to load the file
                     if let Err(e) = self.load_file(&path) {
-                        // Log error but continue processing other files
-                        eprintln!("Warning: Failed to load {:?}: {}", path, e);
+                        // Record warning but continue processing other files
+                        self.push_warning(EnvironmentWarning::LoadFailed {
+                            path,
+                            error: e.to_string(),
+                        });
                     }
                 }
             }
@@ -624,29 +745,43 @@ pub mod environment {
 
         /// Iterate binary object references across all loaded bundles and standalone serialized files.
         pub fn binary_object_infos(&self) -> impl Iterator<Item = BinaryObjectRef<'_>> {
-            let standalone = self.binary_assets.iter().flat_map(|(source, file)| {
+            let typetree_options = self.options.typetree;
+            let standalone_reporter = self.reporter.clone();
+            let bundled_reporter = self.reporter.clone();
+
+            let standalone = self.binary_assets.iter().flat_map(move |(source, file)| {
+                let reporter = standalone_reporter.clone();
                 file.object_handles().map(move |object| BinaryObjectRef {
                     source,
                     source_kind: BinarySourceKind::SerializedFile,
                     asset_index: None,
                     object,
+                    typetree_options,
+                    reporter: reporter.clone(),
                 })
             });
 
-            let bundled = self.bundles.iter().flat_map(|(bundle_source, bundle)| {
-                bundle
-                    .assets
-                    .iter()
-                    .enumerate()
-                    .flat_map(move |(asset_index, file)| {
-                        file.object_handles().map(move |object| BinaryObjectRef {
-                            source: bundle_source,
-                            source_kind: BinarySourceKind::AssetBundle,
-                            asset_index: Some(asset_index),
-                            object,
+            let bundled = self
+                .bundles
+                .iter()
+                .flat_map(move |(bundle_source, bundle)| {
+                    let reporter = bundled_reporter.clone();
+                    bundle
+                        .assets
+                        .iter()
+                        .enumerate()
+                        .flat_map(move |(asset_index, file)| {
+                            let reporter = reporter.clone();
+                            file.object_handles().map(move |object| BinaryObjectRef {
+                                source: bundle_source,
+                                source_kind: BinarySourceKind::AssetBundle,
+                                asset_index: Some(asset_index),
+                                object,
+                                typetree_options,
+                                reporter: reporter.clone(),
+                            })
                         })
-                    })
-            });
+                });
 
             standalone.chain(bundled)
         }
@@ -679,6 +814,8 @@ pub mod environment {
         /// Note: `path_id` is unique within a single `SerializedFile`, but not globally unique across files.
         pub fn find_binary_objects(&self, path_id: i64) -> Vec<BinaryObjectRef<'_>> {
             let mut out = Vec::new();
+            let typetree_options = self.options.typetree;
+            let reporter = self.reporter.clone();
 
             let mut asset_sources: Vec<&BinarySource> = self.binary_assets.keys().collect();
             asset_sources.sort();
@@ -690,6 +827,8 @@ pub mod environment {
                         source_kind: BinarySourceKind::SerializedFile,
                         asset_index: None,
                         object,
+                        typetree_options,
+                        reporter: reporter.clone(),
                     });
                 }
             }
@@ -705,6 +844,8 @@ pub mod environment {
                             source_kind: BinarySourceKind::AssetBundle,
                             asset_index: Some(asset_index),
                             object,
+                            typetree_options,
+                            reporter: reporter.clone(),
                         });
                     }
                 }
@@ -734,6 +875,9 @@ pub mod environment {
             source: &BinarySource,
             path_id: i64,
         ) -> Vec<BinaryObjectRef<'_>> {
+            let typetree_options = self.options.typetree;
+            let reporter = self.reporter.clone();
+
             if let Some((key, file)) = self.binary_assets.get_key_value(source) {
                 if let Some(object) = file.find_object_handle(path_id) {
                     return vec![BinaryObjectRef {
@@ -741,6 +885,8 @@ pub mod environment {
                         source_kind: BinarySourceKind::SerializedFile,
                         asset_index: None,
                         object,
+                        typetree_options,
+                        reporter,
                     }];
                 }
                 return Vec::new();
@@ -755,6 +901,8 @@ pub mod environment {
                             source_kind: BinarySourceKind::AssetBundle,
                             asset_index: Some(asset_index),
                             object,
+                            typetree_options,
+                            reporter: reporter.clone(),
                         });
                     }
                 }
@@ -802,6 +950,9 @@ pub mod environment {
             asset_index: usize,
             path_id: i64,
         ) -> Option<BinaryObjectRef<'_>> {
+            let typetree_options = self.options.typetree;
+            let reporter = self.reporter.clone();
+
             let (key, bundle) = self.bundles.get_key_value(bundle_source)?;
             let asset = bundle.assets.get(asset_index)?;
             let object = asset.find_object_handle(path_id)?;
@@ -810,6 +961,8 @@ pub mod environment {
                 source_kind: BinarySourceKind::AssetBundle,
                 asset_index: Some(asset_index),
                 object,
+                typetree_options,
+                reporter,
             })
         }
 
@@ -835,6 +988,7 @@ pub mod environment {
 
         /// Read a `UnityObject` from a globally-unique key.
         pub fn read_binary_object_key(&self, key: &BinaryObjectKey) -> Result<UnityObject> {
+            let typetree_options = self.options.typetree;
             match key.source_kind {
                 BinarySourceKind::SerializedFile => {
                     let file = self.binary_assets.get(&key.source).ok_or_else(|| {
@@ -850,9 +1004,15 @@ pub mod environment {
                             key.path_id
                         ))
                     })?;
-                    object.read().map_err(|e| {
+                    let obj = object.read_with_options(typetree_options).map_err(|e| {
                         UnityAssetError::format(format!("Failed to parse binary object: {}", e))
-                    })
+                    })?;
+                    if let Some(reporter) = &self.reporter {
+                        for w in obj.typetree_warnings() {
+                            reporter.typetree_warning(key, w);
+                        }
+                    }
+                    Ok(obj)
                 }
                 BinarySourceKind::AssetBundle => {
                     let bundle = self.bundles.get(&key.source).ok_or_else(|| {
@@ -882,9 +1042,15 @@ pub mod environment {
                             key.path_id
                         ))
                     })?;
-                    object.read().map_err(|e| {
+                    let obj = object.read_with_options(typetree_options).map_err(|e| {
                         UnityAssetError::format(format!("Failed to parse binary object: {}", e))
-                    })
+                    })?;
+                    if let Some(reporter) = &self.reporter {
+                        for w in obj.typetree_warnings() {
+                            reporter.typetree_warning(key, w);
+                        }
+                    }
+                    Ok(obj)
                 }
             }
         }
@@ -1158,6 +1324,8 @@ pub mod environment {
             })?;
 
             let mut out: Vec<BundleContainerEntry> = Vec::new();
+            let typetree_options = self.options.typetree;
+            let reporter = self.reporter.clone();
 
             for (asset_index, file) in bundle.assets.iter().enumerate() {
                 for object in file.object_handles() {
@@ -1169,6 +1337,8 @@ pub mod environment {
                         source_kind: BinarySourceKind::AssetBundle,
                         asset_index: Some(asset_index),
                         object,
+                        typetree_options,
+                        reporter: reporter.clone(),
                     };
 
                     // First, try TypeTree extraction when available.

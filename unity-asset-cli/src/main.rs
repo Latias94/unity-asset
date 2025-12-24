@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use unity_asset::UnityDocument;
 use unity_asset::UnityValue;
-use unity_asset::environment::{BinarySource, Environment};
+use unity_asset::environment::{BinarySource, Environment, EnvironmentOptions};
 use unity_asset_binary::{
     asset::class_ids,
     audio::{AudioClipConverter, AudioProcessor},
@@ -22,6 +22,14 @@ use unity_asset_binary::{
 #[command(about = "A Rust-based Unity asset parser")]
 #[command(version)]
 struct Cli {
+    /// Fail-fast TypeTree parsing (no best-effort fallbacks)
+    #[arg(long)]
+    strict: bool,
+
+    /// Print collected load warnings and TypeTree warnings (when applicable)
+    #[arg(long)]
+    show_warnings: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -177,6 +185,8 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let strict = cli.strict;
+    let show_warnings = cli.show_warnings;
 
     match cli.command {
         Commands::ParseYaml {
@@ -196,12 +206,21 @@ fn main() -> Result<()> {
             limit,
             dry_run,
             decode,
-        } => export_bundle_command(input, output, pattern, limit, dry_run, decode),
+        } => export_bundle_command(
+            input,
+            output,
+            pattern,
+            limit,
+            dry_run,
+            decode,
+            strict,
+            show_warnings,
+        ),
         Commands::ListBundle {
             input,
             filter,
             verbose,
-        } => list_bundle_command(input, filter, verbose),
+        } => list_bundle_command(input, filter, verbose, strict, show_warnings),
         Commands::FindObject {
             input,
             pattern,
@@ -218,6 +237,8 @@ fn main() -> Result<()> {
             limit,
             include_unresolved,
             verbose,
+            strict,
+            show_warnings,
         ),
         Commands::InspectObject {
             input,
@@ -241,7 +262,26 @@ fn main() -> Result<()> {
             max_items,
             max_array,
             filter,
+            strict,
+            show_warnings,
         ),
+    }
+}
+
+fn build_environment(strict: bool) -> Environment {
+    if strict {
+        Environment::with_options(EnvironmentOptions::strict())
+    } else {
+        Environment::new()
+    }
+}
+
+fn print_environment_warnings(env: &Environment, show_warnings: bool) {
+    if !show_warnings {
+        return;
+    }
+    for w in env.take_warnings() {
+        eprintln!("warning: {}", w);
     }
 }
 
@@ -464,9 +504,12 @@ fn export_bundle_command(
     limit: Option<usize>,
     dry_run: bool,
     decode: bool,
+    strict: bool,
+    show_warnings: bool,
 ) -> Result<()> {
-    let mut env = Environment::new();
+    let mut env = build_environment(strict);
     env.load(&input)?;
+    print_environment_warnings(&env, show_warnings);
 
     std::fs::create_dir_all(&output)?;
 
@@ -832,9 +875,16 @@ fn export_bundle_command(
     Ok(())
 }
 
-fn list_bundle_command(input: PathBuf, filter: String, verbose: bool) -> Result<()> {
-    let mut env = Environment::new();
+fn list_bundle_command(
+    input: PathBuf,
+    filter: String,
+    verbose: bool,
+    strict: bool,
+    show_warnings: bool,
+) -> Result<()> {
+    let mut env = build_environment(strict);
     env.load(&input)?;
+    print_environment_warnings(&env, show_warnings);
 
     let filter_lc = filter.to_ascii_lowercase();
     let mut bundle_sources: Vec<BinarySource> = env
@@ -895,9 +945,12 @@ fn find_object_command(
     limit: Option<usize>,
     include_unresolved: bool,
     verbose: bool,
+    strict: bool,
+    show_warnings: bool,
 ) -> Result<()> {
-    let mut env = Environment::new();
+    let mut env = build_environment(strict);
     env.load(&input)?;
+    print_environment_warnings(&env, show_warnings);
 
     let pattern_lc = pattern.to_ascii_lowercase();
     let class_name_lc = class_name.to_ascii_lowercase();
@@ -1034,9 +1087,12 @@ fn inspect_object_command(
     max_items: usize,
     max_array: usize,
     filter: String,
+    strict: bool,
+    show_warnings: bool,
 ) -> Result<()> {
-    let mut env = Environment::new();
+    let mut env = build_environment(strict);
     env.load(&input)?;
+    print_environment_warnings(&env, show_warnings);
 
     let mut key = if let Some(key) = key {
         key.parse::<unity_asset::environment::BinaryObjectKey>()
@@ -1072,6 +1128,12 @@ fn inspect_object_command(
     key.source = resolved_source.clone();
 
     let obj = env.read_binary_object_key(&key)?;
+    if show_warnings && !obj.typetree_warnings().is_empty() {
+        eprintln!("TypeTree warnings ({}):", obj.typetree_warnings().len());
+        for w in obj.typetree_warnings() {
+            eprintln!("  - {}: {}", w.field, w.error);
+        }
+    }
 
     println!(
         "Object: {} (class_id={}, byte_size={}, byte_start={}, byte_order={:?})",

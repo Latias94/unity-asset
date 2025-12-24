@@ -209,6 +209,8 @@ cargo run --bin unity-asset -- find-object -i tests/samples/char_118_yuki.ab --c
 # - Or pass the location fields explicitly (use `--kind serialized` for standalone `.assets` files).
 cargo run --bin unity-asset -- inspect-object -i tests/samples --key 'bok1|bundle|0|1|<len>|tests/samples/char_118_yuki.ab' \
     --max-depth 6 --max-items 200 --filter "m_StreamData"
+# If you suspect TypeTree mismatches, enable fail-fast parsing and print warnings:
+# `--strict` (fail-fast) and `--show-warnings` (print TypeTree warnings)
 
 # Export objects from AssetBundles via `m_Container` (UnityPy-like workflow)
 cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --limit 50

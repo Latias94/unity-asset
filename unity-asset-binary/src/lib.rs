@@ -98,8 +98,6 @@ mod tests {
         // TODO: Implement actual async methods when needed
         let _result = tokio::task::yield_now().await;
 
-        println!("✅ Async feature compiles correctly");
-
         // Note: AssetBundle::from_bytes_async and SerializedFile::from_bytes_async
         // are not yet implemented. They would be added when async support is needed.
         assert!(!dummy_data.is_empty());

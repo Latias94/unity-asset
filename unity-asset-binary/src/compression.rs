@@ -115,14 +115,6 @@ fn decompress_lz4(data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
 
             if size_diff <= 128 {
                 // Allow up to 128 bytes difference (Unity padding/alignment)
-                if decompressed.len() != uncompressed_size {
-                    println!(
-                        "DEBUG: LZ4 size mismatch (within tolerance): expected {}, got {} (diff: {})",
-                        uncompressed_size,
-                        decompressed.len(),
-                        size_diff
-                    );
-                }
                 Ok(decompressed)
             } else {
                 Err(BinaryError::decompression_failed(format!(
@@ -136,13 +128,7 @@ fn decompress_lz4(data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
         Err(e) => {
             // If larger buffer fails, try with exact size as fallback
             match lz4_flex::decompress(data, uncompressed_size) {
-                Ok(decompressed) => {
-                    println!(
-                        "DEBUG: LZ4 decompression succeeded with exact size: {} bytes",
-                        decompressed.len()
-                    );
-                    Ok(decompressed)
-                }
+                Ok(decompressed) => Ok(decompressed),
                 Err(_) => Err(BinaryError::decompression_failed(format!(
                     "LZ4 block decompression failed: {}",
                     e
@@ -158,24 +144,6 @@ fn decompress_lzma(data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
     if data.is_empty() {
         return Err(BinaryError::invalid_data("LZMA data is empty".to_string()));
     }
-
-    println!(
-        "DEBUG: LZMA decompression - input size: {}, expected output: {}",
-        data.len(),
-        uncompressed_size
-    );
-
-    // Show first 32 bytes for debugging
-    let preview_len = 32.min(data.len());
-    let preview: Vec<String> = data[..preview_len]
-        .iter()
-        .map(|b| format!("{:02X}", b))
-        .collect();
-    println!(
-        "DEBUG: LZMA data first {} bytes: {}",
-        preview_len,
-        preview.join(" ")
-    );
 
     // Unity LZMA format analysis:
     // Unity uses LZMA with specific header formats:
@@ -237,26 +205,14 @@ fn try_unity_lzma_strategies(data: &[u8], uncompressed_size: usize) -> Result<Ve
         ),
     ];
 
-    for (strategy_name, test_data) in &strategies {
+    for (_strategy_name, test_data) in &strategies {
         if test_data.is_empty() {
             continue;
         }
 
-        println!(
-            "DEBUG: Trying LZMA strategy: {}, data size: {}",
-            strategy_name,
-            test_data.len()
-        );
-
         let mut output = Vec::new();
         match lzma_rs::lzma_decompress(&mut std::io::Cursor::new(test_data), &mut output) {
             Ok(_) => {
-                println!(
-                    "DEBUG: LZMA strategy '{}' succeeded, output size: {}",
-                    strategy_name,
-                    output.len()
-                );
-
                 // Check if size is reasonable
                 let size_ratio = output.len() as f64 / uncompressed_size as f64;
                 if (0.8..=1.2).contains(&size_ratio) {
@@ -311,21 +267,12 @@ fn try_unity_lzma_with_header(data: &[u8], expected_size: usize) -> Result<Vec<u
         }
 
         let compressed_data = &data[data_offset..];
-        println!(
-            "DEBUG: Trying Unity LZMA with offset {}, compressed size: {}",
-            data_offset,
-            compressed_data.len()
-        );
 
         // Try to use xz2 crate for better LZMA support (if available)
         #[cfg(feature = "xz2")]
         {
             match try_unity_lzma_with_xz2(props, dict_size, compressed_data, expected_size) {
                 Ok(result) => {
-                    println!(
-                        "DEBUG: Unity LZMA with xz2 succeeded, output size: {}",
-                        result.len()
-                    );
                     if result.len() == expected_size {
                         return Ok(result);
                     }
@@ -337,15 +284,10 @@ fn try_unity_lzma_with_header(data: &[u8], expected_size: usize) -> Result<Vec<u
         }
 
         // Try UnityPy-style LZMA parameter calculation
-        let lc = props % 9;
+        let _lc = props % 9;
         let remainder = props / 9;
-        let pb = remainder / 5;
-        let lp = remainder % 5;
-
-        println!(
-            "DEBUG: UnityPy LZMA params - lc: {}, pb: {}, lp: {}",
-            lc, pb, lp
-        );
+        let _pb = remainder / 5;
+        let _lp = remainder % 5;
 
         // Try with calculated parameters (create custom LZMA header)
         let mut unity_lzma_data = Vec::new();
@@ -357,10 +299,6 @@ fn try_unity_lzma_with_header(data: &[u8], expected_size: usize) -> Result<Vec<u
         let mut output = Vec::new();
         match lzma_rs::lzma_decompress(&mut std::io::Cursor::new(&unity_lzma_data), &mut output) {
             Ok(_) => {
-                println!(
-                    "DEBUG: Unity LZMA with UnityPy params succeeded, output size: {}",
-                    output.len()
-                );
                 if output.len() == expected_size {
                     return Ok(output);
                 } else if !output.is_empty() {
@@ -385,10 +323,6 @@ fn try_unity_lzma_with_header(data: &[u8], expected_size: usize) -> Result<Vec<u
         let mut output = Vec::new();
         match lzma_rs::lzma_decompress(&mut std::io::Cursor::new(&lzma_data), &mut output) {
             Ok(_) => {
-                println!(
-                    "DEBUG: Unity LZMA with lzma_rs succeeded, output size: {}",
-                    output.len()
-                );
                 if output.len() == expected_size {
                     return Ok(output);
                 } else if !output.is_empty() {
@@ -446,32 +380,16 @@ fn try_unity_raw_lzma(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
             continue;
         }
 
-        println!(
-            "DEBUG: Trying LZMA stream from offset {}, size: {}",
-            offset,
-            lzma_stream.len()
-        );
-
         // Try to decompress as raw LZMA stream
         let mut output = Vec::new();
         match lzma_rs::lzma_decompress(&mut std::io::Cursor::new(lzma_stream), &mut output) {
             Ok(_) => {
-                println!(
-                    "DEBUG: Raw LZMA from offset {} succeeded, output size: {}",
-                    offset,
-                    output.len()
-                );
-
                 // Check if size is reasonable
                 if output.len() == expected_size {
                     return Ok(output);
                 } else if !output.is_empty() {
                     let ratio = output.len() as f64 / expected_size as f64;
                     if (0.5..=2.0).contains(&ratio) {
-                        println!(
-                            "DEBUG: Size ratio {:.2} is acceptable for offset {}",
-                            ratio, offset
-                        );
                         return Ok(output);
                     }
                 }
@@ -493,20 +411,12 @@ fn try_unity_raw_lzma(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
             let mut output = Vec::new();
             match lzma_rs::lzma_decompress(&mut std::io::Cursor::new(&reconstructed), &mut output) {
                 Ok(_) => {
-                    println!(
-                        "DEBUG: Reconstructed LZMA from offset {} succeeded, output size: {}",
-                        offset,
-                        output.len()
-                    );
                     if output.len() == expected_size {
                         return Ok(output);
                     }
                 }
                 Err(e) => {
-                    println!(
-                        "DEBUG: Reconstructed LZMA from offset {} failed: {}",
-                        offset, e
-                    );
+                    let _ = e;
                 }
             }
         }

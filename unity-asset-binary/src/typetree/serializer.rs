@@ -29,7 +29,7 @@ impl Default for TypeTreeParseMode {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TypeTreeParseOptions {
     pub mode: TypeTreeParseMode,
 }

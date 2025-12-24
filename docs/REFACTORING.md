@@ -102,6 +102,7 @@ Rules:
 - Phase 2 is in progress: the binary crate now provides a unified `UnityFile` model and a layered `formats::*` namespace; top-level re-exports are being reduced.
 - Phase 2 is in progress: `Environment` is moving toward a UnityPy-like “File → Objects” flow by loading WebFiles and modeling nested sources (keys support WebFile entries).
 - Phase 2 is in progress: close remaining “load loop” gaps (extension-less files should still be detected as bundle/serialized/web), add WebFile-focused integration tests, and unify `BinarySource` formatting via `Display`.
+- Phase 2 is in progress: strict/lenient TypeTree parsing is now user-selectable end-to-end (object reads honor mode; CLI has `--strict`), and libraries avoid writing to stderr (warnings are collected/returned instead).
 
 ### Phase 0 — Safety & Correctness (mandatory)
 

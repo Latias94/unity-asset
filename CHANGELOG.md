@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `docs/REFACTORING.md`: a UnityPy-aligned fearless refactor roadmap (layering, strict/lenient parsing, decode split, API discipline).
 - `BinarySource: Display` to provide a single, consistent string representation across library diagnostics and CLI output.
+- `unity-asset` `EnvironmentOptions` + `EnvironmentWarning` to control parsing behavior and observe non-fatal load issues without printing from libraries.
+- `unity-asset` CLI: `--strict` (fail-fast TypeTree parsing) and `--show-warnings` (print collected warnings and TypeTree warnings in `inspect-object`).
 - UnityPy-style `ObjectHandle` in `unity-asset-binary` to treat objects as lightweight, on-demand readers (`SerializedFile::object_handles` / `SerializedFile::find_object_handle`).
 - `unity-asset-binary::file` unified loader (`load_unity_file` / `load_unity_file_from_memory`) and a layered `unity-asset-binary::formats::*` namespace.
 - `unity-asset` `Environment` can now load WebFiles and treat contained bundles/assets as first-class binary sources (including streamed resource reads from WebFile entries).
@@ -61,11 +63,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Marked the most comprehensive UnityPy-port integration tests as `#[ignore]` by default to keep `cargo test` fast (see `CONTRIBUTING.md` for running ignored tests).
 - Reduced duplicated bundle parsing in `Environment` unit tests to speed up the default `cargo test` loop.
 - `find-object --verbose` now prints a copy/paste-able `BinaryObjectKey` string which can be fed into `inspect-object --key`.
+- (BREAKING) `BinaryObjectRef` / `EnvironmentObjectRef` are no longer `Copy` to support reporter/warning plumbing.
 
 ### Fixed
 - Hardened length-prefixed string reads to avoid hostile allocations and out-of-bounds reads (length is validated against remaining bytes and a maximum limit).
 - `Environment::load_file` now attempts binary detection for extension-less files (best-effort), improving support for `UnityWebData*` and other build artifacts.
 - Fixed `UnityFile` sniffing to avoid mis-classifying uncompressed `UnityWebData*` WebFiles as legacy `UnityWeb` bundles.
+- Removed `println!`/`eprintln!` from library code paths (warnings are returned/collected instead of writing to stderr).
 - Fixed v<9 endian seek underflow in `SerializedFileHeader` parsing (checked arithmetic + explicit error).
 - Fixed UnityFS archive flags handling to honor `BlocksInfoAtEnd` / padding behavior (and corrected flag constants to match UnityPy).
 - Fixed UnityWeb decompression to prefer the header’s explicit `uncompressed_size` (guessing is only a fallback).

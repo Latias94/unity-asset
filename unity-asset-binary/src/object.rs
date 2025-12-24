@@ -3,7 +3,10 @@
 use crate::asset::{ObjectInfo, SerializedFile};
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
-use crate::typetree::{TypeTree, TypeTreeSerializer};
+use crate::typetree::{
+    TypeTree, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput, TypeTreeParseWarning,
+    TypeTreeSerializer,
+};
 use crate::unity_objects::{GameObject, Transform};
 use std::sync::Arc;
 use unity_asset_core::{UnityClass, UnityValue};
@@ -59,6 +62,10 @@ impl<'a> ObjectHandle<'a> {
     pub fn read(&self) -> Result<UnityObject> {
         UnityObject::from_serialized_file(self.file, self.info)
     }
+
+    pub fn read_with_options(&self, options: TypeTreeParseOptions) -> Result<UnityObject> {
+        UnityObject::from_serialized_file_with_options(self.file, self.info, options)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +103,7 @@ pub struct UnityObject {
     pub class: UnityClass,
     byte_order: ByteOrder,
     raw: ObjectBytes,
+    typetree_warnings: Vec<TypeTreeParseWarning>,
 }
 
 impl UnityObject {
@@ -106,6 +114,7 @@ impl UnityObject {
             info,
             class,
             raw: ObjectBytes::Empty,
+            typetree_warnings: Vec::new(),
         }
     }
 
@@ -149,11 +158,20 @@ impl UnityObject {
             class,
             byte_order: ByteOrder::Little,
             raw,
+            typetree_warnings: Vec::new(),
         }
     }
 
     /// Create a UnityObject from a SerializedFile + ObjectInfo, using TypeTree when available.
     pub fn from_serialized_file(file: &SerializedFile, info: &ObjectInfo) -> Result<Self> {
+        Self::from_serialized_file_with_options(file, info, TypeTreeParseOptions::default())
+    }
+
+    pub fn from_serialized_file_with_options(
+        file: &SerializedFile,
+        info: &ObjectInfo,
+        options: TypeTreeParseOptions,
+    ) -> Result<Self> {
         let class_id = info.type_id;
         let type_tree = type_tree_for_object(file, info);
         let byte_order = file.header.byte_order();
@@ -170,65 +188,27 @@ impl UnityObject {
             info.path_id.to_string(),
         );
 
+        let mut warnings: Vec<TypeTreeParseWarning> = Vec::new();
+
         if let Some(tree) = type_tree {
-            match parse_object_data(file, info, byte_order, tree) {
-                Ok(properties) => class.update_properties(properties),
-                Err(_) => {
-                    let bytes = raw.as_slice();
-                    class.set(
-                        "_raw_data_len".to_string(),
-                        UnityValue::Integer(bytes.len() as i64),
-                    );
-                    if bytes.len() <= RAW_DATA_INLINE_LIMIT {
-                        class.set(
-                            "_raw_data".to_string(),
-                            UnityValue::Array(
-                                bytes
-                                    .iter()
-                                    .copied()
-                                    .map(|b| UnityValue::Integer(b as i64))
-                                    .collect(),
-                            ),
-                        );
-                    } else {
-                        class.set("_raw_data_truncated".to_string(), UnityValue::Bool(true));
-                        let preview = bytes
-                            .iter()
-                            .take(RAW_DATA_PREVIEW_LEN)
-                            .copied()
-                            .map(|b| UnityValue::Integer(b as i64))
-                            .collect();
-                        class.set("_raw_data_preview".to_string(), UnityValue::Array(preview));
-                    }
+            match parse_object_data(file, info, byte_order, tree, options) {
+                Ok(out) => {
+                    class.update_properties(out.properties);
+                    warnings = out.warnings;
                 }
+                Err(e) => match options.mode {
+                    TypeTreeParseMode::Strict => return Err(e),
+                    TypeTreeParseMode::Lenient => {
+                        warnings.push(TypeTreeParseWarning {
+                            field: "<root>".to_string(),
+                            error: e.to_string(),
+                        });
+                        apply_raw_preview(&mut class, raw.as_slice());
+                    }
+                },
             }
         } else {
-            let bytes = raw.as_slice();
-            class.set(
-                "_raw_data_len".to_string(),
-                UnityValue::Integer(bytes.len() as i64),
-            );
-            if bytes.len() <= RAW_DATA_INLINE_LIMIT {
-                class.set(
-                    "_raw_data".to_string(),
-                    UnityValue::Array(
-                        bytes
-                            .iter()
-                            .copied()
-                            .map(|b| UnityValue::Integer(b as i64))
-                            .collect(),
-                    ),
-                );
-            } else {
-                class.set("_raw_data_truncated".to_string(), UnityValue::Bool(true));
-                let preview = bytes
-                    .iter()
-                    .take(RAW_DATA_PREVIEW_LEN)
-                    .copied()
-                    .map(|b| UnityValue::Integer(b as i64))
-                    .collect();
-                class.set("_raw_data_preview".to_string(), UnityValue::Array(preview));
-            }
+            apply_raw_preview(&mut class, raw.as_slice());
         }
 
         Ok(Self {
@@ -240,6 +220,7 @@ impl UnityObject {
             class,
             byte_order,
             raw,
+            typetree_warnings: warnings,
         })
     }
 
@@ -329,6 +310,10 @@ impl UnityObject {
         self.raw.as_slice()
     }
 
+    pub fn typetree_warnings(&self) -> &[TypeTreeParseWarning] {
+        &self.typetree_warnings
+    }
+
     pub fn byte_size(&self) -> u32 {
         self.info.byte_size
     }
@@ -393,9 +378,38 @@ fn parse_object_data(
     info: &ObjectInfo,
     byte_order: ByteOrder,
     tree: &TypeTree,
-) -> Result<indexmap::IndexMap<String, UnityValue>> {
+    options: TypeTreeParseOptions,
+) -> Result<TypeTreeParseOutput> {
     let bytes = object_bytes(file, info)?;
     let mut reader = BinaryReader::new(bytes, byte_order);
     let serializer = TypeTreeSerializer::new(tree);
-    serializer.parse_object(&mut reader)
+    serializer.parse_object_detailed(&mut reader, options)
+}
+
+fn apply_raw_preview(class: &mut UnityClass, bytes: &[u8]) {
+    class.set(
+        "_raw_data_len".to_string(),
+        UnityValue::Integer(bytes.len() as i64),
+    );
+    if bytes.len() <= RAW_DATA_INLINE_LIMIT {
+        class.set(
+            "_raw_data".to_string(),
+            UnityValue::Array(
+                bytes
+                    .iter()
+                    .copied()
+                    .map(|b| UnityValue::Integer(b as i64))
+                    .collect(),
+            ),
+        );
+    } else {
+        class.set("_raw_data_truncated".to_string(), UnityValue::Bool(true));
+        let preview = bytes
+            .iter()
+            .take(RAW_DATA_PREVIEW_LEN)
+            .copied()
+            .map(|b| UnityValue::Integer(b as i64))
+            .collect();
+        class.set("_raw_data_preview".to_string(), UnityValue::Array(preview));
+    }
 }

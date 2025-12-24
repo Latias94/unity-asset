@@ -46,7 +46,10 @@ pub mod types;
 // Re-export main types for easy access
 pub use builder::{TypeTreeBuilder, TypeTreeValidator, ValidationReport};
 pub use parser::{ParsingStats, TypeTreeParser};
-pub use serializer::TypeTreeSerializer;
+pub use serializer::{
+    TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput, TypeTreeParseWarning,
+    TypeTreeSerializer,
+};
 pub use types::{TypeInfo, TypeRegistry, TypeTree, TypeTreeNode, TypeTreeStatistics};
 
 /// Main TypeTree processing facade

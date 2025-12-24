@@ -45,8 +45,8 @@ impl SerdeUnityLoader {
             match self.convert_document_to_unity_class(document, doc_index) {
                 Ok(unity_class) => unity_classes.push(unity_class),
                 Err(e) => {
-                    // Log error but continue processing other documents
-                    eprintln!("Warning: Failed to convert document {}: {}", doc_index, e);
+                    // Best-effort: keep parsing other documents (no stderr logging from library code).
+                    let _ = e;
                 }
             }
         }
