@@ -1,5 +1,7 @@
 //! Texture2D TypeTree parsing tests (streamed textures)
 
+#![cfg(feature = "texture")]
+
 use unity_asset_binary::{
     asset::ObjectInfo, asset::class_ids, object::UnityObject, texture::Texture2DConverter,
     unity_version::UnityVersion,

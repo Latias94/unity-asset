@@ -3,6 +3,7 @@
 //! This file ports all tests from UnityPy's test suite to Rust
 //! to ensure complete compatibility and feature parity.
 
+#![cfg(feature = "full")]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(clippy::manual_flatten)]

@@ -3,6 +3,7 @@
 //! This file tests the Phase 4 texture processing features against UnityPy's
 //! Texture2D handling behavior.
 
+#![cfg(feature = "sprite")]
 #![allow(unused_imports)]
 #![allow(dead_code)]
 #![allow(clippy::field_reassign_with_default)]

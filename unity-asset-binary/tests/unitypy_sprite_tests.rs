@@ -3,6 +3,7 @@
 //! This file tests the Sprite processing features against UnityPy's
 //! Sprite handling behavior.
 
+#![cfg(feature = "sprite")]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]

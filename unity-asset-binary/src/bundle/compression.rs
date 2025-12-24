@@ -48,20 +48,11 @@ impl BundleCompression {
             }
             4 => {
                 // Brotli (newer Unity versions)
-                #[cfg(feature = "brotli")]
-                {
-                    decompress(
-                        compressed_data,
-                        CompressionType::Brotli,
-                        header.uncompressed_blocks_info_size as usize,
-                    )
-                }
-                #[cfg(not(feature = "brotli"))]
-                {
-                    Err(BinaryError::unsupported(
-                        "Brotli compression requires brotli feature",
-                    ))
-                }
+                decompress(
+                    compressed_data,
+                    CompressionType::Brotli,
+                    header.uncompressed_blocks_info_size as usize,
+                )
             }
             _ => Err(BinaryError::unsupported(format!(
                 "Unknown compression type: {}",
@@ -203,10 +194,7 @@ impl BundleCompression {
             0 => true,     // None
             1 => true,     // LZMA
             2 | 3 => true, // LZ4/LZ4HC
-            #[cfg(feature = "brotli")]
             4 => true, // Brotli
-            #[cfg(not(feature = "brotli"))]
-            4 => false, // Brotli
             _ => false,
         }
     }

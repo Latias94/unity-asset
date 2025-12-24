@@ -25,7 +25,6 @@ unity-asset-core = { path = "../unity-asset-core", version = "0.1.0" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 indexmap = { workspace = true }
-anyhow = { workspace = true }
 
 # Binary parsing
 binrw = { workspace = true }
@@ -50,13 +49,12 @@ async-trait = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
 
-# Image processing
-image = { workspace = true }
+# Image processing (optional; only for decode/export features)
+image = { workspace = true, optional = true }
 
 # Audio processing (optional)
 symphonia = { version = "0.5", features = ["all"], optional = true }
 hound = { version = "3.5", optional = true }
-base64 = "0.22"
 
 # Advanced texture decoding (optional)
 texture2ddecoder = { version = "0.1", optional = true }
@@ -65,22 +63,21 @@ texture2ddecoder = { version = "0.1", optional = true }
 obj = { version = "0.10", optional = true }
 
 [features]
-default = ["texture", "audio", "mesh", "sprite", "texture-advanced"]
+default = []
 
 # 异步支持
 async = ["unity-asset-core/async", "tokio", "futures", "async-trait", "tokio-stream", "async-stream"]
 
 # 主要功能模块
-texture = []                                          # 纹理处理 (基础+高级格式)
+texture = ["dep:image"]                               # 纹理处理 (基础+高级格式)
 audio = ["symphonia", "hound"]                        # 音频处理 (所有格式)
 mesh = []                                             # 网格处理 (基础+导出)
-sprite = []                                           # Sprite处理
+sprite = ["texture"]                                  # Sprite处理
 
 # 高级功能 (可选)
-texture-advanced = ["texture2ddecoder"]               # 高级纹理格式 (DXT, ETC, ASTC)
+texture-advanced = ["texture", "texture2ddecoder"]    # 高级纹理格式 (DXT, ETC, ASTC)
 audio-advanced = ["symphonia"]                        # 高级音频格式支持
-mesh-export = ["obj"]                                 # 网格导出功能
-brotli = []                                           # Brotli压缩支持
+mesh-export = ["mesh", "obj"]                         # 网格导出功能
 xz2 = ["dep:xz2"]                                     # XZ2 LZMA压缩支持
 
 # 便捷组合
@@ -89,3 +86,13 @@ full = ["texture", "audio", "mesh", "sprite", "texture-advanced", "mesh-export"]
 
 [dev-dependencies]
 hex = "0.4"
+
+[[example]]
+name = "debug_texture_formats"
+path = "examples/debug_texture_formats.rs"
+required-features = ["texture"]
+
+[[example]]
+name = "texture_decoding_demo"
+path = "examples/texture_decoding_demo.rs"
+required-features = ["texture"]

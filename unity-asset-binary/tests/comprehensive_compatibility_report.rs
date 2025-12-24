@@ -3,6 +3,7 @@
 //! This file generates a comprehensive compatibility report comparing our
 //! Unity Asset Parser with UnityPy and other industry standards.
 
+#![cfg(feature = "audio")]
 #![allow(unused_imports)]
 #![allow(dead_code)]
 

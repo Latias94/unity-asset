@@ -21,6 +21,10 @@
 //! - `texture-advanced`: Advanced texture formats (DXT, ETC, ASTC) - requires texture2ddecoder
 //! - `mesh-export`: Advanced mesh export (OBJ format)
 //!
+//! Notes:
+//! - The default build is **minimal** and focuses on parsing only.
+//! - Enable `full` (or individual feature flags) when you need decoding/export helpers.
+//!
 //! # Example
 //!
 //! ```rust,no_run

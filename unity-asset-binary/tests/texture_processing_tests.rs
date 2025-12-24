@@ -3,6 +3,8 @@
 //! This file tests texture processing functionality including Texture2D parsing,
 //! format detection, and texture data extraction.
 
+#![cfg(feature = "texture")]
+
 #![allow(unused_imports)]
 #![allow(dead_code)]
 

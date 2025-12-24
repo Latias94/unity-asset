@@ -1,5 +1,7 @@
 //! Texture2D raw parsing tests (streamed textures)
 
+#![cfg(feature = "texture")]
+
 use unity_asset_binary::object::UnityObject;
 use unity_asset_binary::texture::Texture2DConverter;
 use unity_asset_binary::unity_version::UnityVersion;

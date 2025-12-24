@@ -3,6 +3,7 @@
 //! This file tests audio processing functionality including AudioClip parsing,
 //! format detection, and audio data extraction.
 
+#![cfg(feature = "audio")]
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
