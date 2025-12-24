@@ -8,9 +8,8 @@
 
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::object::ObjectInfo;
 use unity_asset_binary::{
-    AudioClip, AudioCompressionFormat, AudioProcessor, load_bundle_from_memory,
+    AudioClip, AudioCompressionFormat, AudioProcessor, UnityObject, load_bundle_from_memory,
 };
 
 const SAMPLES_DIR: &str = "tests/samples";
@@ -157,19 +156,23 @@ fn test_audio_processing_from_files() {
                         for asset_object_info in &asset.objects {
                             total_objects += 1;
 
-                            // Convert to our ObjectInfo type
-                            let mut object_info = ObjectInfo::new(
-                                asset_object_info.path_id,
-                                asset_object_info.byte_start,
-                                asset_object_info.byte_size,
-                                asset_object_info.type_id,
-                            );
-                            object_info.data = asset_object_info.data.clone();
-
-                            let class_name = object_info.class_name();
+                            let unity_object =
+                                UnityObject::from_serialized_file(asset, asset_object_info)
+                                    .unwrap_or_else(|_| {
+                                        let fallback_data = asset
+                                            .object_bytes(asset_object_info)
+                                            .map(|b| b.to_vec())
+                                            .unwrap_or_default();
+                                        UnityObject::from_raw(
+                                            asset_object_info.type_id,
+                                            asset_object_info.path_id,
+                                            fallback_data,
+                                        )
+                                    });
+                            let class_name = unity_object.class_name().to_string();
 
                             // Look for AudioClip objects (Class ID 83) or any audio-related objects
-                            if object_info.class_id == 83
+                            if unity_object.class_id() == 83
                                 || class_name.contains("Audio")
                                 || class_name == "Object"
                             {
@@ -177,12 +180,13 @@ fn test_audio_processing_from_files() {
                                 audio_objects += 1;
                                 println!(
                                     "    Found audio object: {} (ID:{}, PathID:{})",
-                                    class_name, object_info.class_id, object_info.path_id
+                                    class_name,
+                                    unity_object.class_id(),
+                                    unity_object.path_id()
                                 );
 
-                                // Try to process the audio object
-                                if let Ok(unity_class) = object_info.parse_object() {
-                                    processed_audio += 1;
+                                processed_audio += 1;
+                                let unity_class = unity_object.as_unity_class();
 
                                     // Try to get audio properties
                                     if let Some(name_value) = unity_class.get("m_Name") {
@@ -218,7 +222,6 @@ fn test_audio_processing_from_files() {
                                             println!("      Data size: {} bytes", size);
                                         }
                                     }
-                                }
                             }
                         }
                     }
@@ -333,121 +336,103 @@ fn test_advanced_audio_extraction() {
                         for asset_object_info in &asset.objects {
                             total_objects += 1;
 
-                            // Convert to our ObjectInfo type
-                            let mut object_info = ObjectInfo::new(
-                                asset_object_info.path_id,
-                                asset_object_info.byte_start,
-                                asset_object_info.byte_size,
-                                asset_object_info.type_id,
-                            );
-                            object_info.data = asset_object_info.data.clone();
+                            let unity_object =
+                                UnityObject::from_serialized_file(asset, asset_object_info)
+                                    .unwrap_or_else(|_| {
+                                        let fallback_data = asset
+                                            .object_bytes(asset_object_info)
+                                            .map(|b| b.to_vec())
+                                            .unwrap_or_default();
+                                        UnityObject::from_raw(
+                                            asset_object_info.type_id,
+                                            asset_object_info.path_id,
+                                            fallback_data,
+                                        )
+                                    });
+                            let class_name = unity_object.class_name().to_string();
+                            let unity_class = unity_object.as_unity_class();
+                            analyzed_objects += 1;
 
-                            let class_name = object_info.class_name();
+                            // Look for audio-related properties
+                            let has_audio_props = unity_class.properties().keys().any(|key| {
+                                let lower = key.to_lowercase();
+                                lower.contains("audio")
+                                    || lower.contains("sound")
+                                    || lower.contains("clip")
+                                    || key.contains("m_CompressionFormat")
+                                    || key.contains("m_Frequency")
+                                    || key.contains("m_Channels")
+                                    || key.contains("m_BitsPerSample")
+                            });
 
-                            // Analyze all objects for potential audio content
-                            if let Ok(unity_class) = object_info.parse_object() {
-                                analyzed_objects += 1;
+                            if has_audio_props {
+                                potential_audio += 1;
+                                println!(
+                                    "    Potential audio object: {} (ID:{}, PathID:{})",
+                                    class_name,
+                                    unity_object.class_id(),
+                                    unity_object.path_id()
+                                );
 
-                                // Look for audio-related properties
-                                let has_audio_props = unity_class.properties().keys().any(|key| {
-                                    key.to_lowercase().contains("audio")
-                                        || key.to_lowercase().contains("sound")
-                                        || key.to_lowercase().contains("clip")
-                                        || key.contains("m_CompressionFormat")
-                                        || key.contains("m_Frequency")
-                                        || key.contains("m_Channels")
-                                        || key.contains("m_BitsPerSample")
-                                });
-
-                                if has_audio_props {
-                                    potential_audio += 1;
-                                    println!(
-                                        "    Potential audio object: {} (ID:{}, PathID:{})",
-                                        class_name, object_info.class_id, object_info.path_id
-                                    );
-
-                                    // Extract audio properties
-                                    if let Some(name_value) = unity_class.get("m_Name") {
-                                        if let unity_asset_core::UnityValue::String(name) =
-                                            name_value
-                                        {
-                                            println!("      Name: '{}'", name);
-                                        }
-                                    }
-
-                                    // Check for compression format
-                                    if let Some(format_value) =
-                                        unity_class.get("m_CompressionFormat")
-                                    {
-                                        if let unity_asset_core::UnityValue::Integer(format_id) =
-                                            format_value
-                                        {
-                                            let format =
-                                                AudioCompressionFormat::from(*format_id as i32);
-                                            println!(
-                                                "      Format: {:?} ({})",
-                                                format,
-                                                format.info().name
-                                            );
-                                        }
-                                    }
-
-                                    // Check for audio properties
-                                    if let Some(freq_value) = unity_class.get("m_Frequency") {
-                                        if let unity_asset_core::UnityValue::Integer(freq) =
-                                            freq_value
-                                        {
-                                            println!("      Frequency: {} Hz", freq);
-                                        }
-                                    }
-
-                                    if let Some(channels_value) = unity_class.get("m_Channels") {
-                                        if let unity_asset_core::UnityValue::Integer(channels) =
-                                            channels_value
-                                        {
-                                            println!("      Channels: {}", channels);
-                                        }
-                                    }
-
-                                    if let Some(bits_value) = unity_class.get("m_BitsPerSample") {
-                                        if let unity_asset_core::UnityValue::Integer(bits) =
-                                            bits_value
-                                        {
-                                            println!("      Bits per sample: {}", bits);
-                                        }
-                                    }
-
-                                    // Check for audio data size
-                                    if let Some(size_value) = unity_class.get("m_Size") {
-                                        if let unity_asset_core::UnityValue::Integer(size) =
-                                            size_value
-                                        {
-                                            println!("      Data size: {} bytes", size);
-                                        }
-                                    }
-
-                                    // Look for streaming info
-                                    if let Some(stream_value) = unity_class.get("m_Resource") {
-                                        println!("      Has streaming resource");
-                                    }
+                                if let Some(name_value) = unity_class.get("m_Name")
+                                    && let unity_asset_core::UnityValue::String(name) = name_value
+                                {
+                                    println!("      Name: '{}'", name);
                                 }
 
-                                // Also check for large binary data that might be audio
-                                if object_info.data.len() > 1024 && class_name == "Object" {
-                                    // Check if data looks like audio (simple heuristic)
-                                    let data_preview =
-                                        &object_info.data[..32.min(object_info.data.len())];
-                                    let has_audio_signature = data_preview.iter().any(|&b| b != 0)
-                                        && data_preview.len() >= 16;
+                                if let Some(format_value) = unity_class.get("m_CompressionFormat")
+                                    && let unity_asset_core::UnityValue::Integer(format_id) =
+                                        format_value
+                                {
+                                    let format = AudioCompressionFormat::from((*format_id) as i32);
+                                    println!("      Format: {:?} ({})", format, format.info().name);
+                                }
 
-                                    if has_audio_signature {
-                                        println!(
-                                            "    Large binary object (potential audio): {} bytes (ID:{}, PathID:{})",
-                                            object_info.data.len(),
-                                            object_info.class_id,
-                                            object_info.path_id
-                                        );
-                                    }
+                                if let Some(freq_value) = unity_class.get("m_Frequency")
+                                    && let unity_asset_core::UnityValue::Integer(freq) = freq_value
+                                {
+                                    println!("      Frequency: {} Hz", freq);
+                                }
+
+                                if let Some(channels_value) = unity_class.get("m_Channels")
+                                    && let unity_asset_core::UnityValue::Integer(channels) =
+                                        channels_value
+                                {
+                                    println!("      Channels: {}", channels);
+                                }
+
+                                if let Some(bits_value) = unity_class.get("m_BitsPerSample")
+                                    && let unity_asset_core::UnityValue::Integer(bits) = bits_value
+                                {
+                                    println!("      Bits per sample: {}", bits);
+                                }
+
+                                if let Some(size_value) = unity_class.get("m_Size")
+                                    && let unity_asset_core::UnityValue::Integer(size) = size_value
+                                {
+                                    println!("      Data size: {} bytes", size);
+                                }
+
+                                if unity_class.get("m_Resource").is_some() {
+                                    println!("      Has streaming resource");
+                                }
+                            }
+
+                            // Also check for large binary data that might be audio
+                            let raw_len = unity_object.raw_data().len();
+                            if raw_len > 1024 && class_name == "Object" {
+                                let preview_len = 32.min(raw_len);
+                                let data_preview = &unity_object.raw_data()[..preview_len];
+                                let has_audio_signature =
+                                    data_preview.iter().any(|&b| b != 0) && data_preview.len() >= 16;
+
+                                if has_audio_signature {
+                                    println!(
+                                        "    Large binary object (potential audio): {} bytes (ID:{}, PathID:{})",
+                                        raw_len,
+                                        unity_object.class_id(),
+                                        unity_object.path_id()
+                                    );
                                 }
                             }
                         }

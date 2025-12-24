@@ -18,8 +18,8 @@ pub struct SerializedType {
     pub class_id: i32,
     /// Whether this type is stripped
     pub is_stripped_type: bool,
-    /// Script type index (for MonoBehaviour)
-    pub script_type_index: Option<i16>,
+    /// Script type index (for MonoBehaviour / ref types); `-1` means not a script type.
+    pub script_type_index: i16,
     /// Type tree for this type
     pub type_tree: TypeTree,
     /// Script ID hash
@@ -42,7 +42,7 @@ impl SerializedType {
         Self {
             class_id,
             is_stripped_type: false,
-            script_type_index: None,
+            script_type_index: -1,
             type_tree: TypeTree::new(),
             script_id: [0; 16],
             old_type_hash: [0; 16],
@@ -58,6 +58,7 @@ impl SerializedType {
         reader: &mut BinaryReader,
         version: u32,
         enable_type_tree: bool,
+        is_ref_type: bool,
     ) -> Result<Self> {
         let class_id = reader.read_i32()?;
         let mut serialized_type = Self::new(class_id);
@@ -67,17 +68,14 @@ impl SerializedType {
         }
 
         if version >= 17 {
-            let script_type_index = reader.read_i16()?;
-            serialized_type.script_type_index = Some(script_type_index);
+            serialized_type.script_type_index = reader.read_i16()?;
         }
 
         if version >= 13 {
-            // Based on unity-rs logic: check conditions for script_id
-            let should_read_script_id = if version < 16 {
-                class_id < 0
-            } else {
-                class_id == 114 // MonoBehaviour
-            };
+            // Based on UnityPy logic.
+            let should_read_script_id = (is_ref_type && serialized_type.script_type_index >= 0)
+                || (version < 16 && class_id < 0)
+                || (version >= 16 && class_id == 114); // MonoBehaviour
 
             if should_read_script_id {
                 // Read script ID
@@ -99,6 +97,16 @@ impl SerializedType {
             } else {
                 serialized_type.type_tree = TypeTreeParser::from_reader(reader, version)?;
             }
+
+            if version >= 21 {
+                if is_ref_type {
+                    serialized_type.class_name = reader.read_cstring()?;
+                    serialized_type.namespace = reader.read_cstring()?;
+                    serialized_type.assembly_name = reader.read_cstring()?;
+                } else {
+                    serialized_type.type_dependencies = read_i32_array(reader)?;
+                }
+            }
         }
 
         Ok(serialized_type)
@@ -106,7 +114,7 @@ impl SerializedType {
 
     /// Check if this is a script type (MonoBehaviour)
     pub fn is_script_type(&self) -> bool {
-        self.class_id == 114 || self.script_type_index.is_some()
+        self.class_id == 114 || self.script_type_index >= 0
     }
 
     /// Check if this type has a TypeTree
@@ -148,12 +156,30 @@ impl SerializedType {
     }
 }
 
+fn read_i32_array(reader: &mut BinaryReader) -> Result<Vec<i32>> {
+    let count = reader.read_i32()?;
+    if count < 0 {
+        return Err(BinaryError::invalid_data(format!(
+            "Negative array length: {}",
+            count
+        )));
+    }
+    let count = count as usize;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(reader.read_i32()?);
+    }
+    Ok(values)
+}
+
 /// External reference to another Unity file
 ///
 /// Represents a reference to an asset in another Unity file,
 /// used for cross-file asset dependencies.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileIdentifier {
+    /// Temporary empty string field for version >= 6.
+    pub temp_empty: String,
     /// GUID of the referenced file
     pub guid: [u8; 16],
     /// Type of the reference
@@ -164,20 +190,40 @@ pub struct FileIdentifier {
 
 impl FileIdentifier {
     /// Parse FileIdentifier from binary data
-    pub fn from_reader(reader: &mut BinaryReader, _version: u32) -> Result<Self> {
+    pub fn from_reader(reader: &mut BinaryReader, version: u32) -> Result<Self> {
+        let temp_empty = if version >= 6 {
+            reader.read_cstring()?
+        } else {
+            String::new()
+        };
+
         let mut guid = [0u8; 16];
-        let guid_bytes = reader.read_bytes(16)?;
-        guid.copy_from_slice(&guid_bytes);
+        let mut type_ = 0i32;
 
-        let type_ = reader.read_i32()?;
-        let path = reader.read_aligned_string()?;
+        if version >= 5 {
+            let guid_bytes = reader.read_bytes(16)?;
+            guid.copy_from_slice(&guid_bytes);
+            type_ = reader.read_i32()?;
+        }
 
-        Ok(Self { guid, type_, path })
+        let path = reader.read_cstring()?;
+
+        Ok(Self {
+            temp_empty,
+            guid,
+            type_,
+            path,
+        })
     }
 
     /// Create a new FileIdentifier
     pub fn new(guid: [u8; 16], type_: i32, path: String) -> Self {
-        Self { guid, type_, path }
+        Self {
+            temp_empty: String::new(),
+            guid,
+            type_,
+            path,
+        }
     }
 
     /// Check if this is a valid file identifier
@@ -221,20 +267,29 @@ pub struct ObjectInfo {
     pub byte_start: u64,
     /// Size of object data
     pub byte_size: u32,
-    /// Type ID of the object
+    /// Unity class ID of the object
     pub type_id: i32,
+    /// Raw type ID from the object table (index into `types` for version >= 16, otherwise `-1`)
+    pub type_index: i32,
     /// Object data
     pub data: Vec<u8>,
 }
 
 impl ObjectInfo {
     /// Create a new ObjectInfo
-    pub fn new(path_id: i64, byte_start: u64, byte_size: u32, type_id: i32) -> Self {
+    pub fn new(
+        path_id: i64,
+        byte_start: u64,
+        byte_size: u32,
+        type_id: i32,
+        type_index: i32,
+    ) -> Self {
         Self {
             path_id,
             byte_start,
             byte_size,
             type_id,
+            type_index,
             data: Vec::new(),
         }
     }
@@ -291,9 +346,9 @@ impl TypeRegistry {
         let class_id = serialized_type.class_id;
 
         // Add to script types if applicable
-        if let Some(script_index) = serialized_type.script_type_index {
+        if serialized_type.script_type_index >= 0 {
             self.script_types
-                .insert(script_index, serialized_type.clone());
+                .insert(serialized_type.script_type_index, serialized_type.clone());
         }
 
         self.types.insert(class_id, serialized_type);
@@ -380,10 +435,34 @@ pub mod class_ids {
     pub const SPRITE: i32 = 213;
     pub const MESH: i32 = 43;
     pub const AUDIO_CLIP: i32 = 83;
+    pub const TEXT_ASSET: i32 = 49;
     pub const MATERIAL: i32 = 21;
     pub const SHADER: i32 = 48;
     pub const ANIMATION_CLIP: i32 = 74;
     pub const ANIMATOR_CONTROLLER: i32 = 91;
+}
+
+/// Script type reference (UnityPy: LocalSerializedObjectIdentifier)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalSerializedObjectIdentifier {
+    pub local_serialized_file_index: i32,
+    pub local_identifier_in_file: i64,
+}
+
+impl LocalSerializedObjectIdentifier {
+    pub fn from_reader(reader: &mut BinaryReader, version: u32) -> Result<Self> {
+        let local_serialized_file_index = reader.read_i32()?;
+        let local_identifier_in_file = if version < 14 {
+            reader.read_i32()? as i64
+        } else {
+            reader.align()?;
+            reader.read_i64()?
+        };
+        Ok(Self {
+            local_serialized_file_index,
+            local_identifier_in_file,
+        })
+    }
 }
 
 #[cfg(test)]

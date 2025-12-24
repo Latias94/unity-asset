@@ -84,6 +84,10 @@ pub struct ExternalReference {
     pub file_id: i32,
     pub path_id: i64,
     pub referenced_by: Vec<i64>,
+    /// Best-effort resolved external file path (from `SerializedFile.externals`)
+    pub file_path: Option<String>,
+    /// Best-effort resolved external file GUID (from `SerializedFile.externals`)
+    pub guid: Option<[u8; 16]>,
 }
 
 /// Internal object reference
@@ -130,6 +134,16 @@ pub struct ComponentRelationship {
     pub component_type: String,
     pub gameobject_id: i64,
     pub dependencies: Vec<i64>,
+    pub external_dependencies: Vec<ExternalObjectRef>,
+}
+
+/// External object reference (PPtr where `fileID > 0`)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalObjectRef {
+    pub file_id: i32,
+    pub path_id: i64,
+    pub file_path: Option<String>,
+    pub guid: Option<[u8; 16]>,
 }
 
 /// Asset reference information

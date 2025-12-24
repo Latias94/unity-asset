@@ -15,7 +15,7 @@
 //! ```rust,no_run
 //! use unity_asset_binary::mesh::{MeshProcessor, MeshConfig};
 //! use unity_asset_binary::unity_version::UnityVersion;
-//! use unity_asset_binary::object::ObjectInfo;
+//! use unity_asset_binary::UnityObjectInfo;
 //!
 //! // Create processor with custom configuration
 //! let version = UnityVersion::parse_version("2020.3.12f1")?;

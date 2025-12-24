@@ -13,6 +13,8 @@ use unity_asset_binary::{
     AssetBundle, SerializedFile, Sprite, SpriteInfo, SpriteProcessor, Texture2D, TextureFormat,
     UnityVersion,
 };
+use unity_asset_core::UnityValue;
+use indexmap::IndexMap;
 
 /// Test comprehensive sprite image extraction
 #[test]
@@ -60,7 +62,7 @@ fn test_sprite_comprehensive_extraction() {
         ("YellowSprite", 4.0, 0.0, 4.0, 4.0, [255, 255, 0, 255]), // Bottom-right (yellow)
     ];
 
-    for (name, x, y, width, height, expected_color) in test_sprites {
+    for (name, x, y, width, height, _expected_color) in test_sprites {
         let mut sprite = Sprite::default();
         sprite.name = name.to_string();
         sprite.rect_x = x;
@@ -251,6 +253,30 @@ fn test_sprite_info_extraction() {
     assert_eq!(sprite.is_atlas_sprite(), true);
 
     println!("  ✓ All sprite information correctly extracted");
+}
+
+#[test]
+fn test_sprite_typetree_texture_pptr_uses_path_id() {
+    let mut props: IndexMap<String, UnityValue> = IndexMap::new();
+    props.insert("m_Name".to_string(), UnityValue::String("Test".to_string()));
+
+    let mut rd: IndexMap<String, UnityValue> = IndexMap::new();
+    let mut texture_pptr: IndexMap<String, UnityValue> = IndexMap::new();
+    texture_pptr.insert("m_FileID".to_string(), UnityValue::Integer(0));
+    texture_pptr.insert("m_PathID".to_string(), UnityValue::Integer(123));
+    rd.insert("texture".to_string(), UnityValue::Object(texture_pptr));
+    props.insert("m_RD".to_string(), UnityValue::Object(rd));
+
+    let obj = unity_asset_binary::UnityObject::from_info_and_class(
+        unity_asset_binary::asset::ObjectInfo::new(1, 0, 0, 213, -1),
+        unity_asset_core::UnityClass::new(213, "Sprite".to_string(), "1".to_string()),
+    );
+    let mut obj = obj;
+    obj.as_unity_class_mut().update_properties(props);
+
+    let processor = SpriteProcessor::new(UnityVersion::default());
+    let result = processor.parse_sprite(&obj).unwrap();
+    assert_eq!(result.sprite.render_data.texture_path_id, 123);
 }
 
 /// Test sprite PNG export functionality

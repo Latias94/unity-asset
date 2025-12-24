@@ -4,6 +4,7 @@
 //! inspired by UnityPy/classes/TypeTree.py
 
 use super::types::{TypeTree, TypeTreeNode};
+use super::common_strings;
 use crate::error::{BinaryError, Result};
 use crate::reader::BinaryReader;
 
@@ -130,10 +131,10 @@ impl TypeTreeParser {
     /// Resolve string references for a single node and its children
     fn resolve_node_strings(node: &mut TypeTreeNode, string_buffer: &[u8]) -> Result<()> {
         // Resolve type name
-        node.type_name = Self::get_string_from_buffer(string_buffer, node.type_str_offset)?;
+        node.type_name = Self::resolve_string(string_buffer, node.type_str_offset)?;
 
         // Resolve field name
-        node.name = Self::get_string_from_buffer(string_buffer, node.name_str_offset)?;
+        node.name = Self::resolve_string(string_buffer, node.name_str_offset)?;
 
         // Resolve children
         for child in &mut node.children {
@@ -141,6 +142,21 @@ impl TypeTreeParser {
         }
 
         Ok(())
+    }
+
+    /// Resolve TypeTree strings which can either reference the local string buffer or a global
+    /// common string buffer (signaled via the high bit in blob TypeTrees).
+    fn resolve_string(buffer: &[u8], offset: u32) -> Result<String> {
+        const COMMON_STRING_FLAG: u32 = 0x8000_0000;
+
+        if (offset & COMMON_STRING_FLAG) != 0 {
+            let common_offset = offset & !COMMON_STRING_FLAG;
+            return Ok(common_strings::get_common_string(common_offset)
+                .unwrap_or_default()
+                .to_string());
+        }
+
+        Self::get_string_from_buffer(buffer, offset)
     }
 
     /// Get string from buffer at offset
@@ -340,6 +356,7 @@ pub struct ParsingStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reader::{BinaryReader, ByteOrder};
 
     #[test]
     fn test_parser_creation() {
@@ -359,5 +376,47 @@ mod tests {
 
         let result = TypeTreeParser::get_string_from_buffer(buffer, 12).unwrap();
         assert_eq!(result, "test");
+    }
+
+    #[test]
+    fn test_common_string_flag_resolves_known_offsets() {
+        const COMMON_STRING_FLAG: u32 = 0x8000_0000;
+
+        let local = b"ignored\0";
+
+        // offset 0 in the common string buffer maps to "AABB"
+        let result = TypeTreeParser::resolve_string(local, COMMON_STRING_FLAG | 0).unwrap();
+        assert_eq!(result, "AABB");
+
+        // An unknown common-string offset should not error, but should resolve to empty.
+        let result = TypeTreeParser::resolve_string(local, COMMON_STRING_FLAG | 123_456).unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_blob_typetree_parsing_resolves_common_strings() {
+        const COMMON_STRING_FLAG: u32 = 0x8000_0000;
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&(1i32).to_le_bytes()); // node_count
+        data.extend_from_slice(&(0i32).to_le_bytes()); // string_buffer_size
+
+        // TypeTreeNode (blob)
+        data.extend_from_slice(&(1u16).to_le_bytes()); // version
+        data.push(0u8); // level
+        data.push(0u8); // type_flags
+        data.extend_from_slice(&(COMMON_STRING_FLAG | 0u32).to_le_bytes()); // type_str_offset => "AABB"
+        data.extend_from_slice(&(COMMON_STRING_FLAG | 0u32).to_le_bytes()); // name_str_offset => "AABB"
+        data.extend_from_slice(&(0i32).to_le_bytes()); // byte_size
+        data.extend_from_slice(&(0i32).to_le_bytes()); // index
+        data.extend_from_slice(&(0i32).to_le_bytes()); // meta_flags
+        data.extend_from_slice(&(0u64).to_le_bytes()); // ref_type_hash (version >= 19)
+
+        let mut reader = BinaryReader::new(&data, ByteOrder::Little);
+        let tree = TypeTreeParser::from_reader_blob(&mut reader, 19).unwrap();
+
+        assert_eq!(tree.nodes.len(), 1);
+        assert_eq!(tree.nodes[0].type_name, "AABB");
+        assert_eq!(tree.nodes[0].name, "AABB");
     }
 }

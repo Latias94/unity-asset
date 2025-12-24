@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================================");
 
     // Create a simple RGBA32 texture for demonstration
-    let mut texture = create_demo_texture();
+    let texture = create_demo_texture();
 
     // Create converter
     let converter = Texture2DConverter::new(UnityVersion::default());
@@ -91,7 +91,7 @@ fn test_format_support(converter: &Texture2DConverter) {
     ];
 
     for format in test_formats {
-        let mut test_texture = create_test_texture_for_format(format);
+        let test_texture = create_test_texture_for_format(format);
 
         match converter.decode_to_image(&test_texture) {
             Ok(_) => println!("  ✅ {:?} - Supported", format),

@@ -26,12 +26,9 @@ impl MeshParser {
 
     /// Parse Mesh from UnityObject
     pub fn parse_from_unity_object(&self, obj: &UnityObject) -> Result<MeshResult> {
-        let mesh = if let Some(type_tree) = &obj.info.type_tree {
-            let properties = obj.parse_with_typetree(type_tree)?;
-            self.parse_from_typetree(&properties)?
-        } else {
-            self.parse_from_binary_data(&obj.info.data)?
-        };
+        let mesh = self
+            .parse_from_typetree(obj.class.properties())
+            .or_else(|_| self.parse_from_binary_data(obj.raw_data()))?;
 
         Ok(MeshResult::new(mesh))
     }

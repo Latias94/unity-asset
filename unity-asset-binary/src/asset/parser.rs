@@ -3,9 +3,10 @@
 //! This module provides the main parsing logic for Unity SerializedFile structures.
 
 use super::header::SerializedFileHeader;
-use super::types::{FileIdentifier, ObjectInfo, SerializedType, TypeRegistry};
+use super::types::{FileIdentifier, LocalSerializedObjectIdentifier, ObjectInfo, SerializedType, TypeRegistry};
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
+use std::sync::Arc;
 
 /// SerializedFile parser
 ///
@@ -16,21 +17,15 @@ pub struct SerializedFileParser;
 impl SerializedFileParser {
     /// Parse SerializedFile from binary data
     pub fn from_bytes(data: Vec<u8>) -> Result<SerializedFile> {
-        let data_clone = data.clone();
-        let mut reader = BinaryReader::new(&data_clone, ByteOrder::Big);
+        // Default to lazy object data loading to avoid copying per-object buffers.
+        Self::from_bytes_with_options(data, false)
+    }
 
-        // Read header
-        let header = SerializedFileHeader::from_reader(&mut reader)?;
-
-        if !header.is_valid() {
-            return Err(BinaryError::invalid_data("Invalid SerializedFile header"));
-        }
-
-        // Switch to the correct byte order
-        reader.set_byte_order(header.byte_order());
-
+    /// Parse SerializedFile from binary data with options
+    pub fn from_bytes_with_options(data: Vec<u8>, preload_object_data: bool) -> Result<SerializedFile> {
+        let data: Arc<[u8]> = data.into();
         let mut file = SerializedFile {
-            header,
+            header: SerializedFileHeader::default(),
             unity_version: String::new(),
             target_platform: 0,
             enable_type_tree: false,
@@ -41,11 +36,30 @@ impl SerializedFileParser {
             externals: Vec::new(),
             ref_types: Vec::new(),
             user_information: String::new(),
-            data: data.clone(),
+            data,
         };
 
-        // Parse metadata
-        Self::parse_metadata(&mut file, &mut reader)?;
+        {
+            let data = file.data.clone();
+            let mut reader = BinaryReader::new(data.as_ref(), ByteOrder::Big);
+
+            // Read header
+            file.header = SerializedFileHeader::from_reader(&mut reader)?;
+
+            if !file.header.is_valid() {
+                return Err(BinaryError::invalid_data("Invalid SerializedFile header"));
+            }
+
+            // Switch to the correct byte order
+            reader.set_byte_order(file.header.byte_order());
+
+            // Parse metadata
+            Self::parse_metadata(&mut file, &mut reader)?;
+        }
+
+        if preload_object_data {
+            file.load_object_data()?;
+        }
 
         Ok(file)
     }
@@ -53,8 +67,19 @@ impl SerializedFileParser {
     /// Parse SerializedFile from binary data asynchronously
     #[cfg(feature = "async")]
     pub async fn from_bytes_async(data: Vec<u8>) -> Result<SerializedFile> {
+        Self::from_bytes_async_with_options(data, false).await
+    }
+
+    /// Parse SerializedFile from binary data asynchronously with options
+    #[cfg(feature = "async")]
+    pub async fn from_bytes_async_with_options(
+        data: Vec<u8>,
+        preload_object_data: bool,
+    ) -> Result<SerializedFile> {
         // For now, use spawn_blocking to run the sync version
-        let result = tokio::task::spawn_blocking(move || Self::from_bytes(data))
+        let result = tokio::task::spawn_blocking(move || {
+            Self::from_bytes_with_options(data, preload_object_data)
+        })
             .await
             .map_err(|e| BinaryError::generic(format!("Task join error: {}", e)))??;
 
@@ -79,20 +104,34 @@ impl SerializedFileParser {
         }
 
         // Read types
-        let type_count = reader.read_u32()? as usize;
+        let type_count = reader.read_i32()?;
+        if type_count < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative type count: {}",
+                type_count
+            )));
+        }
+        let type_count = type_count as usize;
         for _ in 0..type_count {
             let serialized_type =
-                SerializedType::from_reader(reader, file.header.version, file.enable_type_tree)?;
+                SerializedType::from_reader(reader, file.header.version, file.enable_type_tree, false)?;
             file.types.push(serialized_type);
         }
 
         // Read big ID enabled flag (if version 7-13)
         if file.header.version >= 7 && file.header.version < 14 {
-            file.big_id_enabled = reader.read_bool()?;
+            file.big_id_enabled = reader.read_i32()? != 0;
         }
 
         // Read objects
-        let object_count = reader.read_u32()? as usize;
+        let object_count = reader.read_i32()?;
+        if object_count < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative object count: {}",
+                object_count
+            )));
+        }
+        let object_count = object_count as usize;
         for _ in 0..object_count {
             let object_info = Self::parse_object_info(file, reader)?;
             file.objects.push(object_info);
@@ -100,19 +139,30 @@ impl SerializedFileParser {
 
         // Read script types (if version >= 11)
         if file.header.version >= 11 {
-            let script_count = reader.read_u32()? as usize;
+            let script_count = reader.read_i32()?;
+            if script_count < 0 {
+                return Err(BinaryError::invalid_data(format!(
+                    "Negative script count: {}",
+                    script_count
+                )));
+            }
+            let script_count = script_count as usize;
             for _ in 0..script_count {
-                let script_type = SerializedType::from_reader(
-                    reader,
-                    file.header.version,
-                    file.enable_type_tree,
-                )?;
+                let script_type =
+                    LocalSerializedObjectIdentifier::from_reader(reader, file.header.version)?;
                 file.script_types.push(script_type);
             }
         }
 
         // Read externals
-        let external_count = reader.read_u32()? as usize;
+        let external_count = reader.read_i32()?;
+        if external_count < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative external count: {}",
+                external_count
+            )));
+        }
+        let external_count = external_count as usize;
         for _ in 0..external_count {
             let external = FileIdentifier::from_reader(reader, file.header.version)?;
             file.externals.push(external);
@@ -120,12 +170,20 @@ impl SerializedFileParser {
 
         // Read ref types (if version >= 20)
         if file.header.version >= 20 {
-            let ref_type_count = reader.read_u32()? as usize;
+            let ref_type_count = reader.read_i32()?;
+            if ref_type_count < 0 {
+                return Err(BinaryError::invalid_data(format!(
+                    "Negative ref type count: {}",
+                    ref_type_count
+                )));
+            }
+            let ref_type_count = ref_type_count as usize;
             for _ in 0..ref_type_count {
                 let ref_type = SerializedType::from_reader(
                     reader,
                     file.header.version,
                     file.enable_type_tree,
+                    true,
                 )?;
                 file.ref_types.push(ref_type);
             }
@@ -140,31 +198,81 @@ impl SerializedFileParser {
     }
 
     /// Parse object information
-    fn parse_object_info(file: &SerializedFile, reader: &mut BinaryReader) -> Result<ObjectInfo> {
-        // Read path ID
-        let path_id = if file.header.version < 14 {
+    fn parse_object_info(file: &mut SerializedFile, reader: &mut BinaryReader) -> Result<ObjectInfo> {
+        let version = file.header.version;
+
+        // Path ID
+        let path_id = if file.big_id_enabled {
+            reader.read_i64()?
+        } else if version < 14 {
             reader.read_i32()? as i64
         } else {
+            reader.align()?;
             reader.read_i64()?
         };
 
-        // Read byte start
-        let byte_start = if file.header.version >= 22 {
+        // Byte start
+        let byte_start = if version >= 22 {
             reader.read_i64()? as u64
         } else {
             reader.read_u32()? as u64
         };
-
-        // Add data offset
         let byte_start = byte_start + file.header.data_offset as u64;
 
-        // Read byte size
+        // Byte size
         let byte_size = reader.read_u32()?;
 
-        // Read type ID
-        let type_id = reader.read_i32()?;
+        // Raw type id (index into `types` for version >= 16)
+        let raw_type_id = reader.read_i32()?;
 
-        Ok(ObjectInfo::new(path_id, byte_start, byte_size, type_id))
+        // Resolve class id (UnityPy: class_id)
+        let (class_id, type_index) = if version < 16 {
+            let class_id = reader.read_u16()? as i32;
+            (class_id, -1)
+        } else {
+            let idx = raw_type_id;
+            let class_id = file
+                .types
+                .get(idx as usize)
+                .ok_or_else(|| {
+                    BinaryError::invalid_data(format!("Invalid type index in object table: {}", idx))
+                })?
+                .class_id;
+            (class_id, idx)
+        };
+
+        // is_destroyed (version < 11)
+        if version < 11 {
+            let _is_destroyed = reader.read_u16()?;
+        }
+
+        // script_type_index is stored per-object for 11 <= version < 17
+        if (11..17).contains(&version) {
+            let script_type_index = reader.read_i16()?;
+            // UnityPy assigns this to the referenced SerializedType when possible.
+            if version < 16 {
+                if let Some(typ) = file.types.iter_mut().find(|t| t.class_id == raw_type_id) {
+                    typ.script_type_index = script_type_index;
+                }
+            } else if raw_type_id >= 0 {
+                if let Some(typ) = file.types.get_mut(raw_type_id as usize) {
+                    typ.script_type_index = script_type_index;
+                }
+            }
+        }
+
+        // stripped flag (version 15 or 16)
+        if version == 15 || version == 16 {
+            let _stripped = reader.read_u8()?;
+        }
+
+        Ok(ObjectInfo::new(
+            path_id,
+            byte_start,
+            byte_size,
+            class_id,
+            type_index,
+        ))
     }
 
     /// Validate parsed SerializedFile
@@ -227,7 +335,7 @@ pub struct SerializedFile {
     /// Object information
     pub objects: Vec<ObjectInfo>,
     /// Script types
-    pub script_types: Vec<SerializedType>,
+    pub script_types: Vec<LocalSerializedObjectIdentifier>,
     /// External file references
     pub externals: Vec<FileIdentifier>,
     /// Reference types
@@ -235,13 +343,199 @@ pub struct SerializedFile {
     /// User information
     pub user_information: String,
     /// Raw file data
-    data: Vec<u8>,
+    data: Arc<[u8]>,
 }
 
 impl SerializedFile {
     /// Get the raw file data
     pub fn data(&self) -> &[u8] {
-        &self.data
+        self.data.as_ref()
+    }
+
+    /// Get a shared reference to the raw file data.
+    pub fn data_arc(&self) -> Arc<[u8]> {
+        self.data.clone()
+    }
+
+    /// Get the raw bytes for an object without requiring preloaded per-object buffers.
+    pub fn object_bytes<'a>(&'a self, info: &ObjectInfo) -> Result<&'a [u8]> {
+        let start: usize = info
+            .byte_start
+            .try_into()
+            .map_err(|_| BinaryError::invalid_data(format!("Object byte_start overflow: {}", info.byte_start)))?;
+        let end = start.saturating_add(info.byte_size as usize);
+        let data = self.data();
+        if end > data.len() {
+            return Err(BinaryError::invalid_data(format!(
+                "Object data out of bounds (path_id={}, start={}, size={}, file_len={})",
+                info.path_id,
+                start,
+                info.byte_size,
+                data.len()
+            )));
+        }
+        Ok(&data[start..end])
+    }
+
+    /// Best-effort raw parser for Unity `AssetBundle` (class id `142`) `m_Container`.
+    ///
+    /// This exists as a fallback when TypeTree is stripped/unavailable. The layout is version-dependent,
+    /// so this function tries multiple 4-byte-aligned starting offsets and applies sanity checks.
+    ///
+    /// Returns a list of `(asset_path, file_id, path_id)` tuples.
+    pub fn assetbundle_container_raw(&self, info: &ObjectInfo) -> Result<Vec<(String, i32, i64)>> {
+        let data = self.object_bytes(info)?;
+        let byte_order = self.header.byte_order();
+
+        fn parse_pptr(reader: &mut BinaryReader) -> Result<(i32, i64)> {
+            let file_id = reader.read_i32()?;
+            let path_id = reader.read_i64()?;
+            Ok((file_id, path_id))
+        }
+
+        fn parse_aligned_string(reader: &mut BinaryReader) -> Result<String> {
+            let s = reader.read_string()?;
+            reader.align()?;
+            Ok(s)
+        }
+
+        fn try_parse(
+            reader: &mut BinaryReader,
+            assetinfo_layout: bool,
+            assetinfo_asset_last: bool,
+        ) -> Result<Vec<(String, i32, i64)>> {
+            // AssetBundle inherits from Object/NamedObject; many versions start with some base fields.
+            // We start parsing at a candidate offset (handled by outer loop) assuming the next field is m_Name.
+            let _name = parse_aligned_string(reader)?;
+
+            // m_PreloadTable: Array<PPtr<Object>>
+            let preload_size = reader.read_i32()?;
+            if !(0..=1_000_000).contains(&preload_size) {
+                return Err(BinaryError::invalid_data(format!(
+                    "Invalid AssetBundle preload table size: {}",
+                    preload_size
+                )));
+            }
+            for _ in 0..preload_size {
+                let _ = parse_pptr(reader)?;
+            }
+            reader.align()?;
+
+            // m_Container: Array<pair<string, AssetInfo>>
+            let container_size = reader.read_i32()?;
+            if !(0..=1_000_000).contains(&container_size) {
+                return Err(BinaryError::invalid_data(format!(
+                    "Invalid AssetBundle container size: {}",
+                    container_size
+                )));
+            }
+
+            let mut out = Vec::with_capacity(container_size as usize);
+            for _ in 0..container_size {
+                let asset_path = parse_aligned_string(reader)?;
+
+                // Unity uses either:
+                // - AssetInfo { asset: PPtr<Object>, preloadIndex: int, preloadSize: int } (many versions)
+                // - PPtr<Object> only (some versions)
+                let (file_id, path_id) = if assetinfo_layout {
+                    if assetinfo_asset_last {
+                        let _preload_index = reader.read_i32()?;
+                        let _preload_size = reader.read_i32()?;
+                        parse_pptr(reader)?
+                    } else {
+                        let pptr = parse_pptr(reader)?;
+                        let _preload_index = reader.read_i32()?;
+                        let _preload_size = reader.read_i32()?;
+                        pptr
+                    }
+                } else {
+                    parse_pptr(reader)?
+                };
+
+                out.push((asset_path, file_id, path_id));
+            }
+            reader.align()?;
+
+            // m_MainAsset (usually AssetInfo)
+            if assetinfo_layout {
+                if assetinfo_asset_last {
+                    let _preload_index = reader.read_i32()?;
+                    let _preload_size = reader.read_i32()?;
+                    let _ = parse_pptr(reader)?;
+                } else {
+                    let _ = parse_pptr(reader)?;
+                    let _preload_index = reader.read_i32()?;
+                    let _preload_size = reader.read_i32()?;
+                }
+            } else {
+                let _ = parse_pptr(reader)?;
+            }
+            reader.align()?;
+
+            Ok(out)
+        }
+
+        // Try multiple aligned offsets to account for base fields which may precede m_Name.
+        let mut last_err: Option<BinaryError> = None;
+        let externals_len: i32 = self.externals.len().try_into().unwrap_or(i32::MAX);
+        let mut best: Option<(usize, Vec<(String, i32, i64)>)> = None;
+
+        fn score(entries: &[(String, i32, i64)], externals_len: i32) -> usize {
+            entries
+                .iter()
+                .filter(|(path, file_id, path_id)| {
+                    !path.is_empty()
+                        && *path_id != 0
+                        && *file_id >= 0
+                        && (*file_id == 0 || *file_id - 1 <= externals_len)
+                })
+                .count()
+        }
+
+        for offset in (0..=256usize).step_by(4) {
+            if offset >= data.len() {
+                break;
+            }
+
+            // Try both layouts and keep the better-scored candidate.
+            for assetinfo_layout in [true, false] {
+                let variants: &[(bool, bool)] = if assetinfo_layout {
+                    // Try both field orders for AssetInfo.
+                    &[(true, false), (true, true)]
+                } else {
+                    &[(false, false)]
+                };
+
+                for &(_layout, asset_last) in variants {
+                    let mut reader = BinaryReader::new(&data[offset..], byte_order);
+                    match try_parse(&mut reader, assetinfo_layout, asset_last) {
+                        Ok(entries) => {
+                            let s = score(&entries, externals_len);
+                            let better = match &best {
+                                None => true,
+                                Some((best_score, best_entries)) => s > *best_score
+                                    || (s == *best_score && entries.len() > best_entries.len()),
+                            };
+                            if better {
+                                best = Some((s, entries));
+                            }
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+            }
+        }
+
+        if let Some((_score, entries)) = best {
+            // Sanity: container usually has some non-empty paths.
+            if entries.iter().any(|(p, _, _)| !p.is_empty()) {
+                return Ok(entries);
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            BinaryError::invalid_data("Failed to parse AssetBundle container (no candidates matched)")
+        }))
     }
 
     /// Get object count
@@ -280,10 +574,6 @@ impl SerializedFile {
             registry.add_type(stype.clone());
         }
 
-        for script_type in &self.script_types {
-            registry.add_type(script_type.clone());
-        }
-
         registry
     }
 
@@ -305,6 +595,25 @@ impl SerializedFile {
     /// Validate the entire file
     pub fn validate(&self) -> Result<()> {
         SerializedFileParser::validate(self)
+    }
+
+    fn load_object_data(&mut self) -> Result<()> {
+        let data = self.data.clone();
+        let file_len = data.len();
+        for obj in &mut self.objects {
+            let start: usize = obj.byte_start.try_into().map_err(|_| {
+                BinaryError::invalid_data(format!("Object byte_start overflow: {}", obj.byte_start))
+            })?;
+            let end = start.saturating_add(obj.byte_size as usize);
+            if end > file_len {
+                return Err(BinaryError::invalid_data(format!(
+                    "Object data out of bounds (path_id={}, start={}, size={}, file_len={})",
+                    obj.path_id, start, obj.byte_size, file_len
+                )));
+            }
+            obj.data = data[start..end].to_vec();
+        }
+        Ok(())
     }
 }
 

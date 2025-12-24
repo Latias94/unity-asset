@@ -177,7 +177,8 @@ pub use metadata::{
     get_recommended_config,
     is_extraction_supported,
 };
-pub use object::{ObjectInfo as UnityObjectInfo, UnityObject};
+pub use asset::ObjectInfo as UnityObjectInfo;
+pub use object::UnityObject;
 pub use reader::{BinaryReader, ByteOrder};
 pub use typetree::{
     ParsingStats as TypeTreeParsingStats,

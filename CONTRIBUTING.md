@@ -72,6 +72,12 @@ cargo test -p unity-asset-yaml
 cargo test -p unity-asset-binary
 cargo test -p unity-asset-cli
 
+# Fast inner-loop (unit tests only)
+cargo test -p unity-asset-binary --lib
+
+# Slow / comprehensive suites (ignored by default)
+cargo test -p unity-asset-binary --tests -- --ignored
+
 # Test async features
 cargo test --features async
 ```

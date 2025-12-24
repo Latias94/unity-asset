@@ -8,8 +8,7 @@
 
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::object::ObjectInfo;
-use unity_asset_binary::{TextureProcessor, load_bundle_from_memory};
+use unity_asset_binary::{TextureProcessor, UnityObject, load_bundle_from_memory};
 
 const SAMPLES_DIR: &str = "tests/samples";
 
@@ -55,32 +54,37 @@ fn test_texture_format_detection() {
                     for asset in &bundle.assets {
                         for asset_object_info in &asset.objects {
                             total_objects += 1;
-
-                            // Convert to our ObjectInfo type
-                            let mut object_info = ObjectInfo::new(
-                                asset_object_info.path_id,
-                                asset_object_info.byte_start,
-                                asset_object_info.byte_size,
-                                asset_object_info.type_id,
-                            );
-                            object_info.data = asset_object_info.data.clone();
-
-                            let class_name = object_info.class_name();
+                            let unity_object =
+                                UnityObject::from_serialized_file(asset, asset_object_info)
+                                    .unwrap_or_else(|_| {
+                                        let fallback_data = asset
+                                            .object_bytes(asset_object_info)
+                                            .map(|b| b.to_vec())
+                                            .unwrap_or_default();
+                                        UnityObject::from_raw(
+                                            asset_object_info.type_id,
+                                            asset_object_info.path_id,
+                                            fallback_data,
+                                        )
+                                    });
+                            let class_name = unity_object.class_name().to_string();
 
                             // Look for Texture2D objects (Class ID 28) or texture-related objects
-                            if object_info.class_id == 28
+                            if unity_object.class_id() == 28
                                 || class_name == "Texture2D"
                                 || class_name.contains("Texture")
                             {
                                 texture_objects += 1;
                                 println!(
                                     "    Found texture object: {} (ID:{}, PathID:{})",
-                                    class_name, object_info.class_id, object_info.path_id
+                                    class_name,
+                                    unity_object.class_id(),
+                                    unity_object.path_id()
                                 );
 
                                 // Try to process the texture object
-                                if let Ok(unity_class) = object_info.parse_object() {
-                                    processed_textures += 1;
+                                processed_textures += 1;
+                                let unity_class = unity_object.as_unity_class();
 
                                     // Extract texture properties
                                     if let Some(name_value) = unity_class.get("m_Name") {
@@ -145,10 +149,9 @@ fn test_texture_format_detection() {
                                     }
 
                                     // Check for streaming info
-                                    if let Some(stream_value) = unity_class.get("m_StreamData") {
+                                    if let Some(_stream_value) = unity_class.get("m_StreamData") {
                                         println!("      Has streaming data");
                                     }
-                                }
                             }
                         }
                     }
@@ -262,39 +265,43 @@ fn test_texture_data_extraction() {
                 Ok(bundle) => {
                     for asset in &bundle.assets {
                         for asset_object_info in &asset.objects {
-                            let mut object_info = ObjectInfo::new(
-                                asset_object_info.path_id,
-                                asset_object_info.byte_start,
-                                asset_object_info.byte_size,
-                                asset_object_info.type_id,
-                            );
-                            object_info.data = asset_object_info.data.clone();
-
-                            let class_name = object_info.class_name();
+                            let unity_object =
+                                UnityObject::from_serialized_file(asset, asset_object_info)
+                                    .unwrap_or_else(|_| {
+                                        let fallback_data = asset
+                                            .object_bytes(asset_object_info)
+                                            .map(|b| b.to_vec())
+                                            .unwrap_or_default();
+                                        UnityObject::from_raw(
+                                            asset_object_info.type_id,
+                                            asset_object_info.path_id,
+                                            fallback_data,
+                                        )
+                                    });
+                            let class_name = unity_object.class_name().to_string();
 
                             if class_name == "Texture2D" {
                                 total_textures += 1;
 
-                                if let Ok(unity_class) = object_info.parse_object() {
-                                    // Check if texture has embedded data
-                                    let has_data = unity_class.get("image data").is_some()
-                                        || unity_class.get("m_ImageData").is_some()
-                                        || object_info.data.len() > 1024;
+                                let unity_class = unity_object.as_unity_class();
+                                let raw_len = unity_object.raw_data().len();
 
-                                    if has_data {
-                                        textures_with_data += 1;
-                                        total_texture_data_size += object_info.data.len() as u64;
+                                // Check if texture has embedded data
+                                let has_data = unity_class.get("image data").is_some()
+                                    || unity_class.get("m_ImageData").is_some()
+                                    || raw_len > 1024;
 
-                                        if let Some(name_value) = unity_class.get("m_Name") {
-                                            if let unity_asset_core::UnityValue::String(name) =
-                                                name_value
-                                            {
-                                                println!(
-                                                    "    Texture '{}' has {} bytes of data",
-                                                    name,
-                                                    object_info.data.len()
-                                                );
-                                            }
+                                if has_data {
+                                    textures_with_data += 1;
+                                    total_texture_data_size += raw_len as u64;
+
+                                    if let Some(name_value) = unity_class.get("m_Name") {
+                                        if let unity_asset_core::UnityValue::String(name) = name_value
+                                        {
+                                            println!(
+                                                "    Texture '{}' has {} bytes of data",
+                                                name, raw_len
+                                            );
                                         }
                                     }
                                 }

@@ -23,8 +23,8 @@ The project uses a workspace structure to organize different parsing capabilitie
 ```text
 unity-asset/
 ├── unity-asset-core/      # Core data structures and traits
-├── unity-asset-yaml/      # YAML file parsing (complete)
-├── unity-asset-binary/    # Binary asset parsing (complete)
+├── unity-asset-yaml/      # YAML file parsing (stable)
+├── unity-asset-binary/    # Binary asset parsing (advanced, WIP)
 ├── unity-asset-lib/       # Main library crate (published as `unity-asset`)
 ├── unity-asset-cli/       # CLI tools
 │   ├── main.rs           # Synchronous CLI tool
@@ -42,22 +42,22 @@ unity-asset/
 - Filtering and querying capabilities
 - Serialization back to YAML format
 
-#### 🔧 Binary Asset Processing (Advanced)
+#### 🔧 Binary Asset Processing (Advanced, WIP)
 - AssetBundle structure parsing (UnityFS format)
 - SerializedFile parsing with full object extraction
 - TypeTree structure parsing and dynamic object reading
 - Compression support (LZ4, LZMA, Brotli)
-- Metadata extraction and dependency analysis
-- Performance monitoring and optimization
+- Metadata extraction and analysis (experimental; includes dependency graph, best-effort hierarchy/component mapping, and external reference resolution via `externals`)
+- Performance monitoring and basic statistics
 
-#### 🔧 Object Processing (Production Ready)
+#### 🔧 Object Processing (Partial)
 - **AudioClip**: Full format support (Vorbis, MP3, WAV, AAC) with Symphonia decoder
 - **Texture2D**: Complete parsing + basic format decoding + PNG export
 - **Sprite**: Full metadata extraction + atlas support + image cutting
 - **Mesh**: Structure parsing + vertex data extraction + basic export
-- **GameObject/Transform**: Hierarchy parsing and relationship mapping
+- **GameObject/Transform**: Basic TypeTree-based hierarchy & component mapping (best-effort; still WIP)
 
-#### 🔧 CLI Tools (Feature Complete)
+#### 🔧 CLI Tools (Usable, WIP)
 - Synchronous CLI for file inspection and batch processing
 - Asynchronous CLI with concurrent processing and progress tracking
 - Export capabilities (PNG, OGG, WAV, basic mesh formats)
@@ -72,6 +72,9 @@ unity-asset/
 - Audio decoding requires `audio` feature for Symphonia integration
 - Large file performance could be optimized further
 - Error messages could be more user-friendly
+- Some metadata/dependency/hierarchy analyses are currently simplified placeholders
+- Object data is lazily accessed by default; use `SerializedFileParser::from_bytes_with_options(data, true)` if you explicitly need per-object preloaded buffers
+- For large objects without TypeTree, raw bytes are not expanded into `_raw_data` for performance; use `UnityObject::raw_data()`
 
 ## 🚀 Quick Start
 
@@ -139,11 +142,89 @@ if let Ok(settings) = doc.get(Some("PlayerSettings"), None) {
 }
 ```
 
+### UnityPy-like Environment (YAML + Binary)
+
+```rust
+use unity_asset::environment::{Environment, EnvironmentObjectRef};
+
+let mut env = Environment::new();
+env.load("tests/samples")?;
+
+// `path_id` is only unique within a single SerializedFile.
+// Use `BinaryObjectKey` when you need a globally-unique handle you can round-trip later.
+let sources = env.binary_sources();
+if let Some((_kind, source_path)) = sources.first() {
+    let keys = env.find_binary_object_keys_in_source(source_path, 1);
+    if let Some(key) = keys.first() {
+        let _parsed = env.read_binary_object_key(key)?;
+    }
+}
+
+// Unity `PPtr` resolution needs a context object because `fileID` indexes into the context file's externals.
+// For the common case `fileID=0`, it points to the same SerializedFile as the context.
+if let Some(obj_ref) = env.find_binary_object(1) {
+    let _pptr_obj = env.read_binary_pptr(&obj_ref, 0, 1)?;
+}
+
+// AssetBundles often expose a container mapping from asset paths to objects.
+// This is the primary discovery mechanism in UnityPy.
+// Note: This is best-effort; when TypeTree is stripped, we fall back to a raw binary parser for `m_Container`.
+let container = env.find_binary_object_keys_in_bundle_container("Assets/");
+for (asset_path, key) in container.into_iter().take(10) {
+    let _obj = env.read_binary_object_key(&key)?;
+    println!("{} -> path_id={}", asset_path, key.path_id);
+}
+
+for obj in env.objects() {
+    match obj {
+        EnvironmentObjectRef::Yaml(class) => {
+            let _ = &class.class_name;
+        }
+        EnvironmentObjectRef::Binary(obj_ref) => {
+            // Parse on-demand (best-effort)
+            let _parsed = obj_ref.read()?;
+            let _key = obj_ref.key();
+        }
+    }
+}
+```
+
 ### CLI Usage
 
 ```bash
 # Parse a single YAML file
 cargo run --bin unity-asset -- parse-yaml -i ProjectSettings.asset
+
+# List bundle nodes (files) for debugging/inspection
+cargo run --bin unity-asset -- list-bundle -i tests/samples/char_118_yuki.ab --filter "CAB-" --verbose
+
+# Find objects via AssetBundle `m_Container` (discovery)
+cargo run --bin unity-asset -- find-object -i tests/samples/char_118_yuki.ab --pattern "Assets/" --limit 20 --verbose
+
+# Filter by type (useful for scripts/batch workflows)
+cargo run --bin unity-asset -- find-object -i tests/samples/char_118_yuki.ab --class-name "Texture2D" --limit 20
+
+# Inspect a single object (TypeTree / Null-field debugging)
+# - Easiest: copy/paste the `key=bok1|...` line from `find-object --verbose` and use `--key`.
+# - Or pass the location fields explicitly (use `--kind serialized` for standalone `.assets` files).
+cargo run --bin unity-asset -- inspect-object -i tests/samples --key 'bok1|bundle|0|1|<len>|tests/samples/char_118_yuki.ab' \
+    --max-depth 6 --max-items 200 --filter "m_StreamData"
+
+# Export objects from AssetBundles via `m_Container` (UnityPy-like workflow)
+cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --limit 50
+# Decode known types (best-effort):
+# - `AudioClip`: export embedded/streamed audio bytes (e.g. `.ogg`) or decode to `.wav` fallback
+# - `Texture2D`: decode and export as `.png`
+# - `Sprite`: resolve referenced `Texture2D`, crop sprite rect, and export as `.sprite.png`
+cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --decode --limit 50
+#
+# Note: outputs are raw SerializedFile object bytes (`.bin`), not necessarily the original file format.
+#
+# Note (streamed resources): some `AudioClip`/`Texture2D` objects reference external `.resS`/`.resource`
+# files that are not embedded inside the bundle. `export-bundle --decode` will try:
+# 1) resource nodes inside the same bundle (UnityFS)
+# 2) sibling resource files on disk (same directory / `StreamingAssets/`)
+# If the resource file is missing, it falls back to exporting raw `.bin`.
 
 # Try async processing (experimental)
 cargo run --features async --bin unity-asset-async -- \

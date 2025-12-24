@@ -19,7 +19,7 @@ fn create_mock_transform_data() -> Vec<u8> {
 #[test]
 fn test_unity_object_gameobject_detection() {
     // Create UnityObjectInfo for a GameObject (class_id = 1)
-    let mut info = UnityObjectInfo::new(12345, 0, 4, 1);
+    let mut info = UnityObjectInfo::new(12345, 0, 4, 1, -1);
     info.data = create_mock_gameobject_data();
 
     // Create a UnityClass with GameObject properties
@@ -35,10 +35,7 @@ fn test_unity_object_gameobject_detection() {
     );
     unity_class.set("m_IsActive".to_string(), UnityValue::Bool(true));
 
-    let unity_object = UnityObject {
-        info,
-        class: unity_class,
-    };
+    let unity_object = UnityObject::from_info_and_class(info, unity_class);
 
     // Test detection methods
     assert!(unity_object.is_gameobject());
@@ -60,7 +57,7 @@ fn test_unity_object_gameobject_detection() {
 #[test]
 fn test_unity_object_transform_detection() {
     // Create UnityObjectInfo for a Transform (class_id = 4)
-    let mut info = UnityObjectInfo::new(67890, 0, 4, 4);
+    let mut info = UnityObjectInfo::new(67890, 0, 4, 4, -1);
     info.data = create_mock_transform_data();
 
     // Create a UnityClass with Transform properties
@@ -88,10 +85,7 @@ fn test_unity_object_transform_detection() {
     scale.insert("z".to_string(), UnityValue::Float(1.0));
     unity_class.set("m_LocalScale".to_string(), UnityValue::Object(scale));
 
-    let unity_object = UnityObject {
-        info,
-        class: unity_class,
-    };
+    let unity_object = UnityObject::from_info_and_class(info, unity_class);
 
     // Test detection methods
     assert!(!unity_object.is_gameobject());
@@ -114,7 +108,7 @@ fn test_unity_object_transform_detection() {
 #[test]
 fn test_unity_object_describe() {
     // Test GameObject description
-    let mut info = UnityObjectInfo::new(12345, 0, 4, 1);
+    let mut info = UnityObjectInfo::new(12345, 0, 4, 1, -1);
     info.data = create_mock_gameobject_data();
 
     let mut unity_class = UnityClass::new(1, "GameObject".to_string(), "12345".to_string());
@@ -123,10 +117,7 @@ fn test_unity_object_describe() {
         UnityValue::String("MyGameObject".to_string()),
     );
 
-    let unity_object = UnityObject {
-        info,
-        class: unity_class,
-    };
+    let unity_object = UnityObject::from_info_and_class(info, unity_class);
 
     let description = unity_object.describe();
     assert!(description.contains("GameObject"));
@@ -135,14 +126,11 @@ fn test_unity_object_describe() {
     assert!(description.contains("PathID:12345"));
 
     // Test unnamed object
-    let mut info2 = UnityObjectInfo::new(67890, 0, 4, 4);
+    let mut info2 = UnityObjectInfo::new(67890, 0, 4, 4, -1);
     info2.data = create_mock_transform_data();
 
     let unity_class2 = UnityClass::new(4, "Transform".to_string(), "67890".to_string());
-    let unity_object2 = UnityObject {
-        info: info2,
-        class: unity_class2,
-    };
+    let unity_object2 = UnityObject::from_info_and_class(info2, unity_class2);
 
     let description2 = unity_object2.describe();
     assert!(description2.contains("Transform"));
@@ -154,7 +142,7 @@ fn test_unity_object_describe() {
 #[test]
 fn test_unity_object_with_complex_gameobject() {
     // Create a more complex GameObject with components
-    let mut info = UnityObjectInfo::new(11111, 0, 4, 1);
+    let mut info = UnityObjectInfo::new(11111, 0, 4, 1, -1);
     info.data = create_mock_gameobject_data();
 
     let mut unity_class = UnityClass::new(1, "GameObject".to_string(), "11111".to_string());
@@ -184,10 +172,7 @@ fn test_unity_object_with_complex_gameobject() {
     ];
     unity_class.set("m_Component".to_string(), UnityValue::Array(components));
 
-    let unity_object = UnityObject {
-        info,
-        class: unity_class,
-    };
+    let unity_object = UnityObject::from_info_and_class(info, unity_class);
 
     // Parse and verify
     let game_object = unity_object.as_gameobject().unwrap();
@@ -203,7 +188,7 @@ fn test_unity_object_with_complex_gameobject() {
 #[test]
 fn test_unity_object_with_complex_transform() {
     // Create a Transform with parent and children
-    let mut info = UnityObjectInfo::new(44444, 0, 4, 4);
+    let mut info = UnityObjectInfo::new(44444, 0, 4, 4, -1);
     info.data = create_mock_transform_data();
 
     let mut unity_class = UnityClass::new(4, "Transform".to_string(), "44444".to_string());
@@ -248,10 +233,7 @@ fn test_unity_object_with_complex_transform() {
     let children = vec![UnityValue::Object(child1), UnityValue::Object(child2)];
     unity_class.set("m_Children".to_string(), UnityValue::Array(children));
 
-    let unity_object = UnityObject {
-        info,
-        class: unity_class,
-    };
+    let unity_object = UnityObject::from_info_and_class(info, unity_class);
 
     // Parse and verify
     let transform = unity_object.as_transform().unwrap();
@@ -277,14 +259,11 @@ fn test_unity_object_with_complex_transform() {
 #[test]
 fn test_wrong_class_id_parsing() {
     // Test that trying to parse wrong class ID fails gracefully
-    let mut info = UnityObjectInfo::new(99999, 0, 4, 28); // Texture2D class_id
+    let mut info = UnityObjectInfo::new(99999, 0, 4, 28, -1); // Texture2D class_id
     info.data = vec![0x01, 0x02, 0x03, 0x04];
 
     let unity_class = UnityClass::new(28, "Texture2D".to_string(), "99999".to_string());
-    let unity_object = UnityObject {
-        info,
-        class: unity_class,
-    };
+    let unity_object = UnityObject::from_info_and_class(info, unity_class);
 
     // Should not be detected as GameObject or Transform
     assert!(!unity_object.is_gameobject());

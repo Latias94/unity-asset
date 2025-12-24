@@ -314,6 +314,7 @@ impl BundleParser {
                     Ok(serialized_file) => {
                         // Add the SerializedFile as an asset
                         bundle.assets.push(serialized_file);
+                        bundle.asset_names.push(node.name.clone());
                     }
                     Err(_e) => {
                         // If it's not a valid SerializedFile, skip or handle differently

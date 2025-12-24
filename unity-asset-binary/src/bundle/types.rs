@@ -102,6 +102,8 @@ pub struct AssetBundle {
     pub files: Vec<BundleFileInfo>,
     /// Contained assets
     pub assets: Vec<Asset>,
+    /// Asset file names within the bundle (aligned with `assets` indices).
+    pub asset_names: Vec<String>,
     /// Raw bundle data
     data: Vec<u8>,
 }
@@ -115,6 +117,7 @@ impl AssetBundle {
             nodes: Vec::new(),
             files: Vec::new(),
             assets: Vec::new(),
+            asset_names: Vec::new(),
             data,
         }
     }

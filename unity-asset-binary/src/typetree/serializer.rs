@@ -60,23 +60,14 @@ impl<'a> TypeTreeSerializer<'a> {
         reader: &mut BinaryReader,
         node: &TypeTreeNode,
     ) -> Result<UnityValue> {
-        // Handle alignment if needed
-        if node.is_aligned() {
-            reader.align_to(4)?;
-        }
-
         let value = match node.type_name.as_str() {
             // Signed integers
             "SInt8" | "char" => {
                 let val = reader.read_i8()?;
-                // Align after reading 1-byte values
-                reader.align_to(4)?;
                 UnityValue::Integer(val as i64)
             }
             "SInt16" | "short" => {
                 let val = reader.read_i16()?;
-                // Align after reading 2-byte values
-                reader.align_to(4)?;
                 UnityValue::Integer(val as i64)
             }
             "SInt32" | "int" => {
@@ -91,14 +82,10 @@ impl<'a> TypeTreeSerializer<'a> {
             // Unsigned integers
             "UInt8" => {
                 let val = reader.read_u8()?;
-                // Align after reading 1-byte values
-                reader.align_to(4)?;
                 UnityValue::Integer(val as i64)
             }
             "UInt16" | "unsigned short" => {
                 let val = reader.read_u16()?;
-                // Align after reading 2-byte values
-                reader.align_to(4)?;
                 UnityValue::Integer(val as i64)
             }
             "UInt32" | "unsigned int" | "Type*" => {
@@ -123,17 +110,12 @@ impl<'a> TypeTreeSerializer<'a> {
             // Boolean
             "bool" => {
                 let val = reader.read_u8()? != 0;
-                // Align after reading boolean
-                reader.align_to(4)?;
                 UnityValue::Bool(val)
             }
 
             // String
             "string" => {
-                let val = reader.read_string()?;
-                // Align after reading string
-                reader.align_to(4)?;
-                UnityValue::String(val)
+                UnityValue::String(reader.read_aligned_string()?)
             }
 
             // Array types
@@ -172,6 +154,13 @@ impl<'a> TypeTreeSerializer<'a> {
                 }
             }
         };
+
+        // Unity aligns the stream after reading certain fields (meta flag 0x4000).
+        // This is essential for correctly parsing TypeTree-based objects with packed booleans and
+        // nested structs (e.g. StreamedResource / StreamingInfo).
+        if node.is_aligned() {
+            reader.align_to(4)?;
+        }
 
         Ok(value)
     }

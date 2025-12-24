@@ -2000,6 +2000,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "unity-asset",
+ "unity-asset-binary",
 ]
 
 [[package]]

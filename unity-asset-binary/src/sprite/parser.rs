@@ -26,12 +26,9 @@ impl SpriteParser {
 
     /// Parse Sprite from UnityObject
     pub fn parse_from_unity_object(&self, obj: &UnityObject) -> Result<SpriteResult> {
-        let sprite = if let Some(type_tree) = &obj.info.type_tree {
-            let properties = obj.parse_with_typetree(type_tree)?;
-            self.parse_from_typetree(&properties)?
-        } else {
-            self.parse_from_binary_data(&obj.info.data)?
-        };
+        let sprite = self
+            .parse_from_typetree(obj.class.properties())
+            .or_else(|_| self.parse_from_binary_data(obj.raw_data()))?;
 
         Ok(SpriteResult::new(sprite))
     }
@@ -220,9 +217,9 @@ impl SpriteParser {
             // Extract texture reference
             if let Some(texture_value) = rd_obj.get("texture")
                 && let UnityValue::Object(texture_obj) = texture_value
-                && let Some(UnityValue::Integer(file_id)) = texture_obj.get("m_FileID")
+                && let Some(UnityValue::Integer(path_id)) = texture_obj.get("m_PathID")
             {
-                sprite.render_data.texture_path_id = *file_id;
+                sprite.render_data.texture_path_id = *path_id;
             }
 
             // Extract texture rect

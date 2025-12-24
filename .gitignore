@@ -45,5 +45,5 @@ tarpaulin-report.html
 cobertura.xml
 lcov.info
 
-# Reference repositories (keep in repo but ignore changes)
-!repo-ref/.gitkeep
+# Reference repositories (do not commit)
+repo-ref/

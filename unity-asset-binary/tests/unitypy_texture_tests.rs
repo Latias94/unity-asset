@@ -284,7 +284,7 @@ fn test_texture_processor_version_compat() {
 
     for (version_str, expected_formats) in test_versions {
         let version = UnityVersion::parse_version(version_str).unwrap();
-        let converter = Texture2DConverter::new(version);
+        let _converter = Texture2DConverter::new(version);
 
         // Test format support by checking if format info indicates support
         let mut supported_count = 0;
