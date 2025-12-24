@@ -16,11 +16,11 @@ pub struct SerializedFileHeader {
     /// Size of the metadata section
     pub metadata_size: u32,
     /// Total file size
-    pub file_size: u32,
+    pub file_size: u64,
     /// File format version
     pub version: u32,
     /// Offset to the data section
-    pub data_offset: u32,
+    pub data_offset: u64,
     /// Endianness (0 = little, 1 = big)
     pub endian: u8,
     /// Reserved bytes
@@ -31,9 +31,9 @@ impl SerializedFileHeader {
     /// Parse header from binary data (improved based on unity-rs)
     pub fn from_reader(reader: &mut BinaryReader) -> Result<Self> {
         let mut metadata_size = reader.read_u32()?;
-        let mut file_size = reader.read_u32()?;
+        let mut file_size = reader.read_u32()? as u64;
         let version = reader.read_u32()?;
-        let mut data_offset = reader.read_u32()?;
+        let mut data_offset = reader.read_u32()? as u64;
 
         let endian;
         let mut reserved = [0u8; 3];
@@ -46,7 +46,10 @@ impl SerializedFileHeader {
         } else {
             // For older versions, endian is at the end of metadata
             let current_pos = reader.position();
-            reader.set_position((file_size - metadata_size) as u64)?;
+            let endian_pos = file_size
+                .checked_sub(metadata_size as u64)
+                .ok_or_else(|| BinaryError::invalid_data("Invalid header: file_size < metadata_size"))?;
+            reader.set_position(endian_pos)?;
             endian = reader.read_u8()?;
             reader.set_position(current_pos)?;
         }
@@ -54,8 +57,8 @@ impl SerializedFileHeader {
         // Handle version 22+ format changes
         if version >= 22 {
             metadata_size = reader.read_u32()?;
-            file_size = reader.read_i64()? as u32;
-            data_offset = reader.read_i64()? as u32;
+            file_size = i64_to_u64_checked(reader.read_i64()?, "file_size")?;
+            data_offset = i64_to_u64_checked(reader.read_i64()?, "data_offset")?;
             reader.read_i64()?; // Skip unknown field
         }
 
@@ -109,7 +112,7 @@ impl SerializedFileHeader {
             return Err(BinaryError::invalid_data("Metadata size cannot be zero"));
         }
 
-        if self.data_offset < self.metadata_size {
+        if self.data_offset < self.metadata_size as u64 {
             return Err(BinaryError::invalid_data(
                 "Data offset cannot be less than metadata size",
             ));
@@ -175,7 +178,17 @@ pub struct HeaderFormatInfo {
     pub has_extended_format: bool,
     pub supports_large_files: bool,
     pub metadata_size: u32,
-    pub data_offset: u32,
+    pub data_offset: u64,
+}
+
+fn i64_to_u64_checked(value: i64, name: &'static str) -> Result<u64> {
+    if value < 0 {
+        return Err(BinaryError::invalid_data(format!(
+            "Invalid {}: negative value {}",
+            name, value
+        )));
+    }
+    Ok(value as u64)
 }
 
 /// Header validation result
@@ -236,7 +249,7 @@ pub fn validate_header(header: &SerializedFileHeader) -> HeaderValidation {
     }
 
     // Size warnings
-    if header.file_size > 1024 * 1024 * 1024 {
+    if header.file_size > 1024_u64 * 1024 * 1024 {
         validation.add_warning("Large file size (>1GB), may impact performance".to_string());
     }
 

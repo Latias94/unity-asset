@@ -21,6 +21,12 @@ pub struct BinaryReader<'a> {
 }
 
 impl<'a> BinaryReader<'a> {
+    /// Default maximum length for length-prefixed strings.
+    ///
+    /// Unity files can contain large text blobs (e.g. TextAsset), but unbounded allocations are a
+    /// DoS risk when parsing hostile input.
+    pub const DEFAULT_MAX_STRING_LEN: usize = 16 * 1024 * 1024; // 16 MiB
+
     /// Create a new binary reader from byte slice
     pub fn new(data: &'a [u8], byte_order: ByteOrder) -> Self {
         Self {
@@ -218,7 +224,35 @@ impl<'a> BinaryReader<'a> {
 
     /// Read a string with a length prefix (32-bit)
     pub fn read_string(&mut self) -> Result<String> {
-        let length = self.read_u32()? as usize;
+        self.read_string_limited(Self::DEFAULT_MAX_STRING_LEN)
+    }
+
+    /// Read a string with a length prefix and an explicit maximum size.
+    ///
+    /// Unity typically encodes these lengths as signed 32-bit integers.
+    pub fn read_string_limited(&mut self, max_len: usize) -> Result<String> {
+        let length = self.read_i32()?;
+        if length < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative string length: {}",
+                length
+            )));
+        }
+
+        let length: usize = length as usize;
+        if length > max_len {
+            return Err(BinaryError::invalid_data(format!(
+                "String length {} exceeds limit {}",
+                length, max_len
+            )));
+        }
+
+        // Hard check against remaining to avoid allocating huge buffers just to fail later.
+        let remaining = self.remaining();
+        if length > remaining {
+            return Err(BinaryError::not_enough_data(length, remaining));
+        }
+
         let bytes = self.read_bytes(length)?;
         Ok(String::from_utf8(bytes)?)
     }

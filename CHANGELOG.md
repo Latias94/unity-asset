@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.0] - Unreleased
 
 ### Added
+- `docs/REFACTORING.md`: a UnityPy-aligned fearless refactor roadmap (layering, strict/lenient parsing, decode split, API discipline).
 - Optional object data preloading toggle in `SerializedFileParser` to enable future lazy-loading workflows.
 - UnityPy-like `Environment` API in the `unity-asset` crate to load YAML + binary files and iterate objects.
 - `Environment` helpers to find YAML objects by anchor and binary objects by `path_id`.
@@ -40,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Improved UnityPy parity for `SerializedFile` parsing (object table, script types, file identifiers, and version-dependent fields).
 - (BREAKING) Unified binary object model: `UnityObject` now wraps `asset::ObjectInfo` + parsed `UnityClass` instead of maintaining a duplicated `ObjectInfo`.
 - (BREAKING) `SerializedFileParser::from_bytes` now defaults to lazy object data access to avoid copying per-object buffers (use `from_bytes_with_options(data, true)` to restore eager preloading).
+- (BREAKING) `SerializedFileHeader` now stores v22+ `file_size` / `data_offset` as `u64` (no truncation), and rejects negative header values.
 - Metadata dependency analysis now scans TypeTree values for PPtr references (`fileID`/`pathID`) to build an object dependency graph.
 - Metadata relationship analysis now builds a best-effort GameObject/Transform hierarchy and GameObject->Component mapping (TypeTree-based).
 - Component relationships now include best-effort per-component dependency lists (derived from the dependency graph).
@@ -54,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `find-object --verbose` now prints a copy/paste-able `BinaryObjectKey` string which can be fed into `inspect-object --key`.
 
 ### Fixed
+- Hardened length-prefixed string reads to avoid hostile allocations and out-of-bounds reads (length is validated against remaining bytes and a maximum limit).
+- Fixed v<9 endian seek underflow in `SerializedFileHeader` parsing (checked arithmetic + explicit error).
+- Fixed UnityFS archive flags handling to honor `BlocksInfoAtEnd` / padding behavior (and corrected flag constants to match UnityPy).
+- Fixed UnityWeb decompression to prefer the header’s explicit `uncompressed_size` (guessing is only a fallback).
+- TypeTree parsing no longer writes to stderr from library code; added strict/lenient parsing options with structured warnings.
+- `SerializedFile::find_object` now uses a lazy `path_id` index for near O(1) lookups after first query.
 - Correct handling of `big_id_enabled` and other version-sensitive header/object fields.
 - `AudioClip` raw parsing now correctly extracts `StreamedResource` (`m_Source`/`m_Offset`/`m_Size`) and avoids treating the resource path bytes as embedded audio data.
 - `Texture2D` TypeTree parsing now recognizes `m_StreamData` and enables streamed texture bytes to be loaded via the same resource-reading path as AudioClip.

@@ -105,31 +105,20 @@ impl BundleCompression {
         blocks: &[CompressionBlock],
         reader: &mut BinaryReader,
     ) -> Result<Vec<u8>> {
-        let mut decompressed_data = Vec::new();
+        let total_uncompressed: usize = blocks
+            .iter()
+            .map(|b| b.uncompressed_size as usize)
+            .sum();
+        let mut decompressed_data = Vec::with_capacity(total_uncompressed);
 
-        // Calculate the position where block data starts
-        // TEMPORARY FIX: Always assume blocks info is after header, ignore the flag
-        // This matches our fix in read_blocks_info
-        let mut data_pos = header.header_size() + header.compressed_blocks_info_size as u64;
+        // The caller is responsible for positioning `reader` at the start of block data, taking
+        // header alignment and `BlocksInfoAtEnd` into account.
+        let _ = header;
 
-        // Process each compression block
         for block in blocks.iter() {
-            reader.set_position(data_pos)?;
-            let compressed_data = reader.read_bytes(block.compressed_size as usize)?;
-
-            // Check if we have enough data
-            if compressed_data.len() != block.compressed_size as usize {
-                return Err(BinaryError::not_enough_data(
-                    block.compressed_size as usize,
-                    compressed_data.len(),
-                ));
-            }
-
-            let block_data = block.decompress(&compressed_data)?;
+            let compressed = reader.read_bytes(block.compressed_size as usize)?;
+            let block_data = block.decompress(&compressed)?;
             decompressed_data.extend_from_slice(&block_data);
-
-            // Move to next block position
-            data_pos += block.compressed_size as u64;
         }
 
         Ok(decompressed_data)

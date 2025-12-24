@@ -17,6 +17,35 @@ pub struct TypeTreeSerializer<'a> {
     tree: &'a TypeTree,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeTreeParseMode {
+    Strict,
+    Lenient,
+}
+
+impl Default for TypeTreeParseMode {
+    fn default() -> Self {
+        Self::Lenient
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TypeTreeParseOptions {
+    pub mode: TypeTreeParseMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeTreeParseWarning {
+    pub field: String,
+    pub error: String,
+}
+
+#[derive(Debug, Default)]
+pub struct TypeTreeParseOutput {
+    pub properties: IndexMap<String, UnityValue>,
+    pub warnings: Vec<TypeTreeParseWarning>,
+}
+
 impl<'a> TypeTreeSerializer<'a> {
     /// Create a new serializer with a TypeTree
     pub fn new(tree: &'a TypeTree) -> Self {
@@ -25,33 +54,44 @@ impl<'a> TypeTreeSerializer<'a> {
 
     /// Parse object data using the TypeTree structure
     pub fn parse_object(&self, reader: &mut BinaryReader) -> Result<IndexMap<String, UnityValue>> {
-        let mut properties = IndexMap::new();
+        Ok(self
+            .parse_object_detailed(reader, TypeTreeParseOptions::default())?
+            .properties)
+    }
+
+    pub fn parse_object_detailed(
+        &self,
+        reader: &mut BinaryReader,
+        options: TypeTreeParseOptions,
+    ) -> Result<TypeTreeParseOutput> {
+        let mut out = TypeTreeParseOutput::default();
 
         if let Some(root) = self.tree.nodes.first() {
-            // For root node, parse its children as top-level properties
             for child in &root.children {
-                if !child.name.is_empty() {
-                    match self.parse_value_by_type(reader, child) {
-                        Ok(value) => {
-                            properties.insert(child.name.clone(), value);
+                if child.name.is_empty() {
+                    continue;
+                }
+                match self.parse_value_by_type(reader, child) {
+                    Ok(value) => {
+                        out.properties.insert(child.name.clone(), value);
+                    }
+                    Err(e) => {
+                        if reader.remaining() == 0 {
+                            break;
                         }
-                        Err(e) => {
-                            // Check if this is a critical error (insufficient data)
-                            if reader.remaining() == 0 {
-                                // No more data to read, this is expected for some objects
-                                break;
-                            }
-                            // For other errors, we might want to continue or fail
-                            // depending on the use case. For now, we'll continue.
-                            eprintln!("Warning: Failed to parse field '{}': {}", child.name, e);
-                            continue;
+                        match options.mode {
+                            TypeTreeParseMode::Strict => return Err(e),
+                            TypeTreeParseMode::Lenient => out.warnings.push(TypeTreeParseWarning {
+                                field: child.name.clone(),
+                                error: e.to_string(),
+                            }),
                         }
                     }
                 }
             }
         }
 
-        Ok(properties)
+        Ok(out)
     }
 
     /// Parse value based on TypeTree node type

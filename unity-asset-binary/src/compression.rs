@@ -633,12 +633,14 @@ pub struct ArchiveFlags;
 impl ArchiveFlags {
     /// Compression type mask
     pub const COMPRESSION_TYPE_MASK: u32 = 0x3F;
-    /// Block info at end of file
-    pub const BLOCK_INFO_AT_END: u32 = 0x40;
+    /// Blocks and directory info combined (UnityFS)
+    pub const BLOCKS_AND_DIRECTORY_INFO_COMBINED: u32 = 0x40;
+    /// Block info at end of file (UnityFS)
+    pub const BLOCK_INFO_AT_END: u32 = 0x80;
     /// Old web plugin compatibility
-    pub const OLD_WEB_PLUGIN_COMPATIBILITY: u32 = 0x80;
+    pub const OLD_WEB_PLUGIN_COMPATIBILITY: u32 = 0x100;
     /// Block info needs PaddingAtStart
-    pub const BLOCK_INFO_NEEDS_PADDING_AT_START: u32 = 0x100;
+    pub const BLOCK_INFO_NEEDS_PADDING_AT_START: u32 = 0x200;
 }
 
 #[cfg(test)]

@@ -245,7 +245,7 @@ pub struct AssetFileInfo {
     pub format_version: u32,
     pub unity_version: String,
     pub target_platform: i32,
-    pub file_size: u32,
+    pub file_size: u64,
     pub is_big_endian: bool,
     pub supports_type_tree: bool,
 }

@@ -9,6 +9,7 @@ use super::types::{AssetBundle, BundleFileInfo, BundleLoadOptions, DirectoryNode
 use crate::compression::CompressionType;
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
+use crate::unity_version::UnityVersion;
 
 /// Main bundle parser
 ///
@@ -27,17 +28,18 @@ impl BundleParser {
         data: Vec<u8>,
         options: BundleLoadOptions,
     ) -> Result<AssetBundle> {
-        let data_clone = data.clone();
         let mut reader = BinaryReader::new(&data, ByteOrder::Big);
 
-        // Parse header
+        // Parse header (reader position is preserved for subsequent parsing).
         let header = BundleHeader::from_reader(&mut reader)?;
 
         if options.validate {
             header.validate()?;
         }
 
-        let mut bundle = AssetBundle::new(header, data_clone);
+        // The bundle stores decompressed block data. We intentionally keep the original input buffer
+        // outside the bundle to avoid cloning large bundles.
+        let mut bundle = AssetBundle::new(header, Vec::new());
 
         // Parse based on bundle format
         match bundle.header.signature.as_str() {
@@ -74,7 +76,7 @@ impl BundleParser {
         // Decompress data blocks if requested OR if we need to load assets
         if options.decompress_blocks || options.load_assets {
             let blocks_data = Self::read_blocks(bundle, reader)?;
-            Self::parse_files(bundle, &blocks_data)?;
+            Self::parse_files(bundle, blocks_data)?;
 
             // Load assets if requested
             if options.load_assets {
@@ -102,7 +104,7 @@ impl BundleParser {
 
         // Read compression information
         let compressed_size = reader.read_u32()?;
-        let _uncompressed_size = reader.read_u32()?;
+        let uncompressed_size = reader.read_u32()?;
 
         // Skip some bytes based on version
         let skip_bytes = if bundle.header.version >= 2 { 4 } else { 0 };
@@ -116,12 +118,20 @@ impl BundleParser {
         // Read and decompress the directory data
         let compressed_data = reader.read_bytes(compressed_size as usize)?;
         let directory_data = if bundle.header.signature == "UnityWeb" {
-            // UnityWeb uses LZMA compression
+            // UnityWeb uses LZMA compression; prefer the explicit uncompressed size when available.
             crate::compression::decompress(
                 &compressed_data,
                 CompressionType::Lzma,
-                compressed_data.len() * 4, // Estimate uncompressed size
-            )?
+                uncompressed_size as usize,
+            )
+            .or_else(|_| {
+                // Last-resort fallback for malformed headers.
+                crate::compression::decompress(
+                    &compressed_data,
+                    CompressionType::Lzma,
+                    compressed_data.len().saturating_mul(4),
+                )
+            })?
         } else {
             // UnityRaw is uncompressed
             compressed_data
@@ -140,15 +150,39 @@ impl BundleParser {
 
     /// Read compression blocks information
     fn read_blocks_info(bundle: &mut AssetBundle, reader: &mut BinaryReader) -> Result<()> {
-        // Apply version-specific alignment
+        // Apply version-specific alignment.
+        // UnityFS uses 16-byte alignment in newer bundle formats (>=7).
+        // For some older bundle formats, alignment may still be present (e.g. Unity 2019.4+),
+        // but we only treat it as alignment if the padding bytes are all zero.
         if bundle.header.version >= 7 {
-            reader.align()?;
+            reader.align_to(16)?;
+        } else if Self::should_probe_legacy_alignment(&bundle.header) {
+            let pre_align = reader.position();
+            let pad = (16 - (pre_align % 16)) % 16;
+            if pad != 0 {
+                let align_bytes = reader.read_bytes(pad as usize)?;
+                if align_bytes.iter().any(|&b| b != 0) {
+                    reader.set_position(pre_align)?;
+                }
+            }
         }
 
-        // TEMPORARY FIX: Always read blocks info from after header, ignore the flag
-        // The BLOCK_INFO_AT_END flag seems to be misunderstood - Python UnityPy always reads from header
-        let blocks_info_data =
-            reader.read_bytes(bundle.header.compressed_blocks_info_size as usize)?;
+        let start = reader.position();
+        let compressed_size = bundle.header.compressed_blocks_info_size as usize;
+
+        let blocks_info_data = if bundle.header.block_info_at_end() {
+            let len = reader.len();
+            if compressed_size > len {
+                return Err(BinaryError::not_enough_data(compressed_size, len));
+            }
+            let pos = (len - compressed_size) as u64;
+            reader.set_position(pos)?;
+            let bytes = reader.read_bytes(compressed_size)?;
+            reader.set_position(start)?;
+            bytes
+        } else {
+            reader.read_bytes(compressed_size)?
+        };
 
         // Decompress blocks info
         let uncompressed_data =
@@ -163,8 +197,28 @@ impl BundleParser {
         // Parse directory information from the same blocks info data
         Self::parse_directory_from_blocks_info(bundle, &uncompressed_data)?;
 
+        // Some UnityFS variants require padding/alignment before block data starts.
+        if (bundle.header.flags & crate::compression::ArchiveFlags::BLOCK_INFO_NEEDS_PADDING_AT_START) != 0 {
+            reader.align_to(16)?;
+        }
+
         Ok(())
     }
+
+fn should_probe_legacy_alignment(header: &BundleHeader) -> bool {
+    // UnityPy heuristics: for some older bundle formats (<7) Unity started aligning file contents
+    // (notably from 2019.4+). We only probe alignment when the engine version suggests this.
+    let parsed = match UnityVersion::parse_version(&header.unity_revision)
+        .or_else(|_| UnityVersion::parse_version(&header.unity_version))
+    {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let (major, minor) = (parsed.major, parsed.minor);
+
+    // 2019.4+
+    major > 2019 || (major == 2019 && minor >= 4)
+}
 
     /// Read and decompress all blocks
     fn read_blocks(bundle: &AssetBundle, reader: &mut BinaryReader) -> Result<Vec<u8>> {
@@ -172,9 +226,9 @@ impl BundleParser {
     }
 
     /// Parse files from decompressed block data
-    fn parse_files(bundle: &mut AssetBundle, blocks_data: &[u8]) -> Result<()> {
+    fn parse_files(bundle: &mut AssetBundle, blocks_data: Vec<u8>) -> Result<()> {
         // Store the decompressed data
-        *bundle.data_mut() = blocks_data.to_vec();
+        *bundle.data_mut() = blocks_data;
 
         // Create file info for each node
         for node in &bundle.nodes {

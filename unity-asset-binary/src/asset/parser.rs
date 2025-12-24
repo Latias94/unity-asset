@@ -6,7 +6,9 @@ use super::header::SerializedFileHeader;
 use super::types::{FileIdentifier, LocalSerializedObjectIdentifier, ObjectInfo, SerializedType, TypeRegistry};
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 /// SerializedFile parser
 ///
@@ -37,6 +39,7 @@ impl SerializedFileParser {
             ref_types: Vec::new(),
             user_information: String::new(),
             data,
+            object_index_by_path_id: OnceLock::new(),
         };
 
         {
@@ -213,11 +216,13 @@ impl SerializedFileParser {
 
         // Byte start
         let byte_start = if version >= 22 {
-            reader.read_i64()? as u64
+            i64_to_u64_checked(reader.read_i64()?, "object.byte_start")?
         } else {
             reader.read_u32()? as u64
         };
-        let byte_start = byte_start + file.header.data_offset as u64;
+        let byte_start = byte_start
+            .checked_add(file.header.data_offset)
+            .ok_or_else(|| BinaryError::invalid_data("Object byte_start overflow"))?;
 
         // Byte size
         let byte_size = reader.read_u32()?;
@@ -344,6 +349,7 @@ pub struct SerializedFile {
     pub user_information: String,
     /// Raw file data
     data: Arc<[u8]>,
+    object_index_by_path_id: OnceLock<HashMap<i64, usize>>,
 }
 
 impl SerializedFile {
@@ -550,7 +556,14 @@ impl SerializedFile {
 
     /// Find object by path ID
     pub fn find_object(&self, path_id: i64) -> Option<&ObjectInfo> {
-        self.objects.iter().find(|obj| obj.path_id == path_id)
+        let index = self.object_index_by_path_id.get_or_init(|| {
+            let mut map = HashMap::with_capacity(self.objects.len());
+            for (idx, obj) in self.objects.iter().enumerate() {
+                map.insert(obj.path_id, idx);
+            }
+            map
+        });
+        index.get(&path_id).and_then(|idx| self.objects.get(*idx))
     }
 
     /// Find type by class ID
@@ -617,13 +630,23 @@ impl SerializedFile {
     }
 }
 
+fn i64_to_u64_checked(value: i64, name: &'static str) -> Result<u64> {
+    if value < 0 {
+        return Err(BinaryError::invalid_data(format!(
+            "Invalid {}: negative value {}",
+            name, value
+        )));
+    }
+    Ok(value as u64)
+}
+
 /// Parsing statistics
 #[derive(Debug, Clone)]
 pub struct ParsingStats {
     pub version: u32,
     pub unity_version: String,
     pub target_platform: i32,
-    pub file_size: u32,
+    pub file_size: u64,
     pub object_count: usize,
     pub type_count: usize,
     pub script_type_count: usize,
@@ -637,7 +660,7 @@ pub struct ParsingStats {
 pub struct FileStatistics {
     pub version: u32,
     pub unity_version: String,
-    pub file_size: u32,
+    pub file_size: u64,
     pub object_count: usize,
     pub type_count: usize,
     pub script_type_count: usize,
