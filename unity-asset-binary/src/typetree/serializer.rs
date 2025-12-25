@@ -748,6 +748,15 @@ impl<'a> TypeTreeSerializer<'a> {
             }
 
             // Complex object types
+            "ManagedReferencesRegistry" => {
+                // `ManagedReferencesRegistry` can be extremely large. We keep parsing byte-accurate
+                // by consuming the bytes according to the TypeTree, but we do not allocate/return a
+                // full parsed value.
+                ctx.has_managed_registry = true;
+                let mut dummy = PPtrScanResult::default();
+                self.scan_value(reader, node, &mut dummy)?;
+                UnityValue::Null
+            }
             _ => {
                 if !node.children.is_empty() {
                     let mut nested_props = IndexMap::new();

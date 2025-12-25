@@ -138,6 +138,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TypeTree array parsing now honors the alignment meta flag on the `Array` node itself (not just the parent field), fixing misaligned reads after some `vector`/array fields.
 - TypeTree now treats `char` as an unsigned byte (UnityPy-compatible), avoiding negative values for 0x80..0xFF.
 - TypeTree `scan_pptrs` now uses file `ref_types` to traverse managed reference payloads (`ReferencedObjectData`) and collect `PPtr` references best-effort.
+- TypeTree parsing now treats `ManagedReferencesRegistry` as a skip-only node (`Null`) to avoid allocating large registry payloads while keeping the reader byte-accurate.
 - Correct handling of `big_id_enabled` and other version-sensitive header/object fields.
 - `AudioClip` raw parsing now correctly extracts `StreamedResource` (`m_Source`/`m_Offset`/`m_Size`) and avoids treating the resource path bytes as embedded audio data.
 - `Texture2D` TypeTree parsing now recognizes `m_StreamData` and enables streamed texture bytes to be loaded via the same resource-reading path as AudioClip.

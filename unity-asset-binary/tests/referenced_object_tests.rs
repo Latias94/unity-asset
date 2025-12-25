@@ -301,10 +301,129 @@ fn managed_references_registry_is_consumed_without_affecting_following_fields() 
         )
         .unwrap();
 
+    assert!(
+        matches!(out.properties.get("m_Registry"), Some(UnityValue::Null)),
+        "ManagedReferencesRegistry should be skipped (Null) to avoid large allocations"
+    );
     assert_eq!(
         out.properties.get("m_Next").and_then(|v| v.as_i64()),
         Some(0x11223344)
     );
+    assert_eq!(reader.position() as usize, bytes.len());
+}
+
+#[test]
+fn managed_references_registry_skips_large_byte_arrays_and_keeps_reader_in_sync() {
+    let mut tree = TypeTree::new();
+    let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
+
+    let mut registry =
+        TypeTreeNode::with_info("ManagedReferencesRegistry".to_string(), "m_Registry".to_string(), -1);
+    let mut vec_node = TypeTreeNode::with_info("vector".to_string(), "m_Data".to_string(), -1);
+    let mut array_node = TypeTreeNode::with_info("Array".to_string(), "Array".to_string(), -1);
+    array_node.meta_flags = 0x4000; // align to 4 after the array payload
+    array_node.children.push(TypeTreeNode::with_info(
+        "int".to_string(),
+        "size".to_string(),
+        -1,
+    ));
+    array_node.children.push(TypeTreeNode::with_info(
+        "UInt8".to_string(),
+        "data".to_string(),
+        -1,
+    ));
+    vec_node.children.push(array_node);
+    registry.children.push(vec_node);
+
+    root.children.push(registry);
+    root.children.push(TypeTreeNode::with_info(
+        "int".to_string(),
+        "m_Next".to_string(),
+        -1,
+    ));
+    tree.add_node(root);
+
+    let n: i32 = 128 * 1024;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&n.to_le_bytes());
+    bytes.extend(std::iter::repeat(0xABu8).take(n as usize));
+    while bytes.len() % 4 != 0 {
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&0x55667788i32.to_le_bytes());
+
+    let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+    let serializer = TypeTreeSerializer::new(&tree);
+    let out = serializer
+        .parse_object_detailed(
+            &mut reader,
+            unity_asset_binary::typetree::TypeTreeParseOptions::default(),
+        )
+        .unwrap();
+
+    assert!(matches!(out.properties.get("m_Registry"), Some(UnityValue::Null)));
+    assert_eq!(out.properties.get("m_Next").and_then(|v| v.as_i64()), Some(0x55667788));
+    assert_eq!(reader.position() as usize, bytes.len());
+}
+
+#[test]
+fn managed_references_registry_skips_nested_string_vectors_and_keeps_reader_in_sync() {
+    let mut tree = TypeTree::new();
+    let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
+
+    let mut registry =
+        TypeTreeNode::with_info("ManagedReferencesRegistry".to_string(), "m_Registry".to_string(), -1);
+    registry.children.push(TypeTreeNode::with_info(
+        "int".to_string(),
+        "m_Version".to_string(),
+        -1,
+    ));
+
+    let mut vec_node = TypeTreeNode::with_info("vector".to_string(), "m_Names".to_string(), -1);
+    let mut array_node = TypeTreeNode::with_info("Array".to_string(), "Array".to_string(), -1);
+    array_node.meta_flags = 0x4000; // align to 4 after the array payload
+    array_node.children.push(TypeTreeNode::with_info(
+        "int".to_string(),
+        "size".to_string(),
+        -1,
+    ));
+    array_node.children.push(TypeTreeNode::with_info(
+        "string".to_string(),
+        "data".to_string(),
+        -1,
+    ));
+    vec_node.children.push(array_node);
+    registry.children.push(vec_node);
+
+    root.children.push(registry);
+    root.children.push(TypeTreeNode::with_info(
+        "int".to_string(),
+        "m_Next".to_string(),
+        -1,
+    ));
+    tree.add_node(root);
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&2i32.to_le_bytes()); // m_Version
+    bytes.extend_from_slice(&2i32.to_le_bytes()); // size
+    push_aligned_string_le(&mut bytes, "a");
+    push_aligned_string_le(&mut bytes, "bc");
+    while bytes.len() % 4 != 0 {
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&0x01020304i32.to_le_bytes());
+
+    let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+    let serializer = TypeTreeSerializer::new(&tree);
+    let out = serializer
+        .parse_object_detailed(
+            &mut reader,
+            unity_asset_binary::typetree::TypeTreeParseOptions::default(),
+        )
+        .unwrap();
+
+    assert!(matches!(out.properties.get("m_Registry"), Some(UnityValue::Null)));
+    assert_eq!(out.properties.get("m_Next").and_then(|v| v.as_i64()), Some(0x01020304));
     assert_eq!(reader.position() as usize, bytes.len());
 }
 
