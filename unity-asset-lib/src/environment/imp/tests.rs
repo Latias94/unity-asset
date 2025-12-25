@@ -278,6 +278,103 @@ fn environment_assetbundle_container_raw_matches_typetree_when_stripped() {
 }
 
 #[test]
+fn environment_loads_minimal_gameobject_transform_prefab_and_resolves_refs() {
+    let mut env = Environment::new();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../unity-asset-yaml/tests/fixtures/MinimalGameObjectTransform.prefab");
+    env.load_file(&path).unwrap();
+
+    let game_object = env
+        .find_yaml_by_anchor("1001")
+        .expect("GameObject anchor exists");
+    assert_eq!(game_object.class_id, 1);
+    assert_eq!(game_object.name(), Some("TestGO"));
+
+    let comps = game_object
+        .get("m_Component")
+        .expect("m_Component present")
+        .as_array()
+        .expect("m_Component array");
+    assert_eq!(comps.len(), 2);
+
+    let mut comp_ids: Vec<i64> = Vec::new();
+    for comp in comps {
+        let comp = comp.as_object().expect("component entry object");
+        let pptr = comp
+            .get("component")
+            .expect("component key present")
+            .as_object()
+            .expect("component pptr object");
+        let file_id = pptr
+            .get("fileID")
+            .and_then(|v| v.as_i64())
+            .expect("component fileID int");
+        comp_ids.push(file_id);
+    }
+    comp_ids.sort();
+    assert_eq!(comp_ids, vec![1002, 1003]);
+
+    let transform = env.find_yaml_by_anchor("1002").expect("Transform anchor");
+    assert_eq!(transform.class_id, 4);
+    let t_go = transform
+        .get("m_GameObject")
+        .expect("m_GameObject present")
+        .as_object()
+        .expect("m_GameObject object");
+    assert_eq!(t_go.get("fileID").and_then(|v| v.as_i64()), Some(1001));
+
+    let mb = env.find_yaml_by_anchor("1003").expect("MonoBehaviour anchor");
+    assert_eq!(mb.class_id, 114);
+    let mb_go = mb
+        .get("m_GameObject")
+        .expect("m_GameObject present")
+        .as_object()
+        .expect("m_GameObject object");
+    assert_eq!(mb_go.get("fileID").and_then(|v| v.as_i64()), Some(1001));
+    let script = mb
+        .get("m_Script")
+        .expect("m_Script present")
+        .as_object()
+        .expect("m_Script object");
+    assert_eq!(
+        script.get("guid").and_then(|v| v.as_str()),
+        Some("0123456789abcdef0123456789abcdef")
+    );
+}
+
+#[test]
+fn environment_can_parse_external_yaml_prefab_if_provided() {
+    let mut env = Environment::new();
+    let Ok(path) = std::env::var("UNITY_ASSET_YAML_PREFAB") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    if !path.exists() {
+        return;
+    }
+    env.load_file(&path).unwrap();
+
+    let go = env
+        .yaml_objects()
+        .find(|o| o.class_id == 1 && o.name().is_some())
+        .expect("at least one GameObject with a name");
+
+    let comps = go
+        .get("m_Component")
+        .expect("m_Component present")
+        .as_array()
+        .expect("m_Component array");
+    assert!(comps.iter().any(|v| {
+        v.as_object()
+            .and_then(|o| o.get("component"))
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("fileID"))
+            .and_then(|v| v.as_i64())
+            .is_some()
+    }));
+}
+
+#[test]
 fn environment_stream_data_falls_back_to_filesystem_for_bundles() {
     let temp = tempfile::tempdir().unwrap();
     let bundle_src =
