@@ -2,6 +2,7 @@ use unity_asset_binary::bundle::compression::BundleCompression;
 use unity_asset_binary::bundle::header::BundleHeader;
 use unity_asset_binary::bundle::parser::BundleParser;
 use unity_asset_binary::bundle::types::BundleLoadOptions;
+use unity_asset_binary::bundle::types::{AssetBundle, BundleFileInfo, DirectoryNode};
 use unity_asset_binary::compression::CompressionBlock;
 use unity_asset_binary::error::BinaryError;
 use unity_asset_binary::reader::{BinaryReader, ByteOrder};
@@ -114,4 +115,25 @@ fn unityfs_blocks_info_respects_max_blocks_info_size() {
 
     let err = BundleParser::from_bytes_with_options(bytes, BundleLoadOptions::default()).unwrap_err();
     assert!(matches!(err, BinaryError::ResourceLimitExceeded(_)));
+}
+
+#[test]
+fn bundle_extract_slice_rejects_offset_size_overflow() {
+    let bundle = AssetBundle::new(BundleHeader::default(), vec![0u8; 16]);
+
+    let file = BundleFileInfo::new("a".to_string(), u64::MAX - 1, 10);
+    let err = bundle.extract_file_slice(&file).unwrap_err();
+    assert!(matches!(err, BinaryError::InvalidData(_)));
+
+    let node = DirectoryNode::new("b".to_string(), u64::MAX - 1, 10, 0x4);
+    let err = bundle.extract_node_slice(&node).unwrap_err();
+    assert!(matches!(err, BinaryError::InvalidData(_)));
+}
+
+#[test]
+fn bundle_validate_rejects_offset_size_overflow() {
+    let mut bundle = AssetBundle::new(BundleHeader::default(), vec![0u8; 16]);
+    bundle.files.push(BundleFileInfo::new("a".to_string(), u64::MAX - 1, 10));
+    let err = bundle.validate().unwrap_err();
+    assert!(matches!(err, BinaryError::InvalidData(_)));
 }

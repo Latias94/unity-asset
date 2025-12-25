@@ -34,7 +34,7 @@ impl BundleFileInfo {
 
     /// Get the end offset of this file
     pub fn end_offset(&self) -> u64 {
-        self.offset + self.size
+        self.offset.checked_add(self.size).unwrap_or(u64::MAX)
     }
 }
 
@@ -83,7 +83,7 @@ impl DirectoryNode {
 
     /// Get the end offset of this node
     pub fn end_offset(&self) -> u64 {
-        self.offset + self.size
+        self.offset.checked_add(self.size).unwrap_or(u64::MAX)
     }
 }
 
@@ -190,14 +190,30 @@ impl AssetBundle {
     }
 
     pub fn extract_file_slice(&self, file: &BundleFileInfo) -> crate::error::Result<&[u8]> {
-        if file.offset + file.size > self.data.len() as u64 {
+        let end_u64 = file.offset.checked_add(file.size).ok_or_else(|| {
+            crate::error::BinaryError::invalid_data("File offset+size overflow")
+        })?;
+        if end_u64 > self.data.len() as u64 {
             return Err(crate::error::BinaryError::invalid_data(
                 "File offset/size exceeds bundle data",
             ));
         }
 
-        let start = file.offset as usize;
-        let end = (file.offset + file.size) as usize;
+        let start = usize::try_from(file.offset).map_err(|_| {
+            crate::error::BinaryError::ResourceLimitExceeded(
+                "File offset does not fit in usize".to_string(),
+            )
+        })?;
+        let end = usize::try_from(end_u64).map_err(|_| {
+            crate::error::BinaryError::ResourceLimitExceeded(
+                "File end offset does not fit in usize".to_string(),
+            )
+        })?;
+        if start > end {
+            return Err(crate::error::BinaryError::invalid_data(
+                "File slice start exceeds end",
+            ));
+        }
         Ok(&self.data[start..end])
     }
 
@@ -208,14 +224,30 @@ impl AssetBundle {
     }
 
     pub fn extract_node_slice(&self, node: &DirectoryNode) -> crate::error::Result<&[u8]> {
-        if node.offset + node.size > self.data.len() as u64 {
+        let end_u64 = node.offset.checked_add(node.size).ok_or_else(|| {
+            crate::error::BinaryError::invalid_data("Node offset+size overflow")
+        })?;
+        if end_u64 > self.data.len() as u64 {
             return Err(crate::error::BinaryError::invalid_data(
                 "Node offset/size exceeds bundle data",
             ));
         }
 
-        let start = node.offset as usize;
-        let end = (node.offset + node.size) as usize;
+        let start = usize::try_from(node.offset).map_err(|_| {
+            crate::error::BinaryError::ResourceLimitExceeded(
+                "Node offset does not fit in usize".to_string(),
+            )
+        })?;
+        let end = usize::try_from(end_u64).map_err(|_| {
+            crate::error::BinaryError::ResourceLimitExceeded(
+                "Node end offset does not fit in usize".to_string(),
+            )
+        })?;
+        if start > end {
+            return Err(crate::error::BinaryError::invalid_data(
+                "Node slice start exceeds end",
+            ));
+        }
         Ok(&self.data[start..end])
     }
 
@@ -249,6 +281,12 @@ impl AssetBundle {
 
         // Validate files don't exceed bundle size
         for file in &self.files {
+            if file.offset.checked_add(file.size).is_none() {
+                return Err(crate::error::BinaryError::invalid_data(format!(
+                    "File '{}' offset+size overflow",
+                    file.name
+                )));
+            }
             if file.end_offset() > self.size() {
                 return Err(crate::error::BinaryError::invalid_data(format!(
                     "File '{}' exceeds bundle size",
@@ -259,6 +297,12 @@ impl AssetBundle {
 
         // Validate nodes don't exceed bundle size
         for node in &self.nodes {
+            if node.offset.checked_add(node.size).is_none() {
+                return Err(crate::error::BinaryError::invalid_data(format!(
+                    "Node '{}' offset+size overflow",
+                    node.name
+                )));
+            }
             if node.end_offset() > self.size() {
                 return Err(crate::error::BinaryError::invalid_data(format!(
                     "Node '{}' exceeds bundle size",
