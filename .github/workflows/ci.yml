@@ -25,7 +25,10 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
-        components: rustfmt, clippy
+        components: rustfmt
+
+    - name: Install Rust 1.85.0 (clippy)
+      run: rustup toolchain install 1.85.0 --profile minimal --component clippy
 
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
@@ -37,20 +40,20 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Clippy (workspace defaults)
-      run: cargo clippy --workspace --all-targets -- -D warnings
+      run: cargo +1.85.0 clippy --workspace --all-targets -- -D warnings
 
     - name: Clippy (async)
       run: |
-        cargo clippy -p unity-asset-core --all-targets --features async -- -D warnings
-        cargo clippy -p unity-asset-yaml --all-targets --features async -- -D warnings
-        cargo clippy -p unity-asset-binary --all-targets --features async -- -D warnings
-        cargo clippy -p unity-asset --all-targets --features async -- -D warnings
-        cargo clippy -p unity-asset-cli --all-targets --features async -- -D warnings
+        cargo +1.85.0 clippy -p unity-asset-core --all-targets --features async -- -D warnings
+        cargo +1.85.0 clippy -p unity-asset-yaml --all-targets --features async -- -D warnings
+        cargo +1.85.0 clippy -p unity-asset-binary --all-targets --features async -- -D warnings
+        cargo +1.85.0 clippy -p unity-asset --all-targets --features async -- -D warnings
+        cargo +1.85.0 clippy -p unity-asset-cli --all-targets --features async -- -D warnings
 
     - name: Clippy (decode/export)
       run: |
-        cargo clippy -p unity-asset-decode --all-targets --features full -- -D warnings
-        cargo clippy -p unity-asset-cli --all-targets --features decode -- -D warnings
+        cargo +1.85.0 clippy -p unity-asset-decode --all-targets --features full -- -D warnings
+        cargo +1.85.0 clippy -p unity-asset-cli --all-targets --features decode -- -D warnings
 
     - name: Test CLI tools
       run: |
