@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `unity-asset` CLI: `--strict` (fail-fast TypeTree parsing) and `--show-warnings` (print collected warnings and TypeTree warnings in `inspect-object`).
 - `unity-asset-yaml` loader: `load_yaml_with_warnings` / `load_yaml_async_with_warnings` to surface non-fatal per-document conversion failures without printing from library code.
 - UnityPy-style `ObjectHandle` in `unity-asset-binary` to treat objects as lightweight, on-demand readers (`SerializedFile::object_handles` / `SerializedFile::find_object_handle`).
+- `unity-asset-binary` `ObjectHandle::peek_name()` to read `m_Name`/`name` via a TypeTree prefix fast path (without parsing the full object).
 - `unity-asset-binary::file` unified loader (`load_unity_file` / `load_unity_file_from_memory`) and a layered `unity-asset-binary::formats::*` namespace.
 - `unity-asset` `Environment` can now load WebFiles and treat contained bundles/assets as first-class binary sources (including streamed resource reads from WebFile entries).
 - Optional object data preloading toggle in `SerializedFileParser` to enable future lazy-loading workflows.
