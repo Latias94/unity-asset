@@ -103,6 +103,7 @@ Rules:
 - Phase 2 is in progress: `Environment` is moving toward a UnityPy-like “File → Objects” flow by loading WebFiles and modeling nested sources (keys support WebFile entries).
 - Phase 2 is in progress: close remaining “load loop” gaps (extension-less files should still be detected as bundle/serialized/web), add WebFile-focused integration tests, and unify `BinarySource` formatting via `Display`.
 - Phase 2 is in progress: strict/lenient TypeTree parsing is now user-selectable end-to-end (object reads honor mode; CLI has `--strict`), and libraries avoid writing to stderr (warnings are collected/returned instead).
+- Phase 4 has started: `Environment` caches/reporting are now thread-safe (`RwLock`/`Mutex` + `Arc`), and `Environment` is `Send + Sync` to enable parallel extraction workflows.
 
 ### Phase 0 — Safety & Correctness (mandatory)
 

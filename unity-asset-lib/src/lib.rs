@@ -92,12 +92,11 @@ pub use unity_asset_core::document::AsyncUnityDocument;
 /// Environment for managing multiple Unity assets
 pub mod environment {
     use crate::{Result, YamlDocument};
-    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::fmt;
     use std::path::{Path, PathBuf};
-    use std::rc::Rc;
     use std::str::FromStr;
+    use std::sync::{Arc, Mutex, RwLock};
     use unity_asset_binary::asset::SerializedFile;
     use unity_asset_binary::bundle::AssetBundle;
     use unity_asset_binary::file::{UnityFile, load_unity_file_from_memory};
@@ -143,7 +142,7 @@ pub mod environment {
         }
     }
 
-    pub trait EnvironmentReporter {
+    pub trait EnvironmentReporter: Send + Sync {
         fn warn(&self, warning: &EnvironmentWarning);
         fn typetree_warning(&self, _key: &BinaryObjectKey, _warning: &TypeTreeParseWarning) {}
     }
@@ -234,7 +233,7 @@ pub mod environment {
         pub asset_index: Option<usize>,
         pub object: ObjectHandle<'a>,
         typetree_options: TypeTreeParseOptions,
-        reporter: Option<Rc<dyn EnvironmentReporter>>,
+        reporter: Option<Arc<dyn EnvironmentReporter>>,
     }
 
     impl<'a> fmt::Debug for BinaryObjectRef<'a> {
@@ -519,9 +518,9 @@ pub mod environment {
         /// Loaded AssetBundles (e.g. `.bundle`, `.unity3d`, `.ab`)
         bundles: HashMap<BinarySource, AssetBundle>,
         webfiles: HashMap<PathBuf, WebFile>,
-        bundle_container_cache: RefCell<HashMap<BinarySource, Vec<BundleContainerEntry>>>,
-        warnings: RefCell<Vec<EnvironmentWarning>>,
-        reporter: Option<Rc<dyn EnvironmentReporter>>,
+        bundle_container_cache: RwLock<HashMap<BinarySource, Vec<BundleContainerEntry>>>,
+        warnings: Mutex<Vec<EnvironmentWarning>>,
+        reporter: Option<Arc<dyn EnvironmentReporter>>,
         options: EnvironmentOptions,
         /// Base path for relative file resolution
         #[allow(dead_code)]
@@ -540,15 +539,15 @@ pub mod environment {
                 binary_assets: HashMap::new(),
                 bundles: HashMap::new(),
                 webfiles: HashMap::new(),
-                bundle_container_cache: RefCell::new(HashMap::new()),
-                warnings: RefCell::new(Vec::new()),
+                bundle_container_cache: RwLock::new(HashMap::new()),
+                warnings: Mutex::new(Vec::new()),
                 reporter: None,
                 options,
                 base_path: std::env::current_dir().unwrap_or_default(),
             }
         }
 
-        pub fn set_reporter(&mut self, reporter: Option<Rc<dyn EnvironmentReporter>>) {
+        pub fn set_reporter(&mut self, reporter: Option<Arc<dyn EnvironmentReporter>>) {
             self.reporter = reporter;
         }
 
@@ -557,15 +556,27 @@ pub mod environment {
         }
 
         pub fn warnings(&self) -> Vec<EnvironmentWarning> {
-            self.warnings.borrow().clone()
+            match self.warnings.lock() {
+                Ok(v) => v.clone(),
+                Err(e) => e.into_inner().clone(),
+            }
         }
 
         pub fn take_warnings(&self) -> Vec<EnvironmentWarning> {
-            self.warnings.take()
+            match self.warnings.lock() {
+                Ok(mut v) => std::mem::take(&mut *v),
+                Err(e) => {
+                    let mut v = e.into_inner();
+                    std::mem::take(&mut *v)
+                }
+            }
         }
 
         fn push_warning(&self, warning: EnvironmentWarning) {
-            self.warnings.borrow_mut().push(warning.clone());
+            match self.warnings.lock() {
+                Ok(mut warnings) => warnings.push(warning.clone()),
+                Err(e) => e.into_inner().push(warning.clone()),
+            }
             if let Some(reporter) = &self.reporter {
                 reporter.warn(&warning);
             }
@@ -632,12 +643,23 @@ pub mod environment {
                 Ok(UnityFile::AssetBundle(bundle)) => {
                     let source = BinarySource::path(path);
                     self.bundles.insert(source.clone(), bundle);
-                    self.bundle_container_cache.borrow_mut().remove(&source);
+                    match self.bundle_container_cache.write() {
+                        Ok(mut cache) => {
+                            cache.remove(&source);
+                        }
+                        Err(e) => {
+                            let mut cache = e.into_inner();
+                            cache.remove(&source);
+                        }
+                    }
                 }
                 Ok(UnityFile::SerializedFile(asset)) => {
                     let source = BinarySource::path(path);
                     self.binary_assets.insert(source, asset);
-                    self.bundle_container_cache.borrow_mut().clear();
+                    match self.bundle_container_cache.write() {
+                        Ok(mut cache) => cache.clear(),
+                        Err(e) => e.into_inner().clear(),
+                    }
                 }
                 Ok(UnityFile::WebFile(web)) => {
                     let web_path = path.to_path_buf();
@@ -676,7 +698,15 @@ pub mod environment {
                             entry_name,
                         };
                         self.bundles.insert(source.clone(), bundle);
-                        self.bundle_container_cache.borrow_mut().remove(&source);
+                        match self.bundle_container_cache.write() {
+                            Ok(mut cache) => {
+                                cache.remove(&source);
+                            }
+                            Err(e) => {
+                                let mut cache = e.into_inner();
+                                cache.remove(&source);
+                            }
+                        }
                     }
                     UnityFile::SerializedFile(asset) => {
                         let source = BinarySource::WebEntry {
@@ -684,7 +714,10 @@ pub mod environment {
                             entry_name,
                         };
                         self.binary_assets.insert(source, asset);
-                        self.bundle_container_cache.borrow_mut().clear();
+                        match self.bundle_container_cache.write() {
+                            Ok(mut cache) => cache.clear(),
+                            Err(e) => e.into_inner().clear(),
+                        }
                     }
                     UnityFile::WebFile(_) => {
                         // Nested WebFiles are uncommon; ignore for now.
@@ -1338,8 +1371,18 @@ pub mod environment {
             &self,
             bundle_source: &BinarySource,
         ) -> Result<Vec<BundleContainerEntry>> {
-            if let Some(cached) = self.bundle_container_cache.borrow().get(bundle_source) {
-                return Ok(cached.clone());
+            match self.bundle_container_cache.read() {
+                Ok(cache) => {
+                    if let Some(cached) = cache.get(bundle_source) {
+                        return Ok(cached.clone());
+                    }
+                }
+                Err(e) => {
+                    let cache = e.into_inner();
+                    if let Some(cached) = cache.get(bundle_source) {
+                        return Ok(cached.clone());
+                    }
+                }
             }
 
             let (key, bundle) = self.bundles.get_key_value(bundle_source).ok_or_else(|| {
@@ -1413,9 +1456,14 @@ pub mod environment {
                 }
             }
 
-            self.bundle_container_cache
-                .borrow_mut()
-                .insert(bundle_source.clone(), out.clone());
+            match self.bundle_container_cache.write() {
+                Ok(mut cache) => {
+                    cache.insert(bundle_source.clone(), out.clone());
+                }
+                Err(e) => {
+                    e.into_inner().insert(bundle_source.clone(), out.clone());
+                }
+            }
             Ok(out)
         }
 

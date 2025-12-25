@@ -5,7 +5,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
 use unity_asset::UnityDocument;
 use unity_asset::UnityValue;
 use unity_asset::environment::{
@@ -307,8 +307,8 @@ fn build_environment(strict: bool, show_warnings: bool) -> Environment {
         Environment::new()
     };
 
-    let reporter: Option<Rc<dyn EnvironmentReporter>> = if show_warnings {
-        Some(Rc::new(CliReporter { enabled: true }))
+    let reporter: Option<Arc<dyn EnvironmentReporter>> = if show_warnings {
+        Some(Arc::new(CliReporter { enabled: true }))
     } else {
         None
     };

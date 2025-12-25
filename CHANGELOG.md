@@ -67,6 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `find-object --verbose` now prints a copy/paste-able `BinaryObjectKey` string which can be fed into `inspect-object --key`.
 - (BREAKING) `BinaryObjectRef` / `EnvironmentObjectRef` are no longer `Copy` to support reporter/warning plumbing.
 - `unity-asset` CLI warning output is now centralized via `EnvironmentReporter` (no more per-command manual draining/printing).
+- (BREAKING) `EnvironmentReporter` is now `Send + Sync` and stored behind `Arc`, making `Environment` `Send + Sync` for concurrency-ready workflows.
 - (BREAKING) `unity-asset-binary` is now parser-only; decode/export helpers moved to the new `unity-asset-decode` crate (enable `unity-asset-decode/full` or specific features like `texture`/`audio`).
 - `unity-asset-cli` now has an explicit `decode` feature (enabled by default) to allow building a lighter CLI with `--no-default-features`.
 
