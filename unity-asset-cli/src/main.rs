@@ -3777,107 +3777,16 @@ struct DepsOutput {
     deps: unity_asset_binary::metadata::DependencyInfo,
 }
 
-fn deps_command(
-    input: PathBuf,
-    kind: String,
-    source: Option<PathBuf>,
+fn deps_analyze_and_print(
+    resolved_source: &BinarySource,
+    source_kind: unity_asset::environment::BinarySourceKind,
     asset_index: Option<usize>,
-    format: String,
+    file: &unity_asset_binary::asset::SerializedFile,
+    format: &str,
     names: bool,
     max_edges: usize,
-    strict: bool,
-    show_warnings: bool,
-    typetree_registry: Option<&PathBuf>,
 ) -> Result<()> {
     use unity_asset_binary::metadata::DependencyAnalyzer;
-
-    let mut env = build_environment(strict, show_warnings, typetree_registry)?;
-    env.load(&input)?;
-
-    let kind_lc = kind.to_ascii_lowercase();
-    let source_kind = match kind_lc.as_str() {
-        "bundle" => unity_asset::environment::BinarySourceKind::AssetBundle,
-        "serialized" => unity_asset::environment::BinarySourceKind::SerializedFile,
-        other => anyhow::bail!("Invalid --kind: {} (expected bundle|serialized)", other),
-    };
-
-    let (resolved_source, asset_index, file) = match source_kind {
-        unity_asset::environment::BinarySourceKind::AssetBundle => {
-            let idx = asset_index
-                .ok_or_else(|| anyhow::anyhow!("--asset-index is required when --kind bundle"))?;
-            let bundle_source = if let Some(src) = source {
-                let req = BinarySource::path(&src);
-                resolve_loaded_source(&env, source_kind, &req)?
-            } else if env.bundles().len() == 1 {
-                env.bundles()
-                    .keys()
-                    .next()
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("No bundles loaded"))?
-            } else {
-                let mut available: Vec<String> = env
-                    .bundles()
-                    .keys()
-                    .filter_map(|k| match k {
-                        BinarySource::Path(p) => Some(p),
-                        _ => None,
-                    })
-                    .map(|p| p.display().to_string())
-                    .collect();
-                available.sort();
-                anyhow::bail!(
-                    "--source is required when multiple bundles are loaded. Loaded bundles:\n- {}",
-                    available.join("\n- ")
-                );
-            };
-
-            let bundle = env
-                .bundles()
-                .get(&bundle_source)
-                .ok_or_else(|| anyhow::anyhow!("Bundle not found: {}", bundle_source))?;
-            let file = bundle
-                .assets
-                .get(idx)
-                .ok_or_else(|| anyhow::anyhow!("Bundle asset_index out of range: {}", idx))?;
-            (bundle_source, Some(idx), file)
-        }
-        unity_asset::environment::BinarySourceKind::SerializedFile => {
-            if asset_index.is_some() {
-                anyhow::bail!("--asset-index only applies to --kind bundle");
-            }
-            let asset_source = if let Some(src) = source {
-                let req = BinarySource::path(&src);
-                resolve_loaded_source(&env, source_kind, &req)?
-            } else if env.binary_assets().len() == 1 {
-                env.binary_assets()
-                    .keys()
-                    .next()
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("No serialized files loaded"))?
-            } else {
-                let mut available: Vec<String> = env
-                    .binary_assets()
-                    .keys()
-                    .filter_map(|k| match k {
-                        BinarySource::Path(p) => Some(p),
-                        _ => None,
-                    })
-                    .map(|p| p.display().to_string())
-                    .collect();
-                available.sort();
-                anyhow::bail!(
-                    "--source is required when multiple serialized files are loaded. Loaded serialized files:\n- {}",
-                    available.join("\n- ")
-                );
-            };
-
-            let file = env
-                .binary_assets()
-                .get(&asset_source)
-                .ok_or_else(|| anyhow::anyhow!("SerializedFile not found: {}", asset_source))?;
-            (asset_source, None, file)
-        }
-    };
 
     let objects: Vec<&unity_asset_binary::asset::ObjectInfo> = file.objects.iter().collect();
     let mut analyzer = DependencyAnalyzer::new();
@@ -3978,6 +3887,321 @@ fn deps_command(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deps_fast(
+    input: &PathBuf,
+    kind: &str,
+    source: Option<&PathBuf>,
+    asset_index: Option<usize>,
+    format: &str,
+    names: bool,
+    max_edges: usize,
+    show_warnings: bool,
+    typetree_registry: Option<&PathBuf>,
+) -> Result<bool> {
+    let registry = load_typetree_registry(typetree_registry)?;
+
+    let kind_lc = kind.to_ascii_lowercase();
+    let source_kind = match kind_lc.as_str() {
+        "bundle" => unity_asset::environment::BinarySourceKind::AssetBundle,
+        "serialized" => unity_asset::environment::BinarySourceKind::SerializedFile,
+        _ => return Ok(false),
+    };
+
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+    if input.is_dir() {
+        collect_files_recursive(input, &mut candidate_paths)?;
+        candidate_paths.sort();
+        candidate_paths.dedup();
+    } else {
+        candidate_paths.push(input.clone());
+    }
+
+    let requested_source = source.map(|v| v.to_path_buf());
+    let path_matches_requested = |candidate: &Path, requested: &Path| -> bool {
+        if candidate == requested {
+            return true;
+        }
+        let candidate_str = candidate.to_string_lossy().replace('\\', "/");
+        let requested_str = requested.to_string_lossy().replace('\\', "/");
+        if candidate_str.ends_with(&requested_str) || requested_str.ends_with(&candidate_str) {
+            return true;
+        }
+        candidate.file_name() == requested.file_name()
+    };
+
+    let mut matching: Vec<PathBuf> = Vec::new();
+
+    match source_kind {
+        unity_asset::environment::BinarySourceKind::AssetBundle => {
+            for path in &candidate_paths {
+                let prefix = match read_prefix(path, 16) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if !looks_like_bundle_prefix(&prefix) {
+                    continue;
+                }
+                if let Some(req) = requested_source.as_ref() {
+                    if !path_matches_requested(path, req) {
+                        continue;
+                    }
+                }
+                matching.push(path.clone());
+            }
+        }
+        unity_asset::environment::BinarySourceKind::SerializedFile => {
+            for path in &candidate_paths {
+                let prefix = match read_prefix(path, 16) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if looks_like_bundle_prefix(&prefix) {
+                    continue;
+                }
+                if prefix.starts_with(b"UnityWebData") || prefix.starts_with(b"TuanjieWebData") {
+                    continue;
+                }
+                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    if ext.to_ascii_lowercase() != "assets" {
+                        continue;
+                    }
+                }
+                if let Some(req) = requested_source.as_ref() {
+                    if !path_matches_requested(path, req) {
+                        continue;
+                    }
+                }
+                matching.push(path.clone());
+            }
+        }
+    }
+
+    let path = match matching.as_slice() {
+        [] => return Ok(false),
+        [only] => only.clone(),
+        _ => return Ok(false),
+    };
+
+    match source_kind {
+        unity_asset::environment::BinarySourceKind::AssetBundle => {
+            let options = BundleLoadOptions::lazy();
+            let bundle = match load_bundle_for_list(&path, options) {
+                Ok(v) => v,
+                Err(e) => {
+                    if show_warnings {
+                        eprintln!("warning: failed to parse bundle {:?}: {}", path, e);
+                    }
+                    return Ok(false);
+                }
+            };
+            if bundle.header.signature != "UnityFS" {
+                return Ok(false);
+            }
+
+            let idx = match asset_index {
+                Some(v) => v,
+                None => return Ok(false),
+            };
+
+            let asset_nodes = bundle_asset_nodes(&bundle);
+            if idx >= asset_nodes.len() {
+                return Ok(false);
+            }
+
+            let source_key = BinarySource::path(&path);
+            let shared = match bundle.data_arc() {
+                Ok(v) => SharedBytes::from_arc(v),
+                Err(e) => {
+                    if show_warnings {
+                        eprintln!(
+                            "warning: failed to decompress bundle {:?} for deps: {}",
+                            path, e
+                        );
+                    }
+                    return Ok(false);
+                }
+            };
+
+            let node = &asset_nodes[idx];
+            let (start, end) = node_range(node)?;
+            let mut file = unity_asset_binary::asset::SerializedFileParser::from_shared_range(
+                shared,
+                start..end,
+            )?;
+            if let Some(registry) = registry {
+                file.set_type_tree_registry(Some(registry));
+            }
+
+            deps_analyze_and_print(
+                &source_key,
+                unity_asset::environment::BinarySourceKind::AssetBundle,
+                Some(idx),
+                &file,
+                format,
+                names,
+                max_edges,
+            )?;
+        }
+        unity_asset::environment::BinarySourceKind::SerializedFile => {
+            let mut file = match load_serialized_file_for_scan(&path) {
+                Ok(v) => v,
+                Err(e) => {
+                    if show_warnings {
+                        eprintln!("warning: failed to parse SerializedFile {:?}: {}", path, e);
+                    }
+                    return Ok(false);
+                }
+            };
+            if let Some(registry) = registry {
+                file.set_type_tree_registry(Some(registry));
+            }
+
+            let source_key = BinarySource::path(&path);
+            deps_analyze_and_print(
+                &source_key,
+                unity_asset::environment::BinarySourceKind::SerializedFile,
+                None,
+                &file,
+                format,
+                names,
+                max_edges,
+            )?;
+        }
+    }
+
+    Ok(true)
+}
+
+fn deps_command(
+    input: PathBuf,
+    kind: String,
+    source: Option<PathBuf>,
+    asset_index: Option<usize>,
+    format: String,
+    names: bool,
+    max_edges: usize,
+    strict: bool,
+    show_warnings: bool,
+    typetree_registry: Option<&PathBuf>,
+) -> Result<()> {
+    let kind_lc = kind.to_ascii_lowercase();
+    if kind_lc == "bundle" && asset_index.is_none() {
+        anyhow::bail!("--asset-index is required when --kind bundle");
+    }
+    if kind_lc == "serialized" && asset_index.is_some() {
+        anyhow::bail!("--asset-index only applies to --kind bundle");
+    }
+
+    if let Ok(true) = deps_fast(
+        &input,
+        &kind,
+        source.as_ref(),
+        asset_index,
+        &format,
+        names,
+        max_edges,
+        show_warnings,
+        typetree_registry,
+    ) {
+        return Ok(());
+    }
+
+    let mut env = build_environment(strict, show_warnings, typetree_registry)?;
+    env.load(&input)?;
+
+    let source_kind = match kind_lc.as_str() {
+        "bundle" => unity_asset::environment::BinarySourceKind::AssetBundle,
+        "serialized" => unity_asset::environment::BinarySourceKind::SerializedFile,
+        other => anyhow::bail!("Invalid --kind: {} (expected bundle|serialized)", other),
+    };
+
+    let (resolved_source, resolved_asset_index, file) = match source_kind {
+        unity_asset::environment::BinarySourceKind::AssetBundle => {
+            let idx = asset_index
+                .ok_or_else(|| anyhow::anyhow!("--asset-index is required when --kind bundle"))?;
+            let bundle_source = if let Some(src) = source {
+                let req = BinarySource::path(&src);
+                resolve_loaded_source(&env, source_kind, &req)?
+            } else if env.bundles().len() == 1 {
+                env.bundles()
+                    .keys()
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("No bundles loaded"))?
+            } else {
+                let mut available: Vec<String> = env
+                    .bundles()
+                    .keys()
+                    .filter_map(|k| match k {
+                        BinarySource::Path(p) => Some(p),
+                        _ => None,
+                    })
+                    .map(|p| p.display().to_string())
+                    .collect();
+                available.sort();
+                anyhow::bail!(
+                    "--source is required when multiple bundles are loaded. Loaded bundles:\n- {}",
+                    available.join("\n- ")
+                );
+            };
+
+            let bundle = env
+                .bundles()
+                .get(&bundle_source)
+                .ok_or_else(|| anyhow::anyhow!("Bundle not found: {}", bundle_source))?;
+            let file = bundle
+                .assets
+                .get(idx)
+                .ok_or_else(|| anyhow::anyhow!("Bundle asset_index out of range: {}", idx))?;
+            (bundle_source, Some(idx), file)
+        }
+        unity_asset::environment::BinarySourceKind::SerializedFile => {
+            let asset_source = if let Some(src) = source {
+                let req = BinarySource::path(&src);
+                resolve_loaded_source(&env, source_kind, &req)?
+            } else if env.binary_assets().len() == 1 {
+                env.binary_assets()
+                    .keys()
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("No serialized files loaded"))?
+            } else {
+                let mut available: Vec<String> = env
+                    .binary_assets()
+                    .keys()
+                    .filter_map(|k| match k {
+                        BinarySource::Path(p) => Some(p),
+                        _ => None,
+                    })
+                    .map(|p| p.display().to_string())
+                    .collect();
+                available.sort();
+                anyhow::bail!(
+                    "--source is required when multiple serialized files are loaded. Loaded serialized files:\n- {}",
+                    available.join("\n- ")
+                );
+            };
+
+            let file = env
+                .binary_assets()
+                .get(&asset_source)
+                .ok_or_else(|| anyhow::anyhow!("SerializedFile not found: {}", asset_source))?;
+            (asset_source, None, file)
+        }
+    };
+
+    deps_analyze_and_print(
+        &resolved_source,
+        source_kind,
+        resolved_asset_index,
+        file,
+        &format,
+        names,
+        max_edges,
+    )
 }
 
 fn resolve_loaded_source(
