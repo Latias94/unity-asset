@@ -181,7 +181,9 @@ pub(crate) enum Commands {
         #[arg(long)]
         key: Option<String>,
 
-        /// Source file path that contains the object (an AssetBundle or a standalone SerializedFile)
+        /// Source file path that contains the object (an AssetBundle or a standalone SerializedFile).
+        ///
+        /// When `--input` is a single file, this defaults to `--input`.
         #[arg(long)]
         source: Option<PathBuf>,
 

@@ -39,8 +39,11 @@ pub(crate) fn run(
 
         let path_id = path_id
             .ok_or_else(|| anyhow::anyhow!("--path-id is required unless --key is provided"))?;
-        let source = source
-            .ok_or_else(|| anyhow::anyhow!("--source is required unless --key is provided"))?;
+        let source = match source {
+            Some(source) => source,
+            None if input.is_file() => input.clone(),
+            None => anyhow::bail!("--source is required unless --key is provided"),
+        };
 
         unity_asset::environment::BinaryObjectKey {
             source: BinarySource::path(&source),
