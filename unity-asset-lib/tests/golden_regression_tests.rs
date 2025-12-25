@@ -61,6 +61,14 @@ enum GoldenExpect {
         texture_file_id: Option<i64>,
         #[serde(default)]
         texture_path_id: Option<i64>,
+        #[serde(default)]
+        index_buffer_len: Option<usize>,
+        #[serde(default)]
+        index_buffer_prefix: Vec<i64>,
+        #[serde(default)]
+        vertex_data_len: Option<usize>,
+        #[serde(default)]
+        vertex_data_prefix: Vec<i64>,
     },
     #[serde(rename = "mesh")]
     Mesh {
@@ -354,6 +362,10 @@ fn golden_regression_smoke() {
                 rect_height,
                 texture_file_id,
                 texture_path_id,
+                index_buffer_len,
+                index_buffer_prefix,
+                vertex_data_len,
+                vertex_data_prefix,
             } => {
                 let rect = obj
                     .get("m_Rect")
@@ -403,6 +415,121 @@ fn golden_regression_smoke() {
                             .and_then(|v| v.as_i64())
                             .expect("m_RD.texture.m_PathID int");
                         assert_eq!(pid, expected, "m_RD.texture.m_PathID mismatch (case={})", case.id);
+                    }
+                }
+
+                if index_buffer_len.is_some() || !index_buffer_prefix.is_empty() {
+                    let rd = obj
+                        .get("m_RD")
+                        .expect("m_RD present")
+                        .as_object()
+                        .expect("m_RD object");
+                    let buf_v = rd.get("m_IndexBuffer").expect("m_RD.m_IndexBuffer present");
+                    if let Some(len) = index_buffer_len {
+                        match buf_v {
+                            UnityValue::Bytes(b) => {
+                                assert_eq!(
+                                    b.len(),
+                                    len,
+                                    "m_RD.m_IndexBuffer len mismatch (case={})",
+                                    case.id
+                                );
+                                if !index_buffer_prefix.is_empty() {
+                                    let prefix: Vec<i64> = b
+                                        .iter()
+                                        .take(index_buffer_prefix.len())
+                                        .map(|v| *v as i64)
+                                        .collect();
+                                    assert_eq!(
+                                        prefix, index_buffer_prefix,
+                                        "m_RD.m_IndexBuffer prefix mismatch (case={})",
+                                        case.id
+                                    );
+                                }
+                            }
+                            UnityValue::Array(arr) => {
+                                assert_eq!(
+                                    arr.len(),
+                                    len,
+                                    "m_RD.m_IndexBuffer len mismatch (case={})",
+                                    case.id
+                                );
+                                if !index_buffer_prefix.is_empty() {
+                                    let prefix: Vec<i64> = arr
+                                        .iter()
+                                        .take(index_buffer_prefix.len())
+                                        .map(|v| v.as_i64().expect("m_RD.m_IndexBuffer byte"))
+                                        .collect();
+                                    assert_eq!(
+                                        prefix, index_buffer_prefix,
+                                        "m_RD.m_IndexBuffer prefix mismatch (case={})",
+                                        case.id
+                                    );
+                                }
+                            }
+                            other => panic!("unexpected m_RD.m_IndexBuffer type: {other:?}"),
+                        }
+                    }
+                }
+
+                if vertex_data_len.is_some() || !vertex_data_prefix.is_empty() {
+                    let rd = obj
+                        .get("m_RD")
+                        .expect("m_RD present")
+                        .as_object()
+                        .expect("m_RD object");
+                    let vd = rd
+                        .get("m_VertexData")
+                        .expect("m_RD.m_VertexData present")
+                        .as_object()
+                        .expect("m_RD.m_VertexData object");
+                    let buf_v = vd
+                        .get("m_DataSize")
+                        .expect("m_RD.m_VertexData.m_DataSize present");
+                    if let Some(len) = vertex_data_len {
+                        match buf_v {
+                            UnityValue::Bytes(b) => {
+                                assert_eq!(
+                                    b.len(),
+                                    len,
+                                    "m_RD.m_VertexData.m_DataSize len mismatch (case={})",
+                                    case.id
+                                );
+                                if !vertex_data_prefix.is_empty() {
+                                    let prefix: Vec<i64> = b
+                                        .iter()
+                                        .take(vertex_data_prefix.len())
+                                        .map(|v| *v as i64)
+                                        .collect();
+                                    assert_eq!(
+                                        prefix, vertex_data_prefix,
+                                        "m_RD.m_VertexData.m_DataSize prefix mismatch (case={})",
+                                        case.id
+                                    );
+                                }
+                            }
+                            UnityValue::Array(arr) => {
+                                assert_eq!(
+                                    arr.len(),
+                                    len,
+                                    "m_RD.m_VertexData.m_DataSize len mismatch (case={})",
+                                    case.id
+                                );
+                                if !vertex_data_prefix.is_empty() {
+                                    let prefix: Vec<i64> = arr
+                                        .iter()
+                                        .take(vertex_data_prefix.len())
+                                        .map(|v| v.as_i64().expect("m_RD.m_DataSize byte"))
+                                        .collect();
+                                    assert_eq!(
+                                        prefix, vertex_data_prefix,
+                                        "m_RD.m_VertexData.m_DataSize prefix mismatch (case={})",
+                                        case.id
+                                    );
+                                }
+                            }
+                            other => panic!("unexpected m_RD.m_VertexData.m_DataSize type: {other:?}"),
+                        }
                     }
                 }
             }

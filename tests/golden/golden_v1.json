@@ -55,7 +55,11 @@
         "rect_width": 492.0,
         "rect_height": 180.0,
         "texture_file_id": 0,
-        "texture_path_id": -3875358842991402074
+        "texture_path_id": -3875358842991402074,
+        "index_buffer_len": 42,
+        "index_buffer_prefix": [8, 0, 7, 0, 6, 0, 5, 0],
+        "vertex_data_len": 184,
+        "vertex_data_prefix": [246, 40, 28, 64, 0, 0, 64, 63]
       }
     },
     {

@@ -137,6 +137,28 @@ def _update_case_from_unitypy(case: Dict[str, Any], obj: Dict[str, Any]) -> None
         if pid is not None:
             expect["texture_path_id"] = pid
 
+        # Render data buffers are a good cross-engine regression signal (alignment + byte arrays).
+        idx = rd.get("m_IndexBuffer")
+        if isinstance(idx, (bytes, bytearray)):
+            idx = bytes(idx)
+            expect["index_buffer_len"] = len(idx)
+            expect["index_buffer_prefix"] = list(idx[:8])
+        elif isinstance(idx, list) and idx and all(isinstance(x, int) for x in idx):
+            expect["index_buffer_len"] = len(idx)
+            expect["index_buffer_prefix"] = idx[:8]
+
+        vd = rd.get("m_VertexData") or {}
+        vertex_bytes = vd.get("m_DataSize")
+        if isinstance(vertex_bytes, (bytes, bytearray)):
+            vertex_bytes = bytes(vertex_bytes)
+            expect["vertex_data_len"] = len(vertex_bytes)
+            expect["vertex_data_prefix"] = list(vertex_bytes[:8])
+        elif isinstance(vertex_bytes, list) and vertex_bytes and all(
+            isinstance(x, int) for x in vertex_bytes
+        ):
+            expect["vertex_data_len"] = len(vertex_bytes)
+            expect["vertex_data_prefix"] = vertex_bytes[:8]
+
     elif kind == "mesh":
         vd = obj.get("m_VertexData") or {}
         vertex_bytes = vd.get("m_DataSize")
