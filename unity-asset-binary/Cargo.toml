@@ -61,3 +61,4 @@ mmap = ["dep:memmap2"]
 
 [dev-dependencies]
 hex = "0.4"
+tempfile = { workspace = true }
