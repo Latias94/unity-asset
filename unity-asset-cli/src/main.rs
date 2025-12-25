@@ -18,6 +18,8 @@ use unity_asset::environment::{
     BinaryObjectKey, BinarySource, Environment, EnvironmentOptions, EnvironmentReporter,
     EnvironmentWarning,
 };
+use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions, BundleParser};
+use unity_asset_binary::shared_bytes::SharedBytes;
 use unity_asset_binary::typetree::{JsonTypeTreeRegistry, TpkTypeTreeRegistry, TypeTree};
 use unity_asset_binary::{asset::class_ids, object::UnityObject, unity_version::UnityVersion};
 
@@ -2039,37 +2041,49 @@ fn list_bundle_command(
     show_warnings: bool,
     typetree_registry: Option<&PathBuf>,
 ) -> Result<()> {
-    let mut env = build_environment(strict, show_warnings, typetree_registry)?;
-    env.load(&input)?;
+    let _ = (strict, show_warnings, typetree_registry);
 
-    let filter_lc = filter.to_ascii_lowercase();
-    let mut bundle_sources: Vec<BinarySource> = env
-        .binary_sources()
-        .into_iter()
-        .filter_map(|(kind, s)| {
-            if kind == unity_asset::environment::BinarySourceKind::AssetBundle {
-                Some(s)
-            } else {
-                None
-            }
-        })
-        .collect();
-    bundle_sources.sort();
-
-    if bundle_sources.is_empty() {
-        println!("⚠ No AssetBundles found in {:?}", input);
-        return Ok(());
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+    if input.is_dir() {
+        collect_files_recursive(&input, &mut candidate_paths)?;
+        candidate_paths.sort();
+        candidate_paths.dedup();
+    } else {
+        candidate_paths.push(input.clone());
     }
 
-    for bundle_source in bundle_sources {
-        let Some(bundle) = env.bundles().get(&bundle_source) else {
+    let filter_lc = filter.to_ascii_lowercase();
+    let mut found_any = false;
+
+    for path in candidate_paths {
+        let prefix = match read_prefix(&path, 16) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !looks_like_bundle_prefix(&prefix) {
             continue;
+        }
+
+        let options = bundle_list_options();
+        let bundle = match load_bundle_for_list(&path, options) {
+            Ok(v) => v,
+            Err(_) => continue,
         };
 
+        found_any = true;
+
+        let asset_files = bundle
+            .nodes
+            .iter()
+            .filter(|n| n.is_file())
+            .filter(|n| !n.name.ends_with(".resS") && !n.name.ends_with(".resource"))
+            .count();
+
         println!(
-            "Bundle: {} (nodes={}, assets={})",
-            bundle_source,
+            "Bundle: {} (nodes={}, asset_files={}, assets_loaded={})",
+            path.to_string_lossy(),
             bundle.nodes.len(),
+            asset_files,
             bundle.assets.len()
         );
 
@@ -2090,7 +2104,80 @@ fn list_bundle_command(
         }
     }
 
+    if !found_any {
+        println!("⚠ No AssetBundles found in {:?}", input);
+        return Ok(());
+    }
+
     Ok(())
+}
+
+fn bundle_list_options() -> BundleLoadOptions {
+    let mut options = BundleLoadOptions::default();
+    options.load_assets = false;
+    options.decompress_blocks = false;
+    options.validate = true;
+    options
+}
+
+fn looks_like_bundle_prefix(prefix: &[u8]) -> bool {
+    if prefix.len() < 8 {
+        return false;
+    }
+    if prefix.starts_with(b"UnityFS\0") || prefix.starts_with(b"UnityRaw") {
+        return true;
+    }
+    if prefix.starts_with(b"UnityWeb") {
+        if prefix.starts_with(b"UnityWebData") || prefix.starts_with(b"TuanjieWebData") {
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
+fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            collect_files_recursive(&path, out)?;
+        } else if meta.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn read_prefix(path: &Path, max_len: usize) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; max_len];
+    let n = file.read(&mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+fn load_bundle_for_list(path: &Path, options: BundleLoadOptions) -> Result<AssetBundle> {
+    #[cfg(feature = "mmap")]
+    {
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let shared = SharedBytes::Mmap(Arc::new(mmap));
+        let len = shared.len();
+        return Ok(BundleParser::from_shared_range_with_options(
+            shared,
+            0..len,
+            options,
+        )?);
+    }
+
+    #[cfg(not(feature = "mmap"))]
+    {
+        let bytes = std::fs::read(path)?;
+        Ok(BundleParser::from_bytes_with_options(bytes, options)?)
+    }
 }
 
 fn find_object_command(
@@ -2529,25 +2616,39 @@ fn scan_pptr_command(
 
     let requested_source = source.as_ref().map(BinarySource::path);
     let resolved_bundle_source = if scan_bundles {
-        requested_source.as_ref().map(|req| {
-            resolve_loaded_source(&env, unity_asset::environment::BinarySourceKind::AssetBundle, req)
-        }).transpose()?
+        requested_source
+            .as_ref()
+            .map(|req| {
+                resolve_loaded_source(
+                    &env,
+                    unity_asset::environment::BinarySourceKind::AssetBundle,
+                    req,
+                )
+            })
+            .transpose()?
     } else {
         None
     };
     let resolved_serialized_source = if scan_serialized {
-        requested_source.as_ref().map(|req| {
-            resolve_loaded_source(&env, unity_asset::environment::BinarySourceKind::SerializedFile, req)
-        }).transpose()?
+        requested_source
+            .as_ref()
+            .map(|req| {
+                resolve_loaded_source(
+                    &env,
+                    unity_asset::environment::BinarySourceKind::SerializedFile,
+                    req,
+                )
+            })
+            .transpose()?
     } else {
         None
     };
 
     let scan_file = |source_key: &BinarySource,
-                         source_kind: unity_asset::environment::BinarySourceKind,
-                         asset_index_key: Option<usize>,
-                         file: &unity_asset_binary::asset::SerializedFile,
-                         remaining: &mut usize|
+                     source_kind: unity_asset::environment::BinarySourceKind,
+                     asset_index_key: Option<usize>,
+                     file: &unity_asset_binary::asset::SerializedFile,
+                     remaining: &mut usize|
      -> Result<()> {
         if *remaining == 0 {
             return Ok(());
@@ -2735,9 +2836,8 @@ fn deps_command(
 
     let (resolved_source, asset_index, file) = match source_kind {
         unity_asset::environment::BinarySourceKind::AssetBundle => {
-            let idx = asset_index.ok_or_else(|| {
-                anyhow::anyhow!("--asset-index is required when --kind bundle")
-            })?;
+            let idx = asset_index
+                .ok_or_else(|| anyhow::anyhow!("--asset-index is required when --kind bundle"))?;
             let bundle_source = if let Some(src) = source {
                 let req = BinarySource::path(&src);
                 resolve_loaded_source(&env, source_kind, &req)?
@@ -2768,9 +2868,10 @@ fn deps_command(
                 .bundles()
                 .get(&bundle_source)
                 .ok_or_else(|| anyhow::anyhow!("Bundle not found: {}", bundle_source))?;
-            let file = bundle.assets.get(idx).ok_or_else(|| {
-                anyhow::anyhow!("Bundle asset_index out of range: {}", idx)
-            })?;
+            let file = bundle
+                .assets
+                .get(idx)
+                .ok_or_else(|| anyhow::anyhow!("Bundle asset_index out of range: {}", idx))?;
             (bundle_source, Some(idx), file)
         }
         unity_asset::environment::BinarySourceKind::SerializedFile => {
