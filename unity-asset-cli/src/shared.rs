@@ -11,6 +11,14 @@ use unity_asset_binary::typetree::{
     CompositeTypeTreeRegistry, JsonTypeTreeRegistry, TpkTypeTreeRegistry, TypeTreeRegistry,
 };
 
+pub(crate) fn cli_warn(show: bool, msg: impl std::fmt::Display) {
+    let msg = msg.to_string();
+    tracing::warn!(message = %msg);
+    if show {
+        eprintln!("warning: {}", msg);
+    }
+}
+
 fn looks_like_unity_project_root(dir: &Path) -> bool {
     dir.join("Assets").is_dir() && dir.join("ProjectSettings").is_dir()
 }

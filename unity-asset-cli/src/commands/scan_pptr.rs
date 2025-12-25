@@ -1,6 +1,6 @@
 use crate::fast_path;
 use crate::shared::{
-    AppContext, build_environment, load_environment_input, load_serialized_file_for_scan,
+    cli_warn, AppContext, build_environment, load_environment_input, load_serialized_file_for_scan,
     load_typetree_registry, resolve_loaded_source,
 };
 use anyhow::Result;
@@ -197,9 +197,7 @@ fn scan_pptr_fast(
             let bundle = match fast_path::load_bundle_for_list(path, options) {
                 Ok(v) => v,
                 Err(e) => {
-                    if show_warnings {
-                        eprintln!("warning: failed to parse bundle {:?}: {}", path, e);
-                    }
+                    cli_warn(show_warnings, format!("failed to parse bundle {:?}: {}", path, e));
                     continue;
                 }
             };
@@ -224,12 +222,13 @@ fn scan_pptr_fast(
                 let bytes = match bundle.extract_node_data(node) {
                     Ok(v) => v,
                     Err(e) => {
-                        if show_warnings {
-                            eprintln!(
-                                "warning: failed to extract bundle node {:?} for scan-pptr: {}",
+                        cli_warn(
+                            show_warnings,
+                            format!(
+                                "failed to extract bundle node {:?} for scan-pptr: {}",
                                 path, e
-                            );
-                        }
+                            ),
+                        );
                         continue;
                     }
                 };
@@ -260,12 +259,10 @@ fn scan_pptr_fast(
             let shared = match bundle.data_arc() {
                 Ok(v) => SharedBytes::from_arc(v),
                 Err(e) => {
-                    if show_warnings {
-                        eprintln!(
-                            "warning: failed to decompress bundle {:?} for scan-pptr: {}",
-                            path, e
-                        );
-                    }
+                    cli_warn(
+                        show_warnings,
+                        format!("failed to decompress bundle {:?} for scan-pptr: {}", path, e),
+                    );
                     continue;
                 }
             };
@@ -278,9 +275,10 @@ fn scan_pptr_fast(
                 let (start, end) = match fast_path::node_range(node) {
                     Ok(v) => v,
                     Err(e) => {
-                        if show_warnings {
-                            eprintln!("warning: invalid bundle node range ({}): {}", node.name, e);
-                        }
+                        cli_warn(
+                            show_warnings,
+                            format!("invalid bundle node range ({}): {}", node.name, e),
+                        );
                         continue;
                     }
                 };

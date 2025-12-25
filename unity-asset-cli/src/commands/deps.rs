@@ -1,6 +1,6 @@
 use crate::fast_path;
 use crate::shared::{
-    AppContext, build_environment, load_environment_input, load_serialized_file_for_scan,
+    cli_warn, AppContext, build_environment, load_environment_input, load_serialized_file_for_scan,
     load_typetree_registry, resolve_loaded_source,
 };
 use anyhow::Result;
@@ -215,9 +215,7 @@ fn deps_fast(
             let bundle = match fast_path::load_bundle_for_list(&path, options) {
                 Ok(v) => v,
                 Err(e) => {
-                    if show_warnings {
-                        eprintln!("warning: failed to parse bundle {:?}: {}", path, e);
-                    }
+                    cli_warn(show_warnings, format!("failed to parse bundle {:?}: {}", path, e));
                     return Ok(false);
                 }
             };
@@ -240,9 +238,10 @@ fn deps_fast(
             let bytes = match bundle.extract_node_data(node) {
                 Ok(v) => v,
                 Err(e) => {
-                    if show_warnings {
-                        eprintln!("warning: failed to extract bundle node for deps: {}", e);
-                    }
+                    cli_warn(
+                        show_warnings,
+                        format!("failed to extract bundle node for deps: {}", e),
+                    );
                     return Ok(false);
                 }
             };
@@ -265,9 +264,10 @@ fn deps_fast(
             let mut file = match load_serialized_file_for_scan(&path) {
                 Ok(v) => v,
                 Err(e) => {
-                    if show_warnings {
-                        eprintln!("warning: failed to parse SerializedFile {:?}: {}", path, e);
-                    }
+                    cli_warn(
+                        show_warnings,
+                        format!("failed to parse SerializedFile {:?}: {}", path, e),
+                    );
                     return Ok(false);
                 }
             };
