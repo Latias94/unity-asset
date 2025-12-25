@@ -126,6 +126,10 @@ enum Commands {
         #[arg(long, conflicts_with = "overwrite")]
         resume: Option<PathBuf>,
 
+        /// Retry only failed entries from a previous manifest (uses its `asset_path` and `key`)
+        #[arg(long, conflicts_with_all = ["resume", "overwrite"])]
+        retry_failed_from: Option<PathBuf>,
+
         /// Continue exporting even if some entries fail; failed entries are recorded in the manifest
         #[arg(long)]
         continue_on_error: bool,
@@ -254,6 +258,7 @@ fn main() -> Result<()> {
             skip_existing,
             manifest,
             resume,
+            retry_failed_from,
             continue_on_error,
             jobs,
         } => export_bundle_command(
@@ -269,6 +274,7 @@ fn main() -> Result<()> {
             skip_existing,
             manifest,
             resume,
+            retry_failed_from,
             continue_on_error,
             jobs,
             strict,
@@ -763,6 +769,7 @@ fn export_bundle_command(
     skip_existing: bool,
     manifest: Option<PathBuf>,
     resume: Option<PathBuf>,
+    retry_failed_from: Option<PathBuf>,
     continue_on_error: bool,
     jobs: usize,
     strict: bool,
@@ -775,6 +782,36 @@ fn export_bundle_command(
         for e in prev.entries {
             resume_map.insert((e.asset_path.clone(), e.key.clone()), e);
         }
+    }
+
+    let mut retry_failed_jobs: Option<Vec<ExportJob>> = None;
+    if let Some(path) = retry_failed_from.as_ref() {
+        let prev = read_export_manifest(path)?;
+        let mut jobs: Vec<ExportJob> = Vec::new();
+        let mut order = 0usize;
+        for e in prev.entries {
+            if !matches!(e.status, ExportStatus::Failed) {
+                continue;
+            }
+            if !pattern.is_empty()
+                && !e
+                    .asset_path
+                    .to_ascii_lowercase()
+                    .contains(&pattern.to_ascii_lowercase())
+            {
+                continue;
+            }
+            let Ok(key) = e.key.parse::<BinaryObjectKey>() else {
+                continue;
+            };
+            jobs.push(ExportJob {
+                order,
+                asset_path: e.asset_path,
+                key,
+            });
+            order += 1;
+        }
+        retry_failed_jobs = Some(jobs);
     }
 
     let mut env = build_environment(strict, show_warnings);
@@ -795,7 +832,7 @@ fn export_bundle_command(
         .collect();
     bundle_sources.sort();
 
-    if bundle_sources.is_empty() {
+    if bundle_sources.is_empty() && retry_failed_from.is_none() {
         println!("⚠ No AssetBundles found in {:?}", input);
         return Ok(());
     }
@@ -810,75 +847,16 @@ fn export_bundle_command(
     let mut export_jobs: Vec<ExportJob> = Vec::new();
     let mut pre_outcomes: Vec<ExportOutcome> = Vec::new();
 
-    for bundle_source in bundle_sources {
-        let entries = env.bundle_container_entries_source(&bundle_source)?;
-        let mut entries: Vec<_> = entries
-            .into_iter()
-            .filter(|e| e.asset_path.to_ascii_lowercase().contains(&pattern_lc))
-            .collect();
-        entries.sort_by(|a, b| a.asset_path.cmp(&b.asset_path));
-
-        for entry in entries {
+    if let Some(jobs) = retry_failed_jobs.take() {
+        for mut job in jobs {
             if let Some(max) = limit {
                 if planned >= max {
                     break;
                 }
             }
-            let Some(key) = entry.key else {
-                skipped += 1;
-                continue;
-            };
-
-            let key_str = key.to_string();
-            let resume_key = (entry.asset_path.clone(), key_str.clone());
-            let effective_skip_existing = skip_existing || resume.is_some();
-            if effective_skip_existing && !overwrite {
-                if let Some(prev) = resume_map.get(&resume_key) {
-                    if let Some(p) = prev.output_path.as_ref() {
-                        let prev_path = PathBuf::from(p);
-                        if prev_path.exists()
-                            && matches!(
-                                prev.status,
-                                ExportStatus::ExportedRaw
-                                    | ExportStatus::ExportedDecoded
-                                    | ExportStatus::SkippedExisting
-                                    | ExportStatus::Resumed
-                            )
-                        {
-                            resumed += 1;
-                            planned += 1;
-                            pre_outcomes.push(ExportOutcome {
-                                order,
-                                message: format!(
-                                    "↷ {} -> {:?} (resumed)",
-                                    entry.asset_path, prev_path
-                                ),
-                                did_export: false,
-                                did_skip_existing: true,
-                                entry: ExportManifestEntry {
-                                    order,
-                                    asset_path: entry.asset_path.clone(),
-                                    key: key_str,
-                                    source_kind: prev.source_kind.clone(),
-                                    asset_index: prev.asset_index,
-                                    path_id: prev.path_id,
-                                    type_id: prev.type_id,
-                                    class_name: prev.class_name.clone(),
-                                    status: ExportStatus::Resumed,
-                                    output_path: Some(prev_path.to_string_lossy().to_string()),
-                                    output_bytes: prev.output_bytes,
-                                    error: None,
-                                },
-                            });
-                            order += 1;
-                            continue;
-                        }
-                    }
-                }
-            }
 
             if !class_ids.is_empty() || !class_name_lc.is_empty() {
-                let (type_id, _) = lookup_object_type_info(&env, &key);
+                let (type_id, _) = lookup_object_type_info(&env, &job.key);
                 if !class_ids.is_empty() && !class_ids.contains(&type_id) {
                     filtered += 1;
                     continue;
@@ -893,13 +871,103 @@ fn export_bundle_command(
                 }
             }
 
-            export_jobs.push(ExportJob {
-                order,
-                asset_path: entry.asset_path,
-                key,
-            });
+            job.order = order;
+            export_jobs.push(job);
             planned += 1;
             order += 1;
+        }
+    } else {
+        for bundle_source in bundle_sources {
+            let entries = env.bundle_container_entries_source(&bundle_source)?;
+            let mut entries: Vec<_> = entries
+                .into_iter()
+                .filter(|e| e.asset_path.to_ascii_lowercase().contains(&pattern_lc))
+                .collect();
+            entries.sort_by(|a, b| a.asset_path.cmp(&b.asset_path));
+
+            for entry in entries {
+                if let Some(max) = limit {
+                    if planned >= max {
+                        break;
+                    }
+                }
+                let Some(key) = entry.key else {
+                    skipped += 1;
+                    continue;
+                };
+
+                let key_str = key.to_string();
+                let resume_key = (entry.asset_path.clone(), key_str.clone());
+                let effective_skip_existing = skip_existing || resume.is_some();
+                if effective_skip_existing && !overwrite {
+                    if let Some(prev) = resume_map.get(&resume_key) {
+                        if let Some(p) = prev.output_path.as_ref() {
+                            let prev_path = PathBuf::from(p);
+                            if prev_path.exists()
+                                && matches!(
+                                    prev.status,
+                                    ExportStatus::ExportedRaw
+                                        | ExportStatus::ExportedDecoded
+                                        | ExportStatus::SkippedExisting
+                                        | ExportStatus::Resumed
+                                )
+                            {
+                                resumed += 1;
+                                planned += 1;
+                                pre_outcomes.push(ExportOutcome {
+                                    order,
+                                    message: format!(
+                                        "↷ {} -> {:?} (resumed)",
+                                        entry.asset_path, prev_path
+                                    ),
+                                    did_export: false,
+                                    did_skip_existing: true,
+                                    entry: ExportManifestEntry {
+                                        order,
+                                        asset_path: entry.asset_path.clone(),
+                                        key: key_str,
+                                        source_kind: prev.source_kind.clone(),
+                                        asset_index: prev.asset_index,
+                                        path_id: prev.path_id,
+                                        type_id: prev.type_id,
+                                        class_name: prev.class_name.clone(),
+                                        status: ExportStatus::Resumed,
+                                        output_path: Some(prev_path.to_string_lossy().to_string()),
+                                        output_bytes: prev.output_bytes,
+                                        error: None,
+                                    },
+                                });
+                                order += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                if !class_ids.is_empty() || !class_name_lc.is_empty() {
+                    let (type_id, _) = lookup_object_type_info(&env, &key);
+                    if !class_ids.is_empty() && !class_ids.contains(&type_id) {
+                        filtered += 1;
+                        continue;
+                    }
+                    if !class_name_lc.is_empty() {
+                        let name = unity_asset::get_class_name(type_id)
+                            .unwrap_or_else(|| format!("Class_{}", type_id));
+                        if !name.to_ascii_lowercase().contains(&class_name_lc) {
+                            filtered += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                export_jobs.push(ExportJob {
+                    order,
+                    asset_path: entry.asset_path,
+                    key,
+                });
+                planned += 1;
+                order += 1;
+            }
         }
     }
 
