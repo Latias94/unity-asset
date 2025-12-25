@@ -99,7 +99,7 @@ pub mod environment {
     use std::sync::{Arc, Mutex, RwLock};
     use unity_asset_binary::asset::SerializedFile;
     use unity_asset_binary::bundle::AssetBundle;
-    use unity_asset_binary::file::{UnityFile, load_unity_file_from_memory, load_unity_file_from_shared_range};
+    use unity_asset_binary::file::{UnityFile, load_unity_file, load_unity_file_from_shared_range};
     use unity_asset_binary::object::{ObjectHandle, UnityObject};
     use unity_asset_binary::typetree::TypeTreeRegistry;
     use unity_asset_binary::typetree::{
@@ -652,10 +652,7 @@ pub mod environment {
         }
 
         fn try_load_binary(&mut self, path: &Path) -> Result<()> {
-            let data = std::fs::read(path).map_err(|e| {
-                UnityAssetError::format(format!("Failed to read file {:?}: {}", path, e))
-            })?;
-            match load_unity_file_from_memory(data) {
+            match load_unity_file(path) {
                 Ok(UnityFile::AssetBundle(bundle)) => {
                     let mut bundle = bundle;
                     if let Some(registry) = self.type_tree_registry.clone() {
@@ -714,7 +711,7 @@ pub mod environment {
                 };
 
                 let Ok(parsed) =
-                    load_unity_file_from_shared_range(view.backing_arc(), view.absolute_range())
+                    load_unity_file_from_shared_range(view.backing_shared(), view.absolute_range())
                 else {
                     continue;
                 };

@@ -478,7 +478,7 @@ impl BundleParser {
 
     /// Load assets from the bundle files
     fn load_assets(bundle: &mut AssetBundle, options: &BundleLoadOptions) -> Result<()> {
-        let data = bundle.data_arc();
+        let data = crate::shared_bytes::SharedBytes::from_arc(bundle.data_arc());
         let data_len = data.len() as u64;
 
         // Clone nodes to avoid borrow conflicts while pushing assets.

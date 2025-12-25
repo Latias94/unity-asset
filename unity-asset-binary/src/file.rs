@@ -11,9 +11,9 @@ use crate::asset::header::SerializedFileHeader;
 use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
+use crate::shared_bytes::SharedBytes;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnityFileKind {
@@ -95,19 +95,19 @@ fn sniff_serialized_file(data: &[u8]) -> bool {
 /// - The detection order is: bundle → serialized file → webfile.
 /// - WebFile detection can involve decompression, so it is attempted last.
 pub fn load_unity_file_from_memory(data: Vec<u8>) -> Result<UnityFile> {
-    let data: Arc<[u8]> = data.into();
-    let len = data.len();
-    load_unity_file_from_shared_range(data, 0..len)
+    let shared = SharedBytes::from_vec(data);
+    let len = shared.len();
+    load_unity_file_from_shared_range(shared, 0..len)
 }
 
 /// Parse a Unity binary file from a shared backing buffer + byte range.
 ///
 /// This is useful for container formats that can provide a view into a larger buffer (e.g. WebFile entries).
 pub fn load_unity_file_from_shared_range(
-    data: Arc<[u8]>,
+    data: SharedBytes,
     range: Range<usize>,
 ) -> Result<UnityFile> {
-    let view = DataView::from_range(data, range)?;
+    let view = DataView::from_shared_range(data, range)?;
     let bytes = view.as_bytes();
 
     if sniff_bundle(bytes) {
@@ -117,14 +117,14 @@ pub fn load_unity_file_from_shared_range(
 
     if sniff_serialized_file(bytes) {
         let file = crate::asset::SerializedFileParser::from_shared_range(
-            view.backing_arc(),
+            view.backing_shared(),
             view.absolute_range(),
         )?;
         return Ok(UnityFile::SerializedFile(file));
     }
 
     if let Ok(web) = crate::webfile::WebFile::from_shared_range(
-        view.backing_arc(),
+        view.backing_shared(),
         view.absolute_range(),
     ) {
         return Ok(UnityFile::WebFile(web));
@@ -137,10 +137,26 @@ pub fn load_unity_file_from_shared_range(
 
 /// Parse a Unity binary file from a filesystem path.
 pub fn load_unity_file<P: AsRef<Path>>(path: P) -> Result<UnityFile> {
-    let data = std::fs::read(&path).map_err(|e| {
-        BinaryError::generic(format!("Failed to read file {:?}: {}", path.as_ref(), e))
-    })?;
-    load_unity_file_from_memory(data)
+    #[cfg(feature = "mmap")]
+    {
+        let file = std::fs::File::open(&path).map_err(|e| {
+            BinaryError::generic(format!("Failed to open file {:?}: {}", path.as_ref(), e))
+        })?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
+            BinaryError::generic(format!("Failed to mmap file {:?}: {}", path.as_ref(), e))
+        })?;
+        let shared = SharedBytes::Mmap(std::sync::Arc::new(mmap));
+        let len = shared.len();
+        return load_unity_file_from_shared_range(shared, 0..len);
+    }
+
+    #[cfg(not(feature = "mmap"))]
+    {
+        let data = std::fs::read(&path).map_err(|e| {
+            BinaryError::generic(format!("Failed to read file {:?}: {}", path.as_ref(), e))
+        })?;
+        load_unity_file_from_memory(data)
+    }
 }
 
 #[cfg(test)]

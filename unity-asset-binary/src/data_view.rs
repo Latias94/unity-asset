@@ -1,21 +1,21 @@
 use crate::error::{BinaryError, Result};
+use crate::shared_bytes::SharedBytes;
 use std::ops::Range;
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct DataView {
-    data: Arc<[u8]>,
+    data: SharedBytes,
     start: usize,
     len: usize,
 }
 
 impl DataView {
-    pub fn from_arc(data: Arc<[u8]>) -> Self {
+    pub fn from_shared(data: SharedBytes) -> Self {
         let len = data.len();
         Self { data, start: 0, len }
     }
 
-    pub fn from_range(data: Arc<[u8]>, range: Range<usize>) -> Result<Self> {
+    pub fn from_shared_range(data: SharedBytes, range: Range<usize>) -> Result<Self> {
         if range.start > range.end {
             return Err(BinaryError::invalid_data(format!(
                 "Invalid DataView range: {}..{}",
@@ -34,7 +34,7 @@ impl DataView {
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.data[self.start..self.start + self.len]
+        &self.data.as_bytes()[self.start..self.start + self.len]
     }
 
     pub fn len(&self) -> usize {
@@ -45,7 +45,7 @@ impl DataView {
         self.len == 0
     }
 
-    pub fn backing_arc(&self) -> Arc<[u8]> {
+    pub fn backing_shared(&self) -> SharedBytes {
         self.data.clone()
     }
 
@@ -58,6 +58,6 @@ impl DataView {
     }
 
     pub fn identity_key(&self) -> (usize, usize, usize) {
-        (self.data.as_ref().as_ptr() as usize, self.start, self.len)
+        (self.data.ptr_usize(), self.start, self.len)
     }
 }

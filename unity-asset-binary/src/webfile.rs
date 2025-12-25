@@ -8,6 +8,7 @@ use crate::compression::{decompress_brotli, decompress_gzip};
 use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
+use crate::shared_bytes::SharedBytes;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -39,13 +40,13 @@ pub struct WebFile {
 impl WebFile {
     /// Parse a WebFile from binary data
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
-        let data: Arc<[u8]> = data.into();
-        let len = data.len();
-        Self::from_shared_range(data, 0..len)
+        let shared = SharedBytes::from_vec(data);
+        let len = shared.len();
+        Self::from_shared_range(shared, 0..len)
     }
 
-    pub fn from_shared_range(data: Arc<[u8]>, range: Range<usize>) -> Result<Self> {
-        let view = DataView::from_range(data, range)?;
+    pub fn from_shared_range(data: SharedBytes, range: Range<usize>) -> Result<Self> {
+        let view = DataView::from_shared_range(data, range)?;
         Self::from_view(view)
     }
 
@@ -58,10 +59,12 @@ impl WebFile {
         // Decompress if necessary
         let decompressed_data: DataView = match compression {
             WebFileCompression::None => view,
-            WebFileCompression::Gzip => DataView::from_arc(decompress_gzip(view.as_bytes())?.into()),
-            WebFileCompression::Brotli => {
-                DataView::from_arc(decompress_brotli(view.as_bytes())?.into())
-            }
+            WebFileCompression::Gzip => DataView::from_shared(SharedBytes::from_vec(
+                decompress_gzip(view.as_bytes())?,
+            )),
+            WebFileCompression::Brotli => DataView::from_shared(SharedBytes::from_vec(
+                decompress_brotli(view.as_bytes())?,
+            )),
         };
 
         // Create reader for decompressed data
@@ -170,8 +173,16 @@ impl WebFile {
         &self.files
     }
 
+    pub fn data_shared(&self) -> SharedBytes {
+        self.data.backing_shared()
+    }
+
     pub fn data_arc(&self) -> Arc<[u8]> {
-        self.data.backing_arc()
+        match self.data.backing_shared() {
+            SharedBytes::Arc(v) => v,
+            #[cfg(feature = "mmap")]
+            SharedBytes::Mmap(v) => Arc::<[u8]>::from(v.as_ref().as_ref()),
+        }
     }
 
     /// Extract a specific file by name
@@ -212,7 +223,10 @@ impl WebFile {
         let start = file_info.offset as usize;
         let end = start + file_info.size as usize;
         let base = self.data.base_offset();
-        DataView::from_range(self.data.backing_arc(), (base + start)..(base + end))
+        DataView::from_shared_range(
+            self.data.backing_shared(),
+            (base + start)..(base + end),
+        )
     }
 
     /// Try to parse contained files as AssetBundles
@@ -248,7 +262,7 @@ mod tests {
     #[test]
     fn test_webfile_creation() {
         // Test basic WebFile structure creation
-        let data = DataView::from_arc(Arc::<[u8]>::from(Vec::<u8>::new()));
+        let data = DataView::from_shared(SharedBytes::from_vec(Vec::<u8>::new()));
         let webfile = WebFile {
             signature: "UnityWebData1.0".to_string(),
             compression: WebFileCompression::None,

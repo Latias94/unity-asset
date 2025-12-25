@@ -11,6 +11,7 @@ use crate::object::ObjectHandle;
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::typetree::TypeTreeRegistry;
 use crate::data_view::DataView;
+use crate::shared_bytes::SharedBytes;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -34,14 +35,14 @@ impl SerializedFileParser {
         data: Vec<u8>,
         preload_object_data: bool,
     ) -> Result<SerializedFile> {
-        let data: Arc<[u8]> = data.into();
-        let len = data.len();
-        Self::from_shared_range_with_options(data, 0..len, preload_object_data)
+        let shared = SharedBytes::from_vec(data);
+        let len = shared.len();
+        Self::from_shared_range_with_options(shared, 0..len, preload_object_data)
     }
 
     /// Parse a SerializedFile from a shared backing buffer + byte range (zero-copy view).
     pub fn from_shared_range(
-        data: Arc<[u8]>,
+        data: SharedBytes,
         range: Range<usize>,
     ) -> Result<SerializedFile> {
         Self::from_shared_range_with_options(data, range, false)
@@ -49,11 +50,11 @@ impl SerializedFileParser {
 
     /// Parse a SerializedFile from a shared backing buffer + byte range (zero-copy view), with options.
     pub fn from_shared_range_with_options(
-        data: Arc<[u8]>,
+        data: SharedBytes,
         range: Range<usize>,
         preload_object_data: bool,
     ) -> Result<SerializedFile> {
-        let view = DataView::from_range(data, range)?;
+        let view = DataView::from_shared_range(data, range)?;
         Self::from_view_with_options(view, preload_object_data)
     }
 
@@ -76,10 +77,10 @@ impl SerializedFileParser {
         };
 
         {
-            let backing = file.data.backing_arc();
+            let backing = file.data.backing_shared();
             let start = file.data.base_offset();
             let len = file.data.len();
-            let bytes = &backing[start..start + len];
+            let bytes = &backing.as_bytes()[start..start + len];
             let mut reader = BinaryReader::new(bytes, ByteOrder::Big);
 
             // Read header
@@ -407,11 +408,23 @@ impl SerializedFile {
     }
 
     /// Get the backing shared buffer for this file's bytes.
+    pub fn data_shared(&self) -> SharedBytes {
+        self.data.backing_shared()
+    }
+
+    /// Get the backing shared buffer for this file's bytes.
     ///
     /// Note: for embedded files (e.g. files inside a decompressed bundle buffer), this is the
     /// shared backing buffer and may be larger than `self.data()`.
+    ///
+    /// If the backing storage is a memory map, this method currently allocates and copies into
+    /// an `Arc<[u8]>` for compatibility; prefer `data_shared()` for zero-copy access.
     pub fn data_arc(&self) -> Arc<[u8]> {
-        self.data.backing_arc()
+        match self.data.backing_shared() {
+            SharedBytes::Arc(v) => v,
+            #[cfg(feature = "mmap")]
+            SharedBytes::Mmap(v) => Arc::<[u8]>::from(v.as_ref().as_ref()),
+        }
     }
 
     /// Base offset of this file within the backing shared buffer returned by `data_arc()`.
@@ -688,10 +701,10 @@ impl SerializedFile {
     }
 
     fn load_object_data(&mut self) -> Result<()> {
-        let backing = self.data.backing_arc();
+        let backing = self.data.backing_shared();
         let start = self.data.base_offset();
         let len = self.data.len();
-        let bytes = &backing[start..start + len];
+        let bytes = &backing.as_bytes()[start..start + len];
         let file_len = bytes.len();
         for obj in &mut self.objects {
             let start: usize = obj.byte_start.try_into().map_err(|_| {

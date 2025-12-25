@@ -81,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `unity-asset-binary` `AssetBundle::{extract_file_slice, extract_node_slice}` to access bundle entry bytes without allocating.
 - `unity-asset-binary` `file::load_unity_file_from_shared_range` to parse Unity files from a shared backing buffer + byte range (enables zero-copy WebFile entry loading).
 - `unity-asset-binary` WebFile `from_shared_range` + `extract_file_view`/`extract_file_slice` for zero-copy WebFile entry access (best-effort).
+- `unity-asset`/`unity-asset-cli` enable the `mmap` feature by default to reduce peak memory usage when loading from filesystem paths.
 - Marked the most comprehensive UnityPy-port integration tests as `#[ignore]` by default to keep `cargo test` fast (see `CONTRIBUTING.md` for running ignored tests).
 - Reduced duplicated bundle parsing in `Environment` unit tests to speed up the default `cargo test` loop.
 - `find-object --verbose` now prints a copy/paste-able `BinaryObjectKey` string which can be fed into `inspect-object --key`.

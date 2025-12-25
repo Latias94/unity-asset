@@ -3,6 +3,7 @@
 use crate::asset::{ObjectInfo, SerializedFile};
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
+use crate::shared_bytes::SharedBytes;
 use crate::typetree::{
     PPtrScanResult,
     TypeTree, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput, TypeTreeParseWarning,
@@ -121,7 +122,7 @@ enum ObjectBytes {
     Empty,
     Inline(Vec<u8>),
     Shared {
-        data: Arc<[u8]>,
+        data: SharedBytes,
         start: usize,
         end: usize,
     },
@@ -135,7 +136,7 @@ impl ObjectBytes {
         match self {
             ObjectBytes::Empty => &[],
             ObjectBytes::Inline(bytes) => bytes.as_slice(),
-            ObjectBytes::Shared { data, start, end } => &data[*start..*end],
+            ObjectBytes::Shared { data, start, end } => &data.as_bytes()[*start..*end],
         }
     }
 }
@@ -226,7 +227,7 @@ impl UnityObject {
         let (start, end) = object_range(file, info)?;
         let base = file.data_base_offset();
         let raw = ObjectBytes::Shared {
-            data: file.data_arc(),
+            data: file.data_shared(),
             start: base + start,
             end: base + end,
         };

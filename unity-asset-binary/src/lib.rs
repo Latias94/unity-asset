@@ -50,6 +50,7 @@ pub mod metadata;
 pub mod object;
 pub mod performance;
 pub mod reader;
+pub mod shared_bytes;
 pub mod typetree;
 pub mod unity_objects;
 pub mod unity_version;
