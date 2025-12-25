@@ -92,6 +92,14 @@ enum Commands {
         #[arg(long)]
         limit: Option<usize>,
 
+        /// Filter by class id (can be repeated). Only applies to resolvable entries.
+        #[arg(long)]
+        class_id: Vec<i32>,
+
+        /// Filter by class name substring (case-insensitive). Only applies to resolvable entries.
+        #[arg(long, default_value = "")]
+        class_name: String,
+
         /// Only print what would be exported
         #[arg(long)]
         dry_run: bool,
@@ -99,6 +107,14 @@ enum Commands {
         /// Decode known types (AudioClip -> WAV, Texture2D -> PNG) instead of exporting raw object bytes
         #[arg(long)]
         decode: bool,
+
+        /// Overwrite existing output files (still avoids in-run collisions)
+        #[arg(long, conflicts_with = "skip_existing")]
+        overwrite: bool,
+
+        /// Skip entries whose output file already exists
+        #[arg(long)]
+        skip_existing: bool,
 
         /// Parallel export jobs (0 = auto, 1 = serial)
         #[arg(long, default_value_t = 0)]
@@ -216,16 +232,24 @@ fn main() -> Result<()> {
             output,
             pattern,
             limit,
+            class_id,
+            class_name,
             dry_run,
             decode,
+            overwrite,
+            skip_existing,
             jobs,
         } => export_bundle_command(
             input,
             output,
             pattern,
             limit,
+            class_id,
+            class_name,
             dry_run,
             decode,
+            overwrite,
+            skip_existing,
             jobs,
             strict,
             show_warnings,
@@ -562,13 +586,13 @@ struct PathAllocator {
 }
 
 impl PathAllocator {
-    fn reserve(&self, proposed: PathBuf, key: &BinaryObjectKey) -> PathBuf {
+    fn reserve(&self, proposed: PathBuf, key: &BinaryObjectKey, overwrite: bool) -> PathBuf {
         let mut reserved = match self.reserved.lock() {
             Ok(v) => v,
             Err(e) => e.into_inner(),
         };
 
-        if !proposed.exists() && !reserved.contains(&proposed) {
+        if (overwrite || !proposed.exists()) && !reserved.contains(&proposed) {
             reserved.insert(proposed.clone());
             return proposed;
         }
@@ -583,7 +607,7 @@ impl PathAllocator {
         };
 
         let mut candidate = path_with_suffix(&proposed, &base_suffix);
-        if !candidate.exists() && !reserved.contains(&candidate) {
+        if (overwrite || !candidate.exists()) && !reserved.contains(&candidate) {
             reserved.insert(candidate.clone());
             return candidate;
         }
@@ -591,7 +615,7 @@ impl PathAllocator {
         let mut i = 1usize;
         loop {
             candidate = path_with_suffix(&proposed, &format!("{}.{}", base_suffix, i));
-            if !candidate.exists() && !reserved.contains(&candidate) {
+            if (overwrite || !candidate.exists()) && !reserved.contains(&candidate) {
                 reserved.insert(candidate.clone());
                 return candidate;
             }
@@ -616,8 +640,12 @@ fn export_bundle_command(
     output: PathBuf,
     pattern: String,
     limit: Option<usize>,
+    class_ids: Vec<i32>,
+    class_name: String,
     dry_run: bool,
     decode: bool,
+    overwrite: bool,
+    skip_existing: bool,
     jobs: usize,
     strict: bool,
     show_warnings: bool,
@@ -646,7 +674,9 @@ fn export_bundle_command(
     }
 
     let pattern_lc = pattern.to_ascii_lowercase();
+    let class_name_lc = class_name.to_ascii_lowercase();
     let mut skipped = 0usize;
+    let mut filtered = 0usize;
     let mut planned = 0usize;
     let mut order = 0usize;
     let mut export_jobs: Vec<ExportJob> = Vec::new();
@@ -669,6 +699,23 @@ fn export_bundle_command(
                 skipped += 1;
                 continue;
             };
+
+            if !class_ids.is_empty() || !class_name_lc.is_empty() {
+                let (type_id, _) = lookup_object_type_info(&env, &key);
+                if !class_ids.is_empty() && !class_ids.contains(&type_id) {
+                    filtered += 1;
+                    continue;
+                }
+                if !class_name_lc.is_empty() {
+                    let name = unity_asset::get_class_name(type_id)
+                        .unwrap_or_else(|| format!("Class_{}", type_id));
+                    if !name.to_ascii_lowercase().contains(&class_name_lc) {
+                        filtered += 1;
+                        continue;
+                    }
+                }
+            }
+
             export_jobs.push(ExportJob {
                 order,
                 asset_path: entry.asset_path,
@@ -681,8 +728,8 @@ fn export_bundle_command(
 
     if export_jobs.is_empty() {
         println!(
-            "Exported 0 entries, skipped {} (unresolved PPtr/external refs or missing objects)",
-            skipped
+            "Exported 0 entries, skipped {} (unresolved), filtered {}",
+            skipped, filtered
         );
         return Ok(());
     }
@@ -699,13 +746,18 @@ fn export_bundle_command(
             } else {
                 dest.set_extension("bin");
             }
-            let dest = allocator.reserve(dest, &job.key);
+            if skip_existing && dest.exists() && !overwrite {
+                println!("DRY-RUN {} -> SKIP(existing) {:?}", job.asset_path, dest);
+                continue;
+            }
+            let dest = allocator.reserve(dest, &job.key, overwrite);
             println!("DRY-RUN {} -> {:?}", job.asset_path, dest);
         }
         println!(
-            "Exported {} entries, skipped {} (unresolved PPtr/external refs or missing objects)",
+            "Exported {} entries, skipped {} (unresolved), filtered {}",
             export_jobs.len(),
-            skipped
+            skipped,
+            filtered
         );
         return Ok(());
     }
@@ -730,6 +782,7 @@ fn export_bundle_command(
     let next = Arc::new(AtomicUsize::new(0));
     let abort = Arc::new(AtomicBool::new(false));
     let exported = Arc::new(AtomicUsize::new(0));
+    let skipped_existing = Arc::new(AtomicUsize::new(0));
     let results: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let first_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
@@ -740,6 +793,7 @@ fn export_bundle_command(
             let next = Arc::clone(&next);
             let abort = Arc::clone(&abort);
             let exported = Arc::clone(&exported);
+            let skipped_existing = Arc::clone(&skipped_existing);
             let results = Arc::clone(&results);
             let first_error = Arc::clone(&first_error);
             let allocator = Arc::clone(&allocator);
@@ -757,15 +811,17 @@ fn export_bundle_command(
                     }
 
                     let job = &export_jobs[idx];
-                    let line = match export_one_entry(
+                    let (line, did_export, did_skip_existing) = match export_one_entry(
                         &env,
                         &allocator,
                         &output,
                         &job.asset_path,
                         &job.key,
                         decode,
+                        overwrite,
+                        skip_existing,
                     ) {
-                        Ok(line) => line,
+                        Ok(v) => v,
                         Err(e) => {
                             abort.store(true, Ordering::Relaxed);
                             let mut slot = match first_error.lock() {
@@ -779,7 +835,12 @@ fn export_bundle_command(
                         }
                     };
 
-                    exported.fetch_add(1, Ordering::Relaxed);
+                    if did_export {
+                        exported.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if did_skip_existing {
+                        skipped_existing.fetch_add(1, Ordering::Relaxed);
+                    }
                     let mut out = match results.lock() {
                         Ok(v) => v,
                         Err(e) => e.into_inner(),
@@ -807,10 +868,12 @@ fn export_bundle_command(
     }
 
     println!(
-        "Exported {} entries, skipped {} (unresolved PPtr/external refs or missing objects) [jobs={}]",
+        "Exported {} entries, skipped {} (unresolved), skipped {} (existing), filtered {} [jobs={}]",
         exported.load(Ordering::Relaxed),
         skipped,
-        threads
+        skipped_existing.load(Ordering::Relaxed),
+        filtered,
+        threads,
     );
     Ok(())
 }
@@ -822,18 +885,41 @@ fn export_one_entry(
     asset_path: &str,
     key: &BinaryObjectKey,
     decode: bool,
-) -> Result<String> {
+    overwrite: bool,
+    skip_existing: bool,
+) -> Result<(String, bool, bool)> {
     let obj = env.read_binary_object_key(key)?;
 
     if decode {
         #[cfg(feature = "decode")]
-        if let Some(dest) =
-            try_decode_export_best_effort(env, allocator, output, asset_path, key, &obj)
-        {
-            return Ok(format!(
-                "✓ {} -> {:?} (decoded, class_id={})",
-                asset_path, dest, obj.info.type_id
-            ));
+        match try_decode_export_best_effort(
+            env,
+            allocator,
+            output,
+            asset_path,
+            key,
+            &obj,
+            overwrite,
+            skip_existing,
+        ) {
+            DecodeAttempt::Exported(dest) => {
+                return Ok((
+                    format!(
+                        "✓ {} -> {:?} (decoded, class_id={})",
+                        asset_path, dest, obj.info.type_id
+                    ),
+                    true,
+                    false,
+                ));
+            }
+            DecodeAttempt::SkippedExisting(dest) => {
+                return Ok((
+                    format!("↷ {} -> {:?} (skipped existing)", asset_path, dest),
+                    false,
+                    true,
+                ));
+            }
+            DecodeAttempt::NotApplicable => {}
         }
     }
 
@@ -848,19 +934,39 @@ fn export_one_entry(
         }
     }
 
-    let dest = allocator.reserve(dest, key);
+    if skip_existing && dest.exists() && !overwrite {
+        return Ok((
+            format!("↷ {} -> {:?} (skipped existing)", asset_path, dest),
+            false,
+            true,
+        ));
+    }
+
+    let dest = allocator.reserve(dest, key, overwrite);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&dest, bytes)?;
 
-    Ok(format!(
-        "✓ {} -> {:?} (raw, class_id={}, bytes={})",
-        asset_path,
-        dest,
-        obj.info.type_id,
-        bytes.len()
+    Ok((
+        format!(
+            "✓ {} -> {:?} (raw, class_id={}, bytes={})",
+            asset_path,
+            dest,
+            obj.info.type_id,
+            bytes.len()
+        ),
+        true,
+        false,
     ))
+}
+
+#[cfg(feature = "decode")]
+#[derive(Debug, Clone)]
+enum DecodeAttempt {
+    NotApplicable,
+    Exported(PathBuf),
+    SkippedExisting(PathBuf),
 }
 
 #[cfg(feature = "decode")]
@@ -871,7 +977,9 @@ fn try_decode_export_best_effort(
     asset_path: &str,
     key: &BinaryObjectKey,
     obj: &UnityObject,
-) -> Option<PathBuf> {
+    overwrite: bool,
+    skip_existing: bool,
+) -> DecodeAttempt {
     let unity_version = match key.source_kind {
         unity_asset::environment::BinarySourceKind::AssetBundle => env
             .bundles()
@@ -887,7 +995,7 @@ fn try_decode_export_best_effort(
     };
 
     match obj.info.type_id {
-        class_ids::AUDIO_CLIP => (|| -> anyhow::Result<Option<PathBuf>> {
+        class_ids::AUDIO_CLIP => (|| -> anyhow::Result<DecodeAttempt> {
             let converter = AudioClipConverter::new(unity_version.clone());
             let clip = converter.from_unity_object(obj)?;
 
@@ -939,12 +1047,15 @@ fn try_decode_export_best_effort(
                         .unwrap_or(clip.compression_format().extension())
                         .to_ascii_lowercase();
                     dest.set_extension(ext);
-                    let dest = allocator.reserve(dest, key);
+                    if skip_existing && dest.exists() && !overwrite {
+                        return Ok(DecodeAttempt::SkippedExisting(dest));
+                    }
+                    let dest = allocator.reserve(dest, key, overwrite);
                     if let Some(parent) = dest.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
                     std::fs::write(&dest, &audio_bytes)?;
-                    Ok(Some(dest))
+                    Ok(DecodeAttempt::Exported(dest))
                 }
                 _ => {
                     if clip.is_streamed() {
@@ -962,33 +1073,41 @@ fn try_decode_export_best_effort(
                                     .unwrap_or(clip.compression_format().extension())
                                     .to_ascii_lowercase();
                                 dest.set_extension(ext);
-                                let dest = allocator.reserve(dest, key);
+                                if skip_existing && dest.exists() && !overwrite {
+                                    return Ok(DecodeAttempt::SkippedExisting(dest));
+                                }
+                                let dest = allocator.reserve(dest, key, overwrite);
                                 if let Some(parent) = dest.parent() {
                                     std::fs::create_dir_all(parent)?;
                                 }
                                 std::fs::write(&dest, &bytes)?;
-                                return Ok(Some(dest));
+                                return Ok(DecodeAttempt::Exported(dest));
                             }
                         }
                     }
 
                     dest.set_extension("wav");
-                    let dest = allocator.reserve(dest, key);
+                    if skip_existing && dest.exists() && !overwrite {
+                        return Ok(DecodeAttempt::SkippedExisting(dest));
+                    }
+                    let dest = allocator.reserve(dest, key, overwrite);
                     if let Some(parent) = dest.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
                     let audio_processor = AudioProcessor::new(unity_version);
                     audio_processor.process_and_export(obj, &dest)?;
-                    Ok(Some(dest))
+                    Ok(DecodeAttempt::Exported(dest))
                 }
             }
         })()
-        .ok()
-        .flatten(),
-        class_ids::TEXTURE_2D => (|| -> anyhow::Result<Option<PathBuf>> {
+        .unwrap_or(DecodeAttempt::NotApplicable),
+        class_ids::TEXTURE_2D => (|| -> anyhow::Result<DecodeAttempt> {
             let mut dest = output.join(sanitize_asset_path(asset_path));
             dest.set_extension("png");
-            let dest = allocator.reserve(dest, key);
+            if skip_existing && dest.exists() && !overwrite {
+                return Ok(DecodeAttempt::SkippedExisting(dest));
+            }
+            let dest = allocator.reserve(dest, key, overwrite);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -1012,14 +1131,13 @@ fn try_decode_export_best_effort(
 
             let image = texture_processor.decode_texture(&texture)?;
             TextureExporter::export_auto(&image, &dest)?;
-            Ok(Some(dest))
+            Ok(DecodeAttempt::Exported(dest))
         })()
-        .ok()
-        .flatten(),
-        class_ids::TEXT_ASSET => (|| -> anyhow::Result<Option<PathBuf>> {
+        .unwrap_or(DecodeAttempt::NotApplicable),
+        class_ids::TEXT_ASSET => (|| -> anyhow::Result<DecodeAttempt> {
             let bytes = text_asset_bytes(obj);
             if bytes.is_empty() {
-                return Ok(None);
+                return Ok(DecodeAttempt::NotApplicable);
             }
 
             let mut dest = output.join(sanitize_asset_path(asset_path));
@@ -1030,16 +1148,18 @@ fn try_decode_export_best_effort(
                     "bin"
                 });
             }
-            let dest = allocator.reserve(dest, key);
+            if skip_existing && dest.exists() && !overwrite {
+                return Ok(DecodeAttempt::SkippedExisting(dest));
+            }
+            let dest = allocator.reserve(dest, key, overwrite);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&dest, &bytes)?;
-            Ok(Some(dest))
+            Ok(DecodeAttempt::Exported(dest))
         })()
-        .ok()
-        .flatten(),
-        class_ids::SPRITE => (|| -> anyhow::Result<Option<PathBuf>> {
+        .unwrap_or(DecodeAttempt::NotApplicable),
+        class_ids::SPRITE => (|| -> anyhow::Result<DecodeAttempt> {
             let Some(obj_ref) = (match key.source_kind {
                 unity_asset::environment::BinarySourceKind::AssetBundle => key
                     .asset_index
@@ -1048,7 +1168,7 @@ fn try_decode_export_best_effort(
                     env.find_binary_object_in_source_id(&key.source, key.path_id)
                 }
             }) else {
-                return Ok(None);
+                return Ok(DecodeAttempt::NotApplicable);
             };
 
             let sprite_processor = SpriteProcessor::new(unity_version.clone());
@@ -1059,7 +1179,7 @@ fn try_decode_export_best_effort(
             } else if sprite.render_data.texture_path_id != 0 {
                 (0, sprite.render_data.texture_path_id)
             } else {
-                return Ok(None);
+                return Ok(DecodeAttempt::NotApplicable);
             };
 
             let texture_obj = env.read_binary_pptr(&obj_ref, file_id, texture_path_id)?;
@@ -1093,16 +1213,18 @@ fn try_decode_export_best_effort(
             } else {
                 dest.set_extension("png");
             }
-            let dest = allocator.reserve(dest, key);
+            if skip_existing && dest.exists() && !overwrite {
+                return Ok(DecodeAttempt::SkippedExisting(dest));
+            }
+            let dest = allocator.reserve(dest, key, overwrite);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&dest, &png_bytes)?;
-            Ok(Some(dest))
+            Ok(DecodeAttempt::Exported(dest))
         })()
-        .ok()
-        .flatten(),
-        _ => None,
+        .unwrap_or(DecodeAttempt::NotApplicable),
+        _ => DecodeAttempt::NotApplicable,
     }
 }
 

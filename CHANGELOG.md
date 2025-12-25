@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `unity-asset` CLI: `export-bundle` command to export bundle container-matched objects as raw `.bin`.
 - `unity-asset` CLI: `export-bundle --decode` to export `AudioClip` (prefer encoded/embedded bytes; `.wav` fallback) and `Texture2D` as `.png` (best-effort; falls back to raw `.bin`).
 - `unity-asset` CLI: `export-bundle --jobs` to parallelize export/decode work (0 = auto, 1 = serial).
+- `unity-asset` CLI: `export-bundle --class-id/--class-name` filtering, and `--overwrite/--skip-existing` output behavior controls.
 - `unity-asset` CLI: `list-bundle` command to list bundle nodes (files) for debugging/inspection.
 - `unity-asset` CLI: `find-object` command to search AssetBundle `m_Container` entries and print resolvable object keys.
 - `unity-asset` CLI: `inspect-object` command to inspect a single binary object by (source, asset_index, path_id) and print a TypeTree-derived field tree for debugging.
