@@ -36,6 +36,7 @@ unity-asset/
 Examples are maintained per-crate and are built in CI. For instance:
 `cargo run -p unity-asset --example env_load_and_list -- tests/samples`
 `cargo run -p unity-asset-binary --example sniff_kind -- tests/samples/char_118_yuki.ab`
+See `docs/EXAMPLES.md` for a curated list of runnable recipes.
 
 ### Current Capabilities
 

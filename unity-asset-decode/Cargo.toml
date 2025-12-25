@@ -48,3 +48,8 @@ required-features = ["texture"]
 name = "texture_decoding_demo"
 path = "examples/texture_decoding_demo.rs"
 required-features = ["texture"]
+
+[[example]]
+name = "export_textures"
+path = "examples/export_textures.rs"
+required-features = ["texture"]

@@ -13,6 +13,7 @@ Examples are maintained per-crate.
 - `cargo run -p unity-asset --example yaml_load_summary`
 - `cargo run -p unity-asset --example env_load_and_list -- tests/samples`
 - `cargo run -p unity-asset-binary --example sniff_kind -- tests/samples/char_118_yuki.ab`
+See `docs/EXAMPLES.md` for more runnable recipes.
 
 ## YAML samples (works with Unity project demos)
 
