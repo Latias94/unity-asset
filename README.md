@@ -30,9 +30,12 @@ unity-asset/
 ├── unity-asset-cli/       # CLI tools
 │   ├── main.rs           # Synchronous CLI tool
 │   └── main_async.rs     # Asynchronous CLI tool (--features async)
-├── examples/             # Usage examples and demos
 └── tests/                # Integration tests and sample files
 ```
+
+Examples are maintained per-crate and are built in CI. For instance:
+`cargo run -p unity-asset --example env_load_and_list -- tests/samples`
+`cargo run -p unity-asset-binary --example sniff_kind -- tests/samples/char_118_yuki.ab`
 
 ### Current Capabilities
 

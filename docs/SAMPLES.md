@@ -6,6 +6,14 @@ fearless refactors. There are two distinct “sample lines”:
 - **YAML samples**: `.prefab/.unity/.asset` text files (easy to version, great for Unity project demos).
 - **Binary samples**: `AssetBundle` / `SerializedFile` bytes (required to validate UnityFS/TypeTree/ObjectHandle parity).
 
+## Running examples
+
+Examples are maintained per-crate.
+
+- `cargo run -p unity-asset --example yaml_load_summary`
+- `cargo run -p unity-asset --example env_load_and_list -- tests/samples`
+- `cargo run -p unity-asset-binary --example sniff_kind -- tests/samples/char_118_yuki.ab`
+
 ## YAML samples (works with Unity project demos)
 
 If you have a Unity project checkout (e.g. an official demo) with `.prefab/.unity` files:

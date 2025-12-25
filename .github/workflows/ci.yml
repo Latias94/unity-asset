@@ -60,6 +60,12 @@ jobs:
         ./target/debug/unity-asset-async --help
         cargo build -p unity-asset-cli --features decode
 
+    - name: Build examples
+      run: |
+        cargo build -p unity-asset --examples
+        cargo build -p unity-asset-binary --examples
+        cargo build -p unity-asset-decode --examples --features full
+
     - name: Run tests (workspace defaults)
       run: cargo nextest run --workspace
 
