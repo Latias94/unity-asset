@@ -228,6 +228,56 @@ fn environment_typetree_registry_json_restores_parsing_for_stripped_assets() {
 }
 
 #[test]
+fn environment_assetbundle_container_raw_matches_typetree_when_stripped() {
+    let mut env = Environment::new();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/xinzexi_2_n_tex");
+    env.load_file(&path).unwrap();
+
+    let baseline = env.bundle_container_entries(&path).unwrap();
+    assert!(
+        !baseline.is_empty(),
+        "expected at least one m_Container entry in sample bundle"
+    );
+
+    let source = BinarySource::path(&path);
+    {
+        let bundle = env
+            .bundles
+            .get_mut(&source)
+            .expect("sample bundle loaded (mutable)");
+        for file in bundle.assets.iter_mut() {
+            file.enable_type_tree = false;
+            for t in file.types.iter_mut() {
+                t.type_tree.clear();
+            }
+            file.set_type_tree_registry(None);
+        }
+    }
+    env.bundle_container_cache
+        .write()
+        .unwrap()
+        .remove(&source);
+
+    let stripped = env.bundle_container_entries(&path).unwrap();
+    assert!(
+        !stripped.is_empty(),
+        "expected container entries via raw fallback when TypeTree is stripped"
+    );
+
+    let mut a: Vec<(String, i32, i64)> = baseline
+        .iter()
+        .map(|e| (e.asset_path.clone(), e.file_id, e.path_id))
+        .collect();
+    a.sort();
+    let mut b: Vec<(String, i32, i64)> = stripped
+        .iter()
+        .map(|e| (e.asset_path.clone(), e.file_id, e.path_id))
+        .collect();
+    b.sort();
+    assert_eq!(a, b, "raw container entries mismatch typetree baseline");
+}
+
+#[test]
 fn environment_stream_data_falls_back_to_filesystem_for_bundles() {
     let temp = tempfile::tempdir().unwrap();
     let bundle_src =

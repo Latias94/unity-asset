@@ -558,18 +558,28 @@ impl SerializedFile {
         let mut last_err: Option<BinaryError> = None;
         let externals_len: i32 = self.externals.len().try_into().unwrap_or(i32::MAX);
         let mut best: Option<(usize, Vec<(String, i32, i64)>)> = None;
-
-        fn score(entries: &[(String, i32, i64)], externals_len: i32) -> usize {
+        let score = |entries: &[(String, i32, i64)]| -> usize {
             entries
                 .iter()
                 .filter(|(path, file_id, path_id)| {
-                    !path.is_empty()
-                        && *path_id != 0
-                        && *file_id >= 0
-                        && (*file_id == 0 || *file_id - 1 <= externals_len)
+                    if path.is_empty() || *path_id == 0 || *file_id < 0 {
+                        return false;
+                    }
+
+                    // Unity PPtr fileID semantics:
+                    // - 0 => current file
+                    // - 1..=externals.len() => externals[fileID-1]
+                    // Anything else is invalid.
+                    if *file_id == 0 {
+                        // Strong sanity: internal references should point at an actual object in this file.
+                        self.find_object(*path_id).is_some()
+                    } else {
+                        // Strict bounds check (externals_len can be 0).
+                        (*file_id - 1) < externals_len
+                    }
                 })
                 .count()
-        }
+        };
 
         for offset in (0..=256usize).step_by(4) {
             if offset >= data.len() {
@@ -589,7 +599,7 @@ impl SerializedFile {
                     let mut reader = BinaryReader::new(&data[offset..], byte_order);
                     match try_parse(&mut reader, assetinfo_layout, asset_last) {
                         Ok(entries) => {
-                            let s = score(&entries, externals_len);
+                            let s = score(&entries);
                             let better = match &best {
                                 None => true,
                                 Some((best_score, best_entries)) => {
