@@ -23,12 +23,27 @@ impl BundleParser {
         Self::from_bytes_with_options(data, BundleLoadOptions::default())
     }
 
+    /// Parse an AssetBundle from a byte slice.
+    ///
+    /// This avoids copying when the input bytes already live in a shared buffer (e.g. WebFile entries).
+    pub fn from_slice(data: &[u8]) -> Result<AssetBundle> {
+        Self::from_slice_with_options(data, BundleLoadOptions::default())
+    }
+
     /// Parse an AssetBundle from binary data with options
     pub fn from_bytes_with_options(
         data: Vec<u8>,
         options: BundleLoadOptions,
     ) -> Result<AssetBundle> {
-        let mut reader = BinaryReader::new(&data, ByteOrder::Big);
+        Self::from_slice_with_options(&data, options)
+    }
+
+    /// Parse an AssetBundle from a byte slice with options.
+    pub fn from_slice_with_options(
+        data: &[u8],
+        options: BundleLoadOptions,
+    ) -> Result<AssetBundle> {
+        let mut reader = BinaryReader::new(data, ByteOrder::Big);
 
         // Parse header (reader position is preserved for subsequent parsing).
         let header = BundleHeader::from_reader(&mut reader)?;

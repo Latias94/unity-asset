@@ -8,9 +8,12 @@
 //! This module provides a single entry point to parse them into a tagged enum.
 
 use crate::asset::header::SerializedFileHeader;
+use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
+use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnityFileKind {
@@ -92,17 +95,38 @@ fn sniff_serialized_file(data: &[u8]) -> bool {
 /// - The detection order is: bundle → serialized file → webfile.
 /// - WebFile detection can involve decompression, so it is attempted last.
 pub fn load_unity_file_from_memory(data: Vec<u8>) -> Result<UnityFile> {
-    if sniff_bundle(&data) {
-        let bundle = crate::bundle::load_bundle_from_memory(data)?;
+    let data: Arc<[u8]> = data.into();
+    let len = data.len();
+    load_unity_file_from_shared_range(data, 0..len)
+}
+
+/// Parse a Unity binary file from a shared backing buffer + byte range.
+///
+/// This is useful for container formats that can provide a view into a larger buffer (e.g. WebFile entries).
+pub fn load_unity_file_from_shared_range(
+    data: Arc<[u8]>,
+    range: Range<usize>,
+) -> Result<UnityFile> {
+    let view = DataView::from_range(data, range)?;
+    let bytes = view.as_bytes();
+
+    if sniff_bundle(bytes) {
+        let bundle = crate::bundle::BundleParser::from_slice(bytes)?;
         return Ok(UnityFile::AssetBundle(bundle));
     }
 
-    if sniff_serialized_file(&data) {
-        let file = crate::asset::parse_serialized_file(data)?;
+    if sniff_serialized_file(bytes) {
+        let file = crate::asset::SerializedFileParser::from_shared_range(
+            view.backing_arc(),
+            view.absolute_range(),
+        )?;
         return Ok(UnityFile::SerializedFile(file));
     }
 
-    if let Ok(web) = crate::webfile::WebFile::from_bytes(data) {
+    if let Ok(web) = crate::webfile::WebFile::from_shared_range(
+        view.backing_arc(),
+        view.absolute_range(),
+    ) {
         return Ok(UnityFile::WebFile(web));
     }
 

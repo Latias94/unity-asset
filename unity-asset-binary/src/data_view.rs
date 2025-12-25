@@ -53,6 +53,10 @@ impl DataView {
         self.start
     }
 
+    pub fn absolute_range(&self) -> Range<usize> {
+        self.start..self.start + self.len
+    }
+
     pub fn identity_key(&self) -> (usize, usize, usize) {
         (self.data.as_ref().as_ptr() as usize, self.start, self.len)
     }

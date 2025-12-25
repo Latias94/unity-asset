@@ -99,7 +99,7 @@ pub mod environment {
     use std::sync::{Arc, Mutex, RwLock};
     use unity_asset_binary::asset::SerializedFile;
     use unity_asset_binary::bundle::AssetBundle;
-    use unity_asset_binary::file::{UnityFile, load_unity_file_from_memory};
+    use unity_asset_binary::file::{UnityFile, load_unity_file_from_memory, load_unity_file_from_shared_range};
     use unity_asset_binary::object::{ObjectHandle, UnityObject};
     use unity_asset_binary::typetree::TypeTreeRegistry;
     use unity_asset_binary::typetree::{
@@ -708,12 +708,14 @@ pub mod environment {
             entry_names.dedup();
 
             for entry_name in entry_names {
-                let bytes = match web.extract_file(&entry_name) {
+                let view = match web.extract_file_view(&entry_name) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
 
-                let Ok(parsed) = load_unity_file_from_memory(bytes) else {
+                let Ok(parsed) =
+                    load_unity_file_from_shared_range(view.backing_arc(), view.absolute_range())
+                else {
                     continue;
                 };
 

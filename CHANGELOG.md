@@ -79,6 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AssetBundle` now tracks parsed asset file names (`asset_names`) to help resolve in-bundle references.
 - `unity-asset-binary` `SerializedFileParser::from_shared_range*` to parse embedded/packed SerializedFiles from a shared backing buffer without copying bytes (best-effort).
 - `unity-asset-binary` `AssetBundle::{extract_file_slice, extract_node_slice}` to access bundle entry bytes without allocating.
+- `unity-asset-binary` `file::load_unity_file_from_shared_range` to parse Unity files from a shared backing buffer + byte range (enables zero-copy WebFile entry loading).
+- `unity-asset-binary` WebFile `from_shared_range` + `extract_file_view`/`extract_file_slice` for zero-copy WebFile entry access (best-effort).
 - Marked the most comprehensive UnityPy-port integration tests as `#[ignore]` by default to keep `cargo test` fast (see `CONTRIBUTING.md` for running ignored tests).
 - Reduced duplicated bundle parsing in `Environment` unit tests to speed up the default `cargo test` loop.
 - `find-object --verbose` now prints a copy/paste-able `BinaryObjectKey` string which can be fed into `inspect-object --key`.
@@ -100,6 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hardened length-prefixed string reads to avoid hostile allocations and out-of-bounds reads (length is validated against remaining bytes and a maximum limit).
 - Hardened UnityFS/legacy bundle parsing against hostile metadata (rejects negative counts/offsets, enforces `max_memory`/metadata caps before allocation/decompression).
 - Reduced peak memory usage when loading assets from UnityFS bundles by avoiding both an extra full-buffer clone and per-asset file byte copies (best-effort).
+- Hardened WebFile parsing against hostile metadata (rejects negative header sizes/offsets/lengths and enforces basic bounds checks).
 - Prevented integer overflow in LZ4 buffer sizing for large `uncompressed_size` values.
 - `Environment::load_file` now attempts binary detection for extension-less files (best-effort), improving support for `UnityWebData*` and other build artifacts.
 - Fixed `UnityFile` sniffing to avoid mis-classifying uncompressed `UnityWebData*` WebFiles as legacy `UnityWeb` bundles.

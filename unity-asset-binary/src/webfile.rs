@@ -5,8 +5,11 @@
 
 use crate::bundle::{AssetBundle, BundleFileInfo};
 use crate::compression::{decompress_brotli, decompress_gzip};
+use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
+use std::ops::Range;
+use std::sync::Arc;
 
 /// Magic bytes for different compression formats
 const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
@@ -30,26 +33,39 @@ pub struct WebFile {
     /// Files contained in this WebFile
     pub files: Vec<BundleFileInfo>,
     /// Raw decompressed data
-    data: Vec<u8>,
+    data: DataView,
 }
 
 impl WebFile {
     /// Parse a WebFile from binary data
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
-        let mut reader = BinaryReader::new(&data, ByteOrder::Little);
+        let data: Arc<[u8]> = data.into();
+        let len = data.len();
+        Self::from_shared_range(data, 0..len)
+    }
+
+    pub fn from_shared_range(data: Arc<[u8]>, range: Range<usize>) -> Result<Self> {
+        let view = DataView::from_range(data, range)?;
+        Self::from_view(view)
+    }
+
+    fn from_view(view: DataView) -> Result<Self> {
+        let mut reader = BinaryReader::new(view.as_bytes(), ByteOrder::Little);
 
         // Detect compression type
         let compression = Self::detect_compression(&mut reader)?;
 
         // Decompress if necessary
-        let decompressed_data = match compression {
-            WebFileCompression::None => data,
-            WebFileCompression::Gzip => decompress_gzip(&data)?,
-            WebFileCompression::Brotli => decompress_brotli(&data)?,
+        let decompressed_data: DataView = match compression {
+            WebFileCompression::None => view,
+            WebFileCompression::Gzip => DataView::from_arc(decompress_gzip(view.as_bytes())?.into()),
+            WebFileCompression::Brotli => {
+                DataView::from_arc(decompress_brotli(view.as_bytes())?.into())
+            }
         };
 
         // Create reader for decompressed data
-        let mut reader = BinaryReader::new(&decompressed_data, ByteOrder::Little);
+        let mut reader = BinaryReader::new(decompressed_data.as_bytes(), ByteOrder::Little);
 
         // Read signature
         let signature = reader.read_cstring()?;
@@ -61,14 +77,52 @@ impl WebFile {
         }
 
         // Read header length
-        let head_length = reader.read_i32()? as usize;
+        let head_length_i32 = reader.read_i32()?;
+        if head_length_i32 < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative WebFile head_length: {}",
+                head_length_i32
+            )));
+        }
+        let head_length = head_length_i32 as usize;
+        let total_len = decompressed_data.len();
+        if head_length > total_len {
+            return Err(BinaryError::invalid_data(format!(
+                "WebFile head_length {} exceeds data len {}",
+                head_length, total_len
+            )));
+        }
+        if head_length < reader.position() as usize {
+            return Err(BinaryError::invalid_data(format!(
+                "WebFile head_length {} precedes current position {}",
+                head_length,
+                reader.position()
+            )));
+        }
 
         // Read file entries
         let mut files = Vec::new();
         while reader.position() < head_length as u64 {
-            let offset = reader.read_i32()? as u64;
-            let length = reader.read_i32()? as u64;
-            let path_length = reader.read_i32()? as usize;
+            let offset_i32 = reader.read_i32()?;
+            let length_i32 = reader.read_i32()?;
+            let path_len_i32 = reader.read_i32()?;
+
+            if offset_i32 < 0 || length_i32 < 0 || path_len_i32 < 0 {
+                return Err(BinaryError::invalid_data(format!(
+                    "Negative WebFile entry values: offset={} length={} path_len={}",
+                    offset_i32, length_i32, path_len_i32
+                )));
+            }
+
+            let offset = offset_i32 as u64;
+            let length = length_i32 as u64;
+            let path_length = path_len_i32 as usize;
+            if path_length > 16 * 1024 {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "WebFile entry name too large: {}",
+                    path_length
+                )));
+            }
             let name_bytes = reader.read_bytes(path_length)?;
             let name = String::from_utf8(name_bytes).map_err(|e| {
                 BinaryError::invalid_data(format!("Invalid UTF-8 in file name: {}", e))
@@ -116,8 +170,16 @@ impl WebFile {
         &self.files
     }
 
+    pub fn data_arc(&self) -> Arc<[u8]> {
+        self.data.backing_arc()
+    }
+
     /// Extract a specific file by name
     pub fn extract_file(&self, name: &str) -> Result<Vec<u8>> {
+        Ok(self.extract_file_slice(name)?.to_vec())
+    }
+
+    pub fn extract_file_slice(&self, name: &str) -> Result<&[u8]> {
         let file_info = self
             .files
             .iter()
@@ -127,16 +189,30 @@ impl WebFile {
         let start = file_info.offset as usize;
         let end = start + file_info.size as usize;
 
-        if end > self.data.len() {
+        let bytes = self.data.as_bytes();
+        if end > bytes.len() {
             return Err(BinaryError::invalid_data(format!(
                 "File {} extends beyond data bounds: {} > {}",
                 name,
                 end,
-                self.data.len()
+                bytes.len()
             )));
         }
 
-        Ok(self.data[start..end].to_vec())
+        Ok(&bytes[start..end])
+    }
+
+    pub fn extract_file_view(&self, name: &str) -> Result<DataView> {
+        let file_info = self
+            .files
+            .iter()
+            .find(|f| f.name == name)
+            .ok_or_else(|| BinaryError::invalid_data(format!("File not found: {}", name)))?;
+
+        let start = file_info.offset as usize;
+        let end = start + file_info.size as usize;
+        let base = self.data.base_offset();
+        DataView::from_range(self.data.backing_arc(), (base + start)..(base + end))
     }
 
     /// Try to parse contained files as AssetBundles
@@ -144,15 +220,10 @@ impl WebFile {
         let mut bundles = Vec::new();
 
         for file_info in &self.files {
-            // Extract file data
-            let file_data = self.extract_file(&file_info.name)?;
-
-            // Try to parse as AssetBundle
-            match crate::bundle::load_bundle_from_memory(file_data) {
-                Ok(bundle) => bundles.push(bundle),
-                Err(_) => {
-                    // Not an AssetBundle, skip
-                    continue;
+            if let Ok(view) = self.extract_file_view(&file_info.name) {
+                let bytes = view.as_bytes();
+                if let Ok(bundle) = crate::bundle::BundleParser::from_slice(bytes) {
+                    bundles.push(bundle);
                 }
             }
         }
@@ -177,11 +248,12 @@ mod tests {
     #[test]
     fn test_webfile_creation() {
         // Test basic WebFile structure creation
+        let data = DataView::from_arc(Arc::<[u8]>::from(Vec::<u8>::new()));
         let webfile = WebFile {
             signature: "UnityWebData1.0".to_string(),
             compression: WebFileCompression::None,
             files: Vec::new(),
-            data: Vec::new(),
+            data,
         };
 
         assert_eq!(webfile.signature, "UnityWebData1.0");
