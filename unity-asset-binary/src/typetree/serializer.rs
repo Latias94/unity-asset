@@ -389,6 +389,11 @@ impl<'a> TypeTreeSerializer<'a> {
                 size_i32
             )));
         }
+        if let Some(size_node) = array_node.children.first() {
+            if size_node.is_aligned() {
+                reader.align_to(4)?;
+            }
+        }
         let size = size_i32 as usize;
         if size > Self::MAX_ARRAY_LEN {
             return Err(BinaryError::invalid_data(format!(
@@ -407,12 +412,18 @@ impl<'a> TypeTreeSerializer<'a> {
             match element_node.type_name.as_str() {
                 "UInt8" | "char" | "SInt8" | "bool" => {
                     reader.skip_bytes(size)?;
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
+                    }
                     return Ok(());
                 }
                 "SInt16" | "short" | "UInt16" | "unsigned short" => {
                     reader.skip_bytes(size.checked_mul(2).ok_or_else(|| {
                         BinaryError::invalid_data("Array byte length overflow")
                     })?)?;
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
+                    }
                     return Ok(());
                 }
                 "SInt32"
@@ -424,6 +435,9 @@ impl<'a> TypeTreeSerializer<'a> {
                     reader.skip_bytes(size.checked_mul(4).ok_or_else(|| {
                         BinaryError::invalid_data("Array byte length overflow")
                     })?)?;
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
+                    }
                     return Ok(());
                 }
                 "SInt64"
@@ -435,6 +449,9 @@ impl<'a> TypeTreeSerializer<'a> {
                     reader.skip_bytes(size.checked_mul(8).ok_or_else(|| {
                         BinaryError::invalid_data("Array byte length overflow")
                     })?)?;
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
+                    }
                     return Ok(());
                 }
                 _ => {}
@@ -443,6 +460,9 @@ impl<'a> TypeTreeSerializer<'a> {
 
         for _ in 0..size {
             self.scan_value(reader, element_node, out)?;
+        }
+        if array_node.is_aligned() {
+            reader.align_to(4)?;
         }
         Ok(())
     }
@@ -680,6 +700,11 @@ impl<'a> TypeTreeSerializer<'a> {
                 size_i32
             )));
         }
+        if let Some(size_node) = array_node.children.first() {
+            if size_node.is_aligned() {
+                reader.align_to(4)?;
+            }
+        }
         let size = size_i32 as usize;
         if size > Self::MAX_ARRAY_LEN {
             return Err(BinaryError::invalid_data(format!(
@@ -702,21 +727,31 @@ impl<'a> TypeTreeSerializer<'a> {
             match element_node.type_name.as_str() {
                 "UInt8" | "char" => {
                     let bytes = reader.read_bytes(size)?;
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
+                    }
                     return Ok(UnityValue::Bytes(bytes));
                 }
                 "SInt8" => {
                     let bytes = reader.read_bytes(size)?;
                     // Preserve signedness as encoded bytes; callers that care can reinterpret.
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
+                    }
                     return Ok(UnityValue::Bytes(bytes));
                 }
                 "bool" => {
                     let bytes = reader.read_bytes(size)?;
-                    return Ok(UnityValue::Array(
+                    let out = UnityValue::Array(
                         bytes
                             .into_iter()
                             .map(|b| UnityValue::Bool(b != 0))
                             .collect(),
-                    ));
+                    );
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
+                    }
+                    return Ok(out);
                 }
                 "SInt16" | "short" => {
                     let byte_len = size
@@ -731,6 +766,9 @@ impl<'a> TypeTreeSerializer<'a> {
                             ByteOrder::Little => i16::from_le_bytes(raw),
                         };
                         out.push(UnityValue::Integer(v as i64));
+                    }
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
                     }
                     return Ok(UnityValue::Array(out));
                 }
@@ -748,6 +786,9 @@ impl<'a> TypeTreeSerializer<'a> {
                         };
                         out.push(UnityValue::Integer(v as i64));
                     }
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
+                    }
                     return Ok(UnityValue::Array(out));
                 }
                 "SInt32" | "int" => {
@@ -763,6 +804,9 @@ impl<'a> TypeTreeSerializer<'a> {
                             ByteOrder::Little => i32::from_le_bytes(raw),
                         };
                         out.push(UnityValue::Integer(v as i64));
+                    }
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
                     }
                     return Ok(UnityValue::Array(out));
                 }
@@ -780,6 +824,9 @@ impl<'a> TypeTreeSerializer<'a> {
                         };
                         out.push(UnityValue::Integer(v as i64));
                     }
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
+                    }
                     return Ok(UnityValue::Array(out));
                 }
                 "SInt64" | "long long" => {
@@ -795,6 +842,9 @@ impl<'a> TypeTreeSerializer<'a> {
                             ByteOrder::Little => i64::from_le_bytes(raw),
                         };
                         out.push(UnityValue::Integer(v));
+                    }
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
                     }
                     return Ok(UnityValue::Array(out));
                 }
@@ -812,6 +862,9 @@ impl<'a> TypeTreeSerializer<'a> {
                         };
                         out.push(UnityValue::Integer(v as i64));
                     }
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
+                    }
                     return Ok(UnityValue::Array(out));
                 }
                 "float" => {
@@ -827,6 +880,9 @@ impl<'a> TypeTreeSerializer<'a> {
                             ByteOrder::Little => u32::from_le_bytes(raw),
                         };
                         out.push(UnityValue::Float(f32::from_bits(bits) as f64));
+                    }
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
                     }
                     return Ok(UnityValue::Array(out));
                 }
@@ -844,6 +900,9 @@ impl<'a> TypeTreeSerializer<'a> {
                         };
                         out.push(UnityValue::Float(f64::from_bits(bits)));
                     }
+                    if array_node.is_aligned() {
+                        reader.align_to(4)?;
+                    }
                     return Ok(UnityValue::Array(out));
                 }
                 _ => {}
@@ -853,6 +912,9 @@ impl<'a> TypeTreeSerializer<'a> {
         for _ in 0..size {
             let element = self.parse_value_by_type_ctx(reader, element_node, ctx)?;
             elements.push(element);
+        }
+        if array_node.is_aligned() {
+            reader.align_to(4)?;
         }
 
         Ok(UnityValue::Array(elements))
@@ -1126,6 +1188,13 @@ fn referenced_type_triplet(referenced_object: &IndexMap<String, UnityValue>) -> 
 mod tests {
     use super::*;
 
+    fn node(type_name: &str, name: &str) -> TypeTreeNode {
+        let mut n = TypeTreeNode::new();
+        n.type_name = type_name.to_string();
+        n.name = name.to_string();
+        n
+    }
+
     #[test]
     fn test_serializer_creation() {
         let tree = TypeTree::new();
@@ -1142,5 +1211,67 @@ mod tests {
         serializer.align_buffer(&mut buffer, 4);
         assert_eq!(buffer.len(), 4); // Should be padded to 4 bytes
         assert_eq!(buffer[3], 0); // Padding should be zero
+    }
+
+    #[test]
+    fn typetree_array_alignment_honors_array_node_flag() {
+        let mut tree = TypeTree::new();
+
+        let mut root = node("TestObject", "TestObject");
+
+        let mut vec_node = node("vector", "m_Data");
+        let mut array_node = node("Array", "Array");
+        array_node.meta_flags = 0x4000; // kAlignBytes
+        array_node.children = vec![node("int", "size"), node("UInt8", "data")];
+        vec_node.children = vec![array_node];
+
+        let next_node = node("int", "m_Next");
+
+        root.children = vec![vec_node, next_node];
+        tree.nodes.push(root);
+
+        let serializer = TypeTreeSerializer::new(&tree);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1i32.to_le_bytes()); // array size
+        bytes.push(0xAA); // one byte element
+        bytes.extend_from_slice(&[0u8; 3]); // align to 4
+        bytes.extend_from_slice(&0x11223344i32.to_le_bytes()); // next int
+
+        let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+        let props = serializer.parse_object(&mut reader).unwrap();
+        assert_eq!(
+            props.get("m_Next").and_then(|v| v.as_i64()),
+            Some(0x11223344)
+        );
+    }
+
+    #[test]
+    fn typetree_scan_pptrs_honors_array_node_alignment() {
+        let mut tree = TypeTree::new();
+
+        let mut root = node("TestObject", "TestObject");
+
+        let mut vec_node = node("vector", "m_Data");
+        let mut array_node = node("Array", "Array");
+        array_node.meta_flags = 0x4000; // kAlignBytes
+        array_node.children = vec![node("int", "size"), node("UInt8", "data")];
+        vec_node.children = vec![array_node];
+
+        let next_node = node("int", "m_Next");
+        root.children = vec![vec_node, next_node];
+        tree.nodes.push(root);
+
+        let serializer = TypeTreeSerializer::new(&tree);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+        bytes.push(0xAA);
+        bytes.extend_from_slice(&[0u8; 3]);
+        bytes.extend_from_slice(&0x11223344i32.to_le_bytes());
+
+        let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+        let _ = serializer.scan_pptrs(&mut reader).unwrap();
+        assert_eq!(reader.remaining(), 0);
     }
 }

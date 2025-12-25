@@ -133,6 +133,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed UnityWeb decompression to prefer the header’s explicit `uncompressed_size` (guessing is only a fallback).
 - TypeTree parsing no longer writes to stderr from library code; added strict/lenient parsing options with structured warnings.
 - `SerializedFile::find_object` now uses a lazy `path_id` index for near O(1) lookups after first query.
+- TypeTree array parsing now honors the alignment meta flag on the `Array` node itself (not just the parent field), fixing misaligned reads after some `vector`/array fields.
 - Correct handling of `big_id_enabled` and other version-sensitive header/object fields.
 - `AudioClip` raw parsing now correctly extracts `StreamedResource` (`m_Source`/`m_Offset`/`m_Size`) and avoids treating the resource path bytes as embedded audio data.
 - `Texture2D` TypeTree parsing now recognizes `m_StreamData` and enables streamed texture bytes to be loaded via the same resource-reading path as AudioClip.
