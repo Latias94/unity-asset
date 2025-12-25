@@ -80,9 +80,18 @@ enum GoldenExpect {
         vertex_data_len: Option<usize>,
         #[serde(default)]
         vertex_data_prefix: Vec<i64>,
+        #[serde(default)]
+        pptr_internal: Vec<i64>,
+        #[serde(default)]
+        pptr_external: Vec<[i64; 2]>,
     },
     #[serde(rename = "peek_only")]
-    PeekOnly,
+    PeekOnly {
+        #[serde(default)]
+        pptr_internal: Vec<i64>,
+        #[serde(default)]
+        pptr_external: Vec<[i64; 2]>,
+    },
 }
 
 fn golden_path() -> PathBuf {
@@ -125,6 +134,39 @@ fn object_type_info(env: &Environment, key: &BinaryObjectKey) -> (i32, u32) {
             .map(|info| (info.type_id, info.byte_size))
             .unwrap_or((0, 0)),
     }
+}
+
+fn scan_pptrs(env: &Environment, key: &BinaryObjectKey) -> (Vec<i64>, Vec<[i64; 2]>) {
+    let scan = match key.source_kind {
+        BinarySourceKind::AssetBundle => env
+            .bundles()
+            .get(&key.source)
+            .and_then(|b| key.asset_index.and_then(|i| b.assets.get(i)))
+            .and_then(|f| f.find_object_handle(key.path_id))
+            .and_then(|h| h.scan_pptrs().ok().flatten()),
+        BinarySourceKind::SerializedFile => env
+            .binary_assets()
+            .get(&key.source)
+            .and_then(|f| f.find_object_handle(key.path_id))
+            .and_then(|h| h.scan_pptrs().ok().flatten()),
+    };
+
+    let Some(scan) = scan else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut internal = scan.internal;
+    internal.sort();
+    internal.dedup();
+    let mut external: Vec<[i64; 2]> = scan
+        .external
+        .into_iter()
+        .map(|(fid, pid)| [fid as i64, pid])
+        .collect();
+    external.sort();
+    external.dedup();
+
+    (internal, external)
 }
 
 #[test]
@@ -186,27 +228,38 @@ fn golden_regression_smoke() {
         );
 
         match case.expect {
-            GoldenExpect::PeekOnly => continue,
-            _ => {}
-        }
-
-        let obj = env
-            .read_binary_object_key(&key)
-            .unwrap_or_else(|_| panic!("read_binary_object_key failed (case={})", case.id));
-        assert_eq!(
-            obj.name().as_deref(),
-            Some(case.name.as_str()),
-            "m_Name mismatch (case={})",
-            case.id
-        );
-
-        match case.expect {
+            GoldenExpect::PeekOnly {
+                pptr_internal,
+                pptr_external,
+            } => {
+                let (internal, external) = scan_pptrs(&env, &key);
+                assert_eq!(
+                    internal, pptr_internal,
+                    "scan_pptrs internal mismatch (case={})",
+                    case.id
+                );
+                assert_eq!(
+                    external, pptr_external,
+                    "scan_pptrs external mismatch (case={})",
+                    case.id
+                );
+                continue;
+            }
             GoldenExpect::AudioClipStreamed {
                 stream_offset,
                 stream_size,
                 stream_path_suffix,
                 compression_format,
             } => {
+                let obj = env
+                    .read_binary_object_key(&key)
+                    .unwrap_or_else(|_| panic!("read_binary_object_key failed (case={})", case.id));
+                assert_eq!(
+                    obj.name().as_deref(),
+                    Some(case.name.as_str()),
+                    "m_Name mismatch (case={})",
+                    case.id
+                );
                 if let Some(expected) = compression_format {
                     assert_eq!(
                         i64_field(&obj, "m_CompressionFormat"),
@@ -286,6 +339,15 @@ fn golden_regression_smoke() {
                 stream_path_suffix,
                 complete_image_size,
             } => {
+                let obj = env
+                    .read_binary_object_key(&key)
+                    .unwrap_or_else(|_| panic!("read_binary_object_key failed (case={})", case.id));
+                assert_eq!(
+                    obj.name().as_deref(),
+                    Some(case.name.as_str()),
+                    "m_Name mismatch (case={})",
+                    case.id
+                );
                 assert_eq!(
                     i64_field(&obj, "m_Width"),
                     width,
@@ -367,6 +429,15 @@ fn golden_regression_smoke() {
                 vertex_data_len,
                 vertex_data_prefix,
             } => {
+                let obj = env
+                    .read_binary_object_key(&key)
+                    .unwrap_or_else(|_| panic!("read_binary_object_key failed (case={})", case.id));
+                assert_eq!(
+                    obj.name().as_deref(),
+                    Some(case.name.as_str()),
+                    "m_Name mismatch (case={})",
+                    case.id
+                );
                 let rect = obj
                     .get("m_Rect")
                     .expect("m_Rect present")
@@ -538,7 +609,30 @@ fn golden_regression_smoke() {
                 index_buffer_prefix,
                 vertex_data_len,
                 vertex_data_prefix,
+                pptr_internal,
+                pptr_external,
             } => {
+                let (internal, external) = scan_pptrs(&env, &key);
+                assert_eq!(
+                    internal, pptr_internal,
+                    "scan_pptrs internal mismatch (case={})",
+                    case.id
+                );
+                assert_eq!(
+                    external, pptr_external,
+                    "scan_pptrs external mismatch (case={})",
+                    case.id
+                );
+
+                let obj = env
+                    .read_binary_object_key(&key)
+                    .unwrap_or_else(|_| panic!("read_binary_object_key failed (case={})", case.id));
+                assert_eq!(
+                    obj.name().as_deref(),
+                    Some(case.name.as_str()),
+                    "m_Name mismatch (case={})",
+                    case.id
+                );
                 if let Some(len) = index_buffer_len {
                     let buf_v = obj.get("m_IndexBuffer").expect("m_IndexBuffer present");
                     match buf_v {
@@ -640,7 +734,6 @@ fn golden_regression_smoke() {
                     }
                 }
             }
-            GoldenExpect::PeekOnly => {}
         }
     }
 }

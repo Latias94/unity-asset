@@ -63,6 +63,31 @@ def _as_float(v: Any) -> Optional[float]:
     return None
 
 
+def _collect_pptrs(obj: Any) -> Tuple[list[int], list[Tuple[int, int]]]:
+    internal: set[int] = set()
+    external: set[Tuple[int, int]] = set()
+
+    def walk(v: Any) -> None:
+        if isinstance(v, dict):
+            fid = _as_int(v.get("m_FileID"))
+            pid = _as_int(v.get("m_PathID"))
+            if fid is not None and pid is not None and pid != 0:
+                if fid == 0:
+                    internal.add(pid)
+                else:
+                    external.add((fid, pid))
+            for vv in v.values():
+                walk(vv)
+            return
+        if isinstance(v, (list, tuple)):
+            for vv in v:
+                walk(vv)
+            return
+
+    walk(obj)
+    return (sorted(internal), sorted(external))
+
+
 def _load_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -180,6 +205,15 @@ def _update_case_from_unitypy(case: Dict[str, Any], obj: Dict[str, Any]) -> None
         elif isinstance(idx, list) and idx and all(isinstance(x, int) for x in idx):
             expect["index_buffer_len"] = len(idx)
             expect["index_buffer_prefix"] = idx[:8]
+
+        pptr_internal, pptr_external = _collect_pptrs(obj)
+        expect["pptr_internal"] = pptr_internal
+        expect["pptr_external"] = [[fid, pid] for (fid, pid) in pptr_external]
+
+    elif kind == "peek_only":
+        pptr_internal, pptr_external = _collect_pptrs(obj)
+        expect["pptr_internal"] = pptr_internal
+        expect["pptr_external"] = [[fid, pid] for (fid, pid) in pptr_external]
 
     case["expect"] = expect
 

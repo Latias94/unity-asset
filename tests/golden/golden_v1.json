@@ -57,9 +57,27 @@
         "texture_file_id": 0,
         "texture_path_id": -3875358842991402074,
         "index_buffer_len": 42,
-        "index_buffer_prefix": [8, 0, 7, 0, 6, 0, 5, 0],
+        "index_buffer_prefix": [
+          8,
+          0,
+          7,
+          0,
+          6,
+          0,
+          5,
+          0
+        ],
         "vertex_data_len": 184,
-        "vertex_data_prefix": [246, 40, 28, 64, 0, 0, 64, 63]
+        "vertex_data_prefix": [
+          246,
+          40,
+          28,
+          64,
+          0,
+          0,
+          64,
+          63
+        ]
       }
     },
     {
@@ -96,9 +114,29 @@
       "expect": {
         "kind": "mesh",
         "index_buffer_len": 2172,
-        "index_buffer_prefix": [0, 0, 1, 0, 2, 0, 2, 0],
+        "index_buffer_prefix": [
+          0,
+          0,
+          1,
+          0,
+          2,
+          0,
+          2,
+          0
+        ],
         "vertex_data_len": 14480,
-        "vertex_data_prefix": [0, 0, 144, 68, 0, 192, 39, 68]
+        "vertex_data_prefix": [
+          0,
+          0,
+          144,
+          68,
+          0,
+          192,
+          39,
+          68
+        ],
+        "pptr_internal": [],
+        "pptr_external": []
       }
     },
     {
@@ -112,7 +150,18 @@
       "byte_size": 1044,
       "name": "BuildingsWaterTowerAtlas",
       "expect": {
-        "kind": "peek_only"
+        "kind": "peek_only",
+        "pptr_internal": [
+          -6786743639055429899,
+          -6741813433607418867,
+          -5595063733279288418,
+          -4203431552386163320,
+          602278551932518654,
+          1778385807017074325,
+          2108962940966160016,
+          4854455621282830033
+        ],
+        "pptr_external": []
       }
     }
   ]
