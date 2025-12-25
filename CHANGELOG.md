@@ -96,6 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Hardened length-prefixed string reads to avoid hostile allocations and out-of-bounds reads (length is validated against remaining bytes and a maximum limit).
 - Hardened UnityFS/legacy bundle parsing against hostile metadata (rejects negative counts/offsets, enforces `max_memory`/metadata caps before allocation/decompression).
+- Reduced peak memory usage when loading assets from UnityFS bundles by avoiding an extra full-buffer clone of decompressed bundle data.
 - Prevented integer overflow in LZ4 buffer sizing for large `uncompressed_size` values.
 - `Environment::load_file` now attempts binary detection for extension-less files (best-effort), improving support for `UnityWebData*` and other build artifacts.
 - Fixed `UnityFile` sniffing to avoid mis-classifying uncompressed `UnityWebData*` WebFiles as legacy `UnityWeb` bundles.

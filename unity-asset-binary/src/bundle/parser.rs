@@ -87,7 +87,7 @@ impl BundleParser {
 
             // Load assets if requested
             if options.load_assets {
-                Self::load_assets(bundle)?;
+                Self::load_assets(bundle, options)?;
             }
         } else {
             // Just parse directory structure without decompressing all data
@@ -157,7 +157,7 @@ impl BundleParser {
 
         // Load assets if requested
         if options.load_assets {
-            Self::load_assets(bundle)?;
+            Self::load_assets(bundle, options)?;
         }
 
         Ok(())
@@ -454,7 +454,7 @@ impl BundleParser {
             bundle.files.push(file_info);
 
             // Also create a directory node for consistency
-            let node = DirectoryNode::new(name, offset, size, 1); // Flag 1 = file
+            let node = DirectoryNode::new(name, offset, size, 0x4); // Flag 0x4 = file
             bundle.nodes.push(node);
         }
 
@@ -462,44 +462,62 @@ impl BundleParser {
     }
 
     /// Load assets from the bundle files
-    fn load_assets(bundle: &mut AssetBundle) -> Result<()> {
-        // Clone the data to avoid borrowing issues
-        let bundle_data = bundle.data().to_vec();
-        let mut data_reader = BinaryReader::new(&bundle_data, ByteOrder::Big);
+    fn load_assets(bundle: &mut AssetBundle, options: &BundleLoadOptions) -> Result<()> {
+        // Move out the decompressed data buffer to avoid cloning large bundles (peak memory).
+        let bundle_data = std::mem::take(bundle.data_mut());
 
-        // Clone nodes to avoid borrowing issues
-        let nodes = bundle.nodes.clone();
+        let result = (|| {
+            let mut data_reader = BinaryReader::new(&bundle_data, ByteOrder::Big);
 
-        for node in &nodes {
-            if node.is_file() {
-                // Skip non-asset files (like .resS files)
+            // Clone nodes to avoid borrow conflicts while pushing assets.
+            let nodes = bundle.nodes.clone();
+
+            for node in &nodes {
+                if !node.is_file() {
+                    continue;
+                }
+
+                // Skip non-asset files (like .resS files).
                 if node.name.ends_with(".resS") || node.name.ends_with(".resource") {
                     continue;
                 }
 
-                // Set position to the file's offset in decompressed data
-                data_reader.set_position(node.offset)?;
-
-                // Read the file data
-                let file_data = data_reader.read_bytes(node.size as usize)?;
-
-                // Try to parse as SerializedFile
-                match crate::asset::SerializedFileParser::from_bytes(file_data) {
-                    Ok(serialized_file) => {
-                        // Add the SerializedFile as an asset
-                        bundle.assets.push(serialized_file);
-                        bundle.asset_names.push(node.name.clone());
-                    }
-                    Err(_e) => {
-                        // If it's not a valid SerializedFile, skip or handle differently
-                        // For now, we'll skip non-serialized files
-                        continue;
+                if let Some(max_memory) = options.max_memory {
+                    if node.size > max_memory as u64 {
+                        return Err(BinaryError::ResourceLimitExceeded(format!(
+                            "Bundle node '{}' size {} exceeds max_memory {}",
+                            node.name, node.size, max_memory
+                        )));
                     }
                 }
-            }
-        }
 
-        Ok(())
+                // Set position to the file's offset in decompressed data.
+                data_reader.set_position(node.offset)?;
+
+                let size = usize::try_from(node.size).map_err(|_| {
+                    BinaryError::ResourceLimitExceeded(format!(
+                        "Bundle node '{}' size {} does not fit in usize",
+                        node.name, node.size
+                    ))
+                })?;
+
+                // Read the file data.
+                let file_data = data_reader.read_bytes(size)?;
+
+                // Try to parse as SerializedFile.
+                if let Ok(serialized_file) = crate::asset::SerializedFileParser::from_bytes(file_data)
+                {
+                    bundle.assets.push(serialized_file);
+                    bundle.asset_names.push(node.name.clone());
+                }
+            }
+
+            Ok(())
+        })();
+
+        // Always restore the decompressed buffer, even if parsing fails early.
+        *bundle.data_mut() = bundle_data;
+        result
     }
 
     /// Estimate parsing complexity
@@ -551,11 +569,27 @@ pub struct ParsingComplexity {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_parser_creation() {
         // Basic test to ensure parser can be created
         // In practice, you'd need actual bundle data to test parsing
         let _dummy = 1 + 1;
         assert_eq!(_dummy, 2);
+    }
+
+    #[test]
+    fn load_assets_restores_bundle_data_on_error() {
+        let mut bundle = AssetBundle::new(BundleHeader::default(), Vec::new());
+        *bundle.data_mut() = vec![0u8; 8];
+        bundle
+            .nodes
+            .push(DirectoryNode::new("a.assets".to_string(), 1024, 4, 0x4));
+
+        let original = bundle.data().to_vec();
+        let err = BundleParser::load_assets(&mut bundle, &BundleLoadOptions::default()).unwrap_err();
+        assert!(matches!(err, BinaryError::NotEnoughData { .. }));
+        assert_eq!(bundle.data(), original);
     }
 }
