@@ -137,7 +137,12 @@ impl BundleParser {
                     "UnityFS block data start does not fit in usize".to_string(),
                 )
             })?;
-            bundle.set_lazy_unityfs_source(source.clone(), start_usize, options.max_memory);
+            bundle.set_lazy_unityfs_source(
+                source.clone(),
+                start_usize,
+                options.max_memory,
+                options.max_unityfs_block_cache_memory,
+            );
             // Just parse directory structure without decompressing all data
             Self::parse_directory_lazy(bundle, reader)?;
         }

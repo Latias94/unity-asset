@@ -1,0 +1,158 @@
+use crate::cli::Commands;
+use crate::shared::AppContext;
+use anyhow::Result;
+
+mod deps;
+mod dump_typetree_registry;
+mod export_bundle;
+mod extract;
+mod find_object;
+mod inspect_object;
+mod list_bundle;
+mod parse_yaml;
+mod scan_pptr;
+
+pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
+    match command {
+        Commands::ParseYaml {
+            input,
+            format,
+            preserve_types,
+        } => parse_yaml::run(input, format, preserve_types, ctx),
+        Commands::Extract {
+            input,
+            output,
+            types,
+        } => extract::run(input, output, types, ctx),
+        Commands::ExportBundle {
+            input,
+            output,
+            pattern,
+            limit,
+            class_id,
+            class_name,
+            dry_run,
+            decode,
+            overwrite,
+            skip_existing,
+            manifest,
+            resume,
+            retry_failed_from,
+            continue_on_error,
+            jobs,
+        } => export_bundle::run(
+            input,
+            output,
+            pattern,
+            limit,
+            class_id,
+            class_name,
+            dry_run,
+            decode,
+            overwrite,
+            skip_existing,
+            manifest,
+            resume,
+            retry_failed_from,
+            continue_on_error,
+            jobs,
+            ctx,
+        ),
+        Commands::ListBundle {
+            input,
+            filter,
+            verbose,
+        } => list_bundle::run(input, filter, verbose, ctx),
+        Commands::FindObject {
+            input,
+            pattern,
+            name,
+            class_id,
+            class_name,
+            limit,
+            include_unresolved,
+            verbose,
+        } => find_object::run(
+            input,
+            pattern,
+            name,
+            class_id,
+            class_name,
+            limit,
+            include_unresolved,
+            verbose,
+            ctx,
+        ),
+        Commands::InspectObject {
+            input,
+            key,
+            source,
+            kind,
+            asset_index,
+            path_id,
+            max_depth,
+            max_items,
+            max_array,
+            filter,
+        } => inspect_object::run(
+            input,
+            key,
+            source,
+            kind,
+            asset_index,
+            path_id,
+            max_depth,
+            max_items,
+            max_array,
+            filter,
+            ctx,
+        ),
+        Commands::DumpTypeTreeRegistry {
+            input,
+            output,
+            class_id,
+            version_prefix,
+            overwrite,
+        } => dump_typetree_registry::run(input, output, class_id, version_prefix, overwrite, ctx),
+        Commands::ScanPPtr {
+            input,
+            kind,
+            source,
+            asset_index,
+            class_id,
+            name,
+            limit,
+            include_no_typetree,
+            json,
+        } => scan_pptr::run(
+            input,
+            kind,
+            source,
+            asset_index,
+            class_id,
+            name,
+            limit,
+            include_no_typetree,
+            json,
+            ctx,
+        ),
+        Commands::Deps {
+            input,
+            kind,
+            source,
+            asset_index,
+            format,
+            names,
+            max_edges,
+        } => deps::run(
+            input,
+            kind,
+            source,
+            asset_index,
+            format,
+            names,
+            max_edges,
+            ctx,
+        ),
+    }
+}

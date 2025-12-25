@@ -92,12 +92,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `find-object --verbose` now prints a copy/paste-able `BinaryObjectKey` string which can be fed into `inspect-object --key`.
 - (BREAKING) `BinaryObjectRef` / `EnvironmentObjectRef` are no longer `Copy` to support reporter/warning plumbing.
 - `unity-asset` CLI warning output is now centralized via `EnvironmentReporter` (no more per-command manual draining/printing).
+- `unity-asset-cli`: refactored the huge `src/main.rs` into command modules (`src/commands/*`) for easier maintenance and faster iteration (no intended behavior change).
 - (BREAKING) `EnvironmentReporter` is now `Send + Sync` and stored behind `Arc`, making `Environment` `Send + Sync` for concurrency-ready workflows.
 - (BREAKING) `unity-asset-binary` is now parser-only; decode/export helpers moved to the new `unity-asset-decode` crate (enable `unity-asset-decode/full` or specific features like `texture`/`audio`).
 - `unity-asset-cli` now has an explicit `decode` feature (now opt-in) to allow building a lighter CLI by default; use `--features decode` (or `--features full`) to enable decode/export helpers.
 - TypeTree array parsing now uses endianness-aware fast paths for common numeric primitive arrays (`SInt16/UInt16/SInt32/UInt32/SInt64/UInt64/float/double`).
 - (BREAKING) `UnityValue` now includes `Bytes(Vec<u8>)` and TypeTree parsing emits `Bytes` for `TypelessData` and byte arrays (`UInt8`/`char`/`SInt8`), reducing allocations for large objects.
 - (BREAKING) `BundleLoadOptions` now includes explicit resource limits (`max_blocks_info_size`, `max_blocks`, `max_nodes`) and bundle parsing enforces these limits.
+- (BREAKING) `BundleLoadOptions` now includes `max_unityfs_block_cache_memory` to cap lazy UnityFS block caching during `extract_node_data` range reads.
 - (BREAKING) Removed the unimplemented `unity-asset-binary` `xz2` feature to avoid implying improved Unity LZMA compatibility.
 - (BREAKING) `SerializedFile` can now be a zero-copy view into a shared backing buffer (e.g. bundle-decompressed data); `SerializedFile::data_arc()` returns the backing buffer and `SerializedFile::data()` returns the file view.
 - Dependency analysis now scans TypeTree streams for `PPtr` references without allocating full parsed objects, improving performance on large assets.
@@ -109,6 +111,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unified Unity `class_ids` constants across crates (single source of truth in `unity-asset-core`) and fixed Sprite/SpriteRenderer ID mismatches.
 - Hardened UnityFS/legacy bundle parsing against hostile metadata (rejects negative counts/offsets, enforces `max_memory`/metadata caps before allocation/decompression).
 - Hardened UnityFS/legacy bundle parsing against hostile *compressed-size* metadata (caps compressed blocks info reads and legacy directory reads before allocating).
+- Bounded UnityFS lazy block caching with an LRU eviction cap (`BundleLoadOptions::max_unityfs_block_cache_memory`) to avoid accidental OOM on large bundles.
 - Reduced peak memory usage when loading assets from UnityFS bundles by avoiding both an extra full-buffer clone and per-asset file byte copies (best-effort).
 - Hardened WebFile parsing against hostile metadata (rejects negative header sizes/offsets/lengths and enforces basic bounds checks).
 - Prevented integer overflow in LZ4 buffer sizing for large `uncompressed_size` values.

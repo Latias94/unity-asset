@@ -9,6 +9,7 @@ use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -18,9 +19,15 @@ struct UnityFsBlockCache {
     source: DataView,
     block_data_start: usize,
     max_memory: Option<usize>,
+    max_block_cache_memory: Option<usize>,
     compressed_starts: Vec<u64>,
     uncompressed_starts: Vec<u64>,
     cached: Vec<Option<Arc<[u8]>>>,
+    cached_bytes: usize,
+    cached_blocks: usize,
+    tick: u64,
+    last_tick: Vec<u64>,
+    lru: VecDeque<(usize, u64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +201,7 @@ impl AssetBundle {
         source: DataView,
         block_data_start: usize,
         max_memory: Option<usize>,
+        max_block_cache_memory: Option<usize>,
     ) {
         let mut guard = self.lazy.lock().unwrap();
         *guard = Some(LazyDecompress {
@@ -222,11 +230,17 @@ impl AssetBundle {
             source: guard.as_ref().unwrap().source.clone(),
             block_data_start,
             max_memory,
+            max_block_cache_memory,
             compressed_starts,
             uncompressed_starts,
             cached: std::iter::repeat_with(|| None)
                 .take(self.blocks.len())
                 .collect(),
+            cached_bytes: 0,
+            cached_blocks: 0,
+            tick: 0,
+            last_tick: vec![0; self.blocks.len()],
+            lru: VecDeque::new(),
         });
     }
 
@@ -290,6 +304,14 @@ impl AssetBundle {
                         )));
                     }
                 }
+                if let Some(limit) = cache.max_block_cache_memory {
+                    if (block.uncompressed_size as usize) > limit {
+                        return Err(BinaryError::ResourceLimitExceeded(format!(
+                            "Block uncompressed size {} exceeds max_unityfs_block_cache_memory {}",
+                            block.uncompressed_size, limit
+                        )));
+                    }
+                }
 
                 let mut reader = BinaryReader::new(cache.source.as_bytes(), ByteOrder::Big);
                 let comp_start = cache.compressed_starts[idx]
@@ -299,7 +321,40 @@ impl AssetBundle {
                 let compressed = reader.read_bytes(block.compressed_size as usize)?;
                 let decompressed = block.decompress(&compressed)?;
                 let arc: Arc<[u8]> = decompressed.into();
+                let arc_len = arc.len();
                 cache.cached[idx] = Some(arc);
+                cache.cached_bytes = cache.cached_bytes.checked_add(arc_len).ok_or_else(|| {
+                    BinaryError::ResourceLimitExceeded(
+                        "UnityFS block cache size overflow".to_string(),
+                    )
+                })?;
+                cache.cached_blocks = cache.cached_blocks.saturating_add(1);
+            }
+
+            cache.tick = cache.tick.wrapping_add(1);
+            cache.last_tick[idx] = cache.tick;
+            cache.lru.push_back((idx, cache.tick));
+
+            if let Some(limit) = cache.max_block_cache_memory {
+                while cache.cached_bytes > limit {
+                    let Some((evict_idx, evict_tick)) = cache.lru.pop_front() else {
+                        break;
+                    };
+                    if cache.last_tick[evict_idx] != evict_tick {
+                        continue;
+                    }
+                    if let Some(data) = cache.cached[evict_idx].take() {
+                        cache.cached_bytes = cache.cached_bytes.saturating_sub(data.len());
+                        cache.cached_blocks = cache.cached_blocks.saturating_sub(1);
+                    }
+                }
+
+                if cache.cached_bytes > limit {
+                    return Err(BinaryError::ResourceLimitExceeded(format!(
+                        "UnityFS block cache memory {} exceeds max_unityfs_block_cache_memory {}",
+                        cache.cached_bytes, limit
+                    )));
+                }
             }
 
             let data = cache.cached[idx]
@@ -634,7 +689,7 @@ mod tests {
 
         let bytes: Vec<u8> = (0u8..10u8).collect();
         let view = DataView::from_shared(SharedBytes::from_vec(bytes));
-        bundle.set_lazy_unityfs_source(view, 0, None);
+        bundle.set_lazy_unityfs_source(view, 0, None, None);
 
         let node = DirectoryNode::new("test.bin".to_string(), 3, 6, 0x4);
         let out = bundle.extract_node_data(&node).unwrap();
@@ -671,6 +726,13 @@ pub struct BundleLoadOptions {
     pub validate: bool,
     /// Maximum memory usage for decompression (in bytes)
     pub max_memory: Option<usize>,
+    /// Maximum memory for caching UnityFS *decompressed blocks* during lazy range extraction.
+    ///
+    /// This controls peak memory when `AssetBundle::extract_node_data` reads only a few nodes from
+    /// a large UnityFS without fully decompressing the entire bundle.
+    ///
+    /// If `None`, block cache growth is unbounded (not recommended for untrusted inputs).
+    pub max_unityfs_block_cache_memory: Option<usize>,
     /// Maximum size of compressed blocks info (metadata) in bytes.
     ///
     /// This is a cap on the *compressed* bytes read from the input stream before decompression.
@@ -696,6 +758,7 @@ impl Default for BundleLoadOptions {
             decompress_blocks: false,
             validate: true,
             max_memory: Some(1024 * 1024 * 1024), // 1GB default limit
+            max_unityfs_block_cache_memory: Some(1024 * 1024 * 1024), // 1GB default cap
             max_compressed_blocks_info_size: Some(64 * 1024 * 1024), // 64MB compressed metadata cap
             max_blocks_info_size: Some(64 * 1024 * 1024), // 64MB metadata cap
             max_legacy_directory_compressed_size: Some(64 * 1024 * 1024), // 64MB legacy dir cap
@@ -722,6 +785,7 @@ impl BundleLoadOptions {
             decompress_blocks: false,
             validate: false,
             max_memory: None,
+            max_unityfs_block_cache_memory: None,
             max_compressed_blocks_info_size: None,
             max_blocks_info_size: None,
             max_legacy_directory_compressed_size: None,
@@ -737,6 +801,7 @@ impl BundleLoadOptions {
             decompress_blocks: true,
             validate: true,
             max_memory: Some(2048 * 1024 * 1024), // 2GB for complete loading
+            max_unityfs_block_cache_memory: Some(2048 * 1024 * 1024), // 2GB cap
             max_compressed_blocks_info_size: Some(128 * 1024 * 1024), // 128MB compressed metadata cap
             max_blocks_info_size: Some(128 * 1024 * 1024),            // 128MB metadata cap
             max_legacy_directory_compressed_size: Some(128 * 1024 * 1024), // 128MB legacy dir cap
