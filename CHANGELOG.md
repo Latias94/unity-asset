@@ -68,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - (BREAKING) `BinaryObjectRef` / `EnvironmentObjectRef` are no longer `Copy` to support reporter/warning plumbing.
 - `unity-asset` CLI warning output is now centralized via `EnvironmentReporter` (no more per-command manual draining/printing).
 - (BREAKING) `unity-asset-binary` is now parser-only; decode/export helpers moved to the new `unity-asset-decode` crate (enable `unity-asset-decode/full` or specific features like `texture`/`audio`).
+- `unity-asset-cli` now has an explicit `decode` feature (enabled by default) to allow building a lighter CLI with `--no-default-features`.
 
 ### Fixed
 - Hardened length-prefixed string reads to avoid hostile allocations and out-of-bounds reads (length is validated against remaining bytes and a maximum limit).

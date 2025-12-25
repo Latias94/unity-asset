@@ -13,6 +13,8 @@ use unity_asset::environment::{
     EnvironmentWarning,
 };
 use unity_asset_binary::{asset::class_ids, object::UnityObject, unity_version::UnityVersion};
+
+#[cfg(feature = "decode")]
 use unity_asset_decode::{
     audio::{AudioClipConverter, AudioProcessor},
     sprite::SpriteProcessor,
@@ -633,6 +635,15 @@ fn export_bundle_command(
             let obj = env.read_binary_object_key(&key)?;
 
             if decode {
+                #[cfg(not(feature = "decode"))]
+                {
+                    let _ = obj;
+                    anyhow::bail!(
+                        "--decode requires compiling `unity-asset-cli` with feature `decode` (build with default features, or `--features decode`)."
+                    );
+                }
+
+                #[cfg(feature = "decode")]
                 let unity_version = match key.source_kind {
                     unity_asset::environment::BinarySourceKind::AssetBundle => env
                         .bundles()
@@ -647,6 +658,7 @@ fn export_bundle_command(
                         .unwrap_or_default(),
                 };
 
+                #[cfg(feature = "decode")]
                 let decoded_path: Option<PathBuf> = match obj.info.type_id {
                     class_ids::AUDIO_CLIP => (|| -> anyhow::Result<Option<PathBuf>> {
                         let converter = AudioClipConverter::new(unity_version.clone());
@@ -868,6 +880,7 @@ fn export_bundle_command(
                     _ => None,
                 };
 
+                #[cfg(feature = "decode")]
                 if let Some(dest) = decoded_path {
                     println!(
                         "✓ {} -> {:?} (decoded, class_id={})",
