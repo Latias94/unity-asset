@@ -238,6 +238,10 @@ cargo run --bin unity-asset -- inspect-object -i tests/samples --key 'bok2|bundl
 cargo run --bin unity-asset -- scan-pptr -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --limit 5
 cargo run --bin unity-asset -- scan-pptr -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --class-id 114 --json
 
+# Build a best-effort dependency graph via TypeTree PPtr scanning
+cargo run --bin unity-asset -- deps -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --format summary
+cargo run --bin unity-asset -- deps -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --format dot --max-edges 2000 > graph.dot
+
 # Export objects from AssetBundles via `m_Container` (UnityPy-like workflow)
 cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --limit 50
 # Decode known types (best-effort):

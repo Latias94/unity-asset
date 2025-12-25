@@ -302,6 +302,41 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Build a best-effort dependency graph using TypeTree PPtr scanning
+    ///
+    /// This is intentionally optimized for large assets: it prefers the zero-allocation PPtr scan
+    /// path (no full object parsing).
+    #[command(name = "deps")]
+    Deps {
+        /// Input file or directory path (assets/bundles will be auto-detected)
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Source kind: `bundle` or `serialized`
+        #[arg(long, default_value = "bundle")]
+        kind: String,
+
+        /// Source file path that contains the objects (an AssetBundle or a standalone SerializedFile)
+        #[arg(long)]
+        source: Option<PathBuf>,
+
+        /// Asset index inside the bundle (required when `--kind bundle`)
+        #[arg(long)]
+        asset_index: Option<usize>,
+
+        /// Output format: `summary`, `edges`, `dot`, or `json`
+        #[arg(long, default_value = "summary")]
+        format: String,
+
+        /// Include best-effort object names in `edges` output (uses TypeTree prefix peek)
+        #[arg(long)]
+        names: bool,
+
+        /// Maximum edges to print for `edges`/`dot` output (prevents huge dumps)
+        #[arg(long, default_value_t = 2000)]
+        max_edges: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -453,6 +488,26 @@ fn main() -> Result<()> {
             limit,
             include_no_typetree,
             json,
+            strict,
+            show_warnings,
+            typetree_registry.as_ref(),
+        ),
+        Commands::Deps {
+            input,
+            kind,
+            source,
+            asset_index,
+            format,
+            names,
+            max_edges,
+        } => deps_command(
+            input,
+            kind,
+            source,
+            asset_index,
+            format,
+            names,
+            max_edges,
             strict,
             show_warnings,
             typetree_registry.as_ref(),
@@ -2639,6 +2694,219 @@ fn scan_pptr_command(
                 &mut remaining,
             )?;
         }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct DepsOutput {
+    source: String,
+    source_kind: String,
+    asset_index: Option<usize>,
+    unity_version: String,
+    object_count: usize,
+    deps: unity_asset_binary::metadata::DependencyInfo,
+}
+
+fn deps_command(
+    input: PathBuf,
+    kind: String,
+    source: Option<PathBuf>,
+    asset_index: Option<usize>,
+    format: String,
+    names: bool,
+    max_edges: usize,
+    strict: bool,
+    show_warnings: bool,
+    typetree_registry: Option<&PathBuf>,
+) -> Result<()> {
+    use unity_asset_binary::metadata::DependencyAnalyzer;
+
+    let mut env = build_environment(strict, show_warnings, typetree_registry)?;
+    env.load(&input)?;
+
+    let kind_lc = kind.to_ascii_lowercase();
+    let source_kind = match kind_lc.as_str() {
+        "bundle" => unity_asset::environment::BinarySourceKind::AssetBundle,
+        "serialized" => unity_asset::environment::BinarySourceKind::SerializedFile,
+        other => anyhow::bail!("Invalid --kind: {} (expected bundle|serialized)", other),
+    };
+
+    let (resolved_source, asset_index, file) = match source_kind {
+        unity_asset::environment::BinarySourceKind::AssetBundle => {
+            let idx = asset_index.ok_or_else(|| {
+                anyhow::anyhow!("--asset-index is required when --kind bundle")
+            })?;
+            let bundle_source = if let Some(src) = source {
+                let req = BinarySource::path(&src);
+                resolve_loaded_source(&env, source_kind, &req)?
+            } else if env.bundles().len() == 1 {
+                env.bundles()
+                    .keys()
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("No bundles loaded"))?
+            } else {
+                let mut available: Vec<String> = env
+                    .bundles()
+                    .keys()
+                    .filter_map(|k| match k {
+                        BinarySource::Path(p) => Some(p),
+                        _ => None,
+                    })
+                    .map(|p| p.display().to_string())
+                    .collect();
+                available.sort();
+                anyhow::bail!(
+                    "--source is required when multiple bundles are loaded. Loaded bundles:\n- {}",
+                    available.join("\n- ")
+                );
+            };
+
+            let bundle = env
+                .bundles()
+                .get(&bundle_source)
+                .ok_or_else(|| anyhow::anyhow!("Bundle not found: {}", bundle_source))?;
+            let file = bundle.assets.get(idx).ok_or_else(|| {
+                anyhow::anyhow!("Bundle asset_index out of range: {}", idx)
+            })?;
+            (bundle_source, Some(idx), file)
+        }
+        unity_asset::environment::BinarySourceKind::SerializedFile => {
+            if asset_index.is_some() {
+                anyhow::bail!("--asset-index only applies to --kind bundle");
+            }
+            let asset_source = if let Some(src) = source {
+                let req = BinarySource::path(&src);
+                resolve_loaded_source(&env, source_kind, &req)?
+            } else if env.binary_assets().len() == 1 {
+                env.binary_assets()
+                    .keys()
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("No serialized files loaded"))?
+            } else {
+                let mut available: Vec<String> = env
+                    .binary_assets()
+                    .keys()
+                    .filter_map(|k| match k {
+                        BinarySource::Path(p) => Some(p),
+                        _ => None,
+                    })
+                    .map(|p| p.display().to_string())
+                    .collect();
+                available.sort();
+                anyhow::bail!(
+                    "--source is required when multiple serialized files are loaded. Loaded serialized files:\n- {}",
+                    available.join("\n- ")
+                );
+            };
+
+            let file = env
+                .binary_assets()
+                .get(&asset_source)
+                .ok_or_else(|| anyhow::anyhow!("SerializedFile not found: {}", asset_source))?;
+            (asset_source, None, file)
+        }
+    };
+
+    let objects: Vec<&unity_asset_binary::asset::ObjectInfo> = file.objects.iter().collect();
+    let mut analyzer = DependencyAnalyzer::new();
+    let deps = analyzer.analyze_dependencies_in_asset(file, &objects)?;
+
+    let fmt = format.to_ascii_lowercase();
+    match fmt.as_str() {
+        "summary" => {
+            println!(
+                "Source: {} (kind={:?}, asset_index={:?})",
+                resolved_source, source_kind, asset_index
+            );
+            println!("Unity: {}", file.unity_version);
+            println!("Objects: {}", file.objects.len());
+            println!(
+                "Internal refs: {} (edges={})",
+                deps.internal_references.len(),
+                deps.dependency_graph.edges.len()
+            );
+            println!("External refs: {}", deps.external_references.len());
+            println!("Roots: {}", deps.dependency_graph.root_objects.len());
+            println!("Leaves: {}", deps.dependency_graph.leaf_objects.len());
+            println!("Cycles: {}", deps.circular_dependencies.len());
+        }
+        "json" => {
+            let out = DepsOutput {
+                source: resolved_source.to_string(),
+                source_kind: match source_kind {
+                    unity_asset::environment::BinarySourceKind::AssetBundle => "bundle",
+                    unity_asset::environment::BinarySourceKind::SerializedFile => "serialized",
+                }
+                .to_string(),
+                asset_index,
+                unity_version: file.unity_version.clone(),
+                object_count: file.objects.len(),
+                deps,
+            };
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        "edges" => {
+            let mut printed = 0usize;
+            let mut name_cache: std::collections::HashMap<i64, String> =
+                std::collections::HashMap::new();
+
+            for (from, to) in deps.dependency_graph.edges.iter().take(max_edges) {
+                if printed >= max_edges {
+                    break;
+                }
+                if names {
+                    let from_name = name_cache.get(from).cloned().unwrap_or_else(|| {
+                        let n = file
+                            .find_object_handle(*from)
+                            .and_then(|h| h.peek_name().ok().flatten())
+                            .unwrap_or_default();
+                        name_cache.insert(*from, n.clone());
+                        n
+                    });
+                    let to_name = name_cache.get(to).cloned().unwrap_or_else(|| {
+                        let n = file
+                            .find_object_handle(*to)
+                            .and_then(|h| h.peek_name().ok().flatten())
+                            .unwrap_or_default();
+                        name_cache.insert(*to, n.clone());
+                        n
+                    });
+                    println!("{}({}) -> {}({})", from, from_name, to, to_name);
+                } else {
+                    println!("{} -> {}", from, to);
+                }
+                printed += 1;
+            }
+            if deps.dependency_graph.edges.len() > max_edges {
+                println!(
+                    "... (truncated: edges={}, max_edges={})",
+                    deps.dependency_graph.edges.len(),
+                    max_edges
+                );
+            }
+        }
+        "dot" => {
+            println!("digraph deps {{");
+            for (from, to) in deps.dependency_graph.edges.iter().take(max_edges) {
+                println!("  \"{}\" -> \"{}\";", from, to);
+            }
+            if deps.dependency_graph.edges.len() > max_edges {
+                println!(
+                    "  // truncated: edges={}, max_edges={}",
+                    deps.dependency_graph.edges.len(),
+                    max_edges
+                );
+            }
+            println!("}}");
+        }
+        other => anyhow::bail!(
+            "Invalid --format: {} (expected summary|edges|dot|json)",
+            other
+        ),
     }
 
     Ok(())
