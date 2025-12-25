@@ -47,3 +47,7 @@ lcov.info
 
 # Reference repositories (do not commit)
 repo-ref/
+
+# Python virtual environments (local tooling)
+.venv/
+.venv*/

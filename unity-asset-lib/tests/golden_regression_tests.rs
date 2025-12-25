@@ -34,12 +34,24 @@ enum GoldenExpect {
     AudioClipStreamed {
         stream_offset: u64,
         stream_size: u32,
+        #[serde(default)]
+        stream_path_suffix: Option<String>,
+        #[serde(default)]
+        compression_format: Option<i64>,
     },
     #[serde(rename = "texture2d")]
     Texture2D {
         width: i64,
         height: i64,
         texture_format: i64,
+        #[serde(default)]
+        stream_offset: Option<i64>,
+        #[serde(default)]
+        stream_size: Option<i64>,
+        #[serde(default)]
+        stream_path_suffix: Option<String>,
+        #[serde(default)]
+        complete_image_size: Option<i64>,
     },
     #[serde(rename = "sprite")]
     Sprite { rect_width: f64, rect_height: f64 },
@@ -49,6 +61,10 @@ enum GoldenExpect {
         index_buffer_len: Option<usize>,
         #[serde(default)]
         index_buffer_prefix: Vec<i64>,
+        #[serde(default)]
+        vertex_data_len: Option<usize>,
+        #[serde(default)]
+        vertex_data_prefix: Vec<i64>,
     },
     #[serde(rename = "peek_only")]
     PeekOnly,
@@ -173,7 +189,53 @@ fn golden_regression_smoke() {
             GoldenExpect::AudioClipStreamed {
                 stream_offset,
                 stream_size,
+                stream_path_suffix,
+                compression_format,
             } => {
+                if let Some(expected) = compression_format {
+                    assert_eq!(
+                        i64_field(&obj, "m_CompressionFormat"),
+                        expected,
+                        "m_CompressionFormat mismatch (case={})",
+                        case.id
+                    );
+                }
+
+                if let Some(expected_suffix) = stream_path_suffix.as_deref() {
+                    let res = obj
+                        .get("m_Resource")
+                        .expect("m_Resource present")
+                        .as_object()
+                        .expect("m_Resource object");
+                    let source = res
+                        .get("m_Source")
+                        .and_then(|v| v.as_str())
+                        .expect("m_Resource.m_Source string");
+                    assert!(
+                        source.ends_with(expected_suffix),
+                        "m_Resource.m_Source suffix mismatch (case={})",
+                        case.id
+                    );
+                    let off = res
+                        .get("m_Offset")
+                        .and_then(|v| v.as_i64())
+                        .expect("m_Resource.m_Offset int");
+                    let size = res
+                        .get("m_Size")
+                        .and_then(|v| v.as_i64())
+                        .expect("m_Resource.m_Size int");
+                    assert_eq!(
+                        off as u64, stream_offset,
+                        "m_Resource.m_Offset mismatch (case={})",
+                        case.id
+                    );
+                    assert_eq!(
+                        size as u32, stream_size,
+                        "m_Resource.m_Size mismatch (case={})",
+                        case.id
+                    );
+                }
+
                 let unity_version = env
                     .bundles()
                     .get(&key.source)
@@ -204,6 +266,10 @@ fn golden_regression_smoke() {
                 width,
                 height,
                 texture_format,
+                stream_offset,
+                stream_size,
+                stream_path_suffix,
+                complete_image_size,
             } => {
                 assert_eq!(
                     i64_field(&obj, "m_Width"),
@@ -223,6 +289,58 @@ fn golden_regression_smoke() {
                     "m_TextureFormat mismatch (case={})",
                     case.id
                 );
+
+                if let Some(expected) = complete_image_size {
+                    assert_eq!(
+                        i64_field(&obj, "m_CompleteImageSize"),
+                        expected,
+                        "m_CompleteImageSize mismatch (case={})",
+                        case.id
+                    );
+                }
+
+                if stream_offset.is_some() || stream_size.is_some() || stream_path_suffix.is_some()
+                {
+                    let sd = obj
+                        .get("m_StreamData")
+                        .expect("m_StreamData present")
+                        .as_object()
+                        .expect("m_StreamData object");
+
+                    if let Some(expected) = stream_offset {
+                        let off = sd
+                            .get("offset")
+                            .and_then(|v| v.as_i64())
+                            .expect("m_StreamData.offset int");
+                        assert_eq!(
+                            off, expected,
+                            "m_StreamData.offset mismatch (case={})",
+                            case.id
+                        );
+                    }
+                    if let Some(expected) = stream_size {
+                        let size = sd
+                            .get("size")
+                            .and_then(|v| v.as_i64())
+                            .expect("m_StreamData.size int");
+                        assert_eq!(
+                            size, expected,
+                            "m_StreamData.size mismatch (case={})",
+                            case.id
+                        );
+                    }
+                    if let Some(expected_suffix) = stream_path_suffix.as_deref() {
+                        let path = sd
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .expect("m_StreamData.path string");
+                        assert!(
+                            path.ends_with(expected_suffix),
+                            "m_StreamData.path suffix mismatch (case={})",
+                            case.id
+                        );
+                    }
+                }
             }
             GoldenExpect::Sprite {
                 rect_width,
@@ -255,6 +373,8 @@ fn golden_regression_smoke() {
             GoldenExpect::Mesh {
                 index_buffer_len,
                 index_buffer_prefix,
+                vertex_data_len,
+                vertex_data_prefix,
             } => {
                 if let Some(len) = index_buffer_len {
                     let buf_v = obj.get("m_IndexBuffer").expect("m_IndexBuffer present");
@@ -300,6 +420,60 @@ fn golden_regression_smoke() {
                             }
                         }
                         other => panic!("unexpected m_IndexBuffer type: {other:?}"),
+                    }
+                }
+
+                if let Some(len) = vertex_data_len {
+                    let vd = obj
+                        .get("m_VertexData")
+                        .expect("m_VertexData present")
+                        .as_object()
+                        .expect("m_VertexData object");
+                    let buf_v = vd
+                        .get("m_DataSize")
+                        .expect("m_VertexData.m_DataSize present");
+                    match buf_v {
+                        UnityValue::Bytes(b) => {
+                            assert_eq!(
+                                b.len(),
+                                len,
+                                "m_VertexData.m_DataSize len mismatch (case={})",
+                                case.id
+                            );
+                            if !vertex_data_prefix.is_empty() {
+                                let prefix: Vec<i64> = b
+                                    .iter()
+                                    .take(vertex_data_prefix.len())
+                                    .map(|v| *v as i64)
+                                    .collect();
+                                assert_eq!(
+                                    prefix, vertex_data_prefix,
+                                    "m_VertexData.m_DataSize prefix mismatch (case={})",
+                                    case.id
+                                );
+                            }
+                        }
+                        UnityValue::Array(arr) => {
+                            assert_eq!(
+                                arr.len(),
+                                len,
+                                "m_VertexData.m_DataSize len mismatch (case={})",
+                                case.id
+                            );
+                            if !vertex_data_prefix.is_empty() {
+                                let prefix: Vec<i64> = arr
+                                    .iter()
+                                    .take(vertex_data_prefix.len())
+                                    .map(|v| v.as_i64().expect("m_DataSize byte"))
+                                    .collect();
+                                assert_eq!(
+                                    prefix, vertex_data_prefix,
+                                    "m_VertexData.m_DataSize prefix mismatch (case={})",
+                                    case.id
+                                );
+                            }
+                        }
+                        other => panic!("unexpected m_VertexData.m_DataSize type: {other:?}"),
                     }
                 }
             }

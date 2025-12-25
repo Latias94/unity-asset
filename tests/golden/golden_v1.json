@@ -14,7 +14,9 @@
       "expect": {
         "kind": "audioclip_streamed",
         "stream_offset": 4096,
-        "stream_size": 17088
+        "stream_size": 17088,
+        "stream_path_suffix": ".resource",
+        "compression_format": 1
       }
     },
     {
@@ -31,7 +33,11 @@
         "kind": "texture2d",
         "width": 492,
         "height": 180,
-        "texture_format": 56
+        "texture_format": 56,
+        "stream_offset": 0,
+        "stream_size": 39360,
+        "stream_path_suffix": ".resS",
+        "complete_image_size": 39360
       }
     },
     {
@@ -64,7 +70,11 @@
         "kind": "texture2d",
         "width": 2048,
         "height": 976,
-        "texture_format": 47
+        "texture_format": 47,
+        "stream_offset": 0,
+        "stream_size": 1998848,
+        "stream_path_suffix": ".resS",
+        "complete_image_size": 1998848
       }
     },
     {
@@ -80,7 +90,9 @@
       "expect": {
         "kind": "mesh",
         "index_buffer_len": 2172,
-        "index_buffer_prefix": [0, 0, 1, 0, 2, 0, 2, 0]
+        "index_buffer_prefix": [0, 0, 1, 0, 2, 0, 2, 0],
+        "vertex_data_len": 14480,
+        "vertex_data_prefix": [0, 0, 144, 68, 0, 192, 39, 68]
       }
     },
     {
