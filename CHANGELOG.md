@@ -64,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Improved UnityPy parity for `SerializedFile` parsing (object table, script types, file identifiers, and version-dependent fields).
+- Refactored `unity-asset` `Environment` implementation into smaller modules (`container`/`stream`) for maintainability (no intended behavior change).
 - (BREAKING) Unified binary object model: `UnityObject` now wraps `asset::ObjectInfo` + parsed `UnityClass` instead of maintaining a duplicated `ObjectInfo`.
 - (BREAKING) `SerializedFileParser::from_bytes` now defaults to lazy object data access to avoid copying per-object buffers (use `from_bytes_with_options(data, true)` to restore eager preloading).
 - (BREAKING) `SerializedFileHeader` now stores v22+ `file_size` / `data_offset` as `u64` (no truncation), and rejects negative header values.
