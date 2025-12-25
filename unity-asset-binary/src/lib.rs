@@ -42,6 +42,7 @@
 pub mod asset;
 pub mod bundle;
 pub mod compression;
+pub mod data_view;
 pub mod error;
 pub mod file;
 pub mod formats;

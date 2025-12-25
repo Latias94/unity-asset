@@ -6,6 +6,7 @@ use super::header::BundleHeader;
 use crate::asset::Asset;
 use crate::compression::CompressionBlock;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Information about a file within the bundle
 ///
@@ -105,7 +106,7 @@ pub struct AssetBundle {
     /// Asset file names within the bundle (aligned with `assets` indices).
     pub asset_names: Vec<String>,
     /// Raw bundle data
-    data: Vec<u8>,
+    data: Arc<[u8]>,
 }
 
 impl AssetBundle {
@@ -118,18 +119,22 @@ impl AssetBundle {
             files: Vec::new(),
             assets: Vec::new(),
             asset_names: Vec::new(),
-            data,
+            data: data.into(),
         }
     }
 
     /// Get the raw bundle data
     pub fn data(&self) -> &[u8] {
-        &self.data
+        self.data.as_ref()
     }
 
-    /// Get mutable access to the raw bundle data
-    pub fn data_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.data
+    /// Get a shared reference to the raw bundle data.
+    pub fn data_arc(&self) -> Arc<[u8]> {
+        self.data.clone()
+    }
+
+    pub(crate) fn set_data(&mut self, data: Vec<u8>) {
+        self.data = data.into();
     }
 
     /// Get the total size of the bundle
@@ -180,6 +185,11 @@ impl AssetBundle {
 
     /// Extract data for a specific file
     pub fn extract_file_data(&self, file: &BundleFileInfo) -> crate::error::Result<Vec<u8>> {
+        let bytes = self.extract_file_slice(file)?;
+        Ok(bytes.to_vec())
+    }
+
+    pub fn extract_file_slice(&self, file: &BundleFileInfo) -> crate::error::Result<&[u8]> {
         if file.offset + file.size > self.data.len() as u64 {
             return Err(crate::error::BinaryError::invalid_data(
                 "File offset/size exceeds bundle data",
@@ -188,11 +198,16 @@ impl AssetBundle {
 
         let start = file.offset as usize;
         let end = (file.offset + file.size) as usize;
-        Ok(self.data[start..end].to_vec())
+        Ok(&self.data[start..end])
     }
 
     /// Extract data for a specific node
     pub fn extract_node_data(&self, node: &DirectoryNode) -> crate::error::Result<Vec<u8>> {
+        let bytes = self.extract_node_slice(node)?;
+        Ok(bytes.to_vec())
+    }
+
+    pub fn extract_node_slice(&self, node: &DirectoryNode) -> crate::error::Result<&[u8]> {
         if node.offset + node.size > self.data.len() as u64 {
             return Err(crate::error::BinaryError::invalid_data(
                 "Node offset/size exceeds bundle data",
@@ -201,7 +216,7 @@ impl AssetBundle {
 
         let start = node.offset as usize;
         let end = (node.offset + node.size) as usize;
-        Ok(self.data[start..end].to_vec())
+        Ok(&self.data[start..end])
     }
 
     /// Get bundle statistics

@@ -9,7 +9,6 @@ use crate::error::Result;
 use crate::reader::BinaryReader;
 use crate::typetree::{TypeTree, TypeTreeSerializer};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use unity_asset_core::UnityValue;
 
 /// Dependency analyzer for Unity assets
@@ -20,7 +19,7 @@ pub struct DependencyAnalyzer {
     /// Cache for analyzed dependencies
     dependency_cache: HashMap<i64, Vec<i64>>,
     /// Cache for analyzed dependencies (TypeTree + PPtr scan), keyed by (asset identity, path_id)
-    pptr_dependency_cache: HashMap<(usize, i64), ExtractedDependencies>,
+    pptr_dependency_cache: HashMap<((usize, usize, usize), i64), ExtractedDependencies>,
     /// Cache for reverse dependencies
     reverse_dependency_cache: HashMap<i64, Vec<i64>>,
 }
@@ -176,8 +175,7 @@ impl DependencyAnalyzer {
         asset: &SerializedFile,
         obj: &crate::asset::ObjectInfo,
     ) -> Result<ExtractedDependencies> {
-        let data = asset.data_arc();
-        let file_key = Arc::as_ptr(&data) as *const u8 as usize;
+        let file_key = asset.data_identity_key();
 
         if let Some(cached) = self.pptr_dependency_cache.get(&(file_key, obj.path_id)) {
             return Ok(cached.clone());
@@ -324,8 +322,7 @@ impl DependencyAnalyzer {
         asset: &SerializedFile,
         object_id: i64,
     ) -> Option<(Vec<i64>, Vec<(i32, i64)>)> {
-        let data = asset.data_arc();
-        let file_key = Arc::as_ptr(&data) as *const u8 as usize;
+        let file_key = asset.data_identity_key();
         self.pptr_dependency_cache
             .get(&(file_key, object_id))
             .map(|deps| (deps.internal.clone(), deps.external.clone()))

@@ -224,10 +224,11 @@ impl UnityObject {
         let type_tree = type_tree_for_object(file, info);
         let byte_order = file.header.byte_order();
         let (start, end) = object_range(file, info)?;
+        let base = file.data_base_offset();
         let raw = ObjectBytes::Shared {
             data: file.data_arc(),
-            start,
-            end,
+            start: base + start,
+            end: base + end,
         };
 
         let mut class = UnityClass::new(

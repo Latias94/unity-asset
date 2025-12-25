@@ -10,7 +10,9 @@ use crate::error::{BinaryError, Result};
 use crate::object::ObjectHandle;
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::typetree::TypeTreeRegistry;
+use crate::data_view::DataView;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -33,6 +35,29 @@ impl SerializedFileParser {
         preload_object_data: bool,
     ) -> Result<SerializedFile> {
         let data: Arc<[u8]> = data.into();
+        let len = data.len();
+        Self::from_shared_range_with_options(data, 0..len, preload_object_data)
+    }
+
+    /// Parse a SerializedFile from a shared backing buffer + byte range (zero-copy view).
+    pub fn from_shared_range(
+        data: Arc<[u8]>,
+        range: Range<usize>,
+    ) -> Result<SerializedFile> {
+        Self::from_shared_range_with_options(data, range, false)
+    }
+
+    /// Parse a SerializedFile from a shared backing buffer + byte range (zero-copy view), with options.
+    pub fn from_shared_range_with_options(
+        data: Arc<[u8]>,
+        range: Range<usize>,
+        preload_object_data: bool,
+    ) -> Result<SerializedFile> {
+        let view = DataView::from_range(data, range)?;
+        Self::from_view_with_options(view, preload_object_data)
+    }
+
+    fn from_view_with_options(view: DataView, preload_object_data: bool) -> Result<SerializedFile> {
         let mut file = SerializedFile {
             header: SerializedFileHeader::default(),
             unity_version: String::new(),
@@ -46,13 +71,16 @@ impl SerializedFileParser {
             externals: Vec::new(),
             ref_types: Vec::new(),
             user_information: String::new(),
-            data,
+            data: view,
             object_index_by_path_id: OnceLock::new(),
         };
 
         {
-            let data = file.data.clone();
-            let mut reader = BinaryReader::new(data.as_ref(), ByteOrder::Big);
+            let backing = file.data.backing_arc();
+            let start = file.data.base_offset();
+            let len = file.data.len();
+            let bytes = &backing[start..start + len];
+            let mut reader = BinaryReader::new(bytes, ByteOrder::Big);
 
             // Read header
             file.header = SerializedFileHeader::from_reader(&mut reader)?;
@@ -364,7 +392,7 @@ pub struct SerializedFile {
     /// User information
     pub user_information: String,
     /// Raw file data
-    data: Arc<[u8]>,
+    data: DataView,
     object_index_by_path_id: OnceLock<HashMap<i64, usize>>,
 }
 
@@ -375,12 +403,25 @@ impl SerializedFile {
 
     /// Get the raw file data
     pub fn data(&self) -> &[u8] {
-        self.data.as_ref()
+        self.data.as_bytes()
     }
 
-    /// Get a shared reference to the raw file data.
+    /// Get the backing shared buffer for this file's bytes.
+    ///
+    /// Note: for embedded files (e.g. files inside a decompressed bundle buffer), this is the
+    /// shared backing buffer and may be larger than `self.data()`.
     pub fn data_arc(&self) -> Arc<[u8]> {
-        self.data.clone()
+        self.data.backing_arc()
+    }
+
+    /// Base offset of this file within the backing shared buffer returned by `data_arc()`.
+    pub fn data_base_offset(&self) -> usize {
+        self.data.base_offset()
+    }
+
+    /// A stable identity key for caches: `(backing_ptr, base_offset, len)`.
+    pub fn data_identity_key(&self) -> (usize, usize, usize) {
+        self.data.identity_key()
     }
 
     /// Get the raw bytes for an object without requiring preloaded per-object buffers.
@@ -647,8 +688,11 @@ impl SerializedFile {
     }
 
     fn load_object_data(&mut self) -> Result<()> {
-        let data = self.data.clone();
-        let file_len = data.len();
+        let backing = self.data.backing_arc();
+        let start = self.data.base_offset();
+        let len = self.data.len();
+        let bytes = &backing[start..start + len];
+        let file_len = bytes.len();
         for obj in &mut self.objects {
             let start: usize = obj.byte_start.try_into().map_err(|_| {
                 BinaryError::invalid_data(format!("Object byte_start overflow: {}", obj.byte_start))
@@ -660,7 +704,7 @@ impl SerializedFile {
                     obj.path_id, start, obj.byte_size, file_len
                 )));
             }
-            obj.data = data[start..end].to_vec();
+            obj.data = bytes[start..end].to_vec();
         }
         Ok(())
     }

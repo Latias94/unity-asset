@@ -77,6 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - For large objects without TypeTree, `_raw_data` is no longer expanded into a full byte array; use `UnityObject::raw_data()` (properties now include `_raw_data_len` and a small `_raw_data_preview`).
 - `Environment` now caches best-effort AssetBundle `m_Container` extraction results to avoid repeated parsing during lookups.
 - `AssetBundle` now tracks parsed asset file names (`asset_names`) to help resolve in-bundle references.
+- `unity-asset-binary` `SerializedFileParser::from_shared_range*` to parse embedded/packed SerializedFiles from a shared backing buffer without copying bytes (best-effort).
+- `unity-asset-binary` `AssetBundle::{extract_file_slice, extract_node_slice}` to access bundle entry bytes without allocating.
 - Marked the most comprehensive UnityPy-port integration tests as `#[ignore]` by default to keep `cargo test` fast (see `CONTRIBUTING.md` for running ignored tests).
 - Reduced duplicated bundle parsing in `Environment` unit tests to speed up the default `cargo test` loop.
 - `find-object --verbose` now prints a copy/paste-able `BinaryObjectKey` string which can be fed into `inspect-object --key`.
@@ -89,6 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - (BREAKING) `UnityValue` now includes `Bytes(Vec<u8>)` and TypeTree parsing emits `Bytes` for `TypelessData` and byte arrays (`UInt8`/`char`/`SInt8`), reducing allocations for large objects.
 - (BREAKING) `BundleLoadOptions` now includes explicit resource limits (`max_blocks_info_size`, `max_blocks`, `max_nodes`) and bundle parsing enforces these limits.
 - (BREAKING) Removed the unimplemented `unity-asset-binary` `xz2` feature to avoid implying improved Unity LZMA compatibility.
+- (BREAKING) `SerializedFile` can now be a zero-copy view into a shared backing buffer (e.g. bundle-decompressed data); `SerializedFile::data_arc()` returns the backing buffer and `SerializedFile::data()` returns the file view.
 - Dependency analysis now scans TypeTree streams for `PPtr` references without allocating full parsed objects, improving performance on large assets.
 - Best-effort TypeTree support for managed references: parses `ReferencedObjectData` payloads via `SerializedFile.ref_types` (Unity 2019+) and skips `ManagedReferencesRegistry` nodes to keep parsing fast.
 - When managed reference payload types cannot be resolved, `ReferencedObject` now includes `_referenced_type_unresolved=true` and `_referenced_type_key=\"class|ns|asm\"` for explainable fallbacks.
@@ -96,7 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Hardened length-prefixed string reads to avoid hostile allocations and out-of-bounds reads (length is validated against remaining bytes and a maximum limit).
 - Hardened UnityFS/legacy bundle parsing against hostile metadata (rejects negative counts/offsets, enforces `max_memory`/metadata caps before allocation/decompression).
-- Reduced peak memory usage when loading assets from UnityFS bundles by avoiding an extra full-buffer clone of decompressed bundle data.
+- Reduced peak memory usage when loading assets from UnityFS bundles by avoiding both an extra full-buffer clone and per-asset file byte copies (best-effort).
 - Prevented integer overflow in LZ4 buffer sizing for large `uncompressed_size` values.
 - `Environment::load_file` now attempts binary detection for extension-less files (best-effort), improving support for `UnityWebData*` and other build artifacts.
 - Fixed `UnityFile` sniffing to avoid mis-classifying uncompressed `UnityWebData*` WebFiles as legacy `UnityWeb` bundles.

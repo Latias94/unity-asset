@@ -272,7 +272,7 @@ impl BundleParser {
     /// Parse files from decompressed block data
     fn parse_files(bundle: &mut AssetBundle, blocks_data: Vec<u8>) -> Result<()> {
         // Store the decompressed data
-        *bundle.data_mut() = blocks_data;
+        bundle.set_data(blocks_data);
 
         // Create file info for each node
         for node in &bundle.nodes {
@@ -463,61 +463,62 @@ impl BundleParser {
 
     /// Load assets from the bundle files
     fn load_assets(bundle: &mut AssetBundle, options: &BundleLoadOptions) -> Result<()> {
-        // Move out the decompressed data buffer to avoid cloning large bundles (peak memory).
-        let bundle_data = std::mem::take(bundle.data_mut());
+        let data = bundle.data_arc();
+        let data_len = data.len() as u64;
 
-        let result = (|| {
-            let mut data_reader = BinaryReader::new(&bundle_data, ByteOrder::Big);
+        // Clone nodes to avoid borrow conflicts while pushing assets.
+        let nodes = bundle.nodes.clone();
 
-            // Clone nodes to avoid borrow conflicts while pushing assets.
-            let nodes = bundle.nodes.clone();
+        for node in &nodes {
+            if !node.is_file() {
+                continue;
+            }
 
-            for node in &nodes {
-                if !node.is_file() {
-                    continue;
-                }
+            // Skip non-asset files (like .resS files).
+            if node.name.ends_with(".resS") || node.name.ends_with(".resource") {
+                continue;
+            }
 
-                // Skip non-asset files (like .resS files).
-                if node.name.ends_with(".resS") || node.name.ends_with(".resource") {
-                    continue;
-                }
+            let end = node.offset.saturating_add(node.size);
+            if end > data_len {
+                return Err(BinaryError::invalid_data(format!(
+                    "Bundle node '{}' exceeds decompressed data: end {} > {}",
+                    node.name, end, data_len
+                )));
+            }
 
-                if let Some(max_memory) = options.max_memory {
-                    if node.size > max_memory as u64 {
-                        return Err(BinaryError::ResourceLimitExceeded(format!(
-                            "Bundle node '{}' size {} exceeds max_memory {}",
-                            node.name, node.size, max_memory
-                        )));
-                    }
-                }
-
-                // Set position to the file's offset in decompressed data.
-                data_reader.set_position(node.offset)?;
-
-                let size = usize::try_from(node.size).map_err(|_| {
-                    BinaryError::ResourceLimitExceeded(format!(
-                        "Bundle node '{}' size {} does not fit in usize",
-                        node.name, node.size
-                    ))
-                })?;
-
-                // Read the file data.
-                let file_data = data_reader.read_bytes(size)?;
-
-                // Try to parse as SerializedFile.
-                if let Ok(serialized_file) = crate::asset::SerializedFileParser::from_bytes(file_data)
-                {
-                    bundle.assets.push(serialized_file);
-                    bundle.asset_names.push(node.name.clone());
+            if let Some(max_memory) = options.max_memory {
+                if node.size > max_memory as u64 {
+                    return Err(BinaryError::ResourceLimitExceeded(format!(
+                        "Bundle node '{}' size {} exceeds max_memory {}",
+                        node.name, node.size, max_memory
+                    )));
                 }
             }
 
-            Ok(())
-        })();
+            let start = usize::try_from(node.offset).map_err(|_| {
+                BinaryError::ResourceLimitExceeded(format!(
+                    "Bundle node '{}' offset {} does not fit in usize",
+                    node.name, node.offset
+                ))
+            })?;
+            let end = usize::try_from(end).map_err(|_| {
+                BinaryError::ResourceLimitExceeded(format!(
+                    "Bundle node '{}' end {} does not fit in usize",
+                    node.name, end
+                ))
+            })?;
 
-        // Always restore the decompressed buffer, even if parsing fails early.
-        *bundle.data_mut() = bundle_data;
-        result
+            // Parse as a zero-copy view into the decompressed bundle buffer.
+            if let Ok(serialized_file) =
+                crate::asset::SerializedFileParser::from_shared_range(data.clone(), start..end)
+            {
+                bundle.assets.push(serialized_file);
+                bundle.asset_names.push(node.name.clone());
+            }
+        }
+
+        Ok(())
     }
 
     /// Estimate parsing complexity
@@ -580,16 +581,14 @@ mod tests {
     }
 
     #[test]
-    fn load_assets_restores_bundle_data_on_error() {
+    fn load_assets_rejects_out_of_bounds_node() {
         let mut bundle = AssetBundle::new(BundleHeader::default(), Vec::new());
-        *bundle.data_mut() = vec![0u8; 8];
+        bundle.set_data(vec![0u8; 8]);
         bundle
             .nodes
             .push(DirectoryNode::new("a.assets".to_string(), 1024, 4, 0x4));
 
-        let original = bundle.data().to_vec();
         let err = BundleParser::load_assets(&mut bundle, &BundleLoadOptions::default()).unwrap_err();
-        assert!(matches!(err, BinaryError::NotEnoughData { .. }));
-        assert_eq!(bundle.data(), original);
+        assert!(matches!(err, BinaryError::InvalidData(_)));
     }
 }
