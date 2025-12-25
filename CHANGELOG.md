@@ -105,6 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Hardened length-prefixed string reads to avoid hostile allocations and out-of-bounds reads (length is validated against remaining bytes and a maximum limit).
+- Unified Unity `class_ids` constants across crates (single source of truth in `unity-asset-core`) and fixed Sprite/SpriteRenderer ID mismatches.
 - Hardened UnityFS/legacy bundle parsing against hostile metadata (rejects negative counts/offsets, enforces `max_memory`/metadata caps before allocation/decompression).
 - Hardened UnityFS/legacy bundle parsing against hostile *compressed-size* metadata (caps compressed blocks info reads and legacy directory reads before allocating).
 - Reduced peak memory usage when loading assets from UnityFS bundles by avoiding both an extra full-buffer clone and per-asset file byte copies (best-effort).

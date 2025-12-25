@@ -422,25 +422,8 @@ impl TypeRegistry {
     }
 }
 
-/// Unity class ID constants
-pub mod class_ids {
-    pub const OBJECT: i32 = 1;
-    pub const COMPONENT: i32 = 2;
-    pub const BEHAVIOUR: i32 = 3;
-    pub const UNITY_ENGINE_OBJECT: i32 = 4;
-    pub const GAME_OBJECT: i32 = 1;
-    pub const TRANSFORM: i32 = 4;
-    pub const MONO_BEHAVIOUR: i32 = 114;
-    pub const TEXTURE_2D: i32 = 28;
-    pub const SPRITE: i32 = 213;
-    pub const MESH: i32 = 43;
-    pub const AUDIO_CLIP: i32 = 83;
-    pub const TEXT_ASSET: i32 = 49;
-    pub const MATERIAL: i32 = 21;
-    pub const SHADER: i32 = 48;
-    pub const ANIMATION_CLIP: i32 = 74;
-    pub const ANIMATOR_CONTROLLER: i32 = 91;
-}
+/// Unity class ID constants (single source of truth: `unity-asset-core`)
+pub use unity_asset_core::class_ids;
 
 /// Script type reference (UnityPy: LocalSerializedObjectIdentifier)
 #[derive(Debug, Clone, Serialize, Deserialize)]

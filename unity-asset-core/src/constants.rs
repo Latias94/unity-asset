@@ -170,6 +170,7 @@ pub mod class_ids {
     pub const OBJECT: i32 = 0;
     pub const GAME_OBJECT: i32 = 1;
     pub const COMPONENT: i32 = 2;
+    pub const BEHAVIOUR: i32 = 8;
     pub const TRANSFORM: i32 = 4;
     pub const CAMERA: i32 = 20;
     pub const MATERIAL: i32 = 21;
@@ -178,9 +179,15 @@ pub mod class_ids {
     pub const MESH: i32 = 43;
     pub const SHADER: i32 = 48;
     pub const TEXTURE: i32 = 27;
-    pub const SPRITE: i32 = 212;
+    pub const TEXT_ASSET: i32 = 49;
+    pub const ANIMATION_CLIP: i32 = 74;
+    pub const AUDIO_CLIP: i32 = 83;
+    pub const ANIMATOR_CONTROLLER: i32 = 91;
     pub const MONO_BEHAVIOUR: i32 = 114;
     pub const MONO_SCRIPT: i32 = 115;
+    pub const ASSET_BUNDLE: i32 = 142;
+    pub const SPRITE_RENDERER: i32 = 212;
+    pub const SPRITE: i32 = 213;
     pub const PREFAB: i32 = 1001;
     pub const PREFAB_INSTANCE: i32 = 1001; // Same as PREFAB in some versions
 }
@@ -214,6 +221,26 @@ mod tests {
         assert_eq!(LineEnding::Unix.as_str(), "\n");
         assert_eq!(LineEnding::Windows.as_str(), "\r\n");
         assert_eq!(LineEnding::Mac.as_str(), "\r");
+    }
+
+    #[test]
+    fn test_common_class_ids() {
+        assert_eq!(class_ids::OBJECT, 0);
+        assert_eq!(class_ids::GAME_OBJECT, 1);
+        assert_eq!(class_ids::COMPONENT, 2);
+        assert_eq!(class_ids::TRANSFORM, 4);
+        assert_eq!(class_ids::BEHAVIOUR, 8);
+        assert_eq!(class_ids::SPRITE_RENDERER, 212);
+        assert_eq!(class_ids::SPRITE, 213);
+
+        assert_eq!(
+            GLOBAL_CLASS_ID_MAP.get_class_name(class_ids::SPRITE),
+            Some("Sprite".to_string())
+        );
+        assert_eq!(
+            GLOBAL_CLASS_ID_MAP.get_class_name(class_ids::SPRITE_RENDERER),
+            Some("SpriteRenderer".to_string())
+        );
     }
 
     #[test]
