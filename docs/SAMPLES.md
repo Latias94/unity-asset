@@ -59,6 +59,8 @@ For binary samples, we maintain a UnityPy-generated golden JSON used by Rust reg
   - create/activate Python venv (see your local setup)
   - run `./.venv-unitypy/bin/python scripts/regenerate_golden_v1_unitypy.py --write`
 
+Note: golden regeneration is a local development tool and is not part of the CI release workflow.
+
 ## Contribution rules for samples
 
 - Do not commit any `repo-ref/*` content.

@@ -89,7 +89,7 @@ unity-asset/
 
 ### Installation
 
-**Note**: This project will be published to crates.io soon. For now, to try it out:
+**Note**: crates.io publishing is planned, but not guaranteed yet. For now, to try it out:
 
 ```bash
 # Clone and build from source
@@ -109,7 +109,7 @@ cargo run --features async --bin unity-asset-async -- --help
 
 For maintainers: the tag-driven publish/release process is documented in `docs/RELEASING.md`.
 
-Once `0.2.0` is published, you'll be able to install it with:
+Once `v0.2.0` is published to crates.io, you'll be able to install it with:
 
 ```toml
 # Add to your Cargo.toml
