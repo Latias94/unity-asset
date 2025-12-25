@@ -87,6 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - (BREAKING) `UnityValue` now includes `Bytes(Vec<u8>)` and TypeTree parsing emits `Bytes` for `TypelessData` and byte arrays (`UInt8`/`char`/`SInt8`), reducing allocations for large objects.
 - Dependency analysis now scans TypeTree streams for `PPtr` references without allocating full parsed objects, improving performance on large assets.
 - Best-effort TypeTree support for managed references: parses `ReferencedObjectData` payloads via `SerializedFile.ref_types` (Unity 2019+) and skips `ManagedReferencesRegistry` nodes to keep parsing fast.
+- When managed reference payload types cannot be resolved, `ReferencedObject` now includes `_referenced_type_unresolved=true` and `_referenced_type_key=\"class|ns|asm\"` for explainable fallbacks.
 
 ### Fixed
 - Hardened length-prefixed string reads to avoid hostile allocations and out-of-bounds reads (length is validated against remaining bytes and a maximum limit).

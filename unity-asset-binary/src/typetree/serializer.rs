@@ -579,6 +579,19 @@ impl<'a> TypeTreeSerializer<'a> {
                             }
                         }
 
+                        // Explainable fallback: mark unresolved referenced type so callers can
+                        // distinguish “parsed placeholder layout” vs “typed payload”.
+                        if let Some((class, ns, asm)) = referenced_type_triplet(&nested) {
+                            nested.insert(
+                                "_referenced_type_unresolved".to_string(),
+                                UnityValue::Bool(true),
+                            );
+                            nested.insert(
+                                "_referenced_type_key".to_string(),
+                                UnityValue::String(format!("{}|{}|{}", class, ns, asm)),
+                            );
+                        }
+
                         // Fallback: parse according to the placeholder node.
                         let v = self.parse_value_by_type_ctx(reader, child, ctx)?;
                         if !child.name.is_empty() {
@@ -1090,6 +1103,23 @@ fn resolve_ref_type_tree<'a>(
             None
         }
     })
+}
+
+fn referenced_type_triplet(referenced_object: &IndexMap<String, UnityValue>) -> Option<(String, String, String)> {
+    let type_v = referenced_object.get("type")?;
+    let type_obj = type_v.as_object()?;
+    let class = type_obj.get("class")?.as_str()?.to_string();
+    let ns = type_obj
+        .get("ns")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let asm = type_obj
+        .get("asm")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some((class, ns, asm))
 }
 
 #[cfg(test)]

@@ -96,3 +96,79 @@ fn referenced_object_data_is_parsed_via_ref_types() {
     assert_eq!(data.get("m_Value").and_then(|v| v.as_i64()), Some(123));
 }
 
+#[test]
+fn referenced_object_fallback_marks_unresolved_type() {
+    // No ref_types provided; ReferencedObjectData should fall back but remain explainable.
+    let mut tree = TypeTree::new();
+    let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
+
+    let mut ref_obj =
+        TypeTreeNode::with_info("ReferencedObject".to_string(), "m_Ref".to_string(), -1);
+    let mut type_node = TypeTreeNode::with_info("TypeInfo".to_string(), "type".to_string(), -1);
+    type_node.children.push(TypeTreeNode::with_info(
+        "string".to_string(),
+        "class".to_string(),
+        -1,
+    ));
+    type_node.children.push(TypeTreeNode::with_info(
+        "string".to_string(),
+        "ns".to_string(),
+        -1,
+    ));
+    type_node.children.push(TypeTreeNode::with_info(
+        "string".to_string(),
+        "asm".to_string(),
+        -1,
+    ));
+    ref_obj.children.push(type_node);
+    // Placeholder payload: an int field so we can ensure the reader stays in sync.
+    let mut data_node =
+        TypeTreeNode::with_info("ReferencedObjectData".to_string(), "data".to_string(), -1);
+    data_node.children.push(TypeTreeNode::with_info(
+        "int".to_string(),
+        "m_Value".to_string(),
+        -1,
+    ));
+    ref_obj.children.push(data_node);
+
+    root.children.push(ref_obj);
+    tree.add_node(root);
+
+    let mut bytes = Vec::new();
+    push_aligned_string_le(&mut bytes, "MissingClass");
+    push_aligned_string_le(&mut bytes, "NS");
+    push_aligned_string_le(&mut bytes, "ASM");
+    bytes.extend_from_slice(&7i32.to_le_bytes());
+
+    let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+    let serializer = TypeTreeSerializer::new(&tree);
+    let out = serializer
+        .parse_object_prefix_detailed(
+            &mut reader,
+            unity_asset_binary::typetree::TypeTreeParseOptions::default(),
+            1,
+        )
+        .unwrap();
+
+    let UnityValue::Object(m_ref) = out.properties.get("m_Ref").expect("m_Ref present") else {
+        panic!("m_Ref should be object");
+    };
+    assert_eq!(
+        m_ref
+            .get("_referenced_type_unresolved")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        m_ref
+            .get("_referenced_type_key")
+            .and_then(|v| v.as_str()),
+        Some("MissingClass|NS|ASM")
+    );
+
+    let UnityValue::Object(data) = m_ref.get("data").expect("data present") else {
+        panic!("data should be object");
+    };
+    assert_eq!(data.get("m_Value").and_then(|v| v.as_i64()), Some(7));
+    assert_eq!(reader.position() as usize, bytes.len());
+}
