@@ -96,6 +96,15 @@ We keep a small set of **golden regression cases** to protect high-value workflo
 
 If you intentionally change parsing behavior (e.g., TypeTree semantics), update the golden file in the same PR.
 
+To (re)generate golden fields from UnityPy for cross-engine sanity checks, use:
+
+```bash
+# Requires a local UnityPy checkout at `repo-ref/UnityPy` (ignored by git).
+python3 -m venv .venv-unitypy
+./.venv-unitypy/bin/pip install fsspec attrs lz4 brotli Pillow
+./.venv-unitypy/bin/python scripts/regenerate_golden_v1_unitypy.py --write
+```
+
 ### 3. Code Style
 
 We use standard Rust formatting and linting:
