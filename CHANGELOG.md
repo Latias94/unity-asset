@@ -97,6 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - (BREAKING) `BinaryObjectRef` / `EnvironmentObjectRef` are no longer `Copy` to support reporter/warning plumbing.
 - `unity-asset` CLI warning output is now centralized via `EnvironmentReporter` (no more per-command manual draining/printing).
 - `unity-asset-cli`: refactored the huge `src/main.rs` into command modules (`src/commands/*`) for easier maintenance and faster iteration (no intended behavior change).
+- `unity-asset`: split `Environment` internals further (moved `BinaryObjectKey` parsing to `unity-asset-lib/src/environment/imp/key.rs` and environment tests to `unity-asset-lib/src/environment/imp/tests.rs`).
 - (BREAKING) `EnvironmentReporter` is now `Send + Sync` and stored behind `Arc`, making `Environment` `Send + Sync` for concurrency-ready workflows.
 - (BREAKING) `unity-asset-binary` is now parser-only; decode/export helpers moved to the new `unity-asset-decode` crate (enable `unity-asset-decode/full` or specific features like `texture`/`audio`).
 - `unity-asset-cli` now has an explicit `decode` feature (now opt-in) to allow building a lighter CLI by default; use `--features decode` (or `--features full`) to enable decode/export helpers.
