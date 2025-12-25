@@ -116,6 +116,12 @@ unity-asset = "0.1.0"
 cargo install unity-asset-cli
 ```
 
+By default, `unity-asset-cli` is built without decode/export helpers to keep builds lighter. To enable `--decode` support and best-effort exporters:
+
+```bash
+cargo install unity-asset-cli --features decode
+```
+
 ### Testing Status
 
 We have basic tests for core functionality, but this is not a comprehensive test suite. Some tests pass, others reveal limitations in our implementation.

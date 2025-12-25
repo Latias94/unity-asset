@@ -1,8 +1,11 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions, BundleParser, DirectoryNode};
 use unity_asset_binary::error::BinaryError;
+
+#[cfg(feature = "mmap")]
+use std::sync::Arc;
+#[cfg(feature = "mmap")]
 use unity_asset_binary::shared_bytes::SharedBytes;
 
 pub(crate) fn bundle_list_options() -> BundleLoadOptions {

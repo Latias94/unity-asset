@@ -19,12 +19,15 @@ use unity_asset::environment::{
     EnvironmentWarning,
 };
 use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions};
+use unity_asset_binary::object::UnityObject;
 use unity_asset_binary::shared_bytes::SharedBytes;
 use unity_asset_binary::typetree::{
     JsonTypeTreeRegistry, TpkTypeTreeRegistry, TypeTree, TypeTreeParseMode, TypeTreeParseOptions,
     TypeTreeRegistry,
 };
-use unity_asset_binary::{asset::class_ids, object::UnityObject, unity_version::UnityVersion};
+
+#[cfg(feature = "decode")]
+use unity_asset_binary::{asset::class_ids, unity_version::UnityVersion};
 
 mod fast_path;
 
@@ -758,6 +761,7 @@ fn magic_based_extension(asset_path: &str, bytes: &[u8]) -> Option<&'static str>
     }
 }
 
+#[cfg(feature = "decode")]
 fn text_asset_bytes(obj: &UnityObject) -> Vec<u8> {
     // Unity TextAsset commonly stores either:
     // - `m_Script` (string)
@@ -798,6 +802,7 @@ fn text_asset_bytes(obj: &UnityObject) -> Vec<u8> {
     Vec::new()
 }
 
+#[cfg(feature = "decode")]
 fn sprite_texture_pptr(obj: &UnityObject) -> Option<(i32, i64)> {
     let UnityValue::Object(rd) = obj.get("m_RD")? else {
         return None;
@@ -949,6 +954,7 @@ fn now_unix_ms() -> u128 {
         .unwrap_or(0)
 }
 
+#[cfg(feature = "decode")]
 fn file_len(path: &Path) -> Option<u64> {
     std::fs::metadata(path).map(|m| m.len()).ok()
 }

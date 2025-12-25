@@ -48,10 +48,11 @@ futures = { version = "0.3", optional = true }
 indicatif = { version = "0.18", optional = true }
 
 [features]
-default = ["decode", "mmap"]
+default = ["mmap"]
 async = ["unity-asset/async", "tokio", "futures", "indicatif"]
 decode = ["dep:unity-asset-decode"]
 mmap = ["unity-asset/mmap", "unity-asset-binary/mmap", "dep:memmap2"]
+full = ["decode", "mmap"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
