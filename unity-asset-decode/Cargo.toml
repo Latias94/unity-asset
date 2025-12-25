@@ -2,6 +2,7 @@
 name = "unity-asset-decode"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
 description = "Decode/export helpers for Unity assets (Texture/Audio/Sprite/Mesh) built on unity-asset-binary"
 license = "MIT"

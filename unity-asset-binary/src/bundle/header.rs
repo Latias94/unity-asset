@@ -61,7 +61,14 @@ impl BundleHeader {
         match signature.as_str() {
             "UnityFS" => {
                 // Modern UnityFS format
-                header.size = reader.read_i64()? as u64;
+                let size = reader.read_i64()?;
+                if size < 0 {
+                    return Err(BinaryError::invalid_data(format!(
+                        "Negative bundle size in header: {}",
+                        size
+                    )));
+                }
+                header.size = size as u64;
                 header.compressed_blocks_info_size = reader.read_u32()?;
                 header.uncompressed_blocks_info_size = reader.read_u32()?;
                 header.flags = reader.read_u32()?;

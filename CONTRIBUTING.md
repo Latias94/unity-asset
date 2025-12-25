@@ -7,6 +7,8 @@ Thank you for your interest in contributing! This document provides guidelines f
 ### Development Setup
 
 ```bash
+# MSRV: Rust 1.85+ (edition 2024)
+
 # Clone the repository
 git clone https://github.com/Latias94/unity-asset.git
 cd unity-asset

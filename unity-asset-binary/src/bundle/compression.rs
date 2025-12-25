@@ -23,6 +23,23 @@ impl BundleCompression {
         header: &BundleHeader,
         compressed_data: &[u8],
     ) -> Result<Vec<u8>> {
+        Self::decompress_blocks_info_limited(header, compressed_data, None)
+    }
+
+    pub fn decompress_blocks_info_limited(
+        header: &BundleHeader,
+        compressed_data: &[u8],
+        max_uncompressed_size: Option<usize>,
+    ) -> Result<Vec<u8>> {
+        let expected_uncompressed = header.uncompressed_blocks_info_size as usize;
+        if let Some(limit) = max_uncompressed_size {
+            if expected_uncompressed > limit {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Blocks info uncompressed size {} exceeds limit {}",
+                    expected_uncompressed, limit
+                )));
+            }
+        }
         let compression_type = header.flags & 0x3F; // CompressionTypeMask
 
         match compression_type {
@@ -35,7 +52,7 @@ impl BundleCompression {
                 decompress(
                     compressed_data,
                     CompressionType::Lz4,
-                    header.uncompressed_blocks_info_size as usize,
+                    expected_uncompressed,
                 )
             }
             1 => {
@@ -43,7 +60,7 @@ impl BundleCompression {
                 decompress(
                     compressed_data,
                     CompressionType::Lzma,
-                    header.uncompressed_blocks_info_size as usize,
+                    expected_uncompressed,
                 )
             }
             4 => {
@@ -51,7 +68,7 @@ impl BundleCompression {
                 decompress(
                     compressed_data,
                     CompressionType::Brotli,
-                    header.uncompressed_blocks_info_size as usize,
+                    expected_uncompressed,
                 )
             }
             _ => Err(BinaryError::unsupported(format!(
@@ -66,6 +83,16 @@ impl BundleCompression {
     /// This method parses the compression block metadata from the
     /// decompressed blocks info data.
     pub fn parse_compression_blocks(data: &[u8]) -> Result<Vec<CompressionBlock>> {
+        Self::parse_compression_blocks_limited(
+            data,
+            &super::types::BundleLoadOptions::fast(),
+        )
+    }
+
+    pub fn parse_compression_blocks_limited(
+        data: &[u8],
+        options: &super::types::BundleLoadOptions,
+    ) -> Result<Vec<CompressionBlock>> {
         let mut reader = BinaryReader::new(data, ByteOrder::Big);
         let mut blocks = Vec::new();
 
@@ -73,7 +100,32 @@ impl BundleCompression {
         reader.read_bytes(16)?;
 
         // Read compression blocks
-        let block_count = reader.read_i32()? as usize;
+        let block_count_i32 = reader.read_i32()?;
+        if block_count_i32 < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative compression block count: {}",
+                block_count_i32
+            )));
+        }
+        let block_count = block_count_i32 as usize;
+        if block_count > options.max_blocks {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "Compression block count {} exceeds limit {}",
+                block_count, options.max_blocks
+            )));
+        }
+
+        // Ensure the block table fits in the provided buffer.
+        let table_bytes = block_count
+            .checked_mul(10)
+            .ok_or_else(|| BinaryError::invalid_data("Compression block table size overflow"))?;
+        let required = 16usize
+            .checked_add(4)
+            .and_then(|v| v.checked_add(table_bytes))
+            .ok_or_else(|| BinaryError::invalid_data("Compression block table size overflow"))?;
+        if data.len() < required {
+            return Err(BinaryError::not_enough_data(required, data.len()));
+        }
 
         for _ in 0..block_count {
             let uncompressed_size = reader.read_u32()?;
@@ -96,14 +148,53 @@ impl BundleCompression {
         blocks: &[CompressionBlock],
         reader: &mut BinaryReader,
     ) -> Result<Vec<u8>> {
-        let total_uncompressed: usize = blocks.iter().map(|b| b.uncompressed_size as usize).sum();
-        let mut decompressed_data = Vec::with_capacity(total_uncompressed);
+        Self::decompress_data_blocks_limited(header, blocks, reader, None)
+    }
+
+    pub fn decompress_data_blocks_limited(
+        header: &BundleHeader,
+        blocks: &[CompressionBlock],
+        reader: &mut BinaryReader,
+        max_memory: Option<usize>,
+    ) -> Result<Vec<u8>> {
+        let mut total_uncompressed: u64 = 0;
+        for block in blocks {
+            total_uncompressed = total_uncompressed
+                .checked_add(block.uncompressed_size as u64)
+                .ok_or_else(|| BinaryError::invalid_data("Total uncompressed size overflow"))?;
+        }
+        if let Some(limit) = max_memory {
+            if total_uncompressed > limit as u64 {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Bundle decompressed size {} exceeds max_memory {}",
+                    total_uncompressed, limit
+                )));
+            }
+        }
+
+        let total_uncompressed_usize =
+            usize::try_from(total_uncompressed).map_err(|_| {
+                BinaryError::ResourceLimitExceeded(format!(
+                    "Bundle decompressed size {} does not fit in usize",
+                    total_uncompressed
+                ))
+            })?;
+
+        let mut decompressed_data = Vec::with_capacity(total_uncompressed_usize);
 
         // The caller is responsible for positioning `reader` at the start of block data, taking
         // header alignment and `BlocksInfoAtEnd` into account.
         let _ = header;
 
         for block in blocks.iter() {
+            if let Some(limit) = max_memory {
+                if (block.uncompressed_size as u64) > (limit as u64) {
+                    return Err(BinaryError::ResourceLimitExceeded(format!(
+                        "Block uncompressed size {} exceeds max_memory {}",
+                        block.uncompressed_size, limit
+                    )));
+                }
+            }
             let compressed = reader.read_bytes(block.compressed_size as usize)?;
             let block_data = block.decompress(&compressed)?;
             decompressed_data.extend_from_slice(&block_data);

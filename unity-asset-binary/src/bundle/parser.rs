@@ -35,6 +35,13 @@ impl BundleParser {
 
         if options.validate {
             header.validate()?;
+            if header.size > data.len() as u64 {
+                return Err(BinaryError::invalid_data(format!(
+                    "Bundle header size {} exceeds available bytes {}",
+                    header.size,
+                    data.len()
+                )));
+            }
         }
 
         // The bundle stores decompressed block data. We intentionally keep the original input buffer
@@ -71,11 +78,11 @@ impl BundleParser {
         options: &BundleLoadOptions,
     ) -> Result<()> {
         // Read blocks info
-        Self::read_blocks_info(bundle, reader)?;
+        Self::read_blocks_info(bundle, reader, options)?;
 
         // Decompress data blocks if requested OR if we need to load assets
         if options.decompress_blocks || options.load_assets {
-            let blocks_data = Self::read_blocks(bundle, reader)?;
+            let blocks_data = Self::read_blocks(bundle, reader, options)?;
             Self::parse_files(bundle, blocks_data)?;
 
             // Load assets if requested
@@ -105,11 +112,19 @@ impl BundleParser {
         // Read compression information
         let compressed_size = reader.read_u32()?;
         let uncompressed_size = reader.read_u32()?;
+        if let Some(max_memory) = options.max_memory {
+            if (uncompressed_size as u64) > (max_memory as u64) {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Legacy bundle directory uncompressed size {} exceeds max_memory {}",
+                    uncompressed_size, max_memory
+                )));
+            }
+        }
 
         // Skip some bytes based on version
         let skip_bytes = if bundle.header.version >= 2 { 4 } else { 0 };
         if skip_bytes > 0 {
-            reader.read_bytes(skip_bytes)?;
+            reader.skip_bytes(skip_bytes)?;
         }
 
         // Move to the data section
@@ -138,7 +153,7 @@ impl BundleParser {
         };
 
         // Parse directory information from decompressed data
-        Self::parse_legacy_directory(bundle, &directory_data, header_size)?;
+        Self::parse_legacy_directory(bundle, &directory_data, header_size, options)?;
 
         // Load assets if requested
         if options.load_assets {
@@ -149,7 +164,11 @@ impl BundleParser {
     }
 
     /// Read compression blocks information
-    fn read_blocks_info(bundle: &mut AssetBundle, reader: &mut BinaryReader) -> Result<()> {
+    fn read_blocks_info(
+        bundle: &mut AssetBundle,
+        reader: &mut BinaryReader,
+        options: &BundleLoadOptions,
+    ) -> Result<()> {
         // Apply version-specific alignment.
         // UnityFS uses 16-byte alignment in newer bundle formats (>=7).
         // For some older bundle formats, alignment may still be present (e.g. Unity 2019.4+),
@@ -185,17 +204,30 @@ impl BundleParser {
         };
 
         // Decompress blocks info
-        let uncompressed_data =
-            BundleCompression::decompress_blocks_info(&bundle.header, &blocks_info_data)?;
+        if let Some(max_blocks_info_size) = options.max_blocks_info_size {
+            let expected = bundle.header.uncompressed_blocks_info_size as usize;
+            if expected > max_blocks_info_size {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Blocks info uncompressed size {} exceeds limit {}",
+                    expected, max_blocks_info_size
+                )));
+            }
+        }
+        let uncompressed_data = BundleCompression::decompress_blocks_info_limited(
+            &bundle.header,
+            &blocks_info_data,
+            options.max_blocks_info_size,
+        )?;
 
         // Parse compression blocks
-        bundle.blocks = BundleCompression::parse_compression_blocks(&uncompressed_data)?;
+        bundle.blocks =
+            BundleCompression::parse_compression_blocks_limited(&uncompressed_data, options)?;
 
         // Validate blocks
         BundleCompression::validate_blocks(&bundle.blocks)?;
 
         // Parse directory information from the same blocks info data
-        Self::parse_directory_from_blocks_info(bundle, &uncompressed_data)?;
+        Self::parse_directory_from_blocks_info(bundle, &uncompressed_data, options)?;
 
         // Some UnityFS variants require padding/alignment before block data starts.
         if (bundle.header.flags
@@ -224,8 +256,17 @@ impl BundleParser {
     }
 
     /// Read and decompress all blocks
-    fn read_blocks(bundle: &AssetBundle, reader: &mut BinaryReader) -> Result<Vec<u8>> {
-        BundleCompression::decompress_data_blocks(&bundle.header, &bundle.blocks, reader)
+    fn read_blocks(
+        bundle: &AssetBundle,
+        reader: &mut BinaryReader,
+        options: &BundleLoadOptions,
+    ) -> Result<Vec<u8>> {
+        BundleCompression::decompress_data_blocks_limited(
+            &bundle.header,
+            &bundle.blocks,
+            reader,
+            options.max_memory,
+        )
     }
 
     /// Parse files from decompressed block data
@@ -258,27 +299,82 @@ impl BundleParser {
     fn parse_directory_from_blocks_info(
         bundle: &mut AssetBundle,
         blocks_info_data: &[u8],
+        options: &BundleLoadOptions,
     ) -> Result<()> {
         let mut reader = BinaryReader::new(blocks_info_data, ByteOrder::Big);
 
         // Skip uncompressed data hash (16 bytes)
         reader.read_bytes(16)?;
 
-        // Skip compression blocks information
-        let block_count = reader.read_i32()? as usize;
-        for _ in 0..block_count {
-            reader.read_u32()?; // uncompressed_size
-            reader.read_u32()?; // compressed_size
-            reader.read_u16()?; // flags
+        // Skip compression blocks information (we already parsed them).
+        let block_count_i32 = reader.read_i32()?;
+        if block_count_i32 < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative compression block count: {}",
+                block_count_i32
+            )));
         }
+        let block_count: usize = block_count_i32 as usize;
+        if block_count > options.max_blocks {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "Compression block count {} exceeds limit {}",
+                block_count, options.max_blocks
+            )));
+        }
+        let bytes_to_skip = block_count
+            .checked_mul(10)
+            .ok_or_else(|| BinaryError::invalid_data("Compression block table size overflow"))?;
+        reader.skip_bytes(bytes_to_skip)?;
 
         // Now read directory information
-        let node_count = reader.read_i32()? as usize;
+        let node_count_i32 = reader.read_i32()?;
+        if node_count_i32 < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative directory node count: {}",
+                node_count_i32
+            )));
+        }
+        let node_count: usize = node_count_i32 as usize;
+        if node_count > options.max_nodes {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "Directory node count {} exceeds limit {}",
+                node_count, options.max_nodes
+            )));
+        }
+
+        let total_uncompressed: u64 = bundle
+            .blocks
+            .iter()
+            .map(|b| b.uncompressed_size as u64)
+            .sum();
 
         // Read directory nodes (UnityFS format)
         for _i in 0..node_count {
-            let offset = reader.read_i64()? as u64; // UnityFS uses i64 for offset
-            let size = reader.read_i64()? as u64; // UnityFS uses i64 for size
+            let offset_i64 = reader.read_i64()?; // UnityFS uses i64 for offset
+            if offset_i64 < 0 {
+                return Err(BinaryError::invalid_data(format!(
+                    "Negative directory node offset: {}",
+                    offset_i64
+                )));
+            }
+            let size_i64 = reader.read_i64()?; // UnityFS uses i64 for size
+            if size_i64 < 0 {
+                return Err(BinaryError::invalid_data(format!(
+                    "Negative directory node size: {}",
+                    size_i64
+                )));
+            }
+            let offset = offset_i64 as u64;
+            let size = size_i64 as u64;
+            let end = offset
+                .checked_add(size)
+                .ok_or_else(|| BinaryError::invalid_data("Directory node offset+size overflow"))?;
+            if end > total_uncompressed {
+                return Err(BinaryError::invalid_data(format!(
+                    "Directory node exceeds decompressed data: end {} > {}",
+                    end, total_uncompressed
+                )));
+            }
             let flags = reader.read_u32()?;
             let name = reader.read_cstring()?;
 
@@ -299,7 +395,14 @@ impl BundleParser {
         reader.set_position(0)?;
 
         // Read directory node count
-        let node_count = reader.read_i32()? as usize;
+        let node_count_i32 = reader.read_i32()?;
+        if node_count_i32 < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative directory node count: {}",
+                node_count_i32
+            )));
+        }
+        let node_count = node_count_i32 as usize;
 
         // Read directory nodes
         for _ in 0..node_count {
@@ -320,12 +423,26 @@ impl BundleParser {
         bundle: &mut AssetBundle,
         directory_data: &[u8],
         header_size: usize,
+        options: &BundleLoadOptions,
     ) -> Result<()> {
         let mut dir_reader = BinaryReader::new(directory_data, ByteOrder::Big);
         dir_reader.set_position(header_size as u64)?; // Skip header in directory data
 
         // Read file count
-        let file_count = dir_reader.read_i32()? as usize;
+        let file_count_i32 = dir_reader.read_i32()?;
+        if file_count_i32 < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative legacy bundle file count: {}",
+                file_count_i32
+            )));
+        }
+        let file_count: usize = file_count_i32 as usize;
+        if file_count > options.max_nodes {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "Legacy bundle file count {} exceeds limit {}",
+                file_count, options.max_nodes
+            )));
+        }
 
         // Read file entries
         for _ in 0..file_count {

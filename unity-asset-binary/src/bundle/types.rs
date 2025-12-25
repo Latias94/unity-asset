@@ -281,6 +281,12 @@ pub struct BundleLoadOptions {
     pub validate: bool,
     /// Maximum memory usage for decompression (in bytes)
     pub max_memory: Option<usize>,
+    /// Maximum size of decompressed blocks info (metadata) in bytes.
+    pub max_blocks_info_size: Option<usize>,
+    /// Maximum number of compression blocks allowed in metadata.
+    pub max_blocks: usize,
+    /// Maximum number of directory nodes / file entries allowed in metadata.
+    pub max_nodes: usize,
 }
 
 impl Default for BundleLoadOptions {
@@ -290,6 +296,9 @@ impl Default for BundleLoadOptions {
             decompress_blocks: false, // Lazy decompression by default
             validate: true,
             max_memory: Some(1024 * 1024 * 1024), // 1GB default limit
+            max_blocks_info_size: Some(64 * 1024 * 1024), // 64MB metadata cap
+            max_blocks: 1_000_000,
+            max_nodes: 1_000_000,
         }
     }
 }
@@ -302,6 +311,9 @@ impl BundleLoadOptions {
             decompress_blocks: false,
             validate: false,
             max_memory: None,
+            max_blocks_info_size: None,
+            max_blocks: usize::MAX,
+            max_nodes: usize::MAX,
         }
     }
 
@@ -312,6 +324,9 @@ impl BundleLoadOptions {
             decompress_blocks: true,
             validate: true,
             max_memory: Some(2048 * 1024 * 1024), // 2GB for complete loading
+            max_blocks_info_size: Some(128 * 1024 * 1024), // 128MB metadata cap
+            max_blocks: 2_000_000,
+            max_nodes: 2_000_000,
         }
     }
 }

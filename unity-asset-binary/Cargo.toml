@@ -2,6 +2,7 @@
 name = "unity-asset-binary"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
 description = "Unity binary file format parser (AssetBundle, SerializedFile)"
 license = "MIT"
@@ -37,7 +38,6 @@ flate2 = { workspace = true }
 lz4_flex = { workspace = true }
 lzma-rs = "0.3"
 brotli = "3.4"
-xz2 = { version = "0.1", optional = true }
 
 # Performance and utilities
 once_cell = { workspace = true }
@@ -55,7 +55,6 @@ default = []
 
 # 异步支持
 async = ["unity-asset-core/async", "tokio", "futures", "async-trait", "tokio-stream", "async-stream"]
-xz2 = ["dep:xz2"]                                     # XZ2 LZMA压缩支持
 
 [dev-dependencies]
 hex = "0.4"

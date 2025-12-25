@@ -2,6 +2,7 @@
 name = "unity-asset-core"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
 description = "Core data structures and traits for Unity asset parsing"
 license = "MIT"

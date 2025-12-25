@@ -2,6 +2,7 @@
 name = "unity-asset"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
 description = "A comprehensive Rust library for parsing Unity asset files (YAML and binary formats)"
 license = "MIT"

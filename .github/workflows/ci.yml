@@ -26,6 +26,9 @@ jobs:
       with:
         components: rustfmt, clippy
 
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
+
     - name: Cache dependencies
       uses: actions/cache@v4
       with:
@@ -59,9 +62,9 @@ jobs:
     - name: Run tests
       run: |
         if [ -n "${{ matrix.features }}" ]; then
-          cargo test --all --features ${{ matrix.features }}
+          cargo nextest run --workspace --features ${{ matrix.features }}
         else
-          cargo test --all
+          cargo nextest run --workspace
         fi
 
     - name: Test CLI tools
@@ -96,6 +99,29 @@ jobs:
 
     - name: Check documentation
       run: cargo doc --all --all-features --no-deps
+
+  msrv:
+    name: MSRV (Rust 1.85)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust 1.85.0
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: 1.85.0
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-msrv-
+          ${{ runner.os }}-cargo-
+    - name: Build workspace
+      run: cargo build --workspace
 
 
 

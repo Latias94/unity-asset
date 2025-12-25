@@ -78,6 +78,11 @@ unity-asset/
 
 ## 🚀 Quick Start
 
+### Requirements
+
+- Rust **1.85+** (MSRV; `edition = "2024"`)
+- `cargo-nextest` (recommended for running tests)
+
 ### Installation
 
 **Note**: This project will be published to crates.io soon. For now, to try it out:
@@ -88,7 +93,10 @@ git clone https://github.com/Latias94/unity-asset.git
 cd unity-asset
 
 # Build the library
-cargo build --all
+cargo build --workspace
+
+# Run tests (recommended)
+cargo nextest run --workspace
 
 # Try the CLI tools
 cargo run --bin unity-asset -- --help

@@ -87,12 +87,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `unity-asset-cli` now has an explicit `decode` feature (enabled by default) to allow building a lighter CLI with `--no-default-features`.
 - TypeTree array parsing now uses endianness-aware fast paths for common numeric primitive arrays (`SInt16/UInt16/SInt32/UInt32/SInt64/UInt64/float/double`).
 - (BREAKING) `UnityValue` now includes `Bytes(Vec<u8>)` and TypeTree parsing emits `Bytes` for `TypelessData` and byte arrays (`UInt8`/`char`/`SInt8`), reducing allocations for large objects.
+- (BREAKING) `BundleLoadOptions` now includes explicit resource limits (`max_blocks_info_size`, `max_blocks`, `max_nodes`) and bundle parsing enforces these limits.
+- (BREAKING) Removed the unimplemented `unity-asset-binary` `xz2` feature to avoid implying improved Unity LZMA compatibility.
 - Dependency analysis now scans TypeTree streams for `PPtr` references without allocating full parsed objects, improving performance on large assets.
 - Best-effort TypeTree support for managed references: parses `ReferencedObjectData` payloads via `SerializedFile.ref_types` (Unity 2019+) and skips `ManagedReferencesRegistry` nodes to keep parsing fast.
 - When managed reference payload types cannot be resolved, `ReferencedObject` now includes `_referenced_type_unresolved=true` and `_referenced_type_key=\"class|ns|asm\"` for explainable fallbacks.
 
 ### Fixed
 - Hardened length-prefixed string reads to avoid hostile allocations and out-of-bounds reads (length is validated against remaining bytes and a maximum limit).
+- Hardened UnityFS/legacy bundle parsing against hostile metadata (rejects negative counts/offsets, enforces `max_memory`/metadata caps before allocation/decompression).
+- Prevented integer overflow in LZ4 buffer sizing for large `uncompressed_size` values.
 - `Environment::load_file` now attempts binary detection for extension-less files (best-effort), improving support for `UnityWebData*` and other build artifacts.
 - Fixed `UnityFile` sniffing to avoid mis-classifying uncompressed `UnityWebData*` WebFiles as legacy `UnityWeb` bundles.
 - Removed `println!`/`eprintln!` from library code paths (warnings are returned/collected instead of writing to stderr).
