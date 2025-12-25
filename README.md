@@ -234,6 +234,10 @@ cargo run --bin unity-asset -- inspect-object -i tests/samples --key 'bok2|bundl
 # If you suspect TypeTree mismatches, enable fail-fast parsing and print warnings:
 # `--strict` (fail-fast) and `--show-warnings` (print TypeTree warnings)
 
+# Scan PPtr references without fully parsing objects (fast dependency/graph workflows)
+cargo run --bin unity-asset -- scan-pptr -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --limit 5
+cargo run --bin unity-asset -- scan-pptr -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --class-id 114 --json
+
 # Export objects from AssetBundles via `m_Container` (UnityPy-like workflow)
 cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --limit 50
 # Decode known types (best-effort):

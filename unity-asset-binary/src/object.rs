@@ -4,6 +4,7 @@ use crate::asset::{ObjectInfo, SerializedFile};
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::typetree::{
+    PPtrScanResult,
     TypeTree, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput, TypeTreeParseWarning,
     TypeTreeSerializer,
 };
@@ -95,6 +96,23 @@ impl<'a> ObjectHandle<'a> {
             Some(UnityValue::String(s)) => Ok(Some(s.clone())),
             _ => Ok(None),
         }
+    }
+
+    /// Scan TypeTree-based object bytes and collect `PPtr` references (`fileID`, `pathID`) without
+    /// allocating a full parsed `UnityValue` tree.
+    pub fn scan_pptrs(&self) -> Result<Option<PPtrScanResult>> {
+        let Some(tree) = type_tree_for_object(self.file, self.info) else {
+            return Ok(None);
+        };
+        let tree = tree.as_ref();
+        if tree.is_empty() {
+            return Ok(None);
+        }
+
+        let bytes = self.raw_data()?;
+        let mut reader = BinaryReader::new(bytes, self.file.header.byte_order());
+        let serializer = TypeTreeSerializer::new(tree);
+        Ok(Some(serializer.scan_pptrs(&mut reader)?))
     }
 }
 
