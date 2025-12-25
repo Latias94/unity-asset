@@ -20,6 +20,7 @@ struct UnityFsBlockCache {
     block_data_start: usize,
     max_memory: Option<usize>,
     max_block_cache_memory: Option<usize>,
+    max_compressed_block_size: Option<usize>,
     compressed_starts: Vec<u64>,
     uncompressed_starts: Vec<u64>,
     cached: Vec<Option<Arc<[u8]>>>,
@@ -35,6 +36,7 @@ struct LazyDecompress {
     source: DataView,
     block_data_start: usize,
     max_memory: Option<usize>,
+    max_compressed_block_size: Option<usize>,
 }
 
 /// Information about a file within the bundle
@@ -202,12 +204,23 @@ impl AssetBundle {
         block_data_start: usize,
         max_memory: Option<usize>,
         max_block_cache_memory: Option<usize>,
-    ) {
+        max_compressed_block_size: Option<usize>,
+    ) -> Result<()> {
+        if block_data_start > source.len() {
+            return Err(BinaryError::invalid_data(format!(
+                "UnityFS block data start {} exceeds available bytes {}",
+                block_data_start,
+                source.len()
+            )));
+        }
+        let available_compressed = (source.len() - block_data_start) as u64;
+
         let mut guard = self.lazy.lock().unwrap();
         *guard = Some(LazyDecompress {
             source,
             block_data_start,
             max_memory,
+            max_compressed_block_size,
         });
 
         let mut compressed_starts = Vec::with_capacity(self.blocks.len());
@@ -215,14 +228,28 @@ impl AssetBundle {
         let mut comp_cursor: u64 = 0;
         let mut uncomp_cursor: u64 = 0;
         for block in &self.blocks {
+            if let Some(limit) = max_compressed_block_size {
+                if (block.compressed_size as u64) > (limit as u64) {
+                    return Err(BinaryError::ResourceLimitExceeded(format!(
+                        "Block compressed size {} exceeds max_compressed_block_size {}",
+                        block.compressed_size, limit
+                    )));
+                }
+            }
             compressed_starts.push(comp_cursor);
             uncompressed_starts.push(uncomp_cursor);
             comp_cursor = comp_cursor
                 .checked_add(block.compressed_size as u64)
-                .unwrap_or(u64::MAX);
+                .ok_or_else(|| BinaryError::invalid_data("Total compressed size overflow"))?;
             uncomp_cursor = uncomp_cursor
                 .checked_add(block.uncompressed_size as u64)
-                .unwrap_or(u64::MAX);
+                .ok_or_else(|| BinaryError::invalid_data("Total uncompressed size overflow"))?;
+        }
+        if comp_cursor > available_compressed {
+            return Err(BinaryError::invalid_data(format!(
+                "Total compressed block bytes {} exceeds available bytes {}",
+                comp_cursor, available_compressed
+            )));
         }
 
         let mut cache_guard = self.unityfs_cache.lock().unwrap();
@@ -231,6 +258,7 @@ impl AssetBundle {
             block_data_start,
             max_memory,
             max_block_cache_memory,
+            max_compressed_block_size,
             compressed_starts,
             uncompressed_starts,
             cached: std::iter::repeat_with(|| None)
@@ -242,6 +270,8 @@ impl AssetBundle {
             last_tick: vec![0; self.blocks.len()],
             lru: VecDeque::new(),
         });
+
+        Ok(())
     }
 
     pub(crate) fn set_decompressed_data(&mut self, data: Vec<u8>) {
@@ -309,6 +339,14 @@ impl AssetBundle {
                         return Err(BinaryError::ResourceLimitExceeded(format!(
                             "Block uncompressed size {} exceeds max_unityfs_block_cache_memory {}",
                             block.uncompressed_size, limit
+                        )));
+                    }
+                }
+                if let Some(limit) = cache.max_compressed_block_size {
+                    if (block.compressed_size as usize) > limit {
+                        return Err(BinaryError::ResourceLimitExceeded(format!(
+                            "Block compressed size {} exceeds max_compressed_block_size {}",
+                            block.compressed_size, limit
                         )));
                     }
                 }
@@ -420,6 +458,17 @@ impl AssetBundle {
                 "Bundle data is not available (not decompressed and no source)",
             )
         })?;
+
+        if let Some(limit) = lazy.max_compressed_block_size {
+            for block in &self.blocks {
+                if (block.compressed_size as u64) > (limit as u64) {
+                    return Err(BinaryError::ResourceLimitExceeded(format!(
+                        "Block compressed size {} exceeds max_compressed_block_size {}",
+                        block.compressed_size, limit
+                    )));
+                }
+            }
+        }
 
         let mut reader = BinaryReader::new(lazy.source.as_bytes(), ByteOrder::Big);
         reader.set_position(lazy.block_data_start as u64)?;
@@ -689,7 +738,9 @@ mod tests {
 
         let bytes: Vec<u8> = (0u8..10u8).collect();
         let view = DataView::from_shared(SharedBytes::from_vec(bytes));
-        bundle.set_lazy_unityfs_source(view, 0, None, None);
+        bundle
+            .set_lazy_unityfs_source(view, 0, None, None, None)
+            .unwrap();
 
         let node = DirectoryNode::new("test.bin".to_string(), 3, 6, 0x4);
         let out = bundle.extract_node_data(&node).unwrap();
@@ -743,6 +794,11 @@ pub struct BundleLoadOptions {
     ///
     /// This is a cap on the raw bytes read from the input stream before decompression.
     pub max_legacy_directory_compressed_size: Option<usize>,
+    /// Maximum size of a single UnityFS compressed data block (in bytes).
+    ///
+    /// This is a cap on the raw bytes read for each block before decompression. It helps protect
+    /// against malicious headers that declare multi-GB compressed blocks.
+    pub max_compressed_block_size: Option<usize>,
     /// Maximum number of compression blocks allowed in metadata.
     pub max_blocks: usize,
     /// Maximum number of directory nodes / file entries allowed in metadata.
@@ -762,6 +818,7 @@ impl Default for BundleLoadOptions {
             max_compressed_blocks_info_size: Some(64 * 1024 * 1024), // 64MB compressed metadata cap
             max_blocks_info_size: Some(64 * 1024 * 1024), // 64MB metadata cap
             max_legacy_directory_compressed_size: Some(64 * 1024 * 1024), // 64MB legacy dir cap
+            max_compressed_block_size: Some(1024 * 1024 * 1024), // 1GB per-block compressed cap
             max_blocks: 1_000_000,
             max_nodes: 1_000_000,
         }
@@ -789,6 +846,7 @@ impl BundleLoadOptions {
             max_compressed_blocks_info_size: None,
             max_blocks_info_size: None,
             max_legacy_directory_compressed_size: None,
+            max_compressed_block_size: None,
             max_blocks: usize::MAX,
             max_nodes: usize::MAX,
         }
@@ -805,6 +863,7 @@ impl BundleLoadOptions {
             max_compressed_blocks_info_size: Some(128 * 1024 * 1024), // 128MB compressed metadata cap
             max_blocks_info_size: Some(128 * 1024 * 1024),            // 128MB metadata cap
             max_legacy_directory_compressed_size: Some(128 * 1024 * 1024), // 128MB legacy dir cap
+            max_compressed_block_size: Some(2048 * 1024 * 1024), // 2GB per-block compressed cap
             max_blocks: 2_000_000,
             max_nodes: 2_000_000,
         }

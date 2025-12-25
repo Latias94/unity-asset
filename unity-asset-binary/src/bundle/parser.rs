@@ -142,7 +142,8 @@ impl BundleParser {
                 start_usize,
                 options.max_memory,
                 options.max_unityfs_block_cache_memory,
-            );
+                options.max_compressed_block_size,
+            )?;
             // Just parse directory structure without decompressing all data
             Self::parse_directory_lazy(bundle, reader)?;
         }
@@ -340,6 +341,16 @@ impl BundleParser {
         reader: &mut BinaryReader,
         options: &BundleLoadOptions,
     ) -> Result<Vec<u8>> {
+        if let Some(limit) = options.max_compressed_block_size {
+            for block in &bundle.blocks {
+                if (block.compressed_size as u64) > (limit as u64) {
+                    return Err(BinaryError::ResourceLimitExceeded(format!(
+                        "Block compressed size {} exceeds max_compressed_block_size {}",
+                        block.compressed_size, limit
+                    )));
+                }
+            }
+        }
         BundleCompression::decompress_data_blocks_limited(
             &bundle.header,
             &bundle.blocks,

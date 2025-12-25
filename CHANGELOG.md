@@ -106,6 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - (BREAKING) `UnityValue` now includes `Bytes(Vec<u8>)` and TypeTree parsing emits `Bytes` for `TypelessData` and byte arrays (`UInt8`/`char`/`SInt8`), reducing allocations for large objects.
 - (BREAKING) `BundleLoadOptions` now includes explicit resource limits (`max_blocks_info_size`, `max_blocks`, `max_nodes`) and bundle parsing enforces these limits.
 - (BREAKING) `BundleLoadOptions` now includes `max_unityfs_block_cache_memory` to cap lazy UnityFS block caching during `extract_node_data` range reads.
+- (BREAKING) `BundleLoadOptions` now includes `max_compressed_block_size` to cap per-block UnityFS compressed reads (protects against malicious multi-GB block declarations).
 - (BREAKING) Removed the unimplemented `unity-asset-binary` `xz2` feature to avoid implying improved Unity LZMA compatibility.
 - (BREAKING) `SerializedFile` can now be a zero-copy view into a shared backing buffer (e.g. bundle-decompressed data); `SerializedFile::data_arc()` returns the backing buffer and `SerializedFile::data()` returns the file view.
 - Dependency analysis now scans TypeTree streams for `PPtr` references without allocating full parsed objects, improving performance on large assets.
@@ -118,6 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed speculative `get_class_name` mappings for non-Unity class IDs (e.g. `256/512/768` now resolve to `Class_<id>` instead of guessed names).
 - `get_class_name` now recognizes `PrefabInstance` (1001) and `class_ids` now includes `SPRITE_ATLAS` (687078895).
 - Hardened UnityFS/legacy bundle parsing against hostile metadata (rejects negative counts/offsets, enforces `max_memory`/metadata caps before allocation/decompression).
+- UnityFS lazy parsing now rejects bundles where declared total compressed block bytes exceed the available backing range.
 - Hardened UnityFS/legacy bundle parsing against hostile *compressed-size* metadata (caps compressed blocks info reads and legacy directory reads before allocating).
 - Bounded UnityFS lazy block caching with an LRU eviction cap (`BundleLoadOptions::max_unityfs_block_cache_memory`) to avoid accidental OOM on large bundles.
 - Reduced peak memory usage when loading assets from UnityFS bundles by avoiding both an extra full-buffer clone and per-asset file byte copies (best-effort).

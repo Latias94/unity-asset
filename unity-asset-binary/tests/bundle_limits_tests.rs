@@ -190,3 +190,72 @@ fn unityfs_blocks_info_respects_max_compressed_blocks_info_size() {
     let err = BundleParser::from_bytes_with_options(bytes, options).unwrap_err();
     assert!(matches!(err, BinaryError::ResourceLimitExceeded(_)));
 }
+
+#[test]
+fn unityfs_lazy_rejects_total_compressed_exceeds_backing() {
+    let mut blocks_info: Vec<u8> = vec![0u8; 16]; // hash
+    blocks_info.extend_from_slice(&be_i32(1)); // block_count
+    blocks_info.extend_from_slice(&be_u32(1)); // uncompressed_size
+    blocks_info.extend_from_slice(&be_u32(100)); // compressed_size (no backing bytes for it)
+    blocks_info.extend_from_slice(&0u16.to_be_bytes()); // flags (None)
+    blocks_info.extend_from_slice(&be_i32(0)); // node_count
+
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(b"UnityFS\0");
+    bytes.extend_from_slice(&be_u32(7));
+    bytes.extend_from_slice(b"2020.3.0f1\0");
+    bytes.extend_from_slice(b"2020.3.0f1\0");
+    let size_offset = bytes.len();
+    bytes.extend_from_slice(&be_i64(0)); // placeholder for size
+    bytes.extend_from_slice(&be_u32(blocks_info.len() as u32));
+    bytes.extend_from_slice(&be_u32(blocks_info.len() as u32));
+    bytes.extend_from_slice(&be_u32(0)); // flags: no compression, blocks info at start
+
+    // UnityFS v7+ aligns blocks info to 16 bytes.
+    let pad = (16 - (bytes.len() % 16)) % 16;
+    bytes.extend(std::iter::repeat(0u8).take(pad));
+    bytes.extend_from_slice(&blocks_info);
+
+    let total_size = bytes.len() as i64;
+    bytes[size_offset..size_offset + 8].copy_from_slice(&be_i64(total_size));
+
+    let err = BundleParser::from_bytes_with_options(bytes, BundleLoadOptions::lazy()).unwrap_err();
+    assert!(matches!(err, BinaryError::InvalidData(_)));
+}
+
+#[test]
+fn unityfs_lazy_respects_max_compressed_block_size() {
+    let mut blocks_info: Vec<u8> = vec![0u8; 16]; // hash
+    blocks_info.extend_from_slice(&be_i32(1)); // block_count
+    blocks_info.extend_from_slice(&be_u32(1)); // uncompressed_size
+    blocks_info.extend_from_slice(&be_u32(32)); // compressed_size
+    blocks_info.extend_from_slice(&0u16.to_be_bytes()); // flags (None)
+    blocks_info.extend_from_slice(&be_i32(0)); // node_count
+
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(b"UnityFS\0");
+    bytes.extend_from_slice(&be_u32(7));
+    bytes.extend_from_slice(b"2020.3.0f1\0");
+    bytes.extend_from_slice(b"2020.3.0f1\0");
+    let size_offset = bytes.len();
+    bytes.extend_from_slice(&be_i64(0)); // placeholder for size
+    bytes.extend_from_slice(&be_u32(blocks_info.len() as u32));
+    bytes.extend_from_slice(&be_u32(blocks_info.len() as u32));
+    bytes.extend_from_slice(&be_u32(0)); // flags: no compression, blocks info at start
+
+    // UnityFS v7+ aligns blocks info to 16 bytes.
+    let pad = (16 - (bytes.len() % 16)) % 16;
+    bytes.extend(std::iter::repeat(0u8).take(pad));
+    bytes.extend_from_slice(&blocks_info);
+
+    // Dummy block data (not read in lazy mode, but used for backing-length validation).
+    bytes.extend(std::iter::repeat(0u8).take(32));
+
+    let total_size = bytes.len() as i64;
+    bytes[size_offset..size_offset + 8].copy_from_slice(&be_i64(total_size));
+
+    let mut options = BundleLoadOptions::lazy();
+    options.max_compressed_block_size = Some(16);
+    let err = BundleParser::from_bytes_with_options(bytes, options).unwrap_err();
+    assert!(matches!(err, BinaryError::ResourceLimitExceeded(_)));
+}
