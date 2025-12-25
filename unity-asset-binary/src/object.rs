@@ -458,22 +458,14 @@ fn apply_raw_preview(class: &mut UnityClass, bytes: &[u8]) {
     if bytes.len() <= RAW_DATA_INLINE_LIMIT {
         class.set(
             "_raw_data".to_string(),
-            UnityValue::Array(
-                bytes
-                    .iter()
-                    .copied()
-                    .map(|b| UnityValue::Integer(b as i64))
-                    .collect(),
-            ),
+            UnityValue::Bytes(bytes.to_vec()),
         );
     } else {
         class.set("_raw_data_truncated".to_string(), UnityValue::Bool(true));
-        let preview = bytes
-            .iter()
-            .take(RAW_DATA_PREVIEW_LEN)
-            .copied()
-            .map(|b| UnityValue::Integer(b as i64))
-            .collect();
-        class.set("_raw_data_preview".to_string(), UnityValue::Array(preview));
+        let preview_len = bytes.len().min(RAW_DATA_PREVIEW_LEN);
+        class.set(
+            "_raw_data_preview".to_string(),
+            UnityValue::Bytes(bytes[..preview_len].to_vec()),
+        );
     }
 }
