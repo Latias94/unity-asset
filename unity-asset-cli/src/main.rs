@@ -18,6 +18,7 @@ use unity_asset::environment::{
     BinaryObjectKey, BinarySource, Environment, EnvironmentOptions, EnvironmentReporter,
     EnvironmentWarning,
 };
+use unity_asset_binary::typetree::{JsonTypeTreeRegistry, TypeTree};
 use unity_asset_binary::{asset::class_ids, object::UnityObject, unity_version::UnityVersion};
 
 #[cfg(feature = "decode")]
@@ -39,6 +40,10 @@ struct Cli {
     /// Print collected load warnings and TypeTree warnings (when applicable)
     #[arg(long)]
     show_warnings: bool,
+
+    /// External TypeTree registry JSON (best-effort fallback for stripped assets)
+    #[arg(long)]
+    typetree_registry: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -233,12 +238,37 @@ enum Commands {
         #[arg(long, default_value = "")]
         filter: String,
     },
+
+    /// Dump a JSON TypeTree registry from loaded files (for stripped-asset fallback parsing)
+    #[command(name = "dump-typetree-registry")]
+    DumpTypeTreeRegistry {
+        /// Input file or directory path (assets/bundles will be auto-detected)
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output JSON path
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Filter by Unity class ID (repeatable). Empty means dump all.
+        #[arg(long)]
+        class_id: Vec<i32>,
+
+        /// Emit Unity version as a major.minor prefix (e.g. `2020.3.*`) instead of exact version.
+        #[arg(long)]
+        version_prefix: bool,
+
+        /// Overwrite existing output file
+        #[arg(long)]
+        overwrite: bool,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let strict = cli.strict;
     let show_warnings = cli.show_warnings;
+    let typetree_registry = cli.typetree_registry;
 
     match cli.command {
         Commands::ParseYaml {
@@ -285,12 +315,20 @@ fn main() -> Result<()> {
             jobs,
             strict,
             show_warnings,
+            typetree_registry.as_ref(),
         ),
         Commands::ListBundle {
             input,
             filter,
             verbose,
-        } => list_bundle_command(input, filter, verbose, strict, show_warnings),
+        } => list_bundle_command(
+            input,
+            filter,
+            verbose,
+            strict,
+            show_warnings,
+            typetree_registry.as_ref(),
+        ),
         Commands::FindObject {
             input,
             pattern,
@@ -311,6 +349,7 @@ fn main() -> Result<()> {
             verbose,
             strict,
             show_warnings,
+            typetree_registry.as_ref(),
         ),
         Commands::InspectObject {
             input,
@@ -336,6 +375,23 @@ fn main() -> Result<()> {
             filter,
             strict,
             show_warnings,
+            typetree_registry.as_ref(),
+        ),
+        Commands::DumpTypeTreeRegistry {
+            input,
+            output,
+            class_id,
+            version_prefix,
+            overwrite,
+        } => dump_typetree_registry_command(
+            input,
+            output,
+            class_id,
+            version_prefix,
+            overwrite,
+            strict,
+            show_warnings,
+            typetree_registry.as_ref(),
         ),
     }
 }
@@ -368,7 +424,11 @@ impl EnvironmentReporter for CliReporter {
     }
 }
 
-fn build_environment(strict: bool, show_warnings: bool) -> Environment {
+fn build_environment(
+    strict: bool,
+    show_warnings: bool,
+    typetree_registry: Option<&PathBuf>,
+) -> Result<Environment> {
     let mut env = if strict {
         Environment::with_options(EnvironmentOptions::strict())
     } else {
@@ -381,7 +441,14 @@ fn build_environment(strict: bool, show_warnings: bool) -> Environment {
         None
     };
     env.set_reporter(reporter);
-    env
+
+    if let Some(path) = typetree_registry {
+        let registry = JsonTypeTreeRegistry::from_path(path)
+            .map_err(|e| anyhow::anyhow!("Failed to load --typetree-registry {:?}: {}", path, e))?;
+        env.set_type_tree_registry(Some(Arc::new(registry)));
+    }
+
+    Ok(env)
 }
 
 fn parse_yaml_command(
@@ -782,6 +849,7 @@ fn export_bundle_command(
     jobs: usize,
     strict: bool,
     show_warnings: bool,
+    typetree_registry: Option<&PathBuf>,
 ) -> Result<()> {
     let mut resume_map: std::collections::HashMap<(String, String), ExportManifestEntry> =
         std::collections::HashMap::new();
@@ -822,7 +890,7 @@ fn export_bundle_command(
         retry_failed_jobs = Some(jobs);
     }
 
-    let mut env = build_environment(strict, show_warnings);
+    let mut env = build_environment(strict, show_warnings, typetree_registry)?;
     env.load(&input)?;
 
     std::fs::create_dir_all(&output)?;
@@ -1830,8 +1898,9 @@ fn list_bundle_command(
     verbose: bool,
     strict: bool,
     show_warnings: bool,
+    typetree_registry: Option<&PathBuf>,
 ) -> Result<()> {
-    let mut env = build_environment(strict, show_warnings);
+    let mut env = build_environment(strict, show_warnings, typetree_registry)?;
     env.load(&input)?;
 
     let filter_lc = filter.to_ascii_lowercase();
@@ -1896,8 +1965,9 @@ fn find_object_command(
     verbose: bool,
     strict: bool,
     show_warnings: bool,
+    typetree_registry: Option<&PathBuf>,
 ) -> Result<()> {
-    let mut env = build_environment(strict, show_warnings);
+    let mut env = build_environment(strict, show_warnings, typetree_registry)?;
     env.load(&input)?;
 
     let pattern_lc = pattern.to_ascii_lowercase();
@@ -2034,6 +2104,120 @@ fn find_object_command(
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct TypeTreeRegistryDump {
+    schema: u32,
+    entries: Vec<TypeTreeRegistryDumpEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct TypeTreeRegistryDumpEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unity_version: Option<String>,
+    class_id: i32,
+    type_tree: TypeTree,
+}
+
+fn major_minor_version_pattern(unity_version: &str) -> Option<String> {
+    let mut it = unity_version.split('.');
+    let major = it.next()?;
+    let minor = it.next()?;
+    Some(format!("{major}.{minor}.*"))
+}
+
+fn dump_typetree_registry_command(
+    input: PathBuf,
+    output: PathBuf,
+    class_id: Vec<i32>,
+    version_prefix: bool,
+    overwrite: bool,
+    strict: bool,
+    show_warnings: bool,
+    typetree_registry: Option<&PathBuf>,
+) -> Result<()> {
+    if output.exists() && !overwrite {
+        anyhow::bail!(
+            "Output already exists: {:?} (pass --overwrite to replace)",
+            output
+        );
+    }
+
+    let mut env = build_environment(strict, show_warnings, typetree_registry)?;
+    env.load(&input)?;
+
+    let class_filter: Option<HashSet<i32>> = if class_id.is_empty() {
+        None
+    } else {
+        Some(class_id.into_iter().collect())
+    };
+
+    let mut entries: Vec<TypeTreeRegistryDumpEntry> = Vec::new();
+    let mut seen: HashSet<(String, i32)> = HashSet::new();
+
+    let mut files: Vec<&unity_asset_binary::asset::SerializedFile> = Vec::new();
+    for (_src, file) in env.binary_assets() {
+        files.push(file);
+    }
+    for (_src, bundle) in env.bundles() {
+        for file in &bundle.assets {
+            files.push(file);
+        }
+    }
+
+    for file in files {
+        if !file.enable_type_tree {
+            continue;
+        }
+        let version_raw = file.unity_version.clone();
+        let version_out = if version_prefix {
+            major_minor_version_pattern(&version_raw).unwrap_or(version_raw)
+        } else {
+            version_raw
+        };
+
+        for t in &file.types {
+            if let Some(filter) = class_filter.as_ref() {
+                if !filter.contains(&t.class_id) {
+                    continue;
+                }
+            }
+
+            if t.type_tree.is_empty() {
+                continue;
+            }
+
+            let key = (version_out.clone(), t.class_id);
+            if !seen.insert(key) {
+                continue;
+            }
+
+            entries.push(TypeTreeRegistryDumpEntry {
+                unity_version: Some(version_out.clone()),
+                class_id: t.class_id,
+                type_tree: t.type_tree.clone(),
+            });
+        }
+    }
+
+    entries.sort_by(|a, b| {
+        a.unity_version
+            .as_deref()
+            .unwrap_or_default()
+            .cmp(b.unity_version.as_deref().unwrap_or_default())
+            .then_with(|| a.class_id.cmp(&b.class_id))
+    });
+
+    let dump = TypeTreeRegistryDump { schema: 1, entries };
+    let text = serde_json::to_string_pretty(&dump)?;
+    std::fs::write(&output, text)?;
+    println!(
+        "Wrote TypeTree registry: {:?} (entries={})",
+        output,
+        dump.entries.len()
+    );
+    Ok(())
+}
+
 fn lookup_object_type_info(
     env: &Environment,
     key: &unity_asset::environment::BinaryObjectKey,
@@ -2068,8 +2252,9 @@ fn inspect_object_command(
     filter: String,
     strict: bool,
     show_warnings: bool,
+    typetree_registry: Option<&PathBuf>,
 ) -> Result<()> {
-    let mut env = build_environment(strict, show_warnings);
+    let mut env = build_environment(strict, show_warnings, typetree_registry)?;
     env.load(&input)?;
 
     let mut key = if let Some(key) = key {

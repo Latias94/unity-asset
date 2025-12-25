@@ -218,6 +218,12 @@ cargo run --bin unity-asset -- find-object -i tests/samples/char_118_yuki.ab --c
 # Filter by object name (best-effort; requires TypeTree and a name field)
 cargo run --bin unity-asset -- find-object -i tests/samples/char_118_yuki.ab --name "yuki" --limit 20 --verbose
 
+# Dump an external TypeTree registry (best-effort fallback for stripped assets)
+cargo run --bin unity-asset -- dump-typetree-registry -i tests/samples -o typetree_registry.json --version-prefix
+
+# Use an external TypeTree registry during discovery/inspection (best-effort)
+cargo run --bin unity-asset -- --typetree-registry typetree_registry.json find-object -i tests/samples --pattern "Assets/" --limit 20 --verbose
+
 # Inspect a single object (TypeTree / Null-field debugging)
 # - Easiest: copy/paste the `key=bok2|...` line from `find-object --verbose` and use `--key`.
 # - Or pass the location fields explicitly (use `--kind serialized` for standalone `.assets` files).
