@@ -44,7 +44,12 @@ enum GoldenExpect {
     #[serde(rename = "sprite")]
     Sprite { rect_width: f64, rect_height: f64 },
     #[serde(rename = "mesh")]
-    Mesh,
+    Mesh {
+        #[serde(default)]
+        index_buffer_len: Option<usize>,
+        #[serde(default)]
+        index_buffer_prefix: Vec<i64>,
+    },
     #[serde(rename = "peek_only")]
     PeekOnly,
 }
@@ -247,9 +252,36 @@ fn golden_regression_smoke() {
                     case.id
                 );
             }
-            GoldenExpect::Mesh => {
-                // Name assertion above is the core fast-path compatibility check.
-                // If Mesh TypeTree changes, the regression will surface here.
+            GoldenExpect::Mesh {
+                index_buffer_len,
+                index_buffer_prefix,
+            } => {
+                if let Some(len) = index_buffer_len {
+                    let buf = obj
+                        .get("m_IndexBuffer")
+                        .expect("m_IndexBuffer present")
+                        .as_array()
+                        .expect("m_IndexBuffer array");
+                    assert_eq!(
+                        buf.len(),
+                        len,
+                        "m_IndexBuffer len mismatch (case={})",
+                        case.id
+                    );
+
+                    if !index_buffer_prefix.is_empty() {
+                        let prefix: Vec<i64> = buf
+                            .iter()
+                            .take(index_buffer_prefix.len())
+                            .map(|v| v.as_i64().expect("m_IndexBuffer byte"))
+                            .collect();
+                        assert_eq!(
+                            prefix, index_buffer_prefix,
+                            "m_IndexBuffer prefix mismatch (case={})",
+                            case.id
+                        );
+                    }
+                }
             }
             GoldenExpect::PeekOnly => {}
         }

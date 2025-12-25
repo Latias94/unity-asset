@@ -47,6 +47,9 @@ pub struct TypeTreeParseOutput {
 }
 
 impl<'a> TypeTreeSerializer<'a> {
+    const MAX_ARRAY_LEN: usize = 1_000_000;
+    const MAX_TYPELESSDATA_LEN: usize = Self::MAX_ARRAY_LEN;
+
     /// Create a new serializer with a TypeTree
     pub fn new(tree: &'a TypeTree) -> Self {
         Self { tree }
@@ -169,6 +172,32 @@ impl<'a> TypeTreeSerializer<'a> {
             // String
             "string" => UnityValue::String(reader.read_aligned_string()?),
 
+            // Typeless raw bytes (UnityPy: read_byte_array)
+            "TypelessData" => {
+                let length = reader.read_i32()?;
+                if length < 0 {
+                    return Err(BinaryError::invalid_data(format!(
+                        "Negative TypelessData length: {}",
+                        length
+                    )));
+                }
+                let length: usize = length as usize;
+                if length > Self::MAX_TYPELESSDATA_LEN {
+                    return Err(BinaryError::invalid_data(format!(
+                        "TypelessData length {} exceeds limit {}",
+                        length,
+                        Self::MAX_TYPELESSDATA_LEN
+                    )));
+                }
+                let bytes = reader.read_bytes(length)?;
+                UnityValue::Array(
+                    bytes
+                        .into_iter()
+                        .map(|b| UnityValue::Integer(b as i64))
+                        .collect(),
+                )
+            }
+
             // Array types
             _ if !node.children.is_empty()
                 && node.children.iter().any(|c| c.type_name == "Array") =>
@@ -226,9 +255,15 @@ impl<'a> TypeTreeSerializer<'a> {
             .ok_or_else(|| BinaryError::invalid_data("Array node not found in array type"))?;
 
         // Read array size (first child is size)
-        let size = reader.read_i32()? as usize;
-        if size > 1_000_000 {
-            // Sanity check to prevent memory exhaustion
+        let size_i32 = reader.read_i32()?;
+        if size_i32 < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative array size: {}",
+                size_i32
+            )));
+        }
+        let size = size_i32 as usize;
+        if size > Self::MAX_ARRAY_LEN {
             return Err(BinaryError::invalid_data(format!(
                 "Array size too large: {}",
                 size
@@ -242,6 +277,40 @@ impl<'a> TypeTreeSerializer<'a> {
             .children
             .get(1)
             .ok_or_else(|| BinaryError::invalid_data("Array element type not found"))?;
+
+        // Fast-path: byte/bool arrays are extremely common and are a hot path for large objects.
+        if element_node.children.is_empty() {
+            match element_node.type_name.as_str() {
+                "UInt8" | "char" => {
+                    let bytes = reader.read_bytes(size)?;
+                    return Ok(UnityValue::Array(
+                        bytes
+                            .into_iter()
+                            .map(|b| UnityValue::Integer(b as i64))
+                            .collect(),
+                    ));
+                }
+                "SInt8" => {
+                    let bytes = reader.read_bytes(size)?;
+                    return Ok(UnityValue::Array(
+                        bytes
+                            .into_iter()
+                            .map(|b| UnityValue::Integer((b as i8) as i64))
+                            .collect(),
+                    ));
+                }
+                "bool" => {
+                    let bytes = reader.read_bytes(size)?;
+                    return Ok(UnityValue::Array(
+                        bytes
+                            .into_iter()
+                            .map(|b| UnityValue::Bool(b != 0))
+                            .collect(),
+                    ));
+                }
+                _ => {}
+            }
+        }
 
         for _ in 0..size {
             let element = self.parse_value_by_type(reader, element_node)?;

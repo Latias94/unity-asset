@@ -78,7 +78,9 @@
       "byte_size": 17016,
       "name": "xinzexi_2_n-mesh",
       "expect": {
-        "kind": "mesh"
+        "kind": "mesh",
+        "index_buffer_len": 2172,
+        "index_buffer_prefix": [0, 0, 1, 0, 2, 0, 2, 0]
       }
     },
     {
