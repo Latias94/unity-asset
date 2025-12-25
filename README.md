@@ -107,6 +107,8 @@ cargo run --bin unity-asset -- --help
 cargo run --features async --bin unity-asset-async -- --help
 ```
 
+For maintainers: the tag-driven publish/release process is documented in `docs/RELEASING.md`.
+
 Once `0.2.0` is published, you'll be able to install it with:
 
 ```toml
