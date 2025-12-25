@@ -207,6 +207,9 @@ cargo run --bin unity-asset -- find-object -i tests/samples/char_118_yuki.ab --p
 # Filter by type (useful for scripts/batch workflows)
 cargo run --bin unity-asset -- find-object -i tests/samples/char_118_yuki.ab --class-name "Texture2D" --limit 20
 
+# Filter by object name (best-effort; requires TypeTree and a name field)
+cargo run --bin unity-asset -- find-object -i tests/samples/char_118_yuki.ab --name "yuki" --limit 20 --verbose
+
 # Inspect a single object (TypeTree / Null-field debugging)
 # - Easiest: copy/paste the `key=bok2|...` line from `find-object --verbose` and use `--key`.
 # - Or pass the location fields explicitly (use `--kind serialized` for standalone `.assets` files).

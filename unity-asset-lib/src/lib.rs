@@ -1114,6 +1114,76 @@ pub mod environment {
             }
         }
 
+        /// Best-effort peek of `m_Name`/`name` for a binary object key.
+        ///
+        /// This uses a TypeTree prefix fast path (when possible) and returns `Ok(None)` when the
+        /// object has no TypeTree or does not expose a name field.
+        pub fn peek_binary_object_name(&self, key: &BinaryObjectKey) -> Result<Option<String>> {
+            let typetree_options = self.options.typetree;
+            match key.source_kind {
+                BinarySourceKind::SerializedFile => {
+                    let file = self.binary_assets.get(&key.source).ok_or_else(|| {
+                        UnityAssetError::format(format!(
+                            "SerializedFile source not loaded: {}",
+                            key.source.describe()
+                        ))
+                    })?;
+                    let object = file.find_object_handle(key.path_id).ok_or_else(|| {
+                        UnityAssetError::format(format!(
+                            "Object not found in SerializedFile {}: path_id={}",
+                            key.source.describe(),
+                            key.path_id
+                        ))
+                    })?;
+                    object
+                        .peek_name_with_options(typetree_options)
+                        .map_err(|e| {
+                            UnityAssetError::format(format!(
+                                "Failed to peek binary object name: {}",
+                                e
+                            ))
+                        })
+                }
+                BinarySourceKind::AssetBundle => {
+                    let bundle = self.bundles.get(&key.source).ok_or_else(|| {
+                        UnityAssetError::format(format!(
+                            "AssetBundle source not loaded: {}",
+                            key.source.describe()
+                        ))
+                    })?;
+                    let asset_index = key.asset_index.ok_or_else(|| {
+                        UnityAssetError::format(
+                            "AssetBundle key requires an asset_index (which asset in the bundle?)"
+                                .to_string(),
+                        )
+                    })?;
+                    let file = bundle.assets.get(asset_index).ok_or_else(|| {
+                        UnityAssetError::format(format!(
+                            "AssetBundle asset index out of range: {} asset_index={}",
+                            key.source.describe(),
+                            asset_index
+                        ))
+                    })?;
+                    let object = file.find_object_handle(key.path_id).ok_or_else(|| {
+                        UnityAssetError::format(format!(
+                            "Object not found in AssetBundle {} asset_index={}: path_id={}",
+                            key.source.describe(),
+                            asset_index,
+                            key.path_id
+                        ))
+                    })?;
+                    object
+                        .peek_name_with_options(typetree_options)
+                        .map_err(|e| {
+                            UnityAssetError::format(format!(
+                                "Failed to peek binary object name: {}",
+                                e
+                            ))
+                        })
+                }
+            }
+        }
+
         fn find_loaded_serialized_source_by_external_path(
             &self,
             external_path: &str,
@@ -2129,6 +2199,9 @@ pub mod environment {
                     .path
                     .contains("CAB-8579bc75d50073df38987733a7cb3193")
             );
+
+            let peek = env.peek_binary_object_name(&key).unwrap();
+            assert_eq!(peek, obj.name());
         }
 
         #[test]

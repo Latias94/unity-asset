@@ -164,6 +164,12 @@ enum Commands {
         #[arg(long, default_value = "")]
         pattern: String,
 
+        /// Filter by object `m_Name`/`name` substring (case-insensitive) via a TypeTree prefix fast path.
+        ///
+        /// Note: this requires TypeTree to be present and to include a name field; otherwise the object is treated as non-matching.
+        #[arg(long, default_value = "")]
+        name: String,
+
         /// Filter by Unity class ID (repeatable). Example: `--class-id 83` (AudioClip).
         #[arg(long)]
         class_id: Vec<i32>,
@@ -288,6 +294,7 @@ fn main() -> Result<()> {
         Commands::FindObject {
             input,
             pattern,
+            name,
             class_id,
             class_name,
             limit,
@@ -296,6 +303,7 @@ fn main() -> Result<()> {
         } => find_object_command(
             input,
             pattern,
+            name,
             class_id,
             class_name,
             limit,
@@ -1880,6 +1888,7 @@ fn list_bundle_command(
 fn find_object_command(
     input: PathBuf,
     pattern: String,
+    name: String,
     class_id: Vec<i32>,
     class_name: String,
     limit: Option<usize>,
@@ -1892,6 +1901,7 @@ fn find_object_command(
     env.load(&input)?;
 
     let pattern_lc = pattern.to_ascii_lowercase();
+    let name_lc = name.to_ascii_lowercase();
     let class_name_lc = class_name.to_ascii_lowercase();
     let class_ids = class_id;
 
@@ -1951,6 +1961,21 @@ fn find_object_command(
                             continue;
                         }
                     }
+                    if !name_lc.is_empty() {
+                        let matches = match env.peek_binary_object_name(key) {
+                            Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
+                            Ok(None) => false,
+                            Err(e) => {
+                                if show_warnings {
+                                    eprintln!("warning: peek_name failed for key={}: {}", key, e);
+                                }
+                                false
+                            }
+                        };
+                        if !matches {
+                            continue;
+                        }
+                    }
 
                     println!(
                         "{} -> key={} type_id={} byte_size={}",
@@ -1979,6 +2004,21 @@ fn find_object_command(
                     let name = unity_asset::get_class_name(type_id)
                         .unwrap_or_else(|| format!("Class_{}", type_id));
                     if !name.to_ascii_lowercase().contains(&class_name_lc) {
+                        continue;
+                    }
+                }
+                if !name_lc.is_empty() {
+                    let matches = match env.peek_binary_object_name(key) {
+                        Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
+                        Ok(None) => false,
+                        Err(e) => {
+                            if show_warnings {
+                                eprintln!("warning: peek_name failed for key={}: {}", key, e);
+                            }
+                            false
+                        }
+                    };
+                    if !matches {
                         continue;
                     }
                 }
