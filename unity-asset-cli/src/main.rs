@@ -3256,7 +3256,349 @@ struct ScanPPtrExternal {
     path_id: i64,
 }
 
-fn scan_pptr_command(
+#[allow(clippy::too_many_arguments)]
+fn scan_pptr_scan_file(
+    source_key: &BinarySource,
+    source_kind: unity_asset::environment::BinarySourceKind,
+    asset_index_key: Option<usize>,
+    file: &unity_asset_binary::asset::SerializedFile,
+    class_id: &[i32],
+    has_name_filter: bool,
+    name_lc: &str,
+    include_no_typetree: bool,
+    json: bool,
+    remaining: &mut usize,
+) -> Result<()> {
+    if *remaining == 0 {
+        return Ok(());
+    }
+
+    for handle in file.object_handles() {
+        if *remaining == 0 {
+            break;
+        }
+        if !class_id.is_empty() && !class_id.contains(&handle.class_id()) {
+            continue;
+        }
+
+        let obj_name = if has_name_filter {
+            match handle.peek_name() {
+                Ok(v) => v,
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        if has_name_filter {
+            let Some(n) = obj_name.as_ref() else {
+                continue;
+            };
+            if !n.to_ascii_lowercase().contains(name_lc) {
+                continue;
+            }
+        }
+
+        let key = BinaryObjectKey {
+            source: source_key.clone(),
+            source_kind,
+            asset_index: asset_index_key,
+            path_id: handle.path_id(),
+        };
+
+        let info = handle.info();
+        let scan = handle.scan_pptrs()?;
+
+        let (typetree_ok, mut internal, mut external) = match scan {
+            Some(v) => (true, v.internal, v.external),
+            None => (false, Vec::new(), Vec::new()),
+        };
+        if !typetree_ok && !include_no_typetree {
+            continue;
+        }
+
+        internal.sort_unstable();
+        internal.dedup();
+        external.sort_unstable();
+        external.dedup();
+
+        let record = ScanPPtrRecord {
+            key: key.to_string(),
+            source: source_key.to_string(),
+            source_kind: match source_kind {
+                unity_asset::environment::BinarySourceKind::AssetBundle => "bundle",
+                unity_asset::environment::BinarySourceKind::SerializedFile => "serialized",
+            }
+            .to_string(),
+            asset_index: asset_index_key,
+            path_id: handle.path_id(),
+            type_id: handle.class_id(),
+            byte_size: info.byte_size,
+            name: obj_name,
+            internal,
+            external: external
+                .into_iter()
+                .map(|(file_id, path_id)| ScanPPtrExternal { file_id, path_id })
+                .collect(),
+            typetree: if include_no_typetree {
+                Some(typetree_ok)
+            } else {
+                None
+            },
+        };
+
+        if json {
+            println!("{}", serde_json::to_string(&record)?);
+        } else {
+            println!(
+                "key={} type_id={} byte_size={} internal={} external={}",
+                record.key,
+                record.type_id,
+                record.byte_size,
+                record.internal.len(),
+                record.external.len()
+            );
+        }
+
+        *remaining = remaining.saturating_sub(1);
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_pptr_fast(
+    input: &PathBuf,
+    kind: &str,
+    source: Option<&PathBuf>,
+    asset_index: Option<usize>,
+    class_id: &[i32],
+    name: &str,
+    limit: Option<usize>,
+    include_no_typetree: bool,
+    json: bool,
+    show_warnings: bool,
+    typetree_registry: Option<&PathBuf>,
+) -> Result<bool> {
+    let registry = load_typetree_registry(typetree_registry)?;
+
+    let kind_lc = kind.to_ascii_lowercase();
+    let scan_bundles = kind_lc == "all" || kind_lc == "bundle";
+    let scan_serialized = kind_lc == "all" || kind_lc == "serialized";
+    if !scan_bundles && !scan_serialized {
+        anyhow::bail!("Invalid --kind: {} (expected all|bundle|serialized)", kind);
+    }
+
+    let name_lc = name.to_ascii_lowercase();
+    let has_name_filter = !name_lc.is_empty();
+    let mut remaining = limit.unwrap_or(usize::MAX);
+
+    let requested_source = source.map(|v| v.to_path_buf());
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+    if input.is_dir() {
+        collect_files_recursive(input, &mut candidate_paths)?;
+        candidate_paths.sort();
+        candidate_paths.dedup();
+    } else {
+        candidate_paths.push(input.clone());
+    }
+
+    let path_matches_requested = |candidate: &Path, requested: &Path| -> bool {
+        if candidate == requested {
+            return true;
+        }
+        let candidate_str = candidate.to_string_lossy().replace('\\', "/");
+        let requested_str = requested.to_string_lossy().replace('\\', "/");
+        if candidate_str.ends_with(&requested_str) || requested_str.ends_with(&candidate_str) {
+            return true;
+        }
+        candidate.file_name() == requested.file_name()
+    };
+
+    let mut processed_any = false;
+
+    if scan_bundles {
+        for path in &candidate_paths {
+            if remaining == 0 {
+                break;
+            }
+            if let Some(req) = requested_source.as_ref() {
+                if !path_matches_requested(path, req) {
+                    continue;
+                }
+            }
+
+            let prefix = match read_prefix(path, 16) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if !looks_like_bundle_prefix(&prefix) {
+                continue;
+            }
+
+            let options = BundleLoadOptions::lazy();
+            let bundle = match load_bundle_for_list(path, options) {
+                Ok(v) => v,
+                Err(e) => {
+                    if show_warnings {
+                        eprintln!("warning: failed to parse bundle {:?}: {}", path, e);
+                    }
+                    continue;
+                }
+            };
+            if bundle.header.signature != "UnityFS" {
+                continue;
+            }
+
+            let asset_nodes = bundle_asset_nodes(&bundle);
+            if let Some(idx) = asset_index {
+                if idx >= asset_nodes.len() {
+                    // Defer to env fallback to preserve existing UX.
+                    return Ok(false);
+                }
+            }
+
+            let source_key = BinarySource::path(path);
+            let shared = match bundle.data_arc() {
+                Ok(v) => SharedBytes::from_arc(v),
+                Err(e) => {
+                    if show_warnings {
+                        eprintln!(
+                            "warning: failed to decompress bundle {:?} for scan-pptr: {}",
+                            path, e
+                        );
+                    }
+                    continue;
+                }
+            };
+
+            processed_any = true;
+
+            for (idx, node) in asset_nodes.iter().enumerate() {
+                if remaining == 0 {
+                    break;
+                }
+                if let Some(filter_idx) = asset_index {
+                    if filter_idx != idx {
+                        continue;
+                    }
+                }
+
+                let (start, end) = match node_range(node) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if show_warnings {
+                            eprintln!("warning: invalid bundle node range ({}): {}", node.name, e);
+                        }
+                        continue;
+                    }
+                };
+
+                let mut file =
+                    match unity_asset_binary::asset::SerializedFileParser::from_shared_range(
+                        shared.clone(),
+                        start..end,
+                    ) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                if let Some(registry) = registry.clone() {
+                    file.set_type_tree_registry(Some(registry));
+                }
+
+                scan_pptr_scan_file(
+                    &source_key,
+                    unity_asset::environment::BinarySourceKind::AssetBundle,
+                    Some(idx),
+                    &file,
+                    class_id,
+                    has_name_filter,
+                    &name_lc,
+                    include_no_typetree,
+                    json,
+                    &mut remaining,
+                )?;
+            }
+        }
+    }
+
+    if scan_serialized {
+        for path in &candidate_paths {
+            if remaining == 0 {
+                break;
+            }
+            if let Some(req) = requested_source.as_ref() {
+                if !path_matches_requested(path, req) {
+                    continue;
+                }
+            }
+
+            let prefix = match read_prefix(path, 16) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if looks_like_bundle_prefix(&prefix) {
+                continue;
+            }
+            if prefix.starts_with(b"UnityWebData") || prefix.starts_with(b"TuanjieWebData") {
+                continue;
+            }
+            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                if ext.to_ascii_lowercase() != "assets" {
+                    continue;
+                }
+            }
+
+            let mut file = match load_serialized_file_for_scan(path) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Some(registry) = registry.clone() {
+                file.set_type_tree_registry(Some(registry));
+            }
+
+            processed_any = true;
+            let source_key = BinarySource::path(path);
+            scan_pptr_scan_file(
+                &source_key,
+                unity_asset::environment::BinarySourceKind::SerializedFile,
+                None,
+                &file,
+                class_id,
+                has_name_filter,
+                &name_lc,
+                include_no_typetree,
+                json,
+                &mut remaining,
+            )?;
+        }
+    }
+
+    Ok(processed_any)
+}
+
+fn load_serialized_file_for_scan(path: &Path) -> Result<unity_asset_binary::asset::SerializedFile> {
+    #[cfg(feature = "mmap")]
+    {
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let shared = SharedBytes::Mmap(Arc::new(mmap));
+        let len = shared.len();
+        return Ok(
+            unity_asset_binary::asset::SerializedFileParser::from_shared_range(shared, 0..len)?,
+        );
+    }
+
+    #[cfg(not(feature = "mmap"))]
+    {
+        let bytes = std::fs::read(path)?;
+        Ok(unity_asset_binary::asset::SerializedFileParser::from_bytes(
+            bytes,
+        )?)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_pptr_env_fallback(
     input: PathBuf,
     kind: String,
     source: Option<PathBuf>,
@@ -3315,108 +3657,6 @@ fn scan_pptr_command(
         None
     };
 
-    let scan_file = |source_key: &BinarySource,
-                     source_kind: unity_asset::environment::BinarySourceKind,
-                     asset_index_key: Option<usize>,
-                     file: &unity_asset_binary::asset::SerializedFile,
-                     remaining: &mut usize|
-     -> Result<()> {
-        if *remaining == 0 {
-            return Ok(());
-        }
-
-        for handle in file.object_handles() {
-            if *remaining == 0 {
-                break;
-            }
-            if !class_id.is_empty() && !class_id.contains(&handle.class_id()) {
-                continue;
-            }
-
-            let obj_name = if has_name_filter {
-                match handle.peek_name() {
-                    Ok(v) => v,
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
-            if has_name_filter {
-                let Some(n) = obj_name.as_ref() else {
-                    continue;
-                };
-                if !n.to_ascii_lowercase().contains(&name_lc) {
-                    continue;
-                }
-            }
-
-            let key = BinaryObjectKey {
-                source: source_key.clone(),
-                source_kind,
-                asset_index: asset_index_key,
-                path_id: handle.path_id(),
-            };
-
-            let info = handle.info();
-            let scan = handle.scan_pptrs()?;
-
-            let (typetree_ok, mut internal, mut external) = match scan {
-                Some(v) => (true, v.internal, v.external),
-                None => (false, Vec::new(), Vec::new()),
-            };
-            if !typetree_ok && !include_no_typetree {
-                continue;
-            }
-
-            internal.sort_unstable();
-            internal.dedup();
-            external.sort_unstable();
-            external.dedup();
-
-            let record = ScanPPtrRecord {
-                key: key.to_string(),
-                source: source_key.to_string(),
-                source_kind: match source_kind {
-                    unity_asset::environment::BinarySourceKind::AssetBundle => "bundle",
-                    unity_asset::environment::BinarySourceKind::SerializedFile => "serialized",
-                }
-                .to_string(),
-                asset_index: asset_index_key,
-                path_id: handle.path_id(),
-                type_id: handle.class_id(),
-                byte_size: info.byte_size,
-                name: obj_name,
-                internal,
-                external: external
-                    .into_iter()
-                    .map(|(file_id, path_id)| ScanPPtrExternal { file_id, path_id })
-                    .collect(),
-                typetree: if include_no_typetree {
-                    Some(typetree_ok)
-                } else {
-                    None
-                },
-            };
-
-            if json {
-                println!("{}", serde_json::to_string(&record)?);
-            } else {
-                println!(
-                    "key={} type_id={} byte_size={} internal={} external={}",
-                    record.key,
-                    record.type_id,
-                    record.byte_size,
-                    record.internal.len(),
-                    record.external.len()
-                );
-            }
-
-            *remaining = remaining.saturating_sub(1);
-        }
-
-        Ok(())
-    };
-
     if scan_bundles {
         for (bundle_key, bundle) in env.bundles() {
             if remaining == 0 {
@@ -3437,11 +3677,16 @@ fn scan_pptr_command(
                         continue;
                     }
                 }
-                scan_file(
+                scan_pptr_scan_file(
                     bundle_key,
                     unity_asset::environment::BinarySourceKind::AssetBundle,
                     Some(idx),
                     file,
+                    &class_id,
+                    has_name_filter,
+                    &name_lc,
+                    include_no_typetree,
+                    json,
                     &mut remaining,
                 )?;
             }
@@ -3458,17 +3703,68 @@ fn scan_pptr_command(
                     continue;
                 }
             }
-            scan_file(
+            scan_pptr_scan_file(
                 asset_key,
                 unity_asset::environment::BinarySourceKind::SerializedFile,
                 None,
                 file,
+                &class_id,
+                has_name_filter,
+                &name_lc,
+                include_no_typetree,
+                json,
                 &mut remaining,
             )?;
         }
     }
 
     Ok(())
+}
+
+fn scan_pptr_command(
+    input: PathBuf,
+    kind: String,
+    source: Option<PathBuf>,
+    asset_index: Option<usize>,
+    class_id: Vec<i32>,
+    name: String,
+    limit: Option<usize>,
+    include_no_typetree: bool,
+    json: bool,
+    strict: bool,
+    show_warnings: bool,
+    typetree_registry: Option<&PathBuf>,
+) -> Result<()> {
+    if let Ok(true) = scan_pptr_fast(
+        &input,
+        &kind,
+        source.as_ref(),
+        asset_index,
+        &class_id,
+        &name,
+        limit,
+        include_no_typetree,
+        json,
+        show_warnings,
+        typetree_registry,
+    ) {
+        return Ok(());
+    }
+
+    scan_pptr_env_fallback(
+        input,
+        kind,
+        source,
+        asset_index,
+        class_id,
+        name,
+        limit,
+        include_no_typetree,
+        json,
+        strict,
+        show_warnings,
+        typetree_registry,
+    )
 }
 
 #[derive(Debug, Serialize)]
