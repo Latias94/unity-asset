@@ -1,6 +1,6 @@
 use crate::fast_path;
 use crate::shared::{
-    cli_warn, AppContext, build_environment, class_name_for_id, load_environment_input,
+    AppContext, build_environment, class_name_for_id, cli_warn, load_environment_input,
     load_typetree_registry,
 };
 use anyhow::Result;
@@ -136,7 +136,10 @@ fn find_object_env_fallback(
                             Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
                             Ok(None) => false,
                             Err(e) => {
-                                cli_warn(show_warnings, format!("peek_name failed for key={}: {}", key, e));
+                                cli_warn(
+                                    show_warnings,
+                                    format!("peek_name failed for key={}: {}", key, e),
+                                );
                                 false
                             }
                         };
@@ -179,7 +182,10 @@ fn find_object_env_fallback(
                         Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
                         Ok(None) => false,
                         Err(e) => {
-                            cli_warn(show_warnings, format!("peek_name failed for key={}: {}", key, e));
+                            cli_warn(
+                                show_warnings,
+                                format!("peek_name failed for key={}: {}", key, e),
+                            );
                             false
                         }
                     };
@@ -240,11 +246,7 @@ fn find_object_fast(
             }
         }
 
-        let prefix = match fast_path::read_prefix(&path, 16) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if !fast_path::looks_like_bundle_prefix(&prefix) {
+        if !fast_path::is_unityfs_bundle_path(&path) {
             continue;
         }
 
@@ -253,9 +255,6 @@ fn find_object_fast(
             Ok(v) => v,
             Err(_) => continue,
         };
-        if bundle.header.signature != "UnityFS" {
-            continue;
-        }
         processed_any_bundle = true;
 
         let bundle_source = BinarySource::path(&path);
@@ -346,7 +345,10 @@ fn find_object_fast(
                             Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
                             Ok(None) => false,
                             Err(e) => {
-                                cli_warn(show_warnings, format!("peek_name failed for key={}: {}", key, e));
+                                cli_warn(
+                                    show_warnings,
+                                    format!("peek_name failed for key={}: {}", key, e),
+                                );
                                 false
                             }
                         };
@@ -402,7 +404,10 @@ fn find_object_fast(
                         Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
                         Ok(None) => false,
                         Err(e) => {
-                            cli_warn(show_warnings, format!("peek_name failed for key={}: {}", key, e));
+                            cli_warn(
+                                show_warnings,
+                                format!("peek_name failed for key={}: {}", key, e),
+                            );
                             false
                         }
                     };

@@ -6,7 +6,6 @@ use unity_asset::environment::{
     BinaryObjectKey, BinarySource, Environment, EnvironmentOptions, EnvironmentReporter,
     EnvironmentWarning,
 };
-use unity_asset_binary::shared_bytes::SharedBytes;
 use unity_asset_binary::typetree::{
     CompositeTypeTreeRegistry, JsonTypeTreeRegistry, TpkTypeTreeRegistry, TypeTreeRegistry,
 };
@@ -155,26 +154,7 @@ pub(crate) fn load_typetree_registry(
 pub(crate) fn load_serialized_file_for_scan(
     path: &Path,
 ) -> Result<unity_asset_binary::asset::SerializedFile> {
-    #[cfg(feature = "mmap")]
-    {
-        use std::sync::Arc;
-
-        let file = std::fs::File::open(path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let shared = SharedBytes::Mmap(Arc::new(mmap));
-        let len = shared.len();
-        return Ok(
-            unity_asset_binary::asset::SerializedFileParser::from_shared_range(shared, 0..len)?,
-        );
-    }
-
-    #[cfg(not(feature = "mmap"))]
-    {
-        let bytes = std::fs::read(path)?;
-        Ok(unity_asset_binary::asset::SerializedFileParser::from_bytes(
-            bytes,
-        )?)
-    }
+    Ok(unity_asset_binary::file::load_serialized_file(path, false)?)
 }
 
 pub(crate) fn resolve_loaded_source(

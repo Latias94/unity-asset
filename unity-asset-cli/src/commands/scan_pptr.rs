@@ -1,6 +1,6 @@
 use crate::fast_path;
 use crate::shared::{
-    cli_warn, AppContext, build_environment, load_environment_input, load_serialized_file_for_scan,
+    AppContext, build_environment, cli_warn, load_environment_input, load_serialized_file_for_scan,
     load_typetree_registry, resolve_loaded_source,
 };
 use anyhow::Result;
@@ -185,11 +185,7 @@ fn scan_pptr_fast(
                 }
             }
 
-            let prefix = match fast_path::read_prefix(path, 16) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if !fast_path::looks_like_bundle_prefix(&prefix) {
+            if !fast_path::is_unityfs_bundle_path(path) {
                 continue;
             }
 
@@ -197,13 +193,13 @@ fn scan_pptr_fast(
             let bundle = match fast_path::load_bundle_for_list(path, options) {
                 Ok(v) => v,
                 Err(e) => {
-                    cli_warn(show_warnings, format!("failed to parse bundle {:?}: {}", path, e));
+                    cli_warn(
+                        show_warnings,
+                        format!("failed to parse bundle {:?}: {}", path, e),
+                    );
                     continue;
                 }
             };
-            if bundle.header.signature != "UnityFS" {
-                continue;
-            }
 
             let asset_nodes = fast_path::bundle_asset_nodes(&bundle);
             if let Some(idx) = asset_index {
@@ -261,7 +257,10 @@ fn scan_pptr_fast(
                 Err(e) => {
                     cli_warn(
                         show_warnings,
-                        format!("failed to decompress bundle {:?} for scan-pptr: {}", path, e),
+                        format!(
+                            "failed to decompress bundle {:?} for scan-pptr: {}",
+                            path, e
+                        ),
                     );
                     continue;
                 }
@@ -322,20 +321,8 @@ fn scan_pptr_fast(
                 }
             }
 
-            let prefix = match fast_path::read_prefix(path, 16) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if fast_path::looks_like_bundle_prefix(&prefix) {
+            if !fast_path::is_serialized_file_path(path) {
                 continue;
-            }
-            if prefix.starts_with(b"UnityWebData") || prefix.starts_with(b"TuanjieWebData") {
-                continue;
-            }
-            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                if ext.to_ascii_lowercase() != "assets" {
-                    continue;
-                }
             }
 
             let mut file = match load_serialized_file_for_scan(path) {

@@ -10,11 +10,7 @@ pub(crate) fn run(input: PathBuf, filter: String, verbose: bool, _ctx: &AppConte
     let mut found_any = false;
 
     for path in candidate_paths {
-        let prefix = match fast_path::read_prefix(&path, 16) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if !fast_path::looks_like_bundle_prefix(&prefix) {
+        if !fast_path::is_assetbundle_path(&path) {
             continue;
         }
 

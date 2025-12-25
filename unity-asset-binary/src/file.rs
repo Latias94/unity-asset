@@ -7,7 +7,9 @@
 //!
 //! This module provides a single entry point to parse them into a tagged enum.
 
+use crate::asset::SerializedFile;
 use crate::asset::header::SerializedFileHeader;
+use crate::bundle::{AssetBundle, BundleLoadOptions, BundleParser};
 use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
@@ -61,21 +63,61 @@ impl UnityFile {
 }
 
 fn sniff_bundle(data: &[u8]) -> bool {
-    if data.len() < 8 {
+    looks_like_bundle_prefix(data)
+}
+
+/// Return true if the provided byte prefix looks like an AssetBundle container signature.
+///
+/// Notes:
+/// - This mirrors UnityPy-style sniffing and is intentionally conservative.
+/// - `UnityWebData*` / `TuanjieWebData*` are WebFile containers and must not be classified as bundles.
+pub fn looks_like_bundle_prefix(prefix: &[u8]) -> bool {
+    if prefix.len() < 8 {
         return false;
     }
-    if data.starts_with(b"UnityFS\0") || data.starts_with(b"UnityRaw") {
+    if prefix.starts_with(b"UnityFS\0") || prefix.starts_with(b"UnityRaw") {
         return true;
     }
-    if data.starts_with(b"UnityWeb") {
-        // WebFile containers use a longer, distinct signature (`UnityWebData*`) but share the same
-        // 8-byte prefix. Avoid mis-classifying uncompressed WebFiles as legacy UnityWeb bundles.
-        if data.starts_with(b"UnityWebData") || data.starts_with(b"TuanjieWebData") {
+    if prefix.starts_with(b"UnityWeb") {
+        if prefix.starts_with(b"UnityWebData") || prefix.starts_with(b"TuanjieWebData") {
             return false;
         }
         return true;
     }
     false
+}
+
+/// Return true if the provided byte prefix matches the UnityFS bundle signature.
+pub fn looks_like_unityfs_bundle_prefix(prefix: &[u8]) -> bool {
+    prefix.starts_with(b"UnityFS\0")
+}
+
+/// Return true if the provided byte prefix looks like an uncompressed WebFile container signature.
+pub fn looks_like_uncompressed_webfile_prefix(prefix: &[u8]) -> bool {
+    prefix.starts_with(b"UnityWebData") || prefix.starts_with(b"TuanjieWebData")
+}
+
+/// Return true if the provided byte prefix looks like a SerializedFile.
+///
+/// This performs a minimal header parse and validity check.
+pub fn looks_like_serialized_file_prefix(prefix: &[u8]) -> bool {
+    sniff_serialized_file(prefix)
+}
+
+/// Classify a file by inspecting an in-memory prefix.
+///
+/// This is a cheap, conservative helper intended for fast directory scans.
+pub fn sniff_unity_file_kind_prefix(prefix: &[u8]) -> Option<UnityFileKind> {
+    if looks_like_uncompressed_webfile_prefix(prefix) {
+        return Some(UnityFileKind::WebFile);
+    }
+    if looks_like_bundle_prefix(prefix) {
+        return Some(UnityFileKind::AssetBundle);
+    }
+    if looks_like_serialized_file_prefix(prefix) {
+        return Some(UnityFileKind::SerializedFile);
+    }
+    None
 }
 
 fn sniff_serialized_file(data: &[u8]) -> bool {
@@ -158,6 +200,64 @@ pub fn load_unity_file<P: AsRef<Path>>(path: P) -> Result<UnityFile> {
             BinaryError::generic(format!("Failed to read file {:?}: {}", path.as_ref(), e))
         })?;
         load_unity_file_from_memory(data)
+    }
+}
+
+/// Load an AssetBundle from a filesystem path with explicit parser options.
+pub fn load_bundle_file_with_options<P: AsRef<Path>>(
+    path: P,
+    options: BundleLoadOptions,
+) -> Result<AssetBundle> {
+    #[cfg(feature = "mmap")]
+    {
+        let file = std::fs::File::open(&path).map_err(|e| {
+            BinaryError::generic(format!("Failed to open file {:?}: {}", path.as_ref(), e))
+        })?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
+            BinaryError::generic(format!("Failed to mmap file {:?}: {}", path.as_ref(), e))
+        })?;
+        let shared = SharedBytes::Mmap(std::sync::Arc::new(mmap));
+        let len = shared.len();
+        return BundleParser::from_shared_range_with_options(shared, 0..len, options);
+    }
+
+    #[cfg(not(feature = "mmap"))]
+    {
+        let data = std::fs::read(&path).map_err(|e| {
+            BinaryError::generic(format!("Failed to read file {:?}: {}", path.as_ref(), e))
+        })?;
+        BundleParser::from_bytes_with_options(data, options)
+    }
+}
+
+/// Load a SerializedFile from a filesystem path.
+pub fn load_serialized_file<P: AsRef<Path>>(
+    path: P,
+    preload_object_data: bool,
+) -> Result<SerializedFile> {
+    #[cfg(feature = "mmap")]
+    {
+        let file = std::fs::File::open(&path).map_err(|e| {
+            BinaryError::generic(format!("Failed to open file {:?}: {}", path.as_ref(), e))
+        })?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
+            BinaryError::generic(format!("Failed to mmap file {:?}: {}", path.as_ref(), e))
+        })?;
+        let shared = SharedBytes::Mmap(std::sync::Arc::new(mmap));
+        let len = shared.len();
+        return crate::asset::SerializedFileParser::from_shared_range_with_options(
+            shared,
+            0..len,
+            preload_object_data,
+        );
+    }
+
+    #[cfg(not(feature = "mmap"))]
+    {
+        let data = std::fs::read(&path).map_err(|e| {
+            BinaryError::generic(format!("Failed to read file {:?}: {}", path.as_ref(), e))
+        })?;
+        crate::asset::SerializedFileParser::from_bytes_with_options(data, preload_object_data)
     }
 }
 

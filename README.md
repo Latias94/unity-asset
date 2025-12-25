@@ -2,21 +2,21 @@
 
 A Rust implementation of Unity asset parsing, inspired by and learning from [UnityPy](https://github.com/K0lb3/UnityPy). This project focuses on parsing Unity YAML and binary formats with Rust's memory safety and performance characteristics.
 
-## 🎯 Project Status
+## Project Status
 
-**⚠️ Early Development**: This is a learning project and reference implementation. It is **not production-ready** and has significant limitations compared to mature tools like UnityPy.
+**Early Development**: This is a learning project and reference implementation. It is **not production-ready** and has significant limitations compared to mature tools like UnityPy.
 
 ### What This Project Is
-- 📚 **Learning Exercise**: Understanding Unity's file formats through Rust implementation
-- 🔍 **Parser Focus**: Emphasis on parsing and data extraction rather than manipulation
-- 🦀 **Rust Exploration**: Exploring how Rust's type system can help with binary parsing
-- 📖 **Reference Implementation**: Code that others can learn from and build upon
+- **Learning Exercise**: Understanding Unity's file formats through Rust implementation
+- **Parser Focus**: Emphasis on parsing and data extraction rather than manipulation
+- **Rust Exploration**: Exploring how Rust's type system can help with binary parsing
+- **Reference Implementation**: Code that others can learn from and build upon
 
 ### What This Project Is NOT
-- ❌ **UnityPy Replacement**: UnityPy remains the most mature Python solution
-- ❌ **Asset Editor**: This is a read-only parser, not an asset creation/editing tool
+- **UnityPy Replacement**: UnityPy remains the most mature Python solution
+- **Asset Editor**: This is a read-only parser, not an asset creation/editing tool
 
-## 🏗️ Architecture
+## Architecture
 
 The project uses a workspace structure to organize different parsing capabilities:
 
@@ -25,6 +25,7 @@ unity-asset/
 ├── unity-asset-core/      # Core data structures and traits
 ├── unity-asset-yaml/      # YAML file parsing (stable)
 ├── unity-asset-binary/    # Binary asset parsing (advanced, WIP)
+├── unity-asset-decode/    # Optional decode/export helpers (Texture/Audio/Sprite/Mesh)
 ├── unity-asset-lib/       # Main library crate (published as `unity-asset`)
 ├── unity-asset-cli/       # CLI tools
 │   ├── main.rs           # Synchronous CLI tool
@@ -35,14 +36,14 @@ unity-asset/
 
 ### Current Capabilities
 
-#### 🔧 YAML Processing (Complete)
+#### YAML Processing (Complete)
 - Unity YAML format parsing for common file types (.asset, .prefab, .unity)
 - Multi-document parsing support
 - Reference resolution and cross-document linking
 - Filtering and querying capabilities
 - Serialization back to YAML format
 
-#### 🔧 Binary Asset Processing (Advanced, WIP)
+#### Binary Asset Processing (Advanced, WIP)
 - AssetBundle structure parsing (UnityFS format)
 - SerializedFile parsing with full object extraction
 - TypeTree structure parsing and dynamic object reading
@@ -50,14 +51,14 @@ unity-asset/
 - Metadata extraction and analysis (experimental; includes dependency graph, best-effort hierarchy/component mapping, and external reference resolution via `externals`)
 - Performance monitoring and basic statistics
 
-#### 🔧 Object Processing (Partial)
+#### Object Processing (Partial)
 - **AudioClip**: Full format support (Vorbis, MP3, WAV, AAC) via `unity-asset-decode` (Symphonia-based decoder)
 - **Texture2D**: Complete parsing + best-effort decoding + PNG export via `unity-asset-decode`
 - **Sprite**: Full metadata extraction + atlas support + image cutting via `unity-asset-decode`
 - **Mesh**: Structure parsing + vertex data extraction + basic export via `unity-asset-decode`
 - **GameObject/Transform**: Basic TypeTree-based hierarchy & component mapping (best-effort; still WIP)
 
-#### 🔧 CLI Tools (Usable, WIP)
+#### CLI Tools (Usable, WIP)
 - Synchronous CLI for file inspection and batch processing
 - Asynchronous CLI with concurrent processing and progress tracking
 - Export capabilities (PNG, OGG, WAV, basic mesh formats)
@@ -66,7 +67,7 @@ unity-asset/
   - `list-objects`: list objects from SerializedFiles/bundles (path_id/class_id/type/name) using TypeTree fast paths
   - `export-serialized`: export objects from `.asset/.assets` by scanning objects directly (raw `.bin`, optional best-effort decode)
 
-**⚠️ Known Limitations**
+**Known Limitations**
 - Some advanced Unity asset types not yet implemented (MonoBehaviour scripts, complex shaders)
 - Object manipulation is read-only (no writing back to Unity formats)
 - Some edge cases in LZMA decompression may fail on corrupted data
@@ -79,7 +80,7 @@ unity-asset/
 - For large objects without TypeTree, raw bytes are not expanded into `_raw_data` for performance; use `UnityObject::raw_data()`
 - TypeTree byte-like fields are represented as `UnityValue::Bytes` (not `Array<Integer>`) for performance: `TypelessData` and `vector<UInt8/SInt8/char>`. Use `UnityValue::as_bytes()` to access them.
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Requirements
 
@@ -106,12 +107,12 @@ cargo run --bin unity-asset -- --help
 cargo run --features async --bin unity-asset-async -- --help
 ```
 
-Once published, you'll be able to install it with:
+Once `0.2.0` is published, you'll be able to install it with:
 
 ```toml
 # Add to your Cargo.toml
 [dependencies]
-unity-asset = "0.1.0"
+unity-asset = "0.2.0"
 ```
 
 ```bash
@@ -140,7 +141,7 @@ We have basic tests for core functionality, but this is not a comprehensive test
 
 If you need a production tool for Unity asset processing, **use UnityPy instead**.
 
-## 📝 Basic Usage Examples
+## Basic Usage Examples
 
 ### YAML File Parsing
 
@@ -301,17 +302,18 @@ cargo run --features async --bin unity-asset-async -- \
     parse-yaml -i Assets/ --recursive --progress
 ```
 
-## 🏗️ Architecture Details
+## Architecture Details
 
 This project is organized as a Rust workspace with separate crates for different concerns:
 
 - **`unity-asset-core`**: Core data structures and traits
 - **`unity-asset-yaml`**: YAML format parsing
 - **`unity-asset-binary`**: Binary format parsing (AssetBundle, SerializedFile)
+- **`unity-asset-decode`**: Optional decode/export helpers (Texture/Audio/Sprite/Mesh)
 - **`unity-asset-lib`**: Main library crate (published as `unity-asset`)
 - **`unity-asset-cli`**: Command-line tools (published as `unity-asset-cli`)
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 This project is a learning exercise inspired by and learning from several excellent projects:
 
@@ -330,6 +332,6 @@ This project is a learning exercise inspired by and learning from several excell
 - YAML format expertise and reference resolution patterns
 - Clean API design principles
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

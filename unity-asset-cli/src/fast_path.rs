@@ -1,31 +1,46 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions, BundleParser, DirectoryNode};
+use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions, DirectoryNode};
 use unity_asset_binary::error::BinaryError;
 
-#[cfg(feature = "mmap")]
-use std::sync::Arc;
-#[cfg(feature = "mmap")]
-use unity_asset_binary::shared_bytes::SharedBytes;
+const BUNDLE_SNIFF_PREFIX_LEN: usize = 16;
+const SERIALIZED_SNIFF_PREFIX_LEN: usize = 64;
 
 pub(crate) fn bundle_list_options() -> BundleLoadOptions {
     BundleLoadOptions::lazy()
 }
 
-pub(crate) fn looks_like_bundle_prefix(prefix: &[u8]) -> bool {
-    if prefix.len() < 8 {
+pub(crate) fn looks_like_unityfs_bundle_prefix(prefix: &[u8]) -> bool {
+    unity_asset_binary::file::looks_like_unityfs_bundle_prefix(prefix)
+}
+
+pub(crate) fn sniff_unity_file_kind_prefix(
+    prefix: &[u8],
+) -> Option<unity_asset_binary::file::UnityFileKind> {
+    unity_asset_binary::file::sniff_unity_file_kind_prefix(prefix)
+}
+
+pub(crate) fn is_unityfs_bundle_path(path: &Path) -> bool {
+    let Ok(prefix) = read_prefix(path, BUNDLE_SNIFF_PREFIX_LEN) else {
         return false;
-    }
-    if prefix.starts_with(b"UnityFS\0") || prefix.starts_with(b"UnityRaw") {
-        return true;
-    }
-    if prefix.starts_with(b"UnityWeb") {
-        if prefix.starts_with(b"UnityWebData") || prefix.starts_with(b"TuanjieWebData") {
-            return false;
-        }
-        return true;
-    }
-    false
+    };
+    looks_like_unityfs_bundle_prefix(&prefix)
+}
+
+pub(crate) fn is_assetbundle_path(path: &Path) -> bool {
+    let Ok(prefix) = read_prefix(path, BUNDLE_SNIFF_PREFIX_LEN) else {
+        return false;
+    };
+    sniff_unity_file_kind_prefix(&prefix)
+        == Some(unity_asset_binary::file::UnityFileKind::AssetBundle)
+}
+
+pub(crate) fn is_serialized_file_path(path: &Path) -> bool {
+    let Ok(prefix) = read_prefix(path, SERIALIZED_SNIFF_PREFIX_LEN) else {
+        return false;
+    };
+    sniff_unity_file_kind_prefix(&prefix)
+        == Some(unity_asset_binary::file::UnityFileKind::SerializedFile)
 }
 
 pub(crate) fn collect_candidate_paths(input: &Path) -> Result<Vec<PathBuf>> {
@@ -76,24 +91,9 @@ pub(crate) fn read_prefix(path: &Path, max_len: usize) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn load_bundle_for_list(path: &Path, options: BundleLoadOptions) -> Result<AssetBundle> {
-    #[cfg(feature = "mmap")]
-    {
-        let file = std::fs::File::open(path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let shared = SharedBytes::Mmap(Arc::new(mmap));
-        let len = shared.len();
-        return Ok(BundleParser::from_shared_range_with_options(
-            shared,
-            0..len,
-            options,
-        )?);
-    }
-
-    #[cfg(not(feature = "mmap"))]
-    {
-        let bytes = std::fs::read(path)?;
-        Ok(BundleParser::from_bytes_with_options(bytes, options)?)
-    }
+    Ok(unity_asset_binary::file::load_bundle_file_with_options(
+        path, options,
+    )?)
 }
 
 pub(crate) fn bundle_asset_nodes(bundle: &AssetBundle) -> Vec<DirectoryNode> {
