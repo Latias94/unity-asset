@@ -179,6 +179,14 @@ impl BundleParser {
         reader.set_position(header_size as u64)?;
 
         // Read and decompress the directory data
+        if let Some(max) = options.max_legacy_directory_compressed_size {
+            if (compressed_size as usize) > max {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Legacy bundle directory compressed size {} exceeds limit {}",
+                    compressed_size, max
+                )));
+            }
+        }
         let compressed_data = reader.read_bytes(compressed_size as usize)?;
         let directory_data = if bundle.header.signature == "UnityWeb" {
             // UnityWeb uses LZMA compression; prefer the explicit uncompressed size when available.
@@ -236,6 +244,15 @@ impl BundleParser {
 
         let start = reader.position();
         let compressed_size = bundle.header.compressed_blocks_info_size as usize;
+
+        if let Some(max) = options.max_compressed_blocks_info_size {
+            if compressed_size > max {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Blocks info compressed size {} exceeds limit {}",
+                    compressed_size, max
+                )));
+            }
+        }
 
         let blocks_info_data = if bundle.header.block_info_at_end() {
             let len = reader.len();

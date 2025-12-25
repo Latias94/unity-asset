@@ -84,7 +84,8 @@ fn unityfs_blocks_info_rejects_negative_node_count() {
     let total_size = bytes.len() as i64;
     bytes[size_offset..size_offset + 8].copy_from_slice(&be_i64(total_size));
 
-    let err = BundleParser::from_bytes_with_options(bytes, BundleLoadOptions::default()).unwrap_err();
+    let err =
+        BundleParser::from_bytes_with_options(bytes, BundleLoadOptions::default()).unwrap_err();
     assert!(matches!(err, BinaryError::InvalidData(_)));
 }
 
@@ -113,7 +114,8 @@ fn unityfs_blocks_info_respects_max_blocks_info_size() {
     let total_size = bytes.len() as i64;
     bytes[size_offset..size_offset + 8].copy_from_slice(&be_i64(total_size));
 
-    let err = BundleParser::from_bytes_with_options(bytes, BundleLoadOptions::default()).unwrap_err();
+    let err =
+        BundleParser::from_bytes_with_options(bytes, BundleLoadOptions::default()).unwrap_err();
     assert!(matches!(err, BinaryError::ResourceLimitExceeded(_)));
 }
 
@@ -133,7 +135,58 @@ fn bundle_extract_slice_rejects_offset_size_overflow() {
 #[test]
 fn bundle_validate_rejects_offset_size_overflow() {
     let mut bundle = AssetBundle::new(BundleHeader::default(), vec![0u8; 16]);
-    bundle.files.push(BundleFileInfo::new("a".to_string(), u64::MAX - 1, 10));
+    bundle
+        .files
+        .push(BundleFileInfo::new("a".to_string(), u64::MAX - 1, 10));
     let err = bundle.validate().unwrap_err();
     assert!(matches!(err, BinaryError::InvalidData(_)));
+}
+
+#[test]
+fn legacy_directory_respects_max_compressed_size() {
+    let compressed_size: u32 = 1024 * 1024;
+    let uncompressed_size: u32 = 1;
+
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(b"UnityRaw\0");
+    bytes.extend_from_slice(&be_u32(6));
+    bytes.extend_from_slice(b"2020.3.0f1\0");
+    bytes.extend_from_slice(b"2020.3.0f1\0");
+    let size_offset = bytes.len();
+    bytes.extend_from_slice(&be_u32(0)); // placeholder for size
+
+    // Legacy directory header section
+    bytes.extend_from_slice(&be_u32(compressed_size));
+    bytes.extend_from_slice(&be_u32(uncompressed_size));
+    bytes.extend_from_slice(&be_u32(0)); // skip bytes for version >= 2
+
+    let total_size = bytes.len() as u32;
+    bytes[size_offset..size_offset + 4].copy_from_slice(&be_u32(total_size));
+
+    let mut options = BundleLoadOptions::default();
+    options.max_legacy_directory_compressed_size = Some(16);
+    let err = BundleParser::from_bytes_with_options(bytes, options).unwrap_err();
+    assert!(matches!(err, BinaryError::ResourceLimitExceeded(_)));
+}
+
+#[test]
+fn unityfs_blocks_info_respects_max_compressed_blocks_info_size() {
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(b"UnityFS\0");
+    bytes.extend_from_slice(&be_u32(7));
+    bytes.extend_from_slice(b"2020.3.0f1\0");
+    bytes.extend_from_slice(b"2020.3.0f1\0");
+    let size_offset = bytes.len();
+    bytes.extend_from_slice(&be_i64(0)); // placeholder for size
+    bytes.extend_from_slice(&be_u32(1024)); // compressed blocks info size
+    bytes.extend_from_slice(&be_u32(1)); // uncompressed blocks info size
+    bytes.extend_from_slice(&be_u32(0)); // flags: no compression, blocks info at start
+
+    let total_size = bytes.len() as i64;
+    bytes[size_offset..size_offset + 8].copy_from_slice(&be_i64(total_size));
+
+    let mut options = BundleLoadOptions::default();
+    options.max_compressed_blocks_info_size = Some(16);
+    let err = BundleParser::from_bytes_with_options(bytes, options).unwrap_err();
+    assert!(matches!(err, BinaryError::ResourceLimitExceeded(_)));
 }
