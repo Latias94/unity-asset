@@ -97,6 +97,81 @@ fn referenced_object_data_is_parsed_via_ref_types() {
 }
 
 #[test]
+fn referenced_object_data_resolves_via_unity_field_aliases() {
+    // Unity sometimes encodes managed reference type triplets using m_ClassName/m_NameSpace/m_AssemblyName.
+    let mut ref_tree = TypeTree::new();
+    let mut ref_root =
+        TypeTreeNode::with_info("MyClass".to_string(), "MyClass".to_string(), -1);
+    ref_root.children.push(TypeTreeNode::with_info(
+        "int".to_string(),
+        "m_Value".to_string(),
+        -1,
+    ));
+    ref_tree.add_node(ref_root);
+
+    let mut ref_type = SerializedType::new(0);
+    ref_type.class_name = "MyClass".to_string();
+    ref_type.namespace = "MyNS".to_string();
+    ref_type.assembly_name = "MyAsm".to_string();
+    ref_type.type_tree = ref_tree;
+
+    let mut tree = TypeTree::new();
+    let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
+
+    let mut ref_obj =
+        TypeTreeNode::with_info("ReferencedObject".to_string(), "m_Ref".to_string(), -1);
+    let mut type_node = TypeTreeNode::with_info("TypeInfo".to_string(), "type".to_string(), -1);
+    type_node.children.push(TypeTreeNode::with_info(
+        "string".to_string(),
+        "m_ClassName".to_string(),
+        -1,
+    ));
+    type_node.children.push(TypeTreeNode::with_info(
+        "string".to_string(),
+        "m_NameSpace".to_string(),
+        -1,
+    ));
+    type_node.children.push(TypeTreeNode::with_info(
+        "string".to_string(),
+        "m_AssemblyName".to_string(),
+        -1,
+    ));
+    ref_obj.children.push(type_node);
+    ref_obj.children.push(TypeTreeNode::with_info(
+        "ReferencedObjectData".to_string(),
+        "data".to_string(),
+        -1,
+    ));
+    root.children.push(ref_obj);
+    tree.add_node(root);
+
+    let mut bytes = Vec::new();
+    push_aligned_string_le(&mut bytes, "MyClass");
+    push_aligned_string_le(&mut bytes, "MyNS");
+    push_aligned_string_le(&mut bytes, "MyAsm");
+    bytes.extend_from_slice(&456i32.to_le_bytes());
+
+    let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+    let serializer = TypeTreeSerializer::new(&tree);
+    let out = serializer
+        .parse_object_detailed_with_ref_types(
+            &mut reader,
+            unity_asset_binary::typetree::TypeTreeParseOptions::default(),
+            std::slice::from_ref(&ref_type),
+        )
+        .unwrap();
+
+    let UnityValue::Object(m_ref) = out.properties.get("m_Ref").expect("m_Ref present") else {
+        panic!("m_Ref should be object");
+    };
+    let UnityValue::Object(data) = m_ref.get("data").expect("data present") else {
+        panic!("data should be object");
+    };
+    assert_eq!(data.get("m_Value").and_then(|v| v.as_i64()), Some(456));
+    assert_eq!(reader.position() as usize, bytes.len());
+}
+
+#[test]
 fn referenced_object_fallback_marks_unresolved_type() {
     // No ref_types provided; ReferencedObjectData should fall back but remain explainable.
     let mut tree = TypeTree::new();
@@ -170,5 +245,139 @@ fn referenced_object_fallback_marks_unresolved_type() {
         panic!("data should be object");
     };
     assert_eq!(data.get("m_Value").and_then(|v| v.as_i64()), Some(7));
+    assert_eq!(reader.position() as usize, bytes.len());
+}
+
+#[test]
+fn managed_references_registry_is_consumed_without_affecting_following_fields() {
+    // The parser should consume `ManagedReferencesRegistry` bytes without allocating, and keep the
+    // reader in sync for following fields.
+    let mut tree = TypeTree::new();
+    let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
+
+    let mut registry =
+        TypeTreeNode::with_info("ManagedReferencesRegistry".to_string(), "m_Registry".to_string(), -1);
+    let mut vec_node = TypeTreeNode::with_info("vector".to_string(), "m_Data".to_string(), -1);
+    let mut array_node = TypeTreeNode::with_info("Array".to_string(), "Array".to_string(), -1);
+    array_node.meta_flags = 0x4000; // align to 4 after the array payload
+    array_node.children.push(TypeTreeNode::with_info(
+        "int".to_string(),
+        "size".to_string(),
+        -1,
+    ));
+    array_node.children.push(TypeTreeNode::with_info(
+        "UInt8".to_string(),
+        "data".to_string(),
+        -1,
+    ));
+    vec_node.children.push(array_node);
+    registry.children.push(vec_node);
+
+    root.children.push(registry);
+    root.children.push(TypeTreeNode::with_info(
+        "int".to_string(),
+        "m_Next".to_string(),
+        -1,
+    ));
+    tree.add_node(root);
+
+    // Registry bytes:
+    // - array size=1
+    // - one byte
+    // - 3 bytes padding (Array node has align flag)
+    // Then m_Next (int).
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&1i32.to_le_bytes());
+    bytes.push(0xAA);
+    bytes.extend_from_slice(&[0u8; 3]);
+    bytes.extend_from_slice(&0x11223344i32.to_le_bytes());
+
+    let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+    let serializer = TypeTreeSerializer::new(&tree);
+    let out = serializer
+        .parse_object_detailed(
+            &mut reader,
+            unity_asset_binary::typetree::TypeTreeParseOptions::default(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        out.properties.get("m_Next").and_then(|v| v.as_i64()),
+        Some(0x11223344)
+    );
+    assert_eq!(reader.position() as usize, bytes.len());
+}
+
+#[test]
+fn scan_pptrs_can_traverse_managed_reference_payloads_via_ref_types() {
+    // Build a ref type tree: { m_Ptr: PPtr<Object> }.
+    let mut ref_tree = TypeTree::new();
+    let mut ref_root =
+        TypeTreeNode::with_info("MyClass".to_string(), "MyClass".to_string(), -1);
+    let mut pptr = TypeTreeNode::with_info("PPtr<Object>".to_string(), "m_Ptr".to_string(), -1);
+    pptr.children.push(TypeTreeNode::with_info(
+        "int".to_string(),
+        "m_FileID".to_string(),
+        -1,
+    ));
+    pptr.children.push(TypeTreeNode::with_info(
+        "long long".to_string(),
+        "m_PathID".to_string(),
+        -1,
+    ));
+    ref_root.children.push(pptr);
+    ref_tree.add_node(ref_root);
+
+    let mut ref_type = SerializedType::new(0);
+    ref_type.class_name = "MyClass".to_string();
+    ref_type.namespace = "MyNS".to_string();
+    ref_type.assembly_name = "MyAsm".to_string();
+    ref_type.type_tree = ref_tree;
+
+    // Root contains ReferencedObject -> type triplet + data payload.
+    let mut tree = TypeTree::new();
+    let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
+    let mut ref_obj =
+        TypeTreeNode::with_info("ReferencedObject".to_string(), "m_Ref".to_string(), -1);
+    let mut type_node = TypeTreeNode::with_info("TypeInfo".to_string(), "type".to_string(), -1);
+    type_node.children.push(TypeTreeNode::with_info(
+        "string".to_string(),
+        "class".to_string(),
+        -1,
+    ));
+    type_node.children.push(TypeTreeNode::with_info(
+        "string".to_string(),
+        "ns".to_string(),
+        -1,
+    ));
+    type_node.children.push(TypeTreeNode::with_info(
+        "string".to_string(),
+        "asm".to_string(),
+        -1,
+    ));
+    ref_obj.children.push(type_node);
+    ref_obj.children.push(TypeTreeNode::with_info(
+        "ReferencedObjectData".to_string(),
+        "data".to_string(),
+        -1,
+    ));
+    root.children.push(ref_obj);
+    tree.add_node(root);
+
+    let mut bytes = Vec::new();
+    push_aligned_string_le(&mut bytes, "MyClass");
+    push_aligned_string_le(&mut bytes, "MyNS");
+    push_aligned_string_le(&mut bytes, "MyAsm");
+    bytes.extend_from_slice(&0i32.to_le_bytes()); // m_FileID
+    bytes.extend_from_slice(&1234i64.to_le_bytes()); // m_PathID
+
+    let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+    let serializer = TypeTreeSerializer::new(&tree);
+    let scan = serializer
+        .scan_pptrs_with_ref_types(&mut reader, Some(std::slice::from_ref(&ref_type)))
+        .unwrap();
+
+    assert_eq!(scan.internal, vec![1234]);
+    assert!(scan.external.is_empty());
     assert_eq!(reader.position() as usize, bytes.len());
 }

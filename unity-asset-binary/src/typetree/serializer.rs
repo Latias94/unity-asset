@@ -60,6 +60,12 @@ struct TypeTreeParseContext<'a> {
     has_managed_registry: bool,
 }
 
+#[derive(Debug)]
+struct TypeTreeScanContext<'a> {
+    ref_types: Option<&'a [SerializedType]>,
+    has_managed_registry: bool,
+}
+
 impl<'a> TypeTreeSerializer<'a> {
     const MAX_ARRAY_LEN: usize = 1_000_000;
     const MAX_TYPELESSDATA_LEN: usize = Self::MAX_ARRAY_LEN;
@@ -181,13 +187,7 @@ impl<'a> TypeTreeSerializer<'a> {
     /// Scan TypeTree-based object bytes and collect any encountered `PPtr` references without
     /// allocating a full `UnityValue` tree.
     pub fn scan_pptrs(&self, reader: &mut BinaryReader) -> Result<PPtrScanResult> {
-        let mut out = PPtrScanResult::default();
-        if let Some(root) = self.tree.nodes.first() {
-            for child in &root.children {
-                self.scan_value(reader, child, &mut out)?;
-            }
-        }
-        Ok(out)
+        self.scan_pptrs_with_ref_types(reader, None)
     }
 
     fn scan_value(
@@ -196,9 +196,120 @@ impl<'a> TypeTreeSerializer<'a> {
         node: &TypeTreeNode,
         out: &mut PPtrScanResult,
     ) -> Result<()> {
+        let mut ctx = TypeTreeScanContext {
+            ref_types: None,
+            has_managed_registry: false,
+        };
+        self.scan_value_ctx(reader, node, out, &mut ctx)
+    }
+
+    /// Scan TypeTree-based object bytes and collect any encountered `PPtr` references, using
+    /// file-level `ref_types` to best-effort traverse managed reference payloads.
+    pub fn scan_pptrs_with_ref_types(
+        &self,
+        reader: &mut BinaryReader,
+        ref_types: Option<&[SerializedType]>,
+    ) -> Result<PPtrScanResult> {
+        let mut out = PPtrScanResult::default();
+        let mut ctx = TypeTreeScanContext {
+            ref_types,
+            has_managed_registry: false,
+        };
+        if let Some(root) = self.tree.nodes.first() {
+            for child in &root.children {
+                self.scan_value_ctx(reader, child, &mut out, &mut ctx)?;
+            }
+        }
+        Ok(out)
+    }
+
+    fn scan_value_ctx(
+        &self,
+        reader: &mut BinaryReader,
+        node: &TypeTreeNode,
+        out: &mut PPtrScanResult,
+        ctx: &mut TypeTreeScanContext<'_>,
+    ) -> Result<()> {
         // Array types
         if !node.children.is_empty() && node.children.iter().any(|c| c.type_name == "Array") {
-            self.scan_array(reader, node, out)?;
+            self.scan_array(reader, node, out, ctx)?;
+            if node.is_aligned() {
+                reader.align_to(4)?;
+            }
+            return Ok(());
+        }
+
+        // Managed reference payload (`SerializeReference`): best-effort typed scanning via `ref_types`.
+        if node.type_name == "ReferencedObject" && !node.children.is_empty() {
+            let mut class: Option<String> = None;
+            let mut ns: Option<String> = None;
+            let mut asm: Option<String> = None;
+
+            for child in &node.children {
+                if child.type_name == "ManagedReferencesRegistry" {
+                    if ctx.has_managed_registry {
+                        self.scan_value_ctx(reader, child, out, ctx)?;
+                    } else {
+                        ctx.has_managed_registry = true;
+                        self.scan_value_ctx(reader, child, out, ctx)?;
+                    }
+                    continue;
+                }
+
+                if child.name == "type" && !child.children.is_empty() {
+                    for field in &child.children {
+                        if field.type_name == "string"
+                            && (field.name == "class" || field.name == "m_ClassName")
+                        {
+                            class = Some(reader.read_aligned_string()?);
+                            continue;
+                        }
+                        if field.type_name == "string"
+                            && (field.name == "ns" || field.name == "m_NameSpace")
+                        {
+                            ns = Some(reader.read_aligned_string()?);
+                            continue;
+                        }
+                        if field.type_name == "string"
+                            && (field.name == "asm" || field.name == "m_AssemblyName")
+                        {
+                            asm = Some(reader.read_aligned_string()?);
+                            continue;
+                        }
+                        self.scan_value_ctx(reader, field, out, ctx)?;
+                    }
+                    if child.is_aligned() {
+                        reader.align_to(4)?;
+                    }
+                    continue;
+                }
+
+                if child.type_name == "ReferencedObjectData" {
+                    if let (Some(class), Some(ns), Some(asm), Some(ref_types)) =
+                        (class.as_ref(), ns.as_ref(), asm.as_ref(), ctx.ref_types)
+                    {
+                        if let Some(tree) = resolve_ref_type_tree_triplet(class, ns, asm, ref_types)
+                        {
+                            if let Some(root) = tree.nodes.first() {
+                                for field in &root.children {
+                                    self.scan_value_ctx(reader, field, out, ctx)?;
+                                }
+                                if child.is_aligned() {
+                                    reader.align_to(4)?;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Fallback: consume according to placeholder node (if any).
+                    self.scan_value_ctx(reader, child, out, ctx)?;
+                    continue;
+                }
+
+                self.scan_value_ctx(reader, child, out, ctx)?;
+            }
+
             if node.is_aligned() {
                 reader.align_to(4)?;
             }
@@ -225,7 +336,7 @@ impl<'a> TypeTreeSerializer<'a> {
                     let v = self.scan_read_i64_like(reader, child)?;
                     path_id = Some(v);
                 } else {
-                    self.scan_value(reader, child, out)?;
+                    self.scan_value_ctx(reader, child, out, ctx)?;
                 }
             }
 
@@ -316,7 +427,7 @@ impl<'a> TypeTreeSerializer<'a> {
             _ => {
                 if !node.children.is_empty() {
                     for child in &node.children {
-                        self.scan_value(reader, child, out)?;
+                        self.scan_value_ctx(reader, child, out, ctx)?;
                     }
                 } else if node.byte_size > 0 {
                     reader.skip_bytes(node.byte_size as usize)?;
@@ -376,6 +487,7 @@ impl<'a> TypeTreeSerializer<'a> {
         reader: &mut BinaryReader,
         node: &TypeTreeNode,
         out: &mut PPtrScanResult,
+        ctx: &mut TypeTreeScanContext<'_>,
     ) -> Result<()> {
         let array_node = node
             .children
@@ -460,7 +572,7 @@ impl<'a> TypeTreeSerializer<'a> {
         }
 
         for _ in 0..size {
-            self.scan_value(reader, element_node, out)?;
+            self.scan_value_ctx(reader, element_node, out, ctx)?;
         }
         if array_node.is_aligned() {
             reader.align_to(4)?;
@@ -1158,6 +1270,29 @@ fn resolve_ref_type_tree<'a>(
     let ns = get_str_ci(type_obj, &["ns", "m_NameSpace"]).unwrap_or_default();
     let asm = get_str_ci(type_obj, &["asm", "m_AssemblyName"]).unwrap_or_default();
 
+    ref_types.iter().find_map(|t| {
+        if !t.class_name.is_empty()
+            && t.class_name == class
+            && t.namespace == ns
+            && t.assembly_name == asm
+            && !t.type_tree.is_empty()
+        {
+            Some(&t.type_tree)
+        } else {
+            None
+        }
+    })
+}
+
+fn resolve_ref_type_tree_triplet<'a>(
+    class: &str,
+    ns: &str,
+    asm: &str,
+    ref_types: &'a [SerializedType],
+) -> Option<&'a TypeTree> {
+    if class.is_empty() {
+        return None;
+    }
     ref_types.iter().find_map(|t| {
         if !t.class_name.is_empty()
             && t.class_name == class

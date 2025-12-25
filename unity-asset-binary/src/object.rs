@@ -113,7 +113,13 @@ impl<'a> ObjectHandle<'a> {
         let bytes = self.raw_data()?;
         let mut reader = BinaryReader::new(bytes, self.file.header.byte_order());
         let serializer = TypeTreeSerializer::new(tree);
-        Ok(Some(serializer.scan_pptrs(&mut reader)?))
+        if self.file.ref_types.is_empty() {
+            Ok(Some(serializer.scan_pptrs(&mut reader)?))
+        } else {
+            Ok(Some(
+                serializer.scan_pptrs_with_ref_types(&mut reader, Some(&self.file.ref_types))?,
+            ))
+        }
     }
 }
 

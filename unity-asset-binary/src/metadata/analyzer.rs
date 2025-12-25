@@ -376,7 +376,11 @@ fn scan_object_pptrs_with_typetree(
     let bytes = asset.object_bytes(info)?;
     let mut reader = BinaryReader::new(bytes, asset.header.byte_order());
     let serializer = TypeTreeSerializer::new(tree);
-    let scan = serializer.scan_pptrs(&mut reader)?;
+    let scan = if asset.ref_types.is_empty() {
+        serializer.scan_pptrs(&mut reader)?
+    } else {
+        serializer.scan_pptrs_with_ref_types(&mut reader, Some(&asset.ref_types))?
+    };
 
     let mut deps = ExtractedDependencies::default();
     deps.internal = scan.internal;
