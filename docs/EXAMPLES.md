@@ -12,6 +12,10 @@ This repository maintains runnable examples per crate (built in CI).
   - `cargo run -p unity-asset --example env_container_lookup -- tests/samples Assets/`
 - Find by `path_id` and dump JSON:
   - `cargo run -p unity-asset --example env_find_and_dump -- <path> <path_id>`
+- Export a stable binary object index (JSONL):
+  - `cargo run -p unity-asset --example env_export_index_jsonl -- <path> [limit]`
+- Read streamed resource bytes (m_Resource / m_StreamData):
+  - `cargo run -p unity-asset --example env_read_stream_data -- <path> [path_id]`
 - List WebFile entries (UnityWebData* containers):
   - `cargo run -p unity-asset --example env_webfile_list_entries -- <path-to-UnityWebData>`
 
