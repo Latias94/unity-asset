@@ -4,15 +4,14 @@
 //! format detection, and texture data extraction.
 
 #![cfg(feature = "texture")]
-
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::bundle::load_bundle_from_memory;
-use unity_asset_binary::object::UnityObject;
-use unity_asset_binary::texture::TextureProcessor;
+use unity_asset_decode::bundle::load_bundle_from_memory;
+use unity_asset_decode::object::UnityObject;
+use unity_asset_decode::texture::TextureProcessor;
 
 const SAMPLES_DIR: &str = "tests/samples";
 

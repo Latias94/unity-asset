@@ -12,13 +12,11 @@ use unity_asset::environment::{
     BinaryObjectKey, BinarySource, Environment, EnvironmentOptions, EnvironmentReporter,
     EnvironmentWarning,
 };
-use unity_asset_binary::{
-    asset::class_ids,
+use unity_asset_binary::{asset::class_ids, object::UnityObject, unity_version::UnityVersion};
+use unity_asset_decode::{
     audio::{AudioClipConverter, AudioProcessor},
-    object::UnityObject,
     sprite::SpriteProcessor,
     texture::{TextureExporter, TextureProcessor},
-    unity_version::UnityVersion,
 };
 
 #[derive(Parser)]

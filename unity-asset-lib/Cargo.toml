@@ -33,4 +33,4 @@ async = ["unity-asset-core/async", "unity-asset-yaml/async", "unity-asset-binary
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
-unity-asset-binary = { path = "../unity-asset-binary", version = "0.1.0", features = ["full"] }
+unity-asset-decode = { path = "../unity-asset-decode", version = "0.1.0", features = ["audio"] }

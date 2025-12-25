@@ -13,8 +13,8 @@
 //! # Examples
 //!
 //! ```rust,no_run
-//! use unity_asset_binary::sprite::{SpriteProcessor, SpriteConfig};
-//! use unity_asset_binary::unity_version::UnityVersion;
+//! use unity_asset_decode::sprite::{SpriteProcessor, SpriteConfig};
+//! use unity_asset_decode::unity_version::UnityVersion;
 //!
 //! // Create processor with custom configuration
 //! let version = UnityVersion::parse_version("2020.3.12f1")?;
@@ -29,7 +29,7 @@
 //! // Note: In real usage, you would create a UnityObject from parsed data
 //! // For demonstration, we'll just show the processor creation
 //! println!("Sprite processed successfully");
-//! # Ok::<(), unity_asset_binary::error::BinaryError>(())
+//! # Ok::<(), unity_asset_decode::error::BinaryError>(())
 //! ```
 
 pub mod parser;

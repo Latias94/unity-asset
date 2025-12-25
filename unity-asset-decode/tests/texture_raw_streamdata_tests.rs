@@ -2,9 +2,9 @@
 
 #![cfg(feature = "texture")]
 
-use unity_asset_binary::object::UnityObject;
-use unity_asset_binary::texture::Texture2DConverter;
-use unity_asset_binary::unity_version::UnityVersion;
+use unity_asset_decode::object::UnityObject;
+use unity_asset_decode::texture::Texture2DConverter;
+use unity_asset_decode::unity_version::UnityVersion;
 
 fn aligned_string_bytes(s: &str) -> Vec<u8> {
     let mut out = Vec::new();

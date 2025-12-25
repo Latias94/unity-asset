@@ -136,8 +136,8 @@ Deliverables:
 
 ### Phase 3 — Decode/Export Separation
 
-- Move decoding/export logic (Texture/Audio/Mesh/Sprite) into `unity-asset-decode` (or similar).
-- Keep `unity-asset-binary` minimal by default; decoding is opt-in.
+- Move decoding/export logic (Texture/Audio/Mesh/Sprite) into `unity-asset-decode`.
+- Keep `unity-asset-binary` parser-only by default; decoding is opt-in via the decode crate.
 
 ### Phase 4 — Concurrency-ready Environment
 

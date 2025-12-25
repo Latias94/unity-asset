@@ -3,6 +3,7 @@ members = [
     "unity-asset-core",
     "unity-asset-yaml",
     "unity-asset-binary",
+    "unity-asset-decode",
     "unity-asset-lib",
     "unity-asset-cli",
 ]

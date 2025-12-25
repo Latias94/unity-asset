@@ -11,12 +11,12 @@
 use indexmap::IndexMap;
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::asset::SerializedFile;
-use unity_asset_binary::bundle::AssetBundle;
-use unity_asset_binary::sprite::{Sprite, SpriteInfo, SpriteProcessor};
-use unity_asset_binary::texture::{Texture2D, TextureFormat};
-use unity_asset_binary::unity_version::UnityVersion;
 use unity_asset_core::UnityValue;
+use unity_asset_decode::asset::SerializedFile;
+use unity_asset_decode::bundle::AssetBundle;
+use unity_asset_decode::sprite::{Sprite, SpriteInfo, SpriteProcessor};
+use unity_asset_decode::texture::{Texture2D, TextureFormat};
+use unity_asset_decode::unity_version::UnityVersion;
 
 /// Test comprehensive sprite image extraction
 #[test]
@@ -269,8 +269,8 @@ fn test_sprite_typetree_texture_pptr_uses_path_id() {
     rd.insert("texture".to_string(), UnityValue::Object(texture_pptr));
     props.insert("m_RD".to_string(), UnityValue::Object(rd));
 
-    let obj = unity_asset_binary::object::UnityObject::from_info_and_class(
-        unity_asset_binary::asset::ObjectInfo::new(1, 0, 0, 213, -1),
+    let obj = unity_asset_decode::object::UnityObject::from_info_and_class(
+        unity_asset_decode::asset::ObjectInfo::new(1, 0, 0, 213, -1),
         unity_asset_core::UnityClass::new(213, "Sprite".to_string(), "1".to_string()),
     );
     let mut obj = obj;

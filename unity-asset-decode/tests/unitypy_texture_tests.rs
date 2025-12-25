@@ -11,11 +11,11 @@
 
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::asset::SerializedFile;
-use unity_asset_binary::bundle::AssetBundle;
-use unity_asset_binary::sprite::{Sprite, SpriteProcessor};
-use unity_asset_binary::texture::{Texture2D, Texture2DConverter, TextureFormat};
-use unity_asset_binary::unity_version::UnityVersion;
+use unity_asset_decode::asset::SerializedFile;
+use unity_asset_decode::bundle::AssetBundle;
+use unity_asset_decode::sprite::{Sprite, SpriteProcessor};
+use unity_asset_decode::texture::{Texture2D, Texture2DConverter, TextureFormat};
+use unity_asset_decode::unity_version::UnityVersion;
 
 const SAMPLES_DIR: &str = "tests/samples";
 

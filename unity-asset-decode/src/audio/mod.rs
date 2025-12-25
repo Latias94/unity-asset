@@ -15,8 +15,8 @@
 //! # Examples
 //!
 //! ```rust,no_run
-//! use unity_asset_binary::audio::{AudioCompressionFormat, AudioClipConverter, AudioDecoder};
-//! use unity_asset_binary::unity_version::UnityVersion;
+//! use unity_asset_decode::audio::{AudioCompressionFormat, AudioClipConverter, AudioDecoder};
+//! use unity_asset_decode::unity_version::UnityVersion;
 //!
 //! // Create a converter
 //! let converter = AudioClipConverter::new(UnityVersion::default());
@@ -184,13 +184,9 @@ mod tests {
 
     #[test]
     fn test_format_support() {
-        // Basic formats should be supported when audio-advanced feature is enabled
-        #[cfg(feature = "audio-advanced")]
-        {
-            assert!(is_format_supported(AudioCompressionFormat::PCM));
-            assert!(is_format_supported(AudioCompressionFormat::Vorbis));
-            assert!(is_format_supported(AudioCompressionFormat::MP3));
-        }
+        assert!(is_format_supported(AudioCompressionFormat::PCM));
+        assert!(is_format_supported(AudioCompressionFormat::Vorbis));
+        assert!(is_format_supported(AudioCompressionFormat::MP3));
     }
 
     #[test]
@@ -205,8 +201,7 @@ mod tests {
     #[test]
     fn test_supported_formats_list() {
         let formats = get_supported_formats();
-        // Should return a list (may be empty if audio-advanced feature is not enabled)
-        assert!(!formats.is_empty() || formats.is_empty());
+        assert!(!formats.is_empty());
     }
 
     #[test]

@@ -14,16 +14,8 @@
 //!
 //! ## Feature Flags
 //!
-//! - `texture`: Texture processing (basic formats + PNG export)
-//! - `audio`: Audio processing (all formats including Vorbis, MP3)
-//! - `mesh`: Mesh processing (parsing + basic export)
-//! - `sprite`: Sprite processing (requires texture support)
-//! - `texture-advanced`: Advanced texture formats (DXT, ETC, ASTC) - requires texture2ddecoder
-//! - `mesh-export`: Advanced mesh export (OBJ format)
-//!
-//! Notes:
-//! - The default build is **minimal** and focuses on parsing only.
-//! - Enable `full` (or individual feature flags) when you need decoding/export helpers.
+//! This crate is intentionally **parser-only**.
+//! For decoding/export helpers (Texture/Audio/Sprite/Mesh), use the `unity-asset-decode` crate.
 //!
 //! # Example
 //!
@@ -61,19 +53,6 @@ pub mod typetree;
 pub mod unity_objects;
 pub mod unity_version;
 pub mod webfile;
-
-// Feature-gated modules
-#[cfg(feature = "texture")]
-pub mod texture;
-
-#[cfg(feature = "audio")]
-pub mod audio;
-
-#[cfg(feature = "sprite")]
-pub mod sprite;
-
-#[cfg(feature = "mesh")]
-pub mod mesh;
 
 pub use error::{BinaryError, Result};
 

@@ -1954,8 +1954,8 @@ pub mod environment {
 
         #[test]
         fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info() {
-            use unity_asset_binary::audio::AudioClipConverter;
             use unity_asset_binary::unity_version::UnityVersion;
+            use unity_asset_decode::audio::AudioClipConverter;
 
             let mut env = Environment::new();
             let path =

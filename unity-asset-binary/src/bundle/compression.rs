@@ -194,7 +194,7 @@ impl BundleCompression {
             0 => true,     // None
             1 => true,     // LZMA
             2 | 3 => true, // LZ4/LZ4HC
-            4 => true, // Brotli
+            4 => true,     // Brotli
             _ => false,
         }
     }

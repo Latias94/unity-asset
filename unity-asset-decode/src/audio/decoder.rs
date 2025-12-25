@@ -20,7 +20,6 @@ impl AudioDecoder {
     }
 
     /// Decode audio using Symphonia (supports many formats)
-    #[cfg(feature = "symphonia")]
     pub fn decode(&self, clip: &AudioClip) -> Result<DecodedAudio> {
         use std::io::Cursor;
         use symphonia::core::audio::{AudioBufferRef, Signal};
@@ -269,51 +268,27 @@ impl AudioDecoder {
         Ok(DecodedAudio::new(samples, sample_rate, channels))
     }
 
-    /// Fallback decoder for when symphonia feature is not enabled
-    #[cfg(not(feature = "symphonia"))]
-    pub fn decode(&self, _clip: &AudioClip) -> Result<DecodedAudio> {
-        Err(BinaryError::unsupported(
-            "Audio decoding requires symphonia feature",
-        ))
-    }
-
     /// Check if a format can be decoded
     pub fn can_decode(&self, format: AudioCompressionFormat) -> bool {
-        #[cfg(feature = "symphonia")]
-        {
-            matches!(
-                format,
-                AudioCompressionFormat::PCM
-                    | AudioCompressionFormat::Vorbis
-                    | AudioCompressionFormat::MP3
-                    | AudioCompressionFormat::AAC
-                    | AudioCompressionFormat::ADPCM
-            )
-        }
-
-        #[cfg(not(feature = "symphonia"))]
-        {
-            false
-        }
+        matches!(
+            format,
+            AudioCompressionFormat::PCM
+                | AudioCompressionFormat::Vorbis
+                | AudioCompressionFormat::MP3
+                | AudioCompressionFormat::AAC
+                | AudioCompressionFormat::ADPCM
+        )
     }
 
     /// Get list of supported formats
     pub fn supported_formats(&self) -> Vec<AudioCompressionFormat> {
-        #[cfg(feature = "symphonia")]
-        {
-            vec![
-                AudioCompressionFormat::PCM,
-                AudioCompressionFormat::Vorbis,
-                AudioCompressionFormat::MP3,
-                AudioCompressionFormat::AAC,
-                AudioCompressionFormat::ADPCM,
-            ]
-        }
-
-        #[cfg(not(feature = "symphonia"))]
-        {
-            vec![]
-        }
+        vec![
+            AudioCompressionFormat::PCM,
+            AudioCompressionFormat::Vorbis,
+            AudioCompressionFormat::MP3,
+            AudioCompressionFormat::AAC,
+            AudioCompressionFormat::ADPCM,
+        ]
     }
 }
 

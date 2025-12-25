@@ -1,0 +1,48 @@
+[package]
+name = "unity-asset-decode"
+version = "0.1.0"
+edition = "2024"
+authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
+description = "Decode/export helpers for Unity assets (Texture/Audio/Sprite/Mesh) built on unity-asset-binary"
+license = "MIT"
+repository = "https://github.com/Latias94/unity-asset"
+documentation = "https://docs.rs/unity-asset-decode"
+keywords = ["unity", "assets", "decode", "export", "parser"]
+categories = ["parsing", "game-development"]
+
+[dependencies]
+unity-asset-binary = { path = "../unity-asset-binary", version = "0.1.0" }
+unity-asset-core = { path = "../unity-asset-core", version = "0.1.0" }
+serde = { workspace = true }
+image = { workspace = true, optional = true }
+symphonia = { version = "0.5", features = ["all"], optional = true }
+hound = { version = "3.5", optional = true }
+texture2ddecoder = { version = "0.1", optional = true }
+obj = { version = "0.10", optional = true }
+indexmap = { workspace = true }
+
+[features]
+default = []
+
+texture = ["dep:image"]
+texture-advanced = ["texture", "dep:texture2ddecoder"]
+audio = ["dep:symphonia", "dep:hound"]
+mesh = []
+mesh-export = ["mesh", "dep:obj"]
+sprite = ["texture"]
+
+full = ["texture", "texture-advanced", "audio", "mesh", "mesh-export", "sprite"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+hex = "0.4"
+
+[[example]]
+name = "debug_texture_formats"
+path = "examples/debug_texture_formats.rs"
+required-features = ["texture"]
+
+[[example]]
+name = "texture_decoding_demo"
+path = "examples/texture_decoding_demo.rs"
+required-features = ["texture"]

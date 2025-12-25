@@ -6,8 +6,8 @@
 #![cfg(feature = "audio")]
 #![allow(clippy::field_reassign_with_default)]
 
-use unity_asset_binary::audio::{AudioClip, AudioClipMeta, AudioCompressionFormat, AudioProcessor};
-use unity_asset_binary::unity_version::UnityVersion;
+use unity_asset_decode::audio::{AudioClip, AudioClipMeta, AudioCompressionFormat, AudioProcessor};
+use unity_asset_decode::unity_version::UnityVersion;
 
 /// Helper function to detect audio format from data content
 fn detect_format_from_data(data: &[u8]) -> AudioCompressionFormat {

@@ -2,8 +2,8 @@
 //!
 //! This example shows how to use the Texture2DConverter to decode texture data.
 
-use unity_asset_binary::texture::{Texture2D, Texture2DConverter, TextureFormat};
-use unity_asset_binary::unity_version::UnityVersion;
+use unity_asset_decode::texture::{Texture2D, Texture2DConverter, TextureFormat};
+use unity_asset_decode::unity_version::UnityVersion;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Unity Asset Parser - Texture2D Decoding Demo");

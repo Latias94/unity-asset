@@ -9,9 +9,9 @@
 
 use std::fs;
 use std::path::Path;
-use unity_asset_binary::audio::{AudioClip, AudioCompressionFormat, AudioProcessor};
-use unity_asset_binary::bundle::load_bundle_from_memory;
-use unity_asset_binary::object::UnityObject;
+use unity_asset_decode::audio::{AudioClip, AudioCompressionFormat, AudioProcessor};
+use unity_asset_decode::bundle::load_bundle_from_memory;
+use unity_asset_decode::object::UnityObject;
 
 const SAMPLES_DIR: &str = "tests/samples";
 
@@ -124,7 +124,7 @@ fn test_audioclip_creation() {
         println!("    Name: '{}'", clip.name);
 
         // Check that the format is correctly set
-        if let unity_asset_binary::audio::types::AudioClipMeta::Modern {
+        if let unity_asset_decode::audio::types::AudioClipMeta::Modern {
             compression_format, ..
         } = &clip.meta
         {

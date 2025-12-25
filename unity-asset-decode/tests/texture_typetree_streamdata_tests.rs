@@ -2,11 +2,11 @@
 
 #![cfg(feature = "texture")]
 
-use unity_asset_binary::{
+use unity_asset_core::{UnityClass, UnityValue};
+use unity_asset_decode::{
     asset::ObjectInfo, asset::class_ids, object::UnityObject, texture::Texture2DConverter,
     unity_version::UnityVersion,
 };
-use unity_asset_core::{UnityClass, UnityValue};
 
 #[test]
 fn texture2d_converter_parses_streamdata_from_typetree() {

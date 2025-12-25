@@ -15,8 +15,8 @@
 //! # Examples
 //!
 //! ```rust,no_run
-//! use unity_asset_binary::texture::{TextureFormat, Texture2DConverter, TextureDecoder};
-//! use unity_asset_binary::unity_version::UnityVersion;
+//! use unity_asset_decode::texture::{TextureFormat, Texture2DConverter, TextureDecoder};
+//! use unity_asset_decode::unity_version::UnityVersion;
 //!
 //! // Create a converter
 //! let converter = Texture2DConverter::new(UnityVersion::default());

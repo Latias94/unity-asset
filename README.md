@@ -51,10 +51,10 @@ unity-asset/
 - Performance monitoring and basic statistics
 
 #### 🔧 Object Processing (Partial)
-- **AudioClip**: Full format support (Vorbis, MP3, WAV, AAC) with Symphonia decoder
-- **Texture2D**: Complete parsing + basic format decoding + PNG export
-- **Sprite**: Full metadata extraction + atlas support + image cutting
-- **Mesh**: Structure parsing + vertex data extraction + basic export
+- **AudioClip**: Full format support (Vorbis, MP3, WAV, AAC) via `unity-asset-decode` (Symphonia-based decoder)
+- **Texture2D**: Complete parsing + best-effort decoding + PNG export via `unity-asset-decode`
+- **Sprite**: Full metadata extraction + atlas support + image cutting via `unity-asset-decode`
+- **Mesh**: Structure parsing + vertex data extraction + basic export via `unity-asset-decode`
 - **GameObject/Transform**: Basic TypeTree-based hierarchy & component mapping (best-effort; still WIP)
 
 #### 🔧 CLI Tools (Usable, WIP)
@@ -68,8 +68,8 @@ unity-asset/
 - Some advanced Unity asset types not yet implemented (MonoBehaviour scripts, complex shaders)
 - Object manipulation is read-only (no writing back to Unity formats)
 - Some edge cases in LZMA decompression may fail on corrupted data
-- Advanced texture formats require `texture-advanced` feature (DXT, ETC, ASTC)
-- Audio decoding requires `audio` feature for Symphonia integration
+- Advanced texture formats require `unity-asset-decode` `texture-advanced` feature (DXT, ETC, ASTC)
+- Audio decoding requires `unity-asset-decode` `audio` feature (Symphonia integration)
 - Large file performance could be optimized further
 - Error messages could be more user-friendly
 - Some metadata/dependency/hierarchy analyses are currently simplified placeholders
