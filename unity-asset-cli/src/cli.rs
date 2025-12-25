@@ -168,6 +168,22 @@ pub(crate) enum Commands {
         #[arg(long)]
         skip_existing: bool,
 
+        /// Write a JSON manifest of planned/exported objects (for resume and regression checks)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Resume from a previous manifest (skips objects that are already exported and still exist)
+        #[arg(long, conflicts_with = "overwrite")]
+        resume: Option<PathBuf>,
+
+        /// Retry only failed objects from a previous manifest
+        #[arg(long, conflicts_with_all = ["resume", "overwrite"])]
+        retry_failed_from: Option<PathBuf>,
+
+        /// Continue exporting even if some objects fail (failures are recorded in the manifest)
+        #[arg(long)]
+        continue_on_error: bool,
+
         /// Parallel export jobs (0 = auto, 1 = serial)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
