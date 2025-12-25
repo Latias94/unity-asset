@@ -1307,4 +1307,40 @@ mod tests {
             Some(0x11223344)
         );
     }
+
+    #[test]
+    fn typetree_byte_arrays_are_emitted_as_bytes() {
+        let mut tree = TypeTree::new();
+        let mut root = node("TestObject", "TestObject");
+
+        let mut vec_u8 = node("vector", "m_UInt8");
+        let mut arr_u8 = node("Array", "Array");
+        arr_u8.children = vec![node("int", "size"), node("UInt8", "data")];
+        vec_u8.children = vec![arr_u8];
+
+        let mut vec_char = node("vector", "m_Char");
+        let mut arr_char = node("Array", "Array");
+        arr_char.children = vec![node("int", "size"), node("char", "data")];
+        vec_char.children = vec![arr_char];
+
+        root.children = vec![vec_u8, vec_char];
+        tree.nodes.push(root);
+
+        let serializer = TypeTreeSerializer::new(&tree);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2i32.to_le_bytes());
+        bytes.extend_from_slice(&[0xAB, 0xCD]);
+        bytes.extend_from_slice(&3i32.to_le_bytes());
+        bytes.extend_from_slice(&[0x41, 0x80, 0xFF]);
+
+        let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+        let props = serializer.parse_object(&mut reader).unwrap();
+
+        assert_eq!(props.get("m_UInt8").and_then(|v| v.as_bytes()), Some(&[0xAB, 0xCD][..]));
+        assert_eq!(
+            props.get("m_Char").and_then(|v| v.as_bytes()),
+            Some(&[0x41, 0x80, 0xFF][..])
+        );
+    }
 }

@@ -75,6 +75,7 @@ unity-asset/
 - Some metadata/dependency/hierarchy analyses are currently simplified placeholders
 - Object data is lazily accessed by default; use `SerializedFileParser::from_bytes_with_options(data, true)` if you explicitly need per-object preloaded buffers
 - For large objects without TypeTree, raw bytes are not expanded into `_raw_data` for performance; use `UnityObject::raw_data()`
+- TypeTree byte-like fields are represented as `UnityValue::Bytes` (not `Array<Integer>`) for performance: `TypelessData` and `vector<UInt8/SInt8/char>`. Use `UnityValue::as_bytes()` to access them.
 
 ## 🚀 Quick Start
 
