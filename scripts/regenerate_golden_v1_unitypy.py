@@ -214,6 +214,35 @@ def _update_case_from_unitypy(case: Dict[str, Any], obj: Dict[str, Any]) -> None
         expect["pptr_internal"] = pptr_internal
         expect["pptr_external"] = [[fid, pid] for (fid, pid) in pptr_external]
 
+    elif kind == "spriteatlas":
+        packed = obj.get("m_PackedSprites") or []
+        packed_ids: list[int] = []
+        if isinstance(packed, list):
+            for p in packed:
+                if isinstance(p, dict):
+                    pid = _as_int(p.get("m_PathID"))
+                    if pid is not None:
+                        packed_ids.append(pid)
+        expect["packed_sprite_path_ids"] = packed_ids
+
+        # UnityPy represents maps as list[tuple[key,value]]. We only need the Texture2D reference.
+        rdm = obj.get("m_RenderDataMap") or []
+        render_tex_pid: Optional[int] = None
+        if isinstance(rdm, list) and rdm:
+            first = rdm[0]
+            if isinstance(first, (list, tuple)) and len(first) >= 2:
+                value = first[1]
+                if isinstance(value, dict):
+                    tex = value.get("texture")
+                    if isinstance(tex, dict):
+                        render_tex_pid = _as_int(tex.get("m_PathID"))
+        if render_tex_pid is not None:
+            expect["render_texture_path_id"] = render_tex_pid
+
+        pptr_internal, pptr_external = _collect_pptrs(obj)
+        expect["pptr_internal"] = pptr_internal
+        expect["pptr_external"] = [[fid, pid] for (fid, pid) in pptr_external]
+
     elif kind == "peek_only":
         pptr_internal, pptr_external = _collect_pptrs(obj)
         expect["pptr_internal"] = pptr_internal

@@ -89,6 +89,15 @@ enum GoldenExpect {
         #[serde(default)]
         pptr_external: Vec<[i64; 2]>,
     },
+    #[serde(rename = "spriteatlas")]
+    SpriteAtlas {
+        packed_sprite_path_ids: Vec<i64>,
+        render_texture_path_id: i64,
+        #[serde(default)]
+        pptr_internal: Vec<i64>,
+        #[serde(default)]
+        pptr_external: Vec<[i64; 2]>,
+    },
     #[serde(rename = "peek_only")]
     PeekOnly {
         #[serde(default)]
@@ -750,6 +759,91 @@ fn golden_regression_smoke() {
                         }
                         other => panic!("unexpected m_VertexData.m_DataSize type: {other:?}"),
                     }
+                }
+            }
+            GoldenExpect::SpriteAtlas {
+                packed_sprite_path_ids,
+                render_texture_path_id,
+                pptr_internal,
+                pptr_external,
+            } => {
+                let (internal, external) = scan_pptrs(&env, &key);
+                assert_eq!(
+                    internal, pptr_internal,
+                    "scan_pptrs internal mismatch (case={})",
+                    case.id
+                );
+                assert_eq!(
+                    external, pptr_external,
+                    "scan_pptrs external mismatch (case={})",
+                    case.id
+                );
+
+                let obj = env
+                    .read_binary_object_key(&key)
+                    .unwrap_or_else(|_| panic!("read_binary_object_key failed (case={})", case.id));
+                assert_eq!(
+                    obj.name().as_deref(),
+                    Some(case.name.as_str()),
+                    "m_Name mismatch (case={})",
+                    case.id
+                );
+
+                let mut want = packed_sprite_path_ids.clone();
+                want.sort();
+                want.dedup();
+
+                let packed = obj
+                    .get("m_PackedSprites")
+                    .expect("m_PackedSprites present")
+                    .as_array()
+                    .expect("m_PackedSprites array");
+                let mut got: Vec<i64> = packed
+                    .iter()
+                    .map(|v| {
+                        let pptr = v.as_object().expect("m_PackedSprites entry object");
+                        pptr.get("m_PathID")
+                            .and_then(|v| v.as_i64())
+                            .expect("m_PackedSprites entry m_PathID")
+                    })
+                    .collect();
+                got.sort();
+                got.dedup();
+                assert_eq!(
+                    got, want,
+                    "m_PackedSprites path ids mismatch (case={})",
+                    case.id
+                );
+
+                let render_map = obj
+                    .get("m_RenderDataMap")
+                    .expect("m_RenderDataMap present")
+                    .as_array()
+                    .expect("m_RenderDataMap array");
+                assert!(
+                    !render_map.is_empty(),
+                    "m_RenderDataMap should not be empty (case={})",
+                    case.id
+                );
+                for entry in render_map {
+                    let pair = entry.as_array().expect("m_RenderDataMap entry is array");
+                    assert!(
+                        pair.len() >= 2,
+                        "m_RenderDataMap entry should have 2 items (case={})",
+                        case.id
+                    );
+                    let v = pair[1].as_object().expect("m_RenderDataMap value object");
+                    let tex = v.get("texture").expect("m_RenderDataMap value.texture");
+                    let tex = tex.as_object().expect("m_RenderDataMap value.texture object");
+                    let pid = tex
+                        .get("m_PathID")
+                        .and_then(|v| v.as_i64())
+                        .expect("m_RenderDataMap value.texture.m_PathID");
+                    assert_eq!(
+                        pid, render_texture_path_id,
+                        "m_RenderDataMap texture path_id mismatch (case={})",
+                        case.id
+                    );
                 }
             }
         }
