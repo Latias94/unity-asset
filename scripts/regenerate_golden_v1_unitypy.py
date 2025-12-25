@@ -127,6 +127,16 @@ def _update_case_from_unitypy(case: Dict[str, Any], obj: Dict[str, Any]) -> None
         if h is not None:
             expect["rect_height"] = h
 
+        # Cross-object reference sanity: Sprite render data points at a Texture2D via PPtr.
+        rd = obj.get("m_RD") or {}
+        tex = rd.get("texture") or {}
+        fid = _as_int(tex.get("m_FileID"))
+        pid = _as_int(tex.get("m_PathID"))
+        if fid is not None:
+            expect["texture_file_id"] = fid
+        if pid is not None:
+            expect["texture_path_id"] = pid
+
     elif kind == "mesh":
         vd = obj.get("m_VertexData") or {}
         vertex_bytes = vd.get("m_DataSize")
@@ -232,4 +242,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

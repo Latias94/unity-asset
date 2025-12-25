@@ -54,7 +54,14 @@ enum GoldenExpect {
         complete_image_size: Option<i64>,
     },
     #[serde(rename = "sprite")]
-    Sprite { rect_width: f64, rect_height: f64 },
+    Sprite {
+        rect_width: f64,
+        rect_height: f64,
+        #[serde(default)]
+        texture_file_id: Option<i64>,
+        #[serde(default)]
+        texture_path_id: Option<i64>,
+    },
     #[serde(rename = "mesh")]
     Mesh {
         #[serde(default)]
@@ -345,6 +352,8 @@ fn golden_regression_smoke() {
             GoldenExpect::Sprite {
                 rect_width,
                 rect_height,
+                texture_file_id,
+                texture_path_id,
             } => {
                 let rect = obj
                     .get("m_Rect")
@@ -369,6 +378,33 @@ fn golden_regression_smoke() {
                     "m_Rect.height mismatch (case={})",
                     case.id
                 );
+
+                if texture_file_id.is_some() || texture_path_id.is_some() {
+                    let rd = obj
+                        .get("m_RD")
+                        .expect("m_RD present")
+                        .as_object()
+                        .expect("m_RD object");
+                    let tex = rd
+                        .get("texture")
+                        .expect("m_RD.texture present")
+                        .as_object()
+                        .expect("m_RD.texture object");
+                    if let Some(expected) = texture_file_id {
+                        let fid = tex
+                            .get("m_FileID")
+                            .and_then(|v| v.as_i64())
+                            .expect("m_RD.texture.m_FileID int");
+                        assert_eq!(fid, expected, "m_RD.texture.m_FileID mismatch (case={})", case.id);
+                    }
+                    if let Some(expected) = texture_path_id {
+                        let pid = tex
+                            .get("m_PathID")
+                            .and_then(|v| v.as_i64())
+                            .expect("m_RD.texture.m_PathID int");
+                        assert_eq!(pid, expected, "m_RD.texture.m_PathID mismatch (case={})", case.id);
+                    }
+                }
             }
             GoldenExpect::Mesh {
                 index_buffer_len,
