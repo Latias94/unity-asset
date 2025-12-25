@@ -106,6 +106,50 @@
       }
     },
     {
+      "id": "xinzexi_2_n_sprite",
+      "source": "tests/samples/xinzexi_2_n_tex",
+      "source_kind": "bundle",
+      "asset_index": 0,
+      "asset_path": "assets/artresource/atlas/paintings/xinzexi_2_n.png",
+      "path_id": -3052146238478408818,
+      "type_id": 213,
+      "byte_size": 47144,
+      "name": "xinzexi_2_n",
+      "expect": {
+        "kind": "sprite",
+        "rect_width": 2048.0,
+        "rect_height": 976.0,
+        "texture_file_id": 0,
+        "texture_path_id": 7993808429769519520,
+        "index_buffer_len": 5352,
+        "index_buffer_prefix": [
+          131,
+          3,
+          130,
+          3,
+          129,
+          3,
+          126,
+          3
+        ],
+        "vertex_data_len": 18000,
+        "vertex_data_prefix": [
+          10,
+          215,
+          19,
+          193,
+          0,
+          0,
+          96,
+          64
+        ],
+        "pptr_internal": [
+          7993808429769519520
+        ],
+        "pptr_external": []
+      }
+    },
+    {
       "id": "xinzexi_2_n_mesh",
       "source": "tests/samples/xinzexi_2_n_tex",
       "source_kind": "bundle",
