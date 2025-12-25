@@ -5,7 +5,7 @@
 
 use super::types::{TypeTree, TypeTreeNode};
 use crate::error::{BinaryError, Result};
-use crate::reader::BinaryReader;
+use crate::reader::{BinaryReader, ByteOrder};
 use indexmap::IndexMap;
 use unity_asset_core::UnityValue;
 
@@ -280,6 +280,7 @@ impl<'a> TypeTreeSerializer<'a> {
 
         // Fast-path: byte/bool arrays are extremely common and are a hot path for large objects.
         if element_node.children.is_empty() {
+            let byte_order = reader.byte_order();
             match element_node.type_name.as_str() {
                 "UInt8" | "char" => {
                     let bytes = reader.read_bytes(size)?;
@@ -307,6 +308,134 @@ impl<'a> TypeTreeSerializer<'a> {
                             .map(|b| UnityValue::Bool(b != 0))
                             .collect(),
                     ));
+                }
+                "SInt16" | "short" => {
+                    let byte_len = size
+                        .checked_mul(2)
+                        .ok_or_else(|| BinaryError::invalid_data("Array byte length overflow"))?;
+                    let bytes = reader.read_bytes(byte_len)?;
+                    let mut out = Vec::with_capacity(size);
+                    for chunk in bytes.chunks_exact(2) {
+                        let raw: [u8; 2] = chunk.try_into().expect("chunks_exact size");
+                        let v = match byte_order {
+                            ByteOrder::Big => i16::from_be_bytes(raw),
+                            ByteOrder::Little => i16::from_le_bytes(raw),
+                        };
+                        out.push(UnityValue::Integer(v as i64));
+                    }
+                    return Ok(UnityValue::Array(out));
+                }
+                "UInt16" | "unsigned short" => {
+                    let byte_len = size
+                        .checked_mul(2)
+                        .ok_or_else(|| BinaryError::invalid_data("Array byte length overflow"))?;
+                    let bytes = reader.read_bytes(byte_len)?;
+                    let mut out = Vec::with_capacity(size);
+                    for chunk in bytes.chunks_exact(2) {
+                        let raw: [u8; 2] = chunk.try_into().expect("chunks_exact size");
+                        let v = match byte_order {
+                            ByteOrder::Big => u16::from_be_bytes(raw),
+                            ByteOrder::Little => u16::from_le_bytes(raw),
+                        };
+                        out.push(UnityValue::Integer(v as i64));
+                    }
+                    return Ok(UnityValue::Array(out));
+                }
+                "SInt32" | "int" => {
+                    let byte_len = size
+                        .checked_mul(4)
+                        .ok_or_else(|| BinaryError::invalid_data("Array byte length overflow"))?;
+                    let bytes = reader.read_bytes(byte_len)?;
+                    let mut out = Vec::with_capacity(size);
+                    for chunk in bytes.chunks_exact(4) {
+                        let raw: [u8; 4] = chunk.try_into().expect("chunks_exact size");
+                        let v = match byte_order {
+                            ByteOrder::Big => i32::from_be_bytes(raw),
+                            ByteOrder::Little => i32::from_le_bytes(raw),
+                        };
+                        out.push(UnityValue::Integer(v as i64));
+                    }
+                    return Ok(UnityValue::Array(out));
+                }
+                "UInt32" | "unsigned int" | "Type*" => {
+                    let byte_len = size
+                        .checked_mul(4)
+                        .ok_or_else(|| BinaryError::invalid_data("Array byte length overflow"))?;
+                    let bytes = reader.read_bytes(byte_len)?;
+                    let mut out = Vec::with_capacity(size);
+                    for chunk in bytes.chunks_exact(4) {
+                        let raw: [u8; 4] = chunk.try_into().expect("chunks_exact size");
+                        let v = match byte_order {
+                            ByteOrder::Big => u32::from_be_bytes(raw),
+                            ByteOrder::Little => u32::from_le_bytes(raw),
+                        };
+                        out.push(UnityValue::Integer(v as i64));
+                    }
+                    return Ok(UnityValue::Array(out));
+                }
+                "SInt64" | "long long" => {
+                    let byte_len = size
+                        .checked_mul(8)
+                        .ok_or_else(|| BinaryError::invalid_data("Array byte length overflow"))?;
+                    let bytes = reader.read_bytes(byte_len)?;
+                    let mut out = Vec::with_capacity(size);
+                    for chunk in bytes.chunks_exact(8) {
+                        let raw: [u8; 8] = chunk.try_into().expect("chunks_exact size");
+                        let v = match byte_order {
+                            ByteOrder::Big => i64::from_be_bytes(raw),
+                            ByteOrder::Little => i64::from_le_bytes(raw),
+                        };
+                        out.push(UnityValue::Integer(v));
+                    }
+                    return Ok(UnityValue::Array(out));
+                }
+                "UInt64" | "unsigned long long" | "FileSize" => {
+                    let byte_len = size
+                        .checked_mul(8)
+                        .ok_or_else(|| BinaryError::invalid_data("Array byte length overflow"))?;
+                    let bytes = reader.read_bytes(byte_len)?;
+                    let mut out = Vec::with_capacity(size);
+                    for chunk in bytes.chunks_exact(8) {
+                        let raw: [u8; 8] = chunk.try_into().expect("chunks_exact size");
+                        let v = match byte_order {
+                            ByteOrder::Big => u64::from_be_bytes(raw),
+                            ByteOrder::Little => u64::from_le_bytes(raw),
+                        };
+                        out.push(UnityValue::Integer(v as i64));
+                    }
+                    return Ok(UnityValue::Array(out));
+                }
+                "float" => {
+                    let byte_len = size
+                        .checked_mul(4)
+                        .ok_or_else(|| BinaryError::invalid_data("Array byte length overflow"))?;
+                    let bytes = reader.read_bytes(byte_len)?;
+                    let mut out = Vec::with_capacity(size);
+                    for chunk in bytes.chunks_exact(4) {
+                        let raw: [u8; 4] = chunk.try_into().expect("chunks_exact size");
+                        let bits = match byte_order {
+                            ByteOrder::Big => u32::from_be_bytes(raw),
+                            ByteOrder::Little => u32::from_le_bytes(raw),
+                        };
+                        out.push(UnityValue::Float(f32::from_bits(bits) as f64));
+                    }
+                    return Ok(UnityValue::Array(out));
+                }
+                "double" => {
+                    let byte_len = size
+                        .checked_mul(8)
+                        .ok_or_else(|| BinaryError::invalid_data("Array byte length overflow"))?;
+                    let bytes = reader.read_bytes(byte_len)?;
+                    let mut out = Vec::with_capacity(size);
+                    for chunk in bytes.chunks_exact(8) {
+                        let raw: [u8; 8] = chunk.try_into().expect("chunks_exact size");
+                        let bits = match byte_order {
+                            ByteOrder::Big => u64::from_be_bytes(raw),
+                            ByteOrder::Little => u64::from_le_bytes(raw),
+                        };
+                        out.push(UnityValue::Float(f64::from_bits(bits)));
+                    }
+                    return Ok(UnityValue::Array(out));
                 }
                 _ => {}
             }
