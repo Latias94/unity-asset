@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset-core"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -20,6 +20,12 @@ exclude = [
     "*.prefab",
     "*.meta",
 ]
+
+[package.metadata.docs.rs]
+no-default-features = true
+all-features = false
+features = []
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 serde = { workspace = true }

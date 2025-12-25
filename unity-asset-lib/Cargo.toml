@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -24,9 +24,9 @@ exclude = [
 
 [dependencies]
 # Re-export sub-crates
-unity-asset-core = { path = "../unity-asset-core", version = "0.1.0" }
-unity-asset-yaml = { path = "../unity-asset-yaml", version = "0.1.0" }
-unity-asset-binary = { path = "../unity-asset-binary", version = "0.1.0" }
+unity-asset-core = { path = "../unity-asset-core", version = "0.2.0" }
+unity-asset-yaml = { path = "../unity-asset-yaml", version = "0.2.0" }
+unity-asset-binary = { path = "../unity-asset-binary", version = "0.2.0" }
 
 [features]
 default = ["mmap"]
@@ -36,6 +36,12 @@ mmap = ["unity-asset-binary/mmap"]
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
-unity-asset-decode = { path = "../unity-asset-decode", version = "0.1.0", features = ["audio"] }
+unity-asset-decode = { path = "../unity-asset-decode", version = "0.2.0", features = ["audio"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[package.metadata.docs.rs]
+no-default-features = true
+all-features = false
+features = ["mmap"]
+rustdoc-args = ["--cfg", "docsrs"]

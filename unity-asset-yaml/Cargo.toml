@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset-yaml"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -23,7 +23,7 @@ exclude = [
 
 [dependencies]
 # Core dependency
-unity-asset-core = { path = "../unity-asset-core", version = "0.1.0" }
+unity-asset-core = { path = "../unity-asset-core", version = "0.2.0" }
 
 # Workspace dependencies
 serde = { workspace = true }
@@ -43,3 +43,9 @@ tokio-test = "0.4"
 [features]
 default = []
 async = ["unity-asset-core/async", "tokio", "async-trait", "futures"]
+
+[package.metadata.docs.rs]
+no-default-features = true
+all-features = false
+features = []
+rustdoc-args = ["--cfg", "docsrs"]

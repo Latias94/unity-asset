@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset-binary"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -23,7 +23,7 @@ exclude = [
 
 [dependencies]
 # Core dependencies
-unity-asset-core = { path = "../unity-asset-core", version = "0.1.0" }
+unity-asset-core = { path = "../unity-asset-core", version = "0.2.0" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 indexmap = { workspace = true }
@@ -62,3 +62,9 @@ mmap = ["dep:memmap2"]
 [dev-dependencies]
 hex = "0.4"
 tempfile = { workspace = true }
+
+[package.metadata.docs.rs]
+no-default-features = true
+all-features = false
+features = []
+rustdoc-args = ["--cfg", "docsrs"]
