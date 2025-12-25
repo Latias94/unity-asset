@@ -184,6 +184,10 @@ def _update_case_from_unitypy(case: Dict[str, Any], obj: Dict[str, Any]) -> None
             expect["vertex_data_len"] = len(vertex_bytes)
             expect["vertex_data_prefix"] = vertex_bytes[:8]
 
+        pptr_internal, pptr_external = _collect_pptrs(obj)
+        expect["pptr_internal"] = pptr_internal
+        expect["pptr_external"] = [[fid, pid] for (fid, pid) in pptr_external]
+
     elif kind == "mesh":
         vd = obj.get("m_VertexData") or {}
         vertex_bytes = vd.get("m_DataSize")

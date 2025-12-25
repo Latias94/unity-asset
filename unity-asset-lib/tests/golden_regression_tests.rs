@@ -69,6 +69,10 @@ enum GoldenExpect {
         vertex_data_len: Option<usize>,
         #[serde(default)]
         vertex_data_prefix: Vec<i64>,
+        #[serde(default)]
+        pptr_internal: Vec<i64>,
+        #[serde(default)]
+        pptr_external: Vec<[i64; 2]>,
     },
     #[serde(rename = "mesh")]
     Mesh {
@@ -428,7 +432,21 @@ fn golden_regression_smoke() {
                 index_buffer_prefix,
                 vertex_data_len,
                 vertex_data_prefix,
+                pptr_internal,
+                pptr_external,
             } => {
+                let (internal, external) = scan_pptrs(&env, &key);
+                assert_eq!(
+                    internal, pptr_internal,
+                    "scan_pptrs internal mismatch (case={})",
+                    case.id
+                );
+                assert_eq!(
+                    external, pptr_external,
+                    "scan_pptrs external mismatch (case={})",
+                    case.id
+                );
+
                 let obj = env
                     .read_binary_object_key(&key)
                     .unwrap_or_else(|_| panic!("read_binary_object_key failed (case={})", case.id));
