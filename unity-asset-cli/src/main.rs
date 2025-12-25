@@ -7,17 +7,17 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+use unity_asset::UnityDocument;
+use unity_asset::UnityValue;
 use unity_asset::environment::{
     BinaryObjectKey, BinarySource, Environment, EnvironmentOptions, EnvironmentReporter,
     EnvironmentWarning,
 };
-use unity_asset::UnityDocument;
-use unity_asset::UnityValue;
 use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions, BundleParser};
 use unity_asset_binary::error::BinaryError;
 use unity_asset_binary::shared_bytes::SharedBytes;
@@ -1420,93 +1420,95 @@ fn export_bundle_command(
             let allocator = Arc::clone(&allocator);
             let output = output.clone();
 
-            scope.spawn(move || loop {
-                if abort.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let idx = next.fetch_add(1, Ordering::Relaxed);
-                if idx >= export_jobs.len() {
-                    break;
-                }
-
-                let job = &export_jobs[idx];
-                let outcome = match export_one_entry(
-                    &env,
-                    &allocator,
-                    &output,
-                    &job.asset_path,
-                    &job.key,
-                    job.order,
-                    decode,
-                    overwrite,
-                    skip_existing,
-                ) {
-                    Ok(v) => Some(v),
-                    Err(e) => {
-                        if continue_on_error {
-                            failed_count.fetch_add(1, Ordering::Relaxed);
-                            let (type_id, _) = lookup_object_type_info(&env, &job.key);
-                            let class_name = if type_id == 0 {
-                                None
-                            } else {
-                                Some(
-                                    unity_asset::get_class_name(type_id)
-                                        .unwrap_or_else(|| format!("Class_{}", type_id)),
-                                )
-                            };
-                            Some(ExportOutcome {
-                                order: job.order,
-                                message: format!(
-                                    "FAILED {} (key={}) error={}",
-                                    job.asset_path, job.key, e
-                                ),
-                                did_export: false,
-                                did_skip_existing: false,
-                                entry: ExportManifestEntry {
-                                    order: job.order,
-                                    asset_path: job.asset_path.clone(),
-                                    key: job.key.to_string(),
-                                    source_kind: format!("{:?}", job.key.source_kind),
-                                    asset_index: job.key.asset_index,
-                                    path_id: job.key.path_id,
-                                    type_id: if type_id == 0 { None } else { Some(type_id) },
-                                    class_name,
-                                    status: ExportStatus::Failed,
-                                    output_path: None,
-                                    output_bytes: None,
-                                    error: Some(e.to_string()),
-                                },
-                            })
-                        } else {
-                            abort.store(true, Ordering::Relaxed);
-                            let mut slot = match first_error.lock() {
-                                Ok(v) => v,
-                                Err(e) => e.into_inner(),
-                            };
-                            if slot.is_none() {
-                                *slot = Some(format!("{} (key={})", e, job.key));
-                            }
-                            None
-                        }
+            scope.spawn(move || {
+                loop {
+                    if abort.load(Ordering::Relaxed) {
+                        break;
                     }
-                };
 
-                let Some(outcome) = outcome else {
-                    break;
-                };
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= export_jobs.len() {
+                        break;
+                    }
 
-                if outcome.did_export {
-                    exported.fetch_add(1, Ordering::Relaxed);
+                    let job = &export_jobs[idx];
+                    let outcome = match export_one_entry(
+                        &env,
+                        &allocator,
+                        &output,
+                        &job.asset_path,
+                        &job.key,
+                        job.order,
+                        decode,
+                        overwrite,
+                        skip_existing,
+                    ) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            if continue_on_error {
+                                failed_count.fetch_add(1, Ordering::Relaxed);
+                                let (type_id, _) = lookup_object_type_info(&env, &job.key);
+                                let class_name = if type_id == 0 {
+                                    None
+                                } else {
+                                    Some(
+                                        unity_asset::get_class_name(type_id)
+                                            .unwrap_or_else(|| format!("Class_{}", type_id)),
+                                    )
+                                };
+                                Some(ExportOutcome {
+                                    order: job.order,
+                                    message: format!(
+                                        "FAILED {} (key={}) error={}",
+                                        job.asset_path, job.key, e
+                                    ),
+                                    did_export: false,
+                                    did_skip_existing: false,
+                                    entry: ExportManifestEntry {
+                                        order: job.order,
+                                        asset_path: job.asset_path.clone(),
+                                        key: job.key.to_string(),
+                                        source_kind: format!("{:?}", job.key.source_kind),
+                                        asset_index: job.key.asset_index,
+                                        path_id: job.key.path_id,
+                                        type_id: if type_id == 0 { None } else { Some(type_id) },
+                                        class_name,
+                                        status: ExportStatus::Failed,
+                                        output_path: None,
+                                        output_bytes: None,
+                                        error: Some(e.to_string()),
+                                    },
+                                })
+                            } else {
+                                abort.store(true, Ordering::Relaxed);
+                                let mut slot = match first_error.lock() {
+                                    Ok(v) => v,
+                                    Err(e) => e.into_inner(),
+                                };
+                                if slot.is_none() {
+                                    *slot = Some(format!("{} (key={})", e, job.key));
+                                }
+                                None
+                            }
+                        }
+                    };
+
+                    let Some(outcome) = outcome else {
+                        break;
+                    };
+
+                    if outcome.did_export {
+                        exported.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if outcome.did_skip_existing {
+                        skipped_existing.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let mut out = match results.lock() {
+                        Ok(v) => v,
+                        Err(e) => e.into_inner(),
+                    };
+                    out.push(outcome);
                 }
-                if outcome.did_skip_existing {
-                    skipped_existing.fetch_add(1, Ordering::Relaxed);
-                }
-                let mut out = match results.lock() {
-                    Ok(v) => v,
-                    Err(e) => e.into_inner(),
-                };
-                out.push(outcome);
             });
         }
     });
@@ -2115,11 +2117,7 @@ fn list_bundle_command(
 }
 
 fn bundle_list_options() -> BundleLoadOptions {
-    let mut options = BundleLoadOptions::default();
-    options.load_assets = false;
-    options.decompress_blocks = false;
-    options.validate = true;
-    options
+    BundleLoadOptions::lazy()
 }
 
 fn looks_like_bundle_prefix(prefix: &[u8]) -> bool {

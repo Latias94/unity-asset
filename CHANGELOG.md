@@ -79,6 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AssetBundle` now tracks parsed asset file names (`asset_names`) to help resolve in-bundle references.
 - `unity-asset-binary` `SerializedFileParser::from_shared_range*` to parse embedded/packed SerializedFiles from a shared backing buffer without copying bytes (best-effort).
 - `unity-asset-binary` `AssetBundle::{extract_file_slice, extract_node_slice}` to access bundle entry bytes without allocating.
+- `unity-asset-binary` `BundleLoadOptions::lazy()` to validate bundle metadata without preloading assets or decompressing blocks.
 - `unity-asset-binary` `BundleParser::from_shared_range*` to parse AssetBundles from a shared backing buffer + byte range (enables true zero-copy WebFile/mmap bundle loading).
 - UnityFS bundles loaded with `BundleLoadOptions::fast()` now record the original compressed bytes and decompress blocks on first access (`AssetBundle::data_checked` / `data_arc` / `extract_*`).
 - (BREAKING) `BundleParser::from_slice*` now copies bytes; use `from_shared_range*` for zero-copy parsing.

@@ -495,7 +495,9 @@ impl Default for BundleLoadOptions {
     fn default() -> Self {
         Self {
             load_assets: true,
-            decompress_blocks: false, // Lazy decompression by default
+            // Note: UnityFS must decompress blocks to load embedded assets, so `load_assets=true`
+            // implies eager decompression even when `decompress_blocks=false`.
+            decompress_blocks: false,
             validate: true,
             max_memory: Some(1024 * 1024 * 1024), // 1GB default limit
             max_compressed_blocks_info_size: Some(64 * 1024 * 1024), // 64MB compressed metadata cap
@@ -508,6 +510,15 @@ impl Default for BundleLoadOptions {
 }
 
 impl BundleLoadOptions {
+    /// Create options for lazy loading (validate metadata, but do not preload assets or decompress blocks).
+    pub fn lazy() -> Self {
+        let mut options = Self::default();
+        options.load_assets = false;
+        options.decompress_blocks = false;
+        options.validate = true;
+        options
+    }
+
     /// Create options for fast loading (minimal processing)
     pub fn fast() -> Self {
         Self {

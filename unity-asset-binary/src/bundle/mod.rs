@@ -290,6 +290,11 @@ mod tests {
 
     #[test]
     fn test_load_options() {
+        let lazy_options = BundleLoadOptions::lazy();
+        assert!(!lazy_options.load_assets);
+        assert!(!lazy_options.decompress_blocks);
+        assert!(lazy_options.validate);
+
         let fast_options = BundleLoadOptions::fast();
         assert!(!fast_options.load_assets);
         assert!(!fast_options.decompress_blocks);
