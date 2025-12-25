@@ -2400,11 +2400,15 @@ fn find_object_fast(
         };
         entries.sort_by(|a, b| a.asset_path.cmp(&b.asset_path));
 
-        let mut file_cache: Vec<Option<unity_asset_binary::asset::SerializedFile>> =
+        let need_cache =
+            verbose || !class_id.is_empty() || !class_name_lc.is_empty() || !name_lc.is_empty();
+        let mut file_cache: Vec<Option<unity_asset_binary::asset::SerializedFile>> = if need_cache {
             std::iter::repeat_with(|| None)
                 .take(asset_nodes.len())
-                .collect();
-        let shared = SharedBytes::from_arc(bundle.data_arc().map_err(|e| anyhow::anyhow!(e))?);
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         for entry in entries {
             if let Some(max) = limit {
@@ -2428,7 +2432,7 @@ fn find_object_fast(
             if verbose {
                 if let Some(key) = &entry.key {
                     let (type_id, byte_size) = lookup_object_type_info_fast(
-                        &shared,
+                        &bundle,
                         &asset_nodes,
                         &mut file_cache,
                         key,
@@ -2447,7 +2451,7 @@ fn find_object_fast(
                     }
                     if !name_lc.is_empty() {
                         let matches = match peek_object_name_fast(
-                            &shared,
+                            &bundle,
                             &asset_nodes,
                             &mut file_cache,
                             key,
@@ -2486,7 +2490,7 @@ fn find_object_fast(
                     (0, 0)
                 } else {
                     lookup_object_type_info_fast(
-                        &shared,
+                        &bundle,
                         &asset_nodes,
                         &mut file_cache,
                         key,
@@ -2506,7 +2510,7 @@ fn find_object_fast(
                 }
                 if !name_lc.is_empty() {
                     let matches = match peek_object_name_fast(
-                        &shared,
+                        &bundle,
                         &asset_nodes,
                         &mut file_cache,
                         key,
@@ -2569,15 +2573,12 @@ fn extract_bundle_container_entries_fast(
     typetree_options: TypeTreeParseOptions,
     show_warnings: bool,
 ) -> Result<Vec<unity_asset::environment::BundleContainerEntry>> {
-    let shared = SharedBytes::from_arc(bundle.data_arc().map_err(|e| anyhow::anyhow!(e))?);
-
     for (asset_index, node) in asset_nodes.iter().enumerate() {
-        let (start, end) = fast_path::node_range(node)?;
-        let mut file = unity_asset_binary::asset::SerializedFileParser::from_shared_range(
-            shared.clone(),
-            start..end,
-        )
-        .map_err(|e| anyhow::anyhow!(e))?;
+        let bytes = bundle
+            .extract_node_data(node)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let mut file = unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes)
+            .map_err(|e| anyhow::anyhow!(e))?;
         if let Some(registry) = registry.cloned() {
             file.set_type_tree_registry(Some(registry));
         }
@@ -2811,7 +2812,7 @@ fn resolve_pptr_in_bundle(
 }
 
 fn lookup_object_type_info_fast(
-    shared: &SharedBytes,
+    bundle: &AssetBundle,
     asset_nodes: &[unity_asset_binary::bundle::DirectoryNode],
     cache: &mut [Option<unity_asset_binary::asset::SerializedFile>],
     key: &BinaryObjectKey,
@@ -2823,22 +2824,21 @@ fn lookup_object_type_info_fast(
     let Some(asset_index) = key.asset_index else {
         return (0, 0);
     };
-    if asset_index >= asset_nodes.len() {
+    if asset_index >= asset_nodes.len() || asset_index >= cache.len() {
         return (0, 0);
     }
 
     if cache[asset_index].is_none() {
         let node = &asset_nodes[asset_index];
-        if let Ok((start, end)) = fast_path::node_range(node) {
-            if let Ok(mut file) = unity_asset_binary::asset::SerializedFileParser::from_shared_range(
-                shared.clone(),
-                start..end,
-            ) {
-                if let Some(registry) = registry.cloned() {
-                    file.set_type_tree_registry(Some(registry));
-                }
-                cache[asset_index] = Some(file);
+        let bytes = match bundle.extract_node_data(node) {
+            Ok(v) => v,
+            Err(_) => return (0, 0),
+        };
+        if let Ok(mut file) = unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes) {
+            if let Some(registry) = registry.cloned() {
+                file.set_type_tree_registry(Some(registry));
             }
+            cache[asset_index] = Some(file);
         }
     }
 
@@ -2850,7 +2850,7 @@ fn lookup_object_type_info_fast(
 }
 
 fn peek_object_name_fast(
-    shared: &SharedBytes,
+    bundle: &AssetBundle,
     asset_nodes: &[unity_asset_binary::bundle::DirectoryNode],
     cache: &mut [Option<unity_asset_binary::asset::SerializedFile>],
     key: &BinaryObjectKey,
@@ -2863,18 +2863,17 @@ fn peek_object_name_fast(
     let Some(asset_index) = key.asset_index else {
         return Ok(None);
     };
-    if asset_index >= asset_nodes.len() {
+    if asset_index >= asset_nodes.len() || asset_index >= cache.len() {
         return Ok(None);
     }
 
     if cache[asset_index].is_none() {
         let node = &asset_nodes[asset_index];
-        let (start, end) = fast_path::node_range(node)?;
-        let mut file = unity_asset_binary::asset::SerializedFileParser::from_shared_range(
-            shared.clone(),
-            start..end,
-        )
-        .map_err(|e| anyhow::anyhow!(e))?;
+        let bytes = bundle
+            .extract_node_data(node)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let mut file = unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes)
+            .map_err(|e| anyhow::anyhow!(e))?;
         if let Some(registry) = registry.cloned() {
             file.set_type_tree_registry(Some(registry));
         }
@@ -3337,6 +3336,48 @@ fn scan_pptr_fast(
             }
 
             let source_key = BinarySource::path(path);
+            processed_any = true;
+
+            if let Some(filter_idx) = asset_index {
+                let Some(node) = asset_nodes.get(filter_idx) else {
+                    return Ok(false);
+                };
+                let bytes = match bundle.extract_node_data(node) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if show_warnings {
+                            eprintln!(
+                                "warning: failed to extract bundle node {:?} for scan-pptr: {}",
+                                path, e
+                            );
+                        }
+                        continue;
+                    }
+                };
+                let mut file =
+                    match unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                if let Some(registry) = registry.clone() {
+                    file.set_type_tree_registry(Some(registry));
+                }
+
+                scan_pptr_scan_file(
+                    &source_key,
+                    unity_asset::environment::BinarySourceKind::AssetBundle,
+                    Some(filter_idx),
+                    &file,
+                    class_id,
+                    has_name_filter,
+                    &name_lc,
+                    include_no_typetree,
+                    json,
+                    &mut remaining,
+                )?;
+                continue;
+            }
+
             let shared = match bundle.data_arc() {
                 Ok(v) => SharedBytes::from_arc(v),
                 Err(e) => {
@@ -3350,16 +3391,9 @@ fn scan_pptr_fast(
                 }
             };
 
-            processed_any = true;
-
             for (idx, node) in asset_nodes.iter().enumerate() {
                 if remaining == 0 {
                     break;
-                }
-                if let Some(filter_idx) = asset_index {
-                    if filter_idx != idx {
-                        continue;
-                    }
                 }
 
                 let (start, end) = match fast_path::node_range(node) {
@@ -3873,25 +3907,17 @@ fn deps_fast(
             }
 
             let source_key = BinarySource::path(&path);
-            let shared = match bundle.data_arc() {
-                Ok(v) => SharedBytes::from_arc(v),
+            let node = &asset_nodes[idx];
+            let bytes = match bundle.extract_node_data(node) {
+                Ok(v) => v,
                 Err(e) => {
                     if show_warnings {
-                        eprintln!(
-                            "warning: failed to decompress bundle {:?} for deps: {}",
-                            path, e
-                        );
+                        eprintln!("warning: failed to extract bundle node for deps: {}", e);
                     }
                     return Ok(false);
                 }
             };
-
-            let node = &asset_nodes[idx];
-            let (start, end) = fast_path::node_range(node)?;
-            let mut file = unity_asset_binary::asset::SerializedFileParser::from_shared_range(
-                shared,
-                start..end,
-            )?;
+            let mut file = unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes)?;
             if let Some(registry) = registry {
                 file.set_type_tree_registry(Some(registry));
             }

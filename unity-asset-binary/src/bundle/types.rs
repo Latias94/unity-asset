@@ -13,6 +13,16 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+#[derive(Debug)]
+struct UnityFsBlockCache {
+    source: DataView,
+    block_data_start: usize,
+    max_memory: Option<usize>,
+    compressed_starts: Vec<u64>,
+    uncompressed_starts: Vec<u64>,
+    cached: Vec<Option<Arc<[u8]>>>,
+}
+
 #[derive(Debug, Clone)]
 struct LazyDecompress {
     source: DataView,
@@ -123,6 +133,7 @@ pub struct AssetBundle {
     decompressed: OnceLock<Arc<[u8]>>,
     decompress_lock: Mutex<()>,
     lazy: Mutex<Option<LazyDecompress>>,
+    unityfs_cache: Mutex<Option<UnityFsBlockCache>>,
     decompressed_len: u64,
 }
 
@@ -144,6 +155,7 @@ impl AssetBundle {
             decompressed: lock,
             decompress_lock: Mutex::new(()),
             lazy: Mutex::new(None),
+            unityfs_cache: Mutex::new(None),
             decompressed_len,
         }
     }
@@ -160,6 +172,7 @@ impl AssetBundle {
             decompressed: OnceLock::new(),
             decompress_lock: Mutex::new(()),
             lazy: Mutex::new(None),
+            unityfs_cache: Mutex::new(None),
             decompressed_len: 0,
         }
     }
@@ -188,6 +201,33 @@ impl AssetBundle {
             block_data_start,
             max_memory,
         });
+
+        let mut compressed_starts = Vec::with_capacity(self.blocks.len());
+        let mut uncompressed_starts = Vec::with_capacity(self.blocks.len());
+        let mut comp_cursor: u64 = 0;
+        let mut uncomp_cursor: u64 = 0;
+        for block in &self.blocks {
+            compressed_starts.push(comp_cursor);
+            uncompressed_starts.push(uncomp_cursor);
+            comp_cursor = comp_cursor
+                .checked_add(block.compressed_size as u64)
+                .unwrap_or(u64::MAX);
+            uncomp_cursor = uncomp_cursor
+                .checked_add(block.uncompressed_size as u64)
+                .unwrap_or(u64::MAX);
+        }
+
+        let mut cache_guard = self.unityfs_cache.lock().unwrap();
+        *cache_guard = Some(UnityFsBlockCache {
+            source: guard.as_ref().unwrap().source.clone(),
+            block_data_start,
+            max_memory,
+            compressed_starts,
+            uncompressed_starts,
+            cached: std::iter::repeat_with(|| None)
+                .take(self.blocks.len())
+                .collect(),
+        });
     }
 
     pub(crate) fn set_decompressed_data(&mut self, data: Vec<u8>) {
@@ -196,6 +236,109 @@ impl AssetBundle {
         let _ = self.decompressed.set(arc);
         let mut guard = self.lazy.lock().unwrap();
         *guard = None;
+        let mut cache_guard = self.unityfs_cache.lock().unwrap();
+        *cache_guard = None;
+    }
+
+    fn extract_range_unityfs(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| BinaryError::invalid_data("Range offset+size overflow"))?;
+        if end > self.decompressed_len {
+            return Err(BinaryError::invalid_data(
+                "Requested range exceeds decompressed bundle data",
+            ));
+        }
+        let len_usize = usize::try_from(size).map_err(|_| {
+            BinaryError::ResourceLimitExceeded("Requested range does not fit in usize".to_string())
+        })?;
+
+        let mut cache_guard = self.unityfs_cache.lock().unwrap();
+        let cache = cache_guard.as_mut().ok_or_else(|| {
+            BinaryError::invalid_data("Bundle data is not available (no UnityFS lazy cache)")
+        })?;
+
+        if let Some(limit) = cache.max_memory {
+            if size > limit as u64 {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Requested range size {} exceeds max_memory {}",
+                    size, limit
+                )));
+            }
+        }
+
+        let mut out = vec![0u8; len_usize];
+
+        let mut copied = 0usize;
+
+        for (idx, block) in self.blocks.iter().enumerate() {
+            let block_start = cache.uncompressed_starts[idx];
+            let block_end = block_start
+                .checked_add(block.uncompressed_size as u64)
+                .ok_or_else(|| BinaryError::invalid_data("Block uncompressed range overflow"))?;
+
+            if block_end <= offset || block_start >= end {
+                continue;
+            }
+
+            if cache.cached[idx].is_none() {
+                if let Some(limit) = cache.max_memory {
+                    if (block.uncompressed_size as usize) > limit {
+                        return Err(BinaryError::ResourceLimitExceeded(format!(
+                            "Block uncompressed size {} exceeds max_memory {}",
+                            block.uncompressed_size, limit
+                        )));
+                    }
+                }
+
+                let mut reader = BinaryReader::new(cache.source.as_bytes(), ByteOrder::Big);
+                let comp_start = cache.compressed_starts[idx]
+                    .checked_add(cache.block_data_start as u64)
+                    .ok_or_else(|| BinaryError::invalid_data("Block compressed start overflow"))?;
+                reader.set_position(comp_start)?;
+                let compressed = reader.read_bytes(block.compressed_size as usize)?;
+                let decompressed = block.decompress(&compressed)?;
+                let arc: Arc<[u8]> = decompressed.into();
+                cache.cached[idx] = Some(arc);
+            }
+
+            let data = cache.cached[idx]
+                .as_ref()
+                .ok_or_else(|| BinaryError::generic("Failed to materialize block cache"))?;
+
+            let copy_start = std::cmp::max(offset, block_start);
+            let copy_end = std::cmp::min(end, block_end);
+            let src_start = usize::try_from(copy_start - block_start).map_err(|_| {
+                BinaryError::ResourceLimitExceeded(
+                    "Block-relative start does not fit in usize".to_string(),
+                )
+            })?;
+            let src_end = usize::try_from(copy_end - block_start).map_err(|_| {
+                BinaryError::ResourceLimitExceeded(
+                    "Block-relative end does not fit in usize".to_string(),
+                )
+            })?;
+            let dst_start = usize::try_from(copy_start - offset).map_err(|_| {
+                BinaryError::ResourceLimitExceeded(
+                    "Output-relative start does not fit in usize".to_string(),
+                )
+            })?;
+            let dst_end = dst_start + (src_end - src_start);
+
+            out[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
+            copied += src_end - src_start;
+            if copied == len_usize {
+                break;
+            }
+        }
+
+        if copied != len_usize {
+            return Err(BinaryError::invalid_data(
+                "Failed to extract full range from UnityFS blocks",
+            ));
+        }
+
+        Ok(out)
     }
 
     /// Get the decompressed bundle data, decompressing UnityFS blocks on demand.
@@ -233,6 +376,8 @@ impl AssetBundle {
         )?;
         let arc: Arc<[u8]> = data.into();
         let _ = self.decompressed.set(arc);
+        let mut cache_guard = self.unityfs_cache.lock().unwrap();
+        *cache_guard = None;
 
         Ok(self
             .decompressed
@@ -316,8 +461,17 @@ impl AssetBundle {
 
     /// Extract data for a specific file
     pub fn extract_file_data(&self, file: &BundleFileInfo) -> crate::error::Result<Vec<u8>> {
-        let bytes = self.extract_file_slice(file)?;
-        Ok(bytes.to_vec())
+        if self.decompressed.get().is_some() {
+            let bytes = self.extract_file_slice(file)?;
+            return Ok(bytes.to_vec());
+        }
+
+        if self.header.is_legacy() {
+            let bytes = self.extract_file_slice(file)?;
+            return Ok(bytes.to_vec());
+        }
+
+        self.extract_range_unityfs(file.offset, file.size)
     }
 
     pub fn extract_file_slice(&self, file: &BundleFileInfo) -> crate::error::Result<&[u8]> {
@@ -352,8 +506,17 @@ impl AssetBundle {
 
     /// Extract data for a specific node
     pub fn extract_node_data(&self, node: &DirectoryNode) -> crate::error::Result<Vec<u8>> {
-        let bytes = self.extract_node_slice(node)?;
-        Ok(bytes.to_vec())
+        if self.decompressed.get().is_some() {
+            let bytes = self.extract_node_slice(node)?;
+            return Ok(bytes.to_vec());
+        }
+
+        if self.header.is_legacy() {
+            let bytes = self.extract_node_slice(node)?;
+            return Ok(bytes.to_vec());
+        }
+
+        self.extract_range_unityfs(node.offset, node.size)
     }
 
     pub fn extract_node_slice(&self, node: &DirectoryNode) -> crate::error::Result<&[u8]> {
@@ -447,6 +610,39 @@ impl AssetBundle {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compression::CompressionBlock;
+    use crate::data_view::DataView;
+    use crate::shared_bytes::SharedBytes;
+
+    #[test]
+    fn unityfs_extract_node_data_is_lazy_and_supports_cross_block_ranges() {
+        let mut header = BundleHeader::default();
+        header.signature = "UnityFS".to_string();
+
+        let mut bundle = AssetBundle::new_empty(header);
+        bundle.blocks = vec![
+            CompressionBlock::new(5, 5, 0),
+            CompressionBlock::new(5, 5, 0),
+        ];
+        bundle.set_decompressed_len(10);
+
+        let bytes: Vec<u8> = (0u8..10u8).collect();
+        let view = DataView::from_shared(SharedBytes::from_vec(bytes));
+        bundle.set_lazy_unityfs_source(view, 0, None);
+
+        let node = DirectoryNode::new("test.bin".to_string(), 3, 6, 0x4);
+        let out = bundle.extract_node_data(&node).unwrap();
+        assert_eq!(out, vec![3, 4, 5, 6, 7, 8]);
+
+        // Ensure we did not force full-bundle decompression.
+        assert!(bundle.decompressed.get().is_none());
+        assert!(bundle.data().is_empty());
     }
 }
 
