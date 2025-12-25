@@ -115,6 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hardened length-prefixed string reads to avoid hostile allocations and out-of-bounds reads (length is validated against remaining bytes and a maximum limit).
 - Unified Unity `class_ids` constants across crates (single source of truth in `unity-asset-core`) and fixed Sprite/SpriteRenderer ID mismatches.
 - Removed speculative `get_class_name` mappings for non-Unity class IDs (e.g. `256/512/768` now resolve to `Class_<id>` instead of guessed names).
+- `get_class_name` now recognizes `PrefabInstance` (1001) and `class_ids` now includes `SPRITE_ATLAS` (687078895).
 - Hardened UnityFS/legacy bundle parsing against hostile metadata (rejects negative counts/offsets, enforces `max_memory`/metadata caps before allocation/decompression).
 - Hardened UnityFS/legacy bundle parsing against hostile *compressed-size* metadata (caps compressed blocks info reads and legacy directory reads before allocating).
 - Bounded UnityFS lazy block caching with an LRU eviction cap (`BundleLoadOptions::max_unityfs_block_cache_memory`) to avoid accidental OOM on large bundles.

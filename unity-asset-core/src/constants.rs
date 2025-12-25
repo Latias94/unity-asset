@@ -135,6 +135,7 @@ impl UnityClassIdMap {
             184 => Some("RenderTexture".to_string()),
             212 => Some("SpriteRenderer".to_string()),
             213 => Some("Sprite".to_string()),
+            1001 => Some("PrefabInstance".to_string()),
 
             // Physics
             50 => Some("Rigidbody2D".to_string()),
@@ -183,8 +184,8 @@ pub mod class_ids {
     pub const ASSET_BUNDLE: i32 = 142;
     pub const SPRITE_RENDERER: i32 = 212;
     pub const SPRITE: i32 = 213;
-    pub const PREFAB: i32 = 1001;
-    pub const PREFAB_INSTANCE: i32 = 1001; // Same as PREFAB in some versions
+    pub const PREFAB_INSTANCE: i32 = 1001;
+    pub const SPRITE_ATLAS: i32 = 687078895;
 }
 
 /// Common Unity class names
@@ -203,8 +204,8 @@ pub mod class_names {
     pub const SPRITE: &str = "Sprite";
     pub const MONO_BEHAVIOUR: &str = "MonoBehaviour";
     pub const MONO_SCRIPT: &str = "MonoScript";
-    pub const PREFAB: &str = "Prefab";
     pub const PREFAB_INSTANCE: &str = "PrefabInstance";
+    pub const SPRITE_ATLAS: &str = "SpriteAtlas";
 }
 
 #[cfg(test)]
