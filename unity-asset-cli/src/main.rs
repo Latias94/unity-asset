@@ -4,8 +4,12 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
 use unity_asset::UnityDocument;
 use unity_asset::UnityValue;
 use unity_asset::environment::{
@@ -95,6 +99,10 @@ enum Commands {
         /// Decode known types (AudioClip -> WAV, Texture2D -> PNG) instead of exporting raw object bytes
         #[arg(long)]
         decode: bool,
+
+        /// Parallel export jobs (0 = auto, 1 = serial)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
     },
 
     /// List AssetBundle nodes (files) for debugging and inspection
@@ -210,6 +218,7 @@ fn main() -> Result<()> {
             limit,
             dry_run,
             decode,
+            jobs,
         } => export_bundle_command(
             input,
             output,
@@ -217,6 +226,7 @@ fn main() -> Result<()> {
             limit,
             dry_run,
             decode,
+            jobs,
             strict,
             show_warnings,
         ),
@@ -539,6 +549,68 @@ fn sprite_texture_pptr(obj: &UnityObject) -> Option<(i32, i64)> {
     Some((file_id, path_id))
 }
 
+#[derive(Debug, Clone)]
+struct ExportJob {
+    order: usize,
+    asset_path: String,
+    key: BinaryObjectKey,
+}
+
+#[derive(Debug, Default)]
+struct PathAllocator {
+    reserved: Mutex<HashSet<PathBuf>>,
+}
+
+impl PathAllocator {
+    fn reserve(&self, proposed: PathBuf, key: &BinaryObjectKey) -> PathBuf {
+        let mut reserved = match self.reserved.lock() {
+            Ok(v) => v,
+            Err(e) => e.into_inner(),
+        };
+
+        if !proposed.exists() && !reserved.contains(&proposed) {
+            reserved.insert(proposed.clone());
+            return proposed;
+        }
+
+        let base_suffix = match key.source_kind {
+            unity_asset::environment::BinarySourceKind::SerializedFile => {
+                format!("sf.{}", key.path_id)
+            }
+            unity_asset::environment::BinarySourceKind::AssetBundle => {
+                format!("ab{}.{}", key.asset_index.unwrap_or_default(), key.path_id)
+            }
+        };
+
+        let mut candidate = path_with_suffix(&proposed, &base_suffix);
+        if !candidate.exists() && !reserved.contains(&candidate) {
+            reserved.insert(candidate.clone());
+            return candidate;
+        }
+
+        let mut i = 1usize;
+        loop {
+            candidate = path_with_suffix(&proposed, &format!("{}.{}", base_suffix, i));
+            if !candidate.exists() && !reserved.contains(&candidate) {
+                reserved.insert(candidate.clone());
+                return candidate;
+            }
+            i += 1;
+        }
+    }
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = path.extension().and_then(|e| e.to_str());
+    let file_name = match ext {
+        Some(ext) => format!("{}.{}.{}", stem, suffix, ext),
+        None => format!("{}.{}", stem, suffix),
+    };
+    parent.join(file_name)
+}
+
 fn export_bundle_command(
     input: PathBuf,
     output: PathBuf,
@@ -546,6 +618,7 @@ fn export_bundle_command(
     limit: Option<usize>,
     dry_run: bool,
     decode: bool,
+    jobs: usize,
     strict: bool,
     show_warnings: bool,
 ) -> Result<()> {
@@ -572,9 +645,11 @@ fn export_bundle_command(
         return Ok(());
     }
 
-    let mut exported = 0usize;
-    let mut skipped = 0usize;
     let pattern_lc = pattern.to_ascii_lowercase();
+    let mut skipped = 0usize;
+    let mut planned = 0usize;
+    let mut order = 0usize;
+    let mut export_jobs: Vec<ExportJob> = Vec::new();
 
     for bundle_source in bundle_sources {
         let entries = env.bundle_container_entries_source(&bundle_source)?;
@@ -586,345 +661,449 @@ fn export_bundle_command(
 
         for entry in entries {
             if let Some(max) = limit {
-                if exported >= max {
+                if planned >= max {
                     break;
                 }
             }
-
             let Some(key) = entry.key else {
                 skipped += 1;
                 continue;
             };
+            export_jobs.push(ExportJob {
+                order,
+                asset_path: entry.asset_path,
+                key,
+            });
+            planned += 1;
+            order += 1;
+        }
+    }
 
-            let rel = sanitize_asset_path(&entry.asset_path);
-            let mut dest_raw = output.join(rel);
-            dest_raw.set_extension("bin");
+    if export_jobs.is_empty() {
+        println!(
+            "Exported 0 entries, skipped {} (unresolved PPtr/external refs or missing objects)",
+            skipped
+        );
+        return Ok(());
+    }
 
-            let disambiguate = |mut dest: PathBuf| -> PathBuf {
-                if dest.exists() {
-                    let mut i = 1usize;
-                    loop {
-                        let mut alt = dest.clone();
-                        let ext = dest.extension().and_then(|e| e.to_str()).unwrap_or("bin");
-                        alt.set_extension(format!("{}.{}", i, ext));
-                        if !alt.exists() {
-                            dest = alt;
+    let allocator = Arc::new(PathAllocator::default());
+
+    if dry_run {
+        for job in &export_jobs {
+            let mut dest = output.join(sanitize_asset_path(&job.asset_path));
+            if decode {
+                if dest.extension().is_none() {
+                    dest.set_extension("bin");
+                }
+            } else {
+                dest.set_extension("bin");
+            }
+            let dest = allocator.reserve(dest, &job.key);
+            println!("DRY-RUN {} -> {:?}", job.asset_path, dest);
+        }
+        println!(
+            "Exported {} entries, skipped {} (unresolved PPtr/external refs or missing objects)",
+            export_jobs.len(),
+            skipped
+        );
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "decode"))]
+    if decode {
+        anyhow::bail!(
+            "--decode requires compiling `unity-asset-cli` with feature `decode` (build with default features, or `--features decode`)."
+        );
+    }
+
+    let threads = {
+        let auto = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let requested = if jobs == 0 { auto } else { jobs.max(1) };
+        requested.min(export_jobs.len()).max(1)
+    };
+
+    let env = Arc::new(env);
+    let export_jobs = Arc::new(export_jobs);
+    let next = Arc::new(AtomicUsize::new(0));
+    let abort = Arc::new(AtomicBool::new(false));
+    let exported = Arc::new(AtomicUsize::new(0));
+    let results: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let first_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    thread::scope(|scope| {
+        for _ in 0..threads {
+            let env = Arc::clone(&env);
+            let export_jobs = Arc::clone(&export_jobs);
+            let next = Arc::clone(&next);
+            let abort = Arc::clone(&abort);
+            let exported = Arc::clone(&exported);
+            let results = Arc::clone(&results);
+            let first_error = Arc::clone(&first_error);
+            let allocator = Arc::clone(&allocator);
+            let output = output.clone();
+
+            scope.spawn(move || {
+                loop {
+                    if abort.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= export_jobs.len() {
+                        break;
+                    }
+
+                    let job = &export_jobs[idx];
+                    let line = match export_one_entry(
+                        &env,
+                        &allocator,
+                        &output,
+                        &job.asset_path,
+                        &job.key,
+                        decode,
+                    ) {
+                        Ok(line) => line,
+                        Err(e) => {
+                            abort.store(true, Ordering::Relaxed);
+                            let mut slot = match first_error.lock() {
+                                Ok(v) => v,
+                                Err(e) => e.into_inner(),
+                            };
+                            if slot.is_none() {
+                                *slot = Some(format!("{} (key={})", e, job.key));
+                            }
                             break;
                         }
-                        i += 1;
-                    }
-                }
-                dest
-            };
+                    };
 
-            if dry_run {
-                let mut dest = dest_raw.clone();
-                if decode {
-                    // Best-effort preview: keep original extension if present; decoding is decided at runtime.
-                    dest = output.join(sanitize_asset_path(&entry.asset_path));
-                    if dest.extension().is_none() {
-                        dest.set_extension("bin");
+                    exported.fetch_add(1, Ordering::Relaxed);
+                    let mut out = match results.lock() {
+                        Ok(v) => v,
+                        Err(e) => e.into_inner(),
+                    };
+                    out.push((job.order, line));
+                }
+            });
+        }
+    });
+
+    if let Some(err) = match first_error.lock() {
+        Ok(v) => v.clone(),
+        Err(e) => e.into_inner().clone(),
+    } {
+        return Err(anyhow::anyhow!(err));
+    }
+
+    let mut lines = match results.lock() {
+        Ok(v) => v.clone(),
+        Err(e) => e.into_inner().clone(),
+    };
+    lines.sort_by_key(|(order, _)| *order);
+    for (_, line) in lines {
+        println!("{}", line);
+    }
+
+    println!(
+        "Exported {} entries, skipped {} (unresolved PPtr/external refs or missing objects) [jobs={}]",
+        exported.load(Ordering::Relaxed),
+        skipped,
+        threads
+    );
+    Ok(())
+}
+
+fn export_one_entry(
+    env: &Environment,
+    allocator: &PathAllocator,
+    output: &Path,
+    asset_path: &str,
+    key: &BinaryObjectKey,
+    decode: bool,
+) -> Result<String> {
+    let obj = env.read_binary_object_key(key)?;
+
+    if decode {
+        #[cfg(feature = "decode")]
+        if let Some(dest) =
+            try_decode_export_best_effort(env, allocator, output, asset_path, key, &obj)
+        {
+            return Ok(format!(
+                "✓ {} -> {:?} (decoded, class_id={})",
+                asset_path, dest, obj.info.type_id
+            ));
+        }
+    }
+
+    let bytes = obj.raw_data();
+    let mut dest = output.join(sanitize_asset_path(asset_path));
+    dest.set_extension("bin");
+
+    if decode {
+        if let Some(ext) = magic_based_extension(asset_path, bytes) {
+            dest = output.join(sanitize_asset_path(asset_path));
+            dest.set_extension(ext);
+        }
+    }
+
+    let dest = allocator.reserve(dest, key);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&dest, bytes)?;
+
+    Ok(format!(
+        "✓ {} -> {:?} (raw, class_id={}, bytes={})",
+        asset_path,
+        dest,
+        obj.info.type_id,
+        bytes.len()
+    ))
+}
+
+#[cfg(feature = "decode")]
+fn try_decode_export_best_effort(
+    env: &Environment,
+    allocator: &PathAllocator,
+    output: &Path,
+    asset_path: &str,
+    key: &BinaryObjectKey,
+    obj: &UnityObject,
+) -> Option<PathBuf> {
+    let unity_version = match key.source_kind {
+        unity_asset::environment::BinarySourceKind::AssetBundle => env
+            .bundles()
+            .get(&key.source)
+            .and_then(|b| key.asset_index.and_then(|i| b.assets.get(i)))
+            .map(|f| UnityVersion::parse_version(&f.unity_version).unwrap_or_default())
+            .unwrap_or_default(),
+        unity_asset::environment::BinarySourceKind::SerializedFile => env
+            .binary_assets()
+            .get(&key.source)
+            .map(|f| UnityVersion::parse_version(&f.unity_version).unwrap_or_default())
+            .unwrap_or_default(),
+    };
+
+    match obj.info.type_id {
+        class_ids::AUDIO_CLIP => (|| -> anyhow::Result<Option<PathBuf>> {
+            let converter = AudioClipConverter::new(unity_version.clone());
+            let clip = converter.from_unity_object(obj)?;
+
+            if std::env::var_os("UNITY_ASSET_DEBUG_AUDIO").is_some() {
+                eprintln!(
+                    "AudioClip debug: name={:?}, data_len={}, is_streamed={}, stream_path={:?}, stream_offset={}, stream_size={}",
+                    clip.name,
+                    clip.data.len(),
+                    clip.is_streamed(),
+                    clip.stream_info.path,
+                    clip.stream_info.offset,
+                    clip.stream_info.size,
+                );
+                if let Some(UnityValue::Object(res)) = obj.get("m_Resource") {
+                    eprintln!("  m_Resource keys: {:?}", res.keys().collect::<Vec<_>>());
+                    eprintln!("  m_Resource: {:?}", res);
+                }
+                if let Some(UnityValue::Array(items)) = obj.get("m_AudioData") {
+                    eprintln!("  m_AudioData len: {}", items.len());
+                }
+                eprintln!("  m_CompressionFormat: {:?}", obj.get("m_CompressionFormat"));
+                eprintln!("  m_LoadType: {:?}", obj.get("m_LoadType"));
+                eprintln!("  m_Channels: {:?}", obj.get("m_Channels"));
+                eprintln!("  m_Frequency: {:?}", obj.get("m_Frequency"));
+                eprintln!("  m_BitsPerSample: {:?}", obj.get("m_BitsPerSample"));
+                eprintln!("  m_Length: {:?}", obj.get("m_Length"));
+
+                if clip.is_streamed()
+                    && key.source_kind == unity_asset::environment::BinarySourceKind::AssetBundle
+                {
+                    match env.read_bundle_stream_data_source(
+                        &key.source,
+                        &clip.stream_info.path,
+                        clip.stream_info.offset,
+                        clip.stream_info.size,
+                    ) {
+                        Ok(bytes) => eprintln!("  bundle stream bytes: {}", bytes.len()),
+                        Err(e) => eprintln!("  bundle stream error: {}", e),
                     }
                 }
-                dest = disambiguate(dest);
-                println!("DRY-RUN {} -> {:?}", entry.asset_path, dest);
-                exported += 1;
-                continue;
             }
 
-            let obj = env.read_binary_object_key(&key)?;
-
-            if decode {
-                #[cfg(not(feature = "decode"))]
-                {
-                    let _ = obj;
-                    anyhow::bail!(
-                        "--decode requires compiling `unity-asset-cli` with feature `decode` (build with default features, or `--features decode`)."
-                    );
+            let mut dest = output.join(sanitize_asset_path(asset_path));
+            match converter.get_audio_data(&clip) {
+                Ok(audio_bytes) if !audio_bytes.is_empty() => {
+                    let ext = std::path::Path::new(asset_path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or(clip.compression_format().extension())
+                        .to_ascii_lowercase();
+                    dest.set_extension(ext);
+                    let dest = allocator.reserve(dest, key);
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&dest, &audio_bytes)?;
+                    Ok(Some(dest))
                 }
-
-                #[cfg(feature = "decode")]
-                let unity_version = match key.source_kind {
-                    unity_asset::environment::BinarySourceKind::AssetBundle => env
-                        .bundles()
-                        .get(&key.source)
-                        .and_then(|b| key.asset_index.and_then(|i| b.assets.get(i)))
-                        .map(|f| UnityVersion::parse_version(&f.unity_version).unwrap_or_default())
-                        .unwrap_or_default(),
-                    unity_asset::environment::BinarySourceKind::SerializedFile => env
-                        .binary_assets()
-                        .get(&key.source)
-                        .map(|f| UnityVersion::parse_version(&f.unity_version).unwrap_or_default())
-                        .unwrap_or_default(),
-                };
-
-                #[cfg(feature = "decode")]
-                let decoded_path: Option<PathBuf> = match obj.info.type_id {
-                    class_ids::AUDIO_CLIP => (|| -> anyhow::Result<Option<PathBuf>> {
-                        let converter = AudioClipConverter::new(unity_version.clone());
-                        let clip = converter.from_unity_object(&obj)?;
-
-                        if std::env::var_os("UNITY_ASSET_DEBUG_AUDIO").is_some() {
-                            eprintln!(
-                                "AudioClip debug: name={:?}, data_len={}, is_streamed={}, stream_path={:?}, stream_offset={}, stream_size={}",
-                                clip.name,
-                                clip.data.len(),
-                                clip.is_streamed(),
-                                clip.stream_info.path,
-                                clip.stream_info.offset,
-                                clip.stream_info.size,
-                            );
-                            if let Some(UnityValue::Object(res)) = obj.get("m_Resource") {
-                                eprintln!("  m_Resource keys: {:?}", res.keys().collect::<Vec<_>>());
-                                eprintln!("  m_Resource: {:?}", res);
-                            }
-                            if let Some(UnityValue::Array(items)) = obj.get("m_AudioData") {
-                                eprintln!("  m_AudioData len: {}", items.len());
-                            }
-                            eprintln!("  m_CompressionFormat: {:?}", obj.get("m_CompressionFormat"));
-                            eprintln!("  m_LoadType: {:?}", obj.get("m_LoadType"));
-                            eprintln!("  m_Channels: {:?}", obj.get("m_Channels"));
-                            eprintln!("  m_Frequency: {:?}", obj.get("m_Frequency"));
-                            eprintln!("  m_BitsPerSample: {:?}", obj.get("m_BitsPerSample"));
-                            eprintln!("  m_Length: {:?}", obj.get("m_Length"));
-
-                            if clip.is_streamed()
-                                && key.source_kind == unity_asset::environment::BinarySourceKind::AssetBundle
-                            {
-                                match env.read_bundle_stream_data_source(
-                                    &key.source,
-                                    &clip.stream_info.path,
-                                    clip.stream_info.offset,
-                                    clip.stream_info.size,
-                                ) {
-                                    Ok(bytes) => eprintln!("  bundle stream bytes: {}", bytes.len()),
-                                    Err(e) => eprintln!("  bundle stream error: {}", e),
-                                }
-                            }
-                        }
-
-                        let mut dest = output.join(sanitize_asset_path(&entry.asset_path));
-                        match converter.get_audio_data(&clip) {
-                            Ok(audio_bytes) if !audio_bytes.is_empty() => {
-                                let ext = std::path::Path::new(&entry.asset_path)
+                _ => {
+                    if clip.is_streamed() {
+                        if let Ok(bytes) = env.read_stream_data_source(
+                            &key.source,
+                            key.source_kind,
+                            &clip.stream_info.path,
+                            clip.stream_info.offset,
+                            clip.stream_info.size,
+                        ) {
+                            if !bytes.is_empty() {
+                                let ext = std::path::Path::new(asset_path)
                                     .extension()
                                     .and_then(|e| e.to_str())
                                     .unwrap_or(clip.compression_format().extension())
                                     .to_ascii_lowercase();
                                 dest.set_extension(ext);
-                                dest = disambiguate(dest);
+                                let dest = allocator.reserve(dest, key);
                                 if let Some(parent) = dest.parent() {
                                     std::fs::create_dir_all(parent)?;
                                 }
-                                std::fs::write(&dest, &audio_bytes)?;
-                                Ok(Some(dest))
-                            }
-                            _ => {
-                                // If the clip is streamed and we are exporting from a bundle, try to read
-                                // the resource bytes from the bundle or filesystem (UnityPy-like).
-                                if clip.is_streamed() {
-                                    if let Ok(bytes) = env.read_stream_data_source(
-                                        &key.source,
-                                        key.source_kind,
-                                        &clip.stream_info.path,
-                                        clip.stream_info.offset,
-                                        clip.stream_info.size,
-                                    ) {
-                                        if !bytes.is_empty() {
-                                            let ext = std::path::Path::new(&entry.asset_path)
-                                                .extension()
-                                                .and_then(|e| e.to_str())
-                                                .unwrap_or(clip.compression_format().extension())
-                                                .to_ascii_lowercase();
-                                            dest.set_extension(ext);
-                                            dest = disambiguate(dest);
-                                            if let Some(parent) = dest.parent() {
-                                                std::fs::create_dir_all(parent)?;
-                                            }
-                                            std::fs::write(&dest, &bytes)?;
-                                            return Ok(Some(dest));
-                                        }
-                                    }
-                                }
-
-                                dest.set_extension("wav");
-                                dest = disambiguate(dest);
-                                if let Some(parent) = dest.parent() {
-                                    std::fs::create_dir_all(parent)?;
-                                }
-                                let audio_processor = AudioProcessor::new(unity_version);
-                                audio_processor.process_and_export(&obj, &dest)?;
-                                Ok(Some(dest))
+                                std::fs::write(&dest, &bytes)?;
+                                return Ok(Some(dest));
                             }
                         }
-                    })()
-                    .ok()
-                    .flatten(),
-                    class_ids::TEXTURE_2D => (|| -> anyhow::Result<Option<PathBuf>> {
-                        let mut dest = output.join(sanitize_asset_path(&entry.asset_path));
-                        dest.set_extension("png");
-                        dest = disambiguate(dest);
-                        if let Some(parent) = dest.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
+                    }
 
-                        let texture_processor = TextureProcessor::new(unity_version);
-                        let mut texture = texture_processor.convert_object(&obj)?;
-                        if texture.image_data.is_empty() && texture.is_streamed() {
-                            if let Ok(bytes) = env.read_stream_data_source(
-                                &key.source,
-                                key.source_kind,
-                                &texture.stream_info.path,
-                                texture.stream_info.offset,
-                                texture.stream_info.size,
-                            ) {
-                                if !bytes.is_empty() {
-                                    texture.data_size = bytes.len() as i32;
-                                    texture.image_data = bytes;
-                                }
-                            }
-                        }
-
-                        let image = texture_processor.decode_texture(&texture)?;
-                        TextureExporter::export_auto(&image, &dest)?;
-                        Ok(Some(dest))
-                    })()
-                    .ok()
-                    .flatten(),
-                    class_ids::TEXT_ASSET => (|| -> anyhow::Result<Option<PathBuf>> {
-                        let bytes = text_asset_bytes(&obj);
-                        if bytes.is_empty() {
-                            return Ok(None);
-                        }
-
-                        let mut dest = output.join(sanitize_asset_path(&entry.asset_path));
-                        if dest.extension().is_none() {
-                            dest.set_extension(if std::str::from_utf8(&bytes).is_ok() {
-                                "txt"
-                            } else {
-                                "bin"
-                            });
-                        }
-                        dest = disambiguate(dest);
-                        if let Some(parent) = dest.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        std::fs::write(&dest, &bytes)?;
-                        Ok(Some(dest))
-                    })()
-                    .ok()
-                    .flatten(),
-                    class_ids::SPRITE => (|| -> anyhow::Result<Option<PathBuf>> {
-                        let Some(obj_ref) = (match key.source_kind {
-                            unity_asset::environment::BinarySourceKind::AssetBundle => key
-                                .asset_index
-                                .and_then(|i| env.find_binary_object_in_bundle_asset_source(&key.source, i, key.path_id)),
-                            unity_asset::environment::BinarySourceKind::SerializedFile => {
-                                env.find_binary_object_in_source_id(&key.source, key.path_id)
-                            }
-                        }) else {
-                            return Ok(None);
-                        };
-
-                        let sprite_processor = SpriteProcessor::new(unity_version.clone());
-                        let sprite = sprite_processor.parse_sprite(&obj)?.sprite;
-
-                        let (file_id, texture_path_id) = if let Some((file_id, path_id)) = sprite_texture_pptr(&obj) {
-                            (file_id, path_id)
-                        } else if sprite.render_data.texture_path_id != 0 {
-                            (0, sprite.render_data.texture_path_id)
-                        } else {
-                            return Ok(None);
-                        };
-
-                        let texture_obj = env.read_binary_pptr(&obj_ref, file_id, texture_path_id)?;
-
-                        let texture_processor = TextureProcessor::new(unity_version);
-                        let mut texture = texture_processor.convert_object(&texture_obj)?;
-                        if texture.image_data.is_empty() && texture.is_streamed() {
-                            if let Ok(bytes) = env.read_stream_data_source(
-                                &key.source,
-                                key.source_kind,
-                                &texture.stream_info.path,
-                                texture.stream_info.offset,
-                                texture.stream_info.size,
-                            ) {
-                                if !bytes.is_empty() {
-                                    texture.data_size = bytes.len() as i32;
-                                    texture.image_data = bytes;
-                                }
-                            }
-                        }
-
-                        let png_bytes = sprite_processor.extract_sprite_image(&sprite, &texture)?;
-
-                        let mut dest = output.join(sanitize_asset_path(&entry.asset_path));
-                        if dest.extension().is_some() {
-                            let stem = dest
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("sprite");
-                            dest.set_file_name(format!("{}.sprite.png", stem));
-                        } else {
-                            dest.set_extension("png");
-                        }
-                        dest = disambiguate(dest);
-                        if let Some(parent) = dest.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        std::fs::write(&dest, &png_bytes)?;
-                        Ok(Some(dest))
-                    })()
-                    .ok()
-                    .flatten(),
-                    _ => None,
-                };
-
-                #[cfg(feature = "decode")]
-                if let Some(dest) = decoded_path {
-                    println!(
-                        "✓ {} -> {:?} (decoded, class_id={})",
-                        entry.asset_path, dest, obj.info.type_id
-                    );
-                    exported += 1;
-                    continue;
+                    dest.set_extension("wav");
+                    let dest = allocator.reserve(dest, key);
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let audio_processor = AudioProcessor::new(unity_version);
+                    audio_processor.process_and_export(obj, &dest)?;
+                    Ok(Some(dest))
                 }
             }
-
-            let mut dest = dest_raw;
-            if decode {
-                // If decoding didn't apply, still try to preserve the original extension
-                // when the raw bytes match the expected file signature (UnityPy-like behavior for TextAsset, etc.).
-                let bytes = obj.raw_data();
-                if let Some(ext) = magic_based_extension(&entry.asset_path, bytes) {
-                    dest = output.join(sanitize_asset_path(&entry.asset_path));
-                    dest.set_extension(ext);
-                } else if dest.extension().is_none() {
-                    dest.set_extension("bin");
-                }
-            }
-            let dest = disambiguate(dest);
+        })()
+        .ok()
+        .flatten(),
+        class_ids::TEXTURE_2D => (|| -> anyhow::Result<Option<PathBuf>> {
+            let mut dest = output.join(sanitize_asset_path(asset_path));
+            dest.set_extension("png");
+            let dest = allocator.reserve(dest, key);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let bytes = obj.raw_data();
-            std::fs::write(&dest, bytes)?;
-            println!(
-                "✓ {} -> {:?} (raw, class_id={}, bytes={})",
-                entry.asset_path,
-                dest,
-                obj.info.type_id,
-                bytes.len()
-            );
-            exported += 1;
-        }
-    }
 
-    println!(
-        "Exported {} entries, skipped {} (unresolved PPtr/external refs or missing objects)",
-        exported, skipped
-    );
-    Ok(())
+            let texture_processor = TextureProcessor::new(unity_version);
+            let mut texture = texture_processor.convert_object(obj)?;
+            if texture.image_data.is_empty() && texture.is_streamed() {
+                if let Ok(bytes) = env.read_stream_data_source(
+                    &key.source,
+                    key.source_kind,
+                    &texture.stream_info.path,
+                    texture.stream_info.offset,
+                    texture.stream_info.size,
+                ) {
+                    if !bytes.is_empty() {
+                        texture.data_size = bytes.len() as i32;
+                        texture.image_data = bytes;
+                    }
+                }
+            }
+
+            let image = texture_processor.decode_texture(&texture)?;
+            TextureExporter::export_auto(&image, &dest)?;
+            Ok(Some(dest))
+        })()
+        .ok()
+        .flatten(),
+        class_ids::TEXT_ASSET => (|| -> anyhow::Result<Option<PathBuf>> {
+            let bytes = text_asset_bytes(obj);
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+
+            let mut dest = output.join(sanitize_asset_path(asset_path));
+            if dest.extension().is_none() {
+                dest.set_extension(if std::str::from_utf8(&bytes).is_ok() {
+                    "txt"
+                } else {
+                    "bin"
+                });
+            }
+            let dest = allocator.reserve(dest, key);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&dest, &bytes)?;
+            Ok(Some(dest))
+        })()
+        .ok()
+        .flatten(),
+        class_ids::SPRITE => (|| -> anyhow::Result<Option<PathBuf>> {
+            let Some(obj_ref) = (match key.source_kind {
+                unity_asset::environment::BinarySourceKind::AssetBundle => key
+                    .asset_index
+                    .and_then(|i| env.find_binary_object_in_bundle_asset_source(&key.source, i, key.path_id)),
+                unity_asset::environment::BinarySourceKind::SerializedFile => {
+                    env.find_binary_object_in_source_id(&key.source, key.path_id)
+                }
+            }) else {
+                return Ok(None);
+            };
+
+            let sprite_processor = SpriteProcessor::new(unity_version.clone());
+            let sprite = sprite_processor.parse_sprite(obj)?.sprite;
+
+            let (file_id, texture_path_id) = if let Some((file_id, path_id)) = sprite_texture_pptr(obj) {
+                (file_id, path_id)
+            } else if sprite.render_data.texture_path_id != 0 {
+                (0, sprite.render_data.texture_path_id)
+            } else {
+                return Ok(None);
+            };
+
+            let texture_obj = env.read_binary_pptr(&obj_ref, file_id, texture_path_id)?;
+
+            let texture_processor = TextureProcessor::new(unity_version);
+            let mut texture = texture_processor.convert_object(&texture_obj)?;
+            if texture.image_data.is_empty() && texture.is_streamed() {
+                if let Ok(bytes) = env.read_stream_data_source(
+                    &key.source,
+                    key.source_kind,
+                    &texture.stream_info.path,
+                    texture.stream_info.offset,
+                    texture.stream_info.size,
+                ) {
+                    if !bytes.is_empty() {
+                        texture.data_size = bytes.len() as i32;
+                        texture.image_data = bytes;
+                    }
+                }
+            }
+
+            let png_bytes = sprite_processor.extract_sprite_image(&sprite, &texture)?;
+
+            let mut dest = output.join(sanitize_asset_path(asset_path));
+            if dest.extension().is_some() {
+                let stem = dest
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("sprite");
+                dest.set_file_name(format!("{}.sprite.png", stem));
+            } else {
+                dest.set_extension("png");
+            }
+            let dest = allocator.reserve(dest, key);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&dest, &png_bytes)?;
+            Ok(Some(dest))
+        })()
+        .ok()
+        .flatten(),
+        _ => None,
+    }
 }
 
 fn list_bundle_command(
