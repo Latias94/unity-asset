@@ -33,6 +33,15 @@ unity-asset/
 └── tests/                # Integration tests and sample files
 ```
 
+### Crates
+
+- `unity-asset` (library): main user-facing API. Start here for `Environment` (YAML + binary) and `YamlDocument`.
+- `unity-asset-binary` (parser): low-level binary parsers (AssetBundle/SerializedFile/WebFile) plus fast object helpers (`ObjectHandle`).
+- `unity-asset-decode` (decode/export): optional decode/export helpers behind feature flags (Texture/Audio/Sprite/Mesh).
+- `unity-asset-yaml` (YAML): YAML-specific parsing/serialization; also re-exported via `unity-asset`.
+- `unity-asset-core` (core): shared data structures, errors, and dynamic `UnityValue` types.
+- `unity-asset-cli` (CLI): command-line tools (not required for library integration).
+
 Examples are maintained per-crate and are built in CI. For instance:
 `cargo run -p unity-asset --example env_load_and_list -- tests/samples`
 `cargo run -p unity-asset-binary --example sniff_kind -- tests/samples/char_118_yuki.ab`

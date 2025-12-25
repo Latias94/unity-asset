@@ -2,6 +2,17 @@
 
 This repository maintains runnable examples per crate (built in CI).
 
+## Crate Guide
+
+- `unity-asset` (library): main user-facing API. Use this if you want an `Environment` that can load YAML + binary sources and iterate objects across bundles/serialized files/webfiles.
+  - Examples live in `unity-asset-lib/examples/`.
+- `unity-asset-binary` (parser): low-level binary parsers (AssetBundle / SerializedFile / WebFile) plus fast helpers (`sniff_*`, `ObjectHandle::peek_name`, `ObjectHandle::scan_pptrs`).
+  - Examples live in `unity-asset-binary/examples/`.
+- `unity-asset-yaml` (YAML): Unity YAML parsing/serialization utilities. Most users can access this via `unity-asset::YamlDocument`.
+- `unity-asset-decode` (decode/export): optional heavier decode/export helpers (Texture/Audio/Sprite/Mesh) behind feature flags.
+  - Examples live in `unity-asset-decode/examples/`.
+- `unity-asset-cli` (CLI): command-line tools. Not needed for library integration.
+
 ## unity-asset (library)
 
 - YAML load summary:
