@@ -145,6 +145,16 @@ Deliverables:
 - Replace `RefCell` caches with `RwLock`/`DashMap`.
 - Make cache invalidation explicit and testable.
 
+### Phase 5 — TypeTree Completeness & External Registry (TPK-like)
+
+- Improve TypeTree value semantics to match UnityPy’s critical behaviors (arrays, align rules, typeless blobs, common special cases).
+- Add an external TypeTree registry hook (UnityPy TPK-like): when TypeTree is stripped, allow best-effort node resolution from a packaged DB or user-provided source.
+- Add regression tests that compare Rust output against UnityPy “golden” JSON for a small curated sample set (field-level diffs with explainable exceptions).
+
+### Phase 6 — Fast Scanning APIs (peek_name)
+
+- Add ultra-fast “peek” helpers (UnityPy-like) such as `peek_name()` to read `m_Name` without fully parsing objects (enables large-bundle scans and CLI filtering).
+
 ## Migration Strategy
 
 Because this is a fearless refactor, we can choose one of:

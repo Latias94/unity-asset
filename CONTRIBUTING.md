@@ -14,11 +14,14 @@ cd unity-asset
 # Build all crates
 cargo build --all
 
-# Run tests
-cargo test --all
+# Run tests (recommended: nextest)
+cargo nextest run --workspace
+
+# Or use cargo test (slower, but always available)
+cargo test --workspace
 
 # Run with async features
-cargo test --all --features async
+cargo nextest run --workspace --features async
 ```
 
 ### Project Structure
@@ -49,7 +52,7 @@ unity-asset/
 
 4. **Run the test suite**:
    ```bash
-   cargo test --all --all-features
+   cargo nextest run --workspace --all-features
    cargo clippy --all-targets --all-features -- -D warnings
    cargo fmt --all -- --check
    ```
@@ -67,19 +70,19 @@ We maintain high test coverage. Please ensure:
 
 ```bash
 # Run specific test suites
-cargo test -p unity-asset-core
-cargo test -p unity-asset-yaml
-cargo test -p unity-asset-binary
-cargo test -p unity-asset-cli
+cargo nextest run -p unity-asset-core
+cargo nextest run -p unity-asset-yaml
+cargo nextest run -p unity-asset-binary
+cargo nextest run -p unity-asset-cli
 
 # Fast inner-loop (unit tests only)
-cargo test -p unity-asset-binary --lib
+cargo nextest run -p unity-asset-binary --lib
 
 # Slow / comprehensive suites (ignored by default)
-cargo test -p unity-asset-binary --tests -- --ignored
+cargo nextest run -p unity-asset-binary --tests --run-ignored all
 
 # Test async features
-cargo test --features async
+cargo nextest run --workspace --features async
 ```
 
 ### 3. Code Style

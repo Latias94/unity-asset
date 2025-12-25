@@ -208,9 +208,9 @@ cargo run --bin unity-asset -- find-object -i tests/samples/char_118_yuki.ab --p
 cargo run --bin unity-asset -- find-object -i tests/samples/char_118_yuki.ab --class-name "Texture2D" --limit 20
 
 # Inspect a single object (TypeTree / Null-field debugging)
-# - Easiest: copy/paste the `key=bok1|...` line from `find-object --verbose` and use `--key`.
+# - Easiest: copy/paste the `key=bok2|...` line from `find-object --verbose` and use `--key`.
 # - Or pass the location fields explicitly (use `--kind serialized` for standalone `.assets` files).
-cargo run --bin unity-asset -- inspect-object -i tests/samples --key 'bok1|bundle|0|1|<len>|tests/samples/char_118_yuki.ab' \
+cargo run --bin unity-asset -- inspect-object -i tests/samples --key 'bok2|bundle|0|1|<outer_len>|tests/samples/char_118_yuki.ab|0|' \
     --max-depth 6 --max-items 200 --filter "m_StreamData"
 # If you suspect TypeTree mismatches, enable fail-fast parsing and print warnings:
 # `--strict` (fail-fast) and `--show-warnings` (print TypeTree warnings)
@@ -222,6 +222,23 @@ cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern 
 # - `Texture2D`: decode and export as `.png`
 # - `Sprite`: resolve referenced `Texture2D`, crop sprite rect, and export as `.sprite.png`
 cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --decode --limit 50
+#
+# Parallelize export/decode work:
+cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --decode --jobs 0
+#
+# Filter by type (reduces work on large bundles):
+cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --class-name "Texture2D" --decode --jobs 0
+#
+# Re-runs: keep output deterministic and resumable via a manifest
+# - `--continue-on-error` records failures as `status=failed` with an error string
+# - `--resume` skips already-exported entries (when the previous output path still exists)
+# - `--retry-failed-from` re-exports only entries that failed previously
+cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --decode \\
+    --manifest out/manifest.json --continue-on-error --jobs 0
+cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --decode \\
+    --retry-failed-from out/manifest.json --manifest out/manifest.retry.json --continue-on-error --jobs 0
+cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --decode \\
+    --resume out/manifest.retry.json --manifest out/manifest.resume.json --jobs 0
 #
 # Note: outputs are raw SerializedFile object bytes (`.bin`), not necessarily the original file format.
 #
