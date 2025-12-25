@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `unity-asset` CLI: `export-bundle --jobs` to parallelize export/decode work (0 = auto, 1 = serial).
 - `unity-asset` CLI: `export-bundle --class-id/--class-name` filtering, and `--overwrite/--skip-existing` output behavior controls.
 - `unity-asset` CLI: `export-bundle --manifest <path>` to write a JSON export manifest for resume/regression checks.
+- `unity-asset` CLI: `export-bundle --resume <manifest>` to skip already-exported entries when re-running.
 - `unity-asset` CLI: `list-bundle` command to list bundle nodes (files) for debugging/inspection.
 - `unity-asset` CLI: `find-object` command to search AssetBundle `m_Container` entries and print resolvable object keys.
 - `unity-asset` CLI: `inspect-object` command to inspect a single binary object by (source, asset_index, path_id) and print a TypeTree-derived field tree for debugging.

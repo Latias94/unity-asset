@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -121,6 +121,10 @@ enum Commands {
         /// Write a JSON manifest of planned/exported entries (for resume and regression checks)
         #[arg(long)]
         manifest: Option<PathBuf>,
+
+        /// Resume from a previous manifest (skips entries that are already exported and still exist)
+        #[arg(long, conflicts_with = "overwrite")]
+        resume: Option<PathBuf>,
 
         /// Parallel export jobs (0 = auto, 1 = serial)
         #[arg(long, default_value_t = 0)]
@@ -245,6 +249,7 @@ fn main() -> Result<()> {
             overwrite,
             skip_existing,
             manifest,
+            resume,
             jobs,
         } => export_bundle_command(
             input,
@@ -258,6 +263,7 @@ fn main() -> Result<()> {
             overwrite,
             skip_existing,
             manifest,
+            resume,
             jobs,
             strict,
             show_warnings,
@@ -588,16 +594,17 @@ struct ExportJob {
     key: BinaryObjectKey,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ExportStatus {
     ExportedRaw,
     ExportedDecoded,
     SkippedExisting,
+    Resumed,
     Planned,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExportManifestEntry {
     order: usize,
     asset_path: String,
@@ -612,7 +619,7 @@ struct ExportManifestEntry {
     output_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExportManifest {
     created_unix_ms: u128,
     input: String,
@@ -631,6 +638,8 @@ struct ExportManifest {
     exported: usize,
     skipped_unresolved: usize,
     skipped_existing: usize,
+    #[serde(default)]
+    resumed: usize,
     filtered: usize,
     entries: Vec<ExportManifestEntry>,
 }
@@ -724,6 +733,12 @@ fn write_export_manifest(path: &Path, manifest: ExportManifest) -> Result<()> {
     Ok(())
 }
 
+fn read_export_manifest(path: &Path) -> Result<ExportManifest> {
+    let file = std::fs::File::open(path)?;
+    let manifest: ExportManifest = serde_json::from_reader(file)?;
+    Ok(manifest)
+}
+
 fn export_bundle_command(
     input: PathBuf,
     output: PathBuf,
@@ -736,10 +751,20 @@ fn export_bundle_command(
     overwrite: bool,
     skip_existing: bool,
     manifest: Option<PathBuf>,
+    resume: Option<PathBuf>,
     jobs: usize,
     strict: bool,
     show_warnings: bool,
 ) -> Result<()> {
+    let mut resume_map: std::collections::HashMap<(String, String), ExportManifestEntry> =
+        std::collections::HashMap::new();
+    if let Some(path) = resume.as_ref() {
+        let prev = read_export_manifest(path)?;
+        for e in prev.entries {
+            resume_map.insert((e.asset_path.clone(), e.key.clone()), e);
+        }
+    }
+
     let mut env = build_environment(strict, show_warnings);
     env.load(&input)?;
 
@@ -767,9 +792,11 @@ fn export_bundle_command(
     let class_name_lc = class_name.to_ascii_lowercase();
     let mut skipped = 0usize;
     let mut filtered = 0usize;
+    let mut resumed = 0usize;
     let mut planned = 0usize;
     let mut order = 0usize;
     let mut export_jobs: Vec<ExportJob> = Vec::new();
+    let mut pre_outcomes: Vec<ExportOutcome> = Vec::new();
 
     for bundle_source in bundle_sources {
         let entries = env.bundle_container_entries_source(&bundle_source)?;
@@ -789,6 +816,53 @@ fn export_bundle_command(
                 skipped += 1;
                 continue;
             };
+
+            let key_str = key.to_string();
+            let resume_key = (entry.asset_path.clone(), key_str.clone());
+            let effective_skip_existing = skip_existing || resume.is_some();
+            if effective_skip_existing && !overwrite {
+                if let Some(prev) = resume_map.get(&resume_key) {
+                    if let Some(p) = prev.output_path.as_ref() {
+                        let prev_path = PathBuf::from(p);
+                        if prev_path.exists()
+                            && matches!(
+                                prev.status,
+                                ExportStatus::ExportedRaw
+                                    | ExportStatus::ExportedDecoded
+                                    | ExportStatus::SkippedExisting
+                                    | ExportStatus::Resumed
+                            )
+                        {
+                            resumed += 1;
+                            planned += 1;
+                            pre_outcomes.push(ExportOutcome {
+                                order,
+                                message: format!(
+                                    "↷ {} -> {:?} (resumed)",
+                                    entry.asset_path, prev_path
+                                ),
+                                did_export: false,
+                                did_skip_existing: true,
+                                entry: ExportManifestEntry {
+                                    order,
+                                    asset_path: entry.asset_path.clone(),
+                                    key: key_str,
+                                    source_kind: prev.source_kind.clone(),
+                                    asset_index: prev.asset_index,
+                                    path_id: prev.path_id,
+                                    type_id: prev.type_id,
+                                    class_name: prev.class_name.clone(),
+                                    status: ExportStatus::Resumed,
+                                    output_path: Some(prev_path.to_string_lossy().to_string()),
+                                    output_bytes: prev.output_bytes,
+                                },
+                            });
+                            order += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
 
             if !class_ids.is_empty() || !class_name_lc.is_empty() {
                 let (type_id, _) = lookup_object_type_info(&env, &key);
@@ -816,7 +890,7 @@ fn export_bundle_command(
         }
     }
 
-    if export_jobs.is_empty() {
+    if export_jobs.is_empty() && pre_outcomes.is_empty() {
         if let Some(path) = manifest {
             write_export_manifest(
                 &path,
@@ -838,6 +912,7 @@ fn export_bundle_command(
                     exported: 0,
                     skipped_unresolved: skipped,
                     skipped_existing: 0,
+                    resumed: 0,
                     filtered,
                     entries: Vec::new(),
                 },
@@ -853,7 +928,14 @@ fn export_bundle_command(
     let allocator = Arc::new(PathAllocator::default());
 
     if dry_run {
-        let mut manifest_entries: Vec<ExportManifestEntry> = Vec::with_capacity(export_jobs.len());
+        let mut manifest_entries: Vec<ExportManifestEntry> =
+            Vec::with_capacity(pre_outcomes.len() + export_jobs.len());
+
+        for o in &pre_outcomes {
+            println!("DRY-RUN {}", o.message);
+            manifest_entries.push(o.entry.clone());
+        }
+
         for job in &export_jobs {
             let (type_id, _) = lookup_object_type_info(&env, &job.key);
             let class_name = if type_id == 0 {
@@ -907,6 +989,14 @@ fn export_bundle_command(
         }
         manifest_entries.sort_by_key(|e| e.order);
         if let Some(path) = manifest {
+            let resumed_count = manifest_entries
+                .iter()
+                .filter(|e| matches!(e.status, ExportStatus::Resumed))
+                .count();
+            let skipped_existing_count = manifest_entries
+                .iter()
+                .filter(|e| matches!(e.status, ExportStatus::SkippedExisting))
+                .count();
             write_export_manifest(
                 &path,
                 ExportManifest {
@@ -926,20 +1016,19 @@ fn export_bundle_command(
                     planned: manifest_entries.len(),
                     exported: 0,
                     skipped_unresolved: skipped,
-                    skipped_existing: manifest_entries
-                        .iter()
-                        .filter(|e| matches!(e.status, ExportStatus::SkippedExisting))
-                        .count(),
+                    skipped_existing: skipped_existing_count + resumed_count,
+                    resumed: resumed_count,
                     filtered,
                     entries: manifest_entries,
                 },
             )?;
         }
         println!(
-            "Exported {} entries, skipped {} (unresolved), filtered {}",
-            export_jobs.len(),
+            "Exported {} entries, skipped {} (unresolved), filtered {}, resumed {}",
+            export_jobs.len() + pre_outcomes.len(),
             skipped,
-            filtered
+            filtered,
+            resumed
         );
         return Ok(());
     }
@@ -949,6 +1038,51 @@ fn export_bundle_command(
         anyhow::bail!(
             "--decode requires compiling `unity-asset-cli` with feature `decode` (build with default features, or `--features decode`)."
         );
+    }
+
+    if export_jobs.is_empty() {
+        let mut outcomes = pre_outcomes;
+        outcomes.sort_by_key(|o| o.order);
+
+        if let Some(path) = manifest.as_ref() {
+            let mut entries: Vec<ExportManifestEntry> =
+                outcomes.iter().map(|o| o.entry.clone()).collect();
+            entries.sort_by_key(|e| e.order);
+            write_export_manifest(
+                path,
+                ExportManifest {
+                    created_unix_ms: now_unix_ms(),
+                    input: input.to_string_lossy().to_string(),
+                    output: output.to_string_lossy().to_string(),
+                    pattern,
+                    decode,
+                    overwrite,
+                    skip_existing,
+                    jobs: 1,
+                    strict,
+                    show_warnings,
+                    limit,
+                    class_ids,
+                    class_name,
+                    planned,
+                    exported: 0,
+                    skipped_unresolved: skipped,
+                    skipped_existing: resumed,
+                    resumed,
+                    filtered,
+                    entries,
+                },
+            )?;
+        }
+
+        for o in &outcomes {
+            println!("{}", o.message);
+        }
+        println!(
+            "Exported 0 entries, skipped {} (unresolved), skipped {} (existing), filtered {}, resumed {} [jobs=0]",
+            skipped, resumed, filtered, resumed
+        );
+        return Ok(());
     }
 
     let threads = {
@@ -1043,12 +1177,14 @@ fn export_bundle_command(
         Ok(v) => v.clone(),
         Err(e) => e.into_inner().clone(),
     };
+    outcomes.extend(pre_outcomes);
     outcomes.sort_by_key(|o| o.order);
 
     if let Some(path) = manifest.as_ref() {
         let mut entries: Vec<ExportManifestEntry> =
             outcomes.iter().map(|o| o.entry.clone()).collect();
         entries.sort_by_key(|e| e.order);
+        let skipped_existing_total = skipped_existing.load(Ordering::Relaxed) + resumed;
         write_export_manifest(
             path,
             ExportManifest {
@@ -1068,7 +1204,8 @@ fn export_bundle_command(
                 planned,
                 exported: exported.load(Ordering::Relaxed),
                 skipped_unresolved: skipped,
-                skipped_existing: skipped_existing.load(Ordering::Relaxed),
+                skipped_existing: skipped_existing_total,
+                resumed,
                 filtered,
                 entries,
             },
@@ -1084,11 +1221,12 @@ fn export_bundle_command(
     }
 
     println!(
-        "Exported {} entries, skipped {} (unresolved), skipped {} (existing), filtered {} [jobs={}]",
+        "Exported {} entries, skipped {} (unresolved), skipped {} (existing), filtered {}, resumed {} [jobs={}]",
         exported.load(Ordering::Relaxed),
         skipped,
-        skipped_existing.load(Ordering::Relaxed),
+        skipped_existing.load(Ordering::Relaxed) + resumed,
         filtered,
+        resumed,
         threads,
     );
     Ok(())
