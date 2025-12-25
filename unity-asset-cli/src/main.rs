@@ -18,14 +18,15 @@ use unity_asset::environment::{
     BinaryObjectKey, BinarySource, Environment, EnvironmentOptions, EnvironmentReporter,
     EnvironmentWarning,
 };
-use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions, BundleParser};
-use unity_asset_binary::error::BinaryError;
+use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions};
 use unity_asset_binary::shared_bytes::SharedBytes;
 use unity_asset_binary::typetree::{
     JsonTypeTreeRegistry, TpkTypeTreeRegistry, TypeTree, TypeTreeParseMode, TypeTreeParseOptions,
     TypeTreeRegistry,
 };
 use unity_asset_binary::{asset::class_ids, object::UnityObject, unity_version::UnityVersion};
+
+mod fast_path;
 
 #[cfg(feature = "decode")]
 use unity_asset_decode::{
@@ -2047,29 +2048,22 @@ fn list_bundle_command(
 ) -> Result<()> {
     let _ = (strict, show_warnings, typetree_registry);
 
-    let mut candidate_paths: Vec<PathBuf> = Vec::new();
-    if input.is_dir() {
-        collect_files_recursive(&input, &mut candidate_paths)?;
-        candidate_paths.sort();
-        candidate_paths.dedup();
-    } else {
-        candidate_paths.push(input.clone());
-    }
+    let candidate_paths = fast_path::collect_candidate_paths(&input)?;
 
     let filter_lc = filter.to_ascii_lowercase();
     let mut found_any = false;
 
     for path in candidate_paths {
-        let prefix = match read_prefix(&path, 16) {
+        let prefix = match fast_path::read_prefix(&path, 16) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if !looks_like_bundle_prefix(&prefix) {
+        if !fast_path::looks_like_bundle_prefix(&prefix) {
             continue;
         }
 
-        let options = bundle_list_options();
-        let bundle = match load_bundle_for_list(&path, options) {
+        let options = fast_path::bundle_list_options();
+        let bundle = match fast_path::load_bundle_for_list(&path, options) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -2114,70 +2108,6 @@ fn list_bundle_command(
     }
 
     Ok(())
-}
-
-fn bundle_list_options() -> BundleLoadOptions {
-    BundleLoadOptions::lazy()
-}
-
-fn looks_like_bundle_prefix(prefix: &[u8]) -> bool {
-    if prefix.len() < 8 {
-        return false;
-    }
-    if prefix.starts_with(b"UnityFS\0") || prefix.starts_with(b"UnityRaw") {
-        return true;
-    }
-    if prefix.starts_with(b"UnityWeb") {
-        if prefix.starts_with(b"UnityWebData") || prefix.starts_with(b"TuanjieWebData") {
-            return false;
-        }
-        return true;
-    }
-    false
-}
-
-fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        let meta = entry.metadata()?;
-        if meta.is_dir() {
-            collect_files_recursive(&path, out)?;
-        } else if meta.is_file() {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn read_prefix(path: &Path, max_len: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let mut buf = vec![0u8; max_len];
-    let n = file.read(&mut buf)?;
-    buf.truncate(n);
-    Ok(buf)
-}
-
-fn load_bundle_for_list(path: &Path, options: BundleLoadOptions) -> Result<AssetBundle> {
-    #[cfg(feature = "mmap")]
-    {
-        let file = std::fs::File::open(path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let shared = SharedBytes::Mmap(Arc::new(mmap));
-        let len = shared.len();
-        return Ok(BundleParser::from_shared_range_with_options(
-            shared,
-            0..len,
-            options,
-        )?);
-    }
-
-    #[cfg(not(feature = "mmap"))]
-    {
-        let bytes = std::fs::read(path)?;
-        Ok(BundleParser::from_bytes_with_options(bytes, options)?)
-    }
 }
 
 fn find_object_command(
@@ -2401,14 +2331,7 @@ fn find_object_fast(
         }
     };
 
-    let mut candidate_paths: Vec<PathBuf> = Vec::new();
-    if input.is_dir() {
-        collect_files_recursive(input, &mut candidate_paths)?;
-        candidate_paths.sort();
-        candidate_paths.dedup();
-    } else {
-        candidate_paths.push(input.clone());
-    }
+    let candidate_paths = fast_path::collect_candidate_paths(input)?;
 
     let pattern_lc = pattern.to_ascii_lowercase();
     let name_lc = name.to_ascii_lowercase();
@@ -2424,16 +2347,16 @@ fn find_object_fast(
             }
         }
 
-        let prefix = match read_prefix(&path, 16) {
+        let prefix = match fast_path::read_prefix(&path, 16) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if !looks_like_bundle_prefix(&prefix) {
+        if !fast_path::looks_like_bundle_prefix(&prefix) {
             continue;
         }
 
-        let options = bundle_list_options();
-        let mut bundle = match load_bundle_for_list(&path, options) {
+        let options = fast_path::bundle_list_options();
+        let mut bundle = match fast_path::load_bundle_for_list(&path, options) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -2444,7 +2367,7 @@ fn find_object_fast(
         processed_any_bundle = true;
 
         let bundle_source = BinarySource::path(&path);
-        let asset_nodes = bundle_asset_nodes(&bundle);
+        let asset_nodes = fast_path::bundle_asset_nodes(&bundle);
         let asset_names: Vec<String> = asset_nodes.iter().map(|n| n.name.clone()).collect();
 
         let entries = extract_bundle_container_entries_fast(
@@ -2631,16 +2554,6 @@ fn load_typetree_registry(
     }
 }
 
-fn bundle_asset_nodes(bundle: &AssetBundle) -> Vec<unity_asset_binary::bundle::DirectoryNode> {
-    bundle
-        .nodes
-        .iter()
-        .filter(|n| n.is_file())
-        .filter(|n| !n.name.ends_with(".resS") && !n.name.ends_with(".resource"))
-        .cloned()
-        .collect()
-}
-
 fn extract_bundle_container_entries_fast(
     bundle: &mut AssetBundle,
     bundle_source: &BinarySource,
@@ -2653,7 +2566,7 @@ fn extract_bundle_container_entries_fast(
     let shared = SharedBytes::from_arc(bundle.data_arc().map_err(|e| anyhow::anyhow!(e))?);
 
     for (asset_index, node) in asset_nodes.iter().enumerate() {
-        let (start, end) = node_range(node)?;
+        let (start, end) = fast_path::node_range(node)?;
         let mut file = unity_asset_binary::asset::SerializedFileParser::from_shared_range(
             shared.clone(),
             start..end,
@@ -2891,27 +2804,6 @@ fn resolve_pptr_in_bundle(
     })
 }
 
-fn node_range(node: &unity_asset_binary::bundle::DirectoryNode) -> Result<(usize, usize)> {
-    let end_u64 = node
-        .offset
-        .checked_add(node.size)
-        .ok_or_else(|| anyhow::anyhow!("node offset+size overflow"))?;
-    let start = usize::try_from(node.offset).map_err(|_| {
-        anyhow::anyhow!(BinaryError::ResourceLimitExceeded(
-            "Node offset does not fit in usize".to_string()
-        ))
-    })?;
-    let end = usize::try_from(end_u64).map_err(|_| {
-        anyhow::anyhow!(BinaryError::ResourceLimitExceeded(
-            "Node end offset does not fit in usize".to_string()
-        ))
-    })?;
-    if start > end {
-        anyhow::bail!("node slice start exceeds end");
-    }
-    Ok((start, end))
-}
-
 fn lookup_object_type_info_fast(
     shared: &SharedBytes,
     asset_nodes: &[unity_asset_binary::bundle::DirectoryNode],
@@ -2931,7 +2823,7 @@ fn lookup_object_type_info_fast(
 
     if cache[asset_index].is_none() {
         let node = &asset_nodes[asset_index];
-        if let Ok((start, end)) = node_range(node) {
+        if let Ok((start, end)) = fast_path::node_range(node) {
             if let Ok(mut file) = unity_asset_binary::asset::SerializedFileParser::from_shared_range(
                 shared.clone(),
                 start..end,
@@ -2971,7 +2863,7 @@ fn peek_object_name_fast(
 
     if cache[asset_index].is_none() {
         let node = &asset_nodes[asset_index];
-        let (start, end) = node_range(node)?;
+        let (start, end) = fast_path::node_range(node)?;
         let mut file = unity_asset_binary::asset::SerializedFileParser::from_shared_range(
             shared.clone(),
             start..end,
@@ -3393,26 +3285,7 @@ fn scan_pptr_fast(
     let mut remaining = limit.unwrap_or(usize::MAX);
 
     let requested_source = source.map(|v| v.to_path_buf());
-    let mut candidate_paths: Vec<PathBuf> = Vec::new();
-    if input.is_dir() {
-        collect_files_recursive(input, &mut candidate_paths)?;
-        candidate_paths.sort();
-        candidate_paths.dedup();
-    } else {
-        candidate_paths.push(input.clone());
-    }
-
-    let path_matches_requested = |candidate: &Path, requested: &Path| -> bool {
-        if candidate == requested {
-            return true;
-        }
-        let candidate_str = candidate.to_string_lossy().replace('\\', "/");
-        let requested_str = requested.to_string_lossy().replace('\\', "/");
-        if candidate_str.ends_with(&requested_str) || requested_str.ends_with(&candidate_str) {
-            return true;
-        }
-        candidate.file_name() == requested.file_name()
-    };
+    let candidate_paths = fast_path::collect_candidate_paths(input)?;
 
     let mut processed_any = false;
 
@@ -3422,21 +3295,21 @@ fn scan_pptr_fast(
                 break;
             }
             if let Some(req) = requested_source.as_ref() {
-                if !path_matches_requested(path, req) {
+                if !fast_path::path_matches_requested(path, req) {
                     continue;
                 }
             }
 
-            let prefix = match read_prefix(path, 16) {
+            let prefix = match fast_path::read_prefix(path, 16) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if !looks_like_bundle_prefix(&prefix) {
+            if !fast_path::looks_like_bundle_prefix(&prefix) {
                 continue;
             }
 
             let options = BundleLoadOptions::lazy();
-            let bundle = match load_bundle_for_list(path, options) {
+            let bundle = match fast_path::load_bundle_for_list(path, options) {
                 Ok(v) => v,
                 Err(e) => {
                     if show_warnings {
@@ -3449,7 +3322,7 @@ fn scan_pptr_fast(
                 continue;
             }
 
-            let asset_nodes = bundle_asset_nodes(&bundle);
+            let asset_nodes = fast_path::bundle_asset_nodes(&bundle);
             if let Some(idx) = asset_index {
                 if idx >= asset_nodes.len() {
                     // Defer to env fallback to preserve existing UX.
@@ -3483,7 +3356,7 @@ fn scan_pptr_fast(
                     }
                 }
 
-                let (start, end) = match node_range(node) {
+                let (start, end) = match fast_path::node_range(node) {
                     Ok(v) => v,
                     Err(e) => {
                         if show_warnings {
@@ -3527,16 +3400,16 @@ fn scan_pptr_fast(
                 break;
             }
             if let Some(req) = requested_source.as_ref() {
-                if !path_matches_requested(path, req) {
+                if !fast_path::path_matches_requested(path, req) {
                     continue;
                 }
             }
 
-            let prefix = match read_prefix(path, 16) {
+            let prefix = match fast_path::read_prefix(path, 16) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if looks_like_bundle_prefix(&prefix) {
+            if fast_path::looks_like_bundle_prefix(&prefix) {
                 continue;
             }
             if prefix.starts_with(b"UnityWebData") || prefix.starts_with(b"TuanjieWebData") {
@@ -3910,42 +3783,24 @@ fn deps_fast(
         _ => return Ok(false),
     };
 
-    let mut candidate_paths: Vec<PathBuf> = Vec::new();
-    if input.is_dir() {
-        collect_files_recursive(input, &mut candidate_paths)?;
-        candidate_paths.sort();
-        candidate_paths.dedup();
-    } else {
-        candidate_paths.push(input.clone());
-    }
+    let candidate_paths = fast_path::collect_candidate_paths(input)?;
 
     let requested_source = source.map(|v| v.to_path_buf());
-    let path_matches_requested = |candidate: &Path, requested: &Path| -> bool {
-        if candidate == requested {
-            return true;
-        }
-        let candidate_str = candidate.to_string_lossy().replace('\\', "/");
-        let requested_str = requested.to_string_lossy().replace('\\', "/");
-        if candidate_str.ends_with(&requested_str) || requested_str.ends_with(&candidate_str) {
-            return true;
-        }
-        candidate.file_name() == requested.file_name()
-    };
 
     let mut matching: Vec<PathBuf> = Vec::new();
 
     match source_kind {
         unity_asset::environment::BinarySourceKind::AssetBundle => {
             for path in &candidate_paths {
-                let prefix = match read_prefix(path, 16) {
+                let prefix = match fast_path::read_prefix(path, 16) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if !looks_like_bundle_prefix(&prefix) {
+                if !fast_path::looks_like_bundle_prefix(&prefix) {
                     continue;
                 }
                 if let Some(req) = requested_source.as_ref() {
-                    if !path_matches_requested(path, req) {
+                    if !fast_path::path_matches_requested(path, req) {
                         continue;
                     }
                 }
@@ -3954,11 +3809,11 @@ fn deps_fast(
         }
         unity_asset::environment::BinarySourceKind::SerializedFile => {
             for path in &candidate_paths {
-                let prefix = match read_prefix(path, 16) {
+                let prefix = match fast_path::read_prefix(path, 16) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if looks_like_bundle_prefix(&prefix) {
+                if fast_path::looks_like_bundle_prefix(&prefix) {
                     continue;
                 }
                 if prefix.starts_with(b"UnityWebData") || prefix.starts_with(b"TuanjieWebData") {
@@ -3970,7 +3825,7 @@ fn deps_fast(
                     }
                 }
                 if let Some(req) = requested_source.as_ref() {
-                    if !path_matches_requested(path, req) {
+                    if !fast_path::path_matches_requested(path, req) {
                         continue;
                     }
                 }
@@ -3988,7 +3843,7 @@ fn deps_fast(
     match source_kind {
         unity_asset::environment::BinarySourceKind::AssetBundle => {
             let options = BundleLoadOptions::lazy();
-            let bundle = match load_bundle_for_list(&path, options) {
+            let bundle = match fast_path::load_bundle_for_list(&path, options) {
                 Ok(v) => v,
                 Err(e) => {
                     if show_warnings {
@@ -4006,7 +3861,7 @@ fn deps_fast(
                 None => return Ok(false),
             };
 
-            let asset_nodes = bundle_asset_nodes(&bundle);
+            let asset_nodes = fast_path::bundle_asset_nodes(&bundle);
             if idx >= asset_nodes.len() {
                 return Ok(false);
             }
@@ -4026,7 +3881,7 @@ fn deps_fast(
             };
 
             let node = &asset_nodes[idx];
-            let (start, end) = node_range(node)?;
+            let (start, end) = fast_path::node_range(node)?;
             let mut file = unity_asset_binary::asset::SerializedFileParser::from_shared_range(
                 shared,
                 start..end,
