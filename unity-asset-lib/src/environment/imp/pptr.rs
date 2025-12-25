@@ -82,42 +82,42 @@ impl Environment {
 
         // Best-effort: if the context object comes from a bundle, resolve external references to other
         // serialized files inside the same bundle.
-        if context.source_kind == BinarySourceKind::AssetBundle {
-            if let Some(bundle) = self.bundles.get(context.source) {
-                let external_norm = external.path.replace('\\', "/");
-                let external_file_name = std::path::Path::new(&external_norm)
-                    .file_name()
-                    .and_then(|n| n.to_str());
+        if context.source_kind == BinarySourceKind::AssetBundle
+            && let Some(bundle) = self.bundles.get(context.source)
+        {
+            let external_norm = external.path.replace('\\', "/");
+            let external_file_name = std::path::Path::new(&external_norm)
+                .file_name()
+                .and_then(|n| n.to_str());
 
-                let mut candidates: Vec<(usize, &String)> =
-                    bundle.asset_names.iter().enumerate().collect();
-                candidates.sort_by(|a, b| a.1.cmp(b.1));
+            let mut candidates: Vec<(usize, &String)> =
+                bundle.asset_names.iter().enumerate().collect();
+            candidates.sort_by(|a, b| a.1.cmp(b.1));
 
-                if let Some((asset_index, _)) = candidates.into_iter().find(|(_, name)| {
-                    let name_norm = name.replace('\\', "/");
-                    if name_norm == external_norm {
-                        return true;
-                    }
-                    if name_norm.ends_with(&external_norm) || external_norm.ends_with(&name_norm) {
-                        return true;
-                    }
-                    match external_file_name {
-                        Some(file_name) => {
-                            std::path::Path::new(&name_norm)
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                == Some(file_name)
-                        }
-                        None => false,
-                    }
-                }) {
-                    return Some(BinaryObjectKey {
-                        source: context.source.clone(),
-                        source_kind: BinarySourceKind::AssetBundle,
-                        asset_index: Some(asset_index),
-                        path_id,
-                    });
+            if let Some((asset_index, _)) = candidates.into_iter().find(|(_, name)| {
+                let name_norm = name.replace('\\', "/");
+                if name_norm == external_norm {
+                    return true;
                 }
+                if name_norm.ends_with(&external_norm) || external_norm.ends_with(&name_norm) {
+                    return true;
+                }
+                match external_file_name {
+                    Some(file_name) => {
+                        std::path::Path::new(&name_norm)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            == Some(file_name)
+                    }
+                    None => false,
+                }
+            }) {
+                return Some(BinaryObjectKey {
+                    source: context.source.clone(),
+                    source_kind: BinarySourceKind::AssetBundle,
+                    asset_index: Some(asset_index),
+                    path_id,
+                });
             }
         }
 

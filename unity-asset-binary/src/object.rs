@@ -419,12 +419,11 @@ fn type_tree_for_object<'a>(
             .map(|t| &t.type_tree)
     }
 
-    if file.enable_type_tree {
-        if let Some(tree) = from_internal(file, info) {
-            if !tree.is_empty() {
-                return Some(TypeTreeSource::Borrowed(tree));
-            }
-        }
+    if file.enable_type_tree
+        && let Some(tree) = from_internal(file, info)
+        && !tree.is_empty()
+    {
+        return Some(TypeTreeSource::Borrowed(tree));
     }
 
     // Best-effort fallback: stripped files can supply a registry externally.

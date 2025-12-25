@@ -268,12 +268,12 @@ impl AudioClipConverter {
                 clip.data = remaining_data.to_vec();
             }
 
-            if !compression_format_read && reader.remaining() >= 4 {
-                if let Ok(val) = reader.read_i32() {
-                    if (-1..=25).contains(&val) {
-                        compression_format = AudioCompressionFormat::from(val);
-                    }
-                }
+            if !compression_format_read
+                && reader.remaining() >= 4
+                && let Ok(val) = reader.read_i32()
+                && (-1..=25).contains(&val)
+            {
+                compression_format = AudioCompressionFormat::from(val);
             }
 
             clip.meta = AudioClipMeta::Modern {

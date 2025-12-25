@@ -231,13 +231,13 @@ impl WebFile {
         let mut bundles = Vec::new();
 
         for file_info in &self.files {
-            if let Ok(view) = self.extract_file_view(&file_info.name) {
-                if let Ok(bundle) = crate::bundle::BundleParser::from_shared_range(
+            if let Ok(view) = self.extract_file_view(&file_info.name)
+                && let Ok(bundle) = crate::bundle::BundleParser::from_shared_range(
                     view.backing_shared(),
                     view.absolute_range(),
-                ) {
-                    bundles.push(bundle);
-                }
+                )
+            {
+                bundles.push(bundle);
             }
         }
 

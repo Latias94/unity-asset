@@ -58,12 +58,11 @@ impl Environment {
                 return Some(*node);
             }
 
-            if let Some(file_name) = &file_name {
-                if Path::new(&node_norm).file_name().and_then(|n| n.to_str())
+            if let Some(file_name) = &file_name
+                && Path::new(&node_norm).file_name().and_then(|n| n.to_str())
                     == Some(file_name.as_str())
-                {
-                    return Some(*node);
-                }
+            {
+                return Some(*node);
             }
         }
 
@@ -265,12 +264,11 @@ impl Environment {
                 return Some((*name).clone());
             }
 
-            if let Some(file_name) = &file_name {
-                if Path::new(&name_norm).file_name().and_then(|n| n.to_str())
+            if let Some(file_name) = &file_name
+                && Path::new(&name_norm).file_name().and_then(|n| n.to_str())
                     == Some(file_name.as_str())
-                {
-                    return Some((*name).clone());
-                }
+            {
+                return Some((*name).clone());
             }
         }
 

@@ -166,13 +166,13 @@ impl BundleParser {
         // Read compression information
         let compressed_size = reader.read_u32()?;
         let uncompressed_size = reader.read_u32()?;
-        if let Some(max_memory) = options.max_memory {
-            if (uncompressed_size as u64) > (max_memory as u64) {
-                return Err(BinaryError::ResourceLimitExceeded(format!(
-                    "Legacy bundle directory uncompressed size {} exceeds max_memory {}",
-                    uncompressed_size, max_memory
-                )));
-            }
+        if let Some(max_memory) = options.max_memory
+            && (uncompressed_size as u64) > (max_memory as u64)
+        {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "Legacy bundle directory uncompressed size {} exceeds max_memory {}",
+                uncompressed_size, max_memory
+            )));
         }
 
         // Skip some bytes based on version
@@ -185,13 +185,13 @@ impl BundleParser {
         reader.set_position(header_size as u64)?;
 
         // Read and decompress the directory data
-        if let Some(max) = options.max_legacy_directory_compressed_size {
-            if (compressed_size as usize) > max {
-                return Err(BinaryError::ResourceLimitExceeded(format!(
-                    "Legacy bundle directory compressed size {} exceeds limit {}",
-                    compressed_size, max
-                )));
-            }
+        if let Some(max) = options.max_legacy_directory_compressed_size
+            && (compressed_size as usize) > max
+        {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "Legacy bundle directory compressed size {} exceeds limit {}",
+                compressed_size, max
+            )));
         }
         let compressed_data = reader.read_bytes(compressed_size as usize)?;
         let directory_data = if bundle.header.signature == "UnityWeb" {
@@ -251,13 +251,13 @@ impl BundleParser {
         let start = reader.position();
         let compressed_size = bundle.header.compressed_blocks_info_size as usize;
 
-        if let Some(max) = options.max_compressed_blocks_info_size {
-            if compressed_size > max {
-                return Err(BinaryError::ResourceLimitExceeded(format!(
-                    "Blocks info compressed size {} exceeds limit {}",
-                    compressed_size, max
-                )));
-            }
+        if let Some(max) = options.max_compressed_blocks_info_size
+            && compressed_size > max
+        {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "Blocks info compressed size {} exceeds limit {}",
+                compressed_size, max
+            )));
         }
 
         let blocks_info_data = if bundle.header.block_info_at_end() {
@@ -586,13 +586,13 @@ impl BundleParser {
                 )));
             }
 
-            if let Some(max_memory) = options.max_memory {
-                if node.size > max_memory as u64 {
-                    return Err(BinaryError::ResourceLimitExceeded(format!(
-                        "Bundle node '{}' size {} exceeds max_memory {}",
-                        node.name, node.size, max_memory
-                    )));
-                }
+            if let Some(max_memory) = options.max_memory
+                && node.size > max_memory as u64
+            {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Bundle node '{}' size {} exceeds max_memory {}",
+                    node.name, node.size, max_memory
+                )));
             }
 
             let start = usize::try_from(node.offset).map_err(|_| {

@@ -185,19 +185,18 @@ impl DependencyAnalyzer {
 
         let mut deps = ExtractedDependencies::default();
 
-        if asset.enable_type_tree {
-            if let Some(tree) = type_tree_for_object(asset, obj) {
-                if !tree.is_empty() {
-                    // Prefer a zero-allocation scan that still consumes the object stream
-                    // according to the TypeTree. This keeps dependency analysis fast even for
-                    // large objects with big buffers/arrays.
-                    if let Ok(scanned) = scan_object_pptrs_with_typetree(asset, obj, tree) {
-                        deps = scanned;
-                    } else if let Ok(values) = parse_object_with_typetree(asset, obj, tree) {
-                        // Fallback: legacy full parse + recursive scan.
-                        scan_pptr_in_value(&UnityValue::Object(values), &mut deps);
-                    }
-                }
+        if asset.enable_type_tree
+            && let Some(tree) = type_tree_for_object(asset, obj)
+            && !tree.is_empty()
+        {
+            // Prefer a zero-allocation scan that still consumes the object stream
+            // according to the TypeTree. This keeps dependency analysis fast even for
+            // large objects with big buffers/arrays.
+            if let Ok(scanned) = scan_object_pptrs_with_typetree(asset, obj, tree) {
+                deps = scanned;
+            } else if let Ok(values) = parse_object_with_typetree(asset, obj, tree) {
+                // Fallback: legacy full parse + recursive scan.
+                scan_pptr_in_value(&UnityValue::Object(values), &mut deps);
             }
         }
 
@@ -420,13 +419,13 @@ fn scan_pptr_in_value(value: &UnityValue, deps: &mut ExtractedDependencies) {
             }
         }
         UnityValue::Object(obj) => {
-            if let Some((file_id, path_id)) = try_read_pptr(obj) {
-                if path_id != 0 {
-                    if file_id == 0 {
-                        deps.internal.push(path_id);
-                    } else {
-                        deps.external.push((file_id, path_id));
-                    }
+            if let Some((file_id, path_id)) = try_read_pptr(obj)
+                && path_id != 0
+            {
+                if file_id == 0 {
+                    deps.internal.push(path_id);
+                } else {
+                    deps.external.push((file_id, path_id));
                 }
             }
 
@@ -457,19 +456,21 @@ fn extract_gameobject_components(props: &indexmap::IndexMap<String, UnityValue>)
 
         // Unity typetree usually stores { "component": {fileID, pathID} }.
         if let Some(UnityValue::Object(component_obj)) = obj.get("component") {
-            if let Some((file_id, path_id)) = try_read_pptr(component_obj) {
-                if file_id == 0 && path_id != 0 {
-                    out.push(path_id);
-                }
+            if let Some((file_id, path_id)) = try_read_pptr(component_obj)
+                && file_id == 0
+                && path_id != 0
+            {
+                out.push(path_id);
             }
             continue;
         }
 
         // Fallback: treat the object itself as PPtr if it matches.
-        if let Some((file_id, path_id)) = try_read_pptr(obj) {
-            if file_id == 0 && path_id != 0 {
-                out.push(path_id);
-            }
+        if let Some((file_id, path_id)) = try_read_pptr(obj)
+            && file_id == 0
+            && path_id != 0
+        {
+            out.push(path_id);
         }
     }
     out
@@ -492,10 +493,10 @@ fn extract_transform_children(props: &indexmap::IndexMap<String, UnityValue>) ->
 
     let mut out = Vec::new();
     for item in items {
-        if let Some(path_id) = extract_internal_path_id(item) {
-            if path_id != 0 {
-                out.push(path_id);
-            }
+        if let Some(path_id) = extract_internal_path_id(item)
+            && path_id != 0
+        {
+            out.push(path_id);
         }
     }
     out
@@ -646,21 +647,19 @@ impl RelationshipAnalyzer {
         for obj in objects {
             match obj.type_id {
                 class_ids::GAME_OBJECT => {
-                    if let Some(tree) = type_tree_for_object(asset, obj) {
-                        if !tree.is_empty() {
-                            if let Ok(values) = parse_object_with_typetree(asset, obj, tree) {
-                                gameobject_props.insert(obj.path_id, values);
-                            }
-                        }
+                    if let Some(tree) = type_tree_for_object(asset, obj)
+                        && !tree.is_empty()
+                        && let Ok(values) = parse_object_with_typetree(asset, obj, tree)
+                    {
+                        gameobject_props.insert(obj.path_id, values);
                     }
                 }
                 class_ids::TRANSFORM => {
-                    if let Some(tree) = type_tree_for_object(asset, obj) {
-                        if !tree.is_empty() {
-                            if let Ok(values) = parse_object_with_typetree(asset, obj, tree) {
-                                transform_props.insert(obj.path_id, values);
-                            }
-                        }
+                    if let Some(tree) = type_tree_for_object(asset, obj)
+                        && !tree.is_empty()
+                        && let Ok(values) = parse_object_with_typetree(asset, obj, tree)
+                    {
+                        transform_props.insert(obj.path_id, values);
                     }
                 }
                 _ => {}
@@ -688,11 +687,11 @@ impl RelationshipAnalyzer {
 
                 // Heuristic: the Transform component (class_id=4) is the GameObject's Transform.
                 for component_id in components {
-                    if let Some(info) = by_path_id.get(&component_id) {
-                        if info.type_id == class_ids::TRANSFORM {
-                            go_transform.insert(*go_id, component_id);
-                            break;
-                        }
+                    if let Some(info) = by_path_id.get(&component_id)
+                        && info.type_id == class_ids::TRANSFORM
+                    {
+                        go_transform.insert(*go_id, component_id);
+                        break;
                     }
                 }
             } else {
@@ -735,12 +734,12 @@ impl RelationshipAnalyzer {
             };
 
             let mut children_ids = Vec::new();
-            if transform_id != 0 {
-                if let Some(children) = transform_children.get(&transform_id) {
-                    for child_tr in children {
-                        if let Some(child_go) = transform_to_go.get(child_tr) {
-                            children_ids.push(*child_go);
-                        }
+            if transform_id != 0
+                && let Some(children) = transform_children.get(&transform_id)
+            {
+                for child_tr in children {
+                    if let Some(child_go) = transform_to_go.get(child_tr) {
+                        children_ids.push(*child_go);
                     }
                 }
             }

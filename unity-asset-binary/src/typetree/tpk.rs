@@ -533,10 +533,10 @@ impl TypeTreeRegistry for TpkTypeTreeRegistry {
         };
         let encoded = unity_version_to_u64(&v);
 
-        if let Ok(cache) = self.cache.read() {
-            if let Some(found) = cache.get(&(class_id, encoded)) {
-                return Some(found.clone());
-            }
+        if let Ok(cache) = self.cache.read()
+            && let Some(found) = cache.get(&(class_id, encoded))
+        {
+            return Some(found.clone());
         }
 
         let ci = self.blob.class_information.get(&class_id)?;

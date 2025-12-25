@@ -97,7 +97,7 @@ See [docs/EXAMPLES.md](docs/EXAMPLES.md) for a curated list of runnable recipes.
 
 ### Requirements
 
-- Rust **1.85+** (MSRV; `edition = "2024"`)
+- Rust stable (`edition = "2024"`)
 - `cargo-nextest` (recommended for running tests)
 
 ### Installation

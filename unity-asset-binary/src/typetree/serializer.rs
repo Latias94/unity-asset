@@ -286,19 +286,16 @@ impl<'a> TypeTreeSerializer<'a> {
                 if child.type_name == "ReferencedObjectData" {
                     if let (Some(class), Some(ns), Some(asm), Some(ref_types)) =
                         (class.as_ref(), ns.as_ref(), asm.as_ref(), ctx.ref_types)
+                        && let Some(tree) = resolve_ref_type_tree_triplet(class, ns, asm, ref_types)
+                        && let Some(root) = tree.nodes.first()
                     {
-                        if let Some(tree) = resolve_ref_type_tree_triplet(class, ns, asm, ref_types)
-                        {
-                            if let Some(root) = tree.nodes.first() {
-                                for field in &root.children {
-                                    self.scan_value_ctx(reader, field, out, ctx)?;
-                                }
-                                if child.is_aligned() {
-                                    reader.align_to(4)?;
-                                }
-                                continue;
-                            }
+                        for field in &root.children {
+                            self.scan_value_ctx(reader, field, out, ctx)?;
                         }
+                        if child.is_aligned() {
+                            reader.align_to(4)?;
+                        }
+                        continue;
                     }
 
                     // Fallback: consume according to placeholder node (if any).
@@ -339,13 +336,13 @@ impl<'a> TypeTreeSerializer<'a> {
                 }
             }
 
-            if let (Some(file_id), Some(path_id)) = (file_id, path_id) {
-                if path_id != 0 {
-                    if file_id == 0 {
-                        out.internal.push(path_id);
-                    } else {
-                        out.external.push((file_id, path_id));
-                    }
+            if let (Some(file_id), Some(path_id)) = (file_id, path_id)
+                && path_id != 0
+            {
+                if file_id == 0 {
+                    out.internal.push(path_id);
+                } else {
+                    out.external.push((file_id, path_id));
                 }
             }
 
@@ -501,10 +498,10 @@ impl<'a> TypeTreeSerializer<'a> {
                 size_i32
             )));
         }
-        if let Some(size_node) = array_node.children.first() {
-            if size_node.is_aligned() {
-                reader.align_to(4)?;
-            }
+        if let Some(size_node) = array_node.children.first()
+            && size_node.is_aligned()
+        {
+            reader.align_to(4)?;
         }
         let size = size_i32 as usize;
         if size > Self::MAX_ARRAY_LEN {
@@ -689,21 +686,21 @@ impl<'a> TypeTreeSerializer<'a> {
                         let resolved = ctx
                             .ref_types
                             .and_then(|r| resolve_ref_type_tree(&nested, r));
-                        if let Some(tree) = resolved {
-                            if let Some(root) = tree.nodes.first() {
-                                let mut props = IndexMap::new();
-                                for field in &root.children {
-                                    if field.name.is_empty() {
-                                        continue;
-                                    }
-                                    let v = self.parse_value_by_type_ctx(reader, field, ctx)?;
-                                    props.insert(field.name.clone(), v);
+                        if let Some(tree) = resolved
+                            && let Some(root) = tree.nodes.first()
+                        {
+                            let mut props = IndexMap::new();
+                            for field in &root.children {
+                                if field.name.is_empty() {
+                                    continue;
                                 }
-                                if !child.name.is_empty() {
-                                    nested.insert(child.name.clone(), UnityValue::Object(props));
-                                }
-                                continue;
+                                let v = self.parse_value_by_type_ctx(reader, field, ctx)?;
+                                props.insert(field.name.clone(), v);
                             }
+                            if !child.name.is_empty() {
+                                nested.insert(child.name.clone(), UnityValue::Object(props));
+                            }
+                            continue;
                         }
 
                         // Explainable fallback: mark unresolved referenced type so callers can
@@ -816,10 +813,10 @@ impl<'a> TypeTreeSerializer<'a> {
                 size_i32
             )));
         }
-        if let Some(size_node) = array_node.children.first() {
-            if size_node.is_aligned() {
-                reader.align_to(4)?;
-            }
+        if let Some(size_node) = array_node.children.first()
+            && size_node.is_aligned()
+        {
+            reader.align_to(4)?;
         }
         let size = size_i32 as usize;
         if size > Self::MAX_ARRAY_LEN {
@@ -1138,11 +1135,10 @@ impl<'a> TypeTreeSerializer<'a> {
 
                     // Find element type
                     if let Some(array_node) = node.children.iter().find(|c| c.type_name == "Array")
+                        && let Some(element_node) = array_node.children.get(1)
                     {
-                        if let Some(element_node) = array_node.children.get(1) {
-                            for element in elements {
-                                self.serialize_value(buffer, element, element_node)?;
-                            }
+                        for element in elements {
+                            self.serialize_value(buffer, element, element_node)?;
                         }
                     }
                 }
@@ -1215,11 +1211,10 @@ impl<'a> TypeTreeSerializer<'a> {
                 if let UnityValue::Array(elements) = value {
                     let mut size = 4; // Array size
                     if let Some(array_node) = node.children.iter().find(|c| c.type_name == "Array")
+                        && let Some(element_node) = array_node.children.get(1)
                     {
-                        if let Some(element_node) = array_node.children.get(1) {
-                            for element in elements {
-                                size += Self::estimate_value_size(element, element_node);
-                            }
+                        for element in elements {
+                            size += Self::estimate_value_size(element, element_node);
                         }
                     }
                     size
@@ -1258,10 +1253,10 @@ fn resolve_ref_type_tree<'a>(
     fn get_str_ci(map: &IndexMap<String, UnityValue>, keys: &[&str]) -> Option<String> {
         for key in keys {
             for (k, v) in map.iter() {
-                if k.eq_ignore_ascii_case(key) {
-                    if let UnityValue::String(s) = v {
-                        return Some(s.clone());
-                    }
+                if k.eq_ignore_ascii_case(key)
+                    && let UnityValue::String(s) = v
+                {
+                    return Some(s.clone());
                 }
             }
         }

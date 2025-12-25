@@ -32,13 +32,13 @@ impl BundleCompression {
         max_uncompressed_size: Option<usize>,
     ) -> Result<Vec<u8>> {
         let expected_uncompressed = header.uncompressed_blocks_info_size as usize;
-        if let Some(limit) = max_uncompressed_size {
-            if expected_uncompressed > limit {
-                return Err(BinaryError::ResourceLimitExceeded(format!(
-                    "Blocks info uncompressed size {} exceeds limit {}",
-                    expected_uncompressed, limit
-                )));
-            }
+        if let Some(limit) = max_uncompressed_size
+            && expected_uncompressed > limit
+        {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "Blocks info uncompressed size {} exceeds limit {}",
+                expected_uncompressed, limit
+            )));
         }
         let compression_type = header.flags & 0x3F; // CompressionTypeMask
 
@@ -156,13 +156,13 @@ impl BundleCompression {
                 .checked_add(block.uncompressed_size as u64)
                 .ok_or_else(|| BinaryError::invalid_data("Total uncompressed size overflow"))?;
         }
-        if let Some(limit) = max_memory {
-            if total_uncompressed > limit as u64 {
-                return Err(BinaryError::ResourceLimitExceeded(format!(
-                    "Bundle decompressed size {} exceeds max_memory {}",
-                    total_uncompressed, limit
-                )));
-            }
+        if let Some(limit) = max_memory
+            && total_uncompressed > limit as u64
+        {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "Bundle decompressed size {} exceeds max_memory {}",
+                total_uncompressed, limit
+            )));
         }
 
         let total_uncompressed_usize = usize::try_from(total_uncompressed).map_err(|_| {
@@ -179,13 +179,13 @@ impl BundleCompression {
         let _ = header;
 
         for block in blocks.iter() {
-            if let Some(limit) = max_memory {
-                if (block.uncompressed_size as u64) > (limit as u64) {
-                    return Err(BinaryError::ResourceLimitExceeded(format!(
-                        "Block uncompressed size {} exceeds max_memory {}",
-                        block.uncompressed_size, limit
-                    )));
-                }
+            if let Some(limit) = max_memory
+                && (block.uncompressed_size as u64) > (limit as u64)
+            {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Block uncompressed size {} exceeds max_memory {}",
+                    block.uncompressed_size, limit
+                )));
             }
             let compressed = reader.read_bytes(block.compressed_size as usize)?;
             let block_data = block.decompress(&compressed)?;

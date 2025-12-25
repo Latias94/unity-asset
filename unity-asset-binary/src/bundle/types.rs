@@ -228,13 +228,13 @@ impl AssetBundle {
         let mut comp_cursor: u64 = 0;
         let mut uncomp_cursor: u64 = 0;
         for block in &self.blocks {
-            if let Some(limit) = max_compressed_block_size {
-                if (block.compressed_size as u64) > (limit as u64) {
-                    return Err(BinaryError::ResourceLimitExceeded(format!(
-                        "Block compressed size {} exceeds max_compressed_block_size {}",
-                        block.compressed_size, limit
-                    )));
-                }
+            if let Some(limit) = max_compressed_block_size
+                && (block.compressed_size as u64) > (limit as u64)
+            {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Block compressed size {} exceeds max_compressed_block_size {}",
+                    block.compressed_size, limit
+                )));
             }
             compressed_starts.push(comp_cursor);
             uncompressed_starts.push(uncomp_cursor);
@@ -302,13 +302,13 @@ impl AssetBundle {
             BinaryError::invalid_data("Bundle data is not available (no UnityFS lazy cache)")
         })?;
 
-        if let Some(limit) = cache.max_memory {
-            if size > limit as u64 {
-                return Err(BinaryError::ResourceLimitExceeded(format!(
-                    "Requested range size {} exceeds max_memory {}",
-                    size, limit
-                )));
-            }
+        if let Some(limit) = cache.max_memory
+            && size > limit as u64
+        {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "Requested range size {} exceeds max_memory {}",
+                size, limit
+            )));
         }
 
         let mut out = vec![0u8; len_usize];
@@ -326,29 +326,29 @@ impl AssetBundle {
             }
 
             if cache.cached[idx].is_none() {
-                if let Some(limit) = cache.max_memory {
-                    if (block.uncompressed_size as usize) > limit {
-                        return Err(BinaryError::ResourceLimitExceeded(format!(
-                            "Block uncompressed size {} exceeds max_memory {}",
-                            block.uncompressed_size, limit
-                        )));
-                    }
+                if let Some(limit) = cache.max_memory
+                    && (block.uncompressed_size as usize) > limit
+                {
+                    return Err(BinaryError::ResourceLimitExceeded(format!(
+                        "Block uncompressed size {} exceeds max_memory {}",
+                        block.uncompressed_size, limit
+                    )));
                 }
-                if let Some(limit) = cache.max_block_cache_memory {
-                    if (block.uncompressed_size as usize) > limit {
-                        return Err(BinaryError::ResourceLimitExceeded(format!(
-                            "Block uncompressed size {} exceeds max_unityfs_block_cache_memory {}",
-                            block.uncompressed_size, limit
-                        )));
-                    }
+                if let Some(limit) = cache.max_block_cache_memory
+                    && (block.uncompressed_size as usize) > limit
+                {
+                    return Err(BinaryError::ResourceLimitExceeded(format!(
+                        "Block uncompressed size {} exceeds max_unityfs_block_cache_memory {}",
+                        block.uncompressed_size, limit
+                    )));
                 }
-                if let Some(limit) = cache.max_compressed_block_size {
-                    if (block.compressed_size as usize) > limit {
-                        return Err(BinaryError::ResourceLimitExceeded(format!(
-                            "Block compressed size {} exceeds max_compressed_block_size {}",
-                            block.compressed_size, limit
-                        )));
-                    }
+                if let Some(limit) = cache.max_compressed_block_size
+                    && (block.compressed_size as usize) > limit
+                {
+                    return Err(BinaryError::ResourceLimitExceeded(format!(
+                        "Block compressed size {} exceeds max_compressed_block_size {}",
+                        block.compressed_size, limit
+                    )));
                 }
 
                 let mut reader = BinaryReader::new(cache.source.as_bytes(), ByteOrder::Big);

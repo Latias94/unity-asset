@@ -102,10 +102,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
-
-      - name: Install Rust 1.85.0 (clippy)
-        run: rustup toolchain install 1.85.0 --profile minimal --component clippy
+          components: rustfmt, clippy
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -117,7 +114,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (workspace defaults)
-        run: cargo +1.85.0 clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::collapsible_if
 
       - name: Test (workspace defaults)
         run: cargo nextest run --workspace

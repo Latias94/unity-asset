@@ -7,7 +7,7 @@ fn push_aligned_string_le(out: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
     out.extend_from_slice(&(bytes.len() as i32).to_le_bytes());
     out.extend_from_slice(bytes);
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }

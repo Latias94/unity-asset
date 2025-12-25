@@ -49,22 +49,17 @@ fn test_inverted_scalar_loading() {
                     );
 
                     // Check first item for inverted scalar
-                    if let Some(UnityValue::Object(first_item)) = platform_data.first() {
-                        if let Some(UnityValue::Object(first)) = first_item.get("first") {
-                            // The key ": Any" should map to null (inverted scalar)
-                            if let Some(any_value) = first.get("Any") {
-                                match any_value {
-                                    UnityValue::Null => {
-                                        println!(
-                                            "  ✓ Inverted scalar 'Any:' correctly parsed as null"
-                                        );
-                                    }
-                                    other => {
-                                        println!(
-                                            "  ⚠ Inverted scalar 'Any:' parsed as: {:?}",
-                                            other
-                                        );
-                                    }
+                    if let Some(UnityValue::Object(first_item)) = platform_data.first()
+                        && let Some(UnityValue::Object(first)) = first_item.get("first")
+                    {
+                        // The key ": Any" should map to null (inverted scalar)
+                        if let Some(any_value) = first.get("Any") {
+                            match any_value {
+                                UnityValue::Null => {
+                                    println!("  ✓ Inverted scalar 'Any:' correctly parsed as null");
+                                }
+                                other => {
+                                    println!("  ⚠ Inverted scalar 'Any:' parsed as: {:?}", other);
                                 }
                             }
                         }

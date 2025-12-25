@@ -303,10 +303,10 @@ impl SerializedFileParser {
                 if let Some(typ) = file.types.iter_mut().find(|t| t.class_id == raw_type_id) {
                     typ.script_type_index = script_type_index;
                 }
-            } else if raw_type_id >= 0 {
-                if let Some(typ) = file.types.get_mut(raw_type_id as usize) {
-                    typ.script_type_index = script_type_index;
-                }
+            } else if raw_type_id >= 0
+                && let Some(typ) = file.types.get_mut(raw_type_id as usize)
+            {
+                typ.script_type_index = script_type_index;
             }
         }
 
