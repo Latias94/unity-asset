@@ -134,6 +134,48 @@ pub(crate) enum Commands {
         verbose: bool,
     },
 
+    /// List binary objects (path_id/class_id/peek_name) from SerializedFiles or bundles
+    #[command(name = "list-objects")]
+    ListObjects {
+        /// Input file or directory path (assets/bundles will be auto-detected)
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Source kind: `all`, `bundle`, or `serialized`
+        #[arg(long, default_value = "serialized")]
+        kind: String,
+
+        /// Restrict listing to a specific loaded source path
+        #[arg(long)]
+        source: Option<PathBuf>,
+
+        /// Restrict listing to a specific bundle asset index (only applies when --kind bundle or all)
+        #[arg(long)]
+        asset_index: Option<usize>,
+
+        /// Filter by Unity class ID (repeatable). Example: `--class-id 28` (Texture2D).
+        #[arg(long)]
+        class_id: Vec<i32>,
+
+        /// Filter by Unity class name substring (case-insensitive). Example: `--class-name Texture`.
+        #[arg(long, default_value = "")]
+        class_name: String,
+
+        /// Filter by object `m_Name`/`name` substring (case-insensitive) via a TypeTree prefix fast path.
+        ///
+        /// Note: this requires TypeTree to be present and to include a name field; otherwise the object is treated as non-matching.
+        #[arg(long, default_value = "")]
+        name: String,
+
+        /// Limit printed objects
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Print one JSON object per line
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Find objects by AssetBundle `m_Container` asset path pattern (UnityPy-like discovery)
     FindObject {
         /// Input file or directory path (bundles will be auto-detected)

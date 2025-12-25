@@ -11,6 +11,27 @@ use unity_asset_binary::typetree::{
     CompositeTypeTreeRegistry, JsonTypeTreeRegistry, TpkTypeTreeRegistry, TypeTreeRegistry,
 };
 
+fn looks_like_unity_project_root(dir: &Path) -> bool {
+    dir.join("Assets").is_dir() && dir.join("ProjectSettings").is_dir()
+}
+
+pub(crate) fn load_environment_input(env: &mut Environment, input: &Path) -> Result<()> {
+    if input.is_dir() && looks_like_unity_project_root(input) {
+        let mut loaded_any = false;
+        for root in [input.join("Assets"), input.join("ProjectSettings")] {
+            if root.exists() {
+                env.load(&root)?;
+                loaded_any = true;
+            }
+        }
+        if loaded_any {
+            return Ok(());
+        }
+    }
+    env.load(input)?;
+    Ok(())
+}
+
 pub(crate) fn class_name_for_id(class_id: i32) -> Cow<'static, str> {
     unity_asset::get_class_name_str(class_id)
         .map(Cow::Borrowed)

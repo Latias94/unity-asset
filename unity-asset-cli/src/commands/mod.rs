@@ -9,6 +9,7 @@ mod extract;
 mod find_object;
 mod inspect_object;
 mod list_bundle;
+mod list_objects;
 mod parse_yaml;
 mod scan_pptr;
 
@@ -63,6 +64,28 @@ pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
             filter,
             verbose,
         } => list_bundle::run(input, filter, verbose, ctx),
+        Commands::ListObjects {
+            input,
+            kind,
+            source,
+            asset_index,
+            class_id,
+            class_name,
+            name,
+            limit,
+            json,
+        } => list_objects::run(
+            input,
+            kind,
+            source,
+            asset_index,
+            class_id,
+            class_name,
+            name,
+            limit,
+            json,
+            ctx,
+        ),
         Commands::FindObject {
             input,
             pattern,

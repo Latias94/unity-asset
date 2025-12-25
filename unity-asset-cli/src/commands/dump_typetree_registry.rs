@@ -1,4 +1,4 @@
-use crate::shared::{AppContext, build_environment};
+use crate::shared::{AppContext, build_environment, load_environment_input};
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -42,7 +42,7 @@ pub(crate) fn run(
     }
 
     let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
-    env.load(&input)?;
+    load_environment_input(&mut env, &input)?;
 
     let class_filter: Option<HashSet<i32>> = if class_id.is_empty() {
         None

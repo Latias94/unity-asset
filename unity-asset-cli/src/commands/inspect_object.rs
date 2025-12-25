@@ -1,4 +1,4 @@
-use crate::shared::{AppContext, build_environment, resolve_loaded_source};
+use crate::shared::{AppContext, build_environment, load_environment_input, resolve_loaded_source};
 use anyhow::Result;
 use std::path::PathBuf;
 use unity_asset::UnityValue;
@@ -18,7 +18,7 @@ pub(crate) fn run(
     ctx: &AppContext,
 ) -> Result<()> {
     let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
-    env.load(&input)?;
+    load_environment_input(&mut env, &input)?;
 
     let mut key = if let Some(key) = key {
         key.parse::<unity_asset::environment::BinaryObjectKey>()

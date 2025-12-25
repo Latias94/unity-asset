@@ -1,4 +1,7 @@
-use crate::shared::{AppContext, build_environment, class_name_for_id, lookup_object_type_info};
+use crate::shared::{
+    AppContext, build_environment, class_name_for_id, load_environment_input,
+    lookup_object_type_info,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -380,7 +383,7 @@ fn export_bundle_command(
     }
 
     let mut env = build_environment(strict, show_warnings, typetree_registries)?;
-    env.load(&input)?;
+    load_environment_input(&mut env, &input)?;
 
     std::fs::create_dir_all(&output)?;
 

@@ -1,7 +1,7 @@
 use crate::fast_path;
 use crate::shared::{
-    AppContext, build_environment, load_serialized_file_for_scan, load_typetree_registry,
-    resolve_loaded_source,
+    AppContext, build_environment, load_environment_input, load_serialized_file_for_scan,
+    load_typetree_registry, resolve_loaded_source,
 };
 use anyhow::Result;
 use serde::Serialize;
@@ -384,7 +384,7 @@ fn scan_pptr_env_fallback(
     typetree_registries: &[PathBuf],
 ) -> Result<()> {
     let mut env = build_environment(strict, show_warnings, typetree_registries)?;
-    env.load(&input)?;
+    load_environment_input(&mut env, &input)?;
 
     let kind_lc = kind.to_ascii_lowercase();
     let scan_bundles = kind_lc == "all" || kind_lc == "bundle";

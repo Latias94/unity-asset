@@ -1,7 +1,7 @@
 use crate::fast_path;
 use crate::shared::{
-    AppContext, build_environment, load_serialized_file_for_scan, load_typetree_registry,
-    resolve_loaded_source,
+    AppContext, build_environment, load_environment_input, load_serialized_file_for_scan,
+    load_typetree_registry, resolve_loaded_source,
 };
 use anyhow::Result;
 use serde::Serialize;
@@ -324,7 +324,7 @@ pub(crate) fn run(
     }
 
     let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
-    env.load(&input)?;
+    load_environment_input(&mut env, &input)?;
 
     let source_kind = match kind_lc.as_str() {
         "bundle" => unity_asset::environment::BinarySourceKind::AssetBundle,

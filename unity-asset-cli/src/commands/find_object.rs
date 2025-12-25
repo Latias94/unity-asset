@@ -1,5 +1,7 @@
 use crate::fast_path;
-use crate::shared::{AppContext, build_environment, class_name_for_id, load_typetree_registry};
+use crate::shared::{
+    AppContext, build_environment, class_name_for_id, load_environment_input, load_typetree_registry,
+};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -66,7 +68,7 @@ fn find_object_env_fallback(
     typetree_registries: &[PathBuf],
 ) -> Result<()> {
     let mut env = build_environment(strict, show_warnings, typetree_registries)?;
-    env.load(&input)?;
+    load_environment_input(&mut env, &input)?;
 
     let pattern_lc = pattern.to_ascii_lowercase();
     let name_lc = name.to_ascii_lowercase();
