@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `unity-asset` CLI: `find-object --name` to filter by object `m_Name`/`name` via a TypeTree prefix fast path (best-effort).
 - `unity-asset` CLI: `--typetree-registry <path>` to load an external TypeTree registry for stripped assets (best-effort).
 - `unity-asset` CLI: `dump-typetree-registry` to generate a JSON registry from loaded files.
+- `unity-asset` CLI: `--typetree-registry` supports UnityPy-compatible `.tpk` TypeTree packs.
 - `unity-asset` CLI: `inspect-object` command to inspect a single binary object by (source, asset_index, path_id) and print a TypeTree-derived field tree for debugging.
 - `unity-asset` CLI: `find-object` supports `--class-id` / `--class-name` filtering for easier batch workflows.
 - `Environment::read_stream_data_from_fs` to load streamed `.resS`/`.resource` payloads from the filesystem when they are not embedded in a bundle.

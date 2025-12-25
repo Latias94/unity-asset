@@ -42,6 +42,7 @@ mod common_strings;
 pub mod parser;
 pub mod registry;
 pub mod serializer;
+pub mod tpk;
 pub mod types;
 
 // Re-export main types for easy access
@@ -52,6 +53,7 @@ pub use serializer::{
     TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput, TypeTreeParseWarning,
     TypeTreeSerializer,
 };
+pub use tpk::TpkTypeTreeRegistry;
 pub use types::{TypeInfo, TypeRegistry, TypeTree, TypeTreeNode, TypeTreeStatistics};
 
 /// Main TypeTree processing facade

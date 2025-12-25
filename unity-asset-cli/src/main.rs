@@ -18,7 +18,7 @@ use unity_asset::environment::{
     BinaryObjectKey, BinarySource, Environment, EnvironmentOptions, EnvironmentReporter,
     EnvironmentWarning,
 };
-use unity_asset_binary::typetree::{JsonTypeTreeRegistry, TypeTree};
+use unity_asset_binary::typetree::{JsonTypeTreeRegistry, TpkTypeTreeRegistry, TypeTree};
 use unity_asset_binary::{asset::class_ids, object::UnityObject, unity_version::UnityVersion};
 
 #[cfg(feature = "decode")]
@@ -443,9 +443,22 @@ fn build_environment(
     env.set_reporter(reporter);
 
     if let Some(path) = typetree_registry {
-        let registry = JsonTypeTreeRegistry::from_path(path)
-            .map_err(|e| anyhow::anyhow!("Failed to load --typetree-registry {:?}: {}", path, e))?;
-        env.set_type_tree_registry(Some(Arc::new(registry)));
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "tpk" {
+            let registry = TpkTypeTreeRegistry::from_path(path).map_err(|e| {
+                anyhow::anyhow!("Failed to load --typetree-registry {:?}: {}", path, e)
+            })?;
+            env.set_type_tree_registry(Some(Arc::new(registry)));
+        } else {
+            let registry = JsonTypeTreeRegistry::from_path(path).map_err(|e| {
+                anyhow::anyhow!("Failed to load --typetree-registry {:?}: {}", path, e)
+            })?;
+            env.set_type_tree_registry(Some(Arc::new(registry)));
+        }
     }
 
     Ok(env)

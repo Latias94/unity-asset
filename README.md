@@ -224,6 +224,8 @@ cargo run --bin unity-asset -- dump-typetree-registry -i tests/samples -o typetr
 # Use an external TypeTree registry during discovery/inspection (best-effort)
 cargo run --bin unity-asset -- --typetree-registry typetree_registry.json find-object -i tests/samples --pattern "Assets/" --limit 20 --verbose
 
+# `--typetree-registry` also accepts a UnityPy-compatible `.tpk` file.
+
 # Inspect a single object (TypeTree / Null-field debugging)
 # - Easiest: copy/paste the `key=bok2|...` line from `find-object --verbose` and use `--key`.
 # - Or pass the location fields explicitly (use `--kind serialized` for standalone `.assets` files).
