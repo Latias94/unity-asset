@@ -4,12 +4,14 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 use unity_asset::UnityDocument;
 use unity_asset::UnityValue;
 use unity_asset::environment::{
@@ -115,6 +117,10 @@ enum Commands {
         /// Skip entries whose output file already exists
         #[arg(long)]
         skip_existing: bool,
+
+        /// Write a JSON manifest of planned/exported entries (for resume and regression checks)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
 
         /// Parallel export jobs (0 = auto, 1 = serial)
         #[arg(long, default_value_t = 0)]
@@ -238,6 +244,7 @@ fn main() -> Result<()> {
             decode,
             overwrite,
             skip_existing,
+            manifest,
             jobs,
         } => export_bundle_command(
             input,
@@ -250,6 +257,7 @@ fn main() -> Result<()> {
             decode,
             overwrite,
             skip_existing,
+            manifest,
             jobs,
             strict,
             show_warnings,
@@ -580,6 +588,62 @@ struct ExportJob {
     key: BinaryObjectKey,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ExportStatus {
+    ExportedRaw,
+    ExportedDecoded,
+    SkippedExisting,
+    Planned,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExportManifestEntry {
+    order: usize,
+    asset_path: String,
+    key: String,
+    source_kind: String,
+    asset_index: Option<usize>,
+    path_id: i64,
+    type_id: Option<i32>,
+    class_name: Option<String>,
+    status: ExportStatus,
+    output_path: Option<String>,
+    output_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExportManifest {
+    created_unix_ms: u128,
+    input: String,
+    output: String,
+    pattern: String,
+    decode: bool,
+    overwrite: bool,
+    skip_existing: bool,
+    jobs: usize,
+    strict: bool,
+    show_warnings: bool,
+    limit: Option<usize>,
+    class_ids: Vec<i32>,
+    class_name: String,
+    planned: usize,
+    exported: usize,
+    skipped_unresolved: usize,
+    skipped_existing: usize,
+    filtered: usize,
+    entries: Vec<ExportManifestEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct ExportOutcome {
+    order: usize,
+    message: String,
+    did_export: bool,
+    did_skip_existing: bool,
+    entry: ExportManifestEntry,
+}
+
 #[derive(Debug, Default)]
 struct PathAllocator {
     reserved: Mutex<HashSet<PathBuf>>,
@@ -635,6 +699,31 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     parent.join(file_name)
 }
 
+fn now_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn file_len(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).map(|m| m.len()).ok()
+}
+
+fn write_export_manifest(path: &Path, manifest: ExportManifest) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let tmp = path.with_extension("tmp");
+    let file = std::fs::File::create(&tmp)?;
+    serde_json::to_writer_pretty(&file, &manifest)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn export_bundle_command(
     input: PathBuf,
     output: PathBuf,
@@ -646,6 +735,7 @@ fn export_bundle_command(
     decode: bool,
     overwrite: bool,
     skip_existing: bool,
+    manifest: Option<PathBuf>,
     jobs: usize,
     strict: bool,
     show_warnings: bool,
@@ -727,6 +817,32 @@ fn export_bundle_command(
     }
 
     if export_jobs.is_empty() {
+        if let Some(path) = manifest {
+            write_export_manifest(
+                &path,
+                ExportManifest {
+                    created_unix_ms: now_unix_ms(),
+                    input: input.to_string_lossy().to_string(),
+                    output: output.to_string_lossy().to_string(),
+                    pattern,
+                    decode,
+                    overwrite,
+                    skip_existing,
+                    jobs,
+                    strict,
+                    show_warnings,
+                    limit,
+                    class_ids,
+                    class_name,
+                    planned: 0,
+                    exported: 0,
+                    skipped_unresolved: skipped,
+                    skipped_existing: 0,
+                    filtered,
+                    entries: Vec::new(),
+                },
+            )?;
+        }
         println!(
             "Exported 0 entries, skipped {} (unresolved), filtered {}",
             skipped, filtered
@@ -737,7 +853,17 @@ fn export_bundle_command(
     let allocator = Arc::new(PathAllocator::default());
 
     if dry_run {
+        let mut manifest_entries: Vec<ExportManifestEntry> = Vec::with_capacity(export_jobs.len());
         for job in &export_jobs {
+            let (type_id, _) = lookup_object_type_info(&env, &job.key);
+            let class_name = if type_id == 0 {
+                None
+            } else {
+                Some(
+                    unity_asset::get_class_name(type_id)
+                        .unwrap_or_else(|| format!("Class_{}", type_id)),
+                )
+            };
             let mut dest = output.join(sanitize_asset_path(&job.asset_path));
             if decode {
                 if dest.extension().is_none() {
@@ -748,10 +874,66 @@ fn export_bundle_command(
             }
             if skip_existing && dest.exists() && !overwrite {
                 println!("DRY-RUN {} -> SKIP(existing) {:?}", job.asset_path, dest);
+                manifest_entries.push(ExportManifestEntry {
+                    order: job.order,
+                    asset_path: job.asset_path.clone(),
+                    key: job.key.to_string(),
+                    source_kind: format!("{:?}", job.key.source_kind),
+                    asset_index: job.key.asset_index,
+                    path_id: job.key.path_id,
+                    type_id: if type_id == 0 { None } else { Some(type_id) },
+                    class_name: class_name.clone(),
+                    status: ExportStatus::SkippedExisting,
+                    output_path: Some(dest.to_string_lossy().to_string()),
+                    output_bytes: None,
+                });
                 continue;
             }
             let dest = allocator.reserve(dest, &job.key, overwrite);
             println!("DRY-RUN {} -> {:?}", job.asset_path, dest);
+            manifest_entries.push(ExportManifestEntry {
+                order: job.order,
+                asset_path: job.asset_path.clone(),
+                key: job.key.to_string(),
+                source_kind: format!("{:?}", job.key.source_kind),
+                asset_index: job.key.asset_index,
+                path_id: job.key.path_id,
+                type_id: if type_id == 0 { None } else { Some(type_id) },
+                class_name,
+                status: ExportStatus::Planned,
+                output_path: Some(dest.to_string_lossy().to_string()),
+                output_bytes: None,
+            });
+        }
+        manifest_entries.sort_by_key(|e| e.order);
+        if let Some(path) = manifest {
+            write_export_manifest(
+                &path,
+                ExportManifest {
+                    created_unix_ms: now_unix_ms(),
+                    input: input.to_string_lossy().to_string(),
+                    output: output.to_string_lossy().to_string(),
+                    pattern,
+                    decode,
+                    overwrite,
+                    skip_existing,
+                    jobs,
+                    strict,
+                    show_warnings,
+                    limit,
+                    class_ids,
+                    class_name,
+                    planned: manifest_entries.len(),
+                    exported: 0,
+                    skipped_unresolved: skipped,
+                    skipped_existing: manifest_entries
+                        .iter()
+                        .filter(|e| matches!(e.status, ExportStatus::SkippedExisting))
+                        .count(),
+                    filtered,
+                    entries: manifest_entries,
+                },
+            )?;
         }
         println!(
             "Exported {} entries, skipped {} (unresolved), filtered {}",
@@ -783,7 +965,7 @@ fn export_bundle_command(
     let abort = Arc::new(AtomicBool::new(false));
     let exported = Arc::new(AtomicUsize::new(0));
     let skipped_existing = Arc::new(AtomicUsize::new(0));
-    let results: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let results: Arc<Mutex<Vec<ExportOutcome>>> = Arc::new(Mutex::new(Vec::new()));
     let first_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     thread::scope(|scope| {
@@ -811,12 +993,13 @@ fn export_bundle_command(
                     }
 
                     let job = &export_jobs[idx];
-                    let (line, did_export, did_skip_existing) = match export_one_entry(
+                    let outcome = match export_one_entry(
                         &env,
                         &allocator,
                         &output,
                         &job.asset_path,
                         &job.key,
+                        job.order,
                         decode,
                         overwrite,
                         skip_existing,
@@ -835,36 +1018,69 @@ fn export_bundle_command(
                         }
                     };
 
-                    if did_export {
+                    if outcome.did_export {
                         exported.fetch_add(1, Ordering::Relaxed);
                     }
-                    if did_skip_existing {
+                    if outcome.did_skip_existing {
                         skipped_existing.fetch_add(1, Ordering::Relaxed);
                     }
                     let mut out = match results.lock() {
                         Ok(v) => v,
                         Err(e) => e.into_inner(),
                     };
-                    out.push((job.order, line));
+                    out.push(outcome);
                 }
             });
         }
     });
 
-    if let Some(err) = match first_error.lock() {
-        Ok(v) => v.clone(),
-        Err(e) => e.into_inner().clone(),
-    } {
-        return Err(anyhow::anyhow!(err));
-    }
-
-    let mut lines = match results.lock() {
+    let error = match first_error.lock() {
         Ok(v) => v.clone(),
         Err(e) => e.into_inner().clone(),
     };
-    lines.sort_by_key(|(order, _)| *order);
-    for (_, line) in lines {
-        println!("{}", line);
+
+    let mut outcomes = match results.lock() {
+        Ok(v) => v.clone(),
+        Err(e) => e.into_inner().clone(),
+    };
+    outcomes.sort_by_key(|o| o.order);
+
+    if let Some(path) = manifest.as_ref() {
+        let mut entries: Vec<ExportManifestEntry> =
+            outcomes.iter().map(|o| o.entry.clone()).collect();
+        entries.sort_by_key(|e| e.order);
+        write_export_manifest(
+            path,
+            ExportManifest {
+                created_unix_ms: now_unix_ms(),
+                input: input.to_string_lossy().to_string(),
+                output: output.to_string_lossy().to_string(),
+                pattern: pattern.clone(),
+                decode,
+                overwrite,
+                skip_existing,
+                jobs: threads,
+                strict,
+                show_warnings,
+                limit,
+                class_ids: class_ids.clone(),
+                class_name: class_name.clone(),
+                planned,
+                exported: exported.load(Ordering::Relaxed),
+                skipped_unresolved: skipped,
+                skipped_existing: skipped_existing.load(Ordering::Relaxed),
+                filtered,
+                entries,
+            },
+        )?;
+    }
+
+    if let Some(err) = error {
+        return Err(anyhow::anyhow!(err));
+    }
+
+    for o in &outcomes {
+        println!("{}", o.message);
     }
 
     println!(
@@ -884,11 +1100,14 @@ fn export_one_entry(
     output: &Path,
     asset_path: &str,
     key: &BinaryObjectKey,
+    order: usize,
     decode: bool,
     overwrite: bool,
     skip_existing: bool,
-) -> Result<(String, bool, bool)> {
+) -> Result<ExportOutcome> {
     let obj = env.read_binary_object_key(key)?;
+    let type_id = obj.info.type_id;
+    let class_name = unity_asset::get_class_name(type_id);
 
     if decode {
         #[cfg(feature = "decode")]
@@ -902,22 +1121,50 @@ fn export_one_entry(
             overwrite,
             skip_existing,
         ) {
-            DecodeAttempt::Exported(dest) => {
-                return Ok((
-                    format!(
+            DecodeAttempt::Exported { dest, output_bytes } => {
+                return Ok(ExportOutcome {
+                    order,
+                    message: format!(
                         "✓ {} -> {:?} (decoded, class_id={})",
                         asset_path, dest, obj.info.type_id
                     ),
-                    true,
-                    false,
-                ));
+                    did_export: true,
+                    did_skip_existing: false,
+                    entry: ExportManifestEntry {
+                        order,
+                        asset_path: asset_path.to_string(),
+                        key: key.to_string(),
+                        source_kind: format!("{:?}", key.source_kind),
+                        asset_index: key.asset_index,
+                        path_id: key.path_id,
+                        type_id: Some(type_id),
+                        class_name,
+                        status: ExportStatus::ExportedDecoded,
+                        output_path: Some(dest.to_string_lossy().to_string()),
+                        output_bytes,
+                    },
+                });
             }
-            DecodeAttempt::SkippedExisting(dest) => {
-                return Ok((
-                    format!("↷ {} -> {:?} (skipped existing)", asset_path, dest),
-                    false,
-                    true,
-                ));
+            DecodeAttempt::SkippedExisting { dest } => {
+                return Ok(ExportOutcome {
+                    order,
+                    message: format!("↷ {} -> {:?} (skipped existing)", asset_path, dest),
+                    did_export: false,
+                    did_skip_existing: true,
+                    entry: ExportManifestEntry {
+                        order,
+                        asset_path: asset_path.to_string(),
+                        key: key.to_string(),
+                        source_kind: format!("{:?}", key.source_kind),
+                        asset_index: key.asset_index,
+                        path_id: key.path_id,
+                        type_id: Some(type_id),
+                        class_name,
+                        status: ExportStatus::SkippedExisting,
+                        output_path: Some(dest.to_string_lossy().to_string()),
+                        output_bytes: None,
+                    },
+                });
             }
             DecodeAttempt::NotApplicable => {}
         }
@@ -935,11 +1182,25 @@ fn export_one_entry(
     }
 
     if skip_existing && dest.exists() && !overwrite {
-        return Ok((
-            format!("↷ {} -> {:?} (skipped existing)", asset_path, dest),
-            false,
-            true,
-        ));
+        return Ok(ExportOutcome {
+            order,
+            message: format!("↷ {} -> {:?} (skipped existing)", asset_path, dest),
+            did_export: false,
+            did_skip_existing: true,
+            entry: ExportManifestEntry {
+                order,
+                asset_path: asset_path.to_string(),
+                key: key.to_string(),
+                source_kind: format!("{:?}", key.source_kind),
+                asset_index: key.asset_index,
+                path_id: key.path_id,
+                type_id: Some(type_id),
+                class_name,
+                status: ExportStatus::SkippedExisting,
+                output_path: Some(dest.to_string_lossy().to_string()),
+                output_bytes: None,
+            },
+        });
     }
 
     let dest = allocator.reserve(dest, key, overwrite);
@@ -948,25 +1209,44 @@ fn export_one_entry(
     }
     std::fs::write(&dest, bytes)?;
 
-    Ok((
-        format!(
+    Ok(ExportOutcome {
+        order,
+        message: format!(
             "✓ {} -> {:?} (raw, class_id={}, bytes={})",
             asset_path,
             dest,
             obj.info.type_id,
             bytes.len()
         ),
-        true,
-        false,
-    ))
+        did_export: true,
+        did_skip_existing: false,
+        entry: ExportManifestEntry {
+            order,
+            asset_path: asset_path.to_string(),
+            key: key.to_string(),
+            source_kind: format!("{:?}", key.source_kind),
+            asset_index: key.asset_index,
+            path_id: key.path_id,
+            type_id: Some(type_id),
+            class_name,
+            status: ExportStatus::ExportedRaw,
+            output_path: Some(dest.to_string_lossy().to_string()),
+            output_bytes: Some(bytes.len() as u64),
+        },
+    })
 }
 
 #[cfg(feature = "decode")]
 #[derive(Debug, Clone)]
 enum DecodeAttempt {
     NotApplicable,
-    Exported(PathBuf),
-    SkippedExisting(PathBuf),
+    Exported {
+        dest: PathBuf,
+        output_bytes: Option<u64>,
+    },
+    SkippedExisting {
+        dest: PathBuf,
+    },
 }
 
 #[cfg(feature = "decode")]
@@ -1048,14 +1328,17 @@ fn try_decode_export_best_effort(
                         .to_ascii_lowercase();
                     dest.set_extension(ext);
                     if skip_existing && dest.exists() && !overwrite {
-                        return Ok(DecodeAttempt::SkippedExisting(dest));
+                        return Ok(DecodeAttempt::SkippedExisting { dest });
                     }
                     let dest = allocator.reserve(dest, key, overwrite);
                     if let Some(parent) = dest.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
                     std::fs::write(&dest, &audio_bytes)?;
-                    Ok(DecodeAttempt::Exported(dest))
+                    Ok(DecodeAttempt::Exported {
+                        dest,
+                        output_bytes: Some(audio_bytes.len() as u64),
+                    })
                 }
                 _ => {
                     if clip.is_streamed() {
@@ -1074,21 +1357,24 @@ fn try_decode_export_best_effort(
                                     .to_ascii_lowercase();
                                 dest.set_extension(ext);
                                 if skip_existing && dest.exists() && !overwrite {
-                                    return Ok(DecodeAttempt::SkippedExisting(dest));
+                                    return Ok(DecodeAttempt::SkippedExisting { dest });
                                 }
                                 let dest = allocator.reserve(dest, key, overwrite);
                                 if let Some(parent) = dest.parent() {
                                     std::fs::create_dir_all(parent)?;
                                 }
                                 std::fs::write(&dest, &bytes)?;
-                                return Ok(DecodeAttempt::Exported(dest));
+                                return Ok(DecodeAttempt::Exported {
+                                    dest,
+                                    output_bytes: Some(bytes.len() as u64),
+                                });
                             }
                         }
                     }
 
                     dest.set_extension("wav");
                     if skip_existing && dest.exists() && !overwrite {
-                        return Ok(DecodeAttempt::SkippedExisting(dest));
+                        return Ok(DecodeAttempt::SkippedExisting { dest });
                     }
                     let dest = allocator.reserve(dest, key, overwrite);
                     if let Some(parent) = dest.parent() {
@@ -1096,7 +1382,10 @@ fn try_decode_export_best_effort(
                     }
                     let audio_processor = AudioProcessor::new(unity_version);
                     audio_processor.process_and_export(obj, &dest)?;
-                    Ok(DecodeAttempt::Exported(dest))
+                    Ok(DecodeAttempt::Exported {
+                        output_bytes: file_len(&dest),
+                        dest,
+                    })
                 }
             }
         })()
@@ -1105,7 +1394,7 @@ fn try_decode_export_best_effort(
             let mut dest = output.join(sanitize_asset_path(asset_path));
             dest.set_extension("png");
             if skip_existing && dest.exists() && !overwrite {
-                return Ok(DecodeAttempt::SkippedExisting(dest));
+                return Ok(DecodeAttempt::SkippedExisting { dest });
             }
             let dest = allocator.reserve(dest, key, overwrite);
             if let Some(parent) = dest.parent() {
@@ -1131,7 +1420,10 @@ fn try_decode_export_best_effort(
 
             let image = texture_processor.decode_texture(&texture)?;
             TextureExporter::export_auto(&image, &dest)?;
-            Ok(DecodeAttempt::Exported(dest))
+            Ok(DecodeAttempt::Exported {
+                output_bytes: file_len(&dest),
+                dest,
+            })
         })()
         .unwrap_or(DecodeAttempt::NotApplicable),
         class_ids::TEXT_ASSET => (|| -> anyhow::Result<DecodeAttempt> {
@@ -1149,14 +1441,17 @@ fn try_decode_export_best_effort(
                 });
             }
             if skip_existing && dest.exists() && !overwrite {
-                return Ok(DecodeAttempt::SkippedExisting(dest));
+                return Ok(DecodeAttempt::SkippedExisting { dest });
             }
             let dest = allocator.reserve(dest, key, overwrite);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&dest, &bytes)?;
-            Ok(DecodeAttempt::Exported(dest))
+            Ok(DecodeAttempt::Exported {
+                dest,
+                output_bytes: Some(bytes.len() as u64),
+            })
         })()
         .unwrap_or(DecodeAttempt::NotApplicable),
         class_ids::SPRITE => (|| -> anyhow::Result<DecodeAttempt> {
@@ -1214,14 +1509,17 @@ fn try_decode_export_best_effort(
                 dest.set_extension("png");
             }
             if skip_existing && dest.exists() && !overwrite {
-                return Ok(DecodeAttempt::SkippedExisting(dest));
+                return Ok(DecodeAttempt::SkippedExisting { dest });
             }
             let dest = allocator.reserve(dest, key, overwrite);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&dest, &png_bytes)?;
-            Ok(DecodeAttempt::Exported(dest))
+            Ok(DecodeAttempt::Exported {
+                dest,
+                output_bytes: Some(png_bytes.len() as u64),
+            })
         })()
         .unwrap_or(DecodeAttempt::NotApplicable),
         _ => DecodeAttempt::NotApplicable,
