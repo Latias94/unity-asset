@@ -190,12 +190,7 @@ impl<'a> TypeTreeSerializer<'a> {
                     )));
                 }
                 let bytes = reader.read_bytes(length)?;
-                UnityValue::Array(
-                    bytes
-                        .into_iter()
-                        .map(|b| UnityValue::Integer(b as i64))
-                        .collect(),
-                )
+                UnityValue::Bytes(bytes)
             }
 
             // Array types
@@ -284,21 +279,12 @@ impl<'a> TypeTreeSerializer<'a> {
             match element_node.type_name.as_str() {
                 "UInt8" | "char" => {
                     let bytes = reader.read_bytes(size)?;
-                    return Ok(UnityValue::Array(
-                        bytes
-                            .into_iter()
-                            .map(|b| UnityValue::Integer(b as i64))
-                            .collect(),
-                    ));
+                    return Ok(UnityValue::Bytes(bytes));
                 }
                 "SInt8" => {
                     let bytes = reader.read_bytes(size)?;
-                    return Ok(UnityValue::Array(
-                        bytes
-                            .into_iter()
-                            .map(|b| UnityValue::Integer((b as i8) as i64))
-                            .collect(),
-                    ));
+                    // Preserve signedness as encoded bytes; callers that care can reinterpret.
+                    return Ok(UnityValue::Bytes(bytes));
                 }
                 "bool" => {
                     let bytes = reader.read_bytes(size)?;

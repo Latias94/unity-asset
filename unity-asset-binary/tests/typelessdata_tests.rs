@@ -35,11 +35,8 @@ fn typelessdata_reads_length_prefixed_bytes_and_aligns_when_flagged() {
         .unwrap();
 
     let v = out.properties.get("m_Data").expect("m_Data present");
-    let arr = v.as_array().expect("m_Data as array");
-    assert_eq!(arr.len(), 3);
-    assert_eq!(arr[0].as_i64(), Some(97));
-    assert_eq!(arr[1].as_i64(), Some(98));
-    assert_eq!(arr[2].as_i64(), Some(99));
+    let b = v.as_bytes().expect("m_Data as bytes");
+    assert_eq!(b, b"abc");
 
     // Ensure we aligned to 4 after reading 4+3 bytes => position should be 8 (padding consumed).
     assert_eq!(reader.position(), 8);
@@ -48,6 +45,6 @@ fn typelessdata_reads_length_prefixed_bytes_and_aligns_when_flagged() {
     // Ensure no warnings were emitted.
     assert!(out.warnings.is_empty());
 
-    // Ensure the representation is stable (array of integers).
-    assert!(matches!(v, UnityValue::Array(_)));
+    // Ensure the representation is stable (bytes).
+    assert!(matches!(v, UnityValue::Bytes(_)));
 }

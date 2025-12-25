@@ -112,19 +112,28 @@ impl Texture2DConverter {
             .get("image_data")
             .or_else(|| props.get("image data"))
             .or_else(|| props.get("m_ImageData"));
-        if let Some(UnityValue::Array(items)) = image_data_value {
-            let mut bytes = Vec::with_capacity(items.len());
-            for item in items {
-                if let Some(n) = item.as_i64()
-                    && let Ok(b) = u8::try_from(n)
-                {
-                    bytes.push(b);
-                } else {
-                    break;
+        if let Some(v) = image_data_value {
+            match v {
+                UnityValue::Bytes(b) => {
+                    texture.data_size = b.len() as i32;
+                    texture.image_data = b.clone();
                 }
+                UnityValue::Array(items) => {
+                    let mut bytes = Vec::with_capacity(items.len());
+                    for item in items {
+                        if let Some(n) = item.as_i64()
+                            && let Ok(b) = u8::try_from(n)
+                        {
+                            bytes.push(b);
+                        } else {
+                            break;
+                        }
+                    }
+                    texture.data_size = bytes.len() as i32;
+                    texture.image_data = bytes;
+                }
+                _ => {}
             }
-            texture.data_size = bytes.len() as i32;
-            texture.image_data = bytes;
         }
 
         // Streamed texture data: `m_StreamData: { path, offset, size }`

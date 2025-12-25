@@ -242,6 +242,54 @@ impl UnityYamlSerializer {
                     self.indent_level -= 1;
                 }
             }
+            UnityValue::Bytes(b) => {
+                if b.is_empty() {
+                    write!(writer, "[]{}", self.line_ending.as_str()).map_err(|e| {
+                        UnityAssetError::format(format!("Failed to write empty bytes: {}", e))
+                    })?;
+                } else if inline || b.len() <= 64 {
+                    write!(writer, "[").map_err(|e| {
+                        UnityAssetError::format(format!("Failed to write bytes start: {}", e))
+                    })?;
+                    for (i, item) in b.iter().enumerate() {
+                        if i > 0 {
+                            write!(writer, ", ").map_err(|e| {
+                                UnityAssetError::format(format!(
+                                    "Failed to write bytes separator: {}",
+                                    e
+                                ))
+                            })?;
+                        }
+                        write!(writer, "{}", item).map_err(|e| {
+                            UnityAssetError::format(format!("Failed to write byte value: {}", e))
+                        })?;
+                    }
+                    write!(writer, "]{}", self.line_ending.as_str()).map_err(|e| {
+                        UnityAssetError::format(format!("Failed to write bytes end: {}", e))
+                    })?;
+                } else {
+                    write!(writer, "{}", self.line_ending.as_str()).map_err(|e| {
+                        UnityAssetError::format(format!("Failed to write bytes start: {}", e))
+                    })?;
+                    self.indent_level += 1;
+                    for item in b {
+                        self.write_indent(writer)?;
+                        write!(writer, "- {}", item).map_err(|e| {
+                            UnityAssetError::format(format!(
+                                "Failed to write bytes item prefix: {}",
+                                e
+                            ))
+                        })?;
+                        write!(writer, "{}", self.line_ending.as_str()).map_err(|e| {
+                            UnityAssetError::format(format!(
+                                "Failed to write bytes line ending: {}",
+                                e
+                            ))
+                        })?;
+                    }
+                    self.indent_level -= 1;
+                }
+            }
             UnityValue::Object(obj) => {
                 if obj.is_empty() {
                     write!(writer, "{{}}{}", self.line_ending.as_str()).map_err(|e| {
@@ -318,6 +366,11 @@ impl UnityYamlSerializer {
                         UnityAssetError::format(format!("Failed to write string: {}", e))
                     })?;
                 }
+            }
+            UnityValue::Bytes(b) => {
+                write!(writer, "<bytes len={}>", b.len()).map_err(|e| {
+                    UnityAssetError::format(format!("Failed to write bytes: {}", e))
+                })?;
             }
             UnityValue::Array(_) | UnityValue::Object(_) => {
                 // For complex nested structures, we might need more sophisticated handling

@@ -257,29 +257,49 @@ fn golden_regression_smoke() {
                 index_buffer_prefix,
             } => {
                 if let Some(len) = index_buffer_len {
-                    let buf = obj
-                        .get("m_IndexBuffer")
-                        .expect("m_IndexBuffer present")
-                        .as_array()
-                        .expect("m_IndexBuffer array");
-                    assert_eq!(
-                        buf.len(),
-                        len,
-                        "m_IndexBuffer len mismatch (case={})",
-                        case.id
-                    );
-
-                    if !index_buffer_prefix.is_empty() {
-                        let prefix: Vec<i64> = buf
-                            .iter()
-                            .take(index_buffer_prefix.len())
-                            .map(|v| v.as_i64().expect("m_IndexBuffer byte"))
-                            .collect();
-                        assert_eq!(
-                            prefix, index_buffer_prefix,
-                            "m_IndexBuffer prefix mismatch (case={})",
-                            case.id
-                        );
+                    let buf_v = obj.get("m_IndexBuffer").expect("m_IndexBuffer present");
+                    match buf_v {
+                        UnityValue::Bytes(b) => {
+                            assert_eq!(
+                                b.len(),
+                                len,
+                                "m_IndexBuffer len mismatch (case={})",
+                                case.id
+                            );
+                            if !index_buffer_prefix.is_empty() {
+                                let prefix: Vec<i64> = b
+                                    .iter()
+                                    .take(index_buffer_prefix.len())
+                                    .map(|v| *v as i64)
+                                    .collect();
+                                assert_eq!(
+                                    prefix, index_buffer_prefix,
+                                    "m_IndexBuffer prefix mismatch (case={})",
+                                    case.id
+                                );
+                            }
+                        }
+                        UnityValue::Array(arr) => {
+                            assert_eq!(
+                                arr.len(),
+                                len,
+                                "m_IndexBuffer len mismatch (case={})",
+                                case.id
+                            );
+                            if !index_buffer_prefix.is_empty() {
+                                let prefix: Vec<i64> = arr
+                                    .iter()
+                                    .take(index_buffer_prefix.len())
+                                    .map(|v| v.as_i64().expect("m_IndexBuffer byte"))
+                                    .collect();
+                                assert_eq!(
+                                    prefix, index_buffer_prefix,
+                                    "m_IndexBuffer prefix mismatch (case={})",
+                                    case.id
+                                );
+                            }
+                        }
+                        other => panic!("unexpected m_IndexBuffer type: {other:?}"),
                     }
                 }
             }

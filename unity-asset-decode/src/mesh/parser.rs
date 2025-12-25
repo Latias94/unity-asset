@@ -163,13 +163,20 @@ impl MeshParser {
 
             // Extract data size
             if let Some(data_size_value) = vertex_data_obj.get("m_DataSize")
-                && let UnityValue::Array(data_array) = data_size_value
             {
-                mesh.vertex_data.data_size.clear();
-                for data_item in data_array {
-                    if let UnityValue::Integer(byte_val) = data_item {
-                        mesh.vertex_data.data_size.push(*byte_val as u8);
+                match data_size_value {
+                    UnityValue::Bytes(b) => {
+                        mesh.vertex_data.data_size = b.clone();
                     }
+                    UnityValue::Array(arr) => {
+                        mesh.vertex_data.data_size.clear();
+                        for item in arr {
+                            if let UnityValue::Integer(byte_val) = item {
+                                mesh.vertex_data.data_size.push(*byte_val as u8);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -211,6 +218,9 @@ impl MeshParser {
     /// Extract index buffer from UnityValue
     fn extract_index_buffer(&self, mesh: &mut Mesh, value: &UnityValue) -> Result<()> {
         match value {
+            UnityValue::Bytes(b) => {
+                mesh.index_buffer = b.clone();
+            }
             UnityValue::Array(arr) => {
                 mesh.index_buffer.clear();
                 for item in arr {

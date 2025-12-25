@@ -17,6 +17,8 @@ pub enum UnityValue {
     Float(f64),
     String(String),
     Array(Vec<UnityValue>),
+    #[serde(with = "serde_bytes")]
+    Bytes(Vec<u8>),
     Object(IndexMap<String, UnityValue>),
 }
 
@@ -67,6 +69,14 @@ impl UnityValue {
         }
     }
 
+    /// Get as bytes
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            UnityValue::Bytes(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
+
     /// Get as object
     pub fn as_object(&self) -> Option<&IndexMap<String, UnityValue>> {
         match self {
@@ -102,6 +112,7 @@ impl fmt::Display for UnityValue {
                 }
                 write!(f, "]")
             }
+            UnityValue::Bytes(b) => write!(f, "<bytes len={}>", b.len()),
             UnityValue::Object(obj) => {
                 write!(f, "{{")?;
                 for (i, (key, value)) in obj.iter().enumerate() {

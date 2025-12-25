@@ -34,6 +34,8 @@ pub enum DynamicValue {
     Bool(bool),
     /// Array value
     Array(Vec<DynamicValue>),
+    /// Bytes value
+    Bytes(Vec<u8>),
     /// Object value
     Object(HashMap<String, DynamicValue>),
     /// Null value
@@ -53,6 +55,7 @@ impl DynamicValue {
                     arr.iter().map(DynamicValue::from_unity_value).collect();
                 DynamicValue::Array(converted)
             }
+            UnityValue::Bytes(b) => DynamicValue::Bytes(b.clone()),
             UnityValue::Object(obj) => {
                 let converted: HashMap<String, DynamicValue> = obj
                     .iter()
@@ -76,6 +79,7 @@ impl DynamicValue {
                     arr.iter().map(DynamicValue::to_unity_value).collect();
                 UnityValue::Array(converted)
             }
+            DynamicValue::Bytes(b) => UnityValue::Bytes(b.clone()),
             DynamicValue::Object(obj) => {
                 let converted: indexmap::IndexMap<String, UnityValue> = obj
                     .iter()
@@ -127,6 +131,14 @@ impl DynamicValue {
     pub fn as_array(&self) -> Option<&Vec<DynamicValue>> {
         match self {
             DynamicValue::Array(arr) => Some(arr),
+            _ => None,
+        }
+    }
+
+    /// Get as bytes
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            DynamicValue::Bytes(b) => Some(b.as_slice()),
             _ => None,
         }
     }
@@ -262,6 +274,7 @@ impl std::fmt::Display for DynamicValue {
                 }
                 write!(f, "]")
             }
+            DynamicValue::Bytes(b) => write!(f, "<bytes len={}>", b.len()),
             DynamicValue::Object(obj) => {
                 write!(f, "{{")?;
                 for (i, (key, value)) in obj.iter().enumerate() {

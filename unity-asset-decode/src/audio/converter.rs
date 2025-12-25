@@ -108,15 +108,21 @@ impl AudioClipConverter {
 
         clip.ambisonic = props.get("m_Ambisonic").and_then(|v| v.as_bool());
 
-        // Embedded audio bytes: `m_AudioData: List[int]`
-        if let Some(UnityValue::Array(items)) = props.get("m_AudioData") {
-            let mut bytes = Vec::with_capacity(items.len());
-            for item in items {
-                if let Some(n) = item.as_i64() {
-                    bytes.push((n as i64).clamp(0, 255) as u8);
+        // Embedded audio bytes: `m_AudioData: List[int]` / `Bytes`
+        if let Some(v) = props.get("m_AudioData") {
+            match v {
+                UnityValue::Bytes(b) => clip.data = b.clone(),
+                UnityValue::Array(items) => {
+                    let mut bytes = Vec::with_capacity(items.len());
+                    for item in items {
+                        if let Some(n) = item.as_i64() {
+                            bytes.push((n as i64).clamp(0, 255) as u8);
+                        }
+                    }
+                    clip.data = bytes;
                 }
+                _ => {}
             }
-            clip.data = bytes;
         }
 
         // Streamed resource info: `m_Resource: { m_Source, m_Offset, m_Size }`

@@ -651,18 +651,21 @@ fn text_asset_bytes(obj: &UnityObject) -> Vec<u8> {
     }
 
     for key in ["m_Bytes", "m_Data"] {
-        let Some(UnityValue::Array(arr)) = obj.get(key) else {
-            continue;
-        };
-        let mut out = Vec::with_capacity(arr.len());
-        for v in arr {
-            match v {
-                UnityValue::Integer(i) if (0..=255).contains(i) => out.push(*i as u8),
-                _ => return Vec::new(),
+        match obj.get(key) {
+            Some(UnityValue::Bytes(b)) if !b.is_empty() => return b.clone(),
+            Some(UnityValue::Array(arr)) => {
+                let mut out = Vec::with_capacity(arr.len());
+                for v in arr {
+                    match v {
+                        UnityValue::Integer(i) if (0..=255).contains(i) => out.push(*i as u8),
+                        _ => return Vec::new(),
+                    }
+                }
+                if !out.is_empty() {
+                    return out;
+                }
             }
-        }
-        if !out.is_empty() {
-            return out;
+            _ => {}
         }
     }
 
@@ -1672,8 +1675,12 @@ fn try_decode_export_best_effort(
                     eprintln!("  m_Resource keys: {:?}", res.keys().collect::<Vec<_>>());
                     eprintln!("  m_Resource: {:?}", res);
                 }
-                if let Some(UnityValue::Array(items)) = obj.get("m_AudioData") {
-                    eprintln!("  m_AudioData len: {}", items.len());
+                if let Some(v) = obj.get("m_AudioData") {
+                    match v {
+                        UnityValue::Bytes(b) => eprintln!("  m_AudioData len: {}", b.len()),
+                        UnityValue::Array(items) => eprintln!("  m_AudioData len: {}", items.len()),
+                        _ => {}
+                    }
                 }
                 eprintln!("  m_CompressionFormat: {:?}", obj.get("m_CompressionFormat"));
                 eprintln!("  m_LoadType: {:?}", obj.get("m_LoadType"));
@@ -2552,6 +2559,21 @@ fn print_unity_value_tree(
                 );
                 *printed += 1;
             }
+        }
+        UnityValue::Bytes(b) => {
+            let prefix_len = b.len().min(32);
+            let prefix: Vec<String> = b[..prefix_len]
+                .iter()
+                .map(|v| format!("{:02x}", v))
+                .collect();
+            println!(
+                "{}{}: Bytes(len={}, hex_prefix={})",
+                indent,
+                path,
+                b.len(),
+                prefix.join("")
+            );
+            *printed += 1;
         }
         UnityValue::Object(obj) => {
             println!("{}{}: Object(keys={})", indent, path, obj.len());
