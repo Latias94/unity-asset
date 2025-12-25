@@ -1,6 +1,34 @@
 use super::*;
 use std::fs;
 
+fn link_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    match fs::hard_link(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                if symlink(src, dst).is_ok() {
+                    return Ok(());
+                }
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::symlink_file;
+                if symlink_file(src, dst).is_ok() {
+                    return Ok(());
+                }
+            }
+
+            fs::copy(src, dst).map(|_| ())
+        }
+    }
+}
+
 #[test]
 fn environment_loads_yaml_fixture() {
     let mut env = Environment::new();
@@ -380,7 +408,7 @@ fn environment_stream_data_falls_back_to_filesystem_for_bundles() {
     let bundle_src =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/char_118_yuki.ab");
     let bundle_path = temp.path().join("char_118_yuki.ab");
-    fs::copy(&bundle_src, &bundle_path).unwrap();
+    link_or_copy_file(&bundle_src, &bundle_path).unwrap();
 
     let cab = "8579bc75d50073df38987733a7cb3193";
     let stream_path = format!("archive:/CAB-{cab}/CAB-{cab}.resource");
@@ -425,6 +453,10 @@ fn environment_stream_data_falls_back_to_filesystem_for_bundles() {
         )
         .unwrap();
     assert_eq!(read, b"OggS");
+
+    drop(env);
+    fs::remove_file(&resource_path).unwrap();
+    fs::remove_file(&bundle_path).unwrap();
 }
 
 fn build_uncompressed_webfile(entries: Vec<(String, Vec<u8>)>) -> Vec<u8> {
