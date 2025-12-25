@@ -41,7 +41,7 @@ pub(crate) fn run(
         );
     }
 
-    let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registry())?;
+    let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
     env.load(&input)?;
 
     let class_filter: Option<HashSet<i32>> = if class_id.is_empty() {

@@ -48,7 +48,9 @@ pub mod types;
 // Re-export main types for easy access
 pub use builder::{TypeTreeBuilder, TypeTreeValidator, ValidationReport};
 pub use parser::{ParsingStats, TypeTreeParser};
-pub use registry::{InMemoryTypeTreeRegistry, JsonTypeTreeRegistry, TypeTreeRegistry};
+pub use registry::{
+    CompositeTypeTreeRegistry, InMemoryTypeTreeRegistry, JsonTypeTreeRegistry, TypeTreeRegistry,
+};
 pub use serializer::{
     PPtrScanResult, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput,
     TypeTreeParseWarning, TypeTreeSerializer,

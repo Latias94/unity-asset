@@ -154,9 +154,9 @@ fn scan_pptr_fast(
     include_no_typetree: bool,
     json: bool,
     show_warnings: bool,
-    typetree_registry: Option<&PathBuf>,
+    typetree_registries: &[PathBuf],
 ) -> Result<bool> {
-    let registry = load_typetree_registry(typetree_registry)?;
+    let registry = load_typetree_registry(typetree_registries)?;
 
     let kind_lc = kind.to_ascii_lowercase();
     let scan_bundles = kind_lc == "all" || kind_lc == "bundle";
@@ -381,9 +381,9 @@ fn scan_pptr_env_fallback(
     json: bool,
     strict: bool,
     show_warnings: bool,
-    typetree_registry: Option<&PathBuf>,
+    typetree_registries: &[PathBuf],
 ) -> Result<()> {
-    let mut env = build_environment(strict, show_warnings, typetree_registry)?;
+    let mut env = build_environment(strict, show_warnings, typetree_registries)?;
     env.load(&input)?;
 
     let kind_lc = kind.to_ascii_lowercase();
@@ -515,7 +515,7 @@ pub(crate) fn run(
         include_no_typetree,
         json,
         ctx.show_warnings,
-        ctx.typetree_registry(),
+        ctx.typetree_registries(),
     ) {
         return Ok(());
     }
@@ -532,6 +532,6 @@ pub(crate) fn run(
         json,
         ctx.strict,
         ctx.show_warnings,
-        ctx.typetree_registry(),
+        ctx.typetree_registries(),
     )
 }

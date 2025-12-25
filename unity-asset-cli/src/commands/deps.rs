@@ -141,9 +141,9 @@ fn deps_fast(
     names: bool,
     max_edges: usize,
     show_warnings: bool,
-    typetree_registry: Option<&PathBuf>,
+    typetree_registries: &[PathBuf],
 ) -> Result<bool> {
-    let registry = load_typetree_registry(typetree_registry)?;
+    let registry = load_typetree_registry(typetree_registries)?;
 
     let kind_lc = kind.to_ascii_lowercase();
     let source_kind = match kind_lc.as_str() {
@@ -318,12 +318,12 @@ pub(crate) fn run(
         names,
         max_edges,
         ctx.show_warnings,
-        ctx.typetree_registry(),
+        ctx.typetree_registries(),
     ) {
         return Ok(());
     }
 
-    let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registry())?;
+    let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
     env.load(&input)?;
 
     let source_kind = match kind_lc.as_str() {

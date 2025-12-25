@@ -59,7 +59,7 @@ pub(crate) fn run(
         jobs,
         ctx.strict,
         ctx.show_warnings,
-        ctx.typetree_registry(),
+        ctx.typetree_registries(),
     )
 }
 
@@ -338,7 +338,7 @@ fn export_bundle_command(
     jobs: usize,
     strict: bool,
     show_warnings: bool,
-    typetree_registry: Option<&PathBuf>,
+    typetree_registries: &[PathBuf],
 ) -> Result<()> {
     let mut resume_map: std::collections::HashMap<(String, String), ExportManifestEntry> =
         std::collections::HashMap::new();
@@ -379,7 +379,7 @@ fn export_bundle_command(
         retry_failed_jobs = Some(jobs);
     }
 
-    let mut env = build_environment(strict, show_warnings, typetree_registry)?;
+    let mut env = build_environment(strict, show_warnings, typetree_registries)?;
     env.load(&input)?;
 
     std::fs::create_dir_all(&output)?;

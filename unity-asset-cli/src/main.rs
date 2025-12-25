@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     let ctx = shared::AppContext {
         strict: args.strict,
         show_warnings: args.show_warnings,
-        typetree_registry: args.typetree_registry,
+        typetree_registries: args.typetree_registry,
     };
     commands::run(args.command, &ctx)
 }

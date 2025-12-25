@@ -148,7 +148,7 @@ Deliverables:
 ### Phase 5 — TypeTree Completeness & External Registry (TPK-like)
 
 - Improve TypeTree value semantics to match UnityPy’s critical behaviors (arrays, align rules, typeless blobs, common special cases).
-- Add an external TypeTree registry hook (UnityPy TPK-like): when TypeTree is stripped, allow best-effort node resolution from a packaged DB or user-provided source.
+- External TypeTree registry (UnityPy TPK-like): when TypeTree is stripped, allow best-effort node resolution from a packaged DB or user-provided sources (JSON/TPK, composable).
 - Add regression tests that compare Rust output against UnityPy “golden” JSON for a small curated sample set (field-level diffs with explainable exceptions).
 
 ### Phase 6 — Fast Scanning APIs (peek_name)

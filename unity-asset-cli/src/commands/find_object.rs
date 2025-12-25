@@ -31,7 +31,7 @@ pub(crate) fn run(
         verbose,
         ctx.strict,
         ctx.show_warnings,
-        ctx.typetree_registry(),
+        ctx.typetree_registries(),
     ) {
         return Ok(());
     }
@@ -47,7 +47,7 @@ pub(crate) fn run(
         verbose,
         ctx.strict,
         ctx.show_warnings,
-        ctx.typetree_registry(),
+        ctx.typetree_registries(),
     )
 }
 
@@ -63,9 +63,9 @@ fn find_object_env_fallback(
     verbose: bool,
     strict: bool,
     show_warnings: bool,
-    typetree_registry: Option<&PathBuf>,
+    typetree_registries: &[PathBuf],
 ) -> Result<()> {
-    let mut env = build_environment(strict, show_warnings, typetree_registry)?;
+    let mut env = build_environment(strict, show_warnings, typetree_registries)?;
     env.load(&input)?;
 
     let pattern_lc = pattern.to_ascii_lowercase();
@@ -214,9 +214,9 @@ fn find_object_fast(
     verbose: bool,
     strict: bool,
     show_warnings: bool,
-    typetree_registry: Option<&PathBuf>,
+    typetree_registries: &[PathBuf],
 ) -> Result<bool> {
-    let registry = load_typetree_registry(typetree_registry)?;
+    let registry = load_typetree_registry(typetree_registries)?;
     let typetree_options = if strict {
         TypeTreeParseOptions {
             mode: TypeTreeParseMode::Strict,

@@ -14,9 +14,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) show_warnings: bool,
 
-    /// External TypeTree registry JSON/TPK (best-effort fallback for stripped assets)
+    /// External TypeTree registry JSON/TPK (best-effort fallback for stripped assets).
+    ///
+    /// Can be repeated; earlier registries take precedence (first match wins).
     #[arg(long)]
-    pub(crate) typetree_registry: Option<PathBuf>,
+    pub(crate) typetree_registry: Vec<PathBuf>,
 
     #[command(subcommand)]
     pub(crate) command: Commands,

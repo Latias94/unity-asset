@@ -17,7 +17,7 @@ pub(crate) fn run(
     filter: String,
     ctx: &AppContext,
 ) -> Result<()> {
-    let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registry())?;
+    let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
     env.load(&input)?;
 
     let mut key = if let Some(key) = key {

@@ -6,18 +6,20 @@ use unity_asset::environment::{
     EnvironmentWarning,
 };
 use unity_asset_binary::shared_bytes::SharedBytes;
-use unity_asset_binary::typetree::{JsonTypeTreeRegistry, TpkTypeTreeRegistry, TypeTreeRegistry};
+use unity_asset_binary::typetree::{
+    CompositeTypeTreeRegistry, JsonTypeTreeRegistry, TpkTypeTreeRegistry, TypeTreeRegistry,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppContext {
     pub(crate) strict: bool,
     pub(crate) show_warnings: bool,
-    pub(crate) typetree_registry: Option<PathBuf>,
+    pub(crate) typetree_registries: Vec<PathBuf>,
 }
 
 impl AppContext {
-    pub(crate) fn typetree_registry(&self) -> Option<&PathBuf> {
-        self.typetree_registry.as_ref()
+    pub(crate) fn typetree_registries(&self) -> &[PathBuf] {
+        self.typetree_registries.as_slice()
     }
 }
 
@@ -52,7 +54,7 @@ impl EnvironmentReporter for CliReporter {
 pub(crate) fn build_environment(
     strict: bool,
     show_warnings: bool,
-    typetree_registry: Option<&PathBuf>,
+    typetree_registries: &[PathBuf],
 ) -> Result<Environment> {
     let mut env = if strict {
         Environment::with_options(EnvironmentOptions::strict())
@@ -67,7 +69,21 @@ pub(crate) fn build_environment(
     };
     env.set_reporter(reporter);
 
-    if let Some(path) = typetree_registry {
+    let registry = load_typetree_registry(typetree_registries)?;
+    env.set_type_tree_registry(registry);
+
+    Ok(env)
+}
+
+pub(crate) fn load_typetree_registry(
+    typetree_registries: &[PathBuf],
+) -> Result<Option<Arc<dyn TypeTreeRegistry>>> {
+    if typetree_registries.is_empty() {
+        return Ok(None);
+    };
+
+    let mut composite = CompositeTypeTreeRegistry::default();
+    for path in typetree_registries {
         let ext = path
             .extension()
             .and_then(|s| s.to_str())
@@ -77,38 +93,20 @@ pub(crate) fn build_environment(
             let registry = TpkTypeTreeRegistry::from_path(path).map_err(|e| {
                 anyhow::anyhow!("Failed to load --typetree-registry {:?}: {}", path, e)
             })?;
-            env.set_type_tree_registry(Some(Arc::new(registry)));
+            composite.push(Arc::new(registry));
         } else {
             let registry = JsonTypeTreeRegistry::from_path(path).map_err(|e| {
                 anyhow::anyhow!("Failed to load --typetree-registry {:?}: {}", path, e)
             })?;
-            env.set_type_tree_registry(Some(Arc::new(registry)));
+            composite.push(Arc::new(registry));
         }
     }
 
-    Ok(env)
-}
-
-pub(crate) fn load_typetree_registry(
-    typetree_registry: Option<&PathBuf>,
-) -> Result<Option<Arc<dyn TypeTreeRegistry>>> {
-    let Some(path) = typetree_registry else {
+    if composite.is_empty() {
         return Ok(None);
-    };
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if ext == "tpk" {
-        let registry = TpkTypeTreeRegistry::from_path(path)
-            .map_err(|e| anyhow::anyhow!("Failed to load --typetree-registry {:?}: {}", path, e))?;
-        Ok(Some(Arc::new(registry)))
-    } else {
-        let registry = JsonTypeTreeRegistry::from_path(path)
-            .map_err(|e| anyhow::anyhow!("Failed to load --typetree-registry {:?}: {}", path, e))?;
-        Ok(Some(Arc::new(registry)))
     }
+
+    Ok(Some(Arc::new(composite)))
 }
 
 pub(crate) fn load_serialized_file_for_scan(

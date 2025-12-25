@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - UnityPy-style `ObjectHandle` in `unity-asset-binary` to treat objects as lightweight, on-demand readers (`SerializedFile::object_handles` / `SerializedFile::find_object_handle`).
 - `unity-asset-binary` `ObjectHandle::peek_name()` to read `m_Name`/`name` via a TypeTree prefix fast path (without parsing the full object).
 - `unity-asset-binary` external TypeTree registry API (`TypeTreeRegistry`, `JsonTypeTreeRegistry`) for best-effort parsing of stripped assets.
+- `unity-asset-binary` `CompositeTypeTreeRegistry` to compose multiple external registries (first match wins).
 - `unity-asset-binary::file` unified loader (`load_unity_file` / `load_unity_file_from_memory`) and a layered `unity-asset-binary::formats::*` namespace.
 - `unity-asset` `Environment` can now load WebFiles and treat contained bundles/assets as first-class binary sources (including streamed resource reads from WebFile entries).
 - Optional object data preloading toggle in `SerializedFileParser` to enable future lazy-loading workflows.
@@ -51,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `unity-asset` CLI: `find-object` command to search AssetBundle `m_Container` entries and print resolvable object keys (uses fast bundle parsing; avoids preloading bundle assets).
 - `unity-asset` CLI: `find-object --name` to filter by object `m_Name`/`name` via a TypeTree prefix fast path (best-effort).
 - `unity-asset` CLI: `--typetree-registry <path>` to load an external TypeTree registry for stripped assets (best-effort).
+- `unity-asset` CLI: `--typetree-registry` can be repeated to compose multiple registries (earlier registries take precedence).
 - `unity-asset` CLI: `dump-typetree-registry` to generate a JSON registry from loaded files.
 - `unity-asset` CLI: `--typetree-registry` supports UnityPy-compatible `.tpk` TypeTree packs.
 - `unity-asset` CLI: `scan-pptr` to scan `PPtr` references (`fileID`/`pathID`) without fully parsing objects (uses fast bundle parsing when possible; falls back to `Environment` otherwise).
@@ -89,6 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `unity-asset`/`unity-asset-cli` enable the `mmap` feature by default to reduce peak memory usage when loading from filesystem paths.
 - Marked the most comprehensive UnityPy-port integration tests as `#[ignore]` by default to keep `cargo test` fast (see `CONTRIBUTING.md` for running ignored tests).
 - Reduced duplicated bundle parsing in `Environment` unit tests to speed up the default `cargo test` loop.
+- `scripts/regenerate_golden_v1_unitypy.py` to regenerate `tests/golden/golden_v1.json` from the local `repo-ref/UnityPy` checkout.
 - `find-object --verbose` now prints a copy/paste-able `BinaryObjectKey` string which can be fed into `inspect-object --key`.
 - (BREAKING) `BinaryObjectRef` / `EnvironmentObjectRef` are no longer `Copy` to support reporter/warning plumbing.
 - `unity-asset` CLI warning output is now centralized via `EnvironmentReporter` (no more per-command manual draining/printing).
@@ -118,6 +121,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Environment::load_file` now attempts binary detection for extension-less files (best-effort), improving support for `UnityWebData*` and other build artifacts.
 - Fixed `UnityFile` sniffing to avoid mis-classifying uncompressed `UnityWebData*` WebFiles as legacy `UnityWeb` bundles.
 - Removed `println!`/`eprintln!` from library code paths (warnings are returned/collected instead of writing to stderr).
+- Expanded golden regression coverage for streamed resources (Texture2D/AudioClip) and Mesh vertex data.
 - YAML loader no longer prints per-document conversion failures; these are surfaced as warnings instead.
 - Fixed v<9 endian seek underflow in `SerializedFileHeader` parsing (checked arithmetic + explicit error).
 - Fixed UnityFS archive flags handling to honor `BlocksInfoAtEnd` / padding behavior (and corrected flag constants to match UnityPy).
