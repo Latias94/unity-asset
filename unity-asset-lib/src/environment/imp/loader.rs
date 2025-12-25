@@ -193,12 +193,12 @@ impl Environment {
     /// Recursively traverse directory and load Unity files.
     fn traverse_directory(&mut self, dir: &Path) -> Result<()> {
         let entries = std::fs::read_dir(dir).map_err(|e| {
-            UnityAssetError::format(format!("Failed to read directory {:?}: {}", dir, e))
+            UnityAssetError::with_source(format!("Failed to read directory {:?}", dir), e)
         })?;
 
         for entry in entries {
             let entry = entry.map_err(|e| {
-                UnityAssetError::format(format!("Failed to read directory entry: {}", e))
+                UnityAssetError::with_source("Failed to read directory entry", e)
             })?;
             let path = entry.path();
 
@@ -230,4 +230,3 @@ impl Environment {
         Ok(())
     }
 }
-

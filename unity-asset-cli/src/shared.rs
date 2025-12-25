@@ -58,6 +58,7 @@ struct CliReporter {
 
 impl EnvironmentReporter for CliReporter {
     fn warn(&self, warning: &EnvironmentWarning) {
+        tracing::warn!(warning = %warning, "environment warning");
         if !self.enabled {
             return;
         }
@@ -69,6 +70,12 @@ impl EnvironmentReporter for CliReporter {
         key: &BinaryObjectKey,
         warning: &unity_asset_binary::typetree::TypeTreeParseWarning,
     ) {
+        tracing::warn!(
+            key = %key,
+            field = %warning.field,
+            error = %warning.error,
+            "typetree warning"
+        );
         if !self.enabled {
             return;
         }

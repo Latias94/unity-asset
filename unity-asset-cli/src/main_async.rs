@@ -15,6 +15,13 @@ use indicatif::{ProgressBar, ProgressStyle};
 #[cfg(feature = "async")]
 use unity_asset::AsyncUnityDocument;
 
+#[cfg(feature = "async")]
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
 #[derive(Parser)]
 #[command(name = "unity_asset_async")]
 #[command(about = "A high-performance async Unity asset parser")]
@@ -76,6 +83,7 @@ enum Commands {
 #[cfg(feature = "async")]
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
     let cli = Cli::parse();
     let concurrency = cli.concurrency.unwrap_or(8); // Default to 8 concurrent operations
 

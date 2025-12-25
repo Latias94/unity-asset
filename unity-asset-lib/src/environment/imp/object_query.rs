@@ -260,7 +260,7 @@ impl Environment {
                 })?;
                 let obj = object
                     .read_with_options(typetree_options)
-                    .map_err(|e| UnityAssetError::format(format!("Failed to parse binary object: {}", e)))?;
+                    .map_err(|e| UnityAssetError::with_source("Failed to parse binary object", e))?;
                 if let Some(reporter) = &self.reporter {
                     for w in obj.typetree_warnings() {
                         reporter.typetree_warning(key, w);
@@ -297,7 +297,7 @@ impl Environment {
                 })?;
                 let obj = object
                     .read_with_options(typetree_options)
-                    .map_err(|e| UnityAssetError::format(format!("Failed to parse binary object: {}", e)))?;
+                    .map_err(|e| UnityAssetError::with_source("Failed to parse binary object", e))?;
                 if let Some(reporter) = &self.reporter {
                     for w in obj.typetree_warnings() {
                         reporter.typetree_warning(key, w);
@@ -331,7 +331,7 @@ impl Environment {
                 })?;
                 object
                     .peek_name_with_options(typetree_options)
-                    .map_err(|e| UnityAssetError::format(format!("Failed to peek binary object name: {}", e)))
+                    .map_err(|e| UnityAssetError::with_source("Failed to peek binary object name", e))
             }
             BinarySourceKind::AssetBundle => {
                 let bundle = self.bundles.get(&key.source).ok_or_else(|| {
@@ -362,9 +362,8 @@ impl Environment {
                 })?;
                 object
                     .peek_name_with_options(typetree_options)
-                    .map_err(|e| UnityAssetError::format(format!("Failed to peek binary object name: {}", e)))
+                    .map_err(|e| UnityAssetError::with_source("Failed to peek binary object name", e))
             }
         }
     }
 }
-

@@ -412,25 +412,24 @@ impl Environment {
             if !candidate.exists() {
                 continue;
             }
-            let mut file = File::open(&candidate).map_err(|e| {
-                UnityAssetError::format(format!(
-                    "Failed to open stream resource {:?}: {}",
-                    candidate, e
-                ))
-            })?;
+            let mut file = File::open(&candidate)
+                .map_err(|e| UnityAssetError::with_source(format!("Failed to open stream resource {:?}", candidate), e))?;
             file.seek(SeekFrom::Start(offset)).map_err(|e| {
-                UnityAssetError::format(format!(
-                    "Failed to seek stream resource {:?} to {}: {}",
-                    candidate, offset, e
-                ))
+                UnityAssetError::with_source(
+                    format!("Failed to seek stream resource {:?} to {}", candidate, offset),
+                    e,
+                )
             })?;
 
             let mut buffer = vec![0u8; size as usize];
             file.read_exact(&mut buffer).map_err(|e| {
-                UnityAssetError::format(format!(
-                    "Failed to read stream resource {:?} (offset={}, size={}): {}",
-                    candidate, offset, size, e
-                ))
+                UnityAssetError::with_source(
+                    format!(
+                        "Failed to read stream resource {:?} (offset={}, size={})",
+                        candidate, offset, size
+                    ),
+                    e,
+                )
             })?;
             return Ok(buffer);
         }

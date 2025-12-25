@@ -1,6 +1,7 @@
 //! Error types for Unity asset parsing
 
 use std::io;
+use std::error::Error as StdError;
 use thiserror::Error;
 
 /// Result type alias for Unity asset operations
@@ -51,6 +52,17 @@ pub enum UnityAssetError {
     /// Generic parsing errors
     #[error("Parse error: {message}")]
     Parse { message: String },
+
+    /// Wrap an underlying error while preserving its type as a `source()`.
+    ///
+    /// This is used by higher-level crates (e.g. environment) to add context without losing
+    /// the original error kind (I/O, binary parser errors, etc).
+    #[error("{message}: {source}")]
+    WithSource {
+        message: String,
+        #[source]
+        source: Box<dyn StdError + Send + Sync + 'static>,
+    },
 }
 
 impl UnityAssetError {
@@ -107,6 +119,18 @@ impl UnityAssetError {
     pub fn parse<S: Into<String>>(message: S) -> Self {
         Self::Parse {
             message: message.into(),
+        }
+    }
+
+    /// Create a contextual error while preserving the underlying `source` error.
+    pub fn with_source<M, E>(message: M, source: E) -> Self
+    where
+        M: Into<String>,
+        E: StdError + Send + Sync + 'static,
+    {
+        Self::WithSource {
+            message: message.into(),
+            source: Box::new(source),
         }
     }
 }
