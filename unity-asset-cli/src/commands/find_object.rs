@@ -12,6 +12,7 @@ use unity_asset_binary::bundle::AssetBundle;
 use unity_asset_binary::object::UnityObject;
 use unity_asset_binary::typetree::{TypeTreeParseMode, TypeTreeParseOptions, TypeTreeRegistry};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     input: PathBuf,
     pattern: String,
@@ -207,7 +208,7 @@ fn find_object_env_fallback(
 
 #[allow(clippy::too_many_arguments)]
 fn find_object_fast(
-    input: &PathBuf,
+    input: &std::path::Path,
     pattern: &str,
     name: &str,
     class_id: &[i32],
@@ -757,9 +758,9 @@ fn peek_object_name_fast(
             asset_index
         )
     })?;
-    Ok(handle
+    handle
         .peek_name_with_options(options)
-        .map_err(|e| anyhow::anyhow!(e))?)
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 fn lookup_object_type_info(env: &Environment, key: &BinaryObjectKey) -> (i32, u32) {

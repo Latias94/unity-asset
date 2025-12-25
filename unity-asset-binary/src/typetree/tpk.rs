@@ -13,6 +13,8 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
+type TypeTreeCache = Arc<RwLock<HashMap<(i32, u64), Arc<TypeTree>>>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i8)]
 enum TpkCompressionType {
@@ -485,7 +487,7 @@ fn parse_tpk_typetree_blob(data: &[u8]) -> Result<TpkTypeTreeBlob> {
 #[derive(Debug, Clone)]
 pub struct TpkTypeTreeRegistry {
     blob: Arc<TpkTypeTreeBlob>,
-    cache: Arc<RwLock<HashMap<(i32, u64), Arc<TypeTree>>>>,
+    cache: TypeTreeCache,
 }
 
 impl TpkTypeTreeRegistry {

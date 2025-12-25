@@ -59,10 +59,7 @@ fn scan_pptr_scan_file(
         }
 
         let obj_name = if has_name_filter {
-            match handle.peek_name() {
-                Ok(v) => v,
-                Err(_) => None,
-            }
+            handle.peek_name().unwrap_or_default()
         } else {
             None
         };
@@ -144,7 +141,7 @@ fn scan_pptr_scan_file(
 
 #[allow(clippy::too_many_arguments)]
 fn scan_pptr_fast(
-    input: &PathBuf,
+    input: &std::path::Path,
     kind: &str,
     source: Option<&PathBuf>,
     asset_index: Option<usize>,
@@ -477,6 +474,7 @@ fn scan_pptr_env_fallback(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     input: PathBuf,
     kind: String,

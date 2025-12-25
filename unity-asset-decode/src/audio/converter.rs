@@ -90,23 +90,24 @@ impl AudioClipConverter {
             .unwrap_or(0);
         let compression_format = AudioCompressionFormat::from(compression_format_val);
 
-        let mut clip = AudioClip::default();
-        clip.name = name;
-        clip.meta = AudioClipMeta::Modern {
-            load_type,
-            channels,
-            frequency,
-            bits_per_sample,
-            length,
-            is_tracker_format,
-            subsound_index,
-            preload_audio_data,
-            load_in_background,
-            legacy_3d,
-            compression_format,
+        let mut clip = AudioClip {
+            name,
+            meta: AudioClipMeta::Modern {
+                load_type,
+                channels,
+                frequency,
+                bits_per_sample,
+                length,
+                is_tracker_format,
+                subsound_index,
+                preload_audio_data,
+                load_in_background,
+                legacy_3d,
+                compression_format,
+            },
+            ambisonic: props.get("m_Ambisonic").and_then(|v| v.as_bool()),
+            ..Default::default()
         };
-
-        clip.ambisonic = props.get("m_Ambisonic").and_then(|v| v.as_bool());
 
         // Embedded audio bytes: `m_AudioData: List[int]` / `Bytes`
         if let Some(v) = props.get("m_AudioData") {
@@ -116,7 +117,7 @@ impl AudioClipConverter {
                     let mut bytes = Vec::with_capacity(items.len());
                     for item in items {
                         if let Some(n) = item.as_i64() {
-                            bytes.push((n as i64).clamp(0, 255) as u8);
+                            bytes.push(n.clamp(0, 255) as u8);
                         }
                     }
                     clip.data = bytes;

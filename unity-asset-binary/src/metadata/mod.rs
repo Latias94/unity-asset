@@ -400,7 +400,7 @@ pub fn get_asset_statistics(asset: &SerializedFile) -> AssetStatistics {
         object_count: asset.objects.len(),
         type_count: asset.types.len(),
         external_count: asset.externals.len(),
-        file_size: asset.header.file_size as u64,
+        file_size: asset.header.file_size,
         unity_version: asset.unity_version.clone(),
         format_version: asset.header.version,
     }

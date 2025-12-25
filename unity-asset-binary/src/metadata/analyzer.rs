@@ -30,6 +30,8 @@ struct ExtractedDependencies {
     external: Vec<(i32, i64)>,
 }
 
+type CachedPptrDependencies = (Vec<i64>, Vec<(i32, i64)>);
+
 impl DependencyAnalyzer {
     /// Create a new dependency analyzer
     pub fn new() -> Self {
@@ -321,7 +323,7 @@ impl DependencyAnalyzer {
         &self,
         asset: &SerializedFile,
         object_id: i64,
-    ) -> Option<(Vec<i64>, Vec<(i32, i64)>)> {
+    ) -> Option<CachedPptrDependencies> {
         let file_key = asset.data_identity_key();
         self.pptr_dependency_cache
             .get(&(file_key, object_id))
@@ -382,10 +384,10 @@ fn scan_object_pptrs_with_typetree(
         serializer.scan_pptrs_with_ref_types(&mut reader, Some(&asset.ref_types))?
     };
 
-    let mut deps = ExtractedDependencies::default();
-    deps.internal = scan.internal;
-    deps.external = scan.external;
-    Ok(deps)
+    Ok(ExtractedDependencies {
+        internal: scan.internal,
+        external: scan.external,
+    })
 }
 
 fn resolve_external_file(
@@ -449,26 +451,25 @@ fn extract_gameobject_components(props: &indexmap::IndexMap<String, UnityValue>)
 
     let mut out = Vec::new();
     for item in items {
-        match item {
-            UnityValue::Object(obj) => {
-                // Unity typetree usually stores { "component": {fileID, pathID} }.
-                if let Some(UnityValue::Object(component_obj)) = obj.get("component") {
-                    if let Some((file_id, path_id)) = try_read_pptr(component_obj) {
-                        if file_id == 0 && path_id != 0 {
-                            out.push(path_id);
-                        }
-                    }
-                    continue;
-                }
+        let UnityValue::Object(obj) = item else {
+            continue;
+        };
 
-                // Fallback: treat the object itself as PPtr if it matches.
-                if let Some((file_id, path_id)) = try_read_pptr(obj) {
-                    if file_id == 0 && path_id != 0 {
-                        out.push(path_id);
-                    }
+        // Unity typetree usually stores { "component": {fileID, pathID} }.
+        if let Some(UnityValue::Object(component_obj)) = obj.get("component") {
+            if let Some((file_id, path_id)) = try_read_pptr(component_obj) {
+                if file_id == 0 && path_id != 0 {
+                    out.push(path_id);
                 }
             }
-            _ => {}
+            continue;
+        }
+
+        // Fallback: treat the object itself as PPtr if it matches.
+        if let Some((file_id, path_id)) = try_read_pptr(obj) {
+            if file_id == 0 && path_id != 0 {
+                out.push(path_id);
+            }
         }
     }
     out

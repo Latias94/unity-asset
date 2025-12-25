@@ -136,7 +136,7 @@ impl MetadataExtractor {
     /// Extract basic file information
     fn extract_file_info(&self, asset: &SerializedFile) -> FileInfo {
         FileInfo {
-            file_size: asset.header.file_size as u64,
+            file_size: asset.header.file_size,
             unity_version: asset.unity_version.clone(),
             target_platform: format!("{}", asset.target_platform),
             compression_type: "None".to_string(), // TODO: Detect compression

@@ -36,7 +36,7 @@ fn unityfs_bundle_fast_mode_decompresses_on_demand() {
         .expect("extract triggers on-demand decompression");
     assert_eq!(bytes.len() as u64, node.size);
     assert!(
-        bundle.data().len() > 0,
+        !bundle.data().is_empty(),
         "bundle data becomes available after decompression"
     );
 }

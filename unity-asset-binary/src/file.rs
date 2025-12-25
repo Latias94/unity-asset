@@ -25,6 +25,7 @@ pub enum UnityFileKind {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum UnityFile {
     AssetBundle(crate::bundle::AssetBundle),
     SerializedFile(crate::asset::SerializedFile),
@@ -191,7 +192,7 @@ pub fn load_unity_file<P: AsRef<Path>>(path: P) -> Result<UnityFile> {
         })?;
         let shared = SharedBytes::Mmap(std::sync::Arc::new(mmap));
         let len = shared.len();
-        return load_unity_file_from_shared_range(shared, 0..len);
+        load_unity_file_from_shared_range(shared, 0..len)
     }
 
     #[cfg(not(feature = "mmap"))]
@@ -218,7 +219,7 @@ pub fn load_bundle_file_with_options<P: AsRef<Path>>(
         })?;
         let shared = SharedBytes::Mmap(std::sync::Arc::new(mmap));
         let len = shared.len();
-        return BundleParser::from_shared_range_with_options(shared, 0..len, options);
+        BundleParser::from_shared_range_with_options(shared, 0..len, options)
     }
 
     #[cfg(not(feature = "mmap"))]
@@ -245,11 +246,11 @@ pub fn load_serialized_file<P: AsRef<Path>>(
         })?;
         let shared = SharedBytes::Mmap(std::sync::Arc::new(mmap));
         let len = shared.len();
-        return crate::asset::SerializedFileParser::from_shared_range_with_options(
+        crate::asset::SerializedFileParser::from_shared_range_with_options(
             shared,
             0..len,
             preload_object_data,
-        );
+        )
     }
 
     #[cfg(not(feature = "mmap"))]

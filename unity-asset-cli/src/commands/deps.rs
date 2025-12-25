@@ -69,14 +69,10 @@ fn deps_analyze_and_print(
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
         "edges" => {
-            let mut printed = 0usize;
             let mut name_cache: std::collections::HashMap<i64, String> =
                 std::collections::HashMap::new();
 
             for (from, to) in deps.dependency_graph.edges.iter().take(max_edges) {
-                if printed >= max_edges {
-                    break;
-                }
                 if names {
                     let from_name = name_cache.get(from).cloned().unwrap_or_else(|| {
                         let n = file
@@ -98,7 +94,6 @@ fn deps_analyze_and_print(
                 } else {
                     println!("{} -> {}", from, to);
                 }
-                printed += 1;
             }
             if deps.dependency_graph.edges.len() > max_edges {
                 println!(
@@ -133,7 +128,7 @@ fn deps_analyze_and_print(
 
 #[allow(clippy::too_many_arguments)]
 fn deps_fast(
-    input: &PathBuf,
+    input: &std::path::Path,
     kind: &str,
     source: Option<&PathBuf>,
     asset_index: Option<usize>,
@@ -275,6 +270,7 @@ fn deps_fast(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     input: PathBuf,
     kind: String,

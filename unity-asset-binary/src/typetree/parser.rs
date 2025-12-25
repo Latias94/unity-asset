@@ -385,7 +385,7 @@ mod tests {
         let local = b"ignored\0";
 
         // offset 0 in the common string buffer maps to "AABB"
-        let result = TypeTreeParser::resolve_string(local, COMMON_STRING_FLAG | 0).unwrap();
+        let result = TypeTreeParser::resolve_string(local, COMMON_STRING_FLAG).unwrap();
         assert_eq!(result, "AABB");
 
         // An unknown common-string offset should not error, but should resolve to empty.
@@ -405,8 +405,8 @@ mod tests {
         data.extend_from_slice(&(1u16).to_le_bytes()); // version
         data.push(0u8); // level
         data.push(0u8); // type_flags
-        data.extend_from_slice(&(COMMON_STRING_FLAG | 0u32).to_le_bytes()); // type_str_offset => "AABB"
-        data.extend_from_slice(&(COMMON_STRING_FLAG | 0u32).to_le_bytes()); // name_str_offset => "AABB"
+        data.extend_from_slice(&COMMON_STRING_FLAG.to_le_bytes()); // type_str_offset => "AABB"
+        data.extend_from_slice(&COMMON_STRING_FLAG.to_le_bytes()); // name_str_offset => "AABB"
         data.extend_from_slice(&(0i32).to_le_bytes()); // byte_size
         data.extend_from_slice(&(0i32).to_le_bytes()); // index
         data.extend_from_slice(&(0i32).to_le_bytes()); // meta_flags

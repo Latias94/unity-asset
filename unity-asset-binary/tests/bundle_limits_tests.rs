@@ -78,7 +78,7 @@ fn unityfs_blocks_info_rejects_negative_node_count() {
 
     // UnityFS v7+ aligns blocks info to 16 bytes.
     let pad = (16 - (bytes.len() % 16)) % 16;
-    bytes.extend(std::iter::repeat(0u8).take(pad));
+    bytes.extend(std::iter::repeat_n(0u8, pad));
     bytes.extend_from_slice(&blocks_info);
 
     let total_size = bytes.len() as i64;
@@ -108,7 +108,7 @@ fn unityfs_blocks_info_respects_max_blocks_info_size() {
 
     // UnityFS v7+ aligns blocks info to 16 bytes.
     let pad = (16 - (bytes.len() % 16)) % 16;
-    bytes.extend(std::iter::repeat(0u8).take(pad));
+    bytes.extend(std::iter::repeat_n(0u8, pad));
     bytes.extend_from_slice(&blocks_info);
 
     let total_size = bytes.len() as i64;
@@ -163,8 +163,10 @@ fn legacy_directory_respects_max_compressed_size() {
     let total_size = bytes.len() as u32;
     bytes[size_offset..size_offset + 4].copy_from_slice(&be_u32(total_size));
 
-    let mut options = BundleLoadOptions::default();
-    options.max_legacy_directory_compressed_size = Some(16);
+    let options = BundleLoadOptions {
+        max_legacy_directory_compressed_size: Some(16),
+        ..Default::default()
+    };
     let err = BundleParser::from_bytes_with_options(bytes, options).unwrap_err();
     assert!(matches!(err, BinaryError::ResourceLimitExceeded(_)));
 }
@@ -185,8 +187,10 @@ fn unityfs_blocks_info_respects_max_compressed_blocks_info_size() {
     let total_size = bytes.len() as i64;
     bytes[size_offset..size_offset + 8].copy_from_slice(&be_i64(total_size));
 
-    let mut options = BundleLoadOptions::default();
-    options.max_compressed_blocks_info_size = Some(16);
+    let options = BundleLoadOptions {
+        max_compressed_blocks_info_size: Some(16),
+        ..Default::default()
+    };
     let err = BundleParser::from_bytes_with_options(bytes, options).unwrap_err();
     assert!(matches!(err, BinaryError::ResourceLimitExceeded(_)));
 }
@@ -213,7 +217,7 @@ fn unityfs_lazy_rejects_total_compressed_exceeds_backing() {
 
     // UnityFS v7+ aligns blocks info to 16 bytes.
     let pad = (16 - (bytes.len() % 16)) % 16;
-    bytes.extend(std::iter::repeat(0u8).take(pad));
+    bytes.extend(std::iter::repeat_n(0u8, pad));
     bytes.extend_from_slice(&blocks_info);
 
     let total_size = bytes.len() as i64;
@@ -245,11 +249,11 @@ fn unityfs_lazy_respects_max_compressed_block_size() {
 
     // UnityFS v7+ aligns blocks info to 16 bytes.
     let pad = (16 - (bytes.len() % 16)) % 16;
-    bytes.extend(std::iter::repeat(0u8).take(pad));
+    bytes.extend(std::iter::repeat_n(0u8, pad));
     bytes.extend_from_slice(&blocks_info);
 
     // Dummy block data (not read in lazy mode, but used for backing-length validation).
-    bytes.extend(std::iter::repeat(0u8).take(32));
+    bytes.extend(std::iter::repeat_n(0u8, 32));
 
     let total_size = bytes.len() as i64;
     bytes[size_offset..size_offset + 8].copy_from_slice(&be_i64(total_size));

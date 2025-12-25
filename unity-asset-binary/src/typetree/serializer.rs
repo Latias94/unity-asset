@@ -24,16 +24,11 @@ pub struct PPtrScanResult {
     pub external: Vec<(i32, i64)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TypeTreeParseMode {
     Strict,
+    #[default]
     Lenient,
-}
-
-impl Default for TypeTreeParseMode {
-    fn default() -> Self {
-        Self::Lenient
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

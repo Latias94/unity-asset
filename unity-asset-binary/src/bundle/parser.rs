@@ -695,8 +695,10 @@ mod tests {
 
     #[test]
     fn load_assets_rejects_out_of_bounds_node() {
-        let mut header = BundleHeader::default();
-        header.signature = "UnityFS".to_string();
+        let header = BundleHeader {
+            signature: "UnityFS".to_string(),
+            ..Default::default()
+        };
         let mut bundle = AssetBundle::new(header, vec![0u8; 8]);
         bundle
             .nodes

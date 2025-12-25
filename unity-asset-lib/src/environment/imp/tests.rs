@@ -208,7 +208,7 @@ fn environment_typetree_registry_json_restores_parsing_for_stripped_assets() {
 
     let type_tree = {
         let bundle = env.bundles.get(&source).expect("sample bundle loaded");
-        let file = bundle.assets.get(0).expect("bundle has asset 0");
+        let file = bundle.assets.first().expect("bundle has asset 0");
         file.types
             .iter()
             .find(|t| t.class_id == 28)
@@ -222,7 +222,7 @@ fn environment_typetree_registry_json_restores_parsing_for_stripped_assets() {
             .bundles
             .get_mut(&source)
             .expect("sample bundle loaded (mutable)");
-        let file = bundle.assets.get_mut(0).expect("bundle has asset 0");
+        let file = bundle.assets.first_mut().expect("bundle has asset 0");
         file.enable_type_tree = false;
         for t in file.types.iter_mut() {
             t.type_tree.clear();
@@ -462,7 +462,7 @@ fn build_uncompressed_webfile(entries: Vec<(String, Vec<u8>)>) -> Vec<u8> {
 
     let entry_table_len: usize = entries
         .iter()
-        .map(|(name, _)| 12usize.saturating_add(name.as_bytes().len()))
+        .map(|(name, _)| 12usize.saturating_add(name.len()))
         .sum();
     let header_len: usize = signature
         .len()

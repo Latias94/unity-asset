@@ -33,6 +33,7 @@ fn best_effort_class_name(file: &SerializedFile, class_id: i32) -> String {
     class_name_for_id(class_id).to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     input: PathBuf,
     kind: String,
@@ -116,6 +117,7 @@ fn matches_filters(
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn list_serialized(
     env: &Environment,
     input: &PathBuf,
@@ -209,15 +211,19 @@ fn list_serialized(
         }
     }
 
-    if *printed == 0 && !input.is_file() && source.is_none() && env.binary_assets().is_empty() {
-        if !json {
-            println!("⚠ No SerializedFiles found in {:?}", input);
-        }
+    if *printed == 0
+        && !input.is_file()
+        && source.is_none()
+        && env.binary_assets().is_empty()
+        && !json
+    {
+        println!("⚠ No SerializedFiles found in {:?}", input);
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn list_bundles(
     env: &Environment,
     input: &PathBuf,
@@ -324,10 +330,8 @@ fn list_bundles(
         }
     }
 
-    if *printed == 0 && !input.is_file() && source.is_none() && env.bundles().is_empty() {
-        if !json {
-            println!("⚠ No AssetBundles found in {:?}", input);
-        }
+    if *printed == 0 && !input.is_file() && source.is_none() && env.bundles().is_empty() && !json {
+        println!("⚠ No AssetBundles found in {:?}", input);
     }
 
     Ok(())

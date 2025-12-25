@@ -181,6 +181,7 @@ fn read_export_manifest(path: &Path) -> Result<ExportManifest> {
     Ok(manifest)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     input: PathBuf,
     output: PathBuf,
@@ -645,10 +646,7 @@ pub(crate) fn run(
     Ok(())
 }
 
-fn export_one_inner(
-    env: &Environment,
-    job: &ExportJob,
-) -> Result<(
+type ExportOneInnerResult = (
     PathBuf,
     bool,
     ExportStatus,
@@ -656,7 +654,9 @@ fn export_one_inner(
     i32,
     String,
     Option<String>,
-)> {
+);
+
+fn export_one_inner(env: &Environment, job: &ExportJob) -> Result<ExportOneInnerResult> {
     let obj = env.read_binary_object_key(&job.key)?;
     let class_id = obj.info.type_id;
     let class_name = best_effort_class_name(

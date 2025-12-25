@@ -65,7 +65,7 @@ impl BundleFileInfo {
 
     /// Get the end offset of this file
     pub fn end_offset(&self) -> u64 {
-        self.offset.checked_add(self.size).unwrap_or(u64::MAX)
+        self.offset.saturating_add(self.size)
     }
 }
 
@@ -114,7 +114,7 @@ impl DirectoryNode {
 
     /// Get the end offset of this node
     pub fn end_offset(&self) -> u64 {
-        self.offset.checked_add(self.size).unwrap_or(u64::MAX)
+        self.offset.saturating_add(self.size)
     }
 }
 
@@ -726,8 +726,10 @@ mod tests {
 
     #[test]
     fn unityfs_extract_node_data_is_lazy_and_supports_cross_block_ranges() {
-        let mut header = BundleHeader::default();
-        header.signature = "UnityFS".to_string();
+        let header = BundleHeader {
+            signature: "UnityFS".to_string(),
+            ..Default::default()
+        };
 
         let mut bundle = AssetBundle::new_empty(header);
         bundle.blocks = vec![
@@ -828,11 +830,12 @@ impl Default for BundleLoadOptions {
 impl BundleLoadOptions {
     /// Create options for lazy loading (validate metadata, but do not preload assets or decompress blocks).
     pub fn lazy() -> Self {
-        let mut options = Self::default();
-        options.load_assets = false;
-        options.decompress_blocks = false;
-        options.validate = true;
-        options
+        Self {
+            load_assets: false,
+            decompress_blocks: false,
+            validate: true,
+            ..Default::default()
+        }
     }
 
     /// Create options for fast loading (minimal processing)

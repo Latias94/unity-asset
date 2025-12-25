@@ -156,12 +156,10 @@ fn get_sample_files() -> Vec<std::path::PathBuf> {
 
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(samples_path) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if path.is_file() {
-                    files.push(path);
-                }
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                files.push(path);
             }
         }
     }
@@ -215,22 +213,22 @@ impl CompatibilityReport {
 
 /// Analyze texture object
 fn analyze_texture(unity_class: &unity_asset_core::UnityClass, report: &mut CompatibilityReport) {
-    if let Some(format_value) = unity_class.get("m_TextureFormat") {
-        if let unity_asset_core::UnityValue::Integer(format_id) = format_value {
-            let format_name = get_texture_format_name(*format_id as i32);
-            *report.texture_formats.entry(format_name).or_insert(0) += 1;
-        }
+    if let Some(unity_asset_core::UnityValue::Integer(format_id)) =
+        unity_class.get("m_TextureFormat")
+    {
+        let format_name = get_texture_format_name(*format_id as i32);
+        *report.texture_formats.entry(format_name).or_insert(0) += 1;
     }
 }
 
 /// Analyze audio object
 fn analyze_audio(unity_class: &unity_asset_core::UnityClass, report: &mut CompatibilityReport) {
-    if let Some(format_value) = unity_class.get("m_CompressionFormat") {
-        if let unity_asset_core::UnityValue::Integer(format_id) = format_value {
-            let format = AudioCompressionFormat::from(*format_id as i32);
-            let format_name = format!("{:?}", format);
-            *report.audio_formats.entry(format_name).or_insert(0) += 1;
-        }
+    if let Some(unity_asset_core::UnityValue::Integer(format_id)) =
+        unity_class.get("m_CompressionFormat")
+    {
+        let format = AudioCompressionFormat::from(*format_id as i32);
+        let format_name = format!("{:?}", format);
+        *report.audio_formats.entry(format_name).or_insert(0) += 1;
     }
 }
 

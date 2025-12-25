@@ -24,12 +24,10 @@ fn get_sample_files() -> Vec<std::path::PathBuf> {
 
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(samples_path) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if path.is_file() {
-                    files.push(path);
-                }
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                files.push(path);
             }
         }
     }
@@ -190,33 +188,25 @@ fn test_audio_processing_from_files() {
                                 let unity_class = unity_object.as_unity_class();
 
                                 // Try to get audio properties
-                                if let Some(name_value) = unity_class.get("m_Name") {
-                                    if let unity_asset_core::UnityValue::String(name) = name_value {
-                                        println!("      Audio name: '{}'", name);
-                                    }
+                                if let Some(unity_asset_core::UnityValue::String(name)) =
+                                    unity_class.get("m_Name")
+                                {
+                                    println!("      Audio name: '{}'", name);
                                 }
 
                                 // Look for audio format information
-                                if let Some(format_value) = unity_class.get("m_CompressionFormat") {
-                                    if let unity_asset_core::UnityValue::Integer(format_id) =
-                                        format_value
-                                    {
-                                        let format =
-                                            AudioCompressionFormat::from(*format_id as i32);
-                                        println!(
-                                            "      Format: {:?} ({})",
-                                            format,
-                                            format.info().name
-                                        );
-                                    }
+                                if let Some(unity_asset_core::UnityValue::Integer(format_id)) =
+                                    unity_class.get("m_CompressionFormat")
+                                {
+                                    let format = AudioCompressionFormat::from(*format_id as i32);
+                                    println!("      Format: {:?} ({})", format, format.info().name);
                                 }
 
                                 // Look for audio data size
-                                if let Some(size_value) = unity_class.get("m_Size") {
-                                    if let unity_asset_core::UnityValue::Integer(size) = size_value
-                                    {
-                                        println!("      Data size: {} bytes", size);
-                                    }
+                                if let Some(unity_asset_core::UnityValue::Integer(size)) =
+                                    unity_class.get("m_Size")
+                                {
+                                    println!("      Data size: {} bytes", size);
                                 }
                             }
                         }

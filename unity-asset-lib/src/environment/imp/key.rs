@@ -27,9 +27,9 @@ impl std::fmt::Display for BinaryObjectKey {
             kind,
             asset_index,
             self.path_id,
-            outer.as_bytes().len(),
+            outer.len(),
             outer,
-            entry.as_bytes().len(),
+            entry.len(),
             entry
         )
     }
@@ -90,11 +90,11 @@ fn parse_bok1(s: &str) -> std::result::Result<BinaryObjectKey, String> {
     let expected_len = path_len
         .parse::<usize>()
         .map_err(|e| format!("invalid path_len: {}", e))?;
-    if path.as_bytes().len() != expected_len {
+    if path.len() != expected_len {
         return Err(format!(
             "path length mismatch: expected {} bytes, got {} bytes",
             expected_len,
-            path.as_bytes().len()
+            path.len()
         ));
     }
 
@@ -133,7 +133,7 @@ fn parse_bok2(s: &str) -> std::result::Result<BinaryObjectKey, String> {
     let outer_len = outer_len
         .parse::<usize>()
         .map_err(|e| format!("invalid outer_len: {}", e))?;
-    if rest.as_bytes().len() < outer_len {
+    if rest.len() < outer_len {
         return Err("outer is shorter than outer_len".to_string());
     }
 
@@ -151,11 +151,11 @@ fn parse_bok2(s: &str) -> std::result::Result<BinaryObjectKey, String> {
     let entry_len = entry_len
         .parse::<usize>()
         .map_err(|e| format!("invalid entry_len: {}", e))?;
-    if rest.as_bytes().len() != entry_len {
+    if rest.len() != entry_len {
         return Err(format!(
             "entry length mismatch: expected {} bytes, got {} bytes",
             entry_len,
-            rest.as_bytes().len()
+            rest.len()
         ));
     }
 
@@ -180,7 +180,7 @@ fn parse_bok2(s: &str) -> std::result::Result<BinaryObjectKey, String> {
     })
 }
 
-fn split_once<'a>(s: &'a str, delim: char) -> Option<(&'a str, &'a str)> {
+fn split_once(s: &str, delim: char) -> Option<(&str, &str)> {
     let pos = s.find(delim)?;
     Some((&s[..pos], &s[pos + delim.len_utf8()..]))
 }

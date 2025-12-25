@@ -26,6 +26,7 @@ use unity_asset_decode::{
     texture::{TextureExporter, TextureProcessor},
 };
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     input: PathBuf,
     output: PathBuf,
@@ -940,6 +941,7 @@ fn export_bundle_command(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export_one_entry(
     env: &Environment,
     allocator: &PathAllocator,

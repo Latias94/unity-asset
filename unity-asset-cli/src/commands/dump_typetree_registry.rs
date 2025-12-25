@@ -54,10 +54,10 @@ pub(crate) fn run(
     let mut seen: HashSet<(String, i32)> = HashSet::new();
 
     let mut files: Vec<&unity_asset_binary::asset::SerializedFile> = Vec::new();
-    for (_src, file) in env.binary_assets() {
+    for file in env.binary_assets().values() {
         files.push(file);
     }
-    for (_src, bundle) in env.bundles() {
+    for bundle in env.bundles().values() {
         for file in &bundle.assets {
             files.push(file);
         }

@@ -255,19 +255,19 @@ mod tests {
 
     #[test]
     fn test_bundle_header_validation() {
-        let mut header = BundleHeader::default();
-
         // Empty header should fail validation
-        assert!(header.validate().is_err());
+        let empty = BundleHeader::default();
+        assert!(empty.validate().is_err());
 
-        // Set minimum required fields
-        header.signature = "UnityFS".to_string();
-        header.version = 6;
-        header.size = 1000;
-        header.compressed_blocks_info_size = 100;
-        header.uncompressed_blocks_info_size = 200;
-
-        // Should now pass validation
+        // Minimum required fields should pass validation
+        let header = BundleHeader {
+            signature: "UnityFS".to_string(),
+            version: 6,
+            size: 1000,
+            compressed_blocks_info_size: 100,
+            uncompressed_blocks_info_size: 200,
+            ..Default::default()
+        };
         assert!(header.validate().is_ok());
     }
 

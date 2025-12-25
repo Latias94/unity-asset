@@ -554,8 +554,10 @@ impl SerializedFile {
         // Try multiple aligned offsets to account for base fields which may precede m_Name.
         let mut last_err: Option<BinaryError> = None;
         let externals_len: i32 = self.externals.len().try_into().unwrap_or(i32::MAX);
-        let mut best: Option<(usize, Vec<(String, i32, i64)>)> = None;
-        let score = |entries: &[(String, i32, i64)]| -> usize {
+        type ExternalRefCandidate = (String, i32, i64);
+        type BestCandidate = (usize, Vec<ExternalRefCandidate>);
+        let mut best: Option<BestCandidate> = None;
+        let score = |entries: &[ExternalRefCandidate]| -> usize {
             entries
                 .iter()
                 .filter(|(path, file_id, path_id)| {

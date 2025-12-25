@@ -348,7 +348,7 @@ fn managed_references_registry_skips_large_byte_arrays_and_keeps_reader_in_sync(
     let n: i32 = 128 * 1024;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&n.to_le_bytes());
-    bytes.extend(std::iter::repeat(0xABu8).take(n as usize));
+    bytes.extend(std::iter::repeat_n(0xABu8, n as usize));
     while bytes.len() % 4 != 0 {
         bytes.push(0);
     }

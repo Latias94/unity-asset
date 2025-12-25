@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use unity_asset::UnityValue;
 use unity_asset::environment::BinarySource;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     input: PathBuf,
     key: Option<String>,
@@ -102,6 +103,7 @@ pub(crate) fn run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_unity_value_tree(
     path: &str,
     value: &UnityValue,
