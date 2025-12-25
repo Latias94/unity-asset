@@ -1,12 +1,13 @@
 [package]
 name = "unity-asset-decode"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 description = "Decode/export helpers for Unity assets (Texture/Audio/Sprite/Mesh) built on unity-asset-binary"
-license = "MIT"
-repository = "https://github.com/Latias94/unity-asset"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 documentation = "https://docs.rs/unity-asset-decode"
 keywords = ["unity", "assets", "decode", "export", "parser"]
 categories = ["parsing", "game-development"]

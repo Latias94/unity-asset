@@ -1,0 +1,218 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate tag/version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure Cargo.toml versions match tag
+        run: |
+          python3 - <<'PY'
+          import os, re, tomllib
+
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+              raise SystemExit(f"Invalid tag version: {version}")
+
+          manifests = [
+              "unity-asset-core/Cargo.toml",
+              "unity-asset-yaml/Cargo.toml",
+              "unity-asset-binary/Cargo.toml",
+              "unity-asset-decode/Cargo.toml",
+              "unity-asset-lib/Cargo.toml",
+              "unity-asset-cli/Cargo.toml",
+          ]
+
+          def load(path: str) -> dict:
+              with open(path, "rb") as f:
+                  return tomllib.load(f)
+
+          def pkg_version(path: str) -> str:
+              return load(path)["package"]["version"]
+
+          crate_versions = {path: pkg_version(path) for path in manifests}
+          bad = {k: v for k, v in crate_versions.items() if v != version}
+          if bad:
+              raise SystemExit(f"Tag v{version} does not match crate versions: {bad}")
+
+          workspace_crates = {
+              "unity-asset",
+              "unity-asset-cli",
+              "unity-asset-core",
+              "unity-asset-yaml",
+              "unity-asset-binary",
+              "unity-asset-decode",
+          }
+
+          dep_mismatches = []
+          for path in manifests:
+              data = load(path)
+              deps = data.get("dependencies", {})
+              for dep_name, dep_spec in deps.items():
+                  if not isinstance(dep_spec, dict):
+                      continue
+                  if "path" not in dep_spec:
+                      continue
+                  if dep_name not in workspace_crates:
+                      continue
+                  dep_version = dep_spec.get("version")
+                  if dep_version != version:
+                      dep_mismatches.append((path, dep_name, dep_version))
+
+          if dep_mismatches:
+              raise SystemExit(
+                  "Path dependency version mismatches (expected "
+                  f"{version}): {dep_mismatches}"
+              )
+
+          print(f"OK: v{version} matches crate versions and workspace dependency versions")
+          PY
+
+  test:
+    name: Test before publish
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (workspace defaults)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test (workspace defaults)
+        run: cargo nextest run --workspace
+
+      - name: Cargo package (unity-asset-core)
+        run: cargo package -p unity-asset-core
+      # NOTE: We intentionally do not run `cargo package` for crates that depend on
+      # other workspace crates that haven't been published for this tag yet.
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Publish unity-asset-core
+        run: cargo publish -p unity-asset-core --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+      - name: Publish unity-asset-yaml
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo publish -p unity-asset-yaml --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"; then
+              exit 0
+            fi
+            echo "unity-asset-yaml publish failed (attempt $i), waiting for crates.io index..."
+            sleep 30
+          done
+          exit 1
+
+      - name: Publish unity-asset-binary
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo publish -p unity-asset-binary --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"; then
+              exit 0
+            fi
+            echo "unity-asset-binary publish failed (attempt $i), waiting for crates.io index..."
+            sleep 30
+          done
+          exit 1
+
+      - name: Publish unity-asset-decode
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo publish -p unity-asset-decode --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"; then
+              exit 0
+            fi
+            echo "unity-asset-decode publish failed (attempt $i), waiting for crates.io index..."
+            sleep 30
+          done
+          exit 1
+
+      - name: Publish unity-asset
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo publish -p unity-asset --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"; then
+              exit 0
+            fi
+            echo "unity-asset publish failed (attempt $i), waiting for crates.io index..."
+            sleep 30
+          done
+          exit 1
+
+      - name: Publish unity-asset-cli
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo publish -p unity-asset-cli --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"; then
+              exit 0
+            fi
+            echo "unity-asset-cli publish failed (attempt $i), waiting for crates.io index..."
+            sleep 30
+          done
+          exit 1
+
+  github-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs: publish
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract release notes
+        id: notes
+        uses: ffurrer2/extract-release-notes@v2
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.notes.outputs.release_notes }}

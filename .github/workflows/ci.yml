@@ -7,16 +7,17 @@ on:
     types: [opened, synchronize, reopened]
     branches: [ main ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    name: Test Suite
+    name: Test / Lint / Fmt
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        features: ["", "async"]
 
     steps:
     - uses: actions/checkout@v4
@@ -30,53 +31,46 @@ jobs:
       uses: taiki-e/install-action@nextest
 
     - name: Cache dependencies
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
+      uses: Swatinem/rust-cache@v2
 
     - name: Check formatting
       run: cargo fmt --all -- --check
 
-    - name: Run clippy (lib and bin only)
-      run: |
-        if [ -n "${{ matrix.features }}" ]; then
-          cargo clippy --lib --bins --features ${{ matrix.features }} -- -D warnings
-        else
-          cargo clippy --lib --bins -- -D warnings
-        fi
+    - name: Clippy (workspace defaults)
+      run: cargo clippy --workspace --all-targets -- -D warnings
 
-    - name: Run clippy on tests (warnings only)
+    - name: Clippy (async)
       run: |
-        if [ -n "${{ matrix.features }}" ]; then
-          cargo clippy --tests --features ${{ matrix.features }} || true
-        else
-          cargo clippy --tests || true
-        fi
+        cargo clippy -p unity-asset-core --all-targets --features async -- -D warnings
+        cargo clippy -p unity-asset-yaml --all-targets --features async -- -D warnings
+        cargo clippy -p unity-asset-binary --all-targets --features async -- -D warnings
+        cargo clippy -p unity-asset --all-targets --features async -- -D warnings
+        cargo clippy -p unity-asset-cli --all-targets --features async -- -D warnings
 
-    - name: Run tests
+    - name: Clippy (decode/export)
       run: |
-        if [ -n "${{ matrix.features }}" ]; then
-          cargo nextest run --workspace --features ${{ matrix.features }}
-        else
-          cargo nextest run --workspace
-        fi
+        cargo clippy -p unity-asset-decode --all-targets --features full -- -D warnings
+        cargo clippy -p unity-asset-cli --all-targets --features decode -- -D warnings
 
     - name: Test CLI tools
       run: |
-        cargo build --all
+        cargo build --workspace
         ./target/debug/unity-asset --help
-        if [ "${{ matrix.features }}" = "async" ]; then
-          cargo build --features async -p unity-asset-cli
-          ./target/debug/unity-asset-async --help
-        fi
+        cargo build -p unity-asset-cli --features async
+        ./target/debug/unity-asset-async --help
+        cargo build -p unity-asset-cli --features decode
 
-  # 只在main分支运行文档检查，避免PR中的噪音
+    - name: Run tests (workspace defaults)
+      run: cargo nextest run --workspace
+
+    - name: Run tests (async)
+      run: |
+        cargo nextest run -p unity-asset --features async
+        cargo nextest run -p unity-asset-cli --features async
+
+    - name: Run tests (decode/export)
+      run: cargo nextest run -p unity-asset-decode --features full
+
   docs:
     name: Documentation
     runs-on: ubuntu-latest
@@ -86,16 +80,7 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
 
     - name: Cache dependencies
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-cargo-doc-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-doc-
-          ${{ runner.os }}-cargo-
+      uses: Swatinem/rust-cache@v2
 
     - name: Check documentation
       run: cargo doc --all --all-features --no-deps
@@ -110,16 +95,7 @@ jobs:
       with:
         toolchain: 1.85.0
     - name: Cache dependencies
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-msrv-
-          ${{ runner.os }}-cargo-
+      uses: Swatinem/rust-cache@v2
     - name: Build workspace
       run: cargo build --workspace
 
@@ -130,10 +106,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-    
-    - name: Install cargo-audit
-      run: cargo install cargo-audit
-    
-    - name: Run security audit
-      run: cargo audit
+    - uses: rustsec/audit-check@v2
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}

@@ -9,6 +9,14 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/Latias94/unity-asset"
+homepage = "https://github.com/Latias94/unity-asset"
+
 [workspace.dependencies]
 # Core dependencies
 serde = { version = "1", features = ["derive"] }
