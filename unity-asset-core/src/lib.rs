@@ -24,13 +24,18 @@ pub fn get_class_name(class_id: i32) -> Option<String> {
     GLOBAL_CLASS_ID_MAP.get_class_name(class_id)
 }
 
+/// Get Unity class name from class ID without allocating.
+pub fn get_class_name_str(class_id: i32) -> Option<&'static str> {
+    GLOBAL_CLASS_ID_MAP.get_class_name_str(class_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_basic_functionality() {
-        // 基础功能测试
+        // Basic functionality test.
         let class = UnityClass::new(1, "GameObject".to_string(), "123".to_string());
         assert_eq!(class.class_id, 1);
         assert_eq!(class.class_name, "GameObject");

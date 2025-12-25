@@ -1,4 +1,4 @@
-use crate::shared::{AppContext, build_environment, lookup_object_type_info};
+use crate::shared::{AppContext, build_environment, class_name_for_id, lookup_object_type_info};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -427,9 +427,8 @@ fn export_bundle_command(
                     continue;
                 }
                 if !class_name_lc.is_empty() {
-                    let name = unity_asset::get_class_name(type_id)
-                        .unwrap_or_else(|| format!("Class_{}", type_id));
-                    if !name.to_ascii_lowercase().contains(&class_name_lc) {
+                    let name = class_name_for_id(type_id);
+                    if !name.as_ref().to_ascii_lowercase().contains(&class_name_lc) {
                         filtered += 1;
                         continue;
                     }
@@ -516,9 +515,8 @@ fn export_bundle_command(
                         continue;
                     }
                     if !class_name_lc.is_empty() {
-                        let name = unity_asset::get_class_name(type_id)
-                            .unwrap_or_else(|| format!("Class_{}", type_id));
-                        if !name.to_ascii_lowercase().contains(&class_name_lc) {
+                        let name = class_name_for_id(type_id);
+                        if !name.as_ref().to_ascii_lowercase().contains(&class_name_lc) {
                             filtered += 1;
                             continue;
                         }
@@ -588,10 +586,7 @@ fn export_bundle_command(
             let class_name = if type_id == 0 {
                 None
             } else {
-                Some(
-                    unity_asset::get_class_name(type_id)
-                        .unwrap_or_else(|| format!("Class_{}", type_id)),
-                )
+                Some(class_name_for_id(type_id).into_owned())
             };
             let mut dest = output.join(sanitize_asset_path(&job.asset_path));
             if decode {
@@ -799,10 +794,7 @@ fn export_bundle_command(
                                 let class_name = if type_id == 0 {
                                     None
                                 } else {
-                                    Some(
-                                        unity_asset::get_class_name(type_id)
-                                            .unwrap_or_else(|| format!("Class_{}", type_id)),
-                                    )
+                                    Some(class_name_for_id(type_id).into_owned())
                                 };
                                 Some(ExportOutcome {
                                     order: job.order,
@@ -958,7 +950,11 @@ fn export_one_entry(
 ) -> Result<ExportOutcome> {
     let obj = env.read_binary_object_key(key)?;
     let type_id = obj.info.type_id;
-    let class_name = unity_asset::get_class_name(type_id);
+    let class_name = if type_id == 0 {
+        None
+    } else {
+        Some(obj.class_name().to_string())
+    };
 
     if decode {
         #[cfg(feature = "decode")]

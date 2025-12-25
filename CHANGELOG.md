@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/REFACTORING.md`: a UnityPy-aligned fearless refactor roadmap (layering, strict/lenient parsing, decode split, API discipline).
 - `unity-asset-decode`: a new crate that hosts decode/export helpers (Texture/Audio/Sprite/Mesh) on top of `unity-asset-binary`.
 - `BinarySource: Display` to provide a single, consistent string representation across library diagnostics and CLI output.
+- `unity-asset-core`: `get_class_name_str` to map class IDs to names without allocating.
 - `unity-asset` `EnvironmentOptions` + `EnvironmentWarning` to control parsing behavior and observe non-fatal load issues without printing from libraries.
 - `unity-asset` CLI: `--strict` (fail-fast TypeTree parsing) and `--show-warnings` (print collected warnings and TypeTree warnings in `inspect-object`).
 - `unity-asset-yaml` loader: `load_yaml_with_warnings` / `load_yaml_async_with_warnings` to surface non-fatal per-document conversion failures without printing from library code.

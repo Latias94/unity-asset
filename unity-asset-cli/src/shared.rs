@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use unity_asset::environment::{
@@ -9,6 +10,12 @@ use unity_asset_binary::shared_bytes::SharedBytes;
 use unity_asset_binary::typetree::{
     CompositeTypeTreeRegistry, JsonTypeTreeRegistry, TpkTypeTreeRegistry, TypeTreeRegistry,
 };
+
+pub(crate) fn class_name_for_id(class_id: i32) -> Cow<'static, str> {
+    unity_asset::get_class_name_str(class_id)
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| Cow::Owned(format!("Class_{}", class_id)))
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppContext {

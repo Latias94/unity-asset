@@ -1,5 +1,5 @@
 use crate::fast_path;
-use crate::shared::{AppContext, build_environment, load_typetree_registry};
+use crate::shared::{AppContext, build_environment, class_name_for_id, load_typetree_registry};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -123,9 +123,8 @@ fn find_object_env_fallback(
                         continue;
                     }
                     if !class_name_lc.is_empty() {
-                        let name = unity_asset::get_class_name(type_id)
-                            .unwrap_or_else(|| format!("Class_{}", type_id));
-                        if !name.to_ascii_lowercase().contains(&class_name_lc) {
+                        let name = class_name_for_id(type_id);
+                        if !name.as_ref().to_ascii_lowercase().contains(&class_name_lc) {
                             continue;
                         }
                     }
@@ -169,9 +168,8 @@ fn find_object_env_fallback(
                     continue;
                 }
                 if !class_name_lc.is_empty() {
-                    let name = unity_asset::get_class_name(type_id)
-                        .unwrap_or_else(|| format!("Class_{}", type_id));
-                    if !name.to_ascii_lowercase().contains(&class_name_lc) {
+                    let name = class_name_for_id(type_id);
+                    if !name.as_ref().to_ascii_lowercase().contains(&class_name_lc) {
                         continue;
                     }
                 }
@@ -332,9 +330,8 @@ fn find_object_fast(
                         continue;
                     }
                     if !class_name_lc.is_empty() {
-                        let name = unity_asset::get_class_name(type_id)
-                            .unwrap_or_else(|| format!("Class_{}", type_id));
-                        if !name.to_ascii_lowercase().contains(&class_name_lc) {
+                        let name = class_name_for_id(type_id);
+                        if !name.as_ref().to_ascii_lowercase().contains(&class_name_lc) {
                             continue;
                         }
                     }
@@ -391,9 +388,8 @@ fn find_object_fast(
                     continue;
                 }
                 if !class_name_lc.is_empty() {
-                    let name = unity_asset::get_class_name(type_id)
-                        .unwrap_or_else(|| format!("Class_{}", type_id));
-                    if !name.to_ascii_lowercase().contains(&class_name_lc) {
+                    let name = class_name_for_id(type_id);
+                    if !name.as_ref().to_ascii_lowercase().contains(&class_name_lc) {
                         continue;
                     }
                 }

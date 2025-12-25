@@ -88,65 +88,73 @@ impl UnityClassIdMap {
         }
     }
 
-    /// Get class name from class ID
+    /// Get class name from class ID.
     pub fn get_class_name(&self, class_id: i32) -> Option<String> {
-        // Unity class ID to name mapping (based on UnityPy and unity-rs)
-        match class_id {
-            // Core Unity objects
-            0 => Some("Object".to_string()),
-            1 => Some("GameObject".to_string()),
-            2 => Some("Component".to_string()),
-            4 => Some("Transform".to_string()),
-            8 => Some("Behaviour".to_string()),
+        self.get_class_name_str(class_id).map(str::to_string)
+    }
 
-            // Managers
-            3 => Some("LevelGameManager".to_string()),
-            5 => Some("TimeManager".to_string()),
-            6 => Some("GlobalGameManager".to_string()),
-            9 => Some("GameManager".to_string()),
-            11 => Some("AudioManager".to_string()),
-            13 => Some("InputManager".to_string()),
+    /// Get class name from class ID without allocating.
+    pub fn get_class_name_str(&self, class_id: i32) -> Option<&'static str> {
+        class_id_name(class_id)
+    }
+}
 
-            // Rendering
-            20 => Some("Camera".to_string()),
-            21 => Some("Material".to_string()),
-            23 => Some("MeshRenderer".to_string()),
-            25 => Some("Renderer".to_string()),
-            27 => Some("Texture".to_string()),
-            28 => Some("Texture2D".to_string()),
-            33 => Some("MeshFilter".to_string()),
-            43 => Some("Mesh".to_string()),
-            48 => Some("Shader".to_string()),
+fn class_id_name(class_id: i32) -> Option<&'static str> {
+    match class_id {
+        // Core Unity objects
+        0 => Some("Object"),
+        1 => Some("GameObject"),
+        2 => Some("Component"),
+        4 => Some("Transform"),
+        8 => Some("Behaviour"),
 
-            // Text and Assets
-            49 => Some("TextAsset".to_string()),
-            74 => Some("AnimationClip".to_string()),
-            83 => Some("AudioClip".to_string()),
-            89 => Some("CubemapArray".to_string()),
-            90 => Some("Avatar".to_string()),
-            91 => Some("AnimatorController".to_string()),
-            95 => Some("Animator".to_string()),
-            108 => Some("Light".to_string()),
-            114 => Some("MonoBehaviour".to_string()),
-            115 => Some("MonoScript".to_string()),
-            128 => Some("Font".to_string()),
-            142 => Some("AssetBundle".to_string()),
-            152 => Some("MovieTexture".to_string()),
-            184 => Some("RenderTexture".to_string()),
-            212 => Some("SpriteRenderer".to_string()),
-            213 => Some("Sprite".to_string()),
-            1001 => Some("PrefabInstance".to_string()),
+        // Managers
+        3 => Some("LevelGameManager"),
+        5 => Some("TimeManager"),
+        6 => Some("GlobalGameManager"),
+        9 => Some("GameManager"),
+        11 => Some("AudioManager"),
+        13 => Some("InputManager"),
 
-            // Physics
-            50 => Some("Rigidbody2D".to_string()),
-            54 => Some("Rigidbody".to_string()),
-            56 => Some("Collider".to_string()),
+        // Rendering
+        20 => Some("Camera"),
+        21 => Some("Material"),
+        23 => Some("MeshRenderer"),
+        25 => Some("Renderer"),
+        27 => Some("Texture"),
+        28 => Some("Texture2D"),
+        33 => Some("MeshFilter"),
+        43 => Some("Mesh"),
+        48 => Some("Shader"),
 
-            // Special/Unknown types that we've encountered
-            687078895 => Some("SpriteAtlas".to_string()),
+        // Text and Assets
+        49 => Some("TextAsset"),
+        74 => Some("AnimationClip"),
+        83 => Some("AudioClip"),
+        89 => Some("CubemapArray"),
+        90 => Some("Avatar"),
+        91 => Some("AnimatorController"),
+        95 => Some("Animator"),
+        108 => Some("Light"),
+        114 => Some("MonoBehaviour"),
+        115 => Some("MonoScript"),
+        128 => Some("Font"),
+        142 => Some("AssetBundle"),
+        152 => Some("MovieTexture"),
+        184 => Some("RenderTexture"),
+        212 => Some("SpriteRenderer"),
+        213 => Some("Sprite"),
+        1001 => Some("PrefabInstance"),
 
-            _ => None,
-        }
+        // Physics
+        50 => Some("Rigidbody2D"),
+        54 => Some("Rigidbody"),
+        56 => Some("Collider"),
+
+        // Editor / additional types
+        687078895 => Some("SpriteAtlas"),
+
+        _ => None,
     }
 }
 
