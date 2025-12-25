@@ -142,12 +142,7 @@ impl UnityClassIdMap {
             56 => Some("Collider".to_string()),
 
             // Special/Unknown types that we've encountered
-            687078895 => Some("SpriteAtlas".to_string()), // This is the unknown class we found
-
-            // Additional mappings based on our test results
-            256 => Some("Texture2D".to_string()), // Class_256 is likely Texture2D
-            512 => Some("SpriteAtlas".to_string()), // Class_512 is likely SpriteAtlas
-            768 => Some("Sprite".to_string()),    // Class_768 is likely Sprite
+            687078895 => Some("SpriteAtlas".to_string()),
 
             _ => None,
         }
@@ -241,6 +236,11 @@ mod tests {
             GLOBAL_CLASS_ID_MAP.get_class_name(class_ids::SPRITE_RENDERER),
             Some("SpriteRenderer".to_string())
         );
+
+        // Defensive: avoid "guess" mappings for unknown IDs.
+        assert_eq!(GLOBAL_CLASS_ID_MAP.get_class_name(256), None);
+        assert_eq!(GLOBAL_CLASS_ID_MAP.get_class_name(512), None);
+        assert_eq!(GLOBAL_CLASS_ID_MAP.get_class_name(768), None);
     }
 
     #[test]
