@@ -276,6 +276,20 @@ impl TypeTree {
         self.nodes.iter().map(|node| node.name.as_str()).collect()
     }
 
+    /// Return the minimal root-child prefix length needed to read an object name field.
+    ///
+    /// This is inspired by UnityPy's `peek_name()` strategy: we parse only the first N root fields,
+    /// stopping at `m_Name`/`name` instead of reading the full object.
+    pub fn name_peek_prefix(&self) -> Option<(usize, String)> {
+        let root = self.nodes.first()?;
+        for (i, child) in root.children.iter().enumerate() {
+            if child.name == "m_Name" || child.name == "name" {
+                return Some((i + 1, child.name.clone()));
+            }
+        }
+        None
+    }
+
     /// Clear all nodes
     pub fn clear(&mut self) {
         self.nodes.clear();

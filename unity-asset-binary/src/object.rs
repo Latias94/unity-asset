@@ -66,6 +66,35 @@ impl<'a> ObjectHandle<'a> {
     pub fn read_with_options(&self, options: TypeTreeParseOptions) -> Result<UnityObject> {
         UnityObject::from_serialized_file_with_options(self.file, self.info, options)
     }
+
+    /// Peek the object's name (`m_Name`/`name`) without parsing the full TypeTree.
+    ///
+    /// This mirrors UnityPy's `ObjectReader.peek_name()` behavior by parsing only a prefix of the
+    /// root TypeTree until the name field, when possible.
+    pub fn peek_name(&self) -> Result<Option<String>> {
+        self.peek_name_with_options(TypeTreeParseOptions {
+            mode: TypeTreeParseMode::Lenient,
+        })
+    }
+
+    pub fn peek_name_with_options(&self, options: TypeTreeParseOptions) -> Result<Option<String>> {
+        let Some(tree) = type_tree_for_object(self.file, self.info) else {
+            return Ok(None);
+        };
+        let Some((prefix_len, field)) = tree.name_peek_prefix() else {
+            return Ok(None);
+        };
+
+        let bytes = self.raw_data()?;
+        let mut reader = BinaryReader::new(bytes, self.file.header.byte_order());
+        let serializer = TypeTreeSerializer::new(tree);
+        let out = serializer.parse_object_prefix_detailed(&mut reader, options, prefix_len)?;
+
+        match out.properties.get(&field) {
+            Some(UnityValue::String(s)) => Ok(Some(s.clone())),
+            _ => Ok(None),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

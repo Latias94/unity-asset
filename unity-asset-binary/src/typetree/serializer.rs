@@ -64,10 +64,23 @@ impl<'a> TypeTreeSerializer<'a> {
         reader: &mut BinaryReader,
         options: TypeTreeParseOptions,
     ) -> Result<TypeTreeParseOutput> {
+        self.parse_object_prefix_detailed(reader, options, usize::MAX)
+    }
+
+    /// Parse only the first `root_children` fields of the root node.
+    ///
+    /// This enables UnityPy-like fast paths such as `peek_name()` where we only need a small prefix
+    /// of the TypeTree to reach `m_Name`.
+    pub fn parse_object_prefix_detailed(
+        &self,
+        reader: &mut BinaryReader,
+        options: TypeTreeParseOptions,
+        root_children: usize,
+    ) -> Result<TypeTreeParseOutput> {
         let mut out = TypeTreeParseOutput::default();
 
         if let Some(root) = self.tree.nodes.first() {
-            for child in &root.children {
+            for child in root.children.iter().take(root_children) {
                 if child.name.is_empty() {
                     continue;
                 }
