@@ -59,12 +59,12 @@ impl WebFile {
         // Decompress if necessary
         let decompressed_data: DataView = match compression {
             WebFileCompression::None => view,
-            WebFileCompression::Gzip => DataView::from_shared(SharedBytes::from_vec(
-                decompress_gzip(view.as_bytes())?,
-            )),
-            WebFileCompression::Brotli => DataView::from_shared(SharedBytes::from_vec(
-                decompress_brotli(view.as_bytes())?,
-            )),
+            WebFileCompression::Gzip => {
+                DataView::from_shared(SharedBytes::from_vec(decompress_gzip(view.as_bytes())?))
+            }
+            WebFileCompression::Brotli => {
+                DataView::from_shared(SharedBytes::from_vec(decompress_brotli(view.as_bytes())?))
+            }
         };
 
         // Create reader for decompressed data
@@ -223,10 +223,7 @@ impl WebFile {
         let start = file_info.offset as usize;
         let end = start + file_info.size as usize;
         let base = self.data.base_offset();
-        DataView::from_shared_range(
-            self.data.backing_shared(),
-            (base + start)..(base + end),
-        )
+        DataView::from_shared_range(self.data.backing_shared(), (base + start)..(base + end))
     }
 
     /// Try to parse contained files as AssetBundles
@@ -235,8 +232,10 @@ impl WebFile {
 
         for file_info in &self.files {
             if let Ok(view) = self.extract_file_view(&file_info.name) {
-                let bytes = view.as_bytes();
-                if let Ok(bundle) = crate::bundle::BundleParser::from_slice(bytes) {
+                if let Ok(bundle) = crate::bundle::BundleParser::from_shared_range(
+                    view.backing_shared(),
+                    view.absolute_range(),
+                ) {
                     bundles.push(bundle);
                 }
             }

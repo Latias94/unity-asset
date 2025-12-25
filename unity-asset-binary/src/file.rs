@@ -111,7 +111,10 @@ pub fn load_unity_file_from_shared_range(
     let bytes = view.as_bytes();
 
     if sniff_bundle(bytes) {
-        let bundle = crate::bundle::BundleParser::from_slice(bytes)?;
+        let bundle = crate::bundle::BundleParser::from_shared_range(
+            view.backing_shared(),
+            view.absolute_range(),
+        )?;
         return Ok(UnityFile::AssetBundle(bundle));
     }
 
@@ -123,10 +126,9 @@ pub fn load_unity_file_from_shared_range(
         return Ok(UnityFile::SerializedFile(file));
     }
 
-    if let Ok(web) = crate::webfile::WebFile::from_shared_range(
-        view.backing_shared(),
-        view.absolute_range(),
-    ) {
+    if let Ok(web) =
+        crate::webfile::WebFile::from_shared_range(view.backing_shared(), view.absolute_range())
+    {
         return Ok(UnityFile::WebFile(web));
     }
 

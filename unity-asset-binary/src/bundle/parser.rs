@@ -7,9 +7,12 @@ use super::compression::BundleCompression;
 use super::header::BundleHeader;
 use super::types::{AssetBundle, BundleFileInfo, BundleLoadOptions, DirectoryNode};
 use crate::compression::CompressionType;
+use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
+use crate::shared_bytes::SharedBytes;
 use crate::unity_version::UnityVersion;
+use std::ops::Range;
 
 /// Main bundle parser
 ///
@@ -30,43 +33,66 @@ impl BundleParser {
         Self::from_slice_with_options(data, BundleLoadOptions::default())
     }
 
+    /// Parse an AssetBundle from a shared backing buffer + byte range (zero-copy view).
+    pub fn from_shared_range(data: SharedBytes, range: Range<usize>) -> Result<AssetBundle> {
+        Self::from_shared_range_with_options(data, range, BundleLoadOptions::default())
+    }
+
+    /// Parse an AssetBundle from a shared backing buffer + byte range (zero-copy view), with options.
+    pub fn from_shared_range_with_options(
+        data: SharedBytes,
+        range: Range<usize>,
+        options: BundleLoadOptions,
+    ) -> Result<AssetBundle> {
+        let view = DataView::from_shared_range(data, range)?;
+        Self::from_view_with_options(view, options)
+    }
+
     /// Parse an AssetBundle from binary data with options
     pub fn from_bytes_with_options(
         data: Vec<u8>,
         options: BundleLoadOptions,
     ) -> Result<AssetBundle> {
-        Self::from_slice_with_options(&data, options)
+        let shared = SharedBytes::from_vec(data);
+        let len = shared.len();
+        Self::from_shared_range_with_options(shared, 0..len, options)
     }
 
     /// Parse an AssetBundle from a byte slice with options.
-    pub fn from_slice_with_options(
-        data: &[u8],
-        options: BundleLoadOptions,
-    ) -> Result<AssetBundle> {
-        let mut reader = BinaryReader::new(data, ByteOrder::Big);
+    pub fn from_slice_with_options(data: &[u8], options: BundleLoadOptions) -> Result<AssetBundle> {
+        // `&[u8]` has no ownership, so we need to copy to support on-demand access later.
+        // Prefer `from_shared_range` for true zero-copy parsing (e.g. mmap/WebFile views).
+        let shared = SharedBytes::from_vec(data.to_vec());
+        let len = shared.len();
+        Self::from_shared_range_with_options(shared, 0..len, options)
+    }
+
+    fn from_view_with_options(view: DataView, options: BundleLoadOptions) -> Result<AssetBundle> {
+        let bytes = view.as_bytes();
+        let mut reader = BinaryReader::new(bytes, ByteOrder::Big);
 
         // Parse header (reader position is preserved for subsequent parsing).
         let header = BundleHeader::from_reader(&mut reader)?;
 
         if options.validate {
             header.validate()?;
-            if header.size > data.len() as u64 {
+            if header.size > bytes.len() as u64 {
                 return Err(BinaryError::invalid_data(format!(
                     "Bundle header size {} exceeds available bytes {}",
                     header.size,
-                    data.len()
+                    bytes.len()
                 )));
             }
         }
 
-        // The bundle stores decompressed block data. We intentionally keep the original input buffer
-        // outside the bundle to avoid cloning large bundles.
-        let mut bundle = AssetBundle::new(header, Vec::new());
+        let mut bundle = AssetBundle::new_empty(header);
+        if bundle.header.is_legacy() {
+            bundle.set_legacy_source(view.clone());
+        }
 
-        // Parse based on bundle format
         match bundle.header.signature.as_str() {
             "UnityFS" => {
-                Self::parse_unity_fs(&mut bundle, &mut reader, &options)?;
+                Self::parse_unity_fs(&mut bundle, &view, &mut reader, &options)?;
             }
             "UnityWeb" | "UnityRaw" => {
                 Self::parse_legacy(&mut bundle, &mut reader, &options)?;
@@ -89,11 +115,12 @@ impl BundleParser {
     /// Parse UnityFS format bundle
     fn parse_unity_fs(
         bundle: &mut AssetBundle,
+        source: &DataView,
         reader: &mut BinaryReader,
         options: &BundleLoadOptions,
     ) -> Result<()> {
         // Read blocks info
-        Self::read_blocks_info(bundle, reader, options)?;
+        let block_data_start = Self::read_blocks_info(bundle, reader, options)?;
 
         // Decompress data blocks if requested OR if we need to load assets
         if options.decompress_blocks || options.load_assets {
@@ -105,6 +132,12 @@ impl BundleParser {
                 Self::load_assets(bundle, options)?;
             }
         } else {
+            let start_usize = usize::try_from(block_data_start).map_err(|_| {
+                BinaryError::ResourceLimitExceeded(
+                    "UnityFS block data start does not fit in usize".to_string(),
+                )
+            })?;
+            bundle.set_lazy_unityfs_source(source.clone(), start_usize, options.max_memory);
             // Just parse directory structure without decompressing all data
             Self::parse_directory_lazy(bundle, reader)?;
         }
@@ -183,7 +216,7 @@ impl BundleParser {
         bundle: &mut AssetBundle,
         reader: &mut BinaryReader,
         options: &BundleLoadOptions,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         // Apply version-specific alignment.
         // UnityFS uses 16-byte alignment in newer bundle formats (>=7).
         // For some older bundle formats, alignment may still be present (e.g. Unity 2019.4+),
@@ -241,6 +274,15 @@ impl BundleParser {
         // Validate blocks
         BundleCompression::validate_blocks(&bundle.blocks)?;
 
+        let total_uncompressed = bundle.blocks.iter().try_fold(0u64, |acc, b| {
+            acc.checked_add(b.uncompressed_size as u64).ok_or_else(|| {
+                BinaryError::ResourceLimitExceeded(
+                    "Total uncompressed bundle data size overflow".to_string(),
+                )
+            })
+        })?;
+        bundle.set_decompressed_len(total_uncompressed);
+
         // Parse directory information from the same blocks info data
         Self::parse_directory_from_blocks_info(bundle, &uncompressed_data, options)?;
 
@@ -252,7 +294,7 @@ impl BundleParser {
             reader.align_to(16)?;
         }
 
-        Ok(())
+        Ok(reader.position())
     }
 
     fn should_probe_legacy_alignment(header: &BundleHeader) -> bool {
@@ -287,7 +329,7 @@ impl BundleParser {
     /// Parse files from decompressed block data
     fn parse_files(bundle: &mut AssetBundle, blocks_data: Vec<u8>) -> Result<()> {
         // Store the decompressed data
-        bundle.set_data(blocks_data);
+        bundle.set_decompressed_data(blocks_data);
 
         // Create file info for each node
         for node in &bundle.nodes {
@@ -478,8 +520,17 @@ impl BundleParser {
 
     /// Load assets from the bundle files
     fn load_assets(bundle: &mut AssetBundle, options: &BundleLoadOptions) -> Result<()> {
-        let data = crate::shared_bytes::SharedBytes::from_arc(bundle.data_arc());
-        let data_len = data.len() as u64;
+        let (backing, base_offset, visible_len) = if bundle.header.is_unity_fs() {
+            let backing = crate::shared_bytes::SharedBytes::from_arc(bundle.data_arc()?);
+            let visible_len = backing.len() as u64;
+            (backing, 0usize, visible_len)
+        } else {
+            let view = bundle.legacy_source().ok_or_else(|| {
+                BinaryError::invalid_data("Legacy bundle source is not available")
+            })?;
+            let visible_len = view.len() as u64;
+            (view.backing_shared(), view.base_offset(), visible_len)
+        };
 
         // Clone nodes to avoid borrow conflicts while pushing assets.
         let nodes = bundle.nodes.clone();
@@ -495,10 +546,10 @@ impl BundleParser {
             }
 
             let end = node.offset.saturating_add(node.size);
-            if end > data_len {
+            if end > visible_len {
                 return Err(BinaryError::invalid_data(format!(
                     "Bundle node '{}' exceeds decompressed data: end {} > {}",
-                    node.name, end, data_len
+                    node.name, end, visible_len
                 )));
             }
 
@@ -524,10 +575,24 @@ impl BundleParser {
                 ))
             })?;
 
-            // Parse as a zero-copy view into the decompressed bundle buffer.
-            if let Ok(serialized_file) =
-                crate::asset::SerializedFileParser::from_shared_range(data.clone(), start..end)
-            {
+            let abs_start = base_offset.checked_add(start).ok_or_else(|| {
+                BinaryError::ResourceLimitExceeded(format!(
+                    "Bundle node '{}' absolute start overflow",
+                    node.name
+                ))
+            })?;
+            let abs_end = base_offset.checked_add(end).ok_or_else(|| {
+                BinaryError::ResourceLimitExceeded(format!(
+                    "Bundle node '{}' absolute end overflow",
+                    node.name
+                ))
+            })?;
+
+            // Parse as a zero-copy view into the backing buffer (UnityFS decompressed buffer or legacy source).
+            if let Ok(serialized_file) = crate::asset::SerializedFileParser::from_shared_range(
+                backing.clone(),
+                abs_start..abs_end,
+            ) {
                 bundle.assets.push(serialized_file);
                 bundle.asset_names.push(node.name.clone());
             }
@@ -597,13 +662,15 @@ mod tests {
 
     #[test]
     fn load_assets_rejects_out_of_bounds_node() {
-        let mut bundle = AssetBundle::new(BundleHeader::default(), Vec::new());
-        bundle.set_data(vec![0u8; 8]);
+        let mut header = BundleHeader::default();
+        header.signature = "UnityFS".to_string();
+        let mut bundle = AssetBundle::new(header, vec![0u8; 8]);
         bundle
             .nodes
             .push(DirectoryNode::new("a.assets".to_string(), 1024, 4, 0x4));
 
-        let err = BundleParser::load_assets(&mut bundle, &BundleLoadOptions::default()).unwrap_err();
+        let err =
+            BundleParser::load_assets(&mut bundle, &BundleLoadOptions::default()).unwrap_err();
         assert!(matches!(err, BinaryError::InvalidData(_)));
     }
 }

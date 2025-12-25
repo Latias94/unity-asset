@@ -5,8 +5,20 @@
 use super::header::BundleHeader;
 use crate::asset::Asset;
 use crate::compression::CompressionBlock;
+use crate::data_view::DataView;
+use crate::error::{BinaryError, Result};
+use crate::reader::{BinaryReader, ByteOrder};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone)]
+struct LazyDecompress {
+    source: DataView,
+    block_data_start: usize,
+    max_memory: Option<usize>,
+}
 
 /// Information about a file within the bundle
 ///
@@ -105,13 +117,22 @@ pub struct AssetBundle {
     pub assets: Vec<Asset>,
     /// Asset file names within the bundle (aligned with `assets` indices).
     pub asset_names: Vec<String>,
-    /// Raw bundle data
-    data: Arc<[u8]>,
+    /// Raw source view for legacy bundles (UnityWeb/UnityRaw). UnityFS uses decompressed blocks data.
+    legacy_source: Option<DataView>,
+    /// Decompressed bundle data (UnityFS blocks data), initialized lazily.
+    decompressed: OnceLock<Arc<[u8]>>,
+    decompress_lock: Mutex<()>,
+    lazy: Mutex<Option<LazyDecompress>>,
+    decompressed_len: u64,
 }
 
 impl AssetBundle {
     /// Create a new AssetBundle
     pub fn new(header: BundleHeader, data: Vec<u8>) -> Self {
+        let decompressed_len = data.len() as u64;
+        let decompressed: Arc<[u8]> = data.into();
+        let lock = OnceLock::new();
+        let _ = lock.set(decompressed);
         Self {
             header,
             blocks: Vec::new(),
@@ -119,27 +140,137 @@ impl AssetBundle {
             files: Vec::new(),
             assets: Vec::new(),
             asset_names: Vec::new(),
-            data: data.into(),
+            legacy_source: None,
+            decompressed: lock,
+            decompress_lock: Mutex::new(()),
+            lazy: Mutex::new(None),
+            decompressed_len,
         }
     }
 
-    /// Get the raw bundle data
+    pub(crate) fn new_empty(header: BundleHeader) -> Self {
+        Self {
+            header,
+            blocks: Vec::new(),
+            nodes: Vec::new(),
+            files: Vec::new(),
+            assets: Vec::new(),
+            asset_names: Vec::new(),
+            legacy_source: None,
+            decompressed: OnceLock::new(),
+            decompress_lock: Mutex::new(()),
+            lazy: Mutex::new(None),
+            decompressed_len: 0,
+        }
+    }
+
+    pub(crate) fn set_decompressed_len(&mut self, len: u64) {
+        self.decompressed_len = len;
+    }
+
+    pub(crate) fn set_legacy_source(&mut self, source: DataView) {
+        self.legacy_source = Some(source);
+    }
+
+    pub(crate) fn legacy_source(&self) -> Option<&DataView> {
+        self.legacy_source.as_ref()
+    }
+
+    pub(crate) fn set_lazy_unityfs_source(
+        &mut self,
+        source: DataView,
+        block_data_start: usize,
+        max_memory: Option<usize>,
+    ) {
+        let mut guard = self.lazy.lock().unwrap();
+        *guard = Some(LazyDecompress {
+            source,
+            block_data_start,
+            max_memory,
+        });
+    }
+
+    pub(crate) fn set_decompressed_data(&mut self, data: Vec<u8>) {
+        self.decompressed_len = data.len() as u64;
+        let arc: Arc<[u8]> = data.into();
+        let _ = self.decompressed.set(arc);
+        let mut guard = self.lazy.lock().unwrap();
+        *guard = None;
+    }
+
+    /// Get the decompressed bundle data, decompressing UnityFS blocks on demand.
+    pub fn data_checked(&self) -> Result<&[u8]> {
+        if let Some(bytes) = self.decompressed.get() {
+            return Ok(bytes.as_ref());
+        }
+
+        if self.header.is_legacy() {
+            return self
+                .legacy_source
+                .as_ref()
+                .map(|v| v.as_bytes())
+                .ok_or_else(|| BinaryError::invalid_data("Legacy bundle source is not available"));
+        }
+
+        let _guard = self.decompress_lock.lock().unwrap();
+        if let Some(bytes) = self.decompressed.get() {
+            return Ok(bytes.as_ref());
+        }
+
+        let lazy = self.lazy.lock().unwrap().clone().ok_or_else(|| {
+            BinaryError::invalid_data(
+                "Bundle data is not available (not decompressed and no source)",
+            )
+        })?;
+
+        let mut reader = BinaryReader::new(lazy.source.as_bytes(), ByteOrder::Big);
+        reader.set_position(lazy.block_data_start as u64)?;
+        let data = super::compression::BundleCompression::decompress_data_blocks_limited(
+            &self.header,
+            &self.blocks,
+            &mut reader,
+            lazy.max_memory,
+        )?;
+        let arc: Arc<[u8]> = data.into();
+        let _ = self.decompressed.set(arc);
+
+        Ok(self
+            .decompressed
+            .get()
+            .ok_or_else(|| BinaryError::generic("Failed to initialize decompressed bundle data"))?
+            .as_ref())
+    }
+
+    /// Get the raw bundle data if already decompressed, otherwise returns an empty slice.
     pub fn data(&self) -> &[u8] {
-        self.data.as_ref()
+        self.decompressed
+            .get()
+            .map(|v| v.as_ref())
+            .or_else(|| self.legacy_source.as_ref().map(|v| v.as_bytes()))
+            .unwrap_or(&[])
     }
 
-    /// Get a shared reference to the raw bundle data.
-    pub fn data_arc(&self) -> Arc<[u8]> {
-        self.data.clone()
-    }
-
-    pub(crate) fn set_data(&mut self, data: Vec<u8>) {
-        self.data = data.into();
+    /// Get a shared reference to the decompressed bundle data, decompressing on demand.
+    pub fn data_arc(&self) -> Result<Arc<[u8]>> {
+        let _ = self.data_checked()?;
+        self.decompressed
+            .get()
+            .cloned()
+            .ok_or_else(|| BinaryError::generic("Decompressed bundle data missing"))
     }
 
     /// Get the total size of the bundle
     pub fn size(&self) -> u64 {
-        self.data.len() as u64
+        if let Some(bytes) = self.decompressed.get() {
+            bytes.len() as u64
+        } else if self.header.is_legacy() {
+            self.legacy_source
+                .as_ref()
+                .map(|v| v.len() as u64)
+                .unwrap_or(0)
+        } else {
+            self.decompressed_len
+        }
     }
 
     /// Check if the bundle is compressed
@@ -190,10 +321,12 @@ impl AssetBundle {
     }
 
     pub fn extract_file_slice(&self, file: &BundleFileInfo) -> crate::error::Result<&[u8]> {
-        let end_u64 = file.offset.checked_add(file.size).ok_or_else(|| {
-            crate::error::BinaryError::invalid_data("File offset+size overflow")
-        })?;
-        if end_u64 > self.data.len() as u64 {
+        let end_u64 = file
+            .offset
+            .checked_add(file.size)
+            .ok_or_else(|| crate::error::BinaryError::invalid_data("File offset+size overflow"))?;
+        let data = self.data_checked()?;
+        if end_u64 > data.len() as u64 {
             return Err(crate::error::BinaryError::invalid_data(
                 "File offset/size exceeds bundle data",
             ));
@@ -214,7 +347,7 @@ impl AssetBundle {
                 "File slice start exceeds end",
             ));
         }
-        Ok(&self.data[start..end])
+        Ok(&data[start..end])
     }
 
     /// Extract data for a specific node
@@ -224,10 +357,12 @@ impl AssetBundle {
     }
 
     pub fn extract_node_slice(&self, node: &DirectoryNode) -> crate::error::Result<&[u8]> {
-        let end_u64 = node.offset.checked_add(node.size).ok_or_else(|| {
-            crate::error::BinaryError::invalid_data("Node offset+size overflow")
-        })?;
-        if end_u64 > self.data.len() as u64 {
+        let end_u64 = node
+            .offset
+            .checked_add(node.size)
+            .ok_or_else(|| crate::error::BinaryError::invalid_data("Node offset+size overflow"))?;
+        let data = self.data_checked()?;
+        if end_u64 > data.len() as u64 {
             return Err(crate::error::BinaryError::invalid_data(
                 "Node offset/size exceeds bundle data",
             ));
@@ -248,7 +383,7 @@ impl AssetBundle {
                 "Node slice start exceeds end",
             ));
         }
-        Ok(&self.data[start..end])
+        Ok(&data[start..end])
     }
 
     /// Get bundle statistics
