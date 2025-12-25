@@ -126,6 +126,10 @@ enum Commands {
         #[arg(long, conflicts_with = "overwrite")]
         resume: Option<PathBuf>,
 
+        /// Continue exporting even if some entries fail; failed entries are recorded in the manifest
+        #[arg(long)]
+        continue_on_error: bool,
+
         /// Parallel export jobs (0 = auto, 1 = serial)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
@@ -250,6 +254,7 @@ fn main() -> Result<()> {
             skip_existing,
             manifest,
             resume,
+            continue_on_error,
             jobs,
         } => export_bundle_command(
             input,
@@ -264,6 +269,7 @@ fn main() -> Result<()> {
             skip_existing,
             manifest,
             resume,
+            continue_on_error,
             jobs,
             strict,
             show_warnings,
@@ -601,6 +607,7 @@ enum ExportStatus {
     ExportedDecoded,
     SkippedExisting,
     Resumed,
+    Failed,
     Planned,
 }
 
@@ -617,6 +624,8 @@ struct ExportManifestEntry {
     status: ExportStatus,
     output_path: Option<String>,
     output_bytes: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -640,6 +649,8 @@ struct ExportManifest {
     skipped_existing: usize,
     #[serde(default)]
     resumed: usize,
+    #[serde(default)]
+    failed: usize,
     filtered: usize,
     entries: Vec<ExportManifestEntry>,
 }
@@ -752,6 +763,7 @@ fn export_bundle_command(
     skip_existing: bool,
     manifest: Option<PathBuf>,
     resume: Option<PathBuf>,
+    continue_on_error: bool,
     jobs: usize,
     strict: bool,
     show_warnings: bool,
@@ -855,6 +867,7 @@ fn export_bundle_command(
                                     status: ExportStatus::Resumed,
                                     output_path: Some(prev_path.to_string_lossy().to_string()),
                                     output_bytes: prev.output_bytes,
+                                    error: None,
                                 },
                             });
                             order += 1;
@@ -913,6 +926,7 @@ fn export_bundle_command(
                     skipped_unresolved: skipped,
                     skipped_existing: 0,
                     resumed: 0,
+                    failed: 0,
                     filtered,
                     entries: Vec::new(),
                 },
@@ -968,6 +982,7 @@ fn export_bundle_command(
                     status: ExportStatus::SkippedExisting,
                     output_path: Some(dest.to_string_lossy().to_string()),
                     output_bytes: None,
+                    error: None,
                 });
                 continue;
             }
@@ -985,6 +1000,7 @@ fn export_bundle_command(
                 status: ExportStatus::Planned,
                 output_path: Some(dest.to_string_lossy().to_string()),
                 output_bytes: None,
+                error: None,
             });
         }
         manifest_entries.sort_by_key(|e| e.order);
@@ -1018,6 +1034,7 @@ fn export_bundle_command(
                     skipped_unresolved: skipped,
                     skipped_existing: skipped_existing_count + resumed_count,
                     resumed: resumed_count,
+                    failed: 0,
                     filtered,
                     entries: manifest_entries,
                 },
@@ -1069,6 +1086,7 @@ fn export_bundle_command(
                     skipped_unresolved: skipped,
                     skipped_existing: resumed,
                     resumed,
+                    failed: 0,
                     filtered,
                     entries,
                 },
@@ -1099,6 +1117,7 @@ fn export_bundle_command(
     let abort = Arc::new(AtomicBool::new(false));
     let exported = Arc::new(AtomicUsize::new(0));
     let skipped_existing = Arc::new(AtomicUsize::new(0));
+    let failed_count = Arc::new(AtomicUsize::new(0));
     let results: Arc<Mutex<Vec<ExportOutcome>>> = Arc::new(Mutex::new(Vec::new()));
     let first_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
@@ -1110,6 +1129,7 @@ fn export_bundle_command(
             let abort = Arc::clone(&abort);
             let exported = Arc::clone(&exported);
             let skipped_existing = Arc::clone(&skipped_existing);
+            let failed_count = Arc::clone(&failed_count);
             let results = Arc::clone(&results);
             let first_error = Arc::clone(&first_error);
             let allocator = Arc::clone(&allocator);
@@ -1138,18 +1158,58 @@ fn export_bundle_command(
                         overwrite,
                         skip_existing,
                     ) {
-                        Ok(v) => v,
+                        Ok(v) => Some(v),
                         Err(e) => {
-                            abort.store(true, Ordering::Relaxed);
-                            let mut slot = match first_error.lock() {
-                                Ok(v) => v,
-                                Err(e) => e.into_inner(),
-                            };
-                            if slot.is_none() {
-                                *slot = Some(format!("{} (key={})", e, job.key));
+                            if continue_on_error {
+                                failed_count.fetch_add(1, Ordering::Relaxed);
+                                let (type_id, _) = lookup_object_type_info(&env, &job.key);
+                                let class_name = if type_id == 0 {
+                                    None
+                                } else {
+                                    Some(
+                                        unity_asset::get_class_name(type_id)
+                                            .unwrap_or_else(|| format!("Class_{}", type_id)),
+                                    )
+                                };
+                                Some(ExportOutcome {
+                                    order: job.order,
+                                    message: format!(
+                                        "FAILED {} (key={}) error={}",
+                                        job.asset_path, job.key, e
+                                    ),
+                                    did_export: false,
+                                    did_skip_existing: false,
+                                    entry: ExportManifestEntry {
+                                        order: job.order,
+                                        asset_path: job.asset_path.clone(),
+                                        key: job.key.to_string(),
+                                        source_kind: format!("{:?}", job.key.source_kind),
+                                        asset_index: job.key.asset_index,
+                                        path_id: job.key.path_id,
+                                        type_id: if type_id == 0 { None } else { Some(type_id) },
+                                        class_name,
+                                        status: ExportStatus::Failed,
+                                        output_path: None,
+                                        output_bytes: None,
+                                        error: Some(e.to_string()),
+                                    },
+                                })
+                            } else {
+                                abort.store(true, Ordering::Relaxed);
+                                let mut slot = match first_error.lock() {
+                                    Ok(v) => v,
+                                    Err(e) => e.into_inner(),
+                                };
+                                if slot.is_none() {
+                                    *slot = Some(format!("{} (key={})", e, job.key));
+                                }
+                                None
                             }
-                            break;
                         }
+                    };
+
+                    let Some(outcome) = outcome else {
+                        break;
                     };
 
                     if outcome.did_export {
@@ -1206,6 +1266,7 @@ fn export_bundle_command(
                 skipped_unresolved: skipped,
                 skipped_existing: skipped_existing_total,
                 resumed,
+                failed: failed_count.load(Ordering::Relaxed),
                 filtered,
                 entries,
             },
@@ -1220,13 +1281,32 @@ fn export_bundle_command(
         println!("{}", o.message);
     }
 
+    let failed = failed_count.load(Ordering::Relaxed);
+    if continue_on_error && failed > 0 {
+        println!(
+            "Exported {} entries, skipped {} (unresolved), skipped {} (existing), filtered {}, resumed {}, failed {} [jobs={}]",
+            exported.load(Ordering::Relaxed),
+            skipped,
+            skipped_existing.load(Ordering::Relaxed) + resumed,
+            filtered,
+            resumed,
+            failed,
+            threads,
+        );
+        return Err(anyhow::anyhow!(
+            "{} entries failed (use --manifest to inspect, or re-run with --resume)",
+            failed
+        ));
+    }
+
     println!(
-        "Exported {} entries, skipped {} (unresolved), skipped {} (existing), filtered {}, resumed {} [jobs={}]",
+        "Exported {} entries, skipped {} (unresolved), skipped {} (existing), filtered {}, resumed {}, failed {} [jobs={}]",
         exported.load(Ordering::Relaxed),
         skipped,
         skipped_existing.load(Ordering::Relaxed) + resumed,
         filtered,
         resumed,
+        failed,
         threads,
     );
     Ok(())
@@ -1280,6 +1360,7 @@ fn export_one_entry(
                         status: ExportStatus::ExportedDecoded,
                         output_path: Some(dest.to_string_lossy().to_string()),
                         output_bytes,
+                        error: None,
                     },
                 });
             }
@@ -1301,6 +1382,7 @@ fn export_one_entry(
                         status: ExportStatus::SkippedExisting,
                         output_path: Some(dest.to_string_lossy().to_string()),
                         output_bytes: None,
+                        error: None,
                     },
                 });
             }
@@ -1337,6 +1419,7 @@ fn export_one_entry(
                 status: ExportStatus::SkippedExisting,
                 output_path: Some(dest.to_string_lossy().to_string()),
                 output_bytes: None,
+                error: None,
             },
         });
     }
@@ -1370,6 +1453,7 @@ fn export_one_entry(
             status: ExportStatus::ExportedRaw,
             output_path: Some(dest.to_string_lossy().to_string()),
             output_bytes: Some(bytes.len() as u64),
+            error: None,
         },
     })
 }
