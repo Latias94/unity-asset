@@ -239,9 +239,7 @@ impl MeshParser {
     fn extract_local_aabb(&self, mesh: &mut Mesh, value: &UnityValue) -> Result<()> {
         if let UnityValue::Object(aabb_obj) = value {
             // Extract center
-            if let Some(center_value) = aabb_obj.get("m_Center")
-                && let UnityValue::Object(center_obj) = center_value
-            {
+            if let Some(UnityValue::Object(center_obj)) = aabb_obj.get("m_Center") {
                 if let Some(UnityValue::Float(x)) = center_obj.get("x") {
                     mesh.local_aabb.center_x = *x as f32;
                 }
@@ -254,9 +252,7 @@ impl MeshParser {
             }
 
             // Extract extent
-            if let Some(extent_value) = aabb_obj.get("m_Extent")
-                && let UnityValue::Object(extent_obj) = extent_value
-            {
+            if let Some(UnityValue::Object(extent_obj)) = aabb_obj.get("m_Extent") {
                 if let Some(UnityValue::Float(x)) = extent_obj.get("x") {
                     mesh.local_aabb.extent_x = *x as f32;
                 }

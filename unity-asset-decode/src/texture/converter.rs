@@ -61,40 +61,54 @@ impl Texture2DConverter {
 
         let props = obj.class.properties();
 
-        let mut texture = Texture2D::default();
-
-        texture.name = props
+        let name = props
             .get("m_Name")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-
-        texture.width = props.get("m_Width").and_then(as_i32).unwrap_or(0);
-        texture.height = props.get("m_Height").and_then(as_i32).unwrap_or(0);
-        texture.complete_image_size = props
+        let width = props.get("m_Width").and_then(as_i32).unwrap_or(0);
+        let height = props.get("m_Height").and_then(as_i32).unwrap_or(0);
+        let complete_image_size = props
             .get("m_CompleteImageSize")
             .and_then(as_i32)
             .unwrap_or(0);
-        texture.image_count = props.get("m_ImageCount").and_then(as_i32).unwrap_or(1);
-        texture.texture_dimension = props
+        let image_count = props.get("m_ImageCount").and_then(as_i32).unwrap_or(1);
+        let texture_dimension = props
             .get("m_TextureDimension")
             .and_then(as_i32)
             .unwrap_or(2);
-        texture.light_map_format = props.get("m_LightmapFormat").and_then(as_i32).unwrap_or(0);
-        texture.color_space = props.get("m_ColorSpace").and_then(as_i32).unwrap_or(0);
-        texture.is_readable = props
+        let light_map_format = props.get("m_LightmapFormat").and_then(as_i32).unwrap_or(0);
+        let color_space = props.get("m_ColorSpace").and_then(as_i32).unwrap_or(0);
+        let is_readable = props
             .get("m_IsReadable")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        texture.mip_map = props
+        let mip_map = props
             .get("m_MipMap")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        texture.mip_count = props.get("m_MipCount").and_then(as_i32).unwrap_or(1);
+        let mip_count = props.get("m_MipCount").and_then(as_i32).unwrap_or(1);
+        let format = props
+            .get("m_TextureFormat")
+            .and_then(as_i32)
+            .map(TextureFormat::from)
+            .unwrap_or(TextureFormat::Unknown);
 
-        if let Some(fmt) = props.get("m_TextureFormat").and_then(as_i32) {
-            texture.format = TextureFormat::from(fmt);
-        }
+        let mut texture = Texture2D {
+            name,
+            width,
+            height,
+            complete_image_size,
+            format,
+            mip_map,
+            mip_count,
+            is_readable,
+            image_count,
+            texture_dimension,
+            light_map_format,
+            color_space,
+            ..Default::default()
+        };
 
         if let Some(UnityValue::Object(settings)) = props.get("m_TextureSettings") {
             texture.texture_settings.filter_mode =
@@ -121,13 +135,13 @@ impl Texture2DConverter {
                 UnityValue::Array(items) => {
                     let mut bytes = Vec::with_capacity(items.len());
                     for item in items {
-                        if let Some(n) = item.as_i64()
-                            && let Ok(b) = u8::try_from(n)
-                        {
-                            bytes.push(b);
-                        } else {
+                        let Some(n) = item.as_i64() else {
                             break;
-                        }
+                        };
+                        let Ok(b) = u8::try_from(n) else {
+                            break;
+                        };
+                        bytes.push(b);
                     }
                     texture.data_size = bytes.len() as i32;
                     texture.image_data = bytes;

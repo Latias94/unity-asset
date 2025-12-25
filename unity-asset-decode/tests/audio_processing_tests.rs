@@ -360,41 +360,39 @@ fn test_advanced_audio_extraction() {
                                     unity_object.path_id()
                                 );
 
-                                if let Some(name_value) = unity_class.get("m_Name")
-                                    && let unity_asset_core::UnityValue::String(name) = name_value
+                                if let Some(unity_asset_core::UnityValue::String(name)) =
+                                    unity_class.get("m_Name")
                                 {
                                     println!("      Name: '{}'", name);
                                 }
 
-                                if let Some(format_value) = unity_class.get("m_CompressionFormat")
-                                    && let unity_asset_core::UnityValue::Integer(format_id) =
-                                        format_value
+                                if let Some(unity_asset_core::UnityValue::Integer(format_id)) =
+                                    unity_class.get("m_CompressionFormat")
                                 {
                                     let format = AudioCompressionFormat::from((*format_id) as i32);
                                     println!("      Format: {:?} ({})", format, format.info().name);
                                 }
 
-                                if let Some(freq_value) = unity_class.get("m_Frequency")
-                                    && let unity_asset_core::UnityValue::Integer(freq) = freq_value
+                                if let Some(unity_asset_core::UnityValue::Integer(freq)) =
+                                    unity_class.get("m_Frequency")
                                 {
                                     println!("      Frequency: {} Hz", freq);
                                 }
 
-                                if let Some(channels_value) = unity_class.get("m_Channels")
-                                    && let unity_asset_core::UnityValue::Integer(channels) =
-                                        channels_value
+                                if let Some(unity_asset_core::UnityValue::Integer(channels)) =
+                                    unity_class.get("m_Channels")
                                 {
                                     println!("      Channels: {}", channels);
                                 }
 
-                                if let Some(bits_value) = unity_class.get("m_BitsPerSample")
-                                    && let unity_asset_core::UnityValue::Integer(bits) = bits_value
+                                if let Some(unity_asset_core::UnityValue::Integer(bits)) =
+                                    unity_class.get("m_BitsPerSample")
                                 {
                                     println!("      Bits per sample: {}", bits);
                                 }
 
-                                if let Some(size_value) = unity_class.get("m_Size")
-                                    && let unity_asset_core::UnityValue::Integer(size) = size_value
+                                if let Some(unity_asset_core::UnityValue::Integer(size)) =
+                                    unity_class.get("m_Size")
                                 {
                                     println!("      Data size: {} bytes", size);
                                 }
