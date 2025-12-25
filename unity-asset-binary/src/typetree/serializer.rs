@@ -4,6 +4,7 @@
 //! Unity objects using TypeTree information.
 
 use super::types::{TypeTree, TypeTreeNode};
+use crate::asset::SerializedType;
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
 use indexmap::IndexMap;
@@ -52,6 +53,13 @@ pub struct TypeTreeParseOutput {
     pub warnings: Vec<TypeTreeParseWarning>,
 }
 
+#[derive(Debug)]
+struct TypeTreeParseContext<'a> {
+    options: TypeTreeParseOptions,
+    ref_types: Option<&'a [SerializedType]>,
+    has_managed_registry: bool,
+}
+
 impl<'a> TypeTreeSerializer<'a> {
     const MAX_ARRAY_LEN: usize = 1_000_000;
     const MAX_TYPELESSDATA_LEN: usize = Self::MAX_ARRAY_LEN;
@@ -68,12 +76,31 @@ impl<'a> TypeTreeSerializer<'a> {
             .properties)
     }
 
+    pub fn parse_object_with_ref_types(
+        &self,
+        reader: &mut BinaryReader,
+        ref_types: &'a [SerializedType],
+    ) -> Result<IndexMap<String, UnityValue>> {
+        Ok(self
+            .parse_object_detailed_with_ref_types(reader, TypeTreeParseOptions::default(), ref_types)?
+            .properties)
+    }
+
     pub fn parse_object_detailed(
         &self,
         reader: &mut BinaryReader,
         options: TypeTreeParseOptions,
     ) -> Result<TypeTreeParseOutput> {
         self.parse_object_prefix_detailed(reader, options, usize::MAX)
+    }
+
+    pub fn parse_object_detailed_with_ref_types(
+        &self,
+        reader: &mut BinaryReader,
+        options: TypeTreeParseOptions,
+        ref_types: &'a [SerializedType],
+    ) -> Result<TypeTreeParseOutput> {
+        self.parse_object_prefix_detailed_with_ref_types(reader, options, usize::MAX, ref_types)
     }
 
     /// Parse only the first `root_children` fields of the root node.
@@ -86,6 +113,41 @@ impl<'a> TypeTreeSerializer<'a> {
         options: TypeTreeParseOptions,
         root_children: usize,
     ) -> Result<TypeTreeParseOutput> {
+        self.parse_object_prefix_ctx(
+            reader,
+            TypeTreeParseContext {
+                options,
+                ref_types: None,
+                has_managed_registry: false,
+            },
+            root_children,
+        )
+    }
+
+    pub fn parse_object_prefix_detailed_with_ref_types(
+        &self,
+        reader: &mut BinaryReader,
+        options: TypeTreeParseOptions,
+        root_children: usize,
+        ref_types: &'a [SerializedType],
+    ) -> Result<TypeTreeParseOutput> {
+        self.parse_object_prefix_ctx(
+            reader,
+            TypeTreeParseContext {
+                options,
+                ref_types: Some(ref_types),
+                has_managed_registry: false,
+            },
+            root_children,
+        )
+    }
+
+    fn parse_object_prefix_ctx(
+        &self,
+        reader: &mut BinaryReader,
+        mut ctx: TypeTreeParseContext<'a>,
+        root_children: usize,
+    ) -> Result<TypeTreeParseOutput> {
         let mut out = TypeTreeParseOutput::default();
 
         if let Some(root) = self.tree.nodes.first() {
@@ -93,7 +155,7 @@ impl<'a> TypeTreeSerializer<'a> {
                 if child.name.is_empty() {
                     continue;
                 }
-                match self.parse_value_by_type(reader, child) {
+                match self.parse_value_by_type_ctx(reader, child, &mut ctx) {
                     Ok(value) => {
                         out.properties.insert(child.name.clone(), value);
                     }
@@ -101,7 +163,7 @@ impl<'a> TypeTreeSerializer<'a> {
                         if reader.remaining() == 0 {
                             break;
                         }
-                        match options.mode {
+                        match ctx.options.mode {
                             TypeTreeParseMode::Strict => return Err(e),
                             TypeTreeParseMode::Lenient => out.warnings.push(TypeTreeParseWarning {
                                 field: child.name.clone(),
@@ -386,10 +448,11 @@ impl<'a> TypeTreeSerializer<'a> {
     }
 
     /// Parse value based on TypeTree node type
-    fn parse_value_by_type(
+    fn parse_value_by_type_ctx(
         &self,
         reader: &mut BinaryReader,
         node: &TypeTreeNode,
+        ctx: &mut TypeTreeParseContext<'a>,
     ) -> Result<UnityValue> {
         let value = match node.type_name.as_str() {
             // Signed integers
@@ -472,14 +535,66 @@ impl<'a> TypeTreeSerializer<'a> {
             _ if !node.children.is_empty()
                 && node.children.iter().any(|c| c.type_name == "Array") =>
             {
-                self.parse_array(reader, node)?
+                self.parse_array(reader, node, ctx)?
             }
 
             // Pair type
             "pair" if node.children.len() == 2 => {
-                let first = self.parse_value_by_type(reader, &node.children[0])?;
-                let second = self.parse_value_by_type(reader, &node.children[1])?;
+                let first = self.parse_value_by_type_ctx(reader, &node.children[0], ctx)?;
+                let second = self.parse_value_by_type_ctx(reader, &node.children[1], ctx)?;
                 UnityValue::Array(vec![first, second])
+            }
+
+            // Managed reference payload (`SerializeReference`): best-effort typed parsing via `ref_types`.
+            "ReferencedObject" => {
+                let mut nested = IndexMap::new();
+                for child in &node.children {
+                    if child.type_name == "ManagedReferencesRegistry" {
+                        // Consume bytes without allocating: we only need the file-level `ref_types`
+                        // list for resolving `ReferencedObjectData`.
+                        ctx.has_managed_registry = true;
+                        let mut dummy = PPtrScanResult::default();
+                        self.scan_value(reader, child, &mut dummy)?;
+                        continue;
+                    }
+
+                    if child.type_name == "ReferencedObjectData" {
+                        let resolved = ctx
+                            .ref_types
+                            .and_then(|r| resolve_ref_type_tree(&nested, r));
+                        if let Some(tree) = resolved {
+                            if let Some(root) = tree.nodes.first() {
+                                let mut props = IndexMap::new();
+                                for field in &root.children {
+                                    if field.name.is_empty() {
+                                        continue;
+                                    }
+                                    let v = self.parse_value_by_type_ctx(reader, field, ctx)?;
+                                    props.insert(field.name.clone(), v);
+                                }
+                                if !child.name.is_empty() {
+                                    nested.insert(child.name.clone(), UnityValue::Object(props));
+                                }
+                                continue;
+                            }
+                        }
+
+                        // Fallback: parse according to the placeholder node.
+                        let v = self.parse_value_by_type_ctx(reader, child, ctx)?;
+                        if !child.name.is_empty() {
+                            nested.insert(child.name.clone(), v);
+                        }
+                        continue;
+                    }
+
+                    if !child.name.is_empty() {
+                        let v = self.parse_value_by_type_ctx(reader, child, ctx)?;
+                        nested.insert(child.name.clone(), v);
+                    } else {
+                        let _ = self.parse_value_by_type_ctx(reader, child, ctx)?;
+                    }
+                }
+                UnityValue::Object(nested)
             }
 
             // Complex object types
@@ -487,9 +602,24 @@ impl<'a> TypeTreeSerializer<'a> {
                 if !node.children.is_empty() {
                     let mut nested_props = IndexMap::new();
                     for child in &node.children {
+                        if child.type_name == "ManagedReferencesRegistry" {
+                            // UnityPy uses a `has_registry` guard to avoid parsing multiple registries.
+                            // We skip registry nodes to keep parsing fast while remaining byte-accurate.
+                            if ctx.has_managed_registry {
+                                let mut dummy = PPtrScanResult::default();
+                                self.scan_value(reader, child, &mut dummy)?;
+                                continue;
+                            }
+                            ctx.has_managed_registry = true;
+                            let mut dummy = PPtrScanResult::default();
+                            self.scan_value(reader, child, &mut dummy)?;
+                            continue;
+                        }
                         if !child.name.is_empty() {
-                            let child_value = self.parse_value_by_type(reader, child)?;
+                            let child_value = self.parse_value_by_type_ctx(reader, child, ctx)?;
                             nested_props.insert(child.name.clone(), child_value);
+                        } else {
+                            let _ = self.parse_value_by_type_ctx(reader, child, ctx)?;
                         }
                     }
                     UnityValue::Object(nested_props)
@@ -516,7 +646,12 @@ impl<'a> TypeTreeSerializer<'a> {
     }
 
     /// Parse array from TypeTree node
-    fn parse_array(&self, reader: &mut BinaryReader, node: &TypeTreeNode) -> Result<UnityValue> {
+    fn parse_array(
+        &self,
+        reader: &mut BinaryReader,
+        node: &TypeTreeNode,
+        ctx: &mut TypeTreeParseContext<'a>,
+    ) -> Result<UnityValue> {
         // Find the Array child node
         let array_node = node
             .children
@@ -703,7 +838,7 @@ impl<'a> TypeTreeSerializer<'a> {
         }
 
         for _ in 0..size {
-            let element = self.parse_value_by_type(reader, element_node)?;
+            let element = self.parse_value_by_type_ctx(reader, element_node, ctx)?;
             elements.push(element);
         }
 
@@ -914,6 +1049,47 @@ impl<'a> TypeTreeSerializer<'a> {
             }
         }
     }
+}
+
+fn resolve_ref_type_tree<'a>(
+    referenced_object: &IndexMap<String, UnityValue>,
+    ref_types: &'a [SerializedType],
+) -> Option<&'a TypeTree> {
+    let type_v = referenced_object.get("type")?;
+    let type_obj = type_v.as_object()?;
+
+    fn get_str_ci(map: &IndexMap<String, UnityValue>, keys: &[&str]) -> Option<String> {
+        for key in keys {
+            for (k, v) in map.iter() {
+                if k.eq_ignore_ascii_case(key) {
+                    if let UnityValue::String(s) = v {
+                        return Some(s.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    let class = get_str_ci(type_obj, &["class", "m_ClassName"])?;
+    if class.is_empty() {
+        return None;
+    }
+    let ns = get_str_ci(type_obj, &["ns", "m_NameSpace"]).unwrap_or_default();
+    let asm = get_str_ci(type_obj, &["asm", "m_AssemblyName"]).unwrap_or_default();
+
+    ref_types.iter().find_map(|t| {
+        if !t.class_name.is_empty()
+            && t.class_name == class
+            && t.namespace == ns
+            && t.assembly_name == asm
+            && !t.type_tree.is_empty()
+        {
+            Some(&t.type_tree)
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(test)]

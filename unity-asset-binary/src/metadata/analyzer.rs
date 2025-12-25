@@ -364,7 +364,11 @@ fn parse_object_with_typetree(
     let bytes = asset.object_bytes(info)?;
     let mut reader = BinaryReader::new(bytes, asset.header.byte_order());
     let serializer = TypeTreeSerializer::new(tree);
-    serializer.parse_object(&mut reader)
+    if asset.ref_types.is_empty() {
+        serializer.parse_object(&mut reader)
+    } else {
+        serializer.parse_object_with_ref_types(&mut reader, &asset.ref_types)
+    }
 }
 
 fn scan_object_pptrs_with_typetree(

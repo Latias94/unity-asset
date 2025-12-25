@@ -443,7 +443,11 @@ fn parse_object_data(
     let bytes = object_bytes(file, info)?;
     let mut reader = BinaryReader::new(bytes, byte_order);
     let serializer = TypeTreeSerializer::new(tree);
-    serializer.parse_object_detailed(&mut reader, options)
+    if file.ref_types.is_empty() {
+        serializer.parse_object_detailed(&mut reader, options)
+    } else {
+        serializer.parse_object_detailed_with_ref_types(&mut reader, options, &file.ref_types)
+    }
 }
 
 fn apply_raw_preview(class: &mut UnityClass, bytes: &[u8]) {
