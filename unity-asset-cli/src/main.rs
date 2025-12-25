@@ -7,20 +7,24 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
-use unity_asset::UnityDocument;
-use unity_asset::UnityValue;
 use unity_asset::environment::{
     BinaryObjectKey, BinarySource, Environment, EnvironmentOptions, EnvironmentReporter,
     EnvironmentWarning,
 };
+use unity_asset::UnityDocument;
+use unity_asset::UnityValue;
 use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions, BundleParser};
+use unity_asset_binary::error::BinaryError;
 use unity_asset_binary::shared_bytes::SharedBytes;
-use unity_asset_binary::typetree::{JsonTypeTreeRegistry, TpkTypeTreeRegistry, TypeTree};
+use unity_asset_binary::typetree::{
+    JsonTypeTreeRegistry, TpkTypeTreeRegistry, TypeTree, TypeTreeParseMode, TypeTreeParseOptions,
+    TypeTreeRegistry,
+};
 use unity_asset_binary::{asset::class_ids, object::UnityObject, unity_version::UnityVersion};
 
 #[cfg(feature = "decode")]
@@ -1416,95 +1420,93 @@ fn export_bundle_command(
             let allocator = Arc::clone(&allocator);
             let output = output.clone();
 
-            scope.spawn(move || {
-                loop {
-                    if abort.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let idx = next.fetch_add(1, Ordering::Relaxed);
-                    if idx >= export_jobs.len() {
-                        break;
-                    }
-
-                    let job = &export_jobs[idx];
-                    let outcome = match export_one_entry(
-                        &env,
-                        &allocator,
-                        &output,
-                        &job.asset_path,
-                        &job.key,
-                        job.order,
-                        decode,
-                        overwrite,
-                        skip_existing,
-                    ) {
-                        Ok(v) => Some(v),
-                        Err(e) => {
-                            if continue_on_error {
-                                failed_count.fetch_add(1, Ordering::Relaxed);
-                                let (type_id, _) = lookup_object_type_info(&env, &job.key);
-                                let class_name = if type_id == 0 {
-                                    None
-                                } else {
-                                    Some(
-                                        unity_asset::get_class_name(type_id)
-                                            .unwrap_or_else(|| format!("Class_{}", type_id)),
-                                    )
-                                };
-                                Some(ExportOutcome {
-                                    order: job.order,
-                                    message: format!(
-                                        "FAILED {} (key={}) error={}",
-                                        job.asset_path, job.key, e
-                                    ),
-                                    did_export: false,
-                                    did_skip_existing: false,
-                                    entry: ExportManifestEntry {
-                                        order: job.order,
-                                        asset_path: job.asset_path.clone(),
-                                        key: job.key.to_string(),
-                                        source_kind: format!("{:?}", job.key.source_kind),
-                                        asset_index: job.key.asset_index,
-                                        path_id: job.key.path_id,
-                                        type_id: if type_id == 0 { None } else { Some(type_id) },
-                                        class_name,
-                                        status: ExportStatus::Failed,
-                                        output_path: None,
-                                        output_bytes: None,
-                                        error: Some(e.to_string()),
-                                    },
-                                })
-                            } else {
-                                abort.store(true, Ordering::Relaxed);
-                                let mut slot = match first_error.lock() {
-                                    Ok(v) => v,
-                                    Err(e) => e.into_inner(),
-                                };
-                                if slot.is_none() {
-                                    *slot = Some(format!("{} (key={})", e, job.key));
-                                }
-                                None
-                            }
-                        }
-                    };
-
-                    let Some(outcome) = outcome else {
-                        break;
-                    };
-
-                    if outcome.did_export {
-                        exported.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if outcome.did_skip_existing {
-                        skipped_existing.fetch_add(1, Ordering::Relaxed);
-                    }
-                    let mut out = match results.lock() {
-                        Ok(v) => v,
-                        Err(e) => e.into_inner(),
-                    };
-                    out.push(outcome);
+            scope.spawn(move || loop {
+                if abort.load(Ordering::Relaxed) {
+                    break;
                 }
+
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                if idx >= export_jobs.len() {
+                    break;
+                }
+
+                let job = &export_jobs[idx];
+                let outcome = match export_one_entry(
+                    &env,
+                    &allocator,
+                    &output,
+                    &job.asset_path,
+                    &job.key,
+                    job.order,
+                    decode,
+                    overwrite,
+                    skip_existing,
+                ) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        if continue_on_error {
+                            failed_count.fetch_add(1, Ordering::Relaxed);
+                            let (type_id, _) = lookup_object_type_info(&env, &job.key);
+                            let class_name = if type_id == 0 {
+                                None
+                            } else {
+                                Some(
+                                    unity_asset::get_class_name(type_id)
+                                        .unwrap_or_else(|| format!("Class_{}", type_id)),
+                                )
+                            };
+                            Some(ExportOutcome {
+                                order: job.order,
+                                message: format!(
+                                    "FAILED {} (key={}) error={}",
+                                    job.asset_path, job.key, e
+                                ),
+                                did_export: false,
+                                did_skip_existing: false,
+                                entry: ExportManifestEntry {
+                                    order: job.order,
+                                    asset_path: job.asset_path.clone(),
+                                    key: job.key.to_string(),
+                                    source_kind: format!("{:?}", job.key.source_kind),
+                                    asset_index: job.key.asset_index,
+                                    path_id: job.key.path_id,
+                                    type_id: if type_id == 0 { None } else { Some(type_id) },
+                                    class_name,
+                                    status: ExportStatus::Failed,
+                                    output_path: None,
+                                    output_bytes: None,
+                                    error: Some(e.to_string()),
+                                },
+                            })
+                        } else {
+                            abort.store(true, Ordering::Relaxed);
+                            let mut slot = match first_error.lock() {
+                                Ok(v) => v,
+                                Err(e) => e.into_inner(),
+                            };
+                            if slot.is_none() {
+                                *slot = Some(format!("{} (key={})", e, job.key));
+                            }
+                            None
+                        }
+                    }
+                };
+
+                let Some(outcome) = outcome else {
+                    break;
+                };
+
+                if outcome.did_export {
+                    exported.fetch_add(1, Ordering::Relaxed);
+                }
+                if outcome.did_skip_existing {
+                    skipped_existing.fetch_add(1, Ordering::Relaxed);
+                }
+                let mut out = match results.lock() {
+                    Ok(v) => v,
+                    Err(e) => e.into_inner(),
+                };
+                out.push(outcome);
             });
         }
     });
@@ -2193,6 +2195,52 @@ fn find_object_command(
     show_warnings: bool,
     typetree_registry: Option<&PathBuf>,
 ) -> Result<()> {
+    if let Ok(true) = find_object_fast(
+        &input,
+        &pattern,
+        &name,
+        &class_id,
+        &class_name,
+        limit,
+        include_unresolved,
+        verbose,
+        strict,
+        show_warnings,
+        typetree_registry,
+    ) {
+        return Ok(());
+    }
+
+    // Fallback to the legacy Environment-based implementation (supports WebFile-derived sources, etc.).
+    find_object_env_fallback(
+        input,
+        pattern,
+        name,
+        class_id,
+        class_name,
+        limit,
+        include_unresolved,
+        verbose,
+        strict,
+        show_warnings,
+        typetree_registry,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_object_env_fallback(
+    input: PathBuf,
+    pattern: String,
+    name: String,
+    class_id: Vec<i32>,
+    class_name: String,
+    limit: Option<usize>,
+    include_unresolved: bool,
+    verbose: bool,
+    strict: bool,
+    show_warnings: bool,
+    typetree_registry: Option<&PathBuf>,
+) -> Result<()> {
     let mut env = build_environment(strict, show_warnings, typetree_registry)?;
     env.load(&input)?;
 
@@ -2328,6 +2376,631 @@ fn find_object_command(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_object_fast(
+    input: &PathBuf,
+    pattern: &str,
+    name: &str,
+    class_id: &[i32],
+    class_name: &str,
+    limit: Option<usize>,
+    include_unresolved: bool,
+    verbose: bool,
+    strict: bool,
+    show_warnings: bool,
+    typetree_registry: Option<&PathBuf>,
+) -> Result<bool> {
+    let registry = load_typetree_registry(typetree_registry)?;
+    let typetree_options = if strict {
+        TypeTreeParseOptions {
+            mode: TypeTreeParseMode::Strict,
+        }
+    } else {
+        TypeTreeParseOptions {
+            mode: TypeTreeParseMode::Lenient,
+        }
+    };
+
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+    if input.is_dir() {
+        collect_files_recursive(input, &mut candidate_paths)?;
+        candidate_paths.sort();
+        candidate_paths.dedup();
+    } else {
+        candidate_paths.push(input.clone());
+    }
+
+    let pattern_lc = pattern.to_ascii_lowercase();
+    let name_lc = name.to_ascii_lowercase();
+    let class_name_lc = class_name.to_ascii_lowercase();
+
+    let mut processed_any_bundle = false;
+    let mut count = 0usize;
+
+    for path in candidate_paths {
+        if let Some(max) = limit {
+            if count >= max {
+                break;
+            }
+        }
+
+        let prefix = match read_prefix(&path, 16) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !looks_like_bundle_prefix(&prefix) {
+            continue;
+        }
+
+        let options = bundle_list_options();
+        let mut bundle = match load_bundle_for_list(&path, options) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if bundle.header.signature != "UnityFS" {
+            // Keep the fast path focused on UnityFS (the common case). Legacy bundles fall back to env.
+            continue;
+        }
+        processed_any_bundle = true;
+
+        let bundle_source = BinarySource::path(&path);
+        let asset_nodes = bundle_asset_nodes(&bundle);
+        let asset_names: Vec<String> = asset_nodes.iter().map(|n| n.name.clone()).collect();
+
+        let entries = extract_bundle_container_entries_fast(
+            &mut bundle,
+            &bundle_source,
+            &asset_nodes,
+            &asset_names,
+            registry.as_ref(),
+            typetree_options,
+            show_warnings,
+        );
+
+        let mut entries = match entries {
+            Ok(v) => v,
+            Err(e) => {
+                if show_warnings {
+                    eprintln!(
+                        "warning: failed to extract m_Container for {:?}: {}",
+                        path, e
+                    );
+                }
+                continue;
+            }
+        };
+        entries.sort_by(|a, b| a.asset_path.cmp(&b.asset_path));
+
+        let mut file_cache: Vec<Option<unity_asset_binary::asset::SerializedFile>> =
+            std::iter::repeat_with(|| None)
+                .take(asset_nodes.len())
+                .collect();
+        let shared = SharedBytes::from_arc(bundle.data_arc().map_err(|e| anyhow::anyhow!(e))?);
+
+        for entry in entries {
+            if let Some(max) = limit {
+                if count >= max {
+                    return Ok(true);
+                }
+            }
+
+            if !pattern_lc.is_empty()
+                && !entry.asset_path.to_ascii_lowercase().contains(&pattern_lc)
+            {
+                continue;
+            }
+
+            if entry.key.is_none()
+                && (!include_unresolved || !class_id.is_empty() || !class_name_lc.is_empty())
+            {
+                continue;
+            }
+
+            if verbose {
+                if let Some(key) = &entry.key {
+                    let (type_id, byte_size) = lookup_object_type_info_fast(
+                        &shared,
+                        &asset_nodes,
+                        &mut file_cache,
+                        key,
+                        registry.as_ref(),
+                    );
+
+                    if !class_id.is_empty() && !class_id.contains(&type_id) {
+                        continue;
+                    }
+                    if !class_name_lc.is_empty() {
+                        let name = unity_asset::get_class_name(type_id)
+                            .unwrap_or_else(|| format!("Class_{}", type_id));
+                        if !name.to_ascii_lowercase().contains(&class_name_lc) {
+                            continue;
+                        }
+                    }
+                    if !name_lc.is_empty() {
+                        let matches = match peek_object_name_fast(
+                            &shared,
+                            &asset_nodes,
+                            &mut file_cache,
+                            key,
+                            registry.as_ref(),
+                            typetree_options,
+                        ) {
+                            Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
+                            Ok(None) => false,
+                            Err(e) => {
+                                if show_warnings {
+                                    eprintln!("warning: peek_name failed for key={}: {}", key, e);
+                                }
+                                false
+                            }
+                        };
+                        if !matches {
+                            continue;
+                        }
+                    }
+                    println!(
+                        "{} -> key={} (class_id={}, byte_size={})",
+                        entry.asset_path, key, type_id, byte_size
+                    );
+                } else {
+                    println!(
+                        "{} -> unresolved(bundle={}, asset_index={}, file_id={}, path_id={})",
+                        entry.asset_path,
+                        entry.bundle_source,
+                        entry.asset_index,
+                        entry.file_id,
+                        entry.path_id
+                    );
+                }
+            } else if let Some(key) = &entry.key {
+                let (type_id, _byte_size) = if class_id.is_empty() && class_name_lc.is_empty() {
+                    (0, 0)
+                } else {
+                    lookup_object_type_info_fast(
+                        &shared,
+                        &asset_nodes,
+                        &mut file_cache,
+                        key,
+                        registry.as_ref(),
+                    )
+                };
+
+                if !class_id.is_empty() && !class_id.contains(&type_id) {
+                    continue;
+                }
+                if !class_name_lc.is_empty() {
+                    let name = unity_asset::get_class_name(type_id)
+                        .unwrap_or_else(|| format!("Class_{}", type_id));
+                    if !name.to_ascii_lowercase().contains(&class_name_lc) {
+                        continue;
+                    }
+                }
+                if !name_lc.is_empty() {
+                    let matches = match peek_object_name_fast(
+                        &shared,
+                        &asset_nodes,
+                        &mut file_cache,
+                        key,
+                        registry.as_ref(),
+                        typetree_options,
+                    ) {
+                        Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
+                        Ok(None) => false,
+                        Err(e) => {
+                            if show_warnings {
+                                eprintln!("warning: peek_name failed for key={}: {}", key, e);
+                            }
+                            false
+                        }
+                    };
+                    if !matches {
+                        continue;
+                    }
+                }
+                println!("{} -> key={}", entry.asset_path, key);
+            } else {
+                println!("{} -> unresolved", entry.asset_path);
+            }
+
+            count += 1;
+        }
+    }
+
+    Ok(processed_any_bundle)
+}
+
+fn load_typetree_registry(
+    typetree_registry: Option<&PathBuf>,
+) -> Result<Option<Arc<dyn TypeTreeRegistry>>> {
+    let Some(path) = typetree_registry else {
+        return Ok(None);
+    };
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "tpk" {
+        let registry = TpkTypeTreeRegistry::from_path(path)
+            .map_err(|e| anyhow::anyhow!("Failed to load --typetree-registry {:?}: {}", path, e))?;
+        Ok(Some(Arc::new(registry)))
+    } else {
+        let registry = JsonTypeTreeRegistry::from_path(path)
+            .map_err(|e| anyhow::anyhow!("Failed to load --typetree-registry {:?}: {}", path, e))?;
+        Ok(Some(Arc::new(registry)))
+    }
+}
+
+fn bundle_asset_nodes(bundle: &AssetBundle) -> Vec<unity_asset_binary::bundle::DirectoryNode> {
+    bundle
+        .nodes
+        .iter()
+        .filter(|n| n.is_file())
+        .filter(|n| !n.name.ends_with(".resS") && !n.name.ends_with(".resource"))
+        .cloned()
+        .collect()
+}
+
+fn extract_bundle_container_entries_fast(
+    bundle: &mut AssetBundle,
+    bundle_source: &BinarySource,
+    asset_nodes: &[unity_asset_binary::bundle::DirectoryNode],
+    asset_names: &[String],
+    registry: Option<&Arc<dyn TypeTreeRegistry>>,
+    typetree_options: TypeTreeParseOptions,
+    show_warnings: bool,
+) -> Result<Vec<unity_asset::environment::BundleContainerEntry>> {
+    let shared = SharedBytes::from_arc(bundle.data_arc().map_err(|e| anyhow::anyhow!(e))?);
+
+    for (asset_index, node) in asset_nodes.iter().enumerate() {
+        let (start, end) = node_range(node)?;
+        let mut file = unity_asset_binary::asset::SerializedFileParser::from_shared_range(
+            shared.clone(),
+            start..end,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        if let Some(registry) = registry.cloned() {
+            file.set_type_tree_registry(Some(registry));
+        }
+
+        let mut out: Vec<unity_asset::environment::BundleContainerEntry> = Vec::new();
+        for object in file.object_handles() {
+            if object.class_id() != 142 {
+                continue;
+            }
+
+            if file.enable_type_tree {
+                match object.read_with_options(typetree_options) {
+                    Ok(obj) => {
+                        if show_warnings {
+                            for w in obj.typetree_warnings() {
+                                eprintln!(
+                                    "warning: typetree key={} field={} error={}",
+                                    BinaryObjectKey {
+                                        source: bundle_source.clone(),
+                                        source_kind:
+                                            unity_asset::environment::BinarySourceKind::AssetBundle,
+                                        asset_index: Some(asset_index),
+                                        path_id: object.path_id(),
+                                    },
+                                    w.field,
+                                    w.error
+                                );
+                            }
+                        }
+                        out.extend(extract_container_entries_from_typetree(
+                            bundle_source,
+                            asset_index,
+                            &file,
+                            asset_names,
+                            &obj,
+                        ));
+                        if !out.is_empty() {
+                            return Ok(out);
+                        }
+                    }
+                    Err(e) => {
+                        if show_warnings {
+                            eprintln!(
+                                "warning: typetree container parse failed (bundle={}, asset_index={}, path_id={}): {}",
+                                bundle_source,
+                                asset_index,
+                                object.path_id(),
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
+            if let Ok(raw_entries) = file.assetbundle_container_raw(object.info()) {
+                for (asset_path, file_id, path_id) in raw_entries {
+                    if path_id == 0 {
+                        continue;
+                    }
+                    let key = resolve_pptr_in_bundle(
+                        bundle_source,
+                        asset_index,
+                        &file,
+                        asset_names,
+                        file_id,
+                        path_id,
+                    );
+                    out.push(unity_asset::environment::BundleContainerEntry {
+                        bundle_source: bundle_source.clone(),
+                        asset_index,
+                        asset_path,
+                        file_id,
+                        path_id,
+                        key,
+                    });
+                }
+                if !out.is_empty() {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+fn extract_container_entries_from_typetree(
+    bundle_source: &BinarySource,
+    context_asset_index: usize,
+    context_file: &unity_asset_binary::asset::SerializedFile,
+    asset_names: &[String],
+    parsed: &UnityObject,
+) -> Vec<unity_asset::environment::BundleContainerEntry> {
+    let mut out = Vec::new();
+    let Some(UnityValue::Array(items)) = parsed.class.get("m_Container") else {
+        return out;
+    };
+
+    for item in items {
+        let (asset_path, second) = match item {
+            UnityValue::Array(pair) if pair.len() == 2 => {
+                let Some(asset_path) = pair[0].as_str() else {
+                    continue;
+                };
+                (asset_path.to_string(), &pair[1])
+            }
+            UnityValue::Object(obj) => {
+                let first = obj.get("first").and_then(|v| v.as_str());
+                let second = obj.get("second").or_else(|| obj.get("value"));
+                let (Some(first), Some(second)) = (first, second) else {
+                    continue;
+                };
+                (first.to_string(), second)
+            }
+            _ => continue,
+        };
+
+        let Some((file_id, path_id)) = scan_pptr_value(second) else {
+            continue;
+        };
+        if path_id == 0 {
+            continue;
+        }
+
+        let key = resolve_pptr_in_bundle(
+            bundle_source,
+            context_asset_index,
+            context_file,
+            asset_names,
+            file_id,
+            path_id,
+        );
+        out.push(unity_asset::environment::BundleContainerEntry {
+            bundle_source: bundle_source.clone(),
+            asset_index: context_asset_index,
+            asset_path,
+            file_id,
+            path_id,
+            key,
+        });
+    }
+
+    out
+}
+
+fn scan_pptr_value(value: &UnityValue) -> Option<(i32, i64)> {
+    match value {
+        UnityValue::Object(obj) => {
+            let file_id = obj
+                .get("fileID")
+                .or_else(|| obj.get("m_FileID"))
+                .and_then(|v| v.as_i64())
+                .and_then(|v| i32::try_from(v).ok());
+            let path_id = obj
+                .get("pathID")
+                .or_else(|| obj.get("m_PathID"))
+                .and_then(|v| v.as_i64());
+
+            if let (Some(file_id), Some(path_id)) = (file_id, path_id) {
+                return Some((file_id, path_id));
+            }
+
+            for (_, v) in obj.iter() {
+                if let Some(pptr) = scan_pptr_value(v) {
+                    return Some(pptr);
+                }
+            }
+
+            None
+        }
+        UnityValue::Array(items) => items.iter().find_map(scan_pptr_value),
+        _ => None,
+    }
+}
+
+fn resolve_pptr_in_bundle(
+    bundle_source: &BinarySource,
+    context_asset_index: usize,
+    context_file: &unity_asset_binary::asset::SerializedFile,
+    asset_names: &[String],
+    file_id: i32,
+    path_id: i64,
+) -> Option<BinaryObjectKey> {
+    if file_id == 0 {
+        return Some(BinaryObjectKey {
+            source: bundle_source.clone(),
+            source_kind: unity_asset::environment::BinarySourceKind::AssetBundle,
+            asset_index: Some(context_asset_index),
+            path_id,
+        });
+    }
+    if file_id < 0 {
+        return None;
+    }
+
+    let idx: usize = (file_id - 1).try_into().ok()?;
+    let external = context_file.externals.get(idx)?;
+    let external_norm = external.path.replace('\\', "/");
+    let external_file_name = std::path::Path::new(&external_norm)
+        .file_name()
+        .and_then(|n| n.to_str());
+
+    let mut candidates: Vec<(usize, &String)> = asset_names.iter().enumerate().collect();
+    candidates.sort_by(|a, b| a.1.cmp(b.1));
+
+    let (asset_index, _) = candidates.into_iter().find(|(_, name)| {
+        let name_norm = name.replace('\\', "/");
+        if name_norm == external_norm {
+            return true;
+        }
+        if name_norm.ends_with(&external_norm) || external_norm.ends_with(&name_norm) {
+            return true;
+        }
+        match external_file_name {
+            Some(file_name) => {
+                std::path::Path::new(&name_norm)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    == Some(file_name)
+            }
+            None => false,
+        }
+    })?;
+
+    Some(BinaryObjectKey {
+        source: bundle_source.clone(),
+        source_kind: unity_asset::environment::BinarySourceKind::AssetBundle,
+        asset_index: Some(asset_index),
+        path_id,
+    })
+}
+
+fn node_range(node: &unity_asset_binary::bundle::DirectoryNode) -> Result<(usize, usize)> {
+    let end_u64 = node
+        .offset
+        .checked_add(node.size)
+        .ok_or_else(|| anyhow::anyhow!("node offset+size overflow"))?;
+    let start = usize::try_from(node.offset).map_err(|_| {
+        anyhow::anyhow!(BinaryError::ResourceLimitExceeded(
+            "Node offset does not fit in usize".to_string()
+        ))
+    })?;
+    let end = usize::try_from(end_u64).map_err(|_| {
+        anyhow::anyhow!(BinaryError::ResourceLimitExceeded(
+            "Node end offset does not fit in usize".to_string()
+        ))
+    })?;
+    if start > end {
+        anyhow::bail!("node slice start exceeds end");
+    }
+    Ok((start, end))
+}
+
+fn lookup_object_type_info_fast(
+    shared: &SharedBytes,
+    asset_nodes: &[unity_asset_binary::bundle::DirectoryNode],
+    cache: &mut [Option<unity_asset_binary::asset::SerializedFile>],
+    key: &BinaryObjectKey,
+    registry: Option<&Arc<dyn TypeTreeRegistry>>,
+) -> (i32, u32) {
+    if key.source_kind != unity_asset::environment::BinarySourceKind::AssetBundle {
+        return (0, 0);
+    }
+    let Some(asset_index) = key.asset_index else {
+        return (0, 0);
+    };
+    if asset_index >= asset_nodes.len() {
+        return (0, 0);
+    }
+
+    if cache[asset_index].is_none() {
+        let node = &asset_nodes[asset_index];
+        if let Ok((start, end)) = node_range(node) {
+            if let Ok(mut file) = unity_asset_binary::asset::SerializedFileParser::from_shared_range(
+                shared.clone(),
+                start..end,
+            ) {
+                if let Some(registry) = registry.cloned() {
+                    file.set_type_tree_registry(Some(registry));
+                }
+                cache[asset_index] = Some(file);
+            }
+        }
+    }
+
+    cache[asset_index]
+        .as_ref()
+        .and_then(|f| f.find_object(key.path_id))
+        .map(|info| (info.type_id, info.byte_size))
+        .unwrap_or((0, 0))
+}
+
+fn peek_object_name_fast(
+    shared: &SharedBytes,
+    asset_nodes: &[unity_asset_binary::bundle::DirectoryNode],
+    cache: &mut [Option<unity_asset_binary::asset::SerializedFile>],
+    key: &BinaryObjectKey,
+    registry: Option<&Arc<dyn TypeTreeRegistry>>,
+    options: TypeTreeParseOptions,
+) -> Result<Option<String>> {
+    if key.source_kind != unity_asset::environment::BinarySourceKind::AssetBundle {
+        return Ok(None);
+    }
+    let Some(asset_index) = key.asset_index else {
+        return Ok(None);
+    };
+    if asset_index >= asset_nodes.len() {
+        return Ok(None);
+    }
+
+    if cache[asset_index].is_none() {
+        let node = &asset_nodes[asset_index];
+        let (start, end) = node_range(node)?;
+        let mut file = unity_asset_binary::asset::SerializedFileParser::from_shared_range(
+            shared.clone(),
+            start..end,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        if let Some(registry) = registry.cloned() {
+            file.set_type_tree_registry(Some(registry));
+        }
+        cache[asset_index] = Some(file);
+    }
+
+    let file = cache[asset_index].as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "failed to parse serialized file for asset_index={}",
+            asset_index
+        )
+    })?;
+    let handle = file.find_object_handle(key.path_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "object not found: path_id={} (asset_index={})",
+            key.path_id,
+            asset_index
+        )
+    })?;
+    Ok(handle
+        .peek_name_with_options(options)
+        .map_err(|e| anyhow::anyhow!(e))?)
 }
 
 #[derive(Debug, Serialize)]
