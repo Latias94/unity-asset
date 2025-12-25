@@ -188,7 +188,13 @@ impl DependencyAnalyzer {
         if asset.enable_type_tree {
             if let Some(tree) = type_tree_for_object(asset, obj) {
                 if !tree.is_empty() {
-                    if let Ok(values) = parse_object_with_typetree(asset, obj, tree) {
+                    // Prefer a zero-allocation scan that still consumes the object stream
+                    // according to the TypeTree. This keeps dependency analysis fast even for
+                    // large objects with big buffers/arrays.
+                    if let Ok(scanned) = scan_object_pptrs_with_typetree(asset, obj, tree) {
+                        deps = scanned;
+                    } else if let Ok(values) = parse_object_with_typetree(asset, obj, tree) {
+                        // Fallback: legacy full parse + recursive scan.
                         scan_pptr_in_value(&UnityValue::Object(values), &mut deps);
                     }
                 }
@@ -359,6 +365,22 @@ fn parse_object_with_typetree(
     let mut reader = BinaryReader::new(bytes, asset.header.byte_order());
     let serializer = TypeTreeSerializer::new(tree);
     serializer.parse_object(&mut reader)
+}
+
+fn scan_object_pptrs_with_typetree(
+    asset: &SerializedFile,
+    info: &crate::asset::ObjectInfo,
+    tree: &TypeTree,
+) -> Result<ExtractedDependencies> {
+    let bytes = asset.object_bytes(info)?;
+    let mut reader = BinaryReader::new(bytes, asset.header.byte_order());
+    let serializer = TypeTreeSerializer::new(tree);
+    let scan = serializer.scan_pptrs(&mut reader)?;
+
+    let mut deps = ExtractedDependencies::default();
+    deps.internal = scan.internal;
+    deps.external = scan.external;
+    Ok(deps)
 }
 
 fn resolve_external_file(

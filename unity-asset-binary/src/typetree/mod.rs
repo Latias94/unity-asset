@@ -50,8 +50,8 @@ pub use builder::{TypeTreeBuilder, TypeTreeValidator, ValidationReport};
 pub use parser::{ParsingStats, TypeTreeParser};
 pub use registry::{InMemoryTypeTreeRegistry, JsonTypeTreeRegistry, TypeTreeRegistry};
 pub use serializer::{
-    TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput, TypeTreeParseWarning,
-    TypeTreeSerializer,
+    PPtrScanResult, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput,
+    TypeTreeParseWarning, TypeTreeSerializer,
 };
 pub use tpk::TpkTypeTreeRegistry;
 pub use types::{TypeInfo, TypeRegistry, TypeTree, TypeTreeNode, TypeTreeStatistics};

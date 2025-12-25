@@ -17,6 +17,12 @@ pub struct TypeTreeSerializer<'a> {
     tree: &'a TypeTree,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PPtrScanResult {
+    pub internal: Vec<i64>,
+    pub external: Vec<(i32, i64)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeTreeParseMode {
     Strict,
@@ -108,6 +114,275 @@ impl<'a> TypeTreeSerializer<'a> {
         }
 
         Ok(out)
+    }
+
+    /// Scan TypeTree-based object bytes and collect any encountered `PPtr` references without
+    /// allocating a full `UnityValue` tree.
+    pub fn scan_pptrs(&self, reader: &mut BinaryReader) -> Result<PPtrScanResult> {
+        let mut out = PPtrScanResult::default();
+        if let Some(root) = self.tree.nodes.first() {
+            for child in &root.children {
+                self.scan_value(reader, child, &mut out)?;
+            }
+        }
+        Ok(out)
+    }
+
+    fn scan_value(
+        &self,
+        reader: &mut BinaryReader,
+        node: &TypeTreeNode,
+        out: &mut PPtrScanResult,
+    ) -> Result<()> {
+        // Array types
+        if !node.children.is_empty() && node.children.iter().any(|c| c.type_name == "Array") {
+            self.scan_array(reader, node, out)?;
+            if node.is_aligned() {
+                reader.align_to(4)?;
+            }
+            return Ok(());
+        }
+
+        // `PPtr<T>` types (best-effort): parse `fileID` + `pathID` while still consuming all children.
+        let is_pptr = node.type_name == "PPtr" || node.type_name.starts_with("PPtr<");
+        if is_pptr && !node.children.is_empty() {
+            let mut file_id: Option<i32> = None;
+            let mut path_id: Option<i64> = None;
+
+            for child in &node.children {
+                if child.name.eq_ignore_ascii_case("fileID")
+                    || child.name.eq_ignore_ascii_case("m_FileID")
+                {
+                    // Unity encodes fileID as int.
+                    let v = self.scan_read_i32_like(reader, child)?;
+                    file_id = Some(v);
+                } else if child.name.eq_ignore_ascii_case("pathID")
+                    || child.name.eq_ignore_ascii_case("m_PathID")
+                {
+                    // Unity encodes pathID as long (may be 32-bit in older versions, TypeTree guides us).
+                    let v = self.scan_read_i64_like(reader, child)?;
+                    path_id = Some(v);
+                } else {
+                    self.scan_value(reader, child, out)?;
+                }
+            }
+
+            if let (Some(file_id), Some(path_id)) = (file_id, path_id) {
+                if path_id != 0 {
+                    if file_id == 0 {
+                        out.internal.push(path_id);
+                    } else {
+                        out.external.push((file_id, path_id));
+                    }
+                }
+            }
+
+            if node.is_aligned() {
+                reader.align_to(4)?;
+            }
+            return Ok(());
+        }
+
+        match node.type_name.as_str() {
+            "SInt8" | "char" | "UInt8" => {
+                let _ = reader.read_u8()?;
+            }
+            "bool" => {
+                let _ = reader.read_u8()?;
+            }
+            "SInt16" | "short" => {
+                let _ = reader.read_i16()?;
+            }
+            "UInt16" | "unsigned short" => {
+                let _ = reader.read_u16()?;
+            }
+            "SInt32" | "int" => {
+                let _ = reader.read_i32()?;
+            }
+            "UInt32" | "unsigned int" | "Type*" => {
+                let _ = reader.read_u32()?;
+            }
+            "SInt64" | "long long" => {
+                let _ = reader.read_i64()?;
+            }
+            "UInt64" | "unsigned long long" | "FileSize" => {
+                let _ = reader.read_u64()?;
+            }
+            "float" => {
+                let _ = reader.read_f32()?;
+            }
+            "double" => {
+                let _ = reader.read_f64()?;
+            }
+            "string" => {
+                let len = reader.read_i32()?;
+                if len < 0 {
+                    return Err(BinaryError::invalid_data(format!(
+                        "Negative string length: {}",
+                        len
+                    )));
+                }
+                let len: usize = len as usize;
+                if len > BinaryReader::DEFAULT_MAX_STRING_LEN {
+                    return Err(BinaryError::invalid_data(format!(
+                        "String length {} exceeds limit {}",
+                        len,
+                        BinaryReader::DEFAULT_MAX_STRING_LEN
+                    )));
+                }
+                reader.skip_bytes(len)?;
+                reader.align_to(4)?;
+            }
+            "TypelessData" => {
+                let length = reader.read_i32()?;
+                if length < 0 {
+                    return Err(BinaryError::invalid_data(format!(
+                        "Negative TypelessData length: {}",
+                        length
+                    )));
+                }
+                let length: usize = length as usize;
+                if length > Self::MAX_TYPELESSDATA_LEN {
+                    return Err(BinaryError::invalid_data(format!(
+                        "TypelessData length {} exceeds limit {}",
+                        length,
+                        Self::MAX_TYPELESSDATA_LEN
+                    )));
+                }
+                reader.skip_bytes(length)?;
+            }
+            _ => {
+                if !node.children.is_empty() {
+                    for child in &node.children {
+                        self.scan_value(reader, child, out)?;
+                    }
+                } else if node.byte_size > 0 {
+                    reader.skip_bytes(node.byte_size as usize)?;
+                }
+            }
+        }
+
+        if node.is_aligned() {
+            reader.align_to(4)?;
+        }
+        Ok(())
+    }
+
+    fn scan_read_i32_like(&self, reader: &mut BinaryReader, node: &TypeTreeNode) -> Result<i32> {
+        let v = match node.type_name.as_str() {
+            "SInt32" | "int" => reader.read_i32()?,
+            "UInt32" | "unsigned int" | "Type*" => reader.read_u32()? as i32,
+            "SInt16" | "short" => reader.read_i16()? as i32,
+            "UInt16" | "unsigned short" => reader.read_u16()? as i32,
+            "SInt8" | "char" => reader.read_i8()? as i32,
+            "UInt8" => reader.read_u8()? as i32,
+            other => {
+                return Err(BinaryError::invalid_data(format!(
+                    "Unsupported fileID type: {}",
+                    other
+                )));
+            }
+        };
+        if node.is_aligned() {
+            reader.align_to(4)?;
+        }
+        Ok(v)
+    }
+
+    fn scan_read_i64_like(&self, reader: &mut BinaryReader, node: &TypeTreeNode) -> Result<i64> {
+        let v = match node.type_name.as_str() {
+            "SInt64" | "long long" => reader.read_i64()?,
+            "UInt64" | "unsigned long long" | "FileSize" => reader.read_u64()? as i64,
+            "SInt32" | "int" => reader.read_i32()? as i64,
+            "UInt32" | "unsigned int" | "Type*" => reader.read_u32()? as i64,
+            other => {
+                return Err(BinaryError::invalid_data(format!(
+                    "Unsupported pathID type: {}",
+                    other
+                )));
+            }
+        };
+        if node.is_aligned() {
+            reader.align_to(4)?;
+        }
+        Ok(v)
+    }
+
+    fn scan_array(
+        &self,
+        reader: &mut BinaryReader,
+        node: &TypeTreeNode,
+        out: &mut PPtrScanResult,
+    ) -> Result<()> {
+        let array_node = node
+            .children
+            .iter()
+            .find(|child| child.type_name == "Array")
+            .ok_or_else(|| BinaryError::invalid_data("Array node not found in array type"))?;
+
+        let size_i32 = reader.read_i32()?;
+        if size_i32 < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative array size: {}",
+                size_i32
+            )));
+        }
+        let size = size_i32 as usize;
+        if size > Self::MAX_ARRAY_LEN {
+            return Err(BinaryError::invalid_data(format!(
+                "Array size too large: {}",
+                size
+            )));
+        }
+
+        let element_node = array_node
+            .children
+            .get(1)
+            .ok_or_else(|| BinaryError::invalid_data("Array element type not found"))?;
+
+        // Mirror the deserializer fast paths, but skipping bytes instead of allocating.
+        if element_node.children.is_empty() {
+            match element_node.type_name.as_str() {
+                "UInt8" | "char" | "SInt8" | "bool" => {
+                    reader.skip_bytes(size)?;
+                    return Ok(());
+                }
+                "SInt16" | "short" | "UInt16" | "unsigned short" => {
+                    reader.skip_bytes(size.checked_mul(2).ok_or_else(|| {
+                        BinaryError::invalid_data("Array byte length overflow")
+                    })?)?;
+                    return Ok(());
+                }
+                "SInt32"
+                | "int"
+                | "UInt32"
+                | "unsigned int"
+                | "Type*"
+                | "float" => {
+                    reader.skip_bytes(size.checked_mul(4).ok_or_else(|| {
+                        BinaryError::invalid_data("Array byte length overflow")
+                    })?)?;
+                    return Ok(());
+                }
+                "SInt64"
+                | "long long"
+                | "UInt64"
+                | "unsigned long long"
+                | "FileSize"
+                | "double" => {
+                    reader.skip_bytes(size.checked_mul(8).ok_or_else(|| {
+                        BinaryError::invalid_data("Array byte length overflow")
+                    })?)?;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        for _ in 0..size {
+            self.scan_value(reader, element_node, out)?;
+        }
+        Ok(())
     }
 
     /// Parse value based on TypeTree node type

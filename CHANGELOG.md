@@ -85,6 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `unity-asset-cli` now has an explicit `decode` feature (enabled by default) to allow building a lighter CLI with `--no-default-features`.
 - TypeTree array parsing now uses endianness-aware fast paths for common numeric primitive arrays (`SInt16/UInt16/SInt32/UInt32/SInt64/UInt64/float/double`).
 - (BREAKING) `UnityValue` now includes `Bytes(Vec<u8>)` and TypeTree parsing emits `Bytes` for `TypelessData` and byte arrays (`UInt8`/`char`/`SInt8`), reducing allocations for large objects.
+- Dependency analysis now scans TypeTree streams for `PPtr` references without allocating full parsed objects, improving performance on large assets.
 
 ### Fixed
 - Hardened length-prefixed string reads to avoid hostile allocations and out-of-bounds reads (length is validated against remaining bytes and a maximum limit).

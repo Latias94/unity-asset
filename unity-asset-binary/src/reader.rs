@@ -202,6 +202,15 @@ impl<'a> BinaryReader<'a> {
         Ok(buffer)
     }
 
+    /// Skip a fixed number of bytes without allocating.
+    pub fn skip_bytes(&mut self, count: usize) -> Result<()> {
+        if !self.has_bytes(count) {
+            return Err(BinaryError::not_enough_data(count, self.remaining()));
+        }
+        self.seek(count as i64)?;
+        Ok(())
+    }
+
     /// Read all remaining bytes
     pub fn read_remaining(&mut self) -> &[u8] {
         let pos = self.cursor.position() as usize;
@@ -315,6 +324,18 @@ mod tests {
         assert_eq!(reader.read_u8().unwrap(), 0x02);
         assert_eq!(reader.position(), 2);
         assert_eq!(reader.remaining(), 2);
+    }
+
+    #[test]
+    fn test_skip_bytes() {
+        let data = [0x01, 0x02, 0x03, 0x04, 0x05];
+        let mut reader = BinaryReader::new(&data, ByteOrder::Little);
+
+        reader.skip_bytes(2).unwrap();
+        assert_eq!(reader.position(), 2);
+        assert_eq!(reader.read_u8().unwrap(), 0x03);
+
+        assert!(reader.skip_bytes(10).is_err());
     }
 
     #[test]
