@@ -85,6 +85,15 @@ cargo nextest run -p unity-asset-binary --tests --run-ignored all
 cargo nextest run --workspace --features async
 ```
 
+#### Golden Regression Tests
+
+We keep a small set of **golden regression cases** to protect high-value workflows during refactors:
+
+- Golden data: `tests/golden/golden_v1.json`
+- Test entrypoint: `unity-asset-lib/tests/golden_regression_tests.rs`
+
+If you intentionally change parsing behavior (e.g., TypeTree semantics), update the golden file in the same PR.
+
 ### 3. Code Style
 
 We use standard Rust formatting and linting:

@@ -40,12 +40,14 @@
 pub mod builder;
 mod common_strings;
 pub mod parser;
+pub mod registry;
 pub mod serializer;
 pub mod types;
 
 // Re-export main types for easy access
 pub use builder::{TypeTreeBuilder, TypeTreeValidator, ValidationReport};
 pub use parser::{ParsingStats, TypeTreeParser};
+pub use registry::{InMemoryTypeTreeRegistry, JsonTypeTreeRegistry, TypeTreeRegistry};
 pub use serializer::{
     TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput, TypeTreeParseWarning,
     TypeTreeSerializer,

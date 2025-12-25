@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "cases": [
+    {
+      "id": "char_118_yuki_cn_001_audio",
+      "source": "tests/samples/char_118_yuki.ab",
+      "source_kind": "bundle",
+      "asset_index": 0,
+      "asset_path": "assets/torappu/dynamicassets/audio/sound_beta_2/voice/char_118_yuki/cn_001.ogg",
+      "path_id": -8214014251178022607,
+      "type_id": 83,
+      "byte_size": 160,
+      "name": "CN_001",
+      "expect": {
+        "kind": "audioclip_streamed",
+        "stream_offset": 4096,
+        "stream_size": 17088
+      }
+    },
+    {
+      "id": "banner_1_texture2d",
+      "source": "tests/samples/banner_1",
+      "source_kind": "bundle",
+      "asset_index": 0,
+      "asset_path": "assets/assetbundles/images/banner/banner_1.png",
+      "path_id": -3875358842991402074,
+      "type_id": 28,
+      "byte_size": 192,
+      "name": "banner_1",
+      "expect": {
+        "kind": "texture2d",
+        "width": 492,
+        "height": 180,
+        "texture_format": 56
+      }
+    },
+    {
+      "id": "banner_1_sprite",
+      "source": "tests/samples/banner_1",
+      "source_kind": "bundle",
+      "asset_index": 0,
+      "asset_path": "assets/assetbundles/images/banner/banner_1.png",
+      "path_id": -8325468307350463555,
+      "type_id": 213,
+      "byte_size": 592,
+      "name": "banner_1",
+      "expect": {
+        "kind": "sprite",
+        "rect_width": 492.0,
+        "rect_height": 180.0
+      }
+    },
+    {
+      "id": "xinzexi_2_n_texture2d",
+      "source": "tests/samples/xinzexi_2_n_tex",
+      "source_kind": "bundle",
+      "asset_index": 0,
+      "asset_path": "assets/artresource/atlas/paintings/xinzexi_2_n.png",
+      "path_id": 7993808429769519520,
+      "type_id": 28,
+      "byte_size": 192,
+      "name": "xinzexi_2_n",
+      "expect": {
+        "kind": "texture2d",
+        "width": 2048,
+        "height": 976,
+        "texture_format": 47
+      }
+    },
+    {
+      "id": "xinzexi_2_n_mesh",
+      "source": "tests/samples/xinzexi_2_n_tex",
+      "source_kind": "bundle",
+      "asset_index": 0,
+      "asset_path": "assets/artresource/atlas/paintings/xinzexi_2_n-mesh.asset",
+      "path_id": -9097144649164150351,
+      "type_id": 43,
+      "byte_size": 17016,
+      "name": "xinzexi_2_n-mesh",
+      "expect": {
+        "kind": "mesh"
+      }
+    },
+    {
+      "id": "atlas_test_spriteatlas_peek",
+      "source": "tests/samples/atlas_test",
+      "source_kind": "bundle",
+      "asset_index": 0,
+      "asset_path": "assets/ui/textures/atlases/buildingswatertoweratlas.spriteatlas",
+      "path_id": -9222691446010724640,
+      "type_id": 687078895,
+      "byte_size": 1044,
+      "name": "BuildingsWaterTowerAtlas",
+      "expect": {
+        "kind": "peek_only"
+      }
+    }
+  ]
+}

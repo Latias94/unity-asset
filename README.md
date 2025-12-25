@@ -149,8 +149,16 @@ if let Ok(settings) = doc.get(Some("PlayerSettings"), None) {
 
 ```rust
 use unity_asset::environment::{Environment, EnvironmentObjectRef};
+use unity_asset_binary::typetree::JsonTypeTreeRegistry;
+use std::sync::Arc;
 
 let mut env = Environment::new();
+
+// Optional: provide an external TypeTree registry for stripped assets (best-effort).
+// This can improve coverage when `enableTypeTree = false` in serialized files.
+// let registry = JsonTypeTreeRegistry::from_path("typetree_registry.json")?;
+// env.set_type_tree_registry(Some(Arc::new(registry)));
+
 env.load("tests/samples")?;
 
 // `path_id` is only unique within a single SerializedFile.

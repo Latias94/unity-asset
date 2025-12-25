@@ -81,6 +81,7 @@ impl<'a> ObjectHandle<'a> {
         let Some(tree) = type_tree_for_object(self.file, self.info) else {
             return Ok(None);
         };
+        let tree = tree.as_ref();
         let Some((prefix_len, field)) = tree.name_peek_prefix() else {
             return Ok(None);
         };
@@ -220,6 +221,7 @@ impl UnityObject {
         let mut warnings: Vec<TypeTreeParseWarning> = Vec::new();
 
         if let Some(tree) = type_tree {
+            let tree = tree.as_ref();
             match parse_object_data(file, info, byte_order, tree, options) {
                 Ok(out) => {
                     class.update_properties(out.properties);
@@ -360,22 +362,51 @@ fn class_name_from_id(class_id: i32) -> String {
     unity_asset_core::get_class_name(class_id).unwrap_or_else(|| format!("Class_{}", class_id))
 }
 
-fn type_tree_for_object<'a>(file: &'a SerializedFile, info: &ObjectInfo) -> Option<&'a TypeTree> {
-    if !file.enable_type_tree {
-        return None;
+enum TypeTreeSource<'a> {
+    Borrowed(&'a TypeTree),
+    Shared(Arc<TypeTree>),
+}
+
+impl TypeTreeSource<'_> {
+    fn as_ref(&self) -> &TypeTree {
+        match self {
+            Self::Borrowed(t) => t,
+            Self::Shared(t) => t.as_ref(),
+        }
+    }
+}
+
+fn type_tree_for_object<'a>(
+    file: &'a SerializedFile,
+    info: &ObjectInfo,
+) -> Option<TypeTreeSource<'a>> {
+    fn from_internal<'a>(file: &'a SerializedFile, info: &ObjectInfo) -> Option<&'a TypeTree> {
+        if info.type_index >= 0 {
+            return file
+                .types
+                .get(info.type_index as usize)
+                .map(|t| &t.type_tree);
+        }
+        file.types
+            .iter()
+            .find(|t| t.class_id == info.type_id)
+            .map(|t| &t.type_tree)
     }
 
-    if info.type_index >= 0 {
-        return file
-            .types
-            .get(info.type_index as usize)
-            .map(|t| &t.type_tree);
+    if file.enable_type_tree {
+        if let Some(tree) = from_internal(file, info) {
+            if !tree.is_empty() {
+                return Some(TypeTreeSource::Borrowed(tree));
+            }
+        }
     }
 
-    file.types
-        .iter()
-        .find(|t| t.class_id == info.type_id)
-        .map(|t| &t.type_tree)
+    // Best-effort fallback: stripped files can supply a registry externally.
+    // We also allow this fallback even when `enable_type_tree = true` but the internal entry is missing/empty.
+    file.type_tree_registry
+        .as_ref()
+        .and_then(|r| r.resolve(&file.unity_version, info.type_id))
+        .map(TypeTreeSource::Shared)
 }
 
 fn object_bytes<'a>(file: &'a SerializedFile, info: &'a ObjectInfo) -> Result<&'a [u8]> {

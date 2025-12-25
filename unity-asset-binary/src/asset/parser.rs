@@ -9,6 +9,7 @@ use super::types::{
 use crate::error::{BinaryError, Result};
 use crate::object::ObjectHandle;
 use crate::reader::{BinaryReader, ByteOrder};
+use crate::typetree::TypeTreeRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -37,6 +38,7 @@ impl SerializedFileParser {
             unity_version: String::new(),
             target_platform: 0,
             enable_type_tree: false,
+            type_tree_registry: None,
             types: Vec::new(),
             big_id_enabled: false,
             objects: Vec::new(),
@@ -345,6 +347,8 @@ pub struct SerializedFile {
     pub target_platform: i32,
     /// Whether type tree is enabled
     pub enable_type_tree: bool,
+    /// Optional external TypeTree registry for stripped files (best-effort).
+    pub type_tree_registry: Option<Arc<dyn TypeTreeRegistry>>,
     /// Type information
     pub types: Vec<SerializedType>,
     /// Whether big IDs are enabled
@@ -365,6 +369,10 @@ pub struct SerializedFile {
 }
 
 impl SerializedFile {
+    pub fn set_type_tree_registry(&mut self, registry: Option<Arc<dyn TypeTreeRegistry>>) {
+        self.type_tree_registry = registry;
+    }
+
     /// Get the raw file data
     pub fn data(&self) -> &[u8] {
         self.data.as_ref()

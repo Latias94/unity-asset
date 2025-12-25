@@ -101,6 +101,7 @@ pub mod environment {
     use unity_asset_binary::bundle::AssetBundle;
     use unity_asset_binary::file::{UnityFile, load_unity_file_from_memory};
     use unity_asset_binary::object::{ObjectHandle, UnityObject};
+    use unity_asset_binary::typetree::TypeTreeRegistry;
     use unity_asset_binary::typetree::{
         TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseWarning,
     };
@@ -522,6 +523,7 @@ pub mod environment {
         warnings: Mutex<Vec<EnvironmentWarning>>,
         reporter: Option<Arc<dyn EnvironmentReporter>>,
         options: EnvironmentOptions,
+        type_tree_registry: Option<Arc<dyn TypeTreeRegistry>>,
         /// Base path for relative file resolution
         #[allow(dead_code)]
         base_path: PathBuf,
@@ -543,12 +545,26 @@ pub mod environment {
                 warnings: Mutex::new(Vec::new()),
                 reporter: None,
                 options,
+                type_tree_registry: None,
                 base_path: std::env::current_dir().unwrap_or_default(),
             }
         }
 
         pub fn set_reporter(&mut self, reporter: Option<Arc<dyn EnvironmentReporter>>) {
             self.reporter = reporter;
+        }
+
+        pub fn set_type_tree_registry(&mut self, registry: Option<Arc<dyn TypeTreeRegistry>>) {
+            self.type_tree_registry = registry.clone();
+
+            for file in self.binary_assets.values_mut() {
+                file.set_type_tree_registry(registry.clone());
+            }
+            for bundle in self.bundles.values_mut() {
+                for file in bundle.assets.iter_mut() {
+                    file.set_type_tree_registry(registry.clone());
+                }
+            }
         }
 
         pub fn options(&self) -> EnvironmentOptions {
@@ -641,6 +657,12 @@ pub mod environment {
             })?;
             match load_unity_file_from_memory(data) {
                 Ok(UnityFile::AssetBundle(bundle)) => {
+                    let mut bundle = bundle;
+                    if let Some(registry) = self.type_tree_registry.clone() {
+                        for file in bundle.assets.iter_mut() {
+                            file.set_type_tree_registry(Some(registry.clone()));
+                        }
+                    }
                     let source = BinarySource::path(path);
                     self.bundles.insert(source.clone(), bundle);
                     match self.bundle_container_cache.write() {
@@ -654,6 +676,10 @@ pub mod environment {
                     }
                 }
                 Ok(UnityFile::SerializedFile(asset)) => {
+                    let mut asset = asset;
+                    if let Some(registry) = self.type_tree_registry.clone() {
+                        asset.set_type_tree_registry(Some(registry));
+                    }
                     let source = BinarySource::path(path);
                     self.binary_assets.insert(source, asset);
                     match self.bundle_container_cache.write() {
@@ -693,6 +719,12 @@ pub mod environment {
 
                 match parsed {
                     UnityFile::AssetBundle(bundle) => {
+                        let mut bundle = bundle;
+                        if let Some(registry) = self.type_tree_registry.clone() {
+                            for file in bundle.assets.iter_mut() {
+                                file.set_type_tree_registry(Some(registry.clone()));
+                            }
+                        }
                         let source = BinarySource::WebEntry {
                             web_path: web_path.clone(),
                             entry_name,
@@ -709,6 +741,10 @@ pub mod environment {
                         }
                     }
                     UnityFile::SerializedFile(asset) => {
+                        let mut asset = asset;
+                        if let Some(registry) = self.type_tree_registry.clone() {
+                            asset.set_type_tree_registry(Some(registry));
+                        }
                         let source = BinarySource::WebEntry {
                             web_path: web_path.clone(),
                             entry_name,

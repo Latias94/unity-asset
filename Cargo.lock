@@ -1955,6 +1955,8 @@ checksum = "323402cff2dd658f39ca17c789b502021b3f18707c91cdf22e3838e1b4023817"
 name = "unity-asset"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "unity-asset-binary",
@@ -1982,6 +1984,7 @@ dependencies = [
  "once_cell",
  "regex",
  "serde",
+ "serde_json",
  "thiserror 2.0.16",
  "tokio",
  "tokio-stream",
