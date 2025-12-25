@@ -119,6 +119,60 @@ pub(crate) enum Commands {
         jobs: usize,
     },
 
+    /// Export objects from SerializedFiles (e.g. `.asset`, `.assets`) by scanning objects directly
+    #[command(name = "export-serialized")]
+    ExportSerialized {
+        /// Input file or directory path (serialized files will be auto-detected)
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output directory
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Restrict exporting to a specific loaded serialized source path
+        #[arg(long)]
+        source: Option<PathBuf>,
+
+        /// Filter by Unity class id (can be repeated). Empty means export all.
+        #[arg(long)]
+        class_id: Vec<i32>,
+
+        /// Filter by Unity class name substring (case-insensitive).
+        #[arg(long, default_value = "")]
+        class_name: String,
+
+        /// Filter by object `m_Name`/`name` substring (case-insensitive) via a TypeTree prefix fast path.
+        ///
+        /// Note: this requires TypeTree to be present and to include a name field; otherwise the object is treated as non-matching.
+        #[arg(long, default_value = "")]
+        name: String,
+
+        /// Limit exported objects
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Only print what would be exported
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Decode known types (AudioClip -> WAV/encoded, Texture2D -> PNG, Sprite -> PNG, TextAsset -> TXT) instead of exporting raw bytes
+        #[arg(long)]
+        decode: bool,
+
+        /// Overwrite existing output files
+        #[arg(long, conflicts_with = "skip_existing")]
+        overwrite: bool,
+
+        /// Skip objects whose output file already exists
+        #[arg(long)]
+        skip_existing: bool,
+
+        /// Parallel export jobs (0 = auto, 1 = serial)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+    },
+
     /// List AssetBundle nodes (files) for debugging and inspection
     ListBundle {
         /// Input AssetBundle path

@@ -63,6 +63,8 @@ unity-asset/
 - Export capabilities (PNG, OGG, WAV, basic mesh formats)
 - Comprehensive metadata analysis and reporting
 - Basic progress reporting
+  - `list-objects`: list objects from SerializedFiles/bundles (path_id/class_id/type/name) using TypeTree fast paths
+  - `export-serialized`: export objects from `.asset/.assets` by scanning objects directly (raw `.bin`, optional best-effort decode)
 
 **⚠️ Known Limitations**
 - Some advanced Unity asset types not yet implemented (MonoBehaviour scripts, complex shaders)

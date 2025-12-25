@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `unity-asset-core`: `get_class_name_str` to map class IDs to names without allocating.
 - `unity-asset` `EnvironmentOptions` + `EnvironmentWarning` to control parsing behavior and observe non-fatal load issues without printing from libraries.
 - `unity-asset` CLI: `--strict` (fail-fast TypeTree parsing) and `--show-warnings` (print collected warnings and TypeTree warnings in `inspect-object`).
+- `unity-asset` CLI: `list-objects` to list objects from SerializedFiles/bundles via `ObjectHandle` fast paths (`peek_name`, TypeTree root type names).
+- `unity-asset` CLI: `export-serialized` to export objects from `.asset/.assets` by scanning objects directly (best-effort; optional decode).
 - `unity-asset-yaml` loader: `load_yaml_with_warnings` / `load_yaml_async_with_warnings` to surface non-fatal per-document conversion failures without printing from library code.
 - UnityPy-style `ObjectHandle` in `unity-asset-binary` to treat objects as lightweight, on-demand readers (`SerializedFile::object_handles` / `SerializedFile::find_object_handle`).
 - `unity-asset-binary` `ObjectHandle::peek_name()` to read `m_Name`/`name` via a TypeTree prefix fast path (without parsing the full object).

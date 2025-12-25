@@ -4,6 +4,7 @@ use anyhow::Result;
 
 mod deps;
 mod dump_typetree_registry;
+mod export_serialized;
 mod export_bundle;
 mod extract;
 mod find_object;
@@ -56,6 +57,34 @@ pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
             resume,
             retry_failed_from,
             continue_on_error,
+            jobs,
+            ctx,
+        ),
+        Commands::ExportSerialized {
+            input,
+            output,
+            source,
+            class_id,
+            class_name,
+            name,
+            limit,
+            dry_run,
+            decode,
+            overwrite,
+            skip_existing,
+            jobs,
+        } => export_serialized::run(
+            input,
+            output,
+            source,
+            class_id,
+            class_name,
+            name,
+            limit,
+            dry_run,
+            decode,
+            overwrite,
+            skip_existing,
             jobs,
             ctx,
         ),
