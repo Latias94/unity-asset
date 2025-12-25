@@ -336,7 +336,8 @@ impl<'a> TypeTreeSerializer<'a> {
             "UInt32" | "unsigned int" | "Type*" => reader.read_u32()? as i32,
             "SInt16" | "short" => reader.read_i16()? as i32,
             "UInt16" | "unsigned short" => reader.read_u16()? as i32,
-            "SInt8" | "char" => reader.read_i8()? as i32,
+            "SInt8" => reader.read_i8()? as i32,
+            "char" => reader.read_u8()? as i32,
             "UInt8" => reader.read_u8()? as i32,
             other => {
                 return Err(BinaryError::invalid_data(format!(
@@ -476,8 +477,12 @@ impl<'a> TypeTreeSerializer<'a> {
     ) -> Result<UnityValue> {
         let value = match node.type_name.as_str() {
             // Signed integers
-            "SInt8" | "char" => {
+            "SInt8" => {
                 let val = reader.read_i8()?;
+                UnityValue::Integer(val as i64)
+            }
+            "char" => {
+                let val = reader.read_u8()?;
                 UnityValue::Integer(val as i64)
             }
             "SInt16" | "short" => {
@@ -1273,5 +1278,33 @@ mod tests {
         let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
         let _ = serializer.scan_pptrs(&mut reader).unwrap();
         assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn typetree_char_reads_as_unsigned_byte() {
+        let mut tree = TypeTree::new();
+        let mut root = node("TestObject", "TestObject");
+
+        let mut char_node = node("char", "m_Char");
+        char_node.meta_flags = 0x4000;
+        let next_node = node("int", "m_Next");
+
+        root.children = vec![char_node, next_node];
+        tree.nodes.push(root);
+
+        let serializer = TypeTreeSerializer::new(&tree);
+
+        let mut bytes = Vec::new();
+        bytes.push(0xFF);
+        bytes.extend_from_slice(&[0u8; 3]);
+        bytes.extend_from_slice(&0x11223344i32.to_le_bytes());
+
+        let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+        let props = serializer.parse_object(&mut reader).unwrap();
+        assert_eq!(props.get("m_Char").and_then(|v| v.as_i64()), Some(255));
+        assert_eq!(
+            props.get("m_Next").and_then(|v| v.as_i64()),
+            Some(0x11223344)
+        );
     }
 }
