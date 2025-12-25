@@ -6,12 +6,12 @@ use super::header::SerializedFileHeader;
 use super::types::{
     FileIdentifier, LocalSerializedObjectIdentifier, ObjectInfo, SerializedType, TypeRegistry,
 };
+use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
 use crate::object::ObjectHandle;
 use crate::reader::{BinaryReader, ByteOrder};
-use crate::typetree::TypeTreeRegistry;
-use crate::data_view::DataView;
 use crate::shared_bytes::SharedBytes;
+use crate::typetree::TypeTreeRegistry;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -41,10 +41,7 @@ impl SerializedFileParser {
     }
 
     /// Parse a SerializedFile from a shared backing buffer + byte range (zero-copy view).
-    pub fn from_shared_range(
-        data: SharedBytes,
-        range: Range<usize>,
-    ) -> Result<SerializedFile> {
+    pub fn from_shared_range(data: SharedBytes, range: Range<usize>) -> Result<SerializedFile> {
         Self::from_shared_range_with_options(data, range, false)
     }
 

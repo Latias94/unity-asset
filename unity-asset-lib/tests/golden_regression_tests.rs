@@ -505,14 +505,22 @@ fn golden_regression_smoke() {
                             .get("m_FileID")
                             .and_then(|v| v.as_i64())
                             .expect("m_RD.texture.m_FileID int");
-                        assert_eq!(fid, expected, "m_RD.texture.m_FileID mismatch (case={})", case.id);
+                        assert_eq!(
+                            fid, expected,
+                            "m_RD.texture.m_FileID mismatch (case={})",
+                            case.id
+                        );
                     }
                     if let Some(expected) = texture_path_id {
                         let pid = tex
                             .get("m_PathID")
                             .and_then(|v| v.as_i64())
                             .expect("m_RD.texture.m_PathID int");
-                        assert_eq!(pid, expected, "m_RD.texture.m_PathID mismatch (case={})", case.id);
+                        assert_eq!(
+                            pid, expected,
+                            "m_RD.texture.m_PathID mismatch (case={})",
+                            case.id
+                        );
                     }
                 }
 
@@ -626,7 +634,9 @@ fn golden_regression_smoke() {
                                     );
                                 }
                             }
-                            other => panic!("unexpected m_RD.m_VertexData.m_DataSize type: {other:?}"),
+                            other => {
+                                panic!("unexpected m_RD.m_VertexData.m_DataSize type: {other:?}")
+                            }
                         }
                     }
                 }
@@ -834,7 +844,9 @@ fn golden_regression_smoke() {
                     );
                     let v = pair[1].as_object().expect("m_RenderDataMap value object");
                     let tex = v.get("texture").expect("m_RenderDataMap value.texture");
-                    let tex = tex.as_object().expect("m_RenderDataMap value.texture object");
+                    let tex = tex
+                        .as_object()
+                        .expect("m_RenderDataMap value.texture object");
                     let pid = tex
                         .get("m_PathID")
                         .and_then(|v| v.as_i64())

@@ -4,8 +4,8 @@ use anyhow::Result;
 
 mod deps;
 mod dump_typetree_registry;
-mod export_serialized;
 mod export_bundle;
+mod export_serialized;
 mod extract;
 mod find_object;
 mod inspect_object;

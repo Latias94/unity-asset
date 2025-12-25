@@ -94,7 +94,8 @@ impl Environment {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or(&node_norm);
-                if is_resource && (node_norm.starts_with(&cab_prefix) || base.starts_with(&cab_prefix))
+                if is_resource
+                    && (node_norm.starts_with(&cab_prefix) || base.starts_with(&cab_prefix))
                 {
                     return Some(*node);
                 }
@@ -222,9 +223,9 @@ impl Environment {
             )));
         }
 
-        let offset_usize: usize = offset.try_into().map_err(|_| {
-            UnityAssetError::format(format!("Stream offset overflow: {}", offset))
-        })?;
+        let offset_usize: usize = offset
+            .try_into()
+            .map_err(|_| UnityAssetError::format(format!("Stream offset overflow: {}", offset)))?;
         let size_usize: usize = size
             .try_into()
             .map_err(|_| UnityAssetError::format(format!("Stream size overflow: {}", size)))?;
@@ -303,13 +304,12 @@ impl Environment {
             UnityAssetError::format(format!("WebFile source not loaded: {:?}", web_path))
         })?;
 
-        let entry_name =
-            Self::find_webfile_resource_entry(web, stream_path).ok_or_else(|| {
-                UnityAssetError::format(format!(
-                    "Resource entry not found in WebFile {:?}: {}",
-                    web_path, stream_path
-                ))
-            })?;
+        let entry_name = Self::find_webfile_resource_entry(web, stream_path).ok_or_else(|| {
+            UnityAssetError::format(format!(
+                "Resource entry not found in WebFile {:?}: {}",
+                web_path, stream_path
+            ))
+        })?;
 
         let bytes = web.extract_file(&entry_name).map_err(|e| {
             UnityAssetError::format(format!(
@@ -318,9 +318,9 @@ impl Environment {
             ))
         })?;
 
-        let offset_usize: usize = offset.try_into().map_err(|_| {
-            UnityAssetError::format(format!("Stream offset overflow: {}", offset))
-        })?;
+        let offset_usize: usize = offset
+            .try_into()
+            .map_err(|_| UnityAssetError::format(format!("Stream offset overflow: {}", offset)))?;
         let size_usize: usize = size
             .try_into()
             .map_err(|_| UnityAssetError::format(format!("Stream size overflow: {}", size)))?;
@@ -412,11 +412,18 @@ impl Environment {
             if !candidate.exists() {
                 continue;
             }
-            let mut file = File::open(&candidate)
-                .map_err(|e| UnityAssetError::with_source(format!("Failed to open stream resource {:?}", candidate), e))?;
+            let mut file = File::open(&candidate).map_err(|e| {
+                UnityAssetError::with_source(
+                    format!("Failed to open stream resource {:?}", candidate),
+                    e,
+                )
+            })?;
             file.seek(SeekFrom::Start(offset)).map_err(|e| {
                 UnityAssetError::with_source(
-                    format!("Failed to seek stream resource {:?} to {}", candidate, offset),
+                    format!(
+                        "Failed to seek stream resource {:?} to {}",
+                        candidate, offset
+                    ),
                     e,
                 )
             })?;

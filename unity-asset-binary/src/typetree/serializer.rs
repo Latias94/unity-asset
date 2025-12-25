@@ -88,7 +88,11 @@ impl<'a> TypeTreeSerializer<'a> {
         ref_types: &'a [SerializedType],
     ) -> Result<IndexMap<String, UnityValue>> {
         Ok(self
-            .parse_object_detailed_with_ref_types(reader, TypeTreeParseOptions::default(), ref_types)?
+            .parse_object_detailed_with_ref_types(
+                reader,
+                TypeTreeParseOptions::default(),
+                ref_types,
+            )?
             .properties)
     }
 
@@ -539,12 +543,7 @@ impl<'a> TypeTreeSerializer<'a> {
                     }
                     return Ok(());
                 }
-                "SInt32"
-                | "int"
-                | "UInt32"
-                | "unsigned int"
-                | "Type*"
-                | "float" => {
+                "SInt32" | "int" | "UInt32" | "unsigned int" | "Type*" | "float" => {
                     reader.skip_bytes(size.checked_mul(4).ok_or_else(|| {
                         BinaryError::invalid_data("Array byte length overflow")
                     })?)?;
@@ -553,11 +552,7 @@ impl<'a> TypeTreeSerializer<'a> {
                     }
                     return Ok(());
                 }
-                "SInt64"
-                | "long long"
-                | "UInt64"
-                | "unsigned long long"
-                | "FileSize"
+                "SInt64" | "long long" | "UInt64" | "unsigned long long" | "FileSize"
                 | "double" => {
                     reader.skip_bytes(size.checked_mul(8).ok_or_else(|| {
                         BinaryError::invalid_data("Array byte length overflow")
@@ -1316,7 +1311,9 @@ fn resolve_ref_type_tree_triplet<'a>(
     })
 }
 
-fn referenced_type_triplet(referenced_object: &IndexMap<String, UnityValue>) -> Option<(String, String, String)> {
+fn referenced_type_triplet(
+    referenced_object: &IndexMap<String, UnityValue>,
+) -> Option<(String, String, String)> {
     let type_v = referenced_object.get("type")?;
     let type_obj = type_v.as_object()?;
     let class = type_obj.get("class")?.as_str()?.to_string();
@@ -1481,7 +1478,10 @@ mod tests {
         let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
         let props = serializer.parse_object(&mut reader).unwrap();
 
-        assert_eq!(props.get("m_UInt8").and_then(|v| v.as_bytes()), Some(&[0xAB, 0xCD][..]));
+        assert_eq!(
+            props.get("m_UInt8").and_then(|v| v.as_bytes()),
+            Some(&[0xAB, 0xCD][..])
+        );
         assert_eq!(
             props.get("m_Char").and_then(|v| v.as_bytes()),
             Some(&[0x41, 0x80, 0xFF][..])

@@ -197,9 +197,8 @@ impl Environment {
         })?;
 
         for entry in entries {
-            let entry = entry.map_err(|e| {
-                UnityAssetError::with_source("Failed to read directory entry", e)
-            })?;
+            let entry = entry
+                .map_err(|e| UnityAssetError::with_source("Failed to read directory entry", e))?;
             let path = entry.path();
 
             if path.is_dir() {

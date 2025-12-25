@@ -162,8 +162,7 @@ impl MeshParser {
             }
 
             // Extract data size
-            if let Some(data_size_value) = vertex_data_obj.get("m_DataSize")
-            {
+            if let Some(data_size_value) = vertex_data_obj.get("m_DataSize") {
                 match data_size_value {
                     UnityValue::Bytes(b) => {
                         mesh.vertex_data.data_size = b.clone();

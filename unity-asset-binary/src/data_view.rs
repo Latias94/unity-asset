@@ -12,7 +12,11 @@ pub struct DataView {
 impl DataView {
     pub fn from_shared(data: SharedBytes) -> Self {
         let len = data.len();
-        Self { data, start: 0, len }
+        Self {
+            data,
+            start: 0,
+            len,
+        }
     }
 
     pub fn from_shared_range(data: SharedBytes, range: Range<usize>) -> Result<Self> {

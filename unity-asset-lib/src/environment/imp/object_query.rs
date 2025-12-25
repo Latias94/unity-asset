@@ -58,7 +58,11 @@ impl Environment {
 
         let mut bundle_sources: Vec<BinarySource> = self.bundles.keys().cloned().collect();
         bundle_sources.sort();
-        out.extend(bundle_sources.into_iter().map(|s| (BinarySourceKind::AssetBundle, s)));
+        out.extend(
+            bundle_sources
+                .into_iter()
+                .map(|s| (BinarySourceKind::AssetBundle, s)),
+        );
 
         out
     }
@@ -258,9 +262,9 @@ impl Environment {
                         key.path_id
                     ))
                 })?;
-                let obj = object
-                    .read_with_options(typetree_options)
-                    .map_err(|e| UnityAssetError::with_source("Failed to parse binary object", e))?;
+                let obj = object.read_with_options(typetree_options).map_err(|e| {
+                    UnityAssetError::with_source("Failed to parse binary object", e)
+                })?;
                 if let Some(reporter) = &self.reporter {
                     for w in obj.typetree_warnings() {
                         reporter.typetree_warning(key, w);
@@ -277,7 +281,8 @@ impl Environment {
                 })?;
                 let asset_index = key.asset_index.ok_or_else(|| {
                     UnityAssetError::format(
-                        "AssetBundle key requires an asset_index (which asset in the bundle?)".to_string(),
+                        "AssetBundle key requires an asset_index (which asset in the bundle?)"
+                            .to_string(),
                     )
                 })?;
                 let file = bundle.assets.get(asset_index).ok_or_else(|| {
@@ -295,9 +300,9 @@ impl Environment {
                         key.path_id
                     ))
                 })?;
-                let obj = object
-                    .read_with_options(typetree_options)
-                    .map_err(|e| UnityAssetError::with_source("Failed to parse binary object", e))?;
+                let obj = object.read_with_options(typetree_options).map_err(|e| {
+                    UnityAssetError::with_source("Failed to parse binary object", e)
+                })?;
                 if let Some(reporter) = &self.reporter {
                     for w in obj.typetree_warnings() {
                         reporter.typetree_warning(key, w);
@@ -331,7 +336,9 @@ impl Environment {
                 })?;
                 object
                     .peek_name_with_options(typetree_options)
-                    .map_err(|e| UnityAssetError::with_source("Failed to peek binary object name", e))
+                    .map_err(|e| {
+                        UnityAssetError::with_source("Failed to peek binary object name", e)
+                    })
             }
             BinarySourceKind::AssetBundle => {
                 let bundle = self.bundles.get(&key.source).ok_or_else(|| {
@@ -342,7 +349,8 @@ impl Environment {
                 })?;
                 let asset_index = key.asset_index.ok_or_else(|| {
                     UnityAssetError::format(
-                        "AssetBundle key requires an asset_index (which asset in the bundle?)".to_string(),
+                        "AssetBundle key requires an asset_index (which asset in the bundle?)"
+                            .to_string(),
                     )
                 })?;
                 let file = bundle.assets.get(asset_index).ok_or_else(|| {
@@ -362,7 +370,9 @@ impl Environment {
                 })?;
                 object
                     .peek_name_with_options(typetree_options)
-                    .map_err(|e| UnityAssetError::with_source("Failed to peek binary object name", e))
+                    .map_err(|e| {
+                        UnityAssetError::with_source("Failed to peek binary object name", e)
+                    })
             }
         }
     }

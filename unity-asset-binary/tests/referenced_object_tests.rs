@@ -16,8 +16,7 @@ fn push_aligned_string_le(out: &mut Vec<u8>, s: &str) {
 fn referenced_object_data_is_parsed_via_ref_types() {
     // Build a ref type tree: { m_Value: int }
     let mut ref_tree = TypeTree::new();
-    let mut ref_root =
-        TypeTreeNode::with_info("MyClass".to_string(), "MyClass".to_string(), -1);
+    let mut ref_root = TypeTreeNode::with_info("MyClass".to_string(), "MyClass".to_string(), -1);
     ref_root.children.push(TypeTreeNode::with_info(
         "int".to_string(),
         "m_Value".to_string(),
@@ -100,8 +99,7 @@ fn referenced_object_data_is_parsed_via_ref_types() {
 fn referenced_object_data_resolves_via_unity_field_aliases() {
     // Unity sometimes encodes managed reference type triplets using m_ClassName/m_NameSpace/m_AssemblyName.
     let mut ref_tree = TypeTree::new();
-    let mut ref_root =
-        TypeTreeNode::with_info("MyClass".to_string(), "MyClass".to_string(), -1);
+    let mut ref_root = TypeTreeNode::with_info("MyClass".to_string(), "MyClass".to_string(), -1);
     ref_root.children.push(TypeTreeNode::with_info(
         "int".to_string(),
         "m_Value".to_string(),
@@ -235,9 +233,7 @@ fn referenced_object_fallback_marks_unresolved_type() {
         Some(true)
     );
     assert_eq!(
-        m_ref
-            .get("_referenced_type_key")
-            .and_then(|v| v.as_str()),
+        m_ref.get("_referenced_type_key").and_then(|v| v.as_str()),
         Some("MissingClass|NS|ASM")
     );
 
@@ -255,8 +251,11 @@ fn managed_references_registry_is_consumed_without_affecting_following_fields() 
     let mut tree = TypeTree::new();
     let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
 
-    let mut registry =
-        TypeTreeNode::with_info("ManagedReferencesRegistry".to_string(), "m_Registry".to_string(), -1);
+    let mut registry = TypeTreeNode::with_info(
+        "ManagedReferencesRegistry".to_string(),
+        "m_Registry".to_string(),
+        -1,
+    );
     let mut vec_node = TypeTreeNode::with_info("vector".to_string(), "m_Data".to_string(), -1);
     let mut array_node = TypeTreeNode::with_info("Array".to_string(), "Array".to_string(), -1);
     array_node.meta_flags = 0x4000; // align to 4 after the array payload
@@ -317,8 +316,11 @@ fn managed_references_registry_skips_large_byte_arrays_and_keeps_reader_in_sync(
     let mut tree = TypeTree::new();
     let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
 
-    let mut registry =
-        TypeTreeNode::with_info("ManagedReferencesRegistry".to_string(), "m_Registry".to_string(), -1);
+    let mut registry = TypeTreeNode::with_info(
+        "ManagedReferencesRegistry".to_string(),
+        "m_Registry".to_string(),
+        -1,
+    );
     let mut vec_node = TypeTreeNode::with_info("vector".to_string(), "m_Data".to_string(), -1);
     let mut array_node = TypeTreeNode::with_info("Array".to_string(), "Array".to_string(), -1);
     array_node.meta_flags = 0x4000; // align to 4 after the array payload
@@ -361,8 +363,14 @@ fn managed_references_registry_skips_large_byte_arrays_and_keeps_reader_in_sync(
         )
         .unwrap();
 
-    assert!(matches!(out.properties.get("m_Registry"), Some(UnityValue::Null)));
-    assert_eq!(out.properties.get("m_Next").and_then(|v| v.as_i64()), Some(0x55667788));
+    assert!(matches!(
+        out.properties.get("m_Registry"),
+        Some(UnityValue::Null)
+    ));
+    assert_eq!(
+        out.properties.get("m_Next").and_then(|v| v.as_i64()),
+        Some(0x55667788)
+    );
     assert_eq!(reader.position() as usize, bytes.len());
 }
 
@@ -371,8 +379,11 @@ fn managed_references_registry_skips_nested_string_vectors_and_keeps_reader_in_s
     let mut tree = TypeTree::new();
     let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
 
-    let mut registry =
-        TypeTreeNode::with_info("ManagedReferencesRegistry".to_string(), "m_Registry".to_string(), -1);
+    let mut registry = TypeTreeNode::with_info(
+        "ManagedReferencesRegistry".to_string(),
+        "m_Registry".to_string(),
+        -1,
+    );
     registry.children.push(TypeTreeNode::with_info(
         "int".to_string(),
         "m_Version".to_string(),
@@ -422,8 +433,14 @@ fn managed_references_registry_skips_nested_string_vectors_and_keeps_reader_in_s
         )
         .unwrap();
 
-    assert!(matches!(out.properties.get("m_Registry"), Some(UnityValue::Null)));
-    assert_eq!(out.properties.get("m_Next").and_then(|v| v.as_i64()), Some(0x01020304));
+    assert!(matches!(
+        out.properties.get("m_Registry"),
+        Some(UnityValue::Null)
+    ));
+    assert_eq!(
+        out.properties.get("m_Next").and_then(|v| v.as_i64()),
+        Some(0x01020304)
+    );
     assert_eq!(reader.position() as usize, bytes.len());
 }
 
@@ -431,8 +448,7 @@ fn managed_references_registry_skips_nested_string_vectors_and_keeps_reader_in_s
 fn scan_pptrs_can_traverse_managed_reference_payloads_via_ref_types() {
     // Build a ref type tree: { m_Ptr: PPtr<Object> }.
     let mut ref_tree = TypeTree::new();
-    let mut ref_root =
-        TypeTreeNode::with_info("MyClass".to_string(), "MyClass".to_string(), -1);
+    let mut ref_root = TypeTreeNode::with_info("MyClass".to_string(), "MyClass".to_string(), -1);
     let mut pptr = TypeTreeNode::with_info("PPtr<Object>".to_string(), "m_Ptr".to_string(), -1);
     pptr.children.push(TypeTreeNode::with_info(
         "int".to_string(),

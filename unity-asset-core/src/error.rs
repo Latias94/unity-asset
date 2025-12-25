@@ -1,7 +1,7 @@
 //! Error types for Unity asset parsing
 
-use std::io;
 use std::error::Error as StdError;
+use std::io;
 use thiserror::Error;
 
 /// Result type alias for Unity asset operations

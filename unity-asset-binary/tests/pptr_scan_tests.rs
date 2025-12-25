@@ -36,8 +36,11 @@ fn scan_pptrs_finds_internal_and_external_refs() {
     let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
 
     root.children.push(make_pptr_node("m_Single"));
-    root.children
-        .push(TypeTreeNode::with_info("int".to_string(), "m_Marker".to_string(), -1));
+    root.children.push(TypeTreeNode::with_info(
+        "int".to_string(),
+        "m_Marker".to_string(),
+        -1,
+    ));
     root.children.push(make_pptr_array_node("m_List"));
     tree.add_node(root);
 
@@ -73,4 +76,3 @@ fn scan_pptrs_finds_internal_and_external_refs() {
     external.dedup();
     assert_eq!(external, vec![(1, 111)]);
 }
-

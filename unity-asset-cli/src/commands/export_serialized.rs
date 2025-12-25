@@ -1,14 +1,12 @@
-use crate::shared::{
-    AppContext, build_environment, load_environment_input, resolve_loaded_source,
-};
+use crate::shared::{AppContext, build_environment, load_environment_input, resolve_loaded_source};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 use unity_asset::environment::{BinaryObjectKey, BinarySource, BinarySourceKind, Environment};
 use unity_asset_binary::asset::SerializedFile;
 
@@ -228,7 +226,10 @@ pub(crate) fn run(
     if let Some(path) = retry_failed_from.as_ref() {
         let prev = read_export_manifest(path)?;
         if prev.schema != 1 {
-            anyhow::bail!("Unsupported --retry-failed-from manifest schema: {}", prev.schema);
+            anyhow::bail!(
+                "Unsupported --retry-failed-from manifest schema: {}",
+                prev.schema
+            );
         }
 
         let mut jobs: Vec<ExportJob> = Vec::new();
@@ -326,8 +327,7 @@ pub(crate) fn run(
                 }
 
                 let class = best_effort_class_name(file, cid);
-                if !class_name_lc.is_empty()
-                    && !class.to_ascii_lowercase().contains(&class_name_lc)
+                if !class_name_lc.is_empty() && !class.to_ascii_lowercase().contains(&class_name_lc)
                 {
                     continue;
                 }
@@ -451,7 +451,8 @@ pub(crate) fn run(
         }
 
         if let Some(path) = manifest.as_ref() {
-            let mut entries: Vec<ExportManifestEntry> = Vec::with_capacity(pre_entries.len() + export_jobs.len());
+            let mut entries: Vec<ExportManifestEntry> =
+                Vec::with_capacity(pre_entries.len() + export_jobs.len());
             entries.extend(pre_entries.clone());
             for j in export_jobs.iter() {
                 entries.push(ExportManifestEntry {
@@ -659,9 +660,9 @@ fn export_one_inner(
     let obj = env.read_binary_object_key(&job.key)?;
     let class_id = obj.info.type_id;
     let class_name = best_effort_class_name(
-        env.binary_assets()
-            .get(&job.key.source)
-            .ok_or_else(|| anyhow::anyhow!("SerializedFile source not loaded: {}", job.key.source))?,
+        env.binary_assets().get(&job.key.source).ok_or_else(|| {
+            anyhow::anyhow!("SerializedFile source not loaded: {}", job.key.source)
+        })?,
         class_id,
     );
     let obj_name = obj.name();
@@ -674,7 +675,9 @@ fn export_one_inner(
             } else {
                 ExportStatus::SkippedExisting
             };
-            return Ok((dest, exported, status, bytes, class_id, class_name, obj_name));
+            return Ok((
+                dest, exported, status, bytes, class_id, class_name, obj_name,
+            ));
         }
     }
 
@@ -789,7 +792,11 @@ fn try_decode_export_best_effort(
                 Ok(audio_bytes) if !audio_bytes.is_empty() => {
                     dest.set_extension(clip.compression_format().extension());
                     if job.effective_skip_existing && dest.exists() && !job.overwrite {
-                        return Ok(Some((dest, false, std::fs::metadata(&dest).map(|m| m.len()).ok())));
+                        return Ok(Some((
+                            dest,
+                            false,
+                            std::fs::metadata(&dest).map(|m| m.len()).ok(),
+                        )));
                     }
                     if let Some(parent) = dest.parent() {
                         std::fs::create_dir_all(parent)?;
@@ -809,7 +816,11 @@ fn try_decode_export_best_effort(
                             if !bytes.is_empty() {
                                 dest.set_extension(clip.compression_format().extension());
                                 if job.effective_skip_existing && dest.exists() && !job.overwrite {
-                                    return Ok(Some((dest, false, std::fs::metadata(&dest).map(|m| m.len()).ok())));
+                                    return Ok(Some((
+                                        dest,
+                                        false,
+                                        std::fs::metadata(&dest).map(|m| m.len()).ok(),
+                                    )));
                                 }
                                 if let Some(parent) = dest.parent() {
                                     std::fs::create_dir_all(parent)?;
@@ -822,14 +833,22 @@ fn try_decode_export_best_effort(
 
                     dest.set_extension("wav");
                     if job.effective_skip_existing && dest.exists() && !job.overwrite {
-                        return Ok(Some((dest, false, std::fs::metadata(&dest).map(|m| m.len()).ok())));
+                        return Ok(Some((
+                            dest,
+                            false,
+                            std::fs::metadata(&dest).map(|m| m.len()).ok(),
+                        )));
                     }
                     if let Some(parent) = dest.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
                     let audio_processor = AudioProcessor::new(unity_version);
                     audio_processor.process_and_export(&obj, &dest)?;
-                    return Ok(Some((dest, true, std::fs::metadata(&dest).map(|m| m.len()).ok())));
+                    return Ok(Some((
+                        dest,
+                        true,
+                        std::fs::metadata(&dest).map(|m| m.len()).ok(),
+                    )));
                 }
             }
         }
@@ -837,7 +856,11 @@ fn try_decode_export_best_effort(
             let mut dest = job.dest_base.clone();
             dest.set_extension("png");
             if job.effective_skip_existing && dest.exists() && !job.overwrite {
-                return Ok(Some((dest, false, std::fs::metadata(&dest).map(|m| m.len()).ok())));
+                return Ok(Some((
+                    dest,
+                    false,
+                    std::fs::metadata(&dest).map(|m| m.len()).ok(),
+                )));
             }
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -862,7 +885,11 @@ fn try_decode_export_best_effort(
 
             let image = texture_processor.decode_texture(&texture)?;
             TextureExporter::export_auto(&image, &dest)?;
-            return Ok(Some((dest, true, std::fs::metadata(&dest).map(|m| m.len()).ok())));
+            return Ok(Some((
+                dest,
+                true,
+                std::fs::metadata(&dest).map(|m| m.len()).ok(),
+            )));
         }
         class_ids::TEXT_ASSET => {
             let bytes = text_asset_bytes(&obj);
@@ -871,9 +898,17 @@ fn try_decode_export_best_effort(
             }
 
             let mut dest = job.dest_base.clone();
-            dest.set_extension(if std::str::from_utf8(&bytes).is_ok() { "txt" } else { "bin" });
+            dest.set_extension(if std::str::from_utf8(&bytes).is_ok() {
+                "txt"
+            } else {
+                "bin"
+            });
             if job.effective_skip_existing && dest.exists() && !job.overwrite {
-                return Ok(Some((dest, false, std::fs::metadata(&dest).map(|m| m.len()).ok())));
+                return Ok(Some((
+                    dest,
+                    false,
+                    std::fs::metadata(&dest).map(|m| m.len()).ok(),
+                )));
             }
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -882,20 +917,23 @@ fn try_decode_export_best_effort(
             return Ok(Some((dest, true, Some(bytes.len() as u64))));
         }
         class_ids::SPRITE => {
-            let Some(obj_ref) = env.find_binary_object_in_source_id(&job.key.source, job.key.path_id) else {
+            let Some(obj_ref) =
+                env.find_binary_object_in_source_id(&job.key.source, job.key.path_id)
+            else {
                 return Ok(None);
             };
 
             let sprite_processor = SpriteProcessor::new(unity_version.clone());
             let sprite = sprite_processor.parse_sprite(&obj)?.sprite;
 
-            let (file_id, texture_path_id) = if let Some((file_id, path_id)) = sprite_texture_pptr(&obj) {
-                (file_id, path_id)
-            } else if sprite.render_data.texture_path_id != 0 {
-                (0, sprite.render_data.texture_path_id)
-            } else {
-                return Ok(None);
-            };
+            let (file_id, texture_path_id) =
+                if let Some((file_id, path_id)) = sprite_texture_pptr(&obj) {
+                    (file_id, path_id)
+                } else if sprite.render_data.texture_path_id != 0 {
+                    (0, sprite.render_data.texture_path_id)
+                } else {
+                    return Ok(None);
+                };
 
             let texture_obj = env.read_binary_pptr(&obj_ref, file_id, texture_path_id)?;
 
@@ -920,7 +958,11 @@ fn try_decode_export_best_effort(
             let mut dest = job.dest_base.clone();
             dest.set_extension("png");
             if job.effective_skip_existing && dest.exists() && !job.overwrite {
-                return Ok(Some((dest, false, std::fs::metadata(&dest).map(|m| m.len()).ok())));
+                return Ok(Some((
+                    dest,
+                    false,
+                    std::fs::metadata(&dest).map(|m| m.len()).ok(),
+                )));
             }
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;

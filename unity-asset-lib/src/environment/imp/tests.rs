@@ -46,8 +46,7 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
     use unity_asset_decode::audio::AudioClipConverter;
 
     let mut env = Environment::new();
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/char_118_yuki.ab");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/char_118_yuki.ab");
     env.load_file(&path).unwrap();
     assert!(!env.bundles().is_empty());
 
@@ -281,10 +280,7 @@ fn environment_assetbundle_container_raw_matches_typetree_when_stripped() {
             file.set_type_tree_registry(None);
         }
     }
-    env.bundle_container_cache
-        .write()
-        .unwrap()
-        .remove(&source);
+    env.bundle_container_cache.write().unwrap().remove(&source);
 
     let stripped = env.bundle_container_entries(&path).unwrap();
     assert!(
@@ -351,7 +347,9 @@ fn environment_loads_minimal_gameobject_transform_prefab_and_resolves_refs() {
         .expect("m_GameObject object");
     assert_eq!(t_go.get("fileID").and_then(|v| v.as_i64()), Some(1001));
 
-    let mb = env.find_yaml_by_anchor("1003").expect("MonoBehaviour anchor");
+    let mb = env
+        .find_yaml_by_anchor("1003")
+        .expect("MonoBehaviour anchor");
     assert_eq!(mb.class_id, 114);
     let mb_go = mb
         .get("m_GameObject")
@@ -538,9 +536,7 @@ fn environment_loads_extless_webfile_entries_and_reads_resource_bytes() {
 
     let obj_ref = env
         .binary_object_infos()
-        .find(|r| {
-            r.source == &bundle_source && r.source_kind == BinarySourceKind::AssetBundle
-        })
+        .find(|r| r.source == &bundle_source && r.source_kind == BinarySourceKind::AssetBundle)
         .expect("web bundle yields at least one object handle");
 
     let key = obj_ref.key();

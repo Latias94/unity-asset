@@ -7,29 +7,29 @@
 //! - strict/lenient TypeTree parsing knobs + structured warnings
 
 mod imp {
-	    use crate::{Result, YamlDocument};
-	    use std::collections::HashMap;
-	    use std::fmt;
-	    use std::path::{Path, PathBuf};
-	    use std::sync::{Arc, Mutex, RwLock};
-	    use unity_asset_binary::asset::SerializedFile;
-	    use unity_asset_binary::bundle::AssetBundle;
-	    use unity_asset_binary::file::{UnityFile, load_unity_file, load_unity_file_from_shared_range};
+    use crate::{Result, YamlDocument};
+    use std::collections::HashMap;
+    use std::fmt;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, RwLock};
+    use unity_asset_binary::asset::SerializedFile;
+    use unity_asset_binary::bundle::AssetBundle;
+    use unity_asset_binary::file::{UnityFile, load_unity_file, load_unity_file_from_shared_range};
     use unity_asset_binary::object::{ObjectHandle, UnityObject};
     use unity_asset_binary::typetree::TypeTreeRegistry;
     use unity_asset_binary::typetree::{
         TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseWarning,
     };
     use unity_asset_binary::webfile::WebFile;
-	    use unity_asset_core::UnityValue;
-	    use unity_asset_core::{UnityAssetError, UnityClass, UnityDocument};
+    use unity_asset_core::UnityValue;
+    use unity_asset_core::{UnityAssetError, UnityClass, UnityDocument};
 
-	    mod container;
-	    mod key;
-	    mod loader;
-	    mod object_query;
-	    mod pptr;
-	    mod stream;
+    mod container;
+    mod key;
+    mod loader;
+    mod object_query;
+    mod pptr;
+    mod stream;
 
     #[derive(Debug, Clone)]
     pub enum EnvironmentWarning {
@@ -218,16 +218,16 @@ mod imp {
     /// `path_id` is only unique within a single `SerializedFile`, so we include a source path
     /// (bundle/asset path) and optional bundle asset index.
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-	    pub struct BinaryObjectKey {
-	        pub source: BinarySource,
-	        pub source_kind: BinarySourceKind,
-	        pub asset_index: Option<usize>,
-	        pub path_id: i64,
-	    }
+    pub struct BinaryObjectKey {
+        pub source: BinarySource,
+        pub source_kind: BinarySourceKind,
+        pub asset_index: Option<usize>,
+        pub path_id: i64,
+    }
 
-	    /// A best-effort entry extracted from an AssetBundle `m_Container`.
-	    #[derive(Debug, Clone, PartialEq, Eq)]
-	    pub struct BundleContainerEntry {
+    /// A best-effort entry extracted from an AssetBundle `m_Container`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct BundleContainerEntry {
         pub bundle_source: BinarySource,
         pub asset_index: usize,
         pub asset_path: String,

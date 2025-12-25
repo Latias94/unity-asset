@@ -210,7 +210,11 @@ impl Environment {
         let mut out = Vec::new();
         for bundle_source in bundle_sources {
             if let Ok(entries) = self.bundle_container_entries_source(bundle_source) {
-                out.extend(entries.into_iter().filter(|e| e.asset_path.contains(pattern)));
+                out.extend(
+                    entries
+                        .into_iter()
+                        .filter(|e| e.asset_path.contains(pattern)),
+                );
             }
         }
         out

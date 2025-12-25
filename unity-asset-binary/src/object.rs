@@ -5,9 +5,8 @@ use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::shared_bytes::SharedBytes;
 use crate::typetree::{
-    PPtrScanResult,
-    TypeTree, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput, TypeTreeParseWarning,
-    TypeTreeSerializer,
+    PPtrScanResult, TypeTree, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput,
+    TypeTreeParseWarning, TypeTreeSerializer,
 };
 use crate::unity_objects::{GameObject, Transform};
 use std::sync::Arc;
@@ -116,9 +115,10 @@ impl<'a> ObjectHandle<'a> {
         if self.file.ref_types.is_empty() {
             Ok(Some(serializer.scan_pptrs(&mut reader)?))
         } else {
-            Ok(Some(
-                serializer.scan_pptrs_with_ref_types(&mut reader, Some(&self.file.ref_types))?,
-            ))
+            Ok(Some(serializer.scan_pptrs_with_ref_types(
+                &mut reader,
+                Some(&self.file.ref_types),
+            )?))
         }
     }
 }
@@ -482,10 +482,7 @@ fn apply_raw_preview(class: &mut UnityClass, bytes: &[u8]) {
         UnityValue::Integer(bytes.len() as i64),
     );
     if bytes.len() <= RAW_DATA_INLINE_LIMIT {
-        class.set(
-            "_raw_data".to_string(),
-            UnityValue::Bytes(bytes.to_vec()),
-        );
+        class.set("_raw_data".to_string(), UnityValue::Bytes(bytes.to_vec()));
     } else {
         class.set("_raw_data_truncated".to_string(), UnityValue::Bool(true));
         let preview_len = bytes.len().min(RAW_DATA_PREVIEW_LEN);

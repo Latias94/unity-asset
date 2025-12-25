@@ -36,4 +36,3 @@ impl SharedBytes {
         self.as_bytes().as_ptr() as usize
     }
 }
-

@@ -16,9 +16,9 @@ pub(crate) fn run(
     let (doc, warnings) =
         unity_asset::YamlDocument::load_yaml_with_warnings(&input, preserve_types)?;
     if ctx.show_warnings {
-            for w in warnings {
-                cli_warn(ctx.show_warnings, w);
-            }
+        for w in warnings {
+            cli_warn(ctx.show_warnings, w);
+        }
     }
 
     println!("✓ Successfully loaded YAML document");

@@ -49,11 +49,7 @@ impl BundleCompression {
             }
             2 | 3 => {
                 // LZ4 or LZ4HC
-                decompress(
-                    compressed_data,
-                    CompressionType::Lz4,
-                    expected_uncompressed,
-                )
+                decompress(compressed_data, CompressionType::Lz4, expected_uncompressed)
             }
             1 => {
                 // LZMA
@@ -83,10 +79,7 @@ impl BundleCompression {
     /// This method parses the compression block metadata from the
     /// decompressed blocks info data.
     pub fn parse_compression_blocks(data: &[u8]) -> Result<Vec<CompressionBlock>> {
-        Self::parse_compression_blocks_limited(
-            data,
-            &super::types::BundleLoadOptions::fast(),
-        )
+        Self::parse_compression_blocks_limited(data, &super::types::BundleLoadOptions::fast())
     }
 
     pub fn parse_compression_blocks_limited(
@@ -172,13 +165,12 @@ impl BundleCompression {
             }
         }
 
-        let total_uncompressed_usize =
-            usize::try_from(total_uncompressed).map_err(|_| {
-                BinaryError::ResourceLimitExceeded(format!(
-                    "Bundle decompressed size {} does not fit in usize",
-                    total_uncompressed
-                ))
-            })?;
+        let total_uncompressed_usize = usize::try_from(total_uncompressed).map_err(|_| {
+            BinaryError::ResourceLimitExceeded(format!(
+                "Bundle decompressed size {} does not fit in usize",
+                total_uncompressed
+            ))
+        })?;
 
         let mut decompressed_data = Vec::with_capacity(total_uncompressed_usize);
 

@@ -116,4 +116,3 @@ fn numeric_array_fastpath_reads_f32_le() {
     assert!((arr[1].as_f64().unwrap() - (-2.5)).abs() < 1e-6);
     assert_eq!(reader.position(), 4 + 2 * 4);
 }
-

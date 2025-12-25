@@ -85,8 +85,9 @@ impl Environment {
         if context.source_kind == BinarySourceKind::AssetBundle {
             if let Some(bundle) = self.bundles.get(context.source) {
                 let external_norm = external.path.replace('\\', "/");
-                let external_file_name =
-                    std::path::Path::new(&external_norm).file_name().and_then(|n| n.to_str());
+                let external_file_name = std::path::Path::new(&external_norm)
+                    .file_name()
+                    .and_then(|n| n.to_str());
 
                 let mut candidates: Vec<(usize, &String)> =
                     bundle.asset_names.iter().enumerate().collect();
@@ -121,7 +122,8 @@ impl Environment {
         }
 
         // Fallback: resolve to an already-loaded standalone serialized file on disk.
-        let resolved_source = self.find_loaded_serialized_source_by_external_path(&external.path)?;
+        let resolved_source =
+            self.find_loaded_serialized_source_by_external_path(&external.path)?;
         Some(BinaryObjectKey {
             source: resolved_source,
             source_kind: BinarySourceKind::SerializedFile,

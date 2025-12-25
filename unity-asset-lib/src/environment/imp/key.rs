@@ -73,11 +73,13 @@ fn parse_bok1(s: &str) -> std::result::Result<BinaryObjectKey, String> {
     let mut rest = &s[prefix.len()..];
     let (kind, r) = split_once(rest, '|').ok_or_else(|| "missing kind".to_string())?;
     rest = r;
-    let (asset_index, r) = split_once(rest, '|').ok_or_else(|| "missing asset_index".to_string())?;
+    let (asset_index, r) =
+        split_once(rest, '|').ok_or_else(|| "missing asset_index".to_string())?;
     rest = r;
     let (path_id, r) = split_once(rest, '|').ok_or_else(|| "missing path_id".to_string())?;
     rest = r;
-    let (path_len, path) = split_once(rest, '|').ok_or_else(|| "missing path_len/path".to_string())?;
+    let (path_len, path) =
+        split_once(rest, '|').ok_or_else(|| "missing path_len/path".to_string())?;
 
     let source_kind = parse_kind(kind)?;
     let asset_index = parse_asset_index(asset_index)?;
@@ -114,7 +116,8 @@ fn parse_bok2(s: &str) -> std::result::Result<BinaryObjectKey, String> {
 
     let (kind, r) = split_once(rest, '|').ok_or_else(|| "missing kind".to_string())?;
     rest = r;
-    let (asset_index, r) = split_once(rest, '|').ok_or_else(|| "missing asset_index".to_string())?;
+    let (asset_index, r) =
+        split_once(rest, '|').ok_or_else(|| "missing asset_index".to_string())?;
     rest = r;
     let (path_id, r) = split_once(rest, '|').ok_or_else(|| "missing path_id".to_string())?;
     rest = r;
@@ -181,4 +184,3 @@ fn split_once<'a>(s: &'a str, delim: char) -> Option<(&'a str, &'a str)> {
     let pos = s.find(delim)?;
     Some((&s[..pos], &s[pos + delim.len_utf8()..]))
 }
-

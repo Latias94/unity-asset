@@ -45,7 +45,8 @@ pub(crate) fn run(
     json: bool,
     ctx: &AppContext,
 ) -> Result<()> {
-    let mut env = crate::shared::build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
+    let mut env =
+        crate::shared::build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
     load_environment_input(&mut env, &input)?;
 
     let kind_lc = kind.to_ascii_lowercase();
@@ -127,8 +128,11 @@ fn list_serialized(
     printed: &mut usize,
 ) -> Result<()> {
     let sources: Vec<BinarySource> = if let Some(source) = source {
-        let resolved =
-            resolve_loaded_source(env, BinarySourceKind::SerializedFile, &BinarySource::path(source))?;
+        let resolved = resolve_loaded_source(
+            env,
+            BinarySourceKind::SerializedFile,
+            &BinarySource::path(source),
+        )?;
         vec![resolved]
     } else {
         env.binary_assets().keys().cloned().collect()
@@ -227,8 +231,11 @@ fn list_bundles(
     printed: &mut usize,
 ) -> Result<()> {
     let sources: Vec<BinarySource> = if let Some(source) = source {
-        let resolved =
-            resolve_loaded_source(env, BinarySourceKind::AssetBundle, &BinarySource::path(source))?;
+        let resolved = resolve_loaded_source(
+            env,
+            BinarySourceKind::AssetBundle,
+            &BinarySource::path(source),
+        )?;
         vec![resolved]
     } else {
         env.bundles().keys().cloned().collect()
