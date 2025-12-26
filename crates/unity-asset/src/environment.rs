@@ -18,6 +18,9 @@ mod imp {
     use unity_asset_binary::object::{ObjectHandle, UnityObject};
     use unity_asset_binary::typetree::TypeTreeRegistry;
     use unity_asset_binary::typetree::{
+        CompositeTypeTreeRegistry, JsonTypeTreeRegistry, TpkTypeTreeRegistry,
+    };
+    use unity_asset_binary::typetree::{
         TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseWarning,
     };
     use unity_asset_binary::webfile::WebFile;
@@ -307,6 +310,55 @@ mod imp {
                     file.set_type_tree_registry(registry.clone());
                 }
             }
+        }
+
+        /// Load and set an external TypeTree registry from a list of file paths.
+        ///
+        /// Supported formats:
+        /// - `.tpk` (UnityPy/UABEA Type Package registry)
+        /// - `.json` (this project's JSON registry format)
+        ///
+        /// When multiple paths are provided, they are composed in the given order (first match wins).
+        pub fn set_type_tree_registry_from_paths(&mut self, paths: &[PathBuf]) -> Result<()> {
+            if paths.is_empty() {
+                self.set_type_tree_registry(None);
+                return Ok(());
+            }
+
+            let mut composite = CompositeTypeTreeRegistry::default();
+            for path in paths {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+
+                if ext == "tpk" {
+                    let registry = TpkTypeTreeRegistry::from_path(path).map_err(|e| {
+                        UnityAssetError::format(format!(
+                            "Failed to load TypeTree registry {:?}: {}",
+                            path, e
+                        ))
+                    })?;
+                    composite.push(Arc::new(registry));
+                } else {
+                    let registry = JsonTypeTreeRegistry::from_path(path).map_err(|e| {
+                        UnityAssetError::format(format!(
+                            "Failed to load TypeTree registry {:?}: {}",
+                            path, e
+                        ))
+                    })?;
+                    composite.push(Arc::new(registry));
+                }
+            }
+
+            if composite.is_empty() {
+                self.set_type_tree_registry(None);
+                return Ok(());
+            }
+
+            self.set_type_tree_registry(Some(Arc::new(composite)));
+            Ok(())
         }
 
         pub fn options(&self) -> EnvironmentOptions {

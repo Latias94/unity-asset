@@ -284,8 +284,6 @@ fn environment_indexes_meta_guid_for_best_effort_external_resolution() {
 #[test]
 fn environment_typetree_registry_json_restores_parsing_for_stripped_assets() {
     use serde::Serialize;
-    use std::sync::Arc;
-    use unity_asset_binary::typetree::JsonTypeTreeRegistry;
 
     #[derive(Debug, Serialize)]
     struct Dump {
@@ -353,8 +351,7 @@ fn environment_typetree_registry_json_restores_parsing_for_stripped_assets() {
     };
     fs::write(&reg_path, serde_json::to_string_pretty(&dump).unwrap()).unwrap();
 
-    let registry = JsonTypeTreeRegistry::from_path(&reg_path).unwrap();
-    env.set_type_tree_registry(Some(Arc::new(registry)));
+    env.set_type_tree_registry_from_paths(&[reg_path]).unwrap();
 
     let obj = env.read_binary_object_key(&key).unwrap();
     assert_eq!(obj.name().as_deref(), Some("banner_1"));
