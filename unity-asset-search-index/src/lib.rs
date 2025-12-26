@@ -13,7 +13,9 @@ use tantivy::query::QueryParser;
 use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value as _};
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term, doc};
 
-use unity_asset_search_core::{MatchKind, rank_match, to_terms};
+use unity_asset_search_core::{
+    MatchKind, highlight_html, normalize_for_match, parse_query, rank_match, to_terms,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
@@ -23,6 +25,10 @@ pub struct SearchHit {
     pub kind: String,
     pub score: f32,
     pub match_kind: MatchKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub highlight_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub highlight_name: Option<String>,
     #[serde(skip_serializing)]
     rank_fuzzy_score: i64,
 }
@@ -33,6 +39,13 @@ pub struct SearchResponse {
     pub took_ms: u128,
     pub total_hits: usize,
     pub hits: Vec<SearchHit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuggestResponse {
+    pub prefix: String,
+    pub took_ms: u128,
+    pub suggestions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,7 +355,8 @@ impl SearchIndex {
     pub fn search(&self, query: &str, limit: usize) -> Result<SearchResponse> {
         let start = Instant::now();
         let query = query.trim();
-        if query.is_empty() {
+        let spec = parse_query(query);
+        if spec.raw.trim().is_empty() {
             return Ok(SearchResponse {
                 query: String::new(),
                 took_ms: 0,
@@ -353,17 +367,42 @@ impl SearchIndex {
 
         let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
         let searcher = inner.reader.searcher();
-        let query_parser = QueryParser::for_index(
-            &inner.index,
-            vec![
-                inner.fields.name_terms,
-                inner.fields.path_terms,
-                inner.fields.kind_terms,
-            ],
-        );
 
-        let parsed = query_parser.parse_query(query)?;
-        let top_docs = searcher.search(&parsed, &TopDocs::with_limit(limit * 5))?;
+        let mut base_query: Box<dyn tantivy::query::Query> = if spec.free_text.is_empty() {
+            Box::new(tantivy::query::AllQuery)
+        } else {
+            let query_parser = QueryParser::for_index(
+                &inner.index,
+                vec![
+                    inner.fields.name_terms,
+                    inner.fields.path_terms,
+                    inner.fields.kind_terms,
+                ],
+            );
+            Box::new(query_parser.parse_query(&spec.free_text)?)
+        };
+
+        if let Some(kind) = spec
+            .type_filter
+            .as_deref()
+            .and_then(canonicalize_kind_filter)
+        {
+            let term = Term::from_field_text(inner.fields.kind, &kind);
+            let term_query =
+                tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+            base_query = Box::new(tantivy::query::BooleanQuery::intersection(vec![
+                base_query,
+                Box::new(term_query),
+            ]));
+        }
+
+        let fetch_limit = if spec.type_filter.is_some() || spec.path_prefix.is_some() {
+            limit * 30
+        } else {
+            limit * 5
+        };
+
+        let top_docs = searcher.search(&base_query, &TopDocs::with_limit(fetch_limit))?;
 
         let mut hits = Vec::with_capacity(top_docs.len());
         for (bm25, address) in top_docs {
@@ -402,8 +441,15 @@ impl SearchIndex {
                 kind,
                 score: bm25,
                 match_kind: rank.kind,
+                highlight_path: None,
+                highlight_name: None,
                 rank_fuzzy_score: rank.fuzzy_score,
             });
+        }
+
+        if let Some(prefix) = spec.path_prefix.as_deref() {
+            let prefix_norm = normalize_for_match(prefix);
+            hits.retain(|h| normalize_for_match(&h.path).starts_with(&prefix_norm));
         }
 
         hits.sort_by(|a, b| {
@@ -414,11 +460,64 @@ impl SearchIndex {
 
         hits.truncate(limit);
 
+        let tokens = spec.tokens.clone();
+        for hit in &mut hits {
+            hit.highlight_path = highlight_html(&hit.path, &tokens);
+            hit.highlight_name = highlight_html(&hit.name, &tokens);
+        }
+
         Ok(SearchResponse {
             query: query.to_string(),
             took_ms: start.elapsed().as_millis(),
             total_hits: hits.len(),
             hits,
+        })
+    }
+
+    pub fn suggest(&self, prefix: &str, limit: usize) -> Result<SuggestResponse> {
+        let start = Instant::now();
+        let prefix = prefix.trim();
+        if prefix.is_empty() {
+            return Ok(SuggestResponse {
+                prefix: String::new(),
+                took_ms: 0,
+                suggestions: Vec::new(),
+            });
+        }
+
+        let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
+        let mut out = Vec::new();
+
+        for kind in [
+            "Prefab", "Scene", "Material", "Script", "Asset", "Shader", "Texture", "Audio", "File",
+        ] {
+            if kind.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                out.push(format!("t:{kind}"));
+                if out.len() >= limit {
+                    return Ok(SuggestResponse {
+                        prefix: prefix.to_string(),
+                        took_ms: start.elapsed().as_millis(),
+                        suggestions: out,
+                    });
+                }
+            }
+        }
+
+        // Path prefix suggestions from state keys (sorted).
+        for (path, _) in inner.state.files.range(prefix.to_string()..) {
+            if !path.starts_with(prefix) {
+                break;
+            }
+            out.push(path.clone());
+            if out.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(SuggestResponse {
+            prefix: prefix.to_string(),
+            took_ms: start.elapsed().as_millis(),
+            suggestions: out,
         })
     }
 
@@ -437,6 +536,27 @@ impl SearchIndex {
 
         Ok(())
     }
+}
+
+fn canonicalize_kind_filter(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let raw = raw.to_lowercase();
+    let out = match raw.as_str() {
+        "prefab" => "Prefab",
+        "scene" => "Scene",
+        "material" | "mat" => "Material",
+        "script" | "cs" => "Script",
+        "asset" => "Asset",
+        "shader" => "Shader",
+        "texture" | "tex" => "Texture",
+        "audio" => "Audio",
+        "file" => "File",
+        _ => return None,
+    };
+    Some(out.to_string())
 }
 
 fn build_schema() -> Schema {

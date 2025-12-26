@@ -22,6 +22,12 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    Suggest {
+        prefix: String,
+
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
     Status,
     Reindex {
         #[arg(long)]
@@ -34,6 +40,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     match args.cmd {
         Cmd::Search { query, limit } => search(&args.base_url, &query, limit).await?,
+        Cmd::Suggest { prefix, limit } => suggest(&args.base_url, &prefix, limit).await?,
         Cmd::Status => status(&args.base_url).await?,
         Cmd::Reindex { full } => reindex(&args.base_url, args.token.as_deref(), full).await?,
     }
@@ -65,6 +72,22 @@ async fn status(base_url: &str) -> Result<()> {
         .context("request /v1/status")?
         .error_for_status()
         .context("status /v1/status")?;
+
+    let json: serde_json::Value = resp.json().await?;
+    println!("{}", serde_json::to_string_pretty(&json)?);
+    Ok(())
+}
+
+async fn suggest(base_url: &str, prefix: &str, limit: usize) -> Result<()> {
+    let url = format!("{base_url}/v1/suggest");
+    let resp = reqwest::Client::new()
+        .get(url)
+        .query(&[("prefix", prefix), ("limit", &limit.to_string())])
+        .send()
+        .await
+        .context("request /v1/suggest")?
+        .error_for_status()
+        .context("status /v1/suggest")?;
 
     let json: serde_json::Value = resp.json().await?;
     println!("{}", serde_json::to_string_pretty(&json)?);

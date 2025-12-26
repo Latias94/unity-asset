@@ -151,14 +151,26 @@ struct SuggestQuery {
     limit: Option<usize>,
 }
 
-async fn suggest(Query(q): Query<SuggestQuery>) -> impl IntoResponse {
-    let _prefix = q.prefix.as_deref().unwrap_or_default();
-    let _limit = q.limit.unwrap_or(10);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "suggestions": [] })),
-    )
-        .into_response()
+async fn suggest(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SuggestQuery>,
+) -> impl IntoResponse {
+    let prefix = q.prefix.unwrap_or_default();
+    let limit = q.limit.unwrap_or(10).clamp(1, 50);
+    let index = state.index.clone();
+    match tokio::task::spawn_blocking(move || index.suggest(&prefix, limit)).await {
+        Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
+        Ok(Err(err)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
