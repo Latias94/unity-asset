@@ -69,3 +69,5 @@ This repository maintains runnable examples per crate (built in CI).
   - `scripts/bench_boat_attack.zsh repo-ref/BoatAttack`
 - Stress test incremental watcher indexing (burst changes):
   - `scripts/stress_incremental_watch.zsh repo-ref/BoatAttack`
+- Stress test watcher-driven directory rename/move:
+  - `scripts/stress_rename_watch.zsh repo-ref/BoatAttack`

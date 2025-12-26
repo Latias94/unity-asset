@@ -538,8 +538,18 @@ impl SearchIndex {
             }
         };
 
+        let changed_paths = {
+            let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
+            normalize_watch_paths_for_incremental(paths, &inner.state, changed_paths)
+        };
+        if changed_paths.is_empty() {
+            drop(indexing_guard);
+            self.refresh_status()?;
+            return Ok(());
+        }
+
         let scan_start = Instant::now();
-        let delta = scan_changed_paths(paths, changed_paths)?;
+        let delta = scan_changed_paths(paths, &changed_paths)?;
         let scan_ms = scan_start.elapsed().as_millis();
 
         let fields = {
@@ -1149,7 +1159,10 @@ impl SearchIndex {
         let searcher = inner.refs_reader.searcher();
 
         let (field, term_text) = if let Some(file_id) = file_id {
-            (inner.refs_fields.ref_guid_fileid, format!("{guid}:{file_id}"))
+            (
+                inner.refs_fields.ref_guid_fileid,
+                format!("{guid}:{file_id}"),
+            )
         } else {
             (inner.refs_fields.ref_guid, guid.clone())
         };
@@ -1187,10 +1200,10 @@ impl SearchIndex {
             });
         }
 
-        hits.sort_by(|a, b| (a.source_path.as_str(), a.source_kind.as_str()).cmp(&(
-            b.source_path.as_str(),
-            b.source_kind.as_str(),
-        )));
+        hits.sort_by(|a, b| {
+            (a.source_path.as_str(), a.source_kind.as_str())
+                .cmp(&(b.source_path.as_str(), b.source_kind.as_str()))
+        });
         hits.dedup_by(|a, b| a.source_path == b.source_path);
 
         Ok(ReferencesResponse {
@@ -1271,6 +1284,37 @@ impl SearchIndex {
 
         Ok(())
     }
+}
+
+fn normalize_watch_paths_for_incremental(
+    paths: &IndexPaths,
+    state: &IndexState,
+    changed_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for p in changed_paths {
+        if p.starts_with(&paths.index_root_dir) {
+            continue;
+        }
+        if p.extension().is_some_and(|e| e == "meta") {
+            let Some(asset) = asset_path_from_meta(p) else {
+                continue;
+            };
+            if asset.exists() {
+                let Ok(rel) = asset.strip_prefix(&paths.project_root) else {
+                    continue;
+                };
+                let rel = rel.to_string_lossy().to_string();
+                if state.files.contains_key(&rel) {
+                    continue;
+                }
+            }
+            out.push(asset);
+            continue;
+        }
+        out.push(p.clone());
+    }
+    out
 }
 
 fn supported_ignore_files() -> Vec<String> {
@@ -1476,7 +1520,9 @@ fn build_fields(schema: &Schema) -> SearchFields {
         name_terms: schema.get_field("name_terms").expect("name_terms field"),
         kind: schema.get_field("kind").expect("kind field"),
         kind_terms: schema.get_field("kind_terms").expect("kind_terms field"),
-        content_terms: schema.get_field("content_terms").expect("content_terms field"),
+        content_terms: schema
+            .get_field("content_terms")
+            .expect("content_terms field"),
     }
 }
 
@@ -1496,7 +1542,9 @@ fn build_refs_fields(schema: &Schema) -> ReferenceFields {
         source_path: schema.get_field("source_path").expect("source_path"),
         source_kind: schema.get_field("source_kind").expect("source_kind"),
         ref_guid: schema.get_field("ref_guid").expect("ref_guid"),
-        ref_guid_fileid: schema.get_field("ref_guid_fileid").expect("ref_guid_fileid"),
+        ref_guid_fileid: schema
+            .get_field("ref_guid_fileid")
+            .expect("ref_guid_fileid"),
     }
 }
 
@@ -1529,7 +1577,9 @@ fn scan_project_files(paths: &IndexPaths) -> Result<ScanResult> {
         if path.extension().is_some_and(|e| e == "meta") {
             return Ok(None);
         }
-        if should_skip_file(path) || is_excluded_dir(path) || !is_in_scan_roots_raw(&scan_roots, path)
+        if should_skip_file(path)
+            || is_excluded_dir(path)
+            || !is_in_scan_roots_raw(&scan_roots, path)
         {
             return Ok(None);
         }
@@ -1626,7 +1676,8 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
     }
 
     if !existing_files.is_empty() {
-        let existing_set: std::collections::BTreeSet<PathBuf> = existing_files.into_iter().collect();
+        let existing_set: std::collections::BTreeSet<PathBuf> =
+            existing_files.into_iter().collect();
         let allowed_dirs = build_allowed_dirs(paths, &existing_set);
         let existing_set_for_filter = existing_set.clone();
 
@@ -1996,7 +2047,10 @@ fn build_script_guid_map(
 
         let text = read_text_limited(&file.abs_path, 256 * 1024)?;
         let (terms, symbols) = if let Some(text) = text.as_deref() {
-            (script_terms_for_source(file, text), extract_csharp_symbols(text))
+            (
+                script_terms_for_source(file, text),
+                extract_csharp_symbols(text),
+            )
         } else {
             (script_terms_fallback(file), Vec::new())
         };
@@ -2038,7 +2092,10 @@ fn update_script_map_for_file(
 
     let text = read_text_limited(&file.abs_path, 256 * 1024)?;
     let (terms, symbols) = if let Some(text) = text.as_deref() {
-        (script_terms_for_source(file, text), extract_csharp_symbols(text))
+        (
+            script_terms_for_source(file, text),
+            extract_csharp_symbols(text),
+        )
     } else {
         (script_terms_fallback(file), Vec::new())
     };
@@ -2078,7 +2135,12 @@ fn script_terms_for_source(file: &ScannedFile, text: &str) -> String {
     if symbols.is_empty() {
         return script_terms_fallback(file);
     }
-    to_terms(&format!("{} {} {}", file.name, symbols.join(" "), file.rel_path))
+    to_terms(&format!(
+        "{} {} {}",
+        file.name,
+        symbols.join(" "),
+        file.rel_path
+    ))
 }
 
 fn build_doc(
@@ -2206,7 +2268,10 @@ fn extract_unity_binary_references(file: &ScannedFile) -> Result<BinaryRefExtrac
 
     match unity_file {
         unity_asset_binary::file::UnityFile::SerializedFile(sf) => {
-            refs = merge_refs(refs, extract_refs_from_serialized_file(&sf, this_guid.as_deref()));
+            refs = merge_refs(
+                refs,
+                extract_refs_from_serialized_file(&sf, this_guid.as_deref()),
+            );
             Ok(BinaryRefExtraction {
                 source_kind: "SerializedFile".to_string(),
                 refs,
@@ -2380,8 +2445,10 @@ fn extract_content_for_file(
         .unwrap_or("")
         .to_lowercase();
 
-    if matches!(file.kind.as_str(), "Prefab" | "Scene" | "Material" | "Asset")
-        && is_probably_unity_yaml(&file.abs_path)?
+    if matches!(
+        file.kind.as_str(),
+        "Prefab" | "Scene" | "Material" | "Asset"
+    ) && is_probably_unity_yaml(&file.abs_path)?
     {
         let text = read_text_limited(&file.abs_path, 2 * 1024 * 1024)?;
         let Some(text) = text else {
@@ -2392,8 +2459,7 @@ fn extract_content_for_file(
 
     if matches!(
         ext.as_str(),
-        "cs"
-            | "shader"
+        "cs" | "shader"
             | "cginc"
             | "hlsl"
             | "compute"
@@ -2641,7 +2707,12 @@ fn extract_reference_contexts_from_binary(
 
     match unity_file {
         unity_asset_binary::file::UnityFile::SerializedFile(sf) => {
-            extract_reference_contexts_from_serialized_file(&sf, self_guid.as_deref(), &guid, file_id)
+            extract_reference_contexts_from_serialized_file(
+                &sf,
+                self_guid.as_deref(),
+                &guid,
+                file_id,
+            )
         }
         unity_asset_binary::file::UnityFile::AssetBundle(bundle) => {
             let mut out = Vec::new();
@@ -2651,10 +2722,7 @@ fn extract_reference_contexts_from_binary(
                     extract_reference_contexts_from_serialized_file(asset, None, &guid, file_id);
                 if !asset_name.trim().is_empty() {
                     for c in &mut ctx {
-                        let hint = c
-                            .field_hint
-                            .clone()
-                            .unwrap_or_else(|| "PPtr".to_string());
+                        let hint = c.field_hint.clone().unwrap_or_else(|| "PPtr".to_string());
                         c.field_hint = Some(format!("bundle_asset={asset_name} {hint}"));
                     }
                 }
@@ -2768,7 +2836,12 @@ fn guess_field_hint(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
     if let Some(pos) = trimmed.find(':') {
         let key = trimmed[..pos].trim();
-        if !key.is_empty() && key.len() <= 64 && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        if !key.is_empty()
+            && key.len() <= 64
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
             return Some(key.to_string());
         }
     }
@@ -2829,7 +2902,10 @@ fn analyze_unity_yaml_docs(text: &str) -> YamlAnalysis {
             1 => {
                 if let Some(name) = parse_unity_yaml_scalar(line, "m_Name") {
                     if !name.trim().is_empty() {
-                        analysis.go_names.entry(header.file_id).or_insert(name.clone());
+                        analysis
+                            .go_names
+                            .entry(header.file_id)
+                            .or_insert(name.clone());
                         analysis.docs.entry(header.file_id).and_modify(|d| {
                             d.name.get_or_insert(name);
                         });
@@ -2837,10 +2913,13 @@ fn analyze_unity_yaml_docs(text: &str) -> YamlAnalysis {
                 }
             }
             4 | 224 => {
-                let entry = analysis.transforms.entry(header.file_id).or_insert(TransformLink {
-                    game_object_id: None,
-                    father_transform_id: None,
-                });
+                let entry = analysis
+                    .transforms
+                    .entry(header.file_id)
+                    .or_insert(TransformLink {
+                        game_object_id: None,
+                        father_transform_id: None,
+                    });
 
                 if entry.game_object_id.is_none() && line.contains("m_GameObject:") {
                     entry.game_object_id = parse_file_id(line);
@@ -2850,10 +2929,13 @@ fn analyze_unity_yaml_docs(text: &str) -> YamlAnalysis {
                 }
             }
             _ => {
-                let doc = analysis.docs.entry(header.file_id).or_insert_with(|| YamlDocInfo {
-                    name: None,
-                    game_object_id: None,
-                });
+                let doc = analysis
+                    .docs
+                    .entry(header.file_id)
+                    .or_insert_with(|| YamlDocInfo {
+                        name: None,
+                        game_object_id: None,
+                    });
                 if doc.name.is_none() {
                     if let Some(name) = parse_unity_yaml_scalar(line, "m_Name") {
                         if !name.trim().is_empty() {
@@ -2889,7 +2971,9 @@ fn analyze_unity_yaml_docs(text: &str) -> YamlAnalysis {
             &analysis.transforms,
             &mut cache,
         ) {
-            analysis.hierarchy_path_by_transform.insert(*transform_id, path);
+            analysis
+                .hierarchy_path_by_transform
+                .insert(*transform_id, path);
         }
     }
 
@@ -2931,9 +3015,8 @@ fn extract_unity_yaml_content(
     static GUID_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
         Regex::new(r"\bguid:\s*([0-9a-fA-F]{32})\b").expect("guid ref regex")
     });
-    static FILEID_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
-        Regex::new(r"\bfileID:\s*([0-9]+)\b").expect("fileID regex")
-    });
+    static FILEID_RE: once_cell::sync::Lazy<Regex> =
+        once_cell::sync::Lazy::new(|| Regex::new(r"\bfileID:\s*([0-9]+)\b").expect("fileID regex"));
 
     let mut primary_name = None;
     let mut extracted: Vec<String> = Vec::new();
@@ -2956,7 +3039,10 @@ fn extract_unity_yaml_content(
         }
     }
 
-    for path in extract_unity_yaml_hierarchy_paths(text).into_iter().take(512) {
+    for path in extract_unity_yaml_hierarchy_paths(text)
+        .into_iter()
+        .take(512)
+    {
         if extracted.len() >= 4096 {
             break;
         }
@@ -3129,7 +3215,9 @@ fn resolve_transform_path(
     let mut parts: Vec<String> = Vec::new();
     parts.push(leaf_name.to_string());
 
-    let mut current = transforms.get(&transform_id).and_then(|t| t.father_transform_id);
+    let mut current = transforms
+        .get(&transform_id)
+        .and_then(|t| t.father_transform_id);
     while let Some(parent_id) = current {
         if !seen.insert(parent_id) {
             break;
@@ -3589,17 +3677,37 @@ Transform:
         let (contexts, objects) =
             group_reference_contexts_and_objects(vec![a, b], "Assets/a.prefab", None);
         assert_eq!(contexts.len(), 2);
-        assert!(contexts.iter().any(|c| c.object_name.as_deref() == Some("A")));
-        assert!(contexts.iter().any(|c| c.object_name.as_deref() == Some("B")));
+        assert!(
+            contexts
+                .iter()
+                .any(|c| c.object_name.as_deref() == Some("A"))
+        );
+        assert!(
+            contexts
+                .iter()
+                .any(|c| c.object_name.as_deref() == Some("B"))
+        );
         assert_eq!(objects.len(), 2);
-        assert!(objects.iter().any(|c| c.object_name.as_deref() == Some("A")));
-        assert!(objects.iter().any(|c| c.object_name.as_deref() == Some("B")));
+        assert!(
+            objects
+                .iter()
+                .any(|c| c.object_name.as_deref() == Some("A"))
+        );
+        assert!(
+            objects
+                .iter()
+                .any(|c| c.object_name.as_deref() == Some("B"))
+        );
     }
 
     #[test]
     fn stable_id_prefers_guid_and_appends_file_id() {
         assert_eq!(
-            stable_id_for(Some("DEADBEEFDEADBEEFDEADBEEFDEADBEEF"), "Assets/a.prefab", Some(10)),
+            stable_id_for(
+                Some("DEADBEEFDEADBEEFDEADBEEFDEADBEEF"),
+                "Assets/a.prefab",
+                Some(10)
+            ),
             "guid:deadbeefdeadbeefdeadbeefdeadbeef#10"
         );
         assert_eq!(
@@ -3618,14 +3726,18 @@ Transform:
         let index = SearchIndex::open_or_create(&paths).unwrap();
         let status = index.status().unwrap();
 
-        assert!(status
-            .ignore_files_supported
-            .iter()
-            .any(|n| n == ".unity-asset-search-ignore"));
-        assert!(status
-            .project_ignore_files_present
-            .iter()
-            .any(|n| n == ".unity-asset-search-ignore"));
+        assert!(
+            status
+                .ignore_files_supported
+                .iter()
+                .any(|n| n == ".unity-asset-search-ignore")
+        );
+        assert!(
+            status
+                .project_ignore_files_present
+                .iter()
+                .any(|n| n == ".unity-asset-search-ignore")
+        );
     }
 
     #[test]
@@ -3660,5 +3772,74 @@ Transform:
         let status = index.status().unwrap();
         assert_eq!(status.indexed_docs, 0);
         assert_eq!(status.removed_docs, Some(1));
+    }
+
+    #[test]
+    fn normalize_watch_paths_skips_meta_changes_for_indexed_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets")).unwrap();
+
+        let prefab = temp.path().join("Assets/foo.prefab");
+        fs::write(
+            &prefab,
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Foo\n",
+        )
+        .unwrap();
+        let meta = temp.path().join("Assets/foo.prefab.meta");
+        fs::write(
+            &meta,
+            "fileFormatVersion: 2\nguid: deadbeefdeadbeefdeadbeefdeadbeef\n",
+        )
+        .unwrap();
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        index.reindex_full(&paths).unwrap();
+
+        let inner = index.inner.read().unwrap();
+        let normalized = normalize_watch_paths_for_incremental(&paths, &inner.state, &[meta]);
+        assert!(normalized.is_empty());
+    }
+
+    #[test]
+    fn reindex_changed_paths_handles_directory_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets/A")).unwrap();
+
+        let prefab = temp.path().join("Assets/A/foo.prefab");
+        fs::write(
+            &prefab,
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Foo\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("Assets/A/foo.prefab.meta"),
+            "fileFormatVersion: 2\nguid: deadbeefdeadbeefdeadbeefdeadbeef\n",
+        )
+        .unwrap();
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        index.reindex_full(&paths).unwrap();
+
+        fs::create_dir_all(temp.path().join("Assets")).unwrap();
+        fs::rename(temp.path().join("Assets/A"), temp.path().join("Assets/B")).unwrap();
+
+        index
+            .reindex_changed_paths(
+                &paths,
+                &[temp.path().join("Assets/A"), temp.path().join("Assets/B")],
+            )
+            .unwrap();
+
+        let status = index.status().unwrap();
+        assert_eq!(status.indexed_docs, 1);
+
+        let res_old = index.search("in:Assets/A", 20).unwrap();
+        assert_eq!(res_old.hits.len(), 0);
+
+        let res_new = index.search("in:Assets/B", 20).unwrap();
+        assert_eq!(res_new.hits.len(), 1);
+        assert!(res_new.hits[0].path.starts_with("Assets/B/"));
     }
 }
