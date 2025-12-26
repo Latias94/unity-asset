@@ -1,12 +1,15 @@
 [package]
 name = "unity-asset-search-daemon"
 version = "0.3.0"
-publish = false
 edition.workspace = true
 authors.workspace = true
+description = "Local HTTP daemon for Unity project search (used by UnityHero)"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://github.com/Latias94/unity-asset"
+keywords = ["unity", "search", "daemon", "references"]
+categories = ["command-line-utilities", "game-development"]
 
 [dependencies]
 anyhow.workspace = true
@@ -19,7 +22,7 @@ tower-http.workspace = true
 rand.workspace = true
 hex.workspace = true
 notify.workspace = true
-unity-asset-search-index = { path = "../../crates/unity-asset-search-index" }
+unity-asset-search-index = { path = "../../crates/unity-asset-search-index", version = "0.3.0" }
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

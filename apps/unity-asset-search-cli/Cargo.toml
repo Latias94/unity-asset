@@ -1,12 +1,15 @@
 [package]
 name = "unity-asset-search-cli"
 version = "0.3.0"
-publish = false
 edition.workspace = true
 authors.workspace = true
+description = "CLI client for unity-asset-search-daemon (debug/ops utility)"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://github.com/Latias94/unity-asset"
+keywords = ["unity", "search", "cli"]
+categories = ["command-line-utilities", "game-development"]
 
 [dependencies]
 anyhow.workspace = true

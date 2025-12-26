@@ -1,12 +1,15 @@
 [package]
 name = "unity-asset-search-index"
 version = "0.3.0"
-publish = false
 edition.workspace = true
 authors.workspace = true
+description = "Local search index for Unity projects (Search Everything / Find References)"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/unity-asset-search-index"
+keywords = ["unity", "search", "index", "references"]
+categories = ["command-line-utilities", "game-development"]
 
 [dependencies]
 anyhow.workspace = true
@@ -16,7 +19,7 @@ regex.workspace = true
 tantivy.workspace = true
 ignore.workspace = true
 once_cell.workspace = true
-unity-asset-search-core = { path = "../unity-asset-search-core" }
+unity-asset-search-core = { path = "../unity-asset-search-core", version = "0.3.0" }
 unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
 
 [dev-dependencies]

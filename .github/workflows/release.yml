@@ -171,6 +171,28 @@ jobs:
           done
           exit 1
 
+      - name: Publish unity-asset-search-core
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo publish -p unity-asset-search-core --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"; then
+              exit 0
+            fi
+            echo "unity-asset-search-core publish failed (attempt $i), waiting for crates.io index..."
+            sleep 30
+          done
+          exit 1
+
+      - name: Publish unity-asset-search-index
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo publish -p unity-asset-search-index --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"; then
+              exit 0
+            fi
+            echo "unity-asset-search-index publish failed (attempt $i), waiting for crates.io index..."
+            sleep 30
+          done
+          exit 1
+
       - name: Publish unity-asset-decode
         run: |
           for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -200,6 +222,28 @@ jobs:
               exit 0
             fi
             echo "unity-asset-cli publish failed (attempt $i), waiting for crates.io index..."
+            sleep 30
+          done
+          exit 1
+
+      - name: Publish unity-asset-search-daemon
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo publish -p unity-asset-search-daemon --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"; then
+              exit 0
+            fi
+            echo "unity-asset-search-daemon publish failed (attempt $i), waiting for crates.io index..."
+            sleep 30
+          done
+          exit 1
+
+      - name: Publish unity-asset-search-cli
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo publish -p unity-asset-search-cli --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"; then
+              exit 0
+            fi
+            echo "unity-asset-search-cli publish failed (attempt $i), waiting for crates.io index..."
             sleep 30
           done
           exit 1

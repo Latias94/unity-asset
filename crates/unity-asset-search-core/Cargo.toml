@@ -1,12 +1,15 @@
 [package]
 name = "unity-asset-search-core"
 version = "0.3.0"
-publish = false
 edition.workspace = true
 authors.workspace = true
+description = "Core fuzzy matching and query helpers for unity-asset search tooling"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/unity-asset-search-core"
+keywords = ["unity", "search", "fuzzy"]
+categories = ["command-line-utilities", "game-development"]
 
 [dependencies]
 unicode-normalization.workspace = true

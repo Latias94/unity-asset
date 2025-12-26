@@ -17,10 +17,10 @@ This repository uses a tag-driven release workflow.
    - `crates/unity-asset-decode/Cargo.toml`
    - `crates/unity-asset/Cargo.toml` (published as `unity-asset`)
    - `apps/unity-asset-cli/Cargo.toml`
-   - `crates/unity-asset-search-core/Cargo.toml` (not published; used by search tools)
-   - `crates/unity-asset-search-index/Cargo.toml` (not published; used by search tools)
-   - `apps/unity-asset-search-daemon/Cargo.toml` (not published; distributed as binaries)
-   - `apps/unity-asset-search-cli/Cargo.toml` (not published; distributed as binaries)
+   - `crates/unity-asset-search-core/Cargo.toml`
+   - `crates/unity-asset-search-index/Cargo.toml`
+   - `apps/unity-asset-search-daemon/Cargo.toml`
+   - `apps/unity-asset-search-cli/Cargo.toml`
 3. Ensure path dependency versions match the same version (the release workflow validates this).
 4. Update `CHANGELOG.md`.
 5. Run locally:
@@ -42,9 +42,13 @@ On tag push (`vMAJOR.MINOR.PATCH`), GitHub Actions:
    1) `unity-asset-core`
    2) `unity-asset-yaml`
    3) `unity-asset-binary`
-   4) `unity-asset-decode`
-   5) `unity-asset`
-   6) `unity-asset-cli`
+   4) `unity-asset-search-core`
+   5) `unity-asset-search-index`
+   6) `unity-asset-decode`
+   7) `unity-asset`
+   8) `unity-asset-cli`
+   9) `unity-asset-search-daemon`
+   10) `unity-asset-search-cli`
 4. Builds and uploads multi-platform binaries using `cargo-dist`:
    - `unity-asset-search-daemon` (for UnityHero)
    - `unity-asset-search-cli` (debug/ops utility)
