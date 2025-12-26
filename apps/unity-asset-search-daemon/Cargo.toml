@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset-search-daemon"
-version = "0.0.0"
+version = "0.2.0"
 publish = false
 edition.workspace = true
 authors.workspace = true
@@ -23,3 +23,6 @@ unity-asset-search-index = { path = "../../crates/unity-asset-search-index" }
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.dist]
+dist = true

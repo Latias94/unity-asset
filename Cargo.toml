@@ -65,6 +65,11 @@ hex = "0.4"
 ignore = "0.4"
 notify = "8"
 
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 # This is now a pure workspace - no package definition
 # Individual crates are in their respective directories:
 # - crates/unity-asset/     -> Main library crate (published as "unity-asset")

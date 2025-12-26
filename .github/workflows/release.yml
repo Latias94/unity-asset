@@ -43,7 +43,11 @@ jobs:
               "crates/unity-asset-binary/Cargo.toml",
               "crates/unity-asset-decode/Cargo.toml",
               "crates/unity-asset/Cargo.toml",
+              "crates/unity-asset-search-core/Cargo.toml",
+              "crates/unity-asset-search-index/Cargo.toml",
               "apps/unity-asset-cli/Cargo.toml",
+              "apps/unity-asset-search-daemon/Cargo.toml",
+              "apps/unity-asset-search-cli/Cargo.toml",
           ]
 
           def load(path: str) -> dict:
@@ -65,6 +69,10 @@ jobs:
               "unity-asset-yaml",
               "unity-asset-binary",
               "unity-asset-decode",
+              "unity-asset-search-core",
+              "unity-asset-search-index",
+              "unity-asset-search-cli",
+              "unity-asset-search-daemon",
           }
 
           dep_mismatches = []
@@ -196,10 +204,67 @@ jobs:
           done
           exit 1
 
+  dist:
+    name: Build release binaries (cargo-dist)
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            targets: x86_64-unknown-linux-musl
+          - os: windows-latest
+            targets: x86_64-pc-windows-msvc
+          - os: macos-latest
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-dist
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh \
+            | sh
+
+      - name: Install Linux musl tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Install macOS targets
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build archives
+        shell: bash
+        run: |
+          IFS=',' read -ra TARGETS <<< "${{ matrix.targets }}"
+          for t in "${TARGETS[@]}"; do
+            cargo dist build --artifacts=local --tag "${{ github.ref_name }}" --target "$t"
+          done
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: dist/
+
   github-release:
     name: Create GitHub release
     runs-on: ubuntu-latest
-    needs: publish
+    needs: [publish, dist]
     permissions:
       contents: write
     steps:
@@ -210,9 +275,18 @@ jobs:
         id: notes
         uses: ffurrer2/extract-release-notes@v2
 
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist-artifacts
+          merge-multiple: true
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           body: ${{ steps.notes.outputs.release_notes }}
+          files: |
+            dist-artifacts/**

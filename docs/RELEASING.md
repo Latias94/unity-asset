@@ -17,6 +17,10 @@ This repository uses a tag-driven release workflow.
    - `crates/unity-asset-decode/Cargo.toml`
    - `crates/unity-asset/Cargo.toml` (published as `unity-asset`)
    - `apps/unity-asset-cli/Cargo.toml`
+   - `crates/unity-asset-search-core/Cargo.toml` (not published; used by search tools)
+   - `crates/unity-asset-search-index/Cargo.toml` (not published; used by search tools)
+   - `apps/unity-asset-search-daemon/Cargo.toml` (not published; distributed as binaries)
+   - `apps/unity-asset-search-cli/Cargo.toml` (not published; distributed as binaries)
 3. Ensure path dependency versions match the same version (the release workflow validates this).
 4. Update `CHANGELOG.md`.
 5. Run locally:
@@ -41,4 +45,20 @@ On tag push (`vMAJOR.MINOR.PATCH`), GitHub Actions:
    4) `unity-asset-decode`
    5) `unity-asset`
    6) `unity-asset-cli`
-4. Creates a GitHub Release using release notes extracted from `CHANGELOG.md`.
+4. Builds and uploads multi-platform binaries using `cargo-dist`:
+   - `unity-asset-search-daemon` (for UnityHero)
+   - `unity-asset-search-cli` (debug/ops utility)
+5. Creates a GitHub Release using release notes extracted from `CHANGELOG.md` and attaches the built binaries.
+
+## UnityHero packaging (scheme B)
+
+UnityHero (UPM plugin) vendors the daemon binaries into:
+
+- `Packages/com.frankorz.unityhero/Tools/<platform>/`
+
+The UnityHero release workflow should:
+
+1. Download `unity-asset-search-daemon` archives from this repo's GitHub Release.
+2. Extract and place them into `Tools/win-x64/`, `Tools/linux-x64/`, and `Tools/mac-universal/`.
+3. For macOS, merge `x86_64` + `aarch64` into a universal binary (e.g. `lipo -create`).
+4. Ensure macOS/Linux binaries are executable (`chmod +x`).

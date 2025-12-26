@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset-search-index"
-version = "0.0.0"
+version = "0.2.0"
 publish = false
 edition.workspace = true
 authors.workspace = true
