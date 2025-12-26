@@ -1,10 +1,76 @@
 use super::path::canonicalize_if_exists;
 use super::*;
+use std::fs::File;
+use std::io::Read;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetaGuidIndexStats {
     pub dirs_visited: usize,
     pub files_visited: usize,
+    pub meta_files_seen: usize,
+    pub meta_guids_indexed: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectLoadOptions {
+    /// Index `.meta` GUIDs under the project root for best-effort external reference resolution.
+    pub index_meta_guids: bool,
+    /// Load YAML documents (`.asset`, `.prefab`, `.unity`).
+    ///
+    /// For large Unity projects, this can be expensive; consider starting with `binaries_only()`.
+    pub load_yaml_documents: bool,
+    /// Load `.meta` files as YAML documents.
+    ///
+    /// Most workflows only need `.meta` GUIDs, not full parsed `.meta` documents.
+    pub load_meta_documents: bool,
+    /// Load binary Unity files (AssetBundles / SerializedFiles / WebFiles) discovered during scan.
+    pub load_binary_files: bool,
+    /// Stop after visiting this many files (best-effort).
+    pub max_files: Option<usize>,
+    /// Respect `.gitignore` / `.ignore` / global ignores via the `ignore` crate.
+    pub respect_ignores: bool,
+    /// Follow filesystem symlinks during the project walk.
+    pub follow_symlinks: bool,
+}
+
+impl ProjectLoadOptions {
+    pub fn binaries_only() -> Self {
+        Self {
+            index_meta_guids: true,
+            load_yaml_documents: false,
+            load_meta_documents: false,
+            load_binary_files: true,
+            max_files: None,
+            respect_ignores: true,
+            follow_symlinks: false,
+        }
+    }
+
+    pub fn everything() -> Self {
+        Self {
+            index_meta_guids: true,
+            load_yaml_documents: true,
+            load_meta_documents: false,
+            load_binary_files: true,
+            max_files: None,
+            respect_ignores: true,
+            follow_symlinks: false,
+        }
+    }
+}
+
+impl Default for ProjectLoadOptions {
+    fn default() -> Self {
+        Self::binaries_only()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProjectLoadStats {
+    pub files_visited: usize,
+    pub files_loaded: usize,
+    pub yaml_loaded: usize,
+    pub binary_loaded: usize,
     pub meta_files_seen: usize,
     pub meta_guids_indexed: usize,
 }
@@ -297,6 +363,149 @@ impl Environment {
         self.traverse_directory(&path)?;
 
         Ok(())
+    }
+
+    /// Load a Unity project directory (best-effort).
+    ///
+    /// Unlike `load_directory`, this API is designed for real Unity project roots:
+    /// - can index `.meta` GUIDs without loading `.meta` documents
+    /// - can respect ignore files (`.gitignore`, `.ignore`)
+    /// - can avoid attempting to parse every non-Unity file (fast prefix sniffing)
+    pub fn load_project<P: AsRef<Path>>(
+        &mut self,
+        root: P,
+        options: ProjectLoadOptions,
+    ) -> Result<ProjectLoadStats> {
+        use ignore::WalkBuilder;
+        use unity_asset_binary::file::{UnityFileKind, sniff_unity_file_kind_prefix};
+
+        let root = root.as_ref();
+        if !root.exists() {
+            return Err(UnityAssetError::format(format!(
+                "Directory does not exist: {:?}",
+                root
+            )));
+        }
+        if !root.is_dir() {
+            return Err(UnityAssetError::format(format!(
+                "Path is not a directory: {:?}",
+                root
+            )));
+        }
+
+        let root = canonicalize_if_exists(root);
+        let mut stats = ProjectLoadStats::default();
+
+        let mut builder = WalkBuilder::new(&root);
+        builder.follow_links(options.follow_symlinks);
+        builder.hidden(false);
+
+        if options.respect_ignores {
+            builder
+                .git_ignore(true)
+                .git_global(true)
+                .git_exclude(true)
+                .ignore(true);
+        } else {
+            builder
+                .git_ignore(false)
+                .git_global(false)
+                .git_exclude(false)
+                .ignore(false);
+        }
+
+        let skip_dir_names = [
+            "Library",
+            "Temp",
+            "Logs",
+            ".git",
+            ".vs",
+            "obj",
+            "bin",
+            "UserSettings",
+        ];
+
+        let walker = builder.filter_entry(move |entry| {
+            let Some(name) = entry.file_name().to_str() else {
+                return false;
+            };
+            if entry.file_type().is_some_and(|t| t.is_dir()) {
+                return !skip_dir_names.iter().any(|d| d == &name);
+            }
+            true
+        });
+
+        for result in walker.build() {
+            let entry = match result {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if entry.file_type().is_none_or(|t| !t.is_file()) {
+                continue;
+            }
+
+            stats.files_visited += 1;
+            if let Some(max) = options.max_files {
+                if stats.files_visited > max {
+                    break;
+                }
+            }
+
+            let path = canonicalize_if_exists(entry.path());
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+            if ext == "meta" {
+                stats.meta_files_seen += 1;
+                if options.index_meta_guids && self.index_meta_guid_path(&path).is_some() {
+                    stats.meta_guids_indexed += 1;
+                }
+                if options.load_meta_documents {
+                    if self.load_file(&path).is_ok() {
+                        stats.files_loaded += 1;
+                        stats.yaml_loaded += 1;
+                    }
+                }
+                continue;
+            }
+
+            if matches!(ext, "asset" | "prefab" | "unity") {
+                if options.load_yaml_documents {
+                    if self.load_file(&path).is_ok() {
+                        stats.files_loaded += 1;
+                        stats.yaml_loaded += 1;
+                    }
+                    continue;
+                }
+            }
+
+            if !options.load_binary_files {
+                continue;
+            }
+
+            // Fast sniff: only attempt full binary parsing for likely Unity files.
+            let mut prefix = [0u8; 64];
+            let prefix_len = File::open(&path)
+                .and_then(|mut f| f.read(&mut prefix))
+                .unwrap_or(0);
+            if prefix_len == 0 {
+                continue;
+            }
+
+            let Some(kind) = sniff_unity_file_kind_prefix(&prefix[..prefix_len]) else {
+                continue;
+            };
+
+            if matches!(
+                kind,
+                UnityFileKind::AssetBundle | UnityFileKind::SerializedFile | UnityFileKind::WebFile
+            ) && self.load_file(&path).is_ok()
+            {
+                stats.files_loaded += 1;
+                stats.binary_loaded += 1;
+            }
+        }
+
+        Ok(stats)
     }
 
     /// Recursively traverse directory and load Unity files.

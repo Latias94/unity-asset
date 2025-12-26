@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Environment-wide unified object graph (`Environment::build_object_graph`) across YAML + binary sources (best-effort GUID/fileID resolution).
 - Directory-wide `.meta` GUID indexing (`Environment::index_meta_guids_in_directory`) for higher external resolution hit rates without loading every asset file.
 - `Environment::set_type_tree_registry_from_paths` to load `.tpk`/`.json` TypeTree registries (best-effort parsing for stripped assets).
+- `Environment::load_project` to scan a Unity project root with ignore support and fast binary sniffing (and without loading `.meta` documents by default).
 - Graph helpers for analysis and incremental rebuild:
   - `roots` / `leaves` / `cycles` helpers for quick inspection.
   - Rebuild a single source subgraph (`build_dependency_graph_for_source`).

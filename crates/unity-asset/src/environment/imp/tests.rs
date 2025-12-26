@@ -338,6 +338,56 @@ fn environment_index_meta_guids_in_directory_skips_library_and_indexes_nested() 
 }
 
 #[test]
+fn environment_load_project_binaries_only_indexes_meta_without_loading_meta_documents() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let assets_dir = root.join("Assets");
+    std::fs::create_dir_all(&assets_dir).unwrap();
+
+    let meta_asset_path = assets_dir.join("X.asset");
+    let meta_path = assets_dir.join("X.asset.meta");
+    std::fs::write(&meta_asset_path, b"not a real asset").unwrap();
+    std::fs::write(
+        &meta_path,
+        b"fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+
+    // A bundle under the project root should be discovered by fast sniffing.
+    let sample_bundle = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
+    let bundle_dst = root.join("Build/char_118_yuki.ab");
+    link_or_copy_file(&sample_bundle, &bundle_dst).unwrap();
+
+    let mut env = Environment::new();
+    let stats = env
+        .load_project(root, ProjectLoadOptions::binaries_only())
+        .unwrap();
+
+    assert!(stats.meta_files_seen >= 1);
+    assert!(stats.meta_guids_indexed >= 1);
+    assert!(stats.binary_loaded >= 1);
+
+    let expected_guid: [u8; 16] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+        0xef,
+    ];
+    assert_eq!(
+        env.asset_path_for_guid(expected_guid),
+        Some(canonicalize_path(meta_asset_path))
+    );
+
+    // `.meta` should not be stored as a YAML document under binaries_only().
+    let meta_path = canonicalize_path(meta_path);
+    assert!(
+        !env.yaml_documents().contains_key(&meta_path),
+        "expected .meta documents to be skipped under ProjectLoadOptions::binaries_only()"
+    );
+}
+
+#[test]
 fn environment_typetree_registry_json_restores_parsing_for_stripped_assets() {
     use serde::Serialize;
 

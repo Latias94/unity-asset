@@ -42,6 +42,7 @@ mod imp {
         DependencyGraphBuildOptions, DependencyGraphTraversalOptions, DependencyGraphWarning,
         EnvironmentDependencyGraph, ExternalDependencyEdge,
     };
+    pub use loader::{ProjectLoadOptions, ProjectLoadStats};
     pub use object_graph::{
         EnvironmentObjectGraph, EnvironmentObjectKey, ExternalObjectEdge, ObjectGraphBuildOptions,
         ObjectGraphTraversalOptions, YamlExternalEdge, YamlObjectKey,

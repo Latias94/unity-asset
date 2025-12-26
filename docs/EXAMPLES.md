@@ -21,6 +21,8 @@ This repository maintains runnable examples per crate (built in CI).
   - `cargo run -p unity-asset --example yaml_load_summary`
 - Environment load + list:
   - `cargo run -p unity-asset --example env_load_and_list -- tests/samples`
+- Load a Unity project root (index `.meta` GUIDs + scan binaries, skip `.meta` documents by default):
+  - `cargo run -p unity-asset --example env_load_and_list -- repo-ref/BoatAttack` (or use `Environment::load_project` in code)
 - Bundle container lookup (UnityPy-like discovery):
   - `cargo run -p unity-asset --example env_container_lookup -- tests/samples Assets/`
 - Build an Environment-wide dependency graph (TypeTree required for edges):
