@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
-use ignore::{DirEntry, WalkBuilder};
+use ignore::{DirEntry, WalkBuilder, WalkState};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
@@ -1371,29 +1371,19 @@ enum ReindexMode {
 fn scan_project_files(paths: &IndexPaths) -> Result<ScanResult> {
     let mut out = ScanResult::default();
 
-    let walker = build_project_walker(paths)?;
-    for entry in walker {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
-            continue;
-        }
-
-        let path = entry.path();
+    let project_root = paths.project_root.clone();
+    let scan_roots = paths.scan_roots.clone();
+    let files = scan_walk_parallel(build_project_walk_builder(paths), move |path| {
         if path.extension().is_some_and(|e| e == "meta") {
-            continue;
+            return Ok(None);
         }
-
-        if should_skip_file(path) || is_excluded_dir(path) || !is_in_scan_roots(paths, path) {
-            continue;
+        if should_skip_file(path) || is_excluded_dir(path) || !is_in_scan_roots_raw(&scan_roots, path)
+        {
+            return Ok(None);
         }
 
         let rel_path = path
-            .strip_prefix(&paths.project_root)
+            .strip_prefix(&project_root)
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
@@ -1407,15 +1397,17 @@ fn scan_project_files(paths: &IndexPaths) -> Result<ScanResult> {
         let kind = classify_kind(path);
         let fingerprint = fingerprint_for_path(path)?;
 
-        let file = ScannedFile {
-            rel_path: rel_path.clone(),
+        Ok(Some(ScannedFile {
+            rel_path,
             abs_path: path.to_path_buf(),
             fingerprint,
             name,
             kind,
-        };
+        }))
+    })?;
 
-        out.files.insert(rel_path, file);
+    for file in files {
+        out.files.insert(file.rel_path.clone(), file);
     }
 
     Ok(out)
@@ -1505,21 +1497,15 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
             allowed_dirs.contains(p)
         });
 
-    for entry in builder.build() {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-
-        let path = entry.path();
+    let project_root = paths.project_root.clone();
+    let existing_set = Arc::new(existing_set);
+    let files = scan_walk_parallel(builder, move |path| {
         if should_skip_file(path) || is_excluded_dir(path) || !existing_set.contains(path) {
-            continue;
+            return Ok(None);
         }
 
         let rel_path = path
-            .strip_prefix(&paths.project_root)
+            .strip_prefix(&project_root)
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
@@ -1531,19 +1517,112 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
         let kind = classify_kind(path);
         let fingerprint = fingerprint_for_path(path)?;
 
-        out.files.push(ScannedFile {
+        Ok(Some(ScannedFile {
             rel_path,
             abs_path: path.to_path_buf(),
             fingerprint,
             name,
             kind,
-        });
-    }
+        }))
+    })?;
+
+    out.files = files;
 
     Ok(out)
 }
 
-fn build_project_walker(paths: &IndexPaths) -> Result<ignore::Walk> {
+fn scan_walk_parallel<F>(mut builder: WalkBuilder, handle_path: F) -> Result<Vec<ScannedFile>>
+where
+    F: Fn(&Path) -> Result<Option<ScannedFile>> + Send + Sync + 'static,
+{
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16);
+    builder.threads(threads);
+
+    let out = Arc::new(std::sync::Mutex::new(Vec::<ScannedFile>::new()));
+    let err = Arc::new(std::sync::Mutex::new(None::<anyhow::Error>));
+    let handle_path = Arc::new(handle_path);
+
+    struct LocalCollector {
+        out: Arc<std::sync::Mutex<Vec<ScannedFile>>>,
+        local: Vec<ScannedFile>,
+    }
+
+    impl LocalCollector {
+        fn flush(&mut self) {
+            if self.local.is_empty() {
+                return;
+            }
+            let Ok(mut out) = self.out.lock() else {
+                return;
+            };
+            out.append(&mut self.local);
+        }
+    }
+
+    impl Drop for LocalCollector {
+        fn drop(&mut self) {
+            self.flush();
+        }
+    }
+
+    let out_for_run = out.clone();
+    let err_for_run = err.clone();
+    let handle_path_for_run = handle_path.clone();
+    builder.build_parallel().run(|| {
+        let mut collector = LocalCollector {
+            out: out_for_run.clone(),
+            local: Vec::new(),
+        };
+        let err = err_for_run.clone();
+        let handle_path = handle_path_for_run.clone();
+        Box::new(move |result: Result<DirEntry, ignore::Error>| {
+            let Ok(entry) = result else {
+                return WalkState::Continue;
+            };
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                return WalkState::Continue;
+            }
+
+            let path = entry.path();
+            match handle_path(path) {
+                Ok(Some(file)) => {
+                    collector.local.push(file);
+                    if collector.local.len() >= 256 {
+                        collector.flush();
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    if let Ok(mut err) = err.lock() {
+                        if err.is_none() {
+                            *err = Some(e);
+                        }
+                    }
+                    return WalkState::Quit;
+                }
+            }
+            WalkState::Continue
+        })
+    });
+
+    if let Ok(mut err) = err.lock() {
+        if let Some(e) = err.take() {
+            return Err(e);
+        }
+    }
+
+    let mut locked = out.lock().map_err(|_| anyhow!("poisoned lock"))?;
+    let mut files = std::mem::take(&mut *locked);
+    drop(locked);
+
+    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok(files)
+}
+
+fn build_project_walk_builder(paths: &IndexPaths) -> WalkBuilder {
     let scan_roots = paths.scan_roots.clone();
     let project_root = paths.project_root.clone();
 
@@ -1570,11 +1649,7 @@ fn build_project_walker(paths: &IndexPaths) -> Result<ignore::Walk> {
                 .any(|root| root.starts_with(p) || p.starts_with(root))
         });
 
-    Ok(builder.build())
-}
-
-fn is_in_scan_roots(paths: &IndexPaths, path: &Path) -> bool {
-    is_in_scan_roots_raw(&paths.scan_roots, path)
+    builder
 }
 
 fn is_in_scan_roots_raw(scan_roots: &[PathBuf], path: &Path) -> bool {
