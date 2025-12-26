@@ -211,8 +211,13 @@ async fn references(
     let file_id = q.file_id;
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     let index = state.index.clone();
+    let project_root = state.paths.project_root.clone();
 
-    match tokio::task::spawn_blocking(move || index.references(&guid, file_id, limit)).await {
+    match tokio::task::spawn_blocking(move || {
+        index.references_enriched(&project_root, &guid, file_id, limit)
+    })
+    .await
+    {
         Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
         Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,

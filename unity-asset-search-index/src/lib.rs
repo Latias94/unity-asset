@@ -57,6 +57,20 @@ pub struct SearchResponse {
 pub struct ReferenceHit {
     pub source_path: String,
     pub source_kind: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contexts: Vec<ReferenceContext>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceContext {
+    pub doc_file_id: Option<u64>,
+    pub doc_class_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hierarchy_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -977,7 +991,12 @@ impl SearchIndex {
         })
     }
 
-    pub fn references(&self, guid: &str, file_id: Option<u64>, limit: usize) -> Result<ReferencesResponse> {
+    pub fn references(
+        &self,
+        guid: &str,
+        file_id: Option<u64>,
+        limit: usize,
+    ) -> Result<ReferencesResponse> {
         let start = Instant::now();
         let guid = guid.trim().to_lowercase();
         if guid.is_empty() {
@@ -1019,6 +1038,7 @@ impl SearchIndex {
             hits.push(ReferenceHit {
                 source_path,
                 source_kind,
+                contexts: Vec::new(),
             });
         }
 
@@ -1029,6 +1049,34 @@ impl SearchIndex {
             total_hits: hits.len(),
             hits,
         })
+    }
+
+    pub fn references_enriched(
+        &self,
+        project_root: &Path,
+        guid: &str,
+        file_id: Option<u64>,
+        limit: usize,
+    ) -> Result<ReferencesResponse> {
+        let mut resp = self.references(guid, file_id, limit)?;
+        let guid = resp.guid.clone();
+
+        for hit in &mut resp.hits {
+            if hit.source_path.trim().is_empty() {
+                continue;
+            }
+            let abs = project_root.join(&hit.source_path);
+            let Ok(Some(text)) = read_text_limited(&abs, 2 * 1024 * 1024) else {
+                continue;
+            };
+            if !is_probably_unity_yaml_text(&text) {
+                continue;
+            }
+            hit.contexts = extract_reference_contexts_from_yaml(&text, &guid, file_id);
+        }
+
+        resp.took_ms = resp.took_ms.saturating_add(0);
+        Ok(resp)
     }
 
     fn refresh_status(&self) -> Result<()> {
@@ -1807,6 +1855,213 @@ fn extract_content_for_file(
     }
 
     Ok(ExtractedContent::default())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DocHeader {
+    class_id: u32,
+    file_id: u64,
+}
+
+#[derive(Debug, Clone)]
+struct YamlDocInfo {
+    name: Option<String>,
+    game_object_id: Option<u64>,
+}
+
+fn extract_reference_contexts_from_yaml(
+    text: &str,
+    guid: &str,
+    file_id: Option<u64>,
+) -> Vec<ReferenceContext> {
+    let guid = guid.trim().to_lowercase();
+    if guid.is_empty() {
+        return Vec::new();
+    }
+
+    let analysis = analyze_unity_yaml_docs(text);
+    let mut out = Vec::new();
+
+    let guid_needle = guid.as_str();
+    let fileid_needle = file_id.map(|id| id.to_string());
+    let mut current: Option<DocHeader> = None;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if let Some((class_id, doc_file_id)) = parse_unity_yaml_doc_header(line) {
+            current = Some(DocHeader {
+                class_id,
+                file_id: doc_file_id,
+            });
+            continue;
+        }
+
+        let Some(header) = current else {
+            continue;
+        };
+
+        if !line.contains(guid_needle) {
+            continue;
+        }
+        if let Some(fid) = fileid_needle.as_deref() {
+            if !line.contains(fid) {
+                continue;
+            }
+        }
+
+        let field_hint = guess_field_hint(line);
+        let (object_name, hierarchy_path) =
+            analysis.context_for_doc(header.file_id).unwrap_or_default();
+
+        out.push(ReferenceContext {
+            doc_file_id: Some(header.file_id),
+            doc_class_id: Some(header.class_id),
+            object_name,
+            hierarchy_path,
+            field_hint,
+        });
+
+        if out.len() >= 20 {
+            break;
+        }
+    }
+
+    out.sort_by(|a, b| (a.doc_file_id, a.field_hint.as_deref()).cmp(&(b.doc_file_id, b.field_hint.as_deref())));
+    out.dedup_by(|a, b| a.doc_file_id == b.doc_file_id && a.field_hint == b.field_hint);
+    out.truncate(10);
+    out
+}
+
+fn guess_field_hint(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if let Some(pos) = trimmed.find(':') {
+        let key = trimmed[..pos].trim();
+        if !key.is_empty() && key.len() <= 64 && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return Some(key.to_string());
+        }
+    }
+    if trimmed.contains("m_Script:") {
+        return Some("m_Script".to_string());
+    }
+    None
+}
+
+#[derive(Debug, Default)]
+struct YamlAnalysis {
+    docs: std::collections::BTreeMap<u64, YamlDocInfo>,
+    go_names: std::collections::BTreeMap<u64, String>,
+    transforms: std::collections::BTreeMap<u64, TransformLink>,
+    transform_by_game_object: std::collections::BTreeMap<u64, u64>,
+    hierarchy_path_by_transform: std::collections::BTreeMap<u64, String>,
+}
+
+impl YamlAnalysis {
+    fn context_for_doc(&self, doc_file_id: u64) -> Option<(Option<String>, Option<String>)> {
+        let doc = self.docs.get(&doc_file_id)?;
+        let object_name = doc.name.clone().or_else(|| {
+            doc.game_object_id
+                .and_then(|go| self.go_names.get(&go).cloned())
+        });
+
+        let hierarchy_path = doc
+            .game_object_id
+            .and_then(|go| self.transform_by_game_object.get(&go).copied())
+            .and_then(|t| self.hierarchy_path_by_transform.get(&t).cloned());
+
+        Some((object_name, hierarchy_path))
+    }
+}
+
+fn analyze_unity_yaml_docs(text: &str) -> YamlAnalysis {
+    let mut analysis = YamlAnalysis::default();
+
+    let mut current: Option<DocHeader> = None;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+
+        if let Some((class_id, file_id)) = parse_unity_yaml_doc_header(line) {
+            current = Some(DocHeader { class_id, file_id });
+            analysis.docs.entry(file_id).or_insert_with(|| YamlDocInfo {
+                name: None,
+                game_object_id: None,
+            });
+            continue;
+        }
+
+        let Some(header) = current else {
+            continue;
+        };
+
+        match header.class_id {
+            1 => {
+                if let Some(name) = parse_unity_yaml_scalar(line, "m_Name") {
+                    if !name.trim().is_empty() {
+                        analysis.go_names.entry(header.file_id).or_insert(name.clone());
+                        analysis.docs.entry(header.file_id).and_modify(|d| {
+                            d.name.get_or_insert(name);
+                        });
+                    }
+                }
+            }
+            4 | 224 => {
+                let entry = analysis.transforms.entry(header.file_id).or_insert(TransformLink {
+                    game_object_id: None,
+                    father_transform_id: None,
+                });
+
+                if entry.game_object_id.is_none() && line.contains("m_GameObject:") {
+                    entry.game_object_id = parse_file_id(line);
+                }
+                if entry.father_transform_id.is_none() && line.contains("m_Father:") {
+                    entry.father_transform_id = parse_file_id(line).filter(|id| *id != 0);
+                }
+            }
+            _ => {
+                let doc = analysis.docs.entry(header.file_id).or_insert_with(|| YamlDocInfo {
+                    name: None,
+                    game_object_id: None,
+                });
+                if doc.name.is_none() {
+                    if let Some(name) = parse_unity_yaml_scalar(line, "m_Name") {
+                        if !name.trim().is_empty() {
+                            doc.name = Some(name);
+                        }
+                    }
+                }
+                if doc.game_object_id.is_none() && line.contains("m_GameObject:") {
+                    doc.game_object_id = parse_file_id(line);
+                }
+            }
+        }
+    }
+
+    for (transform_id, link) in &analysis.transforms {
+        if let Some(go) = link.game_object_id {
+            analysis.transform_by_game_object.insert(go, *transform_id);
+        }
+    }
+
+    let mut cache = std::collections::BTreeMap::<u64, Option<String>>::new();
+    for (transform_id, link) in &analysis.transforms {
+        let Some(go_id) = link.game_object_id else {
+            continue;
+        };
+        let Some(leaf_name) = analysis.go_names.get(&go_id) else {
+            continue;
+        };
+        if let Some(path) = resolve_transform_path(
+            *transform_id,
+            leaf_name,
+            &analysis.go_names,
+            &analysis.transforms,
+            &mut cache,
+        ) {
+            analysis.hierarchy_path_by_transform.insert(*transform_id, path);
+        }
+    }
+
+    analysis
 }
 
 fn read_text_limited(path: &Path, max_bytes: usize) -> Result<Option<String>> {
