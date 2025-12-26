@@ -50,6 +50,19 @@ On tag push (`vMAJOR.MINOR.PATCH`), GitHub Actions:
    - `unity-asset-search-cli` (debug/ops utility)
 5. Creates a GitHub Release using release notes extracted from `CHANGELOG.md` and attaches the built binaries.
 
+## Backfill missing dist assets (existing tag)
+
+If a tag already exists and the GitHub Release was created without dist assets (e.g. early release workflow),
+use the manual workflow:
+
+- GitHub Actions → `Upload cargo-dist assets to an existing tag`
+
+Inputs:
+
+- `tag`: the existing tag (e.g. `v0.2.0`)
+- `ref`: the git ref to build from
+  - use `main` to backfill old tags (note: this trades exact reproducibility for a practical repair)
+
 ## UnityHero packaging (scheme B)
 
 UnityHero (UPM plugin) vendors the daemon binaries into:

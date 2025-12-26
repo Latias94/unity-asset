@@ -259,7 +259,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.os }}
-          path: dist/
+          path: target/distrib/
 
   github-release:
     name: Create GitHub release
