@@ -1069,10 +1069,11 @@ impl SearchIndex {
             let Ok(Some(text)) = read_text_limited(&abs, 2 * 1024 * 1024) else {
                 continue;
             };
-            if !is_probably_unity_yaml_text(&text) {
-                continue;
+            if is_probably_unity_yaml_text(&text) {
+                hit.contexts = extract_reference_contexts_from_yaml(&text, &guid, file_id);
+            } else {
+                hit.contexts = extract_reference_contexts_from_binary(&abs, &guid, file_id);
             }
-            hit.contexts = extract_reference_contexts_from_yaml(&text, &guid, file_id);
         }
 
         resp.took_ms = resp.took_ms.saturating_add(0);
@@ -2079,6 +2080,156 @@ fn extract_reference_contexts_from_yaml(
     out.sort_by(|a, b| (a.doc_file_id, a.field_hint.as_deref()).cmp(&(b.doc_file_id, b.field_hint.as_deref())));
     out.dedup_by(|a, b| a.doc_file_id == b.doc_file_id && a.field_hint == b.field_hint);
     out.truncate(10);
+    out
+}
+
+fn extract_reference_contexts_from_binary(
+    abs_path: &Path,
+    guid: &str,
+    file_id: Option<u64>,
+) -> Vec<ReferenceContext> {
+    let guid = normalize_guid_string(guid);
+    if guid.is_empty() {
+        return Vec::new();
+    }
+
+    let prefix = read_prefix(abs_path, 256).unwrap_or_default();
+    let kind = unity_asset_binary::file::sniff_unity_file_kind_prefix(&prefix);
+    if kind.is_none() {
+        return Vec::new();
+    }
+
+    let self_guid = read_guid_from_meta(asset_meta_path(abs_path))
+        .map(|g| normalize_guid_string(&g))
+        .filter(|g| !g.is_empty());
+
+    let unity_file = unity_asset_binary::file::load_unity_file(abs_path);
+    let Ok(unity_file) = unity_file else {
+        return Vec::new();
+    };
+
+    match unity_file {
+        unity_asset_binary::file::UnityFile::SerializedFile(sf) => {
+            extract_reference_contexts_from_serialized_file(&sf, self_guid.as_deref(), &guid, file_id)
+        }
+        unity_asset_binary::file::UnityFile::AssetBundle(bundle) => {
+            let mut out = Vec::new();
+            for (idx, asset) in bundle.assets.iter().enumerate() {
+                let asset_name = bundle.asset_names.get(idx).cloned().unwrap_or_default();
+                let mut ctx =
+                    extract_reference_contexts_from_serialized_file(asset, None, &guid, file_id);
+                if !asset_name.trim().is_empty() {
+                    for c in &mut ctx {
+                        let hint = c
+                            .field_hint
+                            .clone()
+                            .unwrap_or_else(|| "PPtr".to_string());
+                        c.field_hint = Some(format!("bundle_asset={asset_name} {hint}"));
+                    }
+                }
+                out.extend(ctx);
+                if out.len() >= 20 {
+                    break;
+                }
+            }
+            out.truncate(20);
+            out
+        }
+        unity_asset_binary::file::UnityFile::WebFile(_) => Vec::new(),
+    }
+}
+
+fn extract_reference_contexts_from_serialized_file(
+    file: &unity_asset_binary::asset::SerializedFile,
+    self_guid: Option<&str>,
+    target_guid: &str,
+    target_file_id: Option<u64>,
+) -> Vec<ReferenceContext> {
+    const MAX_OBJECTS: usize = 50_000;
+    const MAX_CONTEXTS: usize = 20;
+
+    let externals: Vec<Option<String>> = file
+        .externals
+        .iter()
+        .map(|e| {
+            let g = normalize_guid_string(&e.guid_string());
+            (!g.is_empty()).then_some(g)
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    for info in file.objects.iter().take(MAX_OBJECTS) {
+        if out.len() >= MAX_CONTEXTS {
+            break;
+        }
+
+        let handle = unity_asset_binary::object::ObjectHandle::new(file, info);
+        let Ok(Some(pptrs)) = handle.scan_pptrs() else {
+            continue;
+        };
+
+        let mut matched = false;
+        let mut field_hint = None;
+
+        if let Some(self_guid) = self_guid
+            && self_guid == target_guid
+        {
+            for id in &pptrs.internal {
+                let Ok(path_id_u64) = u64::try_from(*id) else {
+                    continue;
+                };
+                if target_file_id.is_some_and(|want| want != path_id_u64) {
+                    continue;
+                }
+                matched = true;
+                field_hint = Some(format!("binary internal pathID={path_id_u64}"));
+                break;
+            }
+        }
+
+        if !matched {
+            for (file_id, path_id) in &pptrs.external {
+                let Ok(path_id_u64) = u64::try_from(*path_id) else {
+                    continue;
+                };
+                if target_file_id.is_some_and(|want| want != path_id_u64) {
+                    continue;
+                }
+                if *file_id <= 0 {
+                    continue;
+                }
+                let idx: usize = (*file_id - 1).try_into().unwrap_or(usize::MAX);
+                let Some(Some(guid)) = externals.get(idx) else {
+                    continue;
+                };
+                if guid != target_guid {
+                    continue;
+                }
+                matched = true;
+                field_hint = Some(format!(
+                    "binary external fileID={file_id} pathID={path_id_u64}"
+                ));
+                break;
+            }
+        }
+
+        if !matched {
+            continue;
+        }
+
+        let doc_file_id = u64::try_from(handle.path_id()).ok();
+        let doc_class_id = u32::try_from(handle.class_id()).ok();
+        let object_name = handle.peek_name().ok().flatten();
+
+        out.push(ReferenceContext {
+            doc_file_id,
+            doc_class_id,
+            object_name,
+            hierarchy_path: None,
+            field_hint,
+        });
+    }
+
     out
 }
 
