@@ -3938,7 +3938,7 @@ Transform:
         .unwrap();
 
         index
-            .reindex_changed_paths(&paths, &[meta.clone()])
+            .reindex_changed_paths(&paths, std::slice::from_ref(&meta))
             .unwrap();
 
         let inner = index.inner.read().unwrap();

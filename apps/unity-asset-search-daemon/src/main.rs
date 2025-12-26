@@ -478,7 +478,7 @@ async fn run_reindex_sharded_full_scan(state: Arc<AppState>) -> anyhow::Result<(
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let scan_roots = paths.scan_roots.clone();
         for root in &scan_roots {
-            index.reindex_changed_paths(&paths, &[root.clone()])?;
+            index.reindex_changed_paths(&paths, std::slice::from_ref(root))?;
         }
         index.note_reindex_summary(
             "sharded_full_scan_incremental",
