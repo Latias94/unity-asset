@@ -32,6 +32,9 @@ enum Cmd {
     Reindex {
         #[arg(long)]
         full: bool,
+
+        #[arg(long, value_name = "PATH")]
+        path: Vec<String>,
     },
 }
 
@@ -42,7 +45,9 @@ async fn main() -> Result<()> {
         Cmd::Search { query, limit } => search(&args.base_url, &query, limit).await?,
         Cmd::Suggest { prefix, limit } => suggest(&args.base_url, &prefix, limit).await?,
         Cmd::Status => status(&args.base_url).await?,
-        Cmd::Reindex { full } => reindex(&args.base_url, args.token.as_deref(), full).await?,
+        Cmd::Reindex { full, path } => {
+            reindex(&args.base_url, args.token.as_deref(), full, &path).await?
+        }
     }
     Ok(())
 }
@@ -94,14 +99,21 @@ async fn suggest(base_url: &str, prefix: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
-async fn reindex(base_url: &str, token: Option<&str>, full: bool) -> Result<()> {
-    let url = format!("{base_url}/v1/reindex");
+async fn reindex(base_url: &str, token: Option<&str>, full: bool, paths: &[String]) -> Result<()> {
+    let mut url = reqwest::Url::parse(&format!("{base_url}/v1/reindex"))?;
+    {
+        let mut qp = url.query_pairs_mut();
+        if full {
+            qp.append_pair("full", "true");
+        }
+        for p in paths {
+            qp.append_pair("path", p);
+        }
+    }
+
     let mut req = reqwest::Client::new().post(url);
     if let Some(token) = token {
         req = req.bearer_auth(token);
-    }
-    if full {
-        req = req.query(&[("full", "true")]);
     }
 
     let resp = req.send().await.context("request /v1/reindex")?;

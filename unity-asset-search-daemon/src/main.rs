@@ -195,6 +195,10 @@ async fn suggest(
 #[derive(Debug, serde::Deserialize)]
 struct ReindexParams {
     full: Option<bool>,
+    #[serde(default)]
+    path: Vec<String>,
+    #[serde(default)]
+    paths: Vec<String>,
 }
 
 async fn reindex(
@@ -211,7 +215,15 @@ async fn reindex(
     }
 
     let full = q.full.unwrap_or(false);
-    match run_reindex(state, full).await {
+    let paths: Vec<String> = q.path.into_iter().chain(q.paths.into_iter()).collect();
+
+    match if full {
+        run_reindex(state, true).await
+    } else if paths.is_empty() {
+        run_reindex(state, false).await
+    } else {
+        run_reindex_paths(state, &paths).await
+    } {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -358,6 +370,24 @@ async fn run_reindex_changed_paths(
     tokio::task::spawn_blocking(move || index.reindex_changed_paths(&paths, &changed_paths))
         .await??;
     Ok(())
+}
+
+async fn run_reindex_paths(state: Arc<AppState>, raw_paths: &[String]) -> anyhow::Result<()> {
+    let mut paths = Vec::new();
+    for raw in raw_paths {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let p = PathBuf::from(raw);
+        let p = if p.is_absolute() {
+            p
+        } else {
+            state.paths.project_root.join(p)
+        };
+        paths.push(p);
+    }
+    run_reindex_changed_paths(state, &paths).await
 }
 
 #[derive(Debug)]
