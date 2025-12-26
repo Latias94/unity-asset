@@ -60,6 +60,6 @@ This repository maintains runnable examples per crate (built in CI).
   - `cargo run -p unity-asset-search-cli -- status`
   - Find references by GUID:
     - `cargo run -p unity-asset-search-cli -- references deadbeefdeadbeefdeadbeefdeadbeef --limit 50`
-    - `cargo run -p unity-asset-search-cli -- references deadbeefdeadbeefdeadbeefdeadbeef --file-id 11500000 --limit 50`
+    - `cargo run -p unity-asset-search-cli -- references deadbeefdeadbeefdeadbeefdeadbeef --file-id 11500000 --limit 50` (YAML `fileID` / binary `pathID`)
 - Run the BoatAttack benchmark harness:
   - `scripts/bench_boat_attack.zsh repo-ref/BoatAttack`

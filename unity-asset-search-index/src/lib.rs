@@ -998,7 +998,7 @@ impl SearchIndex {
         limit: usize,
     ) -> Result<ReferencesResponse> {
         let start = Instant::now();
-        let guid = guid.trim().to_lowercase();
+        let guid = normalize_guid_string(guid.trim());
         if guid.is_empty() {
             return Ok(ReferencesResponse {
                 guid: String::new(),
@@ -1689,25 +1689,33 @@ fn build_doc(
     Ok(document)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ExtractedReferences {
     guids: Vec<String>,
     guid_fileids: Vec<String>,
 }
 
 fn build_refs_doc(fields: &ReferenceFields, file: &ScannedFile) -> Result<Option<TantivyDocument>> {
-    if !is_probably_unity_yaml(&file.abs_path)? {
-        return Ok(None);
-    }
-    let text = read_text_limited(&file.abs_path, 2 * 1024 * 1024)?;
-    let Some(text) = text else {
-        return Ok(None);
+    let yaml_extracted = if is_probably_unity_yaml(&file.abs_path)? {
+        let text = read_text_limited(&file.abs_path, 2 * 1024 * 1024)?;
+        let Some(text) = text else {
+            return Ok(None);
+        };
+        is_probably_unity_yaml_text(&text).then(|| extract_unity_yaml_references(&text))
+    } else {
+        None
     };
-    if !is_probably_unity_yaml_text(&text) {
-        return Ok(None);
-    }
 
-    let extracted = extract_unity_yaml_references(&text);
+    let (source_kind, extracted) = if let Some(extracted) = yaml_extracted {
+        (file.kind.clone(), extracted)
+    } else {
+        let extracted = extract_unity_binary_references(file)?;
+        if extracted.refs.guids.is_empty() && extracted.refs.guid_fileids.is_empty() {
+            return Ok(None);
+        }
+        (extracted.source_kind.clone(), extracted.refs)
+    };
+
     if extracted.guids.is_empty() && extracted.guid_fileids.is_empty() {
         return Ok(None);
     }
@@ -1715,7 +1723,7 @@ fn build_refs_doc(fields: &ReferenceFields, file: &ScannedFile) -> Result<Option
     let mut doc = TantivyDocument::default();
     doc.add_text(fields.source_id, file.rel_path.clone());
     doc.add_text(fields.source_path, file.rel_path.clone());
-    doc.add_text(fields.source_kind, file.kind.clone());
+    doc.add_text(fields.source_kind, source_kind);
 
     for guid in extracted.guids {
         doc.add_text(fields.ref_guid, guid);
@@ -1725,6 +1733,148 @@ fn build_refs_doc(fields: &ReferenceFields, file: &ScannedFile) -> Result<Option
     }
 
     Ok(Some(doc))
+}
+
+#[derive(Debug, Clone)]
+struct BinaryRefExtraction {
+    source_kind: String,
+    refs: ExtractedReferences,
+}
+
+fn normalize_guid_string(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .flat_map(|c| c.to_lowercase())
+        .collect::<String>()
+}
+
+fn read_prefix(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+    let mut f = fs::File::open(path)?;
+    let mut buf = vec![0u8; max_bytes];
+    let n = f.read(&mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+fn extract_unity_binary_references(file: &ScannedFile) -> Result<BinaryRefExtraction> {
+    let prefix = read_prefix(&file.abs_path, 256).unwrap_or_default();
+    let kind = unity_asset_binary::file::sniff_unity_file_kind_prefix(&prefix);
+    let Some(_kind) = kind else {
+        return Ok(BinaryRefExtraction {
+            source_kind: file.kind.clone(),
+            refs: ExtractedReferences::default(),
+        });
+    };
+
+    let this_guid = read_guid_from_meta(asset_meta_path(&file.abs_path))
+        .map(|g| normalize_guid_string(&g))
+        .filter(|g| !g.is_empty());
+
+    let unity_file = unity_asset_binary::file::load_unity_file(&file.abs_path);
+    let Ok(unity_file) = unity_file else {
+        return Ok(BinaryRefExtraction {
+            source_kind: file.kind.clone(),
+            refs: ExtractedReferences::default(),
+        });
+    };
+
+    let mut refs = ExtractedReferences::default();
+
+    match unity_file {
+        unity_asset_binary::file::UnityFile::SerializedFile(sf) => {
+            refs = merge_refs(refs, extract_refs_from_serialized_file(&sf, this_guid.as_deref()));
+            Ok(BinaryRefExtraction {
+                source_kind: "SerializedFile".to_string(),
+                refs,
+            })
+        }
+        unity_asset_binary::file::UnityFile::AssetBundle(bundle) => {
+            for asset in &bundle.assets {
+                refs = merge_refs(refs, extract_refs_from_serialized_file(asset, None));
+                if refs.guids.len() >= 50_000 {
+                    break;
+                }
+            }
+            Ok(BinaryRefExtraction {
+                source_kind: "AssetBundle".to_string(),
+                refs,
+            })
+        }
+        unity_asset_binary::file::UnityFile::WebFile(_) => Ok(BinaryRefExtraction {
+            source_kind: "WebFile".to_string(),
+            refs,
+        }),
+    }
+}
+
+fn merge_refs(mut a: ExtractedReferences, b: ExtractedReferences) -> ExtractedReferences {
+    a.guids.extend(b.guids);
+    a.guid_fileids.extend(b.guid_fileids);
+    a.guids.sort();
+    a.guids.dedup();
+    a.guid_fileids.sort();
+    a.guid_fileids.dedup();
+    a
+}
+
+fn extract_refs_from_serialized_file(
+    file: &unity_asset_binary::asset::SerializedFile,
+    self_guid: Option<&str>,
+) -> ExtractedReferences {
+    const MAX_OBJECTS: usize = 20_000;
+
+    let mut guids = std::collections::BTreeSet::<String>::new();
+    let mut guid_fileids = std::collections::BTreeSet::<String>::new();
+
+    let externals: Vec<Option<String>> = file
+        .externals
+        .iter()
+        .map(|e| {
+            let g = normalize_guid_string(&e.guid_string());
+            (!g.is_empty()).then_some(g)
+        })
+        .collect();
+
+    for info in file.objects.iter().take(MAX_OBJECTS) {
+        let handle = unity_asset_binary::object::ObjectHandle::new(file, info);
+        let Ok(Some(pptrs)) = handle.scan_pptrs() else {
+            continue;
+        };
+
+        if let Some(self_guid) = self_guid {
+            for id in pptrs.internal {
+                if id > 0 {
+                    let g = self_guid.to_string();
+                    guids.insert(g.clone());
+                    guid_fileids.insert(format!("{g}:{id}"));
+                }
+            }
+        }
+
+        for (file_id, path_id) in pptrs.external {
+            if path_id <= 0 {
+                continue;
+            }
+            if file_id <= 0 {
+                continue;
+            }
+            let idx: usize = (file_id - 1).try_into().unwrap_or(usize::MAX);
+            let Some(Some(guid)) = externals.get(idx) else {
+                continue;
+            };
+            guids.insert(guid.clone());
+            guid_fileids.insert(format!("{guid}:{path_id}"));
+        }
+
+        if guids.len() >= 50_000 {
+            break;
+        }
+    }
+
+    ExtractedReferences {
+        guids: guids.into_iter().collect(),
+        guid_fileids: guid_fileids.into_iter().collect(),
+    }
 }
 
 fn extract_unity_yaml_references(text: &str) -> ExtractedReferences {

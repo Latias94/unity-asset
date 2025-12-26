@@ -56,7 +56,8 @@ Current status:
 Current status:
 
 - Implemented (YAML): daemon endpoint `GET /v1/references?guid=...&file_id=...` returns source files that reference the target GUID (best-effort for PPtr-like `{guid,fileID}` blocks).
-- Pending: binary `PPtr` reverse edges (TypeTree-driven), richer field-level context, and Unity Editor jump-to-location.
+- Implemented (binary): best-effort reverse references for `SerializedFile` / `AssetBundle` by scanning TypeTree `PPtr` (`fileID`, `pathID`) and mapping externals to GUIDs when available.
+- Pending: richer field-level context, result grouping/deduplication, and Unity Editor jump-to-location.
 
 ### Phase 4: Deep mode (Tier-2 decode) and non-text assets
 

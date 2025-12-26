@@ -17,6 +17,7 @@ tantivy.workspace = true
 ignore.workspace = true
 once_cell.workspace = true
 unity-asset-search-core = { path = "../unity-asset-search-core" }
+unity-asset-binary = { path = "../unity-asset-binary", version = "0.2.0" }
 
 [dev-dependencies]
 tempfile.workspace = true

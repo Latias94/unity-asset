@@ -3436,6 +3436,7 @@ dependencies = [
  "serde_json",
  "tantivy",
  "tempfile",
+ "unity-asset-binary",
  "unity-asset-search-core",
 ]
 
