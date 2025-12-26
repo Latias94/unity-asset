@@ -559,6 +559,16 @@ impl Environment {
                                         resolved = Some(EnvironmentObjectKey::Yaml(target.clone()));
                                     }
                                 }
+
+                                if resolved.is_none() && options.include_binary {
+                                    if let Some(obj_ref) =
+                                        self.find_binary_object_in_source(p, r.file_id)
+                                    {
+                                        let key = EnvironmentObjectKey::Binary(obj_ref.key());
+                                        nodes_set.insert(key.clone());
+                                        resolved = Some(key);
+                                    }
+                                }
                             }
                             external_from.entry(from_key.clone()).or_default().push(
                                 ExternalObjectEdge::Yaml(YamlExternalEdge {

@@ -569,6 +569,89 @@ fn environment_object_graph_scans_yaml_pptrs_and_meta_guid_paths() {
 }
 
 #[test]
+fn environment_object_graph_resolves_yaml_guid_to_loaded_serialized_file_object() {
+    use unity_asset_binary::bundle::load_bundle;
+    use unity_asset_binary::file::load_unity_file_from_memory;
+
+    let bundle_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
+    let bundle = load_bundle(&bundle_path).unwrap();
+
+    let mut extracted: Option<(Vec<u8>, i64)> = None;
+    for name in bundle.file_names() {
+        let Some(info) = bundle.find_file(name) else {
+            continue;
+        };
+        let bytes = bundle.extract_file_data(info).unwrap();
+        let Ok(unity_file) = load_unity_file_from_memory(bytes.clone()) else {
+            continue;
+        };
+        let Some(file) = unity_file.as_serialized() else {
+            continue;
+        };
+        let Some(first) = file.objects.first() else {
+            continue;
+        };
+        if first.path_id == 0 {
+            continue;
+        }
+        extracted = Some((bytes, first.path_id));
+        break;
+    }
+
+    let (bytes, target_path_id) = extracted.expect("bundle contains at least one SerializedFile");
+
+    let temp = tempfile::tempdir().unwrap();
+    let target_path = temp.path().join("Target.assets");
+    let target_meta = temp.path().join("Target.assets.meta");
+
+    std::fs::write(&target_path, &bytes).unwrap();
+    std::fs::write(
+        &target_meta,
+        b"fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+
+    let yaml_path = temp.path().join("Ref.prefab");
+    let yaml = format!(
+        "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!114 &1\nMonoBehaviour:\n  m_Ref: {{fileID: {}, guid: 0123456789abcdef0123456789abcdef, type: 2}}\n",
+        target_path_id
+    );
+    std::fs::write(&yaml_path, yaml.as_bytes()).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&target_meta).unwrap();
+    env.load_file(&target_path).unwrap();
+    env.load_file(&yaml_path).unwrap();
+
+    let graph = env.build_object_graph(ObjectGraphBuildOptions::default());
+
+    let from = EnvironmentObjectKey::Yaml(YamlObjectKey {
+        path: yaml_path.clone(),
+        anchor: "1".to_string(),
+    });
+    let exts = graph.external_refs_from(&from);
+    let yaml_ext = exts
+        .iter()
+        .find_map(|e| match e {
+            ExternalObjectEdge::Yaml(y) if y.guid.is_some() => Some(y),
+            _ => None,
+        })
+        .expect("expected at least one YAML external edge with a GUID");
+
+    let expected = BinaryObjectKey {
+        source: BinarySource::path(&target_path),
+        source_kind: BinarySourceKind::SerializedFile,
+        asset_index: None,
+        path_id: target_path_id,
+    };
+    assert_eq!(
+        yaml_ext.resolved,
+        Some(EnvironmentObjectKey::Binary(expected))
+    );
+}
+
+#[test]
 fn environment_can_parse_external_yaml_prefab_if_provided() {
     let mut env = Environment::new();
     let Ok(path) = std::env::var("UNITY_ASSET_YAML_PREFAB") else {
