@@ -9,7 +9,9 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{
+    AllQuery, BooleanQuery, BoostQuery, Occur, PhrasePrefixQuery, Query, TermQuery,
+};
 use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value as _};
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term, doc};
 
@@ -168,7 +170,6 @@ pub struct SearchIndex {
 }
 
 struct SearchIndexInner {
-    index: Index,
     reader: IndexReader,
     writer: IndexWriter,
     fields: SearchFields,
@@ -239,7 +240,6 @@ impl SearchIndex {
 
         let this = Self {
             inner: Arc::new(RwLock::new(SearchIndexInner {
-                index,
                 reader,
                 writer,
                 fields,
@@ -368,19 +368,9 @@ impl SearchIndex {
         let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
         let searcher = inner.reader.searcher();
 
-        let mut base_query: Box<dyn tantivy::query::Query> = if spec.free_text.is_empty() {
-            Box::new(tantivy::query::AllQuery)
-        } else {
-            let query_parser = QueryParser::for_index(
-                &inner.index,
-                vec![
-                    inner.fields.name_terms,
-                    inner.fields.path_terms,
-                    inner.fields.kind_terms,
-                ],
-            );
-            Box::new(query_parser.parse_query(&spec.free_text)?)
-        };
+        let terms = to_terms(&spec.free_text);
+        let tokens: Vec<&str> = terms.split_whitespace().collect();
+        let mut base_query: Box<dyn Query> = build_retrieval_query(&inner.fields, &tokens);
 
         if let Some(kind) = spec
             .type_filter
@@ -388,9 +378,8 @@ impl SearchIndex {
             .and_then(canonicalize_kind_filter)
         {
             let term = Term::from_field_text(inner.fields.kind, &kind);
-            let term_query =
-                tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
-            base_query = Box::new(tantivy::query::BooleanQuery::intersection(vec![
+            let term_query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+            base_query = Box::new(BooleanQuery::intersection(vec![
                 base_query,
                 Box::new(term_query),
             ]));
@@ -432,7 +421,12 @@ impl SearchIndex {
                 .unwrap_or_default()
                 .to_string();
 
-            let rank = rank_match(query, &name, &path);
+            let rank_query = if spec.free_text.is_empty() {
+                spec.raw.as_str()
+            } else {
+                spec.free_text.as_str()
+            };
+            let rank = rank_match(rank_query, &name, &path);
 
             hits.push(SearchHit {
                 guid,
@@ -488,30 +482,37 @@ impl SearchIndex {
         let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
         let mut out = Vec::new();
 
-        for kind in [
-            "Prefab", "Scene", "Material", "Script", "Asset", "Shader", "Texture", "Audio", "File",
-        ] {
-            if kind.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                out.push(format!("t:{kind}"));
-                if out.len() >= limit {
-                    return Ok(SuggestResponse {
-                        prefix: prefix.to_string(),
-                        took_ms: start.elapsed().as_millis(),
-                        suggestions: out,
-                    });
+        let (want_kind, want_path, rest) = if let Some(rest) = prefix.strip_prefix("t:") {
+            (true, false, rest)
+        } else if let Some(rest) = prefix.strip_prefix("type:") {
+            (true, false, rest)
+        } else if let Some(rest) = prefix.strip_prefix("in:") {
+            (false, true, rest)
+        } else {
+            (true, true, prefix)
+        };
+
+        if want_kind {
+            let lower = rest.to_lowercase();
+            for kind in [
+                "Prefab", "Scene", "Material", "Script", "Asset", "Shader", "Texture", "Audio",
+                "File",
+            ] {
+                if kind.to_lowercase().starts_with(&lower) {
+                    out.push(format!("t:{kind}"));
+                    if out.len() >= limit {
+                        return Ok(SuggestResponse {
+                            prefix: prefix.to_string(),
+                            took_ms: start.elapsed().as_millis(),
+                            suggestions: out,
+                        });
+                    }
                 }
             }
         }
 
-        // Path prefix suggestions from state keys (sorted).
-        for (path, _) in inner.state.files.range(prefix.to_string()..) {
-            if !path.starts_with(prefix) {
-                break;
-            }
-            out.push(path.clone());
-            if out.len() >= limit {
-                break;
-            }
+        if want_path {
+            out.extend(suggest_in_paths(&inner.state, rest, limit - out.len()));
         }
 
         Ok(SuggestResponse {
@@ -557,6 +558,123 @@ fn canonicalize_kind_filter(raw: &str) -> Option<String> {
         _ => return None,
     };
     Some(out.to_string())
+}
+
+fn build_retrieval_query(fields: &SearchFields, tokens: &[&str]) -> Box<dyn Query> {
+    if tokens.is_empty() {
+        return Box::new(AllQuery);
+    }
+
+    let mut must = Vec::new();
+    for token in tokens {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        must.push((Occur::Must, per_token_query(fields, token)));
+    }
+
+    if must.is_empty() {
+        Box::new(AllQuery)
+    } else {
+        Box::new(BooleanQuery::new(must))
+    }
+}
+
+fn per_token_query(fields: &SearchFields, token: &str) -> Box<dyn Query> {
+    let should = vec![
+        (
+            Occur::Should,
+            boosted_text_queries(fields.name_terms, token, 3.0, 2.0),
+        ),
+        (
+            Occur::Should,
+            boosted_text_queries(fields.path_terms, token, 2.0, 1.5),
+        ),
+        (
+            Occur::Should,
+            boosted_text_queries(fields.kind_terms, token, 1.0, 1.0),
+        ),
+    ];
+
+    Box::new(BooleanQuery::new(should))
+}
+
+fn boosted_text_queries(
+    field: Field,
+    token: &str,
+    exact_boost: f32,
+    prefix_boost: f32,
+) -> Box<dyn Query> {
+    let mut should = Vec::new();
+
+    let term = Term::from_field_text(field, token);
+    let exact = TermQuery::new(term.clone(), tantivy::schema::IndexRecordOption::Basic);
+    let prefix = PhrasePrefixQuery::new(vec![term]);
+
+    should.push((
+        Occur::Should,
+        Box::new(BoostQuery::new(Box::new(exact), exact_boost)) as Box<dyn Query>,
+    ));
+    should.push((
+        Occur::Should,
+        Box::new(BoostQuery::new(Box::new(prefix), prefix_boost)) as Box<dyn Query>,
+    ));
+
+    Box::new(BooleanQuery::new(should))
+}
+
+fn suggest_in_paths(state: &IndexState, raw_prefix: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut out = std::collections::BTreeSet::new();
+    let prefix = raw_prefix.trim();
+    let mut scanned = 0usize;
+
+    if prefix.is_empty() {
+        for (path, _) in state.files.iter() {
+            if scanned >= 2000 {
+                break;
+            }
+            scanned += 1;
+            if let Some(seg) = path.split('/').next() {
+                out.insert(format!("in:{seg}/"));
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+        return out.into_iter().take(limit).collect();
+    }
+
+    let start_key = prefix.to_string();
+    for (path, _) in state.files.range(start_key..) {
+        if scanned >= 2000 {
+            break;
+        }
+        scanned += 1;
+
+        if !path.starts_with(prefix) {
+            break;
+        }
+
+        let suffix = &path[prefix.len()..];
+        if let Some(pos) = suffix.find('/') {
+            out.insert(format!("in:{}{}", prefix, &suffix[..=pos]));
+        } else if let Some(pos) = path.rfind('/') {
+            out.insert(format!("in:{}/", &path[..pos]));
+        } else {
+            out.insert(format!("in:{path}"));
+        }
+
+        if out.len() >= limit {
+            break;
+        }
+    }
+
+    out.into_iter().take(limit).collect()
 }
 
 fn build_schema() -> Schema {
