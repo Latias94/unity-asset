@@ -63,10 +63,9 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
     assert!(!found.is_empty());
 
     // Disambiguation helpers should work on the same source path.
-    assert!(
-        env.find_binary_object_in_source(&path, first.path_id)
-            .is_some()
-    );
+    assert!(env
+        .find_binary_object_in_source(&path, first.path_id)
+        .is_some());
     let obj_ref = env
         .find_binary_object_in_bundle_asset(&path, 0, first.path_id)
         .expect("can find object in bundle asset 0");
@@ -106,10 +105,9 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
     } else {
         (obj_ref.object.file().externals.len() as i32) + 1
     };
-    assert!(
-        env.resolve_binary_pptr(&obj_ref, invalid_file_id, first.path_id)
-            .is_none()
-    );
+    assert!(env
+        .resolve_binary_pptr(&obj_ref, invalid_file_id, first.path_id)
+        .is_none());
 
     let bundle = env
         .bundles()
@@ -176,11 +174,10 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
     assert!(clip.is_streamed());
     assert_eq!(clip.stream_info.offset, 4096);
     assert_eq!(clip.stream_info.size, 17088);
-    assert!(
-        clip.stream_info
-            .path
-            .contains("CAB-8579bc75d50073df38987733a7cb3193")
-    );
+    assert!(clip
+        .stream_info
+        .path
+        .contains("CAB-8579bc75d50073df38987733a7cb3193"));
 
     let peek = env.peek_binary_object_name(&key).unwrap();
     assert_eq!(peek, obj.name());
@@ -279,6 +276,50 @@ fn environment_indexes_meta_guid_for_best_effort_external_resolution() {
 
     let cached = env.asset_path_for_guid(expected_guid);
     assert_eq!(cached, Some(asset_path));
+}
+
+#[test]
+fn environment_index_meta_guids_in_directory_skips_library_and_indexes_nested() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let nested_dir = root.join("Assets/Nested");
+    std::fs::create_dir_all(&nested_dir).unwrap();
+
+    let asset_path = nested_dir.join("MyAsset.asset");
+    let meta_path = nested_dir.join("MyAsset.asset.meta");
+    std::fs::write(&asset_path, b"not a real asset").unwrap();
+    std::fs::write(
+        &meta_path,
+        b"fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+
+    let skipped_dir = root.join("Library");
+    std::fs::create_dir_all(&skipped_dir).unwrap();
+    let skipped_asset = skipped_dir.join("Skip.asset");
+    let skipped_meta = skipped_dir.join("Skip.asset.meta");
+    std::fs::write(&skipped_asset, b"not a real asset").unwrap();
+    std::fs::write(
+        &skipped_meta,
+        b"fileFormatVersion: 2\nguid: deadbeefdeadbeefdeadbeefdeadbeef\n",
+    )
+    .unwrap();
+
+    let env = Environment::new();
+    let stats = env.index_meta_guids_in_directory(root).unwrap();
+    assert!(stats.meta_files_seen >= 1);
+    assert!(stats.meta_guids_indexed >= 1);
+
+    let expected_guid: [u8; 16] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+        0xef,
+    ];
+    assert_eq!(env.asset_path_for_guid(expected_guid), Some(asset_path));
+
+    let skipped_guid = super::meta_guid::parse_guid_32_hex("deadbeefdeadbeefdeadbeefdeadbeef")
+        .expect("parse skipped guid");
+    assert_eq!(env.asset_path_for_guid(skipped_guid), None);
 }
 
 #[test]

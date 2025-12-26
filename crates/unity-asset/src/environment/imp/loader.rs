@@ -1,5 +1,13 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetaGuidIndexStats {
+    pub dirs_visited: usize,
+    pub files_visited: usize,
+    pub meta_files_seen: usize,
+    pub meta_guids_indexed: usize,
+}
+
 impl Environment {
     /// Load assets from a path (file or directory).
     pub fn load<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
@@ -22,7 +30,7 @@ impl Environment {
         if let Some(ext) = path.extension() {
             if ext == "meta" {
                 // Index meta GUIDs even if YAML parsing fails (best-effort reference resolution).
-                self.index_meta_guid_path(path);
+                let _ = self.index_meta_guid_path(path);
             }
 
             match ext.to_str() {
@@ -57,6 +65,77 @@ impl Environment {
         }
 
         Ok(())
+    }
+
+    /// Recursively index `.meta` GUIDs under a directory (without loading YAML/binary assets).
+    ///
+    /// This is useful to improve best-effort external reference resolution (GUID -> asset path),
+    /// while keeping the main loading path focused (e.g. only load bundles / serialized files).
+    pub fn index_meta_guids_in_directory<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<MetaGuidIndexStats> {
+        let path = path.as_ref();
+
+        if !path.exists() {
+            return Err(UnityAssetError::format(format!(
+                "Directory does not exist: {:?}",
+                path
+            )));
+        }
+        if !path.is_dir() {
+            return Err(UnityAssetError::format(format!(
+                "Path is not a directory: {:?}",
+                path
+            )));
+        }
+
+        let mut stats = MetaGuidIndexStats::default();
+        let mut stack: Vec<PathBuf> = vec![path.to_path_buf()];
+
+        while let Some(dir) = stack.pop() {
+            stats.dirs_visited += 1;
+
+            let entries = std::fs::read_dir(&dir).map_err(|e| {
+                UnityAssetError::with_source(format!("Failed to read directory {:?}", dir), e)
+            })?;
+
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    UnityAssetError::with_source("Failed to read directory entry", e)
+                })?;
+                let entry_path = entry.path();
+
+                if entry_path.is_dir() {
+                    if let Some(dir_name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                        match dir_name {
+                            "Library" | "Temp" | "Logs" | ".git" | ".vs" | "obj" | "bin" => {
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                    stack.push(entry_path);
+                    continue;
+                }
+
+                if !entry_path.is_file() {
+                    continue;
+                }
+
+                stats.files_visited += 1;
+                if entry_path.extension().and_then(|e| e.to_str()) != Some("meta") {
+                    continue;
+                }
+
+                stats.meta_files_seen += 1;
+                if self.index_meta_guid_path(&entry_path).is_some() {
+                    stats.meta_guids_indexed += 1;
+                }
+            }
+        }
+
+        Ok(stats)
     }
 
     fn try_load_binary(&mut self, path: &Path) -> Result<()> {

@@ -38,12 +38,12 @@ fn read_guid_from_meta_text(text: &str) -> Option<[u8; 16]> {
 }
 
 impl Environment {
-    pub(crate) fn index_meta_guid_path(&self, meta_path: &Path) {
+    pub(crate) fn index_meta_guid_path(&self, meta_path: &Path) -> Option<[u8; 16]> {
         let Ok(text) = std::fs::read_to_string(meta_path) else {
-            return;
+            return None;
         };
         let Some(guid) = read_guid_from_meta_text(&text) else {
-            return;
+            return None;
         };
 
         // `foo.ext.meta` -> `foo.ext`
@@ -60,6 +60,8 @@ impl Environment {
                 e.into_inner().entry(guid).or_insert(asset_path);
             }
         }
+
+        Some(guid)
     }
 
     pub(crate) fn asset_path_for_guid(&self, guid: [u8; 16]) -> Option<PathBuf> {
