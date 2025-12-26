@@ -338,7 +338,7 @@ async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::
                 }
                 if path
                     .file_name()
-                    .is_some_and(|n| n == ".gitignore" || n == ".ignore")
+                    .is_some_and(|n| n == ".gitignore" || n == ".ignore" || n == ".unity-asset-search-ignore")
                 {
                     force_full = true;
                 }

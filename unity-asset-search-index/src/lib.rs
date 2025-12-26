@@ -1456,6 +1456,7 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
         .git_global(false)
         .git_exclude(false)
         .add_custom_ignore_filename(".gitignore")
+        .add_custom_ignore_filename(".unity-asset-search-ignore")
         .filter_entry(move |e: &DirEntry| {
             let p = e.path();
             if is_excluded_dir(p) {
@@ -1525,6 +1526,7 @@ fn build_project_walker(paths: &IndexPaths) -> Result<ignore::Walk> {
         .git_global(false)
         .git_exclude(false)
         .add_custom_ignore_filename(".gitignore")
+        .add_custom_ignore_filename(".unity-asset-search-ignore")
         .filter_entry(move |e: &DirEntry| {
             let p = e.path();
             if is_excluded_dir(p) {
