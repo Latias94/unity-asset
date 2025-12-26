@@ -59,6 +59,8 @@ pub struct ReferenceHit {
     pub source_kind: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contexts: Vec<ReferenceContext>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub objects: Vec<ReferenceObject>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +73,18 @@ pub struct ReferenceContext {
     pub hierarchy_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub field_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceObject {
+    pub doc_file_id: Option<u64>,
+    pub doc_class_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hierarchy_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_hints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1039,6 +1053,7 @@ impl SearchIndex {
                 source_path,
                 source_kind,
                 contexts: Vec::new(),
+                objects: Vec::new(),
             });
         }
 
@@ -1081,8 +1096,12 @@ impl SearchIndex {
             } else {
                 hit.contexts = extract_reference_contexts_from_binary(&abs, &guid, file_id);
             }
-            hit.contexts = group_reference_contexts(std::mem::take(&mut hit.contexts));
+            let (contexts, objects) =
+                group_reference_contexts_and_objects(std::mem::take(&mut hit.contexts));
+            hit.contexts = contexts;
+            hit.objects = objects;
             hit.contexts.truncate(10);
+            hit.objects.truncate(10);
         }
 
         resp.took_ms = resp.took_ms.saturating_add(0);
@@ -2121,9 +2140,11 @@ struct ContextKey {
     hierarchy_path: Option<String>,
 }
 
-fn group_reference_contexts(contexts: Vec<ReferenceContext>) -> Vec<ReferenceContext> {
+fn group_reference_contexts_and_objects(
+    contexts: Vec<ReferenceContext>,
+) -> (Vec<ReferenceContext>, Vec<ReferenceObject>) {
     if contexts.is_empty() {
-        return contexts;
+        return (contexts, Vec::new());
     }
 
     let mut grouped: std::collections::BTreeMap<
@@ -2152,14 +2173,23 @@ fn group_reference_contexts(contexts: Vec<ReferenceContext>) -> Vec<ReferenceCon
         }
     }
 
-    grouped
-        .into_values()
-        .map(|(mut base, hints)| {
-            let joined = join_hints(hints);
-            base.field_hint = joined;
-            base
-        })
-        .collect()
+    let mut contexts = Vec::with_capacity(grouped.len());
+    let mut objects = Vec::with_capacity(grouped.len());
+
+    for (mut base, hints) in grouped.into_values() {
+        let field_hints: Vec<String> = hints.iter().cloned().collect();
+        objects.push(ReferenceObject {
+            doc_file_id: base.doc_file_id,
+            doc_class_id: base.doc_class_id,
+            object_name: base.object_name.clone(),
+            hierarchy_path: base.hierarchy_path.clone(),
+            field_hints,
+        });
+        base.field_hint = join_hints(hints);
+        contexts.push(base);
+    }
+
+    (contexts, objects)
 }
 
 fn join_hints(hints: std::collections::BTreeSet<String>) -> Option<String> {
@@ -3120,11 +3150,16 @@ Transform:
             field_hint: Some("m_Materials[0]".to_string()),
         };
 
-        let grouped = group_reference_contexts(vec![b, a]);
-        assert_eq!(grouped.len(), 1);
+        let (contexts, objects) = group_reference_contexts_and_objects(vec![b, a]);
+        assert_eq!(contexts.len(), 1);
         assert_eq!(
-            grouped[0].field_hint.as_deref(),
+            contexts[0].field_hint.as_deref(),
             Some("m_Material, m_Materials[0]")
+        );
+        assert_eq!(objects.len(), 1);
+        assert_eq!(
+            objects[0].field_hints,
+            vec!["m_Material".to_string(), "m_Materials[0]".to_string()]
         );
     }
 
@@ -3145,9 +3180,12 @@ Transform:
             field_hint: Some("m_Script".to_string()),
         };
 
-        let grouped = group_reference_contexts(vec![a, b]);
-        assert_eq!(grouped.len(), 2);
-        assert!(grouped.iter().any(|c| c.object_name.as_deref() == Some("A")));
-        assert!(grouped.iter().any(|c| c.object_name.as_deref() == Some("B")));
+        let (contexts, objects) = group_reference_contexts_and_objects(vec![a, b]);
+        assert_eq!(contexts.len(), 2);
+        assert!(contexts.iter().any(|c| c.object_name.as_deref() == Some("A")));
+        assert!(contexts.iter().any(|c| c.object_name.as_deref() == Some("B")));
+        assert_eq!(objects.len(), 2);
+        assert!(objects.iter().any(|c| c.object_name.as_deref() == Some("A")));
+        assert!(objects.iter().any(|c| c.object_name.as_deref() == Some("B")));
     }
 }
