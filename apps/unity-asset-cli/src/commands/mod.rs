@@ -12,6 +12,7 @@ mod inspect_object;
 mod list_bundle;
 mod list_objects;
 mod parse_yaml;
+mod project_graph;
 mod scan_pptr;
 
 pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
@@ -212,6 +213,26 @@ pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
             format,
             names,
             max_edges,
+            ctx,
+        ),
+        Commands::ProjectGraph {
+            input,
+            yaml,
+            format,
+            max_files,
+            max_edges,
+            follow_external,
+            no_ignore,
+            follow_symlinks,
+        } => project_graph::run(
+            input,
+            yaml,
+            format,
+            max_files,
+            max_edges,
+            follow_external,
+            no_ignore,
+            follow_symlinks,
             ctx,
         ),
     }

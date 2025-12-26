@@ -426,4 +426,40 @@ pub(crate) enum Commands {
         #[arg(long, default_value_t = 2000)]
         max_edges: usize,
     },
+
+    /// Build a best-effort object graph for a Unity project root (fast scan + `.meta` GUID indexing).
+    #[command(name = "project-graph")]
+    ProjectGraph {
+        /// Unity project root directory.
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Also load YAML documents (`.asset`, `.prefab`, `.unity`) (heavier).
+        #[arg(long)]
+        yaml: bool,
+
+        /// Output format (summary, dot, jsonl).
+        #[arg(long, default_value = "summary")]
+        format: String,
+
+        /// Limit visited files during scan (best-effort).
+        #[arg(long)]
+        max_files: Option<usize>,
+
+        /// Maximum edges to emit for dot/jsonl.
+        #[arg(long, default_value_t = 200_000)]
+        max_edges: usize,
+
+        /// Follow resolved external edges when emitting dot/jsonl.
+        #[arg(long)]
+        follow_external: bool,
+
+        /// Do not respect ignore files (`.gitignore`, `.ignore`).
+        #[arg(long)]
+        no_ignore: bool,
+
+        /// Follow symlinks during project scan.
+        #[arg(long)]
+        follow_symlinks: bool,
+    },
 }
