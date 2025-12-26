@@ -63,6 +63,7 @@ fuzzy-matcher = "0.3"
 rand = "0.9"
 hex = "0.4"
 ignore = "0.4"
+notify = "8"
 
 # This is now a pure workspace - no package definition
 # Individual crates are in their respective directories:

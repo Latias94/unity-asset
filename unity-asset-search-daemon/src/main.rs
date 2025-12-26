@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -8,6 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use clap::Parser;
+use notify::Watcher as _;
 use rand::TryRngCore;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -37,6 +39,12 @@ struct Args {
 
     #[arg(long)]
     no_auto_reindex: bool,
+
+    #[arg(long)]
+    watch: bool,
+
+    #[arg(long, default_value_t = 1500)]
+    watch_debounce_ms: u64,
 }
 
 #[derive(Clone)]
@@ -44,6 +52,7 @@ struct AppState {
     index: SearchIndex,
     token: String,
     paths: IndexPaths,
+    reindex_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[tokio::main]
@@ -73,17 +82,27 @@ async fn main() -> anyhow::Result<()> {
         index: index.clone(),
         token,
         paths: paths.clone(),
+        reindex_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     if !args.no_auto_reindex {
         let status = index.status()?;
         if status.indexed_docs == 0 && !status.indexing {
-            let index = index.clone();
-            let paths = paths.clone();
+            let state = Arc::new(state.clone());
             tokio::spawn(async move {
-                let _ = tokio::task::spawn_blocking(move || index.reindex(&paths)).await;
+                let _ = run_reindex(state, false).await;
             });
         }
+    }
+
+    if args.watch {
+        let state = Arc::new(state.clone());
+        let debounce = Duration::from_millis(args.watch_debounce_ms.max(100));
+        tokio::spawn(async move {
+            if let Err(err) = watch_and_reindex(state, debounce).await {
+                eprintln!("watch error: {err}");
+            }
+        });
     }
 
     let app = axum::Router::new()
@@ -191,24 +210,9 @@ async fn reindex(
             .into_response();
     }
 
-    let index = state.index.clone();
-    let paths = state.paths.clone();
     let full = q.full.unwrap_or(false);
-    match tokio::task::spawn_blocking(move || {
-        if full {
-            index.reindex_full(&paths)
-        } else {
-            index.reindex(&paths)
-        }
-    })
-    .await
-    {
-        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
-        Ok(Err(err)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-            .into_response(),
+    match run_reindex(state, full).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": err.to_string() })),
@@ -238,5 +242,74 @@ fn generate_token() -> String {
 fn persist_token(index_dir: &std::path::Path, token: &str) -> anyhow::Result<()> {
     let path = index_dir.join("token");
     std::fs::write(path, token)?;
+    Ok(())
+}
+
+async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+    let scan_roots = state.paths.scan_roots.clone();
+    let index_root = state.paths.index_root_dir.clone();
+
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            let Ok(event) = res else {
+                return;
+            };
+
+            for path in event.paths {
+                if path.starts_with(&index_root) {
+                    continue;
+                }
+                let _ = tx.send(());
+                break;
+            }
+        })?;
+
+    for root in scan_roots {
+        watcher.watch(&root, notify::RecursiveMode::Recursive)?;
+    }
+
+    loop {
+        if rx.recv().await.is_none() {
+            return Ok(());
+        }
+
+        let mut deadline = tokio::time::Instant::now() + debounce;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let sleep = tokio::time::sleep(deadline - now);
+            tokio::pin!(sleep);
+            tokio::select! {
+                _ = &mut sleep => break,
+                msg = rx.recv() => {
+                    if msg.is_none() {
+                        return Ok(());
+                    }
+                    deadline = tokio::time::Instant::now() + debounce;
+                }
+            }
+        }
+
+        let _ = run_reindex(state.clone(), false).await;
+    }
+}
+
+async fn run_reindex(state: Arc<AppState>, full: bool) -> anyhow::Result<()> {
+    let _guard = state.reindex_lock.lock().await;
+    let index = state.index.clone();
+    let paths = state.paths.clone();
+
+    tokio::task::spawn_blocking(move || {
+        if full {
+            index.reindex_full(&paths)
+        } else {
+            index.reindex(&paths)
+        }
+    })
+    .await??;
     Ok(())
 }

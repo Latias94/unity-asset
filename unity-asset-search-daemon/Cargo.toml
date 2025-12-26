@@ -18,4 +18,5 @@ clap.workspace = true
 tower-http.workspace = true
 rand.workspace = true
 hex.workspace = true
+notify.workspace = true
 unity-asset-search-index = { path = "../unity-asset-search-index" }
