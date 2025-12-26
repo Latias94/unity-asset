@@ -23,6 +23,12 @@ This repository maintains runnable examples per crate (built in CI).
   - `cargo run -p unity-asset --example env_load_and_list -- tests/samples`
 - Bundle container lookup (UnityPy-like discovery):
   - `cargo run -p unity-asset --example env_container_lookup -- tests/samples Assets/`
+- Build an Environment-wide dependency graph (TypeTree required for edges):
+  - `cargo run -p unity-asset --example env_dependency_graph -- tests/samples/char_118_yuki.ab "Assets/*"`
+  - Print DOT (includes resolved external edges):
+    - `cargo run -p unity-asset --example env_dependency_graph -- tests/samples/char_118_yuki.ab "Assets/*" dot > graph.dot`
+  - Incremental rebuild (core API):
+    - Use `Environment::build_dependency_graph_for_source` plus `Environment::invalidate_dependency_scan_cache_for_source` when reloading a single bundle entry.
 - Find by `path_id` and dump JSON:
   - `cargo run -p unity-asset --example env_find_and_dump -- <path> <path_id>`
 - Export a stable binary object index (JSONL):

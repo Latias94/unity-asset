@@ -135,6 +135,18 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
     let found = env.find_bundle_container_entries(&entries[0].asset_path);
     assert!(!found.is_empty());
 
+    let file_name = entries[0]
+        .asset_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&entries[0].asset_path);
+    let glob = format!("*{}*", file_name);
+    let found_glob = env.find_bundle_container_entries(&glob);
+    assert!(
+        !found_glob.is_empty(),
+        "glob pattern should match at least one container entry"
+    );
+
     let entries = env.bundle_container_entries(&path).unwrap();
     let cn_001 = entries
         .iter()
@@ -172,6 +184,105 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
 
     let peek = env.peek_binary_object_name(&key).unwrap();
     assert_eq!(peek, obj.name());
+}
+
+#[test]
+fn environment_dependency_graph_builds_and_closure_from_container_is_non_empty() {
+    let mut env = Environment::new();
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
+    env.load_file(&path).unwrap();
+
+    let graph = env.build_dependency_graph(DependencyGraphBuildOptions::default());
+    assert!(!graph.nodes().is_empty());
+
+    let entries = env.bundle_container_entries(&path).unwrap();
+    let roots: Vec<_> = entries
+        .into_iter()
+        .filter_map(|e| e.key)
+        .take(8)
+        .collect();
+    assert!(!roots.is_empty());
+
+    let roots_from_helper = env.bundle_container_root_keys("Assets/", Some(8));
+    assert!(!roots_from_helper.is_empty());
+
+    let closure = graph.internal_closure(&roots, Some(2), Some(10_000));
+    assert!(
+        !closure.is_empty(),
+        "expected at least one reachable node from container roots"
+    );
+
+    let closure = graph.closure_with_options(
+        &roots,
+        DependencyGraphTraversalOptions {
+            max_depth: Some(2),
+            max_nodes: Some(10_000),
+            follow_resolved_external: true,
+        },
+    );
+    assert!(!closure.is_empty());
+
+    let dot = graph.to_dot(10_000, true);
+    assert!(dot.contains("digraph"));
+}
+
+#[test]
+fn environment_dependency_graph_can_rebuild_single_source_subgraph() {
+    let mut env = Environment::new();
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
+    env.load_file(&path).unwrap();
+
+    let source = BinarySource::path(&path);
+    let bundle = env.bundles().get(&source).expect("bundle loaded");
+    let file = bundle.assets.first().expect("bundle has asset 0");
+
+    let sub = env
+        .build_dependency_graph_for_source(
+            &source,
+            BinarySourceKind::AssetBundle,
+            Some(0),
+            DependencyGraphBuildOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(sub.nodes().len(), file.objects.len());
+
+    env.invalidate_dependency_scan_cache_for_source(&source, BinarySourceKind::AssetBundle, None);
+    let sub2 = env
+        .build_dependency_graph_for_source(
+            &source,
+            BinarySourceKind::AssetBundle,
+            Some(0),
+            DependencyGraphBuildOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(sub2.nodes().len(), file.objects.len());
+}
+
+#[test]
+fn environment_indexes_meta_guid_for_best_effort_external_resolution() {
+    let temp = tempfile::tempdir().unwrap();
+    let asset_path = temp.path().join("MyAsset.asset");
+    let meta_path = temp.path().join("MyAsset.asset.meta");
+
+    std::fs::write(&asset_path, b"not a real asset").unwrap();
+    std::fs::write(
+        &meta_path,
+        b"fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&meta_path).unwrap();
+
+    let expected_guid: [u8; 16] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+        0xcd, 0xef,
+    ];
+
+    let cached = env.asset_path_for_guid(expected_guid);
+    assert_eq!(cached, Some(asset_path));
 }
 
 #[test]

@@ -1,6 +1,78 @@
 use super::*;
 
 impl Environment {
+    fn match_external_path_score(external_path: &str, candidate: &str) -> i32 {
+        if external_path.is_empty() || candidate.is_empty() {
+            return 0;
+        }
+
+        let a = external_path.replace('\\', "/");
+        let b = candidate.replace('\\', "/");
+
+        if a == b {
+            return 300;
+        }
+        if a.eq_ignore_ascii_case(&b) {
+            return 250;
+        }
+
+        if a.ends_with(&b) || b.ends_with(&a) {
+            return 200;
+        }
+
+        let a_name = std::path::Path::new(&a).file_name().and_then(|n| n.to_str());
+        let b_name = std::path::Path::new(&b).file_name().and_then(|n| n.to_str());
+        if let (Some(a_name), Some(b_name)) = (a_name, b_name) {
+            if a_name == b_name {
+                return 150;
+            }
+            if a_name.eq_ignore_ascii_case(b_name) {
+                return 120;
+            }
+        }
+
+        0
+    }
+
+    fn find_loaded_bundle_asset_by_external_path(
+        &self,
+        external_path: &str,
+    ) -> Option<(BinarySource, usize)> {
+        if external_path.is_empty() {
+            return None;
+        }
+
+        let mut best_score = 0i32;
+        let mut best: Vec<(BinarySource, usize)> = Vec::new();
+
+        let mut bundle_sources: Vec<&BinarySource> = self.bundles.keys().collect();
+        bundle_sources.sort();
+
+        for source in bundle_sources {
+            let Some(bundle) = self.bundles.get(source) else {
+                continue;
+            };
+            for (idx, name) in bundle.asset_names.iter().enumerate() {
+                let score = Self::match_external_path_score(external_path, name);
+                if score == 0 {
+                    continue;
+                }
+                if score > best_score {
+                    best_score = score;
+                    best.clear();
+                    best.push((source.clone(), idx));
+                } else if score == best_score {
+                    best.push((source.clone(), idx));
+                }
+            }
+        }
+
+        match best.as_slice() {
+            [(source, idx)] => Some((source.clone(), *idx)),
+            _ => None,
+        }
+    }
+
     fn find_loaded_serialized_source_by_external_path(
         &self,
         external_path: &str,
@@ -80,6 +152,21 @@ impl Environment {
         let idx: usize = (file_id - 1).try_into().ok()?;
         let external = context.object.file().externals.get(idx)?;
 
+        // Best-effort: GUID-based resolution via loaded `.meta` files.
+        if external.guid != [0u8; 16]
+            && let Some(asset_path) = self.asset_path_for_guid(external.guid)
+        {
+            let direct_key = BinarySource::Path(asset_path.clone());
+            if self.binary_assets.contains_key(&direct_key) {
+                return Some(BinaryObjectKey {
+                    source: direct_key,
+                    source_kind: BinarySourceKind::SerializedFile,
+                    asset_index: None,
+                    path_id,
+                });
+            }
+        }
+
         // Best-effort: if the context object comes from a bundle, resolve external references to other
         // serialized files inside the same bundle.
         if context.source_kind == BinarySourceKind::AssetBundle
@@ -119,6 +206,18 @@ impl Environment {
                     path_id,
                 });
             }
+        }
+
+        // Best-effort: resolve external references to serialized files inside *any* loaded bundle.
+        if let Some((bundle_source, asset_index)) =
+            self.find_loaded_bundle_asset_by_external_path(&external.path)
+        {
+            return Some(BinaryObjectKey {
+                source: bundle_source,
+                source_kind: BinarySourceKind::AssetBundle,
+                asset_index: Some(asset_index),
+                path_id,
+            });
         }
 
         // Fallback: resolve to an already-loaded standalone serialized file on disk.

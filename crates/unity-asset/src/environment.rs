@@ -25,11 +25,18 @@ mod imp {
     use unity_asset_core::{UnityAssetError, UnityClass, UnityDocument};
 
     mod container;
+    mod dependency_graph;
     mod key;
     mod loader;
+    mod meta_guid;
     mod object_query;
     mod pptr;
     mod stream;
+
+    pub use dependency_graph::{
+        DependencyGraphBuildOptions, DependencyGraphTraversalOptions, DependencyGraphWarning,
+        EnvironmentDependencyGraph, ExternalDependencyEdge,
+    };
 
     #[derive(Debug, Clone)]
     pub enum EnvironmentWarning {
@@ -246,6 +253,8 @@ mod imp {
         bundles: HashMap<BinarySource, AssetBundle>,
         webfiles: HashMap<PathBuf, WebFile>,
         bundle_container_cache: RwLock<HashMap<BinarySource, Vec<BundleContainerEntry>>>,
+        dependency_scan_cache: RwLock<dependency_graph::DependencyScanCache>,
+        meta_guid_cache: RwLock<HashMap<[u8; 16], PathBuf>>,
         warnings: Mutex<Vec<EnvironmentWarning>>,
         reporter: Option<Arc<dyn EnvironmentReporter>>,
         options: EnvironmentOptions,
@@ -268,6 +277,8 @@ mod imp {
                 bundles: HashMap::new(),
                 webfiles: HashMap::new(),
                 bundle_container_cache: RwLock::new(HashMap::new()),
+                dependency_scan_cache: RwLock::new(HashMap::new()),
+                meta_guid_cache: RwLock::new(HashMap::new()),
                 warnings: Mutex::new(Vec::new()),
                 reporter: None,
                 options,

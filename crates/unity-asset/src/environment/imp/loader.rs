@@ -20,6 +20,11 @@ impl Environment {
 
         // Check file extension to determine type
         if let Some(ext) = path.extension() {
+            if ext == "meta" {
+                // Index meta GUIDs even if YAML parsing fails (best-effort reference resolution).
+                self.index_meta_guid_path(path);
+            }
+
             match ext.to_str() {
                 Some("asset") | Some("prefab") | Some("unity") | Some("meta") => {
                     match YamlDocument::load_yaml_with_warnings(path, false) {
@@ -64,6 +69,11 @@ impl Environment {
                     }
                 }
                 let source = BinarySource::path(path);
+                self.invalidate_dependency_scan_cache_for_source(
+                    &source,
+                    BinarySourceKind::AssetBundle,
+                    None,
+                );
                 self.bundles.insert(source.clone(), bundle);
                 match self.bundle_container_cache.write() {
                     Ok(mut cache) => {
@@ -81,6 +91,11 @@ impl Environment {
                     asset.set_type_tree_registry(Some(registry));
                 }
                 let source = BinarySource::path(path);
+                self.invalidate_dependency_scan_cache_for_source(
+                    &source,
+                    BinarySourceKind::SerializedFile,
+                    None,
+                );
                 self.binary_assets.insert(source, asset);
                 match self.bundle_container_cache.write() {
                     Ok(mut cache) => cache.clear(),
@@ -131,6 +146,11 @@ impl Environment {
                         web_path: web_path.clone(),
                         entry_name: entry_name.clone(),
                     };
+                    self.invalidate_dependency_scan_cache_for_source(
+                        &source,
+                        BinarySourceKind::AssetBundle,
+                        None,
+                    );
                     self.bundles.insert(source.clone(), bundle);
                     match self.bundle_container_cache.write() {
                         Ok(mut cache) => {
@@ -151,6 +171,11 @@ impl Environment {
                         web_path: web_path.clone(),
                         entry_name,
                     };
+                    self.invalidate_dependency_scan_cache_for_source(
+                        &source,
+                        BinarySourceKind::SerializedFile,
+                        None,
+                    );
                     self.binary_assets.insert(source, asset);
                     match self.bundle_container_cache.write() {
                         Ok(mut cache) => cache.clear(),

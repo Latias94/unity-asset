@@ -110,11 +110,17 @@ impl BundleProcessor {
     pub fn extract_assets_by_type(
         &self,
         bundle_name: &str,
-        _type_id: i32,
+        type_id: i32,
     ) -> Option<Vec<&crate::asset::Asset>> {
         self.loader
             .get_bundle(bundle_name)
-            .map(|bundle| bundle.assets.iter().collect()) // TODO: Implement proper type filtering
+            .map(|bundle| {
+                bundle
+                    .assets
+                    .iter()
+                    .filter(|asset| !asset.objects_of_type(type_id).is_empty())
+                    .collect()
+            })
     }
 
     /// Get bundle information

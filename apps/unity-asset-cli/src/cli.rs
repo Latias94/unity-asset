@@ -66,7 +66,7 @@ pub(crate) enum Commands {
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Filter container entries by substring (case-insensitive). Empty means export all.
+        /// Filter container entries by substring or glob (`*`, `?`) (case-insensitive). Empty means export all.
         #[arg(long, default_value = "")]
         pattern: String,
 
@@ -252,7 +252,7 @@ pub(crate) enum Commands {
         #[arg(short, long)]
         input: PathBuf,
 
-        /// Filter container entries by substring (case-insensitive). Empty means show all.
+        /// Filter container entries by substring or glob (`*`, `?`) (case-insensitive). Empty means show all.
         #[arg(long, default_value = "")]
         pattern: String,
 

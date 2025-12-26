@@ -1,4 +1,5 @@
 use crate::fast_path;
+use crate::pattern::container_asset_path_matches_ci;
 use crate::shared::{
     AppContext, build_environment, class_name_for_id, cli_warn, load_environment_input,
     load_typetree_registry,
@@ -72,7 +73,6 @@ fn find_object_env_fallback(
     let mut env = build_environment(strict, show_warnings, typetree_registries)?;
     load_environment_input(&mut env, &input)?;
 
-    let pattern_lc = pattern.to_ascii_lowercase();
     let name_lc = name.to_ascii_lowercase();
     let class_name_lc = class_name.to_ascii_lowercase();
     let class_ids = class_id;
@@ -107,9 +107,7 @@ fn find_object_env_fallback(
                 }
             }
 
-            if !pattern_lc.is_empty()
-                && !entry.asset_path.to_ascii_lowercase().contains(&pattern_lc)
-            {
+            if !container_asset_path_matches_ci(&entry.asset_path, &pattern) {
                 continue;
             }
 
@@ -233,7 +231,6 @@ fn find_object_fast(
 
     let candidate_paths = fast_path::collect_candidate_paths(input)?;
 
-    let pattern_lc = pattern.to_ascii_lowercase();
     let name_lc = name.to_ascii_lowercase();
     let class_name_lc = class_name.to_ascii_lowercase();
 
@@ -303,9 +300,7 @@ fn find_object_fast(
                 }
             }
 
-            if !pattern_lc.is_empty()
-                && !entry.asset_path.to_ascii_lowercase().contains(&pattern_lc)
-            {
+            if !container_asset_path_matches_ci(&entry.asset_path, pattern) {
                 continue;
             }
 

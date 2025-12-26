@@ -2,6 +2,7 @@ use crate::shared::{
     AppContext, build_environment, class_name_for_id, load_environment_input,
     lookup_object_type_info,
 };
+use crate::pattern::container_asset_path_matches_ci;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -406,7 +407,6 @@ fn export_bundle_command(
         return Ok(());
     }
 
-    let pattern_lc = pattern.to_ascii_lowercase();
     let class_name_lc = class_name.to_ascii_lowercase();
     let mut skipped = 0usize;
     let mut filtered = 0usize;
@@ -449,7 +449,7 @@ fn export_bundle_command(
             let entries = env.bundle_container_entries_source(&bundle_source)?;
             let mut entries: Vec<_> = entries
                 .into_iter()
-                .filter(|e| e.asset_path.to_ascii_lowercase().contains(&pattern_lc))
+                .filter(|e| container_asset_path_matches_ci(&e.asset_path, &pattern))
                 .collect();
             entries.sort_by(|a, b| a.asset_path.cmp(&b.asset_path));
 

@@ -2,11 +2,14 @@
 //!
 //! This module provides the main metadata extraction functionality for Unity assets.
 
+use super::{DependencyAnalyzer, RelationshipAnalyzer};
 use super::types::*;
 use crate::asset::SerializedFile;
 use crate::bundle::AssetBundle;
+use crate::compression::CompressionType;
 use crate::error::Result;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Instant;
 
 /// Metadata extractor for Unity assets
@@ -15,6 +18,8 @@ use std::time::Instant;
 /// from Unity assets including statistics, dependencies, and relationships.
 pub struct MetadataExtractor {
     config: ExtractionConfig,
+    dependency_analyzer: Mutex<DependencyAnalyzer>,
+    relationship_analyzer: Mutex<RelationshipAnalyzer>,
 }
 
 impl MetadataExtractor {
@@ -22,12 +27,18 @@ impl MetadataExtractor {
     pub fn new() -> Self {
         Self {
             config: ExtractionConfig::default(),
+            dependency_analyzer: Mutex::new(DependencyAnalyzer::new()),
+            relationship_analyzer: Mutex::new(RelationshipAnalyzer::new()),
         }
     }
 
     /// Create a metadata extractor with custom configuration
     pub fn with_config(config: ExtractionConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            dependency_analyzer: Mutex::new(DependencyAnalyzer::new()),
+            relationship_analyzer: Mutex::new(RelationshipAnalyzer::new()),
+        }
     }
 
     /// Create a metadata extractor with custom settings (legacy API)
@@ -45,6 +56,8 @@ impl MetadataExtractor {
                 include_performance,
                 include_object_details: true,
             },
+            dependency_analyzer: Mutex::new(DependencyAnalyzer::new()),
+            relationship_analyzer: Mutex::new(RelationshipAnalyzer::new()),
         }
     }
 
@@ -52,9 +65,11 @@ impl MetadataExtractor {
     pub fn extract_from_bundle(&self, bundle: &AssetBundle) -> Result<Vec<ExtractionResult>> {
         let start_time = Instant::now();
         let mut results = Vec::new();
+        let compression_type = Self::bundle_compression_summary(bundle);
 
         for asset in &bundle.assets {
-            let result = self.extract_from_asset(asset)?;
+            let mut result = self.extract_from_asset(asset)?;
+            result.metadata.file_info.compression_type = compression_type.clone();
             results.push(result);
         }
 
@@ -67,6 +82,39 @@ impl MetadataExtractor {
         }
 
         Ok(results)
+    }
+
+    fn bundle_compression_summary(bundle: &AssetBundle) -> String {
+        if bundle.blocks.is_empty() {
+            return bundle
+                .header
+                .compression_type()
+                .map(|v| v.name().to_string())
+                .unwrap_or_else(|_| "Unknown".to_string());
+        }
+
+        let mut types: Vec<String> = bundle
+            .blocks
+            .iter()
+            .map(|b| {
+                let raw = (b.flags as u32) & 0x3F;
+                CompressionType::from_flags(raw)
+                    .map(|v| v.name().to_string())
+                    .unwrap_or_else(|_| format!("Unknown({})", raw))
+            })
+            .collect();
+
+        types.sort();
+        types.dedup();
+
+        if types.len() == 1 {
+            return types
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "Unknown".to_string());
+        }
+
+        format!("Mixed({})", types.join("+"))
     }
 
     /// Extract metadata from a SerializedFile
@@ -88,31 +136,46 @@ impl MetadataExtractor {
         // Extract object statistics
         result.metadata.object_stats = self.extract_object_statistics(&objects_to_analyze);
 
+        let mut dependencies: Option<DependencyInfo> = None;
+
         // Extract dependencies if enabled
         if self.config.include_dependencies {
-            match self.extract_dependencies(&objects_to_analyze) {
-                Ok(deps) => result.metadata.dependencies = deps,
+            let analyzed = match self.dependency_analyzer.lock() {
+                Ok(mut analyzer) => analyzer.analyze_dependencies_in_asset(asset, &objects_to_analyze),
+                Err(e) => e
+                    .into_inner()
+                    .analyze_dependencies_in_asset(asset, &objects_to_analyze),
+            };
+
+            match analyzed {
+                Ok(deps) => {
+                    dependencies = Some(deps);
+                }
                 Err(e) => {
                     result.add_warning(format!("Failed to extract dependencies: {}", e));
-                    result.metadata.dependencies = DependencyInfo {
-                        external_references: Vec::new(),
-                        internal_references: Vec::new(),
-                        dependency_graph: DependencyGraph {
-                            nodes: Vec::new(),
-                            edges: Vec::new(),
-                            root_objects: Vec::new(),
-                            leaf_objects: Vec::new(),
-                        },
-                        circular_dependencies: Vec::new(),
-                    };
+                    dependencies = Some(Self::empty_dependency_info());
                 }
             }
         }
 
         // Extract relationships if enabled
         if self.config.include_hierarchy {
-            match self.extract_relationships(&objects_to_analyze) {
-                Ok(rels) => result.metadata.relationships = rels,
+            let analyzed = match self.relationship_analyzer.lock() {
+                Ok(mut analyzer) => {
+                    analyzer.analyze_relationships_in_asset(asset, &objects_to_analyze)
+                }
+                Err(e) => e
+                    .into_inner()
+                    .analyze_relationships_in_asset(asset, &objects_to_analyze),
+            };
+
+            match analyzed {
+                Ok(mut rels) => {
+                    if let Some(deps) = dependencies.as_ref() {
+                        super::apply_dependency_info_to_relationships(deps, &mut rels);
+                    }
+                    result.metadata.relationships = rels;
+                }
                 Err(e) => {
                     result.add_warning(format!("Failed to extract relationships: {}", e));
                     result.metadata.relationships = AssetRelationships {
@@ -124,6 +187,25 @@ impl MetadataExtractor {
             }
         }
 
+        if let Some(deps) = dependencies {
+            if self.config.include_object_details {
+                let mut by_from: std::collections::HashMap<i64, Vec<i64>> =
+                    std::collections::HashMap::new();
+                for r in &deps.internal_references {
+                    by_from.entry(r.from_object).or_default().push(r.to_object);
+                }
+                for v in by_from.values_mut() {
+                    v.sort_unstable();
+                    v.dedup();
+                }
+                for summary in &mut result.metadata.object_stats.largest_objects {
+                    summary.dependencies = by_from.get(&summary.path_id).cloned().unwrap_or_default();
+                }
+            }
+
+            result.metadata.dependencies = deps;
+        }
+
         // Extract performance metrics if enabled
         if self.config.include_performance {
             let elapsed = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -131,6 +213,20 @@ impl MetadataExtractor {
         }
 
         Ok(result)
+    }
+
+    fn empty_dependency_info() -> DependencyInfo {
+        DependencyInfo {
+            external_references: Vec::new(),
+            internal_references: Vec::new(),
+            dependency_graph: DependencyGraph {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                root_objects: Vec::new(),
+                leaf_objects: Vec::new(),
+            },
+            circular_dependencies: Vec::new(),
+        }
     }
 
     /// Extract basic file information
@@ -205,40 +301,6 @@ impl MetadataExtractor {
                 average_object_size: average_size,
             },
         }
-    }
-
-    /// Extract dependency information (simplified implementation)
-    fn extract_dependencies(
-        &self,
-        _objects: &[&crate::asset::ObjectInfo],
-    ) -> Result<DependencyInfo> {
-        // TODO: Implement proper dependency extraction for new ObjectInfo structure
-        // This is a placeholder implementation
-        Ok(DependencyInfo {
-            external_references: Vec::new(),
-            internal_references: Vec::new(),
-            dependency_graph: DependencyGraph {
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                root_objects: Vec::new(),
-                leaf_objects: Vec::new(),
-            },
-            circular_dependencies: Vec::new(),
-        })
-    }
-
-    /// Extract relationship information (simplified implementation)
-    fn extract_relationships(
-        &self,
-        _objects: &[&crate::asset::ObjectInfo],
-    ) -> Result<AssetRelationships> {
-        // TODO: Implement proper relationship extraction for new ObjectInfo structure
-        // This is a placeholder implementation
-        Ok(AssetRelationships {
-            gameobject_hierarchy: Vec::new(),
-            component_relationships: Vec::new(),
-            asset_references: Vec::new(),
-        })
     }
 
     /// Extract performance metrics

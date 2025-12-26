@@ -8,6 +8,7 @@ use clap::Parser;
 mod cli;
 mod commands;
 mod fast_path;
+mod pattern;
 mod shared;
 
 fn init_tracing() {

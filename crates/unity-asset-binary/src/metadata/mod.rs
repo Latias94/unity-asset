@@ -226,6 +226,7 @@ impl MetadataProcessor {
         // Enhanced dependency analysis if analyzer is available
         if let Some(ref mut analyzer) = self.dependency_analyzer
             && self.extractor.config().include_dependencies
+            && result.metadata.dependencies.dependency_graph.nodes.is_empty()
         {
             let objects: Vec<&crate::asset::ObjectInfo> =
                 if let Some(max) = self.extractor.config().max_objects {
@@ -262,6 +263,9 @@ impl MetadataProcessor {
         // Enhanced relationship analysis if analyzer is available
         if let Some(ref mut analyzer) = self.relationship_analyzer
             && self.extractor.config().include_hierarchy
+            && result.metadata.relationships.gameobject_hierarchy.is_empty()
+            && result.metadata.relationships.component_relationships.is_empty()
+            && result.metadata.relationships.asset_references.is_empty()
         {
             let objects: Vec<&crate::asset::ObjectInfo> =
                 if let Some(max) = self.extractor.config().max_objects {

@@ -1,6 +1,75 @@
 use super::*;
 
 impl Environment {
+    fn parse_glob_pattern(pattern: &str) -> Vec<GlobToken> {
+        let mut out = Vec::new();
+        let mut chars = pattern.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        out.push(GlobToken::Literal(next));
+                    } else {
+                        out.push(GlobToken::Literal('\\'));
+                    }
+                }
+                '*' => {
+                    if !matches!(out.last(), Some(GlobToken::Star)) {
+                        out.push(GlobToken::Star);
+                    }
+                }
+                '?' => out.push(GlobToken::AnyChar),
+                other => out.push(GlobToken::Literal(other)),
+            }
+        }
+
+        out
+    }
+
+    fn glob_match(tokens: &[GlobToken], text: &str) -> bool {
+        let text: Vec<char> = text.chars().collect();
+
+        let mut token_index = 0usize;
+        let mut text_index = 0usize;
+
+        let mut last_star: Option<usize> = None;
+        let mut star_text_index = 0usize;
+
+        while text_index < text.len() {
+            match tokens.get(token_index) {
+                Some(GlobToken::Literal(ch)) if *ch == text[text_index] => {
+                    token_index += 1;
+                    text_index += 1;
+                }
+                Some(GlobToken::AnyChar) => {
+                    token_index += 1;
+                    text_index += 1;
+                }
+                Some(GlobToken::Star) => {
+                    last_star = Some(token_index);
+                    token_index += 1;
+                    star_text_index = text_index;
+                }
+                _ => {
+                    if let Some(star) = last_star {
+                        star_text_index += 1;
+                        text_index = star_text_index;
+                        token_index = star + 1;
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        while matches!(tokens.get(token_index), Some(GlobToken::Star)) {
+            token_index += 1;
+        }
+
+        token_index == tokens.len()
+    }
+
     fn scan_pptr(value: &UnityValue) -> Option<(i32, i64)> {
         match value {
             UnityValue::Object(obj) => {
@@ -202,10 +271,17 @@ impl Environment {
         Ok(out)
     }
 
-    /// Find container entries across all loaded bundles whose `asset_path` contains `pattern`.
+    /// Find container entries across all loaded bundles by `asset_path` pattern (case-insensitive ASCII).
+    ///
+    /// - When `pattern` contains `*` or `?`, it is treated as a glob.
+    /// - Otherwise it is treated as a substring match.
     pub fn find_bundle_container_entries(&self, pattern: &str) -> Vec<BundleContainerEntry> {
         let mut bundle_sources: Vec<&BinarySource> = self.bundles.keys().collect();
         bundle_sources.sort();
+
+        let pattern_lc = pattern.to_ascii_lowercase();
+        let pattern_is_glob = pattern_lc.contains('*') || pattern_lc.contains('?');
+        let glob = pattern_is_glob.then(|| Self::parse_glob_pattern(&pattern_lc));
 
         let mut out = Vec::new();
         for bundle_source in bundle_sources {
@@ -213,7 +289,17 @@ impl Environment {
                 out.extend(
                     entries
                         .into_iter()
-                        .filter(|e| e.asset_path.contains(pattern)),
+                        .filter(|e| {
+                            if pattern_lc.is_empty() {
+                                return true;
+                            }
+                            let asset_path_lc = e.asset_path.to_ascii_lowercase();
+                            if let Some(glob) = glob.as_ref() {
+                                Self::glob_match(glob, &asset_path_lc)
+                            } else {
+                                asset_path_lc.contains(&pattern_lc)
+                            }
+                        }),
                 );
             }
         }
@@ -230,4 +316,26 @@ impl Environment {
             .filter_map(|e| e.key.map(|k| (e.asset_path, k)))
             .collect()
     }
+
+    /// Return unique, sorted object keys resolved from all bundle `m_Container` entries that match `pattern`.
+    pub fn bundle_container_root_keys(&self, pattern: &str, limit: Option<usize>) -> Vec<BinaryObjectKey> {
+        let mut keys: Vec<BinaryObjectKey> = self
+            .find_binary_object_keys_in_bundle_container(pattern)
+            .into_iter()
+            .map(|(_path, key)| key)
+            .collect();
+        keys.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        keys.dedup();
+        if let Some(max) = limit {
+            keys.truncate(max);
+        }
+        keys
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GlobToken {
+    Star,
+    AnyChar,
+    Literal(char),
 }

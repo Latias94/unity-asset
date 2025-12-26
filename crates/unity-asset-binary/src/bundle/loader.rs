@@ -140,9 +140,12 @@ impl BundleLoader {
         let mut results = Vec::new();
 
         for (bundle_name, bundle) in &self.bundles {
-            for asset in &bundle.assets {
-                // SerializedFile doesn't have a name field, use bundle name instead
-                if bundle_name.contains(name) {
+            for (asset_index, asset) in bundle.assets.iter().enumerate() {
+                let matches = bundle
+                    .asset_names
+                    .get(asset_index)
+                    .is_some_and(|n| n.contains(name));
+                if matches {
                     results.push((bundle_name.as_str(), asset));
                 }
             }
@@ -152,15 +155,14 @@ impl BundleLoader {
     }
 
     /// Find assets by type ID across all loaded bundles
-    pub fn find_assets_by_type(&self, _type_id: i32) -> Vec<(&str, &Asset)> {
+    pub fn find_assets_by_type(&self, type_id: i32) -> Vec<(&str, &Asset)> {
         let mut results = Vec::new();
 
         for (bundle_name, bundle) in &self.bundles {
             for asset in &bundle.assets {
-                // SerializedFile doesn't have a type_id field directly
-                // We'll skip this for now or implement differently
-                // TODO: Implement proper type filtering for SerializedFile
-                results.push((bundle_name.as_str(), asset));
+                if !asset.objects_of_type(type_id).is_empty() {
+                    results.push((bundle_name.as_str(), asset));
+                }
             }
         }
 
