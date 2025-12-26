@@ -197,11 +197,7 @@ fn environment_dependency_graph_builds_and_closure_from_container_is_non_empty()
     assert!(!graph.nodes().is_empty());
 
     let entries = env.bundle_container_entries(&path).unwrap();
-    let roots: Vec<_> = entries
-        .into_iter()
-        .filter_map(|e| e.key)
-        .take(8)
-        .collect();
+    let roots: Vec<_> = entries.into_iter().filter_map(|e| e.key).take(8).collect();
     assert!(!roots.is_empty());
 
     let roots_from_helper = env.bundle_container_root_keys("Assets/", Some(8));
@@ -277,8 +273,8 @@ fn environment_indexes_meta_guid_for_best_effort_external_resolution() {
     env.load_file(&meta_path).unwrap();
 
     let expected_guid: [u8; 16] = [
-        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
-        0xcd, 0xef,
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+        0xef,
     ];
 
     let cached = env.asset_path_for_guid(expected_guid);
@@ -479,6 +475,59 @@ fn environment_loads_minimal_gameobject_transform_prefab_and_resolves_refs() {
         script.get("guid").and_then(|v| v.as_str()),
         Some("0123456789abcdef0123456789abcdef")
     );
+}
+
+#[test]
+fn environment_object_graph_scans_yaml_pptrs_and_meta_guid_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let script_asset_path = temp.path().join("MyScript.asset");
+    let script_meta_path = temp.path().join("MyScript.asset.meta");
+
+    std::fs::write(&script_asset_path, b"not a real asset").unwrap();
+    std::fs::write(
+        &script_meta_path,
+        b"fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+
+    let prefab_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../unity-asset-yaml/tests/fixtures/MinimalGameObjectTransform.prefab");
+
+    let mut env = Environment::new();
+    env.load_file(&script_meta_path).unwrap();
+    env.load_file(&prefab_path).unwrap();
+
+    let graph = env.build_object_graph(ObjectGraphBuildOptions {
+        include_yaml: true,
+        include_binary: false,
+        binary: DependencyGraphBuildOptions::default(),
+    });
+
+    let from = EnvironmentObjectKey::Yaml(YamlObjectKey {
+        path: prefab_path.clone(),
+        anchor: "1003".to_string(),
+    });
+    let to = EnvironmentObjectKey::Yaml(YamlObjectKey {
+        path: prefab_path.clone(),
+        anchor: "1001".to_string(),
+    });
+    assert!(
+        graph.internal_refs_from(&from).contains(&to),
+        "expected MonoBehaviour (1003) to reference GameObject (1001)"
+    );
+
+    let exts = graph.external_refs_from(&from);
+    let yaml_ext = exts
+        .iter()
+        .find_map(|e| match e {
+            ExternalObjectEdge::Yaml(y) if y.guid.is_some() => Some(y),
+            _ => None,
+        })
+        .expect("expected at least one YAML external edge with a GUID");
+
+    assert_eq!(yaml_ext.file_id, 11500000);
+    assert_eq!(yaml_ext.asset_path, Some(script_asset_path));
+    assert_eq!(yaml_ext.resolved, None);
 }
 
 #[test]

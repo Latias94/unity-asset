@@ -29,6 +29,10 @@ This repository maintains runnable examples per crate (built in CI).
     - `cargo run -p unity-asset --example env_dependency_graph -- tests/samples/char_118_yuki.ab "Assets/*" dot > graph.dot`
   - Incremental rebuild (core API):
     - Use `Environment::build_dependency_graph_for_source` plus `Environment::invalidate_dependency_scan_cache_for_source` when reloading a single bundle entry.
+- Build a unified object graph (YAML + binary, best-effort resolution):
+  - `cargo run -p unity-asset --example env_object_graph -- crates/unity-asset-yaml/tests/fixtures/MinimalGameObjectTransform.prefab`
+  - Print DOT:
+    - `cargo run -p unity-asset --example env_object_graph -- crates/unity-asset-yaml/tests/fixtures/MinimalGameObjectTransform.prefab dot > graph.dot`
 - Find by `path_id` and dump JSON:
   - `cargo run -p unity-asset --example env_find_and_dump -- <path> <path_id>`
 - Export a stable binary object index (JSONL):

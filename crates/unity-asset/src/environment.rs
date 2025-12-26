@@ -29,6 +29,7 @@ mod imp {
     mod key;
     mod loader;
     mod meta_guid;
+    mod object_graph;
     mod object_query;
     mod pptr;
     mod stream;
@@ -36,6 +37,10 @@ mod imp {
     pub use dependency_graph::{
         DependencyGraphBuildOptions, DependencyGraphTraversalOptions, DependencyGraphWarning,
         EnvironmentDependencyGraph, ExternalDependencyEdge,
+    };
+    pub use object_graph::{
+        EnvironmentObjectGraph, EnvironmentObjectKey, ExternalObjectEdge, ObjectGraphBuildOptions,
+        ObjectGraphTraversalOptions, YamlExternalEdge, YamlObjectKey,
     };
 
     #[derive(Debug, Clone)]

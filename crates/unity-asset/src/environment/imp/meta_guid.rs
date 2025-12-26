@@ -1,6 +1,6 @@
 use super::*;
 
-fn parse_guid_32_hex(raw: &str) -> Option<[u8; 16]> {
+pub(crate) fn parse_guid_32_hex(raw: &str) -> Option<[u8; 16]> {
     let s = raw.trim();
     if s.len() != 32 {
         return None;
@@ -81,8 +81,8 @@ mod tests {
         assert_eq!(
             out,
             [
-                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
-                0x89, 0xab, 0xcd, 0xef
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+                0xcd, 0xef
             ]
         );
     }
@@ -94,4 +94,3 @@ mod tests {
         assert_eq!(out[0], 0x01);
     }
 }
-
