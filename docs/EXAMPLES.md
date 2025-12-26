@@ -71,3 +71,5 @@ This repository maintains runnable examples per crate (built in CI).
   - `scripts/stress_incremental_watch.zsh repo-ref/BoatAttack`
 - Stress test watcher-driven directory rename/move:
   - `scripts/stress_rename_watch.zsh repo-ref/BoatAttack`
+- Stress test watcher-driven git checkout / branch switching:
+  - `scripts/stress_git_checkout_watch.zsh repo-ref/BoatAttack`
