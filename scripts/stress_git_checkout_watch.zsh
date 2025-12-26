@@ -140,14 +140,7 @@ baseline_b="$(baseline_for_ref "${ref_b}")"
 echo "baseline_a(${ref_a})=${baseline_a}"
 echo "baseline_b(${ref_b})=${baseline_b}"
 
-echo "Tracking watcher fallback occurrences..."
-fallback_marker="full scan threshold"
-fallback_count_before="$(python3 - <<PY
-import pathlib
-p=pathlib.Path("${index_dir}")/"daemon.log"
-print(p.read_text(errors="ignore").count("${fallback_marker}") if p.exists() else 0)
-PY
-)"
+fallback_count_before="$(target/release/unity-asset-search-cli --base-url "${base_url}" status | python3 -c 'import json,sys; st=json.load(sys.stdin); print(int(st.get(\"fallback_count\") or 0))')"
 
 echo "Switching between refs for ${iter} iterations (watcher-driven incremental)..."
 durations_path="${metrics_dir}/durations_ms.txt"
@@ -184,12 +177,7 @@ for i in $(seq 1 "${iter}"); do
   fi
 done
 
-fallback_count_after="$(python3 - <<PY
-import pathlib
-p=pathlib.Path("${index_dir}")/"daemon.log"
-print(p.read_text(errors="ignore").count("${fallback_marker}") if p.exists() else 0)
-PY
-)"
+fallback_count_after="$(target/release/unity-asset-search-cli --base-url "${base_url}" status | python3 -c 'import json,sys; st=json.load(sys.stdin); print(int(st.get(\"fallback_count\") or 0))')"
 fallback_count_delta="$(( fallback_count_after - fallback_count_before ))"
 
 echo "Summary (checkout indexing latency):"

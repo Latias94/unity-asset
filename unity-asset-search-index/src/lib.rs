@@ -136,6 +136,16 @@ pub struct StatusResponse {
     pub last_scan_ms: Option<u128>,
     pub updated_docs: Option<u64>,
     pub removed_docs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reindex_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_changed_paths: Option<u64>,
+    #[serde(default)]
+    pub fallback_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fallback_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +445,11 @@ impl SearchIndex {
             last_scan_ms: None,
             updated_docs: None,
             removed_docs: None,
+            last_reindex_kind: None,
+            last_changed_paths: None,
+            fallback_count: 0,
+            last_fallback_reason: None,
+            last_fallback_unix_ms: None,
         };
 
         let this = Self {
@@ -463,6 +478,21 @@ impl SearchIndex {
             .map_err(|_| anyhow!("poisoned lock"))?
             .status
             .clone())
+    }
+
+    pub fn note_fallback(&self, reason: &str) -> Result<()> {
+        let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
+        inner.status.fallback_count = inner.status.fallback_count.saturating_add(1);
+        inner.status.last_fallback_reason = Some(reason.to_string());
+        inner.status.last_fallback_unix_ms = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        );
+        Ok(())
     }
 
     fn yaml_enrich_info_for_rel_path(
@@ -692,6 +722,9 @@ impl SearchIndex {
             inner.status.last_scan_ms = Some(scan_ms);
             inner.status.updated_docs = Some(updated_docs);
             inner.status.removed_docs = Some(removed_docs);
+            inner.status.last_reindex_kind = Some("changed_paths".to_string());
+            inner.status.last_changed_paths =
+                Some(changed_paths.len().try_into().unwrap_or(u64::MAX));
             inner.status.indexing = false;
         }
 
@@ -708,6 +741,7 @@ impl SearchIndex {
             inner.status.updated_docs = None;
             inner.status.removed_docs = None;
             inner.status.last_scan_ms = None;
+            inner.status.last_changed_paths = None;
             IndexingGuard {
                 inner: self.inner.clone(),
             }
@@ -806,6 +840,13 @@ impl SearchIndex {
             inner.status.last_scan_ms = Some(scan_ms);
             inner.status.updated_docs = Some(updated_docs);
             inner.status.removed_docs = Some(removed_docs);
+            inner.status.last_reindex_kind = Some(
+                match mode {
+                    ReindexMode::Incremental => "full_scan_incremental",
+                    ReindexMode::Full => "full_scan_full",
+                }
+                .to_string(),
+            );
             inner.status.indexing = false;
         }
 

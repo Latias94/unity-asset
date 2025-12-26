@@ -51,6 +51,12 @@ struct Args {
     /// This is primarily to handle VCS operations like `git checkout` that can touch thousands of files.
     #[arg(long, default_value_t = 5000)]
     watch_full_scan_threshold: usize,
+
+    /// Periodically run a full incremental scan to self-heal any missed watcher events.
+    ///
+    /// Set to 0 to disable.
+    #[arg(long, default_value_t = 0)]
+    watch_reconcile_interval_ms: u64,
 }
 
 #[derive(Clone)]
@@ -102,14 +108,23 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if args.watch {
-        let state = Arc::new(state.clone());
+        let state_arc = Arc::new(state.clone());
         let debounce = Duration::from_millis(args.watch_debounce_ms.max(100));
         let full_scan_threshold = args.watch_full_scan_threshold;
+        let watch_state = state_arc.clone();
         tokio::spawn(async move {
-            if let Err(err) = watch_and_reindex(state, debounce, full_scan_threshold).await {
+            if let Err(err) = watch_and_reindex(watch_state, debounce, full_scan_threshold).await {
                 eprintln!("watch error: {err}");
             }
         });
+
+        if args.watch_reconcile_interval_ms > 0 {
+            let state = state_arc.clone();
+            let interval = Duration::from_millis(args.watch_reconcile_interval_ms);
+            tokio::spawn(async move {
+                reconcile_loop(state, interval).await;
+            });
+        }
     }
 
     let app = axum::Router::new()
@@ -422,6 +437,7 @@ async fn watch_and_reindex(
                 changed_paths.len(),
                 full_scan_threshold
             );
+            let _ = state.index.note_fallback("watch_full_scan_threshold");
             if let Err(err) = run_reindex(state.clone(), false).await {
                 eprintln!("reindex error (full scan threshold): {err}");
             }
@@ -440,6 +456,16 @@ async fn watch_and_reindex(
         }
         if let Err(err) = run_reindex_changed_paths(state.clone(), &changed_paths).await {
             eprintln!("reindex changed paths error: {err}");
+        }
+    }
+}
+
+async fn reconcile_loop(state: Arc<AppState>, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        ticker.tick().await;
+        if let Err(err) = run_reindex(state.clone(), false).await {
+            eprintln!("reconcile reindex error: {err}");
         }
     }
 }
