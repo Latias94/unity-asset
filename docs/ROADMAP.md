@@ -41,7 +41,8 @@ Current status:
 
 - Implemented: basic Tier-1 signals (YAML `m_Name`, tags, `{guid, fileID}` occurrences) so prefab/scene/object searches become useful quickly.
 - Implemented: resolve `m_Script guid` to script `path` + best-effort `namespace/class` terms, so searching by component/script names returns scenes/prefabs.
-- Pending: hierarchy paths, richer component extraction (built-in components), and result rendering with object paths.
+- Implemented: best-effort prefab/scene hierarchy path terms (`Root/Child/...`) for searching.
+- Pending: richer component extraction (built-in components), and result rendering with object paths.
 
 ### Phase 3: Find References (reverse edges)
 

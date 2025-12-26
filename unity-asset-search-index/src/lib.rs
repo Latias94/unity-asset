@@ -1337,6 +1337,13 @@ fn extract_unity_yaml_content(
         }
     }
 
+    for path in extract_unity_yaml_hierarchy_paths(text).into_iter().take(512) {
+        if extracted.len() >= 4096 {
+            break;
+        }
+        extracted.push(path);
+    }
+
     for cap in TAG_RE.captures_iter(text).take(256) {
         let Some(raw) = cap.get(1).map(|m| m.as_str()) else {
             continue;
@@ -1401,6 +1408,175 @@ fn extract_unity_yaml_content(
         primary_name,
         content_terms,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransformLink {
+    game_object_id: Option<u64>,
+    father_transform_id: Option<u64>,
+}
+
+fn extract_unity_yaml_hierarchy_paths(text: &str) -> Vec<String> {
+    let mut go_names: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    let mut transforms: std::collections::BTreeMap<u64, TransformLink> =
+        std::collections::BTreeMap::new();
+
+    let mut current_class: Option<u32> = None;
+    let mut current_id: Option<u64> = None;
+
+    for line in text.lines() {
+        let line = line.trim_end();
+
+        if let Some((class_id, file_id)) = parse_unity_yaml_doc_header(line) {
+            current_class = Some(class_id);
+            current_id = Some(file_id);
+            continue;
+        }
+
+        let Some(class_id) = current_class else {
+            continue;
+        };
+        let Some(file_id) = current_id else {
+            continue;
+        };
+
+        match class_id {
+            1 => {
+                if let Some(name) = parse_unity_yaml_scalar(line, "m_Name") {
+                    if !name.trim().is_empty() {
+                        go_names.entry(file_id).or_insert(name);
+                    }
+                }
+            }
+            4 | 224 => {
+                let entry = transforms.entry(file_id).or_insert(TransformLink {
+                    game_object_id: None,
+                    father_transform_id: None,
+                });
+
+                if entry.game_object_id.is_none() && line.contains("m_GameObject:") {
+                    entry.game_object_id = parse_file_id(line);
+                }
+                if entry.father_transform_id.is_none() && line.contains("m_Father:") {
+                    let father = parse_file_id(line).filter(|id| *id != 0);
+                    entry.father_transform_id = father;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = std::collections::BTreeSet::<String>::new();
+    let mut cached_paths: std::collections::BTreeMap<u64, Option<String>> =
+        std::collections::BTreeMap::new();
+
+    for (transform_id, link) in &transforms {
+        let Some(go_id) = link.game_object_id else {
+            continue;
+        };
+        let Some(leaf_name) = go_names.get(&go_id) else {
+            continue;
+        };
+        let Some(path) = resolve_transform_path(
+            *transform_id,
+            leaf_name,
+            &go_names,
+            &transforms,
+            &mut cached_paths,
+        ) else {
+            continue;
+        };
+        out.insert(path);
+        if out.len() >= 256 {
+            break;
+        }
+    }
+
+    out.into_iter().collect()
+}
+
+fn resolve_transform_path(
+    transform_id: u64,
+    leaf_name: &str,
+    go_names: &std::collections::BTreeMap<u64, String>,
+    transforms: &std::collections::BTreeMap<u64, TransformLink>,
+    cache: &mut std::collections::BTreeMap<u64, Option<String>>,
+) -> Option<String> {
+    if let Some(cached) = cache.get(&transform_id) {
+        return cached.clone();
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(leaf_name.to_string());
+
+    let mut current = transforms.get(&transform_id).and_then(|t| t.father_transform_id);
+    while let Some(parent_id) = current {
+        if !seen.insert(parent_id) {
+            break;
+        }
+        let Some(parent) = transforms.get(&parent_id) else {
+            break;
+        };
+        let Some(parent_go) = parent.game_object_id else {
+            break;
+        };
+        let Some(parent_name) = go_names.get(&parent_go) else {
+            break;
+        };
+        parts.push(parent_name.to_string());
+        current = parent.father_transform_id;
+        if parts.len() >= 32 {
+            break;
+        }
+    }
+
+    parts.reverse();
+    let path = parts.join("/");
+    let out = Some(path);
+    cache.insert(transform_id, out.clone());
+    out
+}
+
+fn parse_unity_yaml_doc_header(line: &str) -> Option<(u32, u64)> {
+    // Example: --- !u!1 &123456
+    let line = line.trim();
+    if !line.starts_with("---") {
+        return None;
+    }
+    let u_pos = line.find("!u!")?;
+    let after_u = &line[u_pos + 3..];
+    let class_part = after_u.split_whitespace().next()?;
+    let class_str = class_part.trim_start_matches('!');
+    let class_id: u32 = class_str.parse().ok()?;
+
+    let amp_pos = line.rfind('&')?;
+    let id_str = line[amp_pos + 1..].trim();
+    let file_id: u64 = id_str.parse().ok()?;
+    Some((class_id, file_id))
+}
+
+fn parse_unity_yaml_scalar(line: &str, key: &str) -> Option<String> {
+    // m_Name: Foo
+    let trimmed = line.trim_start();
+    let prefix = format!("{key}:");
+    if !trimmed.starts_with(&prefix) {
+        return None;
+    }
+    let value = trimmed[prefix.len()..].trim();
+    Some(value.trim_matches('"').to_string())
+}
+
+fn parse_file_id(line: &str) -> Option<u64> {
+    // {fileID: 123} or fileID: 123
+    let idx = line.find("fileID:")?;
+    let after = &line[idx + "fileID:".len()..];
+    let digits = after
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
 }
 
 fn extract_csharp_terms(text: &str) -> String {
@@ -1587,5 +1763,29 @@ MonoBehaviour:
         assert!(terms.contains("player"));
         assert!(terms.contains("deadbeefdeadbeefdeadbeefdeadbeef"));
         assert!(terms.contains("11500000"));
+    }
+
+    #[test]
+    fn unity_yaml_hierarchy_paths_build_root_child() {
+        let text = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &10
+GameObject:
+  m_Name: Root
+--- !u!4 &20
+Transform:
+  m_GameObject: {fileID: 10}
+  m_Father: {fileID: 0}
+--- !u!1 &11
+GameObject:
+  m_Name: Child
+--- !u!4 &21
+Transform:
+  m_GameObject: {fileID: 11}
+  m_Father: {fileID: 20}
+"#;
+
+        let paths = extract_unity_yaml_hierarchy_paths(text);
+        assert!(paths.iter().any(|p| p == "Root/Child"));
     }
 }
