@@ -285,6 +285,10 @@ struct ReferenceFields {
 struct Fingerprint {
     size: u64,
     mtime_ms: u64,
+    #[serde(default)]
+    meta_size: u64,
+    #[serde(default)]
+    meta_mtime_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1288,7 +1292,7 @@ impl SearchIndex {
 
 fn normalize_watch_paths_for_incremental(
     paths: &IndexPaths,
-    state: &IndexState,
+    _state: &IndexState,
     changed_paths: &[PathBuf],
 ) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -1300,20 +1304,13 @@ fn normalize_watch_paths_for_incremental(
             let Some(asset) = asset_path_from_meta(p) else {
                 continue;
             };
-            if asset.exists() {
-                let Ok(rel) = asset.strip_prefix(&paths.project_root) else {
-                    continue;
-                };
-                let rel = rel.to_string_lossy().to_string();
-                if state.files.contains_key(&rel) {
-                    continue;
-                }
-            }
             out.push(asset);
             continue;
         }
         out.push(p.clone());
     }
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -3454,7 +3451,27 @@ fn fingerprint_for_path(path: &Path) -> Result<Fingerprint> {
         .try_into()
         .unwrap_or(u64::MAX);
 
-    Ok(Fingerprint { size, mtime_ms })
+    let (meta_size, meta_mtime_ms) = asset_meta_path(path)
+        .and_then(|meta_path| fs::metadata(meta_path).ok())
+        .map(|meta| {
+            let size = meta.len();
+            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let mtime_ms = mtime
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            (size, mtime_ms)
+        })
+        .unwrap_or((0, 0));
+
+    Ok(Fingerprint {
+        size,
+        mtime_ms,
+        meta_size,
+        meta_mtime_ms,
+    })
 }
 
 fn asset_meta_path(asset_path: &Path) -> Option<PathBuf> {
@@ -3775,7 +3792,7 @@ Transform:
     }
 
     #[test]
-    fn normalize_watch_paths_skips_meta_changes_for_indexed_assets() {
+    fn normalize_watch_paths_dedupes_meta_and_asset() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path().join("Assets")).unwrap();
 
@@ -3797,8 +3814,9 @@ Transform:
         index.reindex_full(&paths).unwrap();
 
         let inner = index.inner.read().unwrap();
-        let normalized = normalize_watch_paths_for_incremental(&paths, &inner.state, &[meta]);
-        assert!(normalized.is_empty());
+        let normalized =
+            normalize_watch_paths_for_incremental(&paths, &inner.state, &[meta, prefab.clone()]);
+        assert_eq!(normalized, vec![prefab]);
     }
 
     #[test]
@@ -3841,5 +3859,54 @@ Transform:
         let res_new = index.search("in:Assets/B", 20).unwrap();
         assert_eq!(res_new.hits.len(), 1);
         assert!(res_new.hits[0].path.starts_with("Assets/B/"));
+    }
+
+    #[test]
+    fn meta_guid_changes_trigger_doc_guid_update() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets")).unwrap();
+
+        let prefab = temp.path().join("Assets/foo.prefab");
+        fs::write(
+            &prefab,
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Foo\n",
+        )
+        .unwrap();
+        let meta = temp.path().join("Assets/foo.prefab.meta");
+        fs::write(
+            &meta,
+            "fileFormatVersion: 2\nguid: deadbeefdeadbeefdeadbeefdeadbeef\n",
+        )
+        .unwrap();
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        index.reindex_full(&paths).unwrap();
+
+        fs::write(
+            &meta,
+            "fileFormatVersion: 2\nguid: cafe0000cafe0000cafe0000cafe0000\n",
+        )
+        .unwrap();
+
+        index
+            .reindex_changed_paths(&paths, &[meta.clone()])
+            .unwrap();
+
+        let inner = index.inner.read().unwrap();
+        let searcher = inner.reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(inner.fields.id, "Assets/foo.prefab"),
+            tantivy::schema::IndexRecordOption::Basic,
+        );
+        let hits = searcher.search(&query, &TopDocs::with_limit(5)).unwrap();
+        assert_eq!(hits.len(), 1);
+        let doc: TantivyDocument = searcher.doc(hits[0].1).unwrap();
+        let stored = doc
+            .get_first(inner.fields.guid)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(stored, "cafe0000cafe0000cafe0000cafe0000");
     }
 }
