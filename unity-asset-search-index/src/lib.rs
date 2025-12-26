@@ -352,6 +352,21 @@ struct ScriptGuidEntry {
     symbols: Vec<String>,
 }
 
+struct IndexingGuard {
+    inner: Arc<RwLock<SearchIndexInner>>,
+}
+
+impl Drop for IndexingGuard {
+    fn drop(&mut self) {
+        let Ok(mut inner) = self.inner.write() else {
+            return;
+        };
+        if inner.status.indexing {
+            inner.status.indexing = false;
+        }
+    }
+}
+
 impl SearchIndex {
     pub fn open_or_create(paths: &IndexPaths) -> Result<Self> {
         fs::create_dir_all(&paths.index_root_dir).with_context(|| {
@@ -512,13 +527,16 @@ impl SearchIndex {
         changed_paths: &[PathBuf],
     ) -> Result<()> {
         let start = Instant::now();
-        {
+        let indexing_guard = {
             let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
             inner.status.indexing = true;
             inner.status.updated_docs = None;
             inner.status.removed_docs = None;
             inner.status.last_scan_ms = None;
-        }
+            IndexingGuard {
+                inner: self.inner.clone(),
+            }
+        };
 
         let scan_start = Instant::now();
         let delta = scan_changed_paths(paths, changed_paths)?;
@@ -571,6 +589,40 @@ impl SearchIndex {
                         removed_docs += 1;
                     }
                     remove_script_entries_for_rel_path(&mut scripts, &child);
+                }
+            }
+
+            if !delta.rescan_dir_rel_prefixes.is_empty() {
+                let present: std::collections::BTreeSet<String> =
+                    delta.files.iter().map(|f| f.rel_path.clone()).collect();
+
+                for prefix in &delta.rescan_dir_rel_prefixes {
+                    let prefix = prefix.trim_end_matches('/');
+                    if prefix.is_empty() {
+                        continue;
+                    }
+                    let prefix_slash = format!("{prefix}/");
+
+                    let to_remove: Vec<String> = state
+                        .files
+                        .range(prefix_slash.clone()..)
+                        .take_while(|(k, _)| k.starts_with(&prefix_slash))
+                        .filter(|(k, _)| !present.contains(*k))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+
+                    for rel_path in to_remove {
+                        inner
+                            .writer
+                            .delete_term(Term::from_field_text(fields.id, &rel_path));
+                        inner
+                            .refs_writer
+                            .delete_term(Term::from_field_text(refs_fields.source_id, &rel_path));
+                        if state.files.remove(&rel_path).is_some() {
+                            removed_docs += 1;
+                        }
+                        remove_script_entries_for_rel_path(&mut scripts, &rel_path);
+                    }
                 }
             }
 
@@ -629,19 +681,23 @@ impl SearchIndex {
             inner.status.indexing = false;
         }
 
+        drop(indexing_guard);
         self.refresh_status()?;
         Ok(())
     }
 
     fn reindex_impl(&self, paths: &IndexPaths, mode: ReindexMode) -> Result<()> {
         let start = Instant::now();
-        {
+        let indexing_guard = {
             let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
             inner.status.indexing = true;
             inner.status.updated_docs = None;
             inner.status.removed_docs = None;
             inner.status.last_scan_ms = None;
-        }
+            IndexingGuard {
+                inner: self.inner.clone(),
+            }
+        };
 
         let scan_start = Instant::now();
         let scan = scan_project_files(paths)?;
@@ -739,6 +795,7 @@ impl SearchIndex {
             inner.status.indexing = false;
         }
 
+        drop(indexing_guard);
         self.refresh_status()?;
         Ok(())
     }
@@ -1512,6 +1569,7 @@ fn scan_project_files(paths: &IndexPaths) -> Result<ScanResult> {
 struct ChangeScanResult {
     files: Vec<ScannedFile>,
     removed_rel_paths: Vec<String>,
+    rescan_dir_rel_prefixes: Vec<String>,
 }
 
 fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<ChangeScanResult> {
@@ -1542,7 +1600,8 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
     candidates.sort();
     candidates.dedup();
 
-    let mut existing = Vec::new();
+    let mut existing_files = Vec::new();
+    let mut rescan_dirs = Vec::new();
     for candidate in candidates {
         if !candidate.starts_with(&paths.project_root) {
             continue;
@@ -1551,27 +1610,132 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
             continue;
         }
         if candidate.is_file() {
-            existing.push(candidate);
+            existing_files.push(candidate);
         } else if candidate.exists() && candidate.is_dir() {
-            continue;
+            if is_in_scan_roots_raw(&paths.scan_roots, &candidate) {
+                rescan_dirs.push(candidate);
+            }
         } else if let Ok(rel) = candidate.strip_prefix(&paths.project_root) {
             out.removed_rel_paths
                 .push(rel.to_string_lossy().to_string());
         }
     }
 
-    if existing.is_empty() {
+    if existing_files.is_empty() && rescan_dirs.is_empty() {
         return Ok(out);
     }
 
-    let existing_set: std::collections::BTreeSet<PathBuf> = existing.into_iter().collect();
-    let allowed_dirs = build_allowed_dirs(paths, &existing_set);
-    let existing_set_for_filter = existing_set.clone();
+    if !existing_files.is_empty() {
+        let existing_set: std::collections::BTreeSet<PathBuf> = existing_files.into_iter().collect();
+        let allowed_dirs = build_allowed_dirs(paths, &existing_set);
+        let existing_set_for_filter = existing_set.clone();
 
-    let scan_roots = paths.scan_roots.clone();
+        let scan_roots = paths.scan_roots.clone();
+        let project_root = paths.project_root.clone();
+
+        let mut builder = WalkBuilder::new(&project_root);
+        builder
+            .follow_links(false)
+            .parents(false)
+            .ignore(true)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .add_custom_ignore_filename(".gitignore")
+            .add_custom_ignore_filename(".unity-asset-search-ignore")
+            .filter_entry(move |e: &DirEntry| {
+                let p = e.path();
+                if is_excluded_dir(p) {
+                    return false;
+                }
+                if p == project_root {
+                    return true;
+                }
+                if !is_in_scan_roots_raw(&scan_roots, p)
+                    && !scan_roots.iter().any(|r| r.starts_with(p))
+                {
+                    return false;
+                }
+                if e.file_type().is_some_and(|t| t.is_file()) {
+                    return existing_set_for_filter.contains(p);
+                }
+                allowed_dirs.contains(p)
+            });
+
+        let project_root = paths.project_root.clone();
+        let existing_set = Arc::new(existing_set);
+        let mut files = scan_walk_parallel(builder, move |path| {
+            if should_skip_file(path) || is_excluded_dir(path) || !existing_set.contains(path) {
+                return Ok(None);
+            }
+
+            let rel_path = path
+                .strip_prefix(&project_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let kind = classify_kind(path);
+            let fingerprint = fingerprint_for_path(path)?;
+
+            Ok(Some(ScannedFile {
+                rel_path,
+                abs_path: path.to_path_buf(),
+                fingerprint,
+                name,
+                kind,
+            }))
+        })?;
+        out.files.append(&mut files);
+    }
+
+    for dir in normalize_rescan_dirs(rescan_dirs) {
+        let Ok(rel) = dir.strip_prefix(&paths.project_root) else {
+            continue;
+        };
+        let rel_prefix = rel.to_string_lossy().trim_end_matches('/').to_string();
+        if rel_prefix.is_empty() {
+            continue;
+        }
+        out.rescan_dir_rel_prefixes.push(rel_prefix);
+
+        let mut files = scan_dir_files(paths, &dir)?;
+        out.files.append(&mut files);
+    }
+
+    out.rescan_dir_rel_prefixes.sort();
+    out.rescan_dir_rel_prefixes.dedup();
+    out.files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    out.files.dedup_by(|a, b| a.rel_path == b.rel_path);
+
+    Ok(out)
+}
+
+fn normalize_rescan_dirs(mut dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    dirs.sort();
+    dirs.dedup();
+
+    let mut out = Vec::new();
+    for dir in dirs {
+        if out.iter().any(|p: &PathBuf| dir.starts_with(p)) {
+            continue;
+        }
+        out.retain(|p: &PathBuf| !p.starts_with(&dir));
+        out.push(dir);
+    }
+    out
+}
+
+fn scan_dir_files(paths: &IndexPaths, dir: &Path) -> Result<Vec<ScannedFile>> {
     let project_root = paths.project_root.clone();
+    let scan_roots = paths.scan_roots.clone();
+    let scan_roots_for_filter = scan_roots.clone();
 
-    let mut builder = WalkBuilder::new(&project_root);
+    let mut builder = WalkBuilder::new(dir);
     builder
         .follow_links(false)
         .parents(false)
@@ -1586,23 +1750,19 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
             if is_excluded_dir(p) {
                 return false;
             }
-            if p == project_root {
-                return true;
-            }
-            if !is_in_scan_roots_raw(&scan_roots, p) && !scan_roots.iter().any(|r| r.starts_with(p))
-            {
-                return false;
-            }
-            if e.file_type().is_some_and(|t| t.is_file()) {
-                return existing_set_for_filter.contains(p);
-            }
-            allowed_dirs.contains(p)
+            scan_roots_for_filter
+                .iter()
+                .any(|root| root.starts_with(p) || p.starts_with(root))
         });
 
-    let project_root = paths.project_root.clone();
-    let existing_set = Arc::new(existing_set);
-    let files = scan_walk_parallel(builder, move |path| {
-        if should_skip_file(path) || is_excluded_dir(path) || !existing_set.contains(path) {
+    scan_walk_parallel(builder, move |path| {
+        if path.extension().is_some_and(|e| e == "meta") {
+            return Ok(None);
+        }
+        if should_skip_file(path) || is_excluded_dir(path) {
+            return Ok(None);
+        }
+        if !is_in_scan_roots_raw(&scan_roots, path) {
             return Ok(None);
         }
 
@@ -1626,11 +1786,7 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
             name,
             kind,
         }))
-    })?;
-
-    out.files = files;
-
-    Ok(out)
+    })
 }
 
 fn canonicalize_best_effort(path: &Path) -> PathBuf {

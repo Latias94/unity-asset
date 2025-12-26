@@ -329,7 +329,8 @@ async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::
                 return;
             };
 
-            let mut paths = Vec::new();
+            let mut dir_paths = Vec::new();
+            let mut file_paths = Vec::new();
             let mut force_full = false;
 
             for path in event.paths {
@@ -343,10 +344,17 @@ async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::
                     force_full = true;
                 }
                 if path.exists() && path.is_dir() {
-                    continue;
+                    dir_paths.push(path);
+                } else {
+                    file_paths.push(path);
                 }
-                paths.push(path);
             }
+
+            let paths = if !file_paths.is_empty() {
+                file_paths
+            } else {
+                dir_paths
+            };
 
             if paths.is_empty() {
                 return;
@@ -391,12 +399,29 @@ async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::
         }
 
         if force_full {
-            let _ = run_reindex(state.clone(), false).await;
+            if let Err(err) = run_reindex(state.clone(), false).await {
+                eprintln!("reindex error: {err}");
+            }
             continue;
         }
 
-        let changed_paths: Vec<PathBuf> = pending.into_iter().collect();
-        let _ = run_reindex_changed_paths(state.clone(), &changed_paths).await;
+        let mut changed_paths: Vec<PathBuf> = pending.into_iter().collect();
+        let has_file_like = changed_paths
+            .iter()
+            .any(|p| !p.exists() || p.is_file());
+        if has_file_like {
+            changed_paths.retain(|p| !(p.exists() && p.is_dir()));
+        } else {
+            let scan_roots = &state.paths.scan_roots;
+            changed_paths.retain(|p| !scan_roots.iter().any(|r| p == r));
+            changed_paths.retain(|p| p != &state.paths.project_root);
+        }
+        if changed_paths.is_empty() {
+            continue;
+        }
+        if let Err(err) = run_reindex_changed_paths(state.clone(), &changed_paths).await {
+            eprintln!("reindex changed paths error: {err}");
+        }
     }
 }
 

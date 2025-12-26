@@ -67,3 +67,5 @@ This repository maintains runnable examples per crate (built in CI).
     - The response includes `hits[].stable_id` + `hits[].location` (for navigation) and `hits[].objects[]` (Rider-like object grouping with `field_hints[]`).
 - Run the BoatAttack benchmark harness:
   - `scripts/bench_boat_attack.zsh repo-ref/BoatAttack`
+- Stress test incremental watcher indexing (burst changes):
+  - `scripts/stress_incremental_watch.zsh repo-ref/BoatAttack`
