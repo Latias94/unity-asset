@@ -23,8 +23,7 @@ The Rust workspace is currently optimized for Rust development. Unity plugin dev
 
 Create a dedicated repository, e.g.:
 
-- `unity-asset-unity` (recommended name), or
-- `unity-asset-search-unity`
+- `unityhero-unity` (recommended name)
 
 This repository is a UPM package template and is versioned independently from the Rust workspace, while still tracking compatible daemon versions.
 
@@ -53,11 +52,16 @@ The plugin owns a small "daemon manager" layer:
 
 - Determine `project_root` as Unity project directory.
 - Choose `index_dir`:
-  - default to `Library/unity-asset-search` (Unity's recommended cache location),
+  - default to `Library/UnityHero` (Unity's recommended cache location),
   - allow override in plugin settings.
 - Start the daemon process if missing.
 - Keep a single instance per project:
-  - store pid/port/token info under `Library/unity-asset-search/`.
+  - store pid/port/token info under `Library/UnityHero/`.
+
+UPM package identity (recommended):
+
+- package name: `com.frankorz.unityhero`
+- display name: `UnityHero`
 
 ### 4) Packaging strategy for daemon binaries
 
@@ -116,4 +120,3 @@ Cons:
 
 - cannot provide object-level indexing, ranking, and richer queries,
 - becomes hard to extend into "Search Everything" beyond GUID text search.
-
