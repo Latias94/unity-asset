@@ -23,7 +23,10 @@ enum Cmd {
         limit: usize,
     },
     Status,
-    Reindex,
+    Reindex {
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 #[tokio::main]
@@ -32,7 +35,7 @@ async fn main() -> Result<()> {
     match args.cmd {
         Cmd::Search { query, limit } => search(&args.base_url, &query, limit).await?,
         Cmd::Status => status(&args.base_url).await?,
-        Cmd::Reindex => reindex(&args.base_url, args.token.as_deref()).await?,
+        Cmd::Reindex { full } => reindex(&args.base_url, args.token.as_deref(), full).await?,
     }
     Ok(())
 }
@@ -68,11 +71,14 @@ async fn status(base_url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn reindex(base_url: &str, token: Option<&str>) -> Result<()> {
+async fn reindex(base_url: &str, token: Option<&str>, full: bool) -> Result<()> {
     let url = format!("{base_url}/v1/reindex");
     let mut req = reqwest::Client::new().post(url);
     if let Some(token) = token {
         req = req.bearer_auth(token);
+    }
+    if full {
+        req = req.query(&[("full", "true")]);
     }
 
     let resp = req.send().await.context("request /v1/reindex")?;

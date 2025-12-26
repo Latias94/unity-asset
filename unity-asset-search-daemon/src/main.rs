@@ -23,6 +23,12 @@ struct Args {
     #[arg(long)]
     index_dir: Option<PathBuf>,
 
+    #[arg(long, value_name = "PATH")]
+    scan_root: Vec<PathBuf>,
+
+    #[arg(long)]
+    scan_all: bool,
+
     #[arg(long, default_value = "127.0.0.1:9781")]
     listen: SocketAddr,
 
@@ -43,16 +49,23 @@ struct AppState {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let paths = IndexPaths::for_project(args.project_root, args.index_dir)?;
+    let scan_roots = if args.scan_all {
+        Some(vec![PathBuf::from(".")])
+    } else if args.scan_root.is_empty() {
+        None
+    } else {
+        Some(args.scan_root.clone())
+    };
+    let paths = IndexPaths::for_project(args.project_root, args.index_dir, scan_roots)?;
     let index = SearchIndex::open_or_create(&paths)?;
 
     let token = args.token.unwrap_or_else(generate_token);
-    persist_token(&paths.index_dir, &token)?;
+    persist_token(&paths.index_root_dir, &token)?;
 
     eprintln!(
         "unity-asset-search-daemon listening on {} (index: {}, token: {})",
         args.listen,
-        paths.index_dir.display(),
+        paths.index_root_dir.display(),
         token
     );
 
@@ -65,7 +78,11 @@ async fn main() -> anyhow::Result<()> {
     if !args.no_auto_reindex {
         let status = index.status()?;
         if status.indexed_docs == 0 && !status.indexing {
-            index.reindex(&paths)?;
+            let index = index.clone();
+            let paths = paths.clone();
+            tokio::spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || index.reindex(&paths)).await;
+            });
         }
     }
 
@@ -144,7 +161,16 @@ async fn suggest(Query(q): Query<SuggestQuery>) -> impl IntoResponse {
         .into_response()
 }
 
-async fn reindex(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+#[derive(Debug, serde::Deserialize)]
+struct ReindexParams {
+    full: Option<bool>,
+}
+
+async fn reindex(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<ReindexParams>,
+) -> impl IntoResponse {
     if !is_authorized(&headers, &state.token) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -155,7 +181,16 @@ async fn reindex(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
 
     let index = state.index.clone();
     let paths = state.paths.clone();
-    match tokio::task::spawn_blocking(move || index.reindex(&paths)).await {
+    let full = q.full.unwrap_or(false);
+    match tokio::task::spawn_blocking(move || {
+        if full {
+            index.reindex_full(&paths)
+        } else {
+            index.reindex(&paths)
+        }
+    })
+    .await
+    {
         Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Ok(Err(err)) => (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -15,4 +15,8 @@ serde_json.workspace = true
 regex.workspace = true
 tantivy.workspace = true
 ignore.workspace = true
+once_cell.workspace = true
 unity-asset-search-core = { path = "../unity-asset-search-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

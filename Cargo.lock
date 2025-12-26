@@ -3355,10 +3355,12 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "ignore",
+ "once_cell",
  "regex",
  "serde",
  "serde_json",
  "tantivy",
+ "tempfile",
  "unity-asset-search-core",
 ]
 

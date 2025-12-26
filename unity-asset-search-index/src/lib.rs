@@ -1,4 +1,5 @@
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value as _};
-use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, doc};
+use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term, doc};
 
 use unity_asset_search_core::{MatchKind, rank_match, to_terms};
 
@@ -36,30 +37,56 @@ pub struct SearchResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
-    pub index_dir: PathBuf,
+    pub index_root_dir: PathBuf,
+    pub index_data_dir: PathBuf,
+    pub scan_roots: Vec<PathBuf>,
     pub indexed_docs: u64,
     pub last_index_duration_ms: Option<u128>,
     pub indexing: bool,
+    pub last_scan_ms: Option<u128>,
+    pub updated_docs: Option<u64>,
+    pub removed_docs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct IndexPaths {
     pub project_root: PathBuf,
-    pub index_dir: PathBuf,
+    pub index_root_dir: PathBuf,
+    pub index_data_dir: PathBuf,
     pub scan_roots: Vec<PathBuf>,
+    pub state_path: PathBuf,
 }
 
 impl IndexPaths {
-    pub fn for_project(project_root: PathBuf, index_dir: Option<PathBuf>) -> Result<Self> {
-        let index_dir = match index_dir {
+    pub fn for_project(
+        project_root: PathBuf,
+        index_root_dir: Option<PathBuf>,
+        scan_roots: Option<Vec<PathBuf>>,
+    ) -> Result<Self> {
+        let project_root = project_root
+            .canonicalize()
+            .with_context(|| format!("project root does not exist: {}", project_root.display()))?;
+
+        let index_root_dir = match index_root_dir {
             Some(p) => p,
             None => default_index_dir(&project_root),
         };
 
+        let scan_roots = match scan_roots {
+            Some(roots) if !roots.is_empty() => roots,
+            _ => default_scan_roots(&project_root),
+        };
+        let scan_roots = normalize_scan_roots(&project_root, scan_roots)?;
+
+        let index_data_dir = index_root_dir.join("tantivy-v1");
+        let state_path = index_root_dir.join("state-v1.json");
+
         Ok(Self {
-            scan_roots: vec![project_root.clone()],
             project_root,
-            index_dir,
+            index_root_dir,
+            index_data_dir,
+            scan_roots,
+            state_path,
         })
     }
 }
@@ -73,6 +100,55 @@ fn default_index_dir(project_root: &Path) -> PathBuf {
     }
 }
 
+fn default_scan_roots(project_root: &Path) -> Vec<PathBuf> {
+    let assets = project_root.join("Assets");
+    if !assets.is_dir() {
+        return vec![project_root.to_path_buf()];
+    }
+
+    let mut roots = Vec::new();
+    let candidates = [
+        project_root.join("Assets"),
+        project_root.join("Packages"),
+        project_root.join("ProjectSettings"),
+    ];
+    for candidate in candidates {
+        if candidate.is_dir() {
+            roots.push(candidate);
+        }
+    }
+
+    if roots.is_empty() {
+        vec![project_root.to_path_buf()]
+    } else {
+        roots
+    }
+}
+
+fn normalize_scan_roots(project_root: &Path, roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for root in roots {
+        let root = if root.is_absolute() {
+            root
+        } else {
+            project_root.join(root)
+        };
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("scan root does not exist: {}", root.display()))?;
+        if !root.starts_with(project_root) {
+            return Err(anyhow!(
+                "scan root must be inside project root: {}",
+                root.display()
+            ));
+        }
+        out.push(root);
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 #[derive(Clone)]
 pub struct SearchIndex {
     inner: Arc<RwLock<SearchIndexInner>>,
@@ -84,10 +160,12 @@ struct SearchIndexInner {
     writer: IndexWriter,
     fields: SearchFields,
     status: StatusResponse,
+    state: IndexState,
 }
 
 #[derive(Clone)]
 struct SearchFields {
+    id: Field,
     guid: Field,
     path: Field,
     path_terms: Field,
@@ -97,14 +175,29 @@ struct SearchFields {
     kind_terms: Field,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+struct Fingerprint {
+    size: u64,
+    mtime_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct IndexState {
+    files: std::collections::BTreeMap<String, Fingerprint>,
+}
+
 impl SearchIndex {
     pub fn open_or_create(paths: &IndexPaths) -> Result<Self> {
-        fs::create_dir_all(&paths.index_dir)
-            .with_context(|| format!("create index dir: {}", paths.index_dir.display()))?;
+        fs::create_dir_all(&paths.index_root_dir).with_context(|| {
+            format!("create index root dir: {}", paths.index_root_dir.display())
+        })?;
+        fs::create_dir_all(&paths.index_data_dir).with_context(|| {
+            format!("create index data dir: {}", paths.index_data_dir.display())
+        })?;
 
         let schema = build_schema();
-        let index = Index::open_in_dir(&paths.index_dir)
-            .or_else(|_| Index::create_in_dir(&paths.index_dir, schema.clone()))?;
+        let index = Index::open_in_dir(&paths.index_data_dir)
+            .or_else(|_| Index::create_in_dir(&paths.index_data_dir, schema.clone()))?;
 
         let schema = index.schema();
         let fields = build_fields(&schema);
@@ -117,11 +210,18 @@ impl SearchIndex {
             .writer_with_num_threads(4, 128 * 1024 * 1024)
             .context("create index writer")?;
 
+        let state = load_state(&paths.state_path).unwrap_or_default();
+
         let status = StatusResponse {
-            index_dir: paths.index_dir.clone(),
+            index_root_dir: paths.index_root_dir.clone(),
+            index_data_dir: paths.index_data_dir.clone(),
+            scan_roots: paths.scan_roots.clone(),
             indexed_docs: 0,
             last_index_duration_ms: None,
             indexing: false,
+            last_scan_ms: None,
+            updated_docs: None,
+            removed_docs: None,
         };
 
         let this = Self {
@@ -131,6 +231,7 @@ impl SearchIndex {
                 writer,
                 fields,
                 status,
+                state,
             })),
         };
 
@@ -149,27 +250,74 @@ impl SearchIndex {
     }
 
     pub fn reindex(&self, paths: &IndexPaths) -> Result<()> {
+        self.reindex_impl(paths, ReindexMode::Incremental)
+    }
+
+    pub fn reindex_full(&self, paths: &IndexPaths) -> Result<()> {
+        self.reindex_impl(paths, ReindexMode::Full)
+    }
+
+    fn reindex_impl(&self, paths: &IndexPaths, mode: ReindexMode) -> Result<()> {
         let start = Instant::now();
         {
             let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
             inner.status.indexing = true;
+            inner.status.updated_docs = None;
+            inner.status.removed_docs = None;
+            inner.status.last_scan_ms = None;
         }
 
-        let fields = {
-            self.inner
-                .read()
-                .map_err(|_| anyhow!("poisoned lock"))?
-                .fields
-                .clone()
+        let scan_start = Instant::now();
+        let scan = scan_project_files(paths)?;
+        let scan_ms = scan_start.elapsed().as_millis();
+
+        let (fields, mut state) = {
+            let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
+            (inner.fields.clone(), inner.state.clone())
         };
-        let docs = scan_project_docs(paths, &fields)?;
+
+        let mut updated_docs = 0u64;
+        let mut removed_docs = 0u64;
+
         {
             let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
-            inner.writer.delete_all_documents()?;
-            for doc in docs {
-                inner.writer.add_document(doc)?;
+
+            if mode == ReindexMode::Full {
+                inner.writer.delete_all_documents()?;
+                state.files.clear();
             }
+
+            for removed in state
+                .files
+                .keys()
+                .filter(|path| !scan.files.contains_key(*path))
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                inner
+                    .writer
+                    .delete_term(Term::from_field_text(fields.id, &removed));
+                state.files.remove(&removed);
+                removed_docs += 1;
+            }
+
+            for (rel_path, file) in &scan.files {
+                let old = state.files.get(rel_path).copied();
+                if old == Some(file.fingerprint) && mode == ReindexMode::Incremental {
+                    continue;
+                }
+
+                inner
+                    .writer
+                    .delete_term(Term::from_field_text(fields.id, rel_path));
+                inner.writer.add_document(build_doc(&fields, file)?)?;
+                state.files.insert(rel_path.clone(), file.fingerprint);
+                updated_docs += 1;
+            }
+
             inner.writer.commit()?;
+            inner.state = state;
+            store_state(&paths.state_path, &inner.state)?;
         }
 
         self.inner
@@ -181,6 +329,9 @@ impl SearchIndex {
         {
             let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
             inner.status.last_index_duration_ms = Some(start.elapsed().as_millis());
+            inner.status.last_scan_ms = Some(scan_ms);
+            inner.status.updated_docs = Some(updated_docs);
+            inner.status.removed_docs = Some(removed_docs);
             inner.status.indexing = false;
         }
 
@@ -290,6 +441,7 @@ impl SearchIndex {
 
 fn build_schema() -> Schema {
     let mut builder = Schema::builder();
+    builder.add_text_field("id", STRING | STORED);
     builder.add_text_field("guid", STRING | STORED);
     builder.add_text_field("path", STORED);
     builder.add_text_field("path_terms", TEXT);
@@ -302,6 +454,7 @@ fn build_schema() -> Schema {
 
 fn build_fields(schema: &Schema) -> SearchFields {
     SearchFields {
+        id: schema.get_field("id").expect("id field"),
         guid: schema.get_field("guid").expect("guid field"),
         path: schema.get_field("path").expect("path field"),
         path_terms: schema.get_field("path_terms").expect("path_terms field"),
@@ -312,9 +465,28 @@ fn build_fields(schema: &Schema) -> SearchFields {
     }
 }
 
-fn scan_project_docs(paths: &IndexPaths, fields: &SearchFields) -> Result<Vec<TantivyDocument>> {
-    let guid_re = Regex::new(r"(?m)^guid:\s*([0-9a-fA-F]{32})\s*$")?;
-    let mut docs = Vec::new();
+#[derive(Debug, Clone)]
+struct ScannedFile {
+    rel_path: String,
+    abs_path: PathBuf,
+    fingerprint: Fingerprint,
+    name: String,
+    kind: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ScanResult {
+    files: std::collections::BTreeMap<String, ScannedFile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReindexMode {
+    Incremental,
+    Full,
+}
+
+fn scan_project_files(paths: &IndexPaths) -> Result<ScanResult> {
+    let mut out = ScanResult::default();
 
     for root in &paths.scan_roots {
         let walker = WalkBuilder::new(root)
@@ -339,7 +511,7 @@ fn scan_project_docs(paths: &IndexPaths, fields: &SearchFields) -> Result<Vec<Ta
                 continue;
             }
 
-            if should_skip_file(path) {
+            if should_skip_file(path) || is_excluded_dir(path) {
                 continue;
             }
 
@@ -356,29 +528,91 @@ fn scan_project_docs(paths: &IndexPaths, fields: &SearchFields) -> Result<Vec<Ta
                 .to_string();
 
             let kind = classify_kind(path);
+            let fingerprint = fingerprint_for_path(path)?;
 
-            let guid = meta_path_for_asset(path)
-                .and_then(|meta| fs::read_to_string(meta).ok())
-                .and_then(|meta| {
-                    guid_re
-                        .captures(&meta)
-                        .and_then(|cap| cap.get(1))
-                        .map(|m| m.as_str().to_string())
-                });
+            let file = ScannedFile {
+                rel_path: rel_path.clone(),
+                abs_path: path.to_path_buf(),
+                fingerprint,
+                name,
+                kind,
+            };
 
-            docs.push(doc!(
-                fields.guid => guid.clone().unwrap_or_default(),
-                fields.path => rel_path.clone(),
-                fields.path_terms => to_terms(&rel_path),
-                fields.name => name.clone(),
-                fields.name_terms => to_terms(&name),
-                fields.kind => kind.clone(),
-                fields.kind_terms => to_terms(&kind),
-            ));
+            out.files.insert(rel_path, file);
         }
     }
 
-    Ok(docs)
+    Ok(out)
+}
+
+fn build_doc(fields: &SearchFields, file: &ScannedFile) -> Result<TantivyDocument> {
+    let guid = read_guid_from_meta(asset_meta_path(&file.abs_path)).unwrap_or_default();
+
+    Ok(doc!(
+        fields.id => file.rel_path.clone(),
+        fields.guid => guid,
+        fields.path => file.rel_path.clone(),
+        fields.path_terms => to_terms(&file.rel_path),
+        fields.name => file.name.clone(),
+        fields.name_terms => to_terms(&file.name),
+        fields.kind => file.kind.clone(),
+        fields.kind_terms => to_terms(&file.kind),
+    ))
+}
+
+fn fingerprint_for_path(path: &Path) -> Result<Fingerprint> {
+    let meta = fs::metadata(path)?;
+    let size = meta.len();
+    let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let mtime_ms = mtime
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+
+    Ok(Fingerprint { size, mtime_ms })
+}
+
+fn asset_meta_path(asset_path: &Path) -> Option<PathBuf> {
+    meta_path_for_asset(asset_path)
+}
+
+fn read_guid_from_meta(meta_path: Option<PathBuf>) -> Option<String> {
+    static GUID_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+        Regex::new(r"(?m)^guid:\s*([0-9a-fA-F]{32})\s*$").expect("guid regex")
+    });
+
+    let meta_path = meta_path?;
+    let meta = fs::read_to_string(meta_path).ok()?;
+    GUID_RE
+        .captures(&meta)
+        .and_then(|cap| cap.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+fn load_state(path: &Path) -> Result<IndexState> {
+    let bytes = fs::read(path)?;
+    let state = serde_json::from_slice(&bytes)?;
+    Ok(state)
+}
+
+fn store_state(path: &Path, state: &IndexState) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(state)?;
+    atomic_write(path, &bytes)?;
+    Ok(())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(io::Error::other("no parent dir"));
+    };
+    fs::create_dir_all(parent)?;
+
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(tmp, path)?;
+    Ok(())
 }
 
 fn is_excluded_dir(path: &Path) -> bool {
@@ -437,4 +671,30 @@ fn meta_path_for_asset(asset_path: &Path) -> Option<PathBuf> {
 
     let meta = asset_path.with_extension(format!("{ext}.meta"));
     meta.exists().then_some(meta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_scan_roots_includes_unity_dirs_when_present() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets")).unwrap();
+        fs::create_dir_all(temp.path().join("Packages")).unwrap();
+        fs::create_dir_all(temp.path().join("ProjectSettings")).unwrap();
+
+        let roots = default_scan_roots(temp.path());
+        assert_eq!(roots.len(), 3);
+    }
+
+    #[test]
+    fn normalize_scan_roots_rejects_outside_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets")).unwrap();
+
+        let err = normalize_scan_roots(temp.path(), vec![other.path().to_path_buf()]).unwrap_err();
+        assert!(err.to_string().contains("inside project root"));
+    }
 }
