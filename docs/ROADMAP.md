@@ -53,6 +53,11 @@ Current status:
   - best-effort component + field name
   - best-effort hierarchy path (scene/prefab)
 
+Current status:
+
+- Implemented (YAML): daemon endpoint `GET /v1/references?guid=...&file_id=...` returns source files that reference the target GUID (best-effort for PPtr-like `{guid,fileID}` blocks).
+- Pending: binary `PPtr` reverse edges (TypeTree-driven), richer field-level context, and Unity Editor jump-to-location.
+
 ### Phase 4: Deep mode (Tier-2 decode) and non-text assets
 
 - On-demand deep extraction using binary decoding for richer context.

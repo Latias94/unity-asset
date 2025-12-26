@@ -54,6 +54,21 @@ pub struct SearchResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceHit {
+    pub source_path: String,
+    pub source_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferencesResponse {
+    pub guid: String,
+    pub file_id: Option<u64>,
+    pub took_ms: u128,
+    pub total_hits: usize,
+    pub hits: Vec<ReferenceHit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuggestResponse {
     pub prefix: String,
     pub took_ms: u128,
@@ -67,6 +82,7 @@ pub struct StatusResponse {
     pub scan_roots: Vec<PathBuf>,
     pub indexed_docs: u64,
     pub indexed_scripts: u64,
+    pub indexed_ref_sources: u64,
     pub last_index_duration_ms: Option<u128>,
     pub indexing: bool,
     pub last_scan_ms: Option<u128>,
@@ -79,6 +95,7 @@ pub struct IndexPaths {
     pub project_root: PathBuf,
     pub index_root_dir: PathBuf,
     pub index_data_dir: PathBuf,
+    pub refs_index_data_dir: PathBuf,
     pub scan_roots: Vec<PathBuf>,
     pub state_path: PathBuf,
 }
@@ -105,12 +122,14 @@ impl IndexPaths {
         let scan_roots = normalize_scan_roots(&project_root, scan_roots)?;
 
         let index_data_dir = index_root_dir.join("tantivy-v2");
+        let refs_index_data_dir = index_root_dir.join("refs-tantivy-v1");
         let state_path = index_root_dir.join("state-v2.json");
 
         Ok(Self {
             project_root,
             index_root_dir,
             index_data_dir,
+            refs_index_data_dir,
             scan_roots,
             state_path,
         })
@@ -185,6 +204,9 @@ struct SearchIndexInner {
     reader: IndexReader,
     writer: IndexWriter,
     fields: SearchFields,
+    refs_reader: IndexReader,
+    refs_writer: IndexWriter,
+    refs_fields: ReferenceFields,
     status: StatusResponse,
     state: IndexState,
 }
@@ -200,6 +222,15 @@ struct SearchFields {
     kind: Field,
     kind_terms: Field,
     content_terms: Field,
+}
+
+#[derive(Clone)]
+struct ReferenceFields {
+    source_id: Field,
+    source_path: Field,
+    source_kind: Field,
+    ref_guid: Field,
+    ref_guid_fileid: Field,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -281,6 +312,12 @@ impl SearchIndex {
         fs::create_dir_all(&paths.index_data_dir).with_context(|| {
             format!("create index data dir: {}", paths.index_data_dir.display())
         })?;
+        fs::create_dir_all(&paths.refs_index_data_dir).with_context(|| {
+            format!(
+                "create refs index data dir: {}",
+                paths.refs_index_data_dir.display()
+            )
+        })?;
 
         let schema = build_schema();
         let index = Index::open_in_dir(&paths.index_data_dir)
@@ -297,6 +334,19 @@ impl SearchIndex {
             .writer_with_num_threads(4, 128 * 1024 * 1024)
             .context("create index writer")?;
 
+        let refs_schema = build_refs_schema();
+        let refs_index = Index::open_in_dir(&paths.refs_index_data_dir)
+            .or_else(|_| Index::create_in_dir(&paths.refs_index_data_dir, refs_schema.clone()))?;
+        let refs_schema = refs_index.schema();
+        let refs_fields = build_refs_fields(&refs_schema);
+        let refs_reader = refs_index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        let refs_writer = refs_index
+            .writer_with_num_threads(2, 64 * 1024 * 1024)
+            .context("create refs index writer")?;
+
         let state = load_state(&paths.state_path).unwrap_or_default();
 
         let status = StatusResponse {
@@ -305,6 +355,7 @@ impl SearchIndex {
             scan_roots: paths.scan_roots.clone(),
             indexed_docs: 0,
             indexed_scripts: 0,
+            indexed_ref_sources: 0,
             last_index_duration_ms: None,
             indexing: false,
             last_scan_ms: None,
@@ -317,6 +368,9 @@ impl SearchIndex {
                 reader,
                 writer,
                 fields,
+                refs_reader,
+                refs_writer,
+                refs_fields,
                 status,
                 state,
             })),
@@ -419,6 +473,10 @@ impl SearchIndex {
             let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
             inner.fields.clone()
         };
+        let refs_fields = {
+            let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
+            inner.refs_fields.clone()
+        };
 
         let mut updated_docs = 0u64;
         let mut removed_docs = 0u64;
@@ -432,6 +490,9 @@ impl SearchIndex {
                 inner
                     .writer
                     .delete_term(Term::from_field_text(fields.id, removed));
+                inner
+                    .refs_writer
+                    .delete_term(Term::from_field_text(refs_fields.source_id, removed));
                 if state.files.remove(removed).is_some() {
                     removed_docs += 1;
                 }
@@ -454,11 +515,20 @@ impl SearchIndex {
                 inner
                     .writer
                     .add_document(build_doc(&fields, file, &scripts)?)?;
+
+                inner
+                    .refs_writer
+                    .delete_term(Term::from_field_text(refs_fields.source_id, &file.rel_path));
+                if let Some(ref_doc) = build_refs_doc(&refs_fields, file)? {
+                    inner.refs_writer.add_document(ref_doc)?;
+                }
+
                 state.files.insert(file.rel_path.clone(), file.fingerprint);
                 updated_docs += 1;
             }
 
             inner.writer.commit()?;
+            inner.refs_writer.commit()?;
             state.scripts = scripts;
             inner.state = state;
             store_state(&paths.state_path, &inner.state)?;
@@ -468,6 +538,11 @@ impl SearchIndex {
             .read()
             .map_err(|_| anyhow!("poisoned lock"))?
             .reader
+            .reload()?;
+        self.inner
+            .read()
+            .map_err(|_| anyhow!("poisoned lock"))?
+            .refs_reader
             .reload()?;
 
         {
@@ -497,9 +572,13 @@ impl SearchIndex {
         let scan = scan_project_files(paths)?;
         let scan_ms = scan_start.elapsed().as_millis();
 
-        let (fields, mut state) = {
+        let (fields, refs_fields, mut state) = {
             let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
-            (inner.fields.clone(), inner.state.clone())
+            (
+                inner.fields.clone(),
+                inner.refs_fields.clone(),
+                inner.state.clone(),
+            )
         };
 
         let scripts = build_script_guid_map(&scan, &state.scripts)?;
@@ -512,6 +591,7 @@ impl SearchIndex {
 
             if mode == ReindexMode::Full {
                 inner.writer.delete_all_documents()?;
+                inner.refs_writer.delete_all_documents()?;
                 state.files.clear();
                 state.scripts.clear();
             }
@@ -526,6 +606,9 @@ impl SearchIndex {
                 inner
                     .writer
                     .delete_term(Term::from_field_text(fields.id, &removed));
+                inner
+                    .refs_writer
+                    .delete_term(Term::from_field_text(refs_fields.source_id, &removed));
                 state.files.remove(&removed);
                 removed_docs += 1;
             }
@@ -542,11 +625,20 @@ impl SearchIndex {
                 inner
                     .writer
                     .add_document(build_doc(&fields, file, &scripts)?)?;
+
+                inner
+                    .refs_writer
+                    .delete_term(Term::from_field_text(refs_fields.source_id, rel_path));
+                if let Some(ref_doc) = build_refs_doc(&refs_fields, file)? {
+                    inner.refs_writer.add_document(ref_doc)?;
+                }
+
                 state.files.insert(rel_path.clone(), file.fingerprint);
                 updated_docs += 1;
             }
 
             inner.writer.commit()?;
+            inner.refs_writer.commit()?;
             state.scripts = scripts;
             inner.state = state;
             store_state(&paths.state_path, &inner.state)?;
@@ -556,6 +648,11 @@ impl SearchIndex {
             .read()
             .map_err(|_| anyhow!("poisoned lock"))?
             .reader
+            .reload()?;
+        self.inner
+            .read()
+            .map_err(|_| anyhow!("poisoned lock"))?
+            .refs_reader
             .reload()?;
 
         {
@@ -880,13 +977,69 @@ impl SearchIndex {
         })
     }
 
+    pub fn references(&self, guid: &str, file_id: Option<u64>, limit: usize) -> Result<ReferencesResponse> {
+        let start = Instant::now();
+        let guid = guid.trim().to_lowercase();
+        if guid.is_empty() {
+            return Ok(ReferencesResponse {
+                guid: String::new(),
+                file_id,
+                took_ms: 0,
+                total_hits: 0,
+                hits: Vec::new(),
+            });
+        }
+
+        let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
+        let searcher = inner.refs_reader.searcher();
+
+        let (field, term_text) = if let Some(file_id) = file_id {
+            (inner.refs_fields.ref_guid_fileid, format!("{guid}:{file_id}"))
+        } else {
+            (inner.refs_fields.ref_guid, guid.clone())
+        };
+
+        let term = Term::from_field_text(field, &term_text);
+        let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit.clamp(1, 500)))?;
+
+        let mut hits = Vec::with_capacity(top_docs.len());
+        for (_score, address) in top_docs {
+            let retrieved: TantivyDocument = searcher.doc(address)?;
+            let source_path = retrieved
+                .get_first(inner.refs_fields.source_path)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let source_kind = retrieved
+                .get_first(inner.refs_fields.source_kind)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            hits.push(ReferenceHit {
+                source_path,
+                source_kind,
+            });
+        }
+
+        Ok(ReferencesResponse {
+            guid,
+            file_id,
+            took_ms: start.elapsed().as_millis(),
+            total_hits: hits.len(),
+            hits,
+        })
+    }
+
     fn refresh_status(&self) -> Result<()> {
         let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
         let searcher = inner.reader.searcher();
+        let refs_searcher = inner.refs_reader.searcher();
 
         let mut status = inner.status.clone();
         status.indexed_docs = searcher.num_docs();
         status.indexed_scripts = inner.state.scripts.len() as u64;
+        status.indexed_ref_sources = refs_searcher.num_docs();
 
         drop(inner);
         self.inner
@@ -1065,6 +1218,26 @@ fn build_fields(schema: &Schema) -> SearchFields {
         kind: schema.get_field("kind").expect("kind field"),
         kind_terms: schema.get_field("kind_terms").expect("kind_terms field"),
         content_terms: schema.get_field("content_terms").expect("content_terms field"),
+    }
+}
+
+fn build_refs_schema() -> Schema {
+    let mut builder = Schema::builder();
+    builder.add_text_field("source_id", STRING | STORED);
+    builder.add_text_field("source_path", STORED);
+    builder.add_text_field("source_kind", STRING | STORED);
+    builder.add_text_field("ref_guid", STRING);
+    builder.add_text_field("ref_guid_fileid", STRING);
+    builder.build()
+}
+
+fn build_refs_fields(schema: &Schema) -> ReferenceFields {
+    ReferenceFields {
+        source_id: schema.get_field("source_id").expect("source_id"),
+        source_path: schema.get_field("source_path").expect("source_path"),
+        source_kind: schema.get_field("source_kind").expect("source_kind"),
+        ref_guid: schema.get_field("ref_guid").expect("ref_guid"),
+        ref_guid_fileid: schema.get_field("ref_guid_fileid").expect("ref_guid_fileid"),
     }
 }
 
@@ -1466,6 +1639,106 @@ fn build_doc(
     }
 
     Ok(document)
+}
+
+#[derive(Debug, Default)]
+struct ExtractedReferences {
+    guids: Vec<String>,
+    guid_fileids: Vec<String>,
+}
+
+fn build_refs_doc(fields: &ReferenceFields, file: &ScannedFile) -> Result<Option<TantivyDocument>> {
+    if !is_probably_unity_yaml(&file.abs_path)? {
+        return Ok(None);
+    }
+    let text = read_text_limited(&file.abs_path, 2 * 1024 * 1024)?;
+    let Some(text) = text else {
+        return Ok(None);
+    };
+    if !is_probably_unity_yaml_text(&text) {
+        return Ok(None);
+    }
+
+    let extracted = extract_unity_yaml_references(&text);
+    if extracted.guids.is_empty() && extracted.guid_fileids.is_empty() {
+        return Ok(None);
+    }
+
+    let mut doc = TantivyDocument::default();
+    doc.add_text(fields.source_id, file.rel_path.clone());
+    doc.add_text(fields.source_path, file.rel_path.clone());
+    doc.add_text(fields.source_kind, file.kind.clone());
+
+    for guid in extracted.guids {
+        doc.add_text(fields.ref_guid, guid);
+    }
+    for key in extracted.guid_fileids {
+        doc.add_text(fields.ref_guid_fileid, key);
+    }
+
+    Ok(Some(doc))
+}
+
+fn extract_unity_yaml_references(text: &str) -> ExtractedReferences {
+    static PPTR_GUID_FIRST: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+        Regex::new(r"\{[^}]*\bguid:\s*([0-9a-fA-F]{32})\b[^}]*\bfileID:\s*([0-9]+)\b[^}]*\}")
+            .expect("pptr guid-first regex")
+    });
+    static PPTR_FILEID_FIRST: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+        Regex::new(r"\{[^}]*\bfileID:\s*([0-9]+)\b[^}]*\bguid:\s*([0-9a-fA-F]{32})\b[^}]*\}")
+            .expect("pptr fileID-first regex")
+    });
+    static GUID_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+        Regex::new(r"\bguid:\s*([0-9a-fA-F]{32})\b").expect("guid regex")
+    });
+
+    let mut guids = std::collections::BTreeSet::<String>::new();
+    let mut guid_fileids = std::collections::BTreeSet::<String>::new();
+
+    for cap in PPTR_GUID_FIRST.captures_iter(text).take(20_000) {
+        let Some(guid) = cap.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let Some(file_id) = cap.get(2).map(|m| m.as_str()) else {
+            continue;
+        };
+        let guid = guid.to_lowercase();
+        guids.insert(guid.clone());
+        guid_fileids.insert(format!("{guid}:{}", file_id));
+        if guids.len() >= 50_000 {
+            break;
+        }
+    }
+
+    for cap in PPTR_FILEID_FIRST.captures_iter(text).take(20_000) {
+        let Some(file_id) = cap.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let Some(guid) = cap.get(2).map(|m| m.as_str()) else {
+            continue;
+        };
+        let guid = guid.to_lowercase();
+        guids.insert(guid.clone());
+        guid_fileids.insert(format!("{guid}:{}", file_id));
+        if guids.len() >= 50_000 {
+            break;
+        }
+    }
+
+    for cap in GUID_RE.captures_iter(text).take(50_000) {
+        let Some(guid) = cap.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        guids.insert(guid.to_lowercase());
+        if guids.len() >= 50_000 {
+            break;
+        }
+    }
+
+    ExtractedReferences {
+        guids: guids.into_iter().collect(),
+        guid_fileids: guid_fileids.into_iter().collect(),
+    }
 }
 
 #[derive(Debug, Default)]

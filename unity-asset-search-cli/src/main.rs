@@ -22,6 +22,15 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    References {
+        guid: String,
+
+        #[arg(long)]
+        file_id: Option<u64>,
+
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     Suggest {
         prefix: String,
 
@@ -59,6 +68,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     match args.cmd {
         Cmd::Search { query, limit } => search(&args.base_url, &query, limit).await?,
+        Cmd::References {
+            guid,
+            file_id,
+            limit,
+        } => references(&args.base_url, &guid, file_id, limit).await?,
         Cmd::Suggest { prefix, limit } => suggest(&args.base_url, &prefix, limit).await?,
         Cmd::Bench {
             query,
@@ -116,6 +130,29 @@ async fn suggest(base_url: &str, prefix: &str, limit: usize) -> Result<()> {
         .context("request /v1/suggest")?
         .error_for_status()
         .context("status /v1/suggest")?;
+
+    let json: serde_json::Value = resp.json().await?;
+    println!("{}", serde_json::to_string_pretty(&json)?);
+    Ok(())
+}
+
+async fn references(base_url: &str, guid: &str, file_id: Option<u64>, limit: usize) -> Result<()> {
+    let url = format!("{base_url}/v1/references");
+    let mut params: Vec<(String, String)> = vec![
+        ("guid".to_string(), guid.to_string()),
+        ("limit".to_string(), limit.to_string()),
+    ];
+    if let Some(file_id) = file_id {
+        params.push(("file_id".to_string(), file_id.to_string()));
+    }
+    let req = reqwest::Client::new().get(url).query(&params);
+
+    let resp = req
+        .send()
+        .await
+        .context("request /v1/references")?
+        .error_for_status()
+        .context("status /v1/references")?;
 
     let json: serde_json::Value = resp.json().await?;
     println!("{}", serde_json::to_string_pretty(&json)?);

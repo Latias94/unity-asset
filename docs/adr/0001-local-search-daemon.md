@@ -58,6 +58,7 @@ Incremental indexing is driven by fingerprints per GUID (e.g. `mtime/size/hash`)
 - Core endpoints:
   - `GET /v1/search`
   - `GET /v1/suggest`
+  - `GET /v1/references` (Find References by `{guid, fileID?}`)
   - `GET /v1/status` (index progress, versions, last update)
   - `POST /v1/reindex` (scoped reindex)
 

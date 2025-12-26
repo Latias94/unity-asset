@@ -109,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/search", get(search))
         .route("/v1/status", get(status))
         .route("/v1/suggest", get(suggest))
+        .route("/v1/references", get(references))
         .route("/v1/reindex", post(reindex))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -181,6 +182,37 @@ async fn suggest(
     let limit = q.limit.unwrap_or(10).clamp(1, 50);
     let index = state.index.clone();
     match tokio::task::spawn_blocking(move || index.suggest(&prefix, limit)).await {
+        Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
+        Ok(Err(err)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReferencesQuery {
+    guid: String,
+    file_id: Option<u64>,
+    limit: Option<usize>,
+}
+
+async fn references(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ReferencesQuery>,
+) -> impl IntoResponse {
+    let guid = q.guid.clone();
+    let file_id = q.file_id;
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let index = state.index.clone();
+
+    match tokio::task::spawn_blocking(move || index.references(&guid, file_id, limit)).await {
         Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
         Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
