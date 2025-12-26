@@ -50,6 +50,9 @@ This repository maintains runnable examples per crate (built in CI).
 
 ## unity-asset-search (experimental)
 
+- Install the tools:
+  - `cargo install unity-asset-search-daemon`
+  - `cargo install unity-asset-search-cli`
 - Start the daemon (auto reindex on first run):
   - `cargo run -p unity-asset-search-daemon -- --project-root repo-ref/BoatAttack --watch`
 - Exclude paths (recommended):

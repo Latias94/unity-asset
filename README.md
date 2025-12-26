@@ -120,6 +120,13 @@ unity-asset = "0.3.0"
 cargo install unity-asset-cli
 ```
 
+To install the local search daemon (used by UnityHero) and its companion CLI:
+
+```bash
+cargo install unity-asset-search-daemon
+cargo install unity-asset-search-cli
+```
+
 For maintainers: the tag-driven publish/release process is documented in `docs/RELEASING.md`.
 
 To build from source:

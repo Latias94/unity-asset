@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2025-12-26
 
 ### Highlights
+- Publish the search stack to crates.io:
+  - `unity-asset-search-core` and `unity-asset-search-index` (reusable library crates)
+  - `unity-asset-search-daemon` and `unity-asset-search-cli` (tools)
 - Multi-platform release assets for UnityHero packaging (scheme B):
   - `unity-asset-search-daemon` (embedded into UnityHero `Tools/<platform>/`)
   - `unity-asset-search-cli` (optional; debugging/ops utility)
