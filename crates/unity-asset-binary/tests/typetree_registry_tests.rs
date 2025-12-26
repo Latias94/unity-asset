@@ -5,8 +5,7 @@ use unity_asset_binary::typetree::InMemoryTypeTreeRegistry;
 
 #[test]
 fn registry_can_restore_typetree_parsing_when_stripped() {
-    let path =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/banner_1");
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/banner_1");
     let mut bundle = match load_unity_file(&path).expect("load sample bundle") {
         UnityFile::AssetBundle(b) => b,
         other => panic!("expected AssetBundle, got {:?}", other.kind()),

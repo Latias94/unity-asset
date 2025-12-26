@@ -2,8 +2,8 @@ use unity_asset_binary::bundle::{BundleLoadOptions, BundleParser};
 
 #[test]
 fn unityfs_bundle_fast_mode_decompresses_on_demand() {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../tests/samples/char_118_yuki.ab");
+    let path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/char_118_yuki.ab");
     let bytes = std::fs::read(&path).expect("read sample bundle");
 
     let bundle = BundleParser::from_bytes_with_options(bytes, BundleLoadOptions::fast())

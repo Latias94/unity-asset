@@ -81,7 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `unity-asset-core`: Core data structures and traits
 - `unity-asset-yaml`: YAML format parsing and serialization
 - `unity-asset-binary`: Binary asset parsing (AssetBundle, SerializedFile)
-- `unity-asset-lib`: Main library crate
+- `unity-asset`: Main library crate
 - `unity-asset-cli`: Command-line tools
 
 ### Known Limitations

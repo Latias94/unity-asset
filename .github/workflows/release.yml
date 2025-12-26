@@ -38,12 +38,12 @@ jobs:
               raise SystemExit(f"Invalid tag version: {version}")
 
           manifests = [
-              "unity-asset-core/Cargo.toml",
-              "unity-asset-yaml/Cargo.toml",
-              "unity-asset-binary/Cargo.toml",
-              "unity-asset-decode/Cargo.toml",
-              "unity-asset-lib/Cargo.toml",
-              "unity-asset-cli/Cargo.toml",
+              "crates/unity-asset-core/Cargo.toml",
+              "crates/unity-asset-yaml/Cargo.toml",
+              "crates/unity-asset-binary/Cargo.toml",
+              "crates/unity-asset-decode/Cargo.toml",
+              "crates/unity-asset/Cargo.toml",
+              "apps/unity-asset-cli/Cargo.toml",
           ]
 
           def load(path: str) -> dict:

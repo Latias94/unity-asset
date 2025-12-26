@@ -1,15 +1,15 @@
 [workspace]
 members = [
-    "unity-asset-core",
-    "unity-asset-yaml",
-    "unity-asset-binary",
-    "unity-asset-decode",
-    "unity-asset-lib",
-    "unity-asset-cli",
-    "unity-asset-search-core",
-    "unity-asset-search-index",
-    "unity-asset-search-daemon",
-    "unity-asset-search-cli",
+    "crates/unity-asset-core",
+    "crates/unity-asset-yaml",
+    "crates/unity-asset-binary",
+    "crates/unity-asset-decode",
+    "crates/unity-asset",
+    "crates/unity-asset-search-core",
+    "crates/unity-asset-search-index",
+    "apps/unity-asset-cli",
+    "apps/unity-asset-search-daemon",
+    "apps/unity-asset-search-cli",
 ]
 resolver = "2"
 
@@ -67,8 +67,8 @@ notify = "8"
 
 # This is now a pure workspace - no package definition
 # Individual crates are in their respective directories:
-# - unity-asset-lib/     -> Main library crate (published as "unity-asset")
-# - unity-asset-cli/     -> CLI tools (published as "unity-asset-cli")
-# - unity-asset-core/    -> Core data structures
-# - unity-asset-yaml/    -> YAML format support
-# - unity-asset-binary/  -> Binary format support
+# - crates/unity-asset/     -> Main library crate (published as "unity-asset")
+# - apps/unity-asset-cli/   -> CLI tools (published as "unity-asset-cli")
+# - crates/unity-asset-core -> Core data structures
+# - crates/unity-asset-yaml -> YAML format support
+# - crates/unity-asset-binary -> Binary format support

@@ -19,7 +19,7 @@ tower-http.workspace = true
 rand.workspace = true
 hex.workspace = true
 notify.workspace = true
-unity-asset-search-index = { path = "../unity-asset-search-index" }
+unity-asset-search-index = { path = "../../crates/unity-asset-search-index" }
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

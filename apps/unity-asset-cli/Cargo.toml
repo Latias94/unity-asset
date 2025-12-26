@@ -31,9 +31,9 @@ required-features = ["async"]
 
 [dependencies]
 # Core library
-unity-asset = { path = "../unity-asset-lib", version = "0.2.0" }
-unity-asset-binary = { path = "../unity-asset-binary", version = "0.2.0" }
-unity-asset-decode = { path = "../unity-asset-decode", version = "0.2.0", features = ["audio", "sprite", "texture-advanced"], optional = true }
+unity-asset = { path = "../../crates/unity-asset", version = "0.2.0" }
+unity-asset-binary = { path = "../../crates/unity-asset-binary", version = "0.2.0" }
+unity-asset-decode = { path = "../../crates/unity-asset-decode", version = "0.2.0", features = ["audio", "sprite", "texture-advanced"], optional = true }
 
 # CLI dependencies
 clap = { workspace = true }

@@ -46,7 +46,8 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
     use unity_asset_decode::audio::AudioClipConverter;
 
     let mut env = Environment::new();
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/char_118_yuki.ab");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
     env.load_file(&path).unwrap();
     assert!(!env.bundles().is_empty());
 
@@ -194,7 +195,7 @@ fn environment_typetree_registry_json_restores_parsing_for_stripped_assets() {
     }
 
     let mut env = Environment::new();
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/banner_1");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1");
     env.load_file(&path).unwrap();
 
     let source = BinarySource::path(&path);
@@ -257,7 +258,8 @@ fn environment_typetree_registry_json_restores_parsing_for_stripped_assets() {
 #[test]
 fn environment_assetbundle_container_raw_matches_typetree_when_stripped() {
     let mut env = Environment::new();
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/xinzexi_2_n_tex");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/xinzexi_2_n_tex");
     env.load_file(&path).unwrap();
 
     let baseline = env.bundle_container_entries(&path).unwrap();
@@ -404,7 +406,7 @@ fn environment_can_parse_external_yaml_prefab_if_provided() {
 fn environment_stream_data_falls_back_to_filesystem_for_bundles() {
     let temp = tempfile::tempdir().unwrap();
     let bundle_src =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/char_118_yuki.ab");
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
     let bundle_path = temp.path().join("char_118_yuki.ab");
     link_or_copy_file(&bundle_src, &bundle_path).unwrap();
 
@@ -506,7 +508,7 @@ fn build_uncompressed_webfile(entries: Vec<(String, Vec<u8>)>) -> Vec<u8> {
 #[test]
 fn environment_loads_extless_webfile_entries_and_reads_resource_bytes() {
     let sample_bundle_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples/char_118_yuki.ab");
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
     let bundle_bytes = fs::read(&sample_bundle_path).unwrap();
 
     let cab = "8579bc75d50073df38987733a7cb3193";

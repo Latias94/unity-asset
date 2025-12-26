@@ -108,7 +108,7 @@ enum GoldenExpect {
 }
 
 fn golden_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/golden/golden_v1.json")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/golden_v1.json")
 }
 
 fn load_golden() -> GoldenFile {
@@ -120,7 +120,7 @@ fn load_golden() -> GoldenFile {
 
 fn workspace_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../")
+        .join("../../")
         .join(rel)
 }
 
@@ -186,7 +186,7 @@ fn scan_pptrs(env: &Environment, key: &BinaryObjectKey) -> (Vec<i64>, Vec<[i64; 
 fn golden_regression_smoke() {
     let golden = load_golden();
     let mut env = Environment::new();
-    env.load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/samples"))
+    env.load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples"))
         .expect("load samples");
 
     for case in golden.cases {

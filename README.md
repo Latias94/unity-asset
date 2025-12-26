@@ -22,14 +22,17 @@ The project uses a workspace structure to organize different parsing capabilitie
 
 ```text
 unity-asset/
-├── unity-asset-core/      # Core data structures and traits
-├── unity-asset-yaml/      # YAML file parsing (stable)
-├── unity-asset-binary/    # Binary asset parsing (advanced, WIP)
-├── unity-asset-decode/    # Optional decode/export helpers (Texture/Audio/Sprite/Mesh)
-├── unity-asset-lib/       # Main library crate (published as `unity-asset`)
-├── unity-asset-cli/       # CLI tools
-│   ├── main.rs           # Synchronous CLI tool
-│   └── main_async.rs     # Asynchronous CLI tool (--features async)
+├── crates/                # Reusable Rust crates (libraries)
+│   ├── unity-asset-core/  # Core data structures and traits
+│   ├── unity-asset-yaml/  # YAML file parsing (stable)
+│   ├── unity-asset-binary/ # Binary asset parsing (advanced, WIP)
+│   ├── unity-asset-decode/ # Optional decode/export helpers (Texture/Audio/Sprite/Mesh)
+│   ├── unity-asset/       # Main library crate (published as `unity-asset`)
+│   └── unity-asset-search-*/ # Search indexing core (daemon uses these)
+├── apps/                  # End-user applications (CLI/daemon)
+│   ├── unity-asset-cli/   # CLI tools (sync + async)
+│   ├── unity-asset-search-daemon/ # Local search server (HTTP)
+│   └── unity-asset-search-cli/    # Client CLI for the daemon
 └── tests/                # Integration tests and sample files
 ```
 
@@ -41,6 +44,8 @@ unity-asset/
 - `unity-asset-yaml` (YAML): YAML-specific parsing/serialization; also re-exported via `unity-asset`.
 - `unity-asset-core` (core): shared data structures, errors, and dynamic `UnityValue` types.
 - `unity-asset-cli` (CLI): command-line tools (not required for library integration).
+- `unity-asset-search-daemon` (app): local HTTP search daemon (indexing + query).
+- `unity-asset-search-cli` (app): CLI client for the search daemon.
 
 Examples are maintained per-crate and are built in CI. For instance:
 `cargo run -p unity-asset --example env_load_and_list -- tests/samples`
@@ -325,7 +330,7 @@ This project is organized as a Rust workspace with separate crates for different
 - **`unity-asset-yaml`**: YAML format parsing
 - **`unity-asset-binary`**: Binary format parsing (AssetBundle, SerializedFile)
 - **`unity-asset-decode`**: Optional decode/export helpers (Texture/Audio/Sprite/Mesh)
-- **`unity-asset-lib`**: Main library crate (published as `unity-asset`)
+- **`unity-asset`**: Main library crate (published as `unity-asset`)
 - **`unity-asset-cli`**: Command-line tools (published as `unity-asset-cli`)
 
 ## Acknowledgments

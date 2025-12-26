@@ -11,12 +11,12 @@ This repository uses a tag-driven release workflow.
 
 1. Decide the version (e.g. `0.2.1`).
 2. Update versions in all workspace crates:
-   - `unity-asset-core/Cargo.toml`
-   - `unity-asset-yaml/Cargo.toml`
-   - `unity-asset-binary/Cargo.toml`
-   - `unity-asset-decode/Cargo.toml`
-   - `unity-asset-lib/Cargo.toml` (published as `unity-asset`)
-   - `unity-asset-cli/Cargo.toml`
+   - `crates/unity-asset-core/Cargo.toml`
+   - `crates/unity-asset-yaml/Cargo.toml`
+   - `crates/unity-asset-binary/Cargo.toml`
+   - `crates/unity-asset-decode/Cargo.toml`
+   - `crates/unity-asset/Cargo.toml` (published as `unity-asset`)
+   - `apps/unity-asset-cli/Cargo.toml`
 3. Ensure path dependency versions match the same version (the release workflow validates this).
 4. Update `CHANGELOG.md`.
 5. Run locally:
@@ -42,4 +42,3 @@ On tag push (`vMAJOR.MINOR.PATCH`), GitHub Actions:
    5) `unity-asset`
    6) `unity-asset-cli`
 4. Creates a GitHub Release using release notes extracted from `CHANGELOG.md`.
-
