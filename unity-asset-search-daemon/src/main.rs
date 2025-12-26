@@ -438,7 +438,7 @@ async fn watch_and_reindex(
                 full_scan_threshold
             );
             let _ = state.index.note_fallback("watch_full_scan_threshold");
-            if let Err(err) = run_reindex(state.clone(), false).await {
+            if let Err(err) = run_reindex_sharded_full_scan(state.clone()).await {
                 eprintln!("reindex error (full scan threshold): {err}");
             }
             continue;
@@ -464,10 +464,30 @@ async fn reconcile_loop(state: Arc<AppState>, interval: Duration) {
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
-        if let Err(err) = run_reindex(state.clone(), false).await {
+        if let Err(err) = run_reindex_sharded_full_scan(state.clone()).await {
             eprintln!("reconcile reindex error: {err}");
         }
     }
+}
+
+async fn run_reindex_sharded_full_scan(state: Arc<AppState>) -> anyhow::Result<()> {
+    let _guard = state.reindex_lock.lock().await;
+    let index = state.index.clone();
+    let paths = state.paths.clone();
+
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let scan_roots = paths.scan_roots.clone();
+        for root in &scan_roots {
+            index.reindex_changed_paths(&paths, &[root.clone()])?;
+        }
+        index.note_reindex_summary(
+            "sharded_full_scan_incremental",
+            Some(scan_roots.len().try_into().unwrap_or(u64::MAX)),
+        )?;
+        Ok(())
+    })
+    .await??;
+    Ok(())
 }
 
 async fn run_reindex(state: Arc<AppState>, full: bool) -> anyhow::Result<()> {

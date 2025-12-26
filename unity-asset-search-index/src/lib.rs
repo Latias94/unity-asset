@@ -495,6 +495,13 @@ impl SearchIndex {
         Ok(())
     }
 
+    pub fn note_reindex_summary(&self, kind: &str, changed_paths: Option<u64>) -> Result<()> {
+        let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
+        inner.status.last_reindex_kind = Some(kind.to_string());
+        inner.status.last_changed_paths = changed_paths;
+        Ok(())
+    }
+
     fn yaml_enrich_info_for_rel_path(
         &self,
         project_root: &Path,
