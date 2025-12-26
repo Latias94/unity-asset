@@ -45,6 +45,12 @@ struct Args {
 
     #[arg(long, default_value_t = 1500)]
     watch_debounce_ms: u64,
+
+    /// When a watcher burst reports too many distinct paths, fall back to a full incremental scan.
+    ///
+    /// This is primarily to handle VCS operations like `git checkout` that can touch thousands of files.
+    #[arg(long, default_value_t = 5000)]
+    watch_full_scan_threshold: usize,
 }
 
 #[derive(Clone)]
@@ -98,8 +104,9 @@ async fn main() -> anyhow::Result<()> {
     if args.watch {
         let state = Arc::new(state.clone());
         let debounce = Duration::from_millis(args.watch_debounce_ms.max(100));
+        let full_scan_threshold = args.watch_full_scan_threshold;
         tokio::spawn(async move {
-            if let Err(err) = watch_and_reindex(state, debounce).await {
+            if let Err(err) = watch_and_reindex(state, debounce, full_scan_threshold).await {
                 eprintln!("watch error: {err}");
             }
         });
@@ -317,7 +324,11 @@ fn persist_token(index_dir: &std::path::Path, token: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::Result<()> {
+async fn watch_and_reindex(
+    state: Arc<AppState>,
+    debounce: Duration,
+    full_scan_threshold: usize,
+) -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WatchMsg>();
 
     let scan_roots = state.paths.scan_roots.clone();
@@ -337,10 +348,9 @@ async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::
                 if path.starts_with(&index_root) {
                     continue;
                 }
-                if path
-                    .file_name()
-                    .is_some_and(|n| n == ".gitignore" || n == ".ignore" || n == ".unity-asset-search-ignore")
-                {
+                if path.file_name().is_some_and(|n| {
+                    n == ".gitignore" || n == ".ignore" || n == ".unity-asset-search-ignore"
+                }) {
                     force_full = true;
                 }
                 if path.exists() && path.is_dir() {
@@ -406,9 +416,13 @@ async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::
         }
 
         let mut changed_paths: Vec<PathBuf> = pending.into_iter().collect();
-        let has_file_like = changed_paths
-            .iter()
-            .any(|p| !p.exists() || p.is_file());
+        if full_scan_threshold > 0 && changed_paths.len() >= full_scan_threshold {
+            if let Err(err) = run_reindex(state.clone(), false).await {
+                eprintln!("reindex error (full scan threshold): {err}");
+            }
+            continue;
+        }
+        let has_file_like = changed_paths.iter().any(|p| !p.exists() || p.is_file());
         if has_file_like {
             changed_paths.retain(|p| !(p.exists() && p.is_dir()));
         } else {
