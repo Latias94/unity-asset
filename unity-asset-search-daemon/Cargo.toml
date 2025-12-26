@@ -1,0 +1,21 @@
+[package]
+name = "unity-asset-search-daemon"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tower-http.workspace = true
+rand.workspace = true
+hex.workspace = true
+unity-asset-search-index = { path = "../unity-asset-search-index" }
