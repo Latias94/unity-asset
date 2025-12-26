@@ -94,11 +94,7 @@ async fn main() -> Result<()> {
 
 async fn health(base_url: &str) -> Result<()> {
     let url = format!("{base_url}/v1/health");
-    let json = fetch_json(
-        reqwest::Client::new().get(url),
-        "GET /v1/health",
-    )
-    .await?;
+    let json = fetch_json(reqwest::Client::new().get(url), "GET /v1/health").await?;
     println!("{}", serde_json::to_string_pretty(&json)?);
     Ok(())
 }

@@ -243,7 +243,11 @@ pub fn highlight_html(text: &str, query_tokens: &[String]) -> Option<String> {
     if ranges.is_empty() {
         return None;
     }
-    if !text.is_ascii() || ranges.iter().any(|r| !text.is_char_boundary(r.start) || !text.is_char_boundary(r.end)) {
+    if !text.is_ascii()
+        || ranges
+            .iter()
+            .any(|r| !text.is_char_boundary(r.start) || !text.is_char_boundary(r.end))
+    {
         return None;
     }
 
