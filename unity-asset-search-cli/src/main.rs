@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use reqwest::RequestBuilder;
 
 #[derive(Debug, Parser)]
 #[command(name = "unity-asset-search")]
@@ -93,62 +94,44 @@ async fn main() -> Result<()> {
 
 async fn health(base_url: &str) -> Result<()> {
     let url = format!("{base_url}/v1/health");
-    let resp = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await
-        .context("request /v1/health")?
-        .error_for_status()
-        .context("status /v1/health")?;
-
-    let json: serde_json::Value = resp.json().await?;
+    let json = fetch_json(
+        reqwest::Client::new().get(url),
+        "GET /v1/health",
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&json)?);
     Ok(())
 }
 
 async fn search(base_url: &str, query: &str, limit: usize) -> Result<()> {
     let url = format!("{base_url}/v1/search");
-    let resp = reqwest::Client::new()
-        .get(url)
-        .query(&[("q", query), ("limit", &limit.to_string())])
-        .send()
-        .await
-        .context("request /v1/search")?
-        .error_for_status()
-        .context("status /v1/search")?;
-
-    let json: serde_json::Value = resp.json().await?;
+    let json = fetch_json(
+        reqwest::Client::new()
+            .get(url)
+            .query(&[("q", query), ("limit", &limit.to_string())]),
+        "GET /v1/search",
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&json)?);
     Ok(())
 }
 
 async fn status(base_url: &str) -> Result<()> {
     let url = format!("{base_url}/v1/status");
-    let resp = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await
-        .context("request /v1/status")?
-        .error_for_status()
-        .context("status /v1/status")?;
-
-    let json: serde_json::Value = resp.json().await?;
+    let json = fetch_json(reqwest::Client::new().get(url), "GET /v1/status").await?;
     println!("{}", serde_json::to_string_pretty(&json)?);
     Ok(())
 }
 
 async fn suggest(base_url: &str, prefix: &str, limit: usize) -> Result<()> {
     let url = format!("{base_url}/v1/suggest");
-    let resp = reqwest::Client::new()
-        .get(url)
-        .query(&[("prefix", prefix), ("limit", &limit.to_string())])
-        .send()
-        .await
-        .context("request /v1/suggest")?
-        .error_for_status()
-        .context("status /v1/suggest")?;
-
-    let json: serde_json::Value = resp.json().await?;
+    let json = fetch_json(
+        reqwest::Client::new()
+            .get(url)
+            .query(&[("prefix", prefix), ("limit", &limit.to_string())]),
+        "GET /v1/suggest",
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&json)?);
     Ok(())
 }
@@ -162,16 +145,11 @@ async fn references(base_url: &str, guid: &str, file_id: Option<u64>, limit: usi
     if let Some(file_id) = file_id {
         params.push(("file_id".to_string(), file_id.to_string()));
     }
-    let req = reqwest::Client::new().get(url).query(&params);
-
-    let resp = req
-        .send()
-        .await
-        .context("request /v1/references")?
-        .error_for_status()
-        .context("status /v1/references")?;
-
-    let json: serde_json::Value = resp.json().await?;
+    let json = fetch_json(
+        reqwest::Client::new().get(url).query(&params),
+        "GET /v1/references",
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&json)?);
     Ok(())
 }
@@ -234,16 +212,13 @@ async fn search_once(
     limit: usize,
 ) -> Result<u128> {
     let url = format!("{base_url}/v1/search");
-    let resp = client
-        .get(url)
-        .query(&[("q", query), ("limit", &limit.to_string())])
-        .send()
-        .await
-        .with_context(|| format!("request /v1/search (q={query})"))?
-        .error_for_status()
-        .with_context(|| format!("status /v1/search (q={query})"))?;
-
-    let json: serde_json::Value = resp.json().await?;
+    let json = fetch_json(
+        client
+            .get(url)
+            .query(&[("q", query), ("limit", &limit.to_string())]),
+        &format!("GET /v1/search (q={query})"),
+    )
+    .await?;
     let took_ms = json
         .get("took_ms")
         .and_then(|v| v.as_u64())
@@ -288,13 +263,45 @@ async fn reindex(base_url: &str, token: Option<&str>, full: bool, paths: &[Strin
         req = req.bearer_auth(token);
     }
 
-    let resp = req.send().await.context("request /v1/reindex")?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("reindex failed: {status}: {body}");
-    }
-    let json: serde_json::Value = resp.json().await?;
+    let json = fetch_json(req, "POST /v1/reindex").await?;
     println!("{}", serde_json::to_string_pretty(&json)?);
     Ok(())
+}
+
+async fn fetch_json(req: RequestBuilder, ctx: &str) -> Result<serde_json::Value> {
+    let resp = req.send().await.with_context(|| format!("request {ctx}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .with_context(|| format!("read body {ctx}"))?;
+
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&body);
+    if !status.is_success() {
+        if let Ok(json) = &parsed {
+            if let Some(msg) = json.get("error").and_then(|v| v.as_str()) {
+                anyhow::bail!("{ctx} failed: {status}: {msg}");
+            }
+        }
+        anyhow::bail!("{ctx} failed: {status}: {body}");
+    }
+
+    parsed.with_context(|| format!("parse json {ctx}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percentile;
+
+    #[test]
+    fn percentile_handles_empty() {
+        assert_eq!(percentile(&[], 0.50), 0);
+    }
+
+    #[test]
+    fn percentile_picks_endpoints() {
+        let sorted = [10u128, 20, 30, 40];
+        assert_eq!(percentile(&sorted, 0.0), 10);
+        assert_eq!(percentile(&sorted, 1.0), 40);
+    }
 }
