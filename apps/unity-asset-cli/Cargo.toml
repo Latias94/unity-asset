@@ -64,3 +64,6 @@ no-default-features = true
 all-features = false
 features = []
 rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.dist]
+dist = false
