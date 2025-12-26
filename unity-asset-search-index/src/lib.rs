@@ -1042,6 +1042,12 @@ impl SearchIndex {
             });
         }
 
+        hits.sort_by(|a, b| (a.source_path.as_str(), a.source_kind.as_str()).cmp(&(
+            b.source_path.as_str(),
+            b.source_kind.as_str(),
+        )));
+        hits.dedup_by(|a, b| a.source_path == b.source_path);
+
         Ok(ReferencesResponse {
             guid,
             file_id,
@@ -1066,14 +1072,17 @@ impl SearchIndex {
                 continue;
             }
             let abs = project_root.join(&hit.source_path);
-            let Ok(Some(text)) = read_text_limited(&abs, 2 * 1024 * 1024) else {
-                continue;
-            };
-            if is_probably_unity_yaml_text(&text) {
+            let is_yaml = is_probably_unity_yaml(&abs).unwrap_or(false);
+            if is_yaml {
+                let Ok(Some(text)) = read_text_limited(&abs, 2 * 1024 * 1024) else {
+                    continue;
+                };
                 hit.contexts = extract_reference_contexts_from_yaml(&text, &guid, file_id);
             } else {
                 hit.contexts = extract_reference_contexts_from_binary(&abs, &guid, file_id);
             }
+            hit.contexts = group_reference_contexts(std::mem::take(&mut hit.contexts));
+            hit.contexts.truncate(10);
         }
 
         resp.took_ms = resp.took_ms.saturating_add(0);
@@ -2077,10 +2086,97 @@ fn extract_reference_contexts_from_yaml(
         }
     }
 
-    out.sort_by(|a, b| (a.doc_file_id, a.field_hint.as_deref()).cmp(&(b.doc_file_id, b.field_hint.as_deref())));
-    out.dedup_by(|a, b| a.doc_file_id == b.doc_file_id && a.field_hint == b.field_hint);
-    out.truncate(10);
+    out.sort_by(|a, b| {
+        (
+            a.doc_file_id.unwrap_or(0),
+            a.doc_class_id.unwrap_or(0),
+            a.hierarchy_path.as_deref().unwrap_or(""),
+            a.object_name.as_deref().unwrap_or(""),
+            a.field_hint.as_deref().unwrap_or(""),
+        )
+            .cmp(&(
+                b.doc_file_id.unwrap_or(0),
+                b.doc_class_id.unwrap_or(0),
+                b.hierarchy_path.as_deref().unwrap_or(""),
+                b.object_name.as_deref().unwrap_or(""),
+                b.field_hint.as_deref().unwrap_or(""),
+            ))
+    });
+    out.dedup_by(|a, b| {
+        a.doc_file_id == b.doc_file_id
+            && a.doc_class_id == b.doc_class_id
+            && a.object_name == b.object_name
+            && a.hierarchy_path == b.hierarchy_path
+            && a.field_hint == b.field_hint
+    });
+    out.truncate(20);
     out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ContextKey {
+    doc_file_id: Option<u64>,
+    doc_class_id: Option<u32>,
+    object_name: Option<String>,
+    hierarchy_path: Option<String>,
+}
+
+fn group_reference_contexts(contexts: Vec<ReferenceContext>) -> Vec<ReferenceContext> {
+    if contexts.is_empty() {
+        return contexts;
+    }
+
+    let mut grouped: std::collections::BTreeMap<
+        ContextKey,
+        (ReferenceContext, std::collections::BTreeSet<String>),
+    > = std::collections::BTreeMap::new();
+
+    for ctx in contexts {
+        let key = ContextKey {
+            doc_file_id: ctx.doc_file_id,
+            doc_class_id: ctx.doc_class_id,
+            object_name: ctx.object_name.clone(),
+            hierarchy_path: ctx.hierarchy_path.clone(),
+        };
+
+        let entry = grouped.entry(key).or_insert_with(|| {
+            let mut base = ctx.clone();
+            base.field_hint = None;
+            (base, std::collections::BTreeSet::new())
+        });
+
+        if let Some(hint) = ctx.field_hint {
+            if !hint.trim().is_empty() {
+                entry.1.insert(hint);
+            }
+        }
+    }
+
+    grouped
+        .into_values()
+        .map(|(mut base, hints)| {
+            let joined = join_hints(hints);
+            base.field_hint = joined;
+            base
+        })
+        .collect()
+}
+
+fn join_hints(hints: std::collections::BTreeSet<String>) -> Option<String> {
+    let mut out = String::new();
+    for hint in hints {
+        if out.is_empty() {
+            out.push_str(&hint);
+        } else {
+            if out.len() >= 120 {
+                out.push_str(", …");
+                break;
+            }
+            out.push_str(", ");
+            out.push_str(&hint);
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 fn extract_reference_contexts_from_binary(
