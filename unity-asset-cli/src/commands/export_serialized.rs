@@ -785,18 +785,15 @@ fn try_decode_export_best_effort(
     match class_id {
         class_ids::AUDIO_CLIP => {
             let converter = AudioClipConverter::new(unity_version.clone());
-            let clip = converter.from_unity_object(&obj)?;
+            let clip = converter.from_unity_object(obj)?;
 
             let mut dest = job.dest_base.clone();
             match converter.get_audio_data(&clip) {
                 Ok(audio_bytes) if !audio_bytes.is_empty() => {
                     dest.set_extension(clip.compression_format().extension());
                     if job.effective_skip_existing && dest.exists() && !job.overwrite {
-                        return Ok(Some((
-                            dest,
-                            false,
-                            std::fs::metadata(&dest).map(|m| m.len()).ok(),
-                        )));
+                        let existing_len = std::fs::metadata(&dest).map(|m| m.len()).ok();
+                        return Ok(Some((dest, false, existing_len)));
                     }
                     if let Some(parent) = dest.parent() {
                         std::fs::create_dir_all(parent)?;
@@ -816,11 +813,9 @@ fn try_decode_export_best_effort(
                             if !bytes.is_empty() {
                                 dest.set_extension(clip.compression_format().extension());
                                 if job.effective_skip_existing && dest.exists() && !job.overwrite {
-                                    return Ok(Some((
-                                        dest,
-                                        false,
-                                        std::fs::metadata(&dest).map(|m| m.len()).ok(),
-                                    )));
+                                    let existing_len =
+                                        std::fs::metadata(&dest).map(|m| m.len()).ok();
+                                    return Ok(Some((dest, false, existing_len)));
                                 }
                                 if let Some(parent) = dest.parent() {
                                     std::fs::create_dir_all(parent)?;
@@ -833,22 +828,16 @@ fn try_decode_export_best_effort(
 
                     dest.set_extension("wav");
                     if job.effective_skip_existing && dest.exists() && !job.overwrite {
-                        return Ok(Some((
-                            dest,
-                            false,
-                            std::fs::metadata(&dest).map(|m| m.len()).ok(),
-                        )));
+                        let existing_len = std::fs::metadata(&dest).map(|m| m.len()).ok();
+                        return Ok(Some((dest, false, existing_len)));
                     }
                     if let Some(parent) = dest.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
                     let audio_processor = AudioProcessor::new(unity_version);
-                    audio_processor.process_and_export(&obj, &dest)?;
-                    return Ok(Some((
-                        dest,
-                        true,
-                        std::fs::metadata(&dest).map(|m| m.len()).ok(),
-                    )));
+                    audio_processor.process_and_export(obj, &dest)?;
+                    let written_len = std::fs::metadata(&dest).map(|m| m.len()).ok();
+                    return Ok(Some((dest, true, written_len)));
                 }
             }
         }
@@ -856,18 +845,15 @@ fn try_decode_export_best_effort(
             let mut dest = job.dest_base.clone();
             dest.set_extension("png");
             if job.effective_skip_existing && dest.exists() && !job.overwrite {
-                return Ok(Some((
-                    dest,
-                    false,
-                    std::fs::metadata(&dest).map(|m| m.len()).ok(),
-                )));
+                let existing_len = std::fs::metadata(&dest).map(|m| m.len()).ok();
+                return Ok(Some((dest, false, existing_len)));
             }
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
 
             let texture_processor = TextureProcessor::new(unity_version);
-            let mut texture = texture_processor.convert_object(&obj)?;
+            let mut texture = texture_processor.convert_object(obj)?;
             if texture.image_data.is_empty() && texture.is_streamed() {
                 if let Ok(bytes) = env.read_stream_data_source(
                     &job.key.source,
@@ -885,14 +871,11 @@ fn try_decode_export_best_effort(
 
             let image = texture_processor.decode_texture(&texture)?;
             TextureExporter::export_auto(&image, &dest)?;
-            return Ok(Some((
-                dest,
-                true,
-                std::fs::metadata(&dest).map(|m| m.len()).ok(),
-            )));
+            let written_len = std::fs::metadata(&dest).map(|m| m.len()).ok();
+            return Ok(Some((dest, true, written_len)));
         }
         class_ids::TEXT_ASSET => {
-            let bytes = text_asset_bytes(&obj);
+            let bytes = text_asset_bytes(obj);
             if bytes.is_empty() {
                 return Ok(None);
             }
@@ -904,11 +887,8 @@ fn try_decode_export_best_effort(
                 "bin"
             });
             if job.effective_skip_existing && dest.exists() && !job.overwrite {
-                return Ok(Some((
-                    dest,
-                    false,
-                    std::fs::metadata(&dest).map(|m| m.len()).ok(),
-                )));
+                let existing_len = std::fs::metadata(&dest).map(|m| m.len()).ok();
+                return Ok(Some((dest, false, existing_len)));
             }
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -924,10 +904,10 @@ fn try_decode_export_best_effort(
             };
 
             let sprite_processor = SpriteProcessor::new(unity_version.clone());
-            let sprite = sprite_processor.parse_sprite(&obj)?.sprite;
+            let sprite = sprite_processor.parse_sprite(obj)?.sprite;
 
             let (file_id, texture_path_id) =
-                if let Some((file_id, path_id)) = sprite_texture_pptr(&obj) {
+                if let Some((file_id, path_id)) = sprite_texture_pptr(obj) {
                     (file_id, path_id)
                 } else if sprite.render_data.texture_path_id != 0 {
                     (0, sprite.render_data.texture_path_id)
@@ -958,11 +938,8 @@ fn try_decode_export_best_effort(
             let mut dest = job.dest_base.clone();
             dest.set_extension("png");
             if job.effective_skip_existing && dest.exists() && !job.overwrite {
-                return Ok(Some((
-                    dest,
-                    false,
-                    std::fs::metadata(&dest).map(|m| m.len()).ok(),
-                )));
+                let existing_len = std::fs::metadata(&dest).map(|m| m.len()).ok();
+                return Ok(Some((dest, false, existing_len)));
             }
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;

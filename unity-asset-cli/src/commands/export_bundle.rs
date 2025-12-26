@@ -1106,6 +1106,7 @@ enum DecodeAttempt {
 }
 
 #[cfg(feature = "decode")]
+#[allow(clippy::too_many_arguments)]
 fn try_decode_export_best_effort(
     env: &Environment,
     allocator: &PathAllocator,

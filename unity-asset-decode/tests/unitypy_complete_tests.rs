@@ -261,7 +261,7 @@ fn test_save_dict() {
                                 objects_tested += 1;
 
                                 // Get raw data (like obj.get_raw_data())
-                                let raw_data = asset.object_bytes(obj).unwrap_or_else(|_| &[]);
+                                let raw_data = asset.object_bytes(obj).unwrap_or(&[]);
 
                                 // In UnityPy: obj.read_typetree(wrap=False) returns dict
                                 // For now, we simulate this operation
@@ -929,10 +929,10 @@ fn test_object_type_identification() {
 
                                 // Try to parse the object to get more info
                                 let unity_class = unity_object.as_unity_class();
-                                if let Some(name_value) = unity_class.get("m_Name") {
-                                    if let unity_asset_core::UnityValue::String(name) = name_value {
-                                        println!("      Name: '{}'", name);
-                                    }
+                                if let Some(unity_asset_core::UnityValue::String(name)) =
+                                    unity_class.get("m_Name")
+                                {
+                                    println!("      Name: '{}'", name);
                                 }
 
                                 // Show some properties for interesting objects

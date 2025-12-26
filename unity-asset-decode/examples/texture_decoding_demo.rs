@@ -68,8 +68,8 @@ fn create_demo_texture() -> Texture2D {
 
     Texture2D {
         name: "DemoTexture".to_string(),
-        width: width as i32,
-        height: height as i32,
+        width,
+        height,
         complete_image_size: image_data.len() as i32,
         format: TextureFormat::RGBA32,
         mip_map: false,
@@ -145,8 +145,8 @@ fn create_test_texture_for_format(format: TextureFormat) -> Texture2D {
 
     Texture2D {
         name: format!("Test_{:?}", format),
-        width: width as i32,
-        height: height as i32,
+        width,
+        height,
         complete_image_size: image_data.len() as i32,
         format,
         mip_map: false,
