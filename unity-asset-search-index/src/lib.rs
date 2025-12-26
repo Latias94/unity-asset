@@ -105,9 +105,12 @@ pub struct SuggestResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
+    pub project_root: PathBuf,
     pub index_root_dir: PathBuf,
     pub index_data_dir: PathBuf,
     pub scan_roots: Vec<PathBuf>,
+    pub ignore_files_supported: Vec<String>,
+    pub project_ignore_files_present: Vec<String>,
     pub indexed_docs: u64,
     pub indexed_scripts: u64,
     pub indexed_ref_sources: u64,
@@ -377,10 +380,17 @@ impl SearchIndex {
 
         let state = load_state(&paths.state_path).unwrap_or_default();
 
+        let ignore_files_supported = supported_ignore_files();
+        let project_ignore_files_present =
+            detect_project_ignore_files(&paths.project_root, &ignore_files_supported);
+
         let status = StatusResponse {
+            project_root: paths.project_root.clone(),
             index_root_dir: paths.index_root_dir.clone(),
             index_data_dir: paths.index_data_dir.clone(),
             scan_roots: paths.scan_roots.clone(),
+            ignore_files_supported,
+            project_ignore_files_present,
             indexed_docs: 0,
             indexed_scripts: 0,
             indexed_ref_sources: 0,
@@ -1117,6 +1127,8 @@ impl SearchIndex {
         status.indexed_docs = searcher.num_docs();
         status.indexed_scripts = inner.state.scripts.len() as u64;
         status.indexed_ref_sources = refs_searcher.num_docs();
+        status.project_ignore_files_present =
+            detect_project_ignore_files(&status.project_root, &status.ignore_files_supported);
 
         drop(inner);
         self.inner
@@ -1126,6 +1138,24 @@ impl SearchIndex {
 
         Ok(())
     }
+}
+
+fn supported_ignore_files() -> Vec<String> {
+    vec![
+        ".gitignore".to_string(),
+        ".ignore".to_string(),
+        ".unity-asset-search-ignore".to_string(),
+    ]
+}
+
+fn detect_project_ignore_files(project_root: &Path, supported: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in supported {
+        if project_root.join(name).is_file() {
+            out.push(name.clone());
+        }
+    }
+    out
 }
 
 fn canonicalize_kind_filter(raw: &str) -> Option<String> {
@@ -3189,5 +3219,25 @@ Transform:
         assert_eq!(objects.len(), 2);
         assert!(objects.iter().any(|c| c.object_name.as_deref() == Some("A")));
         assert!(objects.iter().any(|c| c.object_name.as_deref() == Some("B")));
+    }
+
+    #[test]
+    fn status_reports_project_ignore_files_present() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets")).unwrap();
+        fs::write(temp.path().join(".unity-asset-search-ignore"), "Library/\n").unwrap();
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        let status = index.status().unwrap();
+
+        assert!(status
+            .ignore_files_supported
+            .iter()
+            .any(|n| n == ".unity-asset-search-ignore"));
+        assert!(status
+            .project_ignore_files_present
+            .iter()
+            .any(|n| n == ".unity-asset-search-ignore"));
     }
 }

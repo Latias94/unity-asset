@@ -53,7 +53,7 @@ This repository maintains runnable examples per crate (built in CI).
 - Start the daemon (auto reindex on first run):
   - `cargo run -p unity-asset-search-daemon -- --project-root repo-ref/BoatAttack --watch`
 - Exclude paths (recommended):
-  - Use `.gitignore` (supported), or add a `.unity-asset-search-ignore` file at project root for tool-specific ignores.
+  - Use `.gitignore` (supported) or `.ignore` (supported), or add a `.unity-asset-search-ignore` file at project root for tool-specific ignores.
 - Query from the CLI:
   - `cargo run -p unity-asset-search-cli -- health`
   - `cargo run -p unity-asset-search-cli -- search "player" --limit 20`
