@@ -131,8 +131,11 @@ async fn search(
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(20).clamp(1, 200);
     let index = state.index.clone();
+    let project_root = state.paths.project_root.clone();
     let query = q.q.clone();
-    match tokio::task::spawn_blocking(move || index.search(&query, limit)).await {
+    match tokio::task::spawn_blocking(move || index.search_enriched(&project_root, &query, limit))
+        .await
+    {
         Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
         Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,

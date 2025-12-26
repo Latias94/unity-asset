@@ -28,6 +28,10 @@ pub struct SearchHit {
     pub kind: String,
     pub score: f32,
     pub match_kind: MatchKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_hierarchy_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_script_symbols: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub highlight_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,6 +214,8 @@ struct ScriptGuidEntry {
     rel_path: String,
     fingerprint: Fingerprint,
     terms: String,
+    #[serde(default)]
+    symbols: Vec<String>,
 }
 
 impl SearchIndex {
@@ -540,6 +546,8 @@ impl SearchIndex {
                 kind,
                 score: bm25,
                 match_kind: rank.kind,
+                matched_hierarchy_paths: Vec::new(),
+                matched_script_symbols: Vec::new(),
                 highlight_path: None,
                 highlight_name: None,
                 rank_fuzzy_score: rank.fuzzy_score,
@@ -558,6 +566,135 @@ impl SearchIndex {
         });
 
         hits.truncate(limit);
+
+        let tokens = spec.tokens.clone();
+        for hit in &mut hits {
+            hit.highlight_path = highlight_html(&hit.path, &tokens);
+            hit.highlight_name = highlight_html(&hit.name, &tokens);
+        }
+
+        Ok(SearchResponse {
+            query: query.to_string(),
+            took_ms: start.elapsed().as_millis(),
+            total_hits: hits.len(),
+            hits,
+        })
+    }
+
+    pub fn search_enriched(
+        &self,
+        project_root: &Path,
+        query: &str,
+        limit: usize,
+    ) -> Result<SearchResponse> {
+        let start = Instant::now();
+        let query = query.trim();
+        let spec = parse_query(query);
+        if spec.raw.trim().is_empty() {
+            return Ok(SearchResponse {
+                query: String::new(),
+                took_ms: 0,
+                total_hits: 0,
+                hits: Vec::new(),
+            });
+        }
+
+        let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
+        let searcher = inner.reader.searcher();
+
+        let terms = to_terms(&spec.free_text);
+        let tokens: Vec<&str> = terms.split_whitespace().collect();
+        let mut base_query: Box<dyn Query> = build_retrieval_query(&inner.fields, &tokens);
+
+        if let Some(kind) = spec
+            .type_filter
+            .as_deref()
+            .and_then(canonicalize_kind_filter)
+        {
+            let term = Term::from_field_text(inner.fields.kind, &kind);
+            let term_query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+            base_query = Box::new(BooleanQuery::intersection(vec![
+                base_query,
+                Box::new(term_query),
+            ]));
+        }
+
+        let fetch_limit = if spec.type_filter.is_some() || spec.path_prefix.is_some() {
+            limit * 30
+        } else {
+            limit * 5
+        };
+
+        let top_docs = searcher.search(&base_query, &TopDocs::with_limit(fetch_limit))?;
+        drop(inner);
+
+        let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
+        let searcher = inner.reader.searcher();
+
+        let mut hits = Vec::with_capacity(top_docs.len());
+        for (bm25, address) in top_docs {
+            let retrieved: TantivyDocument = searcher.doc(address)?;
+
+            let guid = retrieved
+                .get_first(inner.fields.guid)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+
+            let path = retrieved
+                .get_first(inner.fields.path)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            let name = retrieved
+                .get_first(inner.fields.name)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            let kind = retrieved
+                .get_first(inner.fields.kind)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            let rank_query = if spec.free_text.is_empty() {
+                spec.raw.as_str()
+            } else {
+                spec.free_text.as_str()
+            };
+            let rank = rank_match(rank_query, &name, &path);
+
+            hits.push(SearchHit {
+                guid,
+                path,
+                name,
+                kind,
+                score: bm25,
+                match_kind: rank.kind,
+                matched_hierarchy_paths: Vec::new(),
+                matched_script_symbols: Vec::new(),
+                highlight_path: None,
+                highlight_name: None,
+                rank_fuzzy_score: rank.fuzzy_score,
+            });
+        }
+
+        if let Some(prefix) = spec.path_prefix.as_deref() {
+            let prefix_norm = normalize_for_match(prefix);
+            hits.retain(|h| normalize_for_match(&h.path).starts_with(&prefix_norm));
+        }
+
+        hits.sort_by(|a, b| {
+            (a.match_kind as u8, -a.rank_fuzzy_score, -a.score)
+                .partial_cmp(&(b.match_kind as u8, -b.rank_fuzzy_score, -b.score))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        hits.truncate(limit);
+
+        enrich_hits_with_context(self, project_root, &spec, &mut hits);
 
         let tokens = spec.tokens.clone();
         for hit in &mut hits {
@@ -1096,10 +1233,12 @@ fn build_script_guid_map(
             }
         }
 
-        let terms = read_text_limited(&file.abs_path, 256 * 1024)?
-            .as_deref()
-            .map(|text| script_terms_for_source(file, text))
-            .unwrap_or_else(|| script_terms_fallback(file));
+        let text = read_text_limited(&file.abs_path, 256 * 1024)?;
+        let (terms, symbols) = if let Some(text) = text.as_deref() {
+            (script_terms_for_source(file, text), extract_csharp_symbols(text))
+        } else {
+            (script_terms_fallback(file), Vec::new())
+        };
 
         out.insert(
             guid,
@@ -1107,6 +1246,7 @@ fn build_script_guid_map(
                 rel_path: file.rel_path.clone(),
                 fingerprint: file.fingerprint,
                 terms,
+                symbols,
             },
         );
     }
@@ -1135,10 +1275,12 @@ fn update_script_map_for_file(
         }
     }
 
-    let terms = read_text_limited(&file.abs_path, 256 * 1024)?
-        .as_deref()
-        .map(|text| script_terms_for_source(file, text))
-        .unwrap_or_else(|| script_terms_fallback(file));
+    let text = read_text_limited(&file.abs_path, 256 * 1024)?;
+    let (terms, symbols) = if let Some(text) = text.as_deref() {
+        (script_terms_for_source(file, text), extract_csharp_symbols(text))
+    } else {
+        (script_terms_fallback(file), Vec::new())
+    };
 
     scripts.insert(
         guid,
@@ -1146,6 +1288,7 @@ fn update_script_map_for_file(
             rel_path: file.rel_path.clone(),
             fingerprint: file.fingerprint,
             terms,
+            symbols,
         },
     );
     Ok(())
@@ -1170,11 +1313,11 @@ fn script_terms_fallback(file: &ScannedFile) -> String {
 }
 
 fn script_terms_for_source(file: &ScannedFile, text: &str) -> String {
-    let csharp = extract_csharp_terms(text);
-    if csharp.trim().is_empty() {
+    let symbols = extract_csharp_symbols(text);
+    if symbols.is_empty() {
         return script_terms_fallback(file);
     }
-    to_terms(&format!("{} {} {}", file.name, csharp, file.rel_path))
+    to_terms(&format!("{} {} {}", file.name, symbols.join(" "), file.rel_path))
 }
 
 fn build_doc(
@@ -1580,6 +1723,10 @@ fn parse_file_id(line: &str) -> Option<u64> {
 }
 
 fn extract_csharp_terms(text: &str) -> String {
+    extract_csharp_symbols(text).join(" ")
+}
+
+fn extract_csharp_symbols(text: &str) -> Vec<String> {
     static TYPE_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
         Regex::new(
             r"(?m)^\s*(?:\[[^\]]+\]\s*)*(?:public|private|protected|internal|static|sealed|partial|abstract|new|\s)+\s*(?:class|struct|interface|enum|record)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
@@ -1594,16 +1741,120 @@ fn extract_csharp_terms(text: &str) -> String {
     let mut out = Vec::new();
     for cap in TYPE_RE.captures_iter(text).take(256) {
         if let Some(name) = cap.get(1).map(|m| m.as_str()) {
-            out.push(name);
+            out.push(name.to_string());
         }
     }
     for cap in NAMESPACE_RE.captures_iter(text).take(64) {
         if let Some(ns) = cap.get(1).map(|m| m.as_str()) {
-            out.push(ns);
+            out.push(ns.to_string());
         }
     }
 
-    out.join(" ")
+    out
+}
+
+fn enrich_hits_with_context(
+    index: &SearchIndex,
+    project_root: &Path,
+    spec: &unity_asset_search_core::QuerySpec,
+    hits: &mut [SearchHit],
+) {
+    let query_terms = to_terms(&spec.free_text);
+    let query_tokens: Vec<&str> = query_terms.split_whitespace().collect();
+    if query_tokens.is_empty() {
+        return;
+    }
+
+    for hit in hits {
+        if hit.path.trim().is_empty() {
+            continue;
+        }
+        let abs = project_root.join(&hit.path);
+        let Ok(Some(text)) = read_text_limited(&abs, 2 * 1024 * 1024) else {
+            continue;
+        };
+        if !is_probably_unity_yaml_text(&text) {
+            continue;
+        }
+
+        let mut matched_paths = Vec::new();
+        for path in extract_unity_yaml_hierarchy_paths(&text) {
+            if matched_paths.len() >= 6 {
+                break;
+            }
+            if matches_any_token(&to_terms(&path), &query_tokens) {
+                matched_paths.push(path);
+            }
+        }
+        hit.matched_hierarchy_paths = matched_paths;
+
+        let mut matched_symbols = std::collections::BTreeSet::<String>::new();
+        for guid in extract_unity_yaml_script_guids(&text) {
+            if matched_symbols.len() >= 12 {
+                break;
+            }
+            let Some(symbols) = index
+                .inner
+                .read()
+                .ok()
+                .and_then(|inner| inner.state.scripts.get(&guid).map(|e| e.symbols.clone()))
+            else {
+                continue;
+            };
+
+            for sym in symbols {
+                if sym.trim().is_empty() {
+                    continue;
+                }
+                if matches_any_token(&to_terms(&sym), &query_tokens) {
+                    matched_symbols.insert(sym);
+                }
+                if matched_symbols.len() >= 12 {
+                    break;
+                }
+            }
+        }
+        hit.matched_script_symbols = matched_symbols.into_iter().take(12).collect();
+    }
+}
+
+fn matches_any_token(haystack_terms: &str, tokens: &[&str]) -> bool {
+    let haystack = haystack_terms.trim();
+    if haystack.is_empty() {
+        return false;
+    }
+    for t in tokens {
+        if t.is_empty() {
+            continue;
+        }
+        if haystack.contains(t) {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_unity_yaml_script_guids(text: &str) -> Vec<String> {
+    static SCRIPT_GUID_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+        Regex::new(r"m_Script:\s*\{[^}]*\bguid:\s*([0-9a-fA-F]{32})\b")
+            .expect("m_Script guid regex")
+    });
+
+    let mut out = std::collections::BTreeSet::new();
+    for cap in SCRIPT_GUID_RE.captures_iter(text).take(2048) {
+        let Some(guid) = cap.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        out.insert(guid.to_string());
+        if out.len() >= 256 {
+            break;
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn is_probably_unity_yaml_text(text: &str) -> bool {
+    text.contains("%YAML") || text.contains("!u!") || text.contains("\n---")
 }
 
 fn fingerprint_for_path(path: &Path) -> Result<Fingerprint> {
