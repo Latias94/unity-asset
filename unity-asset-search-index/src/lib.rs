@@ -57,6 +57,7 @@ pub struct StatusResponse {
     pub index_data_dir: PathBuf,
     pub scan_roots: Vec<PathBuf>,
     pub indexed_docs: u64,
+    pub indexed_scripts: u64,
     pub last_index_duration_ms: Option<u128>,
     pub indexing: bool,
     pub last_scan_ms: Option<u128>,
@@ -200,6 +201,15 @@ struct Fingerprint {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct IndexState {
     files: std::collections::BTreeMap<String, Fingerprint>,
+    #[serde(default)]
+    scripts: std::collections::BTreeMap<String, ScriptGuidEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScriptGuidEntry {
+    rel_path: String,
+    fingerprint: Fingerprint,
+    terms: String,
 }
 
 impl SearchIndex {
@@ -233,6 +243,7 @@ impl SearchIndex {
             index_data_dir: paths.index_data_dir.clone(),
             scan_roots: paths.scan_roots.clone(),
             indexed_docs: 0,
+            indexed_scripts: 0,
             last_index_duration_ms: None,
             indexing: false,
             last_scan_ms: None,
@@ -301,6 +312,7 @@ impl SearchIndex {
         {
             let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
             let mut state = inner.state.clone();
+            let mut scripts = state.scripts.clone();
 
             for removed in &delta.removed_rel_paths {
                 inner
@@ -309,6 +321,11 @@ impl SearchIndex {
                 if state.files.remove(removed).is_some() {
                     removed_docs += 1;
                 }
+                remove_script_entries_for_rel_path(&mut scripts, removed);
+            }
+
+            for file in &delta.files {
+                update_script_map_for_file(&mut scripts, file)?;
             }
 
             for file in &delta.files {
@@ -320,12 +337,15 @@ impl SearchIndex {
                 inner
                     .writer
                     .delete_term(Term::from_field_text(fields.id, &file.rel_path));
-                inner.writer.add_document(build_doc(&fields, file)?)?;
+                inner
+                    .writer
+                    .add_document(build_doc(&fields, file, &scripts)?)?;
                 state.files.insert(file.rel_path.clone(), file.fingerprint);
                 updated_docs += 1;
             }
 
             inner.writer.commit()?;
+            state.scripts = scripts;
             inner.state = state;
             store_state(&paths.state_path, &inner.state)?;
         }
@@ -368,6 +388,8 @@ impl SearchIndex {
             (inner.fields.clone(), inner.state.clone())
         };
 
+        let scripts = build_script_guid_map(&scan, &state.scripts)?;
+
         let mut updated_docs = 0u64;
         let mut removed_docs = 0u64;
 
@@ -377,6 +399,7 @@ impl SearchIndex {
             if mode == ReindexMode::Full {
                 inner.writer.delete_all_documents()?;
                 state.files.clear();
+                state.scripts.clear();
             }
 
             for removed in state
@@ -402,12 +425,15 @@ impl SearchIndex {
                 inner
                     .writer
                     .delete_term(Term::from_field_text(fields.id, rel_path));
-                inner.writer.add_document(build_doc(&fields, file)?)?;
+                inner
+                    .writer
+                    .add_document(build_doc(&fields, file, &scripts)?)?;
                 state.files.insert(rel_path.clone(), file.fingerprint);
                 updated_docs += 1;
             }
 
             inner.writer.commit()?;
+            state.scripts = scripts;
             inner.state = state;
             store_state(&paths.state_path, &inner.state)?;
         }
@@ -607,6 +633,7 @@ impl SearchIndex {
 
         let mut status = inner.status.clone();
         status.indexed_docs = searcher.num_docs();
+        status.indexed_scripts = inner.state.scripts.len() as u64;
 
         drop(inner);
         self.inner
@@ -1050,9 +1077,113 @@ fn asset_path_from_meta(meta_path: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-fn build_doc(fields: &SearchFields, file: &ScannedFile) -> Result<TantivyDocument> {
+fn build_script_guid_map(
+    scan: &ScanResult,
+    previous: &std::collections::BTreeMap<String, ScriptGuidEntry>,
+) -> Result<std::collections::BTreeMap<String, ScriptGuidEntry>> {
+    let mut out = std::collections::BTreeMap::new();
+
+    for file in scan.files.values().filter(|f| f.kind == "Script") {
+        let guid = read_guid_from_meta(asset_meta_path(&file.abs_path)).unwrap_or_default();
+        if guid.trim().is_empty() {
+            continue;
+        }
+
+        if let Some(prev) = previous.get(&guid) {
+            if prev.fingerprint == file.fingerprint && prev.rel_path == file.rel_path {
+                out.insert(guid, prev.clone());
+                continue;
+            }
+        }
+
+        let terms = read_text_limited(&file.abs_path, 256 * 1024)?
+            .as_deref()
+            .map(|text| script_terms_for_source(file, text))
+            .unwrap_or_else(|| script_terms_fallback(file));
+
+        out.insert(
+            guid,
+            ScriptGuidEntry {
+                rel_path: file.rel_path.clone(),
+                fingerprint: file.fingerprint,
+                terms,
+            },
+        );
+    }
+
+    Ok(out)
+}
+
+fn update_script_map_for_file(
+    scripts: &mut std::collections::BTreeMap<String, ScriptGuidEntry>,
+    file: &ScannedFile,
+) -> Result<()> {
+    if file.kind != "Script" {
+        return Ok(());
+    }
+
+    remove_script_entries_for_rel_path(scripts, &file.rel_path);
+
     let guid = read_guid_from_meta(asset_meta_path(&file.abs_path)).unwrap_or_default();
-    let extracted = extract_content_for_file(file)?;
+    if guid.trim().is_empty() {
+        return Ok(());
+    }
+
+    if let Some(existing) = scripts.get(&guid) {
+        if existing.rel_path == file.rel_path && existing.fingerprint == file.fingerprint {
+            return Ok(());
+        }
+    }
+
+    let terms = read_text_limited(&file.abs_path, 256 * 1024)?
+        .as_deref()
+        .map(|text| script_terms_for_source(file, text))
+        .unwrap_or_else(|| script_terms_fallback(file));
+
+    scripts.insert(
+        guid,
+        ScriptGuidEntry {
+            rel_path: file.rel_path.clone(),
+            fingerprint: file.fingerprint,
+            terms,
+        },
+    );
+    Ok(())
+}
+
+fn remove_script_entries_for_rel_path(
+    scripts: &mut std::collections::BTreeMap<String, ScriptGuidEntry>,
+    rel_path: &str,
+) {
+    let keys: Vec<String> = scripts
+        .iter()
+        .filter(|(_, entry)| entry.rel_path == rel_path)
+        .map(|(guid, _)| guid.clone())
+        .collect();
+    for key in keys {
+        scripts.remove(&key);
+    }
+}
+
+fn script_terms_fallback(file: &ScannedFile) -> String {
+    to_terms(&format!("{} {}", file.name, file.rel_path))
+}
+
+fn script_terms_for_source(file: &ScannedFile, text: &str) -> String {
+    let csharp = extract_csharp_terms(text);
+    if csharp.trim().is_empty() {
+        return script_terms_fallback(file);
+    }
+    to_terms(&format!("{} {} {}", file.name, csharp, file.rel_path))
+}
+
+fn build_doc(
+    fields: &SearchFields,
+    file: &ScannedFile,
+    scripts: &std::collections::BTreeMap<String, ScriptGuidEntry>,
+) -> Result<TantivyDocument> {
+    let guid = read_guid_from_meta(asset_meta_path(&file.abs_path)).unwrap_or_default();
+    let extracted = extract_content_for_file(file, scripts)?;
 
     let display_name = extracted
         .primary_name
@@ -1084,7 +1215,10 @@ struct ExtractedContent {
     content_terms: Option<String>,
 }
 
-fn extract_content_for_file(file: &ScannedFile) -> Result<ExtractedContent> {
+fn extract_content_for_file(
+    file: &ScannedFile,
+    scripts: &std::collections::BTreeMap<String, ScriptGuidEntry>,
+) -> Result<ExtractedContent> {
     let ext = file
         .abs_path
         .extension()
@@ -1099,7 +1233,7 @@ fn extract_content_for_file(file: &ScannedFile) -> Result<ExtractedContent> {
         let Some(text) = text else {
             return Ok(ExtractedContent::default());
         };
-        return Ok(extract_unity_yaml_content(&text));
+        return Ok(extract_unity_yaml_content(&text, scripts));
     }
 
     if matches!(
@@ -1165,7 +1299,10 @@ fn is_probably_unity_yaml(path: &Path) -> Result<bool> {
     Ok(head.contains("%YAML") || head.contains("!u!") || head.contains("---"))
 }
 
-fn extract_unity_yaml_content(text: &str) -> ExtractedContent {
+fn extract_unity_yaml_content(
+    text: &str,
+    scripts: &std::collections::BTreeMap<String, ScriptGuidEntry>,
+) -> ExtractedContent {
     static NAME_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
         Regex::new(r"(?m)^\s*m_Name:\s*(.+?)\s*$").expect("m_Name regex")
     });
@@ -1180,7 +1317,8 @@ fn extract_unity_yaml_content(text: &str) -> ExtractedContent {
     });
 
     let mut primary_name = None;
-    let mut extracted = Vec::new();
+    let mut extracted: Vec<String> = Vec::new();
+    let mut referenced_guids: Vec<String> = Vec::new();
 
     for cap in NAME_RE.captures_iter(text).take(512) {
         let Some(raw) = cap.get(1).map(|m| m.as_str()) else {
@@ -1193,7 +1331,7 @@ fn extract_unity_yaml_content(text: &str) -> ExtractedContent {
         if primary_name.is_none() {
             primary_name = Some(value.to_string());
         }
-        extracted.push(value);
+        extracted.push(value.to_string());
         if extracted.len() >= 2048 {
             break;
         }
@@ -1207,7 +1345,7 @@ fn extract_unity_yaml_content(text: &str) -> ExtractedContent {
         if value.is_empty() {
             continue;
         }
-        extracted.push(value);
+        extracted.push(value.to_string());
         if extracted.len() >= 2048 {
             break;
         }
@@ -1217,7 +1355,8 @@ fn extract_unity_yaml_content(text: &str) -> ExtractedContent {
         let Some(guid) = cap.get(1).map(|m| m.as_str()) else {
             continue;
         };
-        extracted.push(guid);
+        extracted.push(guid.to_string());
+        referenced_guids.push(guid.to_string());
         if extracted.len() >= 4096 {
             break;
         }
@@ -1227,16 +1366,35 @@ fn extract_unity_yaml_content(text: &str) -> ExtractedContent {
         let Some(id) = cap.get(1).map(|m| m.as_str()) else {
             continue;
         };
-        extracted.push(id);
+        extracted.push(id.to_string());
         if extracted.len() >= 4096 {
             break;
         }
     }
 
-    let content_terms = if extracted.is_empty() {
+    referenced_guids.sort();
+    referenced_guids.dedup();
+
+    let base_terms = if extracted.is_empty() {
         None
     } else {
         Some(to_terms(&extracted.join(" ")))
+    };
+
+    let mut resolved = String::new();
+    for guid in referenced_guids {
+        let Some(entry) = scripts.get(&guid) else {
+            continue;
+        };
+        resolved.push_str(&entry.terms);
+        resolved.push(' ');
+    }
+    let resolved = resolved.trim();
+
+    let content_terms = match (base_terms, resolved.is_empty()) {
+        (None, _) => None,
+        (Some(base), true) => Some(base),
+        (Some(base), false) => Some(format!("{base} {resolved}").trim().to_string()),
     };
 
     ExtractedContent {
@@ -1422,7 +1580,8 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: deadbeefdeadbeefdeadbeefdeadbeef, type: 3}
 "#;
 
-        let extracted = extract_unity_yaml_content(text);
+        let scripts = std::collections::BTreeMap::new();
+        let extracted = extract_unity_yaml_content(text, &scripts);
         assert_eq!(extracted.primary_name.as_deref(), Some("Player"));
         let terms = extracted.content_terms.unwrap_or_default();
         assert!(terms.contains("player"));

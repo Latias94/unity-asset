@@ -96,4 +96,4 @@ The existing parsing crates remain the source for deep extraction (Tier-2) and a
 ## Implementation status
 
 - Tier-0 shipped (path/name/type indexing).
-- Tier-1 started (basic YAML extraction: `m_Name`, tags, and `{guid, fileID}` references; plus limited text indexing for scripts/config).
+- Tier-1 started (basic YAML extraction: `m_Name`, tags, `{guid, fileID}` references; script GUIDs are resolved to best-effort C# class/namespace terms for searching).

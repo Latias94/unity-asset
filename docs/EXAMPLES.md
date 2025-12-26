@@ -54,6 +54,7 @@ This repository maintains runnable examples per crate (built in CI).
   - `cargo run -p unity-asset-search-daemon -- --project-root repo-ref/BoatAttack --watch`
 - Query from the CLI:
   - `cargo run -p unity-asset-search-cli -- search "player" --limit 20`
+  - `cargo run -p unity-asset-search-cli -- search "PlayerController" --limit 20`
   - `cargo run -p unity-asset-search-cli -- suggest "t:pr" --limit 10`
   - `cargo run -p unity-asset-search-cli -- status`
 - Run the BoatAttack benchmark harness:
