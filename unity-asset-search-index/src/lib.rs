@@ -270,6 +270,83 @@ impl SearchIndex {
         self.reindex_impl(paths, ReindexMode::Full)
     }
 
+    pub fn reindex_changed_paths(
+        &self,
+        paths: &IndexPaths,
+        changed_paths: &[PathBuf],
+    ) -> Result<()> {
+        let start = Instant::now();
+        {
+            let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
+            inner.status.indexing = true;
+            inner.status.updated_docs = None;
+            inner.status.removed_docs = None;
+            inner.status.last_scan_ms = None;
+        }
+
+        let scan_start = Instant::now();
+        let delta = scan_changed_paths(paths, changed_paths)?;
+        let scan_ms = scan_start.elapsed().as_millis();
+
+        let fields = {
+            let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
+            inner.fields.clone()
+        };
+
+        let mut updated_docs = 0u64;
+        let mut removed_docs = 0u64;
+
+        {
+            let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
+            let mut state = inner.state.clone();
+
+            for removed in &delta.removed_rel_paths {
+                inner
+                    .writer
+                    .delete_term(Term::from_field_text(fields.id, removed));
+                if state.files.remove(removed).is_some() {
+                    removed_docs += 1;
+                }
+            }
+
+            for file in &delta.files {
+                let old = state.files.get(&file.rel_path).copied();
+                if old == Some(file.fingerprint) {
+                    continue;
+                }
+
+                inner
+                    .writer
+                    .delete_term(Term::from_field_text(fields.id, &file.rel_path));
+                inner.writer.add_document(build_doc(&fields, file)?)?;
+                state.files.insert(file.rel_path.clone(), file.fingerprint);
+                updated_docs += 1;
+            }
+
+            inner.writer.commit()?;
+            inner.state = state;
+            store_state(&paths.state_path, &inner.state)?;
+        }
+
+        self.inner
+            .read()
+            .map_err(|_| anyhow!("poisoned lock"))?
+            .reader
+            .reload()?;
+
+        {
+            let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
+            inner.status.last_index_duration_ms = Some(start.elapsed().as_millis());
+            inner.status.last_scan_ms = Some(scan_ms);
+            inner.status.updated_docs = Some(updated_docs);
+            inner.status.removed_docs = Some(removed_docs);
+            inner.status.indexing = false;
+        }
+
+        self.refresh_status()?;
+        Ok(())
+    }
+
     fn reindex_impl(&self, paths: &IndexPaths, mode: ReindexMode) -> Result<()> {
         let start = Instant::now();
         {
@@ -781,6 +858,114 @@ fn scan_project_files(paths: &IndexPaths) -> Result<ScanResult> {
     }
 
     Ok(out)
+}
+
+#[derive(Debug, Clone, Default)]
+struct ChangeScanResult {
+    files: Vec<ScannedFile>,
+    removed_rel_paths: Vec<String>,
+}
+
+fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<ChangeScanResult> {
+    let mut out = ChangeScanResult::default();
+    if changed_paths.is_empty() {
+        return Ok(out);
+    }
+
+    let mut candidates = Vec::new();
+    for p in changed_paths {
+        if p.starts_with(&paths.index_root_dir) {
+            continue;
+        }
+        if p.extension().is_some_and(|e| e == "meta") {
+            if let Some(asset) = asset_path_from_meta(p) {
+                candidates.push(asset);
+            }
+        } else {
+            candidates.push(p.clone());
+        }
+    }
+
+    candidates.sort();
+    candidates.dedup();
+
+    let mut existing = Vec::new();
+    for candidate in candidates {
+        if !candidate.starts_with(&paths.project_root) {
+            continue;
+        }
+        if should_skip_file(&candidate) || is_excluded_dir(&candidate) {
+            continue;
+        }
+        if candidate.is_file() {
+            existing.push(candidate);
+        } else if let Ok(rel) = candidate.strip_prefix(&paths.project_root) {
+            out.removed_rel_paths
+                .push(rel.to_string_lossy().to_string());
+        }
+    }
+
+    if existing.is_empty() {
+        return Ok(out);
+    }
+
+    let mut builder = WalkBuilder::new(&existing[0]);
+    for path in existing.iter().skip(1) {
+        builder.add(path);
+    }
+    builder
+        .follow_links(false)
+        .standard_filters(true)
+        .max_depth(Some(0));
+
+    for entry in builder.build() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "meta") {
+            continue;
+        }
+        if should_skip_file(path) || is_excluded_dir(path) {
+            continue;
+        }
+
+        let rel_path = path
+            .strip_prefix(&paths.project_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let kind = classify_kind(path);
+        let fingerprint = fingerprint_for_path(path)?;
+
+        out.files.push(ScannedFile {
+            rel_path,
+            abs_path: path.to_path_buf(),
+            fingerprint,
+            name,
+            kind,
+        });
+    }
+
+    Ok(out)
+}
+
+fn asset_path_from_meta(meta_path: &Path) -> Option<PathBuf> {
+    let file_name = meta_path.file_name()?.to_str()?;
+    if !file_name.ends_with(".meta") {
+        return None;
+    }
+    let mut out = meta_path.to_path_buf();
+    out.set_file_name(file_name.trim_end_matches(".meta"));
+    Some(out)
 }
 
 fn build_doc(fields: &SearchFields, file: &ScannedFile) -> Result<TantivyDocument> {

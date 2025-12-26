@@ -246,7 +246,7 @@ fn persist_token(index_dir: &std::path::Path, token: &str) -> anyhow::Result<()>
 }
 
 async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::Result<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WatchMsg>();
 
     let scan_roots = state.paths.scan_roots.clone();
     let index_root = state.paths.index_root_dir.clone();
@@ -257,13 +257,29 @@ async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::
                 return;
             };
 
+            let mut paths = Vec::new();
+            let mut force_full = false;
+
             for path in event.paths {
                 if path.starts_with(&index_root) {
                     continue;
                 }
-                let _ = tx.send(());
-                break;
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == ".gitignore" || n == ".ignore")
+                {
+                    force_full = true;
+                }
+                if path.is_dir() {
+                    force_full = true;
+                }
+                paths.push(path);
             }
+
+            if paths.is_empty() {
+                return;
+            }
+            let _ = tx.send(WatchMsg { paths, force_full });
         })?;
 
     for root in scan_roots {
@@ -271,8 +287,14 @@ async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::
     }
 
     loop {
-        if rx.recv().await.is_none() {
+        let Some(first) = rx.recv().await else {
             return Ok(());
+        };
+
+        let mut pending = std::collections::BTreeSet::<PathBuf>::new();
+        let mut force_full = first.force_full;
+        for p in first.paths {
+            pending.insert(p);
         }
 
         let mut deadline = tokio::time::Instant::now() + debounce;
@@ -286,15 +308,22 @@ async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::
             tokio::select! {
                 _ = &mut sleep => break,
                 msg = rx.recv() => {
-                    if msg.is_none() {
-                        return Ok(());
+                    let Some(msg) = msg else { return Ok(()); };
+                    force_full |= msg.force_full;
+                    for p in msg.paths {
+                        pending.insert(p);
                     }
                     deadline = tokio::time::Instant::now() + debounce;
                 }
             }
         }
 
-        let _ = run_reindex(state.clone(), false).await;
+        if force_full || pending.len() > 500 {
+            let _ = run_reindex(state.clone(), false).await;
+        } else {
+            let changed_paths: Vec<PathBuf> = pending.into_iter().collect();
+            let _ = run_reindex_changed_paths(state.clone(), &changed_paths).await;
+        }
     }
 }
 
@@ -312,4 +341,27 @@ async fn run_reindex(state: Arc<AppState>, full: bool) -> anyhow::Result<()> {
     })
     .await??;
     Ok(())
+}
+
+async fn run_reindex_changed_paths(
+    state: Arc<AppState>,
+    changed_paths: &[PathBuf],
+) -> anyhow::Result<()> {
+    if changed_paths.is_empty() {
+        return Ok(());
+    }
+    let _guard = state.reindex_lock.lock().await;
+    let index = state.index.clone();
+    let paths = state.paths.clone();
+    let changed_paths = changed_paths.to_vec();
+
+    tokio::task::spawn_blocking(move || index.reindex_changed_paths(&paths, &changed_paths))
+        .await??;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct WatchMsg {
+    paths: Vec<PathBuf>,
+    force_full: bool,
 }
