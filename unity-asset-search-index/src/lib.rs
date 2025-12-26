@@ -1,5 +1,6 @@
 use std::fs;
 use std::io;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -13,7 +14,7 @@ use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, Occur, PhrasePrefixQuery, Query, TermQuery,
 };
 use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value as _};
-use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term, doc};
+use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 use unity_asset_search_core::{
     MatchKind, highlight_html, normalize_for_match, parse_query, rank_match, to_terms,
@@ -93,8 +94,8 @@ impl IndexPaths {
         };
         let scan_roots = normalize_scan_roots(&project_root, scan_roots)?;
 
-        let index_data_dir = index_root_dir.join("tantivy-v1");
-        let state_path = index_root_dir.join("state-v1.json");
+        let index_data_dir = index_root_dir.join("tantivy-v2");
+        let state_path = index_root_dir.join("state-v2.json");
 
         Ok(Self {
             project_root,
@@ -187,6 +188,7 @@ struct SearchFields {
     name_terms: Field,
     kind: Field,
     kind_terms: Field,
+    content_terms: Field,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -672,6 +674,10 @@ fn per_token_query(fields: &SearchFields, token: &str) -> Box<dyn Query> {
             Occur::Should,
             boosted_text_queries(fields.kind_terms, token, 1.0, 1.0),
         ),
+        (
+            Occur::Should,
+            boosted_text_queries(fields.content_terms, token, 1.2, 1.0),
+        ),
     ];
 
     Box::new(BooleanQuery::new(should))
@@ -764,6 +770,7 @@ fn build_schema() -> Schema {
     builder.add_text_field("name_terms", TEXT);
     builder.add_text_field("kind", STRING | STORED);
     builder.add_text_field("kind_terms", TEXT);
+    builder.add_text_field("content_terms", TEXT);
     builder.build()
 }
 
@@ -777,6 +784,7 @@ fn build_fields(schema: &Schema) -> SearchFields {
         name_terms: schema.get_field("name_terms").expect("name_terms field"),
         kind: schema.get_field("kind").expect("kind field"),
         kind_terms: schema.get_field("kind_terms").expect("kind_terms field"),
+        content_terms: schema.get_field("content_terms").expect("content_terms field"),
     }
 }
 
@@ -1044,17 +1052,224 @@ fn asset_path_from_meta(meta_path: &Path) -> Option<PathBuf> {
 
 fn build_doc(fields: &SearchFields, file: &ScannedFile) -> Result<TantivyDocument> {
     let guid = read_guid_from_meta(asset_meta_path(&file.abs_path)).unwrap_or_default();
+    let extracted = extract_content_for_file(file)?;
 
-    Ok(doc!(
-        fields.id => file.rel_path.clone(),
-        fields.guid => guid,
-        fields.path => file.rel_path.clone(),
-        fields.path_terms => to_terms(&file.rel_path),
-        fields.name => file.name.clone(),
-        fields.name_terms => to_terms(&file.name),
-        fields.kind => file.kind.clone(),
-        fields.kind_terms => to_terms(&file.kind),
-    ))
+    let display_name = extracted
+        .primary_name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&file.name)
+        .to_string();
+
+    let mut document = TantivyDocument::default();
+    document.add_text(fields.id, file.rel_path.clone());
+    document.add_text(fields.guid, guid);
+    document.add_text(fields.path, file.rel_path.clone());
+    document.add_text(fields.path_terms, to_terms(&file.rel_path));
+    document.add_text(fields.name, display_name.clone());
+    document.add_text(fields.name_terms, to_terms(&display_name));
+    document.add_text(fields.kind, file.kind.clone());
+    document.add_text(fields.kind_terms, to_terms(&file.kind));
+
+    if let Some(content_terms) = extracted.content_terms.filter(|s| !s.trim().is_empty()) {
+        document.add_text(fields.content_terms, content_terms);
+    }
+
+    Ok(document)
+}
+
+#[derive(Debug, Default)]
+struct ExtractedContent {
+    primary_name: Option<String>,
+    content_terms: Option<String>,
+}
+
+fn extract_content_for_file(file: &ScannedFile) -> Result<ExtractedContent> {
+    let ext = file
+        .abs_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if matches!(file.kind.as_str(), "Prefab" | "Scene" | "Material" | "Asset")
+        && is_probably_unity_yaml(&file.abs_path)?
+    {
+        let text = read_text_limited(&file.abs_path, 2 * 1024 * 1024)?;
+        let Some(text) = text else {
+            return Ok(ExtractedContent::default());
+        };
+        return Ok(extract_unity_yaml_content(&text));
+    }
+
+    if matches!(
+        ext.as_str(),
+        "cs"
+            | "shader"
+            | "cginc"
+            | "hlsl"
+            | "compute"
+            | "json"
+            | "asmdef"
+            | "asmref"
+            | "uxml"
+            | "uss"
+            | "txt"
+            | "md"
+            | "yaml"
+            | "yml"
+    ) {
+        let text = read_text_limited(&file.abs_path, 256 * 1024)?;
+        let Some(text) = text else {
+            return Ok(ExtractedContent::default());
+        };
+
+        let mut combined = String::new();
+        if ext == "cs" {
+            let csharp_terms = extract_csharp_terms(&text);
+            if !csharp_terms.is_empty() {
+                combined.push_str(&csharp_terms);
+                combined.push(' ');
+            }
+        }
+        combined.push_str(&text);
+
+        return Ok(ExtractedContent {
+            primary_name: None,
+            content_terms: Some(to_terms(&combined)),
+        });
+    }
+
+    Ok(ExtractedContent::default())
+}
+
+fn read_text_limited(path: &Path, max_bytes: usize) -> Result<Option<String>> {
+    let file = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(max_bytes as u64).read_to_end(&mut buf)?;
+    if buf.contains(&0) {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).to_string()))
+}
+
+fn is_probably_unity_yaml(path: &Path) -> Result<bool> {
+    let mut file = fs::File::open(path)?;
+    let mut buf = [0u8; 256];
+    let n = file.read(&mut buf)?;
+    let head = &buf[..n];
+    if head.contains(&0) {
+        return Ok(false);
+    }
+    let head = String::from_utf8_lossy(head);
+    Ok(head.contains("%YAML") || head.contains("!u!") || head.contains("---"))
+}
+
+fn extract_unity_yaml_content(text: &str) -> ExtractedContent {
+    static NAME_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+        Regex::new(r"(?m)^\s*m_Name:\s*(.+?)\s*$").expect("m_Name regex")
+    });
+    static TAG_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+        Regex::new(r"(?m)^\s*m_TagString:\s*(.+?)\s*$").expect("m_TagString regex")
+    });
+    static GUID_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+        Regex::new(r"\bguid:\s*([0-9a-fA-F]{32})\b").expect("guid ref regex")
+    });
+    static FILEID_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+        Regex::new(r"\bfileID:\s*([0-9]+)\b").expect("fileID regex")
+    });
+
+    let mut primary_name = None;
+    let mut extracted = Vec::new();
+
+    for cap in NAME_RE.captures_iter(text).take(512) {
+        let Some(raw) = cap.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let value = raw.trim().trim_matches('"').trim();
+        if value.is_empty() {
+            continue;
+        }
+        if primary_name.is_none() {
+            primary_name = Some(value.to_string());
+        }
+        extracted.push(value);
+        if extracted.len() >= 2048 {
+            break;
+        }
+    }
+
+    for cap in TAG_RE.captures_iter(text).take(256) {
+        let Some(raw) = cap.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let value = raw.trim().trim_matches('"').trim();
+        if value.is_empty() {
+            continue;
+        }
+        extracted.push(value);
+        if extracted.len() >= 2048 {
+            break;
+        }
+    }
+
+    for cap in GUID_RE.captures_iter(text).take(1024) {
+        let Some(guid) = cap.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        extracted.push(guid);
+        if extracted.len() >= 4096 {
+            break;
+        }
+    }
+
+    for cap in FILEID_RE.captures_iter(text).take(1024) {
+        let Some(id) = cap.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        extracted.push(id);
+        if extracted.len() >= 4096 {
+            break;
+        }
+    }
+
+    let content_terms = if extracted.is_empty() {
+        None
+    } else {
+        Some(to_terms(&extracted.join(" ")))
+    };
+
+    ExtractedContent {
+        primary_name,
+        content_terms,
+    }
+}
+
+fn extract_csharp_terms(text: &str) -> String {
+    static TYPE_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+        Regex::new(
+            r"(?m)^\s*(?:\[[^\]]+\]\s*)*(?:public|private|protected|internal|static|sealed|partial|abstract|new|\s)+\s*(?:class|struct|interface|enum|record)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+        )
+        .expect("csharp type regex")
+    });
+    static NAMESPACE_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+        Regex::new(r"(?m)^\s*namespace\s+([A-Za-z_][A-Za-z0-9_\\.]+)\s*[{;]")
+            .expect("csharp namespace regex")
+    });
+
+    let mut out = Vec::new();
+    for cap in TYPE_RE.captures_iter(text).take(256) {
+        if let Some(name) = cap.get(1).map(|m| m.as_str()) {
+            out.push(name);
+        }
+    }
+    for cap in NAMESPACE_RE.captures_iter(text).take(64) {
+        if let Some(ns) = cap.get(1).map(|m| m.as_str()) {
+            out.push(ns);
+        }
+    }
+
+    out.join(" ")
 }
 
 fn fingerprint_for_path(path: &Path) -> Result<Fingerprint> {
@@ -1193,5 +1408,25 @@ mod tests {
 
         let err = normalize_scan_roots(temp.path(), vec![other.path().to_path_buf()]).unwrap_err();
         assert!(err.to_string().contains("inside project root"));
+    }
+
+    #[test]
+    fn unity_yaml_extraction_picks_primary_name_and_guid() {
+        let text = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &1
+GameObject:
+  m_Name: Player
+--- !u!114 &2
+MonoBehaviour:
+  m_Script: {fileID: 11500000, guid: deadbeefdeadbeefdeadbeefdeadbeef, type: 3}
+"#;
+
+        let extracted = extract_unity_yaml_content(text);
+        assert_eq!(extracted.primary_name.as_deref(), Some("Player"));
+        let terms = extracted.content_terms.unwrap_or_default();
+        assert!(terms.contains("player"));
+        assert!(terms.contains("deadbeefdeadbeefdeadbeefdeadbeef"));
+        assert!(terms.contains("11500000"));
     }
 }

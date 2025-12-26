@@ -16,3 +16,5 @@ serde_json.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]

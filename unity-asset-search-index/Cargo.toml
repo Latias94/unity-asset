@@ -20,3 +20,6 @@ unity-asset-search-core = { path = "../unity-asset-search-core" }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]

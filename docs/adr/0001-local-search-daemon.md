@@ -1,8 +1,7 @@
 # ADR 0001: Local search daemon for "Search Everything"
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2025-12-26
-- Current repo HEAD at time of writing: `f4a6bd6bbc3228f1b34a9c4b534e23e06836f286`
 
 ## Context
 
@@ -94,3 +93,7 @@ The existing parsing crates remain the source for deep extraction (Tier-2) and a
 3. SQLite FTS5 instead of Tantivy
    - Simpler operationally, but less flexible for advanced ranking, suggestions, and search features expected from an IDE-like experience.
 
+## Implementation status
+
+- Tier-0 shipped (path/name/type indexing).
+- Tier-1 started (basic YAML extraction: `m_Name`, tags, and `{guid, fileID}` references; plus limited text indexing for scripts/config).

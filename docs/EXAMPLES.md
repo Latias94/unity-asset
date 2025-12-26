@@ -12,6 +12,8 @@ This repository maintains runnable examples per crate (built in CI).
 - `unity-asset-decode` (decode/export): optional heavier decode/export helpers (Texture/Audio/Sprite/Mesh) behind feature flags.
   - Examples live in `unity-asset-decode/examples/`.
 - `unity-asset-cli` (CLI): command-line tools. Not needed for library integration.
+- `unity-asset-search-daemon` (experimental): local "Search Everything" daemon (`localhost` HTTP API).
+- `unity-asset-search-cli` (experimental): CLI client for the search daemon (search/status/suggest/reindex/bench).
 
 ## unity-asset (library)
 
@@ -45,3 +47,14 @@ This repository maintains runnable examples per crate (built in CI).
 
 - Export Texture2D PNGs:
   - `cargo run -p unity-asset-decode --example export_textures --features texture -- tests/samples/char_118_yuki.ab target/out`
+
+## unity-asset-search (experimental)
+
+- Start the daemon (auto reindex on first run):
+  - `cargo run -p unity-asset-search-daemon -- --project-root repo-ref/BoatAttack --watch`
+- Query from the CLI:
+  - `cargo run -p unity-asset-search-cli -- search "player" --limit 20`
+  - `cargo run -p unity-asset-search-cli -- suggest "t:pr" --limit 10`
+  - `cargo run -p unity-asset-search-cli -- status`
+- Run the BoatAttack benchmark harness:
+  - `scripts/bench_boat_attack.zsh repo-ref/BoatAttack`

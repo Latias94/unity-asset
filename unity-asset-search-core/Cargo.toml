@@ -13,3 +13,5 @@ unicode-normalization.workspace = true
 fuzzy-matcher.workspace = true
 serde.workspace = true
 
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
