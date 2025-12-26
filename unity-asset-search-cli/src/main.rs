@@ -22,6 +22,7 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    Health,
     References {
         guid: String,
 
@@ -68,6 +69,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     match args.cmd {
         Cmd::Search { query, limit } => search(&args.base_url, &query, limit).await?,
+        Cmd::Health => health(&args.base_url).await?,
         Cmd::References {
             guid,
             file_id,
@@ -86,6 +88,21 @@ async fn main() -> Result<()> {
             reindex(&args.base_url, args.token.as_deref(), full, &path).await?
         }
     }
+    Ok(())
+}
+
+async fn health(base_url: &str) -> Result<()> {
+    let url = format!("{base_url}/v1/health");
+    let resp = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .context("request /v1/health")?
+        .error_for_status()
+        .context("status /v1/health")?;
+
+    let json: serde_json::Value = resp.json().await?;
+    println!("{}", serde_json::to_string_pretty(&json)?);
     Ok(())
 }
 

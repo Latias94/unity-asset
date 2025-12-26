@@ -106,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let app = axum::Router::new()
+        .route("/v1/health", get(health))
         .route("/v1/search", get(search))
         .route("/v1/status", get(status))
         .route("/v1/suggest", get(suggest))
@@ -118,6 +119,25 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct HealthResponse {
+    ok: bool,
+    api_version: u32,
+    version: &'static str,
+}
+
+async fn health() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(HealthResponse {
+            ok: true,
+            api_version: 1,
+            version: env!("CARGO_PKG_VERSION"),
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Debug, serde::Deserialize)]
