@@ -1,3 +1,4 @@
+use super::path::{canonicalize_if_exists, canonicalize_source_if_possible};
 use super::*;
 
 impl Environment {
@@ -123,7 +124,8 @@ impl Environment {
         source: P,
         path_id: i64,
     ) -> Vec<BinaryObjectRef<'_>> {
-        let source = BinarySource::path(source.as_ref());
+        let source_path = canonicalize_if_exists(source.as_ref());
+        let source = BinarySource::path(&source_path);
         self.find_binary_objects_in_source_id(&source, path_id)
     }
 
@@ -198,7 +200,8 @@ impl Environment {
         asset_index: usize,
         path_id: i64,
     ) -> Option<BinaryObjectRef<'_>> {
-        let bundle_source = BinarySource::path(bundle_path.as_ref());
+        let bundle_path = canonicalize_if_exists(bundle_path.as_ref());
+        let bundle_source = BinarySource::path(&bundle_path);
         self.find_binary_object_in_bundle_asset_source(&bundle_source, asset_index, path_id)
     }
 
@@ -249,12 +252,20 @@ impl Environment {
         let typetree_options = self.options.typetree;
         match key.source_kind {
             BinarySourceKind::SerializedFile => {
-                let file = self.binary_assets.get(&key.source).ok_or_else(|| {
-                    UnityAssetError::format(format!(
-                        "SerializedFile source not loaded: {}",
-                        key.source.describe()
-                    ))
-                })?;
+                let file = match self.binary_assets.get(&key.source) {
+                    Some(v) => v,
+                    None => {
+                        let alt = canonicalize_source_if_possible(&key.source);
+                        alt.as_ref()
+                            .and_then(|s| self.binary_assets.get(s))
+                            .ok_or_else(|| {
+                                UnityAssetError::format(format!(
+                                    "SerializedFile source not loaded: {}",
+                                    key.source.describe()
+                                ))
+                            })?
+                    }
+                };
                 let object = file.find_object_handle(key.path_id).ok_or_else(|| {
                     UnityAssetError::format(format!(
                         "Object not found in SerializedFile {}: path_id={}",
@@ -273,12 +284,20 @@ impl Environment {
                 Ok(obj)
             }
             BinarySourceKind::AssetBundle => {
-                let bundle = self.bundles.get(&key.source).ok_or_else(|| {
-                    UnityAssetError::format(format!(
-                        "AssetBundle source not loaded: {}",
-                        key.source.describe()
-                    ))
-                })?;
+                let bundle = match self.bundles.get(&key.source) {
+                    Some(v) => v,
+                    None => {
+                        let alt = canonicalize_source_if_possible(&key.source);
+                        alt.as_ref()
+                            .and_then(|s| self.bundles.get(s))
+                            .ok_or_else(|| {
+                                UnityAssetError::format(format!(
+                                    "AssetBundle source not loaded: {}",
+                                    key.source.describe()
+                                ))
+                            })?
+                    }
+                };
                 let asset_index = key.asset_index.ok_or_else(|| {
                     UnityAssetError::format(
                         "AssetBundle key requires an asset_index (which asset in the bundle?)"
@@ -321,12 +340,20 @@ impl Environment {
         let typetree_options = self.options.typetree;
         match key.source_kind {
             BinarySourceKind::SerializedFile => {
-                let file = self.binary_assets.get(&key.source).ok_or_else(|| {
-                    UnityAssetError::format(format!(
-                        "SerializedFile source not loaded: {}",
-                        key.source.describe()
-                    ))
-                })?;
+                let file = match self.binary_assets.get(&key.source) {
+                    Some(v) => v,
+                    None => {
+                        let alt = canonicalize_source_if_possible(&key.source);
+                        alt.as_ref()
+                            .and_then(|s| self.binary_assets.get(s))
+                            .ok_or_else(|| {
+                                UnityAssetError::format(format!(
+                                    "SerializedFile source not loaded: {}",
+                                    key.source.describe()
+                                ))
+                            })?
+                    }
+                };
                 let object = file.find_object_handle(key.path_id).ok_or_else(|| {
                     UnityAssetError::format(format!(
                         "Object not found in SerializedFile {}: path_id={}",
@@ -341,12 +368,20 @@ impl Environment {
                     })
             }
             BinarySourceKind::AssetBundle => {
-                let bundle = self.bundles.get(&key.source).ok_or_else(|| {
-                    UnityAssetError::format(format!(
-                        "AssetBundle source not loaded: {}",
-                        key.source.describe()
-                    ))
-                })?;
+                let bundle = match self.bundles.get(&key.source) {
+                    Some(v) => v,
+                    None => {
+                        let alt = canonicalize_source_if_possible(&key.source);
+                        alt.as_ref()
+                            .and_then(|s| self.bundles.get(s))
+                            .ok_or_else(|| {
+                                UnityAssetError::format(format!(
+                                    "AssetBundle source not loaded: {}",
+                                    key.source.describe()
+                                ))
+                            })?
+                    }
+                };
                 let asset_index = key.asset_index.ok_or_else(|| {
                     UnityAssetError::format(
                         "AssetBundle key requires an asset_index (which asset in the bundle?)"

@@ -34,6 +34,7 @@ mod imp {
     mod meta_guid;
     mod object_graph;
     mod object_query;
+    mod path;
     mod pptr;
     mod stream;
 

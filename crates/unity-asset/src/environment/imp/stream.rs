@@ -1,3 +1,4 @@
+use super::path::canonicalize_if_exists;
 use super::*;
 
 impl Environment {
@@ -179,7 +180,8 @@ impl Environment {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>> {
-        let bundle_source = BinarySource::path(bundle_path.as_ref());
+        let bundle_path = canonicalize_if_exists(bundle_path.as_ref());
+        let bundle_source = BinarySource::path(&bundle_path);
         self.read_bundle_stream_data_source(&bundle_source, stream_path, offset, size)
     }
 
@@ -352,7 +354,8 @@ impl Environment {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>> {
-        let source = BinarySource::path(source_path.as_ref());
+        let source_path = canonicalize_if_exists(source_path.as_ref());
+        let source = BinarySource::path(&source_path);
         self.read_stream_data_source(&source, source_kind, stream_path, offset, size)
     }
 

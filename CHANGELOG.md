@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Metadata reporting:
   - Populate `file_info.compression_type` when extracting from bundles.
   - Fill `ObjectSummary.dependencies` from scanned internal references when enabled.
+- More robust external reference resolution by canonicalizing filesystem paths when loading and indexing `.meta` GUIDs.
 
 ### Breaking Changes
 - None intended. As a reminder, in the 0.x series breaking changes may occur between minor versions.

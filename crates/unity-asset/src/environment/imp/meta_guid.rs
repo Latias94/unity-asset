@@ -1,3 +1,4 @@
+use super::path::canonicalize_if_exists;
 use super::*;
 
 pub(crate) fn parse_guid_32_hex(raw: &str) -> Option<[u8; 16]> {
@@ -51,6 +52,7 @@ impl Environment {
         if asset_path.extension().and_then(|e| e.to_str()) == Some("meta") {
             asset_path.set_extension("");
         }
+        asset_path = canonicalize_if_exists(&asset_path);
 
         match self.meta_guid_cache.write() {
             Ok(mut cache) => {

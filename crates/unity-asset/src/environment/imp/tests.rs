@@ -1,6 +1,10 @@
 use super::*;
 use std::fs;
 
+fn canonicalize_path(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
 fn link_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
@@ -32,8 +36,10 @@ fn link_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[test]
 fn environment_loads_yaml_fixture() {
     let mut env = Environment::new();
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../unity-asset-yaml/tests/fixtures/SingleDoc.asset");
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../unity-asset-yaml/tests/fixtures/SingleDoc.asset"),
+    );
     env.load_file(&path).unwrap();
     assert!(!env.yaml_documents().is_empty());
     assert!(env.yaml_objects().next().is_some());
@@ -46,8 +52,9 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
     use unity_asset_decode::audio::AudioClipConverter;
 
     let mut env = Environment::new();
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
     env.load_file(&path).unwrap();
     assert!(!env.bundles().is_empty());
 
@@ -63,9 +70,10 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
     assert!(!found.is_empty());
 
     // Disambiguation helpers should work on the same source path.
-    assert!(env
-        .find_binary_object_in_source(&path, first.path_id)
-        .is_some());
+    assert!(
+        env.find_binary_object_in_source(&path, first.path_id)
+            .is_some()
+    );
     let obj_ref = env
         .find_binary_object_in_bundle_asset(&path, 0, first.path_id)
         .expect("can find object in bundle asset 0");
@@ -105,9 +113,10 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
     } else {
         (obj_ref.object.file().externals.len() as i32) + 1
     };
-    assert!(env
-        .resolve_binary_pptr(&obj_ref, invalid_file_id, first.path_id)
-        .is_none());
+    assert!(
+        env.resolve_binary_pptr(&obj_ref, invalid_file_id, first.path_id)
+            .is_none()
+    );
 
     let bundle = env
         .bundles()
@@ -174,10 +183,11 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
     assert!(clip.is_streamed());
     assert_eq!(clip.stream_info.offset, 4096);
     assert_eq!(clip.stream_info.size, 17088);
-    assert!(clip
-        .stream_info
-        .path
-        .contains("CAB-8579bc75d50073df38987733a7cb3193"));
+    assert!(
+        clip.stream_info
+            .path
+            .contains("CAB-8579bc75d50073df38987733a7cb3193")
+    );
 
     let peek = env.peek_binary_object_name(&key).unwrap();
     assert_eq!(peek, obj.name());
@@ -186,8 +196,9 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
 #[test]
 fn environment_dependency_graph_builds_and_closure_from_container_is_non_empty() {
     let mut env = Environment::new();
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
     env.load_file(&path).unwrap();
 
     let graph = env.build_dependency_graph(DependencyGraphBuildOptions::default());
@@ -223,8 +234,9 @@ fn environment_dependency_graph_builds_and_closure_from_container_is_non_empty()
 #[test]
 fn environment_dependency_graph_can_rebuild_single_source_subgraph() {
     let mut env = Environment::new();
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
     env.load_file(&path).unwrap();
 
     let source = BinarySource::path(&path);
@@ -275,7 +287,7 @@ fn environment_indexes_meta_guid_for_best_effort_external_resolution() {
     ];
 
     let cached = env.asset_path_for_guid(expected_guid);
-    assert_eq!(cached, Some(asset_path));
+    assert_eq!(cached, Some(canonicalize_path(asset_path)));
 }
 
 #[test]
@@ -315,7 +327,10 @@ fn environment_index_meta_guids_in_directory_skips_library_and_indexes_nested() 
         0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
         0xef,
     ];
-    assert_eq!(env.asset_path_for_guid(expected_guid), Some(asset_path));
+    assert_eq!(
+        env.asset_path_for_guid(expected_guid),
+        Some(canonicalize_path(asset_path))
+    );
 
     let skipped_guid = super::meta_guid::parse_guid_32_hex("deadbeefdeadbeefdeadbeefdeadbeef")
         .expect("parse skipped guid");
@@ -341,7 +356,9 @@ fn environment_typetree_registry_json_restores_parsing_for_stripped_assets() {
     }
 
     let mut env = Environment::new();
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1");
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
+    );
     env.load_file(&path).unwrap();
 
     let source = BinarySource::path(&path);
@@ -403,8 +420,9 @@ fn environment_typetree_registry_json_restores_parsing_for_stripped_assets() {
 #[test]
 fn environment_assetbundle_container_raw_matches_typetree_when_stripped() {
     let mut env = Environment::new();
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/xinzexi_2_n_tex");
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/xinzexi_2_n_tex"),
+    );
     env.load_file(&path).unwrap();
 
     let baseline = env.bundle_container_entries(&path).unwrap();
@@ -451,8 +469,10 @@ fn environment_assetbundle_container_raw_matches_typetree_when_stripped() {
 #[test]
 fn environment_loads_minimal_gameobject_transform_prefab_and_resolves_refs() {
     let mut env = Environment::new();
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../unity-asset-yaml/tests/fixtures/MinimalGameObjectTransform.prefab");
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../unity-asset-yaml/tests/fixtures/MinimalGameObjectTransform.prefab"),
+    );
     env.load_file(&path).unwrap();
 
     let game_object = env
@@ -530,6 +550,7 @@ fn environment_object_graph_scans_yaml_pptrs_and_meta_guid_paths() {
 
     let prefab_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../unity-asset-yaml/tests/fixtures/MinimalGameObjectTransform.prefab");
+    let prefab_path = canonicalize_path(prefab_path);
 
     let mut env = Environment::new();
     env.load_file(&script_meta_path).unwrap();
@@ -564,7 +585,10 @@ fn environment_object_graph_scans_yaml_pptrs_and_meta_guid_paths() {
         .expect("expected at least one YAML external edge with a GUID");
 
     assert_eq!(yaml_ext.file_id, 11500000);
-    assert_eq!(yaml_ext.asset_path, Some(script_asset_path));
+    assert_eq!(
+        yaml_ext.asset_path,
+        Some(canonicalize_path(script_asset_path))
+    );
     assert_eq!(yaml_ext.resolved, None);
 }
 
@@ -573,8 +597,9 @@ fn environment_object_graph_resolves_yaml_guid_to_loaded_serialized_file_object(
     use unity_asset_binary::bundle::load_bundle;
     use unity_asset_binary::file::load_unity_file_from_memory;
 
-    let bundle_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
+    let bundle_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
     let bundle = load_bundle(&bundle_path).unwrap();
 
     let mut extracted: Option<(Vec<u8>, i64)> = None;
@@ -618,6 +643,10 @@ fn environment_object_graph_resolves_yaml_guid_to_loaded_serialized_file_object(
         target_path_id
     );
     std::fs::write(&yaml_path, yaml.as_bytes()).unwrap();
+
+    let target_path = canonicalize_path(target_path);
+    let target_meta = canonicalize_path(target_meta);
+    let yaml_path = canonicalize_path(yaml_path);
 
     let mut env = Environment::new();
     env.load_file(&target_meta).unwrap();
@@ -686,8 +715,9 @@ fn environment_can_parse_external_yaml_prefab_if_provided() {
 #[test]
 fn environment_stream_data_falls_back_to_filesystem_for_bundles() {
     let temp = tempfile::tempdir().unwrap();
-    let bundle_src =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
+    let bundle_src = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
     let bundle_path = temp.path().join("char_118_yuki.ab");
     link_or_copy_file(&bundle_src, &bundle_path).unwrap();
 
@@ -788,8 +818,9 @@ fn build_uncompressed_webfile(entries: Vec<(String, Vec<u8>)>) -> Vec<u8> {
 
 #[test]
 fn environment_loads_extless_webfile_entries_and_reads_resource_bytes() {
-    let sample_bundle_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
+    let sample_bundle_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
     let bundle_bytes = fs::read(&sample_bundle_path).unwrap();
 
     let cab = "8579bc75d50073df38987733a7cb3193";
@@ -809,6 +840,7 @@ fn environment_loads_extless_webfile_entries_and_reads_resource_bytes() {
 
     let mut env = Environment::new();
     env.load_file(&web_path).unwrap();
+    let web_path = canonicalize_path(web_path);
     assert!(env.webfiles().contains_key(&web_path));
 
     let bundle_source = BinarySource::WebEntry {

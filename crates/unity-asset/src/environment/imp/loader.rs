@@ -1,3 +1,4 @@
+use super::path::canonicalize_if_exists;
 use super::*;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -24,44 +25,44 @@ impl Environment {
 
     /// Load a single file.
     pub fn load_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let path = path.as_ref();
+        let path = canonicalize_if_exists(path.as_ref());
 
         // Check file extension to determine type
         if let Some(ext) = path.extension() {
             if ext == "meta" {
                 // Index meta GUIDs even if YAML parsing fails (best-effort reference resolution).
-                let _ = self.index_meta_guid_path(path);
+                let _ = self.index_meta_guid_path(&path);
             }
 
             match ext.to_str() {
                 Some("asset") | Some("prefab") | Some("unity") | Some("meta") => {
-                    match YamlDocument::load_yaml_with_warnings(path, false) {
+                    match YamlDocument::load_yaml_with_warnings(&path, false) {
                         Ok((doc, warnings)) => {
                             for w in warnings {
                                 self.push_warning(EnvironmentWarning::YamlDocumentSkipped {
-                                    path: path.to_path_buf(),
+                                    path: path.clone(),
                                     doc_index: w.doc_index,
                                     error: w.error,
                                 });
                             }
-                            self.yaml_documents.insert(path.to_path_buf(), doc);
+                            self.yaml_documents.insert(path.clone(), doc);
                         }
                         Err(_) => {
                             // Some Unity projects can store `.asset`-like files in binary form.
                             // If YAML parsing fails, fall back to binary detection.
-                            self.try_load_binary(path)?;
+                            self.try_load_binary(&path)?;
                         }
                     }
                 }
                 _ => {
                     // Best-effort binary detection for common build outputs.
-                    self.try_load_binary(path)?;
+                    self.try_load_binary(&path)?;
                 }
             }
         } else {
             // Some Unity outputs (especially streamed resources and certain build artifacts)
             // can be extension-less. Attempt binary detection anyway.
-            self.try_load_binary(path)?;
+            self.try_load_binary(&path)?;
         }
 
         Ok(())
@@ -90,8 +91,10 @@ impl Environment {
             )));
         }
 
+        let path = canonicalize_if_exists(path);
+
         let mut stats = MetaGuidIndexStats::default();
-        let mut stack: Vec<PathBuf> = vec![path.to_path_buf()];
+        let mut stack: Vec<PathBuf> = vec![path];
 
         while let Some(dir) = stack.pop() {
             stats.dirs_visited += 1;
@@ -288,8 +291,10 @@ impl Environment {
             )));
         }
 
+        let path = canonicalize_if_exists(path);
+
         // Recursively traverse directory
-        self.traverse_directory(path)?;
+        self.traverse_directory(&path)?;
 
         Ok(())
     }

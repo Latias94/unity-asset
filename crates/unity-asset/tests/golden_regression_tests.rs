@@ -119,9 +119,10 @@ fn load_golden() -> GoldenFile {
 }
 
 fn workspace_path(rel: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../")
-        .join(rel)
+        .join(rel);
+    std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 fn i64_field(obj: &unity_asset_binary::object::UnityObject, key: &str) -> i64 {

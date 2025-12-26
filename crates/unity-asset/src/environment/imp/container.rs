@@ -1,3 +1,4 @@
+use super::path::canonicalize_if_exists;
 use super::*;
 
 impl Environment {
@@ -168,7 +169,8 @@ impl Environment {
         &self,
         bundle_path: P,
     ) -> Result<Vec<BundleContainerEntry>> {
-        let bundle_source = BinarySource::path(bundle_path.as_ref());
+        let bundle_path = canonicalize_if_exists(bundle_path.as_ref());
+        let bundle_source = BinarySource::path(&bundle_path);
         self.bundle_container_entries_source(&bundle_source)
     }
 
@@ -286,21 +288,17 @@ impl Environment {
         let mut out = Vec::new();
         for bundle_source in bundle_sources {
             if let Ok(entries) = self.bundle_container_entries_source(bundle_source) {
-                out.extend(
-                    entries
-                        .into_iter()
-                        .filter(|e| {
-                            if pattern_lc.is_empty() {
-                                return true;
-                            }
-                            let asset_path_lc = e.asset_path.to_ascii_lowercase();
-                            if let Some(glob) = glob.as_ref() {
-                                Self::glob_match(glob, &asset_path_lc)
-                            } else {
-                                asset_path_lc.contains(&pattern_lc)
-                            }
-                        }),
-                );
+                out.extend(entries.into_iter().filter(|e| {
+                    if pattern_lc.is_empty() {
+                        return true;
+                    }
+                    let asset_path_lc = e.asset_path.to_ascii_lowercase();
+                    if let Some(glob) = glob.as_ref() {
+                        Self::glob_match(glob, &asset_path_lc)
+                    } else {
+                        asset_path_lc.contains(&pattern_lc)
+                    }
+                }));
             }
         }
         out
@@ -318,7 +316,11 @@ impl Environment {
     }
 
     /// Return unique, sorted object keys resolved from all bundle `m_Container` entries that match `pattern`.
-    pub fn bundle_container_root_keys(&self, pattern: &str, limit: Option<usize>) -> Vec<BinaryObjectKey> {
+    pub fn bundle_container_root_keys(
+        &self,
+        pattern: &str,
+        limit: Option<usize>,
+    ) -> Vec<BinaryObjectKey> {
         let mut keys: Vec<BinaryObjectKey> = self
             .find_binary_object_keys_in_bundle_container(pattern)
             .into_iter()
