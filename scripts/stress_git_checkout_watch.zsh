@@ -26,6 +26,8 @@ ref_b="${REF_B:-HEAD~1}"
 
 index_dir="$(mktemp -d -t unity-asset-search-index.XXXXXX)"
 trap "rm -rf ${index_dir} 2>/dev/null || true" EXIT
+metrics_dir="${index_dir}/metrics"
+mkdir -p "${metrics_dir}"
 
 if [[ ! -d "${project_root}/.git" ]]; then
   echo "expected a git repo at ${project_root} (missing .git)" >&2
@@ -87,8 +89,7 @@ wait_idle() {
     local ok
     ok="$(echo "${json}" | python3 -c 'import json,sys; st=json.load(sys.stdin); print(int(st.get(\"indexing\") is False))')"
     if [[ "${ok}" == "1" ]]; then
-      echo "${label}: idle"
-      echo "${json}" | python3 -c 'import json,sys; st=json.load(sys.stdin); print(json.dumps({\"indexed_docs\": st.get(\"indexed_docs\"), \"updated_docs\": st.get(\"updated_docs\"), \"removed_docs\": st.get(\"removed_docs\"), \"last_index_duration_ms\": st.get(\"last_index_duration_ms\"), \"last_scan_ms\": st.get(\"last_scan_ms\")}, ensure_ascii=False))'
+      echo "${json}" > "${metrics_dir}/${label}.status.json"
       return 0
     fi
     sleep 0.5
@@ -103,6 +104,20 @@ wait_idle() {
   return 1
 }
 
+extract_ms() {
+  local status_json_path="$1"
+  local key="$2"
+  python3 - "$status_json_path" "$key" <<'PY'
+import json,sys
+path=sys.argv[1]
+key=sys.argv[2]
+with open(path,"r",encoding="utf-8") as f:
+    st=json.load(f)
+v=st.get(key)
+print("" if v is None else int(v))
+PY
+}
+
 baseline_for_ref() {
   local ref="$1"
   echo "Checkout ${ref}..."
@@ -113,7 +128,7 @@ baseline_for_ref() {
 
   echo "Full reindex for baseline (${ref})..."
   target/release/unity-asset-search-cli --base-url "${base_url}" --token "${token}" reindex --full >/dev/null
-  wait_idle "baseline-${ref}"
+  wait_idle "baseline-${ref//\//_}"
 
   target/release/unity-asset-search-cli --base-url "${base_url}" status \
     | python3 -c 'import json,sys; st=json.load(sys.stdin); print(int(st.get("indexed_docs") or 0))'
@@ -125,14 +140,29 @@ baseline_b="$(baseline_for_ref "${ref_b}")"
 echo "baseline_a(${ref_a})=${baseline_a}"
 echo "baseline_b(${ref_b})=${baseline_b}"
 
+echo "Tracking watcher fallback occurrences..."
+fallback_marker="full scan threshold"
+fallback_count_before="$(python3 - <<PY
+import pathlib
+p=pathlib.Path("${index_dir}")/"daemon.log"
+print(p.read_text(errors="ignore").count("${fallback_marker}") if p.exists() else 0)
+PY
+)"
+
 echo "Switching between refs for ${iter} iterations (watcher-driven incremental)..."
+durations_path="${metrics_dir}/durations_ms.txt"
+scan_ms_path="${metrics_dir}/scan_ms.txt"
+: > "${durations_path}"
+: > "${scan_ms_path}"
 for i in $(seq 1 "${iter}"); do
   echo "iter ${i}/${iter}: checkout ${ref_a}"
   (
     cd "${project_root}"
     git checkout -q "${ref_a}"
   )
-  wait_idle "checkout-${ref_a}"
+  wait_idle "checkout-${i}-A"
+  echo "$(extract_ms "${metrics_dir}/checkout-${i}-A.status.json" "last_index_duration_ms")" >> "${durations_path}"
+  echo "$(extract_ms "${metrics_dir}/checkout-${i}-A.status.json" "last_scan_ms")" >> "${scan_ms_path}"
   cur_a="$(target/release/unity-asset-search-cli --base-url "${base_url}" status | python3 -c 'import json,sys; st=json.load(sys.stdin); print(int(st.get(\"indexed_docs\") or 0))')"
   if [[ "${cur_a}" -ne "${baseline_a}" ]]; then
     echo "indexed_docs mismatch after checkout ${ref_a}: got ${cur_a}, expected ${baseline_a}" >&2
@@ -144,13 +174,68 @@ for i in $(seq 1 "${iter}"); do
     cd "${project_root}"
     git checkout -q "${ref_b}"
   )
-  wait_idle "checkout-${ref_b}"
+  wait_idle "checkout-${i}-B"
+  echo "$(extract_ms "${metrics_dir}/checkout-${i}-B.status.json" "last_index_duration_ms")" >> "${durations_path}"
+  echo "$(extract_ms "${metrics_dir}/checkout-${i}-B.status.json" "last_scan_ms")" >> "${scan_ms_path}"
   cur_b="$(target/release/unity-asset-search-cli --base-url "${base_url}" status | python3 -c 'import json,sys; st=json.load(sys.stdin); print(int(st.get(\"indexed_docs\") or 0))')"
   if [[ "${cur_b}" -ne "${baseline_b}" ]]; then
     echo "indexed_docs mismatch after checkout ${ref_b}: got ${cur_b}, expected ${baseline_b}" >&2
     exit 1
   fi
 done
+
+fallback_count_after="$(python3 - <<PY
+import pathlib
+p=pathlib.Path("${index_dir}")/"daemon.log"
+print(p.read_text(errors="ignore").count("${fallback_marker}") if p.exists() else 0)
+PY
+)"
+fallback_count_delta="$(( fallback_count_after - fallback_count_before ))"
+
+echo "Summary (checkout indexing latency):"
+python3 - <<PY
+import json,statistics
+from pathlib import Path
+
+def read_ints(path: str) -> list[int]:
+    out=[]
+    for line in Path(path).read_text().splitlines():
+        line=line.strip()
+        if not line:
+            continue
+        try:
+            out.append(int(line))
+        except ValueError:
+            pass
+    return out
+
+def percentile(xs: list[int], p: float) -> int:
+    if not xs:
+        return 0
+    xs=sorted(xs)
+    k=int(round((len(xs)-1)*p))
+    k=max(0,min(len(xs)-1,k))
+    return xs[k]
+
+dur=read_ints("${durations_path}")
+scan=read_ints("${scan_ms_path}")
+
+summary={
+  "ops": len(dur),
+  "index_ms": {
+    "p50": percentile(dur, 0.50),
+    "p95": percentile(dur, 0.95),
+    "max": max(dur) if dur else 0,
+  },
+  "scan_ms": {
+    "p50": percentile(scan, 0.50),
+    "p95": percentile(scan, 0.95),
+    "max": max(scan) if scan else 0,
+  },
+  "fallback_full_scan_threshold_hits": int("${fallback_count_delta}"),
+}
+print(json.dumps(summary, ensure_ascii=False, indent=2))
+PY
 
 echo "Restoring ${ref_a}..."
 (
@@ -159,4 +244,3 @@ echo "Restoring ${ref_a}..."
 )
 
 echo "Done."
-

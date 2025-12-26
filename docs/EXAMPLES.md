@@ -73,6 +73,7 @@ This repository maintains runnable examples per crate (built in CI).
   - `scripts/stress_rename_watch.zsh repo-ref/BoatAttack`
 - Stress test watcher-driven git checkout / branch switching:
   - `scripts/stress_git_checkout_watch.zsh repo-ref/BoatAttack`
+  - The script prints a JSON summary (p50/p95/max) and counts how many times the daemon fell back to a full scan due to watcher storms.
   - If the project is large, you may want to lower debounce or tune the fallback threshold:
     - `DEBOUNCE_MS=200 scripts/stress_git_checkout_watch.zsh repo-ref/BoatAttack`
     - `cargo run -p unity-asset-search-daemon -- --project-root repo-ref/BoatAttack --watch --watch-debounce-ms 200 --watch-full-scan-threshold 5000`

@@ -417,6 +417,11 @@ async fn watch_and_reindex(
 
         let mut changed_paths: Vec<PathBuf> = pending.into_iter().collect();
         if full_scan_threshold > 0 && changed_paths.len() >= full_scan_threshold {
+            eprintln!(
+                "watch burst: {} paths >= {} (full scan threshold), falling back to full scan",
+                changed_paths.len(),
+                full_scan_threshold
+            );
             if let Err(err) = run_reindex(state.clone(), false).await {
                 eprintln!("reindex error (full scan threshold): {err}");
             }
