@@ -4,13 +4,13 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
+use ignore::WalkBuilder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value as _};
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, doc};
-use walkdir::WalkDir;
 
 use unity_asset_search_core::{MatchKind, rank_match, to_terms};
 
@@ -56,17 +56,10 @@ impl IndexPaths {
             None => default_index_dir(&project_root),
         };
 
-        let assets_dir = project_root.join("Assets");
-        let scan_roots = if assets_dir.is_dir() {
-            vec![assets_dir]
-        } else {
-            vec![project_root.clone()]
-        };
-
         Ok(Self {
+            scan_roots: vec![project_root.clone()],
             project_root,
             index_dir,
-            scan_roots,
         })
     }
 }
@@ -324,13 +317,20 @@ fn scan_project_docs(paths: &IndexPaths, fields: &SearchFields) -> Result<Vec<Ta
     let mut docs = Vec::new();
 
     for root in &paths.scan_roots {
-        let walker = WalkDir::new(root)
+        let walker = WalkBuilder::new(root)
             .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| !is_excluded_dir(e.path()));
+            .standard_filters(true)
+            .filter_entry(|e| !is_excluded_dir(e.path()))
+            .build();
 
-        for entry in walker.filter_map(Result::ok) {
-            if entry.file_type().is_dir() {
+        for entry in walker {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
                 continue;
             }
 
@@ -388,10 +388,12 @@ fn is_excluded_dir(path: &Path) -> bool {
             ".git"
                 | "target"
                 | "Library"
-                | "repo-ref"
                 | ".venv-unitypy"
                 | ".unity-asset-search"
                 | "unity-asset-search"
+                | "Temp"
+                | "Obj"
+                | "Logs"
         )
     })
 }

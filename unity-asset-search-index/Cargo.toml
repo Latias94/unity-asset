@@ -13,6 +13,6 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true
-walkdir.workspace = true
 tantivy.workspace = true
+ignore.workspace = true
 unity-asset-search-core = { path = "../unity-asset-search-core" }
