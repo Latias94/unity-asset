@@ -19,7 +19,13 @@ target/release/unity-asset-search-daemon \
 pid=$!
 trap "kill ${pid} 2>/dev/null || true" EXIT
 
-sleep 1
+echo "Waiting for daemon to become ready..."
+for i in {1..100}; do
+  if target/release/unity-asset-search-cli --base-url "${base_url}" health >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.05
+done
 
 echo "Full reindex..."
 target/release/unity-asset-search-cli --base-url "${base_url}" --token "${token}" reindex --full
