@@ -434,12 +434,16 @@ pub(crate) enum Commands {
         #[arg(short, long)]
         input: PathBuf,
 
+        /// Write output to a file instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+
         /// Also load YAML documents (`.asset`, `.prefab`, `.unity`) (heavier).
         #[arg(long)]
         yaml: bool,
 
-        /// Output format (summary, dot, jsonl).
-        #[arg(long, default_value = "summary")]
+        /// Output format (summary, dot, jsonl, json).
+        #[arg(long, default_value = "summary", value_name = "FORMAT")]
         format: String,
 
         /// Limit visited files during scan (best-effort).

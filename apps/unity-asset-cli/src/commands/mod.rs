@@ -217,6 +217,7 @@ pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
         ),
         Commands::ProjectGraph {
             input,
+            output,
             yaml,
             format,
             max_files,
@@ -226,6 +227,7 @@ pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
             follow_symlinks,
         } => project_graph::run(
             input,
+            output,
             yaml,
             format,
             max_files,
