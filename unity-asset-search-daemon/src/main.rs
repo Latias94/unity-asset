@@ -342,8 +342,8 @@ async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::
                 {
                     force_full = true;
                 }
-                if path.is_dir() {
-                    force_full = true;
+                if path.exists() && path.is_dir() {
+                    continue;
                 }
                 paths.push(path);
             }
@@ -390,12 +390,13 @@ async fn watch_and_reindex(state: Arc<AppState>, debounce: Duration) -> anyhow::
             }
         }
 
-        if force_full || pending.len() > 500 {
+        if force_full {
             let _ = run_reindex(state.clone(), false).await;
-        } else {
-            let changed_paths: Vec<PathBuf> = pending.into_iter().collect();
-            let _ = run_reindex_changed_paths(state.clone(), &changed_paths).await;
+            continue;
         }
+
+        let changed_paths: Vec<PathBuf> = pending.into_iter().collect();
+        let _ = run_reindex_changed_paths(state.clone(), &changed_paths).await;
     }
 }
 

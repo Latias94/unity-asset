@@ -542,6 +542,7 @@ impl SearchIndex {
             let mut scripts = state.scripts.clone();
 
             for removed in &delta.removed_rel_paths {
+                let removed_prefix = format!("{removed}/");
                 inner
                     .writer
                     .delete_term(Term::from_field_text(fields.id, removed));
@@ -552,6 +553,25 @@ impl SearchIndex {
                     removed_docs += 1;
                 }
                 remove_script_entries_for_rel_path(&mut scripts, removed);
+
+                let removed_children: Vec<String> = state
+                    .files
+                    .range(removed_prefix.clone()..)
+                    .take_while(|(k, _)| k.starts_with(&removed_prefix))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for child in removed_children {
+                    inner
+                        .writer
+                        .delete_term(Term::from_field_text(fields.id, &child));
+                    inner
+                        .refs_writer
+                        .delete_term(Term::from_field_text(refs_fields.source_id, &child));
+                    if state.files.remove(&child).is_some() {
+                        removed_docs += 1;
+                    }
+                    remove_script_entries_for_rel_path(&mut scripts, &child);
+                }
             }
 
             for file in &delta.files {
@@ -1505,8 +1525,13 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
         if p.starts_with(&paths.index_root_dir) {
             continue;
         }
+        let p = if p.is_absolute() && !p.starts_with(&paths.project_root) {
+            canonicalize_best_effort(p)
+        } else {
+            p.clone()
+        };
         if p.extension().is_some_and(|e| e == "meta") {
-            if let Some(asset) = asset_path_from_meta(p) {
+            if let Some(asset) = asset_path_from_meta(&p) {
                 candidates.push(asset);
             }
         } else {
@@ -1527,6 +1552,8 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
         }
         if candidate.is_file() {
             existing.push(candidate);
+        } else if candidate.exists() && candidate.is_dir() {
+            continue;
         } else if let Ok(rel) = candidate.strip_prefix(&paths.project_root) {
             out.removed_rel_paths
                 .push(rel.to_string_lossy().to_string());
@@ -1604,6 +1631,36 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
     out.files = files;
 
     Ok(out)
+}
+
+fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if let Ok(canon) = path.canonicalize() {
+        return canon;
+    }
+
+    let mut cur = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canon) = cur.canonicalize() {
+            let mut out = canon;
+            for part in tail.into_iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+
+        let Some(name) = cur.file_name().map(|s| s.to_os_string()) else {
+            break;
+        };
+        if !cur.pop() {
+            break;
+        }
+        tail.push(name);
+    }
+    path.to_path_buf()
 }
 
 fn scan_walk_parallel<F>(mut builder: WalkBuilder, handle_path: F) -> Result<Vec<ScannedFile>>
@@ -3413,5 +3470,39 @@ Transform:
             .project_ignore_files_present
             .iter()
             .any(|n| n == ".unity-asset-search-ignore"));
+    }
+
+    #[test]
+    fn reindex_changed_paths_removes_directory_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets/Dir")).unwrap();
+        fs::create_dir_all(temp.path().join("Packages")).unwrap();
+        fs::create_dir_all(temp.path().join("ProjectSettings")).unwrap();
+
+        let prefab = temp.path().join("Assets/Dir/foo.prefab");
+        fs::write(
+            &prefab,
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Foo\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("Assets/Dir/foo.prefab.meta"),
+            "fileFormatVersion: 2\nguid: deadbeefdeadbeefdeadbeefdeadbeef\n",
+        )
+        .unwrap();
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        index.reindex_full(&paths).unwrap();
+        let status = index.status().unwrap();
+        assert_eq!(status.indexed_docs, 1);
+
+        fs::remove_dir_all(temp.path().join("Assets/Dir")).unwrap();
+        index
+            .reindex_changed_paths(&paths, &[temp.path().join("Assets/Dir")])
+            .unwrap();
+        let status = index.status().unwrap();
+        assert_eq!(status.indexed_docs, 0);
+        assert_eq!(status.removed_docs, Some(1));
     }
 }
