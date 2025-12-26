@@ -17,7 +17,8 @@ use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value as _};
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 use unity_asset_search_core::{
-    MatchKind, highlight_html, normalize_for_match, parse_query, rank_match, to_terms,
+    HighlightRange, MatchKind, highlight_html, highlight_ranges, normalize_for_match, parse_query,
+    rank_match, to_terms,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +33,10 @@ pub struct SearchHit {
     pub matched_hierarchy_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_script_symbols: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub highlight_path_ranges: Vec<HighlightRange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub highlight_name_ranges: Vec<HighlightRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub highlight_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,6 +178,7 @@ fn normalize_scan_roots(project_root: &Path, roots: Vec<PathBuf>) -> Result<Vec<
 #[derive(Clone)]
 pub struct SearchIndex {
     inner: Arc<RwLock<SearchIndexInner>>,
+    enrich_cache: Arc<std::sync::Mutex<EnrichCache>>,
 }
 
 struct SearchIndexInner {
@@ -200,6 +206,55 @@ struct SearchFields {
 struct Fingerprint {
     size: u64,
     mtime_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct YamlFileCacheEntry {
+    fingerprint: Fingerprint,
+    is_yaml: bool,
+    hierarchy_paths: Vec<String>,
+    script_guids: Vec<String>,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+struct EnrichCache {
+    clock: u64,
+    max_entries: usize,
+    files: std::collections::HashMap<String, YamlFileCacheEntry>,
+}
+
+impl EnrichCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            clock: 0,
+            max_entries: max_entries.max(32),
+            files: std::collections::HashMap::new(),
+        }
+    }
+
+    fn touch(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    fn evict_if_needed(&mut self) {
+        if self.files.len() <= self.max_entries {
+            return;
+        }
+
+        let mut oldest_key: Option<String> = None;
+        let mut oldest_used = u64::MAX;
+        for (k, v) in &self.files {
+            if v.last_used < oldest_used {
+                oldest_used = v.last_used;
+                oldest_key = Some(k.clone());
+            }
+        }
+        if let Some(k) = oldest_key {
+            self.files.remove(&k);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -265,6 +320,7 @@ impl SearchIndex {
                 status,
                 state,
             })),
+            enrich_cache: Arc::new(std::sync::Mutex::new(EnrichCache::new(256))),
         };
 
         this.refresh_status()?;
@@ -279,6 +335,58 @@ impl SearchIndex {
             .map_err(|_| anyhow!("poisoned lock"))?
             .status
             .clone())
+    }
+
+    fn yaml_enrich_info_for_rel_path(
+        &self,
+        project_root: &Path,
+        rel_path: &str,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        if rel_path.trim().is_empty() {
+            return None;
+        }
+
+        let abs = project_root.join(rel_path);
+        let fingerprint = fingerprint_for_path(&abs).ok()?;
+
+        let mut cache = self.enrich_cache.lock().ok()?;
+        let now = cache.touch();
+
+        if let Some(entry) = cache.files.get_mut(rel_path) {
+            if entry.fingerprint == fingerprint {
+                entry.last_used = now;
+                if entry.is_yaml {
+                    return Some((entry.hierarchy_paths.clone(), entry.script_guids.clone()));
+                }
+                return None;
+            }
+        }
+
+        let text = read_text_limited(&abs, 2 * 1024 * 1024).ok().flatten();
+        let is_yaml = text.as_deref().is_some_and(is_probably_unity_yaml_text);
+        let (hierarchy_paths, script_guids) = if is_yaml {
+            let text = text.as_deref().unwrap_or_default();
+            (
+                extract_unity_yaml_hierarchy_paths(text),
+                extract_unity_yaml_script_guids(text),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        cache.files.insert(
+            rel_path.to_string(),
+            YamlFileCacheEntry {
+                fingerprint,
+                is_yaml,
+                hierarchy_paths: hierarchy_paths.clone(),
+                script_guids: script_guids.clone(),
+                last_used: now,
+            },
+        );
+        cache.evict_if_needed();
+
+        is_yaml.then_some((hierarchy_paths, script_guids))
     }
 
     pub fn reindex(&self, paths: &IndexPaths) -> Result<()> {
@@ -548,6 +656,8 @@ impl SearchIndex {
                 match_kind: rank.kind,
                 matched_hierarchy_paths: Vec::new(),
                 matched_script_symbols: Vec::new(),
+                highlight_path_ranges: Vec::new(),
+                highlight_name_ranges: Vec::new(),
                 highlight_path: None,
                 highlight_name: None,
                 rank_fuzzy_score: rank.fuzzy_score,
@@ -569,6 +679,8 @@ impl SearchIndex {
 
         let tokens = spec.tokens.clone();
         for hit in &mut hits {
+            hit.highlight_path_ranges = highlight_ranges(&hit.path, &tokens);
+            hit.highlight_name_ranges = highlight_ranges(&hit.name, &tokens);
             hit.highlight_path = highlight_html(&hit.path, &tokens);
             hit.highlight_name = highlight_html(&hit.name, &tokens);
         }
@@ -675,6 +787,8 @@ impl SearchIndex {
                 match_kind: rank.kind,
                 matched_hierarchy_paths: Vec::new(),
                 matched_script_symbols: Vec::new(),
+                highlight_path_ranges: Vec::new(),
+                highlight_name_ranges: Vec::new(),
                 highlight_path: None,
                 highlight_name: None,
                 rank_fuzzy_score: rank.fuzzy_score,
@@ -698,6 +812,8 @@ impl SearchIndex {
 
         let tokens = spec.tokens.clone();
         for hit in &mut hits {
+            hit.highlight_path_ranges = highlight_ranges(&hit.path, &tokens);
+            hit.highlight_name_ranges = highlight_ranges(&hit.name, &tokens);
             hit.highlight_path = highlight_html(&hit.path, &tokens);
             hit.highlight_name = highlight_html(&hit.name, &tokens);
         }
@@ -1765,56 +1881,78 @@ fn enrich_hits_with_context(
         return;
     }
 
-    for hit in hits {
-        if hit.path.trim().is_empty() {
+    let mut extracted: Vec<Option<(Vec<String>, Vec<String>)>> = Vec::with_capacity(hits.len());
+    let mut needed_guids = std::collections::BTreeSet::<String>::new();
+
+    for hit in hits.iter() {
+        if !matches!(hit.kind.as_str(), "Prefab" | "Scene") {
+            extracted.push(None);
             continue;
         }
-        let abs = project_root.join(&hit.path);
-        let Ok(Some(text)) = read_text_limited(&abs, 2 * 1024 * 1024) else {
+
+        let Some((hierarchy_paths, script_guids)) =
+            index.yaml_enrich_info_for_rel_path(project_root, &hit.path)
+        else {
+            extracted.push(None);
             continue;
         };
-        if !is_probably_unity_yaml_text(&text) {
-            continue;
-        }
 
-        let mut matched_paths = Vec::new();
-        for path in extract_unity_yaml_hierarchy_paths(&text) {
-            if matched_paths.len() >= 6 {
-                break;
-            }
-            if matches_any_token(&to_terms(&path), &query_tokens) {
-                matched_paths.push(path);
-            }
+        for g in &script_guids {
+            needed_guids.insert(g.clone());
         }
-        hit.matched_hierarchy_paths = matched_paths;
+        extracted.push(Some((hierarchy_paths, script_guids)));
+    }
+
+    let script_symbols_by_guid: std::collections::HashMap<String, Vec<String>> = index
+        .inner
+        .read()
+        .ok()
+        .map(|inner| {
+            needed_guids
+                .into_iter()
+                .filter_map(|guid| {
+                    inner
+                        .state
+                        .scripts
+                        .get(&guid)
+                        .map(|e| (guid, e.symbols.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for (hit, info) in hits.iter_mut().zip(extracted.into_iter()) {
+        let Some((hierarchy_paths, script_guids)) = info else {
+            continue;
+        };
+
+        hit.matched_hierarchy_paths = hierarchy_paths
+            .into_iter()
+            .filter(|p| matches_any_token(&to_terms(p), &query_tokens))
+            .take(6)
+            .collect();
 
         let mut matched_symbols = std::collections::BTreeSet::<String>::new();
-        for guid in extract_unity_yaml_script_guids(&text) {
-            if matched_symbols.len() >= 12 {
-                break;
-            }
-            let Some(symbols) = index
-                .inner
-                .read()
-                .ok()
-                .and_then(|inner| inner.state.scripts.get(&guid).map(|e| e.symbols.clone()))
-            else {
+        for guid in script_guids {
+            let Some(symbols) = script_symbols_by_guid.get(&guid) else {
                 continue;
             };
-
             for sym in symbols {
-                if sym.trim().is_empty() {
-                    continue;
-                }
-                if matches_any_token(&to_terms(&sym), &query_tokens) {
-                    matched_symbols.insert(sym);
-                }
                 if matched_symbols.len() >= 12 {
                     break;
                 }
+                if sym.trim().is_empty() {
+                    continue;
+                }
+                if matches_any_token(&to_terms(sym), &query_tokens) {
+                    matched_symbols.insert(sym.clone());
+                }
+            }
+            if matched_symbols.len() >= 12 {
+                break;
             }
         }
-        hit.matched_script_symbols = matched_symbols.into_iter().take(12).collect();
+        hit.matched_script_symbols = matched_symbols.into_iter().collect();
     }
 }
 

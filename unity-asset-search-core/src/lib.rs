@@ -3,6 +3,12 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HighlightRange {
+    pub start: usize,
+    pub end: usize,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QuerySpec {
     pub raw: String,
@@ -233,16 +239,44 @@ pub fn rank_match(query: &str, name: &str, path: &str) -> RankedScore {
 }
 
 pub fn highlight_html(text: &str, query_tokens: &[String]) -> Option<String> {
+    let ranges = highlight_ranges(text, query_tokens);
+    if ranges.is_empty() {
+        return None;
+    }
+    if !text.is_ascii() || ranges.iter().any(|r| !text.is_char_boundary(r.start) || !text.is_char_boundary(r.end)) {
+        return None;
+    }
+
+    let mut out = String::with_capacity(text.len() + ranges.len() * 9);
+    let mut cursor = 0usize;
+    for HighlightRange { start, end } in ranges {
+        if let Some(prefix) = text.get(cursor..start) {
+            out.push_str(prefix);
+        }
+        out.push_str("<em>");
+        if let Some(mid) = text.get(start..end) {
+            out.push_str(mid);
+        }
+        out.push_str("</em>");
+        cursor = end;
+    }
+    if let Some(rest) = text.get(cursor..) {
+        out.push_str(rest);
+    }
+    Some(out)
+}
+
+pub fn highlight_ranges(text: &str, query_tokens: &[String]) -> Vec<HighlightRange> {
     let tokens: Vec<&str> = query_tokens
         .iter()
         .map(String::as_str)
         .filter(|t| !t.is_empty())
         .collect();
     if tokens.is_empty() {
-        return None;
+        return Vec::new();
     }
     if !text.is_ascii() || tokens.iter().any(|t| !t.is_ascii()) {
-        return None;
+        return Vec::new();
     }
 
     let hay = text.as_bytes();
@@ -270,27 +304,14 @@ pub fn highlight_html(text: &str, query_tokens: &[String]) -> Option<String> {
     }
 
     if ranges.is_empty() {
-        return None;
+        return Vec::new();
     }
     ranges.sort_by_key(|(s, _)| *s);
 
-    let mut out = String::with_capacity(text.len() + ranges.len() * 9);
-    let mut cursor = 0usize;
-    for (start, end) in ranges {
-        if let Some(prefix) = text.get(cursor..start) {
-            out.push_str(prefix);
-        }
-        out.push_str("<em>");
-        if let Some(mid) = text.get(start..end) {
-            out.push_str(mid);
-        }
-        out.push_str("</em>");
-        cursor = end;
-    }
-    if let Some(rest) = text.get(cursor..) {
-        out.push_str(rest);
-    }
-    Some(out)
+    ranges
+        .into_iter()
+        .map(|(start, end)| HighlightRange { start, end })
+        .collect()
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<(usize, usize)> {
