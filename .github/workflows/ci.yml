@@ -72,7 +72,7 @@ jobs:
     - name: Run tests (async)
       run: |
         cargo nextest run -p unity-asset --features async
-        cargo nextest run -p unity-asset-cli --features async
+        cargo nextest run -p unity-asset-cli --features async --no-tests=pass
 
     - name: Run tests (decode/export)
       run: cargo nextest run -p unity-asset-decode --features full
