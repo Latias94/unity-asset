@@ -27,6 +27,8 @@ pub struct SearchHit {
     pub path: String,
     pub name: String,
     pub kind: String,
+    pub stable_id: String,
+    pub location: Location,
     pub score: f32,
     pub match_kind: MatchKind,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -46,6 +48,17 @@ pub struct SearchHit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Location {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub query: String,
     pub took_ms: u128,
@@ -57,6 +70,8 @@ pub struct SearchResponse {
 pub struct ReferenceHit {
     pub source_path: String,
     pub source_kind: String,
+    pub stable_id: String,
+    pub location: Location,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contexts: Vec<ReferenceContext>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -79,6 +94,8 @@ pub struct ReferenceContext {
 pub struct ReferenceObject {
     pub doc_file_id: Option<u64>,
     pub doc_class_id: Option<u32>,
+    pub stable_id: String,
+    pub location: Location,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub object_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -781,12 +798,21 @@ impl SearchIndex {
                 spec.free_text.as_str()
             };
             let rank = rank_match(rank_query, &name, &path);
+            let stable_id = stable_id_for(guid.as_deref(), &path, None);
+            let location = Location {
+                path: path.clone(),
+                guid: guid.clone(),
+                file_id: None,
+                class_id: None,
+            };
 
             hits.push(SearchHit {
                 guid,
                 path,
                 name,
                 kind,
+                stable_id,
+                location,
                 score: bm25,
                 match_kind: rank.kind,
                 matched_hierarchy_paths: Vec::new(),
@@ -912,12 +938,21 @@ impl SearchIndex {
                 spec.free_text.as_str()
             };
             let rank = rank_match(rank_query, &name, &path);
+            let stable_id = stable_id_for(guid.as_deref(), &path, None);
+            let location = Location {
+                path: path.clone(),
+                guid: guid.clone(),
+                file_id: None,
+                class_id: None,
+            };
 
             hits.push(SearchHit {
                 guid,
                 path,
                 name,
                 kind,
+                stable_id,
+                location,
                 score: bm25,
                 match_kind: rank.kind,
                 matched_hierarchy_paths: Vec::new(),
@@ -1059,9 +1094,17 @@ impl SearchIndex {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
+            let stable_id = stable_id_for(None, &source_path, None);
             hits.push(ReferenceHit {
-                source_path,
+                source_path: source_path.clone(),
                 source_kind,
+                stable_id,
+                location: Location {
+                    path: source_path.clone(),
+                    guid: None,
+                    file_id: None,
+                    class_id: None,
+                },
                 contexts: Vec::new(),
                 objects: Vec::new(),
             });
@@ -1097,6 +1140,16 @@ impl SearchIndex {
                 continue;
             }
             let abs = project_root.join(&hit.source_path);
+            let source_guid = read_guid_from_meta(asset_meta_path(&abs))
+                .map(|g| normalize_guid_string(&g))
+                .filter(|g| !g.is_empty());
+            hit.stable_id = stable_id_for(source_guid.as_deref(), &hit.source_path, None);
+            hit.location = Location {
+                path: hit.source_path.clone(),
+                guid: source_guid.clone(),
+                file_id: None,
+                class_id: None,
+            };
             let is_yaml = is_probably_unity_yaml(&abs).unwrap_or(false);
             if is_yaml {
                 let Ok(Some(text)) = read_text_limited(&abs, 2 * 1024 * 1024) else {
@@ -1106,8 +1159,11 @@ impl SearchIndex {
             } else {
                 hit.contexts = extract_reference_contexts_from_binary(&abs, &guid, file_id);
             }
-            let (contexts, objects) =
-                group_reference_contexts_and_objects(std::mem::take(&mut hit.contexts));
+            let (contexts, objects) = group_reference_contexts_and_objects(
+                std::mem::take(&mut hit.contexts),
+                &hit.source_path,
+                source_guid.as_deref(),
+            );
             hit.contexts = contexts;
             hit.objects = objects;
             hit.contexts.truncate(10);
@@ -1154,6 +1210,25 @@ fn detect_project_ignore_files(project_root: &Path, supported: &[String]) -> Vec
         if project_root.join(name).is_file() {
             out.push(name.clone());
         }
+    }
+    out
+}
+
+fn stable_id_base(guid: Option<&str>, path: &str) -> String {
+    if let Some(guid) = guid {
+        let guid = normalize_guid_string(guid);
+        if !guid.is_empty() {
+            return format!("guid:{guid}");
+        }
+    }
+    format!("path:{path}")
+}
+
+fn stable_id_for(guid: Option<&str>, path: &str, file_id: Option<u64>) -> String {
+    let mut out = stable_id_base(guid, path);
+    if let Some(file_id) = file_id {
+        out.push('#');
+        out.push_str(&file_id.to_string());
     }
     out
 }
@@ -2249,6 +2324,8 @@ struct ContextKey {
 
 fn group_reference_contexts_and_objects(
     contexts: Vec<ReferenceContext>,
+    source_path: &str,
+    source_guid: Option<&str>,
 ) -> (Vec<ReferenceContext>, Vec<ReferenceObject>) {
     if contexts.is_empty() {
         return (contexts, Vec::new());
@@ -2285,9 +2362,17 @@ fn group_reference_contexts_and_objects(
 
     for (mut base, hints) in grouped.into_values() {
         let field_hints: Vec<String> = hints.iter().cloned().collect();
+        let file_id = base.doc_file_id;
         objects.push(ReferenceObject {
             doc_file_id: base.doc_file_id,
             doc_class_id: base.doc_class_id,
+            stable_id: stable_id_for(source_guid, source_path, file_id),
+            location: Location {
+                path: source_path.to_string(),
+                guid: source_guid.map(str::to_string),
+                file_id,
+                class_id: base.doc_class_id,
+            },
             object_name: base.object_name.clone(),
             hierarchy_path: base.hierarchy_path.clone(),
             field_hints,
@@ -3257,17 +3342,18 @@ Transform:
             field_hint: Some("m_Materials[0]".to_string()),
         };
 
-        let (contexts, objects) = group_reference_contexts_and_objects(vec![b, a]);
+        let (contexts, objects) =
+            group_reference_contexts_and_objects(vec![b, a], "Assets/a.prefab", None);
         assert_eq!(contexts.len(), 1);
         assert_eq!(
             contexts[0].field_hint.as_deref(),
             Some("m_Material, m_Materials[0]")
         );
         assert_eq!(objects.len(), 1);
-        assert_eq!(
-            objects[0].field_hints,
-            vec!["m_Material".to_string(), "m_Materials[0]".to_string()]
-        );
+        assert_eq!(objects[0].location.path, "Assets/a.prefab");
+        assert_eq!(objects[0].location.file_id, Some(10));
+        assert_eq!(objects[0].location.class_id, Some(1));
+        assert_eq!(objects[0].field_hints, vec!["m_Material", "m_Materials[0]"]);
     }
 
     #[test]
@@ -3287,13 +3373,26 @@ Transform:
             field_hint: Some("m_Script".to_string()),
         };
 
-        let (contexts, objects) = group_reference_contexts_and_objects(vec![a, b]);
+        let (contexts, objects) =
+            group_reference_contexts_and_objects(vec![a, b], "Assets/a.prefab", None);
         assert_eq!(contexts.len(), 2);
         assert!(contexts.iter().any(|c| c.object_name.as_deref() == Some("A")));
         assert!(contexts.iter().any(|c| c.object_name.as_deref() == Some("B")));
         assert_eq!(objects.len(), 2);
         assert!(objects.iter().any(|c| c.object_name.as_deref() == Some("A")));
         assert!(objects.iter().any(|c| c.object_name.as_deref() == Some("B")));
+    }
+
+    #[test]
+    fn stable_id_prefers_guid_and_appends_file_id() {
+        assert_eq!(
+            stable_id_for(Some("DEADBEEFDEADBEEFDEADBEEFDEADBEEF"), "Assets/a.prefab", Some(10)),
+            "guid:deadbeefdeadbeefdeadbeefdeadbeef#10"
+        );
+        assert_eq!(
+            stable_id_for(None, "Assets/a.prefab", Some(10)),
+            "path:Assets/a.prefab#10"
+        );
     }
 
     #[test]
