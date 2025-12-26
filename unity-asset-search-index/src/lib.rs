@@ -3102,4 +3102,52 @@ Transform:
         let paths = extract_unity_yaml_hierarchy_paths(text);
         assert!(paths.iter().any(|p| p == "Root/Child"));
     }
+
+    #[test]
+    fn group_reference_contexts_merges_hints_for_same_object() {
+        let a = ReferenceContext {
+            doc_file_id: Some(10),
+            doc_class_id: Some(1),
+            object_name: Some("Player".to_string()),
+            hierarchy_path: Some("Root/Player".to_string()),
+            field_hint: Some("m_Material".to_string()),
+        };
+        let b = ReferenceContext {
+            doc_file_id: Some(10),
+            doc_class_id: Some(1),
+            object_name: Some("Player".to_string()),
+            hierarchy_path: Some("Root/Player".to_string()),
+            field_hint: Some("m_Materials[0]".to_string()),
+        };
+
+        let grouped = group_reference_contexts(vec![b, a]);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(
+            grouped[0].field_hint.as_deref(),
+            Some("m_Material, m_Materials[0]")
+        );
+    }
+
+    #[test]
+    fn group_reference_contexts_keeps_objects_separate() {
+        let a = ReferenceContext {
+            doc_file_id: Some(10),
+            doc_class_id: Some(1),
+            object_name: Some("A".to_string()),
+            hierarchy_path: Some("Root/A".to_string()),
+            field_hint: None,
+        };
+        let b = ReferenceContext {
+            doc_file_id: Some(11),
+            doc_class_id: Some(1),
+            object_name: Some("B".to_string()),
+            hierarchy_path: Some("Root/B".to_string()),
+            field_hint: Some("m_Script".to_string()),
+        };
+
+        let grouped = group_reference_contexts(vec![a, b]);
+        assert_eq!(grouped.len(), 2);
+        assert!(grouped.iter().any(|c| c.object_name.as_deref() == Some("A")));
+        assert!(grouped.iter().any(|c| c.object_name.as_deref() == Some("B")));
+    }
 }
