@@ -10,23 +10,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - Unreleased
 
 ### Highlights
-- Prepare publishing the search stack to crates.io:
-  - `unity-asset-search-core` and `unity-asset-search-index` (reusable library crates)
-  - `unity-asset-search-daemon` and `unity-asset-search-cli` (tools)
-- Multi-platform release assets for UnityHero packaging (scheme B):
-  - `unity-asset-search-daemon` (embedded into UnityHero `Tools/<platform>/`)
-  - `unity-asset-search-cli` (optional; debugging/ops utility)
-- Release automation upgrades via `cargo-dist` to ship binaries alongside the GitHub Release.
+- Better “UnityPy-style” discovery and export workflows:
+  - AssetBundle `m_Container` discovery supports glob patterns (`*`, `?`) and case-insensitive matching.
+  - Environment-wide dependency graph for SerializedFiles (TypeTree + PPtr scan), with best-effort external resolution.
+- Search stack is ready for downstream use:
+  - `unity-asset-search-core` / `unity-asset-search-index` (library crates)
+  - `unity-asset-search-daemon` / `unity-asset-search-cli` (tools)
 
 ### Added
-- `cargo-dist` configuration and CI to build and attach platform archives to GitHub Releases.
-- A manual GitHub Actions workflow to backfill missing dist assets for an existing tag (repair path).
 - Glob matching for AssetBundle `m_Container` discovery (`*`, `?`) and CLI support for glob patterns.
 - Dependency graph extraction for SerializedFiles (TypeTree + PPtr scan) in `MetadataExtractor`.
 - Environment-wide dependency graph builder (best-effort external resolution via `.meta` GUID cache and bundle name heuristics).
-- Environment dependency graph helpers:
-  - Rebuild a single source subgraph (`build_dependency_graph_for_source`)
-  - Incremental invalidation when reloading sources (`invalidate_dependency_scan_cache_for_source`)
+- Graph helpers for analysis and incremental rebuild:
+  - `roots` / `leaves` / `cycles` helpers for quick inspection.
+  - Rebuild a single source subgraph (`build_dependency_graph_for_source`).
+  - Incremental invalidation when reloading sources (`invalidate_dependency_scan_cache_for_source`).
+- Release automation via `cargo-dist` to ship multi-platform binaries alongside GitHub Releases.
+- A manual GitHub Actions workflow to backfill missing dist assets for an existing tag (repair path).
 
 ### Changed
 - Bundle search/filter helpers now align better with UnityPy-style discovery semantics:
