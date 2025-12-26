@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset-yaml"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 authors.workspace = true
 description = "YAML format support for Unity asset parsing"
@@ -22,7 +22,7 @@ exclude = [
 
 [dependencies]
 # Core dependency
-unity-asset-core = { path = "../unity-asset-core", version = "0.2.0" }
+unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
 
 # Workspace dependencies
 serde = { workspace = true }

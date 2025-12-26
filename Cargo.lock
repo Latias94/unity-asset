@@ -3293,7 +3293,7 @@ checksum = "323402cff2dd658f39ca17c789b502021b3f18707c91cdf22e3838e1b4023817"
 
 [[package]]
 name = "unity-asset"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3307,7 +3307,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-binary"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3335,7 +3335,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3355,7 +3355,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3371,7 +3371,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-decode"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hex",
  "hound",
@@ -3388,7 +3388,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-search-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3400,7 +3400,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-search-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fuzzy-matcher",
  "serde",
@@ -3409,7 +3409,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-search-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3426,7 +3426,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-search-index"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ignore",
@@ -3442,7 +3442,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-yaml"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",

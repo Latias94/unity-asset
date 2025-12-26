@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-12-26
+
+### Highlights
+- Multi-platform release assets for UnityHero packaging (scheme B):
+  - `unity-asset-search-daemon` (embedded into UnityHero `Tools/<platform>/`)
+  - `unity-asset-search-cli` (optional; debugging/ops utility)
+- Release automation upgrades via `cargo-dist` to ship binaries alongside the GitHub Release.
+
+### Added
+- `cargo-dist` configuration and CI to build and attach platform archives to GitHub Releases.
+- A manual GitHub Actions workflow to backfill missing dist assets for an existing tag (repair path).
+
+### Breaking Changes
+- None intended. As a reminder, in the 0.x series breaking changes may occur between minor versions.
+
 ## [0.2.0] - 2025-12-26
 
 ### Highlights

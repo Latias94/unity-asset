@@ -107,37 +107,28 @@ See `docs/README.md` for documentation entry points, and `docs/EXAMPLES.md` for 
 
 ### Installation
 
-**Note**: crates.io publishing is planned, but not guaranteed yet. For now, to try it out:
-
-```bash
-# Clone and build from source
-git clone https://github.com/Latias94/unity-asset.git
-cd unity-asset
-
-# Build the library
-cargo build --workspace
-
-# Run tests (recommended)
-cargo nextest run --workspace
-
-# Try the CLI tools
-cargo run --bin unity-asset -- --help
-cargo run --features async --bin unity-asset-async -- --help
-```
-
-For maintainers: the tag-driven publish/release process is documented in `docs/RELEASING.md`.
-
-Once `v0.2.0` is published to crates.io, you'll be able to install it with:
+This project is published on crates.io. Install it with:
 
 ```toml
 # Add to your Cargo.toml
 [dependencies]
-unity-asset = "0.2.0"
+unity-asset = "0.3.0"
 ```
 
 ```bash
 # Install CLI tools
 cargo install unity-asset-cli
+```
+
+For maintainers: the tag-driven publish/release process is documented in `docs/RELEASING.md`.
+
+To build from source:
+
+```bash
+git clone https://github.com/Latias94/unity-asset.git
+cd unity-asset
+cargo build --workspace
+cargo nextest run --workspace
 ```
 
 By default, `unity-asset-cli` is built without decode/export helpers to keep builds lighter. To enable `--decode` support and best-effort exporters:
