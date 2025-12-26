@@ -1,0 +1,13 @@
+# Default queries for `unity-asset-search bench`
+#
+# Lines starting with `#` are ignored.
+
+prefab
+t:Prefab in:Assets/UI button
+t:Shader
+t:Material in:Assets
+in:Assets/Scenes
+audio
+texture
+anim
+controller

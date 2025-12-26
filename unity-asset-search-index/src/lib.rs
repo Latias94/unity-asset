@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
-use ignore::WalkBuilder;
+use ignore::{DirEntry, WalkBuilder};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
@@ -803,58 +803,51 @@ enum ReindexMode {
 fn scan_project_files(paths: &IndexPaths) -> Result<ScanResult> {
     let mut out = ScanResult::default();
 
-    for root in &paths.scan_roots {
-        let walker = WalkBuilder::new(root)
-            .follow_links(false)
-            .standard_filters(true)
-            .filter_entry(|e| !is_excluded_dir(e.path()))
-            .build();
-
-        for entry in walker {
-            let Ok(entry) = entry else {
-                continue;
-            };
-            if !entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_file())
-            {
-                continue;
-            }
-
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "meta") {
-                continue;
-            }
-
-            if should_skip_file(path) || is_excluded_dir(path) {
-                continue;
-            }
-
-            let rel_path = path
-                .strip_prefix(&paths.project_root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
-
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
-
-            let kind = classify_kind(path);
-            let fingerprint = fingerprint_for_path(path)?;
-
-            let file = ScannedFile {
-                rel_path: rel_path.clone(),
-                abs_path: path.to_path_buf(),
-                fingerprint,
-                name,
-                kind,
-            };
-
-            out.files.insert(rel_path, file);
+    let walker = build_project_walker(paths)?;
+    for entry in walker {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
         }
+
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "meta") {
+            continue;
+        }
+
+        if should_skip_file(path) || is_excluded_dir(path) || !is_in_scan_roots(paths, path) {
+            continue;
+        }
+
+        let rel_path = path
+            .strip_prefix(&paths.project_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let kind = classify_kind(path);
+        let fingerprint = fingerprint_for_path(path)?;
+
+        let file = ScannedFile {
+            rel_path: rel_path.clone(),
+            abs_path: path.to_path_buf(),
+            fingerprint,
+            name,
+            kind,
+        };
+
+        out.files.insert(rel_path, file);
     }
 
     Ok(out)
@@ -909,14 +902,39 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
         return Ok(out);
     }
 
-    let mut builder = WalkBuilder::new(&existing[0]);
-    for path in existing.iter().skip(1) {
-        builder.add(path);
-    }
+    let existing_set: std::collections::BTreeSet<PathBuf> = existing.into_iter().collect();
+    let allowed_dirs = build_allowed_dirs(paths, &existing_set);
+    let existing_set_for_filter = existing_set.clone();
+
+    let scan_roots = paths.scan_roots.clone();
+    let project_root = paths.project_root.clone();
+
+    let mut builder = WalkBuilder::new(&project_root);
     builder
         .follow_links(false)
-        .standard_filters(true)
-        .max_depth(Some(0));
+        .parents(false)
+        .ignore(true)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .add_custom_ignore_filename(".gitignore")
+        .filter_entry(move |e: &DirEntry| {
+            let p = e.path();
+            if is_excluded_dir(p) {
+                return false;
+            }
+            if p == project_root {
+                return true;
+            }
+            if !is_in_scan_roots_raw(&scan_roots, p) && !scan_roots.iter().any(|r| r.starts_with(p))
+            {
+                return false;
+            }
+            if e.file_type().is_some_and(|t| t.is_file()) {
+                return existing_set_for_filter.contains(p);
+            }
+            allowed_dirs.contains(p)
+        });
 
     for entry in builder.build() {
         let Ok(entry) = entry else {
@@ -925,11 +943,9 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
+
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "meta") {
-            continue;
-        }
-        if should_skip_file(path) || is_excluded_dir(path) {
+        if should_skip_file(path) || is_excluded_dir(path) || !existing_set.contains(path) {
             continue;
         }
 
@@ -956,6 +972,64 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
     }
 
     Ok(out)
+}
+
+fn build_project_walker(paths: &IndexPaths) -> Result<ignore::Walk> {
+    let scan_roots = paths.scan_roots.clone();
+    let project_root = paths.project_root.clone();
+
+    let mut builder = WalkBuilder::new(&project_root);
+    builder
+        .follow_links(false)
+        .parents(false)
+        .ignore(true)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .add_custom_ignore_filename(".gitignore")
+        .filter_entry(move |e: &DirEntry| {
+            let p = e.path();
+            if is_excluded_dir(p) {
+                return false;
+            }
+            if p == project_root {
+                return true;
+            }
+            scan_roots
+                .iter()
+                .any(|root| root.starts_with(p) || p.starts_with(root))
+        });
+
+    Ok(builder.build())
+}
+
+fn is_in_scan_roots(paths: &IndexPaths, path: &Path) -> bool {
+    is_in_scan_roots_raw(&paths.scan_roots, path)
+}
+
+fn is_in_scan_roots_raw(scan_roots: &[PathBuf], path: &Path) -> bool {
+    scan_roots.iter().any(|root| path.starts_with(root))
+}
+
+fn build_allowed_dirs(
+    paths: &IndexPaths,
+    files: &std::collections::BTreeSet<PathBuf>,
+) -> std::collections::BTreeSet<PathBuf> {
+    let mut out = std::collections::BTreeSet::new();
+    out.insert(paths.project_root.clone());
+
+    for file in files {
+        let mut dir = file.parent();
+        while let Some(d) = dir {
+            out.insert(d.to_path_buf());
+            if d == paths.project_root {
+                break;
+            }
+            dir = d.parent();
+        }
+    }
+
+    out
 }
 
 fn asset_path_from_meta(meta_path: &Path) -> Option<PathBuf> {
