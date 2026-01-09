@@ -20,8 +20,12 @@ impl Environment {
             return 200;
         }
 
-        let a_name = std::path::Path::new(&a).file_name().and_then(|n| n.to_str());
-        let b_name = std::path::Path::new(&b).file_name().and_then(|n| n.to_str());
+        let a_name = std::path::Path::new(&a)
+            .file_name()
+            .and_then(|n| n.to_str());
+        let b_name = std::path::Path::new(&b)
+            .file_name()
+            .and_then(|n| n.to_str());
         if let (Some(a_name), Some(b_name)) = (a_name, b_name) {
             if a_name == b_name {
                 return 150;

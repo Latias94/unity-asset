@@ -330,7 +330,10 @@ impl EnvironmentDependencyGraph {
         }
 
         for (to, froms) in &self.internal_to {
-            incoming.entry(to.clone()).or_default().extend(froms.iter().cloned());
+            incoming
+                .entry(to.clone())
+                .or_default()
+                .extend(froms.iter().cloned());
         }
 
         if follow_resolved_external {
@@ -512,16 +515,25 @@ impl Environment {
         options: DependencyGraphBuildOptions,
     ) -> Result<EnvironmentDependencyGraph> {
         let file = match source_kind {
-            BinarySourceKind::SerializedFile => self
-                .binary_assets
-                .get(source)
-                .ok_or_else(|| UnityAssetError::format(format!("SerializedFile not loaded: {}", source.describe())))?,
+            BinarySourceKind::SerializedFile => {
+                self.binary_assets.get(source).ok_or_else(|| {
+                    UnityAssetError::format(format!(
+                        "SerializedFile not loaded: {}",
+                        source.describe()
+                    ))
+                })?
+            }
             BinarySourceKind::AssetBundle => {
                 let idx = asset_index.ok_or_else(|| {
-                    UnityAssetError::format("asset_index is required for bundle sources".to_string())
+                    UnityAssetError::format(
+                        "asset_index is required for bundle sources".to_string(),
+                    )
                 })?;
                 let bundle = self.bundles.get(source).ok_or_else(|| {
-                    UnityAssetError::format(format!("AssetBundle not loaded: {}", source.describe()))
+                    UnityAssetError::format(format!(
+                        "AssetBundle not loaded: {}",
+                        source.describe()
+                    ))
                 })?;
                 bundle.assets.get(idx).ok_or_else(|| {
                     UnityAssetError::format(format!(
@@ -539,10 +551,7 @@ impl Environment {
         ))
     }
 
-    fn dependency_scan_cached(
-        &self,
-        obj_ref: &BinaryObjectRef<'_>,
-    ) -> CachedScanEntry {
+    fn dependency_scan_cached(&self, obj_ref: &BinaryObjectRef<'_>) -> CachedScanEntry {
         let key = obj_ref.key();
         match self.dependency_scan_cache.read() {
             Ok(cache) => {
@@ -585,15 +594,27 @@ impl Environment {
         computed
     }
 
-    pub fn build_dependency_graph(&self, options: DependencyGraphBuildOptions) -> EnvironmentDependencyGraph {
-        let mut sources: Vec<(&BinarySource, BinarySourceKind, Option<usize>, &SerializedFile)> =
-            Vec::new();
+    pub fn build_dependency_graph(
+        &self,
+        options: DependencyGraphBuildOptions,
+    ) -> EnvironmentDependencyGraph {
+        let mut sources: Vec<(
+            &BinarySource,
+            BinarySourceKind,
+            Option<usize>,
+            &SerializedFile,
+        )> = Vec::new();
         for (source, file) in &self.binary_assets {
             sources.push((source, BinarySourceKind::SerializedFile, None, file));
         }
         for (bundle_source, bundle) in &self.bundles {
             for (asset_index, file) in bundle.assets.iter().enumerate() {
-                sources.push((bundle_source, BinarySourceKind::AssetBundle, Some(asset_index), file));
+                sources.push((
+                    bundle_source,
+                    BinarySourceKind::AssetBundle,
+                    Some(asset_index),
+                    file,
+                ));
             }
         }
 
@@ -602,7 +623,12 @@ impl Environment {
 
     fn build_dependency_graph_from_files(
         &self,
-        mut sources: Vec<(&BinarySource, BinarySourceKind, Option<usize>, &SerializedFile)>,
+        mut sources: Vec<(
+            &BinarySource,
+            BinarySourceKind,
+            Option<usize>,
+            &SerializedFile,
+        )>,
         options: DependencyGraphBuildOptions,
     ) -> EnvironmentDependencyGraph {
         let mut nodes: Vec<BinaryObjectKey> = Vec::new();
@@ -610,8 +636,10 @@ impl Environment {
             std::collections::HashMap::new();
         let mut internal_to: std::collections::HashMap<BinaryObjectKey, Vec<BinaryObjectKey>> =
             std::collections::HashMap::new();
-        let mut external_from: std::collections::HashMap<BinaryObjectKey, Vec<ExternalDependencyEdge>> =
-            std::collections::HashMap::new();
+        let mut external_from: std::collections::HashMap<
+            BinaryObjectKey,
+            Vec<ExternalDependencyEdge>,
+        > = std::collections::HashMap::new();
         let mut warnings: Vec<DependencyGraphWarning> = Vec::new();
 
         let mut remaining = options.max_objects.unwrap_or(usize::MAX);
@@ -667,11 +695,17 @@ impl Environment {
                     }
                     CachedScanEntry::Error(e) => {
                         if options.continue_on_error {
-                            warnings.push(DependencyGraphWarning { key: from_key, error: e });
+                            warnings.push(DependencyGraphWarning {
+                                key: from_key,
+                                error: e,
+                            });
                             remaining = remaining.saturating_sub(1);
                             continue;
                         }
-                        warnings.push(DependencyGraphWarning { key: from_key, error: e });
+                        warnings.push(DependencyGraphWarning {
+                            key: from_key,
+                            error: e,
+                        });
                         break;
                     }
                 };
@@ -696,7 +730,10 @@ impl Environment {
                         .entry(from_key.clone())
                         .or_default()
                         .push(to_key.clone());
-                    internal_to.entry(to_key).or_default().push(from_key.clone());
+                    internal_to
+                        .entry(to_key)
+                        .or_default()
+                        .push(from_key.clone());
                 }
 
                 // External edges (fileID>0).
@@ -731,14 +768,13 @@ impl Environment {
                     };
                     let resolved = self.resolve_binary_pptr(&obj_ref, file_id, path_id);
 
-                    external_from
-                        .entry(from_key.clone())
-                        .or_default()
-                        .push(ExternalDependencyEdge {
+                    external_from.entry(from_key.clone()).or_default().push(
+                        ExternalDependencyEdge {
                             from: from_key.clone(),
                             target,
                             resolved,
-                        });
+                        },
+                    );
                 }
 
                 remaining = remaining.saturating_sub(1);
@@ -759,8 +795,16 @@ impl Environment {
         }
         for v in external_from.values_mut() {
             v.sort_by(|a, b| {
-                let ak = (a.target.file_id, a.target.path_id, a.resolved.as_ref().map(|k| k.to_string()));
-                let bk = (b.target.file_id, b.target.path_id, b.resolved.as_ref().map(|k| k.to_string()));
+                let ak = (
+                    a.target.file_id,
+                    a.target.path_id,
+                    a.resolved.as_ref().map(|k| k.to_string()),
+                );
+                let bk = (
+                    b.target.file_id,
+                    b.target.path_id,
+                    b.resolved.as_ref().map(|k| k.to_string()),
+                );
                 ak.cmp(&bk)
             });
             v.dedup_by(|a, b| {

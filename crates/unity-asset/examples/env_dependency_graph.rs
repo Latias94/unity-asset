@@ -15,7 +15,10 @@ fn main() -> unity_asset::Result<()> {
         .get(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("tests/samples/char_118_yuki.ab"));
-    let pattern = args.get(2).cloned().unwrap_or_else(|| "Assets/".to_string());
+    let pattern = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "Assets/".to_string());
 
     let mut env = Environment::new();
     env.load_file(&input)?;

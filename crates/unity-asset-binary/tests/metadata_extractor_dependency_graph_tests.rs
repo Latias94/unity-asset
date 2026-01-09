@@ -12,13 +12,23 @@ fn metadata_extractor_populates_dependency_graph_nodes() {
     let path = sample_bundle_path();
     let bytes = std::fs::read(&path).expect("read sample bundle");
     let bundle = BundleParser::from_bytes(bytes).expect("parse sample bundle");
-    let asset = bundle.assets.first().expect("bundle has at least one asset");
+    let asset = bundle
+        .assets
+        .first()
+        .expect("bundle has at least one asset");
 
     let extractor = MetadataExtractor::new();
-    let result = extractor.extract_from_asset(asset).expect("extract metadata");
+    let result = extractor
+        .extract_from_asset(asset)
+        .expect("extract metadata");
 
     assert!(
-        !result.metadata.dependencies.dependency_graph.nodes.is_empty(),
+        !result
+            .metadata
+            .dependencies
+            .dependency_graph
+            .nodes
+            .is_empty(),
         "dependency graph nodes should be populated (not placeholder)"
     );
     assert_eq!(
@@ -27,4 +37,3 @@ fn metadata_extractor_populates_dependency_graph_nodes() {
         "dependency graph nodes should cover analyzed objects"
     );
 }
-

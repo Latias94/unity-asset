@@ -76,7 +76,10 @@ fn bundle_loader_find_assets_by_type_filters_results() {
         "should return empty list for absent type id"
     );
 
-    let present_type_id = *present.iter().next().expect("fixture has at least one type id");
+    let present_type_id = *present
+        .iter()
+        .next()
+        .expect("fixture has at least one type id");
     let expected_count = bundle
         .assets
         .iter()
@@ -85,10 +88,16 @@ fn bundle_loader_find_assets_by_type_filters_results() {
 
     let results = loader.find_assets_by_type(present_type_id);
     assert_eq!(results.len(), expected_count);
-    assert!(results.iter().all(|(name, _)| *name == expected_bundle_name));
-    assert!(results
-        .iter()
-        .all(|(_name, asset)| !asset.objects_of_type(present_type_id).is_empty()));
+    assert!(
+        results
+            .iter()
+            .all(|(name, _)| *name == expected_bundle_name)
+    );
+    assert!(
+        results
+            .iter()
+            .all(|(_name, asset)| !asset.objects_of_type(present_type_id).is_empty())
+    );
 }
 
 #[test]
@@ -97,7 +106,9 @@ fn bundle_processor_extract_assets_by_type_filters_results() {
     let bundle_name = path.to_string_lossy().to_string();
 
     let mut processor = BundleProcessor::new();
-    processor.process_file(&path).expect("process sample bundle");
+    processor
+        .process_file(&path)
+        .expect("process sample bundle");
 
     let bundle = processor
         .loader()
@@ -111,7 +122,10 @@ fn bundle_processor_extract_assets_by_type_filters_results() {
         .expect("bundle exists");
     assert!(absent.is_empty());
 
-    let present_type_id = *present.iter().next().expect("fixture has at least one type id");
+    let present_type_id = *present
+        .iter()
+        .next()
+        .expect("fixture has at least one type id");
     let expected_count = bundle
         .assets
         .iter()
@@ -121,9 +135,11 @@ fn bundle_processor_extract_assets_by_type_filters_results() {
         .extract_assets_by_type(&bundle_name, present_type_id)
         .expect("bundle exists");
     assert_eq!(filtered.len(), expected_count);
-    assert!(filtered
-        .iter()
-        .all(|asset| !asset.objects_of_type(present_type_id).is_empty()));
+    assert!(
+        filtered
+            .iter()
+            .all(|asset| !asset.objects_of_type(present_type_id).is_empty())
+    );
 }
 
 #[test]
@@ -142,9 +158,11 @@ fn metadata_extractor_from_bundle_sets_bundle_compression_type() {
         !results.is_empty(),
         "fixture should yield at least one serialized file"
     );
-    assert!(results
-        .iter()
-        .all(|r| r.metadata.file_info.compression_type == expected));
+    assert!(
+        results
+            .iter()
+            .all(|r| r.metadata.file_info.compression_type == expected)
+    );
 }
 
 #[test]
@@ -163,10 +181,7 @@ fn bundle_loader_find_assets_by_name_matches_embedded_asset_names() {
         "fixture should have embedded asset file names"
     );
 
-    let needle = bundle.asset_names[0]
-        .chars()
-        .take(8)
-        .collect::<String>();
+    let needle = bundle.asset_names[0].chars().take(8).collect::<String>();
     let expected_count = bundle
         .asset_names
         .iter()
@@ -175,9 +190,11 @@ fn bundle_loader_find_assets_by_name_matches_embedded_asset_names() {
 
     let matches = loader.find_assets_by_name(&needle);
     assert_eq!(matches.len(), expected_count);
-    assert!(matches
-        .iter()
-        .all(|(name, _asset)| *name == expected_bundle_name));
+    assert!(
+        matches
+            .iter()
+            .all(|(name, _asset)| *name == expected_bundle_name)
+    );
 
     assert!(
         loader

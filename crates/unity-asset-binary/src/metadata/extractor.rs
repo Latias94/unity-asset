@@ -2,8 +2,8 @@
 //!
 //! This module provides the main metadata extraction functionality for Unity assets.
 
-use super::{DependencyAnalyzer, RelationshipAnalyzer};
 use super::types::*;
+use super::{DependencyAnalyzer, RelationshipAnalyzer};
 use crate::asset::SerializedFile;
 use crate::bundle::AssetBundle;
 use crate::compression::CompressionType;
@@ -141,7 +141,9 @@ impl MetadataExtractor {
         // Extract dependencies if enabled
         if self.config.include_dependencies {
             let analyzed = match self.dependency_analyzer.lock() {
-                Ok(mut analyzer) => analyzer.analyze_dependencies_in_asset(asset, &objects_to_analyze),
+                Ok(mut analyzer) => {
+                    analyzer.analyze_dependencies_in_asset(asset, &objects_to_analyze)
+                }
                 Err(e) => e
                     .into_inner()
                     .analyze_dependencies_in_asset(asset, &objects_to_analyze),
@@ -199,7 +201,8 @@ impl MetadataExtractor {
                     v.dedup();
                 }
                 for summary in &mut result.metadata.object_stats.largest_objects {
-                    summary.dependencies = by_from.get(&summary.path_id).cloned().unwrap_or_default();
+                    summary.dependencies =
+                        by_from.get(&summary.path_id).cloned().unwrap_or_default();
                 }
             }
 

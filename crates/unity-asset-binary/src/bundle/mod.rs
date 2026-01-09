@@ -112,15 +112,13 @@ impl BundleProcessor {
         bundle_name: &str,
         type_id: i32,
     ) -> Option<Vec<&crate::asset::Asset>> {
-        self.loader
-            .get_bundle(bundle_name)
-            .map(|bundle| {
-                bundle
-                    .assets
-                    .iter()
-                    .filter(|asset| !asset.objects_of_type(type_id).is_empty())
-                    .collect()
-            })
+        self.loader.get_bundle(bundle_name).map(|bundle| {
+            bundle
+                .assets
+                .iter()
+                .filter(|asset| !asset.objects_of_type(type_id).is_empty())
+                .collect()
+        })
     }
 
     /// Get bundle information
