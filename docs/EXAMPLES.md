@@ -74,6 +74,8 @@ This repository maintains runnable examples per crate (built in CI).
   - `cargo install unity-asset-search-cli`
 - Start the daemon (auto reindex on first run):
   - `cargo run -p unity-asset-search-daemon -- --project-root repo-ref/BoatAttack --watch`
+- Start the daemon with an Everything-like experience (indexes bundle container paths; disables `.gitignore`):
+  - `cargo run -p unity-asset-search-daemon -- --project-root repo-ref/BoatAttack --watch --search-everything`
 - Exclude paths (recommended):
   - Use `.gitignore` (supported) or `.ignore` (supported), or add a `.unity-asset-search-ignore` file at project root for tool-specific ignores.
 - Query from the CLI:
@@ -81,6 +83,8 @@ This repository maintains runnable examples per crate (built in CI).
   - `cargo run -p unity-asset-search-cli -- search "player" --limit 20`
   - `cargo run -p unity-asset-search-cli -- search "PlayerController" --limit 20`
   - `cargo run -p unity-asset-search-cli -- search "UI StartButton" --limit 20`
+  - Search bundle container paths (requires daemon `--search-everything` or `--index-bundle-container-entries`):
+    - `cargo run -p unity-asset-search-cli -- search "type:bundlecontainer statements_iron" --limit 20`
   - `cargo run -p unity-asset-search-cli -- suggest "t:pr" --limit 10`
   - `cargo run -p unity-asset-search-cli -- status`
   - Find references by GUID:

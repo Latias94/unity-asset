@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `roots` / `leaves` / `cycles` helpers for quick inspection.
   - Rebuild a single source subgraph (`build_dependency_graph_for_source`).
   - Incremental invalidation when reloading sources (`invalidate_dependency_scan_cache_for_source`).
+- Search indexing can optionally include AssetBundle `m_Container` asset paths as `kind=BundleContainer` for Everything-style discovery.
+- Search daemon flags for container indexing and ignore control (`--search-everything`, `--index-bundle-container-entries`, `--no-gitignore`, `--no-ignore-files`).
 - Release automation via `cargo-dist` to ship multi-platform binaries alongside GitHub Releases.
 - A manual GitHub Actions workflow to backfill missing dist assets for an existing tag (repair path).
 
@@ -42,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Populate `file_info.compression_type` when extracting from bundles.
   - Fill `ObjectSummary.dependencies` from scanned internal references when enabled.
 - More robust external reference resolution by canonicalizing filesystem paths when loading and indexing `.meta` GUIDs.
+- Preserve AssetBundle `m_Container` entries with null PPtr (`m_PathID=0`) as unresolved paths instead of dropping them.
 
 ### Breaking Changes
 - None intended. As a reminder, in the 0.x series breaking changes may occur between minor versions.

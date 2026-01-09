@@ -14,7 +14,7 @@ use rand::TryRngCore;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-use unity_asset_search_index::{IndexPaths, SearchIndex};
+use unity_asset_search_index::{IndexPaths, SearchIndex, SearchIndexOptions};
 
 #[derive(Debug, Parser)]
 #[command(name = "unity-asset-search-daemon")]
@@ -57,6 +57,36 @@ struct Args {
     /// Set to 0 to disable.
     #[arg(long, default_value_t = 0)]
     watch_reconcile_interval_ms: u64,
+
+    /// Also index AssetBundle `m_Container` asset paths (UnityPy-like discovery).
+    ///
+    /// This makes built-time asset paths searchable even when the source files are not present on disk.
+    #[arg(long)]
+    index_bundle_container_entries: bool,
+
+    /// Preset for an Everything-like experience.
+    ///
+    /// Equivalent to enabling `--index-bundle-container-entries` and disabling `.gitignore` rules
+    /// (bundles are commonly gitignored).
+    #[arg(long, alias = "everything")]
+    search_everything: bool,
+
+    #[arg(long, hide = true)]
+    unityflow: bool,
+
+    /// Cap indexed container entries per bundle (prevents pathological bundles from exploding the index).
+    #[arg(long, default_value_t = 50_000)]
+    max_bundle_container_entries_per_bundle: usize,
+
+    /// Do not apply ignore files (`.gitignore`, `.ignore`, `.unity-asset-search-ignore`) when scanning.
+    ///
+    /// This is useful for indexing build artifacts (e.g. `Assets/StreamingAssets/AssetBundles/`) that are commonly gitignored.
+    #[arg(long)]
+    no_ignore_files: bool,
+
+    /// Ignore `.gitignore` rules while still honoring other ignore mechanisms.
+    #[arg(long)]
+    no_gitignore: bool,
 }
 
 #[derive(Clone)]
@@ -70,6 +100,10 @@ struct AppState {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let preset_everything = args.search_everything || args.unityflow;
+    let index_bundle_container_entries = preset_everything || args.index_bundle_container_entries;
+    let no_gitignore = preset_everything || args.no_gitignore;
+
     let scan_roots = if args.scan_all {
         Some(vec![PathBuf::from(".")])
     } else if args.scan_root.is_empty() {
@@ -78,7 +112,13 @@ async fn main() -> anyhow::Result<()> {
         Some(args.scan_root.clone())
     };
     let paths = IndexPaths::for_project(args.project_root, args.index_dir, scan_roots)?;
-    let index = SearchIndex::open_or_create(&paths)?;
+    let options = SearchIndexOptions {
+        index_bundle_container_entries,
+        max_bundle_container_entries_per_bundle: args.max_bundle_container_entries_per_bundle,
+        respect_ignore_files: !args.no_ignore_files,
+        respect_project_gitignore: !no_gitignore,
+    };
+    let index = SearchIndex::open_or_create_with_options(&paths, options)?;
 
     let token = args.token.unwrap_or_else(generate_token);
     persist_token(&paths.index_root_dir, &token)?;
@@ -88,6 +128,13 @@ async fn main() -> anyhow::Result<()> {
         args.listen,
         paths.index_root_dir.display(),
         token
+    );
+    eprintln!(
+        "options: index_bundle_container_entries={} max_bundle_container_entries_per_bundle={} respect_ignore_files={} respect_project_gitignore={}",
+        index_bundle_container_entries,
+        args.max_bundle_container_entries_per_bundle,
+        !args.no_ignore_files,
+        !no_gitignore
     );
 
     let state = AppState {
@@ -99,7 +146,9 @@ async fn main() -> anyhow::Result<()> {
 
     if !args.no_auto_reindex {
         let status = index.status()?;
-        if status.indexed_docs == 0 && !status.indexing {
+        let should_reindex =
+            (status.indexed_docs == 0 && !status.indexing) || index.options_changed();
+        if should_reindex {
             let state = Arc::new(state.clone());
             tokio::spawn(async move {
                 let _ = run_reindex(state, false).await;

@@ -20,6 +20,18 @@ enum Cmd {
     Search {
         query: String,
 
+        /// Filter by kind (shorthand for adding `type:<KIND>` to the query).
+        ///
+        /// Examples: `Prefab`, `Scene`, `Script`, `BundleContainer`.
+        #[arg(long)]
+        r#type: Option<String>,
+
+        /// Filter by path prefix (shorthand for adding `in:"<PREFIX>"` to the query).
+        ///
+        /// Examples: `Assets/UI`, `Packages/com.company.product/`.
+        #[arg(long)]
+        in_path: Option<String>,
+
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
@@ -69,7 +81,15 @@ enum Cmd {
 async fn main() -> Result<()> {
     let args = Args::parse();
     match args.cmd {
-        Cmd::Search { query, limit } => search(&args.base_url, &query, limit).await?,
+        Cmd::Search {
+            query,
+            r#type,
+            in_path,
+            limit,
+        } => {
+            let query = build_search_query(&query, r#type.as_deref(), in_path.as_deref());
+            search(&args.base_url, &query, limit).await?
+        }
         Cmd::Health => health(&args.base_url).await?,
         Cmd::References {
             guid,
@@ -90,6 +110,26 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn build_search_query(raw: &str, kind: Option<&str>, in_path: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if let Some(kind) = kind.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(format!("type:{kind}"));
+    }
+    if let Some(prefix) = in_path.map(str::trim).filter(|s| !s.is_empty()) {
+        let quoted = if prefix.contains(' ') || prefix.contains('"') {
+            prefix.replace('"', "\\\"")
+        } else {
+            prefix.to_string()
+        };
+        parts.push(format!("in:\"{quoted}\""));
+    }
+    let raw = raw.trim();
+    if !raw.is_empty() {
+        parts.push(raw.to_string());
+    }
+    parts.join(" ").trim().to_string()
 }
 
 async fn health(base_url: &str) -> Result<()> {
