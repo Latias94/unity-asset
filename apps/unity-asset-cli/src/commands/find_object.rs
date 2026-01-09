@@ -494,17 +494,18 @@ fn extract_bundle_container_entries_fast(
 
             if let Ok(raw_entries) = file.assetbundle_container_raw(object.info()) {
                 for (asset_path, file_id, path_id) in raw_entries {
-                    if path_id == 0 {
-                        continue;
-                    }
-                    let key = resolve_pptr_in_bundle(
-                        bundle_source,
-                        asset_index,
-                        &file,
-                        asset_names,
-                        file_id,
-                        path_id,
-                    );
+                    let key = if path_id == 0 {
+                        None
+                    } else {
+                        resolve_pptr_in_bundle(
+                            bundle_source,
+                            asset_index,
+                            &file,
+                            asset_names,
+                            file_id,
+                            path_id,
+                        )
+                    };
                     out.push(unity_asset::environment::BundleContainerEntry {
                         bundle_source: bundle_source.clone(),
                         asset_index,
@@ -558,18 +559,18 @@ fn extract_container_entries_from_typetree(
         let Some((file_id, path_id)) = scan_pptr_value(second) else {
             continue;
         };
-        if path_id == 0 {
-            continue;
-        }
-
-        let key = resolve_pptr_in_bundle(
-            bundle_source,
-            context_asset_index,
-            context_file,
-            asset_names,
-            file_id,
-            path_id,
-        );
+        let key = if path_id == 0 {
+            None
+        } else {
+            resolve_pptr_in_bundle(
+                bundle_source,
+                context_asset_index,
+                context_file,
+                asset_names,
+                file_id,
+                path_id,
+            )
+        };
 
         out.push(unity_asset::environment::BundleContainerEntry {
             bundle_source: bundle_source.clone(),

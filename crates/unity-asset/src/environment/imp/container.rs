@@ -143,11 +143,12 @@ impl Environment {
             let Some((file_id, path_id)) = Self::scan_pptr(second) else {
                 continue;
             };
-            if path_id == 0 {
-                continue;
-            }
 
-            let key = self.resolve_binary_pptr(context, file_id, path_id);
+            let key = if path_id == 0 {
+                None
+            } else {
+                self.resolve_binary_pptr(context, file_id, path_id)
+            };
             out.push(BundleContainerEntry {
                 bundle_source: context.source.clone(),
                 asset_index: context.asset_index.unwrap_or(0),
@@ -232,23 +233,23 @@ impl Environment {
                 // Fallback: raw parsing for stripped TypeTree bundles.
                 if let Ok(raw_entries) = object.file().assetbundle_container_raw(object.info()) {
                     for (asset_path, file_id, path_id) in raw_entries {
-                        if path_id == 0 {
-                            continue;
-                        }
-                        let key = self
-                            .resolve_binary_pptr(&obj_ref, file_id, path_id)
-                            .or_else(|| {
-                                // Fallback: if external mapping fails, try to locate the object by `path_id`
-                                // within the same bundle. This is best-effort and only used when `file_id`
-                                // can't be resolved.
-                                let matches =
-                                    self.find_binary_objects_in_source_id(obj_ref.source, path_id);
-                                if matches.len() == 1 {
-                                    Some(matches[0].key())
-                                } else {
-                                    None
-                                }
-                            });
+                        let key = if path_id == 0 {
+                            None
+                        } else {
+                            self.resolve_binary_pptr(&obj_ref, file_id, path_id)
+                                .or_else(|| {
+                                    // Fallback: if external mapping fails, try to locate the object by `path_id`
+                                    // within the same bundle. This is best-effort and only used when `file_id`
+                                    // can't be resolved.
+                                    let matches = self
+                                        .find_binary_objects_in_source_id(obj_ref.source, path_id);
+                                    if matches.len() == 1 {
+                                        Some(matches[0].key())
+                                    } else {
+                                        None
+                                    }
+                                })
+                        };
                         out.push(BundleContainerEntry {
                             bundle_source: obj_ref.source.clone(),
                             asset_index,

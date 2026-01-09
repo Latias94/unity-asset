@@ -12,24 +12,7 @@ fn link_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
 
     match fs::hard_link(src, dst) {
         Ok(()) => Ok(()),
-        Err(_) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::symlink;
-                if symlink(src, dst).is_ok() {
-                    return Ok(());
-                }
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::symlink_file;
-                if symlink_file(src, dst).is_ok() {
-                    return Ok(());
-                }
-            }
-
-            fs::copy(src, dst).map(|_| ())
-        }
+        Err(_) => fs::copy(src, dst).map(|_| ()),
     }
 }
 
@@ -362,9 +345,11 @@ fn environment_load_project_binaries_only_indexes_meta_without_loading_meta_docu
     link_or_copy_file(&sample_bundle, &bundle_dst).unwrap();
 
     let mut env = Environment::new();
-    let stats = env
-        .load_project(root, ProjectLoadOptions::binaries_only())
-        .unwrap();
+    let mut options = ProjectLoadOptions::binaries_only();
+    // Avoid machine-specific global ignore rules (e.g. global gitignore ignoring `Build/`),
+    // which can make this test flaky across developer environments.
+    options.respect_ignores = false;
+    let stats = env.load_project(root, options).unwrap();
 
     assert!(stats.meta_files_seen >= 1);
     assert!(stats.meta_guids_indexed >= 1);

@@ -354,9 +354,26 @@ impl Environment {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>> {
-        let source_path = canonicalize_if_exists(source_path.as_ref());
-        let source = BinarySource::path(&source_path);
-        self.read_stream_data_source(&source, source_kind, stream_path, offset, size)
+        let source_path = source_path.as_ref();
+        let canonical = canonicalize_if_exists(source_path);
+        let source = BinarySource::path(&canonical);
+
+        match self.read_stream_data_source(&source, source_kind, stream_path, offset, size) {
+            Ok(bytes) => Ok(bytes),
+            Err(primary) => {
+                // `canonicalize_if_exists` resolves symlinks. For streamed resources, Unity's
+                // on-disk lookup is relative to the *path the user opened* (e.g. a symlinked
+                // bundle next to its `.resource` file). Try the original path as a fallback.
+                if source_path != canonical {
+                    if let Ok(bytes) =
+                        self.read_stream_data_from_fs(source_path, stream_path, offset, size)
+                    {
+                        return Ok(bytes);
+                    }
+                }
+                Err(primary)
+            }
+        }
     }
 
     pub fn read_stream_data_source(
