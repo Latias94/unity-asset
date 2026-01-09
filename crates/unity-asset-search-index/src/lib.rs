@@ -146,6 +146,14 @@ pub struct StatusResponse {
     pub last_fallback_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fallback_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub index_bundle_container_entries: bool,
+    #[serde(default)]
+    pub max_bundle_container_entries_per_bundle: u64,
+    #[serde(default)]
+    pub respect_ignore_files: bool,
+    #[serde(default)]
+    pub respect_project_gitignore: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +164,25 @@ pub struct IndexPaths {
     pub refs_index_data_dir: PathBuf,
     pub scan_roots: Vec<PathBuf>,
     pub state_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchIndexOptions {
+    pub index_bundle_container_entries: bool,
+    pub max_bundle_container_entries_per_bundle: usize,
+    pub respect_ignore_files: bool,
+    pub respect_project_gitignore: bool,
+}
+
+impl Default for SearchIndexOptions {
+    fn default() -> Self {
+        Self {
+            index_bundle_container_entries: false,
+            max_bundle_container_entries_per_bundle: 50_000,
+            respect_ignore_files: true,
+            respect_project_gitignore: true,
+        }
+    }
 }
 
 impl IndexPaths {
@@ -259,6 +286,7 @@ pub struct SearchIndex {
 }
 
 struct SearchIndexInner {
+    options: SearchIndexOptions,
     reader: IndexReader,
     writer: IndexWriter,
     fields: SearchFields,
@@ -280,6 +308,7 @@ struct SearchFields {
     kind: Field,
     kind_terms: Field,
     content_terms: Field,
+    container_source_path: Field,
 }
 
 #[derive(Clone)]
@@ -352,6 +381,8 @@ impl EnrichCache {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct IndexState {
+    #[serde(default)]
+    options: SearchIndexOptions,
     files: std::collections::BTreeMap<String, Fingerprint>,
     #[serde(default)]
     scripts: std::collections::BTreeMap<String, ScriptGuidEntry>,
@@ -383,6 +414,13 @@ impl Drop for IndexingGuard {
 
 impl SearchIndex {
     pub fn open_or_create(paths: &IndexPaths) -> Result<Self> {
+        Self::open_or_create_with_options(paths, SearchIndexOptions::default())
+    }
+
+    pub fn open_or_create_with_options(
+        paths: &IndexPaths,
+        options: SearchIndexOptions,
+    ) -> Result<Self> {
         fs::create_dir_all(&paths.index_root_dir).with_context(|| {
             format!("create index root dir: {}", paths.index_root_dir.display())
         })?;
@@ -450,10 +488,18 @@ impl SearchIndex {
             fallback_count: 0,
             last_fallback_reason: None,
             last_fallback_unix_ms: None,
+            index_bundle_container_entries: options.index_bundle_container_entries,
+            max_bundle_container_entries_per_bundle: options
+                .max_bundle_container_entries_per_bundle
+                .try_into()
+                .unwrap_or(u64::MAX),
+            respect_ignore_files: options.respect_ignore_files,
+            respect_project_gitignore: options.respect_project_gitignore,
         };
 
         let this = Self {
             inner: Arc::new(RwLock::new(SearchIndexInner {
+                options,
                 reader,
                 writer,
                 fields,
@@ -478,6 +524,13 @@ impl SearchIndex {
             .map_err(|_| anyhow!("poisoned lock"))?
             .status
             .clone())
+    }
+
+    pub fn options_changed(&self) -> bool {
+        self.inner
+            .read()
+            .map(|inner| inner.state.options != inner.options)
+            .unwrap_or(false)
     }
 
     pub fn note_fallback(&self, reason: &str) -> Result<()> {
@@ -555,6 +608,14 @@ impl SearchIndex {
     }
 
     pub fn reindex(&self, paths: &IndexPaths) -> Result<()> {
+        let options_changed = self
+            .inner
+            .read()
+            .map(|inner| inner.state.options != inner.options)
+            .unwrap_or(false);
+        if options_changed {
+            return self.reindex_full(paths);
+        }
         self.reindex_impl(paths, ReindexMode::Incremental)
     }
 
@@ -567,6 +628,15 @@ impl SearchIndex {
         paths: &IndexPaths,
         changed_paths: &[PathBuf],
     ) -> Result<()> {
+        let options_changed = self
+            .inner
+            .read()
+            .map(|inner| inner.state.options != inner.options)
+            .unwrap_or(false);
+        if options_changed {
+            return self.reindex_full(paths);
+        }
+
         let start = Instant::now();
         let indexing_guard = {
             let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
@@ -589,8 +659,13 @@ impl SearchIndex {
             return Ok(());
         }
 
+        let options = {
+            let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
+            inner.options
+        };
+
         let scan_start = Instant::now();
-        let delta = scan_changed_paths(paths, &changed_paths)?;
+        let delta = scan_changed_paths(paths, &changed_paths, options)?;
         let scan_ms = scan_start.elapsed().as_millis();
 
         let fields = {
@@ -616,6 +691,9 @@ impl SearchIndex {
                     .writer
                     .delete_term(Term::from_field_text(fields.id, removed));
                 inner
+                    .writer
+                    .delete_term(Term::from_field_text(fields.container_source_path, removed));
+                inner
                     .refs_writer
                     .delete_term(Term::from_field_text(refs_fields.source_id, removed));
                 if state.files.remove(removed).is_some() {
@@ -633,6 +711,9 @@ impl SearchIndex {
                     inner
                         .writer
                         .delete_term(Term::from_field_text(fields.id, &child));
+                    inner
+                        .writer
+                        .delete_term(Term::from_field_text(fields.container_source_path, &child));
                     inner
                         .refs_writer
                         .delete_term(Term::from_field_text(refs_fields.source_id, &child));
@@ -666,6 +747,10 @@ impl SearchIndex {
                         inner
                             .writer
                             .delete_term(Term::from_field_text(fields.id, &rel_path));
+                        inner.writer.delete_term(Term::from_field_text(
+                            fields.container_source_path,
+                            &rel_path,
+                        ));
                         inner
                             .refs_writer
                             .delete_term(Term::from_field_text(refs_fields.source_id, &rel_path));
@@ -690,6 +775,10 @@ impl SearchIndex {
                 inner
                     .writer
                     .delete_term(Term::from_field_text(fields.id, &file.rel_path));
+                inner.writer.delete_term(Term::from_field_text(
+                    fields.container_source_path,
+                    &file.rel_path,
+                ));
                 inner
                     .writer
                     .add_document(build_doc(&fields, file, &scripts)?)?;
@@ -697,8 +786,17 @@ impl SearchIndex {
                 inner
                     .refs_writer
                     .delete_term(Term::from_field_text(refs_fields.source_id, &file.rel_path));
-                if let Some(ref_doc) = build_refs_doc(&refs_fields, file)? {
+                let (ref_doc, container_paths) =
+                    build_refs_doc_and_container_entries(&refs_fields, file, options)?;
+                if let Some(ref_doc) = ref_doc {
                     inner.refs_writer.add_document(ref_doc)?;
+                }
+                for asset_path in container_paths {
+                    inner.writer.add_document(build_bundle_container_doc(
+                        &fields,
+                        &file.rel_path,
+                        &asset_path,
+                    ))?;
                 }
 
                 state.files.insert(file.rel_path.clone(), file.fingerprint);
@@ -708,6 +806,7 @@ impl SearchIndex {
             inner.writer.commit()?;
             inner.refs_writer.commit()?;
             state.scripts = scripts;
+            state.options = options;
             inner.state = state;
             store_state(&paths.state_path, &inner.state)?;
         }
@@ -754,8 +853,13 @@ impl SearchIndex {
             }
         };
 
+        let options = {
+            let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
+            inner.options
+        };
+
         let scan_start = Instant::now();
-        let scan = scan_project_files(paths)?;
+        let scan = scan_project_files(paths, options)?;
         let scan_ms = scan_start.elapsed().as_millis();
 
         let (fields, refs_fields, mut state) = {
@@ -792,6 +896,10 @@ impl SearchIndex {
                 inner
                     .writer
                     .delete_term(Term::from_field_text(fields.id, &removed));
+                inner.writer.delete_term(Term::from_field_text(
+                    fields.container_source_path,
+                    &removed,
+                ));
                 inner
                     .refs_writer
                     .delete_term(Term::from_field_text(refs_fields.source_id, &removed));
@@ -808,6 +916,10 @@ impl SearchIndex {
                 inner
                     .writer
                     .delete_term(Term::from_field_text(fields.id, rel_path));
+                inner.writer.delete_term(Term::from_field_text(
+                    fields.container_source_path,
+                    rel_path,
+                ));
                 inner
                     .writer
                     .add_document(build_doc(&fields, file, &scripts)?)?;
@@ -815,8 +927,17 @@ impl SearchIndex {
                 inner
                     .refs_writer
                     .delete_term(Term::from_field_text(refs_fields.source_id, rel_path));
-                if let Some(ref_doc) = build_refs_doc(&refs_fields, file)? {
+                let (ref_doc, container_paths) =
+                    build_refs_doc_and_container_entries(&refs_fields, file, options)?;
+                if let Some(ref_doc) = ref_doc {
                     inner.refs_writer.add_document(ref_doc)?;
+                }
+                for asset_path in container_paths {
+                    inner.writer.add_document(build_bundle_container_doc(
+                        &fields,
+                        rel_path,
+                        &asset_path,
+                    ))?;
                 }
 
                 state.files.insert(rel_path.clone(), file.fingerprint);
@@ -826,6 +947,7 @@ impl SearchIndex {
             inner.writer.commit()?;
             inner.refs_writer.commit()?;
             state.scripts = scripts;
+            state.options = options;
             inner.state = state;
             store_state(&paths.state_path, &inner.state)?;
         }
@@ -931,15 +1053,25 @@ impl SearchIndex {
                 .unwrap_or_default()
                 .to_string();
 
+            let container_source_path = retrieved
+                .get_first(inner.fields.container_source_path)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+
             let rank_query = if spec.free_text.is_empty() {
                 spec.raw.as_str()
             } else {
                 spec.free_text.as_str()
             };
             let rank = rank_match(rank_query, &name, &path);
-            let stable_id = stable_id_for(guid.as_deref(), &path, None);
+            let stable_id = if let Some(src) = container_source_path.as_deref() {
+                stable_id_for(None, &format!("container:{src}|{path}"), None)
+            } else {
+                stable_id_for(guid.as_deref(), &path, None)
+            };
             let location = Location {
-                path: path.clone(),
+                path: container_source_path.unwrap_or_else(|| path.clone()),
                 guid: guid.clone(),
                 file_id: None,
                 class_id: None,
@@ -1071,15 +1203,25 @@ impl SearchIndex {
                 .unwrap_or_default()
                 .to_string();
 
+            let container_source_path = retrieved
+                .get_first(inner.fields.container_source_path)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+
             let rank_query = if spec.free_text.is_empty() {
                 spec.raw.as_str()
             } else {
                 spec.free_text.as_str()
             };
             let rank = rank_match(rank_query, &name, &path);
-            let stable_id = stable_id_for(guid.as_deref(), &path, None);
+            let stable_id = if let Some(src) = container_source_path.as_deref() {
+                stable_id_for(None, &format!("container:{src}|{path}"), None)
+            } else {
+                stable_id_for(guid.as_deref(), &path, None)
+            };
             let location = Location {
-                path: path.clone(),
+                path: container_source_path.unwrap_or_else(|| path.clone()),
                 guid: guid.clone(),
                 file_id: None,
                 class_id: None,
@@ -1414,6 +1556,7 @@ fn canonicalize_kind_filter(raw: &str) -> Option<String> {
         "shader" => "Shader",
         "texture" | "tex" => "Texture",
         "audio" => "Audio",
+        "bundlecontainer" | "container" | "bundle-container" => "BundleContainer",
         "file" => "File",
         _ => return None,
     };
@@ -1552,6 +1695,7 @@ fn build_schema() -> Schema {
     builder.add_text_field("kind", STRING | STORED);
     builder.add_text_field("kind_terms", TEXT);
     builder.add_text_field("content_terms", TEXT);
+    builder.add_text_field("container_source_path", STRING | STORED);
     builder.build()
 }
 
@@ -1568,6 +1712,9 @@ fn build_fields(schema: &Schema) -> SearchFields {
         content_terms: schema
             .get_field("content_terms")
             .expect("content_terms field"),
+        container_source_path: schema
+            .get_field("container_source_path")
+            .expect("container_source_path field"),
     }
 }
 
@@ -1613,12 +1760,12 @@ enum ReindexMode {
     Full,
 }
 
-fn scan_project_files(paths: &IndexPaths) -> Result<ScanResult> {
+fn scan_project_files(paths: &IndexPaths, options: SearchIndexOptions) -> Result<ScanResult> {
     let mut out = ScanResult::default();
 
     let project_root = paths.project_root.clone();
     let scan_roots = paths.scan_roots.clone();
-    let files = scan_walk_parallel(build_project_walk_builder(paths), move |path| {
+    let files = scan_walk_parallel(build_project_walk_builder(paths, options), move |path| {
         if path.extension().is_some_and(|e| e == "meta") {
             return Ok(None);
         }
@@ -1633,7 +1780,7 @@ fn scan_project_files(paths: &IndexPaths) -> Result<ScanResult> {
             .strip_prefix(&project_root)
             .unwrap_or(path)
             .to_string_lossy()
-            .to_string();
+            .replace('\\', "/");
 
         let name = path
             .file_stem()
@@ -1667,7 +1814,11 @@ struct ChangeScanResult {
     rescan_dir_rel_prefixes: Vec<String>,
 }
 
-fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<ChangeScanResult> {
+fn scan_changed_paths(
+    paths: &IndexPaths,
+    changed_paths: &[PathBuf],
+    options: SearchIndexOptions,
+) -> Result<ChangeScanResult> {
     let mut out = ChangeScanResult::default();
     if changed_paths.is_empty() {
         return Ok(out);
@@ -1712,7 +1863,7 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
             }
         } else if let Ok(rel) = candidate.strip_prefix(&paths.project_root) {
             out.removed_rel_paths
-                .push(rel.to_string_lossy().to_string());
+                .push(rel.to_string_lossy().replace('\\', "/"));
         }
     }
 
@@ -1730,33 +1881,24 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
         let project_root = paths.project_root.clone();
 
         let mut builder = WalkBuilder::new(&project_root);
-        builder
-            .follow_links(false)
-            .parents(false)
-            .ignore(true)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
-            .add_custom_ignore_filename(".gitignore")
-            .add_custom_ignore_filename(".unity-asset-search-ignore")
-            .filter_entry(move |e: &DirEntry| {
-                let p = e.path();
-                if is_excluded_dir(p) {
-                    return false;
-                }
-                if p == project_root {
-                    return true;
-                }
-                if !is_in_scan_roots_raw(&scan_roots, p)
-                    && !scan_roots.iter().any(|r| r.starts_with(p))
-                {
-                    return false;
-                }
-                if e.file_type().is_some_and(|t| t.is_file()) {
-                    return existing_set_for_filter.contains(p);
-                }
-                allowed_dirs.contains(p)
-            });
+        configure_walk_builder_ignore(&mut builder, options);
+        builder.filter_entry(move |e: &DirEntry| {
+            let p = e.path();
+            if is_excluded_dir(p) {
+                return false;
+            }
+            if p == project_root {
+                return true;
+            }
+            if !is_in_scan_roots_raw(&scan_roots, p) && !scan_roots.iter().any(|r| r.starts_with(p))
+            {
+                return false;
+            }
+            if e.file_type().is_some_and(|t| t.is_file()) {
+                return existing_set_for_filter.contains(p);
+            }
+            allowed_dirs.contains(p)
+        });
 
         let project_root = paths.project_root.clone();
         let existing_set = Arc::new(existing_set);
@@ -1769,7 +1911,7 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
                 .strip_prefix(&project_root)
                 .unwrap_or(path)
                 .to_string_lossy()
-                .to_string();
+                .replace('\\', "/");
             let name = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -1793,13 +1935,17 @@ fn scan_changed_paths(paths: &IndexPaths, changed_paths: &[PathBuf]) -> Result<C
         let Ok(rel) = dir.strip_prefix(&paths.project_root) else {
             continue;
         };
-        let rel_prefix = rel.to_string_lossy().trim_end_matches('/').to_string();
+        let rel_prefix = rel
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_string();
         if rel_prefix.is_empty() {
             continue;
         }
         out.rescan_dir_rel_prefixes.push(rel_prefix);
 
-        let mut files = scan_dir_files(paths, &dir)?;
+        let mut files = scan_dir_files(paths, &dir, options)?;
         out.files.append(&mut files);
     }
 
@@ -1826,30 +1972,26 @@ fn normalize_rescan_dirs(mut dirs: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
-fn scan_dir_files(paths: &IndexPaths, dir: &Path) -> Result<Vec<ScannedFile>> {
+fn scan_dir_files(
+    paths: &IndexPaths,
+    dir: &Path,
+    options: SearchIndexOptions,
+) -> Result<Vec<ScannedFile>> {
     let project_root = paths.project_root.clone();
     let scan_roots = paths.scan_roots.clone();
     let scan_roots_for_filter = scan_roots.clone();
 
     let mut builder = WalkBuilder::new(dir);
-    builder
-        .follow_links(false)
-        .parents(false)
-        .ignore(true)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .add_custom_ignore_filename(".gitignore")
-        .add_custom_ignore_filename(".unity-asset-search-ignore")
-        .filter_entry(move |e: &DirEntry| {
-            let p = e.path();
-            if is_excluded_dir(p) {
-                return false;
-            }
-            scan_roots_for_filter
-                .iter()
-                .any(|root| root.starts_with(p) || p.starts_with(root))
-        });
+    configure_walk_builder_ignore(&mut builder, options);
+    builder.filter_entry(move |e: &DirEntry| {
+        let p = e.path();
+        if is_excluded_dir(p) {
+            return false;
+        }
+        scan_roots_for_filter
+            .iter()
+            .any(|root| root.starts_with(p) || p.starts_with(root))
+    });
 
     scan_walk_parallel(builder, move |path| {
         if path.extension().is_some_and(|e| e == "meta") {
@@ -1866,7 +2008,7 @@ fn scan_dir_files(paths: &IndexPaths, dir: &Path) -> Result<Vec<ScannedFile>> {
             .strip_prefix(&project_root)
             .unwrap_or(path)
             .to_string_lossy()
-            .to_string();
+            .replace('\\', "/");
         let name = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -2006,32 +2148,41 @@ where
     Ok(files)
 }
 
-fn build_project_walk_builder(paths: &IndexPaths) -> WalkBuilder {
+fn configure_walk_builder_ignore(builder: &mut WalkBuilder, options: SearchIndexOptions) {
+    builder
+        .follow_links(false)
+        .parents(false)
+        .ignore(options.respect_ignore_files)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false);
+
+    if options.respect_ignore_files {
+        if options.respect_project_gitignore {
+            builder.add_custom_ignore_filename(".gitignore");
+        }
+        builder.add_custom_ignore_filename(".unity-asset-search-ignore");
+    }
+}
+
+fn build_project_walk_builder(paths: &IndexPaths, options: SearchIndexOptions) -> WalkBuilder {
     let scan_roots = paths.scan_roots.clone();
     let project_root = paths.project_root.clone();
 
     let mut builder = WalkBuilder::new(&project_root);
-    builder
-        .follow_links(false)
-        .parents(false)
-        .ignore(true)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .add_custom_ignore_filename(".gitignore")
-        .add_custom_ignore_filename(".unity-asset-search-ignore")
-        .filter_entry(move |e: &DirEntry| {
-            let p = e.path();
-            if is_excluded_dir(p) {
-                return false;
-            }
-            if p == project_root {
-                return true;
-            }
-            scan_roots
-                .iter()
-                .any(|root| root.starts_with(p) || p.starts_with(root))
-        });
+    configure_walk_builder_ignore(&mut builder, options);
+    builder.filter_entry(move |e: &DirEntry| {
+        let p = e.path();
+        if is_excluded_dir(p) {
+            return false;
+        }
+        if p == project_root {
+            return true;
+        }
+        scan_roots
+            .iter()
+            .any(|root| root.starts_with(p) || p.starts_with(root))
+    });
 
     builder
 }
@@ -2220,35 +2371,85 @@ fn build_doc(
     Ok(document)
 }
 
+fn container_name_from_asset_path(asset_path: &str) -> String {
+    let asset_path = asset_path.trim();
+    let file_name = asset_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(asset_path)
+        .rsplit('\\')
+        .next()
+        .unwrap_or(asset_path)
+        .trim();
+    if file_name.is_empty() {
+        asset_path.to_string()
+    } else {
+        file_name.to_string()
+    }
+}
+
+fn build_bundle_container_doc(
+    fields: &SearchFields,
+    bundle_rel_path: &str,
+    asset_path: &str,
+) -> TantivyDocument {
+    let asset_path = asset_path.trim();
+    let bundle_rel_path = bundle_rel_path.trim();
+    let display_name = container_name_from_asset_path(asset_path);
+
+    let mut document = TantivyDocument::default();
+    document.add_text(
+        fields.id,
+        format!("container:{bundle_rel_path}:{asset_path}"),
+    );
+    document.add_text(fields.guid, "");
+    document.add_text(fields.path, asset_path.to_string());
+    document.add_text(fields.path_terms, to_terms(asset_path));
+    document.add_text(fields.name, display_name.clone());
+    document.add_text(fields.name_terms, to_terms(&display_name));
+    document.add_text(fields.kind, "BundleContainer");
+    document.add_text(fields.kind_terms, to_terms("BundleContainer"));
+    document.add_text(fields.content_terms, to_terms(bundle_rel_path));
+    document.add_text(fields.container_source_path, bundle_rel_path.to_string());
+    document
+}
+
 #[derive(Debug, Default, Clone)]
 struct ExtractedReferences {
     guids: Vec<String>,
     guid_fileids: Vec<String>,
 }
 
-fn build_refs_doc(fields: &ReferenceFields, file: &ScannedFile) -> Result<Option<TantivyDocument>> {
+fn build_refs_doc_and_container_entries(
+    fields: &ReferenceFields,
+    file: &ScannedFile,
+    options: SearchIndexOptions,
+) -> Result<(Option<TantivyDocument>, Vec<String>)> {
     let yaml_extracted = if is_probably_unity_yaml(&file.abs_path)? {
         let text = read_text_limited(&file.abs_path, 2 * 1024 * 1024)?;
         let Some(text) = text else {
-            return Ok(None);
+            return Ok((None, Vec::new()));
         };
         is_probably_unity_yaml_text(&text).then(|| extract_unity_yaml_references(&text))
     } else {
         None
     };
 
+    let mut container_asset_paths: Vec<String> = Vec::new();
+
     let (source_kind, extracted) = if let Some(extracted) = yaml_extracted {
         (file.kind.clone(), extracted)
     } else {
-        let extracted = extract_unity_binary_references(file)?;
-        if extracted.refs.guids.is_empty() && extracted.refs.guid_fileids.is_empty() {
-            return Ok(None);
-        }
-        (extracted.source_kind.clone(), extracted.refs)
+        let extracted = extract_unity_binary_extraction(file, options)?;
+        let Some(extracted) = extracted else {
+            return Ok((None, Vec::new()));
+        };
+        container_asset_paths = extracted.container_asset_paths;
+        (extracted.source_kind, extracted.refs)
     };
 
     if extracted.guids.is_empty() && extracted.guid_fileids.is_empty() {
-        return Ok(None);
+        return Ok((None, container_asset_paths));
     }
 
     let mut doc = TantivyDocument::default();
@@ -2263,13 +2464,14 @@ fn build_refs_doc(fields: &ReferenceFields, file: &ScannedFile) -> Result<Option
         doc.add_text(fields.ref_guid_fileid, key);
     }
 
-    Ok(Some(doc))
+    Ok((Some(doc), container_asset_paths))
 }
 
 #[derive(Debug, Clone)]
-struct BinaryRefExtraction {
+struct BinaryExtraction {
     source_kind: String,
     refs: ExtractedReferences,
+    container_asset_paths: Vec<String>,
 }
 
 fn normalize_guid_string(raw: &str) -> String {
@@ -2287,14 +2489,14 @@ fn read_prefix(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn extract_unity_binary_references(file: &ScannedFile) -> Result<BinaryRefExtraction> {
+fn extract_unity_binary_extraction(
+    file: &ScannedFile,
+    options: SearchIndexOptions,
+) -> Result<Option<BinaryExtraction>> {
     let prefix = read_prefix(&file.abs_path, 256).unwrap_or_default();
     let kind = unity_asset_binary::file::sniff_unity_file_kind_prefix(&prefix);
-    let Some(_kind) = kind else {
-        return Ok(BinaryRefExtraction {
-            source_kind: file.kind.clone(),
-            refs: ExtractedReferences::default(),
-        });
+    let Some(kind) = kind else {
+        return Ok(None);
     };
 
     let this_guid = read_guid_from_meta(asset_meta_path(&file.abs_path))
@@ -2303,13 +2505,11 @@ fn extract_unity_binary_references(file: &ScannedFile) -> Result<BinaryRefExtrac
 
     let unity_file = unity_asset_binary::file::load_unity_file(&file.abs_path);
     let Ok(unity_file) = unity_file else {
-        return Ok(BinaryRefExtraction {
-            source_kind: file.kind.clone(),
-            refs: ExtractedReferences::default(),
-        });
+        return Ok(None);
     };
 
     let mut refs = ExtractedReferences::default();
+    let mut container_asset_paths: Vec<String> = Vec::new();
 
     match unity_file {
         unity_asset_binary::file::UnityFile::SerializedFile(sf) => {
@@ -2317,10 +2517,11 @@ fn extract_unity_binary_references(file: &ScannedFile) -> Result<BinaryRefExtrac
                 refs,
                 extract_refs_from_serialized_file(&sf, this_guid.as_deref()),
             );
-            Ok(BinaryRefExtraction {
+            Ok(Some(BinaryExtraction {
                 source_kind: "SerializedFile".to_string(),
                 refs,
-            })
+                container_asset_paths,
+            }))
         }
         unity_asset_binary::file::UnityFile::AssetBundle(bundle) => {
             for asset in &bundle.assets {
@@ -2329,16 +2530,101 @@ fn extract_unity_binary_references(file: &ScannedFile) -> Result<BinaryRefExtrac
                     break;
                 }
             }
-            Ok(BinaryRefExtraction {
+            if options.index_bundle_container_entries
+                && kind == unity_asset_binary::file::UnityFileKind::AssetBundle
+            {
+                let max_entries = options.max_bundle_container_entries_per_bundle.max(1);
+                let mut out = std::collections::BTreeSet::<String>::new();
+                for asset in &bundle.assets {
+                    for info in asset.objects.iter() {
+                        if info.type_id != 142 {
+                            continue;
+                        }
+                        let Ok(entries) = asset.assetbundle_container_raw(info) else {
+                            continue;
+                        };
+                        for (asset_path, _file_id, _path_id) in entries {
+                            if asset_path.trim().is_empty() {
+                                continue;
+                            }
+                            out.insert(asset_path);
+                            if out.len() >= max_entries {
+                                break;
+                            }
+                        }
+                        if out.len() >= max_entries {
+                            break;
+                        }
+                    }
+                    if out.len() >= max_entries {
+                        break;
+                    }
+                }
+                container_asset_paths = out.into_iter().collect();
+            }
+
+            Ok(Some(BinaryExtraction {
                 source_kind: "AssetBundle".to_string(),
                 refs,
-            })
+                container_asset_paths,
+            }))
         }
-        unity_asset_binary::file::UnityFile::WebFile(_) => Ok(BinaryRefExtraction {
+        unity_asset_binary::file::UnityFile::WebFile(_) => Ok(Some(BinaryExtraction {
             source_kind: "WebFile".to_string(),
             refs,
-        }),
+            container_asset_paths,
+        })),
     }
+}
+
+#[cfg(test)]
+fn extract_assetbundle_container_asset_paths(
+    bundle_path: &Path,
+    max_entries: usize,
+) -> Result<Vec<String>> {
+    use unity_asset_binary::file::{UnityFile, UnityFileKind};
+
+    if max_entries == 0 {
+        return Ok(Vec::new());
+    }
+
+    let prefix = read_prefix(bundle_path, 256).unwrap_or_default();
+    let kind = unity_asset_binary::file::sniff_unity_file_kind_prefix(&prefix);
+    if kind != Some(UnityFileKind::AssetBundle) {
+        return Ok(Vec::new());
+    }
+
+    let unity_file = unity_asset_binary::file::load_unity_file(bundle_path);
+    let Ok(unity_file) = unity_file else {
+        return Ok(Vec::new());
+    };
+
+    let UnityFile::AssetBundle(bundle) = unity_file else {
+        return Ok(Vec::new());
+    };
+
+    let mut out = std::collections::BTreeSet::<String>::new();
+    for asset in &bundle.assets {
+        for info in asset.objects.iter() {
+            if info.type_id != 142 {
+                continue;
+            }
+            let Ok(entries) = asset.assetbundle_container_raw(info) else {
+                continue;
+            };
+            for (asset_path, _file_id, _path_id) in entries {
+                if asset_path.trim().is_empty() {
+                    continue;
+                }
+                out.insert(asset_path);
+                if out.len() >= max_entries {
+                    return Ok(out.into_iter().collect());
+                }
+            }
+        }
+    }
+
+    Ok(out.into_iter().collect())
 }
 
 fn merge_refs(mut a: ExtractedReferences, b: ExtractedReferences) -> ExtractedReferences {
@@ -3624,6 +3910,54 @@ fn meta_path_for_asset(asset_path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundle_container_entries_are_indexed_when_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets")).unwrap();
+
+        let sample_bundle =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
+        assert!(sample_bundle.is_file(), "missing test bundle sample");
+
+        let dest_bundle = temp.path().join("Assets/sample.ab");
+        fs::copy(&sample_bundle, &dest_bundle).unwrap();
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create_with_options(
+            &paths,
+            SearchIndexOptions {
+                index_bundle_container_entries: true,
+                max_bundle_container_entries_per_bundle: 10_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        index.reindex_full(&paths).unwrap();
+
+        let extracted = extract_assetbundle_container_asset_paths(&dest_bundle, 10_000).unwrap();
+        assert!(
+            !extracted.is_empty(),
+            "sample bundle had no container entries"
+        );
+
+        let needle = container_name_from_asset_path(&extracted[0]);
+        let query = format!("type:bundlecontainer {needle}");
+        let resp = index
+            .search_enriched(paths.project_root.as_path(), &query, 50)
+            .unwrap();
+
+        assert!(
+            resp.hits.iter().any(|h| h.kind == "BundleContainer"),
+            "expected BundleContainer hits"
+        );
+        assert!(
+            resp.hits
+                .iter()
+                .any(|h| h.kind == "BundleContainer" && h.location.path == "Assets/sample.ab"),
+            "expected BundleContainer hit with location pointing at bundle"
+        );
+    }
 
     #[test]
     fn default_scan_roots_includes_unity_dirs_when_present() {
