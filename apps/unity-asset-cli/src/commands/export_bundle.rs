@@ -1,8 +1,8 @@
+use crate::pattern::container_asset_path_matches_ci;
 use crate::shared::{
     AppContext, build_environment, class_name_for_id, load_environment_input,
     lookup_object_type_info,
 };
-use crate::pattern::container_asset_path_matches_ci;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

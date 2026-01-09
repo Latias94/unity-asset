@@ -446,6 +446,14 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "summary", value_name = "FORMAT")]
         format: String,
 
+        /// Only run the project scan (load project + collect warnings), skip object graph build.
+        #[arg(long)]
+        scan_only: bool,
+
+        /// Write environment warnings to a JSONL file (one JSON object per warning).
+        #[arg(long)]
+        warnings_jsonl: Option<PathBuf>,
+
         /// Limit visited files during scan (best-effort).
         #[arg(long)]
         max_files: Option<usize>,

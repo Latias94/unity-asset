@@ -99,4 +99,3 @@ fn glob_match(tokens: &[GlobToken], text: &str) -> bool {
 
     token_index == tokens.len()
 }
-

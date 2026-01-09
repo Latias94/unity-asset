@@ -4,7 +4,9 @@ use serde::Serialize;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use unity_asset::environment::{ExternalObjectEdge, ObjectGraphBuildOptions, ProjectLoadOptions};
+use unity_asset::environment::{
+    EnvironmentWarning, ExternalObjectEdge, ObjectGraphBuildOptions, ProjectLoadOptions,
+};
 
 #[derive(Debug, Serialize)]
 struct JsonlEdge<'a> {
@@ -56,6 +58,8 @@ pub(crate) fn run(
     output: Option<PathBuf>,
     yaml: bool,
     format: String,
+    scan_only: bool,
+    warnings_jsonl: Option<PathBuf>,
     max_files: Option<usize>,
     max_edges: usize,
     follow_external: bool,
@@ -75,6 +79,76 @@ pub(crate) fn run(
     options.follow_symlinks = follow_symlinks;
 
     let stats = env.load_project(&input, options)?;
+
+    if let Some(path) = warnings_jsonl.as_ref() {
+        #[derive(Debug, Serialize)]
+        struct WarningLine {
+            kind: &'static str,
+            path: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            doc_index: Option<usize>,
+            error: String,
+        }
+
+        let mut f = File::create(path)?;
+        for w in env.take_warnings() {
+            let line = match w {
+                EnvironmentWarning::LoadFailed { path, error } => WarningLine {
+                    kind: "load_failed",
+                    path: path.to_string_lossy().to_string(),
+                    doc_index: None,
+                    error,
+                },
+                EnvironmentWarning::YamlDocumentSkipped {
+                    path,
+                    doc_index,
+                    error,
+                } => WarningLine {
+                    kind: "yaml_document_skipped",
+                    path: path.to_string_lossy().to_string(),
+                    doc_index: Some(doc_index),
+                    error,
+                },
+            };
+            writeln!(f, "{}", serde_json::to_string(&line)?)?;
+        }
+    }
+
+    if scan_only {
+        let fmt = format.to_ascii_lowercase();
+        let mut out = open_output(output.as_ref())?;
+        match fmt.as_str() {
+            "summary" => {
+                writeln!(
+                    out,
+                    "scan: visited={} loaded={} yaml_loaded={} binary_loaded={} meta_seen={} meta_indexed={}",
+                    stats.files_visited,
+                    stats.files_loaded,
+                    stats.yaml_loaded,
+                    stats.binary_loaded,
+                    stats.meta_files_seen,
+                    stats.meta_guids_indexed
+                )?;
+            }
+            "json" => {
+                let scan = ProjectGraphJsonScan {
+                    files_visited: stats.files_visited,
+                    files_loaded: stats.files_loaded,
+                    yaml_loaded: stats.yaml_loaded,
+                    binary_loaded: stats.binary_loaded,
+                    meta_files_seen: stats.meta_files_seen,
+                    meta_guids_indexed: stats.meta_guids_indexed,
+                };
+                let payload = serde_json::json!({ "scan": scan });
+                writeln!(out, "{}", serde_json::to_string_pretty(&payload)?)?;
+            }
+            other => anyhow::bail!(
+                "Invalid --format for --scan-only: {} (expected summary|json)",
+                other
+            ),
+        }
+        return Ok(());
+    }
 
     let graph = env.build_object_graph(ObjectGraphBuildOptions {
         include_yaml: yaml,
