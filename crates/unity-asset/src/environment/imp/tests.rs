@@ -1227,6 +1227,92 @@ fn environment_can_write_streamed_resource_cab_for_standalone_serialized_file_an
 }
 
 #[test]
+fn environment_typed_audio_clip_helper_can_repoint_streamed_resource_and_reload() {
+    use unity_asset_binary::unity_version::UnityVersion;
+    use unity_asset_decode::audio::AudioClipConverter;
+    use unity_asset_write::{PackerOptions, UnityPyPacker};
+
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
+
+    let mut env = Environment::new();
+    env.load_file(&path).unwrap();
+
+    let entry = env
+        .bundle_container_entries(&path)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.asset_path.to_ascii_lowercase().ends_with("/cn_001.ogg"))
+        .expect("sample bundle contains cn_001.ogg container entry");
+    let key = entry
+        .key
+        .expect("cn_001.ogg container entry resolves to an object key");
+
+    let mut session = env.edit_session();
+    let write = session
+        .write_streamed_audio_clip_data(&key, None, b"OggS")
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let out_dir = temp.path().join("out");
+    session
+        .save(
+            PackerOptions {
+                packer: UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_bundle_path = canonicalize_path(out_dir.join("char_118_yuki.ab"));
+    assert!(out_bundle_path.exists());
+
+    let mut env2 = Environment::new();
+    env2.load_file(&out_bundle_path).unwrap();
+
+    let entry2 = env2
+        .bundle_container_entries(&out_bundle_path)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.asset_path.to_ascii_lowercase().ends_with("/cn_001.ogg"))
+        .expect("saved bundle contains cn_001.ogg container entry");
+    let key2 = entry2
+        .key
+        .expect("saved cn_001.ogg container entry resolves to an object key");
+
+    assert_eq!(key2.path_id, key.path_id);
+
+    let obj = env2.read_binary_object_key(&key2).unwrap();
+    let unity_version = env2
+        .bundles()
+        .get(&BinarySource::path(&out_bundle_path))
+        .and_then(|b| key2.asset_index.and_then(|i| b.assets.get(i)))
+        .and_then(|f| UnityVersion::parse_version(&f.unity_version).ok())
+        .unwrap_or_default();
+
+    let converter = AudioClipConverter::new(unity_version);
+    let clip = converter.from_unity_object(&obj).unwrap();
+
+    assert!(clip.data.is_empty(), "streamed clip should not embed bytes");
+    assert!(clip.is_streamed());
+    assert_eq!(clip.stream_info.path, write.path);
+    assert_eq!(clip.stream_info.offset, write.offset);
+    assert_eq!(clip.stream_info.size, write.size);
+
+    let bytes = env2
+        .read_stream_data(
+            &out_bundle_path,
+            BinarySourceKind::AssetBundle,
+            &write.path,
+            write.offset,
+            write.size,
+        )
+        .unwrap();
+    assert_eq!(bytes, b"OggS");
+}
+
+#[test]
 fn streamed_write_helper_updates_m_stream_data_shape() {
     let mut class = UnityClass::new(0, "Test".to_string(), "0".to_string());
     let mut stream_data = UnityValue::Object(Default::default());

@@ -285,7 +285,10 @@ Acceptance:
 - [x] Write standalone sidecar cab files under `out/{asset_file_name}_data/{cab_name}` (best-effort; UnityPy does not expose this for standalone `SerializedFile`)
 - [x] Provide an ergonomic helper for streamed-resource fields:
   - [x] `EnvironmentEditSession::write_streamed_resource_to_field(...)` writes bytes into a cab and updates `{path,offset,size}` / `{m_Source,m_Offset,m_Size}` in-place (e.g. `m_StreamData`)
-- [ ] TODO: typed convenience helpers for common streamed asset types (AudioClip/Texture2D/etc)
+- [x] Provide typed convenience helpers for common streamed asset types:
+  - [x] AudioClip (`m_Resource`)
+  - [x] Texture2D (`m_StreamData`)
+- [ ] TODO: expand typed helpers (Mesh/VideoClip/TextAsset/etc)
 
 Acceptance:
 - [x] A bundle can be modified to point `m_StreamData` at a newly written cab and reloaded.

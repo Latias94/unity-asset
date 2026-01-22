@@ -40,6 +40,7 @@ mod imp {
     mod save;
     mod stream;
     mod streamed_write;
+    mod typed;
 
     pub use dependency_graph::{
         DependencyGraphBuildOptions, DependencyGraphTraversalOptions, DependencyGraphWarning,
