@@ -236,31 +236,54 @@ fn unityfs_uses_block_alignment(header: &BundleHeader) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn can_save_unityfs_bundle_and_reload() {
+    fn save_sample_with_packer(packer: UnityPyPacker) -> unity_asset_binary::bundle::AssetBundle {
         let bytes = include_bytes!("../../../../tests/samples/char_118_yuki.ab").to_vec();
         let bundle = unity_asset_binary::bundle::BundleParser::from_bytes(bytes).unwrap();
 
-        let saved = BundleWriter::save(
-            &bundle,
-            &BundleEdits::default(),
-            PackerOptions {
-                packer: UnityPyPacker::Original,
-            },
-        )
-        .unwrap();
+        let saved =
+            BundleWriter::save(&bundle, &BundleEdits::default(), PackerOptions { packer }).unwrap();
 
-        let reparsed = unity_asset_binary::bundle::BundleParser::from_bytes(saved).unwrap();
-        assert_eq!(reparsed.header.signature, "UnityFS");
-        assert!(!reparsed.nodes.is_empty());
+        unity_asset_binary::bundle::BundleParser::from_bytes(saved).unwrap()
+    }
 
-        // Ensure at least one embedded SerializedFile still parses.
-        let node = reparsed
+    fn assert_roundtrip_contains_serialized_file(bundle: &unity_asset_binary::bundle::AssetBundle) {
+        assert_eq!(bundle.header.signature, "UnityFS");
+        assert!(!bundle.nodes.is_empty());
+
+        let node = bundle
             .nodes
             .iter()
             .find(|n| n.is_file() && !n.name.ends_with(".resS") && !n.name.ends_with(".resource"))
-            .unwrap();
-        let node_bytes = reparsed.extract_node_data(node).unwrap();
-        let _sf = unity_asset_binary::asset::SerializedFileParser::from_bytes(node_bytes).unwrap();
+            .expect("expected at least one serialized file node in saved bundle");
+        let node_bytes = bundle.extract_node_data(node).unwrap();
+        let sf = unity_asset_binary::asset::SerializedFileParser::from_bytes(node_bytes).unwrap();
+        assert!(!sf.objects.is_empty());
+    }
+
+    #[test]
+    fn can_save_unityfs_bundle_and_reload() {
+        let reparsed = save_sample_with_packer(UnityPyPacker::Original);
+        assert_roundtrip_contains_serialized_file(&reparsed);
+    }
+
+    #[test]
+    fn can_save_unityfs_bundle_with_no_compression_and_reload() {
+        let reparsed = save_sample_with_packer(UnityPyPacker::None);
+        assert_eq!(reparsed.header.flags, 64);
+        assert_roundtrip_contains_serialized_file(&reparsed);
+    }
+
+    #[test]
+    fn can_save_unityfs_bundle_with_lz4_and_reload() {
+        let reparsed = save_sample_with_packer(UnityPyPacker::Lz4);
+        assert_eq!(reparsed.header.flags, 194);
+        assert_roundtrip_contains_serialized_file(&reparsed);
+    }
+
+    #[test]
+    fn can_save_unityfs_bundle_with_lzma_and_reload() {
+        let reparsed = save_sample_with_packer(UnityPyPacker::Lzma);
+        assert_eq!(reparsed.header.flags, 65);
+        assert_roundtrip_contains_serialized_file(&reparsed);
     }
 }
