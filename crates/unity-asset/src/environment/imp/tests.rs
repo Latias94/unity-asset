@@ -1313,6 +1313,104 @@ fn environment_typed_audio_clip_helper_can_repoint_streamed_resource_and_reload(
 }
 
 #[test]
+fn environment_typed_texture2d_helper_can_repoint_streamed_resource_and_reload() {
+    use unity_asset_write::{PackerOptions, UnityPyPacker};
+
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/xinzexi_2_n_tex"),
+    );
+
+    let mut env = Environment::new();
+    env.load_file(&path).unwrap();
+
+    let bundle_source = BinarySource::path(&path);
+    let tex_ref = env
+        .binary_object_infos()
+        .find(|r| {
+            r.source == &bundle_source
+                && r.source_kind == BinarySourceKind::AssetBundle
+                && r.object.class_id() == 28
+        })
+        .expect("expected at least one Texture2D object in sample bundle");
+    let key = tex_ref.key();
+
+    let mut session = env.edit_session();
+    let write = session
+        .write_streamed_texture2d_image_data(&key, None, b"RUST_TEX")
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let out_dir = temp.path().join("out");
+    session
+        .save(
+            PackerOptions {
+                packer: UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_bundle_path = canonicalize_path(out_dir.join("xinzexi_2_n_tex"));
+    assert!(out_bundle_path.exists());
+
+    let mut env2 = Environment::new();
+    env2.load_file(&out_bundle_path).unwrap();
+
+    let out_source = BinarySource::path(&out_bundle_path);
+    let key2 = env2
+        .binary_object_infos()
+        .find(|r| {
+            r.source == &out_source
+                && r.source_kind == BinarySourceKind::AssetBundle
+                && r.asset_index == key.asset_index
+                && r.object.path_id() == key.path_id
+        })
+        .expect("expected edited Texture2D object after save")
+        .key();
+
+    let obj = env2.read_binary_object_key(&key2).unwrap();
+    let props = obj.class.properties();
+    let UnityValue::Object(stream) = props
+        .get("m_StreamData")
+        .expect("Texture2D has m_StreamData field")
+    else {
+        panic!("Texture2D m_StreamData should be an object");
+    };
+    let path = stream
+        .get("path")
+        .or_else(|| stream.get("m_Source"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let offset = stream
+        .get("offset")
+        .or_else(|| stream.get("m_Offset"))
+        .and_then(|v| v.as_i64())
+        .and_then(|n| u64::try_from(n).ok())
+        .unwrap_or_default();
+    let size = stream
+        .get("size")
+        .or_else(|| stream.get("m_Size"))
+        .and_then(|v| v.as_i64())
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or_default();
+
+    assert_eq!(path, write.path);
+    assert_eq!(offset, write.offset);
+    assert_eq!(size, write.size);
+
+    let bytes = env2
+        .read_stream_data(
+            &out_bundle_path,
+            BinarySourceKind::AssetBundle,
+            &write.path,
+            write.offset,
+            write.size,
+        )
+        .unwrap();
+    assert_eq!(bytes, b"RUST_TEX");
+}
+
+#[test]
 fn streamed_write_helper_updates_m_stream_data_shape() {
     let mut class = UnityClass::new(0, "Test".to_string(), "0".to_string());
     let mut stream_data = UnityValue::Object(Default::default());
