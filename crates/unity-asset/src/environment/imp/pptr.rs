@@ -252,4 +252,58 @@ impl Environment {
             })?;
         self.read_binary_object_key(&key)
     }
+
+    fn binary_object_ref_for_key(&self, key: &BinaryObjectKey) -> Result<BinaryObjectRef<'_>> {
+        match key.source_kind {
+            BinarySourceKind::SerializedFile => self
+                .find_binary_object_in_source_id(&key.source, key.path_id)
+                .ok_or_else(|| {
+                    UnityAssetError::format(format!(
+                        "Object not found in SerializedFile {}: path_id={}",
+                        key.source.describe(),
+                        key.path_id
+                    ))
+                }),
+            BinarySourceKind::AssetBundle => {
+                let asset_index = key.asset_index.ok_or_else(|| {
+                    UnityAssetError::format("AssetBundle key requires an asset_index")
+                })?;
+                self.find_binary_object_in_bundle_asset_source(
+                    &key.source,
+                    asset_index,
+                    key.path_id,
+                )
+                .ok_or_else(|| {
+                    UnityAssetError::format(format!(
+                        "Object not found in AssetBundle {} asset_index={} path_id={}",
+                        key.source.describe(),
+                        asset_index,
+                        key.path_id
+                    ))
+                })
+            }
+        }
+    }
+
+    /// Resolve a `PPtr` stored at a dot-separated field path (e.g. `m_RD.texture`) to a globally-unique object key.
+    pub fn resolve_pptr_path_key(
+        &self,
+        context_key: &BinaryObjectKey,
+        pptr_path: &str,
+    ) -> Result<Option<BinaryObjectKey>> {
+        let obj_ref = self.binary_object_ref_for_key(context_key)?;
+        let obj = obj_ref.read()?;
+
+        let Some(v) = super::pptr_path::get_value_at_path(obj.as_unity_class(), pptr_path) else {
+            return Ok(None);
+        };
+        let Some((file_id, path_id)) = super::pptr_path::read_pptr(v) else {
+            return Ok(None);
+        };
+        if path_id == 0 {
+            return Ok(None);
+        }
+
+        Ok(self.resolve_binary_pptr(&obj_ref, file_id, path_id))
+    }
 }

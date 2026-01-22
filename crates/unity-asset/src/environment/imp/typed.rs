@@ -34,40 +34,22 @@ fn clear_mesh_vertex_data_fields(vertex_data: &mut UnityValue) {
 fn ensure_pptr_field(class: &mut UnityClass, field_name: &str) {
     ensure_object_field(class, field_name);
     match class.get_mut(field_name) {
-        Some(other) => {
-            *other = UnityValue::Object(Default::default());
-        }
+        Some(UnityValue::Object(_)) => {}
+        Some(other) => *other = UnityValue::Object(Default::default()),
         None => {}
-    }
-}
-
-fn set_pptr_object_fields(obj: &mut UnityValue, file_id: i32, path_id: i64) {
-    let Some(map) = obj.as_object_mut() else {
-        return;
-    };
-
-    let file_id_value = UnityValue::Integer(file_id as i64);
-    let path_id_value = UnityValue::Integer(path_id);
-
-    // Support both common PPtr key variants.
-    for key in ["fileID", "m_FileID"] {
-        map.insert(key.to_string(), file_id_value.clone());
-    }
-    for key in ["pathID", "m_PathID"] {
-        map.insert(key.to_string(), path_id_value.clone());
     }
 }
 
 fn apply_pptr_field(class: &mut UnityClass, field_name: &str, file_id: i32, path_id: i64) {
     ensure_pptr_field(class, field_name);
     if let Some(v) = class.get_mut(field_name) {
-        set_pptr_object_fields(v, file_id, path_id);
+        super::pptr_path::write_pptr(v, file_id, path_id);
     }
 }
 
 fn pptr_value(file_id: i32, path_id: i64) -> UnityValue {
     let mut v = UnityValue::Object(Default::default());
-    set_pptr_object_fields(&mut v, file_id, path_id);
+    super::pptr_path::write_pptr(&mut v, file_id, path_id);
     v
 }
 

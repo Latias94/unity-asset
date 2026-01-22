@@ -116,6 +116,29 @@ impl<'a> EnvironmentEditSession<'a> {
     ) -> Result<()> {
         self.env.save(pack, out_dir)
     }
+
+    /// Resolve a `PPtr` stored at a dot-separated field path (e.g. `m_RD.texture`) to a globally-unique object key.
+    pub fn resolve_pptr_path_key(
+        &self,
+        context_key: &BinaryObjectKey,
+        pptr_path: &str,
+    ) -> Result<Option<BinaryObjectKey>> {
+        self.env.resolve_pptr_path_key(context_key, pptr_path)
+    }
+
+    /// Set a `PPtr` stored at a dot-separated field path (e.g. `m_RD.texture`) to point at `target_key`.
+    ///
+    /// This best-effort helper also appends a new external entry (when needed) and returns the
+    /// resulting `(file_id, path_id)` pair written into the object.
+    pub fn set_pptr_path_to_key(
+        &mut self,
+        context_key: &BinaryObjectKey,
+        pptr_path: &str,
+        target_key: &BinaryObjectKey,
+    ) -> Result<(i32, i64)> {
+        self.env
+            .set_pptr_path_to_key(context_key, pptr_path, target_key)
+    }
 }
 
 impl Environment {
@@ -334,6 +357,90 @@ impl Environment {
             },
         }
     }
+
+    /// Set a `PPtr` stored at a dot-separated field path (e.g. `m_RD.texture`) to point at `target_key`.
+    ///
+    /// This is a best-effort helper that computes the correct `fileID` relative to the context object:
+    /// - `fileID=0` for targets inside the same serialized file
+    /// - `fileID>0` for targets in other serialized files, by adding an external entry when missing
+    pub fn set_pptr_path_to_key(
+        &mut self,
+        context_key: &BinaryObjectKey,
+        pptr_path: &str,
+        target_key: &BinaryObjectKey,
+    ) -> Result<(i32, i64)> {
+        let same_file = context_key.source_kind == target_key.source_kind
+            && context_key.source == target_key.source
+            && context_key.asset_index == target_key.asset_index;
+
+        match context_key.source_kind {
+            BinarySourceKind::SerializedFile => {
+                let (source_key, file) =
+                    resolve_serialized_file_source(&self.binary_assets, &context_key.source)?;
+                let source_key = source_key.clone();
+                let state = self.write_state.standalone.entry(source_key).or_default();
+
+                let file_id = if same_file {
+                    0
+                } else {
+                    let path = external_path_for_target(None, target_key)?;
+                    get_or_add_external_file_id(file, &mut state.edits, &path)
+                };
+
+                edit_in_serialized_file(file, state, context_key.path_id, |class| {
+                    super::pptr_path::write_pptr_at_path(
+                        class,
+                        pptr_path,
+                        file_id,
+                        target_key.path_id,
+                    )
+                })?;
+
+                Ok((file_id, target_key.path_id))
+            }
+            BinarySourceKind::AssetBundle => {
+                let asset_index = context_key.asset_index.ok_or_else(|| {
+                    UnityAssetError::format("AssetBundle key requires an asset_index")
+                })?;
+                let (bundle_source, bundle) =
+                    resolve_bundle_source(&self.bundles, &context_key.source)?;
+                let bundle_source_key = bundle_source.clone();
+
+                let asset = bundle.assets.get(asset_index).ok_or_else(|| {
+                    UnityAssetError::format(format!(
+                        "AssetBundle asset index out of range: {} asset_index={}",
+                        context_key.source.describe(),
+                        asset_index
+                    ))
+                })?;
+
+                let bundle_state = self
+                    .write_state
+                    .bundles
+                    .entry(bundle_source_key)
+                    .or_default();
+                let state = bundle_state.assets.entry(asset_index).or_default();
+
+                let file_id = if same_file {
+                    0
+                } else {
+                    let path = external_path_for_target(Some((bundle_source, bundle)), target_key)?;
+                    get_or_add_external_file_id(asset, &mut state.edits, &path)
+                };
+
+                edit_in_serialized_file(asset, state, context_key.path_id, |class| {
+                    super::pptr_path::write_pptr_at_path(
+                        class,
+                        pptr_path,
+                        file_id,
+                        target_key.path_id,
+                    )
+                })?;
+
+                Ok((file_id, target_key.path_id))
+            }
+        }
+    }
 }
 
 fn edit_in_serialized_file(
@@ -434,6 +541,66 @@ fn register_external_if_missing(
         type_: 0,
         path: path.to_string(),
     });
+}
+
+fn get_or_add_external_file_id(
+    file: &SerializedFile,
+    edits: &mut SerializedFileEdits,
+    path: &str,
+) -> i32 {
+    if let Some((idx, _)) = file
+        .externals
+        .iter()
+        .enumerate()
+        .find(|(_, e)| e.path == path)
+    {
+        return (idx as i32) + 1;
+    }
+
+    if let Some((idx, _)) = edits
+        .additional_externals
+        .iter()
+        .enumerate()
+        .find(|(_, e)| e.path == path)
+    {
+        let base = file.externals.len() as i32;
+        return base + (idx as i32) + 1;
+    }
+
+    let guid = pseudo_guid();
+    edits.add_external(FileIdentifier {
+        temp_empty: String::new(),
+        guid,
+        type_: 0,
+        path: path.to_string(),
+    });
+
+    let base = file.externals.len() as i32;
+    let idx = (edits.additional_externals.len() - 1) as i32;
+    base + idx + 1
+}
+
+fn external_path_for_target(
+    bundle: Option<(&BinarySource, &AssetBundle)>,
+    target_key: &BinaryObjectKey,
+) -> Result<String> {
+    if let Some((bundle_source, bundle)) = bundle
+        && target_key.source_kind == BinarySourceKind::AssetBundle
+        && &target_key.source == bundle_source
+        && let Some(target_asset_index) = target_key.asset_index
+        && let Some(name) = bundle.asset_names.get(target_asset_index)
+    {
+        return Ok(name.clone());
+    }
+
+    match &target_key.source {
+        BinarySource::Path(p) => Ok(p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| p.to_string_lossy().to_string())),
+        BinarySource::WebEntry { entry_name, .. } => Ok(entry_name.clone()),
+    }
 }
 
 fn pseudo_guid() -> [u8; 16] {

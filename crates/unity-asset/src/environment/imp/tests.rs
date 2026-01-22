@@ -1617,3 +1617,165 @@ fn typed_mesh_filter_helper_updates_mesh_pptr() {
     assert_eq!(mesh.get("m_FileID").and_then(|v| v.as_i64()), Some(0));
     assert_eq!(mesh.get("m_PathID").and_then(|v| v.as_i64()), Some(123));
 }
+
+#[test]
+fn environment_resolve_pptr_path_key_resolves_sprite_texture() {
+    let mut env = Environment::new();
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
+    );
+    env.load_file(&path).unwrap();
+
+    let sprite_ref = env
+        .binary_object_infos()
+        .find(|r| r.source_kind == BinarySourceKind::AssetBundle && r.object.class_id() == 213)
+        .expect("sample bundle contains at least one Sprite");
+    let sprite_key = sprite_ref.key();
+
+    let resolved = env
+        .resolve_pptr_path_key(&sprite_key, "m_RD.texture")
+        .unwrap()
+        .expect("sprite should reference a texture via m_RD.texture");
+
+    let sprite_obj = env.read_binary_object_key(&sprite_key).unwrap();
+    let v = super::pptr_path::get_value_at_path(sprite_obj.as_unity_class(), "m_RD.texture")
+        .expect("m_RD.texture exists");
+    let (_, expected_path_id) = super::pptr_path::read_pptr(v).expect("m_RD.texture is a PPtr");
+    assert_eq!(resolved.path_id, expected_path_id);
+
+    let texture = env.read_binary_object_key(&resolved).unwrap();
+    assert_eq!(texture.class_id(), 28, "expected Texture2D target");
+}
+
+#[test]
+fn environment_can_set_pptr_path_to_key_and_reload() {
+    use unity_asset_write::{PackerOptions, UnityPyPacker};
+
+    let mut env = Environment::new();
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/atlas_test"),
+    );
+    env.load_file(&path).unwrap();
+
+    let sprite_key = env
+        .binary_object_infos()
+        .find(|r| r.source_kind == BinarySourceKind::AssetBundle && r.object.class_id() == 213)
+        .expect("sample bundle contains at least one Sprite")
+        .key();
+    let atlas_key = env
+        .binary_object_infos()
+        .find(|r| {
+            r.source_kind == BinarySourceKind::AssetBundle && r.object.class_id() == 687078895
+        })
+        .expect("sample bundle contains a SpriteAtlas")
+        .key();
+
+    let mut session = env.edit_session();
+    session
+        .set_pptr_path_to_key(&sprite_key, "m_SpriteAtlas", &atlas_key)
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let out_dir = temp.path().join("out");
+    session
+        .save(
+            PackerOptions {
+                packer: UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_bundle_path = canonicalize_path(out_dir.join("atlas_test"));
+    assert!(out_bundle_path.exists());
+
+    let mut env2 = Environment::new();
+    env2.load_file(&out_bundle_path).unwrap();
+    let sprite_ref = env2
+        .find_binary_object_in_bundle_asset(&out_bundle_path, 0, sprite_key.path_id)
+        .expect("saved bundle contains sprite path id");
+    let sprite_obj = env2.read_binary_object_key(&sprite_ref.key()).unwrap();
+
+    let atlas_ref =
+        super::pptr_path::get_value_at_path(sprite_obj.as_unity_class(), "m_SpriteAtlas")
+            .expect("m_SpriteAtlas present");
+    let (file_id, path_id) =
+        super::pptr_path::read_pptr(atlas_ref).expect("m_SpriteAtlas is a PPtr");
+    assert_eq!(file_id, 0);
+    assert_eq!(path_id, atlas_key.path_id);
+}
+
+#[test]
+fn environment_set_pptr_path_to_key_adds_external_when_cross_source() {
+    use unity_asset_write::{PackerOptions, UnityPyPacker};
+
+    let mut env = Environment::new();
+    let banner_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
+    );
+    let atlas_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/atlas_test"),
+    );
+
+    env.load_file(&banner_path).unwrap();
+    env.load_file(&atlas_path).unwrap();
+
+    let sprite_key = env
+        .binary_object_infos()
+        .find(|r| r.source == &BinarySource::path(&banner_path) && r.object.class_id() == 213)
+        .expect("banner_1 bundle contains a Sprite")
+        .key();
+    let atlas_key = env
+        .binary_object_infos()
+        .find(|r| r.source == &BinarySource::path(&atlas_path) && r.object.class_id() == 687078895)
+        .expect("atlas_test bundle contains a SpriteAtlas")
+        .key();
+
+    let mut session = env.edit_session();
+    let (file_id, _) = session
+        .set_pptr_path_to_key(&sprite_key, "m_SpriteAtlas", &atlas_key)
+        .unwrap();
+    assert!(file_id > 0);
+
+    let temp = tempfile::tempdir().unwrap();
+    let out_dir = temp.path().join("out");
+    session
+        .save(
+            PackerOptions {
+                packer: UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_bundle_path = canonicalize_path(out_dir.join("banner_1"));
+    assert!(out_bundle_path.exists());
+
+    let mut env2 = Environment::new();
+    env2.load_file(&out_bundle_path).unwrap();
+    let sprite_ref = env2
+        .find_binary_object_in_bundle_asset(&out_bundle_path, 0, sprite_key.path_id)
+        .expect("saved bundle contains sprite path id");
+    let sprite_obj = env2.read_binary_object_key(&sprite_ref.key()).unwrap();
+
+    let atlas_ref =
+        super::pptr_path::get_value_at_path(sprite_obj.as_unity_class(), "m_SpriteAtlas")
+            .expect("m_SpriteAtlas present");
+    let (saved_file_id, saved_path_id) =
+        super::pptr_path::read_pptr(atlas_ref).expect("m_SpriteAtlas is a PPtr");
+    assert_eq!(saved_file_id, file_id);
+    assert_eq!(saved_path_id, atlas_key.path_id);
+
+    let bundle = env2
+        .bundles()
+        .get(&BinarySource::path(&out_bundle_path))
+        .expect("saved bundle loaded");
+    let sf = bundle
+        .assets
+        .first()
+        .expect("bundle has at least one asset");
+    assert!(
+        sf.externals.iter().any(|e| e.path == "atlas_test"),
+        "expected added external entry for cross-source PPtr"
+    );
+}

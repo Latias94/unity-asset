@@ -37,6 +37,7 @@ mod imp {
     mod object_query;
     mod path;
     mod pptr;
+    mod pptr_path;
     mod save;
     mod stream;
     mod streamed_write;
