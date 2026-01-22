@@ -31,6 +31,46 @@ fn clear_mesh_vertex_data_fields(vertex_data: &mut UnityValue) {
     }
 }
 
+fn ensure_pptr_field(class: &mut UnityClass, field_name: &str) {
+    ensure_object_field(class, field_name);
+    match class.get_mut(field_name) {
+        Some(other) => {
+            *other = UnityValue::Object(Default::default());
+        }
+        None => {}
+    }
+}
+
+fn set_pptr_object_fields(obj: &mut UnityValue, file_id: i32, path_id: i64) {
+    let Some(map) = obj.as_object_mut() else {
+        return;
+    };
+
+    let file_id_value = UnityValue::Integer(file_id as i64);
+    let path_id_value = UnityValue::Integer(path_id);
+
+    // Support both common PPtr key variants.
+    for key in ["fileID", "m_FileID"] {
+        map.insert(key.to_string(), file_id_value.clone());
+    }
+    for key in ["pathID", "m_PathID"] {
+        map.insert(key.to_string(), path_id_value.clone());
+    }
+}
+
+fn apply_pptr_field(class: &mut UnityClass, field_name: &str, file_id: i32, path_id: i64) {
+    ensure_pptr_field(class, field_name);
+    if let Some(v) = class.get_mut(field_name) {
+        set_pptr_object_fields(v, file_id, path_id);
+    }
+}
+
+fn pptr_value(file_id: i32, path_id: i64) -> UnityValue {
+    let mut v = UnityValue::Object(Default::default());
+    set_pptr_object_fields(&mut v, file_id, path_id);
+    v
+}
+
 pub(crate) fn apply_text_asset_script(class: &mut UnityClass, script: &str) -> Result<()> {
     let Some(v) = class.get_mut("m_Script") else {
         return Err(UnityAssetError::format(
@@ -62,6 +102,51 @@ pub(crate) fn apply_video_clip_external_resources_write(
 ) -> Result<()> {
     ensure_object_field(class, "m_ExternalResources");
     super::streamed_write::apply_streamed_resource_write(class, "m_ExternalResources", write)?;
+    Ok(())
+}
+
+pub(crate) fn apply_video_player_url(class: &mut UnityClass, url: &str) -> Result<()> {
+    let Some(v) = class.get_mut("m_Url") else {
+        return Err(UnityAssetError::format(
+            "VideoPlayer missing required field: m_Url",
+        ));
+    };
+    *v = UnityValue::String(url.to_string());
+    Ok(())
+}
+
+pub(crate) fn apply_video_player_video_clip_pptr(
+    class: &mut UnityClass,
+    file_id: i32,
+    path_id: i64,
+) -> Result<()> {
+    apply_pptr_field(class, "m_VideoClip", file_id, path_id);
+    Ok(())
+}
+
+pub(crate) fn apply_mesh_renderer_materials(
+    class: &mut UnityClass,
+    materials: &[(i32, i64)],
+) -> Result<()> {
+    class.set(
+        "m_Materials".to_string(),
+        UnityValue::Array(
+            materials
+                .iter()
+                .copied()
+                .map(|(file_id, path_id)| pptr_value(file_id, path_id))
+                .collect(),
+        ),
+    );
+    Ok(())
+}
+
+pub(crate) fn apply_mesh_renderer_additional_vertex_streams_pptr(
+    class: &mut UnityClass,
+    file_id: i32,
+    path_id: i64,
+) -> Result<()> {
+    apply_pptr_field(class, "m_AdditionalVertexStreams", file_id, path_id);
     Ok(())
 }
 
@@ -161,5 +246,47 @@ impl<'a> EnvironmentEditSession<'a> {
     /// Set the `m_Script` string on a TextAsset (UnityPy-like convenience helper).
     pub fn set_text_asset_script(&mut self, key: &BinaryObjectKey, script: &str) -> Result<()> {
         self.edit_binary_object_key(key, |class| apply_text_asset_script(class, script))
+    }
+
+    /// Set the `m_Url` string on a VideoPlayer (UnityPy-like convenience helper).
+    pub fn set_video_player_url(&mut self, key: &BinaryObjectKey, url: &str) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_video_player_url(class, url))
+    }
+
+    /// Set the `m_VideoClip` PPtr on a VideoPlayer (UnityPy-like convenience helper).
+    ///
+    /// Notes:
+    /// - Use `file_id=0` for a VideoClip inside the same serialized file as the VideoPlayer.
+    /// - External references require the correct `file_id` index into the file's `externals` table.
+    pub fn set_video_player_video_clip_pptr(
+        &mut self,
+        key: &BinaryObjectKey,
+        file_id: i32,
+        path_id: i64,
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| {
+            apply_video_player_video_clip_pptr(class, file_id, path_id)
+        })
+    }
+
+    /// Replace the `m_Materials` list on a MeshRenderer with the provided PPtr list.
+    pub fn set_mesh_renderer_materials(
+        &mut self,
+        key: &BinaryObjectKey,
+        materials: &[(i32, i64)],
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_mesh_renderer_materials(class, materials))
+    }
+
+    /// Set `m_AdditionalVertexStreams` on a MeshRenderer (best-effort; optional field in Unity).
+    pub fn set_mesh_renderer_additional_vertex_streams_pptr(
+        &mut self,
+        key: &BinaryObjectKey,
+        file_id: i32,
+        path_id: i64,
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| {
+            apply_mesh_renderer_additional_vertex_streams_pptr(class, file_id, path_id)
+        })
     }
 }

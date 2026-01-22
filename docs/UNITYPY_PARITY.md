@@ -292,7 +292,10 @@ Acceptance:
   - [x] VideoClip (`m_ExternalResources`)
 - [x] Provide a typed convenience helper for a common non-streamed edit:
   - [x] TextAsset (`m_Script`)
-- [ ] TODO: expand typed helpers (MeshRenderer/VideoPlayer/TextAsset bytes/etc)
+- [x] Expand typed helpers (UnityPy-like ergonomics):
+  - [x] MeshRenderer (`m_Materials`, `m_AdditionalVertexStreams`)
+  - [x] VideoPlayer (`m_Url`, `m_VideoClip`)
+- [ ] TODO: expand typed helpers further (more classes + deeper editor semantics)
 
 Acceptance:
 - [x] A bundle can be modified to point `m_StreamData` at a newly written cab and reloaded.

@@ -1537,3 +1537,69 @@ fn typed_text_asset_script_helper_updates_field() {
     super::typed::apply_text_asset_script(&mut class, "new").unwrap();
     assert_eq!(class.get("m_Script").and_then(|v| v.as_str()), Some("new"));
 }
+
+#[test]
+fn typed_video_player_helpers_update_url_and_video_clip_pptr() {
+    let mut class = UnityClass::new(0, "VideoPlayer".to_string(), "0".to_string());
+    class.set("m_Url".to_string(), UnityValue::String("old".to_string()));
+
+    let mut clip = UnityValue::Object(Default::default());
+    let UnityValue::Object(map) = &mut clip else {
+        unreachable!();
+    };
+    map.insert("m_FileID".to_string(), UnityValue::Integer(1));
+    map.insert("m_PathID".to_string(), UnityValue::Integer(2));
+    class.set("m_VideoClip".to_string(), clip);
+
+    super::typed::apply_video_player_url(&mut class, "https://example.test/video.mp4").unwrap();
+    super::typed::apply_video_player_video_clip_pptr(&mut class, 0, 123).unwrap();
+
+    assert_eq!(
+        class.get("m_Url").and_then(|v| v.as_str()),
+        Some("https://example.test/video.mp4")
+    );
+
+    let UnityValue::Object(clip) = class.get("m_VideoClip").unwrap() else {
+        panic!("m_VideoClip should be an object");
+    };
+    assert_eq!(clip.get("fileID").and_then(|v| v.as_i64()), Some(0));
+    assert_eq!(clip.get("pathID").and_then(|v| v.as_i64()), Some(123));
+    assert_eq!(clip.get("m_FileID").and_then(|v| v.as_i64()), Some(0));
+    assert_eq!(clip.get("m_PathID").and_then(|v| v.as_i64()), Some(123));
+}
+
+#[test]
+fn typed_mesh_renderer_helpers_update_materials_and_additional_vertex_streams() {
+    let mut class = UnityClass::new(0, "MeshRenderer".to_string(), "0".to_string());
+    class.set("m_Materials".to_string(), UnityValue::Array(Vec::new()));
+    class.set(
+        "m_AdditionalVertexStreams".to_string(),
+        UnityValue::Object(Default::default()),
+    );
+
+    super::typed::apply_mesh_renderer_materials(&mut class, &[(0, 10), (2, 20)]).unwrap();
+    super::typed::apply_mesh_renderer_additional_vertex_streams_pptr(&mut class, 0, 99).unwrap();
+
+    let UnityValue::Array(materials) = class.get("m_Materials").unwrap() else {
+        panic!("m_Materials should be an array");
+    };
+    assert_eq!(materials.len(), 2);
+
+    let UnityValue::Object(m0) = &materials[0] else {
+        panic!("m_Materials[0] should be an object");
+    };
+    assert_eq!(m0.get("m_FileID").and_then(|v| v.as_i64()), Some(0));
+    assert_eq!(m0.get("m_PathID").and_then(|v| v.as_i64()), Some(10));
+
+    let UnityValue::Object(m1) = &materials[1] else {
+        panic!("m_Materials[1] should be an object");
+    };
+    assert_eq!(m1.get("m_FileID").and_then(|v| v.as_i64()), Some(2));
+    assert_eq!(m1.get("m_PathID").and_then(|v| v.as_i64()), Some(20));
+
+    let UnityValue::Object(vs) = class.get("m_AdditionalVertexStreams").unwrap() else {
+        panic!("m_AdditionalVertexStreams should be an object");
+    };
+    assert_eq!(vs.get("m_FileID").and_then(|v| v.as_i64()), Some(0));
+    assert_eq!(vs.get("m_PathID").and_then(|v| v.as_i64()), Some(99));
+}
