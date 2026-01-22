@@ -3303,6 +3303,7 @@ dependencies = [
  "unity-asset-binary",
  "unity-asset-core",
  "unity-asset-decode",
+ "unity-asset-write",
  "unity-asset-yaml",
 ]
 
@@ -3439,6 +3440,21 @@ dependencies = [
  "tempfile",
  "unity-asset-binary",
  "unity-asset-search-core",
+]
+
+[[package]]
+name = "unity-asset-write"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "brotli",
+ "flate2",
+ "indexmap",
+ "lz4_flex 0.12.0",
+ "lzma-rs",
+ "tempfile",
+ "unity-asset-binary",
+ "unity-asset-core",
 ]
 
 [[package]]

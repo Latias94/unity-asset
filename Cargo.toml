@@ -4,6 +4,7 @@ members = [
     "crates/unity-asset-yaml",
     "crates/unity-asset-binary",
     "crates/unity-asset-decode",
+    "crates/unity-asset-write",
     "crates/unity-asset",
     "crates/unity-asset-search-core",
     "crates/unity-asset-search-index",

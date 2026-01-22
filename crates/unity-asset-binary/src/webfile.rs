@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 /// Magic bytes for different compression formats
 const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
-const BROTLI_MAGIC: &[u8] = &[0xce, 0xb2, 0xcf, 0x81, 0x13, 0x00];
+// UnityPy uses the ASCII marker at offset 0x20 as a heuristic.
+const BROTLI_MAGIC: &[u8] = b"brotli";
 
 /// Compression type used in WebFile
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,33 +52,45 @@ impl WebFile {
     }
 
     fn from_view(view: DataView) -> Result<Self> {
-        let mut reader = BinaryReader::new(view.as_bytes(), ByteOrder::Little);
+        // Detect compression with cheap heuristics first (UnityPy-style).
+        let mut probe = BinaryReader::new(view.as_bytes(), ByteOrder::Little);
+        let probed = Self::detect_compression(&mut probe)?;
 
-        // Detect compression type
-        let compression = Self::detect_compression(&mut reader)?;
-
-        // Decompress if necessary
-        let decompressed_data: DataView = match compression {
-            WebFileCompression::None => view,
+        // Decompress if necessary, with a brotli fallback for non-heuristic streams.
+        let (compression, decompressed_data, signature) = match probed {
             WebFileCompression::Gzip => {
-                DataView::from_shared(SharedBytes::from_vec(decompress_gzip(view.as_bytes())?))
+                let decompressed =
+                    DataView::from_shared(SharedBytes::from_vec(decompress_gzip(view.as_bytes())?));
+                let signature = read_webfile_signature(decompressed.as_bytes())?;
+                (WebFileCompression::Gzip, decompressed, signature)
             }
             WebFileCompression::Brotli => {
-                DataView::from_shared(SharedBytes::from_vec(decompress_brotli(view.as_bytes())?))
+                let decompressed = DataView::from_shared(SharedBytes::from_vec(decompress_brotli(
+                    view.as_bytes(),
+                )?));
+                let signature = read_webfile_signature(decompressed.as_bytes())?;
+                (WebFileCompression::Brotli, decompressed, signature)
+            }
+            WebFileCompression::None => {
+                // Attempt uncompressed parse first.
+                if let Ok(signature) = read_webfile_signature(view.as_bytes()) {
+                    (WebFileCompression::None, view, signature)
+                } else {
+                    // Some brotli streams (including UnityPy's own WebFile.save output) do not
+                    // match the 0x20 marker heuristic. Try brotli decompression as a fallback.
+                    let decompressed = DataView::from_shared(SharedBytes::from_vec(
+                        decompress_brotli(view.as_bytes())?,
+                    ));
+                    let signature = read_webfile_signature(decompressed.as_bytes())?;
+                    (WebFileCompression::Brotli, decompressed, signature)
+                }
             }
         };
 
         // Create reader for decompressed data
         let mut reader = BinaryReader::new(decompressed_data.as_bytes(), ByteOrder::Little);
-
-        // Read signature
-        let signature = reader.read_cstring()?;
-        if !signature.starts_with("UnityWebData") && !signature.starts_with("TuanjieWebData") {
-            return Err(BinaryError::invalid_signature(
-                "UnityWebData or TuanjieWebData",
-                &signature,
-            ));
-        }
+        // Consume the signature we already validated.
+        let _ = reader.read_cstring()?;
 
         // Read header length
         let head_length_i32 = reader.read_i32()?;
@@ -213,6 +226,23 @@ impl WebFile {
         Ok(&bytes[start..end])
     }
 
+    pub fn extract_file_slice_by_info(&self, info: &BundleFileInfo) -> Result<&[u8]> {
+        let start = info.offset as usize;
+        let end = start + info.size as usize;
+
+        let bytes = self.data.as_bytes();
+        if end > bytes.len() {
+            return Err(BinaryError::invalid_data(format!(
+                "File {} extends beyond data bounds: {} > {}",
+                info.name,
+                end,
+                bytes.len()
+            )));
+        }
+
+        Ok(&bytes[start..end])
+    }
+
     pub fn extract_file_view(&self, name: &str) -> Result<DataView> {
         let file_info = self
             .files
@@ -243,6 +273,18 @@ impl WebFile {
 
         Ok(bundles)
     }
+}
+
+fn read_webfile_signature(data: &[u8]) -> Result<String> {
+    let mut reader = BinaryReader::new(data, ByteOrder::Little);
+    let signature = reader.read_cstring()?;
+    if !signature.starts_with("UnityWebData") && !signature.starts_with("TuanjieWebData") {
+        return Err(BinaryError::invalid_signature(
+            "UnityWebData or TuanjieWebData",
+            &signature,
+        ));
+    }
+    Ok(signature)
 }
 
 #[cfg(test)]

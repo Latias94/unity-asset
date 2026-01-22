@@ -25,6 +25,11 @@ pub struct SerializedFileHeader {
     pub endian: u8,
     /// Reserved bytes
     pub reserved: [u8; 3],
+    /// Extended header unknown field (version >= 22).
+    ///
+    /// UnityPy stores this as `SerializedFile.unknown` and writes it back when saving.
+    /// We keep it in the header to preserve round-trippability.
+    pub unknown: i64,
 }
 
 impl SerializedFileHeader {
@@ -59,7 +64,17 @@ impl SerializedFileHeader {
             metadata_size = reader.read_u32()?;
             file_size = i64_to_u64_checked(reader.read_i64()?, "file_size")?;
             data_offset = i64_to_u64_checked(reader.read_i64()?, "data_offset")?;
-            reader.read_i64()?; // Skip unknown field
+            // Preserve the unknown field for parity with UnityPy's save path.
+            let unknown = reader.read_i64()?;
+            return Ok(Self {
+                metadata_size,
+                file_size,
+                version,
+                data_offset,
+                endian,
+                reserved,
+                unknown,
+            });
         }
 
         Ok(Self {
@@ -69,6 +84,7 @@ impl SerializedFileHeader {
             data_offset,
             endian,
             reserved,
+            unknown: 0,
         })
     }
 
@@ -166,6 +182,7 @@ impl Default for SerializedFileHeader {
             data_offset: 0,
             endian: 0, // Little endian by default
             reserved: [0; 3],
+            unknown: 0,
         }
     }
 }

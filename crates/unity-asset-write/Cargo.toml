@@ -1,0 +1,31 @@
+[package]
+name = "unity-asset-write"
+version = "0.3.0"
+edition.workspace = true
+authors.workspace = true
+description = "Unity asset edit/write support (SerializedFile/Bundle/WebFile), targeting UnityPy parity"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/unity-asset-write"
+readme = "../../README.md"
+keywords = ["unity", "assets", "writer", "editor", "bundle"]
+categories = ["parsing", "game-development"]
+
+[dependencies]
+unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
+unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
+indexmap = { workspace = true }
+lz4_flex = { workspace = true }
+lzma-rs = "0.3"
+brotli = "3.4"
+flate2 = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tempfile = { workspace = true }
+
+[package.metadata.docs.rs]
+no-default-features = true
+all-features = false
+rustdoc-args = ["--cfg", "docsrs"]
