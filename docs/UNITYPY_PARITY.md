@@ -293,6 +293,7 @@ Acceptance:
 - [x] Provide a typed convenience helper for a common non-streamed edit:
   - [x] TextAsset (`m_Script`)
 - [x] Expand typed helpers (UnityPy-like ergonomics):
+  - [x] MeshFilter (`m_Mesh`)
   - [x] MeshRenderer (`m_Materials`, `m_AdditionalVertexStreams`)
   - [x] VideoPlayer (`m_Url`, `m_VideoClip`)
 - [ ] TODO: expand typed helpers further (more classes + deeper editor semantics)

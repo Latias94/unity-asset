@@ -1603,3 +1603,17 @@ fn typed_mesh_renderer_helpers_update_materials_and_additional_vertex_streams() 
     assert_eq!(vs.get("m_FileID").and_then(|v| v.as_i64()), Some(0));
     assert_eq!(vs.get("m_PathID").and_then(|v| v.as_i64()), Some(99));
 }
+
+#[test]
+fn typed_mesh_filter_helper_updates_mesh_pptr() {
+    let mut class = UnityClass::new(0, "MeshFilter".to_string(), "0".to_string());
+    class.set("m_Mesh".to_string(), UnityValue::Object(Default::default()));
+
+    super::typed::apply_mesh_filter_mesh_pptr(&mut class, 0, 123);
+
+    let UnityValue::Object(mesh) = class.get("m_Mesh").unwrap() else {
+        panic!("m_Mesh should be an object");
+    };
+    assert_eq!(mesh.get("m_FileID").and_then(|v| v.as_i64()), Some(0));
+    assert_eq!(mesh.get("m_PathID").and_then(|v| v.as_i64()), Some(123));
+}

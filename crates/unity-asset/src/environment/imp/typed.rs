@@ -124,6 +124,10 @@ pub(crate) fn apply_video_player_video_clip_pptr(
     Ok(())
 }
 
+pub(crate) fn apply_mesh_filter_mesh_pptr(class: &mut UnityClass, file_id: i32, path_id: i64) {
+    apply_pptr_field(class, "m_Mesh", file_id, path_id);
+}
+
 pub(crate) fn apply_mesh_renderer_materials(
     class: &mut UnityClass,
     materials: &[(i32, i64)],
@@ -266,6 +270,36 @@ impl<'a> EnvironmentEditSession<'a> {
     ) -> Result<()> {
         self.edit_binary_object_key(key, |class| {
             apply_video_player_video_clip_pptr(class, file_id, path_id)
+        })
+    }
+
+    /// Set a Unity `PPtr`-shaped field (`fileID/pathID`) in a best-effort manner.
+    ///
+    /// This supports both `fileID/pathID` and `m_FileID/m_PathID` key variants and will create the
+    /// field object if needed.
+    pub fn set_pptr_field(
+        &mut self,
+        key: &BinaryObjectKey,
+        field_name: &str,
+        file_id: i32,
+        path_id: i64,
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| {
+            apply_pptr_field(class, field_name, file_id, path_id);
+            Ok(())
+        })
+    }
+
+    /// Set the `m_Mesh` PPtr on a MeshFilter (UnityPy-like convenience helper).
+    pub fn set_mesh_filter_mesh_pptr(
+        &mut self,
+        key: &BinaryObjectKey,
+        file_id: i32,
+        path_id: i64,
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| {
+            apply_mesh_filter_mesh_pptr(class, file_id, path_id);
+            Ok(())
         })
     }
 
