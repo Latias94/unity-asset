@@ -1,0 +1,17 @@
+# Clippy configuration for Unity Asset Parser
+# This file configures clippy behavior across the entire workspace
+
+# Allow some lints in test code that we want to be strict about in lib code
+# Tests often have different patterns and requirements
+
+# Cognitive complexity - tests can be more complex
+cognitive-complexity-threshold = 50
+
+# Allow more arguments in test functions
+too-many-arguments-threshold = 10
+
+# Allow longer functions in tests
+too-many-lines-threshold = 200
+
+# Test-specific allowances that don't affect library code quality
+# These are reasonable for test code but not for production code
