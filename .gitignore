@@ -36,6 +36,7 @@ test_output_*/
 # Local development
 .env
 .env.local
+.claude/
 
 # Benchmark results
 criterion/
