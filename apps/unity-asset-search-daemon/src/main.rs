@@ -122,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
 
     let token = args.token.unwrap_or_else(generate_token);
     persist_token(&paths.index_root_dir, &token)?;
+    persist_pid(&paths.index_root_dir)?;
 
     eprintln!(
         "unity-asset-search-daemon listening on {} (index: {}, token: {})",
@@ -326,6 +327,10 @@ async fn references(
 #[derive(Debug, serde::Deserialize)]
 struct ReindexParams {
     full: Option<bool>,
+    /// When false, start reindex in the background and return immediately.
+    ///
+    /// This is useful for UIs (e.g. Unity Editor) where a full reindex can take minutes.
+    wait: Option<bool>,
     #[serde(default)]
     path: Vec<String>,
     #[serde(default)]
@@ -346,7 +351,44 @@ async fn reindex(
     }
 
     let full = q.full.unwrap_or(false);
+    let wait = q.wait.unwrap_or(true);
     let paths: Vec<String> = q.path.into_iter().chain(q.paths.into_iter()).collect();
+
+    if !wait {
+        let indexing = state
+            .index
+            .status()
+            .ok()
+            .map(|s| s.indexing)
+            .unwrap_or(false);
+        if indexing {
+            return (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "ok": true, "started": false, "indexing": true })),
+            )
+                .into_response();
+        }
+
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let result = if full {
+                run_reindex(state_clone, true).await
+            } else if paths.is_empty() {
+                run_reindex(state_clone, false).await
+            } else {
+                run_reindex_paths(state_clone, &paths).await
+            };
+            if let Err(err) = result {
+                eprintln!("reindex error: {err}");
+            }
+        });
+
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "ok": true, "started": true, "indexing": true })),
+        )
+            .into_response();
+    }
 
     match if full {
         run_reindex(state, true).await
@@ -385,6 +427,13 @@ fn generate_token() -> String {
 fn persist_token(index_dir: &std::path::Path, token: &str) -> anyhow::Result<()> {
     let path = index_dir.join("token");
     std::fs::write(path, token)?;
+    Ok(())
+}
+
+fn persist_pid(index_dir: &std::path::Path) -> anyhow::Result<()> {
+    let pid = std::process::id();
+    let path = index_dir.join("pid");
+    std::fs::write(path, pid.to_string())?;
     Ok(())
 }
 

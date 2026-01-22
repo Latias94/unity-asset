@@ -50,7 +50,7 @@ On tag push (`vMAJOR.MINOR.PATCH`), GitHub Actions:
    9) `unity-asset-search-daemon`
    10) `unity-asset-search-cli`
 4. Builds and uploads multi-platform binaries using `cargo-dist`:
-   - `unity-asset-search-daemon` (for UnityHero)
+   - `unity-asset-search-daemon` (for the Unity Editor plugin)
    - `unity-asset-search-cli` (debug/ops utility)
 5. Creates a GitHub Release using release notes extracted from `CHANGELOG.md` and attaches the built binaries.
 
@@ -67,13 +67,13 @@ Inputs:
 - `ref`: the git ref to build from
   - use `main` to backfill old tags (note: this trades exact reproducibility for a practical repair)
 
-## UnityHero packaging (scheme B)
+## Unity Editor plugin packaging (scheme B)
 
-UnityHero (UPM plugin) vendors the daemon binaries into:
+The Unity Editor UPM plugin vendors the daemon binaries into:
 
-- `Packages/com.frankorz.unityhero/Tools/<platform>/`
+- `Packages/<package-id>/Tools/<platform>/`
 
-The UnityHero release workflow should:
+The Unity plugin release workflow should:
 
 1. Download `unity-asset-search-daemon` archives from this repo's GitHub Release.
 2. Extract and place them into `Tools/win-x64/`, `Tools/linux-x64/`, and `Tools/mac-universal/`.

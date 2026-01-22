@@ -14,6 +14,7 @@ This repository maintains runnable examples per crate (built in CI).
 - `unity-asset-cli` (CLI): command-line tools. Not needed for library integration.
 - `unity-asset-search-daemon` (experimental): local "Search Everything" daemon (`localhost` HTTP API).
 - `unity-asset-search-cli` (experimental): CLI client for the search daemon (search/status/suggest/reindex/bench).
+- Unity Editor plugin (experimental UPM package): `com.frankorz.asset-hero`.
 
 ## unity-asset (library)
 

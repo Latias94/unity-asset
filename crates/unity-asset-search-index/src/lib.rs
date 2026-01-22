@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -80,7 +81,9 @@ pub struct ReferenceHit {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReferenceContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub doc_file_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub doc_class_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub object_name: Option<String>,
@@ -88,11 +91,17 @@ pub struct ReferenceContext {
     pub hierarchy_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub field_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_column: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReferenceObject {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub doc_file_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub doc_class_id: Option<u32>,
     pub stable_id: String,
     pub location: Location,
@@ -107,6 +116,7 @@ pub struct ReferenceObject {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReferencesResponse {
     pub guid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub file_id: Option<u64>,
     pub took_ms: u128,
     pub total_hits: usize,
@@ -121,6 +131,20 @@ pub struct SuggestResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexProgress {
+    pub operation: String,
+    pub phase: String,
+    pub phase_index: u32,
+    pub phase_count: u32,
+    pub phases: Vec<String>,
+    pub processed: u64,
+    pub total: u64,
+    pub has_total: bool,
+    pub started_unix_ms: u64,
+    pub updated_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub project_root: PathBuf,
     pub index_root_dir: PathBuf,
@@ -128,13 +152,21 @@ pub struct StatusResponse {
     pub scan_roots: Vec<PathBuf>,
     pub ignore_files_supported: Vec<String>,
     pub project_ignore_files_present: Vec<String>,
+    #[serde(default)]
+    pub indexed_files: u64,
     pub indexed_docs: u64,
     pub indexed_scripts: u64,
     pub indexed_ref_sources: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_index_duration_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_index_unix_ms: Option<u64>,
     pub indexing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_scan_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_docs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub removed_docs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reindex_kind: Option<String>,
@@ -154,6 +186,8 @@ pub struct StatusResponse {
     pub respect_ignore_files: bool,
     #[serde(default)]
     pub respect_project_gitignore: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<IndexProgress>,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +328,7 @@ struct SearchIndexInner {
     refs_writer: IndexWriter,
     refs_fields: ReferenceFields,
     status: StatusResponse,
+    progress: Option<Arc<IndexProgressState>>,
     state: IndexState,
 }
 
@@ -401,6 +436,79 @@ struct IndexingGuard {
     inner: Arc<RwLock<SearchIndexInner>>,
 }
 
+#[derive(Debug)]
+struct IndexProgressState {
+    operation: String,
+    phases: Vec<String>,
+    started_unix_ms: u64,
+    updated_unix_ms: AtomicU64,
+    phase_index: AtomicU32,
+    processed: AtomicU64,
+    has_total: AtomicBool,
+    total: AtomicU64,
+}
+
+impl IndexProgressState {
+    fn new(operation: impl Into<String>, phases: Vec<String>) -> Self {
+        let now = unix_ms_now();
+        Self {
+            operation: operation.into(),
+            phases,
+            started_unix_ms: now,
+            updated_unix_ms: AtomicU64::new(now),
+            phase_index: AtomicU32::new(1),
+            processed: AtomicU64::new(0),
+            has_total: AtomicBool::new(false),
+            total: AtomicU64::new(0),
+        }
+    }
+
+    fn set_phase(&self, phase_index: u32, has_total: bool, total: u64) {
+        let now = unix_ms_now();
+        self.phase_index
+            .store(phase_index.max(1), Ordering::Relaxed);
+        self.processed.store(0, Ordering::Relaxed);
+        self.has_total.store(has_total, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+        self.updated_unix_ms.store(now, Ordering::Relaxed);
+    }
+
+    fn inc_processed(&self, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        let new = self.processed.fetch_add(delta, Ordering::Relaxed) + delta;
+        if new % 256 == 0 {
+            self.updated_unix_ms.store(unix_ms_now(), Ordering::Relaxed);
+        }
+    }
+
+    fn mark_updated(&self) {
+        self.updated_unix_ms.store(unix_ms_now(), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> IndexProgress {
+        let phase_index = self.phase_index.load(Ordering::Relaxed).max(1);
+        let phase = self
+            .phases
+            .get(phase_index.saturating_sub(1) as usize)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        IndexProgress {
+            operation: self.operation.clone(),
+            phase,
+            phase_index,
+            phase_count: self.phases.len().try_into().unwrap_or(u32::MAX),
+            phases: self.phases.clone(),
+            processed: self.processed.load(Ordering::Relaxed),
+            total: self.total.load(Ordering::Relaxed),
+            has_total: self.has_total.load(Ordering::Relaxed),
+            started_unix_ms: self.started_unix_ms,
+            updated_unix_ms: self.updated_unix_ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
 impl Drop for IndexingGuard {
     fn drop(&mut self) {
         let Ok(mut inner) = self.inner.write() else {
@@ -409,6 +517,7 @@ impl Drop for IndexingGuard {
         if inner.status.indexing {
             inner.status.indexing = false;
         }
+        inner.progress = None;
     }
 }
 
@@ -475,10 +584,12 @@ impl SearchIndex {
             scan_roots: paths.scan_roots.clone(),
             ignore_files_supported,
             project_ignore_files_present,
+            indexed_files: 0,
             indexed_docs: 0,
             indexed_scripts: 0,
             indexed_ref_sources: 0,
             last_index_duration_ms: None,
+            last_index_unix_ms: None,
             indexing: false,
             last_scan_ms: None,
             updated_docs: None,
@@ -495,6 +606,7 @@ impl SearchIndex {
                 .unwrap_or(u64::MAX),
             respect_ignore_files: options.respect_ignore_files,
             respect_project_gitignore: options.respect_project_gitignore,
+            progress: None,
         };
 
         let this = Self {
@@ -507,6 +619,7 @@ impl SearchIndex {
                 refs_writer,
                 refs_fields,
                 status,
+                progress: None,
                 state,
             })),
             enrich_cache: Arc::new(std::sync::Mutex::new(EnrichCache::new(256))),
@@ -518,12 +631,12 @@ impl SearchIndex {
 
     pub fn status(&self) -> Result<StatusResponse> {
         self.refresh_status()?;
-        Ok(self
-            .inner
-            .read()
-            .map_err(|_| anyhow!("poisoned lock"))?
-            .status
-            .clone())
+        let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
+        let mut status = inner.status.clone();
+        if let Some(progress) = inner.progress.as_ref() {
+            status.progress = Some(progress.snapshot());
+        }
+        Ok(status)
     }
 
     pub fn options_changed(&self) -> bool {
@@ -537,14 +650,7 @@ impl SearchIndex {
         let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
         inner.status.fallback_count = inner.status.fallback_count.saturating_add(1);
         inner.status.last_fallback_reason = Some(reason.to_string());
-        inner.status.last_fallback_unix_ms = Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX),
-        );
+        inner.status.last_fallback_unix_ms = Some(unix_ms_now());
         Ok(())
     }
 
@@ -638,12 +744,23 @@ impl SearchIndex {
         }
 
         let start = Instant::now();
+        let progress = Arc::new(IndexProgressState::new(
+            "changed_paths",
+            vec![
+                "scan_changed_paths".to_string(),
+                "index_documents".to_string(),
+                "commit".to_string(),
+                "reload".to_string(),
+            ],
+        ));
         let indexing_guard = {
             let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
             inner.status.indexing = true;
             inner.status.updated_docs = None;
             inner.status.removed_docs = None;
             inner.status.last_scan_ms = None;
+            progress.set_phase(1, false, 0);
+            inner.progress = Some(progress.clone());
             IndexingGuard {
                 inner: self.inner.clone(),
             }
@@ -658,6 +775,7 @@ impl SearchIndex {
             self.refresh_status()?;
             return Ok(());
         }
+        progress.set_phase(1, true, changed_paths.len().try_into().unwrap_or(u64::MAX));
 
         let options = {
             let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
@@ -667,6 +785,7 @@ impl SearchIndex {
         let scan_start = Instant::now();
         let delta = scan_changed_paths(paths, &changed_paths, options)?;
         let scan_ms = scan_start.elapsed().as_millis();
+        progress.mark_updated();
 
         let fields = {
             let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
@@ -679,6 +798,14 @@ impl SearchIndex {
 
         let mut updated_docs = 0u64;
         let mut removed_docs = 0u64;
+
+        let total_work = delta
+            .removed_rel_paths
+            .len()
+            .saturating_add(delta.files.len())
+            .try_into()
+            .unwrap_or(u64::MAX);
+        progress.set_phase(2, true, total_work);
 
         {
             let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
@@ -700,6 +827,7 @@ impl SearchIndex {
                     removed_docs += 1;
                 }
                 remove_script_entries_for_rel_path(&mut scripts, removed);
+                progress.inc_processed(1);
 
                 let removed_children: Vec<String> = state
                     .files
@@ -721,6 +849,7 @@ impl SearchIndex {
                         removed_docs += 1;
                     }
                     remove_script_entries_for_rel_path(&mut scripts, &child);
+                    progress.inc_processed(1);
                 }
             }
 
@@ -758,6 +887,7 @@ impl SearchIndex {
                             removed_docs += 1;
                         }
                         remove_script_entries_for_rel_path(&mut scripts, &rel_path);
+                        progress.inc_processed(1);
                     }
                 }
             }
@@ -801,16 +931,20 @@ impl SearchIndex {
 
                 state.files.insert(file.rel_path.clone(), file.fingerprint);
                 updated_docs += 1;
+                progress.inc_processed(1);
             }
 
+            progress.set_phase(3, false, 0);
             inner.writer.commit()?;
             inner.refs_writer.commit()?;
+            progress.mark_updated();
             state.scripts = scripts;
             state.options = options;
             inner.state = state;
             store_state(&paths.state_path, &inner.state)?;
         }
 
+        progress.set_phase(4, false, 0);
         self.inner
             .read()
             .map_err(|_| anyhow!("poisoned lock"))?
@@ -821,6 +955,7 @@ impl SearchIndex {
             .map_err(|_| anyhow!("poisoned lock"))?
             .refs_reader
             .reload()?;
+        progress.mark_updated();
 
         {
             let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
@@ -832,6 +967,8 @@ impl SearchIndex {
             inner.status.last_changed_paths =
                 Some(changed_paths.len().try_into().unwrap_or(u64::MAX));
             inner.status.indexing = false;
+            inner.status.last_index_unix_ms = Some(unix_ms_now());
+            inner.progress = None;
         }
 
         drop(indexing_guard);
@@ -841,6 +978,20 @@ impl SearchIndex {
 
     fn reindex_impl(&self, paths: &IndexPaths, mode: ReindexMode) -> Result<()> {
         let start = Instant::now();
+        let operation = match mode {
+            ReindexMode::Incremental => "full_scan_incremental",
+            ReindexMode::Full => "full_scan_full",
+        };
+        let progress = Arc::new(IndexProgressState::new(
+            operation,
+            vec![
+                "scan_project_files".to_string(),
+                "build_scripts".to_string(),
+                "index_documents".to_string(),
+                "commit".to_string(),
+                "reload".to_string(),
+            ],
+        ));
         let indexing_guard = {
             let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
             inner.status.indexing = true;
@@ -848,6 +999,9 @@ impl SearchIndex {
             inner.status.removed_docs = None;
             inner.status.last_scan_ms = None;
             inner.status.last_changed_paths = None;
+            let previous_files: u64 = inner.state.files.len().try_into().unwrap_or(u64::MAX);
+            progress.set_phase(1, previous_files > 0, previous_files);
+            inner.progress = Some(progress.clone());
             IndexingGuard {
                 inner: self.inner.clone(),
             }
@@ -859,8 +1013,9 @@ impl SearchIndex {
         };
 
         let scan_start = Instant::now();
-        let scan = scan_project_files(paths, options)?;
+        let scan = scan_project_files(paths, options, Some(progress.clone()))?;
         let scan_ms = scan_start.elapsed().as_millis();
+        progress.mark_updated();
 
         let (fields, refs_fields, mut state) = {
             let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
@@ -871,10 +1026,50 @@ impl SearchIndex {
             )
         };
 
+        let script_total: u64 = scan
+            .files
+            .values()
+            .filter(|f| f.kind == "Script")
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        progress.set_phase(2, script_total > 0, script_total);
         let scripts = build_script_guid_map(&scan, &state.scripts)?;
+        if script_total > 0 {
+            progress.inc_processed(script_total);
+            progress.mark_updated();
+        }
 
         let mut updated_docs = 0u64;
         let mut removed_docs = 0u64;
+
+        let removed_rel_paths: Vec<String> = if mode == ReindexMode::Full {
+            Vec::new()
+        } else {
+            state
+                .files
+                .keys()
+                .filter(|path| !scan.files.contains_key(*path))
+                .cloned()
+                .collect()
+        };
+        let to_update_rel_paths: Vec<String> = if mode == ReindexMode::Full {
+            scan.files.keys().cloned().collect()
+        } else {
+            scan.files
+                .iter()
+                .filter_map(|(rel_path, file)| {
+                    let old = state.files.get(rel_path).copied();
+                    (old != Some(file.fingerprint)).then_some(rel_path.clone())
+                })
+                .collect()
+        };
+        let total_work = removed_rel_paths
+            .len()
+            .saturating_add(to_update_rel_paths.len())
+            .try_into()
+            .unwrap_or(u64::MAX);
+        progress.set_phase(3, true, total_work);
 
         {
             let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
@@ -886,32 +1081,25 @@ impl SearchIndex {
                 state.scripts.clear();
             }
 
-            for removed in state
-                .files
-                .keys()
-                .filter(|path| !scan.files.contains_key(*path))
-                .cloned()
-                .collect::<Vec<_>>()
-            {
+            for removed in &removed_rel_paths {
                 inner
                     .writer
-                    .delete_term(Term::from_field_text(fields.id, &removed));
-                inner.writer.delete_term(Term::from_field_text(
-                    fields.container_source_path,
-                    &removed,
-                ));
+                    .delete_term(Term::from_field_text(fields.id, removed));
+                inner
+                    .writer
+                    .delete_term(Term::from_field_text(fields.container_source_path, removed));
                 inner
                     .refs_writer
-                    .delete_term(Term::from_field_text(refs_fields.source_id, &removed));
-                state.files.remove(&removed);
+                    .delete_term(Term::from_field_text(refs_fields.source_id, removed));
+                state.files.remove(removed);
                 removed_docs += 1;
+                progress.inc_processed(1);
             }
 
-            for (rel_path, file) in &scan.files {
-                let old = state.files.get(rel_path).copied();
-                if old == Some(file.fingerprint) && mode == ReindexMode::Incremental {
+            for rel_path in &to_update_rel_paths {
+                let Some(file) = scan.files.get(rel_path) else {
                     continue;
-                }
+                };
 
                 inner
                     .writer
@@ -942,16 +1130,20 @@ impl SearchIndex {
 
                 state.files.insert(rel_path.clone(), file.fingerprint);
                 updated_docs += 1;
+                progress.inc_processed(1);
             }
 
+            progress.set_phase(4, false, 0);
             inner.writer.commit()?;
             inner.refs_writer.commit()?;
+            progress.mark_updated();
             state.scripts = scripts;
             state.options = options;
             inner.state = state;
             store_state(&paths.state_path, &inner.state)?;
         }
 
+        progress.set_phase(5, false, 0);
         self.inner
             .read()
             .map_err(|_| anyhow!("poisoned lock"))?
@@ -962,6 +1154,7 @@ impl SearchIndex {
             .map_err(|_| anyhow!("poisoned lock"))?
             .refs_reader
             .reload()?;
+        progress.mark_updated();
 
         {
             let mut inner = self.inner.write().map_err(|_| anyhow!("poisoned lock"))?;
@@ -977,6 +1170,8 @@ impl SearchIndex {
                 .to_string(),
             );
             inner.status.indexing = false;
+            inner.status.last_index_unix_ms = Some(unix_ms_now());
+            inner.progress = None;
         }
 
         drop(indexing_guard);
@@ -1464,6 +1659,7 @@ impl SearchIndex {
         let refs_searcher = inner.refs_reader.searcher();
 
         let mut status = inner.status.clone();
+        status.indexed_files = inner.state.files.len() as u64;
         status.indexed_docs = searcher.num_docs();
         status.indexed_scripts = inner.state.scripts.len() as u64;
         status.indexed_ref_sources = refs_searcher.num_docs();
@@ -1510,6 +1706,15 @@ fn supported_ignore_files() -> Vec<String> {
         ".ignore".to_string(),
         ".unity-asset-search-ignore".to_string(),
     ]
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn detect_project_ignore_files(project_root: &Path, supported: &[String]) -> Vec<String> {
@@ -1760,45 +1965,53 @@ enum ReindexMode {
     Full,
 }
 
-fn scan_project_files(paths: &IndexPaths, options: SearchIndexOptions) -> Result<ScanResult> {
+fn scan_project_files(
+    paths: &IndexPaths,
+    options: SearchIndexOptions,
+    progress: Option<Arc<IndexProgressState>>,
+) -> Result<ScanResult> {
     let mut out = ScanResult::default();
 
     let project_root = paths.project_root.clone();
     let scan_roots = paths.scan_roots.clone();
-    let files = scan_walk_parallel(build_project_walk_builder(paths, options), move |path| {
-        if path.extension().is_some_and(|e| e == "meta") {
-            return Ok(None);
-        }
-        if should_skip_file(path)
-            || is_excluded_dir(path)
-            || !is_in_scan_roots_raw(&scan_roots, path)
-        {
-            return Ok(None);
-        }
+    let files = scan_walk_parallel(
+        build_project_walk_builder(paths, options),
+        progress,
+        move |path| {
+            if path.extension().is_some_and(|e| e == "meta") {
+                return Ok(None);
+            }
+            if should_skip_file(path)
+                || is_excluded_dir(path)
+                || !is_in_scan_roots_raw(&scan_roots, path)
+            {
+                return Ok(None);
+            }
 
-        let rel_path = path
-            .strip_prefix(&project_root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+            let rel_path = path
+                .strip_prefix(&project_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
 
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default()
-            .to_string();
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
 
-        let kind = classify_kind(path);
-        let fingerprint = fingerprint_for_path(path)?;
+            let kind = classify_kind(path);
+            let fingerprint = fingerprint_for_path(path)?;
 
-        Ok(Some(ScannedFile {
-            rel_path,
-            abs_path: path.to_path_buf(),
-            fingerprint,
-            name,
-            kind,
-        }))
-    })?;
+            Ok(Some(ScannedFile {
+                rel_path,
+                abs_path: path.to_path_buf(),
+                fingerprint,
+                name,
+                kind,
+            }))
+        },
+    )?;
 
     for file in files {
         out.files.insert(file.rel_path.clone(), file);
@@ -1902,7 +2115,7 @@ fn scan_changed_paths(
 
         let project_root = paths.project_root.clone();
         let existing_set = Arc::new(existing_set);
-        let mut files = scan_walk_parallel(builder, move |path| {
+        let mut files = scan_walk_parallel(builder, None, move |path| {
             if should_skip_file(path) || is_excluded_dir(path) || !existing_set.contains(path) {
                 return Ok(None);
             }
@@ -1993,7 +2206,7 @@ fn scan_dir_files(
             .any(|root| root.starts_with(p) || p.starts_with(root))
     });
 
-    scan_walk_parallel(builder, move |path| {
+    scan_walk_parallel(builder, None, move |path| {
         if path.extension().is_some_and(|e| e == "meta") {
             return Ok(None);
         }
@@ -2057,7 +2270,11 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn scan_walk_parallel<F>(mut builder: WalkBuilder, handle_path: F) -> Result<Vec<ScannedFile>>
+fn scan_walk_parallel<F>(
+    mut builder: WalkBuilder,
+    progress: Option<Arc<IndexProgressState>>,
+    handle_path: F,
+) -> Result<Vec<ScannedFile>>
 where
     F: Fn(&Path) -> Result<Option<ScannedFile>> + Send + Sync + 'static,
 {
@@ -2097,6 +2314,7 @@ where
     let out_for_run = out.clone();
     let err_for_run = err.clone();
     let handle_path_for_run = handle_path.clone();
+    let progress_for_run = progress.clone();
     builder.build_parallel().run(|| {
         let mut collector = LocalCollector {
             out: out_for_run.clone(),
@@ -2104,6 +2322,7 @@ where
         };
         let err = err_for_run.clone();
         let handle_path = handle_path_for_run.clone();
+        let progress = progress_for_run.clone();
         Box::new(move |result: Result<DirEntry, ignore::Error>| {
             let Ok(entry) = result else {
                 return WalkState::Continue;
@@ -2113,6 +2332,9 @@ where
             }
 
             let path = entry.path();
+            if let Some(progress) = progress.as_ref() {
+                progress.inc_processed(1);
+            }
             match handle_path(path) {
                 Ok(Some(file)) => {
                     collector.local.push(file);
@@ -2857,7 +3079,7 @@ fn extract_reference_contexts_from_yaml(
     let fileid_needle = file_id.map(|id| id.to_string());
     let mut current: Option<DocHeader> = None;
 
-    for raw_line in text.lines() {
+    for (line_idx, raw_line) in text.lines().enumerate() {
         let line = raw_line.trim_end();
         if let Some((class_id, doc_file_id)) = parse_unity_yaml_doc_header(line) {
             current = Some(DocHeader {
@@ -2884,12 +3106,19 @@ fn extract_reference_contexts_from_yaml(
         let (object_name, hierarchy_path) =
             analysis.context_for_doc(header.file_id).unwrap_or_default();
 
+        let source_line = Some((line_idx.saturating_add(1)).try_into().unwrap_or(u32::MAX));
+        let source_column = raw_line
+            .find(guid_needle)
+            .map(|idx| (idx.saturating_add(1)).try_into().unwrap_or(u32::MAX));
+
         out.push(ReferenceContext {
             doc_file_id: Some(header.file_id),
             doc_class_id: Some(header.class_id),
             object_name,
             hierarchy_path,
             field_hint,
+            source_line,
+            source_column,
         });
 
         if out.len() >= 20 {
@@ -2904,6 +3133,7 @@ fn extract_reference_contexts_from_yaml(
             a.hierarchy_path.as_deref().unwrap_or(""),
             a.object_name.as_deref().unwrap_or(""),
             a.field_hint.as_deref().unwrap_or(""),
+            a.source_line.unwrap_or(0),
         )
             .cmp(&(
                 b.doc_file_id.unwrap_or(0),
@@ -2911,9 +3141,28 @@ fn extract_reference_contexts_from_yaml(
                 b.hierarchy_path.as_deref().unwrap_or(""),
                 b.object_name.as_deref().unwrap_or(""),
                 b.field_hint.as_deref().unwrap_or(""),
+                b.source_line.unwrap_or(0),
             ))
     });
     out.dedup_by(|a, b| {
+        if a.doc_file_id == b.doc_file_id
+            && a.doc_class_id == b.doc_class_id
+            && a.object_name == b.object_name
+            && a.hierarchy_path == b.hierarchy_path
+            && a.field_hint == b.field_hint
+        {
+            if let Some(b_line) = b.source_line {
+                let take = match a.source_line {
+                    None => true,
+                    Some(a_line) => b_line < a_line,
+                };
+                if take {
+                    a.source_line = b.source_line;
+                    a.source_column = b.source_column;
+                }
+            }
+            return true;
+        }
         a.doc_file_id == b.doc_file_id
             && a.doc_class_id == b.doc_class_id
             && a.object_name == b.object_name
@@ -2959,6 +3208,17 @@ fn group_reference_contexts_and_objects(
             base.field_hint = None;
             (base, std::collections::BTreeSet::new())
         });
+
+        if let Some(ctx_line) = ctx.source_line {
+            let take = match entry.0.source_line {
+                None => true,
+                Some(existing_line) => ctx_line < existing_line,
+            };
+            if take {
+                entry.0.source_line = Some(ctx_line);
+                entry.0.source_column = ctx.source_column;
+            }
+        }
 
         if let Some(hint) = ctx.field_hint {
             if !hint.trim().is_empty() {
@@ -3157,6 +3417,8 @@ fn extract_reference_contexts_from_serialized_file(
             object_name,
             hierarchy_path: None,
             field_hint,
+            source_line: None,
+            source_column: None,
         });
     }
 
@@ -4033,6 +4295,8 @@ Transform:
             object_name: Some("Player".to_string()),
             hierarchy_path: Some("Root/Player".to_string()),
             field_hint: Some("m_Material".to_string()),
+            source_line: None,
+            source_column: None,
         };
         let b = ReferenceContext {
             doc_file_id: Some(10),
@@ -4040,6 +4304,8 @@ Transform:
             object_name: Some("Player".to_string()),
             hierarchy_path: Some("Root/Player".to_string()),
             field_hint: Some("m_Materials[0]".to_string()),
+            source_line: None,
+            source_column: None,
         };
 
         let (contexts, objects) =
@@ -4064,6 +4330,8 @@ Transform:
             object_name: Some("A".to_string()),
             hierarchy_path: Some("Root/A".to_string()),
             field_hint: None,
+            source_line: None,
+            source_column: None,
         };
         let b = ReferenceContext {
             doc_file_id: Some(11),
@@ -4071,6 +4339,8 @@ Transform:
             object_name: Some("B".to_string()),
             hierarchy_path: Some("Root/B".to_string()),
             field_hint: Some("m_Script".to_string()),
+            source_line: None,
+            source_column: None,
         };
 
         let (contexts, objects) =

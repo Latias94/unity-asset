@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-01-22
 
 ### Highlights
 - Better “UnityPy-style” discovery and export workflows:
@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Incremental invalidation when reloading sources (`invalidate_dependency_scan_cache_for_source`).
 - Search indexing can optionally include AssetBundle `m_Container` asset paths as `kind=BundleContainer` for Everything-style discovery.
 - Search daemon flags for container indexing and ignore control (`--search-everything`, `--index-bundle-container-entries`, `--no-gitignore`, `--no-ignore-files`).
+- Search daemon `/v1/status` reports best-effort reindex progress (operation + phases + counters) for in-editor UX.
+- Search daemon `/v1/reindex` supports `wait=false` to start long reindex jobs asynchronously (recommended for GUI clients).
+- Experimental Unity Editor plugin (Asset Hero, UPM package `com.frankorz.asset-hero`, currently in `repo-ref/` only) to start the daemon and provide in-editor search + find references (Unity 2022.3+, UI Toolkit).
 - Release automation via `cargo-dist` to ship multi-platform binaries alongside GitHub Releases.
 - A manual GitHub Actions workflow to backfill missing dist assets for an existing tag (repair path).
 

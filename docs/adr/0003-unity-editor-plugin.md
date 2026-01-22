@@ -1,6 +1,6 @@
 # ADR 0003: Unity Editor plugin integration and repository strategy
 
-- Status: Proposed
+- Status: In Progress
 - Date: 2025-12-26
 
 ## Context
@@ -23,7 +23,7 @@ The Rust workspace is currently optimized for Rust development. Unity plugin dev
 
 Create a dedicated repository, e.g.:
 
-- `unityhero-unity` (recommended name)
+- `unity-asset-search-unity` (example)
 
 This repository is a UPM package template and is versioned independently from the Rust workspace, while still tracking compatible daemon versions.
 
@@ -52,16 +52,16 @@ The plugin owns a small "daemon manager" layer:
 
 - Determine `project_root` as Unity project directory.
 - Choose `index_dir`:
-  - default to `Library/UnityHero` (Unity's recommended cache location),
+  - default to `Library/unity-asset-search` (Unity's recommended cache location),
   - allow override in plugin settings.
 - Start the daemon process if missing.
 - Keep a single instance per project:
-  - store pid/port/token info under `Library/UnityHero/`.
+  - store pid/port/token info under `Library/unity-asset-search/`.
 
-UPM package identity (recommended):
+UPM package identity (example):
 
-- package name: `com.frankorz.unityhero`
-- display name: `UnityHero`
+- package name: `com.frankorz.asset-hero`
+- display name: `Asset Hero`
 
 ### 4) Packaging strategy for daemon binaries
 
