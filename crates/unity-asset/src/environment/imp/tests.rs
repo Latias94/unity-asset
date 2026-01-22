@@ -177,6 +177,84 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
 }
 
 #[test]
+fn environment_can_edit_binary_object_and_save_bundle() {
+    use unity_asset_write::{PackerOptions, UnityPyPacker};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let in_path = tmp.path().join("char_118_yuki.ab");
+    let out_dir = tmp.path().join("out");
+
+    std::fs::write(
+        &in_path,
+        include_bytes!("../../../../../tests/samples/char_118_yuki.ab"),
+    )
+    .unwrap();
+
+    let in_path = canonicalize_path(in_path);
+
+    let mut env = Environment::new();
+    env.load_file(&in_path).unwrap();
+
+    let bundle = env
+        .bundles()
+        .get(&BinarySource::path(&in_path))
+        .expect("sample bundle loaded");
+    let sf = bundle.assets.first().expect("bundle has asset 0");
+
+    let (path_id, old_name) = sf
+        .object_handles()
+        .filter_map(|h| h.peek_name().ok().flatten().map(|n| (h.path_id(), n)))
+        .find(|(_id, name)| !name.is_empty())
+        .expect("expected at least one object with peekable name in sample");
+
+    let key = BinaryObjectKey {
+        source: BinarySource::path(&in_path),
+        source_kind: BinarySourceKind::AssetBundle,
+        asset_index: Some(0),
+        path_id,
+    };
+
+    let new_name = format!("RUST_ENV_SAVE_{}", old_name);
+
+    env.edit_binary_object_key(&key, |class| {
+        if let Some(v) = class.get_mut("m_Name") {
+            *v = UnityValue::String(new_name.clone());
+            return Ok(());
+        }
+        if let Some(v) = class.get_mut("name") {
+            *v = UnityValue::String(new_name.clone());
+            return Ok(());
+        }
+        Err(UnityAssetError::format("No m_Name/name field found"))
+    })
+    .unwrap();
+
+    env.save(
+        PackerOptions {
+            packer: UnityPyPacker::Original,
+        },
+        &out_dir,
+    )
+    .unwrap();
+
+    let out_path = out_dir.join("char_118_yuki.ab");
+    assert!(out_path.is_file());
+
+    let saved_bundle =
+        unity_asset_binary::bundle::BundleParser::from_bytes(std::fs::read(out_path).unwrap())
+            .unwrap();
+    let saved_sf = saved_bundle
+        .assets
+        .first()
+        .expect("saved bundle has asset 0");
+    let saved_obj = saved_sf
+        .find_object_handle(path_id)
+        .expect("edited object exists after save");
+    let saved_name = saved_obj.peek_name().unwrap().unwrap();
+    assert_eq!(saved_name, new_name);
+}
+
+#[test]
 fn environment_dependency_graph_builds_and_closure_from_container_is_non_empty() {
     let mut env = Environment::new();
     let path = canonicalize_path(
@@ -907,4 +985,278 @@ fn environment_loads_extless_webfile_entries_and_reads_resource_bytes() {
         )
         .unwrap();
     assert_eq!(read, b"OggS");
+}
+
+#[test]
+fn environment_save_repacks_webfile_after_editing_embedded_bundle() {
+    let sample_bundle_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
+    let bundle_bytes = fs::read(&sample_bundle_path).unwrap();
+
+    let entry_name = "char_118_yuki.ab".to_string();
+    let web_bytes = build_uncompressed_webfile(vec![(entry_name.clone(), bundle_bytes)]);
+
+    let temp = tempfile::tempdir().unwrap();
+    let web_path = temp.path().join("UnityWebData");
+    fs::write(&web_path, web_bytes).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&web_path).unwrap();
+    let web_path = canonicalize_path(web_path);
+
+    let bundle_source = BinarySource::WebEntry {
+        web_path: web_path.clone(),
+        entry_name: entry_name.clone(),
+    };
+
+    // Pick a stable object inside the embedded bundle and patch its name.
+    let mut chosen: Option<(BinaryObjectKey, String)> = None;
+    for r in env.binary_object_infos() {
+        if r.source != &bundle_source || r.source_kind != BinarySourceKind::AssetBundle {
+            continue;
+        }
+        if let Ok(Some(name)) = r.object.peek_name() {
+            if !name.is_empty() {
+                chosen = Some((r.key(), name));
+                break;
+            }
+        }
+    }
+
+    let (key, old_name) = chosen.expect("expected at least one object with a peekable name");
+    let new_name = format!("RUST_WEBFILE_SAVE_{}", old_name);
+
+    env.edit_binary_object_key(&key, |class| {
+        if let Some(v) = class.get_mut("m_Name") {
+            *v = UnityValue::String(new_name.clone());
+        } else if let Some(v) = class.get_mut("name") {
+            *v = UnityValue::String(new_name.clone());
+        } else {
+            return Err(UnityAssetError::format(
+                "Chosen object has peekable name but no m_Name/name field",
+            ));
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    let out_dir = temp.path().join("out");
+    env.save(
+        unity_asset_write::PackerOptions {
+            packer: unity_asset_write::UnityPyPacker::Original,
+        },
+        &out_dir,
+    )
+    .unwrap();
+
+    // UnityPy-style save should rebuild the container, not emit extracted entry files.
+    let out_web_path = out_dir.join("UnityWebData");
+    assert!(out_web_path.exists());
+    assert!(!out_dir.join(&entry_name).exists());
+
+    let mut env2 = Environment::new();
+    env2.load_file(&out_web_path).unwrap();
+    let out_web_path = canonicalize_path(out_web_path);
+
+    let out_bundle_source = BinarySource::WebEntry {
+        web_path: out_web_path,
+        entry_name,
+    };
+
+    let r2 = env2
+        .binary_object_infos()
+        .find(|r| {
+            r.source == &out_bundle_source
+                && r.source_kind == BinarySourceKind::AssetBundle
+                && r.asset_index == key.asset_index
+                && r.object.path_id() == key.path_id
+        })
+        .expect("expected edited object handle in repacked webfile bundle");
+
+    let observed = r2
+        .object
+        .peek_name()
+        .unwrap()
+        .expect("edited object should still have a name");
+    assert_eq!(observed, new_name);
+}
+
+#[test]
+fn environment_can_write_streamed_resource_cab_into_bundle_and_reload() {
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
+
+    let mut env = Environment::new();
+    env.load_file(&path).unwrap();
+
+    let bundle_source = BinarySource::path(&path);
+
+    let key = env
+        .binary_object_infos()
+        .find(|r| r.source == &bundle_source && r.source_kind == BinarySourceKind::AssetBundle)
+        .expect("expected at least one binary object in sample bundle")
+        .key();
+
+    let mut session = env.edit_session();
+    let write = session.write_to_cab(&key, None, b"OggS").unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let out_dir = temp.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_bundle_path = out_dir.join("char_118_yuki.ab");
+    assert!(out_bundle_path.exists());
+
+    let mut env2 = Environment::new();
+    env2.load_file(&out_bundle_path).unwrap();
+
+    let bytes = env2
+        .read_stream_data(
+            &out_bundle_path,
+            BinarySourceKind::AssetBundle,
+            &write.path,
+            write.offset,
+            write.size,
+        )
+        .unwrap();
+    assert_eq!(bytes, b"OggS");
+
+    // The cab should be present as a bundle node after saving.
+    let out_source = BinarySource::path(canonicalize_path(out_bundle_path));
+    let out_bundle = env2
+        .bundles()
+        .get(&out_source)
+        .expect("saved bundle should be loaded");
+    assert!(
+        out_bundle
+            .nodes
+            .iter()
+            .any(|n| n.is_file() && n.name == "CAB-UnityPy_Mod.resS")
+    );
+
+    // Externals should include the cab path on the serialized file that owns this object.
+    let asset_index = key
+        .asset_index
+        .expect("chosen object is from an AssetBundle source");
+    let sf = out_bundle
+        .assets
+        .get(asset_index)
+        .expect("asset_index should exist");
+    assert!(sf.externals.iter().any(|e| e.path == write.path));
+}
+
+#[test]
+fn environment_can_write_streamed_resource_cab_for_standalone_serialized_file_and_reload() {
+    // Extract a SerializedFile from a sample bundle so we have a realistic standalone `.assets`.
+    let bundle_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
+    let bundle_bytes = fs::read(&bundle_path).unwrap();
+    let bundle = unity_asset_binary::bundle::BundleParser::from_bytes(bundle_bytes).unwrap();
+    let node = bundle
+        .nodes
+        .iter()
+        .find(|n| n.is_file() && !n.name.ends_with(".resS") && !n.name.ends_with(".resource"))
+        .expect("sample bundle should contain a serialized file node");
+    let node_bytes = bundle.extract_node_data(node).unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let assets_path = temp.path().join("standalone.assets");
+    fs::write(&assets_path, node_bytes).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&assets_path).unwrap();
+    let assets_path = canonicalize_path(assets_path);
+    let source = BinarySource::path(&assets_path);
+
+    let key = env
+        .binary_object_infos()
+        .find(|r| r.source == &source && r.source_kind == BinarySourceKind::SerializedFile)
+        .expect("standalone serialized file should yield objects")
+        .key();
+
+    let mut session = env.edit_session();
+    let write = session.write_to_cab(&key, None, b"OggS").unwrap();
+
+    let out_dir = temp.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_assets_path = out_dir.join("standalone.assets");
+    assert!(out_assets_path.exists());
+
+    // Sidecar cab should be written under `out/{asset_file_name}_data/{cab_name}`.
+    let cab_path = out_dir
+        .join("standalone.assets_data")
+        .join("CAB-UnityPy_Mod.resS");
+    assert!(cab_path.exists());
+
+    // Saved serialized file should include the external reference.
+    let saved_bytes = fs::read(&out_assets_path).unwrap();
+    let sf = unity_asset_binary::asset::SerializedFileParser::from_bytes(saved_bytes).unwrap();
+    assert!(sf.externals.iter().any(|e| e.path == write.path));
+
+    // The environment stream reader should be able to resolve the cab from filesystem candidates.
+    let mut env2 = Environment::new();
+    env2.load_file(&out_assets_path).unwrap();
+    let bytes = env2
+        .read_stream_data(
+            &out_assets_path,
+            BinarySourceKind::SerializedFile,
+            &write.path,
+            write.offset,
+            write.size,
+        )
+        .unwrap();
+    assert_eq!(bytes, b"OggS");
+}
+
+#[test]
+fn streamed_write_helper_updates_m_stream_data_shape() {
+    let mut class = UnityClass::new(0, "Test".to_string(), "0".to_string());
+    let mut stream_data = UnityValue::Object(Default::default());
+    let UnityValue::Object(stream) = &mut stream_data else {
+        unreachable!();
+    };
+    stream.insert(
+        "m_Source".to_string(),
+        UnityValue::String("old".to_string()),
+    );
+    stream.insert("m_Offset".to_string(), UnityValue::Integer(1));
+    stream.insert("m_Size".to_string(), UnityValue::Integer(2));
+    class.set("m_StreamData".to_string(), stream_data);
+
+    let write = super::edit::StreamedResourceWrite {
+        path: "archive:/foo_data/CAB-UnityPy_Mod.resS".to_string(),
+        offset: 123,
+        size: 4,
+    };
+
+    super::streamed_write::apply_streamed_resource_write(&mut class, "m_StreamData", &write)
+        .unwrap();
+
+    let UnityValue::Object(stream) = class.get("m_StreamData").unwrap() else {
+        panic!("m_StreamData should be an object after write");
+    };
+    assert_eq!(
+        stream.get("m_Source").and_then(|v| v.as_str()),
+        Some("archive:/foo_data/CAB-UnityPy_Mod.resS")
+    );
+    assert_eq!(stream.get("m_Offset").and_then(|v| v.as_i64()), Some(123));
+    assert_eq!(stream.get("m_Size").and_then(|v| v.as_i64()), Some(4));
 }

@@ -29,6 +29,7 @@ mod imp {
 
     mod container;
     mod dependency_graph;
+    mod edit;
     mod key;
     mod loader;
     mod meta_guid;
@@ -36,12 +37,15 @@ mod imp {
     mod object_query;
     mod path;
     mod pptr;
+    mod save;
     mod stream;
+    mod streamed_write;
 
     pub use dependency_graph::{
         DependencyGraphBuildOptions, DependencyGraphTraversalOptions, DependencyGraphWarning,
         EnvironmentDependencyGraph, ExternalDependencyEdge,
     };
+    pub use edit::{EnvironmentEditSession, StreamedResourceWrite};
     pub use loader::{ProjectLoadOptions, ProjectLoadStats};
     pub use object_graph::{
         EnvironmentObjectGraph, EnvironmentObjectKey, ExternalObjectEdge, ObjectGraphBuildOptions,
@@ -269,6 +273,7 @@ mod imp {
         reporter: Option<Arc<dyn EnvironmentReporter>>,
         options: EnvironmentOptions,
         type_tree_registry: Option<Arc<dyn TypeTreeRegistry>>,
+        write_state: edit::EnvironmentWriteState,
         /// Base path for relative file resolution
         #[allow(dead_code)]
         base_path: PathBuf,
@@ -293,6 +298,7 @@ mod imp {
                 reporter: None,
                 options,
                 type_tree_registry: None,
+                write_state: edit::EnvironmentWriteState::default(),
                 base_path: std::env::current_dir().unwrap_or_default(),
             }
         }

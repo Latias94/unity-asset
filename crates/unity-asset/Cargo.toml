@@ -26,6 +26,7 @@ exclude = [
 unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
 unity-asset-yaml = { path = "../unity-asset-yaml", version = "0.3.0" }
 unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
+unity-asset-write = { path = "../unity-asset-write", version = "0.3.0" }
 ignore = { workspace = true }
 
 [features]
