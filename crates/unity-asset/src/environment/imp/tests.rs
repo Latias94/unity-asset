@@ -1411,6 +1411,52 @@ fn environment_typed_texture2d_helper_can_repoint_streamed_resource_and_reload()
 }
 
 #[test]
+fn typed_mesh_helper_updates_stream_data_and_clears_buffers() {
+    let mut class = UnityClass::new(0, "Mesh".to_string(), "0".to_string());
+    class.set(
+        "m_IndexBuffer".to_string(),
+        UnityValue::Bytes(vec![1, 2, 3]),
+    );
+
+    let mut vertex_data = UnityValue::Object(Default::default());
+    let UnityValue::Object(map) = &mut vertex_data else {
+        unreachable!();
+    };
+    map.insert("m_DataSize".to_string(), UnityValue::Integer(3));
+    map.insert("m_Data".to_string(), UnityValue::Bytes(vec![9, 9, 9]));
+    class.set("m_VertexData".to_string(), vertex_data);
+
+    let write = super::edit::StreamedResourceWrite {
+        path: "archive:/foo_data/CAB-UnityPy_Mod.resS".to_string(),
+        offset: 123,
+        size: 4,
+    };
+
+    super::typed::apply_mesh_streaming_write(&mut class, &write).unwrap();
+
+    let UnityValue::Object(stream) = class.get("m_StreamData").unwrap() else {
+        panic!("m_StreamData should be an object after write");
+    };
+    assert_eq!(
+        stream.get("path").and_then(|v| v.as_str()),
+        Some("archive:/foo_data/CAB-UnityPy_Mod.resS")
+    );
+    assert_eq!(stream.get("offset").and_then(|v| v.as_i64()), Some(123));
+    assert_eq!(stream.get("size").and_then(|v| v.as_i64()), Some(4));
+
+    assert_eq!(
+        class.get("m_IndexBuffer"),
+        Some(&UnityValue::Bytes(Vec::new()))
+    );
+
+    let UnityValue::Object(vd) = class.get("m_VertexData").unwrap() else {
+        panic!("m_VertexData should be an object");
+    };
+    assert_eq!(vd.get("m_DataSize").and_then(|v| v.as_i64()), Some(0));
+    assert_eq!(vd.get("m_Data"), Some(&UnityValue::Bytes(Vec::new())));
+}
+
+#[test]
 fn streamed_write_helper_updates_m_stream_data_shape() {
     let mut class = UnityClass::new(0, "Test".to_string(), "0".to_string());
     let mut stream_data = UnityValue::Object(Default::default());
@@ -1443,4 +1489,51 @@ fn streamed_write_helper_updates_m_stream_data_shape() {
     );
     assert_eq!(stream.get("m_Offset").and_then(|v| v.as_i64()), Some(123));
     assert_eq!(stream.get("m_Size").and_then(|v| v.as_i64()), Some(4));
+}
+
+#[test]
+fn streamed_write_helper_updates_video_clip_external_resources_shape() {
+    let mut class = UnityClass::new(0, "Test".to_string(), "0".to_string());
+    let mut res = UnityValue::Object(Default::default());
+    let UnityValue::Object(map) = &mut res else {
+        unreachable!();
+    };
+    map.insert(
+        "m_Source".to_string(),
+        UnityValue::String("old".to_string()),
+    );
+    map.insert("m_Offset".to_string(), UnityValue::Integer(1));
+    map.insert("m_Size".to_string(), UnityValue::Integer(2));
+    class.set("m_ExternalResources".to_string(), res);
+
+    let write = super::edit::StreamedResourceWrite {
+        path: "archive:/foo_data/CAB-UnityPy_Mod.resS".to_string(),
+        offset: 123,
+        size: 4,
+    };
+
+    super::streamed_write::apply_streamed_resource_write(&mut class, "m_ExternalResources", &write)
+        .unwrap();
+
+    let UnityValue::Object(stream) = class.get("m_ExternalResources").unwrap() else {
+        panic!("m_ExternalResources should be an object after write");
+    };
+    assert_eq!(
+        stream.get("m_Source").and_then(|v| v.as_str()),
+        Some("archive:/foo_data/CAB-UnityPy_Mod.resS")
+    );
+    assert_eq!(stream.get("m_Offset").and_then(|v| v.as_i64()), Some(123));
+    assert_eq!(stream.get("m_Size").and_then(|v| v.as_i64()), Some(4));
+}
+
+#[test]
+fn typed_text_asset_script_helper_updates_field() {
+    let mut class = UnityClass::new(0, "TextAsset".to_string(), "0".to_string());
+    class.set(
+        "m_Script".to_string(),
+        UnityValue::String("old".to_string()),
+    );
+
+    super::typed::apply_text_asset_script(&mut class, "new").unwrap();
+    assert_eq!(class.get("m_Script").and_then(|v| v.as_str()), Some("new"));
 }

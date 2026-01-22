@@ -288,7 +288,11 @@ Acceptance:
 - [x] Provide typed convenience helpers for common streamed asset types:
   - [x] AudioClip (`m_Resource`)
   - [x] Texture2D (`m_StreamData`)
-- [ ] TODO: expand typed helpers (Mesh/VideoClip/TextAsset/etc)
+  - [x] Mesh (`m_StreamData`)
+  - [x] VideoClip (`m_ExternalResources`)
+- [x] Provide a typed convenience helper for a common non-streamed edit:
+  - [x] TextAsset (`m_Script`)
+- [ ] TODO: expand typed helpers (MeshRenderer/VideoPlayer/TextAsset bytes/etc)
 
 Acceptance:
 - [x] A bundle can be modified to point `m_StreamData` at a newly written cab and reloaded.
