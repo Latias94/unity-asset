@@ -30,6 +30,10 @@ Non-goals (for now):
 - Byte-for-byte identical output vs original inputs (UnityPy itself is not byte-stable either)
 - Perfect editor-level semantics for all asset types (parity targets file-format correctness first)
 
+Future parity targets (post edit-pipeline):
+- UnityPy's typed object layer (`repo-ref/UnityPy/UnityPy/classes/*`, especially `generated.py`) for ergonomic field access and safe edits
+- Export/convenience helpers (`repo-ref/UnityPy/UnityPy/tools/extractor.py`, `repo-ref/UnityPy/UnityPy/export/*`)
+
 ## High-Level Architecture (Rust Target)
 
 To avoid destabilizing the existing parser crates, the write/edit pipeline should live in a **dedicated crate** and integrate into higher-level APIs:
@@ -47,6 +51,25 @@ Integration:
 
 ## Module Mapping (UnityPy → Rust)
 
+### Environment / Loading semantics
+
+UnityPy:
+- `repo-ref/UnityPy/UnityPy/environment.py`
+  - `Environment.load_file(...)` supports:
+    - `.split0/.split1/...` merge (common mobile/console outputs)
+    - `.zip/.apk` load
+    - case-insensitive path resolution via `find_sensitive_path(...)`
+
+Rust (current):
+- `crates/unity-asset/src/environment/imp/loader.rs`
+  - `Environment::load_file(...)` best-effort detects YAML vs binary
+  - `Environment::load_project(...)` project walk + optional `.meta` GUID indexing
+
+TODO (parity):
+- [ ] Support `.splitN` merge load (UnityPy `reSplit` + `_load_split_file`)
+- [ ] Support `.zip/.apk` environment load (UnityPy `load_zip_file`)
+- [ ] Add case-insensitive path resolution helper for dependency loads (UnityPy `find_sensitive_path`)
+
 ### Environment / Save entrypoint
 
 UnityPy:
@@ -54,7 +77,8 @@ UnityPy:
   - `Environment.save(pack="none", out_path="output")`
 
 Rust (current):
-- `crates/unity-asset/src/environment.rs` (load/iterate only, no save)
+- `crates/unity-asset/src/environment.rs`
+  - `Environment::save(pack, out_dir)` writes only changed sources
 
 Rust (target):
 - `crates/unity-asset/src/environment.rs`
@@ -79,6 +103,19 @@ Rust (target):
   - stores either:
     - parsed properties + TypeTree → encode to raw bytes (`save_typetree` / `edit_object`), or
     - raw byte patch (escape hatch: `set_raw_data`)
+
+### MonoBehaviour TypeTree generation
+
+UnityPy:
+- `repo-ref/UnityPy/UnityPy/files/ObjectReader.py`
+  - `generate_monobehaviour_node(...)` uses `Environment.typetree_generator` + script metadata
+
+Rust (current):
+- supports `TypeTreeRegistry` inputs (`.tpk` / JSON) for stripped TypeTrees
+- does not yet generate MonoBehaviour nodes from script assemblies
+
+TODO (parity):
+- [ ] Provide a MonoBehaviour node generator hook (equivalent capability to UnityPy `typetree_generator`)
 
 ### TypeTree read/write
 
@@ -223,6 +260,7 @@ Acceptance:
   - [x] `string`, `TypelessData`
   - [x] `pair` (accepts Array(len=2) + Object(first/second))
   - [x] arrays (including aligned arrays)
+  - [ ] TODO: handle rare TypeTrees with unnamed children (writer currently expects named children)
   - [ ] `PPtr<>` (TODO: add explicit normalization/acceptance tests)
   - [x] `ReferencedObject` (ref_types-aware)
   - [x] managed references registry (`ManagedReferencesRegistry`) skip rules
@@ -246,6 +284,9 @@ Acceptance:
 - A `.assets` produced by Rust can be loaded by:
   - [x] this Rust parser
   - [ ] UnityPy (baseline snapshot) (TODO: add cross-check integration tests)
+
+TODO (parity):
+- [ ] Support stripped TypeTree edits in `SerializedFileEditSession` via `TypeTreeRegistry` (currently TODO in code)
 
 ### M4 — BundleFile.save (UnityFS) parity
 
@@ -293,6 +334,7 @@ Acceptance:
   - [x] set via `EnvironmentEditSession::set_pptr_path_to_key(...)` (best-effort externals)
 - [x] Provide best-effort "find references" for binary `PPtr` fields:
   - [x] `Environment::find_binary_pptr_references_to(...)` returns `(from, pptr_path, file_id, path_id, resolved)`
+- [ ] TODO: implement YAML-side "find references" for YAML PPtr-like objects (prefab/scene YAML), returning `(YamlObjectKey, pptr_path, file_id/guid/type, resolved?)`
 - [x] Provide typed convenience helpers for common streamed asset types:
   - [x] AudioClip (`m_Resource`)
   - [x] Texture2D (`m_StreamData`)
