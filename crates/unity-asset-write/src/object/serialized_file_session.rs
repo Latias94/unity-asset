@@ -7,6 +7,7 @@ use unity_asset_core::{UnityAssetError, UnityClass, UnityValue};
 use crate::serialized_file::SerializedFileEdits;
 use crate::typetree::{TypeTreeWriteOptions, TypeTreeWriter};
 use crate::{BinaryWriter, ChangeTracker, Endian, Result};
+use std::sync::Arc;
 
 /// A UnityPy-like edit session for a single `SerializedFile`.
 ///
@@ -133,9 +134,9 @@ fn encode_object_typetree(
     let mut w = BinaryWriter::new(endian);
 
     let writer = if file.ref_types.is_empty() {
-        TypeTreeWriter::new(tree)
+        TypeTreeWriter::new(tree.as_ref())
     } else {
-        TypeTreeWriter::with_ref_types(tree, &file.ref_types)
+        TypeTreeWriter::with_ref_types(tree.as_ref(), &file.ref_types)
     };
 
     writer.write_object(
@@ -148,19 +149,47 @@ fn encode_object_typetree(
     Ok(w.into_bytes())
 }
 
-fn type_tree_for_object<'a>(file: &'a SerializedFile, info: &ObjectInfo) -> Option<&'a TypeTree> {
-    if !file.enable_type_tree {
-        // TODO(parity): support stripped TypeTree via `TypeTreeRegistry` here (file.type_tree_registry).
-        return None;
+enum TypeTreeSource<'a> {
+    Borrowed(&'a TypeTree),
+    Shared(Arc<TypeTree>),
+}
+
+impl TypeTreeSource<'_> {
+    fn as_ref(&self) -> &TypeTree {
+        match self {
+            Self::Borrowed(t) => t,
+            Self::Shared(t) => t.as_ref(),
+        }
+    }
+}
+
+fn type_tree_for_object<'a>(
+    file: &'a SerializedFile,
+    info: &ObjectInfo,
+) -> Option<TypeTreeSource<'a>> {
+    fn from_internal<'a>(file: &'a SerializedFile, info: &ObjectInfo) -> Option<&'a TypeTree> {
+        if info.type_index >= 0 {
+            let idx = info.type_index as usize;
+            return file.types.get(idx).map(|t| &t.type_tree);
+        }
+
+        file.types
+            .iter()
+            .find(|t| t.class_id == info.type_id)
+            .map(|t| &t.type_tree)
     }
 
-    if info.type_index >= 0 {
-        let idx = info.type_index as usize;
-        return file.types.get(idx).map(|t| &t.type_tree);
+    if file.enable_type_tree
+        && let Some(tree) = from_internal(file, info)
+        && !tree.is_empty()
+    {
+        return Some(TypeTreeSource::Borrowed(tree));
     }
 
-    file.types
-        .iter()
-        .find(|t| t.class_id == info.type_id)
-        .map(|t| &t.type_tree)
+    // Best-effort fallback: stripped files can supply a registry externally.
+    // We also allow this fallback even when `enableTypeTree=true` but the internal entry is missing/empty.
+    file.type_tree_registry
+        .as_ref()
+        .and_then(|r| r.resolve(&file.unity_version, info.type_id))
+        .map(TypeTreeSource::Shared)
 }

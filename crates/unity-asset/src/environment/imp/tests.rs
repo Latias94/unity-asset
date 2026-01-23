@@ -658,6 +658,120 @@ fn environment_typetree_registry_json_restores_parsing_for_stripped_assets() {
 }
 
 #[test]
+fn environment_can_edit_and_save_stripped_assets_with_typetree_registry() {
+    use serde::Serialize;
+    use unity_asset_binary::typetree::JsonTypeTreeRegistry;
+    use unity_asset_write::{PackerOptions, UnityPyPacker};
+
+    #[derive(Debug, Serialize)]
+    struct Dump {
+        schema: u32,
+        entries: Vec<Entry>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct Entry {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unity_version: Option<String>,
+        class_id: i32,
+        type_tree: unity_asset_binary::typetree::TypeTree,
+    }
+
+    let mut env = Environment::new();
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
+    );
+    env.load_file(&path).unwrap();
+
+    let source = BinarySource::path(&path);
+    let texture_path_id = -3875358842991402074i64;
+    let key = BinaryObjectKey {
+        source: source.clone(),
+        source_kind: BinarySourceKind::AssetBundle,
+        asset_index: Some(0),
+        path_id: texture_path_id,
+    };
+
+    let type_tree = {
+        let bundle = env.bundles.get(&source).expect("sample bundle loaded");
+        let file = bundle.assets.first().expect("bundle has asset 0");
+        file.types
+            .iter()
+            .find(|t| t.class_id == 28)
+            .expect("bundle asset has Texture2D type tree")
+            .type_tree
+            .clone()
+    };
+
+    {
+        let bundle = env
+            .bundles
+            .get_mut(&source)
+            .expect("sample bundle loaded (mutable)");
+        let file = bundle.assets.first_mut().expect("bundle has asset 0");
+        file.enable_type_tree = false;
+        for t in file.types.iter_mut() {
+            t.type_tree.clear();
+        }
+        file.set_type_tree_registry(None);
+    }
+
+    let obj = env.read_binary_object_key(&key).unwrap();
+    assert_eq!(obj.name(), None, "expected no typetree without registry");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let reg_path = tmp.path().join("typetree_registry.json");
+    let dump = Dump {
+        schema: 1,
+        entries: vec![Entry {
+            unity_version: None,
+            class_id: 28,
+            type_tree,
+        }],
+    };
+    fs::write(&reg_path, serde_json::to_string_pretty(&dump).unwrap()).unwrap();
+
+    env.set_type_tree_registry_from_paths(&[reg_path.clone()])
+        .unwrap();
+
+    env.edit_binary_object_key(&key, |class| {
+        class.set(
+            "m_Name".to_string(),
+            UnityValue::String("banner_1_edited".to_string()),
+        );
+        Ok(())
+    })
+    .unwrap();
+
+    let out_dir = tmp.path().join("out");
+    env.save(
+        PackerOptions {
+            packer: UnityPyPacker::Original,
+        },
+        &out_dir,
+    )
+    .unwrap();
+
+    let out_path = out_dir.join("banner_1");
+    assert!(out_path.is_file());
+
+    let mut saved_bundle =
+        unity_asset_binary::bundle::BundleParser::from_bytes(std::fs::read(&out_path).unwrap())
+            .unwrap();
+    let reg = std::sync::Arc::new(JsonTypeTreeRegistry::from_path(&reg_path).unwrap());
+
+    let file = saved_bundle.assets.first_mut().expect("bundle has asset 0");
+    file.set_type_tree_registry(Some(reg));
+
+    let saved = file
+        .find_object_handle(texture_path_id)
+        .expect("edited object exists after save")
+        .read()
+        .unwrap();
+    assert_eq!(saved.name().as_deref(), Some("banner_1_edited"));
+}
+
+#[test]
 fn environment_assetbundle_container_raw_matches_typetree_when_stripped() {
     let mut env = Environment::new();
     let path = canonicalize_path(

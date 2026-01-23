@@ -286,7 +286,7 @@ Acceptance:
   - [ ] UnityPy (baseline snapshot) (TODO: add cross-check integration tests)
 
 TODO (parity):
-- [ ] Support stripped TypeTree edits in `SerializedFileEditSession` via `TypeTreeRegistry` (currently TODO in code)
+- [x] Support stripped TypeTree edits in `SerializedFileEditSession` via `TypeTreeRegistry`
 
 ### M4 — BundleFile.save (UnityFS) parity
 
