@@ -285,6 +285,9 @@ Acceptance:
 - [x] Write standalone sidecar cab files under `out/{asset_file_name}_data/{cab_name}` (best-effort; UnityPy does not expose this for standalone `SerializedFile`)
 - [x] Provide an ergonomic helper for streamed-resource fields:
   - [x] `EnvironmentEditSession::write_streamed_resource_to_field(...)` writes bytes into a cab and updates `{path,offset,size}` / `{m_Source,m_Offset,m_Size}` in-place (e.g. `m_StreamData`)
+- [x] Provide generic dot-path editing helpers for binary objects:
+  - [x] `EnvironmentEditSession::set_binary_value_at_path(...)` for `UnityValue` updates
+  - [x] `EnvironmentEditSession::get_binary_value_at_path(...)` reads from pending edits or by parsing the source object
 - [x] Provide a generic `PPtr` path helper (Unity-style references):
   - [x] resolve via `Environment::resolve_pptr_path_key(...)`
   - [x] set via `EnvironmentEditSession::set_pptr_path_to_key(...)` (best-effort externals)

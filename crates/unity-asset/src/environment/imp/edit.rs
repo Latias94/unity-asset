@@ -121,6 +121,32 @@ impl<'a> EnvironmentEditSession<'a> {
         self.env.save(pack, out_dir)
     }
 
+    /// Set a value at a dot-separated field path (supports array indices like `m_Container[0].data`).
+    ///
+    /// This is a convenience wrapper around `edit_binary_object_key` + `pptr_path::set_value_at_path`.
+    pub fn set_binary_value_at_path(
+        &mut self,
+        key: &BinaryObjectKey,
+        field_path: &str,
+        value: UnityValue,
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| {
+            super::pptr_path::set_value_at_path(class, field_path, value)
+        })
+    }
+
+    /// Read a value at a dot-separated field path (supports array indices like `m_Container[0].data`).
+    ///
+    /// This reads from pending edits when present, falling back to parsing the object from the loaded source.
+    pub fn get_binary_value_at_path(
+        &mut self,
+        key: &BinaryObjectKey,
+        field_path: &str,
+    ) -> Result<Option<UnityValue>> {
+        let class = self.read_binary_object_class_for_view(key)?;
+        Ok(super::pptr_path::get_value_at_path(&class, field_path).cloned())
+    }
+
     /// Resolve a `PPtr` stored at a dot-separated field path (e.g. `m_RD.texture`) to a globally-unique object key.
     pub fn resolve_pptr_path_key(
         &self,
@@ -152,6 +178,69 @@ impl<'a> EnvironmentEditSession<'a> {
         target_key: &BinaryObjectKey,
     ) -> Result<i32> {
         self.env.file_id_for_target(context_key, target_key)
+    }
+
+    fn read_binary_object_class_for_view(&mut self, key: &BinaryObjectKey) -> Result<UnityClass> {
+        match key.source_kind {
+            BinarySourceKind::SerializedFile => {
+                let (source_key, file) =
+                    resolve_serialized_file_source(&self.env.binary_assets, &key.source)?;
+                if let Some(state) = self.env.write_state.standalone.get(source_key)
+                    && let Some(class) = state.classes.get(&key.path_id)
+                {
+                    return Ok(class.clone());
+                }
+
+                let handle = file.find_object_handle(key.path_id).ok_or_else(|| {
+                    UnityAssetError::format(format!(
+                        "Object not found in SerializedFile {}: path_id={}",
+                        key.source.describe(),
+                        key.path_id
+                    ))
+                })?;
+                let parsed = handle.read().map_err(|e| {
+                    UnityAssetError::with_source("Failed to parse binary object", e)
+                })?;
+                Ok(parsed.class)
+            }
+            BinarySourceKind::AssetBundle => {
+                let asset_index = key.asset_index.ok_or_else(|| {
+                    UnityAssetError::format(
+                        "AssetBundle key requires an asset_index (which asset in the bundle?)"
+                            .to_string(),
+                    )
+                })?;
+                let (bundle_source_key, bundle) =
+                    resolve_bundle_source(&self.env.bundles, &key.source)?;
+
+                if let Some(bundle_state) = self.env.write_state.bundles.get(bundle_source_key)
+                    && let Some(asset_state) = bundle_state.assets.get(&asset_index)
+                    && let Some(class) = asset_state.classes.get(&key.path_id)
+                {
+                    return Ok(class.clone());
+                }
+
+                let file = bundle.assets.get(asset_index).ok_or_else(|| {
+                    UnityAssetError::format(format!(
+                        "AssetBundle asset index out of range: {} asset_index={}",
+                        key.source.describe(),
+                        asset_index
+                    ))
+                })?;
+                let handle = file.find_object_handle(key.path_id).ok_or_else(|| {
+                    UnityAssetError::format(format!(
+                        "Object not found in AssetBundle {} asset_index={}: path_id={}",
+                        key.source.describe(),
+                        asset_index,
+                        key.path_id
+                    ))
+                })?;
+                let parsed = handle.read().map_err(|e| {
+                    UnityAssetError::with_source("Failed to parse binary object", e)
+                })?;
+                Ok(parsed.class)
+            }
+        }
     }
 }
 
