@@ -392,12 +392,71 @@ impl Environment {
                                 ))
                             })?
                             .to_string(),
+                        BinarySource::ArchiveEntry { entry_name, .. } => {
+                            std::path::Path::new(entry_name)
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .ok_or_else(|| {
+                                    UnityAssetError::format(format!(
+                                        "Invalid archive entry name: {}",
+                                        entry_name
+                                    ))
+                                })?
+                                .to_string()
+                        }
                         BinarySource::WebEntry { .. } => unreachable!("handled below"),
                     };
 
                     // Use `archive:/{file_name}_data/{cab_name}` so `read_stream_data_from_fs` can
                     // resolve it via `base_dir.join(normalized)` after saving, without colliding
                     // with the `.assets` file itself on disk.
+                    let cab_dir = format!("{file_name}_data");
+                    let cab_path = format!("archive:/{}/{}", cab_dir, cab_name);
+
+                    let file_state = self.write_state.standalone.entry(source_key).or_default();
+                    let cab = file_state
+                        .cabs
+                        .entry(cab_name.to_string())
+                        .or_insert_with(|| WritableCab::new(cab_name, 0x4));
+
+                    let offset = cab.append(data)?;
+                    let size: u32 = data.len().try_into().map_err(|_| {
+                        UnityAssetError::format(format!(
+                            "Streamed resource too large for u32 size: {}",
+                            data.len()
+                        ))
+                    })?;
+
+                    register_external_if_missing(file, &mut file_state.edits, &cab_path);
+
+                    Ok(StreamedResourceWrite {
+                        path: cab_path,
+                        offset,
+                        size,
+                    })
+                }
+                BinarySource::ArchiveEntry { .. } => {
+                    let (source_key, file) =
+                        resolve_serialized_file_source(&self.binary_assets, &key.source)?;
+                    let source_key = source_key.clone();
+
+                    let file_name = match &source_key {
+                        BinarySource::Path(_) => unreachable!("handled above"),
+                        BinarySource::ArchiveEntry { entry_name, .. } => {
+                            std::path::Path::new(entry_name)
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .ok_or_else(|| {
+                                    UnityAssetError::format(format!(
+                                        "Invalid archive entry name: {}",
+                                        entry_name
+                                    ))
+                                })?
+                                .to_string()
+                        }
+                        BinarySource::WebEntry { .. } => unreachable!("handled below"),
+                    };
+
                     let cab_dir = format!("{file_name}_data");
                     let cab_path = format!("archive:/{}/{}", cab_dir, cab_name);
 
@@ -757,6 +816,11 @@ fn external_path_for_target(
             .and_then(|s| s.to_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| p.to_string_lossy().to_string())),
+        BinarySource::ArchiveEntry { entry_name, .. } => Ok(std::path::Path::new(entry_name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| entry_name.clone())),
         BinarySource::WebEntry { entry_name, .. } => Ok(entry_name.clone()),
     }
 }

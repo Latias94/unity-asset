@@ -53,6 +53,20 @@ pub(crate) fn canonicalize_source_if_possible(source: &BinarySource) -> Option<B
                 None
             }
         }
+        BinarySource::ArchiveEntry {
+            archive_path,
+            entry_name,
+        } => {
+            let canon = canonicalize_if_exists(archive_path);
+            if &canon != archive_path {
+                Some(BinarySource::ArchiveEntry {
+                    archive_path: canon,
+                    entry_name: entry_name.clone(),
+                })
+            } else {
+                None
+            }
+        }
         BinarySource::WebEntry {
             web_path,
             entry_name,

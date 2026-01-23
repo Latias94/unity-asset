@@ -825,13 +825,99 @@ fn environment_can_load_zip_assetbundle_entry() {
     let mut env = Environment::new();
     env.load_file(&zip_path).unwrap();
 
-    let source = BinarySource::WebEntry {
-        web_path: zip_path.clone(),
+    let source = BinarySource::ArchiveEntry {
+        archive_path: zip_path.clone(),
         entry_name: "inner/char_118_yuki.ab".to_string(),
     };
 
     let entries = env.bundle_container_entries_source(&source).unwrap();
     assert!(!entries.is_empty());
+}
+
+#[test]
+fn environment_can_edit_zip_assetbundle_entry_and_save() {
+    use std::io::Write;
+    use unity_asset_write::{PackerOptions, UnityPyPacker};
+    use zip::write::FileOptions;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let zip_path = tmp.path().join("samples.zip");
+    let out_dir = tmp.path().join("out");
+
+    let f = std::fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(f);
+    zip.start_file("inner/char_118_yuki.ab", FileOptions::default())
+        .unwrap();
+    zip.write_all(include_bytes!(
+        "../../../../../tests/samples/char_118_yuki.ab"
+    ))
+    .unwrap();
+    zip.finish().unwrap();
+
+    let zip_path = canonicalize_path(zip_path);
+
+    let mut env = Environment::new();
+    env.load_file(&zip_path).unwrap();
+
+    let source = BinarySource::ArchiveEntry {
+        archive_path: zip_path.clone(),
+        entry_name: "inner/char_118_yuki.ab".to_string(),
+    };
+
+    let bundle = env.bundles().get(&source).expect("zip bundle loaded");
+    let sf = bundle.assets.first().expect("bundle has asset 0");
+
+    let (path_id, old_name) = sf
+        .object_handles()
+        .filter_map(|h| h.peek_name().ok().flatten().map(|n| (h.path_id(), n)))
+        .find(|(_id, name)| !name.is_empty())
+        .expect("expected at least one object with peekable name in sample");
+
+    let key = BinaryObjectKey {
+        source: source.clone(),
+        source_kind: BinarySourceKind::AssetBundle,
+        asset_index: Some(0),
+        path_id,
+    };
+
+    let new_name = format!("RUST_ZIP_ENV_SAVE_{}", old_name);
+
+    env.edit_binary_object_key(&key, |class| {
+        if let Some(v) = class.get_mut("m_Name") {
+            *v = UnityValue::String(new_name.clone());
+            return Ok(());
+        }
+        if let Some(v) = class.get_mut("name") {
+            *v = UnityValue::String(new_name.clone());
+            return Ok(());
+        }
+        Err(UnityAssetError::format("No m_Name/name field found"))
+    })
+    .unwrap();
+
+    env.save(
+        PackerOptions {
+            packer: UnityPyPacker::Original,
+        },
+        &out_dir,
+    )
+    .unwrap();
+
+    let out_path = out_dir.join("char_118_yuki.ab");
+    assert!(out_path.is_file());
+
+    let saved_bundle =
+        unity_asset_binary::bundle::BundleParser::from_bytes(std::fs::read(out_path).unwrap())
+            .unwrap();
+    let saved_sf = saved_bundle
+        .assets
+        .first()
+        .expect("saved bundle has asset 0");
+    let saved_obj = saved_sf
+        .find_object_handle(path_id)
+        .expect("edited object exists after save");
+    let saved_name = saved_obj.peek_name().unwrap().unwrap();
+    assert_eq!(saved_name, new_name);
 }
 
 #[test]

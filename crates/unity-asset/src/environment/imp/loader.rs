@@ -230,9 +230,11 @@ impl Environment {
                 continue;
             }
 
-            // Use `WebEntry` as a generic "container entry" key (also used for WebFile entries).
-            let source = BinarySource::WebEntry {
-                web_path: archive_path.clone(),
+            // Zip/APK entries behave like independent inputs (UnityPy-style): we load each entry
+            // as a top-level source, and saving writes the edited entry as a standalone output
+            // (we do not repack the zip).
+            let source = BinarySource::ArchiveEntry {
+                archive_path: archive_path.clone(),
                 entry_name: name,
             };
             self.try_load_unity_bytes(source, bytes);
@@ -288,6 +290,10 @@ impl Environment {
                 // Best-effort: store under a synthetic "path" so existing WebFile logic can load entries.
                 let web_key = match &source {
                     BinarySource::Path(p) => p.clone(),
+                    BinarySource::ArchiveEntry {
+                        archive_path,
+                        entry_name,
+                    } => archive_path.join(entry_name),
                     BinarySource::WebEntry {
                         web_path,
                         entry_name,

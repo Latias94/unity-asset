@@ -87,6 +87,18 @@ fn save_impl(
                     }
                 }
             }
+            super::BinarySource::ArchiveEntry { .. } => {
+                let out_name = output_name_for_source(source)?;
+                fs::write(out_dir.join(out_name), bytes)?;
+
+                if !file_state.cabs.is_empty() {
+                    let cab_dir = out_dir.join(format!("{}_data", out_name.to_string_lossy()));
+                    fs::create_dir_all(&cab_dir)?;
+                    for cab in file_state.cabs.values() {
+                        fs::write(cab_dir.join(&cab.name), cab.bytes())?;
+                    }
+                }
+            }
             super::BinarySource::WebEntry {
                 web_path,
                 entry_name,
@@ -151,6 +163,10 @@ fn save_impl(
                 let out_name = output_name_for_source(bundle_source)?;
                 fs::write(out_dir.join(out_name), bytes)?;
             }
+            super::BinarySource::ArchiveEntry { .. } => {
+                let out_name = output_name_for_source(bundle_source)?;
+                fs::write(out_dir.join(out_name), bytes)?;
+            }
             super::BinarySource::WebEntry {
                 web_path,
                 entry_name,
@@ -208,6 +224,13 @@ fn output_name_for_source(source: &super::BinarySource) -> Result<&OsStr> {
         super::BinarySource::Path(p) => Ok(p.file_name().ok_or_else(|| {
             UnityAssetError::format(format!("Invalid source path: {}", p.to_string_lossy()))
         })?),
+        super::BinarySource::ArchiveEntry { entry_name, .. } => {
+            Ok(std::path::Path::new(entry_name)
+                .file_name()
+                .ok_or_else(|| {
+                    UnityAssetError::format(format!("Invalid archive entry name: {}", entry_name))
+                })?)
+        }
         super::BinarySource::WebEntry { entry_name, .. } => Ok(OsStr::new(entry_name)),
     }
 }

@@ -136,6 +136,15 @@ mod imp {
     #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
     pub enum BinarySource {
         Path(PathBuf),
+        /// An entry inside a `.zip/.apk` archive loaded via `Environment::load_file`.
+        ///
+        /// UnityPy's zip loader treats entries as independent inputs (not as a container that is
+        /// re-packed on save), so we keep this distinct from `WebEntry` which represents entries
+        /// inside a Unity `WebFile` container.
+        ArchiveEntry {
+            archive_path: PathBuf,
+            entry_name: String,
+        },
         WebEntry {
             web_path: PathBuf,
             entry_name: String,
@@ -146,6 +155,10 @@ mod imp {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
                 BinarySource::Path(p) => write!(f, "{}", p.to_string_lossy()),
+                BinarySource::ArchiveEntry {
+                    archive_path,
+                    entry_name,
+                } => write!(f, "{}::{}", archive_path.to_string_lossy(), entry_name),
                 BinarySource::WebEntry {
                     web_path,
                     entry_name,
@@ -166,6 +179,7 @@ mod imp {
         fn as_path(&self) -> Option<&PathBuf> {
             match self {
                 BinarySource::Path(p) => Some(p),
+                BinarySource::ArchiveEntry { .. } => None,
                 BinarySource::WebEntry { .. } => None,
             }
         }
