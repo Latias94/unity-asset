@@ -333,6 +333,31 @@ $env:UNITYPY_PYTHON = "C:\\path\\to\\python.exe"
 cargo nextest run -p unity-asset-write unitypy_
 ```
 
+How to run external AssetBundle E2E edits locally (no samples checked into repo):
+
+This repo includes opt-in tests that can edit and repack an *external* AssetBundle, then optionally ask UnityPy to validate the result.
+
+1) Point the test at an existing bundle on your machine (the test writes to a temp output dir; it does not modify the input file):
+
+```
+$env:UNITY_ASSET_EXTERNAL_BUNDLE = "C:\\path\\to\\bundle.ab"
+```
+
+2) Run the Rust-side E2E:
+
+```
+cargo nextest run -p unity-asset external_bundle_
+```
+
+3) Optional: enable UnityPy validation (requires `repo-ref/UnityPy` and a working python env):
+
+```
+$env:UNITYPY_E2E = "1"
+# optional, if not using `.venv-unitypy`:
+$env:UNITYPY_PYTHON = "C:\\path\\to\\python.exe"
+cargo nextest run -p unity-asset external_bundle_
+```
+
 ## Risk Register (Known Hard Parts)
 
 - Unity version branching: header formats (`<9`, `>=9`, `>=22`) and object table changes.
