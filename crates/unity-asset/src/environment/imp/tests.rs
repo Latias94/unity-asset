@@ -1579,7 +1579,7 @@ fn typed_mesh_renderer_helpers_update_materials_and_additional_vertex_streams() 
         UnityValue::Object(Default::default()),
     );
 
-    super::typed::apply_mesh_renderer_materials(&mut class, &[(0, 10), (2, 20)]).unwrap();
+    super::typed::apply_renderer_materials(&mut class, &[(0, 10), (2, 20)]).unwrap();
     super::typed::apply_mesh_renderer_additional_vertex_streams_pptr(&mut class, 0, 99).unwrap();
 
     let UnityValue::Array(materials) = class.get("m_Materials").unwrap() else {
@@ -1604,6 +1604,30 @@ fn typed_mesh_renderer_helpers_update_materials_and_additional_vertex_streams() 
     };
     assert_eq!(vs.get("m_FileID").and_then(|v| v.as_i64()), Some(0));
     assert_eq!(vs.get("m_PathID").and_then(|v| v.as_i64()), Some(99));
+}
+
+#[test]
+fn typed_renderer_helper_updates_materials_field() {
+    let mut class = UnityClass::new(0, "SkinnedMeshRenderer".to_string(), "0".to_string());
+
+    super::typed::apply_renderer_materials(&mut class, &[(0, 10), (2, 20)]).unwrap();
+
+    let UnityValue::Array(materials) = class.get("m_Materials").unwrap() else {
+        panic!("m_Materials should be an array");
+    };
+    assert_eq!(materials.len(), 2);
+
+    let UnityValue::Object(m0) = &materials[0] else {
+        panic!("m_Materials[0] should be an object");
+    };
+    assert_eq!(m0.get("m_FileID").and_then(|v| v.as_i64()), Some(0));
+    assert_eq!(m0.get("m_PathID").and_then(|v| v.as_i64()), Some(10));
+
+    let UnityValue::Object(m1) = &materials[1] else {
+        panic!("m_Materials[1] should be an object");
+    };
+    assert_eq!(m1.get("m_FileID").and_then(|v| v.as_i64()), Some(2));
+    assert_eq!(m1.get("m_PathID").and_then(|v| v.as_i64()), Some(20));
 }
 
 #[test]

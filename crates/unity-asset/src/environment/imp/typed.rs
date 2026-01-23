@@ -423,7 +423,7 @@ pub(crate) fn apply_mesh_filter_mesh_pptr(class: &mut UnityClass, file_id: i32, 
     apply_pptr_field(class, "m_Mesh", file_id, path_id);
 }
 
-pub(crate) fn apply_mesh_renderer_materials(
+pub(crate) fn apply_renderer_materials(
     class: &mut UnityClass,
     materials: &[(i32, i64)],
 ) -> Result<()> {
@@ -598,13 +598,49 @@ impl<'a> EnvironmentEditSession<'a> {
         })
     }
 
+    /// Replace the `m_Materials` list on any `Renderer`-like object with the provided PPtr list.
+    ///
+    /// This is intentionally tolerant and only requires the typetree to accept `m_Materials`.
+    pub fn set_renderer_materials(
+        &mut self,
+        key: &BinaryObjectKey,
+        materials: &[(i32, i64)],
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_renderer_materials(class, materials))
+    }
+
+    /// Replace the `m_Materials` list on any `Renderer`-like object using a list of object keys.
+    ///
+    /// This computes `fileID` values automatically and appends externals as needed.
+    pub fn set_renderer_materials_to_keys(
+        &mut self,
+        renderer_key: &BinaryObjectKey,
+        material_keys: &[BinaryObjectKey],
+    ) -> Result<()> {
+        let mut materials: Vec<(i32, i64)> = Vec::with_capacity(material_keys.len());
+        for material_key in material_keys {
+            let file_id = self.file_id_for_target(renderer_key, material_key)?;
+            materials.push((file_id, material_key.path_id));
+        }
+        self.set_renderer_materials(renderer_key, &materials)
+    }
+
     /// Replace the `m_Materials` list on a MeshRenderer with the provided PPtr list.
     pub fn set_mesh_renderer_materials(
         &mut self,
         key: &BinaryObjectKey,
         materials: &[(i32, i64)],
     ) -> Result<()> {
-        self.edit_binary_object_key(key, |class| apply_mesh_renderer_materials(class, materials))
+        self.set_renderer_materials(key, materials)
+    }
+
+    /// Replace the `m_Materials` list on a MeshRenderer using a list of object keys.
+    pub fn set_mesh_renderer_materials_to_keys(
+        &mut self,
+        mesh_renderer_key: &BinaryObjectKey,
+        material_keys: &[BinaryObjectKey],
+    ) -> Result<()> {
+        self.set_renderer_materials_to_keys(mesh_renderer_key, material_keys)
     }
 
     /// Set `m_AdditionalVertexStreams` on a MeshRenderer (best-effort; optional field in Unity).
@@ -617,6 +653,20 @@ impl<'a> EnvironmentEditSession<'a> {
         self.edit_binary_object_key(key, |class| {
             apply_mesh_renderer_additional_vertex_streams_pptr(class, file_id, path_id)
         })
+    }
+
+    /// Set `m_AdditionalVertexStreams` on a MeshRenderer using an object key.
+    pub fn set_mesh_renderer_additional_vertex_streams_to_key(
+        &mut self,
+        mesh_renderer_key: &BinaryObjectKey,
+        mesh_key: &BinaryObjectKey,
+    ) -> Result<()> {
+        let file_id = self.file_id_for_target(mesh_renderer_key, mesh_key)?;
+        self.set_mesh_renderer_additional_vertex_streams_pptr(
+            mesh_renderer_key,
+            file_id,
+            mesh_key.path_id,
+        )
     }
 
     /// Set a Material `m_SavedProperties.m_TexEnvs[*].m_Texture` entry by property name.
