@@ -1,5 +1,7 @@
 use super::*;
 use std::fs;
+use std::path::Path;
+use std::process::Command;
 
 fn canonicalize_path(path: PathBuf) -> PathBuf {
     std::fs::canonicalize(&path).unwrap_or(path)
@@ -1957,4 +1959,272 @@ fn typed_material_helpers_update_floats_ints_colors_and_texenv_scale_offset() {
     assert_eq!(scale.get("y").and_then(|v| v.as_f64()), Some(3.0));
     assert_eq!(offset.get("x").and_then(|v| v.as_f64()), Some(0.1));
     assert_eq!(offset.get("y").and_then(|v| v.as_f64()), Some(0.2));
+}
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root should be two levels above unity-asset crate")
+        .to_path_buf()
+}
+
+fn unitypy_python() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("UNITYPY_PYTHON") {
+        return Some(PathBuf::from(p));
+    }
+
+    let venv = repo_root()
+        .join(".venv-unitypy")
+        .join("Scripts")
+        .join("python.exe");
+    if venv.exists() {
+        return Some(venv);
+    }
+
+    None
+}
+
+fn unitypy_check(script: &str, args: &[String]) -> Result<()> {
+    let python = unitypy_python().ok_or_else(|| {
+        UnityAssetError::format(format!(
+            "UnityPy E2E is enabled, but no python was found. Set `UNITYPY_PYTHON`, or create a venv at `{}`.",
+            repo_root().join(".venv-unitypy").display()
+        ))
+    })?;
+
+    let out = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .args(args)
+        .output()
+        .map_err(|e| UnityAssetError::format(format!("Failed to run UnityPy python: {}", e)))?;
+
+    if !out.status.success() {
+        return Err(UnityAssetError::format(format!(
+            "UnityPy check failed (exit={:?}).\nstdout:\n{}\nstderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
+fn find_material_texenv_texture_pptr(
+    class: &UnityClass,
+    property_name: &str,
+) -> Option<(i32, i64)> {
+    let saved = class.get("m_SavedProperties")?.as_object()?;
+    let tex_envs = saved.get("m_TexEnvs")?.as_array()?;
+
+    for entry in tex_envs {
+        let (first, second) = match entry {
+            UnityValue::Array(a) if a.len() == 2 => (&a[0], &a[1]),
+            UnityValue::Object(map) => (map.get("first")?, map.get("second")?),
+            _ => continue,
+        };
+
+        let name = match first {
+            UnityValue::String(s) => s.as_str(),
+            UnityValue::Object(map) => map.get("name")?.as_str()?,
+            _ => continue,
+        };
+        if name != property_name {
+            continue;
+        }
+
+        let tex_env = second.as_object()?;
+        let texture_pptr = tex_env.get("m_Texture")?;
+        return super::pptr_path::read_pptr(texture_pptr);
+    }
+
+    None
+}
+
+#[test]
+fn external_bundle_can_edit_material_and_unitypy_observes_change() {
+    let Ok(bundle_path) = std::env::var("UNITY_ASSET_EXTERNAL_BUNDLE") else {
+        return;
+    };
+    let bundle_path = PathBuf::from(bundle_path);
+    if !bundle_path.exists() {
+        return;
+    }
+
+    let mut env = Environment::new();
+    env.load_file(&bundle_path).unwrap();
+
+    let mut chosen: Option<(BinaryObjectKey, String, Option<(i32, i64)>, BinaryObjectKey)> = None;
+    for r in env
+        .binary_object_infos()
+        .filter(|r| r.source_kind == BinarySourceKind::AssetBundle && r.object.class_id() == 21)
+    {
+        let key = r.key();
+        let obj = r.read().unwrap();
+        let class = obj.as_unity_class();
+
+        let saved = class.get("m_SavedProperties").and_then(|v| v.as_object());
+        let tex_envs = saved
+            .and_then(|s| s.get("m_TexEnvs"))
+            .and_then(|v| v.as_array());
+        let Some(tex_envs) = tex_envs else {
+            continue;
+        };
+
+        // Prefer `_MainTex` if present, else pick the first property name we can parse.
+        let mut prop_name: Option<String> = None;
+        for entry in tex_envs {
+            let first = match entry {
+                UnityValue::Array(a) if a.len() == 2 => Some(&a[0]),
+                UnityValue::Object(map) => map.get("first"),
+                _ => None,
+            };
+            let Some(first) = first else {
+                continue;
+            };
+            let name = match first {
+                UnityValue::String(s) => Some(s.as_str()),
+                UnityValue::Object(map) => map.get("name").and_then(|v| v.as_str()),
+                _ => None,
+            };
+            let Some(name) = name else {
+                continue;
+            };
+            if name == "_MainTex" {
+                prop_name = Some("_MainTex".to_string());
+                break;
+            }
+            if prop_name.is_none() {
+                prop_name = Some(name.to_string());
+            }
+        }
+
+        let Some(prop_name) = prop_name else {
+            continue;
+        };
+
+        let before = find_material_texenv_texture_pptr(class, &prop_name);
+
+        let mut textures: Vec<BinaryObjectKey> = env
+            .binary_object_infos()
+            .filter(|t| {
+                t.source_kind == BinarySourceKind::AssetBundle
+                    && t.object.class_id() == 28
+                    && t.source == &key.source
+            })
+            .map(|t| t.key())
+            .collect();
+        textures.sort_by(|a, b| a.path_id.cmp(&b.path_id));
+        if textures.is_empty() {
+            continue;
+        }
+
+        let texture_key = match before {
+            Some((_, before_path_id)) => textures
+                .iter()
+                .find(|k| k.path_id != before_path_id)
+                .cloned()
+                .unwrap_or_else(|| textures[0].clone()),
+            None => textures[0].clone(),
+        };
+
+        chosen = Some((key, prop_name, before, texture_key));
+        break;
+    }
+
+    let (material_key, property_name, _before, texture_key) =
+        chosen.expect("expected at least one Material with m_SavedProperties.m_TexEnvs");
+
+    let mut session = env.edit_session();
+    session
+        .set_material_texenv_texture_to_key(&material_key, &property_name, &texture_key)
+        .unwrap();
+    session
+        .set_material_float(&material_key, "_Glossiness", 0.123)
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let out_dir = temp.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_bundle_path = out_dir.join(bundle_path.file_name().expect("bundle has file name"));
+    assert!(out_bundle_path.exists());
+
+    let mut env2 = Environment::new();
+    env2.load_file(&out_bundle_path).unwrap();
+
+    let out_source = BinarySource::path(&out_bundle_path);
+    let mat_ref = env2
+        .binary_object_infos()
+        .find(|r| {
+            r.source_kind == BinarySourceKind::AssetBundle
+                && r.object.class_id() == 21
+                && r.object.path_id() == material_key.path_id
+                && r.source == &out_source
+        })
+        .expect("saved bundle contains edited material path id");
+    let mat_obj = mat_ref.read().unwrap();
+
+    let pptr = find_material_texenv_texture_pptr(mat_obj.as_unity_class(), &property_name)
+        .expect("expected texenv entry after save");
+    assert_eq!(pptr.0, 0, "expected in-file PPtr (fileID=0)");
+    assert_eq!(pptr.1, texture_key.path_id);
+
+    if std::env::var("UNITYPY_E2E").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let py = r#"
+import os, sys
+repo_root = sys.argv[1]
+bundle_path = sys.argv[2]
+mat_path_id = int(sys.argv[3])
+prop_name = sys.argv[4]
+tex_path_id = int(sys.argv[5])
+sys.path.insert(0, os.path.join(repo_root, "repo-ref", "UnityPy"))
+import UnityPy  # noqa: E402
+
+env = UnityPy.load(bundle_path)
+mats = [o for o in env.objects if o.type.name == "Material"]
+target = None
+for o in mats:
+    if getattr(o, "path_id", None) == mat_path_id:
+        target = o
+        break
+assert target is not None, ("material path_id not found", mat_path_id, len(mats))
+mat = target.read()
+sheet = mat.m_SavedProperties
+tex_envs = getattr(sheet, "m_TexEnvs", [])
+found = False
+for (k, envtex) in tex_envs:
+    name = getattr(k, "name", k)
+    if name != prop_name:
+        continue
+    tex = envtex.m_Texture
+    assert getattr(tex, "path_id", None) == tex_path_id, (name, tex.path_id, tex_path_id)
+    found = True
+    break
+assert found, ("texenv not found", prop_name)
+"#;
+
+    unitypy_check(
+        py,
+        &[
+            repo_root().display().to_string(),
+            out_bundle_path.display().to_string(),
+            material_key.path_id.to_string(),
+            property_name,
+            texture_key.path_id.to_string(),
+        ],
+    )
+    .unwrap();
 }
