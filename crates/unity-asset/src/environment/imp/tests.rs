@@ -2380,6 +2380,375 @@ assert getattr(mats[0], "path_id", None) == mat_path_id, (mats[0].path_id, mat_p
     .unwrap();
 }
 
+fn read_streamed_resource(v: &UnityValue) -> Option<(String, i64, i64)> {
+    let UnityValue::Object(map) = v else {
+        return None;
+    };
+    let path = map
+        .get("path")
+        .or_else(|| map.get("m_Source"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let offset = map
+        .get("offset")
+        .or_else(|| map.get("m_Offset"))
+        .and_then(|v| v.as_i64())?;
+    let size = map
+        .get("size")
+        .or_else(|| map.get("m_Size"))
+        .and_then(|v| v.as_i64())?;
+    Some((path, offset, size))
+}
+
+#[test]
+fn external_bundle_can_edit_text_asset_script_and_unitypy_observes_change() {
+    let Ok(bundle_path) = std::env::var("UNITY_ASSET_EXTERNAL_BUNDLE") else {
+        return;
+    };
+    let bundle_path = PathBuf::from(bundle_path);
+    if !bundle_path.exists() {
+        return;
+    }
+
+    let mut env = Environment::new();
+    env.load_file(&bundle_path).unwrap();
+
+    let Some(text_ref) = env.binary_object_infos().find(|r| {
+        r.source_kind == BinarySourceKind::AssetBundle
+            && r.object.class_id() == unity_asset_core::class_ids::TEXT_ASSET
+            && r.asset_index.is_some()
+    }) else {
+        return;
+    };
+    let text_key = text_ref.key();
+
+    let new_script = "unity-asset: edited TextAsset m_Script";
+    let mut session = env.edit_session();
+    // Skip bundles whose TextAsset typetree doesn't expose m_Script.
+    if session
+        .set_text_asset_script(&text_key, new_script)
+        .is_err()
+    {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let out_dir = temp.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_bundle_path = out_dir.join(bundle_path.file_name().expect("bundle has file name"));
+    assert!(out_bundle_path.exists());
+
+    let mut env2 = Environment::new();
+    env2.load_file(&out_bundle_path).unwrap();
+
+    let out_source = BinarySource::path(&out_bundle_path);
+    let text_ref2 = env2
+        .binary_object_infos()
+        .find(|r| {
+            r.source_kind == BinarySourceKind::AssetBundle
+                && r.object.class_id() == unity_asset_core::class_ids::TEXT_ASSET
+                && r.object.path_id() == text_key.path_id
+                && r.source == &out_source
+        })
+        .expect("saved bundle contains edited TextAsset path id");
+    let obj2 = text_ref2.read().unwrap();
+    let class2 = obj2.as_unity_class();
+    assert_eq!(
+        class2.get("m_Script").and_then(|v| v.as_str()),
+        Some(new_script)
+    );
+
+    if std::env::var("UNITYPY_E2E").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let py = r#"
+import os, sys
+repo_root = sys.argv[1]
+bundle_path = sys.argv[2]
+path_id = int(sys.argv[3])
+expected = sys.argv[4]
+sys.path.insert(0, os.path.join(repo_root, "repo-ref", "UnityPy"))
+import UnityPy  # noqa: E402
+
+env = UnityPy.load(bundle_path)
+objs = [o for o in env.objects if o.type.name == "TextAsset"]
+target = None
+for o in objs:
+    if getattr(o, "path_id", None) == path_id:
+        target = o
+        break
+assert target is not None, ("textasset path_id not found", path_id, len(objs))
+t = target.read()
+v = getattr(t, "m_Script", None)
+if v is None:
+    v = getattr(t, "script", None)
+assert v == expected, (v, expected)
+"#;
+
+    unitypy_check(
+        py,
+        &[
+            repo_root().display().to_string(),
+            out_bundle_path.display().to_string(),
+            text_key.path_id.to_string(),
+            new_script.to_string(),
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn external_bundle_can_edit_mesh_stream_data_and_unitypy_observes_change() {
+    let Ok(bundle_path) = std::env::var("UNITY_ASSET_EXTERNAL_BUNDLE") else {
+        return;
+    };
+    let bundle_path = PathBuf::from(bundle_path);
+    if !bundle_path.exists() {
+        return;
+    }
+
+    let mut env = Environment::new();
+    env.load_file(&bundle_path).unwrap();
+
+    let Some(mesh_ref) = env.binary_object_infos().find(|r| {
+        r.source_kind == BinarySourceKind::AssetBundle
+            && r.object.class_id() == unity_asset_core::class_ids::MESH
+            && r.asset_index.is_some()
+    }) else {
+        return;
+    };
+    let mesh_key = mesh_ref.key();
+
+    let data = b"unity-asset mesh streamed bytes";
+    let mut session = env.edit_session();
+    let write = session
+        .write_streamed_mesh_data(&mesh_key, Some("CAB-UnityAsset_Mesh.resS"), data)
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let out_dir = temp.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_bundle_path = out_dir.join(bundle_path.file_name().expect("bundle has file name"));
+    assert!(out_bundle_path.exists());
+
+    let mut env2 = Environment::new();
+    env2.load_file(&out_bundle_path).unwrap();
+
+    let out_source = BinarySource::path(&out_bundle_path);
+    let mesh_ref2 = env2
+        .binary_object_infos()
+        .find(|r| {
+            r.source_kind == BinarySourceKind::AssetBundle
+                && r.object.class_id() == unity_asset_core::class_ids::MESH
+                && r.object.path_id() == mesh_key.path_id
+                && r.source == &out_source
+        })
+        .expect("saved bundle contains edited Mesh path id");
+    let obj2 = mesh_ref2.read().unwrap();
+    let class2 = obj2.as_unity_class();
+
+    let (path, offset, size) = read_streamed_resource(class2.get("m_StreamData").unwrap())
+        .expect("Mesh m_StreamData is a StreamedResource");
+    assert_eq!(path, write.path);
+    assert_eq!(offset as u64, write.offset);
+    assert_eq!(size as u32, write.size);
+
+    assert_eq!(
+        class2.get("m_IndexBuffer").and_then(|v| v.as_bytes()),
+        Some(&[][..])
+    );
+    if let Some(UnityValue::Object(vd)) = class2.get("m_VertexData") {
+        assert_eq!(vd.get("m_DataSize").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(vd.get("m_Data").and_then(|v| v.as_bytes()), Some(&[][..]));
+    }
+
+    if std::env::var("UNITYPY_E2E").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let py = r#"
+import os, sys
+repo_root = sys.argv[1]
+bundle_path = sys.argv[2]
+path_id = int(sys.argv[3])
+expected_path = sys.argv[4]
+expected_offset = int(sys.argv[5])
+expected_size = int(sys.argv[6])
+sys.path.insert(0, os.path.join(repo_root, "repo-ref", "UnityPy"))
+import UnityPy  # noqa: E402
+
+env = UnityPy.load(bundle_path)
+objs = [o for o in env.objects if o.type.name == "Mesh"]
+target = None
+for o in objs:
+    if getattr(o, "path_id", None) == path_id:
+        target = o
+        break
+assert target is not None, ("mesh path_id not found", path_id, len(objs))
+m = target.read()
+sd = getattr(m, "m_StreamData", None)
+assert sd is not None
+path = getattr(sd, "path", getattr(sd, "m_Source", None))
+offset = getattr(sd, "offset", getattr(sd, "m_Offset", None))
+size = getattr(sd, "size", getattr(sd, "m_Size", None))
+assert path == expected_path, (path, expected_path)
+assert int(offset) == expected_offset, (offset, expected_offset)
+assert int(size) == expected_size, (size, expected_size)
+
+# Best-effort: ensure buffers were cleared
+ib = getattr(m, "m_IndexBuffer", None)
+if ib is not None:
+    assert len(ib) == 0, len(ib)
+vd = getattr(m, "m_VertexData", None)
+if vd is not None:
+    ds = getattr(vd, "m_DataSize", None)
+    if ds is not None:
+        assert int(ds) == 0, ds
+"#;
+
+    unitypy_check(
+        py,
+        &[
+            repo_root().display().to_string(),
+            out_bundle_path.display().to_string(),
+            mesh_key.path_id.to_string(),
+            write.path,
+            write.offset.to_string(),
+            write.size.to_string(),
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn external_bundle_can_edit_video_clip_external_resources_and_unitypy_observes_change() {
+    let Ok(bundle_path) = std::env::var("UNITY_ASSET_EXTERNAL_BUNDLE") else {
+        return;
+    };
+    let bundle_path = PathBuf::from(bundle_path);
+    if !bundle_path.exists() {
+        return;
+    }
+
+    let mut env = Environment::new();
+    env.load_file(&bundle_path).unwrap();
+
+    let Some(clip_ref) = env.binary_object_infos().find(|r| {
+        r.source_kind == BinarySourceKind::AssetBundle
+            && r.object.class_id() == 329
+            && r.asset_index.is_some()
+    }) else {
+        return;
+    };
+    let clip_key = clip_ref.key();
+
+    let data = b"unity-asset videoclip streamed bytes";
+    let mut session = env.edit_session();
+    let write = session
+        .write_streamed_video_clip_data(&clip_key, Some("CAB-UnityAsset_Video.resS"), data)
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let out_dir = temp.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_bundle_path = out_dir.join(bundle_path.file_name().expect("bundle has file name"));
+    assert!(out_bundle_path.exists());
+
+    let mut env2 = Environment::new();
+    env2.load_file(&out_bundle_path).unwrap();
+
+    let out_source = BinarySource::path(&out_bundle_path);
+    let clip_ref2 = env2
+        .binary_object_infos()
+        .find(|r| {
+            r.source_kind == BinarySourceKind::AssetBundle
+                && r.object.class_id() == 329
+                && r.object.path_id() == clip_key.path_id
+                && r.source == &out_source
+        })
+        .expect("saved bundle contains edited VideoClip path id");
+    let obj2 = clip_ref2.read().unwrap();
+    let class2 = obj2.as_unity_class();
+
+    let (path, offset, size) = read_streamed_resource(class2.get("m_ExternalResources").unwrap())
+        .expect("VideoClip m_ExternalResources is a StreamedResource");
+    assert_eq!(path, write.path);
+    assert_eq!(offset as u64, write.offset);
+    assert_eq!(size as u32, write.size);
+
+    if std::env::var("UNITYPY_E2E").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let py = r#"
+import os, sys
+repo_root = sys.argv[1]
+bundle_path = sys.argv[2]
+path_id = int(sys.argv[3])
+expected_path = sys.argv[4]
+expected_offset = int(sys.argv[5])
+expected_size = int(sys.argv[6])
+sys.path.insert(0, os.path.join(repo_root, "repo-ref", "UnityPy"))
+import UnityPy  # noqa: E402
+
+env = UnityPy.load(bundle_path)
+objs = [o for o in env.objects if o.type.name == "VideoClip"]
+target = None
+for o in objs:
+    if getattr(o, "path_id", None) == path_id:
+        target = o
+        break
+assert target is not None, ("videoclip path_id not found", path_id, len(objs))
+c = target.read()
+er = getattr(c, "m_ExternalResources", None)
+assert er is not None
+path = getattr(er, "path", getattr(er, "m_Source", None))
+offset = getattr(er, "offset", getattr(er, "m_Offset", None))
+size = getattr(er, "size", getattr(er, "m_Size", None))
+assert path == expected_path, (path, expected_path)
+assert int(offset) == expected_offset, (offset, expected_offset)
+assert int(size) == expected_size, (size, expected_size)
+"#;
+
+    unitypy_check(
+        py,
+        &[
+            repo_root().display().to_string(),
+            out_bundle_path.display().to_string(),
+            clip_key.path_id.to_string(),
+            write.path,
+            write.offset.to_string(),
+            write.size.to_string(),
+        ],
+    )
+    .unwrap();
+}
+
 #[test]
 fn environment_can_edit_yaml_prefab_by_anchor_and_save() {
     let dir = tempfile::tempdir().unwrap();

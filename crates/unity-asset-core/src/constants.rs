@@ -144,6 +144,8 @@ fn class_id_name(class_id: i32) -> Option<&'static str> {
         184 => Some("RenderTexture"),
         212 => Some("SpriteRenderer"),
         213 => Some("Sprite"),
+        328 => Some("VideoPlayer"),
+        329 => Some("VideoClip"),
         1001 => Some("PrefabInstance"),
 
         // Physics
