@@ -191,6 +191,15 @@ fn save_impl(
         fs::write(out_dir.join(out_name), bytes)?;
     }
 
+    // 4) Save edited YAML documents (prefab/scene/etc) to out_dir.
+    for (path, doc) in state.yaml_documents.iter() {
+        let out_path = output_path_for_yaml(env, out_dir, path)?;
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        doc.save_to(&out_path)?;
+    }
+
     Ok(())
 }
 
@@ -201,6 +210,21 @@ fn output_name_for_source(source: &super::BinarySource) -> Result<&OsStr> {
         })?),
         super::BinarySource::WebEntry { entry_name, .. } => Ok(OsStr::new(entry_name)),
     }
+}
+
+fn output_path_for_yaml(
+    env: &Environment,
+    out_dir: &Path,
+    path: &Path,
+) -> Result<std::path::PathBuf> {
+    if let Ok(rel) = path.strip_prefix(&env.base_path) {
+        return Ok(out_dir.join(rel));
+    }
+
+    let name = path.file_name().ok_or_else(|| {
+        UnityAssetError::format(format!("Invalid YAML path: {}", path.to_string_lossy()))
+    })?;
+    Ok(out_dir.join(name))
 }
 
 fn resolve_webfile<'a>(

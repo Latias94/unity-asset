@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use unity_asset_core::document::AsyncUnityDocument;
 
 /// A Unity YAML document containing one or more Unity objects
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct YamlDocument {
     /// The Unity objects in this document
     data: Vec<UnityClass>,

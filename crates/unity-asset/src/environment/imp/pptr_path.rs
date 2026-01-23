@@ -196,3 +196,13 @@ pub(crate) fn write_pptr_at_path(
     write_pptr(v, file_id, path_id);
     Ok(())
 }
+
+pub(crate) fn set_value_at_path(
+    class: &mut UnityClass,
+    path: &str,
+    value: UnityValue,
+) -> Result<()> {
+    let v = get_value_at_path_mut(class, path)?;
+    *v = value;
+    Ok(())
+}

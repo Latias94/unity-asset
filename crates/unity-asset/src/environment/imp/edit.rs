@@ -15,6 +15,7 @@ pub struct EnvironmentWriteState {
     pub(crate) standalone: HashMap<BinarySource, SerializedFileWriteState>,
     pub(crate) bundles: HashMap<BinarySource, BundleWriteState>,
     pub(crate) webfiles: HashMap<std::path::PathBuf, WebFileWriteState>,
+    pub(crate) yaml_documents: HashMap<std::path::PathBuf, YamlDocument>,
 }
 
 #[derive(Debug, Default)]
@@ -38,7 +39,10 @@ pub(crate) struct WebFileWriteState {
 
 impl EnvironmentWriteState {
     pub fn is_empty(&self) -> bool {
-        self.standalone.is_empty() && self.bundles.is_empty() && self.webfiles.is_empty()
+        self.standalone.is_empty()
+            && self.bundles.is_empty()
+            && self.webfiles.is_empty()
+            && self.yaml_documents.is_empty()
     }
 }
 

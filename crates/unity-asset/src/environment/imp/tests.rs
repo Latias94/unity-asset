@@ -2379,3 +2379,53 @@ assert getattr(mats[0], "path_id", None) == mat_path_id, (mats[0].path_id, mat_p
     )
     .unwrap();
 }
+
+#[test]
+fn environment_can_edit_yaml_prefab_by_anchor_and_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Old
+  m_Component:
+  - component: {fileID: 100001}
+--- !u!4 &100001
+Transform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    session
+        .set_yaml_value_at_path(
+            &prefab_path,
+            "100000",
+            "m_Name",
+            UnityValue::String("New".to_string()),
+        )
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui.prefab");
+    assert!(out_prefab.exists());
+
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+    let go = doc.get(Some("GameObject"), Some(&["m_Name"])).unwrap();
+    assert_eq!(go.get("m_Name").and_then(|v| v.as_str()), Some("New"));
+}
