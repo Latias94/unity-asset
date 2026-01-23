@@ -66,9 +66,9 @@ Rust (current):
   - `Environment::load_project(...)` project walk + optional `.meta` GUID indexing
 
 TODO (parity):
-- [ ] Support `.splitN` merge load (UnityPy `reSplit` + `_load_split_file`)
-- [ ] Support `.zip/.apk` environment load (UnityPy `load_zip_file`)
-- [ ] Add case-insensitive path resolution helper for dependency loads (UnityPy `find_sensitive_path`)
+- [x] Support `.splitN` merge load (UnityPy `reSplit` + `_load_split_file`)
+- [x] Support `.zip/.apk` environment load (UnityPy `load_zip_file`)
+- [x] Add case-insensitive path resolution helper for dependency loads (UnityPy `find_sensitive_path`) (best-effort for relative paths)
 
 ### Environment / Save entrypoint
 

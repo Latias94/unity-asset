@@ -772,6 +772,69 @@ fn environment_can_edit_and_save_stripped_assets_with_typetree_registry() {
 }
 
 #[test]
+fn environment_can_load_split_assetbundle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let split0 = tmp.path().join("char_118_yuki.ab.split0");
+    let split1 = tmp.path().join("char_118_yuki.ab.split1");
+
+    let bytes = include_bytes!("../../../../../tests/samples/char_118_yuki.ab");
+    let mid = bytes.len() / 2;
+    std::fs::write(&split0, &bytes[..mid]).unwrap();
+    std::fs::write(&split1, &bytes[mid..]).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&split0).unwrap();
+
+    let source = env
+        .bundles()
+        .keys()
+        .find(|s| match s {
+            BinarySource::Path(p) => p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == "char_118_yuki.ab"),
+            _ => false,
+        })
+        .cloned()
+        .expect("expected split bundle to be loaded");
+
+    let entries = env.bundle_container_entries_source(&source).unwrap();
+    assert!(!entries.is_empty());
+}
+
+#[test]
+fn environment_can_load_zip_assetbundle_entry() {
+    use std::io::Write;
+    use zip::write::FileOptions;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let zip_path = tmp.path().join("samples.zip");
+
+    let f = std::fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(f);
+    zip.start_file("inner/char_118_yuki.ab", FileOptions::default())
+        .unwrap();
+    zip.write_all(include_bytes!(
+        "../../../../../tests/samples/char_118_yuki.ab"
+    ))
+    .unwrap();
+    zip.finish().unwrap();
+
+    let zip_path = canonicalize_path(zip_path);
+
+    let mut env = Environment::new();
+    env.load_file(&zip_path).unwrap();
+
+    let source = BinarySource::WebEntry {
+        web_path: zip_path.clone(),
+        entry_name: "inner/char_118_yuki.ab".to_string(),
+    };
+
+    let entries = env.bundle_container_entries_source(&source).unwrap();
+    assert!(!entries.is_empty());
+}
+
+#[test]
 fn environment_assetbundle_container_raw_matches_typetree_when_stripped() {
     let mut env = Environment::new();
     let path = canonicalize_path(

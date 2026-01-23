@@ -1,7 +1,11 @@
 use super::path::canonicalize_if_exists;
+use super::path::find_sensitive_path;
 use super::*;
 use std::fs::File;
 use std::io::Read;
+use unity_asset_binary::file::load_unity_file_from_memory;
+use unity_asset_binary::file::{UnityFileKind, sniff_unity_file_kind_prefix};
+use zip::ZipArchive;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetaGuidIndexStats {
@@ -91,10 +95,46 @@ impl Environment {
 
     /// Load a single file.
     pub fn load_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let path = canonicalize_if_exists(path.as_ref());
+        let mut path = canonicalize_if_exists(path.as_ref());
+
+        // Keep `base_path` aligned with the most recent load entrypoint (UnityPy-like behavior).
+        if let Some(parent) = path.parent() {
+            self.base_path = parent.to_path_buf();
+        }
+
+        if !path.exists() {
+            // Unity-style case-insensitive resolution for relative paths.
+            if let Some(p) = find_sensitive_path(&self.base_path, &path) {
+                path = canonicalize_if_exists(&p);
+            }
+        }
+
+        // UnityPy split-file convention: `<base>.split0/.split1/...`.
+        if !path.exists() {
+            // If a base path is provided, attempt loading `<path>.split0`.
+            let split0 = append_suffix(&path, ".split0");
+            if split0.exists() {
+                path = split0;
+            }
+        }
+
+        if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && ext.starts_with("split")
+            && ext[5..].parse::<usize>().is_ok()
+        {
+            self.try_load_split_file(&path)?;
+            return Ok(());
+        }
 
         // Check file extension to determine type
         if let Some(ext) = path.extension() {
+            if ext.to_string_lossy().eq_ignore_ascii_case("zip")
+                || ext.to_string_lossy().eq_ignore_ascii_case("apk")
+            {
+                self.load_zip_archive(&path)?;
+                return Ok(());
+            }
+
             if ext == "meta" {
                 // Index meta GUIDs even if YAML parsing fails (best-effort reference resolution).
                 let _ = self.index_meta_guid_path(&path);
@@ -132,6 +172,131 @@ impl Environment {
         }
 
         Ok(())
+    }
+
+    fn try_load_split_file(&mut self, split_part_path: &Path) -> Result<()> {
+        let base = split_part_path.with_extension("");
+        let base_key = strip_verbatim_prefix(&base);
+        let bytes = load_split_bytes(&base_key)?;
+        self.try_load_unity_bytes(BinarySource::path(&base_key), bytes);
+        Ok(())
+    }
+
+    fn load_zip_archive(&mut self, archive_path: &Path) -> Result<()> {
+        let f = File::open(archive_path).map_err(|e| {
+            UnityAssetError::with_source(
+                format!("Failed to open zip archive {:?}", archive_path),
+                e,
+            )
+        })?;
+        let mut zip = ZipArchive::new(f).map_err(|e| {
+            UnityAssetError::with_source(
+                format!("Failed to parse zip archive {:?}", archive_path),
+                e,
+            )
+        })?;
+
+        let archive_path = canonicalize_if_exists(archive_path);
+        if let Some(parent) = archive_path.parent() {
+            self.base_path = parent.to_path_buf();
+        }
+
+        for i in 0..zip.len() {
+            let mut entry = match zip.by_index(i) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if entry.is_dir() {
+                continue;
+            }
+
+            let name = entry.name().replace('\\', "/");
+            let mut bytes: Vec<u8> = Vec::new();
+            if entry.read_to_end(&mut bytes).is_err() {
+                continue;
+            }
+            if bytes.is_empty() {
+                continue;
+            }
+
+            let prefix_len = bytes.len().min(64);
+            let Some(kind) = sniff_unity_file_kind_prefix(&bytes[..prefix_len]) else {
+                continue;
+            };
+            if !matches!(
+                kind,
+                UnityFileKind::AssetBundle | UnityFileKind::SerializedFile | UnityFileKind::WebFile
+            ) {
+                continue;
+            }
+
+            // Use `WebEntry` as a generic "container entry" key (also used for WebFile entries).
+            let source = BinarySource::WebEntry {
+                web_path: archive_path.clone(),
+                entry_name: name,
+            };
+            self.try_load_unity_bytes(source, bytes);
+        }
+
+        Ok(())
+    }
+
+    fn try_load_unity_bytes(&mut self, source: BinarySource, bytes: Vec<u8>) {
+        let Ok(unity_file) = load_unity_file_from_memory(bytes) else {
+            return;
+        };
+
+        match unity_file {
+            UnityFile::AssetBundle(mut bundle) => {
+                if let Some(registry) = self.type_tree_registry.clone() {
+                    for file in bundle.assets.iter_mut() {
+                        file.set_type_tree_registry(Some(registry.clone()));
+                    }
+                }
+                self.invalidate_dependency_scan_cache_for_source(
+                    &source,
+                    BinarySourceKind::AssetBundle,
+                    None,
+                );
+                self.bundles.insert(source.clone(), bundle);
+                match self.bundle_container_cache.write() {
+                    Ok(mut cache) => {
+                        cache.remove(&source);
+                    }
+                    Err(e) => {
+                        let mut cache = e.into_inner();
+                        cache.remove(&source);
+                    }
+                }
+            }
+            UnityFile::SerializedFile(mut asset) => {
+                if let Some(registry) = self.type_tree_registry.clone() {
+                    asset.set_type_tree_registry(Some(registry));
+                }
+                self.invalidate_dependency_scan_cache_for_source(
+                    &source,
+                    BinarySourceKind::SerializedFile,
+                    None,
+                );
+                self.binary_assets.insert(source, asset);
+                match self.bundle_container_cache.write() {
+                    Ok(mut cache) => cache.clear(),
+                    Err(e) => e.into_inner().clear(),
+                }
+            }
+            UnityFile::WebFile(web) => {
+                // Best-effort: store under a synthetic "path" so existing WebFile logic can load entries.
+                let web_key = match &source {
+                    BinarySource::Path(p) => p.clone(),
+                    BinarySource::WebEntry {
+                        web_path,
+                        entry_name,
+                    } => web_path.join(entry_name),
+                };
+                self.webfiles.insert(web_key.clone(), web);
+                let _ = self.load_webfile_entries(&web_key);
+            }
+        }
     }
 
     /// Recursively index `.meta` GUIDs under a directory (without loading YAML/binary assets).
@@ -377,7 +542,6 @@ impl Environment {
         options: ProjectLoadOptions,
     ) -> Result<ProjectLoadStats> {
         use ignore::WalkBuilder;
-        use unity_asset_binary::file::{UnityFileKind, sniff_unity_file_kind_prefix};
 
         let root = root.as_ref();
         if !root.exists() {
@@ -546,4 +710,53 @@ impl Environment {
 
         Ok(())
     }
+}
+
+fn load_split_bytes(base: &Path) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut found_any = false;
+
+    for i in 0..999usize {
+        let part = append_suffix(base, &format!(".split{i}"));
+        if !part.exists() {
+            if found_any {
+                break;
+            }
+            continue;
+        }
+        found_any = true;
+        let bytes = std::fs::read(&part).map_err(|e| {
+            UnityAssetError::with_source(format!("Failed to read split part {:?}", part), e)
+        })?;
+        out.extend_from_slice(&bytes);
+    }
+
+    if !found_any {
+        return Err(UnityAssetError::format(format!(
+            "No split parts found for base path: {:?}",
+            base
+        )));
+    }
+
+    Ok(out)
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{}", rest));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
 }
