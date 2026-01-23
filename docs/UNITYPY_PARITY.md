@@ -195,7 +195,7 @@ Rust (target):
 - [x] Create `crates/unity-asset-write` with minimal public surface
 - [x] Define core traits/structs:
   - [x] `ChangeTracker` (UnityPy `mark_changed`)
-  - [ ] `EditSession` (per `SerializedFile`)
+  - [x] `SerializedFileEditSession` (per `SerializedFile`)
   - [x] `PackerOptions` (string/tuple parity with UnityPy)
 - [x] Add `unity-asset` integration stubs:
   - [x] `Environment::save(pack, out_dir)` implemented (standalone SerializedFile + UnityFS bundle repack)
@@ -291,6 +291,8 @@ Acceptance:
 - [x] Provide a generic `PPtr` path helper (Unity-style references):
   - [x] resolve via `Environment::resolve_pptr_path_key(...)`
   - [x] set via `EnvironmentEditSession::set_pptr_path_to_key(...)` (best-effort externals)
+- [x] Provide best-effort "find references" for binary `PPtr` fields:
+  - [x] `Environment::find_binary_pptr_references_to(...)` returns `(from, pptr_path, file_id, path_id, resolved)`
 - [x] Provide typed convenience helpers for common streamed asset types:
   - [x] AudioClip (`m_Resource`)
   - [x] Texture2D (`m_StreamData`)
