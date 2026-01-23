@@ -417,57 +417,7 @@ impl EnvironmentObjectGraph {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct YamlPptrRef {
-    file_id: i64,
-    guid: Option<[u8; 16]>,
-}
-
-fn parse_yaml_pptr(obj: &unity_asset_core::UnityValue) -> Option<YamlPptrRef> {
-    let map = obj.as_object()?;
-    if map.is_empty() || map.len() > 3 {
-        return None;
-    }
-    for k in map.keys() {
-        if k != "fileID" && k != "guid" && k != "type" {
-            return None;
-        }
-    }
-
-    let file_id = map.get("fileID")?.as_i64()?;
-    if file_id == 0 {
-        return None;
-    }
-
-    let guid = map
-        .get("guid")
-        .and_then(|v| v.as_str())
-        .and_then(super::meta_guid::parse_guid_32_hex)
-        .filter(|g| *g != [0u8; 16]);
-
-    Some(YamlPptrRef { file_id, guid })
-}
-
-fn scan_yaml_pptrs(value: &UnityValue, out: &mut Vec<YamlPptrRef>) {
-    if let Some(pptr) = parse_yaml_pptr(value) {
-        out.push(pptr);
-        return;
-    }
-
-    match value {
-        UnityValue::Array(items) => {
-            for v in items {
-                scan_yaml_pptrs(v, out);
-            }
-        }
-        UnityValue::Object(map) => {
-            for v in map.values() {
-                scan_yaml_pptrs(v, out);
-            }
-        }
-        _ => {}
-    }
-}
+use super::yaml_pptr::{YamlPptrRef, scan_yaml_pptrs};
 
 impl Environment {
     pub fn build_object_graph(&self, options: ObjectGraphBuildOptions) -> EnvironmentObjectGraph {

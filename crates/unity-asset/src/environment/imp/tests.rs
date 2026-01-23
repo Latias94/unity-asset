@@ -833,6 +833,122 @@ fn environment_object_graph_scans_yaml_pptrs_and_meta_guid_paths() {
 }
 
 #[test]
+fn environment_can_find_yaml_pptr_references_to_yaml_anchor_with_paths() {
+    let prefab_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../unity-asset-yaml/tests/fixtures/MinimalGameObjectTransform.prefab");
+    let prefab_path = canonicalize_path(prefab_path);
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let target = EnvironmentObjectKey::Yaml(YamlObjectKey {
+        path: prefab_path.clone(),
+        anchor: "1001".to_string(),
+    });
+
+    let refs = env
+        .find_yaml_pptr_references_to(&target, YamlPptrReferenceSearchOptions::default())
+        .unwrap();
+
+    assert!(
+        refs.iter().any(|r| {
+            r.from.path == prefab_path && r.from.anchor == "1002" && r.pptr_path == "m_GameObject"
+        }),
+        "expected Transform (1002) to reference GameObject (1001) at m_GameObject"
+    );
+    assert!(
+        refs.iter().any(|r| {
+            r.from.path == prefab_path && r.from.anchor == "1003" && r.pptr_path == "m_GameObject"
+        }),
+        "expected MonoBehaviour (1003) to reference GameObject (1001) at m_GameObject"
+    );
+}
+
+#[test]
+fn environment_can_find_yaml_pptr_references_to_binary_object_with_paths() {
+    use unity_asset_binary::bundle::load_bundle;
+    use unity_asset_binary::file::load_unity_file_from_memory;
+
+    let bundle_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
+    let bundle = load_bundle(&bundle_path).unwrap();
+
+    let mut extracted: Option<(Vec<u8>, i64)> = None;
+    for name in bundle.file_names() {
+        let Some(info) = bundle.find_file(name) else {
+            continue;
+        };
+        let bytes = bundle.extract_file_data(info).unwrap();
+        let Ok(unity_file) = load_unity_file_from_memory(bytes.clone()) else {
+            continue;
+        };
+        let Some(file) = unity_file.as_serialized() else {
+            continue;
+        };
+        let Some(first) = file.objects.first() else {
+            continue;
+        };
+        if first.path_id == 0 {
+            continue;
+        }
+        extracted = Some((bytes, first.path_id));
+        break;
+    }
+
+    let (bytes, target_path_id) = extracted.expect("bundle contains at least one SerializedFile");
+
+    let temp = tempfile::tempdir().unwrap();
+    let target_path = temp.path().join("Target.assets");
+    let target_meta = temp.path().join("Target.assets.meta");
+    let yaml_path = temp.path().join("Ref.prefab");
+
+    std::fs::write(&target_path, &bytes).unwrap();
+    std::fs::write(
+        &target_meta,
+        b"fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+
+    let yaml = format!(
+        "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!114 &1\nMonoBehaviour:\n  m_Ref: {{fileID: {}, guid: 0123456789abcdef0123456789abcdef, type: 2}}\n",
+        target_path_id
+    );
+    std::fs::write(&yaml_path, yaml.as_bytes()).unwrap();
+
+    let target_path = canonicalize_path(target_path);
+    let target_meta = canonicalize_path(target_meta);
+    let yaml_path = canonicalize_path(yaml_path);
+
+    let mut env = Environment::new();
+    env.load_file(&target_meta).unwrap();
+    env.load_file(&target_path).unwrap();
+    env.load_file(&yaml_path).unwrap();
+
+    let target = EnvironmentObjectKey::Binary(BinaryObjectKey {
+        source: BinarySource::path(&target_path),
+        source_kind: BinarySourceKind::SerializedFile,
+        asset_index: None,
+        path_id: target_path_id,
+    });
+
+    let refs = env
+        .find_yaml_pptr_references_to(&target, YamlPptrReferenceSearchOptions::default())
+        .unwrap();
+
+    assert!(
+        refs.iter().any(|r| {
+            r.from.path == yaml_path && r.from.anchor == "1" && r.pptr_path == "m_Ref"
+        }),
+        "expected Ref.prefab &1 to reference the target at m_Ref"
+    );
+    assert!(
+        refs.iter().any(|r| r.resolved.as_ref() == Some(&target)),
+        "expected at least one resolved reference to the binary target"
+    );
+}
+
+#[test]
 fn environment_object_graph_resolves_yaml_guid_to_loaded_serialized_file_object() {
     use unity_asset_binary::bundle::load_bundle;
     use unity_asset_binary::file::load_unity_file_from_memory;

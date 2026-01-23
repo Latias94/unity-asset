@@ -43,6 +43,7 @@ mod imp {
     mod streamed_write;
     mod typed;
     mod yaml_edit;
+    mod yaml_pptr;
 
     pub use dependency_graph::{
         DependencyGraphBuildOptions, DependencyGraphTraversalOptions, DependencyGraphWarning,
@@ -55,6 +56,7 @@ mod imp {
         ObjectGraphTraversalOptions, YamlExternalEdge, YamlObjectKey,
     };
     pub use pptr::{BinaryPptrReference, PptrReferenceSearchOptions};
+    pub use yaml_pptr::{YamlPptrReference, YamlPptrReferenceSearchOptions};
 
     #[derive(Debug, Clone)]
     pub enum EnvironmentWarning {

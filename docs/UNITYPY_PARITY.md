@@ -334,7 +334,7 @@ Acceptance:
   - [x] set via `EnvironmentEditSession::set_pptr_path_to_key(...)` (best-effort externals)
 - [x] Provide best-effort "find references" for binary `PPtr` fields:
   - [x] `Environment::find_binary_pptr_references_to(...)` returns `(from, pptr_path, file_id, path_id, resolved)`
-- [ ] TODO: implement YAML-side "find references" for YAML PPtr-like objects (prefab/scene YAML), returning `(YamlObjectKey, pptr_path, file_id/guid/type, resolved?)`
+- [x] Implement YAML-side "find references" for YAML PPtr-like objects (prefab/scene YAML), returning `(YamlObjectKey, pptr_path, file_id/guid/type, resolved?)`
 - [x] Provide typed convenience helpers for common streamed asset types:
   - [x] AudioClip (`m_Resource`)
   - [x] Texture2D (`m_StreamData`)
