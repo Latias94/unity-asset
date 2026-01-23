@@ -298,7 +298,10 @@ Acceptance:
 - [x] Expand typed helpers (UnityPy-like ergonomics):
   - [x] MeshFilter (`m_Mesh`)
   - [x] MeshRenderer (`m_Materials`, `m_AdditionalVertexStreams`)
-  - [x] Material (`m_SavedProperties.m_TexEnvs[*].m_Texture` by name)
+  - [x] Material:
+    - [x] TexEnv texture (`m_SavedProperties.m_TexEnvs[*].m_Texture`) by name
+    - [x] TexEnv scale/offset (`m_SavedProperties.m_TexEnvs[*].m_Scale/m_Offset`) by name
+    - [x] Floats/Colors/Ints (`m_SavedProperties.m_Floats/m_Colors/m_Ints`) by name
   - [x] VideoPlayer (`m_Url`, `m_VideoClip`)
 - [ ] TODO: expand typed helpers further (more classes + deeper editor semantics)
 

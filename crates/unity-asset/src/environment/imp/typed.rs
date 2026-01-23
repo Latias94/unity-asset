@@ -75,7 +75,7 @@ fn ensure_array_child<'a>(value: &'a mut UnityValue, key: &str) -> &'a mut Vec<U
     }
 }
 
-fn texenv_key_name(v: &UnityValue) -> Option<&str> {
+fn property_key_name(v: &UnityValue) -> Option<&str> {
     match v {
         UnityValue::String(s) => Some(s.as_str()),
         UnityValue::Object(map) => map.get("name").and_then(|v| v.as_str()),
@@ -120,7 +120,7 @@ pub(crate) fn apply_material_set_texenv_texture_pptr(
         let Some((first, second)) = pair_first_second_mut(entry) else {
             continue;
         };
-        let Some(name) = texenv_key_name(first) else {
+        let Some(name) = property_key_name(first) else {
             continue;
         };
         if name != property_name {
@@ -164,6 +164,205 @@ pub(crate) fn apply_material_set_texenv_texture_pptr(
     let entry = UnityValue::Array(vec![UnityValue::String(property_name.to_string()), tex_env]);
     tex_envs.push(entry);
 
+    Ok(())
+}
+
+pub(crate) fn apply_material_set_texenv_scale_offset(
+    class: &mut UnityClass,
+    property_name: &str,
+    scale: (f64, f64),
+    offset: (f64, f64),
+) -> Result<()> {
+    ensure_object_field(class, "m_SavedProperties");
+    let Some(saved) = class.get_mut("m_SavedProperties") else {
+        unreachable!();
+    };
+
+    let tex_envs = ensure_array_child(saved, "m_TexEnvs");
+
+    for entry in tex_envs.iter_mut() {
+        let Some((first, second)) = pair_first_second_mut(entry) else {
+            continue;
+        };
+        let Some(name) = property_key_name(first) else {
+            continue;
+        };
+        if name != property_name {
+            continue;
+        }
+
+        let tex_env = ensure_object_child(second, "m_Offset");
+        *tex_env = UnityValue::Object(
+            [
+                ("x".to_string(), UnityValue::Float(offset.0)),
+                ("y".to_string(), UnityValue::Float(offset.1)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let tex_env = ensure_object_child(second, "m_Scale");
+        *tex_env = UnityValue::Object(
+            [
+                ("x".to_string(), UnityValue::Float(scale.0)),
+                ("y".to_string(), UnityValue::Float(scale.1)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        return Ok(());
+    }
+
+    // Not found: append a new entry (string key variant).
+    let tex_env = UnityValue::Object(
+        [
+            (
+                "m_Offset".to_string(),
+                UnityValue::Object(
+                    [
+                        ("x".to_string(), UnityValue::Float(offset.0)),
+                        ("y".to_string(), UnityValue::Float(offset.1)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            ),
+            (
+                "m_Scale".to_string(),
+                UnityValue::Object(
+                    [
+                        ("x".to_string(), UnityValue::Float(scale.0)),
+                        ("y".to_string(), UnityValue::Float(scale.1)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            ),
+            (
+                "m_Texture".to_string(),
+                UnityValue::Object(Default::default()),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    tex_envs.push(UnityValue::Array(vec![
+        UnityValue::String(property_name.to_string()),
+        tex_env,
+    ]));
+
+    Ok(())
+}
+
+pub(crate) fn apply_material_set_float(
+    class: &mut UnityClass,
+    property_name: &str,
+    value: f64,
+) -> Result<()> {
+    ensure_object_field(class, "m_SavedProperties");
+    let Some(saved) = class.get_mut("m_SavedProperties") else {
+        unreachable!();
+    };
+
+    let floats = ensure_array_child(saved, "m_Floats");
+
+    for entry in floats.iter_mut() {
+        let Some((first, second)) = pair_first_second_mut(entry) else {
+            continue;
+        };
+        let Some(name) = property_key_name(first) else {
+            continue;
+        };
+        if name != property_name {
+            continue;
+        }
+        *second = UnityValue::Float(value);
+        return Ok(());
+    }
+
+    floats.push(UnityValue::Array(vec![
+        UnityValue::String(property_name.to_string()),
+        UnityValue::Float(value),
+    ]));
+    Ok(())
+}
+
+pub(crate) fn apply_material_set_int(
+    class: &mut UnityClass,
+    property_name: &str,
+    value: i64,
+) -> Result<()> {
+    ensure_object_field(class, "m_SavedProperties");
+    let Some(saved) = class.get_mut("m_SavedProperties") else {
+        unreachable!();
+    };
+
+    let ints = ensure_array_child(saved, "m_Ints");
+
+    for entry in ints.iter_mut() {
+        let Some((first, second)) = pair_first_second_mut(entry) else {
+            continue;
+        };
+        let Some(name) = property_key_name(first) else {
+            continue;
+        };
+        if name != property_name {
+            continue;
+        }
+        *second = UnityValue::Integer(value);
+        return Ok(());
+    }
+
+    ints.push(UnityValue::Array(vec![
+        UnityValue::String(property_name.to_string()),
+        UnityValue::Integer(value),
+    ]));
+    Ok(())
+}
+
+pub(crate) fn apply_material_set_color(
+    class: &mut UnityClass,
+    property_name: &str,
+    rgba: (f64, f64, f64, f64),
+) -> Result<()> {
+    ensure_object_field(class, "m_SavedProperties");
+    let Some(saved) = class.get_mut("m_SavedProperties") else {
+        unreachable!();
+    };
+
+    let colors = ensure_array_child(saved, "m_Colors");
+
+    let color_value = UnityValue::Object(
+        [
+            ("r".to_string(), UnityValue::Float(rgba.0)),
+            ("g".to_string(), UnityValue::Float(rgba.1)),
+            ("b".to_string(), UnityValue::Float(rgba.2)),
+            ("a".to_string(), UnityValue::Float(rgba.3)),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    for entry in colors.iter_mut() {
+        let Some((first, second)) = pair_first_second_mut(entry) else {
+            continue;
+        };
+        let Some(name) = property_key_name(first) else {
+            continue;
+        };
+        if name != property_name {
+            continue;
+        }
+        *second = color_value;
+        return Ok(());
+    }
+
+    colors.push(UnityValue::Array(vec![
+        UnityValue::String(property_name.to_string()),
+        color_value,
+    ]));
     Ok(())
 }
 
@@ -437,6 +636,51 @@ impl<'a> EnvironmentEditSession<'a> {
                 file_id,
                 texture_key.path_id,
             )
+        })
+    }
+
+    pub fn set_material_texenv_scale_offset(
+        &mut self,
+        material_key: &BinaryObjectKey,
+        property_name: &str,
+        scale: (f64, f64),
+        offset: (f64, f64),
+    ) -> Result<()> {
+        self.edit_binary_object_key(material_key, |class| {
+            apply_material_set_texenv_scale_offset(class, property_name, scale, offset)
+        })
+    }
+
+    pub fn set_material_float(
+        &mut self,
+        material_key: &BinaryObjectKey,
+        property_name: &str,
+        value: f64,
+    ) -> Result<()> {
+        self.edit_binary_object_key(material_key, |class| {
+            apply_material_set_float(class, property_name, value)
+        })
+    }
+
+    pub fn set_material_int(
+        &mut self,
+        material_key: &BinaryObjectKey,
+        property_name: &str,
+        value: i64,
+    ) -> Result<()> {
+        self.edit_binary_object_key(material_key, |class| {
+            apply_material_set_int(class, property_name, value)
+        })
+    }
+
+    pub fn set_material_color_rgba(
+        &mut self,
+        material_key: &BinaryObjectKey,
+        property_name: &str,
+        rgba: (f64, f64, f64, f64),
+    ) -> Result<()> {
+        self.edit_binary_object_key(material_key, |class| {
+            apply_material_set_color(class, property_name, rgba)
         })
     }
 }

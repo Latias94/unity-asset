@@ -1877,3 +1877,84 @@ fn typed_material_helper_updates_or_inserts_texenv_texture() {
     let (_, path_id) = super::pptr_path::read_pptr(texture).expect("m_Texture is PPtr");
     assert_eq!(path_id, 456);
 }
+
+#[test]
+fn typed_material_helpers_update_floats_ints_colors_and_texenv_scale_offset() {
+    let mut class = UnityClass::new(0, "Material".to_string(), "0".to_string());
+    class.set(
+        "m_SavedProperties".to_string(),
+        UnityValue::Object(Default::default()),
+    );
+
+    super::typed::apply_material_set_float(&mut class, "_Glossiness", 0.75).unwrap();
+    super::typed::apply_material_set_int(&mut class, "_Mode", 2).unwrap();
+    super::typed::apply_material_set_color(&mut class, "_Color", (1.0, 0.5, 0.25, 1.0)).unwrap();
+    super::typed::apply_material_set_texenv_scale_offset(
+        &mut class,
+        "_MainTex",
+        (2.0, 3.0),
+        (0.1, 0.2),
+    )
+    .unwrap();
+
+    let saved = class
+        .get("m_SavedProperties")
+        .and_then(|v| v.as_object())
+        .expect("m_SavedProperties object");
+
+    let floats = saved
+        .get("m_Floats")
+        .and_then(|v| v.as_array())
+        .expect("m_Floats array");
+    assert!(floats.iter().any(|v| {
+        v.as_array().and_then(|a| a.get(0)).and_then(|k| k.as_str()) == Some("_Glossiness")
+            && v.as_array().and_then(|a| a.get(1)).and_then(|x| x.as_f64()) == Some(0.75)
+    }));
+
+    let ints = saved
+        .get("m_Ints")
+        .and_then(|v| v.as_array())
+        .expect("m_Ints array");
+    assert!(ints.iter().any(|v| {
+        v.as_array().and_then(|a| a.get(0)).and_then(|k| k.as_str()) == Some("_Mode")
+            && v.as_array().and_then(|a| a.get(1)).and_then(|x| x.as_i64()) == Some(2)
+    }));
+
+    let colors = saved
+        .get("m_Colors")
+        .and_then(|v| v.as_array())
+        .expect("m_Colors array");
+    let color = colors
+        .iter()
+        .find(|v| v.as_array().and_then(|a| a.get(0)).and_then(|k| k.as_str()) == Some("_Color"))
+        .expect("_Color entry exists");
+    let rgba = color
+        .as_array()
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_object())
+        .expect("color value object");
+    assert_eq!(rgba.get("r").and_then(|v| v.as_f64()), Some(1.0));
+    assert_eq!(rgba.get("g").and_then(|v| v.as_f64()), Some(0.5));
+    assert_eq!(rgba.get("b").and_then(|v| v.as_f64()), Some(0.25));
+    assert_eq!(rgba.get("a").and_then(|v| v.as_f64()), Some(1.0));
+
+    let texenvs = saved
+        .get("m_TexEnvs")
+        .and_then(|v| v.as_array())
+        .expect("m_TexEnvs array");
+    let main = texenvs
+        .iter()
+        .find(|v| v.as_array().and_then(|a| a.get(0)).and_then(|k| k.as_str()) == Some("_MainTex"))
+        .expect("_MainTex entry exists");
+    let env = main
+        .as_array()
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_object())
+        .expect("texenv object");
+    let scale = env.get("m_Scale").and_then(|v| v.as_object()).unwrap();
+    let offset = env.get("m_Offset").and_then(|v| v.as_object()).unwrap();
+    assert_eq!(scale.get("x").and_then(|v| v.as_f64()), Some(2.0));
+    assert_eq!(scale.get("y").and_then(|v| v.as_f64()), Some(3.0));
+    assert_eq!(offset.get("x").and_then(|v| v.as_f64()), Some(0.1));
+    assert_eq!(offset.get("y").and_then(|v| v.as_f64()), Some(0.2));
+}
