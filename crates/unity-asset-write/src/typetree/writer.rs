@@ -117,17 +117,52 @@ pub(crate) fn write_value(
     }
 
     if node.type_name == "pair" && node.children.len() == 2 {
-        let elems = match value {
-            UnityValue::Array(v) if v.len() == 2 => v,
+        match value {
+            UnityValue::Array(v) if v.len() == 2 => {
+                write_value(writer, &node.children[0], &v[0], ctx, options)?;
+                write_value(writer, &node.children[1], &v[1], ctx, options)?;
+            }
+            UnityValue::Object(map) => {
+                let k0 = if node.children[0].name.is_empty() {
+                    "first"
+                } else {
+                    node.children[0].name.as_str()
+                };
+                let k1 = if node.children[1].name.is_empty() {
+                    "second"
+                } else {
+                    node.children[1].name.as_str()
+                };
+
+                let Some(v0) = map.get(k0) else {
+                    if options.allow_missing_fields {
+                        return Ok(());
+                    }
+                    return Err(UnityAssetError::format(format!(
+                        "Missing pair field '{}' for TypeTree write",
+                        k0
+                    )));
+                };
+                let Some(v1) = map.get(k1) else {
+                    if options.allow_missing_fields {
+                        return Ok(());
+                    }
+                    return Err(UnityAssetError::format(format!(
+                        "Missing pair field '{}' for TypeTree write",
+                        k1
+                    )));
+                };
+
+                write_value(writer, &node.children[0], v0, ctx, options)?;
+                write_value(writer, &node.children[1], v1, ctx, options)?;
+            }
             _ => {
                 return Err(UnityAssetError::format(format!(
-                    "TypeTree write type mismatch: expected pair as Array(len=2), got {:?}",
+                    "TypeTree write type mismatch: expected pair as Array(len=2) or Object(first/second), got {:?}",
                     value
                 )));
             }
-        };
-        write_value(writer, &node.children[0], &elems[0], ctx, options)?;
-        write_value(writer, &node.children[1], &elems[1], ctx, options)?;
+        }
         if align {
             writer.align_stream(4);
         }
@@ -463,5 +498,42 @@ mod tests {
         let m_ref = parsed.get("m_Ref").and_then(|v| v.as_object()).unwrap();
         let data = m_ref.get("data").and_then(|v| v.as_object()).unwrap();
         assert_eq!(data.get("x"), Some(&UnityValue::Integer(7)));
+    }
+
+    #[test]
+    fn roundtrip_pair_accepts_object_shape() {
+        let mut root = node("TestObject", "Base");
+
+        let mut pair = node("pair", "m_Pair");
+        pair.children.push(node("string", "first"));
+        pair.children.push(node("int", "second"));
+        root.children.push(pair);
+
+        let mut tree = TypeTree::new();
+        tree.add_node(root);
+
+        let mut pair_obj = IndexMap::new();
+        pair_obj.insert("first".to_string(), UnityValue::String("hello".to_string()));
+        pair_obj.insert("second".to_string(), UnityValue::Integer(123));
+
+        let mut props = IndexMap::new();
+        props.insert("m_Pair".to_string(), UnityValue::Object(pair_obj));
+
+        let writer_impl = TypeTreeWriter::new(&tree);
+        let mut out = BinaryWriter::new(Endian::Little);
+        writer_impl
+            .write_object(&mut out, &props, TypeTreeWriteOptions::default())
+            .unwrap();
+
+        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
+        let serializer = TypeTreeSerializer::new(&tree);
+        let parsed = serializer.parse_object(&mut reader).unwrap();
+
+        let pair_val = parsed.get("m_Pair").unwrap();
+        let UnityValue::Array(arr) = pair_val else {
+            panic!("expected m_Pair to parse as array, got {:?}", pair_val);
+        };
+        assert_eq!(arr.get(0).and_then(|v| v.as_str()), Some("hello"));
+        assert_eq!(arr.get(1).and_then(|v| v.as_i64()), Some(123));
     }
 }
