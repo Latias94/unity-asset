@@ -2067,6 +2067,17 @@ fn find_material_texenv_texture_pptr(
     None
 }
 
+fn read_renderer_materials_pptrs(class: &UnityClass) -> Vec<(i32, i64)> {
+    let Some(materials) = class.get("m_Materials").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    materials
+        .iter()
+        .filter_map(|v| super::pptr_path::read_pptr(v))
+        .collect()
+}
+
 #[test]
 fn external_bundle_can_edit_material_and_unitypy_observes_change() {
     let Ok(bundle_path) = std::env::var("UNITY_ASSET_EXTERNAL_BUNDLE") else {
@@ -2248,6 +2259,122 @@ assert found, ("texenv not found", prop_name)
             material_key.path_id.to_string(),
             property_name,
             texture_key.path_id.to_string(),
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn external_bundle_can_edit_mesh_renderer_materials_and_reload() {
+    let Ok(bundle_path) = std::env::var("UNITY_ASSET_EXTERNAL_BUNDLE") else {
+        return;
+    };
+    let bundle_path = PathBuf::from(bundle_path);
+    if !bundle_path.exists() {
+        return;
+    }
+
+    let mut env = Environment::new();
+    env.load_file(&bundle_path).unwrap();
+
+    let Some(renderer_ref) = env.binary_object_infos().find(|r| {
+        r.source_kind == BinarySourceKind::AssetBundle
+            && r.object.class_id() == 23
+            && r.asset_index.is_some()
+    }) else {
+        return;
+    };
+    let renderer_key = renderer_ref.key();
+
+    let Some(material_key) = env
+        .binary_object_infos()
+        .find(|r| {
+            r.source_kind == BinarySourceKind::AssetBundle
+                && r.object.class_id() == 21
+                && r.source == renderer_ref.source
+                && r.asset_index == renderer_ref.asset_index
+        })
+        .map(|r| r.key())
+    else {
+        return;
+    };
+
+    let mut session = env.edit_session();
+    session
+        .set_mesh_renderer_materials_to_keys(&renderer_key, &[material_key.clone()])
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let out_dir = temp.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_bundle_path = out_dir.join(bundle_path.file_name().expect("bundle has file name"));
+    assert!(out_bundle_path.exists());
+
+    let mut env2 = Environment::new();
+    env2.load_file(&out_bundle_path).unwrap();
+
+    let out_source = BinarySource::path(&out_bundle_path);
+    let renderer_ref2 = env2
+        .binary_object_infos()
+        .find(|r| {
+            r.source_kind == BinarySourceKind::AssetBundle
+                && r.object.class_id() == 23
+                && r.object.path_id() == renderer_key.path_id
+                && r.source == &out_source
+        })
+        .expect("saved bundle contains edited MeshRenderer path id");
+    let renderer_obj2 = renderer_ref2.read().unwrap();
+
+    let materials = read_renderer_materials_pptrs(renderer_obj2.as_unity_class());
+    assert!(
+        !materials.is_empty(),
+        "expected MeshRenderer to have m_Materials after save"
+    );
+    assert_eq!(materials[0].0, 0, "expected in-file PPtr (fileID=0)");
+    assert_eq!(materials[0].1, material_key.path_id);
+
+    if std::env::var("UNITYPY_E2E").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let py = r#"
+import os, sys
+repo_root = sys.argv[1]
+bundle_path = sys.argv[2]
+renderer_path_id = int(sys.argv[3])
+mat_path_id = int(sys.argv[4])
+sys.path.insert(0, os.path.join(repo_root, "repo-ref", "UnityPy"))
+import UnityPy  # noqa: E402
+
+env = UnityPy.load(bundle_path)
+objs = [o for o in env.objects if o.type.name == "MeshRenderer"]
+target = None
+for o in objs:
+    if getattr(o, "path_id", None) == renderer_path_id:
+        target = o
+        break
+assert target is not None, ("meshrenderer path_id not found", renderer_path_id, len(objs))
+r = target.read()
+mats = getattr(r, "m_Materials", [])
+assert len(mats) > 0, "m_Materials is empty"
+assert getattr(mats[0], "path_id", None) == mat_path_id, (mats[0].path_id, mat_path_id)
+"#;
+
+    unitypy_check(
+        py,
+        &[
+            repo_root().display().to_string(),
+            out_bundle_path.display().to_string(),
+            renderer_key.path_id.to_string(),
+            material_key.path_id.to_string(),
         ],
     )
     .unwrap();
