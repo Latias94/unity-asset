@@ -54,6 +54,7 @@ mod imp {
         EnvironmentObjectGraph, EnvironmentObjectKey, ExternalObjectEdge, ObjectGraphBuildOptions,
         ObjectGraphTraversalOptions, YamlExternalEdge, YamlObjectKey,
     };
+    pub use pptr::{BinaryPptrReference, PptrReferenceSearchOptions};
 
     #[derive(Debug, Clone)]
     pub enum EnvironmentWarning {

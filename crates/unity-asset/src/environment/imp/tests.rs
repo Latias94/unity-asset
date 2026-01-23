@@ -421,6 +421,39 @@ fn environment_dependency_graph_can_rebuild_single_source_subgraph() {
 }
 
 #[test]
+fn environment_can_find_binary_pptr_references_to_target_key() {
+    let mut env = Environment::new();
+    let path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
+    env.load_file(&path).unwrap();
+
+    let graph = env.build_dependency_graph(DependencyGraphBuildOptions::default());
+    let mut picked: Option<(BinaryObjectKey, BinaryObjectKey)> = None;
+
+    for from in graph.nodes() {
+        if let Some(to) = graph.internal_refs_from(from).first() {
+            picked = Some((from.clone(), to.clone()));
+            break;
+        }
+    }
+
+    let Some((from, target)) = picked else {
+        return;
+    };
+
+    let refs = env
+        .find_binary_pptr_references_to(&target, PptrReferenceSearchOptions::default())
+        .unwrap();
+
+    assert!(
+        refs.iter()
+            .any(|r| r.from == from && r.resolved.as_ref() == Some(&target)),
+        "expected at least one resolved reference from a known dependency edge"
+    );
+}
+
+#[test]
 fn environment_indexes_meta_guid_for_best_effort_external_resolution() {
     let temp = tempfile::tempdir().unwrap();
     let asset_path = temp.path().join("MyAsset.asset");

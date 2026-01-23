@@ -1,5 +1,33 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+pub struct PptrReferenceSearchOptions {
+    pub continue_on_error: bool,
+    pub max_objects: Option<usize>,
+    pub max_results: Option<usize>,
+    pub max_pptrs_per_object: Option<usize>,
+}
+
+impl Default for PptrReferenceSearchOptions {
+    fn default() -> Self {
+        Self {
+            continue_on_error: true,
+            max_objects: None,
+            max_results: None,
+            max_pptrs_per_object: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryPptrReference {
+    pub from: BinaryObjectKey,
+    pub pptr_path: String,
+    pub file_id: i32,
+    pub path_id: i64,
+    pub resolved: Option<BinaryObjectKey>,
+}
+
 impl Environment {
     fn match_external_path_score(external_path: &str, candidate: &str) -> i32 {
         if external_path.is_empty() || candidate.is_empty() {
@@ -305,5 +333,112 @@ impl Environment {
         }
 
         Ok(self.resolve_binary_pptr(&obj_ref, file_id, path_id))
+    }
+
+    pub fn find_binary_pptr_references_to(
+        &self,
+        target_key: &BinaryObjectKey,
+        options: PptrReferenceSearchOptions,
+    ) -> Result<Vec<BinaryPptrReference>> {
+        let mut out: Vec<BinaryPptrReference> = Vec::new();
+
+        let mut scanned_objects = 0usize;
+        for obj_ref in self.binary_object_infos() {
+            if let Some(max) = options.max_objects
+                && scanned_objects >= max
+            {
+                break;
+            }
+            if let Some(max) = options.max_results
+                && out.len() >= max
+            {
+                break;
+            }
+            scanned_objects = scanned_objects.saturating_add(1);
+
+            let from_key = obj_ref.key();
+
+            let class = match obj_ref.source_kind {
+                BinarySourceKind::SerializedFile => {
+                    if let Some(state) = self.write_state.standalone.get(obj_ref.source)
+                        && let Some(class) = state.classes.get(&from_key.path_id)
+                    {
+                        class.clone()
+                    } else {
+                        match obj_ref.read() {
+                            Ok(obj) => obj.class,
+                            Err(e) => {
+                                if options.continue_on_error {
+                                    continue;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                BinarySourceKind::AssetBundle => {
+                    let Some(asset_index) = obj_ref.asset_index else {
+                        if options.continue_on_error {
+                            continue;
+                        }
+                        return Err(UnityAssetError::format(
+                            "AssetBundle object ref missing asset_index".to_string(),
+                        ));
+                    };
+
+                    if let Some(bundle_state) = self.write_state.bundles.get(obj_ref.source)
+                        && let Some(asset_state) = bundle_state.assets.get(&asset_index)
+                        && let Some(class) = asset_state.classes.get(&from_key.path_id)
+                    {
+                        class.clone()
+                    } else {
+                        match obj_ref.read() {
+                            Ok(obj) => obj.class,
+                            Err(e) => {
+                                if options.continue_on_error {
+                                    continue;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+            };
+
+            let pptrs =
+                super::pptr_path::scan_pptrs_with_paths(&class, options.max_pptrs_per_object);
+            for p in pptrs {
+                if p.path_id == 0 {
+                    continue;
+                }
+
+                let resolved = self.resolve_binary_pptr(&obj_ref, p.file_id, p.path_id);
+                if resolved.as_ref() != Some(target_key) {
+                    continue;
+                }
+
+                out.push(BinaryPptrReference {
+                    from: from_key.clone(),
+                    pptr_path: p.path,
+                    file_id: p.file_id,
+                    path_id: p.path_id,
+                    resolved,
+                });
+
+                if let Some(max) = options.max_results
+                    && out.len() >= max
+                {
+                    break;
+                }
+            }
+        }
+
+        out.sort_by(|a, b| {
+            a.from
+                .to_string()
+                .cmp(&b.from.to_string())
+                .then_with(|| a.pptr_path.cmp(&b.pptr_path))
+        });
+        Ok(out)
     }
 }

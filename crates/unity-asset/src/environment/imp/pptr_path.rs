@@ -1,5 +1,12 @@
 use super::{Result, UnityAssetError, UnityClass, UnityValue};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PptrAtPath {
+    pub path: String,
+    pub file_id: i32,
+    pub path_id: i64,
+}
+
 #[derive(Debug, Clone)]
 struct PathSegment {
     name: String,
@@ -167,6 +174,63 @@ pub(crate) fn read_pptr(value: &UnityValue) -> Option<(i32, i64)> {
     Some((file_id, path_id))
 }
 
+pub(crate) fn scan_pptrs_with_paths(
+    class: &UnityClass,
+    max_pptrs: Option<usize>,
+) -> Vec<PptrAtPath> {
+    fn scan_value(value: &UnityValue, prefix: &str, out: &mut Vec<PptrAtPath>, max: Option<usize>) {
+        if let Some(max) = max
+            && out.len() >= max
+        {
+            return;
+        }
+
+        if let Some((file_id, path_id)) = read_pptr(value) {
+            out.push(PptrAtPath {
+                path: prefix.to_string(),
+                file_id,
+                path_id,
+            });
+            return;
+        }
+
+        match value {
+            UnityValue::Object(map) => {
+                for (key, child) in map {
+                    let next = if prefix.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{}.{}", prefix, key)
+                    };
+                    scan_value(child, &next, out, max);
+                }
+            }
+            UnityValue::Array(arr) => {
+                for (idx, child) in arr.iter().enumerate() {
+                    let next = if prefix.is_empty() {
+                        format!("[{}]", idx)
+                    } else {
+                        format!("{}[{}]", prefix, idx)
+                    };
+                    scan_value(child, &next, out, max);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out: Vec<PptrAtPath> = Vec::new();
+    for (key, value) in class.properties() {
+        scan_value(value, key, &mut out, max_pptrs);
+        if let Some(max) = max_pptrs
+            && out.len() >= max
+        {
+            break;
+        }
+    }
+    out
+}
+
 pub(crate) fn write_pptr(value: &mut UnityValue, file_id: i32, path_id: i64) {
     if !matches!(value, UnityValue::Object(_)) {
         *value = UnityValue::Object(Default::default());
@@ -205,4 +269,62 @@ pub(crate) fn set_value_at_path(
     let v = get_value_at_path_mut(class, path)?;
     *v = value;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_pptrs_with_paths_emits_dot_and_index_paths() {
+        let mut class = UnityClass::new(0, "Test".to_string(), "0".to_string());
+        class.set(
+            "root".to_string(),
+            UnityValue::Object(
+                [
+                    (
+                        "m_Ptr".to_string(),
+                        UnityValue::Object(
+                            [
+                                ("fileID".to_string(), UnityValue::Integer(1)),
+                                ("pathID".to_string(), UnityValue::Integer(2)),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        ),
+                    ),
+                    (
+                        "arr".to_string(),
+                        UnityValue::Array(vec![UnityValue::Object(
+                            [
+                                ("m_FileID".to_string(), UnityValue::Integer(0)),
+                                ("m_PathID".to_string(), UnityValue::Integer(42)),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        )]),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
+
+        let pptrs = scan_pptrs_with_paths(&class, None);
+        assert_eq!(
+            pptrs,
+            vec![
+                PptrAtPath {
+                    path: "root.m_Ptr".to_string(),
+                    file_id: 1,
+                    path_id: 2,
+                },
+                PptrAtPath {
+                    path: "root.arr[0]".to_string(),
+                    file_id: 0,
+                    path_id: 42,
+                },
+            ]
+        );
+    }
 }
