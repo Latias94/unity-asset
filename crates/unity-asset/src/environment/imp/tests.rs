@@ -1793,3 +1793,87 @@ fn pptr_path_supports_array_indices() {
     assert_eq!(file_id, 0);
     assert_eq!(path_id, 42);
 }
+
+#[test]
+fn typed_material_helper_updates_or_inserts_texenv_texture() {
+    let mut class = UnityClass::new(0, "Material".to_string(), "0".to_string());
+
+    let mut saved = UnityValue::Object(Default::default());
+    saved
+        .as_object_mut()
+        .unwrap()
+        .insert("m_TexEnvs".to_string(), UnityValue::Array(Vec::new()));
+
+    let UnityValue::Array(envs) = saved.as_object_mut().unwrap().get_mut("m_TexEnvs").unwrap()
+    else {
+        unreachable!();
+    };
+
+    let first = UnityValue::Object(
+        [(
+            "name".to_string(),
+            UnityValue::String("_MainTex".to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let second = UnityValue::Object(
+        [(
+            "m_Texture".to_string(),
+            UnityValue::Object(Default::default()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    envs.push(UnityValue::Array(vec![first, second]));
+
+    class.set("m_SavedProperties".to_string(), saved);
+
+    super::typed::apply_material_set_texenv_texture_pptr(&mut class, "_MainTex", 0, 123).unwrap();
+    super::typed::apply_material_set_texenv_texture_pptr(&mut class, "_DetailTex", 0, 456).unwrap();
+
+    let saved = class
+        .get("m_SavedProperties")
+        .and_then(|v| v.as_object())
+        .expect("m_SavedProperties object");
+    let envs = saved
+        .get("m_TexEnvs")
+        .and_then(|v| v.as_array())
+        .expect("m_TexEnvs array");
+    assert_eq!(envs.len(), 2);
+
+    let main = envs
+        .iter()
+        .find(|v| {
+            v.as_array()
+                .and_then(|a| a.get(0))
+                .and_then(|f| f.as_object())
+                .and_then(|o| o.get("name"))
+                .and_then(|v| v.as_str())
+                == Some("_MainTex")
+        })
+        .expect("_MainTex entry exists");
+    let second = main
+        .as_array()
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_object())
+        .expect("second texenv object");
+    let texture = second.get("m_Texture").expect("m_Texture present");
+    let (_, path_id) = super::pptr_path::read_pptr(texture).expect("m_Texture is PPtr");
+    assert_eq!(path_id, 123);
+
+    let detail = envs
+        .iter()
+        .find(|v| {
+            v.as_array().and_then(|a| a.get(0)).and_then(|f| f.as_str()) == Some("_DetailTex")
+        })
+        .expect("_DetailTex entry exists");
+    let second = detail
+        .as_array()
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_object())
+        .expect("second texenv object");
+    let texture = second.get("m_Texture").expect("m_Texture present");
+    let (_, path_id) = super::pptr_path::read_pptr(texture).expect("m_Texture is PPtr");
+    assert_eq!(path_id, 456);
+}

@@ -53,6 +53,120 @@ fn pptr_value(file_id: i32, path_id: i64) -> UnityValue {
     v
 }
 
+fn ensure_object_child<'a>(value: &'a mut UnityValue, key: &str) -> &'a mut UnityValue {
+    if !matches!(value, UnityValue::Object(_)) {
+        *value = UnityValue::Object(Default::default());
+    }
+    let UnityValue::Object(map) = value else {
+        unreachable!();
+    };
+    map.entry(key.to_string())
+        .or_insert_with(|| UnityValue::Object(Default::default()))
+}
+
+fn ensure_array_child<'a>(value: &'a mut UnityValue, key: &str) -> &'a mut Vec<UnityValue> {
+    let child = ensure_object_child(value, key);
+    if !matches!(child, UnityValue::Array(_)) {
+        *child = UnityValue::Array(Vec::new());
+    }
+    match child {
+        UnityValue::Array(v) => v,
+        _ => unreachable!(),
+    }
+}
+
+fn texenv_key_name(v: &UnityValue) -> Option<&str> {
+    match v {
+        UnityValue::String(s) => Some(s.as_str()),
+        UnityValue::Object(map) => map.get("name").and_then(|v| v.as_str()),
+        _ => None,
+    }
+}
+
+fn pair_first_second_mut<'a>(
+    v: &'a mut UnityValue,
+) -> Option<(&'a mut UnityValue, &'a mut UnityValue)> {
+    match v {
+        UnityValue::Array(arr) if arr.len() == 2 => {
+            // SAFETY: split borrow
+            let (a, b) = arr.split_at_mut(1);
+            Some((&mut a[0], &mut b[0]))
+        }
+        UnityValue::Object(map) => {
+            // Unity TypeTree pair children are typically named `first`/`second`.
+            let first = map.get_mut("first")? as *mut UnityValue;
+            let second = map.get_mut("second")? as *mut UnityValue;
+            // SAFETY: different keys, so distinct entries.
+            unsafe { Some((&mut *first, &mut *second)) }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn apply_material_set_texenv_texture_pptr(
+    class: &mut UnityClass,
+    property_name: &str,
+    file_id: i32,
+    path_id: i64,
+) -> Result<()> {
+    ensure_object_field(class, "m_SavedProperties");
+    let Some(saved) = class.get_mut("m_SavedProperties") else {
+        unreachable!();
+    };
+
+    let tex_envs = ensure_array_child(saved, "m_TexEnvs");
+
+    for entry in tex_envs.iter_mut() {
+        let Some((first, second)) = pair_first_second_mut(entry) else {
+            continue;
+        };
+        let Some(name) = texenv_key_name(first) else {
+            continue;
+        };
+        if name != property_name {
+            continue;
+        }
+
+        let tex_env = ensure_object_child(second, "m_Texture");
+        super::pptr_path::write_pptr(tex_env, file_id, path_id);
+        return Ok(());
+    }
+
+    // Not found: append a new entry (string key variant).
+    let mut tex_env = UnityValue::Object(Default::default());
+    tex_env
+        .as_object_mut()
+        .unwrap()
+        .insert("m_Texture".to_string(), pptr_value(file_id, path_id));
+    tex_env.as_object_mut().unwrap().insert(
+        "m_Offset".to_string(),
+        UnityValue::Object(
+            [
+                ("x".to_string(), UnityValue::Float(0.0)),
+                ("y".to_string(), UnityValue::Float(0.0)),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
+    tex_env.as_object_mut().unwrap().insert(
+        "m_Scale".to_string(),
+        UnityValue::Object(
+            [
+                ("x".to_string(), UnityValue::Float(1.0)),
+                ("y".to_string(), UnityValue::Float(1.0)),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
+
+    let entry = UnityValue::Array(vec![UnityValue::String(property_name.to_string()), tex_env]);
+    tex_envs.push(entry);
+
+    Ok(())
+}
+
 pub(crate) fn apply_text_asset_script(class: &mut UnityClass, script: &str) -> Result<()> {
     let Some(v) = class.get_mut("m_Script") else {
         return Err(UnityAssetError::format(
@@ -303,6 +417,26 @@ impl<'a> EnvironmentEditSession<'a> {
     ) -> Result<()> {
         self.edit_binary_object_key(key, |class| {
             apply_mesh_renderer_additional_vertex_streams_pptr(class, file_id, path_id)
+        })
+    }
+
+    /// Set a Material `m_SavedProperties.m_TexEnvs[*].m_Texture` entry by property name.
+    ///
+    /// This is the most common workflow for repointing textures (e.g. `_MainTex`).
+    pub fn set_material_texenv_texture_to_key(
+        &mut self,
+        material_key: &BinaryObjectKey,
+        property_name: &str,
+        texture_key: &BinaryObjectKey,
+    ) -> Result<()> {
+        let file_id = self.file_id_for_target(material_key, texture_key)?;
+        self.edit_binary_object_key(material_key, |class| {
+            apply_material_set_texenv_texture_pptr(
+                class,
+                property_name,
+                file_id,
+                texture_key.path_id,
+            )
         })
     }
 }

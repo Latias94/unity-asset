@@ -139,6 +139,16 @@ impl<'a> EnvironmentEditSession<'a> {
         self.env
             .set_pptr_path_to_key(context_key, pptr_path, target_key)
     }
+
+    /// Ensure the context serialized file has an external mapping for `target_key` and return the
+    /// `fileID` to use in a `PPtr` field.
+    pub fn file_id_for_target(
+        &mut self,
+        context_key: &BinaryObjectKey,
+        target_key: &BinaryObjectKey,
+    ) -> Result<i32> {
+        self.env.file_id_for_target(context_key, target_key)
+    }
 }
 
 impl Environment {
@@ -438,6 +448,61 @@ impl Environment {
                 })?;
 
                 Ok((file_id, target_key.path_id))
+            }
+        }
+    }
+
+    /// Compute the `fileID` to use when writing a `PPtr` from `context_key` to `target_key`.
+    ///
+    /// - Returns `0` if both objects live in the same serialized file.
+    /// - Otherwise appends an external entry (if needed) and returns its `fileID` (`index + 1`).
+    pub fn file_id_for_target(
+        &mut self,
+        context_key: &BinaryObjectKey,
+        target_key: &BinaryObjectKey,
+    ) -> Result<i32> {
+        let same_file = context_key.source_kind == target_key.source_kind
+            && context_key.source == target_key.source
+            && context_key.asset_index == target_key.asset_index;
+        if same_file {
+            return Ok(0);
+        }
+
+        match context_key.source_kind {
+            BinarySourceKind::SerializedFile => {
+                let (source_key, file) =
+                    resolve_serialized_file_source(&self.binary_assets, &context_key.source)?;
+                let source_key = source_key.clone();
+                let state = self.write_state.standalone.entry(source_key).or_default();
+
+                let path = external_path_for_target(None, target_key)?;
+                Ok(get_or_add_external_file_id(file, &mut state.edits, &path))
+            }
+            BinarySourceKind::AssetBundle => {
+                let asset_index = context_key.asset_index.ok_or_else(|| {
+                    UnityAssetError::format("AssetBundle key requires an asset_index")
+                })?;
+                let (bundle_source, bundle) =
+                    resolve_bundle_source(&self.bundles, &context_key.source)?;
+                let bundle_source_key = bundle_source.clone();
+
+                let asset = bundle.assets.get(asset_index).ok_or_else(|| {
+                    UnityAssetError::format(format!(
+                        "AssetBundle asset index out of range: {} asset_index={}",
+                        context_key.source.describe(),
+                        asset_index
+                    ))
+                })?;
+
+                let bundle_state = self
+                    .write_state
+                    .bundles
+                    .entry(bundle_source_key)
+                    .or_default();
+                let state = bundle_state.assets.entry(asset_index).or_default();
+
+                let path = external_path_for_target(Some((bundle_source, bundle)), target_key)?;
+                Ok(get_or_add_external_file_id(asset, &mut state.edits, &path))
             }
         }
     }

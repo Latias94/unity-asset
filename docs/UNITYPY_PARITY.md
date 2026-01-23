@@ -221,7 +221,7 @@ Acceptance:
 - [x] Cover types:
   - [x] primitives (`SInt8/UInt8/.../double/bool`)
   - [x] `string`, `TypelessData`
-  - [x] `pair`
+  - [x] `pair` (accepts Array(len=2) + Object(first/second))
   - [x] arrays (including aligned arrays)
   - [ ] `PPtr<>` (TODO: add explicit normalization/acceptance tests)
   - [x] `ReferencedObject` (ref_types-aware)
@@ -298,6 +298,7 @@ Acceptance:
 - [x] Expand typed helpers (UnityPy-like ergonomics):
   - [x] MeshFilter (`m_Mesh`)
   - [x] MeshRenderer (`m_Materials`, `m_AdditionalVertexStreams`)
+  - [x] Material (`m_SavedProperties.m_TexEnvs[*].m_Texture` by name)
   - [x] VideoPlayer (`m_Url`, `m_VideoClip`)
 - [ ] TODO: expand typed helpers further (more classes + deeper editor semantics)
 
