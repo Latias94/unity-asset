@@ -34,6 +34,22 @@ Future parity targets (post edit-pipeline):
 - UnityPy's typed object layer (`repo-ref/UnityPy/UnityPy/classes/*`, especially `generated.py`) for ergonomic field access and safe edits
 - Export/convenience helpers (`repo-ref/UnityPy/UnityPy/tools/extractor.py`, `repo-ref/UnityPy/UnityPy/export/*`)
 
+## Current Gap Shortlist
+
+This is a quick “what’s left” index; the detailed checklist below remains the source of truth.
+
+P0 (blocks broad edit compatibility):
+- MonoBehaviour TypeTree generation (UnityPy `typetree_generator`-style capability) or an equivalent pluggable script-type registry.
+- Dependency resolution fallback (`Environment.find_file`-style simplified-name lookup) to resolve externals when paths are incomplete.
+
+P1 (important, but not blocking most modern samples):
+- `SerializedFile.save` for `version < 9` (legacy header/layout support).
+- Legacy bundle save (`UnityWeb` / `UnityRaw`).
+
+P2 / future:
+- Bundle encryption save support (UnityPy explicitly has a TODO here too).
+- Broader typed helper coverage for UI/editor workflows (RectTransform/Canvas/Text/etc).
+
 ## High-Level Architecture (Rust Target)
 
 To avoid destabilizing the existing parser crates, the write/edit pipeline should live in a **dedicated crate** and integrate into higher-level APIs:
@@ -59,6 +75,9 @@ UnityPy:
     - `.split0/.split1/...` merge (common mobile/console outputs)
     - `.zip/.apk` load
     - case-insensitive path resolution via `find_sensitive_path(...)`
+  - `Environment.find_file(...)` supports best-effort dependency lookup by:
+    - simplified name matching (`simplify_name`: basename + lowercase)
+    - scanning the environment root directory when direct lookup fails
 
 Rust (current):
 - `crates/unity-asset/src/environment/imp/loader.rs`
@@ -69,6 +88,9 @@ TODO (parity):
 - [x] Support `.splitN` merge load (UnityPy `reSplit` + `_load_split_file`)
 - [x] Support `.zip/.apk` environment load (UnityPy `load_zip_file`)
 - [x] Add case-insensitive path resolution helper for dependency loads (UnityPy `find_sensitive_path`) (best-effort for relative paths)
+- [ ] Add a best-effort `find_file`-style fallback when resolving dependencies by path fails:
+  - simplified-name matching (basename + lowercase)
+  - optional directory scan under `Environment.base_path` (guarded / cached to avoid O(N) per lookup)
 
 ### Environment / Save entrypoint
 
@@ -79,6 +101,7 @@ UnityPy:
 Rust (current):
 - `crates/unity-asset/src/environment.rs`
   - `Environment::save(pack, out_dir)` writes only changed sources
+  - `.zip/.apk` entries are treated as standalone sources (UnityPy-style): edited entries are written to `out_dir` and the archive is not re-packed
 
 Rust (target):
 - `crates/unity-asset/src/environment.rs`
