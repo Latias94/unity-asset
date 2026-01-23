@@ -1779,3 +1779,17 @@ fn environment_set_pptr_path_to_key_adds_external_when_cross_source() {
         "expected added external entry for cross-source PPtr"
     );
 }
+
+#[test]
+fn pptr_path_supports_array_indices() {
+    let mut class = UnityClass::new(0, "Test".to_string(), "0".to_string());
+    class.set("m_Materials".to_string(), UnityValue::Array(Vec::new()));
+
+    super::pptr_path::write_pptr_at_path(&mut class, "m_Materials[1]", 0, 42).unwrap();
+
+    let v = super::pptr_path::get_value_at_path(&class, "m_Materials[1]")
+        .expect("m_Materials[1] exists");
+    let (file_id, path_id) = super::pptr_path::read_pptr(v).expect("element is a PPtr");
+    assert_eq!(file_id, 0);
+    assert_eq!(path_id, 42);
+}

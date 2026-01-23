@@ -1,5 +1,59 @@
 use super::{Result, UnityAssetError, UnityClass, UnityValue};
 
+#[derive(Debug, Clone)]
+struct PathSegment {
+    name: String,
+    index: Option<usize>,
+}
+
+fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
+    let mut out = Vec::new();
+    for raw in path.split('.').filter(|s| !s.is_empty()) {
+        out.push(parse_segment(raw)?);
+    }
+    if out.is_empty() {
+        return Err(UnityAssetError::format("PPtr path is empty"));
+    }
+    Ok(out)
+}
+
+fn parse_segment(seg: &str) -> Result<PathSegment> {
+    let Some(bracket) = seg.find('[') else {
+        return Ok(PathSegment {
+            name: seg.to_string(),
+            index: None,
+        });
+    };
+
+    if !seg.ends_with(']') {
+        return Err(UnityAssetError::format(format!(
+            "Invalid PPtr path segment (missing ']'): {}",
+            seg
+        )));
+    }
+
+    let name = &seg[..bracket];
+    let idx_str = &seg[bracket + 1..seg.len() - 1];
+    if name.is_empty() {
+        return Err(UnityAssetError::format(format!(
+            "Invalid PPtr path segment (empty name): {}",
+            seg
+        )));
+    }
+
+    let index: usize = idx_str.parse().map_err(|_| {
+        UnityAssetError::format(format!(
+            "Invalid PPtr path segment index '{}': {}",
+            idx_str, seg
+        ))
+    })?;
+
+    Ok(PathSegment {
+        name: name.to_string(),
+        index: Some(index),
+    })
+}
+
 fn value_get_child<'a>(value: &'a UnityValue, key: &str) -> Option<&'a UnityValue> {
     match value {
         UnityValue::Object(map) => map.get(key),
@@ -7,20 +61,50 @@ fn value_get_child<'a>(value: &'a UnityValue, key: &str) -> Option<&'a UnityValu
     }
 }
 
-fn value_get_child_mut<'a>(value: &'a mut UnityValue, key: &str) -> Option<&'a mut UnityValue> {
+fn array_get<'a>(value: &'a UnityValue, idx: usize) -> Option<&'a UnityValue> {
     match value {
-        UnityValue::Object(map) => map.get_mut(key),
+        UnityValue::Array(v) => v.get(idx),
         _ => None,
     }
 }
 
-pub(crate) fn get_value_at_path<'a>(class: &'a UnityClass, path: &str) -> Option<&'a UnityValue> {
-    let mut it = path.split('.').filter(|s| !s.is_empty());
-    let first = it.next()?;
-    let mut cur = class.get(first)?;
-    for seg in it {
-        cur = value_get_child(cur, seg)?;
+fn empty_value_for_segment(seg: &PathSegment) -> UnityValue {
+    if seg.index.is_some() {
+        UnityValue::Array(Vec::new())
+    } else {
+        UnityValue::Object(Default::default())
     }
+}
+
+fn array_ensure_index<'a>(value: &'a mut UnityValue, idx: usize) -> &'a mut UnityValue {
+    if !matches!(value, UnityValue::Array(_)) {
+        *value = UnityValue::Array(Vec::new());
+    }
+    let UnityValue::Array(v) = value else {
+        unreachable!();
+    };
+    if v.len() <= idx {
+        v.resize(idx + 1, UnityValue::Null);
+    }
+    &mut v[idx]
+}
+
+pub(crate) fn get_value_at_path<'a>(class: &'a UnityClass, path: &str) -> Option<&'a UnityValue> {
+    let segs = parse_path(path).ok()?;
+    let first = segs.first()?;
+
+    let mut cur = class.get(first.name.as_str())?;
+    if let Some(idx) = first.index {
+        cur = array_get(cur, idx)?;
+    }
+
+    for seg in &segs[1..] {
+        cur = value_get_child(cur, seg.name.as_str())?;
+        if let Some(idx) = seg.index {
+            cur = array_get(cur, idx)?;
+        }
+    }
+
     Some(cur)
 }
 
@@ -28,41 +112,42 @@ pub(crate) fn get_value_at_path_mut<'a>(
     class: &'a mut UnityClass,
     path: &str,
 ) -> Result<&'a mut UnityValue> {
-    let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
-    if segments.is_empty() {
-        return Err(UnityAssetError::format("PPtr path is empty"));
+    let segs = parse_path(path)?;
+    let first = &segs[0];
+
+    if class.get(&first.name).is_none() {
+        class.set(first.name.clone(), empty_value_for_segment(first));
     }
 
-    let first = segments[0];
-    if segments.len() == 1 {
-        if class.get(first).is_none() {
-            class.set(first.to_string(), UnityValue::Object(Default::default()));
-        }
-        return Ok(class
-            .get_mut(first)
-            .ok_or_else(|| UnityAssetError::format("Failed to access path root"))?);
-    }
-
-    let mut cur: &mut UnityValue = class.get_mut(first).ok_or_else(|| {
-        UnityAssetError::format(format!("PPtr path missing required root field: {}", first))
+    let mut cur: &mut UnityValue = class.get_mut(&first.name).ok_or_else(|| {
+        UnityAssetError::format(format!(
+            "PPtr path missing required root field: {}",
+            first.name
+        ))
     })?;
-
-    for seg in &segments[1..segments.len() - 1] {
-        cur = value_get_child_mut(cur, seg).ok_or_else(|| {
-            UnityAssetError::format(format!("PPtr path missing required segment: {}", seg))
-        })?;
+    if let Some(idx) = first.index {
+        cur = array_ensure_index(cur, idx);
     }
 
-    let leaf = segments[segments.len() - 1];
-    match cur {
-        UnityValue::Object(map) => Ok(map
-            .entry(leaf.to_string())
-            .or_insert_with(|| UnityValue::Object(Default::default()))),
-        _ => Err(UnityAssetError::format(format!(
-            "PPtr path parent is not an object: {}",
-            segments[segments.len() - 2]
-        ))),
+    for seg in &segs[1..] {
+        cur = match cur {
+            UnityValue::Object(map) => map
+                .entry(seg.name.clone())
+                .or_insert_with(|| empty_value_for_segment(seg)),
+            _ => {
+                return Err(UnityAssetError::format(format!(
+                    "PPtr path parent is not an object: {}",
+                    seg.name
+                )));
+            }
+        };
+
+        if let Some(idx) = seg.index {
+            cur = array_ensure_index(cur, idx);
+        }
     }
+
+    Ok(cur)
 }
 
 pub(crate) fn read_pptr(value: &UnityValue) -> Option<(i32, i64)> {
