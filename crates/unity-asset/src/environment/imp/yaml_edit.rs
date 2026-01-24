@@ -2,7 +2,10 @@ use super::path::canonicalize_if_exists;
 use super::*;
 
 impl Environment {
-    fn ensure_yaml_loaded(&mut self, path: &std::path::Path) -> Result<std::path::PathBuf> {
+    pub(crate) fn ensure_yaml_loaded(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
         let path = canonicalize_if_exists(path);
         if self.yaml_documents.contains_key(&path) {
             return Ok(path);

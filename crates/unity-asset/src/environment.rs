@@ -46,6 +46,8 @@ mod imp {
     mod typed;
     mod yaml_edit;
     mod yaml_pptr;
+    mod yaml_query;
+    mod yaml_ui;
 
     pub use dependency_graph::{
         DependencyGraphBuildOptions, DependencyGraphTraversalOptions, DependencyGraphWarning,
