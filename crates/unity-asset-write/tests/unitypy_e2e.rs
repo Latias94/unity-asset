@@ -377,9 +377,11 @@ fn unitypy_observes_rust_typetree_edit_in_repacked_bundle() -> anyhow::Result<()
     };
     let mut w = BinaryWriter::new(endian);
     let tt_writer = TypeTreeWriter::with_ref_types(type_tree, &serialized.ref_types);
-    tt_writer.write_object(
+    let original_bytes = handle.raw_data()?;
+    tt_writer.write_object_with_original_bytes(
         &mut w,
         obj.class.properties(),
+        original_bytes,
         TypeTreeWriteOptions {
             allow_missing_fields: false,
         },

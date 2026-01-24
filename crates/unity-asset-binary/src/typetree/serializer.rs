@@ -158,6 +158,9 @@ impl<'a> TypeTreeSerializer<'a> {
         if let Some(root) = self.tree.nodes.first() {
             for child in root.children.iter().take(root_children) {
                 if child.name.is_empty() {
+                    // Even if a field is unnamed, we must still advance the reader to keep offsets
+                    // correct for subsequent fields.
+                    self.skip_value_with_ref_types(reader, child, ctx.ref_types)?;
                     continue;
                 }
                 match self.parse_value_by_type_ctx(reader, child, &mut ctx) {
@@ -181,6 +184,29 @@ impl<'a> TypeTreeSerializer<'a> {
         }
 
         Ok(out)
+    }
+
+    /// Consume a value from the reader without allocating a parsed `UnityValue` tree.
+    ///
+    /// This is primarily useful for:
+    /// - Keeping the reader position correct for unnamed fields
+    /// - Writer "template" workflows that need to preserve unknown byte slices
+    pub fn skip_value(&self, reader: &mut BinaryReader, node: &TypeTreeNode) -> Result<()> {
+        self.skip_value_with_ref_types(reader, node, None)
+    }
+
+    pub fn skip_value_with_ref_types(
+        &self,
+        reader: &mut BinaryReader,
+        node: &TypeTreeNode,
+        ref_types: Option<&'a [SerializedType]>,
+    ) -> Result<()> {
+        let mut dummy = PPtrScanResult::default();
+        let mut ctx = TypeTreeScanContext {
+            ref_types,
+            has_managed_registry: false,
+        };
+        self.scan_value_ctx(reader, node, &mut dummy, &mut ctx)
     }
 
     /// Scan TypeTree-based object bytes and collect any encountered `PPtr` references without

@@ -293,7 +293,7 @@ Acceptance:
   - [x] `string`, `TypelessData`
   - [x] `pair` (accepts Array(len=2) + Object(first/second))
   - [x] arrays (including aligned arrays)
-  - [ ] TODO: handle rare TypeTrees with unnamed children (writer currently expects named children)
+  - [x] Handle rare TypeTrees with unnamed children by preserving original byte slices (template write mode)
   - [ ] `PPtr<>` (TODO: add explicit normalization/acceptance tests)
   - [x] `ReferencedObject` (ref_types-aware)
   - [x] managed references registry (`ManagedReferencesRegistry`) skip rules

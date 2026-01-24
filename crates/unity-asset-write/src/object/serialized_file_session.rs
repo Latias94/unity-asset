@@ -139,9 +139,20 @@ fn encode_object_typetree(
         TypeTreeWriter::with_ref_types(tree.as_ref(), &file.ref_types)
     };
 
-    writer.write_object(
+    let original = file.object_bytes(info).map_err(|e| {
+        UnityAssetError::with_source(
+            format!(
+                "Failed to read original object bytes for TypeTree write: path_id={} class_id={}",
+                info.path_id, info.type_id
+            ),
+            e,
+        )
+    })?;
+
+    writer.write_object_with_original_bytes(
         &mut w,
         properties,
+        original,
         TypeTreeWriteOptions {
             allow_missing_fields: false,
         },

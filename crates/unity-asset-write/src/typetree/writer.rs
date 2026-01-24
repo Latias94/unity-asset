@@ -63,10 +63,9 @@ impl<'a> TypeTreeWriter<'a> {
         };
         for child in &root.children {
             if child.name.is_empty() {
-                // TODO(parity): some trees may contain unnamed children. UnityPy doesn't usually
-                // expose those via dict access. We'll need a strategy for preserving bytes when
-                // editing existing objects.
-                continue;
+                return Err(UnityAssetError::format(
+                    "TypeTree write encountered an unnamed child node; use write_object_with_original_bytes(...) to preserve template bytes",
+                ));
             }
             let Some(v) = properties.get(&child.name) else {
                 if options.allow_missing_fields {
@@ -80,6 +79,27 @@ impl<'a> TypeTreeWriter<'a> {
             write_value(writer, child, v, &mut ctx, options)?;
         }
         Ok(())
+    }
+
+    /// Encode an object as a byte blob, preserving any unknown/unnamed fields by copying their
+    /// original byte slices from `original_bytes`.
+    ///
+    /// This is required for rare TypeTrees that contain unnamed child nodes (`m_Name == ""`).
+    pub fn write_object_with_original_bytes(
+        &self,
+        writer: &mut BinaryWriter,
+        properties: &IndexMap<String, UnityValue>,
+        original_bytes: &[u8],
+        options: TypeTreeWriteOptions,
+    ) -> Result<()> {
+        super::template::write_object_with_original_bytes(
+            writer,
+            self.tree,
+            self.ref_types,
+            properties,
+            original_bytes,
+            options,
+        )
     }
 }
 
@@ -201,7 +221,9 @@ pub(crate) fn write_value(
 
     for child in &node.children {
         if child.name.is_empty() {
-            continue;
+            return Err(UnityAssetError::format(
+                "TypeTree write encountered an unnamed child node; use write_object_with_original_bytes(...) to preserve template bytes",
+            ));
         }
         let Some(v) = obj.get(&child.name) else {
             if options.allow_missing_fields {
@@ -535,5 +557,100 @@ mod tests {
         };
         assert_eq!(arr.get(0).and_then(|v| v.as_str()), Some("hello"));
         assert_eq!(arr.get(1).and_then(|v| v.as_i64()), Some(123));
+    }
+
+    #[test]
+    fn template_write_preserves_unnamed_root_children() {
+        let mut root = node("TestObject", "Base");
+        root.children.push(node("int", "m_A"));
+        root.children.push(node("int", ""));
+        root.children.push(node("int", "m_B"));
+
+        let mut tree = TypeTree::new();
+        tree.add_node(root);
+
+        let mut original_w = BinaryWriter::new(Endian::Little);
+        original_w.write_i32(1);
+        original_w.write_i32(0x11223344);
+        original_w.write_i32(2);
+        let original_bytes = original_w.into_bytes();
+
+        let mut props = IndexMap::new();
+        props.insert("m_A".to_string(), UnityValue::Integer(10));
+        props.insert("m_B".to_string(), UnityValue::Integer(20));
+
+        let writer_impl = TypeTreeWriter::new(&tree);
+
+        // Non-template mode must fail instead of silently dropping bytes.
+        let mut out = BinaryWriter::new(Endian::Little);
+        assert!(
+            writer_impl
+                .write_object(&mut out, &props, TypeTreeWriteOptions::default())
+                .is_err()
+        );
+
+        let mut out = BinaryWriter::new(Endian::Little);
+        writer_impl
+            .write_object_with_original_bytes(
+                &mut out,
+                &props,
+                original_bytes.as_slice(),
+                TypeTreeWriteOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(&out.bytes()[4..8], &original_bytes[4..8]);
+
+        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
+        let serializer = TypeTreeSerializer::new(&tree);
+        let parsed = serializer.parse_object(&mut reader).unwrap();
+        assert_eq!(parsed.get("m_A"), Some(&UnityValue::Integer(10)));
+        assert_eq!(parsed.get("m_B"), Some(&UnityValue::Integer(20)));
+    }
+
+    #[test]
+    fn template_write_preserves_unnamed_nested_children() {
+        let mut root = node("TestObject", "Base");
+
+        let mut foo = node("Foo", "m_Foo");
+        foo.children.push(node("int", "x"));
+        foo.children.push(node("int", ""));
+        foo.children.push(node("int", "y"));
+        root.children.push(foo);
+
+        let mut tree = TypeTree::new();
+        tree.add_node(root);
+
+        let mut original_w = BinaryWriter::new(Endian::Little);
+        original_w.write_i32(1);
+        original_w.write_i32(77);
+        original_w.write_i32(2);
+        let original_bytes = original_w.into_bytes();
+
+        let mut foo_obj = IndexMap::new();
+        foo_obj.insert("x".to_string(), UnityValue::Integer(10));
+        foo_obj.insert("y".to_string(), UnityValue::Integer(20));
+        let mut props = IndexMap::new();
+        props.insert("m_Foo".to_string(), UnityValue::Object(foo_obj));
+
+        let writer_impl = TypeTreeWriter::new(&tree);
+        let mut out = BinaryWriter::new(Endian::Little);
+        writer_impl
+            .write_object_with_original_bytes(
+                &mut out,
+                &props,
+                original_bytes.as_slice(),
+                TypeTreeWriteOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(&out.bytes()[4..8], &original_bytes[4..8]);
+
+        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
+        let serializer = TypeTreeSerializer::new(&tree);
+        let parsed = serializer.parse_object(&mut reader).unwrap();
+        let foo_parsed = parsed.get("m_Foo").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(foo_parsed.get("x"), Some(&UnityValue::Integer(10)));
+        assert_eq!(foo_parsed.get("y"), Some(&UnityValue::Integer(20)));
     }
 }

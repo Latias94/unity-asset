@@ -6,6 +6,7 @@
 mod context;
 mod primitives;
 mod referenced_object;
+mod template;
 mod writer;
 
 pub use context::TypeTreeWriteContext;
