@@ -406,6 +406,8 @@ Acceptance:
     - [x] Slider: value, min/max, wholeNumbers, interactable, persistent onValueChanged calls (best-effort)
     - [x] Dropdown: value, interactable, persistent onValueChanged calls (best-effort)
     - [x] InputField: text, interactable, persistent onValueChanged/onEndEdit calls (best-effort)
+    - [x] TMP_InputField: text, interactable, persistent onValueChanged/onEndEdit calls (best-effort)
+    - [x] ScrollRect: content/viewport refs, axis toggles, normalizedPosition/velocity, persistent onValueChanged calls (best-effort)
 
 Acceptance:
 - [x] A bundle can be modified to point `m_StreamData` at a newly written cab and reloaded.

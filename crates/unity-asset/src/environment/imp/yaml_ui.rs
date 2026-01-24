@@ -1611,6 +1611,334 @@ impl<'a> EnvironmentEditSession<'a> {
         )
     }
 
+    pub fn find_yaml_tmp_input_field_key(
+        &mut self,
+        game_object: &YamlObjectKey,
+    ) -> Result<YamlObjectKey> {
+        self.find_yaml_monobehaviour_key_by_required_fields(
+            game_object,
+            &[
+                "m_Text",
+                "m_TextComponent",
+                "m_OnValueChanged",
+                "m_OnEndEdit",
+            ],
+        )
+    }
+
+    pub fn yaml_ui_tmp_input_field_set_text(
+        &mut self,
+        tmp_input: &YamlObjectKey,
+        text: &str,
+    ) -> Result<()> {
+        self.set_yaml_string_at_key_path_first_match(tmp_input, &["m_Text", "m_text"], text)
+    }
+
+    pub fn yaml_ui_tmp_input_field_set_interactable(
+        &mut self,
+        tmp_input: &YamlObjectKey,
+        interactable: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            tmp_input,
+            "m_Interactable",
+            UnityValue::Integer(if interactable { 1 } else { 0 }),
+        )
+    }
+
+    pub fn yaml_ui_tmp_input_field_clear_on_value_changed(
+        &mut self,
+        tmp_input: &YamlObjectKey,
+    ) -> Result<()> {
+        self.env_mut().edit_yaml_object_anchor(
+            &tmp_input.path,
+            tmp_input.anchor.as_str(),
+            |class| {
+                let calls = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnValueChanged.m_PersistentCalls.m_Calls",
+                )?;
+                *calls = UnityValue::Array(Vec::new());
+                Ok(())
+            },
+        )
+    }
+
+    pub fn yaml_ui_tmp_input_field_add_on_value_changed_call(
+        &mut self,
+        tmp_input: &YamlObjectKey,
+        target_file_id: i64,
+        target_guid_32_hex: Option<&str>,
+        target_type_id: Option<i64>,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_guid_32_hex = target_guid_32_hex.map(|s| s.trim().to_ascii_lowercase());
+        let target = yaml_pptr_value(
+            target_file_id,
+            target_guid_32_hex.as_deref(),
+            target_type_id,
+        );
+
+        self.env_mut().edit_yaml_object_anchor(
+            &tmp_input.path,
+            tmp_input.anchor.as_str(),
+            |class| {
+                let calls_value = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnValueChanged.m_PersistentCalls.m_Calls",
+                )?;
+                let calls = ensure_array_mut(calls_value);
+                calls.push(unity_event_persistent_call(target, method_name, 0));
+                Ok(())
+            },
+        )
+    }
+
+    pub fn yaml_ui_tmp_input_field_add_on_value_changed_target_anchor(
+        &mut self,
+        tmp_input: &YamlObjectKey,
+        target_anchor: &str,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_file_id = target_anchor.trim().parse::<i64>().map_err(|e| {
+            UnityAssetError::format(format!(
+                "Invalid YAML anchor fileID for TMP_InputField onValueChanged target: {:?} ({})",
+                target_anchor, e
+            ))
+        })?;
+        self.yaml_ui_tmp_input_field_add_on_value_changed_call(
+            tmp_input,
+            target_file_id,
+            None,
+            None,
+            method_name,
+        )
+    }
+
+    pub fn yaml_ui_tmp_input_field_clear_on_end_edit(
+        &mut self,
+        tmp_input: &YamlObjectKey,
+    ) -> Result<()> {
+        self.env_mut().edit_yaml_object_anchor(
+            &tmp_input.path,
+            tmp_input.anchor.as_str(),
+            |class| {
+                let calls = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnEndEdit.m_PersistentCalls.m_Calls",
+                )?;
+                *calls = UnityValue::Array(Vec::new());
+                Ok(())
+            },
+        )
+    }
+
+    pub fn yaml_ui_tmp_input_field_add_on_end_edit_call(
+        &mut self,
+        tmp_input: &YamlObjectKey,
+        target_file_id: i64,
+        target_guid_32_hex: Option<&str>,
+        target_type_id: Option<i64>,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_guid_32_hex = target_guid_32_hex.map(|s| s.trim().to_ascii_lowercase());
+        let target = yaml_pptr_value(
+            target_file_id,
+            target_guid_32_hex.as_deref(),
+            target_type_id,
+        );
+
+        self.env_mut().edit_yaml_object_anchor(
+            &tmp_input.path,
+            tmp_input.anchor.as_str(),
+            |class| {
+                let calls_value = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnEndEdit.m_PersistentCalls.m_Calls",
+                )?;
+                let calls = ensure_array_mut(calls_value);
+                calls.push(unity_event_persistent_call(target, method_name, 0));
+                Ok(())
+            },
+        )
+    }
+
+    pub fn yaml_ui_tmp_input_field_add_on_end_edit_target_anchor(
+        &mut self,
+        tmp_input: &YamlObjectKey,
+        target_anchor: &str,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_file_id = target_anchor.trim().parse::<i64>().map_err(|e| {
+            UnityAssetError::format(format!(
+                "Invalid YAML anchor fileID for TMP_InputField onEndEdit target: {:?} ({})",
+                target_anchor, e
+            ))
+        })?;
+        self.yaml_ui_tmp_input_field_add_on_end_edit_call(
+            tmp_input,
+            target_file_id,
+            None,
+            None,
+            method_name,
+        )
+    }
+
+    pub fn find_yaml_scroll_rect_key(
+        &mut self,
+        game_object: &YamlObjectKey,
+    ) -> Result<YamlObjectKey> {
+        self.find_yaml_monobehaviour_key_by_required_fields(
+            game_object,
+            &[
+                "m_Content",
+                "m_Viewport",
+                "m_OnValueChanged",
+                "m_Horizontal",
+                "m_Vertical",
+            ],
+        )
+    }
+
+    pub fn yaml_ui_scroll_rect_set_content_target_anchor(
+        &mut self,
+        scroll_rect: &YamlObjectKey,
+        content_anchor: &str,
+    ) -> Result<()> {
+        self.set_yaml_pptr_to_yaml_anchor_at_key_path(scroll_rect, "m_Content", content_anchor)
+    }
+
+    pub fn yaml_ui_scroll_rect_set_viewport_target_anchor(
+        &mut self,
+        scroll_rect: &YamlObjectKey,
+        viewport_anchor: &str,
+    ) -> Result<()> {
+        self.set_yaml_pptr_to_yaml_anchor_at_key_path(scroll_rect, "m_Viewport", viewport_anchor)
+    }
+
+    pub fn yaml_ui_scroll_rect_set_horizontal(
+        &mut self,
+        scroll_rect: &YamlObjectKey,
+        enabled: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            scroll_rect,
+            "m_Horizontal",
+            UnityValue::Integer(if enabled { 1 } else { 0 }),
+        )
+    }
+
+    pub fn yaml_ui_scroll_rect_set_vertical(
+        &mut self,
+        scroll_rect: &YamlObjectKey,
+        enabled: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            scroll_rect,
+            "m_Vertical",
+            UnityValue::Integer(if enabled { 1 } else { 0 }),
+        )
+    }
+
+    pub fn yaml_ui_scroll_rect_set_normalized_position(
+        &mut self,
+        scroll_rect: &YamlObjectKey,
+        x: f64,
+        y: f64,
+    ) -> Result<()> {
+        self.set_yaml_vec2_at_key_path(scroll_rect, "m_NormalizedPosition", x, y)
+    }
+
+    pub fn yaml_ui_scroll_rect_set_velocity(
+        &mut self,
+        scroll_rect: &YamlObjectKey,
+        x: f64,
+        y: f64,
+    ) -> Result<()> {
+        self.set_yaml_vec2_at_key_path(scroll_rect, "m_Velocity", x, y)
+    }
+
+    pub fn yaml_ui_scroll_rect_set_scroll_sensitivity(
+        &mut self,
+        scroll_rect: &YamlObjectKey,
+        sensitivity: f64,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            scroll_rect,
+            "m_ScrollSensitivity",
+            UnityValue::Float(sensitivity),
+        )
+    }
+
+    pub fn yaml_ui_scroll_rect_clear_on_value_changed(
+        &mut self,
+        scroll_rect: &YamlObjectKey,
+    ) -> Result<()> {
+        self.env_mut().edit_yaml_object_anchor(
+            &scroll_rect.path,
+            scroll_rect.anchor.as_str(),
+            |class| {
+                let calls = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnValueChanged.m_PersistentCalls.m_Calls",
+                )?;
+                *calls = UnityValue::Array(Vec::new());
+                Ok(())
+            },
+        )
+    }
+
+    pub fn yaml_ui_scroll_rect_add_on_value_changed_call(
+        &mut self,
+        scroll_rect: &YamlObjectKey,
+        target_file_id: i64,
+        target_guid_32_hex: Option<&str>,
+        target_type_id: Option<i64>,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_guid_32_hex = target_guid_32_hex.map(|s| s.trim().to_ascii_lowercase());
+        let target = yaml_pptr_value(
+            target_file_id,
+            target_guid_32_hex.as_deref(),
+            target_type_id,
+        );
+
+        self.env_mut().edit_yaml_object_anchor(
+            &scroll_rect.path,
+            scroll_rect.anchor.as_str(),
+            |class| {
+                let calls_value = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnValueChanged.m_PersistentCalls.m_Calls",
+                )?;
+                let calls = ensure_array_mut(calls_value);
+                calls.push(unity_event_persistent_call(target, method_name, 0));
+                Ok(())
+            },
+        )
+    }
+
+    pub fn yaml_ui_scroll_rect_add_on_value_changed_target_anchor(
+        &mut self,
+        scroll_rect: &YamlObjectKey,
+        target_anchor: &str,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_file_id = target_anchor.trim().parse::<i64>().map_err(|e| {
+            UnityAssetError::format(format!(
+                "Invalid YAML anchor fileID for ScrollRect onValueChanged target: {:?} ({})",
+                target_anchor, e
+            ))
+        })?;
+        self.yaml_ui_scroll_rect_add_on_value_changed_call(
+            scroll_rect,
+            target_file_id,
+            None,
+            None,
+            method_name,
+        )
+    }
+
     pub fn yaml_rect_transform_set_anchored_position(
         &mut self,
         rect_transform: &YamlObjectKey,

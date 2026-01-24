@@ -4987,3 +4987,381 @@ MonoBehaviour:
     });
     assert_eq!(target_file_id, Some(114002), "target={:?}", target);
 }
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_tmp_input_field_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_tmp_input.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: TMPInput
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 114001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!114 &114001
+MonoBehaviour:
+  m_GameObject: {fileID: 100000}
+  m_Interactable: 1
+  m_Text: Hello
+  m_TextComponent: {fileID: 114003}
+  m_OnValueChanged:
+    m_PersistentCalls:
+      m_Calls: []
+  m_OnEndEdit:
+    m_PersistentCalls:
+      m_Calls: []
+--- !u!1 &100001
+GameObject:
+  m_Name: Target
+  m_Component:
+  - component: {fileID: 200002}
+  - component: {fileID: 114002}
+--- !u!4 &200002
+Transform:
+  m_GameObject: {fileID: 100001}
+  m_Father: {fileID: 0}
+  m_Children: []
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+--- !u!114 &114002
+MonoBehaviour:
+  m_GameObject: {fileID: 100001}
+  m_Enabled: 1
+--- !u!1 &100002
+GameObject:
+  m_Name: Text
+  m_Component:
+  - component: {fileID: 200003}
+  - component: {fileID: 114003}
+--- !u!224 &200003
+RectTransform:
+  m_GameObject: {fileID: 100002}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!114 &114003
+MonoBehaviour:
+  m_GameObject: {fileID: 100002}
+  m_Enabled: 1
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "TMPInput")
+        .unwrap();
+    let tmp_input = session.find_yaml_tmp_input_field_key(&go).unwrap();
+
+    session
+        .yaml_ui_tmp_input_field_set_text(&tmp_input, "World")
+        .unwrap();
+    session
+        .yaml_ui_tmp_input_field_set_interactable(&tmp_input, false)
+        .unwrap();
+    session
+        .yaml_ui_tmp_input_field_clear_on_value_changed(&tmp_input)
+        .unwrap();
+    session
+        .yaml_ui_tmp_input_field_clear_on_end_edit(&tmp_input)
+        .unwrap();
+    session
+        .yaml_ui_tmp_input_field_add_on_value_changed_target_anchor(
+            &tmp_input,
+            "114002",
+            "OnChanged",
+        )
+        .unwrap();
+    session
+        .yaml_ui_tmp_input_field_add_on_end_edit_target_anchor(&tmp_input, "114002", "OnEndEdit")
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_tmp_input.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+
+    let tmp_input = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "114001")
+        .expect("TMP_InputField MonoBehaviour anchor");
+    assert_eq!(
+        tmp_input.get("m_Interactable").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+    assert_eq!(
+        tmp_input.get("m_Text").and_then(|v| v.as_str()),
+        Some("World")
+    );
+
+    let calls_changed = tmp_input
+        .get("m_OnValueChanged")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_PersistentCalls"))
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_Calls"))
+        .and_then(|v| v.as_array())
+        .expect("m_OnValueChanged.m_PersistentCalls.m_Calls array");
+    assert_eq!(calls_changed.len(), 1);
+    let call = calls_changed[0].as_object().expect("call is object");
+    assert_eq!(
+        call.get("m_MethodName").and_then(|v| v.as_str()),
+        Some("OnChanged")
+    );
+    let target = call
+        .get("m_Target")
+        .and_then(|v| v.as_object())
+        .expect("m_Target object");
+    let target_file_id = target.iter().find_map(|(k, v)| {
+        if k.eq_ignore_ascii_case("fileID") || k.eq_ignore_ascii_case("m_FileID") {
+            v.as_i64()
+                .or_else(|| v.as_f64().map(|f| f as i64))
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        } else {
+            None
+        }
+    });
+    assert_eq!(target_file_id, Some(114002), "target={:?}", target);
+
+    let calls_end = tmp_input
+        .get("m_OnEndEdit")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_PersistentCalls"))
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_Calls"))
+        .and_then(|v| v.as_array())
+        .expect("m_OnEndEdit.m_PersistentCalls.m_Calls array");
+    assert_eq!(calls_end.len(), 1);
+    let call = calls_end[0].as_object().expect("call is object");
+    assert_eq!(
+        call.get("m_MethodName").and_then(|v| v.as_str()),
+        Some("OnEndEdit")
+    );
+    let target = call
+        .get("m_Target")
+        .and_then(|v| v.as_object())
+        .expect("m_Target object");
+    let target_file_id = target.iter().find_map(|(k, v)| {
+        if k.eq_ignore_ascii_case("fileID") || k.eq_ignore_ascii_case("m_FileID") {
+            v.as_i64()
+                .or_else(|| v.as_f64().map(|f| f as i64))
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        } else {
+            None
+        }
+    });
+    assert_eq!(target_file_id, Some(114002), "target={:?}", target);
+}
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_scroll_rect_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_scroll_rect.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: ScrollView
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 114001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!114 &114001
+MonoBehaviour:
+  m_GameObject: {fileID: 100000}
+  m_Content: {fileID: 0}
+  m_Viewport: {fileID: 0}
+  m_Horizontal: 1
+  m_Vertical: 0
+  m_NormalizedPosition: {x: 0, y: 1}
+  m_Velocity: {x: 0, y: 0}
+  m_ScrollSensitivity: 1
+  m_OnValueChanged:
+    m_PersistentCalls:
+      m_Calls: []
+--- !u!1 &100001
+GameObject:
+  m_Name: Content
+  m_Component:
+  - component: {fileID: 200002}
+--- !u!224 &200002
+RectTransform:
+  m_GameObject: {fileID: 100001}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!1 &100002
+GameObject:
+  m_Name: Viewport
+  m_Component:
+  - component: {fileID: 200003}
+--- !u!224 &200003
+RectTransform:
+  m_GameObject: {fileID: 100002}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!1 &100003
+GameObject:
+  m_Name: Target
+  m_Component:
+  - component: {fileID: 200004}
+  - component: {fileID: 114002}
+--- !u!4 &200004
+Transform:
+  m_GameObject: {fileID: 100003}
+  m_Father: {fileID: 0}
+  m_Children: []
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+--- !u!114 &114002
+MonoBehaviour:
+  m_GameObject: {fileID: 100003}
+  m_Enabled: 1
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "ScrollView")
+        .unwrap();
+    let scroll_rect = session.find_yaml_scroll_rect_key(&go).unwrap();
+
+    session
+        .yaml_ui_scroll_rect_set_content_target_anchor(&scroll_rect, "200002")
+        .unwrap();
+    session
+        .yaml_ui_scroll_rect_set_viewport_target_anchor(&scroll_rect, "200003")
+        .unwrap();
+    session
+        .yaml_ui_scroll_rect_set_horizontal(&scroll_rect, false)
+        .unwrap();
+    session
+        .yaml_ui_scroll_rect_set_vertical(&scroll_rect, true)
+        .unwrap();
+    session
+        .yaml_ui_scroll_rect_set_normalized_position(&scroll_rect, 0.5, 0.25)
+        .unwrap();
+    session
+        .yaml_ui_scroll_rect_set_velocity(&scroll_rect, 1.0, -1.0)
+        .unwrap();
+    session
+        .yaml_ui_scroll_rect_set_scroll_sensitivity(&scroll_rect, 2.0)
+        .unwrap();
+    session
+        .yaml_ui_scroll_rect_add_on_value_changed_target_anchor(&scroll_rect, "114002", "OnScroll")
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_scroll_rect.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+
+    let scroll_rect = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "114001")
+        .expect("ScrollRect MonoBehaviour anchor");
+    let content = scroll_rect
+        .get("m_Content")
+        .and_then(|v| v.as_object())
+        .expect("m_Content object");
+    assert_eq!(content.get("fileID").and_then(|v| v.as_i64()), Some(200002));
+    let viewport = scroll_rect
+        .get("m_Viewport")
+        .and_then(|v| v.as_object())
+        .expect("m_Viewport object");
+    assert_eq!(
+        viewport.get("fileID").and_then(|v| v.as_i64()),
+        Some(200003)
+    );
+
+    assert_eq!(
+        scroll_rect.get("m_Horizontal").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+    assert_eq!(
+        scroll_rect.get("m_Vertical").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+    assert_eq!(
+        scroll_rect
+            .get("m_ScrollSensitivity")
+            .and_then(|v| v.as_f64()),
+        Some(2.0)
+    );
+
+    let pos = scroll_rect
+        .get("m_NormalizedPosition")
+        .and_then(|v| v.as_object())
+        .expect("m_NormalizedPosition object");
+    assert_eq!(pos.get("x").and_then(|v| v.as_f64()), Some(0.5));
+    assert_eq!(pos.get("y").and_then(|v| v.as_f64()), Some(0.25));
+    let vel = scroll_rect
+        .get("m_Velocity")
+        .and_then(|v| v.as_object())
+        .expect("m_Velocity object");
+    assert_eq!(vel.get("x").and_then(|v| v.as_f64()), Some(1.0));
+    assert_eq!(vel.get("y").and_then(|v| v.as_f64()), Some(-1.0));
+
+    let calls = scroll_rect
+        .get("m_OnValueChanged")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_PersistentCalls"))
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_Calls"))
+        .and_then(|v| v.as_array())
+        .expect("m_OnValueChanged.m_PersistentCalls.m_Calls array");
+    assert_eq!(calls.len(), 1);
+    let call = calls[0].as_object().expect("call is object");
+    assert_eq!(
+        call.get("m_MethodName").and_then(|v| v.as_str()),
+        Some("OnScroll")
+    );
+    let target = call
+        .get("m_Target")
+        .and_then(|v| v.as_object())
+        .expect("m_Target object");
+    let target_file_id = target.iter().find_map(|(k, v)| {
+        if k.eq_ignore_ascii_case("fileID") || k.eq_ignore_ascii_case("m_FileID") {
+            v.as_i64()
+                .or_else(|| v.as_f64().map(|f| f as i64))
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        } else {
+            None
+        }
+    });
+    assert_eq!(target_file_id, Some(114002), "target={:?}", target);
+}
