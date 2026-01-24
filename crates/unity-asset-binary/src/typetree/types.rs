@@ -18,6 +18,8 @@ pub struct TypeTreeNode {
     pub name: String,
     /// Size in bytes (-1 for variable size)
     pub byte_size: i32,
+    /// Variable count (legacy TypeTree format, version==2 only)
+    pub variable_count: i32,
     /// Index in the type tree
     pub index: i32,
     /// Type flags
@@ -45,6 +47,7 @@ impl TypeTreeNode {
             type_name: String::new(),
             name: String::new(),
             byte_size: 0,
+            variable_count: 0,
             index: 0,
             type_flags: 0,
             version: 0,

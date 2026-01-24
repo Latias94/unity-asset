@@ -73,12 +73,8 @@ fn dump_node_legacy(node: &TypeTreeNode, writer: &mut BinaryWriter, version: u32
     writer.write_string_to_null(&node.name);
     writer.write_i32(node.byte_size);
 
-    // NOTE: UnityPy has `m_VariableCount` for version==2, which we don't model. This repo mainly
-    // targets Unity 5+; if needed, add it to the TypeTreeNode struct and parser.
     if version == 2 {
-        return Err(UnityAssetError::format(
-            "TypeTree legacy dump for version==2 is not supported yet",
-        ));
+        writer.write_i32(node.variable_count);
     }
 
     if version != 3 {
@@ -109,5 +105,40 @@ fn flatten_preorder<'a>(node: &'a TypeTreeNode, out: &mut Vec<&'a TypeTreeNode>)
     out.push(node);
     for child in &node.children {
         flatten_preorder(child, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BinaryWriter, Endian};
+
+    #[test]
+    fn typetree_legacy_dump_v2_includes_variable_count() {
+        let mut root = TypeTreeNode::new();
+        root.type_name = "int".to_string();
+        root.name = "m_Value".to_string();
+        root.byte_size = 4;
+        root.variable_count = 123;
+        root.index = 0;
+        root.type_flags = 0;
+        root.version = 1;
+        root.meta_flags = 0;
+        root.level = 0;
+        root.children = Vec::new();
+
+        let mut tree = TypeTree::new();
+        tree.nodes = vec![root];
+
+        let mut writer = BinaryWriter::new(Endian::Big);
+        dump_typetree_legacy(&tree, &mut writer, 2).unwrap();
+        let out = writer.into_bytes();
+
+        // Layout follows UnityPy TypeTreeNode.dump:
+        // type\0, name\0, byte_size(i32), variable_count(i32), index(i32), ...
+        assert!(out.starts_with(b"int\0m_Value\0"));
+        let fixed = &out["int\0m_Value\0".len()..];
+        assert_eq!(&fixed[0..4], &4i32.to_be_bytes()); // byte_size
+        assert_eq!(&fixed[4..8], &123i32.to_be_bytes()); // variable_count
     }
 }

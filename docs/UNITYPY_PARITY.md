@@ -322,7 +322,7 @@ Acceptance:
   - [x] alignment (object stream + metadata alignment)
 - [x] Support “edited object bytes” overriding original slices (`SerializedFileEdits`)
 - [x] Support `version < 9` save (legacy metadata-at-end layout, with endian boolean prefix)
-- [ ] TODO: legacy TypeTree dump `SerializedType::write_type_tree` for `version == 2`
+- [x] Legacy TypeTree dump `SerializedType::write_type_tree` for `version == 2` (writes `m_VariableCount` best-effort)
 
 Acceptance:
 - A `.assets` produced by Rust can be loaded by:

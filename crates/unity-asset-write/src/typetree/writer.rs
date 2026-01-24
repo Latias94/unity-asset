@@ -431,6 +431,7 @@ mod tests {
             type_name: type_name.to_string(),
             name: name.to_string(),
             byte_size: -1,
+            variable_count: 0,
             index: 0,
             type_flags: 0,
             version: 0,
