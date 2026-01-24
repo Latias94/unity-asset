@@ -48,7 +48,7 @@ P1 (important, but not blocking most modern samples):
 
 P2 / future:
 - Bundle encryption save support (UnityPy explicitly has a TODO here too).
-- Broader typed helper coverage for UI/editor workflows (RectTransform/Canvas/Text/etc).
+- Broader typed helper coverage for UI/editor workflows (RectTransform/Canvas/Text/etc), including YAML prefab/scene editing ergonomics.
 
 ## High-Level Architecture (Rust Target)
 
@@ -136,10 +136,15 @@ UnityPy:
 
 Rust (current):
 - supports `TypeTreeRegistry` inputs (`.tpk` / JSON) for stripped TypeTrees
+- supports script-specific TypeTree lookup for MonoBehaviour-like script types via `script_id` (registry hook)
+  - JSON registry `schema: 2` supports `script_id` (32-hex) entries
+- supports a script TypeTree generator hook (UnityPy `typetree_generator` equivalent) via `Environment::set_script_type_tree_generator(...)`
 - does not yet generate MonoBehaviour nodes from script assemblies
 
 TODO (parity):
 - [ ] Provide a MonoBehaviour node generator hook (equivalent capability to UnityPy `typetree_generator`)
+  - [x] Hook point + cache exists (caller-provided generator, keyed by `script_id`)
+  - [ ] Provide a built-in generator implementation (managed/il2cpp) or a documented external workflow to feed the hook
 
 ### TypeTree read/write
 
@@ -374,7 +379,13 @@ Acceptance:
     - [x] TexEnv scale/offset (`m_SavedProperties.m_TexEnvs[*].m_Scale/m_Offset`) by name
     - [x] Floats/Colors/Ints (`m_SavedProperties.m_Floats/m_Colors/m_Ints`) by name
   - [x] VideoPlayer (`m_Url`, `m_VideoClip`)
+- [x] Add YAML prefab/scene editing helpers (UI-focused baseline):
+  - [x] Query YAML objects by `class_name` + dot-path + string value, returning `YamlObjectKey`
+  - [x] Resolve `GameObject.m_Component[*].component.fileID` to component anchors within the same YAML file
+  - [x] Find MonoBehaviour components by `m_Script.guid` (script GUID)
+  - [x] RectTransform setters (`m_AnchoredPosition`, `m_SizeDelta`)
 - [ ] TODO: expand typed helpers further (more classes + deeper editor semantics)
+  - [ ] YAML UI helpers: Canvas/CanvasScaler, Image/RawImage (sprite/texture refs), Text/TMP_Text, Button events, layout groups
 
 Acceptance:
 - [x] A bundle can be modified to point `m_StreamData` at a newly written cab and reloaded.
