@@ -157,15 +157,14 @@ impl BundleParser {
         reader: &mut BinaryReader,
         options: &BundleLoadOptions,
     ) -> Result<()> {
-        // Legacy bundles have a simpler structure
-        let header_size = bundle.header.header_size() as usize;
+        let legacy = bundle.header.legacy_web_raw.as_ref().ok_or_else(|| {
+            BinaryError::invalid_data("Legacy bundle header fields were not parsed")
+        })?;
 
-        // Skip to after header
-        reader.set_position(header_size as u64)?;
+        let header_size = legacy.header_size as usize;
+        let compressed_size = legacy.compressed_size;
+        let uncompressed_size = legacy.uncompressed_size;
 
-        // Read compression information
-        let compressed_size = reader.read_u32()?;
-        let uncompressed_size = reader.read_u32()?;
         if let Some(max_memory) = options.max_memory
             && (uncompressed_size as u64) > (max_memory as u64)
         {
@@ -175,13 +174,7 @@ impl BundleParser {
             )));
         }
 
-        // Skip some bytes based on version
-        let skip_bytes = if bundle.header.version >= 2 { 4 } else { 0 };
-        if skip_bytes > 0 {
-            reader.skip_bytes(skip_bytes)?;
-        }
-
-        // Move to the data section
+        // Seek to the (compressed) directory+file-content blob (UnityPy uses `reader.Position = headerSize`).
         reader.set_position(header_size as u64)?;
 
         // Read and decompress the directory data
@@ -214,8 +207,13 @@ impl BundleParser {
             compressed_data
         };
 
-        // Parse directory information from decompressed data
-        Self::parse_legacy_directory(bundle, &directory_data, header_size, options)?;
+        // Legacy bundles store directory entries + file content in the same blob.
+        // Make that blob the active data source so node offsets can be interpreted relative to it.
+        let directory_view = DataView::from_shared(SharedBytes::from_vec(directory_data));
+        bundle.set_legacy_source(directory_view.clone());
+
+        // Parse directory information from the uncompressed blob.
+        Self::parse_legacy_directory(bundle, directory_view.as_bytes(), 0, options)?;
 
         // Load assets if requested
         if options.load_assets {
@@ -515,8 +513,9 @@ impl BundleParser {
         header_size: usize,
         options: &BundleLoadOptions,
     ) -> Result<()> {
+        let _ = header_size; // legacy offsets are relative to the uncompressed blob
+
         let mut dir_reader = BinaryReader::new(directory_data, ByteOrder::Big);
-        dir_reader.set_position(header_size as u64)?; // Skip header in directory data
 
         // Read file count
         let file_count_i32 = dir_reader.read_i32()?;

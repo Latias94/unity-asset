@@ -342,7 +342,8 @@ TODO (parity):
   - [x] Packer compatibility:
   - [x] `"none"`, `"lz4"`, `"lzma"`, `"original"`, tuple form
 - [x] Directory info rebuild and file flags propagation
-- [ ] TODO: legacy bundle save (`UnityWeb` / `UnityRaw`)
+- [x] Legacy bundle parse (`UnityWeb` / `UnityRaw`) header + directory offsets (UnityPy `read_web_raw` parity)
+- [x] Legacy bundle save (`UnityWeb` / `UnityRaw`) (UnityPy only supports saving versions `<= 3`)
 
 Acceptance:
 - [x] A rebuilt bundle loads in this Rust parser (roundtrip test)

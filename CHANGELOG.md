@@ -43,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - GameObject: set name (`m_Name`/`name`) and active (`m_IsActive`).
   - Transform: set local position/rotation/scale.
   - RectTransform: set anchored position/size/anchors/pivot/offsets (best-effort).
+- Legacy bundle repacking (UnityPy parity):
+  - `BundleWriter` now supports saving `UnityWeb` / `UnityRaw` bundles (versions `<= 3`).
 - Directory-wide `.meta` GUID indexing (`Environment::index_meta_guids_in_directory`) for higher external resolution hit rates without loading every asset file.
 - `Environment::set_type_tree_registry_from_paths` to load `.tpk`/`.json` TypeTree registries (best-effort parsing for stripped assets).
 - External workflow to generate MonoBehaviour/script TypeTrees via UnityPy + TypeTreeGeneratorAPI:
@@ -75,6 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TypeTree writer: preserve rare unnamed child fields by copying their original byte slices during object rewrites.
 - TypeTree writer: normalize `PPtr<>` inputs (`m_FileID/m_PathID` vs `fileID/pathID`, `Null` -> zero pointer).
 - SerializedFile (legacy): parse and save `version < 9` layout by seeking metadata at end-of-file (endian boolean prefix) and emitting a compatible save layout.
+- BundleFile (legacy): parse `UnityWeb` / `UnityRaw` bundles using UnityPy `read_web_raw` header layout and directory offsets (fixes extraction/load semantics for UnityWeb).
 - More robust external reference resolution by canonicalizing filesystem paths when loading and indexing `.meta` GUIDs.
 - Preserve AssetBundle `m_Container` entries with null PPtr (`m_PathID=0`) as unresolved paths instead of dropping them.
 

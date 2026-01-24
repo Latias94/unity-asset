@@ -149,21 +149,32 @@ fn legacy_directory_respects_max_compressed_size() {
 
     let mut bytes: Vec<u8> = Vec::new();
     bytes.extend_from_slice(b"UnityRaw\0");
-    bytes.extend_from_slice(&be_u32(6));
+    bytes.extend_from_slice(&be_u32(3));
     bytes.extend_from_slice(b"2020.3.0f1\0");
     bytes.extend_from_slice(b"2020.3.0f1\0");
-    let size_offset = bytes.len();
-    bytes.extend_from_slice(&be_u32(0)); // placeholder for size
 
-    // Legacy directory header section
+    // Legacy header fields (UnityPy `read_web_raw` ordering, levelCount=1).
+    // We don't need to provide the directory blob itself: the limit is checked before reading bytes.
+    let header_start = bytes.len() as u32;
+    let mut header_size = header_start.saturating_add(24 + 4 + 4); // v3 includes completeFileSize + fileInfoHeaderSize
+    header_size = (header_size.saturating_add(3)) & !3;
+    let complete_file_size = header_size.saturating_add(compressed_size);
+
+    bytes.extend_from_slice(&be_u32(complete_file_size)); // minimumStreamedBytes
+    bytes.extend_from_slice(&be_u32(header_size)); // headerSize
+    bytes.extend_from_slice(&be_u32(1)); // numberOfLevelsToDownloadBeforeStreaming
+    bytes.extend_from_slice(&be_i32(1)); // levelCount
     bytes.extend_from_slice(&be_u32(compressed_size));
     bytes.extend_from_slice(&be_u32(uncompressed_size));
-    bytes.extend_from_slice(&be_u32(0)); // skip bytes for version >= 2
+    bytes.extend_from_slice(&be_u32(complete_file_size)); // completeFileSize
+    bytes.extend_from_slice(&be_u32(4)); // fileInfoHeaderSize (dummy)
 
-    let total_size = bytes.len() as u32;
-    bytes[size_offset..size_offset + 4].copy_from_slice(&be_u32(total_size));
+    while bytes.len() % 4 != 0 {
+        bytes.push(0);
+    }
 
     let options = BundleLoadOptions {
+        validate: false,
         max_legacy_directory_compressed_size: Some(16),
         ..Default::default()
     };

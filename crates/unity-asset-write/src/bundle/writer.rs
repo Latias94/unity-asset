@@ -8,6 +8,7 @@ use crate::bundle::BundleEdits;
 use crate::bundle::chunk::chunk_based_compress;
 use crate::{
     BinaryWriter, Endian, PackerOptions, UnityPyPacker, compress_lz4, compress_lzma_unity,
+    compress_lzma_unity_with_size,
 };
 
 pub struct BundleWriter;
@@ -23,6 +24,7 @@ impl BundleWriter {
     ) -> Result<Vec<u8>> {
         match bundle.header.signature.as_str() {
             "UnityFS" => Self::save_unityfs(bundle, edits, options),
+            "UnityWeb" | "UnityRaw" => Self::save_web_raw(bundle, edits),
             other => Err(UnityAssetError::format(format!(
                 "Bundle saving not implemented for signature: {}",
                 other
@@ -184,6 +186,179 @@ impl BundleWriter {
 
         Ok(writer.into_bytes())
     }
+
+    /// UnityWeb / UnityRaw (`BundleFile.save_web_raw`) implementation.
+    ///
+    /// UnityPy only supports saving versions `<= 3` for this format.
+    pub fn save_web_raw(bundle: &AssetBundle, edits: &BundleEdits) -> Result<Vec<u8>> {
+        let header = &bundle.header;
+        if header.version > 3 {
+            return Err(UnityAssetError::format(format!(
+                "Saving legacy bundles with version > 3 is not supported (got {})",
+                header.version
+            )));
+        }
+
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut existing_names: HashSet<&str> = HashSet::new();
+
+        for node in &bundle.nodes {
+            if !node.is_file() {
+                continue;
+            }
+
+            let bytes = if let Some(replaced) = edits.get(&node.name) {
+                replaced.to_vec()
+            } else {
+                bundle.extract_node_data(node).map_err(|e| {
+                    UnityAssetError::with_source(
+                        format!("Failed to extract legacy bundle node data: {}", node.name),
+                        e,
+                    )
+                })?
+            };
+
+            existing_names.insert(node.name.as_str());
+            files.push((node.name.clone(), bytes));
+        }
+
+        // Append new files that were not present in the original bundle.
+        let mut extra: Vec<(&str, &[u8])> = edits
+            .iter()
+            .filter(|(name, _)| !existing_names.contains(*name))
+            .collect();
+        extra.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (name, bytes) in extra {
+            files.push((name.to_string(), bytes.to_vec()));
+        }
+
+        // Calculate fileInfoHeaderSize so offsets can be precomputed (UnityPy `save_web_raw`).
+        let mut file_info_header_size: u32 = 4; // nodesCount
+        for (name, _) in &files {
+            file_info_header_size =
+                file_info_header_size.saturating_add(name.as_bytes().len() as u32 + 1);
+            file_info_header_size = file_info_header_size.saturating_add(4 * 2); // offset + size
+        }
+        file_info_header_size = align_u32(file_info_header_size, 4);
+
+        // Prepare directory info + file content.
+        let mut directory_info_writer = BinaryWriter::new(Endian::Big);
+        let file_count_i32 = i32::try_from(files.len()).map_err(|_| {
+            UnityAssetError::format(format!(
+                "Legacy bundle file count too large for i32: {}",
+                files.len()
+            ))
+        })?;
+        directory_info_writer.write_i32(file_count_i32);
+
+        let mut file_content_writer = BinaryWriter::new(Endian::Big);
+        let mut current_offset: u32 = file_info_header_size;
+        for (name, data) in &files {
+            directory_info_writer.write_string_to_null(name);
+            directory_info_writer.write_u32(current_offset);
+
+            let size_u32 = u32::try_from(data.len()).map_err(|_| {
+                UnityAssetError::format(format!(
+                    "Legacy bundle file '{}' too large for u32 size: {}",
+                    name,
+                    data.len()
+                ))
+            })?;
+            directory_info_writer.write_u32(size_u32);
+
+            file_content_writer.write(data);
+            current_offset = current_offset.checked_add(size_u32).ok_or_else(|| {
+                UnityAssetError::format("Legacy bundle file content offset overflow")
+            })?;
+        }
+
+        // Pad directory info header to `file_info_header_size` (4-byte alignment).
+        let dir_len_u64 = directory_info_writer.position();
+        let dir_len_u32 = u32::try_from(dir_len_u64).map_err(|_| {
+            UnityAssetError::format(format!(
+                "Legacy directory info too large for u32: {}",
+                dir_len_u64
+            ))
+        })?;
+        if dir_len_u32 > file_info_header_size {
+            return Err(UnityAssetError::format(format!(
+                "Legacy directory header exceeded computed file_info_header_size: {} > {}",
+                dir_len_u32, file_info_header_size
+            )));
+        }
+        directory_info_writer.write(&vec![0u8; (file_info_header_size - dir_len_u32) as usize]);
+
+        let mut uncompressed_content = Vec::new();
+        uncompressed_content.extend_from_slice(&directory_info_writer.into_bytes());
+        uncompressed_content.extend_from_slice(&file_content_writer.into_bytes());
+
+        let uncompressed_size_u32 = u32::try_from(uncompressed_content.len()).map_err(|_| {
+            UnityAssetError::format(format!(
+                "Legacy uncompressed content too large for u32: {}",
+                uncompressed_content.len()
+            ))
+        })?;
+
+        let compressed_content = if header.signature == "UnityWeb" {
+            compress_lzma_unity_with_size(&uncompressed_content)?
+        } else {
+            uncompressed_content
+        };
+
+        let compressed_size_u32 = u32::try_from(compressed_content.len()).map_err(|_| {
+            UnityAssetError::format(format!(
+                "Legacy compressed content too large for u32: {}",
+                compressed_content.len()
+            ))
+        })?;
+
+        // Write header.
+        let mut writer = BinaryWriter::new(Endian::Big);
+        writer.write_string_to_null(&header.signature);
+        writer.write_u32(header.version);
+        writer.write_string_to_null(&header.unity_version);
+        writer.write_string_to_null(&header.unity_revision);
+
+        // header_size = writer.Position + fixed fields (levelCount = 1).
+        // Matches UnityPy `save_web_raw` (version<=3).
+        let mut header_size_u32 = u32::try_from(writer.position())
+            .map_err(|_| UnityAssetError::format("Legacy header position does not fit in u32"))?;
+        header_size_u32 = header_size_u32.saturating_add(24);
+        if header.version >= 2 {
+            header_size_u32 = header_size_u32.saturating_add(4);
+        }
+        if header.version >= 3 {
+            header_size_u32 = header_size_u32.saturating_add(4);
+        }
+        if header.version >= 4 {
+            header_size_u32 = header_size_u32.saturating_add(20);
+        }
+        header_size_u32 = (header_size_u32.saturating_add(3)) & !3;
+
+        let complete_file_size = header_size_u32
+            .checked_add(compressed_size_u32)
+            .ok_or_else(|| UnityAssetError::format("Legacy complete file size overflow"))?;
+
+        writer.write_u32(complete_file_size); // minimumStreamedBytes (same as completeFileSize)
+        writer.write_u32(header_size_u32); // headerSize
+        writer.write_u32(1); // numberOfLevelsToDownloadBeforeStreaming
+        writer.write_i32(1); // levelCount
+
+        writer.write_u32(compressed_size_u32);
+        writer.write_u32(uncompressed_size_u32);
+
+        if header.version >= 2 {
+            writer.write_u32(complete_file_size);
+        }
+        if header.version >= 3 {
+            writer.write_u32(file_info_header_size);
+        }
+
+        writer.align_stream(4);
+        writer.write(&compressed_content);
+
+        Ok(writer.into_bytes())
+    }
 }
 
 fn resolve_unityfs_flags(
@@ -215,6 +390,18 @@ fn compress_unityfs_blob(data: &[u8], switch: u32) -> Result<Vec<u8>> {
             "Unsupported UnityFS blob compression switch: {}",
             other
         ))),
+    }
+}
+
+fn align_u32(v: u32, align: u32) -> u32 {
+    if align == 0 {
+        return v;
+    }
+    let rem = v % align;
+    if rem == 0 {
+        v
+    } else {
+        v.saturating_add(align - rem)
     }
 }
 

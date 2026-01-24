@@ -8,6 +8,33 @@ use crate::error::{BinaryError, Result};
 use crate::reader::BinaryReader;
 use serde::{Deserialize, Serialize};
 
+/// Parsed header fields for legacy Unity bundles (`UnityWeb` / `UnityRaw`).
+///
+/// UnityPy reference: `repo-ref/UnityPy/UnityPy/files/BundleFile.py::BundleFile.read_web_raw`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LegacyWebRawHeader {
+    /// Optional hash (version >= 4): 16 bytes.
+    pub hash: Option<Vec<u8>>,
+    /// Optional CRC (version >= 4).
+    pub crc: Option<u32>,
+
+    pub minimum_streamed_bytes: u32,
+    /// Absolute offset to the start of the (compressed) directory+file-content blob.
+    pub header_size: u32,
+    pub number_of_levels_to_download_before_streaming: u32,
+    pub level_count: i32,
+
+    /// Size of the (compressed) directory+file-content blob.
+    pub compressed_size: u32,
+    /// Size of the (uncompressed) directory+file-content blob.
+    pub uncompressed_size: u32,
+
+    /// Complete file size (version >= 2).
+    pub complete_file_size: Option<u32>,
+    /// Directory info header size (version >= 3).
+    pub file_info_header_size: Option<u32>,
+}
+
 /// AssetBundle header information
 ///
 /// Contains metadata about the bundle including version, compression settings,
@@ -32,6 +59,8 @@ pub struct BundleHeader {
     pub flags: u32,
     /// Actual header size (recorded during parsing)
     pub actual_header_size: u64,
+    /// Legacy header fields (`UnityWeb` / `UnityRaw`), if applicable.
+    pub legacy_web_raw: Option<LegacyWebRawHeader>,
 }
 
 impl BundleHeader {
@@ -55,6 +84,7 @@ impl BundleHeader {
             uncompressed_blocks_info_size: 0,
             flags: 0,
             actual_header_size: 0,
+            legacy_web_raw: None,
         };
 
         // Read additional fields based on bundle format
@@ -74,17 +104,67 @@ impl BundleHeader {
                 header.flags = reader.read_u32()?;
             }
             "UnityWeb" | "UnityRaw" => {
-                // Legacy formats
-                header.size = reader.read_u32()? as u64;
-                // Legacy formats don't have block info sizes or flags
+                // Legacy formats: parse header fields as UnityPy does in `read_web_raw`.
+                // Note: UnityPy reads the hash/crc when version >= 4, but its `save_web_raw`
+                // only supports version <= 3. We still parse newer headers for read parity.
+                let mut legacy = LegacyWebRawHeader::default();
+
+                if version >= 4 {
+                    let hash = reader.read_bytes(16)?;
+                    if hash.len() != 16 {
+                        return Err(BinaryError::invalid_data(format!(
+                            "Legacy bundle hash length mismatch: expected 16, got {}",
+                            hash.len()
+                        )));
+                    }
+                    legacy.hash = Some(hash);
+                    legacy.crc = Some(reader.read_u32()?);
+                }
+
+                legacy.minimum_streamed_bytes = reader.read_u32()?;
+                legacy.header_size = reader.read_u32()?;
+                legacy.number_of_levels_to_download_before_streaming = reader.read_u32()?;
+                legacy.level_count = reader.read_i32()?;
+
+                if legacy.level_count < 1 {
+                    return Err(BinaryError::invalid_data(format!(
+                        "Invalid legacy bundle levelCount: {}",
+                        legacy.level_count
+                    )));
+                }
+
+                // Skip all but the last level's size pairs.
+                if legacy.level_count > 1 {
+                    let skip = 8u64
+                        .checked_mul((legacy.level_count as u64).saturating_sub(1))
+                        .ok_or_else(|| {
+                            BinaryError::invalid_data("Legacy levelCount skip overflow")
+                        })?;
+                    reader.skip_bytes(skip as usize)?;
+                }
+
+                legacy.compressed_size = reader.read_u32()?;
+                legacy.uncompressed_size = reader.read_u32()?;
+
+                if version >= 2 {
+                    legacy.complete_file_size = Some(reader.read_u32()?);
+                }
+                if version >= 3 {
+                    legacy.file_info_header_size = Some(reader.read_u32()?);
+                }
+
+                header.size = legacy
+                    .complete_file_size
+                    .unwrap_or(legacy.minimum_streamed_bytes) as u64;
+
+                // Legacy formats don't have block info sizes or flags.
                 header.compressed_blocks_info_size = 0;
                 header.uncompressed_blocks_info_size = 0;
                 header.flags = 0;
 
-                // Skip padding byte for some legacy versions
-                if version < 6 {
-                    reader.read_u8()?;
-                }
+                // For legacy bundles, the "header size" we care about is the absolute offset to the data blob.
+                header.actual_header_size = legacy.header_size as u64;
+                header.legacy_web_raw = Some(legacy);
             }
             _ => {
                 return Err(BinaryError::unsupported(format!(
@@ -94,8 +174,11 @@ impl BundleHeader {
             }
         }
 
-        // Record the actual header size
-        header.actual_header_size = reader.position();
+        // Record the actual header size (for UnityFS we record the reader position;
+        // for legacy bundles this is already set to the `headerSize` field above).
+        if !header.is_legacy() {
+            header.actual_header_size = reader.position();
+        }
 
         Ok(header)
     }
