@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-01-22
+## [0.3.0] - Not Released
 
 ### Highlights
 - Better “UnityPy-style” discovery and export workflows:
@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Environment-wide unified object graph (`Environment::build_object_graph`) across YAML + binary sources (best-effort GUID/fileID resolution).
 - Directory-wide `.meta` GUID indexing (`Environment::index_meta_guids_in_directory`) for higher external resolution hit rates without loading every asset file.
 - `Environment::set_type_tree_registry_from_paths` to load `.tpk`/`.json` TypeTree registries (best-effort parsing for stripped assets).
+- External workflow to generate MonoBehaviour/script TypeTrees via UnityPy + TypeTreeGeneratorAPI:
+  - `scripts/export_unitypy_script_typetrees.py` exports a JSON TypeTree registry (`schema: 2`) keyed by `script_id` (Hash128).
+  - `docs/SCRIPT_TYPETREES.md` documents export + Rust-side loading.
+  - Opt-in E2E test wires the exporter into Rust parsing to validate stripped MonoBehaviour parsing.
 - `Environment::load_project` to scan a Unity project root with ignore support and fast binary sniffing (and without loading `.meta` documents by default).
 - Graph helpers for analysis and incremental rebuild:
   - `roots` / `leaves` / `cycles` helpers for quick inspection.

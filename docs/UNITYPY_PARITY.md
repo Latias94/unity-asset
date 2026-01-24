@@ -39,7 +39,9 @@ Future parity targets (post edit-pipeline):
 This is a quick “what’s left” index; the detailed checklist below remains the source of truth.
 
 P0 (blocks broad edit compatibility):
-- MonoBehaviour TypeTree generation (UnityPy `typetree_generator`-style capability) or an equivalent pluggable script-type registry.
+- MonoBehaviour/script TypeTrees for stripped files:
+  - supported via `script_id` registry lookup + external exporter workflow (`docs/SCRIPT_TYPETREES.md`)
+  - TODO: built-in generator implementation (managed/il2cpp) is still missing
 - Dependency resolution fallback (`Environment.find_file`-style simplified-name lookup) to resolve externals when paths are incomplete.
 
 P1 (important, but not blocking most modern samples):
@@ -144,7 +146,10 @@ Rust (current):
 TODO (parity):
 - [ ] Provide a MonoBehaviour node generator hook (equivalent capability to UnityPy `typetree_generator`)
   - [x] Hook point + cache exists (caller-provided generator, keyed by `script_id`)
-  - [ ] Provide a built-in generator implementation (managed/il2cpp) or a documented external workflow to feed the hook
+  - [x] Document an external workflow to feed the hook via a JSON registry (`schema: 2`)
+    - exporter: `scripts/export_unitypy_script_typetrees.py` (UnityPy + TypeTreeGeneratorAPI)
+    - docs: `docs/SCRIPT_TYPETREES.md`
+  - [ ] Provide a built-in generator implementation (managed/il2cpp) (future)
 
 ### TypeTree read/write
 

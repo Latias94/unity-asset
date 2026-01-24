@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use unity_asset_binary::asset::{ObjectInfo, SerializedFile};
 use unity_asset_binary::bundle::AssetBundle;
 use unity_asset_binary::reader::ByteOrder;
-use unity_asset_binary::typetree::TypeTree;
+use unity_asset_binary::typetree::{JsonTypeTreeRegistry, TypeTree, TypeTreeRegistry};
 use unity_asset_core::UnityValue;
 use unity_asset_write::bundle::{BundleEdits, BundleWriter};
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
@@ -62,6 +63,27 @@ fn unitypy_check(script: &str, args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn python_run(script_path: &Path, args: &[String]) -> anyhow::Result<()> {
+    let python = unitypy_python().ok_or_else(|| {
+        anyhow::anyhow!(
+            "UnityPy E2E is enabled, but no python was found. Set `UNITYPY_PYTHON`, or create a venv at `{}`.",
+            repo_root().join(".venv-unitypy").display()
+        )
+    })?;
+
+    let out = Command::new(python).arg(script_path).args(args).output()?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!(
+            "Python script failed (exit={:?}, script={}).\nstdout:\n{}\nstderr:\n{}",
+            out.status.code(),
+            script_path.display(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
 fn type_tree_for_object<'a>(file: &'a SerializedFile, info: &ObjectInfo) -> Option<&'a TypeTree> {
     if !file.enable_type_tree {
         return None;
@@ -76,6 +98,16 @@ fn type_tree_for_object<'a>(file: &'a SerializedFile, info: &ObjectInfo) -> Opti
         .iter()
         .find(|t| t.class_id == info.type_id)
         .map(|t| &t.type_tree)
+}
+
+fn serialized_type_for_object<'a>(
+    file: &'a SerializedFile,
+    info: &ObjectInfo,
+) -> Option<&'a unity_asset_binary::asset::SerializedType> {
+    if info.type_index >= 0 {
+        return file.types.get(info.type_index as usize);
+    }
+    file.types.iter().find(|t| t.class_id == info.type_id)
 }
 
 fn find_first_serialized_node(
@@ -398,6 +430,116 @@ assert o.peek_name() == expected_name, (o.peek_name(), expected_name)
             new_name,
         ],
     )?;
+
+    Ok(())
+}
+
+#[test]
+fn unitypy_script_typetree_registry_enables_monobehaviour_parse() -> anyhow::Result<()> {
+    if std::env::var("UNITYPY_SCRIPT_TYPETREE_E2E").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    let input = std::env::var("UNITYPY_SCRIPT_TYPETREE_INPUT").map(PathBuf::from)?;
+    let game_root = std::env::var("UNITYPY_SCRIPT_TYPETREE_GAME_ROOT")
+        .ok()
+        .map(PathBuf::from);
+    let managed_dir = std::env::var("UNITYPY_SCRIPT_TYPETREE_MANAGED_DIR")
+        .ok()
+        .map(PathBuf::from);
+
+    if game_root.is_some() == managed_dir.is_some() {
+        anyhow::bail!(
+            "Set exactly one of `UNITYPY_SCRIPT_TYPETREE_GAME_ROOT` or `UNITYPY_SCRIPT_TYPETREE_MANAGED_DIR`."
+        );
+    }
+
+    let tmp_registry = tempfile::NamedTempFile::new()?;
+    let exporter = repo_root()
+        .join("scripts")
+        .join("export_unitypy_script_typetrees.py");
+
+    let mut exporter_args: Vec<String> = Vec::new();
+    exporter_args.push("--input".to_string());
+    exporter_args.push(input.display().to_string());
+    exporter_args.push("--output".to_string());
+    exporter_args.push(tmp_registry.path().display().to_string());
+    if let Some(root) = game_root {
+        exporter_args.push("--game-root".to_string());
+        exporter_args.push(root.display().to_string());
+    }
+    if let Some(dir) = managed_dir {
+        exporter_args.push("--managed-dir".to_string());
+        exporter_args.push(dir.display().to_string());
+    }
+    exporter_args.push("--verbose".to_string());
+
+    python_run(&exporter, &exporter_args)?;
+
+    let registry = Arc::new(JsonTypeTreeRegistry::from_path(tmp_registry.path())?);
+    let registry: Arc<dyn TypeTreeRegistry> = registry;
+
+    let bytes = std::fs::read(&input)?;
+    let mut serialized = match unity_asset_binary::bundle::BundleParser::from_bytes(bytes.clone()) {
+        Ok(bundle) => {
+            let node = find_first_serialized_node(&bundle).ok_or_else(|| {
+                anyhow::anyhow!("No serialized node found in bundle: {}", input.display())
+            })?;
+            let node_bytes = bundle.extract_node_data(node)?;
+            unity_asset_binary::asset::SerializedFileParser::from_bytes(node_bytes)?
+        }
+        Err(_) => unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes)?,
+    };
+
+    let mut chosen: Option<usize> = None;
+    for (idx, info) in serialized.objects.iter().enumerate() {
+        if info.type_id != 114 {
+            continue;
+        }
+
+        let Some(st) = serialized_type_for_object(&serialized, info) else {
+            continue;
+        };
+        if st.script_id == [0u8; 16] {
+            continue;
+        }
+        if serialized.enable_type_tree && !st.type_tree.is_empty() {
+            continue;
+        }
+
+        chosen = Some(idx);
+        break;
+    }
+
+    let idx = chosen.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No stripped MonoBehaviour with non-zero script_id found in: {}",
+            input.display()
+        )
+    })?;
+
+    {
+        let info = &serialized.objects[idx];
+        let before = unity_asset_binary::object::ObjectHandle::new(&serialized, info).read()?;
+        assert!(
+            before.has_property("_raw_data_len"),
+            "Expected raw preview before attaching script TypeTree registry"
+        );
+    }
+
+    serialized.set_type_tree_registry(Some(registry));
+    {
+        let info = &serialized.objects[idx];
+        let after = unity_asset_binary::object::ObjectHandle::new(&serialized, info).read()?;
+        assert!(
+            !after.has_property("_raw_data_len"),
+            "Expected structured parse after attaching script TypeTree registry"
+        );
+        assert!(
+            after.has_property("m_Script"),
+            "Expected MonoBehaviour header field `m_Script` to exist after parse"
+        );
+    }
 
     Ok(())
 }
