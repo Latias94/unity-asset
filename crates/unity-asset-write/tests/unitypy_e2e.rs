@@ -11,7 +11,9 @@ use unity_asset_write::bundle::{BundleEdits, BundleWriter};
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
 use unity_asset_write::typetree::{TypeTreeWriteOptions, TypeTreeWriter};
 use unity_asset_write::webfile::{WebFileEdits, WebFilePacker, WebFileWriter};
-use unity_asset_write::{BinaryWriter, Endian, PackerOptions, UnityPyPacker};
+use unity_asset_write::{
+    BinaryWriter, Endian, PackerOptions, UnityPyPacker, compress_lzma_unity_with_size,
+};
 
 fn repo_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is `.../crates/unity-asset-write`.
@@ -165,6 +167,87 @@ fn build_uncompressed_webfile(entries: Vec<(String, Vec<u8>)>) -> Vec<u8> {
     out
 }
 
+fn build_minimal_legacy_bundle(
+    signature: &str,
+    file_name: &str,
+    file_bytes: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let version_player = "3.5.0f5";
+    let version_engine = "3.5.0f5";
+
+    let mut file_info_header_size: usize = 4; // nodesCount
+    file_info_header_size = file_info_header_size
+        .saturating_add(file_name.as_bytes().len().saturating_add(1))
+        .saturating_add(4 * 2);
+    file_info_header_size = (file_info_header_size.saturating_add(3)) & !3;
+
+    let mut directory_info_writer = BinaryWriter::new(Endian::Big);
+    directory_info_writer.write_i32(1);
+    directory_info_writer.write_string_to_null(file_name);
+    directory_info_writer.write_u32(u32::try_from(file_info_header_size)?);
+    directory_info_writer.write_u32(u32::try_from(file_bytes.len())?);
+
+    let dir_len = directory_info_writer.position();
+    if dir_len > file_info_header_size {
+        anyhow::bail!(
+            "computed file_info_header_size too small: {} > {}",
+            dir_len,
+            file_info_header_size
+        );
+    }
+    directory_info_writer.write(&vec![0u8; file_info_header_size - dir_len]);
+
+    let mut blob = directory_info_writer.into_bytes();
+    blob.extend_from_slice(file_bytes);
+
+    let uncompressed_size_u32 = u32::try_from(blob.len())?;
+
+    let (compressed_blob, compressed_size_u32) = if signature == "UnityWeb" {
+        let compressed = compress_lzma_unity_with_size(&blob)?;
+        let compressed_len = u32::try_from(compressed.len())?;
+        (compressed, compressed_len)
+    } else {
+        (blob, uncompressed_size_u32)
+    };
+
+    let mut writer = BinaryWriter::new(Endian::Big);
+    writer.write_string_to_null(signature);
+    writer.write_u32(3); // version
+    writer.write_string_to_null(version_player);
+    writer.write_string_to_null(version_engine);
+
+    // Matches UnityPy `BundleFile.save_web_raw` header size math (levelCount=1).
+    let mut header_size_u32 = u32::try_from(writer.position())?;
+    header_size_u32 = header_size_u32.saturating_add(24);
+    header_size_u32 = header_size_u32.saturating_add(4); // completeFileSize
+    header_size_u32 = header_size_u32.saturating_add(4); // fileInfoHeaderSize
+    header_size_u32 = (header_size_u32.saturating_add(3)) & !3;
+
+    let complete_file_size_u32 = header_size_u32
+        .checked_add(compressed_size_u32)
+        .ok_or_else(|| anyhow::anyhow!("legacy completeFileSize overflow"))?;
+
+    writer.write_u32(complete_file_size_u32); // minimumStreamedBytes
+    writer.write_u32(header_size_u32); // headerSize
+    writer.write_u32(1); // numberOfLevelsToDownloadBeforeStreaming
+    writer.write_i32(1); // levelCount
+    writer.write_u32(compressed_size_u32);
+    writer.write_u32(uncompressed_size_u32);
+    writer.write_u32(complete_file_size_u32); // completeFileSize
+    writer.write_u32(u32::try_from(file_info_header_size)?); // fileInfoHeaderSize
+
+    writer.align_stream(4);
+    anyhow::ensure!(
+        u32::try_from(writer.position())? == header_size_u32,
+        "legacy header size mismatch (pos={}, headerSize={})",
+        writer.position(),
+        header_size_u32
+    );
+
+    writer.write(&compressed_blob);
+    Ok(writer.into_bytes())
+}
+
 #[test]
 fn unitypy_can_load_saved_unityfs_bundle() -> anyhow::Result<()> {
     if std::env::var("UNITYPY_E2E").ok().as_deref() != Some("1") {
@@ -224,6 +307,102 @@ assert expected_name in files, expected_name
             tmp.path().display().to_string(),
             expected_count.to_string(),
             expected_name,
+        ],
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn unitypy_can_load_saved_legacy_unityraw_bundle() -> anyhow::Result<()> {
+    if std::env::var("UNITYPY_E2E").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    let input = build_minimal_legacy_bundle("UnityRaw", "test.txt", b"abc")?;
+    let bundle = unity_asset_binary::bundle::BundleParser::from_bytes(input)?;
+
+    let mut edits = BundleEdits::default();
+    edits.replace_file_bytes("test.txt", b"abcd".to_vec());
+    let saved = BundleWriter::save(&bundle, &edits, PackerOptions::default())?;
+
+    let tmp = tempfile::NamedTempFile::new()?;
+    std::fs::write(tmp.path(), &saved)?;
+
+    let py = r#"
+import os, sys
+repo_root = sys.argv[1]
+bundle_path = sys.argv[2]
+expected_sig = sys.argv[3]
+file_name = sys.argv[4]
+expected = sys.argv[5].encode("utf-8")
+sys.path.insert(0, os.path.join(repo_root, "repo-ref", "UnityPy"))
+import UnityPy  # noqa: E402
+
+env = UnityPy.load(bundle_path)
+f = env.file
+assert getattr(f, "signature", None) == expected_sig
+assert file_name in f.files
+got = f.files[file_name].bytes
+assert got == expected, (got, expected)
+"#;
+
+    unitypy_check(
+        py,
+        &[
+            repo_root().display().to_string(),
+            tmp.path().display().to_string(),
+            "UnityRaw".to_string(),
+            "test.txt".to_string(),
+            "abcd".to_string(),
+        ],
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn unitypy_can_load_saved_legacy_unityweb_bundle() -> anyhow::Result<()> {
+    if std::env::var("UNITYPY_E2E").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    let input = build_minimal_legacy_bundle("UnityWeb", "test.txt", b"abc")?;
+    let bundle = unity_asset_binary::bundle::BundleParser::from_bytes(input)?;
+
+    let mut edits = BundleEdits::default();
+    edits.replace_file_bytes("test.txt", b"abcd".to_vec());
+    let saved = BundleWriter::save(&bundle, &edits, PackerOptions::default())?;
+
+    let tmp = tempfile::NamedTempFile::new()?;
+    std::fs::write(tmp.path(), &saved)?;
+
+    let py = r#"
+import os, sys
+repo_root = sys.argv[1]
+bundle_path = sys.argv[2]
+expected_sig = sys.argv[3]
+file_name = sys.argv[4]
+expected = sys.argv[5].encode("utf-8")
+sys.path.insert(0, os.path.join(repo_root, "repo-ref", "UnityPy"))
+import UnityPy  # noqa: E402
+
+env = UnityPy.load(bundle_path)
+f = env.file
+assert getattr(f, "signature", None) == expected_sig
+assert file_name in f.files
+got = f.files[file_name].bytes
+assert got == expected, (got, expected)
+"#;
+
+    unitypy_check(
+        py,
+        &[
+            repo_root().display().to_string(),
+            tmp.path().display().to_string(),
+            "UnityWeb".to_string(),
+            "test.txt".to_string(),
+            "abcd".to_string(),
         ],
     )?;
 
