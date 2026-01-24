@@ -13,6 +13,31 @@ fn vec2_value(x: f64, y: f64) -> UnityValue {
     )
 }
 
+fn color_rgba_value(r: f64, g: f64, b: f64, a: f64) -> UnityValue {
+    UnityValue::Object(
+        [
+            ("r".to_string(), UnityValue::Float(r)),
+            ("g".to_string(), UnityValue::Float(g)),
+            ("b".to_string(), UnityValue::Float(b)),
+            ("a".to_string(), UnityValue::Float(a)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
+fn yaml_pptr_value(file_id: i64, guid_32_hex: Option<&str>, type_id: Option<i64>) -> UnityValue {
+    let mut entries: Vec<(String, UnityValue)> = Vec::new();
+    entries.push(("fileID".to_string(), UnityValue::Integer(file_id)));
+    if let Some(guid) = guid_32_hex {
+        entries.push(("guid".to_string(), UnityValue::String(guid.to_string())));
+    }
+    if let Some(type_id) = type_id {
+        entries.push(("type".to_string(), UnityValue::Integer(type_id)));
+    }
+    UnityValue::Object(entries.into_iter().collect())
+}
+
 fn read_gameobject_component_file_ids(game_object: &UnityClass) -> Vec<i64> {
     let Some(value) = super::pptr_path::get_value_at_path(game_object, "m_Component") else {
         return Vec::new();
@@ -67,6 +92,61 @@ impl<'a> EnvironmentEditSession<'a> {
         y: f64,
     ) -> Result<()> {
         self.set_yaml_value_at_key_path(key, field_path, vec2_value(x, y))
+    }
+
+    pub fn set_yaml_color_rgba_at_key_path(
+        &mut self,
+        key: &YamlObjectKey,
+        field_path: &str,
+        r: f64,
+        g: f64,
+        b: f64,
+        a: f64,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(key, field_path, color_rgba_value(r, g, b, a))
+    }
+
+    pub fn set_yaml_pptr_at_key_path(
+        &mut self,
+        key: &YamlObjectKey,
+        field_path: &str,
+        file_id: i64,
+        guid_32_hex: Option<&str>,
+        type_id: Option<i64>,
+    ) -> Result<()> {
+        let guid_32_hex = guid_32_hex.map(|s| s.trim().to_ascii_lowercase());
+        self.set_yaml_value_at_key_path(
+            key,
+            field_path,
+            yaml_pptr_value(file_id, guid_32_hex.as_deref(), type_id),
+        )
+    }
+
+    pub fn set_yaml_pptr_to_yaml_anchor_at_key_path(
+        &mut self,
+        key: &YamlObjectKey,
+        field_path: &str,
+        anchor: &str,
+    ) -> Result<()> {
+        let file_id = anchor.trim().parse::<i64>().map_err(|e| {
+            UnityAssetError::format(format!(
+                "Invalid YAML anchor fileID for PPtr: {:?} ({})",
+                anchor, e
+            ))
+        })?;
+        self.set_yaml_pptr_at_key_path(key, field_path, file_id, None, None)
+    }
+
+    pub fn yaml_gameobject_set_active(
+        &mut self,
+        game_object: &YamlObjectKey,
+        active: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            game_object,
+            "m_IsActive",
+            UnityValue::Integer(if active { 1 } else { 0 }),
+        )
     }
 
     pub fn find_yaml_gameobject_key_by_name(
@@ -201,5 +281,50 @@ impl<'a> EnvironmentEditSession<'a> {
         y: f64,
     ) -> Result<()> {
         self.set_yaml_vec2_at_key_path(rect_transform, "m_SizeDelta", x, y)
+    }
+
+    pub fn yaml_rect_transform_set_anchor_min(
+        &mut self,
+        rect_transform: &YamlObjectKey,
+        x: f64,
+        y: f64,
+    ) -> Result<()> {
+        self.set_yaml_vec2_at_key_path(rect_transform, "m_AnchorMin", x, y)
+    }
+
+    pub fn yaml_rect_transform_set_anchor_max(
+        &mut self,
+        rect_transform: &YamlObjectKey,
+        x: f64,
+        y: f64,
+    ) -> Result<()> {
+        self.set_yaml_vec2_at_key_path(rect_transform, "m_AnchorMax", x, y)
+    }
+
+    pub fn yaml_rect_transform_set_pivot(
+        &mut self,
+        rect_transform: &YamlObjectKey,
+        x: f64,
+        y: f64,
+    ) -> Result<()> {
+        self.set_yaml_vec2_at_key_path(rect_transform, "m_Pivot", x, y)
+    }
+
+    pub fn yaml_rect_transform_set_offset_min(
+        &mut self,
+        rect_transform: &YamlObjectKey,
+        x: f64,
+        y: f64,
+    ) -> Result<()> {
+        self.set_yaml_vec2_at_key_path(rect_transform, "m_OffsetMin", x, y)
+    }
+
+    pub fn yaml_rect_transform_set_offset_max(
+        &mut self,
+        rect_transform: &YamlObjectKey,
+        x: f64,
+        y: f64,
+    ) -> Result<()> {
+        self.set_yaml_vec2_at_key_path(rect_transform, "m_OffsetMax", x, y)
     }
 }

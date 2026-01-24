@@ -3482,3 +3482,176 @@ MonoBehaviour:
         .expect("MonoBehaviour anchor");
     assert_eq!(mono.get("m_Text").and_then(|v| v.as_str()), Some("World"));
 }
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_helpers_extended() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Root
+  m_IsActive: 0
+  m_Component:
+  - component: {fileID: 100001}
+  - component: {fileID: 100002}
+--- !u!224 &100001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+  m_AnchorMin: {x: 0, y: 0}
+  m_AnchorMax: {x: 1, y: 1}
+  m_AnchoredPosition: {x: 0, y: 0}
+  m_SizeDelta: {x: 0, y: 0}
+  m_Pivot: {x: 0.5, y: 0.5}
+  m_OffsetMin: {x: 0, y: 0}
+  m_OffsetMax: {x: 0, y: 0}
+--- !u!114 &100002
+MonoBehaviour:
+  m_GameObject: {fileID: 100000}
+  m_Script: {fileID: 11500000, guid: 0123456789abcdef0123456789abcdef, type: 3}
+  m_Color: {r: 1, g: 1, b: 1, a: 1}
+  m_Sprite: {fileID: 0}
+  m_Ref: {fileID: 0}
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Root")
+        .unwrap();
+    session.yaml_gameobject_set_active(&go, true).unwrap();
+
+    let rect = session
+        .find_yaml_component_key_by_class_name(&go, "RectTransform")
+        .unwrap();
+    session
+        .yaml_rect_transform_set_anchor_min(&rect, 0.2, 0.3)
+        .unwrap();
+    session
+        .yaml_rect_transform_set_anchor_max(&rect, 0.8, 0.9)
+        .unwrap();
+    session
+        .yaml_rect_transform_set_pivot(&rect, 0.1, 0.2)
+        .unwrap();
+    session
+        .yaml_rect_transform_set_offset_min(&rect, -1.0, -2.0)
+        .unwrap();
+    session
+        .yaml_rect_transform_set_offset_max(&rect, 3.0, 4.0)
+        .unwrap();
+
+    let mono = session
+        .find_yaml_monobehaviour_key_by_script_guid(&go, "0123456789abcdef0123456789abcdef")
+        .unwrap();
+    session
+        .set_yaml_color_rgba_at_key_path(&mono, "m_Color", 0.1, 0.2, 0.3, 0.4)
+        .unwrap();
+    session
+        .set_yaml_pptr_at_key_path(
+            &mono,
+            "m_Sprite",
+            21300000,
+            Some("fedcba9876543210fedcba9876543210"),
+            Some(3),
+        )
+        .unwrap();
+    session
+        .set_yaml_pptr_to_yaml_anchor_at_key_path(&mono, "m_Ref", "100001")
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+
+    let go = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "100000")
+        .expect("GameObject anchor");
+    assert_eq!(go.get("m_IsActive").and_then(|v| v.as_i64()), Some(1));
+
+    let rect = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "100001")
+        .expect("RectTransform anchor");
+    let anchor_min = rect
+        .get("m_AnchorMin")
+        .and_then(|v| v.as_object())
+        .expect("m_AnchorMin object");
+    assert_eq!(anchor_min.get("x").and_then(|v| v.as_f64()), Some(0.2));
+    assert_eq!(anchor_min.get("y").and_then(|v| v.as_f64()), Some(0.3));
+    let anchor_max = rect
+        .get("m_AnchorMax")
+        .and_then(|v| v.as_object())
+        .expect("m_AnchorMax object");
+    assert_eq!(anchor_max.get("x").and_then(|v| v.as_f64()), Some(0.8));
+    assert_eq!(anchor_max.get("y").and_then(|v| v.as_f64()), Some(0.9));
+    let pivot = rect
+        .get("m_Pivot")
+        .and_then(|v| v.as_object())
+        .expect("m_Pivot object");
+    assert_eq!(pivot.get("x").and_then(|v| v.as_f64()), Some(0.1));
+    assert_eq!(pivot.get("y").and_then(|v| v.as_f64()), Some(0.2));
+    let offset_min = rect
+        .get("m_OffsetMin")
+        .and_then(|v| v.as_object())
+        .expect("m_OffsetMin object");
+    assert_eq!(offset_min.get("x").and_then(|v| v.as_f64()), Some(-1.0));
+    assert_eq!(offset_min.get("y").and_then(|v| v.as_f64()), Some(-2.0));
+    let offset_max = rect
+        .get("m_OffsetMax")
+        .and_then(|v| v.as_object())
+        .expect("m_OffsetMax object");
+    assert_eq!(offset_max.get("x").and_then(|v| v.as_f64()), Some(3.0));
+    assert_eq!(offset_max.get("y").and_then(|v| v.as_f64()), Some(4.0));
+
+    let mono = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "100002")
+        .expect("MonoBehaviour anchor");
+    let color = mono
+        .get("m_Color")
+        .and_then(|v| v.as_object())
+        .expect("m_Color object");
+    assert_eq!(color.get("r").and_then(|v| v.as_f64()), Some(0.1));
+    assert_eq!(color.get("g").and_then(|v| v.as_f64()), Some(0.2));
+    assert_eq!(color.get("b").and_then(|v| v.as_f64()), Some(0.3));
+    assert_eq!(color.get("a").and_then(|v| v.as_f64()), Some(0.4));
+
+    let sprite = mono
+        .get("m_Sprite")
+        .and_then(|v| v.as_object())
+        .expect("m_Sprite object");
+    assert_eq!(
+        sprite.get("fileID").and_then(|v| v.as_i64()),
+        Some(21300000)
+    );
+    assert_eq!(
+        sprite.get("guid").and_then(|v| v.as_str()),
+        Some("fedcba9876543210fedcba9876543210")
+    );
+    assert_eq!(sprite.get("type").and_then(|v| v.as_i64()), Some(3));
+
+    let r = mono
+        .get("m_Ref")
+        .and_then(|v| v.as_object())
+        .expect("m_Ref object");
+    assert_eq!(r.get("fileID").and_then(|v| v.as_i64()), Some(100001));
+}
