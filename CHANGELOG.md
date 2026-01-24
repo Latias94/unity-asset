@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Glob matching for AssetBundle `m_Container` discovery (`*`, `?`) and CLI support for glob patterns.
-- `unity-asset-cli stats` to print parsing stats (SerializedFile version/unity/version counts) for loaded sources.
+- `unity-asset-cli stats` to print parsing stats (bundle signature + SerializedFile version/unity/metadata counts) for loaded sources, with an optional `--summary` aggregation mode.
 - Dependency graph extraction for SerializedFiles (TypeTree + PPtr scan) in `MetadataExtractor`.
 - Environment-wide dependency graph builder (best-effort external resolution via `.meta` GUID cache and bundle name heuristics).
 - Environment-wide unified object graph (`Environment::build_object_graph`) across YAML + binary sources (best-effort GUID/fileID resolution).
@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - LayoutElement: set sizes + ignoreLayout + layout priority.
   - ToggleGroup: set allowSwitchOff.
   - Scrollbar: set value/size/steps/interactable and append persistent `onValueChanged` calls.
+- Additional binary typed helpers (UnityPy-like ergonomics):
+  - GameObject: set name (`m_Name`/`name`) and active (`m_IsActive`).
+  - Transform: set local position/rotation/scale.
+  - RectTransform: set anchored position/size/anchors/pivot/offsets (best-effort).
 - Directory-wide `.meta` GUID indexing (`Environment::index_meta_guids_in_directory`) for higher external resolution hit rates without loading every asset file.
 - `Environment::set_type_tree_registry_from_paths` to load `.tpk`/`.json` TypeTree registries (best-effort parsing for stripped assets).
 - External workflow to generate MonoBehaviour/script TypeTrees via UnityPy + TypeTreeGeneratorAPI:

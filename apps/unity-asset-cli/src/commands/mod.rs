@@ -129,8 +129,9 @@ pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
             input,
             kind,
             limit,
+            summary,
             json,
-        } => stats::run(&input, kind.as_str(), &limit, &json, ctx),
+        } => stats::run(&input, kind.as_str(), &limit, &summary, &json, ctx),
         Commands::FindObject {
             input,
             pattern,

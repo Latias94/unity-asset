@@ -51,6 +51,18 @@ P2 / future:
 - Bundle encryption save support (UnityPy explicitly has a TODO here too).
 - Broader typed helper coverage for UI/editor workflows (RectTransform/Canvas/Text/etc), including YAML prefab/scene editing ergonomics.
 
+## Finding Legacy Samples (v<9 / UnityWeb / UnityRaw)
+
+Some remaining parity items require a validation corpus (otherwise we risk implementing the wrong layout).
+
+Use the CLI to quickly identify bundle signatures and embedded SerializedFile versions:
+
+```
+cargo run -p unity-asset-cli --bin unity-asset -- stats --input <path-or-dir> --kind all --limit 50
+# or aggregated counts:
+cargo run -p unity-asset-cli --bin unity-asset -- stats --input <path-or-dir> --kind all --summary
+```
+
 ## High-Level Architecture (Rust Target)
 
 To avoid destabilizing the existing parser crates, the write/edit pipeline should live in a **dedicated crate** and integrate into higher-level APIs:

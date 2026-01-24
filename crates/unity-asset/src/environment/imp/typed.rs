@@ -31,6 +31,42 @@ fn clear_mesh_vertex_data_fields(vertex_data: &mut UnityValue) {
     }
 }
 
+fn vec2_value(x: f64, y: f64) -> UnityValue {
+    UnityValue::Object(
+        [
+            ("x".to_string(), UnityValue::Float(x)),
+            ("y".to_string(), UnityValue::Float(y)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
+fn vec3_value(x: f64, y: f64, z: f64) -> UnityValue {
+    UnityValue::Object(
+        [
+            ("x".to_string(), UnityValue::Float(x)),
+            ("y".to_string(), UnityValue::Float(y)),
+            ("z".to_string(), UnityValue::Float(z)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
+fn quat_value(x: f64, y: f64, z: f64, w: f64) -> UnityValue {
+    UnityValue::Object(
+        [
+            ("x".to_string(), UnityValue::Float(x)),
+            ("y".to_string(), UnityValue::Float(y)),
+            ("z".to_string(), UnityValue::Float(z)),
+            ("w".to_string(), UnityValue::Float(w)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
 fn ensure_pptr_field(class: &mut UnityClass, field_name: &str) {
     ensure_object_field(class, field_name);
     match class.get_mut(field_name) {
@@ -423,6 +459,121 @@ pub(crate) fn apply_mesh_filter_mesh_pptr(class: &mut UnityClass, file_id: i32, 
     apply_pptr_field(class, "m_Mesh", file_id, path_id);
 }
 
+pub(crate) fn apply_game_object_name(class: &mut UnityClass, name: &str) -> Result<()> {
+    // Unity uses `m_Name` for GameObjects; some custom TypeTrees may expose `name`.
+    let key = if class.get("m_Name").is_some() {
+        "m_Name"
+    } else if class.get("name").is_some() {
+        "name"
+    } else {
+        "m_Name"
+    };
+    class.set(key.to_string(), UnityValue::String(name.to_string()));
+    Ok(())
+}
+
+pub(crate) fn apply_game_object_active(class: &mut UnityClass, active: bool) -> Result<()> {
+    let key = if class.get("m_IsActive").is_some() {
+        "m_IsActive"
+    } else if class.get("m_isActive").is_some() {
+        "m_isActive"
+    } else {
+        "m_IsActive"
+    };
+    class.set(key.to_string(), UnityValue::Bool(active));
+    Ok(())
+}
+
+pub(crate) fn apply_transform_local_position(
+    class: &mut UnityClass,
+    position: (f64, f64, f64),
+) -> Result<()> {
+    class.set(
+        "m_LocalPosition".to_string(),
+        vec3_value(position.0, position.1, position.2),
+    );
+    Ok(())
+}
+
+pub(crate) fn apply_transform_local_rotation(
+    class: &mut UnityClass,
+    rotation: (f64, f64, f64, f64),
+) -> Result<()> {
+    class.set(
+        "m_LocalRotation".to_string(),
+        quat_value(rotation.0, rotation.1, rotation.2, rotation.3),
+    );
+    Ok(())
+}
+
+pub(crate) fn apply_transform_local_scale(
+    class: &mut UnityClass,
+    scale: (f64, f64, f64),
+) -> Result<()> {
+    class.set(
+        "m_LocalScale".to_string(),
+        vec3_value(scale.0, scale.1, scale.2),
+    );
+    Ok(())
+}
+
+pub(crate) fn apply_rect_transform_anchored_position(
+    class: &mut UnityClass,
+    position: (f64, f64),
+) -> Result<()> {
+    // Some layouts use `m_AnchoredPosition3D`; prefer the 2D field when present.
+    if class.get("m_AnchoredPosition").is_some() {
+        class.set(
+            "m_AnchoredPosition".to_string(),
+            vec2_value(position.0, position.1),
+        );
+    } else if class.get("m_AnchoredPosition3D").is_some() {
+        class.set(
+            "m_AnchoredPosition3D".to_string(),
+            vec3_value(position.0, position.1, 0.0),
+        );
+    } else {
+        class.set(
+            "m_AnchoredPosition".to_string(),
+            vec2_value(position.0, position.1),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_rect_transform_size_delta(
+    class: &mut UnityClass,
+    size: (f64, f64),
+) -> Result<()> {
+    class.set("m_SizeDelta".to_string(), vec2_value(size.0, size.1));
+    Ok(())
+}
+
+pub(crate) fn apply_rect_transform_anchor_min(class: &mut UnityClass, v: (f64, f64)) -> Result<()> {
+    class.set("m_AnchorMin".to_string(), vec2_value(v.0, v.1));
+    Ok(())
+}
+
+pub(crate) fn apply_rect_transform_anchor_max(class: &mut UnityClass, v: (f64, f64)) -> Result<()> {
+    class.set("m_AnchorMax".to_string(), vec2_value(v.0, v.1));
+    Ok(())
+}
+
+pub(crate) fn apply_rect_transform_pivot(class: &mut UnityClass, v: (f64, f64)) -> Result<()> {
+    class.set("m_Pivot".to_string(), vec2_value(v.0, v.1));
+    Ok(())
+}
+
+pub(crate) fn apply_rect_transform_offset_min(class: &mut UnityClass, v: (f64, f64)) -> Result<()> {
+    class.set("m_OffsetMin".to_string(), vec2_value(v.0, v.1));
+    Ok(())
+}
+
+pub(crate) fn apply_rect_transform_offset_max(class: &mut UnityClass, v: (f64, f64)) -> Result<()> {
+    class.set("m_OffsetMax".to_string(), vec2_value(v.0, v.1));
+    Ok(())
+}
+
 pub(crate) fn apply_renderer_materials(
     class: &mut UnityClass,
     materials: &[(i32, i64)],
@@ -732,5 +883,91 @@ impl<'a> EnvironmentEditSession<'a> {
         self.edit_binary_object_key(material_key, |class| {
             apply_material_set_color(class, property_name, rgba)
         })
+    }
+
+    pub fn set_game_object_name(&mut self, key: &BinaryObjectKey, name: &str) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_game_object_name(class, name))
+    }
+
+    pub fn set_game_object_active(&mut self, key: &BinaryObjectKey, active: bool) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_game_object_active(class, active))
+    }
+
+    pub fn set_transform_local_position(
+        &mut self,
+        key: &BinaryObjectKey,
+        position: (f64, f64, f64),
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_transform_local_position(class, position))
+    }
+
+    pub fn set_transform_local_rotation(
+        &mut self,
+        key: &BinaryObjectKey,
+        rotation: (f64, f64, f64, f64),
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_transform_local_rotation(class, rotation))
+    }
+
+    pub fn set_transform_local_scale(
+        &mut self,
+        key: &BinaryObjectKey,
+        scale: (f64, f64, f64),
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_transform_local_scale(class, scale))
+    }
+
+    pub fn set_rect_transform_anchored_position(
+        &mut self,
+        key: &BinaryObjectKey,
+        position: (f64, f64),
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| {
+            apply_rect_transform_anchored_position(class, position)
+        })
+    }
+
+    pub fn set_rect_transform_size_delta(
+        &mut self,
+        key: &BinaryObjectKey,
+        size: (f64, f64),
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_rect_transform_size_delta(class, size))
+    }
+
+    pub fn set_rect_transform_anchor_min(
+        &mut self,
+        key: &BinaryObjectKey,
+        v: (f64, f64),
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_rect_transform_anchor_min(class, v))
+    }
+
+    pub fn set_rect_transform_anchor_max(
+        &mut self,
+        key: &BinaryObjectKey,
+        v: (f64, f64),
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_rect_transform_anchor_max(class, v))
+    }
+
+    pub fn set_rect_transform_pivot(&mut self, key: &BinaryObjectKey, v: (f64, f64)) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_rect_transform_pivot(class, v))
+    }
+
+    pub fn set_rect_transform_offset_min(
+        &mut self,
+        key: &BinaryObjectKey,
+        v: (f64, f64),
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_rect_transform_offset_min(class, v))
+    }
+
+    pub fn set_rect_transform_offset_max(
+        &mut self,
+        key: &BinaryObjectKey,
+        v: (f64, f64),
+    ) -> Result<()> {
+        self.edit_binary_object_key(key, |class| apply_rect_transform_offset_max(class, v))
     }
 }

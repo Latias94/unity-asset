@@ -2149,6 +2149,78 @@ fn typed_mesh_filter_helper_updates_mesh_pptr() {
 }
 
 #[test]
+fn typed_game_object_helpers_update_name_and_active() {
+    let mut class = UnityClass::new(0, "GameObject".to_string(), "0".to_string());
+    class.set("m_Name".to_string(), UnityValue::String("old".to_string()));
+    class.set("m_IsActive".to_string(), UnityValue::Bool(false));
+
+    super::typed::apply_game_object_name(&mut class, "new").unwrap();
+    super::typed::apply_game_object_active(&mut class, true).unwrap();
+
+    assert_eq!(class.get("m_Name").and_then(|v| v.as_str()), Some("new"));
+    assert_eq!(
+        class.get("m_IsActive").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
+fn typed_transform_helpers_update_local_transform() {
+    let mut class = UnityClass::new(0, "Transform".to_string(), "0".to_string());
+
+    super::typed::apply_transform_local_position(&mut class, (1.0, 2.0, 3.0)).unwrap();
+    super::typed::apply_transform_local_rotation(&mut class, (0.0, 0.25, 0.5, 1.0)).unwrap();
+    super::typed::apply_transform_local_scale(&mut class, (4.0, 5.0, 6.0)).unwrap();
+
+    let UnityValue::Object(pos) = class.get("m_LocalPosition").unwrap() else {
+        panic!("m_LocalPosition should be an object");
+    };
+    assert_eq!(pos.get("x").and_then(|v| v.as_f64()), Some(1.0));
+    assert_eq!(pos.get("y").and_then(|v| v.as_f64()), Some(2.0));
+    assert_eq!(pos.get("z").and_then(|v| v.as_f64()), Some(3.0));
+
+    let UnityValue::Object(rot) = class.get("m_LocalRotation").unwrap() else {
+        panic!("m_LocalRotation should be an object");
+    };
+    assert_eq!(rot.get("x").and_then(|v| v.as_f64()), Some(0.0));
+    assert_eq!(rot.get("y").and_then(|v| v.as_f64()), Some(0.25));
+    assert_eq!(rot.get("z").and_then(|v| v.as_f64()), Some(0.5));
+    assert_eq!(rot.get("w").and_then(|v| v.as_f64()), Some(1.0));
+
+    let UnityValue::Object(scale) = class.get("m_LocalScale").unwrap() else {
+        panic!("m_LocalScale should be an object");
+    };
+    assert_eq!(scale.get("x").and_then(|v| v.as_f64()), Some(4.0));
+    assert_eq!(scale.get("y").and_then(|v| v.as_f64()), Some(5.0));
+    assert_eq!(scale.get("z").and_then(|v| v.as_f64()), Some(6.0));
+}
+
+#[test]
+fn typed_rect_transform_helpers_update_ui_fields() {
+    let mut class = UnityClass::new(0, "RectTransform".to_string(), "0".to_string());
+
+    super::typed::apply_rect_transform_anchored_position(&mut class, (10.0, 20.0)).unwrap();
+    super::typed::apply_rect_transform_size_delta(&mut class, (100.0, 200.0)).unwrap();
+    super::typed::apply_rect_transform_anchor_min(&mut class, (0.25, 0.5)).unwrap();
+    super::typed::apply_rect_transform_anchor_max(&mut class, (0.75, 1.0)).unwrap();
+    super::typed::apply_rect_transform_pivot(&mut class, (0.5, 0.5)).unwrap();
+    super::typed::apply_rect_transform_offset_min(&mut class, (-1.0, -2.0)).unwrap();
+    super::typed::apply_rect_transform_offset_max(&mut class, (3.0, 4.0)).unwrap();
+
+    let UnityValue::Object(v) = class.get("m_AnchoredPosition").unwrap() else {
+        panic!("m_AnchoredPosition should be an object");
+    };
+    assert_eq!(v.get("x").and_then(|v| v.as_f64()), Some(10.0));
+    assert_eq!(v.get("y").and_then(|v| v.as_f64()), Some(20.0));
+
+    let UnityValue::Object(v) = class.get("m_SizeDelta").unwrap() else {
+        panic!("m_SizeDelta should be an object");
+    };
+    assert_eq!(v.get("x").and_then(|v| v.as_f64()), Some(100.0));
+    assert_eq!(v.get("y").and_then(|v| v.as_f64()), Some(200.0));
+}
+
+#[test]
 fn environment_resolve_pptr_path_key_resolves_sprite_texture() {
     let mut env = Environment::new();
     let path = canonicalize_path(

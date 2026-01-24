@@ -256,9 +256,13 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "all")]
         kind: String,
 
-        /// Limit printed entries
+        /// Limit scanned/printed entries
         #[arg(long)]
         limit: Option<usize>,
+
+        /// Print aggregated counts instead of per-source records
+        #[arg(long)]
+        summary: bool,
 
         /// Print one JSON object per line
         #[arg(long)]
