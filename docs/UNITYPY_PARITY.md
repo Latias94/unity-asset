@@ -395,13 +395,15 @@ Acceptance:
   - [x] Generic YAML setters for common UI fields:
     - [x] PPtr-like refs (`{fileID,guid,type}`) and internal anchor refs
     - [x] Color (`{r,g,b,a}`) and GameObject active (`m_IsActive`)
-- [ ] TODO: expand typed helpers further (more classes + deeper editor semantics)
+  - [ ] TODO: expand typed helpers further (more classes + deeper editor semantics)
   - [ ] YAML UI helpers:
     - [x] Image/RawImage: sprite/texture refs, color, raycast target
     - [x] Text/TMP_Text: text, color, font size (best-effort)
     - [x] Button: interactable + persistent onClick calls (best-effort)
     - [x] Canvas/CanvasScaler (best-effort)
     - [x] Layout groups (best-effort)
+    - [x] Toggle: isOn, interactable, persistent onValueChanged calls (best-effort)
+    - [x] Slider: value, min/max, wholeNumbers, interactable, persistent onValueChanged calls (best-effort)
 
 Acceptance:
 - [x] A bundle can be modified to point `m_StreamData` at a newly written cab and reloaded.

@@ -4451,3 +4451,259 @@ MonoBehaviour:
         Some(0)
     );
 }
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_toggle_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_toggle.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Toggle
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 114001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!114 &114001
+MonoBehaviour:
+  m_GameObject: {fileID: 100000}
+  m_Interactable: 1
+  m_IsOn: 0
+  m_OnValueChanged:
+    m_PersistentCalls:
+      m_Calls: []
+--- !u!1 &100001
+GameObject:
+  m_Name: Target
+  m_Component:
+  - component: {fileID: 200002}
+  - component: {fileID: 114002}
+--- !u!4 &200002
+Transform:
+  m_GameObject: {fileID: 100001}
+  m_Father: {fileID: 0}
+  m_Children: []
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+--- !u!114 &114002
+MonoBehaviour:
+  m_GameObject: {fileID: 100001}
+  m_Enabled: 1
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let toggle_go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Toggle")
+        .unwrap();
+    let toggle = session.find_yaml_toggle_key(&toggle_go).unwrap();
+
+    session
+        .yaml_ui_toggle_set_interactable(&toggle, false)
+        .unwrap();
+    session.yaml_ui_toggle_set_is_on(&toggle, true).unwrap();
+    session
+        .yaml_ui_toggle_add_on_value_changed_target_anchor(&toggle, "114002", "OnToggle")
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_toggle.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+
+    let toggle = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "114001")
+        .expect("Toggle MonoBehaviour anchor");
+    assert_eq!(
+        toggle.get("m_Interactable").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+    assert_eq!(toggle.get("m_IsOn").and_then(|v| v.as_i64()), Some(1));
+
+    let calls = toggle
+        .get("m_OnValueChanged")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_PersistentCalls"))
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_Calls"))
+        .and_then(|v| v.as_array())
+        .expect("m_OnValueChanged.m_PersistentCalls.m_Calls array");
+    assert_eq!(calls.len(), 1);
+    let call = calls[0].as_object().expect("call is object");
+    assert_eq!(
+        call.get("m_MethodName").and_then(|v| v.as_str()),
+        Some("OnToggle")
+    );
+    let target = call
+        .get("m_Target")
+        .and_then(|v| v.as_object())
+        .expect("m_Target object");
+    let target_file_id = target.iter().find_map(|(k, v)| {
+        if k.eq_ignore_ascii_case("fileID") || k.eq_ignore_ascii_case("m_FileID") {
+            v.as_i64()
+                .or_else(|| v.as_f64().map(|f| f as i64))
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        } else {
+            None
+        }
+    });
+    assert_eq!(target_file_id, Some(114002), "target={:?}", target);
+}
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_slider_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_slider.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Slider
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 114001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!114 &114001
+MonoBehaviour:
+  m_GameObject: {fileID: 100000}
+  m_Interactable: 1
+  m_Value: 0
+  m_MinValue: 0
+  m_MaxValue: 1
+  m_WholeNumbers: 0
+  m_OnValueChanged:
+    m_PersistentCalls:
+      m_Calls: []
+--- !u!1 &100001
+GameObject:
+  m_Name: Target
+  m_Component:
+  - component: {fileID: 200002}
+  - component: {fileID: 114002}
+--- !u!4 &200002
+Transform:
+  m_GameObject: {fileID: 100001}
+  m_Father: {fileID: 0}
+  m_Children: []
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+--- !u!114 &114002
+MonoBehaviour:
+  m_GameObject: {fileID: 100001}
+  m_Enabled: 1
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let slider_go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Slider")
+        .unwrap();
+    let slider = session.find_yaml_slider_key(&slider_go).unwrap();
+
+    session
+        .yaml_ui_slider_set_min_max(&slider, -1.0, 3.0)
+        .unwrap();
+    session.yaml_ui_slider_set_value(&slider, 2.5).unwrap();
+    session
+        .yaml_ui_slider_set_whole_numbers(&slider, true)
+        .unwrap();
+    session
+        .yaml_ui_slider_set_interactable(&slider, false)
+        .unwrap();
+    session
+        .yaml_ui_slider_add_on_value_changed_target_anchor(&slider, "114002", "OnSlider")
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_slider.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+
+    let slider = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "114001")
+        .expect("Slider MonoBehaviour anchor");
+
+    assert_eq!(
+        slider.get("m_Interactable").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+    assert_eq!(
+        slider.get("m_WholeNumbers").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+
+    let read_f64 = |v: &unity_asset_core::UnityValue| {
+        v.as_f64()
+            .or_else(|| v.as_i64().map(|i| i as f64))
+            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+    };
+    assert_eq!(slider.get("m_MinValue").and_then(read_f64), Some(-1.0));
+    assert_eq!(slider.get("m_MaxValue").and_then(read_f64), Some(3.0));
+    assert_eq!(slider.get("m_Value").and_then(read_f64), Some(2.5));
+
+    let calls = slider
+        .get("m_OnValueChanged")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_PersistentCalls"))
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_Calls"))
+        .and_then(|v| v.as_array())
+        .expect("m_OnValueChanged.m_PersistentCalls.m_Calls array");
+    assert_eq!(calls.len(), 1);
+    let call = calls[0].as_object().expect("call is object");
+    assert_eq!(
+        call.get("m_MethodName").and_then(|v| v.as_str()),
+        Some("OnSlider")
+    );
+    let target = call
+        .get("m_Target")
+        .and_then(|v| v.as_object())
+        .expect("m_Target object");
+    let target_file_id = target.iter().find_map(|(k, v)| {
+        if k.eq_ignore_ascii_case("fileID") || k.eq_ignore_ascii_case("m_FileID") {
+            v.as_i64()
+                .or_else(|| v.as_f64().map(|f| f as i64))
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        } else {
+            None
+        }
+    });
+    assert_eq!(target_file_id, Some(114002), "target={:?}", target);
+}

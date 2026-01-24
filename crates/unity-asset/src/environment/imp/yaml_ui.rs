@@ -1051,6 +1051,282 @@ impl<'a> EnvironmentEditSession<'a> {
         )
     }
 
+    pub fn find_yaml_toggle_key(&mut self, game_object: &YamlObjectKey) -> Result<YamlObjectKey> {
+        self.find_yaml_monobehaviour_key_by_required_fields(
+            game_object,
+            &["m_IsOn", "m_Interactable", "m_OnValueChanged"],
+        )
+    }
+
+    pub fn yaml_ui_toggle_set_is_on(&mut self, toggle: &YamlObjectKey, is_on: bool) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            toggle,
+            "m_IsOn",
+            UnityValue::Integer(if is_on { 1 } else { 0 }),
+        )
+    }
+
+    pub fn yaml_ui_toggle_set_interactable(
+        &mut self,
+        toggle: &YamlObjectKey,
+        interactable: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            toggle,
+            "m_Interactable",
+            UnityValue::Integer(if interactable { 1 } else { 0 }),
+        )
+    }
+
+    pub fn yaml_ui_toggle_clear_on_value_changed(&mut self, toggle: &YamlObjectKey) -> Result<()> {
+        self.env_mut()
+            .edit_yaml_object_anchor(&toggle.path, toggle.anchor.as_str(), |class| {
+                let calls = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnValueChanged.m_PersistentCalls.m_Calls",
+                )?;
+                *calls = UnityValue::Array(Vec::new());
+                Ok(())
+            })
+    }
+
+    pub fn yaml_ui_toggle_add_on_value_changed_call(
+        &mut self,
+        toggle: &YamlObjectKey,
+        target_file_id: i64,
+        target_guid_32_hex: Option<&str>,
+        target_type_id: Option<i64>,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_guid_32_hex = target_guid_32_hex.map(|s| s.trim().to_ascii_lowercase());
+        let target = yaml_pptr_value(
+            target_file_id,
+            target_guid_32_hex.as_deref(),
+            target_type_id,
+        );
+
+        self.env_mut()
+            .edit_yaml_object_anchor(&toggle.path, toggle.anchor.as_str(), |class| {
+                let calls_value = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnValueChanged.m_PersistentCalls.m_Calls",
+                )?;
+                let calls = ensure_array_mut(calls_value);
+
+                let args: UnityValue = UnityValue::Object(
+                    [
+                        (
+                            "m_ObjectArgument".to_string(),
+                            yaml_pptr_value(0, None, None),
+                        ),
+                        (
+                            "m_ObjectArgumentAssemblyTypeName".to_string(),
+                            UnityValue::String(String::new()),
+                        ),
+                        ("m_IntArgument".to_string(), UnityValue::Integer(0)),
+                        ("m_FloatArgument".to_string(), UnityValue::Float(0.0)),
+                        (
+                            "m_StringArgument".to_string(),
+                            UnityValue::String(String::new()),
+                        ),
+                        ("m_BoolArgument".to_string(), UnityValue::Integer(0)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+
+                let call: UnityValue = UnityValue::Object(
+                    [
+                        ("m_Target".to_string(), target),
+                        (
+                            "m_MethodName".to_string(),
+                            UnityValue::String(method_name.to_string()),
+                        ),
+                        // Best-effort: treat as event-defined so Unity can bind "dynamic" listeners.
+                        ("m_Mode".to_string(), UnityValue::Integer(0)),
+                        ("m_Arguments".to_string(), args),
+                        // UnityEventCallState.RuntimeOnly
+                        ("m_CallState".to_string(), UnityValue::Integer(2)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+
+                calls.push(call);
+                Ok(())
+            })
+    }
+
+    pub fn yaml_ui_toggle_add_on_value_changed_target_anchor(
+        &mut self,
+        toggle: &YamlObjectKey,
+        target_anchor: &str,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_file_id = target_anchor.trim().parse::<i64>().map_err(|e| {
+            UnityAssetError::format(format!(
+                "Invalid YAML anchor fileID for onValueChanged target: {:?} ({})",
+                target_anchor, e
+            ))
+        })?;
+        self.yaml_ui_toggle_add_on_value_changed_call(
+            toggle,
+            target_file_id,
+            None,
+            None,
+            method_name,
+        )
+    }
+
+    pub fn find_yaml_slider_key(&mut self, game_object: &YamlObjectKey) -> Result<YamlObjectKey> {
+        self.find_yaml_monobehaviour_key_by_required_fields(
+            game_object,
+            &["m_Value", "m_Interactable", "m_OnValueChanged"],
+        )
+    }
+
+    pub fn yaml_ui_slider_set_value(&mut self, slider: &YamlObjectKey, value: f64) -> Result<()> {
+        self.set_yaml_value_at_key_path(slider, "m_Value", UnityValue::Float(value))
+    }
+
+    pub fn yaml_ui_slider_set_min_max(
+        &mut self,
+        slider: &YamlObjectKey,
+        min: f64,
+        max: f64,
+    ) -> Result<()> {
+        self.env_mut()
+            .edit_yaml_object_anchor(&slider.path, slider.anchor.as_str(), |class| {
+                super::pptr_path::set_value_at_path(class, "m_MinValue", UnityValue::Float(min))?;
+                super::pptr_path::set_value_at_path(class, "m_MaxValue", UnityValue::Float(max))?;
+                Ok(())
+            })
+    }
+
+    pub fn yaml_ui_slider_set_whole_numbers(
+        &mut self,
+        slider: &YamlObjectKey,
+        whole_numbers: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            slider,
+            "m_WholeNumbers",
+            UnityValue::Integer(if whole_numbers { 1 } else { 0 }),
+        )
+    }
+
+    pub fn yaml_ui_slider_set_interactable(
+        &mut self,
+        slider: &YamlObjectKey,
+        interactable: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            slider,
+            "m_Interactable",
+            UnityValue::Integer(if interactable { 1 } else { 0 }),
+        )
+    }
+
+    pub fn yaml_ui_slider_clear_on_value_changed(&mut self, slider: &YamlObjectKey) -> Result<()> {
+        self.env_mut()
+            .edit_yaml_object_anchor(&slider.path, slider.anchor.as_str(), |class| {
+                let calls = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnValueChanged.m_PersistentCalls.m_Calls",
+                )?;
+                *calls = UnityValue::Array(Vec::new());
+                Ok(())
+            })
+    }
+
+    pub fn yaml_ui_slider_add_on_value_changed_call(
+        &mut self,
+        slider: &YamlObjectKey,
+        target_file_id: i64,
+        target_guid_32_hex: Option<&str>,
+        target_type_id: Option<i64>,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_guid_32_hex = target_guid_32_hex.map(|s| s.trim().to_ascii_lowercase());
+        let target = yaml_pptr_value(
+            target_file_id,
+            target_guid_32_hex.as_deref(),
+            target_type_id,
+        );
+
+        self.env_mut()
+            .edit_yaml_object_anchor(&slider.path, slider.anchor.as_str(), |class| {
+                let calls_value = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnValueChanged.m_PersistentCalls.m_Calls",
+                )?;
+                let calls = ensure_array_mut(calls_value);
+
+                let args: UnityValue = UnityValue::Object(
+                    [
+                        (
+                            "m_ObjectArgument".to_string(),
+                            yaml_pptr_value(0, None, None),
+                        ),
+                        (
+                            "m_ObjectArgumentAssemblyTypeName".to_string(),
+                            UnityValue::String(String::new()),
+                        ),
+                        ("m_IntArgument".to_string(), UnityValue::Integer(0)),
+                        ("m_FloatArgument".to_string(), UnityValue::Float(0.0)),
+                        (
+                            "m_StringArgument".to_string(),
+                            UnityValue::String(String::new()),
+                        ),
+                        ("m_BoolArgument".to_string(), UnityValue::Integer(0)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+
+                let call: UnityValue = UnityValue::Object(
+                    [
+                        ("m_Target".to_string(), target),
+                        (
+                            "m_MethodName".to_string(),
+                            UnityValue::String(method_name.to_string()),
+                        ),
+                        // Best-effort: treat as event-defined so Unity can bind "dynamic" listeners.
+                        ("m_Mode".to_string(), UnityValue::Integer(0)),
+                        ("m_Arguments".to_string(), args),
+                        // UnityEventCallState.RuntimeOnly
+                        ("m_CallState".to_string(), UnityValue::Integer(2)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+
+                calls.push(call);
+                Ok(())
+            })
+    }
+
+    pub fn yaml_ui_slider_add_on_value_changed_target_anchor(
+        &mut self,
+        slider: &YamlObjectKey,
+        target_anchor: &str,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_file_id = target_anchor.trim().parse::<i64>().map_err(|e| {
+            UnityAssetError::format(format!(
+                "Invalid YAML anchor fileID for onValueChanged target: {:?} ({})",
+                target_anchor, e
+            ))
+        })?;
+        self.yaml_ui_slider_add_on_value_changed_call(
+            slider,
+            target_file_id,
+            None,
+            None,
+            method_name,
+        )
+    }
+
     pub fn yaml_rect_transform_set_anchored_position(
         &mut self,
         rect_transform: &YamlObjectKey,
