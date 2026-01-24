@@ -171,6 +171,42 @@ impl<'a> EnvironmentEditSession<'a> {
         self.set_yaml_value_at_key_path(key, field_path, vec2_value(x, y))
     }
 
+    pub fn set_yaml_value_at_key_path_first_match(
+        &mut self,
+        key: &YamlObjectKey,
+        candidate_paths: &[&str],
+        value: UnityValue,
+    ) -> Result<()> {
+        if candidate_paths.is_empty() {
+            return Err(UnityAssetError::format("No candidate paths provided"));
+        }
+
+        self.env_mut()
+            .edit_yaml_object_anchor(&key.path, key.anchor.as_str(), |class| {
+                let mut chosen = candidate_paths[0];
+                for p in candidate_paths {
+                    if super::pptr_path::get_value_at_path(class, p).is_some() {
+                        chosen = p;
+                        break;
+                    }
+                }
+                super::pptr_path::set_value_at_path(class, chosen, value)
+            })
+    }
+
+    pub fn set_yaml_string_at_key_path_first_match(
+        &mut self,
+        key: &YamlObjectKey,
+        candidate_paths: &[&str],
+        value: &str,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path_first_match(
+            key,
+            candidate_paths,
+            UnityValue::String(value.to_string()),
+        )
+    }
+
     pub fn set_yaml_vec3_at_key_path(
         &mut self,
         key: &YamlObjectKey,
@@ -218,6 +254,22 @@ impl<'a> EnvironmentEditSession<'a> {
         self.set_yaml_value_at_key_path(
             key,
             field_path,
+            yaml_pptr_value(file_id, guid_32_hex.as_deref(), type_id),
+        )
+    }
+
+    pub fn set_yaml_pptr_at_key_path_first_match(
+        &mut self,
+        key: &YamlObjectKey,
+        candidate_paths: &[&str],
+        file_id: i64,
+        guid_32_hex: Option<&str>,
+        type_id: Option<i64>,
+    ) -> Result<()> {
+        let guid_32_hex = guid_32_hex.map(|s| s.trim().to_ascii_lowercase());
+        self.set_yaml_value_at_key_path_first_match(
+            key,
+            candidate_paths,
             yaml_pptr_value(file_id, guid_32_hex.as_deref(), type_id),
         )
     }
@@ -503,6 +555,141 @@ impl<'a> EnvironmentEditSession<'a> {
             script_guid_32_hex,
             yaml_key.display()
         )))
+    }
+
+    pub fn find_yaml_monobehaviour_key_by_required_fields(
+        &mut self,
+        game_object: &YamlObjectKey,
+        required_paths: &[&str],
+    ) -> Result<YamlObjectKey> {
+        if required_paths.is_empty() {
+            return Err(UnityAssetError::format("No required fields provided"));
+        }
+
+        let (yaml_key, doc) = self.yaml_doc_for_read(&game_object.path)?;
+        let go = doc
+            .entries()
+            .iter()
+            .find(|o| o.anchor == game_object.anchor)
+            .ok_or_else(|| {
+                UnityAssetError::format(format!(
+                    "GameObject anchor not found: {} (file: {})",
+                    game_object.anchor,
+                    yaml_key.display()
+                ))
+            })?;
+
+        let mut matches: Vec<YamlObjectKey> = Vec::new();
+        for file_id in read_gameobject_component_file_ids(go) {
+            let anchor = file_id.to_string();
+            let Some(component) = doc.entries().iter().find(|o| o.anchor == anchor) else {
+                continue;
+            };
+            if component.class_name != "MonoBehaviour" {
+                continue;
+            }
+            if required_paths.iter().all(|p| {
+                component.get(*p).is_some()
+                    || super::pptr_path::get_value_at_path(component, p).is_some()
+            }) {
+                matches.push(YamlObjectKey {
+                    path: yaml_key.clone(),
+                    anchor,
+                });
+            }
+        }
+
+        match matches.as_slice() {
+            [only] => Ok(only.clone()),
+            [] => Err(UnityAssetError::format(format!(
+                "MonoBehaviour not found on GameObject {} with required fields {:?} (file: {})",
+                game_object.anchor,
+                required_paths,
+                yaml_key.display()
+            ))),
+            many => Err(UnityAssetError::format(format!(
+                "MonoBehaviour required-field match is not unique on GameObject {} (fields={:?}, matches={}, file: {})",
+                game_object.anchor,
+                required_paths,
+                many.len(),
+                yaml_key.display()
+            ))),
+        }
+    }
+
+    pub fn yaml_ui_set_graphic_raycast_target(
+        &mut self,
+        component: &YamlObjectKey,
+        enabled: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path_first_match(
+            component,
+            &["m_RaycastTarget", "m_raycastTarget"],
+            UnityValue::Integer(if enabled { 1 } else { 0 }),
+        )
+    }
+
+    pub fn yaml_ui_set_image_sprite(
+        &mut self,
+        image_component: &YamlObjectKey,
+        file_id: i64,
+        guid_32_hex: Option<&str>,
+        type_id: Option<i64>,
+    ) -> Result<()> {
+        self.set_yaml_pptr_at_key_path_first_match(
+            image_component,
+            &["m_Sprite"],
+            file_id,
+            guid_32_hex,
+            type_id,
+        )
+    }
+
+    pub fn yaml_ui_set_raw_image_texture(
+        &mut self,
+        raw_image_component: &YamlObjectKey,
+        file_id: i64,
+        guid_32_hex: Option<&str>,
+        type_id: Option<i64>,
+    ) -> Result<()> {
+        self.set_yaml_pptr_at_key_path_first_match(
+            raw_image_component,
+            &["m_Texture"],
+            file_id,
+            guid_32_hex,
+            type_id,
+        )
+    }
+
+    pub fn yaml_ui_set_graphic_color_rgba(
+        &mut self,
+        component: &YamlObjectKey,
+        r: f64,
+        g: f64,
+        b: f64,
+        a: f64,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path_first_match(
+            component,
+            &["m_Color", "m_fontColor"],
+            color_rgba_value(r, g, b, a),
+        )
+    }
+
+    pub fn yaml_ui_set_text_string(&mut self, component: &YamlObjectKey, text: &str) -> Result<()> {
+        self.set_yaml_string_at_key_path_first_match(component, &["m_Text", "m_text"], text)
+    }
+
+    pub fn yaml_ui_set_text_font_size(
+        &mut self,
+        component: &YamlObjectKey,
+        size: i64,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path_first_match(
+            component,
+            &["m_FontData.m_FontSize", "m_fontSize"],
+            UnityValue::Integer(size),
+        )
     }
 
     pub fn yaml_rect_transform_set_anchored_position(

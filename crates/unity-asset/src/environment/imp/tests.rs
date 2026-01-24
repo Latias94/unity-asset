@@ -3852,3 +3852,229 @@ RectTransform:
         .expect("Text m_Father object");
     assert_eq!(father.get("fileID").and_then(|v| v.as_i64()), Some(200001));
 }
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_text_image_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_text_image.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Canvas
+  m_Component:
+  - component: {fileID: 200001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children:
+  - {fileID: 200002}
+--- !u!1 &100001
+GameObject:
+  m_Name: Button
+  m_Component:
+  - component: {fileID: 200002}
+  - component: {fileID: 300002}
+--- !u!224 &200002
+RectTransform:
+  m_GameObject: {fileID: 100001}
+  m_Father: {fileID: 200001}
+  m_Children:
+  - {fileID: 200003}
+--- !u!114 &300002
+MonoBehaviour:
+  m_GameObject: {fileID: 100001}
+  m_Sprite: {fileID: 0}
+  m_Color: {r: 1, g: 1, b: 1, a: 1}
+  m_RaycastTarget: 1
+--- !u!1 &100002
+GameObject:
+  m_Name: Text
+  m_Component:
+  - component: {fileID: 200003}
+  - component: {fileID: 300003}
+--- !u!224 &200003
+RectTransform:
+  m_GameObject: {fileID: 100002}
+  m_Father: {fileID: 200002}
+  m_Children: []
+--- !u!114 &300003
+MonoBehaviour:
+  m_GameObject: {fileID: 100002}
+  m_Text: Hello
+  m_Color: {r: 1, g: 1, b: 1, a: 1}
+  m_FontData:
+    m_FontSize: 14
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let canvas = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Canvas")
+        .unwrap();
+    let button_go = session
+        .find_yaml_child_gameobject_key_by_hierarchy_path(&canvas, "Button")
+        .unwrap();
+    let text_go = session
+        .find_yaml_child_gameobject_key_by_hierarchy_path(&canvas, "Button/Text")
+        .unwrap();
+
+    let image_mb = session
+        .find_yaml_monobehaviour_key_by_required_fields(
+            &button_go,
+            &["m_Sprite", "m_RaycastTarget", "m_Color"],
+        )
+        .unwrap();
+    session
+        .yaml_ui_set_image_sprite(
+            &image_mb,
+            21300000,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some(3),
+        )
+        .unwrap();
+    session
+        .yaml_ui_set_graphic_color_rgba(&image_mb, 0.1, 0.2, 0.3, 0.4)
+        .unwrap();
+    session
+        .yaml_ui_set_graphic_raycast_target(&image_mb, false)
+        .unwrap();
+
+    let text_mb = session
+        .find_yaml_monobehaviour_key_by_required_fields(&text_go, &["m_Text", "m_FontData"])
+        .unwrap();
+    session.yaml_ui_set_text_string(&text_mb, "World").unwrap();
+    session.yaml_ui_set_text_font_size(&text_mb, 32).unwrap();
+    session
+        .yaml_ui_set_graphic_color_rgba(&text_mb, 0.9, 0.8, 0.7, 0.6)
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_text_image.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+
+    let image = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "300002")
+        .expect("Image MonoBehaviour anchor");
+    let sprite = image
+        .get("m_Sprite")
+        .and_then(|v| v.as_object())
+        .expect("m_Sprite object");
+    assert_eq!(
+        sprite.get("fileID").and_then(|v| v.as_i64()),
+        Some(21300000)
+    );
+    assert_eq!(
+        sprite.get("guid").and_then(|v| v.as_str()),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+    assert_eq!(sprite.get("type").and_then(|v| v.as_i64()), Some(3));
+    assert_eq!(
+        image.get("m_RaycastTarget").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+
+    let text = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "300003")
+        .expect("Text MonoBehaviour anchor");
+    assert_eq!(text.get("m_Text").and_then(|v| v.as_str()), Some("World"));
+    let font_data = text
+        .get("m_FontData")
+        .and_then(|v| v.as_object())
+        .expect("m_FontData object");
+    assert_eq!(
+        font_data.get("m_FontSize").and_then(|v| v.as_i64()),
+        Some(32)
+    );
+}
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_tmp_text_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_tmp.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Root
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 300001}
+--- !u!4 &200001
+Transform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+--- !u!114 &300001
+MonoBehaviour:
+  m_GameObject: {fileID: 100000}
+  m_text: Hi
+  m_fontSize: 12
+  m_fontColor: {r: 1, g: 1, b: 1, a: 1}
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let root = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Root")
+        .unwrap();
+    let tmp = session
+        .find_yaml_monobehaviour_key_by_required_fields(&root, &["m_text", "m_fontSize"])
+        .unwrap();
+    session.yaml_ui_set_text_string(&tmp, "Bye").unwrap();
+    session.yaml_ui_set_text_font_size(&tmp, 99).unwrap();
+    session
+        .yaml_ui_set_graphic_color_rgba(&tmp, 0.0, 0.1, 0.2, 0.3)
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_tmp.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+    let tmp = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "300001")
+        .expect("TMP MonoBehaviour anchor");
+    assert_eq!(tmp.get("m_text").and_then(|v| v.as_str()), Some("Bye"));
+    assert_eq!(tmp.get("m_fontSize").and_then(|v| v.as_i64()), Some(99));
+    let c = tmp
+        .get("m_fontColor")
+        .and_then(|v| v.as_object())
+        .expect("m_fontColor object");
+    assert_eq!(c.get("r").and_then(|v| v.as_f64()), Some(0.0));
+    assert_eq!(c.get("g").and_then(|v| v.as_f64()), Some(0.1));
+    assert_eq!(c.get("b").and_then(|v| v.as_f64()), Some(0.2));
+    assert_eq!(c.get("a").and_then(|v| v.as_f64()), Some(0.3));
+}
