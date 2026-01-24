@@ -41,8 +41,7 @@ This is a quick “what’s left” index; the detailed checklist below remains 
 P0 (blocks broad edit compatibility):
 - MonoBehaviour/script TypeTrees for stripped files:
   - supported via `script_id` registry lookup + external exporter workflow (`docs/SCRIPT_TYPETREES.md`)
-  - TODO: built-in generator implementation (managed/il2cpp) is still missing
-- Dependency resolution fallback (`Environment.find_file`-style simplified-name lookup) to resolve externals when paths are incomplete.
+  - Note: a built-in generator (managed/il2cpp) is intentionally deferred until a mature reference/validation corpus exists.
 
 P1 (important, but not blocking most modern samples):
 - `SerializedFile.save` for `version < 9` (legacy header/layout support).
