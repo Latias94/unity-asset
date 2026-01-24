@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Metadata reporting:
   - Populate `file_info.compression_type` when extracting from bundles.
   - Fill `ObjectSummary.dependencies` from scanned internal references when enabled.
+- YAML serializer: avoid emitting `{...}` placeholders for complex objects when they appear as items in block arrays.
 - More robust external reference resolution by canonicalizing filesystem paths when loading and indexing `.meta` GUIDs.
 - Preserve AssetBundle `m_Container` entries with null PPtr (`m_PathID=0`) as unresolved paths instead of dropping them.
 

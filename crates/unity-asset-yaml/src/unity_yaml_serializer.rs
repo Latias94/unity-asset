@@ -237,7 +237,19 @@ impl UnityYamlSerializer {
                                 e
                             ))
                         })?;
-                        self.serialize_value(writer, item, true)?;
+                        match item {
+                            UnityValue::Array(inner)
+                                if !inner.is_empty() && !self.is_simple_array(inner) =>
+                            {
+                                self.serialize_value(writer, item, false)?
+                            }
+                            UnityValue::Object(inner)
+                                if !inner.is_empty() && !self.is_simple_object(inner) =>
+                            {
+                                self.serialize_value(writer, item, false)?
+                            }
+                            _ => self.serialize_value(writer, item, true)?,
+                        }
                     }
                     self.indent_level -= 1;
                 }
