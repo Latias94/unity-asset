@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Environment-wide unified object graph (`Environment::build_object_graph`) across YAML + binary sources (best-effort GUID/fileID resolution).
 - YAML UI edit helpers (best-effort):
   - Button: set `m_Interactable`, clear/append persistent `onClick` calls (`m_OnClick.m_PersistentCalls.m_Calls`).
+  - Canvas: render mode, pixel perfect, sorting flags (overlay-focused).
+  - CanvasScaler: scale mode + reference resolution (screen-size workflow).
+  - LayoutGroup: padding/alignment/spacing + common child layout toggles.
 - Directory-wide `.meta` GUID indexing (`Environment::index_meta_guids_in_directory`) for higher external resolution hit rates without loading every asset file.
 - `Environment::set_type_tree_registry_from_paths` to load `.tpk`/`.json` TypeTree registries (best-effort parsing for stripped assets).
 - External workflow to generate MonoBehaviour/script TypeTrees via UnityPy + TypeTreeGeneratorAPI:

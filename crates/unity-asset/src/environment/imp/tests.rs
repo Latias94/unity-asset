@@ -4207,3 +4207,247 @@ MonoBehaviour:
     });
     assert_eq!(target_file_id, Some(300003), "target={:?}", target);
 }
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_canvas_scaler_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_canvas.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Canvas
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 223001}
+  - component: {fileID: 114001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!223 &223001
+Canvas:
+  m_GameObject: {fileID: 100000}
+  m_RenderMode: 0
+  m_PixelPerfect: 0
+  m_OverrideSorting: 0
+  m_SortingOrder: 0
+  m_TargetDisplay: 0
+--- !u!114 &114001
+MonoBehaviour:
+  m_GameObject: {fileID: 100000}
+  m_Enabled: 1
+  m_UiScaleMode: 0
+  m_ReferencePixelsPerUnit: 100
+  m_ScaleFactor: 1
+  m_ReferenceResolution: {x: 800, y: 600}
+  m_ScreenMatchMode: 0
+  m_MatchWidthOrHeight: 0
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let canvas_go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Canvas")
+        .unwrap();
+    let canvas = session.find_yaml_canvas_key(&canvas_go).unwrap();
+    let scaler = session.find_yaml_canvas_scaler_key(&canvas_go).unwrap();
+
+    session.yaml_ui_canvas_set_render_mode(&canvas, 2).unwrap();
+    session
+        .yaml_ui_canvas_set_pixel_perfect(&canvas, true)
+        .unwrap();
+    session
+        .yaml_ui_canvas_set_override_sorting(&canvas, true)
+        .unwrap();
+    session
+        .yaml_ui_canvas_set_sorting_order(&canvas, 10)
+        .unwrap();
+
+    session
+        .yaml_ui_canvas_scaler_set_ui_scale_mode(&scaler, 1)
+        .unwrap();
+    session
+        .yaml_ui_canvas_scaler_set_reference_resolution(&scaler, 1920.0, 1080.0)
+        .unwrap();
+    session
+        .yaml_ui_canvas_scaler_set_screen_match_mode(&scaler, 0)
+        .unwrap();
+    session
+        .yaml_ui_canvas_scaler_set_match_width_or_height(&scaler, 0.5)
+        .unwrap();
+    session
+        .yaml_ui_canvas_scaler_set_scale_factor(&scaler, 2.0)
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_canvas.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+
+    let canvas = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "223001")
+        .expect("Canvas anchor");
+    assert_eq!(canvas.get("m_RenderMode").and_then(|v| v.as_i64()), Some(2));
+    assert_eq!(
+        canvas.get("m_PixelPerfect").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+    assert_eq!(
+        canvas.get("m_OverrideSorting").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+    assert_eq!(
+        canvas.get("m_SortingOrder").and_then(|v| v.as_i64()),
+        Some(10)
+    );
+
+    let read_f64 = |v: &unity_asset_core::UnityValue| {
+        v.as_f64()
+            .or_else(|| v.as_i64().map(|i| i as f64))
+            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+    };
+
+    let scaler = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "114001")
+        .expect("CanvasScaler MonoBehaviour anchor");
+    assert_eq!(
+        scaler.get("m_UiScaleMode").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+    let ref_res = scaler
+        .get("m_ReferenceResolution")
+        .and_then(|v| v.as_object())
+        .expect("m_ReferenceResolution object");
+    assert_eq!(ref_res.get("x").and_then(read_f64), Some(1920.0));
+    assert_eq!(ref_res.get("y").and_then(read_f64), Some(1080.0));
+    assert_eq!(
+        scaler.get("m_MatchWidthOrHeight").and_then(read_f64),
+        Some(0.5)
+    );
+    assert_eq!(scaler.get("m_ScaleFactor").and_then(read_f64), Some(2.0));
+}
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_layout_group_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_layout.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Layout
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 114001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!114 &114001
+MonoBehaviour:
+  m_GameObject: {fileID: 100000}
+  m_Padding: {m_Left: 0, m_Right: 0, m_Top: 0, m_Bottom: 0}
+  m_ChildAlignment: 0
+  m_Spacing: 0
+  m_ChildControlWidth: 1
+  m_ChildControlHeight: 1
+  m_ChildForceExpandWidth: 1
+  m_ChildForceExpandHeight: 1
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Layout")
+        .unwrap();
+    let layout = session.find_yaml_layout_group_key(&go).unwrap();
+
+    session
+        .yaml_ui_layout_group_set_padding(&layout, 1, 2, 3, 4)
+        .unwrap();
+    session
+        .yaml_ui_layout_group_set_child_alignment(&layout, 2)
+        .unwrap();
+    session
+        .yaml_ui_layout_group_set_spacing(&layout, 12.5)
+        .unwrap();
+    session
+        .yaml_ui_layout_group_set_child_control(&layout, false, true)
+        .unwrap();
+    session
+        .yaml_ui_layout_group_set_child_force_expand(&layout, false, false)
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_layout.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+
+    let layout = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "114001")
+        .expect("LayoutGroup MonoBehaviour anchor");
+    let padding = layout
+        .get("m_Padding")
+        .and_then(|v| v.as_object())
+        .expect("m_Padding object");
+    assert_eq!(padding.get("m_Left").and_then(|v| v.as_i64()), Some(1));
+    assert_eq!(padding.get("m_Right").and_then(|v| v.as_i64()), Some(2));
+    assert_eq!(padding.get("m_Top").and_then(|v| v.as_i64()), Some(3));
+    assert_eq!(padding.get("m_Bottom").and_then(|v| v.as_i64()), Some(4));
+    assert_eq!(
+        layout.get("m_ChildAlignment").and_then(|v| v.as_i64()),
+        Some(2)
+    );
+    assert_eq!(layout.get("m_Spacing").and_then(|v| v.as_f64()), Some(12.5));
+    assert_eq!(
+        layout.get("m_ChildControlWidth").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+    assert_eq!(
+        layout.get("m_ChildControlHeight").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+    assert_eq!(
+        layout
+            .get("m_ChildForceExpandWidth")
+            .and_then(|v| v.as_i64()),
+        Some(0)
+    );
+    assert_eq!(
+        layout
+            .get("m_ChildForceExpandHeight")
+            .and_then(|v| v.as_i64()),
+        Some(0)
+    );
+}

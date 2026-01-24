@@ -400,8 +400,8 @@ Acceptance:
     - [x] Image/RawImage: sprite/texture refs, color, raycast target
     - [x] Text/TMP_Text: text, color, font size (best-effort)
     - [x] Button: interactable + persistent onClick calls (best-effort)
-    - [ ] Canvas/CanvasScaler
-    - [ ] Layout groups
+    - [x] Canvas/CanvasScaler (best-effort)
+    - [x] Layout groups (best-effort)
 
 Acceptance:
 - [x] A bundle can be modified to point `m_StreamData` at a newly written cab and reloaded.
