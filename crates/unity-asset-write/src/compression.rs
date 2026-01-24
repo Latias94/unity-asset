@@ -94,3 +94,27 @@ fn compress_lzma_unity_impl(data: &[u8], unpacked_size: Option<u64>) -> Result<V
     unity.extend_from_slice(&out[13..]);
     Ok(unity)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lzma_unity_header_matches_unitypy_defaults() {
+        // UnityPy hard-codes:
+        // - props: 0x5D (lc=3, lp=0, pb=2)
+        // - dict_size: 0x800000 (1 << 23)
+        // See: repo-ref/UnityPy/UnityPy/helpers/CompressionHelper.py
+        let data = b"hello unity-asset";
+        let out = compress_lzma_unity(data).unwrap();
+        assert!(out.len() >= 5);
+        assert_eq!(out[0], 0x5D);
+        assert_eq!(&out[1..5], &0x0080_0000u32.to_le_bytes());
+
+        let out = compress_lzma_unity_with_size(data).unwrap();
+        assert!(out.len() >= 13);
+        assert_eq!(out[0], 0x5D);
+        assert_eq!(&out[1..5], &0x0080_0000u32.to_le_bytes());
+        assert_eq!(&out[5..13], &(data.len() as u64).to_le_bytes());
+    }
+}

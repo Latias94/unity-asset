@@ -143,7 +143,7 @@ Rust (current):
 - does not yet generate MonoBehaviour nodes from script assemblies
 
 TODO (parity):
-- [ ] Provide a MonoBehaviour node generator hook (equivalent capability to UnityPy `typetree_generator`)
+- [x] Provide a MonoBehaviour node generator hook (equivalent capability to UnityPy `typetree_generator`)
   - [x] Hook point + cache exists (caller-provided generator, keyed by `script_id`)
   - [x] Document an external workflow to feed the hook via a JSON registry (`schema: 2`)
     - exporter: `scripts/export_unitypy_script_typetrees.py` (UnityPy + TypeTreeGeneratorAPI)
@@ -327,8 +327,8 @@ TODO (parity):
 - [x] Implement compression:
   - [x] LZ4 (block mode)
   - [x] LZMA (UnityPy-style header layout: 5-byte header, no unpacked-size field)
-  - [ ] TODO: validate LZMA encoder parameters (props/dict) vs UnityPy defaults
-- [x] Packer compatibility:
+  - [x] Validate LZMA encoder parameters (props/dict) vs UnityPy defaults (guarded by unit test)
+  - [x] Packer compatibility:
   - [x] `"none"`, `"lz4"`, `"lzma"`, `"original"`, tuple form
 - [x] Directory info rebuild and file flags propagation
 - [ ] TODO: legacy bundle save (`UnityWeb` / `UnityRaw`)
