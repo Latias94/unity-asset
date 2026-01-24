@@ -479,6 +479,38 @@ $env:UNITYPY_PYTHON = "C:\\path\\to\\python.exe"
 cargo nextest run -p unity-asset external_bundle_
 ```
 
+How to run an external corpus regression (directory scan, limited; no samples checked into repo):
+
+This is useful for validating broad format compatibility against a local bundle directory without checking any assets into git.
+The test performs `parse -> save -> reparse` and can optionally ask UnityPy to load the saved output.
+
+1) Point the test at a directory (or a single file) on your machine:
+
+```
+$env:UNITY_ASSET_EXTERNAL_CORPUS = "C:\\path\\to\\AssetBundles"
+```
+
+2) Limit scope to keep runs fast (recommended):
+
+```
+$env:UNITY_ASSET_EXTERNAL_CORPUS_LIMIT = "20"         # default: 20
+$env:UNITY_ASSET_EXTERNAL_CORPUS_MAX_BYTES = "200000000" # default: 200,000,000 (~200MB)
+```
+
+3) Run the Rust-side roundtrip:
+
+```
+cargo nextest run -p unity-asset-write external_corpus_
+```
+
+4) Optional: enable UnityPy validation (only checks a small subset per run):
+
+```
+$env:UNITYPY_E2E = "1"
+$env:UNITY_ASSET_EXTERNAL_CORPUS_UNITYPY_LIMIT = "3"  # default: 3
+cargo nextest run -p unity-asset-write external_corpus_
+```
+
 ## Risk Register (Known Hard Parts)
 
 - Unity version branching: header formats (`<9`, `>=9`, `>=22`) and object table changes.
