@@ -3655,3 +3655,87 @@ MonoBehaviour:
         .expect("m_Ref object");
     assert_eq!(r.get("fileID").and_then(|v| v.as_i64()), Some(100001));
 }
+
+#[test]
+fn environment_can_edit_yaml_prefab_transform_helpers_extended() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("transform.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Root
+  m_Component:
+  - component: {fileID: 100001}
+--- !u!4 &100001
+Transform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Root")
+        .unwrap();
+    let tr = session
+        .find_yaml_component_key_by_class_name(&go, "Transform")
+        .unwrap();
+    session
+        .yaml_transform_set_local_position(&tr, 1.0, 2.0, 3.0)
+        .unwrap();
+    session
+        .yaml_transform_set_local_scale(&tr, 4.0, 5.0, 6.0)
+        .unwrap();
+    session
+        .yaml_transform_set_local_rotation_quat(&tr, 0.1, 0.2, 0.3, 0.4)
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("transform.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+
+    let tr = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "100001")
+        .expect("Transform anchor");
+    let pos = tr
+        .get("m_LocalPosition")
+        .and_then(|v| v.as_object())
+        .expect("m_LocalPosition object");
+    assert_eq!(pos.get("x").and_then(|v| v.as_f64()), Some(1.0));
+    assert_eq!(pos.get("y").and_then(|v| v.as_f64()), Some(2.0));
+    assert_eq!(pos.get("z").and_then(|v| v.as_f64()), Some(3.0));
+    let scale = tr
+        .get("m_LocalScale")
+        .and_then(|v| v.as_object())
+        .expect("m_LocalScale object");
+    assert_eq!(scale.get("x").and_then(|v| v.as_f64()), Some(4.0));
+    assert_eq!(scale.get("y").and_then(|v| v.as_f64()), Some(5.0));
+    assert_eq!(scale.get("z").and_then(|v| v.as_f64()), Some(6.0));
+    let rot = tr
+        .get("m_LocalRotation")
+        .and_then(|v| v.as_object())
+        .expect("m_LocalRotation object");
+    assert_eq!(rot.get("x").and_then(|v| v.as_f64()), Some(0.1));
+    assert_eq!(rot.get("y").and_then(|v| v.as_f64()), Some(0.2));
+    assert_eq!(rot.get("z").and_then(|v| v.as_f64()), Some(0.3));
+    assert_eq!(rot.get("w").and_then(|v| v.as_f64()), Some(0.4));
+}

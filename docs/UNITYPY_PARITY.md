@@ -389,6 +389,7 @@ Acceptance:
   - [x] Resolve `GameObject.m_Component[*].component.fileID` to component anchors within the same YAML file
   - [x] Find MonoBehaviour components by `m_Script.guid` (script GUID)
   - [x] RectTransform setters (`m_AnchoredPosition`, `m_SizeDelta`, `m_AnchorMin`, `m_AnchorMax`, `m_Pivot`, `m_OffsetMin`, `m_OffsetMax`)
+  - [x] Transform setters (`m_LocalPosition`, `m_LocalRotation`, `m_LocalScale`)
   - [x] Generic YAML setters for common UI fields:
     - [x] PPtr-like refs (`{fileID,guid,type}`) and internal anchor refs
     - [x] Color (`{r,g,b,a}`) and GameObject active (`m_IsActive`)

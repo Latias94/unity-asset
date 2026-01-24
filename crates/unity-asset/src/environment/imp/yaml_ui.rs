@@ -13,6 +13,31 @@ fn vec2_value(x: f64, y: f64) -> UnityValue {
     )
 }
 
+fn vec3_value(x: f64, y: f64, z: f64) -> UnityValue {
+    UnityValue::Object(
+        [
+            ("x".to_string(), UnityValue::Float(x)),
+            ("y".to_string(), UnityValue::Float(y)),
+            ("z".to_string(), UnityValue::Float(z)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
+fn quat_value(x: f64, y: f64, z: f64, w: f64) -> UnityValue {
+    UnityValue::Object(
+        [
+            ("x".to_string(), UnityValue::Float(x)),
+            ("y".to_string(), UnityValue::Float(y)),
+            ("z".to_string(), UnityValue::Float(z)),
+            ("w".to_string(), UnityValue::Float(w)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
 fn color_rgba_value(r: f64, g: f64, b: f64, a: f64) -> UnityValue {
     UnityValue::Object(
         [
@@ -92,6 +117,29 @@ impl<'a> EnvironmentEditSession<'a> {
         y: f64,
     ) -> Result<()> {
         self.set_yaml_value_at_key_path(key, field_path, vec2_value(x, y))
+    }
+
+    pub fn set_yaml_vec3_at_key_path(
+        &mut self,
+        key: &YamlObjectKey,
+        field_path: &str,
+        x: f64,
+        y: f64,
+        z: f64,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(key, field_path, vec3_value(x, y, z))
+    }
+
+    pub fn set_yaml_quat_at_key_path(
+        &mut self,
+        key: &YamlObjectKey,
+        field_path: &str,
+        x: f64,
+        y: f64,
+        z: f64,
+        w: f64,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(key, field_path, quat_value(x, y, z, w))
     }
 
     pub fn set_yaml_color_rgba_at_key_path(
@@ -326,5 +374,36 @@ impl<'a> EnvironmentEditSession<'a> {
         y: f64,
     ) -> Result<()> {
         self.set_yaml_vec2_at_key_path(rect_transform, "m_OffsetMax", x, y)
+    }
+
+    pub fn yaml_transform_set_local_position(
+        &mut self,
+        transform: &YamlObjectKey,
+        x: f64,
+        y: f64,
+        z: f64,
+    ) -> Result<()> {
+        self.set_yaml_vec3_at_key_path(transform, "m_LocalPosition", x, y, z)
+    }
+
+    pub fn yaml_transform_set_local_scale(
+        &mut self,
+        transform: &YamlObjectKey,
+        x: f64,
+        y: f64,
+        z: f64,
+    ) -> Result<()> {
+        self.set_yaml_vec3_at_key_path(transform, "m_LocalScale", x, y, z)
+    }
+
+    pub fn yaml_transform_set_local_rotation_quat(
+        &mut self,
+        transform: &YamlObjectKey,
+        x: f64,
+        y: f64,
+        z: f64,
+        w: f64,
+    ) -> Result<()> {
+        self.set_yaml_quat_at_key_path(transform, "m_LocalRotation", x, y, z, w)
     }
 }
