@@ -408,6 +408,9 @@ Acceptance:
     - [x] InputField: text, interactable, persistent onValueChanged/onEndEdit calls (best-effort)
     - [x] TMP_InputField: text, interactable, persistent onValueChanged/onEndEdit calls (best-effort)
     - [x] ScrollRect: content/viewport refs, axis toggles, normalizedPosition/velocity, persistent onValueChanged calls (best-effort)
+    - [x] CanvasGroup: alpha, interactable, raycast flags (best-effort)
+    - [x] ContentSizeFitter: horizontal/vertical fit modes (best-effort)
+    - [x] LayoutElement: sizes + ignoreLayout + priority (best-effort)
 
 Acceptance:
 - [x] A bundle can be modified to point `m_StreamData` at a newly written cab and reloaded.

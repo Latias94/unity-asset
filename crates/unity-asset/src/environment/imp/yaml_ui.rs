@@ -1939,6 +1939,207 @@ impl<'a> EnvironmentEditSession<'a> {
         )
     }
 
+    pub fn find_yaml_canvas_group_key(
+        &mut self,
+        game_object: &YamlObjectKey,
+    ) -> Result<YamlObjectKey> {
+        self.find_yaml_component_key_by_class_name(game_object, "CanvasGroup")
+    }
+
+    pub fn yaml_ui_canvas_group_set_alpha(
+        &mut self,
+        canvas_group: &YamlObjectKey,
+        alpha: f64,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(canvas_group, "m_Alpha", UnityValue::Float(alpha))
+    }
+
+    pub fn yaml_ui_canvas_group_set_interactable(
+        &mut self,
+        canvas_group: &YamlObjectKey,
+        interactable: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            canvas_group,
+            "m_Interactable",
+            UnityValue::Integer(if interactable { 1 } else { 0 }),
+        )
+    }
+
+    pub fn yaml_ui_canvas_group_set_blocks_raycast(
+        &mut self,
+        canvas_group: &YamlObjectKey,
+        blocks_raycast: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            canvas_group,
+            "m_BlocksRaycasts",
+            UnityValue::Integer(if blocks_raycast { 1 } else { 0 }),
+        )
+    }
+
+    pub fn yaml_ui_canvas_group_set_ignore_parent_groups(
+        &mut self,
+        canvas_group: &YamlObjectKey,
+        ignore_parent_groups: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            canvas_group,
+            "m_IgnoreParentGroups",
+            UnityValue::Integer(if ignore_parent_groups { 1 } else { 0 }),
+        )
+    }
+
+    pub fn find_yaml_content_size_fitter_key(
+        &mut self,
+        game_object: &YamlObjectKey,
+    ) -> Result<YamlObjectKey> {
+        self.find_yaml_monobehaviour_key_by_required_fields(
+            game_object,
+            &["m_HorizontalFit", "m_VerticalFit"],
+        )
+    }
+
+    pub fn yaml_ui_content_size_fitter_set_fit_modes(
+        &mut self,
+        fitter: &YamlObjectKey,
+        horizontal_fit: i64,
+        vertical_fit: i64,
+    ) -> Result<()> {
+        self.env_mut()
+            .edit_yaml_object_anchor(&fitter.path, fitter.anchor.as_str(), |class| {
+                super::pptr_path::set_value_at_path(
+                    class,
+                    "m_HorizontalFit",
+                    UnityValue::Integer(horizontal_fit),
+                )?;
+                super::pptr_path::set_value_at_path(
+                    class,
+                    "m_VerticalFit",
+                    UnityValue::Integer(vertical_fit),
+                )?;
+                Ok(())
+            })
+    }
+
+    pub fn find_yaml_layout_element_key(
+        &mut self,
+        game_object: &YamlObjectKey,
+    ) -> Result<YamlObjectKey> {
+        self.find_yaml_monobehaviour_key_by_required_fields(
+            game_object,
+            &[
+                "m_IgnoreLayout",
+                "m_MinWidth",
+                "m_MinHeight",
+                "m_PreferredWidth",
+                "m_PreferredHeight",
+                "m_FlexibleWidth",
+                "m_FlexibleHeight",
+                "m_LayoutPriority",
+            ],
+        )
+    }
+
+    pub fn yaml_ui_layout_element_set_ignore_layout(
+        &mut self,
+        layout_element: &YamlObjectKey,
+        ignore_layout: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            layout_element,
+            "m_IgnoreLayout",
+            UnityValue::Integer(if ignore_layout { 1 } else { 0 }),
+        )
+    }
+
+    pub fn yaml_ui_layout_element_set_min_size(
+        &mut self,
+        layout_element: &YamlObjectKey,
+        min_width: f64,
+        min_height: f64,
+    ) -> Result<()> {
+        self.env_mut().edit_yaml_object_anchor(
+            &layout_element.path,
+            layout_element.anchor.as_str(),
+            |class| {
+                super::pptr_path::set_value_at_path(
+                    class,
+                    "m_MinWidth",
+                    UnityValue::Float(min_width),
+                )?;
+                super::pptr_path::set_value_at_path(
+                    class,
+                    "m_MinHeight",
+                    UnityValue::Float(min_height),
+                )?;
+                Ok(())
+            },
+        )
+    }
+
+    pub fn yaml_ui_layout_element_set_preferred_size(
+        &mut self,
+        layout_element: &YamlObjectKey,
+        preferred_width: f64,
+        preferred_height: f64,
+    ) -> Result<()> {
+        self.env_mut().edit_yaml_object_anchor(
+            &layout_element.path,
+            layout_element.anchor.as_str(),
+            |class| {
+                super::pptr_path::set_value_at_path(
+                    class,
+                    "m_PreferredWidth",
+                    UnityValue::Float(preferred_width),
+                )?;
+                super::pptr_path::set_value_at_path(
+                    class,
+                    "m_PreferredHeight",
+                    UnityValue::Float(preferred_height),
+                )?;
+                Ok(())
+            },
+        )
+    }
+
+    pub fn yaml_ui_layout_element_set_flexible_size(
+        &mut self,
+        layout_element: &YamlObjectKey,
+        flexible_width: f64,
+        flexible_height: f64,
+    ) -> Result<()> {
+        self.env_mut().edit_yaml_object_anchor(
+            &layout_element.path,
+            layout_element.anchor.as_str(),
+            |class| {
+                super::pptr_path::set_value_at_path(
+                    class,
+                    "m_FlexibleWidth",
+                    UnityValue::Float(flexible_width),
+                )?;
+                super::pptr_path::set_value_at_path(
+                    class,
+                    "m_FlexibleHeight",
+                    UnityValue::Float(flexible_height),
+                )?;
+                Ok(())
+            },
+        )
+    }
+
+    pub fn yaml_ui_layout_element_set_layout_priority(
+        &mut self,
+        layout_element: &YamlObjectKey,
+        priority: i64,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            layout_element,
+            "m_LayoutPriority",
+            UnityValue::Integer(priority),
+        )
+    }
+
     pub fn yaml_rect_transform_set_anchored_position(
         &mut self,
         rect_transform: &YamlObjectKey,

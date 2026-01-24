@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - InputField: set `m_Text`/`m_Interactable` and append persistent `onValueChanged`/`onEndEdit` calls.
   - TMP_InputField: set `m_Text`/`m_Interactable` and append persistent `onValueChanged`/`onEndEdit` calls.
   - ScrollRect: set content/viewport refs, axis toggles, normalized position/velocity, and append persistent `onValueChanged` calls.
+  - CanvasGroup: set alpha/interactable/raycast flags.
+  - ContentSizeFitter: set horizontal/vertical fit modes.
+  - LayoutElement: set sizes + ignoreLayout + layout priority.
 - Directory-wide `.meta` GUID indexing (`Environment::index_meta_guids_in_directory`) for higher external resolution hit rates without loading every asset file.
 - `Environment::set_type_tree_registry_from_paths` to load `.tpk`/`.json` TypeTree registries (best-effort parsing for stripped assets).
 - External workflow to generate MonoBehaviour/script TypeTrees via UnityPy + TypeTreeGeneratorAPI:

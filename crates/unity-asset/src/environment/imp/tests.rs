@@ -5365,3 +5365,234 @@ MonoBehaviour:
     });
     assert_eq!(target_file_id, Some(114002), "target={:?}", target);
 }
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_canvas_group_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_canvas_group.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Panel
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 225001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!225 &225001
+CanvasGroup:
+  m_GameObject: {fileID: 100000}
+  m_Alpha: 1
+  m_Interactable: 1
+  m_BlocksRaycasts: 1
+  m_IgnoreParentGroups: 0
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Panel")
+        .unwrap();
+    let group = session.find_yaml_canvas_group_key(&go).unwrap();
+    session.yaml_ui_canvas_group_set_alpha(&group, 0.4).unwrap();
+    session
+        .yaml_ui_canvas_group_set_interactable(&group, false)
+        .unwrap();
+    session
+        .yaml_ui_canvas_group_set_blocks_raycast(&group, false)
+        .unwrap();
+    session
+        .yaml_ui_canvas_group_set_ignore_parent_groups(&group, true)
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_canvas_group.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+    let group = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "225001")
+        .expect("CanvasGroup anchor");
+    assert_eq!(group.get("m_Alpha").and_then(|v| v.as_f64()), Some(0.4));
+    assert_eq!(
+        group.get("m_Interactable").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+    assert_eq!(
+        group.get("m_BlocksRaycasts").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+    assert_eq!(
+        group.get("m_IgnoreParentGroups").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+}
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_layout_element_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_layout_element.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Item
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 114001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!114 &114001
+MonoBehaviour:
+  m_GameObject: {fileID: 100000}
+  m_IgnoreLayout: 0
+  m_MinWidth: 0
+  m_MinHeight: 0
+  m_PreferredWidth: 0
+  m_PreferredHeight: 0
+  m_FlexibleWidth: 0
+  m_FlexibleHeight: 0
+  m_LayoutPriority: 1
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Item")
+        .unwrap();
+    let el = session.find_yaml_layout_element_key(&go).unwrap();
+    session
+        .yaml_ui_layout_element_set_ignore_layout(&el, true)
+        .unwrap();
+    session
+        .yaml_ui_layout_element_set_min_size(&el, 10.0, 11.0)
+        .unwrap();
+    session
+        .yaml_ui_layout_element_set_preferred_size(&el, 20.0, 21.0)
+        .unwrap();
+    session
+        .yaml_ui_layout_element_set_flexible_size(&el, 30.0, 31.0)
+        .unwrap();
+    session
+        .yaml_ui_layout_element_set_layout_priority(&el, 7)
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_layout_element.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+    let el = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "114001")
+        .expect("LayoutElement anchor");
+
+    let read_f64 = |v: &unity_asset_core::UnityValue| {
+        v.as_f64()
+            .or_else(|| v.as_i64().map(|i| i as f64))
+            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+    };
+
+    assert_eq!(el.get("m_IgnoreLayout").and_then(|v| v.as_i64()), Some(1));
+    assert_eq!(el.get("m_MinWidth").and_then(read_f64), Some(10.0));
+    assert_eq!(el.get("m_MinHeight").and_then(read_f64), Some(11.0));
+    assert_eq!(el.get("m_PreferredWidth").and_then(read_f64), Some(20.0));
+    assert_eq!(el.get("m_PreferredHeight").and_then(read_f64), Some(21.0));
+    assert_eq!(el.get("m_FlexibleWidth").and_then(read_f64), Some(30.0));
+    assert_eq!(el.get("m_FlexibleHeight").and_then(read_f64), Some(31.0));
+    assert_eq!(el.get("m_LayoutPriority").and_then(|v| v.as_i64()), Some(7));
+}
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_content_size_fitter_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_content_size_fitter.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Fit
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 114001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!114 &114001
+MonoBehaviour:
+  m_GameObject: {fileID: 100000}
+  m_HorizontalFit: 0
+  m_VerticalFit: 0
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Fit")
+        .unwrap();
+    let fitter = session.find_yaml_content_size_fitter_key(&go).unwrap();
+    session
+        .yaml_ui_content_size_fitter_set_fit_modes(&fitter, 2, 1)
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_content_size_fitter.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+    let fitter = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "114001")
+        .expect("ContentSizeFitter anchor");
+    assert_eq!(
+        fitter.get("m_HorizontalFit").and_then(|v| v.as_i64()),
+        Some(2)
+    );
+    assert_eq!(
+        fitter.get("m_VerticalFit").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+}
