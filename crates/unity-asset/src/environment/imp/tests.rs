@@ -3739,3 +3739,116 @@ Transform:
     assert_eq!(rot.get("z").and_then(|v| v.as_f64()), Some(0.3));
     assert_eq!(rot.get("w").and_then(|v| v.as_f64()), Some(0.4));
 }
+
+#[test]
+fn environment_can_find_yaml_gameobject_by_hierarchy_path_and_reparent() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("hierarchy.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Canvas
+  m_Component:
+  - component: {fileID: 200001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children:
+  - {fileID: 200002}
+--- !u!1 &100001
+GameObject:
+  m_Name: Button
+  m_Component:
+  - component: {fileID: 200002}
+--- !u!224 &200002
+RectTransform:
+  m_GameObject: {fileID: 100001}
+  m_Father: {fileID: 200001}
+  m_Children:
+  - {fileID: 200003}
+--- !u!1 &100002
+GameObject:
+  m_Name: Text
+  m_Component:
+  - component: {fileID: 200003}
+--- !u!224 &200003
+RectTransform:
+  m_GameObject: {fileID: 100002}
+  m_Father: {fileID: 200002}
+  m_Children: []
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let canvas = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Canvas")
+        .unwrap();
+
+    let text = session
+        .find_yaml_child_gameobject_key_by_hierarchy_path(&canvas, "Button/Text")
+        .unwrap();
+    assert_eq!(text.anchor, "100002");
+
+    session.yaml_reparent_gameobject(&text, &canvas).unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("hierarchy.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+
+    let canvas_tr = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "200001")
+        .expect("Canvas RectTransform anchor");
+    let canvas_children = canvas_tr
+        .get("m_Children")
+        .and_then(|v| v.as_array())
+        .expect("Canvas m_Children array");
+    let canvas_child_ids: Vec<i64> = canvas_children
+        .iter()
+        .filter_map(|v| v.as_object())
+        .filter_map(|m| m.get("fileID").and_then(|v| v.as_i64()))
+        .collect();
+    assert_eq!(canvas_child_ids, vec![200002, 200003]);
+
+    let button_tr = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "200002")
+        .expect("Button RectTransform anchor");
+    let button_children = button_tr
+        .get("m_Children")
+        .and_then(|v| v.as_array())
+        .expect("Button m_Children array");
+    let button_child_ids: Vec<i64> = button_children
+        .iter()
+        .filter_map(|v| v.as_object())
+        .filter_map(|m| m.get("fileID").and_then(|v| v.as_i64()))
+        .collect();
+    assert_eq!(button_child_ids, Vec::<i64>::new());
+
+    let text_tr = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "200003")
+        .expect("Text RectTransform anchor");
+    let father = text_tr
+        .get("m_Father")
+        .and_then(|v| v.as_object())
+        .expect("Text m_Father object");
+    assert_eq!(father.get("fileID").and_then(|v| v.as_i64()), Some(200001));
+}

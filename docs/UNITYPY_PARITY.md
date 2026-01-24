@@ -390,6 +390,9 @@ Acceptance:
   - [x] Find MonoBehaviour components by `m_Script.guid` (script GUID)
   - [x] RectTransform setters (`m_AnchoredPosition`, `m_SizeDelta`, `m_AnchorMin`, `m_AnchorMax`, `m_Pivot`, `m_OffsetMin`, `m_OffsetMax`)
   - [x] Transform setters (`m_LocalPosition`, `m_LocalRotation`, `m_LocalScale`)
+  - [x] Hierarchy helpers:
+    - [x] Find child GameObject by name path (traverse `m_Children` → `m_GameObject`)
+    - [x] Reparent GameObjects (update `m_Father` / `m_Children`)
   - [x] Generic YAML setters for common UI fields:
     - [x] PPtr-like refs (`{fileID,guid,type}`) and internal anchor refs
     - [x] Color (`{r,g,b,a}`) and GameObject active (`m_IsActive`)

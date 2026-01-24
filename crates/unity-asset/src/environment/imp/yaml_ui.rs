@@ -63,6 +63,45 @@ fn yaml_pptr_value(file_id: i64, guid_32_hex: Option<&str>, type_id: Option<i64>
     UnityValue::Object(entries.into_iter().collect())
 }
 
+fn read_child_transform_file_ids(transform: &UnityClass) -> Vec<i64> {
+    let Some(value) = super::pptr_path::get_value_at_path(transform, "m_Children") else {
+        return Vec::new();
+    };
+    let UnityValue::Array(items) = value else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<i64> = Vec::new();
+    for item in items {
+        let Some(pptr) = super::yaml_pptr::parse_yaml_pptr(item) else {
+            continue;
+        };
+        if pptr.guid.is_some() {
+            continue;
+        }
+        out.push(pptr.file_id);
+    }
+    out
+}
+
+fn read_transform_gameobject_file_id(transform: &UnityClass) -> Option<i64> {
+    let value = super::pptr_path::get_value_at_path(transform, "m_GameObject")?;
+    let pptr = super::yaml_pptr::parse_yaml_pptr(value)?;
+    if pptr.guid.is_some() {
+        return None;
+    }
+    Some(pptr.file_id)
+}
+
+fn read_transform_parent_file_id(transform: &UnityClass) -> Option<i64> {
+    let value = super::pptr_path::get_value_at_path(transform, "m_Father")?;
+    let pptr = super::yaml_pptr::parse_yaml_pptr(value)?;
+    if pptr.guid.is_some() {
+        return None;
+    }
+    Some(pptr.file_id)
+}
+
 fn read_gameobject_component_file_ids(game_object: &UnityClass) -> Vec<i64> {
     let Some(value) = super::pptr_path::get_value_at_path(game_object, "m_Component") else {
         return Vec::new();
@@ -91,6 +130,19 @@ fn read_gameobject_component_file_ids(game_object: &UnityClass) -> Vec<i64> {
 }
 
 impl<'a> EnvironmentEditSession<'a> {
+    fn yaml_doc_for_read(&mut self, yaml_path: &Path) -> Result<(PathBuf, &YamlDocument)> {
+        let yaml_path = canonicalize_if_exists(yaml_path);
+        let yaml_key = self.env_mut().ensure_yaml_loaded(&yaml_path)?;
+        let env = self.env();
+        let doc = env
+            .write_state
+            .yaml_documents
+            .get(&yaml_key)
+            .or_else(|| env.yaml_documents.get(&yaml_key))
+            .expect("ensure_yaml_loaded ensures base yaml doc exists");
+        Ok((yaml_key, doc))
+    }
+
     pub fn set_yaml_value_at_key_path(
         &mut self,
         key: &YamlObjectKey,
@@ -256,6 +308,146 @@ impl<'a> EnvironmentEditSession<'a> {
         )))
     }
 
+    pub fn find_yaml_transform_key_for_gameobject(
+        &mut self,
+        game_object: &YamlObjectKey,
+    ) -> Result<YamlObjectKey> {
+        match self.find_yaml_component_key_by_class_name(game_object, "RectTransform") {
+            Ok(v) => Ok(v),
+            Err(_) => self.find_yaml_component_key_by_class_name(game_object, "Transform"),
+        }
+    }
+
+    pub fn find_yaml_child_gameobject_key_by_hierarchy_path(
+        &mut self,
+        root_game_object: &YamlObjectKey,
+        hierarchy_path: &str,
+    ) -> Result<YamlObjectKey> {
+        let segments: Vec<&str> = hierarchy_path
+            .split('/')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if segments.is_empty() {
+            return Ok(root_game_object.clone());
+        }
+
+        let yaml_path = canonicalize_if_exists(&root_game_object.path);
+        let yaml_key = self.env_mut().ensure_yaml_loaded(&yaml_path)?;
+        let doc = {
+            let env = self.env();
+            env.write_state
+                .yaml_documents
+                .get(&yaml_key)
+                .or_else(|| env.yaml_documents.get(&yaml_key))
+                .expect("ensure_yaml_loaded ensures base yaml doc exists")
+        };
+
+        if yaml_key != yaml_path {
+            return Err(UnityAssetError::format(format!(
+                "Hierarchy root YAML path mismatch after canonicalization: {} vs {}",
+                yaml_path.display(),
+                yaml_key.display()
+            )));
+        }
+
+        let mut current_go = root_game_object.clone();
+        for seg in segments {
+            let go_obj = doc
+                .entries()
+                .iter()
+                .find(|o| o.anchor == current_go.anchor && o.class_name == "GameObject")
+                .ok_or_else(|| {
+                    UnityAssetError::format(format!(
+                        "GameObject anchor not found: {} (file: {})",
+                        current_go.anchor,
+                        yaml_key.display()
+                    ))
+                })?;
+
+            let component_ids = read_gameobject_component_file_ids(go_obj);
+            let transform_anchor = ["RectTransform", "Transform"]
+                .into_iter()
+                .find_map(|want| {
+                    component_ids.iter().find_map(|file_id| {
+                        let anchor = file_id.to_string();
+                        let component = doc.entries().iter().find(|o| o.anchor == anchor)?;
+                        if component.class_name == want {
+                            Some(component.anchor.clone())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .ok_or_else(|| {
+                    UnityAssetError::format(format!(
+                        "Transform component not found on GameObject {} (file: {})",
+                        current_go.anchor,
+                        yaml_key.display()
+                    ))
+                })?;
+
+            let transform = doc
+                .entries()
+                .iter()
+                .find(|o| o.anchor == transform_anchor)
+                .expect("transform_anchor comes from doc lookup");
+
+            let mut matches: Vec<YamlObjectKey> = Vec::new();
+            for child_tr_file_id in read_child_transform_file_ids(transform) {
+                let child_tr_anchor = child_tr_file_id.to_string();
+                let Some(child_tr) = doc.entries().iter().find(|o| o.anchor == child_tr_anchor)
+                else {
+                    continue;
+                };
+                let Some(child_go_file_id) = read_transform_gameobject_file_id(child_tr) else {
+                    continue;
+                };
+                let child_go_anchor = child_go_file_id.to_string();
+                let Some(child_go) = doc
+                    .entries()
+                    .iter()
+                    .find(|o| o.anchor == child_go_anchor && o.class_name == "GameObject")
+                else {
+                    continue;
+                };
+                let Some(name) = child_go.get("m_Name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if name == seg {
+                    matches.push(YamlObjectKey {
+                        path: yaml_key.clone(),
+                        anchor: child_go_anchor,
+                    });
+                }
+            }
+
+            match matches.as_slice() {
+                [only] => current_go = only.clone(),
+                [] => {
+                    return Err(UnityAssetError::format(format!(
+                        "Child GameObject not found under {}: {} (file: {})",
+                        current_go.anchor,
+                        seg,
+                        yaml_key.display()
+                    )));
+                }
+                many => {
+                    return Err(UnityAssetError::format(format!(
+                        "Child GameObject name is not unique under {}: {} (matches={}, file: {})",
+                        current_go.anchor,
+                        seg,
+                        many.len(),
+                        yaml_key.display()
+                    )));
+                }
+            }
+        }
+
+        Ok(current_go)
+    }
+
     pub fn find_yaml_monobehaviour_key_by_script_guid(
         &mut self,
         game_object: &YamlObjectKey,
@@ -405,5 +597,111 @@ impl<'a> EnvironmentEditSession<'a> {
         w: f64,
     ) -> Result<()> {
         self.set_yaml_quat_at_key_path(transform, "m_LocalRotation", x, y, z, w)
+    }
+
+    pub fn yaml_reparent_gameobject(
+        &mut self,
+        child_game_object: &YamlObjectKey,
+        new_parent_game_object: &YamlObjectKey,
+    ) -> Result<()> {
+        let child_yaml = canonicalize_if_exists(&child_game_object.path);
+        let parent_yaml = canonicalize_if_exists(&new_parent_game_object.path);
+        if child_yaml != parent_yaml {
+            return Err(UnityAssetError::format(format!(
+                "Reparent requires both objects to be in the same YAML file: child={} parent={}",
+                child_yaml.display(),
+                parent_yaml.display()
+            )));
+        }
+
+        let child_go = YamlObjectKey {
+            path: child_yaml.clone(),
+            anchor: child_game_object.anchor.clone(),
+        };
+        let new_parent_go = YamlObjectKey {
+            path: parent_yaml.clone(),
+            anchor: new_parent_game_object.anchor.clone(),
+        };
+
+        let child_tr = self.find_yaml_transform_key_for_gameobject(&child_go)?;
+        let new_parent_tr = self.find_yaml_transform_key_for_gameobject(&new_parent_go)?;
+        let child_tr_id = child_tr.anchor.parse::<i64>().map_err(|e| {
+            UnityAssetError::format(format!(
+                "Invalid child Transform anchor fileID: {} ({})",
+                child_tr.anchor, e
+            ))
+        })?;
+
+        let (yaml_key, old_parent_tr_file_id) = {
+            let (yaml_key, doc) = self.yaml_doc_for_read(&child_yaml)?;
+            let child_tr_obj = doc
+                .entries()
+                .iter()
+                .find(|o| o.anchor == child_tr.anchor)
+                .ok_or_else(|| {
+                    UnityAssetError::format(format!(
+                        "Child Transform anchor not found: {} (file: {})",
+                        child_tr.anchor,
+                        yaml_key.display()
+                    ))
+                })?;
+            (
+                yaml_key,
+                read_transform_parent_file_id(child_tr_obj).filter(|v| *v != 0),
+            )
+        };
+
+        // 1) Update child's parent pointer.
+        self.set_yaml_pptr_to_yaml_anchor_at_key_path(
+            &child_tr,
+            "m_Father",
+            new_parent_tr.anchor.as_str(),
+        )?;
+
+        // 2) Remove child from old parent's m_Children.
+        if let Some(old_parent_tr_file_id) = old_parent_tr_file_id {
+            let old_parent_tr_key = YamlObjectKey {
+                path: yaml_key.clone(),
+                anchor: old_parent_tr_file_id.to_string(),
+            };
+
+            self.env_mut().edit_yaml_object_anchor(
+                &yaml_key,
+                old_parent_tr_key.anchor.as_str(),
+                |class| {
+                    let mut children: Vec<i64> = read_child_transform_file_ids(class);
+                    children.retain(|v| *v != child_tr_id);
+                    let value = UnityValue::Array(
+                        children
+                            .into_iter()
+                            .map(|id| yaml_pptr_value(id, None, None))
+                            .collect(),
+                    );
+                    super::pptr_path::set_value_at_path(class, "m_Children", value)
+                },
+            )?;
+        }
+
+        // 3) Add child to new parent's m_Children (append).
+        self.env_mut().edit_yaml_object_anchor(
+            &yaml_key,
+            new_parent_tr.anchor.as_str(),
+            |class| {
+                let mut children: Vec<i64> = read_child_transform_file_ids(class);
+                if !children.contains(&child_tr_id) {
+                    children.push(child_tr_id);
+                }
+
+                let value = UnityValue::Array(
+                    children
+                        .into_iter()
+                        .map(|id| yaml_pptr_value(id, None, None))
+                        .collect(),
+                );
+                super::pptr_path::set_value_at_path(class, "m_Children", value)
+            },
+        )?;
+
+        Ok(())
     }
 }
