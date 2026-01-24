@@ -1,6 +1,6 @@
 //! Unity object representation and helpers.
 
-use crate::asset::{ObjectInfo, SerializedFile};
+use crate::asset::{ObjectInfo, SerializedFile, SerializedType};
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::shared_bytes::SharedBytes;
@@ -406,32 +406,38 @@ fn type_tree_for_object<'a>(
     file: &'a SerializedFile,
     info: &ObjectInfo,
 ) -> Option<TypeTreeSource<'a>> {
-    fn from_internal<'a>(file: &'a SerializedFile, info: &ObjectInfo) -> Option<&'a TypeTree> {
+    fn from_internal<'a>(
+        file: &'a SerializedFile,
+        info: &ObjectInfo,
+    ) -> Option<&'a SerializedType> {
         if info.type_index >= 0 {
-            return file
-                .types
-                .get(info.type_index as usize)
-                .map(|t| &t.type_tree);
+            return file.types.get(info.type_index as usize);
         }
-        file.types
-            .iter()
-            .find(|t| t.class_id == info.type_id)
-            .map(|t| &t.type_tree)
+        file.types.iter().find(|t| t.class_id == info.type_id)
     }
 
     if file.enable_type_tree
-        && let Some(tree) = from_internal(file, info)
-        && !tree.is_empty()
+        && let Some(typ) = from_internal(file, info)
+        && !typ.type_tree.is_empty()
     {
-        return Some(TypeTreeSource::Borrowed(tree));
+        return Some(TypeTreeSource::Borrowed(&typ.type_tree));
     }
 
     // Best-effort fallback: stripped files can supply a registry externally.
     // We also allow this fallback even when `enable_type_tree = true` but the internal entry is missing/empty.
-    file.type_tree_registry
-        .as_ref()
-        .and_then(|r| r.resolve(&file.unity_version, info.type_id))
-        .map(TypeTreeSource::Shared)
+    file.type_tree_registry.as_ref().and_then(|r| {
+        if let Some(typ) = from_internal(file, info)
+            && typ.is_script_type()
+            && typ.script_id != [0u8; 16]
+        {
+            if let Some(tree) = r.resolve_script(&file.unity_version, typ.class_id, typ.script_id) {
+                return Some(TypeTreeSource::Shared(tree));
+            }
+        }
+
+        r.resolve(&file.unity_version, info.type_id)
+            .map(TypeTreeSource::Shared)
+    })
 }
 
 fn object_bytes<'a>(file: &'a SerializedFile, info: &'a ObjectInfo) -> Result<&'a [u8]> {

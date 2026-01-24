@@ -49,7 +49,8 @@ pub mod types;
 pub use builder::{TypeTreeBuilder, TypeTreeValidator, ValidationReport};
 pub use parser::{ParsingStats, TypeTreeParser};
 pub use registry::{
-    CompositeTypeTreeRegistry, InMemoryTypeTreeRegistry, JsonTypeTreeRegistry, TypeTreeRegistry,
+    CompositeTypeTreeRegistry, InMemoryTypeTreeRegistry, JsonTypeTreeRegistry,
+    ScriptTypeTreeGenerator, ScriptTypeTreeGeneratorRegistry, TypeTreeRegistry,
 };
 pub use serializer::{
     PPtrScanResult, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput,

@@ -18,7 +18,8 @@ mod imp {
     use unity_asset_binary::object::{ObjectHandle, UnityObject};
     use unity_asset_binary::typetree::TypeTreeRegistry;
     use unity_asset_binary::typetree::{
-        CompositeTypeTreeRegistry, JsonTypeTreeRegistry, TpkTypeTreeRegistry,
+        CompositeTypeTreeRegistry, JsonTypeTreeRegistry, ScriptTypeTreeGenerator,
+        ScriptTypeTreeGeneratorRegistry, TpkTypeTreeRegistry,
     };
     use unity_asset_binary::typetree::{
         TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseWarning,
@@ -294,6 +295,8 @@ mod imp {
         warnings: Mutex<Vec<EnvironmentWarning>>,
         reporter: Option<Arc<dyn EnvironmentReporter>>,
         options: EnvironmentOptions,
+        base_type_tree_registry: Option<Arc<dyn TypeTreeRegistry>>,
+        script_type_tree_registry: Option<Arc<dyn TypeTreeRegistry>>,
         type_tree_registry: Option<Arc<dyn TypeTreeRegistry>>,
         write_state: edit::EnvironmentWriteState,
         /// Base path for relative file resolution
@@ -320,6 +323,8 @@ mod imp {
                 warnings: Mutex::new(Vec::new()),
                 reporter: None,
                 options,
+                base_type_tree_registry: None,
+                script_type_tree_registry: None,
                 type_tree_registry: None,
                 write_state: edit::EnvironmentWriteState::default(),
                 base_path: std::env::current_dir().unwrap_or_default(),
@@ -330,17 +335,50 @@ mod imp {
             self.reporter = reporter;
         }
 
-        pub fn set_type_tree_registry(&mut self, registry: Option<Arc<dyn TypeTreeRegistry>>) {
-            self.type_tree_registry = registry.clone();
+        fn rebuild_type_tree_registry(&mut self) {
+            let mut composite = CompositeTypeTreeRegistry::default();
+            if let Some(script) = self.script_type_tree_registry.clone() {
+                composite.push(script);
+            }
+            if let Some(base) = self.base_type_tree_registry.clone() {
+                composite.push(base);
+            }
+
+            let effective: Option<Arc<dyn TypeTreeRegistry>> = if composite.is_empty() {
+                None
+            } else {
+                Some(Arc::new(composite))
+            };
+
+            self.type_tree_registry = effective.clone();
 
             for file in self.binary_assets.values_mut() {
-                file.set_type_tree_registry(registry.clone());
+                file.set_type_tree_registry(effective.clone());
             }
             for bundle in self.bundles.values_mut() {
                 for file in bundle.assets.iter_mut() {
-                    file.set_type_tree_registry(registry.clone());
+                    file.set_type_tree_registry(effective.clone());
                 }
             }
+        }
+
+        pub fn set_type_tree_registry(&mut self, registry: Option<Arc<dyn TypeTreeRegistry>>) {
+            self.base_type_tree_registry = registry;
+            self.rebuild_type_tree_registry();
+        }
+
+        /// Set a script TypeTree generator hook (UnityPy `typetree_generator` equivalent).
+        ///
+        /// When set, script-specific TypeTrees can be resolved via `TypeTreeRegistry::resolve_script(...)`
+        /// and cached. This is primarily used to edit `MonoBehaviour` objects whose TypeTrees are stripped.
+        pub fn set_script_type_tree_generator(
+            &mut self,
+            generator: Option<Arc<dyn ScriptTypeTreeGenerator>>,
+        ) {
+            self.script_type_tree_registry = generator.map(|g| {
+                Arc::new(ScriptTypeTreeGeneratorRegistry::new(g)) as Arc<dyn TypeTreeRegistry>
+            });
+            self.rebuild_type_tree_registry();
         }
 
         /// Load and set an external TypeTree registry from a list of file paths.
