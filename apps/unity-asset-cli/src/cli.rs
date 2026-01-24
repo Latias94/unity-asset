@@ -246,6 +246,25 @@ pub(crate) enum Commands {
         json: bool,
     },
 
+    /// Print parsing stats (SerializedFile header/version/metadata) for loaded sources
+    Stats {
+        /// Input file or directory path (assets/bundles will be auto-detected)
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Source kind: `all`, `bundle`, or `serialized`
+        #[arg(long, default_value = "all")]
+        kind: String,
+
+        /// Limit printed entries
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Print one JSON object per line
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Find objects by AssetBundle `m_Container` asset path pattern (UnityPy-like discovery)
     FindObject {
         /// Input file or directory path (bundles will be auto-detected)

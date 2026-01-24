@@ -14,6 +14,7 @@ mod list_objects;
 mod parse_yaml;
 mod project_graph;
 mod scan_pptr;
+mod stats;
 
 pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
     match command {
@@ -124,6 +125,12 @@ pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
             json,
             ctx,
         ),
+        Commands::Stats {
+            input,
+            kind,
+            limit,
+            json,
+        } => stats::run(&input, kind.as_str(), &limit, &json, ctx),
         Commands::FindObject {
             input,
             pattern,
