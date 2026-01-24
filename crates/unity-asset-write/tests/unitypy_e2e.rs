@@ -274,6 +274,81 @@ assert len(objects) > 0
     Ok(())
 }
 
+fn push_cstring(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(s.as_bytes());
+    out.push(0);
+}
+
+fn make_minimal_serialized_file_v8_le() -> Vec<u8> {
+    let version: u32 = 8;
+    let data_offset: u32 = 32;
+
+    let mut meta: Vec<u8> = Vec::new();
+    push_cstring(&mut meta, "2.5.0f5");
+    meta.extend_from_slice(&0i32.to_le_bytes()); // target_platform
+    meta.extend_from_slice(&0i32.to_le_bytes()); // type_count
+    meta.extend_from_slice(&0i32.to_le_bytes()); // big_id_enabled (7<=v<14)
+    meta.extend_from_slice(&0i32.to_le_bytes()); // object_count
+    meta.extend_from_slice(&0i32.to_le_bytes()); // externals_count
+    push_cstring(&mut meta, "");
+
+    let metadata_size: u32 = (1u32).saturating_add(meta.len() as u32); // +1 endian boolean
+    let file_size: u32 = data_offset.saturating_add(metadata_size);
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&metadata_size.to_be_bytes());
+    out.extend_from_slice(&file_size.to_be_bytes());
+    out.extend_from_slice(&version.to_be_bytes());
+    out.extend_from_slice(&data_offset.to_be_bytes());
+
+    if out.len() < data_offset as usize {
+        out.resize(data_offset as usize, 0);
+    }
+
+    out.push(0u8); // endian: 0 = little
+    out.extend_from_slice(&meta);
+
+    out
+}
+
+#[test]
+fn unitypy_can_load_saved_legacy_v8_serialized_file() -> anyhow::Result<()> {
+    if std::env::var("UNITYPY_E2E").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    let bytes = make_minimal_serialized_file_v8_le();
+    let serialized = unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes)?;
+    let saved = SerializedFileWriter::save(&serialized, &SerializedFileEdits::default())?;
+
+    let tmp = tempfile::NamedTempFile::new()?;
+    std::fs::write(tmp.path(), &saved)?;
+
+    let py = r#"
+import os, sys
+repo_root = sys.argv[1]
+assets_path = sys.argv[2]
+sys.path.insert(0, os.path.join(repo_root, "repo-ref", "UnityPy"))
+import UnityPy  # noqa: E402
+
+env = UnityPy.load(assets_path)
+f = env.file
+assert f.header.version == 8
+assert len(f.types) == 0
+assert len(f.objects) == 0
+"#;
+
+    unitypy_check(
+        py,
+        &[
+            repo_root().display().to_string(),
+            tmp.path().display().to_string(),
+        ],
+    )?;
+
+    Ok(())
+}
+
 #[test]
 fn unitypy_can_load_saved_webfile() -> anyhow::Result<()> {
     if std::env::var("UNITYPY_E2E").ok().as_deref() != Some("1") {

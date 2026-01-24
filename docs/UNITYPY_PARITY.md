@@ -44,7 +44,6 @@ P0 (blocks broad edit compatibility):
   - Note: a built-in generator (managed/il2cpp) is intentionally deferred until a mature reference/validation corpus exists.
 
 P1 (important, but not blocking most modern samples):
-- `SerializedFile.save` for `version < 9` (legacy header/layout support).
 - Legacy bundle save (`UnityWeb` / `UnityRaw`).
 
 P2 / future:
@@ -322,7 +321,7 @@ Acceptance:
   - [x] size, type id/index, stripped/script fields
   - [x] alignment (object stream + metadata alignment)
 - [x] Support “edited object bytes” overriding original slices (`SerializedFileEdits`)
-- [ ] TODO: support `version < 9` save (UnityPy supports older layouts)
+- [x] Support `version < 9` save (legacy metadata-at-end layout, with endian boolean prefix)
 - [ ] TODO: legacy TypeTree dump `SerializedType::write_type_tree` for `version == 2`
 
 Acceptance:

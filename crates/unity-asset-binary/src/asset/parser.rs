@@ -90,6 +90,24 @@ impl SerializedFileParser {
             // Switch to the correct byte order
             reader.set_byte_order(file.header.byte_order());
 
+            // Legacy layout (version < 9):
+            // - Data section lives at `data_offset`
+            // - Metadata lives at the end of the file
+            // - `metadata_size` includes a 1-byte endian boolean prefix
+            if file.header.version < 9 {
+                let meta_start = file
+                    .header
+                    .file_size
+                    .checked_sub(file.header.metadata_size as u64)
+                    .ok_or_else(|| {
+                        BinaryError::invalid_data("Invalid header: file_size < metadata_size")
+                    })?;
+                let meta_body_start = meta_start.checked_add(1).ok_or_else(|| {
+                    BinaryError::invalid_data("Invalid header: metadata start overflow")
+                })?;
+                reader.set_position(meta_body_start)?;
+            }
+
             // Parse metadata
             Self::parse_metadata(&mut file, &mut reader)?;
         }

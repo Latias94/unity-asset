@@ -36,11 +36,6 @@ impl SerializedFileWriter {
         options: SerializedFileSaveOptions,
     ) -> Result<Vec<u8>> {
         let version = file.header.version;
-        if version < 9 {
-            return Err(UnityAssetError::format(
-                "SerializedFile save for version < 9 is not implemented yet",
-            ));
-        }
 
         let endian = match file.header.byte_order() {
             unity_asset_binary::reader::ByteOrder::Little => Endian::Little,
@@ -141,27 +136,65 @@ impl SerializedFileWriter {
         }
 
         // Header + layout
-        let metadata_size = meta.len();
+        let mut metadata_size = meta.len();
         let data_size = data.len();
 
-        let header_size: usize = if version >= 22 { 48 } else { 20 };
-        let mut data_offset = header_size + metadata_size;
-        data_offset += (16 - (data_offset % 16)) % 16;
-        let file_size = data_offset
-            .checked_add(data_size)
-            .ok_or_else(|| UnityAssetError::format("file size overflow"))?;
+        let header_size: usize = if version >= 22 {
+            48
+        } else if version >= 9 {
+            20
+        } else {
+            16
+        };
+
+        // v<9 stores metadata at the end of the file and includes a 1-byte endian boolean prefix.
+        let data_offset: usize = if version < 9 {
+            let header_data_offset: usize = file.header.data_offset.try_into().unwrap_or(0usize);
+            let default_offset = 32usize;
+            let mut out = header_data_offset.max(default_offset);
+            if out < header_size {
+                out = header_size;
+            }
+            metadata_size = metadata_size
+                .checked_add(1)
+                .ok_or_else(|| UnityAssetError::format("metadata_size overflow"))?;
+            out
+        } else {
+            let mut out = header_size + metadata_size;
+            out += (16 - (out % 16)) % 16;
+            out
+        };
+
+        let file_size: usize = if version < 9 {
+            data_offset
+                .checked_add(data_size)
+                .and_then(|v| v.checked_add(metadata_size))
+                .ok_or_else(|| UnityAssetError::format("file size overflow"))?
+        } else {
+            data_offset
+                .checked_add(data_size)
+                .ok_or_else(|| UnityAssetError::format("file size overflow"))?
+        };
 
         let metadata_size_u32: u32 = metadata_size.try_into().map_err(|_| {
             UnityAssetError::format(format!("metadata_size does not fit u32: {}", metadata_size))
         })?;
-        let file_size_u32: u32 = if version < 22 {
+        let file_size_u32: u32 = if version < 9 {
+            file_size.try_into().map_err(|_| {
+                UnityAssetError::format(format!("file_size does not fit u32: {}", file_size))
+            })?
+        } else if version < 22 {
             file_size.try_into().map_err(|_| {
                 UnityAssetError::format(format!("file_size does not fit u32: {}", file_size))
             })?
         } else {
             0
         };
-        let data_offset_u32: u32 = if version < 22 {
+        let data_offset_u32: u32 = if version < 9 {
+            data_offset.try_into().map_err(|_| {
+                UnityAssetError::format(format!("data_offset does not fit u32: {}", data_offset))
+            })?
+        } else if version < 22 {
             data_offset.try_into().map_err(|_| {
                 UnityAssetError::format(format!("data_offset does not fit u32: {}", data_offset))
             })?
@@ -172,7 +205,32 @@ impl SerializedFileWriter {
         // Unity SerializedFile header fields are always written in big-endian order.
         // UnityPy uses `EndianBinaryWriter()` default (`">"`).
         let mut out = BinaryWriter::new(Endian::Big);
-        if version < 22 {
+        if version < 9 {
+            // Legacy layout:
+            // - header is 16 bytes
+            // - data starts at `data_offset`
+            // - then 1-byte endian boolean
+            // - then metadata
+            out.write_u32(metadata_size_u32);
+            out.write_u32(file_size_u32);
+            out.write_u32(version);
+            out.write_u32(data_offset_u32);
+
+            if out.position() > data_offset {
+                return Err(UnityAssetError::format(format!(
+                    "Legacy data_offset {} is smaller than header size {}",
+                    data_offset,
+                    out.position()
+                )));
+            }
+            if out.position() < data_offset {
+                out.write(&vec![0u8; data_offset - out.position()]);
+            }
+
+            out.write(data.bytes());
+            out.write_bool(file.header.endian != 0);
+            out.write(meta.bytes());
+        } else if version < 22 {
             out.write_u32(metadata_size_u32);
             out.write_u32(file_size_u32);
             out.write_u32(version);
