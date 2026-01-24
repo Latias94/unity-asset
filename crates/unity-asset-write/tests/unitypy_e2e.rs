@@ -281,7 +281,9 @@ fn push_cstring(out: &mut Vec<u8>, s: &str) {
 
 fn make_minimal_serialized_file_v8_le() -> Vec<u8> {
     let version: u32 = 8;
-    let data_offset: u32 = 32;
+    // UnityPy's file type detection skips AssetsFile checks for files < 128 bytes.
+    // Keep this synthetic sample comfortably above that threshold.
+    let data_offset: u32 = 128;
 
     let mut meta: Vec<u8> = Vec::new();
     push_cstring(&mut meta, "2.5.0f5");
