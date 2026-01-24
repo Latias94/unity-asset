@@ -1990,6 +1990,25 @@ impl<'a> EnvironmentEditSession<'a> {
         )
     }
 
+    pub fn find_yaml_toggle_group_key(
+        &mut self,
+        game_object: &YamlObjectKey,
+    ) -> Result<YamlObjectKey> {
+        self.find_yaml_component_key_by_class_name(game_object, "ToggleGroup")
+    }
+
+    pub fn yaml_ui_toggle_group_set_allow_switch_off(
+        &mut self,
+        toggle_group: &YamlObjectKey,
+        allow_switch_off: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            toggle_group,
+            "m_AllowSwitchOff",
+            UnityValue::Integer(if allow_switch_off { 1 } else { 0 }),
+        )
+    }
+
     pub fn find_yaml_content_size_fitter_key(
         &mut self,
         game_object: &YamlObjectKey,
@@ -2137,6 +2156,124 @@ impl<'a> EnvironmentEditSession<'a> {
             layout_element,
             "m_LayoutPriority",
             UnityValue::Integer(priority),
+        )
+    }
+
+    pub fn find_yaml_scrollbar_key(
+        &mut self,
+        game_object: &YamlObjectKey,
+    ) -> Result<YamlObjectKey> {
+        match self.find_yaml_component_key_by_class_name(game_object, "Scrollbar") {
+            Ok(v) => Ok(v),
+            Err(_) => self.find_yaml_monobehaviour_key_by_required_fields(
+                game_object,
+                &["m_Value", "m_Size", "m_NumberOfSteps", "m_OnValueChanged"],
+            ),
+        }
+    }
+
+    pub fn yaml_ui_scrollbar_set_value(
+        &mut self,
+        scrollbar: &YamlObjectKey,
+        value: f64,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(scrollbar, "m_Value", UnityValue::Float(value))
+    }
+
+    pub fn yaml_ui_scrollbar_set_size(
+        &mut self,
+        scrollbar: &YamlObjectKey,
+        size: f64,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(scrollbar, "m_Size", UnityValue::Float(size))
+    }
+
+    pub fn yaml_ui_scrollbar_set_number_of_steps(
+        &mut self,
+        scrollbar: &YamlObjectKey,
+        steps: i64,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(scrollbar, "m_NumberOfSteps", UnityValue::Integer(steps))
+    }
+
+    pub fn yaml_ui_scrollbar_set_interactable(
+        &mut self,
+        scrollbar: &YamlObjectKey,
+        interactable: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path(
+            scrollbar,
+            "m_Interactable",
+            UnityValue::Integer(if interactable { 1 } else { 0 }),
+        )
+    }
+
+    pub fn yaml_ui_scrollbar_clear_on_value_changed(
+        &mut self,
+        scrollbar: &YamlObjectKey,
+    ) -> Result<()> {
+        self.env_mut().edit_yaml_object_anchor(
+            &scrollbar.path,
+            scrollbar.anchor.as_str(),
+            |class| {
+                let calls = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnValueChanged.m_PersistentCalls.m_Calls",
+                )?;
+                *calls = UnityValue::Array(Vec::new());
+                Ok(())
+            },
+        )
+    }
+
+    pub fn yaml_ui_scrollbar_add_on_value_changed_call(
+        &mut self,
+        scrollbar: &YamlObjectKey,
+        target_file_id: i64,
+        target_guid_32_hex: Option<&str>,
+        target_type_id: Option<i64>,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_guid_32_hex = target_guid_32_hex.map(|s| s.trim().to_ascii_lowercase());
+        let target = yaml_pptr_value(
+            target_file_id,
+            target_guid_32_hex.as_deref(),
+            target_type_id,
+        );
+
+        self.env_mut().edit_yaml_object_anchor(
+            &scrollbar.path,
+            scrollbar.anchor.as_str(),
+            |class| {
+                let calls_value = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnValueChanged.m_PersistentCalls.m_Calls",
+                )?;
+                let calls = ensure_array_mut(calls_value);
+                calls.push(unity_event_persistent_call(target, method_name, 0));
+                Ok(())
+            },
+        )
+    }
+
+    pub fn yaml_ui_scrollbar_add_on_value_changed_target_anchor(
+        &mut self,
+        scrollbar: &YamlObjectKey,
+        target_anchor: &str,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_file_id = target_anchor.trim().parse::<i64>().map_err(|e| {
+            UnityAssetError::format(format!(
+                "Invalid YAML anchor fileID for Scrollbar onValueChanged target: {:?} ({})",
+                target_anchor, e
+            ))
+        })?;
+        self.yaml_ui_scrollbar_add_on_value_changed_call(
+            scrollbar,
+            target_file_id,
+            None,
+            None,
+            method_name,
         )
     }
 

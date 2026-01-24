@@ -5596,3 +5596,201 @@ MonoBehaviour:
         Some(1)
     );
 }
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_toggle_group_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_toggle_group.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Group
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 191001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!191 &191001
+ToggleGroup:
+  m_GameObject: {fileID: 100000}
+  m_AllowSwitchOff: 0
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Group")
+        .unwrap();
+    let group = session.find_yaml_toggle_group_key(&go).unwrap();
+    session
+        .yaml_ui_toggle_group_set_allow_switch_off(&group, true)
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_toggle_group.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+    let group = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "191001")
+        .expect("ToggleGroup anchor");
+    assert_eq!(
+        group.get("m_AllowSwitchOff").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+}
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_scrollbar_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_scrollbar.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Scrollbar
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 207001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!207 &207001
+Scrollbar:
+  m_GameObject: {fileID: 100000}
+  m_Interactable: 1
+  m_Value: 0
+  m_Size: 0.2
+  m_NumberOfSteps: 0
+  m_OnValueChanged:
+    m_PersistentCalls:
+      m_Calls: []
+--- !u!1 &100001
+GameObject:
+  m_Name: Target
+  m_Component:
+  - component: {fileID: 200002}
+  - component: {fileID: 114002}
+--- !u!4 &200002
+Transform:
+  m_GameObject: {fileID: 100001}
+  m_Father: {fileID: 0}
+  m_Children: []
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+--- !u!114 &114002
+MonoBehaviour:
+  m_GameObject: {fileID: 100001}
+  m_Enabled: 1
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Scrollbar")
+        .unwrap();
+    let scrollbar = session.find_yaml_scrollbar_key(&go).unwrap();
+
+    session
+        .yaml_ui_scrollbar_set_interactable(&scrollbar, false)
+        .unwrap();
+    session
+        .yaml_ui_scrollbar_set_value(&scrollbar, 0.75)
+        .unwrap();
+    session.yaml_ui_scrollbar_set_size(&scrollbar, 0.5).unwrap();
+    session
+        .yaml_ui_scrollbar_set_number_of_steps(&scrollbar, 7)
+        .unwrap();
+    session
+        .yaml_ui_scrollbar_clear_on_value_changed(&scrollbar)
+        .unwrap();
+    session
+        .yaml_ui_scrollbar_add_on_value_changed_target_anchor(&scrollbar, "114002", "OnScroll")
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_scrollbar.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+    let scrollbar = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "207001")
+        .expect("Scrollbar anchor");
+
+    let read_f64 = |v: &unity_asset_core::UnityValue| {
+        v.as_f64()
+            .or_else(|| v.as_i64().map(|i| i as f64))
+            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+    };
+
+    assert_eq!(
+        scrollbar.get("m_Interactable").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+    assert_eq!(scrollbar.get("m_Value").and_then(read_f64), Some(0.75));
+    assert_eq!(scrollbar.get("m_Size").and_then(read_f64), Some(0.5));
+    assert_eq!(
+        scrollbar.get("m_NumberOfSteps").and_then(|v| v.as_i64()),
+        Some(7)
+    );
+
+    let calls = scrollbar
+        .get("m_OnValueChanged")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_PersistentCalls"))
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_Calls"))
+        .and_then(|v| v.as_array())
+        .expect("m_OnValueChanged.m_PersistentCalls.m_Calls array");
+    assert_eq!(calls.len(), 1);
+    let call = calls[0].as_object().expect("call is object");
+    assert_eq!(
+        call.get("m_MethodName").and_then(|v| v.as_str()),
+        Some("OnScroll")
+    );
+    let target = call
+        .get("m_Target")
+        .and_then(|v| v.as_object())
+        .expect("m_Target object");
+    let target_file_id = target.iter().find_map(|(k, v)| {
+        if k.eq_ignore_ascii_case("fileID") || k.eq_ignore_ascii_case("m_FileID") {
+            v.as_i64()
+                .or_else(|| v.as_f64().map(|f| f as i64))
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        } else {
+            None
+        }
+    });
+    assert_eq!(target_file_id, Some(114002), "target={:?}", target);
+}

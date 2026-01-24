@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - CanvasGroup: set alpha/interactable/raycast flags.
   - ContentSizeFitter: set horizontal/vertical fit modes.
   - LayoutElement: set sizes + ignoreLayout + layout priority.
+  - ToggleGroup: set allowSwitchOff.
+  - Scrollbar: set value/size/steps/interactable and append persistent `onValueChanged` calls.
 - Directory-wide `.meta` GUID indexing (`Environment::index_meta_guids_in_directory`) for higher external resolution hit rates without loading every asset file.
 - `Environment::set_type_tree_registry_from_paths` to load `.tpk`/`.json` TypeTree registries (best-effort parsing for stripped assets).
 - External workflow to generate MonoBehaviour/script TypeTrees via UnityPy + TypeTreeGeneratorAPI:

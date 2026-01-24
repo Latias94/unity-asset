@@ -411,6 +411,8 @@ Acceptance:
     - [x] CanvasGroup: alpha, interactable, raycast flags (best-effort)
     - [x] ContentSizeFitter: horizontal/vertical fit modes (best-effort)
     - [x] LayoutElement: sizes + ignoreLayout + priority (best-effort)
+    - [x] ToggleGroup: allowSwitchOff (best-effort)
+    - [x] Scrollbar: value/size/steps/interactable + persistent onValueChanged calls (best-effort)
 
 Acceptance:
 - [x] A bundle can be modified to point `m_StreamData` at a newly written cab and reloaded.
