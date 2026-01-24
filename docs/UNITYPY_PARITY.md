@@ -404,6 +404,8 @@ Acceptance:
     - [x] Layout groups (best-effort)
     - [x] Toggle: isOn, interactable, persistent onValueChanged calls (best-effort)
     - [x] Slider: value, min/max, wholeNumbers, interactable, persistent onValueChanged calls (best-effort)
+    - [x] Dropdown: value, interactable, persistent onValueChanged calls (best-effort)
+    - [x] InputField: text, interactable, persistent onValueChanged/onEndEdit calls (best-effort)
 
 Acceptance:
 - [x] A bundle can be modified to point `m_StreamData` at a newly written cab and reloaded.

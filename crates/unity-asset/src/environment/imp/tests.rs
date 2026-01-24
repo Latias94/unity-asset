@@ -4707,3 +4707,283 @@ MonoBehaviour:
     });
     assert_eq!(target_file_id, Some(114002), "target={:?}", target);
 }
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_dropdown_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_dropdown.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Dropdown
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 114001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!114 &114001
+MonoBehaviour:
+  m_GameObject: {fileID: 100000}
+  m_Interactable: 1
+  m_Value: 0
+  m_OnValueChanged:
+    m_PersistentCalls:
+      m_Calls: []
+--- !u!1 &100001
+GameObject:
+  m_Name: Target
+  m_Component:
+  - component: {fileID: 200002}
+  - component: {fileID: 114002}
+--- !u!4 &200002
+Transform:
+  m_GameObject: {fileID: 100001}
+  m_Father: {fileID: 0}
+  m_Children: []
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+--- !u!114 &114002
+MonoBehaviour:
+  m_GameObject: {fileID: 100001}
+  m_Enabled: 1
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let dropdown_go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Dropdown")
+        .unwrap();
+    let dropdown = session.find_yaml_dropdown_key(&dropdown_go).unwrap();
+
+    session
+        .yaml_ui_dropdown_set_interactable(&dropdown, false)
+        .unwrap();
+    session.yaml_ui_dropdown_set_value(&dropdown, 3).unwrap();
+    session
+        .yaml_ui_dropdown_clear_on_value_changed(&dropdown)
+        .unwrap();
+    session
+        .yaml_ui_dropdown_add_on_value_changed_target_anchor(&dropdown, "114002", "OnDropdown")
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_dropdown.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+
+    let dropdown = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "114001")
+        .expect("Dropdown MonoBehaviour anchor");
+    assert_eq!(
+        dropdown.get("m_Interactable").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+    assert_eq!(dropdown.get("m_Value").and_then(|v| v.as_i64()), Some(3));
+
+    let calls = dropdown
+        .get("m_OnValueChanged")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_PersistentCalls"))
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_Calls"))
+        .and_then(|v| v.as_array())
+        .expect("m_OnValueChanged.m_PersistentCalls.m_Calls array");
+    assert_eq!(calls.len(), 1);
+    let call = calls[0].as_object().expect("call is object");
+    assert_eq!(
+        call.get("m_MethodName").and_then(|v| v.as_str()),
+        Some("OnDropdown")
+    );
+    let target = call
+        .get("m_Target")
+        .and_then(|v| v.as_object())
+        .expect("m_Target object");
+    let target_file_id = target.iter().find_map(|(k, v)| {
+        if k.eq_ignore_ascii_case("fileID") || k.eq_ignore_ascii_case("m_FileID") {
+            v.as_i64()
+                .or_else(|| v.as_f64().map(|f| f as i64))
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        } else {
+            None
+        }
+    });
+    assert_eq!(target_file_id, Some(114002), "target={:?}", target);
+}
+
+#[test]
+fn environment_can_edit_yaml_prefab_ui_input_field_helpers() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefab_path = dir.path().join("ui_input.prefab");
+    let prefab = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100000
+GameObject:
+  m_Name: Input
+  m_Component:
+  - component: {fileID: 200001}
+  - component: {fileID: 114001}
+--- !u!224 &200001
+RectTransform:
+  m_GameObject: {fileID: 100000}
+  m_Father: {fileID: 0}
+  m_Children: []
+--- !u!114 &114001
+MonoBehaviour:
+  m_GameObject: {fileID: 100000}
+  m_Interactable: 1
+  m_Text: Hello
+  m_OnValueChanged:
+    m_PersistentCalls:
+      m_Calls: []
+  m_OnEndEdit:
+    m_PersistentCalls:
+      m_Calls: []
+--- !u!1 &100001
+GameObject:
+  m_Name: Target
+  m_Component:
+  - component: {fileID: 200002}
+  - component: {fileID: 114002}
+--- !u!4 &200002
+Transform:
+  m_GameObject: {fileID: 100001}
+  m_Father: {fileID: 0}
+  m_Children: []
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+--- !u!114 &114002
+MonoBehaviour:
+  m_GameObject: {fileID: 100001}
+  m_Enabled: 1
+"#;
+    fs::write(&prefab_path, prefab).unwrap();
+
+    let mut env = Environment::new();
+    env.load_file(&prefab_path).unwrap();
+
+    let mut session = env.edit_session();
+    let input_go = session
+        .find_yaml_gameobject_key_by_name(&prefab_path, "Input")
+        .unwrap();
+    let input = session.find_yaml_input_field_key(&input_go).unwrap();
+
+    session
+        .yaml_ui_input_field_set_text(&input, "World")
+        .unwrap();
+    session
+        .yaml_ui_input_field_set_interactable(&input, false)
+        .unwrap();
+    session
+        .yaml_ui_input_field_clear_on_value_changed(&input)
+        .unwrap();
+    session
+        .yaml_ui_input_field_clear_on_end_edit(&input)
+        .unwrap();
+    session
+        .yaml_ui_input_field_add_on_value_changed_target_anchor(&input, "114002", "OnChanged")
+        .unwrap();
+    session
+        .yaml_ui_input_field_add_on_end_edit_target_anchor(&input, "114002", "OnEndEdit")
+        .unwrap();
+
+    let out_dir = dir.path().join("out");
+    session
+        .save(
+            unity_asset_write::PackerOptions {
+                packer: unity_asset_write::UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_prefab = out_dir.join("ui_input.prefab");
+    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
+
+    let input = doc
+        .entries()
+        .iter()
+        .find(|o| o.anchor == "114001")
+        .expect("InputField MonoBehaviour anchor");
+    assert_eq!(
+        input.get("m_Interactable").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+    assert_eq!(input.get("m_Text").and_then(|v| v.as_str()), Some("World"));
+
+    let calls_changed = input
+        .get("m_OnValueChanged")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_PersistentCalls"))
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_Calls"))
+        .and_then(|v| v.as_array())
+        .expect("m_OnValueChanged.m_PersistentCalls.m_Calls array");
+    assert_eq!(calls_changed.len(), 1);
+    let call = calls_changed[0].as_object().expect("call is object");
+    assert_eq!(
+        call.get("m_MethodName").and_then(|v| v.as_str()),
+        Some("OnChanged")
+    );
+    let target = call
+        .get("m_Target")
+        .and_then(|v| v.as_object())
+        .expect("m_Target object");
+    let target_file_id = target.iter().find_map(|(k, v)| {
+        if k.eq_ignore_ascii_case("fileID") || k.eq_ignore_ascii_case("m_FileID") {
+            v.as_i64()
+                .or_else(|| v.as_f64().map(|f| f as i64))
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        } else {
+            None
+        }
+    });
+    assert_eq!(target_file_id, Some(114002), "target={:?}", target);
+
+    let calls_end = input
+        .get("m_OnEndEdit")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_PersistentCalls"))
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("m_Calls"))
+        .and_then(|v| v.as_array())
+        .expect("m_OnEndEdit.m_PersistentCalls.m_Calls array");
+    assert_eq!(calls_end.len(), 1);
+    let call = calls_end[0].as_object().expect("call is object");
+    assert_eq!(
+        call.get("m_MethodName").and_then(|v| v.as_str()),
+        Some("OnEndEdit")
+    );
+    let target = call
+        .get("m_Target")
+        .and_then(|v| v.as_object())
+        .expect("m_Target object");
+    let target_file_id = target.iter().find_map(|(k, v)| {
+        if k.eq_ignore_ascii_case("fileID") || k.eq_ignore_ascii_case("m_FileID") {
+            v.as_i64()
+                .or_else(|| v.as_f64().map(|f| f as i64))
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        } else {
+            None
+        }
+    });
+    assert_eq!(target_file_id, Some(114002), "target={:?}", target);
+}

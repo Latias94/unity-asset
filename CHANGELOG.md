@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - LayoutGroup: padding/alignment/spacing + common child layout toggles.
   - Toggle: set `m_IsOn`/`m_Interactable` and append persistent `onValueChanged` calls.
   - Slider: set value/min/max/wholeNumbers/interactable and append persistent `onValueChanged` calls.
+  - Dropdown: set `m_Value`/`m_Interactable` and append persistent `onValueChanged` calls.
+  - InputField: set `m_Text`/`m_Interactable` and append persistent `onValueChanged`/`onEndEdit` calls.
 - Directory-wide `.meta` GUID indexing (`Environment::index_meta_guids_in_directory`) for higher external resolution hit rates without loading every asset file.
 - `Environment::set_type_tree_registry_from_paths` to load `.tpk`/`.json` TypeTree registries (best-effort parsing for stripped assets).
 - External workflow to generate MonoBehaviour/script TypeTrees via UnityPy + TypeTreeGeneratorAPI:
