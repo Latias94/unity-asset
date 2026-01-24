@@ -28,6 +28,7 @@ mod imp {
     use unity_asset_core::{UnityAssetError, UnityClass, UnityDocument};
 
     mod container;
+    mod dependency_files;
     mod dependency_graph;
     mod edit;
     mod key;
@@ -288,6 +289,7 @@ mod imp {
         webfiles: HashMap<PathBuf, WebFile>,
         bundle_container_cache: RwLock<HashMap<BinarySource, Vec<BundleContainerEntry>>>,
         dependency_scan_cache: RwLock<dependency_graph::DependencyScanCache>,
+        dependency_file_index: RwLock<dependency_files::DependencyFileIndex>,
         meta_guid_cache: RwLock<HashMap<[u8; 16], PathBuf>>,
         warnings: Mutex<Vec<EnvironmentWarning>>,
         reporter: Option<Arc<dyn EnvironmentReporter>>,
@@ -313,6 +315,7 @@ mod imp {
                 webfiles: HashMap::new(),
                 bundle_container_cache: RwLock::new(HashMap::new()),
                 dependency_scan_cache: RwLock::new(HashMap::new()),
+                dependency_file_index: RwLock::new(dependency_files::DependencyFileIndex::default()),
                 meta_guid_cache: RwLock::new(HashMap::new()),
                 warnings: Mutex::new(Vec::new()),
                 reporter: None,

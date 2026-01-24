@@ -2311,6 +2311,82 @@ fn environment_set_pptr_path_to_key_adds_external_when_cross_source() {
 }
 
 #[test]
+fn environment_resolve_pptr_path_key_best_effort_loads_external_bundle_from_subdir() {
+    use unity_asset_write::{PackerOptions, UnityPyPacker};
+
+    let mut env = Environment::new();
+    let banner_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
+    );
+    let atlas_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/atlas_test"),
+    );
+
+    env.load_file(&banner_path).unwrap();
+    env.load_file(&atlas_path).unwrap();
+
+    let sprite_key = env
+        .binary_object_infos()
+        .find(|r| r.source == &BinarySource::path(&banner_path) && r.object.class_id() == 213)
+        .expect("banner_1 bundle contains a Sprite")
+        .key();
+    let atlas_key = env
+        .binary_object_infos()
+        .find(|r| r.source == &BinarySource::path(&atlas_path) && r.object.class_id() == 687078895)
+        .expect("atlas_test bundle contains a SpriteAtlas")
+        .key();
+
+    let mut session = env.edit_session();
+    let (file_id, _) = session
+        .set_pptr_path_to_key(&sprite_key, "m_SpriteAtlas", &atlas_key)
+        .unwrap();
+    assert!(file_id > 0);
+
+    let temp = tempfile::tempdir().unwrap();
+    let out_dir = temp.path().join("out");
+    session
+        .save(
+            PackerOptions {
+                packer: UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_bundle_path = canonicalize_path(out_dir.join("banner_1"));
+    assert!(out_bundle_path.exists());
+
+    // Place the external dependency in a nested folder to force the `find_file`-style directory scan.
+    let deps_dir = out_dir.join("deps");
+    std::fs::create_dir_all(&deps_dir).unwrap();
+    let atlas_copy_path = deps_dir.join("atlas_test");
+    std::fs::copy(&atlas_path, &atlas_copy_path).unwrap();
+    let atlas_copy_path = canonicalize_path(atlas_copy_path);
+
+    let mut env2 = Environment::new();
+    env2.load_file(&out_bundle_path).unwrap();
+
+    let sprite_ref = env2
+        .find_binary_object_in_bundle_asset(&out_bundle_path, 0, sprite_key.path_id)
+        .expect("saved bundle contains sprite path id");
+    let sprite_key2 = sprite_ref.key();
+
+    let mut session2 = env2.edit_session();
+    let resolved = session2
+        .resolve_pptr_path_key(&sprite_key2, "m_SpriteAtlas")
+        .unwrap()
+        .expect("sprite should reference a SpriteAtlas via external PPtr");
+
+    assert_eq!(resolved.path_id, atlas_key.path_id);
+    assert_eq!(resolved.source_kind, BinarySourceKind::AssetBundle);
+    assert_eq!(resolved.source, BinarySource::path(&atlas_copy_path));
+    assert!(
+        env2.bundles()
+            .contains_key(&BinarySource::path(&atlas_copy_path))
+    );
+}
+
+#[test]
 fn pptr_path_supports_array_indices() {
     let mut class = UnityClass::new(0, "Test".to_string(), "0".to_string());
     class.set("m_Materials".to_string(), UnityValue::Array(Vec::new()));

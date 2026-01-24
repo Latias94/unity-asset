@@ -88,9 +88,10 @@ TODO (parity):
 - [x] Support `.splitN` merge load (UnityPy `reSplit` + `_load_split_file`)
 - [x] Support `.zip/.apk` environment load (UnityPy `load_zip_file`)
 - [x] Add case-insensitive path resolution helper for dependency loads (UnityPy `find_sensitive_path`) (best-effort for relative paths)
-- [ ] Add a best-effort `find_file`-style fallback when resolving dependencies by path fails:
+- [x] Add a best-effort `find_file`-style fallback when resolving dependencies by path fails:
   - simplified-name matching (basename + lowercase)
-  - optional directory scan under `Environment.base_path` (guarded / cached to avoid O(N) per lookup)
+  - optional directory scan under `Environment.base_path` (cached index)
+  - implementation: `crates/unity-asset/src/environment/imp/dependency_files.rs` + `Environment::resolve_pptr_path_key_best_effort(...)`
 
 ### Environment / Save entrypoint
 

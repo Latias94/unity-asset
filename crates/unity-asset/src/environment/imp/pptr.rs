@@ -28,43 +28,83 @@ pub struct BinaryPptrReference {
     pub resolved: Option<BinaryObjectKey>,
 }
 
-impl Environment {
-    fn match_external_path_score(external_path: &str, candidate: &str) -> i32 {
-        if external_path.is_empty() || candidate.is_empty() {
-            return 0;
-        }
-
-        let a = external_path.replace('\\', "/");
-        let b = candidate.replace('\\', "/");
-
-        if a == b {
-            return 300;
-        }
-        if a.eq_ignore_ascii_case(&b) {
-            return 250;
-        }
-
-        if a.ends_with(&b) || b.ends_with(&a) {
-            return 200;
-        }
-
-        let a_name = std::path::Path::new(&a)
-            .file_name()
-            .and_then(|n| n.to_str());
-        let b_name = std::path::Path::new(&b)
-            .file_name()
-            .and_then(|n| n.to_str());
-        if let (Some(a_name), Some(b_name)) = (a_name, b_name) {
-            if a_name == b_name {
-                return 150;
-            }
-            if a_name.eq_ignore_ascii_case(b_name) {
-                return 120;
-            }
-        }
-
-        0
+pub(crate) fn match_external_path_score(external_path: &str, candidate: &str) -> i32 {
+    if external_path.is_empty() || candidate.is_empty() {
+        return 0;
     }
+
+    let a = external_path.replace('\\', "/");
+    let b = candidate.replace('\\', "/");
+
+    if a == b {
+        return 300;
+    }
+    if a.eq_ignore_ascii_case(&b) {
+        return 250;
+    }
+
+    if a.ends_with(&b) || b.ends_with(&a) {
+        return 200;
+    }
+
+    let a_name = std::path::Path::new(&a)
+        .file_name()
+        .and_then(|n| n.to_str());
+    let b_name = std::path::Path::new(&b)
+        .file_name()
+        .and_then(|n| n.to_str());
+    if let (Some(a_name), Some(b_name)) = (a_name, b_name) {
+        if a_name == b_name {
+            return 150;
+        }
+        if a_name.eq_ignore_ascii_case(b_name) {
+            return 120;
+        }
+    }
+
+    0
+}
+
+#[derive(Debug, Clone)]
+struct ExternalHint {
+    path: Option<String>,
+    guid: Option<[u8; 16]>,
+}
+
+trait ExternalHintLike {
+    fn path(&self) -> Option<&str>;
+    fn guid(&self) -> Option<[u8; 16]>;
+}
+
+impl ExternalHintLike for ExternalHint {
+    fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
+    fn guid(&self) -> Option<[u8; 16]> {
+        self.guid
+    }
+}
+
+fn bundle_source_simple_name(source: &BinarySource) -> Option<String> {
+    match source {
+        BinarySource::Path(p) => p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string()),
+        BinarySource::ArchiveEntry { entry_name, .. } => std::path::Path::new(entry_name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string()),
+        BinarySource::WebEntry { entry_name, .. } => std::path::Path::new(entry_name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string()),
+    }
+}
+
+impl Environment {
+    // NOTE: path scoring lives at module scope so it can be reused by dependency resolution code.
 
     fn find_loaded_bundle_asset_by_external_path(
         &self,
@@ -84,8 +124,28 @@ impl Environment {
             let Some(bundle) = self.bundles.get(source) else {
                 continue;
             };
+
+            // UnityPy's externals sometimes store the *file name* of the referenced bundle, not a
+            // bundle-internal node name. Best-effort: if this bundle has exactly one serialized
+            // file, allow matching by bundle source name and map it to asset_index=0.
+            if bundle.assets.len() == 1 {
+                let Some(source_name) = bundle_source_simple_name(source) else {
+                    continue;
+                };
+                let score = match_external_path_score(external_path, &source_name);
+                if score > 0 {
+                    if score > best_score {
+                        best_score = score;
+                        best.clear();
+                        best.push((source.clone(), 0));
+                    } else if score == best_score {
+                        best.push((source.clone(), 0));
+                    }
+                }
+            }
+
             for (idx, name) in bundle.asset_names.iter().enumerate() {
-                let score = Self::match_external_path_score(external_path, name);
+                let score = match_external_path_score(external_path, name);
                 if score == 0 {
                     continue;
                 }
@@ -333,6 +393,109 @@ impl Environment {
         }
 
         Ok(self.resolve_binary_pptr(&obj_ref, file_id, path_id))
+    }
+
+    /// Resolve a `PPtr` stored at a dot-separated field path, loading missing dependencies best-effort.
+    ///
+    /// This is closer to UnityPy's behavior where dereferencing a `PPtr` may trigger dependency loads
+    /// through `Environment.find_file(...)`.
+    pub fn resolve_pptr_path_key_best_effort(
+        &mut self,
+        context_key: &BinaryObjectKey,
+        pptr_path: &str,
+    ) -> Result<Option<BinaryObjectKey>> {
+        let (file_id, path_id, hint) = {
+            let obj_ref = self.binary_object_ref_for_key(context_key)?;
+            let obj = obj_ref.read()?;
+
+            let Some(v) = super::pptr_path::get_value_at_path(obj.as_unity_class(), pptr_path)
+            else {
+                return Ok(None);
+            };
+            let Some((file_id, path_id)) = super::pptr_path::read_pptr(v) else {
+                return Ok(None);
+            };
+            if path_id == 0 {
+                return Ok(None);
+            }
+
+            let hint = if file_id > 0 {
+                let idx = usize::try_from(file_id - 1).ok().unwrap_or(usize::MAX);
+                obj_ref
+                    .object
+                    .file()
+                    .externals
+                    .get(idx)
+                    .map(|ext| ExternalHint {
+                        path: if ext.path.is_empty() {
+                            None
+                        } else {
+                            Some(ext.path.clone())
+                        },
+                        guid: if ext.guid == [0u8; 16] {
+                            None
+                        } else {
+                            Some(ext.guid)
+                        },
+                    })
+            } else {
+                None
+            };
+
+            (file_id, path_id, hint)
+        };
+
+        // First attempt: resolve without loading anything.
+        if let Ok(obj_ref) = self.binary_object_ref_for_key(context_key)
+            && let Some(resolved) = self.resolve_binary_pptr(&obj_ref, file_id, path_id)
+        {
+            return Ok(Some(resolved));
+        }
+
+        // Best-effort: load dependency by GUID or path and retry.
+        if let Some(hint) = hint {
+            self.try_load_dependency_for_external_hint(&hint);
+        }
+
+        let obj_ref = self.binary_object_ref_for_key(context_key)?;
+        Ok(self.resolve_binary_pptr(&obj_ref, file_id, path_id))
+    }
+
+    fn try_load_dependency_for_external_hint(&mut self, hint: &impl ExternalHintLike) {
+        // Preserve base_path (UnityPy's Environment.path does not change during dependency loads).
+        let saved_base_path = self.base_path.clone();
+
+        if let Some(guid) = hint.guid() {
+            if let Some(asset_path) = self.asset_path_for_guid(guid) {
+                let source = BinarySource::path(&asset_path);
+                if !self.binary_assets.contains_key(&source) && !self.bundles.contains_key(&source)
+                {
+                    if let Err(e) = self.load_file(&asset_path) {
+                        self.push_warning(EnvironmentWarning::LoadFailed {
+                            path: asset_path,
+                            error: e.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Some(path) = hint.path() {
+            if let Some(found) = self.find_dependency_path_best_effort(path) {
+                let source = BinarySource::path(&found);
+                if !self.binary_assets.contains_key(&source) && !self.bundles.contains_key(&source)
+                {
+                    if let Err(e) = self.load_file(&found) {
+                        self.push_warning(EnvironmentWarning::LoadFailed {
+                            path: found,
+                            error: e.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        self.base_path = saved_base_path;
     }
 
     pub fn find_binary_pptr_references_to(

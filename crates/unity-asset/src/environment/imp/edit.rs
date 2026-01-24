@@ -148,12 +148,15 @@ impl<'a> EnvironmentEditSession<'a> {
     }
 
     /// Resolve a `PPtr` stored at a dot-separated field path (e.g. `m_RD.texture`) to a globally-unique object key.
+    ///
+    /// Best-effort: may load missing dependency files on demand (UnityPy `Environment.find_file`-style).
     pub fn resolve_pptr_path_key(
-        &self,
+        &mut self,
         context_key: &BinaryObjectKey,
         pptr_path: &str,
     ) -> Result<Option<BinaryObjectKey>> {
-        self.env.resolve_pptr_path_key(context_key, pptr_path)
+        self.env
+            .resolve_pptr_path_key_best_effort(context_key, pptr_path)
     }
 
     /// Set a `PPtr` stored at a dot-separated field path (e.g. `m_RD.texture`) to point at `target_key`.
