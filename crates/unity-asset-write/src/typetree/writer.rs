@@ -189,6 +189,69 @@ pub(crate) fn write_value(
         return Ok(());
     }
 
+    // Unity `PPtr<T>`: allow a small amount of normalization to match UnityPy ergonomics.
+    //
+    // UnityPy writes PPtr values either from dicts with `m_FileID/m_PathID`, or from `PPtr` objects
+    // whose attributes follow the same naming scheme. In this project, YAML uses `fileID/pathID`,
+    // so we accept both spellings when writing binary TypeTrees.
+    let is_pptr = node.type_name == "PPtr" || node.type_name.starts_with("PPtr<");
+    if is_pptr {
+        // Null PPtr shorthand.
+        if matches!(value, UnityValue::Null) {
+            for child in &node.children {
+                if child.name.is_empty() {
+                    return Err(UnityAssetError::format(
+                        "TypeTree write encountered an unnamed child node; use write_object_with_original_bytes(...) to preserve template bytes",
+                    ));
+                }
+                write_value(writer, child, &UnityValue::Integer(0), ctx, options)?;
+            }
+            if align {
+                writer.align_stream(4);
+            }
+            return Ok(());
+        }
+
+        let obj = value.as_object().ok_or_else(|| {
+            UnityAssetError::format(format!(
+                "TypeTree write type mismatch: expected object/null for PPtr, got {:?}",
+                value
+            ))
+        })?;
+
+        for child in &node.children {
+            if child.name.is_empty() {
+                return Err(UnityAssetError::format(
+                    "TypeTree write encountered an unnamed child node; use write_object_with_original_bytes(...) to preserve template bytes",
+                ));
+            }
+
+            let v = if is_pptr_file_id_field(&child.name) {
+                pptr_get_field(obj, &child.name, &["m_FileID", "fileID"])
+            } else if is_pptr_path_id_field(&child.name) {
+                pptr_get_field(obj, &child.name, &["m_PathID", "pathID"])
+            } else {
+                obj.get(&child.name)
+            };
+
+            let Some(v) = v else {
+                if options.allow_missing_fields {
+                    continue;
+                }
+                return Err(UnityAssetError::format(format!(
+                    "Missing field '{}' for TypeTree write (parent type '{}')",
+                    child.name, node.type_name
+                )));
+            };
+            write_value(writer, child, v, ctx, options)?;
+        }
+
+        if align {
+            writer.align_stream(4);
+        }
+        return Ok(());
+    }
+
     if node.type_name == "ReferencedObject" {
         let referenced = value.as_object().ok_or_else(|| {
             UnityAssetError::format(format!(
@@ -326,6 +389,33 @@ fn write_array(
     // UnityPy aligns for arrays based on node/alignment meta flags; higher-level `write_value`
     // handles the final alignment. Keep element-level alignment inside `write_value`.
     Ok(())
+}
+
+fn is_pptr_file_id_field(name: &str) -> bool {
+    name.eq_ignore_ascii_case("fileID") || name.eq_ignore_ascii_case("m_FileID")
+}
+
+fn is_pptr_path_id_field(name: &str) -> bool {
+    name.eq_ignore_ascii_case("pathID") || name.eq_ignore_ascii_case("m_PathID")
+}
+
+fn pptr_get_field<'a>(
+    obj: &'a IndexMap<String, UnityValue>,
+    primary: &str,
+    aliases: &[&str],
+) -> Option<&'a UnityValue> {
+    if let Some(v) = obj.get(primary) {
+        return Some(v);
+    }
+    for alias in aliases {
+        if let Some(v) = obj.get(*alias) {
+            return Some(v);
+        }
+        if let Some((_, v)) = obj.iter().find(|(k, _)| k.eq_ignore_ascii_case(alias)) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -652,5 +742,67 @@ mod tests {
         let foo_parsed = parsed.get("m_Foo").and_then(|v| v.as_object()).unwrap();
         assert_eq!(foo_parsed.get("x"), Some(&UnityValue::Integer(10)));
         assert_eq!(foo_parsed.get("y"), Some(&UnityValue::Integer(20)));
+    }
+
+    #[test]
+    fn write_pptr_accepts_fileid_pathid_aliases() {
+        let mut root = node("TestObject", "Base");
+
+        let mut tex = node("PPtr<Texture2D>", "m_Tex");
+        tex.children.push(node("int", "m_FileID"));
+        tex.children.push(node("long long", "m_PathID"));
+        root.children.push(tex);
+
+        let mut tree = TypeTree::new();
+        tree.add_node(root);
+
+        let mut pptr = IndexMap::new();
+        pptr.insert("fileID".to_string(), UnityValue::Integer(0));
+        pptr.insert("pathID".to_string(), UnityValue::Integer(1234));
+
+        let mut props = IndexMap::new();
+        props.insert("m_Tex".to_string(), UnityValue::Object(pptr));
+
+        let writer_impl = TypeTreeWriter::new(&tree);
+        let mut out = BinaryWriter::new(Endian::Little);
+        writer_impl
+            .write_object(&mut out, &props, TypeTreeWriteOptions::default())
+            .unwrap();
+
+        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
+        let serializer = TypeTreeSerializer::new(&tree);
+        let parsed = serializer.parse_object(&mut reader).unwrap();
+        let tex = parsed.get("m_Tex").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(tex.get("m_FileID"), Some(&UnityValue::Integer(0)));
+        assert_eq!(tex.get("m_PathID"), Some(&UnityValue::Integer(1234)));
+    }
+
+    #[test]
+    fn write_pptr_accepts_null_as_zero_ptr() {
+        let mut root = node("TestObject", "Base");
+
+        let mut tex = node("PPtr<Texture2D>", "m_Tex");
+        tex.children.push(node("int", "m_FileID"));
+        tex.children.push(node("long long", "m_PathID"));
+        root.children.push(tex);
+
+        let mut tree = TypeTree::new();
+        tree.add_node(root);
+
+        let mut props = IndexMap::new();
+        props.insert("m_Tex".to_string(), UnityValue::Null);
+
+        let writer_impl = TypeTreeWriter::new(&tree);
+        let mut out = BinaryWriter::new(Endian::Little);
+        writer_impl
+            .write_object(&mut out, &props, TypeTreeWriteOptions::default())
+            .unwrap();
+
+        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
+        let serializer = TypeTreeSerializer::new(&tree);
+        let parsed = serializer.parse_object(&mut reader).unwrap();
+        let tex = parsed.get("m_Tex").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(tex.get("m_FileID"), Some(&UnityValue::Integer(0)));
+        assert_eq!(tex.get("m_PathID"), Some(&UnityValue::Integer(0)));
     }
 }

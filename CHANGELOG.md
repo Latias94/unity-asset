@@ -68,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Fill `ObjectSummary.dependencies` from scanned internal references when enabled.
 - YAML serializer: avoid emitting `{...}` placeholders for complex objects when they appear as items in block arrays.
 - TypeTree writer: preserve rare unnamed child fields by copying their original byte slices during object rewrites.
+- TypeTree writer: normalize `PPtr<>` inputs (`m_FileID/m_PathID` vs `fileID/pathID`, `Null` -> zero pointer).
 - More robust external reference resolution by canonicalizing filesystem paths when loading and indexing `.meta` GUIDs.
 - Preserve AssetBundle `m_Container` entries with null PPtr (`m_PathID=0`) as unresolved paths instead of dropping them.
 

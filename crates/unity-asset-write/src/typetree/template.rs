@@ -202,6 +202,13 @@ fn write_value_with_template(
         return Ok(());
     }
 
+    // Delegate PPtr writes to the normal writer so we reuse its normalization rules
+    // (`m_FileID/m_PathID` vs `fileID/pathID`, `Null` -> zero pointer).
+    let is_pptr = node.type_name == "PPtr" || node.type_name.starts_with("PPtr<");
+    if is_pptr {
+        return write_value(writer, node, value, ctx, options);
+    }
+
     if node.type_name == "ReferencedObject" {
         let referenced = value.as_object().ok_or_else(|| {
             UnityAssetError::format(format!(

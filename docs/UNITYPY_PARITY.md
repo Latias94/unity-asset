@@ -294,7 +294,7 @@ Acceptance:
   - [x] `pair` (accepts Array(len=2) + Object(first/second))
   - [x] arrays (including aligned arrays)
   - [x] Handle rare TypeTrees with unnamed children by preserving original byte slices (template write mode)
-  - [ ] `PPtr<>` (TODO: add explicit normalization/acceptance tests)
+  - [x] `PPtr<>` (accept `m_FileID/m_PathID` and `fileID/pathID`; `Null` -> zero pointer) + tests
   - [x] `ReferencedObject` (ref_types-aware)
   - [x] managed references registry (`ManagedReferencesRegistry`) skip rules
 - [x] Add targeted fixtures by parsing existing samples and re-serializing a no-op tree
