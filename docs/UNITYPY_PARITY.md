@@ -400,7 +400,7 @@ Acceptance:
   - [ ] YAML UI helpers:
     - [x] Image/RawImage: sprite/texture refs, color, raycast target
     - [x] Text/TMP_Text: text, color, font size (best-effort)
-    - [ ] Button: onClick events, interactable
+    - [x] Button: interactable + persistent onClick calls (best-effort)
     - [ ] Canvas/CanvasScaler
     - [ ] Layout groups
 

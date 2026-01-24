@@ -63,6 +63,16 @@ fn yaml_pptr_value(file_id: i64, guid_32_hex: Option<&str>, type_id: Option<i64>
     UnityValue::Object(entries.into_iter().collect())
 }
 
+fn ensure_array_mut(value: &mut UnityValue) -> &mut Vec<UnityValue> {
+    if !matches!(value, UnityValue::Array(_)) {
+        *value = UnityValue::Array(Vec::new());
+    }
+    match value {
+        UnityValue::Array(v) => v,
+        _ => unreachable!(),
+    }
+}
+
 fn read_child_transform_file_ids(transform: &UnityClass) -> Vec<i64> {
     let Some(value) = super::pptr_path::get_value_at_path(transform, "m_Children") else {
         return Vec::new();
@@ -690,6 +700,119 @@ impl<'a> EnvironmentEditSession<'a> {
             &["m_FontData.m_FontSize", "m_fontSize"],
             UnityValue::Integer(size),
         )
+    }
+
+    pub fn find_yaml_button_key(&mut self, game_object: &YamlObjectKey) -> Result<YamlObjectKey> {
+        self.find_yaml_monobehaviour_key_by_required_fields(
+            game_object,
+            &["m_OnClick", "m_Interactable"],
+        )
+    }
+
+    pub fn yaml_ui_button_set_interactable(
+        &mut self,
+        button: &YamlObjectKey,
+        interactable: bool,
+    ) -> Result<()> {
+        self.set_yaml_value_at_key_path_first_match(
+            button,
+            &["m_Interactable"],
+            UnityValue::Integer(if interactable { 1 } else { 0 }),
+        )
+    }
+
+    pub fn yaml_ui_button_clear_on_click(&mut self, button: &YamlObjectKey) -> Result<()> {
+        self.env_mut()
+            .edit_yaml_object_anchor(&button.path, button.anchor.as_str(), |class| {
+                let calls = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnClick.m_PersistentCalls.m_Calls",
+                )?;
+                *calls = UnityValue::Array(Vec::new());
+                Ok(())
+            })
+    }
+
+    pub fn yaml_ui_button_add_on_click_call(
+        &mut self,
+        button: &YamlObjectKey,
+        target_file_id: i64,
+        target_guid_32_hex: Option<&str>,
+        target_type_id: Option<i64>,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_guid_32_hex = target_guid_32_hex.map(|s| s.trim().to_ascii_lowercase());
+        let target = yaml_pptr_value(
+            target_file_id,
+            target_guid_32_hex.as_deref(),
+            target_type_id,
+        );
+
+        self.env_mut()
+            .edit_yaml_object_anchor(&button.path, button.anchor.as_str(), |class| {
+                let calls_value = super::pptr_path::get_value_at_path_mut(
+                    class,
+                    "m_OnClick.m_PersistentCalls.m_Calls",
+                )?;
+                let calls = ensure_array_mut(calls_value);
+
+                let args: UnityValue = UnityValue::Object(
+                    [
+                        (
+                            "m_ObjectArgument".to_string(),
+                            yaml_pptr_value(0, None, None),
+                        ),
+                        (
+                            "m_ObjectArgumentAssemblyTypeName".to_string(),
+                            UnityValue::String(String::new()),
+                        ),
+                        ("m_IntArgument".to_string(), UnityValue::Integer(0)),
+                        ("m_FloatArgument".to_string(), UnityValue::Float(0.0)),
+                        (
+                            "m_StringArgument".to_string(),
+                            UnityValue::String(String::new()),
+                        ),
+                        ("m_BoolArgument".to_string(), UnityValue::Integer(0)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+
+                let call: UnityValue = UnityValue::Object(
+                    [
+                        ("m_Target".to_string(), target),
+                        (
+                            "m_MethodName".to_string(),
+                            UnityValue::String(method_name.to_string()),
+                        ),
+                        // PersistentListenerMode.Void
+                        ("m_Mode".to_string(), UnityValue::Integer(1)),
+                        ("m_Arguments".to_string(), args),
+                        // UnityEventCallState.RuntimeOnly
+                        ("m_CallState".to_string(), UnityValue::Integer(2)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+
+                calls.push(call);
+                Ok(())
+            })
+    }
+
+    pub fn yaml_ui_button_add_on_click_target_anchor(
+        &mut self,
+        button: &YamlObjectKey,
+        target_anchor: &str,
+        method_name: &str,
+    ) -> Result<()> {
+        let target_file_id = target_anchor.trim().parse::<i64>().map_err(|e| {
+            UnityAssetError::format(format!(
+                "Invalid YAML anchor fileID for onClick target: {:?} ({})",
+                target_anchor, e
+            ))
+        })?;
+        self.yaml_ui_button_add_on_click_call(button, target_file_id, None, None, method_name)
     }
 
     pub fn yaml_rect_transform_set_anchored_position(
