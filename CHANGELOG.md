@@ -79,6 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TypeTree writer: support legacy `version==2` TypeTree dump by writing `m_VariableCount` (best-effort).
 - SerializedFile (legacy): parse and save `version < 9` layout by seeking metadata at end-of-file (endian boolean prefix) and emitting a compatible save layout.
 - BundleFile (legacy): parse `UnityWeb` / `UnityRaw` bundles using UnityPy `read_web_raw` header layout and directory offsets (fixes extraction/load semantics for UnityWeb).
+- BundleFile (UnityFS): strip encryption flags on save (UnityPy parity; encryption is not re-applied).
 - More robust external reference resolution by canonicalizing filesystem paths when loading and indexing `.meta` GUIDs.
 - Preserve AssetBundle `m_Container` entries with null PPtr (`m_PathID=0`) as unresolved paths instead of dropping them.
 

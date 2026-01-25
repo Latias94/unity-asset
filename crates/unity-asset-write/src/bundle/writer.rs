@@ -366,19 +366,25 @@ fn resolve_unityfs_flags(
     bundle: &AssetBundle,
     options: PackerOptions,
 ) -> Result<(u32, u32)> {
-    match options.packer {
-        UnityPyPacker::None => Ok((64, 64)),
-        UnityPyPacker::Lz4 => Ok((194, 2)),
-        UnityPyPacker::Lzma => Ok((65, 1)),
+    let (data_flag, block_info_flag) = match options.packer {
+        UnityPyPacker::None => (64, 64),
+        UnityPyPacker::Lz4 => (194, 2),
+        UnityPyPacker::Lzma => (65, 1),
         UnityPyPacker::Original => {
             let block_info_flag = bundle.blocks.first().map(|b| b.flags as u32).unwrap_or(64);
-            Ok((header.flags, block_info_flag))
+            (header.flags, block_info_flag)
         }
         UnityPyPacker::UnityFsFlags {
             block_info_flag,
             data_flag,
-        } => Ok((data_flag, block_info_flag)),
-    }
+        } => (data_flag, block_info_flag),
+    };
+
+    Ok(strip_unityfs_encryption_flags(
+        header,
+        data_flag,
+        block_info_flag,
+    ))
 }
 
 fn compress_unityfs_blob(data: &[u8], switch: u32) -> Result<Vec<u8>> {
@@ -417,6 +423,57 @@ fn unityfs_uses_block_alignment(header: &BundleHeader) -> bool {
         return false;
     };
     parsed.major > 2019 || (parsed.major == 2019 && parsed.minor >= 4)
+}
+
+fn strip_unityfs_encryption_flags(
+    header: &BundleHeader,
+    data_flag: u32,
+    block_info_flag: u32,
+) -> (u32, u32) {
+    // UnityPy clears encryption flags during save because it does not re-encrypt.
+    //
+    // Note: Unity CN introduced encryption before the alignment fix was introduced.
+    // Unity CN also reused the same bit (0x200) later for `BlockInfoNeedPaddingAtStart`.
+    // UnityPy disambiguates this based on the engine version, so we do the same.
+    let uses_old_flags = unityfs_uses_old_archive_flags(header).unwrap_or(false);
+    let encryption_mask = if uses_old_flags {
+        0x200 // ArchiveFlagsOld.UsesAssetBundleEncryption
+    } else {
+        0x1400 // ArchiveFlags.UsesAssetBundleEncryption (old: 0x400, new: 0x1000)
+    };
+
+    (
+        data_flag & !encryption_mask,
+        block_info_flag & !encryption_mask,
+    )
+}
+
+fn unityfs_uses_old_archive_flags(header: &BundleHeader) -> Option<bool> {
+    let parsed = UnityVersion::parse_version(&header.unity_revision)
+        .or_else(|_| UnityVersion::parse_version(&header.unity_version))
+        .ok()?;
+
+    let (major, minor, build) = (parsed.major, parsed.minor, parsed.build);
+
+    // Mirrors UnityPy `BundleFile.read_fs` version checks for ArchiveFlagsOld vs ArchiveFlags.
+    //
+    // - version < (2020,)
+    // - 2020.x < 2020.3.34
+    // - 2021.x < 2021.3.2
+    // - 2022.x < 2022.1.1
+    let is_old = if major < 2020 {
+        true
+    } else if major == 2020 {
+        minor < 3 || (minor == 3 && build < 34)
+    } else if major == 2021 {
+        minor < 3 || (minor == 3 && build < 2)
+    } else if major == 2022 {
+        minor < 1 || (minor == 1 && build < 1)
+    } else {
+        false
+    };
+
+    Some(is_old)
 }
 
 #[cfg(test)]
@@ -465,6 +522,60 @@ mod tests {
         let reparsed = save_sample_with_packer(UnityPyPacker::Lz4);
         assert_eq!(reparsed.header.flags, 194);
         assert_roundtrip_contains_serialized_file(&reparsed);
+    }
+
+    #[test]
+    fn unityfs_save_strips_encryption_flag_for_old_versions() {
+        let bytes = include_bytes!("../../../../tests/samples/char_118_yuki.ab").to_vec();
+        let mut bundle = unity_asset_binary::bundle::BundleParser::from_bytes(bytes).unwrap();
+
+        bundle.header.unity_revision = "2020.3.33f1".to_string();
+        bundle.header.unity_version = "2020.3.33f1".to_string();
+
+        bundle.header.flags |= 0x200;
+        if let Some(first) = bundle.blocks.first_mut() {
+            first.flags |= 0x200;
+        }
+
+        let saved = BundleWriter::save(
+            &bundle,
+            &BundleEdits::default(),
+            PackerOptions {
+                packer: UnityPyPacker::Original,
+            },
+        )
+        .unwrap();
+
+        let reparsed = unity_asset_binary::bundle::BundleParser::from_bytes(saved).unwrap();
+        assert_eq!(reparsed.header.flags & 0x200, 0);
+    }
+
+    #[test]
+    fn unityfs_save_strips_new_encryption_bits_but_keeps_padding_bit() {
+        let bytes = include_bytes!("../../../../tests/samples/char_118_yuki.ab").to_vec();
+        let mut bundle = unity_asset_binary::bundle::BundleParser::from_bytes(bytes).unwrap();
+
+        bundle.header.unity_revision = "2020.3.34f1".to_string();
+        bundle.header.unity_version = "2020.3.34f1".to_string();
+
+        bundle.header.flags |= 0x200; // BlockInfoNeedPaddingAtStart (new flags)
+        bundle.header.flags |= 0x1000; // UsesAssetBundleEncryption (new flags)
+        if let Some(first) = bundle.blocks.first_mut() {
+            first.flags |= 0x1000;
+        }
+
+        let saved = BundleWriter::save(
+            &bundle,
+            &BundleEdits::default(),
+            PackerOptions {
+                packer: UnityPyPacker::Original,
+            },
+        )
+        .unwrap();
+
+        let reparsed = unity_asset_binary::bundle::BundleParser::from_bytes(saved).unwrap();
+        assert_ne!(reparsed.header.flags & 0x200, 0);
+        assert_eq!(reparsed.header.flags & 0x1000, 0);
     }
 
     #[test]

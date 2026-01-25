@@ -44,10 +44,12 @@ P0 (blocks broad edit compatibility):
   - Note: a built-in generator (managed/il2cpp) is intentionally deferred until a mature reference/validation corpus exists.
 
 P1 (important, but not blocking most modern samples):
-- Legacy bundle save (`UnityWeb` / `UnityRaw`).
+- Unity CN encrypted UnityFS bundles:
+  - UnityPy can decrypt/load via `ArchiveStorageManager.ArchiveStorageDecryptor`.
+  - Rust does not implement decryption yet (requires a real-world corpus + validation strategy).
 
 P2 / future:
-- Bundle encryption save support (UnityPy explicitly has a TODO here too).
+- Bundle encryption save support (UnityPy explicitly has a TODO here too; it clears encryption flags on save).
 - Broader typed helper coverage for UI/editor workflows (RectTransform/Canvas/Text/etc), including YAML prefab/scene editing ergonomics.
 
 ## Finding Legacy Samples (v<9 / UnityWeb / UnityRaw)
@@ -327,7 +329,7 @@ Acceptance:
 Acceptance:
 - A `.assets` produced by Rust can be loaded by:
   - [x] this Rust parser
-  - [ ] UnityPy (baseline snapshot) (TODO: add cross-check integration tests)
+  - [x] UnityPy (baseline snapshot) (opt-in: `UNITYPY_E2E=1`; see `crates/unity-asset-write/tests/unitypy_e2e.rs`)
 
 TODO (parity):
 - [x] Support stripped TypeTree edits in `SerializedFileEditSession` via `TypeTreeRegistry`
@@ -342,12 +344,13 @@ TODO (parity):
   - [x] Packer compatibility:
   - [x] `"none"`, `"lz4"`, `"lzma"`, `"original"`, tuple form
 - [x] Directory info rebuild and file flags propagation
+- [x] Strip bundle encryption flags on save (UnityPy parity; encryption is not re-applied)
 - [x] Legacy bundle parse (`UnityWeb` / `UnityRaw`) header + directory offsets (UnityPy `read_web_raw` parity)
 - [x] Legacy bundle save (`UnityWeb` / `UnityRaw`) (UnityPy only supports saving versions `<= 3`)
 
 Acceptance:
 - [x] A rebuilt bundle loads in this Rust parser (roundtrip test)
-- [ ] TODO: load in UnityPy and compare directory listing (add integration tests)
+- [x] UnityPy loads the saved bundle and matches directory listing (opt-in: `UNITYPY_E2E=1`; see `crates/unity-asset-write/tests/unitypy_e2e.rs`)
 
 ### M5 — WebFile.save parity
 
