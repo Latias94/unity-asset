@@ -108,8 +108,17 @@ impl UnityVersion {
             return Ok(Self::default());
         }
 
+        let version = version.trim();
+        if version.is_empty() {
+            return Ok(Self::default());
+        }
+
+        // Unity sometimes appends a revision hash in parentheses (e.g. ProjectVersion.txt).
+        // That suffix is irrelevant for version comparisons and header heuristics, so we ignore it.
+        let version = version.split_whitespace().next().unwrap_or(version);
+
         // Use regex to parse version string
-        let version_regex = regex::Regex::new(r"^(\d+)\.(\d+)\.(\d+)([a-zA-Z]?)(\d*)$")
+        let version_regex = regex::Regex::new(r"^(\d+)\.(\d+)\.(\d+)([a-zA-Z]?)(\d*)(.*)$")
             .map_err(|e| BinaryError::invalid_data(format!("Regex error: {}", e)))?;
 
         if let Some(captures) = version_regex.captures(version) {
@@ -134,6 +143,7 @@ impl UnityVersion {
 
             let type_str = captures.get(4).map(|m| m.as_str()).unwrap_or("");
             let type_number_str = captures.get(5).map(|m| m.as_str()).unwrap_or("0");
+            let extra_str = captures.get(6).map(|m| m.as_str()).unwrap_or("");
 
             // If no type letter is provided, default to "f" (final release)
             let version_type = if type_str.is_empty() {
@@ -151,9 +161,13 @@ impl UnityVersion {
 
             let mut version = Self::new(major, minor, build, version_type, type_number);
 
-            // Store custom type string for unknown types
-            if version_type == UnityVersionType::U {
+            // Store custom type strings:
+            // - unknown release channels (e.g. Tuanjie `t`)
+            // - extra suffixes after the type number (e.g. UnityCN `f1c1`)
+            if version_type == UnityVersionType::U && !type_str.is_empty() {
                 version.type_str = Some(type_str.to_string());
+            } else if !extra_str.is_empty() {
+                version.type_str = Some(extra_str.to_string());
             }
 
             Ok(version)
@@ -240,17 +254,19 @@ impl UnityVersion {
 
 impl fmt::Display for UnityVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(ref custom_type) = self.type_str {
+        if self.version_type == UnityVersionType::U {
+            let channel = self.type_str.as_deref().unwrap_or("u");
             write!(
                 f,
                 "{}.{}.{}{}{}",
-                self.major, self.minor, self.build, custom_type, self.type_number
+                self.major, self.minor, self.build, channel, self.type_number
             )
         } else {
+            let extra = self.type_str.as_deref().unwrap_or("");
             write!(
                 f,
-                "{}.{}.{}{}{}",
-                self.major, self.minor, self.build, self.version_type, self.type_number
+                "{}.{}.{}{}{}{}",
+                self.major, self.minor, self.build, self.version_type, self.type_number, extra
             )
         }
     }
@@ -385,6 +401,36 @@ mod tests {
     fn test_version_display() {
         let version = UnityVersion::parse_version("2020.3.12f1").unwrap();
         assert_eq!(version.to_string(), "2020.3.12f1");
+    }
+
+    #[test]
+    fn test_unitycn_suffix_parsing() {
+        let version = UnityVersion::parse_version("2022.3.48f1c1").unwrap();
+        assert_eq!(version.major, 2022);
+        assert_eq!(version.minor, 3);
+        assert_eq!(version.build, 48);
+        assert_eq!(version.version_type, UnityVersionType::F);
+        assert_eq!(version.type_number, 1);
+        assert_eq!(version.type_str.as_deref(), Some("c1"));
+        assert_eq!(version.to_string(), "2022.3.48f1c1");
+    }
+
+    #[test]
+    fn test_tuanjie_channel_parsing() {
+        let version = UnityVersion::parse_version("2022.3.48t6").unwrap();
+        assert_eq!(version.major, 2022);
+        assert_eq!(version.minor, 3);
+        assert_eq!(version.build, 48);
+        assert_eq!(version.version_type, UnityVersionType::U);
+        assert_eq!(version.type_number, 6);
+        assert_eq!(version.type_str.as_deref(), Some("t"));
+        assert_eq!(version.to_string(), "2022.3.48t6");
+    }
+
+    #[test]
+    fn test_version_parsing_ignores_revision_suffix() {
+        let version = UnityVersion::parse_version("2022.3.48t6 (b281c1694403)").unwrap();
+        assert_eq!(version.to_string(), "2022.3.48t6");
     }
 
     #[test]

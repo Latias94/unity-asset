@@ -74,6 +74,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Populate `file_info.compression_type` when extracting from bundles.
   - Fill `ObjectSummary.dependencies` from scanned internal references when enabled.
 - YAML serializer: avoid emitting `{...}` placeholders for complex objects when they appear as items in block arrays.
+- Unity version parser: accept UnityCN/Tuanjie suffix forms (e.g. `2022.3.48t6`, `2022.3.48f1c1`) and ignore revision suffixes in parentheses.
 - TypeTree writer: preserve rare unnamed child fields by copying their original byte slices during object rewrites.
 - TypeTree writer: normalize `PPtr<>` inputs (`m_FileID/m_PathID` vs `fileID/pathID`, `Null` -> zero pointer).
 - TypeTree writer: support legacy `version==2` TypeTree dump by writing `m_VariableCount` (best-effort).

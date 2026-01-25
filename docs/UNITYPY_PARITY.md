@@ -13,6 +13,7 @@ This repo treats the vendored UnityPy snapshot as the executable specification f
 
 - UnityPy version: `1.24.2` (`repo-ref/UnityPy/UnityPy/__init__.py`)
 - UnityPy commit: `14f2134c5996a21b15e5fb3ab649e0168e32267d` (`repo-ref/UnityPy`)
+- UnityCN/Tuanjie quirks: `docs/UNITYCN_NOTES.md`
 
 ## Scope Definition (What “Parity” Means)
 

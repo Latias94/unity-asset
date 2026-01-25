@@ -12,6 +12,9 @@ struct StatsRecord {
 
     bundle_signature: Option<String>,
     bundle_version: Option<u32>,
+    bundle_unity_version: Option<String>,
+    bundle_unity_revision: Option<String>,
+    bundle_flags: Option<u32>,
     asset_index: Option<usize>,
     name: Option<String>,
 
@@ -90,6 +93,7 @@ struct StatsSummary {
     total: usize,
     by_source_kind: BTreeMap<String, usize>,
     by_bundle_signature: BTreeMap<String, usize>,
+    by_bundle_flags: BTreeMap<String, usize>,
     by_serialized_version: BTreeMap<String, usize>,
 }
 
@@ -111,6 +115,12 @@ impl StatsSummary {
 
         if let Some(sig) = record.bundle_signature.as_ref() {
             *self.by_bundle_signature.entry(sig.clone()).or_insert(0) += 1;
+        }
+
+        if let Some(flags) = record.bundle_flags {
+            let sig = record.bundle_signature.as_deref().unwrap_or("<unknown>");
+            let key = format!("{sig} flags=0x{flags:08X}");
+            *self.by_bundle_flags.entry(key).or_insert(0) += 1;
         }
 
         let v_key = format!("{} v{}", record.source_kind, record.serialized_version);
@@ -150,6 +160,17 @@ impl StatsSummary {
                 );
             }
 
+            for (k, v) in &self.by_bundle_flags {
+                println!(
+                    "{}",
+                    serde_json::to_string(&StatsSummaryLine {
+                        group: "bundle_flags".to_string(),
+                        key: k.clone(),
+                        count: *v,
+                    })?
+                );
+            }
+
             for (k, v) in &self.by_serialized_version {
                 println!(
                     "{}",
@@ -174,6 +195,12 @@ impl StatsSummary {
         if !self.by_bundle_signature.is_empty() {
             println!("by_bundle_signature:");
             for (k, v) in &self.by_bundle_signature {
+                println!("  {}: {}", k, v);
+            }
+        }
+        if !self.by_bundle_flags.is_empty() {
+            println!("by_bundle_flags:");
+            for (k, v) in &self.by_bundle_flags {
                 println!("  {}: {}", k, v);
             }
         }
@@ -219,6 +246,9 @@ fn visit_serialized_files(
             source_kind: "serialized".to_string(),
             bundle_signature: None,
             bundle_version: None,
+            bundle_unity_version: None,
+            bundle_unity_revision: None,
+            bundle_flags: None,
             asset_index: None,
             name: None,
             serialized_version: file.header.version,
@@ -265,6 +295,9 @@ fn visit_bundles(
 
         let bundle_signature = bundle.header.signature.clone();
         let bundle_version = bundle.header.version;
+        let bundle_unity_version = Some(bundle.header.unity_version.clone());
+        let bundle_unity_revision = Some(bundle.header.unity_revision.clone());
+        let bundle_flags = Some(bundle.header.flags);
 
         for (asset_index, file) in bundle.assets.iter().enumerate() {
             if printed >= limit {
@@ -276,6 +309,9 @@ fn visit_bundles(
                 source_kind: "bundle".to_string(),
                 bundle_signature: Some(bundle_signature.clone()),
                 bundle_version: Some(bundle_version),
+                bundle_unity_version: bundle_unity_version.clone(),
+                bundle_unity_revision: bundle_unity_revision.clone(),
+                bundle_flags,
                 asset_index: Some(asset_index),
                 name: bundle.asset_names.get(asset_index).cloned(),
                 serialized_version: file.header.version,
@@ -337,11 +373,22 @@ fn stats_bundles(
                 .bundle_version
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "<unknown>".to_string());
+            let bundle_engine = record
+                .bundle_unity_revision
+                .as_deref()
+                .or(record.bundle_unity_version.as_deref())
+                .unwrap_or("<unknown>");
+            let flags = record
+                .bundle_flags
+                .map(|v| format!("0x{v:08X}"))
+                .unwrap_or_else(|| "<unknown>".to_string());
             println!(
-                "{} sig={} bundle_ver={} asset_index={} name={} version={} unity={} objects={} types={}",
+                "{} sig={} bundle_ver={} engine={} flags={} asset_index={} name={} version={} unity={} objects={} types={}",
                 record.source,
                 signature,
                 bundle_version,
+                bundle_engine,
+                flags,
                 record.asset_index.unwrap_or(0),
                 name,
                 record.serialized_version,
