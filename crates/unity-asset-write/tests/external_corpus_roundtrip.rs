@@ -66,6 +66,25 @@ fn parse_env_usize(name: &str) -> anyhow::Result<Option<usize>> {
     Ok(Some(v.parse::<usize>()?))
 }
 
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).ok().as_deref() == Some("1")
+}
+
+fn parse_packer_env() -> anyhow::Result<UnityPyPacker> {
+    let Ok(raw) = std::env::var("UNITY_ASSET_EXTERNAL_CORPUS_PACKER") else {
+        return Ok(UnityPyPacker::Original);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(UnityPyPacker::Original);
+    }
+    UnityPyPacker::from_unitypy_str(raw).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Invalid UNITY_ASSET_EXTERNAL_CORPUS_PACKER={raw:?}. Expected one of: none, lz4, lzma, original."
+        )
+    })
+}
+
 fn read_prefix(path: &Path, max: usize) -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
@@ -150,6 +169,8 @@ fn external_corpus_bundle_roundtrip_and_optional_unitypy_validation() -> anyhow:
         .min(limit);
 
     let unitypy_enabled = std::env::var("UNITYPY_E2E").ok().as_deref() == Some("1");
+    let verbose = env_flag("UNITY_ASSET_EXTERNAL_CORPUS_VERBOSE");
+    let packer = parse_packer_env()?;
 
     let mut attempted = 0usize;
     let mut skipped_too_large = 0usize;
@@ -178,6 +199,16 @@ fn external_corpus_bundle_roundtrip_and_optional_unitypy_validation() -> anyhow:
         }
 
         attempted += 1;
+        if verbose {
+            eprintln!(
+                "[external-corpus] ({}/{}) {} ({} bytes, sig={})",
+                attempted,
+                limit,
+                path.display(),
+                meta.len(),
+                sig
+            );
+        }
 
         let bytes = std::fs::read(path)?;
         let bundle = match BundleParser::from_bytes_with_options(bytes, BundleLoadOptions::lazy()) {
@@ -206,19 +237,14 @@ fn external_corpus_bundle_roundtrip_and_optional_unitypy_validation() -> anyhow:
             .map(|n| n.name.clone())
             .collect();
 
-        let saved = match BundleWriter::save(
-            &bundle,
-            &BundleEdits::default(),
-            PackerOptions {
-                packer: UnityPyPacker::Original,
-            },
-        ) {
-            Ok(b) => b,
-            Err(e) => {
-                failures.push((path.to_path_buf(), format!("save failed: {e}")));
-                return Ok(true);
-            }
-        };
+        let saved =
+            match BundleWriter::save(&bundle, &BundleEdits::default(), PackerOptions { packer }) {
+                Ok(b) => b,
+                Err(e) => {
+                    failures.push((path.to_path_buf(), format!("save failed: {e}")));
+                    return Ok(true);
+                }
+            };
 
         let reparsed =
             match BundleParser::from_bytes_with_options(saved.clone(), BundleLoadOptions::lazy()) {
@@ -289,8 +315,15 @@ assert getattr(f, "signature", None) == expected_sig
 files = getattr(f, "files", None)
 assert files is not None
 assert file_name in files, (file_name, list(files.keys())[:10])
-got = files[file_name].bytes
-assert len(got) == expected_len, (len(got), expected_len)
+item = files[file_name]
+if hasattr(item, "bytes"):
+    got = item.bytes
+elif hasattr(item, "reader") and hasattr(item.reader, "bytes"):
+    got = item.reader.bytes
+else:
+    got = None
+assert got is not None, type(item)
+assert len(got) == expected_len, (len(got), expected_len, type(item))
 "#;
 
                 unitypy_check(
@@ -332,6 +365,11 @@ assert len(got) == expected_len, (len(got), expected_len)
         }
         anyhow::bail!(msg);
     }
+
+    eprintln!(
+        "External corpus OK: attempted={}, skipped_not_bundle={}, skipped_too_large={}, unitypy_checked={}",
+        attempted, skipped_not_bundle, skipped_too_large, unitypy_checked
+    );
 
     Ok(())
 }

@@ -495,6 +495,8 @@ $env:UNITY_ASSET_EXTERNAL_CORPUS = "C:\\path\\to\\AssetBundles"
 ```
 $env:UNITY_ASSET_EXTERNAL_CORPUS_LIMIT = "20"         # default: 20
 $env:UNITY_ASSET_EXTERNAL_CORPUS_MAX_BYTES = "200000000" # default: 200,000,000 (~200MB)
+$env:UNITY_ASSET_EXTERNAL_CORPUS_VERBOSE = "1"        # optional: print every processed path
+$env:UNITY_ASSET_EXTERNAL_CORPUS_PACKER = "none"      # optional: none|lz4|lzma|original (default: original)
 ```
 
 3) Run the Rust-side roundtrip:
