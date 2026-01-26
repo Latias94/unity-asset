@@ -104,79 +104,58 @@ impl UnityVersion {
     /// Parse Unity version from string
     /// Supports formats like: "2020.3.12f1", "5.6.0", "2018.1.1b2"
     pub fn parse_version(version: &str) -> Result<Self> {
-        if version.is_empty() {
+        // Mirrors UnityPy `UnityVersion.from_str` behavior:
+        // - parse `<major>.<minor>.<build><type_str><type_number>` where `<type_str>` can be more than 1 char
+        // - unknown type strings are preserved (e.g. Tuanjie `t`, UnityCN `f1c`)
+        // - ignore any revision hash suffix in parentheses (ProjectVersion.txt style)
+        let raw = version.trim();
+        if raw.is_empty() {
             return Ok(Self::default());
         }
+        let raw = raw.split_whitespace().next().unwrap_or(raw);
 
-        let version = version.trim();
-        if version.is_empty() {
-            return Ok(Self::default());
+        let mut parts = raw.splitn(3, '.');
+        let major = parts
+            .next()
+            .ok_or_else(|| BinaryError::invalid_data(format!("Invalid version format: {}", raw)))?
+            .parse::<u16>()
+            .map_err(|e| BinaryError::invalid_data(format!("Invalid major version: {}", e)))?;
+        let minor = parts
+            .next()
+            .ok_or_else(|| BinaryError::invalid_data(format!("Invalid version format: {}", raw)))?
+            .parse::<u16>()
+            .map_err(|e| BinaryError::invalid_data(format!("Invalid minor version: {}", e)))?;
+        let tail = parts
+            .next()
+            .ok_or_else(|| BinaryError::invalid_data(format!("Invalid version format: {}", raw)))?;
+
+        let (build_digits, suffix) = split_leading_digits(tail);
+        if build_digits.is_empty() {
+            return Err(BinaryError::invalid_data(format!(
+                "Invalid build version: {}",
+                raw
+            )));
+        }
+        let build = build_digits
+            .parse::<u16>()
+            .map_err(|e| BinaryError::invalid_data(format!("Invalid build version: {}", e)))?;
+
+        if suffix.is_empty() {
+            return Ok(Self::new(major, minor, build, UnityVersionType::F, 0));
         }
 
-        // Unity sometimes appends a revision hash in parentheses (e.g. ProjectVersion.txt).
-        // That suffix is irrelevant for version comparisons and header heuristics, so we ignore it.
-        let version = version.split_whitespace().next().unwrap_or(version);
+        let (type_str, type_number) = split_trailing_number(suffix);
+        let type_number_u8 = type_number.unwrap_or(0);
 
-        // Use regex to parse version string
-        let version_regex = regex::Regex::new(r"^(\d+)\.(\d+)\.(\d+)([a-zA-Z]?)(\d*)(.*)$")
-            .map_err(|e| BinaryError::invalid_data(format!("Regex error: {}", e)))?;
+        let parsed_type = UnityVersionType::from_str(type_str).unwrap_or(UnityVersionType::U);
+        let mut out = Self::new(major, minor, build, parsed_type, type_number_u8);
 
-        if let Some(captures) = version_regex.captures(version) {
-            let major = captures
-                .get(1)
-                .unwrap()
-                .as_str()
-                .parse::<u16>()
-                .map_err(|e| BinaryError::invalid_data(format!("Invalid major version: {}", e)))?;
-            let minor = captures
-                .get(2)
-                .unwrap()
-                .as_str()
-                .parse::<u16>()
-                .map_err(|e| BinaryError::invalid_data(format!("Invalid minor version: {}", e)))?;
-            let build = captures
-                .get(3)
-                .unwrap()
-                .as_str()
-                .parse::<u16>()
-                .map_err(|e| BinaryError::invalid_data(format!("Invalid build version: {}", e)))?;
-
-            let type_str = captures.get(4).map(|m| m.as_str()).unwrap_or("");
-            let type_number_str = captures.get(5).map(|m| m.as_str()).unwrap_or("0");
-            let extra_str = captures.get(6).map(|m| m.as_str()).unwrap_or("");
-
-            // If no type letter is provided, default to "f" (final release)
-            let version_type = if type_str.is_empty() {
-                UnityVersionType::F
-            } else {
-                UnityVersionType::from_str(type_str)?
-            };
-            let type_number = if type_number_str.is_empty() {
-                0
-            } else {
-                type_number_str
-                    .parse::<u8>()
-                    .map_err(|e| BinaryError::invalid_data(format!("Invalid type number: {}", e)))?
-            };
-
-            let mut version = Self::new(major, minor, build, version_type, type_number);
-
-            // Store custom type strings:
-            // - unknown release channels (e.g. Tuanjie `t`)
-            // - extra suffixes after the type number (e.g. UnityCN `f1c1`)
-            if version_type == UnityVersionType::U && !type_str.is_empty() {
-                version.type_str = Some(type_str.to_string());
-            } else if !extra_str.is_empty() {
-                version.type_str = Some(extra_str.to_string());
-            }
-
-            Ok(version)
-        } else {
-            Err(BinaryError::invalid_data(format!(
-                "Invalid version format: {}",
-                version
-            )))
+        // Preserve unknown/custom type strings exactly, UnityPy-style.
+        if out.version_type == UnityVersionType::U {
+            out.type_str = Some(type_str.to_string());
         }
+
+        Ok(out)
     }
 
     /// Convert to tuple for comparison
@@ -262,14 +241,37 @@ impl fmt::Display for UnityVersion {
                 self.major, self.minor, self.build, channel, self.type_number
             )
         } else {
-            let extra = self.type_str.as_deref().unwrap_or("");
             write!(
                 f,
-                "{}.{}.{}{}{}{}",
-                self.major, self.minor, self.build, self.version_type, self.type_number, extra
+                "{}.{}.{}{}{}",
+                self.major, self.minor, self.build, self.version_type, self.type_number
             )
         }
     }
+}
+
+fn split_leading_digits(s: &str) -> (&str, &str) {
+    let idx = s
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| s.len());
+    s.split_at(idx)
+}
+
+fn split_trailing_number(s: &str) -> (&str, Option<u8>) {
+    let idx = s
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map(|(i, ch)| i + ch.len_utf8())
+        .unwrap_or(0);
+    let (head, tail) = s.split_at(idx);
+    if tail.is_empty() {
+        return (head, Some(0));
+    }
+    let n = tail.parse::<u8>().ok();
+    (head, n)
 }
 
 impl PartialOrd for UnityVersion {
@@ -409,9 +411,9 @@ mod tests {
         assert_eq!(version.major, 2022);
         assert_eq!(version.minor, 3);
         assert_eq!(version.build, 48);
-        assert_eq!(version.version_type, UnityVersionType::F);
+        assert_eq!(version.version_type, UnityVersionType::U);
         assert_eq!(version.type_number, 1);
-        assert_eq!(version.type_str.as_deref(), Some("c1"));
+        assert_eq!(version.type_str.as_deref(), Some("f1c"));
         assert_eq!(version.to_string(), "2022.3.48f1c1");
     }
 

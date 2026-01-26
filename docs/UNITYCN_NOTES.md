@@ -8,7 +8,7 @@ UnityCN/Tuanjie projects may use version strings like:
 
 - `2022.3.48t6` (Tuanjie channel)
 - `2022.3.48t6 (b281c1694403)` (revision suffix, as seen in `ProjectSettings/ProjectVersion.txt`)
-- `2022.3.48f1c1` (UnityCN extra suffix after the type number)
+- `2022.3.48f1c1` (UnityCN-style suffix; UnityPy treats this as an unknown/custom channel `f1c` with number `1`)
 
 Rust-side notes:
 
@@ -36,4 +36,3 @@ Some bundles contain objects whose `path_id` values are negative 64-bit integers
 Implications:
 - Parsing/edit/save must preserve these values exactly.
 - Any downstream feature that assumes `path_id >= 0` (e.g. converting to `u64`) may drop coverage and should be treated as best-effort.
-
