@@ -400,6 +400,7 @@ Acceptance:
   - [x] MeshRenderer (`m_Materials`, `m_AdditionalVertexStreams`)
   - [x] SpriteRenderer (`m_Sprite`)
   - [x] Sprite (`m_RD.texture`, `m_RD.alphaTexture`)
+  - [x] SpriteAtlas (`m_RenderDataMap[*].texture`, `m_RenderDataMap[*].alphaTexture`)
   - [x] Material:
     - [x] TexEnv texture (`m_SavedProperties.m_TexEnvs[*].m_Texture`) by name
     - [x] TexEnv scale/offset (`m_SavedProperties.m_TexEnvs[*].m_Scale/m_Offset`) by name

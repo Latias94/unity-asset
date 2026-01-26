@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - RectTransform: set anchored position/size/anchors/pivot/offsets (best-effort).
   - SpriteRenderer: set `m_Sprite` (PPtr).
   - Sprite: set `m_RD.texture` / `m_RD.alphaTexture` (PPtr).
+  - SpriteAtlas: set `m_RenderDataMap[*].texture` / `m_RenderDataMap[*].alphaTexture` (PPtr).
 - `EnvironmentEditSession::save_binary_object_class` to support a UnityPy `Object.save()`-style workflow for binary edits.
 - Legacy bundle repacking (UnityPy parity):
   - `BundleWriter` now supports saving `UnityWeb` / `UnityRaw` bundles (versions `<= 3`).

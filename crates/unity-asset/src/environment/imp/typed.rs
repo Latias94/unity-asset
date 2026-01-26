@@ -641,6 +641,52 @@ pub(crate) fn apply_sprite_alpha_texture_pptr(
     apply_sprite_render_data_texture_field_pptr(class, "alphaTexture", file_id, path_id)
 }
 
+fn apply_sprite_atlas_render_data_texture_field_pptr(
+    class: &mut UnityClass,
+    field_name: &str,
+    file_id: i32,
+    path_id: i64,
+) -> Result<()> {
+    let Some(render_data_map) = class.get_mut("m_RenderDataMap") else {
+        return Err(UnityAssetError::format(format!(
+            "SpriteAtlas missing required field: m_RenderDataMap (to set {})",
+            field_name
+        )));
+    };
+
+    let UnityValue::Array(entries) = render_data_map else {
+        return Err(UnityAssetError::format(
+            "SpriteAtlas m_RenderDataMap is not an array".to_string(),
+        ));
+    };
+
+    for entry in entries.iter_mut() {
+        let Some((_first, second)) = pair_first_second_mut(entry) else {
+            continue;
+        };
+        let tex = ensure_object_child(second, field_name);
+        super::pptr_path::write_pptr(tex, file_id, path_id);
+    }
+
+    Ok(())
+}
+
+pub(crate) fn apply_sprite_atlas_texture_pptr(
+    class: &mut UnityClass,
+    file_id: i32,
+    path_id: i64,
+) -> Result<()> {
+    apply_sprite_atlas_render_data_texture_field_pptr(class, "texture", file_id, path_id)
+}
+
+pub(crate) fn apply_sprite_atlas_alpha_texture_pptr(
+    class: &mut UnityClass,
+    file_id: i32,
+    path_id: i64,
+) -> Result<()> {
+    apply_sprite_atlas_render_data_texture_field_pptr(class, "alphaTexture", file_id, path_id)
+}
+
 impl<'a> EnvironmentEditSession<'a> {
     /// Write `data` into a cab and configure an AudioClip to stream from it (UnityPy-style).
     ///
@@ -897,6 +943,32 @@ impl<'a> EnvironmentEditSession<'a> {
         })
     }
 
+    /// Set `SpriteAtlas.m_RenderDataMap[*].(texture|alphaTexture)` to point at a Texture2D.
+    ///
+    /// Notes:
+    /// - Unity typically stores atlas render data as a list of pairs; this updates every entry.
+    pub fn set_sprite_atlas_texture_to_key(
+        &mut self,
+        sprite_atlas_key: &BinaryObjectKey,
+        texture_key: &BinaryObjectKey,
+    ) -> Result<()> {
+        let file_id = self.file_id_for_target(sprite_atlas_key, texture_key)?;
+        self.edit_binary_object_key(sprite_atlas_key, |class| {
+            apply_sprite_atlas_texture_pptr(class, file_id, texture_key.path_id)
+        })
+    }
+
+    pub fn set_sprite_atlas_alpha_texture_to_key(
+        &mut self,
+        sprite_atlas_key: &BinaryObjectKey,
+        texture_key: &BinaryObjectKey,
+    ) -> Result<()> {
+        let file_id = self.file_id_for_target(sprite_atlas_key, texture_key)?;
+        self.edit_binary_object_key(sprite_atlas_key, |class| {
+            apply_sprite_atlas_alpha_texture_pptr(class, file_id, texture_key.path_id)
+        })
+    }
+
     /// Set a Material `m_SavedProperties.m_TexEnvs[*].m_Texture` entry by property name.
     ///
     /// This is the most common workflow for repointing textures (e.g. `_MainTex`).
@@ -1095,5 +1167,37 @@ mod tests {
         let (file_id, path_id) = get_pptr_fields(sprite).unwrap();
         assert_eq!(file_id, 0);
         assert_eq!(path_id, 123);
+    }
+
+    #[test]
+    fn apply_sprite_atlas_alpha_texture_pptr_updates_all_entries() {
+        let mut class = UnityClass::new(687078895, "SpriteAtlas".to_string(), "0".to_string());
+        class.set(
+            "m_RenderDataMap".to_string(),
+            UnityValue::Array(vec![
+                UnityValue::Array(vec![
+                    UnityValue::Array(vec![UnityValue::Null, UnityValue::Integer(0)]),
+                    UnityValue::Object(Default::default()),
+                ]),
+                UnityValue::Array(vec![
+                    UnityValue::Array(vec![UnityValue::Null, UnityValue::Integer(0)]),
+                    UnityValue::Object(Default::default()),
+                ]),
+            ]),
+        );
+
+        apply_sprite_atlas_alpha_texture_pptr(&mut class, 0, 77).unwrap();
+
+        let map = class.get("m_RenderDataMap").unwrap().as_array().unwrap();
+        assert_eq!(map.len(), 2);
+        for entry in map {
+            let UnityValue::Array(pair) = entry else {
+                panic!("expected pair array");
+            };
+            let second = pair.get(1).unwrap().as_object().unwrap();
+            let alpha = second.get("alphaTexture").unwrap().as_object().unwrap();
+            assert_eq!(alpha.get("m_FileID").and_then(|v| v.as_i64()), Some(0));
+            assert_eq!(alpha.get("m_PathID").and_then(|v| v.as_i64()), Some(77));
+        }
     }
 }
