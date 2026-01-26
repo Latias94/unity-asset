@@ -82,6 +82,18 @@ Integration:
 
 ## Module Mapping (UnityPy → Rust)
 
+This mapping is intentionally **source-derived**: it enumerates UnityPy's write/edit entrypoints and
+maps each one to its Rust equivalent (or documents a gap). Baseline UnityPy files scanned for this
+section:
+
+- `repo-ref/UnityPy/UnityPy/environment.py`
+- `repo-ref/UnityPy/UnityPy/files/File.py`
+- `repo-ref/UnityPy/UnityPy/files/ObjectReader.py`
+- `repo-ref/UnityPy/UnityPy/files/SerializedFile.py`
+- `repo-ref/UnityPy/UnityPy/files/BundleFile.py`
+- `repo-ref/UnityPy/UnityPy/files/WebFile.py`
+- `repo-ref/UnityPy/UnityPy/helpers/TypeTreeHelper.py`
+
 ### Environment / Loading semantics
 
 UnityPy:
@@ -118,10 +130,10 @@ Rust (current):
 - `crates/unity-asset/src/environment.rs`
   - `Environment::save(pack, out_dir)` writes only changed sources
   - `.zip/.apk` entries are treated as standalone sources (UnityPy-style): edited entries are written to `out_dir` and the archive is not re-packed
-
-Rust (target):
-- `crates/unity-asset/src/environment.rs`
-  - `Environment::save(pack, out_dir)` delegating to `unity-asset-write`
+  - delegates to `unity-asset-write` rebuilders:
+    - `SerializedFileWriter`
+    - `BundleWriter`
+    - `WebFileWriter`
 
 ### Object editing hook
 
@@ -131,6 +143,8 @@ UnityPy:
 - `repo-ref/UnityPy/UnityPy/files/ObjectReader.py`
   - `save_typetree(...)` (writes TypeTree and stores raw bytes)
   - `set_raw_data(...)` + `assets_file.mark_changed()`
+  - `patch(...)` is an alias for `save_typetree(...)`
+  - `get_raw_data()` reads the current object bytes (useful for low-level diffs)
 
 Rust (current):
 - `crates/unity-asset-binary/src/object.rs`
@@ -139,13 +153,33 @@ Rust (current):
   - `EnvironmentEditSession` provides UnityPy-like edit + save hooks on top of `ObjectHandle`:
     - `edit_binary_object_key(...)` (mutate in a closure)
     - `save_binary_object_class(...)` (UnityPy `Object.save()`-style: mutate outside, then persist)
-
-Rust (target):
 - `crates/unity-asset-write/src/object/serialized_file_session.rs`
   - `SerializedFileEditSession` (UnityPy-like: edit -> save_typetree/set_raw_data -> mark_changed)
+  - `ChangeTracker` trait mirrors UnityPy `mark_changed()` / `is_changed`
   - stores either:
     - parsed properties + TypeTree → encode to raw bytes (`save_typetree` / `edit_object`), or
     - raw byte patch (escape hatch: `set_raw_data`)
+
+### File.mark_changed / get_writeable_cab (streamed resources)
+
+UnityPy:
+- `repo-ref/UnityPy/UnityPy/files/File.py`
+  - `File.mark_changed()` bubbles up to parent containers
+  - `File.get_writeable_cab(name=None)` creates an `EndianBinaryWriter` stored under the container
+- `repo-ref/UnityPy/UnityPy/files/SerializedFile.py`
+  - `SerializedFile.get_writeable_cab(...)` registers the cab as an external (GUID + `archive:/...`)
+    when the serialized file is inside a Bundle/WebFile container
+
+Rust (current):
+- `crates/unity-asset/src/environment/imp/edit.rs`
+  - `EnvironmentEditSession::write_to_cab(...)` / `write_streamed_resource_to_field(...)`
+- `crates/unity-asset-write/src/resources/mod.rs`
+  - `WritableCab` (UnityPy `EndianBinaryWriter` analogue; stored in container edits)
+
+Notes:
+- UnityPy returns `None` for `SerializedFile.get_writeable_cab` when not inside a container.
+  Rust supports a best-effort standalone sidecar write under `out/{file}_data/{cab}` to keep the
+  streamed-resource editing workflow possible for `.assets` files.
 
 ### MonoBehaviour TypeTree generation
 
@@ -179,16 +213,10 @@ UnityPy:
 Rust (current):
 - `crates/unity-asset-binary/src/typetree/serializer.rs`
   - parse + scan fast paths
-  - has `serialize_object(...)` but not yet parity-grade (endianness/alignment/edge types)
-
-Rust (target):
+  - `TypeTreeSerializer` drives parsing and PPtr scanning (read-only)
 - `crates/unity-asset-write/src/typetree/`
-  - implement TypeTree-driven writer with strict alignment and full primitive coverage
-  - must match UnityPy’s behavior for:
-    - `string` (`write_aligned_string`)
-    - `TypelessData` (`write_byte_array`)
-    - array layout and aligned array element types
-    - `pair`, `PPtr<>`, `ReferencedObject`, managed references registry
+  - TypeTree-driven writer (UnityPy `TypeTreeHelper.write_value` parity)
+  - includes best-effort template writes for rare unnamed children (preserve original byte slices)
 
 ### SerializedFile save/rebuild
 
@@ -205,10 +233,11 @@ Rust (current):
   - read-only parse logic, plus lazy object slicing
 - `crates/unity-asset-binary/src/asset/header.rs`
   - header parse, including v22 extended fields
-
-Rust (target):
 - `crates/unity-asset-write/src/serialized_file/writer.rs`
   - `SerializedFileWriter::save(...) -> Vec<u8>`
+  - supports both:
+    - v>=9 layout (metadata after header)
+    - v<9 legacy layout (metadata at end-of-file; UnityPy parity)
   - all version gates mirrored from UnityPy:
     - v>=7 unityVersion
     - v>=8 platform
@@ -233,16 +262,14 @@ UnityPy:
 Rust (current):
 - `crates/unity-asset-binary/src/bundle/*`
   - robust parsing + decompression, including lazy block cache
-- `crates/unity-asset-binary/src/compression.rs`
-  - decompression support (LZ4/LZMA/Brotli/Gzip) but **no compression** yet
-
-Rust (target):
-- `crates/unity-asset-write/src/bundle_write.rs`
-  - UnityFS writer that supports the same packer semantics as UnityPy
-  - requires implementing compression (LZ4 + LZMA at least) for:
-    - blocks info compression
-    - data blocks compression
-  - must preserve flags and implement `"original"` behavior
+- `crates/unity-asset-write/src/bundle/writer.rs`
+  - `BundleWriter::save(...)` (UnityPy parity)
+  - supports:
+    - UnityFS repack with UnityPy packer semantics (`none`/`lz4`/`lzma`/`original`/custom flags)
+    - legacy UnityWeb/UnityRaw repack (UnityPy only supports saving versions `<= 3`)
+  - strips UnityFS encryption flags on save (UnityPy parity; encryption is not re-applied)
+- `crates/unity-asset-write/src/bundle/edits.rs`
+  - `BundleEdits` supports both replacing existing entries and adding new entries
 
 ### WebFile save/rebuild
 
@@ -252,12 +279,11 @@ UnityPy:
   - supports gzip/brotli/none
 
 Rust (current):
-- `crates/unity-asset-binary/src/webfile.rs` (parse only)
-
-Rust (target):
-- `crates/unity-asset-write/src/webfile_write.rs`
-  - implement save with packer options matching UnityPy
-  - requires brotli/gzip **compression** counterparts (decompression already exists)
+- `crates/unity-asset-binary/src/webfile.rs` (parse)
+- `crates/unity-asset-write/src/webfile/writer.rs`
+  - `WebFileWriter::save(...)` (UnityPy parity; gzip/brotli/none)
+  - supports signature validation (`UnityWebData*` / `TuanjieWebData*`)
+  - supports replacements/additions via `WebFileEdits`
 
 ### Resource files / `.resS` (writeable cab)
 
@@ -268,13 +294,11 @@ UnityPy:
   - `SerializedFile.get_writeable_cab(...)` registers it in externals
 
 Rust (current):
-- loader can read resources (best-effort export paths exist)
-
-Rust (target):
-- `crates/unity-asset-write/src/resources.rs`
+- loader can read resources (best-effort; streamed read helpers exist)
+- `crates/unity-asset-write/src/resources/mod.rs`
   - `WritableCab` abstraction
   - external registration and path conventions aligned with UnityPy:
-    - `archive:/{bundle_name}/{cab_name}`
+    - `archive:/{serialized_name}/{cab_name}` (UnityPy uses the serialized file name as the first component)
 
 ## TODO Milestones (Trackable Checklist)
 
