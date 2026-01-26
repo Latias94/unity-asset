@@ -135,6 +135,10 @@ UnityPy:
 Rust (current):
 - `crates/unity-asset-binary/src/object.rs`
   - `ObjectHandle` (UnityPy `ObjectReader`-like) is read-only today
+- `crates/unity-asset/src/environment/imp/edit.rs`
+  - `EnvironmentEditSession` provides UnityPy-like edit + save hooks on top of `ObjectHandle`:
+    - `edit_binary_object_key(...)` (mutate in a closure)
+    - `save_binary_object_class(...)` (UnityPy `Object.save()`-style: mutate outside, then persist)
 
 Rust (target):
 - `crates/unity-asset-write/src/object/serialized_file_session.rs`

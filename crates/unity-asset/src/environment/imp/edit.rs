@@ -82,6 +82,35 @@ impl<'a> EnvironmentEditSession<'a> {
         self.env.edit_binary_object_key(key, f)
     }
 
+    /// Replace the entire parsed `UnityClass` of a binary object and record it as a pending write.
+    ///
+    /// This is the closest Rust equivalent to UnityPy's `Object.save()` workflow: parse an object,
+    /// mutate it outside a closure, then persist it back into its source file.
+    ///
+    /// Notes:
+    /// - The provided `class.class_id` must match the target object's class id.
+    pub fn save_binary_object_class(
+        &mut self,
+        key: &BinaryObjectKey,
+        class: UnityClass,
+    ) -> Result<()> {
+        let expected = expected_class_id_for_key(self.env, key)?;
+        if class.class_id != expected {
+            return Err(UnityAssetError::format(format!(
+                "Class id mismatch for {} path_id={}: expected={}, got={}",
+                key.source.describe(),
+                key.path_id,
+                expected,
+                class.class_id
+            )));
+        }
+
+        self.edit_binary_object_key(key, move |current| {
+            *current = class;
+            Ok(())
+        })
+    }
+
     /// Append `data` into a UnityPy-style writable cab (e.g. `CAB-UnityPy_Mod.resS`) and return the
     /// `(path, offset, size)` triple that can be written into streamed-resource fields.
     ///
@@ -700,6 +729,46 @@ fn edit_in_serialized_file(
     }
 
     Ok(())
+}
+
+fn expected_class_id_for_key(env: &Environment, key: &BinaryObjectKey) -> Result<i32> {
+    match key.source_kind {
+        BinarySourceKind::SerializedFile => {
+            let (_, file) = resolve_serialized_file_source(&env.binary_assets, &key.source)?;
+            let handle = file.find_object_handle(key.path_id).ok_or_else(|| {
+                UnityAssetError::format(format!(
+                    "Object not found in SerializedFile {}: path_id={}",
+                    key.source.describe(),
+                    key.path_id
+                ))
+            })?;
+            Ok(handle.class_id())
+        }
+        BinarySourceKind::AssetBundle => {
+            let asset_index = key.asset_index.ok_or_else(|| {
+                UnityAssetError::format(
+                    "AssetBundle key requires an asset_index (which asset in the bundle?)",
+                )
+            })?;
+            let (_, bundle) = resolve_bundle_source(&env.bundles, &key.source)?;
+            let file = bundle.assets.get(asset_index).ok_or_else(|| {
+                UnityAssetError::format(format!(
+                    "AssetBundle asset index out of range: {} asset_index={}",
+                    key.source.describe(),
+                    asset_index
+                ))
+            })?;
+            let handle = file.find_object_handle(key.path_id).ok_or_else(|| {
+                UnityAssetError::format(format!(
+                    "Object not found in AssetBundle {} asset_index={}: path_id={}",
+                    key.source.describe(),
+                    asset_index,
+                    key.path_id
+                ))
+            })?;
+            Ok(handle.class_id())
+        }
+    }
 }
 
 fn resolve_serialized_file_source<'a>(

@@ -347,6 +347,85 @@ fn environment_edit_session_can_set_sprite_texture_pptr_and_save_bundle() {
 }
 
 #[test]
+fn environment_edit_session_can_save_binary_object_class_and_save_bundle() {
+    use unity_asset_write::{PackerOptions, UnityPyPacker};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let in_path = tmp.path().join("char_118_yuki.ab");
+    let out_dir = tmp.path().join("out");
+
+    std::fs::write(
+        &in_path,
+        include_bytes!("../../../../../tests/samples/char_118_yuki.ab"),
+    )
+    .unwrap();
+
+    let in_path = canonicalize_path(in_path);
+
+    let mut env = Environment::new();
+    env.load_file(&in_path).unwrap();
+
+    let bundle = env
+        .bundles()
+        .get(&BinarySource::path(&in_path))
+        .expect("sample bundle loaded");
+    let sf = bundle.assets.first().expect("bundle has asset 0");
+
+    let (path_id, old_name) = sf
+        .object_handles()
+        .filter_map(|h| h.peek_name().ok().flatten().map(|n| (h.path_id(), n)))
+        .find(|(_id, name)| !name.is_empty())
+        .expect("expected at least one object with peekable name in sample");
+
+    let key = BinaryObjectKey {
+        source: BinarySource::path(&in_path),
+        source_kind: BinarySourceKind::AssetBundle,
+        asset_index: Some(0),
+        path_id,
+    };
+
+    let obj = env.read_binary_object_key(&key).unwrap();
+    let mut class = obj.as_unity_class().clone();
+    let field_name = if class.get("m_Name").is_some() {
+        "m_Name"
+    } else if class.get("name").is_some() {
+        "name"
+    } else {
+        return;
+    };
+
+    let new_name = format!("RUST_ENV_OBJ_SAVE_{}", old_name);
+    *class.get_mut(field_name).unwrap() = UnityValue::String(new_name.clone());
+
+    let mut session = env.edit_session();
+    session.save_binary_object_class(&key, class).unwrap();
+    session
+        .save(
+            PackerOptions {
+                packer: UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_path = out_dir.join("char_118_yuki.ab");
+    assert!(out_path.is_file());
+
+    let saved_bundle =
+        unity_asset_binary::bundle::BundleParser::from_bytes(std::fs::read(out_path).unwrap())
+            .unwrap();
+    let saved_sf = saved_bundle
+        .assets
+        .first()
+        .expect("saved bundle has asset 0");
+    let saved_obj = saved_sf
+        .find_object_handle(path_id)
+        .expect("edited object exists after save");
+    let saved_name = saved_obj.peek_name().unwrap().unwrap();
+    assert_eq!(saved_name, new_name);
+}
+
+#[test]
 fn environment_edit_session_can_set_binary_value_at_path_and_save_bundle() {
     use unity_asset_write::{PackerOptions, UnityPyPacker};
 
