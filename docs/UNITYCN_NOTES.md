@@ -36,3 +36,21 @@ Some bundles contain objects whose `path_id` values are negative 64-bit integers
 Implications:
 - Parsing/edit/save must preserve these values exactly.
 - Any downstream feature that assumes `path_id >= 0` (e.g. converting to `u64`) may drop coverage and should be treated as best-effort.
+
+How to scan (no hardcoded paths):
+
+```
+cargo run -p unity-asset-cli --bin unity-asset -- stats-pathid --input <path-or-dir> --kind bundle --limit 50
+# include duplicate checks (slower):
+cargo run -p unity-asset-cli --bin unity-asset -- stats-pathid --input <path-or-dir> --kind bundle --limit 50 --check-duplicates
+```
+
+Observed (external UnityCN project corpus, sample):
+
+- `stats --kind bundle --summary --limit 30` reported `UnityFS flags=0x00000243` for all 30 scanned bundle assets.
+- `stats-pathid --kind bundle --limit 30`:
+  - `files_scanned=30`, `objects_total=4552`
+  - `negative=2253`, `zero=0`, `positive=2299`
+  - `min=-9213568037368421799`, `max=9222975297749798082`
+- `stats-pathid --kind bundle --limit 10 --check-duplicates`:
+  - `files_with_duplicates=0`, `duplicate_path_ids=0`

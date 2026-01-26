@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Glob matching for AssetBundle `m_Container` discovery (`*`, `?`) and CLI support for glob patterns.
 - `unity-asset-cli stats` to print parsing stats (bundle signature + SerializedFile version/unity/metadata counts) for loaded sources, with an optional `--summary` aggregation mode.
+- `unity-asset-cli stats-pathid` to summarize `path_id` sign/min/max distributions for binary objects (useful for UnityCN/Tuanjie investigations).
 - Dependency graph extraction for SerializedFiles (TypeTree + PPtr scan) in `MetadataExtractor`.
 - Environment-wide dependency graph builder (best-effort external resolution via `.meta` GUID cache and bundle name heuristics).
 - Environment-wide unified object graph (`Environment::build_object_graph`) across YAML + binary sources (best-effort GUID/fileID resolution).

@@ -269,6 +269,30 @@ pub(crate) enum Commands {
         json: bool,
     },
 
+    /// Summarize binary `path_id` distributions (negative/zero/positive) for UnityCN/Tuanjie investigations
+    #[command(name = "stats-pathid")]
+    StatsPathId {
+        /// Input file or directory path (assets/bundles will be auto-detected)
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Source kind: `all`, `bundle`, or `serialized`
+        #[arg(long, default_value = "all")]
+        kind: String,
+
+        /// Limit scanned serialized files (bundle assets count as one each)
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Check for duplicate path IDs within each serialized file (slower; uses a HashSet)
+        #[arg(long)]
+        check_duplicates: bool,
+
+        /// Print one JSON summary object
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Find objects by AssetBundle `m_Container` asset path pattern (UnityPy-like discovery)
     FindObject {
         /// Input file or directory path (bundles will be auto-detected)

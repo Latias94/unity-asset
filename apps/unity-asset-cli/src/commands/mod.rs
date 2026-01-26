@@ -15,6 +15,7 @@ mod parse_yaml;
 mod project_graph;
 mod scan_pptr;
 mod stats;
+mod stats_pathid;
 
 pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
     match command {
@@ -132,6 +133,13 @@ pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
             summary,
             json,
         } => stats::run(&input, kind.as_str(), &limit, &summary, &json, ctx),
+        Commands::StatsPathId {
+            input,
+            kind,
+            limit,
+            check_duplicates,
+            json,
+        } => stats_pathid::run(input, kind, limit, check_duplicates, json, ctx),
         Commands::FindObject {
             input,
             pattern,
