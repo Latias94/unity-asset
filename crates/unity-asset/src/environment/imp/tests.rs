@@ -257,6 +257,96 @@ fn environment_can_edit_binary_object_and_save_bundle() {
 }
 
 #[test]
+fn environment_edit_session_can_set_sprite_texture_pptr_and_save_bundle() {
+    use unity_asset_write::{PackerOptions, UnityPyPacker};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let in_path = tmp.path().join("atlas_test");
+    let out_dir = tmp.path().join("out");
+
+    std::fs::write(
+        &in_path,
+        include_bytes!("../../../../../tests/samples/atlas_test"),
+    )
+    .unwrap();
+
+    let in_path = canonicalize_path(in_path);
+
+    let mut env = Environment::new();
+    env.load_file(&in_path).unwrap();
+
+    let bundle = env
+        .bundles()
+        .get(&BinarySource::path(&in_path))
+        .expect("sample bundle loaded");
+    let sf = bundle.assets.first().expect("bundle has asset 0");
+
+    let sprite_path_id = sf
+        .object_handles()
+        .find(|h| h.class_id() == 213)
+        .map(|h| h.path_id())
+        .expect("expected at least one Sprite in sample bundle");
+    let texture_path_id = sf
+        .object_handles()
+        .find(|h| h.class_id() == 28)
+        .map(|h| h.path_id())
+        .expect("expected at least one Texture2D in sample bundle");
+
+    let sprite_key = BinaryObjectKey {
+        source: BinarySource::path(&in_path),
+        source_kind: BinarySourceKind::AssetBundle,
+        asset_index: Some(0),
+        path_id: sprite_path_id,
+    };
+
+    let texture_key = BinaryObjectKey {
+        source: BinarySource::path(&in_path),
+        source_kind: BinarySourceKind::AssetBundle,
+        asset_index: Some(0),
+        path_id: texture_path_id,
+    };
+
+    let mut session = env.edit_session();
+    session
+        .set_sprite_texture_to_key(&sprite_key, &texture_key)
+        .unwrap();
+
+    session
+        .save(
+            PackerOptions {
+                packer: UnityPyPacker::Original,
+            },
+            &out_dir,
+        )
+        .unwrap();
+
+    let out_path = out_dir.join("atlas_test");
+    assert!(out_path.is_file());
+
+    let saved_bundle =
+        unity_asset_binary::bundle::BundleParser::from_bytes(std::fs::read(out_path).unwrap())
+            .unwrap();
+    let saved_sf = saved_bundle
+        .assets
+        .first()
+        .expect("saved bundle has asset 0");
+
+    let saved_sprite = saved_sf
+        .find_object_handle(sprite_path_id)
+        .expect("edited sprite exists after save")
+        .read()
+        .unwrap();
+
+    let rd = saved_sprite.class.get("m_RD").unwrap().as_object().unwrap();
+    let texture = rd.get("texture").unwrap().as_object().unwrap();
+    assert_eq!(texture.get("m_FileID").and_then(|v| v.as_i64()), Some(0));
+    assert_eq!(
+        texture.get("m_PathID").and_then(|v| v.as_i64()),
+        Some(texture_path_id)
+    );
+}
+
+#[test]
 fn environment_edit_session_can_set_binary_value_at_path_and_save_bundle() {
     use unity_asset_write::{PackerOptions, UnityPyPacker};
 

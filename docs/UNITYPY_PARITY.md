@@ -394,6 +394,8 @@ Acceptance:
 - [x] Expand typed helpers (UnityPy-like ergonomics):
   - [x] MeshFilter (`m_Mesh`)
   - [x] MeshRenderer (`m_Materials`, `m_AdditionalVertexStreams`)
+  - [x] SpriteRenderer (`m_Sprite`)
+  - [x] Sprite (`m_RD.texture`, `m_RD.alphaTexture`)
   - [x] Material:
     - [x] TexEnv texture (`m_SavedProperties.m_TexEnvs[*].m_Texture`) by name
     - [x] TexEnv scale/offset (`m_SavedProperties.m_TexEnvs[*].m_Scale/m_Offset`) by name
@@ -439,7 +441,7 @@ Acceptance:
   - [x] UnityFS bundle: Rust save -> UnityPy load OK + directory sanity checks
   - [x] SerializedFile: Rust save -> UnityPy load OK + objects non-empty
   - [x] Rust TypeTree edit (rename a `m_Name`/`name` field) -> repack bundle -> UnityPy observes mutation
-- [ ] Add corpus-driven tests with `tests/samples/*`:
+- [x] Add corpus-driven tests with `tests/samples/*`:
   - [x] bundle round-trip (no-op save)
   - [x] serialized file round-trip
 

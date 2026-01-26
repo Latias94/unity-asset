@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - GameObject: set name (`m_Name`/`name`) and active (`m_IsActive`).
   - Transform: set local position/rotation/scale.
   - RectTransform: set anchored position/size/anchors/pivot/offsets (best-effort).
+  - SpriteRenderer: set `m_Sprite` (PPtr).
+  - Sprite: set `m_RD.texture` / `m_RD.alphaTexture` (PPtr).
 - Legacy bundle repacking (UnityPy parity):
   - `BundleWriter` now supports saving `UnityWeb` / `UnityRaw` bundles (versions `<= 3`).
 - Directory-wide `.meta` GUID indexing (`Environment::index_meta_guids_in_directory`) for higher external resolution hit rates without loading every asset file.
