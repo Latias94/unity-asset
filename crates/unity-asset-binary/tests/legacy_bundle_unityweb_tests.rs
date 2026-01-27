@@ -19,7 +19,7 @@ fn pad_to_multiple(buf: &mut Vec<u8>, align: usize) {
     if align == 0 {
         return;
     }
-    while buf.len() % align != 0 {
+    while !buf.len().is_multiple_of(align) {
         buf.push(0);
     }
 }
@@ -53,7 +53,7 @@ fn can_parse_minimal_unityweb_v3_bundle_and_extract_file() {
 
     // fileInfoHeaderSize = 4 (nodesCount) + (len(name)+1) + 8 (offset+size), aligned to 4.
     let mut file_info_header_size = 4usize;
-    file_info_header_size += file_name.as_bytes().len() + 1;
+    file_info_header_size += file_name.len() + 1;
     file_info_header_size += 8;
     file_info_header_size = (file_info_header_size + 3) & !3;
 

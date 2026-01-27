@@ -348,11 +348,11 @@ impl Environment {
 
                 if entry_path.is_dir() {
                     if let Some(dir_name) = entry_path.file_name().and_then(|n| n.to_str()) {
-                        match dir_name {
-                            "Library" | "Temp" | "Logs" | ".git" | ".vs" | "obj" | "bin" => {
-                                continue;
-                            }
-                            _ => {}
+                        if matches!(
+                            dir_name,
+                            "Library" | "Temp" | "Logs" | ".git" | ".vs" | "obj" | "bin"
+                        ) {
+                            continue;
                         }
                     }
                     stack.push(entry_path);

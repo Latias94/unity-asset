@@ -1,21 +1,11 @@
 use super::object_graph::{EnvironmentObjectKey, YamlObjectKey};
 use super::*;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct YamlPptrReferenceSearchOptions {
     pub max_objects: Option<usize>,
     pub max_results: Option<usize>,
     pub max_pptrs_per_object: Option<usize>,
-}
-
-impl Default for YamlPptrReferenceSearchOptions {
-    fn default() -> Self {
-        Self {
-            max_objects: None,
-            max_results: None,
-            max_pptrs_per_object: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,7 +262,7 @@ impl Environment {
                         match target {
                             EnvironmentObjectKey::Yaml(t) => {
                                 pptr.guid.is_none()
-                                    && &from.path == &t.path
+                                    && from.path == t.path
                                     && pptr.file_id.to_string() == t.anchor
                             }
                             EnvironmentObjectKey::Binary(_) => false,

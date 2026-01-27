@@ -13,6 +13,12 @@ pub(crate) fn chunk_based_compress(
     data: &[u8],
     block_info_flag: u32,
 ) -> Result<(Vec<u8>, Vec<UnityFsBlockInfo>)> {
+    type CompressFn = fn(&[u8]) -> Result<Vec<u8>>;
+
+    fn compress_lz4_result(chunk: &[u8]) -> Result<Vec<u8>> {
+        Ok(compress_lz4(chunk))
+    }
+
     let switch = block_info_flag & 0x3F;
 
     if switch == 0 {
@@ -38,9 +44,9 @@ pub(crate) fn chunk_based_compress(
         ));
     }
 
-    let (chunk_size, compress_fn): (usize, fn(&[u8]) -> Result<Vec<u8>>) = match switch {
-        1 => (usize::MAX, |chunk| Ok(compress_lzma_unity(chunk)?)),
-        2 | 3 => (0x0002_0000, |chunk| Ok(compress_lz4(chunk))),
+    let (chunk_size, compress_fn): (usize, CompressFn) = match switch {
+        1 => (usize::MAX, compress_lzma_unity),
+        2 | 3 => (0x0002_0000, compress_lz4_result),
         other => {
             return Err(UnityAssetError::format(format!(
                 "Unsupported UnityFS compression switch: {}",

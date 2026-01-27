@@ -235,8 +235,7 @@ impl BundleWriter {
         // Calculate fileInfoHeaderSize so offsets can be precomputed (UnityPy `save_web_raw`).
         let mut file_info_header_size: u32 = 4; // nodesCount
         for (name, _) in &files {
-            file_info_header_size =
-                file_info_header_size.saturating_add(name.as_bytes().len() as u32 + 1);
+            file_info_header_size = file_info_header_size.saturating_add(name.len() as u32 + 1);
             file_info_header_size = file_info_header_size.saturating_add(4 * 2); // offset + size
         }
         file_info_header_size = align_u32(file_info_header_size, 4);

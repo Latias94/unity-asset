@@ -19,7 +19,7 @@ fn pad_to_multiple(buf: &mut Vec<u8>, align: usize) {
     if align == 0 {
         return;
     }
-    while buf.len() % align != 0 {
+    while !buf.len().is_multiple_of(align) {
         buf.push(0);
     }
 }
@@ -34,7 +34,7 @@ fn build_minimal_unityraw_v3_bundle(file_name: &str, file_bytes: &[u8]) -> Vec<u
     write_i32_be(&mut directory_info, 1);
 
     let mut file_info_header_size = 4usize;
-    file_info_header_size += file_name.as_bytes().len() + 1;
+    file_info_header_size += file_name.len() + 1;
     file_info_header_size += 8;
     file_info_header_size = (file_info_header_size + 3) & !3;
 
@@ -110,7 +110,7 @@ fn build_minimal_unityweb_v3_bundle(file_name: &str, file_bytes: &[u8]) -> Vec<u
     write_i32_be(&mut directory_info, 1);
 
     let mut file_info_header_size = 4usize;
-    file_info_header_size += file_name.as_bytes().len() + 1;
+    file_info_header_size += file_name.len() + 1;
     file_info_header_size += 8;
     file_info_header_size = (file_info_header_size + 3) & !3;
 

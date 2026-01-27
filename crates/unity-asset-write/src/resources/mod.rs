@@ -28,6 +28,10 @@ impl WritableCab {
         self.bytes.len() as u64
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
     pub fn append(&mut self, data: &[u8]) -> Result<u64> {
         let offset = self.len();
         let new_len = self

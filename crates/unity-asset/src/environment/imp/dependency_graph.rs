@@ -65,22 +65,12 @@ pub struct EnvironmentDependencyGraph {
     warnings: Vec<DependencyGraphWarning>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct DependencyGraphTraversalOptions {
     pub max_depth: Option<usize>,
     pub max_nodes: Option<usize>,
     /// Follow `ExternalDependencyEdge.resolved` when present.
     pub follow_resolved_external: bool,
-}
-
-impl Default for DependencyGraphTraversalOptions {
-    fn default() -> Self {
-        Self {
-            max_depth: None,
-            max_nodes: None,
-            follow_resolved_external: false,
-        }
-    }
 }
 
 impl EnvironmentDependencyGraph {
@@ -142,7 +132,7 @@ impl EnvironmentDependencyGraph {
                     .filter_map(|e| e.resolved.clone()),
             );
         }
-        out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        out.sort_by_key(|a| a.to_string());
         out.dedup();
         out
     }
@@ -155,7 +145,7 @@ impl EnvironmentDependencyGraph {
             .filter(|k| incoming.get(*k).map(|v| v.is_empty()).unwrap_or(true))
             .cloned()
             .collect();
-        out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        out.sort_by_key(|a| a.to_string());
         out
     }
 
@@ -175,7 +165,7 @@ impl EnvironmentDependencyGraph {
                 out.push(k.clone());
             }
         }
-        out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        out.sort_by_key(|a| a.to_string());
         out
     }
 
@@ -206,14 +196,14 @@ impl EnvironmentDependencyGraph {
                 }
             }
 
-            comp.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            comp.sort_by_key(|a| a.to_string());
             out.push(comp);
             if out.len() >= max_components {
                 break;
             }
         }
 
-        out.sort_by(|a, b| b.len().cmp(&a.len()));
+        out.sort_by_key(|v| std::cmp::Reverse(v.len()));
         out
     }
 
@@ -271,7 +261,7 @@ impl EnvironmentDependencyGraph {
         }
 
         let mut out: Vec<BinaryObjectKey> = visited.into_iter().collect();
-        out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        out.sort_by_key(|a| a.to_string());
         out
     }
 
@@ -348,7 +338,7 @@ impl EnvironmentDependencyGraph {
         }
 
         for v in incoming.values_mut() {
-            v.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            v.sort_by_key(|a| a.to_string());
             v.dedup();
         }
 
@@ -782,15 +772,15 @@ impl Environment {
         }
 
         // Deduplicate and stabilize.
-        nodes.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        nodes.sort_by_key(|a| a.to_string());
         nodes.dedup();
 
         for v in internal_from.values_mut() {
-            v.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            v.sort_by_key(|a| a.to_string());
             v.dedup();
         }
         for v in internal_to.values_mut() {
-            v.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            v.sort_by_key(|a| a.to_string());
             v.dedup();
         }
         for v in external_from.values_mut() {

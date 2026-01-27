@@ -478,7 +478,7 @@ impl IndexProgressState {
             return;
         }
         let new = self.processed.fetch_add(delta, Ordering::Relaxed) + delta;
-        if new % 256 == 0 {
+        if new.is_multiple_of(256) {
             self.updated_unix_ms.store(unix_ms_now(), Ordering::Relaxed);
         }
     }
@@ -2625,14 +2625,14 @@ fn build_bundle_container_doc(
         format!("container:{bundle_rel_path}:{asset_path}"),
     );
     document.add_text(fields.guid, "");
-    document.add_text(fields.path, asset_path.to_string());
+    document.add_text(fields.path, asset_path);
     document.add_text(fields.path_terms, to_terms(asset_path));
     document.add_text(fields.name, display_name.clone());
     document.add_text(fields.name_terms, to_terms(&display_name));
     document.add_text(fields.kind, "BundleContainer");
     document.add_text(fields.kind_terms, to_terms("BundleContainer"));
     document.add_text(fields.content_terms, to_terms(bundle_rel_path));
-    document.add_text(fields.container_source_path, bundle_rel_path.to_string());
+    document.add_text(fields.container_source_path, bundle_rel_path);
     document
 }
 

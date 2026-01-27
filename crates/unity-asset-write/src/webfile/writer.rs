@@ -60,7 +60,7 @@ impl WebFileWriter {
         let mut writer = BinaryWriter::new(Endian::Little);
         writer.write_string_to_null(signature);
 
-        let total_path_bytes: usize = files.keys().map(|k| k.as_bytes().len()).sum();
+        let total_path_bytes: usize = files.keys().map(|k| k.len()).sum();
         let entry_table_bytes = 12usize
             .checked_mul(files.len())
             .ok_or_else(|| UnityAssetError::format("WebFile entry table size overflow"))?;

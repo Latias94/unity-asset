@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
 
     let index_bundle_container_entries = std::env::var("UNITY_ASSET_INDEX_BUNDLE_CONTAINER")
         .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false");
+        .is_some_and(|v| v != "0" && !v.eq_ignore_ascii_case("false"));
     let max_bundle_container_entries_per_bundle: usize =
         std::env::var("UNITY_ASSET_MAX_BUNDLE_CONTAINER_ENTRIES")
             .ok()
@@ -39,11 +39,11 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or(50_000);
     let respect_ignore_files = std::env::var("UNITY_ASSET_RESPECT_IGNORE_FILES")
         .ok()
-        .map(|v| v != "0" && v.to_ascii_lowercase() != "false")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
     let respect_project_gitignore = std::env::var("UNITY_ASSET_RESPECT_GITIGNORE")
         .ok()
-        .map(|v| v != "0" && v.to_ascii_lowercase() != "false")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
 
     let index = SearchIndex::open_or_create_with_options(
@@ -53,7 +53,6 @@ fn main() -> anyhow::Result<()> {
             max_bundle_container_entries_per_bundle,
             respect_ignore_files,
             respect_project_gitignore,
-            ..Default::default()
         },
     )?;
 

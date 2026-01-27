@@ -21,14 +21,13 @@ impl std::fmt::Display for BinaryObjectKey {
                 let outer = p.to_string_lossy().to_string();
                 write!(
                     f,
-                    "bok2|{}|{}|{}|{}|{}|{}|{}",
+                    "bok2|{}|{}|{}|{}|{}|{}|",
                     kind,
                     asset_index,
                     self.path_id,
                     outer.len(),
                     outer,
-                    0,
-                    ""
+                    0
                 )
             }
             BinarySource::WebEntry {
@@ -38,13 +37,12 @@ impl std::fmt::Display for BinaryObjectKey {
                 let outer = web_path.to_string_lossy().to_string();
                 write!(
                     f,
-                    "bok3|{}|{}|{}|{}|{}|{}|{}|{}",
+                    "bok3|{}|{}|{}|{}|{}|w|{}|{}",
                     kind,
                     asset_index,
                     self.path_id,
                     outer.len(),
                     outer,
-                    "w",
                     entry_name.len(),
                     entry_name
                 )
@@ -56,13 +54,12 @@ impl std::fmt::Display for BinaryObjectKey {
                 let outer = archive_path.to_string_lossy().to_string();
                 write!(
                     f,
-                    "bok3|{}|{}|{}|{}|{}|{}|{}|{}",
+                    "bok3|{}|{}|{}|{}|{}|a|{}|{}",
                     kind,
                     asset_index,
                     self.path_id,
                     outer.len(),
                     outer,
-                    "a",
                     entry_name.len(),
                     entry_name
                 )

@@ -119,9 +119,7 @@ fn property_key_name(v: &UnityValue) -> Option<&str> {
     }
 }
 
-fn pair_first_second_mut<'a>(
-    v: &'a mut UnityValue,
-) -> Option<(&'a mut UnityValue, &'a mut UnityValue)> {
+fn pair_first_second_mut(v: &mut UnityValue) -> Option<(&mut UnityValue, &mut UnityValue)> {
     match v {
         UnityValue::Array(arr) if arr.len() == 2 => {
             // SAFETY: split borrow

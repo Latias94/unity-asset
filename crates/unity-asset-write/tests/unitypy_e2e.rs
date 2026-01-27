@@ -177,7 +177,7 @@ fn build_minimal_legacy_bundle(
 
     let mut file_info_header_size: usize = 4; // nodesCount
     file_info_header_size = file_info_header_size
-        .saturating_add(file_name.as_bytes().len().saturating_add(1))
+        .saturating_add(file_name.len().saturating_add(1))
         .saturating_add(4 * 2);
     file_info_header_size = (file_info_header_size.saturating_add(3)) & !3;
 
@@ -717,11 +717,12 @@ fn unitypy_script_typetree_registry_enables_monobehaviour_parse() -> anyhow::Res
         .join("scripts")
         .join("export_unitypy_script_typetrees.py");
 
-    let mut exporter_args: Vec<String> = Vec::new();
-    exporter_args.push("--input".to_string());
-    exporter_args.push(input.display().to_string());
-    exporter_args.push("--output".to_string());
-    exporter_args.push(tmp_registry.path().display().to_string());
+    let mut exporter_args: Vec<String> = vec![
+        "--input".to_string(),
+        input.display().to_string(),
+        "--output".to_string(),
+        tmp_registry.path().display().to_string(),
+    ];
     if let Some(root) = game_root {
         exporter_args.push("--game-root".to_string());
         exporter_args.push(root.display().to_string());

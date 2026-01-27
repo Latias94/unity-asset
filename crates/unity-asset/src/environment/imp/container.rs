@@ -327,7 +327,7 @@ impl Environment {
             .into_iter()
             .map(|(_path, key)| key)
             .collect();
-        keys.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        keys.sort_by_key(|a| a.to_string());
         keys.dedup();
         if let Some(max) = limit {
             keys.truncate(max);

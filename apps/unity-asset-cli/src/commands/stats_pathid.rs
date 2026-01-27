@@ -224,7 +224,6 @@ mod tests {
     #[test]
     fn stats_tracks_min_max_and_signs() {
         let mut stats = PathIdStats::default();
-        stats.objects_total = 0;
 
         for v in [-3i64, -1, 0, 2, 7] {
             stats.objects_total += 1;

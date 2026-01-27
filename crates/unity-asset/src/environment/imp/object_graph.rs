@@ -64,21 +64,11 @@ impl Default for ObjectGraphBuildOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ObjectGraphTraversalOptions {
     pub max_depth: Option<usize>,
     pub max_nodes: Option<usize>,
     pub follow_resolved_external: bool,
-}
-
-impl Default for ObjectGraphTraversalOptions {
-    fn default() -> Self {
-        Self {
-            max_depth: None,
-            max_nodes: None,
-            follow_resolved_external: false,
-        }
-    }
 }
 
 /// A best-effort object graph across all loaded sources in an `Environment`.
@@ -185,7 +175,7 @@ impl EnvironmentObjectGraph {
         }
 
         let mut out: Vec<EnvironmentObjectKey> = visited.into_iter().collect();
-        out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        out.sort_by_key(|a| a.to_string());
         out
     }
 
@@ -223,7 +213,7 @@ impl EnvironmentObjectGraph {
             .into_iter()
             .filter_map(|(k, deg)| if deg == 0 { Some(k) } else { None })
             .collect();
-        out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        out.sort_by_key(|a| a.to_string());
         out
     }
 
@@ -256,7 +246,7 @@ impl EnvironmentObjectGraph {
             .into_iter()
             .filter_map(|(k, deg)| if deg == 0 { Some(k) } else { None })
             .collect();
-        out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        out.sort_by_key(|a| a.to_string());
         out
     }
 
@@ -282,6 +272,10 @@ impl EnvironmentObjectGraph {
             st: &mut TarjanState,
             max_components: usize,
         ) {
+            if st.components.len() >= max_components {
+                return;
+            }
+
             st.indices.insert(v.clone(), st.index);
             st.lowlink.insert(v.clone(), st.index);
             st.index += 1;
@@ -329,11 +323,8 @@ impl EnvironmentObjectGraph {
                         .iter()
                         .any(|n| n == &comp[0]);
                 if comp.len() > 1 || has_self_loop {
-                    comp.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+                    comp.sort_by_key(|a| a.to_string());
                     st.components.push(comp);
-                    if st.components.len() >= max_components {
-                        return;
-                    }
                 }
             }
         }
@@ -362,7 +353,7 @@ impl EnvironmentObjectGraph {
             }
         }
 
-        st.components.sort_by(|a, b| b.len().cmp(&a.len()));
+        st.components.sort_by_key(|v| std::cmp::Reverse(v.len()));
         st.components
     }
 
@@ -560,16 +551,16 @@ impl Environment {
         }
 
         for v in internal_from.values_mut() {
-            v.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            v.sort_by_key(|a| a.to_string());
             v.dedup();
         }
         for v in internal_to.values_mut() {
-            v.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            v.sort_by_key(|a| a.to_string());
             v.dedup();
         }
 
         let mut nodes: Vec<EnvironmentObjectKey> = nodes_set.into_iter().collect();
-        nodes.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        nodes.sort_by_key(|a| a.to_string());
 
         EnvironmentObjectGraph {
             nodes,

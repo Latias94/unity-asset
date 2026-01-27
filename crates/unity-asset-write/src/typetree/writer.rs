@@ -8,17 +8,9 @@ use unity_asset_binary::asset::SerializedType;
 use unity_asset_binary::typetree::{TypeTree, TypeTreeNode};
 use unity_asset_core::{UnityAssetError, UnityValue};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TypeTreeWriteOptions {
     pub allow_missing_fields: bool,
-}
-
-impl Default for TypeTreeWriteOptions {
-    fn default() -> Self {
-        Self {
-            allow_missing_fields: false,
-        }
-    }
 }
 
 /// A TypeTree-driven writer, targeting UnityPy's `TypeTreeHelper.write_value` behavior.
@@ -646,7 +638,7 @@ mod tests {
         let UnityValue::Array(arr) = pair_val else {
             panic!("expected m_Pair to parse as array, got {:?}", pair_val);
         };
-        assert_eq!(arr.get(0).and_then(|v| v.as_str()), Some("hello"));
+        assert_eq!(arr.first().and_then(|v| v.as_str()), Some("hello"));
         assert_eq!(arr.get(1).and_then(|v| v.as_i64()), Some(123));
     }
 

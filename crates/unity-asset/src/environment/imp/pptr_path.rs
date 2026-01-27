@@ -68,7 +68,7 @@ fn value_get_child<'a>(value: &'a UnityValue, key: &str) -> Option<&'a UnityValu
     }
 }
 
-fn array_get<'a>(value: &'a UnityValue, idx: usize) -> Option<&'a UnityValue> {
+fn array_get(value: &UnityValue, idx: usize) -> Option<&UnityValue> {
     match value {
         UnityValue::Array(v) => v.get(idx),
         _ => None,
@@ -83,7 +83,7 @@ fn empty_value_for_segment(seg: &PathSegment) -> UnityValue {
     }
 }
 
-fn array_ensure_index<'a>(value: &'a mut UnityValue, idx: usize) -> &'a mut UnityValue {
+fn array_ensure_index(value: &mut UnityValue, idx: usize) -> &mut UnityValue {
     if !matches!(value, UnityValue::Array(_)) {
         *value = UnityValue::Array(Vec::new());
     }

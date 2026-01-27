@@ -997,7 +997,7 @@ fn environment_can_edit_and_save_stripped_assets_with_typetree_registry() {
     };
     fs::write(&reg_path, serde_json::to_string_pretty(&dump).unwrap()).unwrap();
 
-    env.set_type_tree_registry_from_paths(&[reg_path.clone()])
+    env.set_type_tree_registry_from_paths(std::slice::from_ref(&reg_path))
         .unwrap();
 
     env.edit_binary_object_key(&key, |class| {
@@ -2790,7 +2790,7 @@ fn typed_material_helper_updates_or_inserts_texenv_texture() {
         .iter()
         .find(|v| {
             v.as_array()
-                .and_then(|a| a.get(0))
+                .and_then(|a| a.first())
                 .and_then(|f| f.as_object())
                 .and_then(|o| o.get("name"))
                 .and_then(|v| v.as_str())
@@ -2809,7 +2809,10 @@ fn typed_material_helper_updates_or_inserts_texenv_texture() {
     let detail = envs
         .iter()
         .find(|v| {
-            v.as_array().and_then(|a| a.get(0)).and_then(|f| f.as_str()) == Some("_DetailTex")
+            v.as_array()
+                .and_then(|a| a.first())
+                .and_then(|f| f.as_str())
+                == Some("_DetailTex")
         })
         .expect("_DetailTex entry exists");
     let second = detail
@@ -2851,7 +2854,10 @@ fn typed_material_helpers_update_floats_ints_colors_and_texenv_scale_offset() {
         .and_then(|v| v.as_array())
         .expect("m_Floats array");
     assert!(floats.iter().any(|v| {
-        v.as_array().and_then(|a| a.get(0)).and_then(|k| k.as_str()) == Some("_Glossiness")
+        v.as_array()
+            .and_then(|a| a.first())
+            .and_then(|k| k.as_str())
+            == Some("_Glossiness")
             && v.as_array().and_then(|a| a.get(1)).and_then(|x| x.as_f64()) == Some(0.75)
     }));
 
@@ -2860,7 +2866,10 @@ fn typed_material_helpers_update_floats_ints_colors_and_texenv_scale_offset() {
         .and_then(|v| v.as_array())
         .expect("m_Ints array");
     assert!(ints.iter().any(|v| {
-        v.as_array().and_then(|a| a.get(0)).and_then(|k| k.as_str()) == Some("_Mode")
+        v.as_array()
+            .and_then(|a| a.first())
+            .and_then(|k| k.as_str())
+            == Some("_Mode")
             && v.as_array().and_then(|a| a.get(1)).and_then(|x| x.as_i64()) == Some(2)
     }));
 
@@ -2870,7 +2879,12 @@ fn typed_material_helpers_update_floats_ints_colors_and_texenv_scale_offset() {
         .expect("m_Colors array");
     let color = colors
         .iter()
-        .find(|v| v.as_array().and_then(|a| a.get(0)).and_then(|k| k.as_str()) == Some("_Color"))
+        .find(|v| {
+            v.as_array()
+                .and_then(|a| a.first())
+                .and_then(|k| k.as_str())
+                == Some("_Color")
+        })
         .expect("_Color entry exists");
     let rgba = color
         .as_array()
@@ -2888,7 +2902,12 @@ fn typed_material_helpers_update_floats_ints_colors_and_texenv_scale_offset() {
         .expect("m_TexEnvs array");
     let main = texenvs
         .iter()
-        .find(|v| v.as_array().and_then(|a| a.get(0)).and_then(|k| k.as_str()) == Some("_MainTex"))
+        .find(|v| {
+            v.as_array()
+                .and_then(|a| a.first())
+                .and_then(|k| k.as_str())
+                == Some("_MainTex")
+        })
         .expect("_MainTex entry exists");
     let env = main
         .as_array()
@@ -2992,7 +3011,7 @@ fn read_renderer_materials_pptrs(class: &UnityClass) -> Vec<(i32, i64)> {
 
     materials
         .iter()
-        .filter_map(|v| super::pptr_path::read_pptr(v))
+        .filter_map(super::pptr_path::read_pptr)
         .collect()
 }
 
@@ -3009,7 +3028,8 @@ fn external_bundle_can_edit_material_and_unitypy_observes_change() {
     let mut env = Environment::new();
     env.load_file(&bundle_path).unwrap();
 
-    let mut chosen: Option<(BinaryObjectKey, String, Option<(i32, i64)>, BinaryObjectKey)> = None;
+    type Chosen = (BinaryObjectKey, String, Option<(i32, i64)>, BinaryObjectKey);
+    let mut chosen: Option<Chosen> = None;
     for r in env
         .binary_object_infos()
         .filter(|r| r.source_kind == BinarySourceKind::AssetBundle && r.object.class_id() == 21)
@@ -3219,7 +3239,7 @@ fn external_bundle_can_edit_mesh_renderer_materials_and_reload() {
 
     let mut session = env.edit_session();
     session
-        .set_mesh_renderer_materials_to_keys(&renderer_key, &[material_key.clone()])
+        .set_mesh_renderer_materials_to_keys(&renderer_key, std::slice::from_ref(&material_key))
         .unwrap();
 
     let temp = tempfile::tempdir().unwrap();

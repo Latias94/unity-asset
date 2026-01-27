@@ -640,7 +640,7 @@ impl<'a> EnvironmentEditSession<'a> {
                 continue;
             }
             if required_paths.iter().all(|p| {
-                component.get(*p).is_some()
+                component.get(p).is_some()
                     || super::pptr_path::get_value_at_path(component, p).is_some()
             }) {
                 matches.push(YamlObjectKey {

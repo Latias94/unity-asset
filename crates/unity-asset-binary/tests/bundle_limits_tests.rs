@@ -169,7 +169,7 @@ fn legacy_directory_respects_max_compressed_size() {
     bytes.extend_from_slice(&be_u32(complete_file_size)); // completeFileSize
     bytes.extend_from_slice(&be_u32(4)); // fileInfoHeaderSize (dummy)
 
-    while bytes.len() % 4 != 0 {
+    while !bytes.len().is_multiple_of(4) {
         bytes.push(0);
     }
 

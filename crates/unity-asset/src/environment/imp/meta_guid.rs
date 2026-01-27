@@ -8,10 +8,8 @@ pub(crate) fn parse_guid_32_hex(raw: &str) -> Option<[u8; 16]> {
     }
 
     let mut out = [0u8; 16];
-    for i in 0..16 {
-        let hi = s.as_bytes().get(i * 2).copied()?;
-        let lo = s.as_bytes().get(i * 2 + 1).copied()?;
-        out[i] = (hex_nibble(hi)? << 4) | hex_nibble(lo)?;
+    for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+        out[i] = (hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?;
     }
     Some(out)
 }
@@ -43,9 +41,7 @@ impl Environment {
         let Ok(text) = std::fs::read_to_string(meta_path) else {
             return None;
         };
-        let Some(guid) = read_guid_from_meta_text(&text) else {
-            return None;
-        };
+        let guid = read_guid_from_meta_text(&text)?;
 
         // `foo.ext.meta` -> `foo.ext`
         let mut asset_path = meta_path.to_path_buf();
