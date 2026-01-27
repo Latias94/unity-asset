@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - Not Released
+## [0.3.0] - 2026-01-27
 
 ### Highlights
 - Better “UnityPy-style” discovery and export workflows:
