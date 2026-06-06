@@ -44,6 +44,7 @@ pub mod registry;
 pub mod serializer;
 pub mod tpk;
 pub mod types;
+pub mod assetripper_typetree;
 
 // Re-export main types for easy access
 pub use builder::{TypeTreeBuilder, TypeTreeValidator, ValidationReport};
