@@ -6,7 +6,7 @@ use crate::reader::{BinaryReader, ByteOrder};
 use crate::shared_bytes::SharedBytes;
 use crate::typetree::{
     PPtrScanResult, TypeTree, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput,
-    TypeTreeParseWarning, TypeTreeSerializer,
+    TypeTreeParseWarning, TypeTreeSerializationMode, TypeTreeSerializer,
 };
 use crate::unity_objects::{GameObject, Transform};
 use std::sync::Arc;
@@ -435,7 +435,13 @@ fn type_tree_for_object<'a>(
             }
         }
 
-        r.resolve(&file.unity_version, info.type_id)
+        // Unity's BuildTarget.NoTarget value (-2) marks editor serialization.
+        let mode = if file.target_platform == -2 {
+            TypeTreeSerializationMode::Editor
+        } else {
+            TypeTreeSerializationMode::Release
+        };
+        r.resolve_with_mode(&file.unity_version, info.type_id, mode)
             .map(TypeTreeSource::Shared)
     })
 }
