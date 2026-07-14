@@ -37,6 +37,7 @@
 //! # Ok::<(), unity_asset_binary::error::BinaryError>(())
 //! ```
 
+pub mod assetripper_typetree;
 pub mod builder;
 mod common_strings;
 pub mod parser;
@@ -44,14 +45,17 @@ pub mod registry;
 pub mod serializer;
 pub mod tpk;
 pub mod types;
-pub mod assetripper_typetree;
 
 // Re-export main types for easy access
+pub use assetripper_typetree::{
+    AssetRipperTypeTreeGeneratorRegistry, AssetRipperTypeTreeGeneratorRegistryError,
+};
 pub use builder::{TypeTreeBuilder, TypeTreeValidator, ValidationReport};
 pub use parser::{ParsingStats, TypeTreeParser};
 pub use registry::{
     CompositeTypeTreeRegistry, InMemoryTypeTreeRegistry, JsonTypeTreeRegistry,
     ScriptTypeTreeGenerator, ScriptTypeTreeGeneratorRegistry, TypeTreeRegistry,
+    TypeTreeSerializationMode,
 };
 pub use serializer::{
     PPtrScanResult, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput,

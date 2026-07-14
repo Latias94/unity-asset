@@ -14,8 +14,29 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+/// Selects the TypeTree variant used to deserialize an object.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum TypeTreeSerializationMode {
+    #[default]
+    Release,
+    Editor,
+}
+
 pub trait TypeTreeRegistry: Send + Sync + std::fmt::Debug {
     fn resolve(&self, unity_version: &str, class_id: i32) -> Option<Arc<TypeTree>>;
+
+    /// Resolve a TypeTree for the requested serialization mode.
+    ///
+    /// Registries that only contain one representation can keep implementing
+    /// [`Self::resolve`]; their tree is valid for both modes.
+    fn resolve_with_mode(
+        &self,
+        unity_version: &str,
+        class_id: i32,
+        _mode: TypeTreeSerializationMode,
+    ) -> Option<Arc<TypeTree>> {
+        self.resolve(unity_version, class_id)
+    }
 
     /// Resolve a script type tree (e.g. MonoBehaviour) using the script's 16-byte ID.
     ///
@@ -138,6 +159,20 @@ impl TypeTreeRegistry for CompositeTypeTreeRegistry {
         for r in &self.registries {
             if let Some(t) = r.resolve(unity_version, class_id) {
                 return Some(t);
+            }
+        }
+        None
+    }
+
+    fn resolve_with_mode(
+        &self,
+        unity_version: &str,
+        class_id: i32,
+        mode: TypeTreeSerializationMode,
+    ) -> Option<Arc<TypeTree>> {
+        for registry in &self.registries {
+            if let Some(tree) = registry.resolve_with_mode(unity_version, class_id, mode) {
+                return Some(tree);
             }
         }
         None
