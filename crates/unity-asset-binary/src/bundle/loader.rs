@@ -181,11 +181,7 @@ impl BundleLoader {
             total_size,
             total_assets,
             total_files,
-            average_bundle_size: if bundle_count > 0 {
-                total_size / bundle_count
-            } else {
-                0
-            },
+            average_bundle_size: total_size.checked_div(bundle_count).unwrap_or(0),
         }
     }
 

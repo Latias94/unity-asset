@@ -275,7 +275,7 @@ impl MetadataExtractor {
         }
 
         // Sort by size and keep largest objects
-        object_summaries.sort_by(|a, b| b.byte_size.cmp(&a.byte_size));
+        object_summaries.sort_by_key(|summary| std::cmp::Reverse(summary.byte_size));
         if object_summaries.len() > 100 {
             object_summaries.truncate(100); // Keep top 100
         }

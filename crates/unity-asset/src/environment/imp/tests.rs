@@ -3081,7 +3081,7 @@ fn external_bundle_can_edit_material_and_unitypy_observes_change() {
             })
             .map(|t| t.key())
             .collect();
-        textures.sort_by(|a, b| a.path_id.cmp(&b.path_id));
+        textures.sort_by_key(|texture| texture.path_id);
         if textures.is_empty() {
             continue;
         }
