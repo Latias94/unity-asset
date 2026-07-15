@@ -198,7 +198,8 @@ let mut env = Environment::new();
 env.load("tests/samples")?;
 
 // `path_id` is only unique within a single SerializedFile.
-// Use `BinaryObjectKey` when you need a globally-unique handle you can round-trip later.
+// `BinaryObjectKey` is a legacy runtime locator; do not persist or parse its Display output.
+// Persisted workflows use the versioned `ObjectAddress` contract.
 let sources = env.binary_sources();
 if let Some((_kind, source_path)) = sources.first() {
     let keys = env.find_binary_object_keys_in_source(source_path, 1);
@@ -267,9 +268,9 @@ cargo run --bin unity-asset -- \
     find-object -i tests/samples --pattern "Assets/" --limit 20 --verbose
 
 # Inspect a single object (TypeTree / Null-field debugging)
-# - Easiest: copy/paste the `key=bok2|...` line from `find-object --verbose` and use `--key`.
+# - Easiest: copy the `address=oa1:...` value from `find-object` and use `--address`.
 # - Or pass the location fields explicitly (use `--kind serialized` for standalone `.assets` files).
-cargo run --bin unity-asset -- inspect-object -i tests/samples --key 'bok2|bundle|0|1|<outer_len>|tests/samples/char_118_yuki.ab|0|' \
+cargo run --bin unity-asset -- inspect-object -i tests/samples --address '<oa1-address-from-find-object>' \
     --max-depth 6 --max-items 200 --filter "m_StreamData"
 # If you suspect TypeTree mismatches, enable fail-fast parsing and print warnings:
 # `--strict` (fail-fast) and `--show-warnings` (print TypeTree warnings)

@@ -1,7 +1,7 @@
 use crate::fast_path;
 use crate::shared::{
     AppContext, build_environment, cli_warn, load_environment_input, load_serialized_file_for_scan,
-    load_typetree_registry, resolve_loaded_source,
+    load_typetree_registry, object_address_for_key_with_bundle_names, resolve_loaded_source,
 };
 use anyhow::Result;
 use serde::Serialize;
@@ -12,10 +12,10 @@ use unity_asset_binary::shared_bytes::SharedBytes;
 
 #[derive(Debug, Serialize)]
 struct ScanPPtrRecord {
-    key: String,
+    address: String,
     source: String,
     source_kind: String,
-    asset_index: Option<usize>,
+    asset_index_hint: Option<usize>,
     path_id: i64,
     type_id: i32,
     byte_size: u32,
@@ -33,11 +33,22 @@ struct ScanPPtrExternal {
     path_id: i64,
 }
 
+fn register_parsed_bundle_member(
+    asset_names: &mut Vec<String>,
+    node: &unity_asset_binary::bundle::DirectoryNode,
+) -> usize {
+    let asset_index = asset_names.len();
+    asset_names.push(node.name.clone());
+    asset_index
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_pptr_scan_file(
+    input: &std::path::Path,
     source_key: &BinarySource,
     source_kind: unity_asset::environment::BinarySourceKind,
     asset_index_key: Option<usize>,
+    bundle_asset_names: Option<&[String]>,
     file: &unity_asset_binary::asset::SerializedFile,
     class_id: &[i32],
     has_name_filter: bool,
@@ -78,6 +89,8 @@ fn scan_pptr_scan_file(
             asset_index: asset_index_key,
             path_id: handle.path_id(),
         };
+        let address = object_address_for_key_with_bundle_names(input, &key, bundle_asset_names)?
+            .to_compact_string()?;
 
         let info = handle.info();
         let scan = handle.scan_pptrs()?;
@@ -96,14 +109,14 @@ fn scan_pptr_scan_file(
         external.dedup();
 
         let record = ScanPPtrRecord {
-            key: key.to_string(),
+            address,
             source: source_key.to_string(),
             source_kind: match source_kind {
                 unity_asset::environment::BinarySourceKind::AssetBundle => "bundle",
                 unity_asset::environment::BinarySourceKind::SerializedFile => "serialized",
             }
             .to_string(),
-            asset_index: asset_index_key,
+            asset_index_hint: asset_index_key,
             path_id: handle.path_id(),
             type_id: handle.class_id(),
             byte_size: info.byte_size,
@@ -124,8 +137,8 @@ fn scan_pptr_scan_file(
             println!("{}", serde_json::to_string(&record)?);
         } else {
             println!(
-                "key={} type_id={} byte_size={} internal={} external={}",
-                record.key,
+                "address={} type_id={} byte_size={} internal={} external={}",
+                record.address,
                 record.type_id,
                 record.byte_size,
                 record.internal.len(),
@@ -199,53 +212,58 @@ fn scan_pptr_fast(
             };
 
             let asset_nodes = fast_path::bundle_asset_nodes(&bundle);
-            if let Some(idx) = asset_index {
-                if idx >= asset_nodes.len() {
-                    return Ok(false);
-                }
-            }
-
             let source_key = BinarySource::path(path);
             processed_any = true;
 
             if let Some(filter_idx) = asset_index {
-                let Some(node) = asset_nodes.get(filter_idx) else {
-                    return Ok(false);
-                };
-                let bytes = match bundle.extract_node_data(node) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        cli_warn(
-                            show_warnings,
-                            format!(
-                                "failed to extract bundle node {:?} for scan-pptr: {}",
-                                path, e
-                            ),
-                        );
+                let mut asset_names = Vec::new();
+                let mut matched = false;
+                for node in &asset_nodes {
+                    let bytes = match bundle.extract_node_data(node) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            cli_warn(
+                                show_warnings,
+                                format!(
+                                    "failed to extract bundle node {:?} for scan-pptr: {}",
+                                    path, e
+                                ),
+                            );
+                            continue;
+                        }
+                    };
+                    let mut file =
+                        match unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                    let parsed_index = register_parsed_bundle_member(&mut asset_names, node);
+                    if parsed_index != filter_idx {
                         continue;
                     }
-                };
-                let mut file =
-                    match unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                if let Some(registry) = registry.clone() {
-                    file.set_type_tree_registry(Some(registry));
+                    if let Some(registry) = registry.clone() {
+                        file.set_type_tree_registry(Some(registry));
+                    }
+                    scan_pptr_scan_file(
+                        input,
+                        &source_key,
+                        unity_asset::environment::BinarySourceKind::AssetBundle,
+                        Some(parsed_index),
+                        Some(&asset_names),
+                        &file,
+                        class_id,
+                        has_name_filter,
+                        &name_lc,
+                        include_no_typetree,
+                        json,
+                        &mut remaining,
+                    )?;
+                    matched = true;
+                    break;
                 }
-
-                scan_pptr_scan_file(
-                    &source_key,
-                    unity_asset::environment::BinarySourceKind::AssetBundle,
-                    Some(filter_idx),
-                    &file,
-                    class_id,
-                    has_name_filter,
-                    &name_lc,
-                    include_no_typetree,
-                    json,
-                    &mut remaining,
-                )?;
+                if !matched {
+                    return Ok(false);
+                }
                 continue;
             }
 
@@ -263,11 +281,11 @@ fn scan_pptr_fast(
                 }
             };
 
-            for (idx, node) in asset_nodes.iter().enumerate() {
+            let mut asset_names = Vec::new();
+            for node in &asset_nodes {
                 if remaining == 0 {
                     break;
                 }
-
                 let (start, end) = match fast_path::node_range(node) {
                     Ok(v) => v,
                     Err(e) => {
@@ -287,14 +305,17 @@ fn scan_pptr_fast(
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+                let parsed_index = register_parsed_bundle_member(&mut asset_names, node);
                 if let Some(registry) = registry.clone() {
                     file.set_type_tree_registry(Some(registry));
                 }
 
                 scan_pptr_scan_file(
+                    input,
                     &source_key,
                     unity_asset::environment::BinarySourceKind::AssetBundle,
-                    Some(idx),
+                    Some(parsed_index),
+                    Some(&asset_names),
                     &file,
                     class_id,
                     has_name_filter,
@@ -333,8 +354,10 @@ fn scan_pptr_fast(
             processed_any = true;
             let source_key = BinarySource::path(path);
             scan_pptr_scan_file(
+                input,
                 &source_key,
                 unity_asset::environment::BinarySourceKind::SerializedFile,
+                None,
                 None,
                 &file,
                 class_id,
@@ -431,9 +454,11 @@ fn scan_pptr_env_fallback(
                     }
                 }
                 scan_pptr_scan_file(
+                    &input,
                     bundle_key,
                     unity_asset::environment::BinarySourceKind::AssetBundle,
                     Some(idx),
+                    Some(&bundle.asset_names),
                     file,
                     &class_id,
                     has_name_filter,
@@ -457,8 +482,10 @@ fn scan_pptr_env_fallback(
                 }
             }
             scan_pptr_scan_file(
+                &input,
                 asset_key,
                 unity_asset::environment::BinarySourceKind::SerializedFile,
+                None,
                 None,
                 file,
                 &class_id,
@@ -487,7 +514,7 @@ pub(crate) fn run(
     json: bool,
     ctx: &AppContext,
 ) -> Result<()> {
-    if let Ok(true) = scan_pptr_fast(
+    if scan_pptr_fast(
         &input,
         &kind,
         source.as_ref(),
@@ -499,7 +526,7 @@ pub(crate) fn run(
         json,
         ctx.show_warnings,
         ctx.typetree_registries(),
-    ) {
+    )? {
         return Ok(());
     }
 
@@ -517,4 +544,70 @@ pub(crate) fn run(
         ctx.show_warnings,
         ctx.typetree_registries(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_record_exposes_compact_address_and_marks_index_as_hint() {
+        let address = unity_asset::ObjectAddress::binary_bundle_member(
+            unity_asset::SourceLocator::path("game.ab").unwrap(),
+            unity_asset::SourceMemberId::new("cab/main").unwrap(),
+            7,
+        )
+        .unwrap()
+        .to_compact_string()
+        .unwrap();
+        let record = ScanPPtrRecord {
+            address: address.clone(),
+            source: "runtime/game.ab".into(),
+            source_kind: "bundle".into(),
+            asset_index_hint: Some(3),
+            path_id: 7,
+            type_id: 1,
+            byte_size: 0,
+            name: None,
+            internal: Vec::new(),
+            external: Vec::new(),
+            typetree: Some(true),
+        };
+
+        let json = serde_json::to_value(record).unwrap();
+        assert_eq!(json["address"], address);
+        assert_eq!(json["asset_index_hint"], 3);
+        assert!(json.get("asset_index").is_none());
+        assert!(address.parse::<unity_asset::ObjectAddress>().is_ok());
+    }
+
+    #[test]
+    fn raw_bundle_nodes_do_not_shift_serialized_member_occurrences() {
+        let nodes = [
+            unity_asset_binary::bundle::DirectoryNode::new("cab/x".into(), 0, 1, 0x4),
+            unity_asset_binary::bundle::DirectoryNode::new("cab/x".into(), 1, 1, 0x4),
+        ];
+        let mut names = Vec::new();
+        let parsed_index = register_parsed_bundle_member(&mut names, &nodes[1]);
+        assert_eq!(parsed_index, 0);
+        assert_eq!(names, ["cab/x"]);
+
+        let key = BinaryObjectKey {
+            source: BinarySource::path(std::path::Path::new("game.ab")),
+            source_kind: unity_asset::environment::BinarySourceKind::AssetBundle,
+            asset_index: Some(0),
+            path_id: 7,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let bundle_path = root.path().join("game.ab");
+        std::fs::write(&bundle_path, b"bundle").unwrap();
+        let key = BinaryObjectKey {
+            source: BinarySource::path(&bundle_path),
+            ..key
+        };
+        let address =
+            object_address_for_key_with_bundle_names(root.path(), &key, Some(&names)).unwrap();
+
+        assert_eq!(address.bundle_member().unwrap().same_name_occurrence(), 0);
+    }
 }

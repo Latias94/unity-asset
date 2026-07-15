@@ -70,8 +70,14 @@
 
 // Re-export from core crate
 pub use unity_asset_core::{
-    DocumentFormat, Result, UnityAssetError, UnityClass, UnityClassRegistry, UnityDocument,
-    UnityValue, constants::*,
+    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BudgetError, BudgetedJsonError,
+    BundleMemberId, ChangeSet, ChangeSetError, ContainmentKind, ContractError, DecompressionBudget,
+    DecompressionUsage, Diagnostic, DiagnosticError, DiagnosticSeverity, DigestBuildError,
+    DigestParseError, DigestV1, DigestV1Builder, DocumentFormat, FieldPath, FieldPathError,
+    FieldPathSegment, IdentityRemap, ObjectAddress, ObjectId, ObjectKind, Result,
+    RevisionedObjectHandle, SourceAlias, SourceFingerprint, SourceId, SourceKind, SourceLocator,
+    SourceMemberId, TransactionId, UnityAssetError, UnityClass, UnityClassRegistry, UnityDocument,
+    UnityValue, WorkspaceId, WorkspaceRevision, YamlAnchor, YamlDocumentSelector, constants::*,
 };
 
 pub use unity_asset_core::get_class_name;
@@ -92,3 +98,5 @@ pub use unity_asset_core::document::AsyncUnityDocument;
 
 /// Environment for managing multiple Unity assets
 pub mod environment;
+
+pub mod workspace;

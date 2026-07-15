@@ -8,9 +8,17 @@ This context describes how loaded Unity assets are identified, inspected, change
 A physical Unity asset input or a nested member that contributes bytes to an Asset Workspace.
 _Avoid_: File, input, binary source
 
-**Source Origin**:
-The physical location from which an Asset Source was loaded, such as a disk path, archive member, or WebFile member.
-_Avoid_: Source kind
+**Physical Origin**:
+The runtime filesystem location currently bound to a root Asset Source. It is never part of persisted object identity.
+_Avoid_: Object address, source alias
+
+**Source Alias**:
+A portable, workspace-relative name that keeps a root Asset Source stable when the workspace moves.
+_Avoid_: Absolute path, canonical path
+
+**Source Locator**:
+A serializable Source Alias followed by exact archive, WebFile, or bundle containment steps. A streamed resource uses its actual container-member edge rather than a synthetic resource edge.
+_Avoid_: Asset index tuple, physical path
 
 **Source Ownership**:
 The nesting relationship that connects an outer artifact, its container members, SerializedFiles, and streamed-resource sidecars.
@@ -25,7 +33,7 @@ An Object Identity bound to an Asset Workspace namespace and Workspace Revision 
 _Avoid_: Bare object ID
 
 **Object Address**:
-A validated, serializable locator that an Asset Workspace resolves to an Object Identity.
+A validated, serializable Source Locator plus object-local key that an Asset Workspace resolves to an Object Identity.
 _Avoid_: Display string, raw key fields
 
 **Asset Workspace**:

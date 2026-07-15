@@ -29,6 +29,7 @@ unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
 unity-asset-write = { path = "../unity-asset-write", version = "0.3.0" }
 ignore = { workspace = true }
 zip = { workspace = true }
+thiserror = { workspace = true }
 
 [features]
 default = ["mmap"]

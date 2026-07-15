@@ -162,7 +162,7 @@ pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
         ),
         Commands::InspectObject {
             input,
-            key,
+            address,
             source,
             kind,
             asset_index,
@@ -173,7 +173,7 @@ pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
             filter,
         } => inspect_object::run(
             input,
-            key,
+            address,
             source,
             kind,
             asset_index,

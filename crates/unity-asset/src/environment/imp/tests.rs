@@ -69,10 +69,6 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
     assert_eq!(key.asset_index, Some(0));
     assert_eq!(key.path_id, first.path_id);
 
-    let key_str = key.to_string();
-    let parsed: BinaryObjectKey = key_str.parse().expect("BinaryObjectKey parse");
-    assert_eq!(parsed, key);
-
     let parsed = env.read_binary_object_key(&key).unwrap();
     assert_eq!(parsed.info.path_id, first.path_id);
 
@@ -1741,10 +1737,6 @@ fn environment_loads_extless_webfile_entries_and_reads_resource_bytes() {
 
     let key = obj_ref.key();
     assert_eq!(key.source, bundle_source);
-
-    let key_str = key.to_string();
-    let parsed: BinaryObjectKey = key_str.parse().expect("BinaryObjectKey parse");
-    assert_eq!(parsed, key);
 
     let stream_path = format!("archive:/CAB-{cab}/{resource_name}");
     let read = env

@@ -106,7 +106,7 @@ pub(crate) enum Commands {
         #[arg(long, conflicts_with = "overwrite")]
         resume: Option<PathBuf>,
 
-        /// Retry only failed entries from a previous manifest (uses its `asset_path` and `key`)
+        /// Retry only failed entries from a previous manifest (uses its `asset_path` and `address`)
         #[arg(long, conflicts_with_all = ["resume", "overwrite"])]
         retry_failed_from: Option<PathBuf>,
 
@@ -321,7 +321,7 @@ pub(crate) enum Commands {
         #[arg(long)]
         limit: Option<usize>,
 
-        /// Include entries that could not be resolved to a `BinaryObjectKey`
+        /// Include entries that could not be resolved to an Object Address
         #[arg(long)]
         include_unresolved: bool,
 
@@ -336,9 +336,9 @@ pub(crate) enum Commands {
         #[arg(short, long)]
         input: PathBuf,
 
-        /// Copy/paste key emitted by `find-object --verbose` (overrides --source/--kind/--asset-index/--path-id)
+        /// Object Address emitted by `find-object` (overrides --source/--kind/--asset-index/--path-id)
         #[arg(long)]
-        key: Option<String>,
+        address: Option<String>,
 
         /// Source file path that contains the object (an AssetBundle or a standalone SerializedFile).
         ///

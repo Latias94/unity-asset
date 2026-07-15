@@ -1,4 +1,7 @@
-use crate::shared::{AppContext, class_name_for_id, load_environment_input, resolve_loaded_source};
+use crate::shared::{
+    AppContext, class_name_for_id, load_environment_input, object_address_for_key,
+    resolve_loaded_source,
+};
 use anyhow::Result;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -7,10 +10,10 @@ use unity_asset_binary::asset::SerializedFile;
 
 #[derive(Debug, Serialize)]
 struct ListObjectRecord {
-    key: String,
+    address: String,
     source: String,
     source_kind: String,
-    asset_index: Option<usize>,
+    asset_index_hint: Option<usize>,
     path_id: i64,
     class_id: i32,
     class_name: String,
@@ -175,12 +178,13 @@ fn list_serialized(
                 asset_index: None,
                 path_id: handle.path_id(),
             };
+            let address = object_address_for_key(env, input, &key)?.to_compact_string()?;
 
             let record = ListObjectRecord {
-                key: key.to_string(),
+                address,
                 source: src.to_string(),
                 source_kind: "serialized".to_string(),
-                asset_index: None,
+                asset_index_hint: None,
                 path_id: handle.path_id(),
                 class_id,
                 class_name,
@@ -194,7 +198,7 @@ fn list_serialized(
             } else {
                 println!(
                     "{} class_id={} class={} path_id={} byte_size={} name={}",
-                    record.key,
+                    record.address,
                     record.class_id,
                     record.class_name,
                     record.path_id,
@@ -292,12 +296,13 @@ fn list_bundles(
                     asset_index: Some(idx),
                     path_id: handle.path_id(),
                 };
+                let address = object_address_for_key(env, input, &key)?.to_compact_string()?;
 
                 let record = ListObjectRecord {
-                    key: key.to_string(),
+                    address,
                     source: src.to_string(),
                     source_kind: "bundle".to_string(),
-                    asset_index: Some(idx),
+                    asset_index_hint: Some(idx),
                     path_id: handle.path_id(),
                     class_id,
                     class_name,
@@ -311,7 +316,7 @@ fn list_bundles(
                 } else {
                     println!(
                         "{} class_id={} class={} asset_index={} path_id={} byte_size={} name={}",
-                        record.key,
+                        record.address,
                         record.class_id,
                         record.class_name,
                         idx,
@@ -335,4 +340,37 @@ fn list_bundles(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_record_exposes_one_compact_copy_address() {
+        let address = unity_asset::ObjectAddress::binary_direct(
+            unity_asset::SourceLocator::path("game.assets").unwrap(),
+            7,
+        )
+        .unwrap()
+        .to_compact_string()
+        .unwrap();
+        let record = ListObjectRecord {
+            address: address.clone(),
+            source: "runtime/game.assets".into(),
+            source_kind: "serialized".into(),
+            asset_index_hint: None,
+            path_id: 7,
+            class_id: 1,
+            class_name: "GameObject".into(),
+            byte_size: 0,
+            name: None,
+            typetree: true,
+        };
+
+        let json = serde_json::to_value(record).unwrap();
+        assert_eq!(json["address"], address);
+        assert!(json.get("asset_index").is_none());
+        assert!(address.parse::<unity_asset::ObjectAddress>().is_ok());
+    }
 }

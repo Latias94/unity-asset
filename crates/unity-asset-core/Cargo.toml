@@ -32,6 +32,9 @@ serde_bytes = { workspace = true }
 indexmap = { workspace = true }
 thiserror = { workspace = true }
 lazy_static = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
 
 # Async support (optional)
 tokio = { workspace = true, optional = true }

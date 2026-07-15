@@ -2,7 +2,7 @@ use crate::fast_path;
 use crate::pattern::container_asset_path_matches_ci;
 use crate::shared::{
     AppContext, build_environment, class_name_for_id, cli_warn, load_environment_input,
-    load_typetree_registry,
+    load_typetree_registry, object_address_for_key, object_address_for_key_with_bundle_names,
 };
 use anyhow::Result;
 use std::path::PathBuf;
@@ -25,7 +25,7 @@ pub(crate) fn run(
     verbose: bool,
     ctx: &AppContext,
 ) -> Result<()> {
-    if let Ok(true) = find_object_fast(
+    if find_object_fast(
         &input,
         &pattern,
         &name,
@@ -37,7 +37,7 @@ pub(crate) fn run(
         ctx.strict,
         ctx.show_warnings,
         ctx.typetree_registries(),
-    ) {
+    )? {
         return Ok(());
     }
 
@@ -131,13 +131,15 @@ fn find_object_env_fallback(
                         }
                     }
                     if !name_lc.is_empty() {
+                        let address =
+                            object_address_for_key(&env, &input, key)?.to_compact_string()?;
                         let matches = match env.peek_binary_object_name(key) {
                             Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
                             Ok(None) => false,
                             Err(e) => {
                                 cli_warn(
                                     show_warnings,
-                                    format!("peek_name failed for key={}: {}", key, e),
+                                    format!("peek_name failed for address={}: {}", address, e),
                                 );
                                 false
                             }
@@ -147,9 +149,10 @@ fn find_object_env_fallback(
                         }
                     }
 
+                    let address = object_address_for_key(&env, &input, key)?.to_compact_string()?;
                     println!(
-                        "{} -> key={} type_id={} byte_size={}",
-                        entry.asset_path, key, type_id, byte_size
+                        "{} -> address={} type_id={} byte_size={}",
+                        entry.asset_path, address, type_id, byte_size
                     );
                 } else {
                     println!(
@@ -177,13 +180,14 @@ fn find_object_env_fallback(
                     }
                 }
                 if !name_lc.is_empty() {
+                    let address = object_address_for_key(&env, &input, key)?.to_compact_string()?;
                     let matches = match env.peek_binary_object_name(key) {
                         Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
                         Ok(None) => false,
                         Err(e) => {
                             cli_warn(
                                 show_warnings,
-                                format!("peek_name failed for key={}: {}", key, e),
+                                format!("peek_name failed for address={}: {}", address, e),
                             );
                             false
                         }
@@ -192,7 +196,8 @@ fn find_object_env_fallback(
                         continue;
                     }
                 }
-                println!("{} -> key={}", entry.asset_path, key);
+                let address = object_address_for_key(&env, &input, key)?.to_compact_string()?;
+                println!("{} -> address={}", entry.asset_path, address);
             } else {
                 println!("{} -> unresolved", entry.asset_path);
             }
@@ -330,6 +335,12 @@ fn find_object_fast(
                         }
                     }
                     if !name_lc.is_empty() {
+                        let address = object_address_for_key_with_bundle_names(
+                            input,
+                            key,
+                            Some(&asset_names),
+                        )?
+                        .to_compact_string()?;
                         let matches = match peek_object_name_fast(
                             &bundle,
                             &asset_nodes,
@@ -343,7 +354,7 @@ fn find_object_fast(
                             Err(e) => {
                                 cli_warn(
                                     show_warnings,
-                                    format!("peek_name failed for key={}: {}", key, e),
+                                    format!("peek_name failed for address={}: {}", address, e),
                                 );
                                 false
                             }
@@ -352,9 +363,12 @@ fn find_object_fast(
                             continue;
                         }
                     }
+                    let address =
+                        object_address_for_key_with_bundle_names(input, key, Some(&asset_names))?
+                            .to_compact_string()?;
                     println!(
-                        "{} -> key={} (class_id={}, byte_size={})",
-                        entry.asset_path, key, type_id, byte_size
+                        "{} -> address={} (class_id={}, byte_size={})",
+                        entry.asset_path, address, type_id, byte_size
                     );
                 } else {
                     println!(
@@ -389,6 +403,9 @@ fn find_object_fast(
                     }
                 }
                 if !name_lc.is_empty() {
+                    let address =
+                        object_address_for_key_with_bundle_names(input, key, Some(&asset_names))?
+                            .to_compact_string()?;
                     let matches = match peek_object_name_fast(
                         &bundle,
                         &asset_nodes,
@@ -402,7 +419,7 @@ fn find_object_fast(
                         Err(e) => {
                             cli_warn(
                                 show_warnings,
-                                format!("peek_name failed for key={}: {}", key, e),
+                                format!("peek_name failed for address={}: {}", address, e),
                             );
                             false
                         }
@@ -411,7 +428,10 @@ fn find_object_fast(
                         continue;
                     }
                 }
-                println!("{} -> key={}", entry.asset_path, key);
+                let address =
+                    object_address_for_key_with_bundle_names(input, key, Some(&asset_names))?
+                        .to_compact_string()?;
+                println!("{} -> address={}", entry.asset_path, address);
             } else {
                 println!("{} -> unresolved", entry.asset_path);
             }
@@ -454,14 +474,10 @@ fn extract_bundle_container_entries_fast(
                         if show_warnings {
                             for w in obj.typetree_warnings() {
                                 eprintln!(
-                                    "warning: typetree key={} field={} error={}",
-                                    BinaryObjectKey {
-                                        source: bundle_source.clone(),
-                                        source_kind:
-                                            unity_asset::environment::BinarySourceKind::AssetBundle,
-                                        asset_index: Some(asset_index),
-                                        path_id: object.path_id(),
-                                    },
+                                    "warning: typetree source={} asset_index={} path_id={} field={} error={}",
+                                    bundle_source,
+                                    asset_index,
+                                    object.path_id(),
                                     w.field,
                                     w.error
                                 );
@@ -637,32 +653,14 @@ fn resolve_pptr_in_bundle(
 
     let idx: usize = (file_id - 1).try_into().ok()?;
     let external = context_file.externals.get(idx)?;
-    let external_norm = external.path.replace('\\', "/");
-    let external_file_name = std::path::Path::new(&external_norm)
-        .file_name()
-        .and_then(|n| n.to_str());
-
-    let mut candidates: Vec<(usize, &String)> = asset_names.iter().enumerate().collect();
-    candidates.sort_by(|a, b| a.1.cmp(b.1));
-
-    let (asset_index, _) = candidates.into_iter().find(|(_, name)| {
-        let name_norm = name.replace('\\', "/");
-        if name_norm == external_norm {
-            return true;
-        }
-        if name_norm.ends_with(&external_norm) || external_norm.ends_with(&name_norm) {
-            return true;
-        }
-        match external_file_name {
-            Some(file_name) => {
-                std::path::Path::new(&name_norm)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    == Some(file_name)
-            }
-            None => false,
-        }
-    })?;
+    let mut candidates = asset_names
+        .iter()
+        .enumerate()
+        .filter_map(|(asset_index, name)| (name == &external.path).then_some(asset_index));
+    let asset_index = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
 
     Some(BinaryObjectKey {
         source: bundle_source.clone(),

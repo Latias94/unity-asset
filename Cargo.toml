@@ -30,6 +30,7 @@ serde_bytes = "0.11"
 indexmap = { version = "2", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
+blake3 = "1.8"
 
 # Binary parsing
 binrw = "0.15"

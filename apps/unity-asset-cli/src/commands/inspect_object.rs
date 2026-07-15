@@ -1,13 +1,16 @@
-use crate::shared::{AppContext, build_environment, load_environment_input, resolve_loaded_source};
+use crate::shared::{
+    AppContext, binary_object_key_for_address, build_environment, load_environment_input,
+    object_address_for_key, resolve_loaded_source,
+};
 use anyhow::Result;
 use std::path::PathBuf;
-use unity_asset::UnityValue;
 use unity_asset::environment::BinarySource;
+use unity_asset::{ObjectAddress, UnityValue};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     input: PathBuf,
-    key: Option<String>,
+    address: Option<String>,
     source: Option<PathBuf>,
     kind: String,
     asset_index: Option<usize>,
@@ -21,9 +24,9 @@ pub(crate) fn run(
     let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
     load_environment_input(&mut env, &input)?;
 
-    let mut key = if let Some(key) = key {
-        key.parse::<unity_asset::environment::BinaryObjectKey>()
-            .map_err(|e| anyhow::anyhow!(e))?
+    let key = if let Some(address) = address {
+        let address = address.parse::<ObjectAddress>()?;
+        binary_object_key_for_address(&env, &input, &address)?
     } else {
         let kind_lc = kind.to_ascii_lowercase();
         let source_kind = match kind_lc.as_str() {
@@ -39,23 +42,25 @@ pub(crate) fn run(
         }
 
         let path_id = path_id
-            .ok_or_else(|| anyhow::anyhow!("--path-id is required unless --key is provided"))?;
+            .ok_or_else(|| anyhow::anyhow!("--path-id is required unless --address is provided"))?;
         let source = match source {
             Some(source) => source,
             None if input.is_file() => input.clone(),
-            None => anyhow::bail!("--source is required unless --key is provided"),
+            None => anyhow::bail!("--source is required unless --address is provided"),
         };
 
-        unity_asset::environment::BinaryObjectKey {
+        let mut key = unity_asset::environment::BinaryObjectKey {
             source: BinarySource::path(&source),
             source_kind,
             asset_index,
             path_id,
-        }
+        };
+        key.source = resolve_loaded_source(&env, key.source_kind, &key.source)?;
+        key
     };
 
-    let resolved_source = resolve_loaded_source(&env, key.source_kind, &key.source)?;
-    key.source = resolved_source.clone();
+    let resolved_source = key.source.clone();
+    let address = object_address_for_key(&env, &input, &key)?;
 
     let obj = env.read_binary_object_key(&key)?;
 
@@ -71,7 +76,7 @@ pub(crate) fn run(
         "Source: {} (kind={:?}, asset_index={:?}, path_id={})",
         resolved_source, key.source_kind, key.asset_index, key.path_id
     );
-    println!("Key: {}", key);
+    println!("Address: {}", address.to_compact_string()?);
 
     let filter_lc = filter.to_ascii_lowercase();
     let mut printed = 0usize;

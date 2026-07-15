@@ -4,18 +4,40 @@
 //! This crate provides the fundamental building blocks that are shared
 //! across different Unity asset formats (YAML, binary, etc.).
 
+mod bounded;
+pub mod budget;
+pub mod change;
 pub mod constants;
+pub mod diagnostic;
+pub mod digest;
 pub mod document;
 pub mod dynamic_access;
 pub mod error;
+pub mod field_path;
+pub mod identity;
+pub mod revision;
 pub mod unity_class;
 pub mod unity_value;
 
 // Re-export main types
+pub use budget::{
+    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BudgetError, BudgetedJsonError,
+    DecompressionBudget, DecompressionUsage,
+};
+pub use change::{ChangeSet, ChangeSetError, IdentityRemap, TransactionId};
 pub use constants::*;
+pub use diagnostic::{Diagnostic, DiagnosticError, DiagnosticSeverity};
+pub use digest::{DigestBuildError, DigestParseError, DigestV1, DigestV1Builder};
 pub use document::{DocumentFormat, UnityDocument};
 pub use dynamic_access::{DynamicAccess, DynamicValue};
 pub use error::{Result, UnityAssetError};
+pub use field_path::{FieldPath, FieldPathError, FieldPathSegment};
+pub use identity::{
+    BundleMemberId, ContainmentKind, ContainmentStep, ContractError, ObjectAddress, ObjectId,
+    ObjectKind, RevisionedObjectHandle, SourceAlias, SourceId, SourceLocator, SourceMemberId,
+    WorkspaceId, YamlAnchor, YamlDocumentSelector,
+};
+pub use revision::{SourceFingerprint, SourceKind, WorkspaceRevision};
 pub use unity_class::{UnityClass, UnityClassRegistry};
 pub use unity_value::UnityValue;
 

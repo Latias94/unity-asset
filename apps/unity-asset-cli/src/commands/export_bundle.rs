@@ -1,7 +1,7 @@
 use crate::pattern::container_asset_path_matches_ci;
 use crate::shared::{
-    AppContext, build_environment, class_name_for_id, load_environment_input,
-    lookup_object_type_info,
+    AppContext, binary_object_key_for_address, build_environment, class_name_for_id,
+    load_environment_input, lookup_object_type_info, object_address_for_key,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(feature = "decode")]
 use unity_asset::UnityValue;
 use unity_asset::environment::{BinaryObjectKey, BinarySource, Environment};
+use unity_asset::{AssetLoadBudget, AssetLoadLimits, ObjectAddress};
 #[cfg(feature = "decode")]
 use unity_asset_binary::object::UnityObject;
 
@@ -171,6 +172,7 @@ struct ExportJob {
     order: usize,
     asset_path: String,
     key: BinaryObjectKey,
+    address: ObjectAddress,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,10 +190,7 @@ enum ExportStatus {
 struct ExportManifestEntry {
     order: usize,
     asset_path: String,
-    key: String,
-    source_kind: String,
-    asset_index: Option<usize>,
-    path_id: i64,
+    address: ObjectAddress,
     type_id: Option<i32>,
     class_name: Option<String>,
     status: ExportStatus,
@@ -203,6 +202,7 @@ struct ExportManifestEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExportManifest {
+    schema: u32,
     created_unix_ms: u128,
     input: String,
     output: String,
@@ -228,6 +228,9 @@ struct ExportManifest {
     entries: Vec<ExportManifestEntry>,
 }
 
+const EXPORT_MANIFEST_SCHEMA: u32 = 2;
+const MAX_EXPORT_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 struct ExportOutcome {
     order: usize,
@@ -235,6 +238,28 @@ struct ExportOutcome {
     did_export: bool,
     did_skip_existing: bool,
     entry: ExportManifestEntry,
+}
+
+fn failed_export_outcome(env: &Environment, job: &ExportJob, error: String) -> ExportOutcome {
+    let (type_id, _) = lookup_object_type_info(env, &job.key);
+    let class_name = (type_id != 0).then(|| class_name_for_id(type_id).into_owned());
+    ExportOutcome {
+        order: job.order,
+        message: format!("FAILED {} error={}", job.asset_path, error),
+        did_export: false,
+        did_skip_existing: false,
+        entry: ExportManifestEntry {
+            order: job.order,
+            asset_path: job.asset_path.clone(),
+            address: job.address.clone(),
+            type_id: (type_id != 0).then_some(type_id),
+            class_name,
+            status: ExportStatus::Failed,
+            output_path: None,
+            output_bytes: None,
+            error: Some(error),
+        },
+    }
 }
 
 #[derive(Debug, Default)]
@@ -320,8 +345,34 @@ fn write_export_manifest(path: &Path, manifest: ExportManifest) -> Result<()> {
 
 fn read_export_manifest(path: &Path) -> Result<ExportManifest> {
     let file = std::fs::File::open(path)?;
-    let manifest: ExportManifest = serde_json::from_reader(file)?;
-    Ok(manifest)
+    deserialize_export_manifest(file, MAX_EXPORT_MANIFEST_BYTES)
+}
+
+fn deserialize_export_manifest(
+    reader: impl std::io::Read,
+    max_bytes: u64,
+) -> Result<ExportManifest> {
+    let limits = AssetLoadLimits {
+        max_bytes,
+        ..AssetLoadLimits::default()
+    };
+    let mut budget = AssetLoadBudget::new(limits)?;
+    Ok(budget.deserialize_json(reader)?)
+}
+
+fn ensure_unique_manifest_jobs(entries: &[ExportManifestEntry], usage: &str) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        let job = (entry.asset_path.clone(), entry.address.clone());
+        if !seen.insert(job) {
+            anyhow::bail!(
+                "Duplicate asset path/address pair in {usage} manifest: asset_path={:?}, address={}",
+                entry.asset_path,
+                entry.address.to_compact_string()?
+            );
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -345,18 +396,33 @@ fn export_bundle_command(
     show_warnings: bool,
     typetree_registries: &[PathBuf],
 ) -> Result<()> {
-    let mut resume_map: std::collections::HashMap<(String, String), ExportManifestEntry> =
+    let mut env = build_environment(strict, show_warnings, typetree_registries)?;
+    load_environment_input(&mut env, &input)?;
+
+    let mut resume_map: std::collections::HashMap<(String, ObjectAddress), ExportManifestEntry> =
         std::collections::HashMap::new();
     if let Some(path) = resume.as_ref() {
         let prev = read_export_manifest(path)?;
+        if prev.schema != EXPORT_MANIFEST_SCHEMA {
+            anyhow::bail!("Unsupported --resume manifest schema: {}", prev.schema);
+        }
+        ensure_unique_manifest_jobs(&prev.entries, "--resume")?;
         for e in prev.entries {
-            resume_map.insert((e.asset_path.clone(), e.key.clone()), e);
+            let resume_key = (e.asset_path.clone(), e.address.clone());
+            resume_map.insert(resume_key, e);
         }
     }
 
     let mut retry_failed_jobs: Option<Vec<ExportJob>> = None;
     if let Some(path) = retry_failed_from.as_ref() {
         let prev = read_export_manifest(path)?;
+        if prev.schema != EXPORT_MANIFEST_SCHEMA {
+            anyhow::bail!(
+                "Unsupported --retry-failed-from manifest schema: {}",
+                prev.schema
+            );
+        }
+        ensure_unique_manifest_jobs(&prev.entries, "--retry-failed-from")?;
         let mut jobs: Vec<ExportJob> = Vec::new();
         let mut order = 0usize;
         for e in prev.entries {
@@ -371,21 +437,24 @@ fn export_bundle_command(
             {
                 continue;
             }
-            let Ok(key) = e.key.parse::<BinaryObjectKey>() else {
-                continue;
-            };
+            let address = e.address.clone();
+            let key = binary_object_key_for_address(&env, &input, &address)?;
+            if key.source_kind != unity_asset::environment::BinarySourceKind::AssetBundle {
+                anyhow::bail!(
+                    "--retry-failed-from entry {} is not an AssetBundle address",
+                    address.to_compact_string()?
+                );
+            }
             jobs.push(ExportJob {
                 order,
                 asset_path: e.asset_path,
                 key,
+                address,
             });
             order += 1;
         }
         retry_failed_jobs = Some(jobs);
     }
-
-    let mut env = build_environment(strict, show_warnings, typetree_registries)?;
-    load_environment_input(&mut env, &input)?;
 
     std::fs::create_dir_all(&output)?;
 
@@ -464,8 +533,8 @@ fn export_bundle_command(
                     continue;
                 };
 
-                let key_str = key.to_string();
-                let resume_key = (entry.asset_path.clone(), key_str.clone());
+                let address = object_address_for_key(&env, &input, &key)?;
+                let resume_key = (entry.asset_path.clone(), address.clone());
                 let effective_skip_existing = skip_existing || resume.is_some();
                 if effective_skip_existing && !overwrite {
                     if let Some(prev) = resume_map.get(&resume_key) {
@@ -493,10 +562,7 @@ fn export_bundle_command(
                                     entry: ExportManifestEntry {
                                         order,
                                         asset_path: entry.asset_path.clone(),
-                                        key: key_str,
-                                        source_kind: prev.source_kind.clone(),
-                                        asset_index: prev.asset_index,
-                                        path_id: prev.path_id,
+                                        address,
                                         type_id: prev.type_id,
                                         class_name: prev.class_name.clone(),
                                         status: ExportStatus::Resumed,
@@ -531,6 +597,7 @@ fn export_bundle_command(
                     order,
                     asset_path: entry.asset_path,
                     key,
+                    address,
                 });
                 planned += 1;
                 order += 1;
@@ -543,6 +610,7 @@ fn export_bundle_command(
             write_export_manifest(
                 &path,
                 ExportManifest {
+                    schema: EXPORT_MANIFEST_SCHEMA,
                     created_unix_ms: now_unix_ms(),
                     input: input.to_string_lossy().to_string(),
                     output: output.to_string_lossy().to_string(),
@@ -605,10 +673,7 @@ fn export_bundle_command(
                 manifest_entries.push(ExportManifestEntry {
                     order: job.order,
                     asset_path: job.asset_path.clone(),
-                    key: job.key.to_string(),
-                    source_kind: format!("{:?}", job.key.source_kind),
-                    asset_index: job.key.asset_index,
-                    path_id: job.key.path_id,
+                    address: job.address.clone(),
                     type_id: if type_id == 0 { None } else { Some(type_id) },
                     class_name: class_name.clone(),
                     status: ExportStatus::SkippedExisting,
@@ -623,10 +688,7 @@ fn export_bundle_command(
             manifest_entries.push(ExportManifestEntry {
                 order: job.order,
                 asset_path: job.asset_path.clone(),
-                key: job.key.to_string(),
-                source_kind: format!("{:?}", job.key.source_kind),
-                asset_index: job.key.asset_index,
-                path_id: job.key.path_id,
+                address: job.address.clone(),
                 type_id: if type_id == 0 { None } else { Some(type_id) },
                 class_name,
                 status: ExportStatus::Planned,
@@ -648,6 +710,7 @@ fn export_bundle_command(
             write_export_manifest(
                 &path,
                 ExportManifest {
+                    schema: EXPORT_MANIFEST_SCHEMA,
                     created_unix_ms: now_unix_ms(),
                     input: input.to_string_lossy().to_string(),
                     output: output.to_string_lossy().to_string(),
@@ -700,6 +763,7 @@ fn export_bundle_command(
             write_export_manifest(
                 path,
                 ExportManifest {
+                    schema: EXPORT_MANIFEST_SCHEMA,
                     created_unix_ms: now_unix_ms(),
                     input: input.to_string_lossy().to_string(),
                     output: output.to_string_lossy().to_string(),
@@ -785,6 +849,7 @@ fn export_bundle_command(
                         &output,
                         &job.asset_path,
                         &job.key,
+                        &job.address,
                         job.order,
                         decode,
                         overwrite,
@@ -792,48 +857,20 @@ fn export_bundle_command(
                     ) {
                         Ok(v) => Some(v),
                         Err(e) => {
-                            if continue_on_error {
-                                failed_count.fetch_add(1, Ordering::Relaxed);
-                                let (type_id, _) = lookup_object_type_info(&env, &job.key);
-                                let class_name = if type_id == 0 {
-                                    None
-                                } else {
-                                    Some(class_name_for_id(type_id).into_owned())
-                                };
-                                Some(ExportOutcome {
-                                    order: job.order,
-                                    message: format!(
-                                        "FAILED {} (key={}) error={}",
-                                        job.asset_path, job.key, e
-                                    ),
-                                    did_export: false,
-                                    did_skip_existing: false,
-                                    entry: ExportManifestEntry {
-                                        order: job.order,
-                                        asset_path: job.asset_path.clone(),
-                                        key: job.key.to_string(),
-                                        source_kind: format!("{:?}", job.key.source_kind),
-                                        asset_index: job.key.asset_index,
-                                        path_id: job.key.path_id,
-                                        type_id: if type_id == 0 { None } else { Some(type_id) },
-                                        class_name,
-                                        status: ExportStatus::Failed,
-                                        output_path: None,
-                                        output_bytes: None,
-                                        error: Some(e.to_string()),
-                                    },
-                                })
-                            } else {
+                            failed_count.fetch_add(1, Ordering::Relaxed);
+                            let error = e.to_string();
+                            let outcome = failed_export_outcome(&env, job, error.clone());
+                            if !continue_on_error {
                                 abort.store(true, Ordering::Relaxed);
                                 let mut slot = match first_error.lock() {
                                     Ok(v) => v,
                                     Err(e) => e.into_inner(),
                                 };
                                 if slot.is_none() {
-                                    *slot = Some(format!("{} (key={})", e, job.key));
+                                    *slot = Some(error);
                                 }
-                                None
                             }
+                            Some(outcome)
                         }
                     };
 
@@ -877,6 +914,7 @@ fn export_bundle_command(
         write_export_manifest(
             path,
             ExportManifest {
+                schema: EXPORT_MANIFEST_SCHEMA,
                 created_unix_ms: now_unix_ms(),
                 input: input.to_string_lossy().to_string(),
                 output: output.to_string_lossy().to_string(),
@@ -948,6 +986,7 @@ fn export_one_entry(
     output: &Path,
     asset_path: &str,
     key: &BinaryObjectKey,
+    address: &ObjectAddress,
     order: usize,
     decode: bool,
     overwrite: bool,
@@ -985,10 +1024,7 @@ fn export_one_entry(
                     entry: ExportManifestEntry {
                         order,
                         asset_path: asset_path.to_string(),
-                        key: key.to_string(),
-                        source_kind: format!("{:?}", key.source_kind),
-                        asset_index: key.asset_index,
-                        path_id: key.path_id,
+                        address: address.clone(),
                         type_id: Some(type_id),
                         class_name,
                         status: ExportStatus::ExportedDecoded,
@@ -1007,10 +1043,7 @@ fn export_one_entry(
                     entry: ExportManifestEntry {
                         order,
                         asset_path: asset_path.to_string(),
-                        key: key.to_string(),
-                        source_kind: format!("{:?}", key.source_kind),
-                        asset_index: key.asset_index,
-                        path_id: key.path_id,
+                        address: address.clone(),
                         type_id: Some(type_id),
                         class_name,
                         status: ExportStatus::SkippedExisting,
@@ -1044,10 +1077,7 @@ fn export_one_entry(
             entry: ExportManifestEntry {
                 order,
                 asset_path: asset_path.to_string(),
-                key: key.to_string(),
-                source_kind: format!("{:?}", key.source_kind),
-                asset_index: key.asset_index,
-                path_id: key.path_id,
+                address: address.clone(),
                 type_id: Some(type_id),
                 class_name,
                 status: ExportStatus::SkippedExisting,
@@ -1078,10 +1108,7 @@ fn export_one_entry(
         entry: ExportManifestEntry {
             order,
             asset_path: asset_path.to_string(),
-            key: key.to_string(),
-            source_kind: format!("{:?}", key.source_kind),
-            asset_index: key.asset_index,
-            path_id: key.path_id,
+            address: address.clone(),
             type_id: Some(type_id),
             class_name,
             status: ExportStatus::ExportedRaw,
@@ -1384,5 +1411,100 @@ fn try_decode_export_best_effort(
         })()
         .unwrap_or(DecodeAttempt::NotApplicable),
         _ => DecodeAttempt::NotApplicable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object_address() -> ObjectAddress {
+        ObjectAddress::binary_bundle_member(
+            unity_asset::SourceLocator::path("game.ab").unwrap(),
+            unity_asset::SourceMemberId::new("cab/main").unwrap(),
+            1,
+        )
+        .unwrap()
+    }
+
+    fn manifest_entry(asset_path: &str, address: ObjectAddress) -> ExportManifestEntry {
+        ExportManifestEntry {
+            order: 0,
+            asset_path: asset_path.into(),
+            address,
+            type_id: None,
+            class_name: None,
+            status: ExportStatus::Failed,
+            output_path: None,
+            output_bytes: None,
+            error: Some("failed".into()),
+        }
+    }
+
+    #[test]
+    fn manifest_entry_rejects_malformed_object_address() {
+        let value = serde_json::json!({
+            "order": 0,
+            "asset_path": "assets/example.bin",
+            "address": "bok2|bundle|0|1|7|game.ab|0|",
+            "type_id": null,
+            "class_name": null,
+            "status": "failed",
+            "output_path": null,
+            "output_bytes": null,
+            "error": "failed"
+        });
+
+        assert!(serde_json::from_value::<ExportManifestEntry>(value).is_err());
+    }
+
+    #[test]
+    fn resume_and_retry_reject_duplicate_asset_path_address_pairs() {
+        let address = object_address();
+        let duplicates = vec![
+            manifest_entry("assets/a.bin", address.clone()),
+            manifest_entry("assets/a.bin", address.clone()),
+        ];
+        assert!(ensure_unique_manifest_jobs(&duplicates, "--resume").is_err());
+        assert!(ensure_unique_manifest_jobs(&duplicates, "--retry-failed-from").is_err());
+
+        let aliases = vec![
+            manifest_entry("assets/a.bin", address.clone()),
+            manifest_entry("assets/b.bin", address),
+        ];
+        assert!(ensure_unique_manifest_jobs(&aliases, "--resume").is_ok());
+    }
+
+    #[test]
+    fn fail_fast_outcome_keeps_the_typed_retry_address() {
+        let address = object_address();
+        let job = ExportJob {
+            order: 3,
+            asset_path: "assets/a.bin".into(),
+            key: BinaryObjectKey {
+                source: BinarySource::path("game.ab"),
+                source_kind: unity_asset::environment::BinarySourceKind::AssetBundle,
+                asset_index: Some(9),
+                path_id: 1,
+            },
+            address: address.clone(),
+        };
+
+        let outcome = failed_export_outcome(&Environment::new(), &job, "write failed".into());
+        assert!(matches!(outcome.entry.status, ExportStatus::Failed));
+        assert_eq!(outcome.entry.address, address);
+        let json = serde_json::to_value(outcome.entry).unwrap();
+        assert!(json.get("address").is_some());
+        assert!(json.get("key").is_none());
+        assert!(json.get("asset_index").is_none());
+        assert!(json.get("path_id").is_none());
+        assert!(json.get("source_kind").is_none());
+    }
+
+    #[test]
+    fn oversized_manifest_is_rejected_before_json_decode() {
+        let oversized = std::io::Cursor::new(vec![b' '; 33]);
+        let error = deserialize_export_manifest(oversized, 32).unwrap_err();
+        assert!(error.to_string().contains("bytes"));
     }
 }

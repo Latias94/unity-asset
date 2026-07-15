@@ -1,4 +1,7 @@
-use crate::shared::{AppContext, build_environment, load_environment_input, resolve_loaded_source};
+use crate::shared::{
+    AppContext, binary_object_key_for_address, build_environment, load_environment_input,
+    object_address_for_key, resolve_loaded_source,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -8,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use unity_asset::environment::{BinaryObjectKey, BinarySource, BinarySourceKind, Environment};
+use unity_asset::{AssetLoadBudget, AssetLoadLimits, ObjectAddress};
 use unity_asset_binary::asset::SerializedFile;
 
 #[cfg(feature = "decode")]
@@ -97,6 +101,7 @@ struct ExportJob {
     order: usize,
     label: String,
     key: BinaryObjectKey,
+    address: ObjectAddress,
     dest_base: PathBuf,
     decode: bool,
     overwrite: bool,
@@ -117,9 +122,7 @@ enum ExportStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExportManifestEntry {
     order: usize,
-    key: String,
-    source: String,
-    path_id: i64,
+    address: ObjectAddress,
     class_id: Option<i32>,
     class_name: Option<String>,
     name: Option<String>,
@@ -154,6 +157,9 @@ struct ExportManifest {
     entries: Vec<ExportManifestEntry>,
 }
 
+const EXPORT_MANIFEST_SCHEMA: u32 = 2;
+const MAX_EXPORT_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+
 fn now_unix_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -177,8 +183,41 @@ fn write_export_manifest(path: &Path, manifest: &ExportManifest) -> Result<()> {
 
 fn read_export_manifest(path: &Path) -> Result<ExportManifest> {
     let file = std::fs::File::open(path)?;
-    let manifest: ExportManifest = serde_json::from_reader(file)?;
-    Ok(manifest)
+    deserialize_export_manifest(file, MAX_EXPORT_MANIFEST_BYTES)
+}
+
+fn deserialize_export_manifest(
+    reader: impl std::io::Read,
+    max_bytes: u64,
+) -> Result<ExportManifest> {
+    let limits = AssetLoadLimits {
+        max_bytes,
+        ..AssetLoadLimits::default()
+    };
+    let mut budget = AssetLoadBudget::new(limits)?;
+    Ok(budget.deserialize_json(reader)?)
+}
+
+fn ensure_unique_manifest_addresses(entries: &[ExportManifestEntry], usage: &str) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        if !seen.insert(entry.address.clone()) {
+            anyhow::bail!(
+                "Duplicate object address in {usage} manifest: {}",
+                entry.address.to_compact_string()?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_exports_succeeded(failed: usize) -> Result<()> {
+    if failed > 0 {
+        anyhow::bail!(
+            "{failed} objects failed (use --manifest to inspect, or re-run with --retry-failed-from)"
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -211,27 +250,30 @@ pub(crate) fn run(
     let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
     load_environment_input(&mut env, &input)?;
 
-    let mut resume_map: std::collections::HashMap<String, ExportManifestEntry> =
+    let mut resume_map: std::collections::HashMap<ObjectAddress, ExportManifestEntry> =
         std::collections::HashMap::new();
     if let Some(path) = resume.as_ref() {
         let prev = read_export_manifest(path)?;
-        if prev.schema != 1 {
+        if prev.schema != EXPORT_MANIFEST_SCHEMA {
             anyhow::bail!("Unsupported --resume manifest schema: {}", prev.schema);
         }
+        ensure_unique_manifest_addresses(&prev.entries, "--resume")?;
         for e in prev.entries {
-            resume_map.insert(e.key.clone(), e);
+            let address = e.address.clone();
+            resume_map.insert(address, e);
         }
     }
 
     let mut retry_failed_jobs: Option<Vec<ExportJob>> = None;
     if let Some(path) = retry_failed_from.as_ref() {
         let prev = read_export_manifest(path)?;
-        if prev.schema != 1 {
+        if prev.schema != EXPORT_MANIFEST_SCHEMA {
             anyhow::bail!(
                 "Unsupported --retry-failed-from manifest schema: {}",
                 prev.schema
             );
         }
+        ensure_unique_manifest_addresses(&prev.entries, "--retry-failed-from")?;
 
         let mut jobs: Vec<ExportJob> = Vec::new();
         let mut order = 0usize;
@@ -239,11 +281,13 @@ pub(crate) fn run(
             if !matches!(e.status, ExportStatus::Failed) {
                 continue;
             }
-            let Ok(key) = e.key.parse::<BinaryObjectKey>() else {
-                continue;
-            };
+            let address = e.address.clone();
+            let key = binary_object_key_for_address(&env, &input, &address)?;
             if key.source_kind != BinarySourceKind::SerializedFile {
-                continue;
+                anyhow::bail!(
+                    "--retry-failed-from entry {} is not a SerializedFile address",
+                    address.to_compact_string()?
+                );
             }
 
             let rel = source_rel_for_output(&input, &key.source);
@@ -257,17 +301,18 @@ pub(crate) fn run(
                 .name
                 .as_deref()
                 .filter(|s| !s.is_empty())
-                .map(|s| format!("{}_{}", s, e.path_id))
-                .unwrap_or_else(|| format!("{}", e.path_id));
+                .map(|s| format!("{}_{}", s, key.path_id))
+                .unwrap_or_else(|| format!("{}", key.path_id));
 
             let mut dest_base = output.join(&src_dir).join(sanitize_asset_path(&class));
             dest_base.push(sanitize_asset_path(&base_name));
 
-            let label = format!("{}/{}#{}", rel, class, e.path_id);
+            let label = format!("{}/{}#{}", rel, class, key.path_id);
             jobs.push(ExportJob {
                 order,
                 label,
                 key,
+                address,
                 dest_base,
                 decode,
                 overwrite,
@@ -362,10 +407,10 @@ pub(crate) fn run(
                     asset_index: None,
                     path_id: handle.path_id(),
                 };
+                let address = object_address_for_key(&env, &input, &key)?;
 
-                let key_str = key.to_string();
                 if effective_skip_existing && !overwrite {
-                    if let Some(prev) = resume_map.get(&key_str) {
+                    if let Some(prev) = resume_map.get(&address) {
                         if let Some(p) = prev.output_path.as_ref() {
                             let prev_path = PathBuf::from(p);
                             if prev_path.exists()
@@ -380,9 +425,7 @@ pub(crate) fn run(
                                 resumed += 1;
                                 pre_entries.push(ExportManifestEntry {
                                     order,
-                                    key: key_str,
-                                    source: src.to_string(),
-                                    path_id: handle.path_id(),
+                                    address,
                                     class_id: Some(cid),
                                     class_name: Some(class.clone()),
                                     name: peek_name.clone(),
@@ -403,6 +446,7 @@ pub(crate) fn run(
                     order,
                     label,
                     key,
+                    address,
                     dest_base,
                     decode,
                     overwrite,
@@ -416,7 +460,7 @@ pub(crate) fn run(
     if export_jobs.is_empty() && pre_entries.is_empty() {
         if let Some(path) = manifest.as_ref() {
             let out = ExportManifest {
-                schema: 1,
+                schema: EXPORT_MANIFEST_SCHEMA,
                 created_unix_ms: now_unix_ms(),
                 input: input.to_string_lossy().to_string(),
                 output: output.to_string_lossy().to_string(),
@@ -458,9 +502,7 @@ pub(crate) fn run(
             for j in export_jobs.iter() {
                 entries.push(ExportManifestEntry {
                     order: j.order,
-                    key: j.key.to_string(),
-                    source: j.key.source.to_string(),
-                    path_id: j.key.path_id,
+                    address: j.address.clone(),
                     class_id: None,
                     class_name: None,
                     name: None,
@@ -471,7 +513,7 @@ pub(crate) fn run(
                 });
             }
             let out = ExportManifest {
-                schema: 1,
+                schema: EXPORT_MANIFEST_SCHEMA,
                 created_unix_ms: now_unix_ms(),
                 input: input.to_string_lossy().to_string(),
                 output: output.to_string_lossy().to_string(),
@@ -547,9 +589,7 @@ pub(crate) fn run(
                         let mut guard = manifest_entries.lock().unwrap();
                         guard.push(ExportManifestEntry {
                             order: job.order,
-                            key: job.key.to_string(),
-                            source: job.key.source.to_string(),
-                            path_id: job.key.path_id,
+                            address: job.address.clone(),
                             class_id: Some(class_id),
                             class_name: Some(class_name),
                             name: obj_name,
@@ -565,9 +605,7 @@ pub(crate) fn run(
                         let mut guard = manifest_entries.lock().unwrap();
                         guard.push(ExportManifestEntry {
                             order: job.order,
-                            key: job.key.to_string(),
-                            source: job.key.source.to_string(),
-                            path_id: job.key.path_id,
+                            address: job.address.clone(),
                             class_id: Some(class_id),
                             class_name: Some(class_name),
                             name: obj_name,
@@ -583,9 +621,7 @@ pub(crate) fn run(
                         let mut guard = manifest_entries.lock().unwrap();
                         guard.push(ExportManifestEntry {
                             order: job.order,
-                            key: job.key.to_string(),
-                            source: job.key.source.to_string(),
-                            path_id: job.key.path_id,
+                            address: job.address.clone(),
                             class_id: None,
                             class_name: None,
                             name: None,
@@ -607,11 +643,12 @@ pub(crate) fn run(
         let _ = h.join();
     }
 
+    let failed_count = failed.load(Ordering::Relaxed);
     println!(
         "Exported {} objects, skipped existing {}, failed {} [jobs={}]",
         exported.load(Ordering::Relaxed),
         skipped_existing_count.load(Ordering::Relaxed),
-        failed.load(Ordering::Relaxed),
+        failed_count,
         threads
     );
 
@@ -619,7 +656,7 @@ pub(crate) fn run(
         let mut entries = manifest_entries.lock().unwrap().clone();
         entries.sort_by_key(|e| e.order);
         let out = ExportManifest {
-            schema: 1,
+            schema: EXPORT_MANIFEST_SCHEMA,
             created_unix_ms: now_unix_ms(),
             input: input.to_string_lossy().to_string(),
             output: output.to_string_lossy().to_string(),
@@ -637,13 +674,13 @@ pub(crate) fn run(
             exported: exported.load(Ordering::Relaxed),
             skipped_existing: skipped_existing_count.load(Ordering::Relaxed),
             resumed,
-            failed: failed.load(Ordering::Relaxed),
+            failed: failed_count,
             entries,
         };
         write_export_manifest(path.as_path(), &out)?;
     }
 
-    Ok(())
+    ensure_exports_succeeded(failed_count)
 }
 
 type ExportOneInnerResult = (
@@ -951,4 +988,72 @@ fn try_decode_export_best_effort(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest_entry(address: ObjectAddress) -> ExportManifestEntry {
+        ExportManifestEntry {
+            order: 0,
+            address,
+            class_id: None,
+            class_name: None,
+            name: None,
+            status: ExportStatus::Failed,
+            output_path: None,
+            output_bytes: None,
+            error: Some("failed".into()),
+        }
+    }
+
+    #[test]
+    fn manifest_entry_rejects_malformed_object_address() {
+        let value = serde_json::json!({
+            "order": 0,
+            "address": "bok2|serialized|-|1|8|game.ab|0|",
+            "class_id": null,
+            "class_name": null,
+            "name": null,
+            "status": "failed",
+            "output_path": null,
+            "output_bytes": null,
+            "error": "failed"
+        });
+
+        assert!(serde_json::from_value::<ExportManifestEntry>(value).is_err());
+    }
+
+    #[test]
+    fn resume_and_retry_reject_duplicate_addresses() {
+        let address = ObjectAddress::binary_direct(
+            unity_asset::SourceLocator::path("game.assets").unwrap(),
+            1,
+        )
+        .unwrap();
+        let entries = vec![manifest_entry(address.clone()), manifest_entry(address)];
+
+        assert!(ensure_unique_manifest_addresses(&entries, "--resume").is_err());
+        assert!(ensure_unique_manifest_addresses(&entries, "--retry-failed-from").is_err());
+
+        let json = serde_json::to_value(&entries[0]).unwrap();
+        assert!(json.get("address").is_some());
+        assert!(json.get("key").is_none());
+        assert!(json.get("source").is_none());
+        assert!(json.get("path_id").is_none());
+    }
+
+    #[test]
+    fn oversized_manifest_is_rejected_before_json_decode() {
+        let oversized = std::io::Cursor::new(vec![b' '; 33]);
+        let error = deserialize_export_manifest(oversized, 32).unwrap_err();
+        assert!(error.to_string().contains("bytes"));
+    }
+
+    #[test]
+    fn failed_exports_return_an_error() {
+        assert!(ensure_exports_succeeded(0).is_ok());
+        assert!(ensure_exports_succeeded(1).is_err());
+    }
 }
