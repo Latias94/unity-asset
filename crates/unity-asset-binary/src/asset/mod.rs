@@ -28,11 +28,17 @@
 //! # Ok::<(), unity_asset_binary::error::BinaryError>(())
 //! ```
 
+pub mod format;
 pub mod header;
 pub mod parser;
 pub mod types;
 
 // Re-export main types for easy access
+pub use format::{
+    ExternalEncoding, HeaderLayout, MetadataField, MetadataPlacement, ObjectOffsetEncoding,
+    ObjectTailEncoding, ObjectTypeEncoding, PathIdEncoding, SerializedFileFormat,
+    SerializedFileLayout, SerializedFileRegions, TypeTreeEnablement, TypeTreeEncoding,
+};
 pub use header::{HeaderFormatInfo, HeaderValidation, SerializedFileHeader, validate_header};
 pub use parser::{FileStatistics, ParsingStats, SerializedFile, SerializedFileParser};
 pub use types::{FileIdentifier, ObjectInfo, SerializedType, TypeRegistry, class_ids};
@@ -252,33 +258,12 @@ pub struct AssetFileInfo {
 
 /// Get supported Unity versions
 pub fn get_supported_versions() -> Vec<u32> {
-    (5..=50).collect() // Support Unity 5.x to 2023.x (approximately)
+    SerializedFileFormat::supported_versions().collect()
 }
 
 /// Check if a Unity version is supported
 pub fn is_version_supported(version: u32) -> bool {
-    (5..=50).contains(&version)
-}
-
-/// Get recommended parsing options for a Unity version
-pub fn get_parsing_options(version: u32) -> ParsingOptions {
-    ParsingOptions {
-        enable_type_tree: version >= 13,
-        use_big_ids: version >= 14,
-        supports_script_types: version >= 11,
-        supports_ref_types: version >= 20,
-        uses_extended_format: version >= 22,
-    }
-}
-
-/// Parsing options for different Unity versions
-#[derive(Debug, Clone)]
-pub struct ParsingOptions {
-    pub enable_type_tree: bool,
-    pub use_big_ids: bool,
-    pub supports_script_types: bool,
-    pub supports_ref_types: bool,
-    pub uses_extended_format: bool,
+    SerializedFileFormat::is_supported(version)
 }
 
 #[cfg(test)]
@@ -296,18 +281,6 @@ mod tests {
         assert!(is_version_supported(19));
         assert!(is_version_supported(5));
         assert!(!is_version_supported(100));
-    }
-
-    #[test]
-    fn test_parsing_options() {
-        let options = get_parsing_options(19);
-        assert!(options.enable_type_tree);
-        assert!(options.use_big_ids);
-        assert!(options.supports_script_types);
-
-        let old_options = get_parsing_options(10);
-        assert!(!old_options.enable_type_tree);
-        assert!(!old_options.use_big_ids);
     }
 
     #[test]
