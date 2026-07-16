@@ -183,6 +183,89 @@ fn object_address_deserialization_rejects_missing_bundle_identity() {
 }
 
 #[test]
+fn object_address_wire_rejects_illegal_variants_versions_and_path_id_coercions() {
+    let cases = [
+        (
+            "direct address with bundle membership",
+            r#"{
+                "version":1,
+                "kind":"binary_direct",
+                "source":{
+                    "version":1,
+                    "outer_path":"mainData",
+                    "members":[{
+                        "container":"bundle",
+                        "member":{"name":"CAB-main","same_name_occurrence":0}
+                    }]
+                },
+                "path_id":12
+            }"#,
+        ),
+        (
+            "unknown kind tag",
+            r#"{
+                "version":1,
+                "kind":"binary_future",
+                "source":{"version":1,"outer_path":"mainData","members":[]},
+                "path_id":12
+            }"#,
+        ),
+        (
+            "unknown contract version",
+            r#"{
+                "version":2,
+                "kind":"binary_direct",
+                "source":{"version":1,"outer_path":"mainData","members":[]},
+                "path_id":12
+            }"#,
+        ),
+        (
+            "null path id",
+            r#"{
+                "version":1,
+                "kind":"binary_direct",
+                "source":{"version":1,"outer_path":"mainData","members":[]},
+                "path_id":0
+            }"#,
+        ),
+        (
+            "unsigned path id overflow",
+            r#"{
+                "version":1,
+                "kind":"binary_direct",
+                "source":{"version":1,"outer_path":"mainData","members":[]},
+                "path_id":18446744073709551615
+            }"#,
+        ),
+        (
+            "string path id coercion",
+            r#"{
+                "version":1,
+                "kind":"binary_direct",
+                "source":{"version":1,"outer_path":"mainData","members":[]},
+                "path_id":"12"
+            }"#,
+        ),
+        (
+            "floating path id coercion",
+            r#"{
+                "version":1,
+                "kind":"binary_direct",
+                "source":{"version":1,"outer_path":"mainData","members":[]},
+                "path_id":12.0
+            }"#,
+        ),
+    ];
+
+    for (case, wire) in cases {
+        assert!(
+            serde_json::from_str::<ObjectAddress>(wire).is_err(),
+            "accepted {case}"
+        );
+    }
+}
+
+#[test]
 fn compact_addresses_reject_unbounded_input_before_decoding() {
     let oversized = format!("oa1:{}", "00".repeat(512 * 1024));
     assert!(matches!(
@@ -191,6 +274,7 @@ fn compact_addresses_reject_unbounded_input_before_decoding() {
     ));
     assert!(ObjectAddress::from_str("oa1:0").is_err());
     assert!(ObjectAddress::from_str("oa1:zz").is_err());
+    assert!(ObjectAddress::from_str("oa1:ff").is_err());
     assert!(ObjectAddress::from_str("bok3:legacy").is_err());
 }
 
