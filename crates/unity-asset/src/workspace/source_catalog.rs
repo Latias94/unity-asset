@@ -529,10 +529,14 @@ impl SourceCatalog {
         logical_length = checked_add(logical_length, 16)?;
         for (source, record) in &self.by_id {
             logical_length = checked_add(logical_length, 16)?;
-            logical_length = checked_add(logical_length, 8)?;
-            logical_length = checked_add(logical_length, checked_len(source.kind().tag().len())?)?;
-            logical_length = checked_add(logical_length, 8)?;
-            logical_length = checked_add(logical_length, checked_len(record.canonical_key.len())?)?;
+            logical_length = checked_add(
+                logical_length,
+                DigestV1Builder::framed_len(source.kind().tag().as_bytes())?,
+            )?;
+            logical_length = checked_add(
+                logical_length,
+                DigestV1Builder::framed_len(&record.canonical_key)?,
+            )?;
             logical_length = checked_add(logical_length, DigestV1::BYTE_LEN as u64)?;
         }
 
@@ -541,8 +545,8 @@ impl SourceCatalog {
         digest.update(&self.workspace.get().to_le_bytes())?;
         for (source, record) in &self.by_id {
             digest.update(&source.local().to_le_bytes())?;
-            update_framed(&mut digest, source.kind().tag().as_bytes())?;
-            update_framed(&mut digest, &record.canonical_key)?;
+            digest.update_framed(source.kind().tag().as_bytes())?;
+            digest.update_framed(&record.canonical_key)?;
             digest.update(record.fingerprint.digest().as_bytes())?;
         }
         Ok(WorkspaceRevision::new(digest.finalize()?))
@@ -739,12 +743,6 @@ fn checked_len(length: usize) -> Result<u64, CatalogError> {
 fn checked_add(left: u64, right: u64) -> Result<u64, CatalogError> {
     left.checked_add(right)
         .ok_or(CatalogError::RevisionLengthOverflow)
-}
-
-fn update_framed(digest: &mut DigestV1Builder, bytes: &[u8]) -> Result<(), DigestBuildError> {
-    let length = u64::try_from(bytes.len()).map_err(|_| DigestBuildError::LengthOverflow)?;
-    digest.update(&length.to_le_bytes())?;
-    digest.update(bytes)
 }
 
 fn deterministic_local_id(key: &[u8]) -> u128 {

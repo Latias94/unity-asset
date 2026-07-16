@@ -3617,6 +3617,7 @@ version = "0.3.0"
 dependencies = [
  "fuzzy-matcher",
  "serde",
+ "serde_json",
  "unicode-normalization",
 ]
 
@@ -3642,14 +3643,17 @@ name = "unity-asset-search-index"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "hex",
  "ignore",
  "once_cell",
  "regex",
  "serde",
  "serde_json",
  "tantivy",
+ "tantivy-columnar",
  "tempfile",
  "unity-asset-binary",
+ "unity-asset-core",
  "unity-asset-search-core",
 ]
 

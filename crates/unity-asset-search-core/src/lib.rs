@@ -1,7 +1,17 @@
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
+
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeOwned, Error as _};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::canonical_combining_class;
+
+const MAX_FUZZY_FIELD_CHARS: usize = 512;
+const MAX_HIGHLIGHT_FIELD_BYTES: usize = 32 * 1024;
+const MAX_HIGHLIGHT_QUERY_BYTES: usize = 4 * 1024;
+pub const ABSOLUTE_MAX_CANDIDATES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HighlightRange {
@@ -9,29 +19,1095 @@ pub struct HighlightRange {
     pub end: usize,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueryTerm {
+    text: String,
+    quoted: bool,
+}
+
+impl QueryTerm {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn is_quoted(&self) -> bool {
+        self.quoted
+    }
+}
+
+impl AsRef<str> for QueryTerm {
+    fn as_ref(&self) -> &str {
+        &self.text
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QuerySpec {
-    pub raw: String,
-    pub free_text: String,
-    pub type_filter: Option<String>,
-    pub path_prefix: Option<String>,
-    pub tokens: Vec<String>,
+    raw: String,
+    type_filter: Option<String>,
+    path_prefix: Option<String>,
+    terms: Vec<QueryTerm>,
+    diagnostics: Vec<SearchDiagnostic>,
+}
+
+impl QuerySpec {
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    pub fn type_filter(&self) -> Option<&str> {
+        self.type_filter.as_deref()
+    }
+
+    pub fn path_prefix(&self) -> Option<&str> {
+        self.path_prefix.as_deref()
+    }
+
+    pub fn terms(&self) -> &[QueryTerm] {
+        &self.terms
+    }
+
+    pub fn diagnostics(&self) -> &[SearchDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn has_blocking_diagnostic(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(SearchDiagnostic::blocks_execution)
+    }
+
+    pub fn has_filters(&self) -> bool {
+        self.type_filter.is_some() || self.path_prefix.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MatchKind {
-    Exact = 0,
-    Prefix = 1,
-    Substring = 2,
-    Abbreviation = 3,
-    Fuzzy = 4,
-    None = 5,
+    Exact,
+    Prefix,
+    Token,
+    Substring,
+    Abbreviation,
+    Fuzzy,
+    None,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RankedScore {
+impl MatchKind {
+    fn ranking_priority(self) -> u8 {
+        match self {
+            Self::Exact => 0,
+            Self::Prefix => 1,
+            Self::Token => 2,
+            Self::Substring => 3,
+            Self::Abbreviation => 4,
+            Self::Fuzzy => 5,
+            Self::None => 6,
+        }
+    }
+
+    fn ranking_cmp(self, other: Self) -> Ordering {
+        self.ranking_priority().cmp(&other.ranking_priority())
+    }
+
+    fn worse_of(self, other: Self) -> Self {
+        if self.ranking_cmp(other).is_gt() {
+            self
+        } else {
+            other
+        }
+    }
+
+    fn meets(self, minimum: Self) -> bool {
+        !self.ranking_cmp(minimum).is_gt()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchField {
+    Name,
+    Path,
+    Kind,
+    Content,
+}
+
+impl MatchField {
+    pub const ALL: [Self; 4] = [Self::Name, Self::Path, Self::Kind, Self::Content];
+
+    fn boost(self) -> u32 {
+        match self {
+            Self::Name => 4,
+            Self::Path => 3,
+            Self::Kind => 2,
+            Self::Content => 1,
+        }
+    }
+
+    pub const fn retrieval_policy(self) -> RetrievalFieldPolicy {
+        match self {
+            Self::Name => RetrievalFieldPolicy::new(3_000, 2_000, 500),
+            Self::Path => RetrievalFieldPolicy::new(2_000, 1_500, 375),
+            Self::Kind => RetrievalFieldPolicy::new(1_000, 1_000, 250),
+            Self::Content => RetrievalFieldPolicy::new(1_200, 1_000, 250),
+        }
+    }
+
+    pub const fn requires_retrieval_evidence(self) -> bool {
+        matches!(self, Self::Content)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RetrievalFieldPolicy {
+    exact_millis: u16,
+    prefix_millis: u16,
+    fuzzy_millis: u16,
+}
+
+impl RetrievalFieldPolicy {
+    const SCALE: f32 = 1_000.0;
+
+    const fn new(exact_millis: u16, prefix_millis: u16, fuzzy_millis: u16) -> Self {
+        Self {
+            exact_millis,
+            prefix_millis,
+            fuzzy_millis,
+        }
+    }
+
+    pub fn exact_boost(self) -> f32 {
+        f32::from(self.exact_millis) / Self::SCALE
+    }
+
+    pub fn prefix_boost(self) -> f32 {
+        f32::from(self.prefix_millis) / Self::SCALE
+    }
+
+    pub fn fuzzy_boost(self) -> f32 {
+        f32::from(self.fuzzy_millis) / Self::SCALE
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TermExplanation {
+    pub term: String,
+    pub quoted: bool,
     pub kind: MatchKind,
+    pub field: MatchField,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchExplanation {
+    pub terms: Vec<TermExplanation>,
+    pub fuzzy_fallback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankingSignals {
+    pub field_boost: u32,
     pub fuzzy_score: i64,
+    pub retrieval_stage: RetrievalStage,
+    pub retrieval_score: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankedMatch {
+    pub rank: usize,
+    pub stable_key: String,
+    pub match_kind: MatchKind,
+    pub ranking_signals: RankingSignals,
+    pub explanation: MatchExplanation,
+    pub highlight_path_ranges: Vec<HighlightRange>,
+    pub highlight_name_ranges: Vec<HighlightRange>,
+    pub highlight_path: Option<String>,
+    pub highlight_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalEvidence {
+    pub term_index: usize,
+    pub field: MatchField,
+    pub kind: MatchKind,
+}
+
+impl RetrievalEvidence {
+    pub const fn new(term_index: usize, field: MatchField, kind: MatchKind) -> Self {
+        Self {
+            term_index,
+            field,
+            kind,
+        }
+    }
+
+    pub fn is_better_than(self, other: Self) -> bool {
+        self.kind
+            .ranking_cmp(other.kind)
+            .then_with(|| other.field.boost().cmp(&self.field.boost()))
+            .is_lt()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateFacts {
+    pub stable_key: String,
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub retrieval_score: i64,
+    pub evidence: Vec<RetrievalEvidence>,
+}
+
+impl CandidateFacts {
+    pub fn new(
+        stable_key: impl Into<String>,
+        name: impl Into<String>,
+        path: impl Into<String>,
+        kind: impl Into<String>,
+        retrieval_score: i64,
+    ) -> Self {
+        Self {
+            stable_key: stable_key.into(),
+            name: name.into(),
+            path: path.into(),
+            kind: kind.into(),
+            retrieval_score,
+            evidence: Vec::new(),
+        }
+    }
+
+    pub fn with_evidence(mut self, evidence: impl IntoIterator<Item = RetrievalEvidence>) -> Self {
+        self.evidence = evidence.into_iter().collect();
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateField {
+    StableKey,
+    Name,
+    Path,
+    Kind,
+    Guid,
+    ContainerSourcePath,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchDiagnosticSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchDiagnostic {
+    EmptyQuery,
+    UnterminatedQuote {
+        byte_offset: usize,
+    },
+    EmptyQuotedTerm {
+        byte_offset: usize,
+    },
+    MissingFilterValue {
+        field: String,
+    },
+    DuplicateFilter {
+        field: String,
+    },
+    UnsupportedTypeFilter {
+        value: String,
+    },
+    CandidateLimitExceeded {
+        stage: RetrievalStage,
+        provided: usize,
+        limit: usize,
+    },
+    QueryByteLimitExceeded {
+        actual: usize,
+        limit: usize,
+    },
+    QueryTermLimitExceeded {
+        actual: usize,
+        limit: usize,
+    },
+    RetrievalTermLimitExceeded {
+        actual: usize,
+        limit: usize,
+    },
+    CandidateFieldByteLimitExceeded {
+        field: CandidateField,
+        actual: usize,
+        limit: usize,
+    },
+    CandidateTotalByteLimitExceeded {
+        consumed: usize,
+        limit: usize,
+    },
+    CandidateInputLimitExceeded {
+        limit: usize,
+    },
+    CandidateEvidenceLimitExceeded {
+        actual: usize,
+        limit: usize,
+    },
+    InvalidRetrievalEvidence {
+        term_index: usize,
+    },
+    DuplicateCandidateKey {
+        stable_key: String,
+    },
+    Unknown {
+        contract_version: u16,
+        code: String,
+        severity: SearchDiagnosticSeverity,
+        blocks_execution: bool,
+        details: serde_json::Value,
+    },
+}
+
+impl SearchDiagnostic {
+    pub const WIRE_VERSION: u16 = 1;
+
+    pub fn code(&self) -> &str {
+        match self {
+            Self::EmptyQuery => "empty_query",
+            Self::UnterminatedQuote { .. } => "unterminated_quote",
+            Self::EmptyQuotedTerm { .. } => "empty_quoted_term",
+            Self::MissingFilterValue { .. } => "missing_filter_value",
+            Self::DuplicateFilter { .. } => "duplicate_filter",
+            Self::UnsupportedTypeFilter { .. } => "unsupported_type_filter",
+            Self::CandidateLimitExceeded { .. } => "candidate_limit_exceeded",
+            Self::QueryByteLimitExceeded { .. } => "query_byte_limit_exceeded",
+            Self::QueryTermLimitExceeded { .. } => "query_term_limit_exceeded",
+            Self::RetrievalTermLimitExceeded { .. } => "retrieval_term_limit_exceeded",
+            Self::CandidateFieldByteLimitExceeded { .. } => "candidate_field_byte_limit_exceeded",
+            Self::CandidateTotalByteLimitExceeded { .. } => "candidate_total_byte_limit_exceeded",
+            Self::CandidateInputLimitExceeded { .. } => "candidate_input_limit_exceeded",
+            Self::CandidateEvidenceLimitExceeded { .. } => "candidate_evidence_limit_exceeded",
+            Self::InvalidRetrievalEvidence { .. } => "invalid_retrieval_evidence",
+            Self::DuplicateCandidateKey { .. } => "duplicate_candidate_key",
+            Self::Unknown { code, .. } => code,
+        }
+    }
+
+    pub const fn severity(&self) -> SearchDiagnosticSeverity {
+        if let Self::Unknown { severity, .. } = self {
+            return *severity;
+        }
+        if self.blocks_execution() {
+            SearchDiagnosticSeverity::Error
+        } else {
+            SearchDiagnosticSeverity::Warning
+        }
+    }
+
+    pub const fn blocks_execution(&self) -> bool {
+        if let Self::Unknown {
+            blocks_execution, ..
+        } = self
+        {
+            return *blocks_execution;
+        }
+        !matches!(
+            self,
+            Self::CandidateLimitExceeded { .. }
+                | Self::CandidateFieldByteLimitExceeded { .. }
+                | Self::CandidateTotalByteLimitExceeded { .. }
+                | Self::CandidateInputLimitExceeded { .. }
+                | Self::CandidateEvidenceLimitExceeded { .. }
+                | Self::InvalidRetrievalEvidence { .. }
+                | Self::DuplicateCandidateKey { .. }
+        )
+    }
+
+    pub const fn may_hide_matches(&self) -> bool {
+        matches!(
+            self,
+            Self::CandidateLimitExceeded { .. }
+                | Self::CandidateFieldByteLimitExceeded { .. }
+                | Self::CandidateTotalByteLimitExceeded { .. }
+                | Self::CandidateInputLimitExceeded { .. }
+                | Self::CandidateEvidenceLimitExceeded { .. }
+                | Self::InvalidRetrievalEvidence { .. }
+                | Self::Unknown { .. }
+        )
+    }
+
+    fn version(&self) -> u16 {
+        match self {
+            Self::Unknown {
+                contract_version, ..
+            } => *contract_version,
+            _ => Self::WIRE_VERSION,
+        }
+    }
+
+    fn details(&self) -> serde_json::Value {
+        match self {
+            Self::EmptyQuery => serde_json::json!({}),
+            Self::UnterminatedQuote { byte_offset } | Self::EmptyQuotedTerm { byte_offset } => {
+                serde_json::json!({ "byte_offset": byte_offset })
+            }
+            Self::MissingFilterValue { field } | Self::DuplicateFilter { field } => {
+                serde_json::json!({ "field": field })
+            }
+            Self::UnsupportedTypeFilter { value } => serde_json::json!({ "value": value }),
+            Self::CandidateLimitExceeded {
+                stage,
+                provided,
+                limit,
+            } => serde_json::json!({
+                "stage": stage,
+                "provided": provided,
+                "limit": limit,
+            }),
+            Self::QueryByteLimitExceeded { actual, limit }
+            | Self::QueryTermLimitExceeded { actual, limit }
+            | Self::RetrievalTermLimitExceeded { actual, limit }
+            | Self::CandidateEvidenceLimitExceeded { actual, limit } => {
+                serde_json::json!({ "actual": actual, "limit": limit })
+            }
+            Self::CandidateFieldByteLimitExceeded {
+                field,
+                actual,
+                limit,
+            } => serde_json::json!({
+                "field": field,
+                "actual": actual,
+                "limit": limit,
+            }),
+            Self::CandidateTotalByteLimitExceeded { consumed, limit } => {
+                serde_json::json!({ "consumed": consumed, "limit": limit })
+            }
+            Self::CandidateInputLimitExceeded { limit } => {
+                serde_json::json!({ "limit": limit })
+            }
+            Self::InvalidRetrievalEvidence { term_index } => {
+                serde_json::json!({ "term_index": term_index })
+            }
+            Self::DuplicateCandidateKey { stable_key } => {
+                serde_json::json!({ "stable_key": stable_key })
+            }
+            Self::Unknown { details, .. } => details.clone(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SearchDiagnosticWire {
+    #[serde(alias = "version")]
+    contract_version: u16,
+    code: String,
+    severity: SearchDiagnosticSeverity,
+    blocks_execution: bool,
+    #[serde(default)]
+    details: serde_json::Value,
+}
+
+impl Serialize for SearchDiagnostic {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        SearchDiagnosticWire {
+            contract_version: self.version(),
+            code: self.code().to_string(),
+            severity: self.severity(),
+            blocks_execution: self.blocks_execution(),
+            details: self.details(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SearchDiagnostic {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SearchDiagnosticWire::deserialize(deserializer)?;
+        if wire.contract_version != Self::WIRE_VERSION {
+            return Ok(Self::Unknown {
+                contract_version: wire.contract_version,
+                code: wire.code,
+                severity: wire.severity,
+                blocks_execution: wire.blocks_execution,
+                details: wire.details,
+            });
+        }
+
+        let diagnostic = match wire.code.as_str() {
+            "empty_query" => Self::EmptyQuery,
+            "unterminated_quote" => Self::UnterminatedQuote {
+                byte_offset: diagnostic_detail(&wire.details, "byte_offset")?,
+            },
+            "empty_quoted_term" => Self::EmptyQuotedTerm {
+                byte_offset: diagnostic_detail(&wire.details, "byte_offset")?,
+            },
+            "missing_filter_value" => Self::MissingFilterValue {
+                field: diagnostic_detail(&wire.details, "field")?,
+            },
+            "duplicate_filter" => Self::DuplicateFilter {
+                field: diagnostic_detail(&wire.details, "field")?,
+            },
+            "unsupported_type_filter" => Self::UnsupportedTypeFilter {
+                value: diagnostic_detail(&wire.details, "value")?,
+            },
+            "candidate_limit_exceeded" => Self::CandidateLimitExceeded {
+                stage: diagnostic_detail(&wire.details, "stage")?,
+                provided: diagnostic_detail(&wire.details, "provided")?,
+                limit: diagnostic_detail(&wire.details, "limit")?,
+            },
+            "query_byte_limit_exceeded" => Self::QueryByteLimitExceeded {
+                actual: diagnostic_detail(&wire.details, "actual")?,
+                limit: diagnostic_detail(&wire.details, "limit")?,
+            },
+            "query_term_limit_exceeded" => Self::QueryTermLimitExceeded {
+                actual: diagnostic_detail(&wire.details, "actual")?,
+                limit: diagnostic_detail(&wire.details, "limit")?,
+            },
+            "retrieval_term_limit_exceeded" => Self::RetrievalTermLimitExceeded {
+                actual: diagnostic_detail(&wire.details, "actual")?,
+                limit: diagnostic_detail(&wire.details, "limit")?,
+            },
+            "candidate_field_byte_limit_exceeded" => Self::CandidateFieldByteLimitExceeded {
+                field: diagnostic_detail(&wire.details, "field")?,
+                actual: diagnostic_detail(&wire.details, "actual")?,
+                limit: diagnostic_detail(&wire.details, "limit")?,
+            },
+            "candidate_total_byte_limit_exceeded" => Self::CandidateTotalByteLimitExceeded {
+                consumed: diagnostic_detail(&wire.details, "consumed")?,
+                limit: diagnostic_detail(&wire.details, "limit")?,
+            },
+            "candidate_input_limit_exceeded" => Self::CandidateInputLimitExceeded {
+                limit: diagnostic_detail(&wire.details, "limit")?,
+            },
+            "candidate_evidence_limit_exceeded" => Self::CandidateEvidenceLimitExceeded {
+                actual: diagnostic_detail(&wire.details, "actual")?,
+                limit: diagnostic_detail(&wire.details, "limit")?,
+            },
+            "invalid_retrieval_evidence" => Self::InvalidRetrievalEvidence {
+                term_index: diagnostic_detail(&wire.details, "term_index")?,
+            },
+            "duplicate_candidate_key" => Self::DuplicateCandidateKey {
+                stable_key: diagnostic_detail(&wire.details, "stable_key")?,
+            },
+            _ => {
+                return Ok(Self::Unknown {
+                    contract_version: wire.contract_version,
+                    code: wire.code,
+                    severity: wire.severity,
+                    blocks_execution: wire.blocks_execution,
+                    details: wire.details,
+                });
+            }
+        };
+
+        if diagnostic.severity() != wire.severity
+            || diagnostic.blocks_execution() != wire.blocks_execution
+        {
+            return Err(D::Error::custom(format!(
+                "diagnostic `{}` has inconsistent severity or blocking semantics",
+                diagnostic.code()
+            )));
+        }
+        Ok(diagnostic)
+    }
+}
+
+fn diagnostic_detail<T, E>(details: &serde_json::Value, field: &str) -> Result<T, E>
+where
+    T: DeserializeOwned,
+    E: serde::de::Error,
+{
+    let value = details
+        .get(field)
+        .cloned()
+        .ok_or_else(|| E::custom(format!("diagnostic details are missing `{field}`")))?;
+    serde_json::from_value(value).map_err(E::custom)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchRequest {
+    pub query: String,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalTerm {
+    pub term_index: usize,
+    pub text: String,
+    pub fuzzy_distance: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalStage {
+    Strict,
+    FuzzyFallback,
+}
+
+impl RetrievalStage {
+    fn ranking_priority(self) -> u8 {
+        match self {
+            Self::Strict => 0,
+            Self::FuzzyFallback => 1,
+        }
+    }
+}
+
+impl SearchRequest {
+    pub fn new(query: impl Into<String>, limit: usize) -> Self {
+        Self {
+            query: query.into(),
+            limit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FuzzyFallbackPolicy {
+    pub minimum_confident_matches: usize,
+    pub minimum_confident_kind: MatchKind,
+    pub minimum_query_chars: usize,
+    pub maximum_query_chars: usize,
+    pub maximum_edit_distance: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchLimits {
+    pub max_query_bytes: usize,
+    pub max_query_terms: usize,
+    pub max_retrieval_terms: usize,
+    pub max_candidate_inputs: usize,
+    pub max_stable_key_bytes: usize,
+    pub max_name_bytes: usize,
+    pub max_path_bytes: usize,
+    pub max_kind_bytes: usize,
+    pub max_guid_bytes: usize,
+    pub max_container_source_path_bytes: usize,
+    pub max_evidence_items: usize,
+    pub max_total_candidate_bytes: usize,
+}
+
+impl Default for SearchLimits {
+    fn default() -> Self {
+        Self {
+            max_query_bytes: 4 * 1024,
+            max_query_terms: 128,
+            max_retrieval_terms: 256,
+            max_candidate_inputs: ABSOLUTE_MAX_CANDIDATES,
+            max_stable_key_bytes: 4 * 1024,
+            max_name_bytes: 16 * 1024,
+            max_path_bytes: 32 * 1024,
+            max_kind_bytes: 1024,
+            max_guid_bytes: 128,
+            max_container_source_path_bytes: 32 * 1024,
+            max_evidence_items: 256,
+            max_total_candidate_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+
+impl SearchLimits {
+    pub fn validate_field_bytes(
+        self,
+        field: CandidateField,
+        actual: usize,
+    ) -> Result<(), SearchDiagnostic> {
+        let limit = match field {
+            CandidateField::StableKey => self.max_stable_key_bytes,
+            CandidateField::Name => self.max_name_bytes,
+            CandidateField::Path => self.max_path_bytes,
+            CandidateField::Kind => self.max_kind_bytes,
+            CandidateField::Guid => self.max_guid_bytes,
+            CandidateField::ContainerSourcePath => self.max_container_source_path_bytes,
+        };
+        if actual > limit {
+            return Err(SearchDiagnostic::CandidateFieldByteLimitExceeded {
+                field,
+                actual,
+                limit,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn measure_candidate(
+        self,
+        stable_key: &str,
+        name: &str,
+        path: &str,
+        kind: &str,
+        evidence_items: usize,
+    ) -> Result<usize, SearchDiagnostic> {
+        for (field, actual) in [
+            (CandidateField::StableKey, stable_key.len()),
+            (CandidateField::Name, name.len()),
+            (CandidateField::Path, path.len()),
+            (CandidateField::Kind, kind.len()),
+        ] {
+            self.validate_field_bytes(field, actual)?;
+        }
+        if evidence_items > self.max_evidence_items {
+            return Err(SearchDiagnostic::CandidateEvidenceLimitExceeded {
+                actual: evidence_items,
+                limit: self.max_evidence_items,
+            });
+        }
+
+        stable_key
+            .len()
+            .checked_add(name.len())
+            .and_then(|size| size.checked_add(path.len()))
+            .and_then(|size| size.checked_add(kind.len()))
+            .and_then(|size| {
+                size.checked_add(
+                    evidence_items.saturating_mul(std::mem::size_of::<RetrievalEvidence>()),
+                )
+            })
+            .ok_or(SearchDiagnostic::CandidateTotalByteLimitExceeded {
+                consumed: usize::MAX,
+                limit: self.max_total_candidate_bytes,
+            })
+    }
+}
+
+impl Default for FuzzyFallbackPolicy {
+    fn default() -> Self {
+        Self {
+            minimum_confident_matches: 1,
+            minimum_confident_kind: MatchKind::Abbreviation,
+            minimum_query_chars: 3,
+            maximum_query_chars: 64,
+            maximum_edit_distance: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchPolicy {
+    pub max_candidates: usize,
+    pub candidate_multiplier: usize,
+    pub filtered_candidate_multiplier: usize,
+    pub fuzzy_fallback: FuzzyFallbackPolicy,
+    pub limits: SearchLimits,
+}
+
+impl Default for SearchPolicy {
+    fn default() -> Self {
+        Self {
+            max_candidates: 200,
+            candidate_multiplier: 5,
+            filtered_candidate_multiplier: 30,
+            fuzzy_fallback: FuzzyFallbackPolicy::default(),
+            limits: SearchLimits::default(),
+        }
+    }
+}
+
+impl SearchPolicy {
+    pub fn prepare(self, request: SearchRequest) -> PreparedSearch {
+        let mut query = if request.query.len() > self.limits.max_query_bytes {
+            QuerySpec {
+                raw: String::new(),
+                type_filter: None,
+                path_prefix: None,
+                terms: Vec::new(),
+                diagnostics: vec![SearchDiagnostic::QueryByteLimitExceeded {
+                    actual: request.query.len(),
+                    limit: self.limits.max_query_bytes,
+                }],
+            }
+        } else {
+            parse_query(&request.query)
+        };
+        if query.terms.len() > self.limits.max_query_terms {
+            query
+                .diagnostics
+                .push(SearchDiagnostic::QueryTermLimitExceeded {
+                    actual: query.terms.len(),
+                    limit: self.limits.max_query_terms,
+                });
+        }
+        let retrieval_term_count = query.terms.iter().fold(0usize, |count, term| {
+            count.saturating_add(to_terms(&term.text).split_whitespace().count())
+        });
+        if retrieval_term_count > self.limits.max_retrieval_terms {
+            query
+                .diagnostics
+                .push(SearchDiagnostic::RetrievalTermLimitExceeded {
+                    actual: retrieval_term_count,
+                    limit: self.limits.max_retrieval_terms,
+                });
+        }
+        PreparedSearch {
+            policy: self,
+            request,
+            query,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreparedSearch {
+    policy: SearchPolicy,
+    request: SearchRequest,
+    query: QuerySpec,
+}
+
+impl PreparedSearch {
+    pub fn query(&self) -> &QuerySpec {
+        &self.query
+    }
+
+    pub fn candidate_limit(&self) -> usize {
+        if self.request.limit == 0 || self.query.has_blocking_diagnostic() {
+            return 0;
+        }
+
+        let multiplier = if self.query.has_filters() {
+            self.policy.filtered_candidate_multiplier
+        } else {
+            self.policy.candidate_multiplier
+        };
+        self.request
+            .limit
+            .saturating_mul(multiplier)
+            .min(self.policy.max_candidates)
+            .min(ABSOLUTE_MAX_CANDIDATES)
+    }
+
+    pub fn retrieval_terms(&self, stage: RetrievalStage) -> Vec<RetrievalTerm> {
+        if self.query.has_blocking_diagnostic() {
+            return Vec::new();
+        }
+        let mut retrieval_terms = Vec::new();
+        for (term_index, query_term) in self.query.terms.iter().enumerate() {
+            let normalized = to_terms(&query_term.text);
+            for term in normalized.split_whitespace() {
+                let char_count = term.chars().count();
+                let fuzzy_distance = (stage == RetrievalStage::FuzzyFallback
+                    && !query_term.quoted
+                    && char_count >= self.policy.fuzzy_fallback.minimum_query_chars
+                    && char_count <= self.policy.fuzzy_fallback.maximum_query_chars)
+                    .then(|| {
+                        self.policy
+                            .fuzzy_fallback
+                            .maximum_edit_distance
+                            .min(if char_count <= 7 { 1 } else { 2 })
+                            .min(u8::MAX as usize) as u8
+                    })
+                    .filter(|distance| *distance > 0);
+                retrieval_terms.push(RetrievalTerm {
+                    term_index,
+                    text: term.to_string(),
+                    fuzzy_distance,
+                });
+            }
+        }
+        retrieval_terms
+    }
+
+    pub fn execute(&self, candidates: impl IntoIterator<Item = CandidateFacts>) -> SearchOutcome {
+        let mut diagnostics = self.query.diagnostics.clone();
+        if let Some(outcome) = self.empty_outcome(&diagnostics) {
+            return outcome;
+        }
+
+        let mut selection = CandidateSelection::new(self.candidate_limit());
+        selection.ingest(
+            candidates,
+            RetrievalStage::Strict,
+            &self.query,
+            self.policy.limits,
+            &mut diagnostics,
+        );
+        let strict = self.evaluate_strict(&selection);
+        self.finish_selection(selection, diagnostics, strict.fallback_used)
+    }
+
+    pub fn execute_with_fallback<S, F, O, E>(
+        &self,
+        strict_candidates: S,
+        retrieve_fallback: F,
+    ) -> Result<SearchOutcome, E>
+    where
+        S: IntoIterator<Item = CandidateFacts>,
+        F: FnOnce(&BTreeSet<String>) -> Result<O, E>,
+        O: IntoIterator<Item = CandidateFacts>,
+    {
+        let mut diagnostics = self.query.diagnostics.clone();
+        if let Some(outcome) = self.empty_outcome(&diagnostics) {
+            return Ok(outcome);
+        }
+
+        let mut selection = CandidateSelection::new(self.candidate_limit());
+        selection.ingest(
+            strict_candidates,
+            RetrievalStage::Strict,
+            &self.query,
+            self.policy.limits,
+            &mut diagnostics,
+        );
+        let strict = self.evaluate_strict(&selection);
+        if strict.fallback_used {
+            selection.ingest(
+                retrieve_fallback(&strict.matching_keys)?,
+                RetrievalStage::FuzzyFallback,
+                &self.query,
+                self.policy.limits,
+                &mut diagnostics,
+            );
+        }
+        Ok(self.finish_selection(selection, diagnostics, strict.fallback_used))
+    }
+
+    fn empty_outcome(&self, diagnostics: &[SearchDiagnostic]) -> Option<SearchOutcome> {
+        (self.query.has_blocking_diagnostic() || self.request.limit == 0).then(|| SearchOutcome {
+            query: self.query.clone(),
+            matches: Vec::new(),
+            diagnostics: diagnostics.to_vec(),
+            fallback_used: false,
+            match_count: MatchCount {
+                value: 0,
+                relation: if self.request.limit == 0 {
+                    MatchCountRelation::LowerBound
+                } else {
+                    MatchCountRelation::Exact
+                },
+            },
+            request_limit_truncated: false,
+            candidates_provided: 0,
+            candidates_eligible: 0,
+            candidates_considered: 0,
+        })
+    }
+
+    fn evaluate_strict(&self, selection: &CandidateSelection) -> StrictEvaluation {
+        let terms: Vec<_> = self
+            .query
+            .terms
+            .iter()
+            .map(PreparedQueryTerm::new)
+            .collect();
+        let mut matching_keys = BTreeSet::new();
+        let mut strict_kinds = Vec::new();
+        for candidate in selection.bounded_strict() {
+            if let Some(kind) =
+                rank_candidate_kind(&terms, candidate, &self.policy.fuzzy_fallback, false)
+            {
+                matching_keys.insert(candidate.stable_key.clone());
+                strict_kinds.push(kind);
+            }
+        }
+        StrictEvaluation {
+            fallback_used: should_use_fuzzy_fallback(
+                &self.query,
+                strict_kinds,
+                self.policy.fuzzy_fallback,
+            ),
+            matching_keys,
+        }
+    }
+
+    fn finish_selection(
+        &self,
+        selection: CandidateSelection,
+        mut diagnostics: Vec<SearchDiagnostic>,
+        fallback_used: bool,
+    ) -> SearchOutcome {
+        let selection = selection.finish(&mut diagnostics);
+        let active_candidates = selection
+            .strict
+            .iter()
+            .map(|candidate| (RetrievalStage::Strict, candidate))
+            .chain(
+                fallback_used
+                    .then_some(selection.fallback.iter())
+                    .into_iter()
+                    .flatten()
+                    .map(|candidate| (RetrievalStage::FuzzyFallback, candidate)),
+            );
+        let mut ranked = rank_candidates(
+            &self.query,
+            active_candidates,
+            &self.policy.fuzzy_fallback,
+            fallback_used,
+        );
+
+        ranked.sort_by(compare_ranked);
+        let mut seen = BTreeSet::new();
+        ranked.retain(|ranked| seen.insert(ranked.match_.stable_key.clone()));
+        let match_count = MatchCount {
+            value: ranked.len(),
+            relation: if diagnostics.iter().any(SearchDiagnostic::may_hide_matches) {
+                MatchCountRelation::LowerBound
+            } else {
+                MatchCountRelation::Exact
+            },
+        };
+        let request_limit_truncated = match_count.value > self.request.limit;
+        ranked.truncate(self.request.limit);
+        for (index, ranked) in ranked.iter_mut().enumerate() {
+            ranked.match_.rank = index + 1;
+            ranked.add_highlights(&self.query.terms);
+        }
+
+        SearchOutcome {
+            query: self.query.clone(),
+            matches: ranked.into_iter().map(|ranked| ranked.match_).collect(),
+            diagnostics,
+            fallback_used,
+            match_count,
+            request_limit_truncated,
+            candidates_provided: selection.provided,
+            candidates_eligible: selection.eligible,
+            candidates_considered: selection.strict.len()
+                + usize::from(fallback_used) * selection.fallback.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchCountRelation {
+    Exact,
+    LowerBound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchCount {
+    pub value: usize,
+    pub relation: MatchCountRelation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SearchOutcome {
+    pub query: QuerySpec,
+    pub matches: Vec<RankedMatch>,
+    pub diagnostics: Vec<SearchDiagnostic>,
+    pub fallback_used: bool,
+    pub match_count: MatchCount,
+    pub request_limit_truncated: bool,
+    pub candidates_provided: usize,
+    pub candidates_eligible: usize,
+    pub candidates_considered: usize,
+}
+
+impl SearchOutcome {
+    pub fn extend_diagnostics(&mut self, diagnostics: impl IntoIterator<Item = SearchDiagnostic>) {
+        let mut may_hide_matches = false;
+        self.diagnostics
+            .extend(diagnostics.into_iter().inspect(|diagnostic| {
+                may_hide_matches |= diagnostic.may_hide_matches();
+            }));
+        if may_hide_matches {
+            self.match_count.relation = MatchCountRelation::LowerBound;
+        }
+    }
 }
 
 pub fn normalize_for_match(input: &str) -> String {
@@ -39,96 +1115,187 @@ pub fn normalize_for_match(input: &str) -> String {
 }
 
 pub fn parse_query(input: &str) -> QuerySpec {
-    let raw = input.to_string();
+    let (lexemes, mut diagnostics) = lex_query(input);
     let mut type_filter = None;
     let mut path_prefix = None;
+    let mut terms = Vec::new();
 
-    let mut tokens = Vec::new();
-    let mut quoted = Vec::new();
-
-    let mut buf = String::new();
-    let mut in_quotes = false;
-    let mut token_was_quoted = false;
-
-    for ch in input.chars() {
-        if ch == '"' {
-            in_quotes = !in_quotes;
-            if in_quotes {
-                token_was_quoted = true;
+    for lexeme in lexemes {
+        let field = (!lexeme.whole_quoted)
+            .then(|| lexeme.text.split_once(':'))
+            .flatten()
+            .map(|(field, value)| (field.to_ascii_lowercase(), value));
+        match field {
+            Some((field, value)) if field == "t" || field == "type" => {
+                if value.trim().is_empty() {
+                    diagnostics.push(SearchDiagnostic::MissingFilterValue {
+                        field: "type".to_string(),
+                    });
+                } else if type_filter.is_some() {
+                    diagnostics.push(SearchDiagnostic::DuplicateFilter {
+                        field: "type".to_string(),
+                    });
+                } else if let Some(canonical) = canonicalize_type_filter(value) {
+                    type_filter = Some(canonical);
+                } else {
+                    diagnostics.push(SearchDiagnostic::UnsupportedTypeFilter {
+                        value: value.trim().to_string(),
+                    });
+                }
             }
-            continue;
-        }
-
-        if ch.is_whitespace() && !in_quotes {
-            if !buf.is_empty() {
-                tokens.push(buf.clone());
-                quoted.push(token_was_quoted);
-                buf.clear();
-                token_was_quoted = false;
+            Some((field, value)) if field == "in" => {
+                if value.trim().is_empty() {
+                    diagnostics.push(SearchDiagnostic::MissingFilterValue {
+                        field: "in".to_string(),
+                    });
+                } else if path_prefix.is_some() {
+                    diagnostics.push(SearchDiagnostic::DuplicateFilter {
+                        field: "in".to_string(),
+                    });
+                } else {
+                    path_prefix = Some(value.trim().to_string());
+                }
             }
-            continue;
-        }
-
-        buf.push(ch);
-    }
-    if !buf.is_empty() {
-        tokens.push(buf);
-        quoted.push(token_was_quoted);
-    }
-
-    let mut free_tokens = Vec::new();
-    let mut highlight_tokens = Vec::new();
-
-    for (token, was_quoted) in tokens.into_iter().zip(quoted.into_iter()) {
-        if let Some(value) = token
-            .strip_prefix("t:")
-            .or_else(|| token.strip_prefix("type:"))
-        {
-            let value = value.trim().trim_matches('"').to_string();
-            if !value.is_empty() {
-                type_filter = Some(value);
-            }
-            continue;
-        }
-        if let Some(value) = token.strip_prefix("in:") {
-            let value = value.trim().trim_matches('"').to_string();
-            if !value.is_empty() {
-                path_prefix = Some(value);
-            }
-            continue;
-        }
-
-        if was_quoted {
-            free_tokens.push(format!("\"{token}\""));
-        } else {
-            free_tokens.push(token.clone());
-        }
-
-        if !token.is_empty() {
-            highlight_tokens.push(token);
+            _ => terms.push(QueryTerm {
+                text: lexeme.text,
+                quoted: lexeme.whole_quoted,
+            }),
         }
     }
 
-    let free_text = free_tokens.join(" ").trim().to_string();
+    if input.trim().is_empty() {
+        diagnostics.push(SearchDiagnostic::EmptyQuery);
+    }
 
     QuerySpec {
-        raw,
-        free_text,
+        raw: input.to_string(),
         type_filter,
         path_prefix,
-        tokens: highlight_tokens,
+        terms,
+        diagnostics,
     }
 }
 
+#[derive(Debug)]
+struct Lexeme {
+    text: String,
+    whole_quoted: bool,
+}
+
+fn lex_query(input: &str) -> (Vec<Lexeme>, Vec<SearchDiagnostic>) {
+    let mut lexemes = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut chars = input.char_indices().peekable();
+
+    while let Some((_, ch)) = chars.peek().copied() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        chars.next();
+    }
+
+    while chars.peek().is_some() {
+        let mut text = String::new();
+        let mut saw_quote = false;
+        let mut saw_unquoted_text = false;
+        let mut quote_start = None;
+
+        while let Some((offset, ch)) = chars.peek().copied() {
+            if ch.is_whitespace() && quote_start.is_none() {
+                break;
+            }
+            chars.next();
+            if ch == '"' {
+                saw_quote = true;
+                if let Some(start) = quote_start.take() {
+                    if text.is_empty() {
+                        diagnostics.push(SearchDiagnostic::EmptyQuotedTerm { byte_offset: start });
+                    }
+                } else {
+                    quote_start = Some(offset);
+                }
+                continue;
+            }
+            saw_unquoted_text |= quote_start.is_none();
+            text.push(ch);
+        }
+
+        if let Some(byte_offset) = quote_start {
+            diagnostics.push(SearchDiagnostic::UnterminatedQuote { byte_offset });
+        }
+        if !text.is_empty() || saw_quote {
+            lexemes.push(Lexeme {
+                text,
+                whole_quoted: saw_quote && !saw_unquoted_text,
+            });
+        }
+
+        while let Some((_, ch)) = chars.peek().copied() {
+            if !ch.is_whitespace() {
+                break;
+            }
+            chars.next();
+        }
+    }
+
+    (lexemes, diagnostics)
+}
+
+fn canonicalize_type_filter(raw: &str) -> Option<String> {
+    let normalized = normalize_for_match(raw.trim());
+    let canonical = match normalized.as_str() {
+        "prefab" => "Prefab",
+        "scene" => "Scene",
+        "material" | "mat" => "Material",
+        "script" | "cs" => "Script",
+        "animation" | "animationclip" | "anim" => "AnimationClip",
+        "animator" | "animatorcontroller" | "controller" => "AnimatorController",
+        "asset" => "Asset",
+        "shader" => "Shader",
+        "texture" | "tex" => "Texture",
+        "audio" => "Audio",
+        "bundlecontainer" | "container" | "bundle-container" => "BundleContainer",
+        "file" => "File",
+        _ => return None,
+    };
+    Some(canonical.to_string())
+}
+
 pub fn to_terms(input: &str) -> String {
+    let normalized: Vec<char> = input.nfkc().collect();
     let mut out = String::with_capacity(input.len());
+    let mut previous: Option<char> = None;
 
-    let mut prev_is_boundary = true;
-    let mut prev_is_lower = false;
-    let mut prev_is_digit = false;
+    for (index, ch) in normalized.iter().copied().enumerate() {
+        if is_term_separator(ch) {
+            push_term_boundary(&mut out);
+            previous = None;
+            continue;
+        }
 
-    for ch in input.nfkc() {
-        let is_sep = matches!(
+        let next = normalized.get(index + 1).copied();
+        if let Some(previous) = previous {
+            let camel_boundary = ch.is_uppercase()
+                && (previous.is_lowercase()
+                    || (previous.is_uppercase() && next.is_some_and(|next| next.is_lowercase())));
+            let digit_boundary = ch.is_numeric() != previous.is_numeric();
+            if camel_boundary || digit_boundary {
+                push_term_boundary(&mut out);
+            }
+        }
+
+        for lower in ch.to_lowercase() {
+            out.push(lower);
+        }
+        previous = Some(ch);
+    }
+
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_term_separator(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
             ch,
             '/' | '\\'
                 | '.'
@@ -145,203 +1312,858 @@ pub fn to_terms(input: &str) -> String {
                 | '}'
                 | '"'
                 | '\''
-        );
-        let is_boundary = is_sep || ch.is_whitespace();
+        )
+}
 
-        if is_boundary {
-            if !prev_is_boundary {
-                out.push(' ');
+fn push_term_boundary(out: &mut String) {
+    if !out.is_empty() && !out.ends_with(' ') {
+        out.push(' ');
+    }
+}
+
+fn compare_candidate_priority(left: &CandidateFacts, right: &CandidateFacts) -> Ordering {
+    right
+        .retrieval_score
+        .cmp(&left.retrieval_score)
+        .then_with(|| left.stable_key.cmp(&right.stable_key))
+        .then_with(|| left.path.cmp(&right.path))
+        .then_with(|| left.name.cmp(&right.name))
+        .then_with(|| left.kind.cmp(&right.kind))
+}
+
+fn merge_duplicate_candidate(existing: &mut CandidateFacts, mut incoming: CandidateFacts) {
+    let incoming_is_preferred = compare_candidate_priority(&incoming, existing).is_lt();
+    let mut evidence = std::mem::take(&mut existing.evidence);
+    evidence.append(&mut incoming.evidence);
+    evidence.sort_by(|left, right| {
+        left.term_index
+            .cmp(&right.term_index)
+            .then_with(|| left.kind.ranking_cmp(right.kind))
+            .then_with(|| right.field.boost().cmp(&left.field.boost()))
+    });
+    evidence.dedup();
+
+    if incoming_is_preferred {
+        incoming.evidence = evidence;
+        *existing = incoming;
+    } else {
+        existing.evidence = evidence;
+    }
+}
+
+#[derive(Debug)]
+struct StrictEvaluation {
+    fallback_used: bool,
+    matching_keys: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct CandidateSelection {
+    limit: usize,
+    strict: BTreeMap<String, CandidateFacts>,
+    fallback: BTreeMap<String, CandidateFacts>,
+    duplicate_keys: BTreeSet<String>,
+    provided: usize,
+    eligible: usize,
+    total_bytes: usize,
+    input_limit_reported: bool,
+    byte_budget_exhausted: bool,
+}
+
+impl CandidateSelection {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            strict: BTreeMap::new(),
+            fallback: BTreeMap::new(),
+            duplicate_keys: BTreeSet::new(),
+            provided: 0,
+            eligible: 0,
+            total_bytes: 0,
+            input_limit_reported: false,
+            byte_budget_exhausted: false,
+        }
+    }
+
+    fn bounded_strict(&self) -> Vec<&CandidateFacts> {
+        let mut candidates: Vec<_> = self.strict.values().collect();
+        candidates.sort_by(|left, right| compare_candidate_priority(left, right));
+        candidates.truncate(self.limit);
+        candidates
+    }
+
+    fn ingest(
+        &mut self,
+        candidates: impl IntoIterator<Item = CandidateFacts>,
+        stage: RetrievalStage,
+        query: &QuerySpec,
+        limits: SearchLimits,
+        diagnostics: &mut Vec<SearchDiagnostic>,
+    ) {
+        if self.byte_budget_exhausted {
+            return;
+        }
+        let mut candidates = candidates.into_iter();
+        while self.provided < limits.max_candidate_inputs {
+            let Some(candidate) = candidates.next() else {
+                break;
+            };
+            self.provided = self.provided.saturating_add(1);
+            let candidate_bytes = match candidate_size(&candidate, limits) {
+                Ok(size) => size,
+                Err(diagnostic) => {
+                    diagnostics.push(diagnostic);
+                    continue;
+                }
+            };
+            let Some(next_total) = self.total_bytes.checked_add(candidate_bytes) else {
+                diagnostics.push(SearchDiagnostic::CandidateTotalByteLimitExceeded {
+                    consumed: usize::MAX,
+                    limit: limits.max_total_candidate_bytes,
+                });
+                self.byte_budget_exhausted = true;
+                break;
+            };
+            if next_total > limits.max_total_candidate_bytes {
+                diagnostics.push(SearchDiagnostic::CandidateTotalByteLimitExceeded {
+                    consumed: next_total,
+                    limit: limits.max_total_candidate_bytes,
+                });
+                self.byte_budget_exhausted = true;
+                break;
             }
-            prev_is_boundary = true;
-            prev_is_lower = false;
-            prev_is_digit = false;
-            continue;
+            self.total_bytes = next_total;
+
+            if candidate.evidence.iter().any(|evidence| {
+                evidence.term_index >= query.terms.len()
+                    || evidence.field != MatchField::Content
+                    || matches!(evidence.kind, MatchKind::None)
+            }) {
+                let term_index = candidate
+                    .evidence
+                    .iter()
+                    .find(|evidence| evidence.term_index >= query.terms.len())
+                    .map_or(usize::MAX, |evidence| evidence.term_index);
+                diagnostics.push(SearchDiagnostic::InvalidRetrievalEvidence { term_index });
+                continue;
+            }
+            if !candidate_matches_filters(query, &candidate) {
+                continue;
+            }
+
+            let selected = match stage {
+                RetrievalStage::Strict => &mut self.strict,
+                RetrievalStage::FuzzyFallback => &mut self.fallback,
+            };
+            if let Some(existing) = selected.get_mut(&candidate.stable_key) {
+                self.duplicate_keys.insert(candidate.stable_key.clone());
+                merge_duplicate_candidate(existing, candidate);
+            } else {
+                self.eligible = self.eligible.saturating_add(1);
+                selected.insert(candidate.stable_key.clone(), candidate);
+            }
         }
 
-        let is_upper = ch.is_uppercase();
-        let is_lower = ch.is_lowercase();
-        let is_digit = ch.is_ascii_digit();
-
-        if !prev_is_boundary && is_upper && prev_is_lower {
-            out.push(' ');
+        if !self.input_limit_reported
+            && self.provided == limits.max_candidate_inputs
+            && candidates.next().is_some()
+        {
+            diagnostics.push(SearchDiagnostic::CandidateInputLimitExceeded {
+                limit: limits.max_candidate_inputs,
+            });
+            self.input_limit_reported = true;
         }
-        if !prev_is_boundary && is_digit && !prev_is_digit {
-            out.push(' ');
-        }
-
-        for lower in ch.to_lowercase() {
-            out.push(lower);
-        }
-        prev_is_boundary = false;
-        prev_is_lower = is_lower;
-        prev_is_digit = is_digit;
     }
 
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    fn finish(mut self, diagnostics: &mut Vec<SearchDiagnostic>) -> BoundedCandidates {
+        for stable_key in std::mem::take(&mut self.duplicate_keys) {
+            diagnostics.push(SearchDiagnostic::DuplicateCandidateKey { stable_key });
+        }
+        for (stage, stage_eligible) in [
+            (RetrievalStage::Strict, self.strict.len()),
+            (RetrievalStage::FuzzyFallback, self.fallback.len()),
+        ] {
+            if stage_eligible > self.limit {
+                diagnostics.push(SearchDiagnostic::CandidateLimitExceeded {
+                    stage,
+                    provided: stage_eligible,
+                    limit: self.limit,
+                });
+            }
+        }
+
+        BoundedCandidates {
+            strict: bound_candidates(self.strict, self.limit),
+            fallback: bound_candidates(self.fallback, self.limit),
+            provided: self.provided,
+            eligible: self.eligible,
+        }
+    }
 }
 
-pub fn rank_match(query: &str, name: &str, path: &str) -> RankedScore {
-    let query_norm = normalize_for_match(query).trim().to_string();
-    if query_norm.is_empty() {
-        return RankedScore {
-            kind: MatchKind::None,
-            fuzzy_score: 0,
-        };
+fn bound_candidates(
+    candidates: BTreeMap<String, CandidateFacts>,
+    limit: usize,
+) -> Vec<CandidateFacts> {
+    let mut candidates: Vec<_> = candidates.into_values().collect();
+    candidates.sort_by(compare_candidate_priority);
+    candidates.truncate(limit);
+    candidates
+}
+
+#[derive(Debug)]
+struct BoundedCandidates {
+    strict: Vec<CandidateFacts>,
+    fallback: Vec<CandidateFacts>,
+    provided: usize,
+    eligible: usize,
+}
+
+fn candidate_size(
+    candidate: &CandidateFacts,
+    limits: SearchLimits,
+) -> Result<usize, SearchDiagnostic> {
+    limits.measure_candidate(
+        &candidate.stable_key,
+        &candidate.name,
+        &candidate.path,
+        &candidate.kind,
+        candidate.evidence.len(),
+    )
+}
+
+#[derive(Debug)]
+struct PreparedQueryTerm<'a> {
+    source: &'a QueryTerm,
+    normalized: String,
+    tokenized: String,
+}
+
+impl<'a> PreparedQueryTerm<'a> {
+    fn new(source: &'a QueryTerm) -> Self {
+        Self {
+            source,
+            normalized: normalize_for_match(source.text.trim()),
+            tokenized: to_terms(&source.text),
+        }
     }
+}
 
-    let name_norm = normalize_for_match(name);
-    let path_norm = normalize_for_match(path);
+#[derive(Debug)]
+struct PreparedField<'a> {
+    source: &'a str,
+    normalized: String,
+    tokenized: String,
+    fuzzy_normalized: String,
+    fuzzy_tokenized: String,
+}
 
-    if query_norm == name_norm || query_norm == path_norm {
-        return RankedScore {
-            kind: MatchKind::Exact,
-            fuzzy_score: i64::MAX,
-        };
+impl<'a> PreparedField<'a> {
+    fn new(source: &'a str) -> Self {
+        let fuzzy_source = prefix_by_chars(source, MAX_FUZZY_FIELD_CHARS);
+        Self {
+            source,
+            normalized: normalize_for_match(source),
+            tokenized: to_terms(source),
+            fuzzy_normalized: normalize_for_match(fuzzy_source),
+            fuzzy_tokenized: to_terms(fuzzy_source),
+        }
     }
+}
 
-    if name_norm.starts_with(&query_norm) || path_norm.starts_with(&query_norm) {
-        return RankedScore {
-            kind: MatchKind::Prefix,
-            fuzzy_score: i64::MAX / 2,
-        };
+#[derive(Debug)]
+struct PreparedCandidate<'a> {
+    facts: &'a CandidateFacts,
+    name: PreparedField<'a>,
+    path: PreparedField<'a>,
+    kind: PreparedField<'a>,
+}
+
+impl<'a> PreparedCandidate<'a> {
+    fn new(facts: &'a CandidateFacts) -> Self {
+        Self {
+            facts,
+            name: PreparedField::new(&facts.name),
+            path: PreparedField::new(&facts.path),
+            kind: PreparedField::new(&facts.kind),
+        }
     }
+}
 
-    if name_norm.contains(&query_norm) || path_norm.contains(&query_norm) {
-        return RankedScore {
-            kind: MatchKind::Substring,
-            fuzzy_score: i64::MAX / 4,
-        };
+fn prefix_by_chars(text: &str, max_chars: usize) -> &str {
+    text.char_indices()
+        .nth(max_chars)
+        .map_or(text, |(end, _)| &text[..end])
+}
+
+#[derive(Debug)]
+struct InternalRankedMatch<'a> {
+    match_: RankedMatch,
+    normalized_path: String,
+    normalized_name: String,
+    source_path: &'a str,
+    source_name: &'a str,
+}
+
+impl InternalRankedMatch<'_> {
+    fn add_highlights(&mut self, query_terms: &[QueryTerm]) {
+        self.match_.highlight_path_ranges = highlight_ranges_for(self.source_path, query_terms);
+        self.match_.highlight_name_ranges = highlight_ranges_for(self.source_name, query_terms);
+        self.match_.highlight_path =
+            highlight_html_from_ranges(self.source_path, &self.match_.highlight_path_ranges);
+        self.match_.highlight_name =
+            highlight_html_from_ranges(self.source_name, &self.match_.highlight_name_ranges);
     }
+}
 
-    if is_abbreviation_match(&query_norm, name) || is_abbreviation_match(&query_norm, path) {
-        return RankedScore {
-            kind: MatchKind::Abbreviation,
-            fuzzy_score: i64::MAX / 8,
-        };
-    }
-
-    let matcher = SkimMatcherV2::default();
-    let fuzzy_score = matcher
-        .fuzzy_match(&name_norm, &query_norm)
+fn rank_candidates<'a>(
+    query: &QuerySpec,
+    candidates: impl IntoIterator<Item = (RetrievalStage, &'a CandidateFacts)>,
+    fallback: &FuzzyFallbackPolicy,
+    allow_fuzzy: bool,
+) -> Vec<InternalRankedMatch<'a>> {
+    let terms: Vec<_> = query.terms.iter().map(PreparedQueryTerm::new).collect();
+    candidates
         .into_iter()
-        .chain(matcher.fuzzy_match(&path_norm, &query_norm))
-        .max()
-        .unwrap_or(0);
-
-    RankedScore {
-        kind: if fuzzy_score > 0 {
-            MatchKind::Fuzzy
-        } else {
-            MatchKind::None
-        },
-        fuzzy_score,
-    }
-}
-
-pub fn highlight_html(text: &str, query_tokens: &[String]) -> Option<String> {
-    let ranges = highlight_ranges(text, query_tokens);
-    if ranges.is_empty() {
-        return None;
-    }
-    if !text.is_ascii()
-        || ranges
-            .iter()
-            .any(|r| !text.is_char_boundary(r.start) || !text.is_char_boundary(r.end))
-    {
-        return None;
-    }
-
-    let mut out = String::with_capacity(text.len() + ranges.len() * 9);
-    let mut cursor = 0usize;
-    for HighlightRange { start, end } in ranges {
-        if let Some(prefix) = text.get(cursor..start) {
-            out.push_str(prefix);
-        }
-        out.push_str("<em>");
-        if let Some(mid) = text.get(start..end) {
-            out.push_str(mid);
-        }
-        out.push_str("</em>");
-        cursor = end;
-    }
-    if let Some(rest) = text.get(cursor..) {
-        out.push_str(rest);
-    }
-    Some(out)
-}
-
-pub fn highlight_ranges(text: &str, query_tokens: &[String]) -> Vec<HighlightRange> {
-    let tokens: Vec<&str> = query_tokens
-        .iter()
-        .map(String::as_str)
-        .filter(|t| !t.is_empty())
-        .collect();
-    if tokens.is_empty() {
-        return Vec::new();
-    }
-    if !text.is_ascii() || tokens.iter().any(|t| !t.is_ascii()) {
-        return Vec::new();
-    }
-
-    let hay = text.as_bytes();
-    let hay_lower: Vec<u8> = hay.iter().map(|b| b.to_ascii_lowercase()).collect();
-
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for token in tokens {
-        let needle_lower: Vec<u8> = token
-            .as_bytes()
-            .iter()
-            .map(|b| b.to_ascii_lowercase())
-            .collect();
-        if needle_lower.is_empty() {
-            continue;
-        }
-
-        let Some((start, end)) = find_subslice(&hay_lower, &needle_lower) else {
-            continue;
-        };
-
-        if ranges.iter().any(|(s, e)| !(end <= *s || start >= *e)) {
-            continue;
-        }
-        ranges.push((start, end));
-    }
-
-    if ranges.is_empty() {
-        return Vec::new();
-    }
-    ranges.sort_by_key(|(s, _)| *s);
-
-    ranges
-        .into_iter()
-        .map(|(start, end)| HighlightRange { start, end })
+        .filter_map(|(stage, candidate)| {
+            rank_candidate(&terms, candidate, stage, fallback, allow_fuzzy)
+        })
         .collect()
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<(usize, usize)> {
-    if needle.is_empty() || needle.len() > haystack.len() {
+fn rank_candidate_kind(
+    terms: &[PreparedQueryTerm<'_>],
+    candidate: &CandidateFacts,
+    fallback: &FuzzyFallbackPolicy,
+    allow_fuzzy: bool,
+) -> Option<MatchKind> {
+    if terms.is_empty() {
+        return Some(MatchKind::None);
+    }
+    let candidate = PreparedCandidate::new(candidate);
+    let mut match_kind = MatchKind::Exact;
+    for (term_index, term) in terms.iter().enumerate() {
+        let term_match = best_term_match(term_index, term, &candidate, fallback, allow_fuzzy)?;
+        match_kind = match_kind.worse_of(term_match.kind);
+    }
+    Some(match_kind)
+}
+
+fn candidate_matches_filters(query: &QuerySpec, candidate: &CandidateFacts) -> bool {
+    if let Some(kind) = query.type_filter.as_deref()
+        && normalize_for_match(&candidate.kind) != normalize_for_match(kind)
+    {
+        return false;
+    }
+    if let Some(prefix) = query.path_prefix.as_deref()
+        && !normalize_for_match(&candidate.path).starts_with(&normalize_for_match(prefix))
+    {
+        return false;
+    }
+    true
+}
+
+fn rank_candidate<'a>(
+    terms: &[PreparedQueryTerm<'_>],
+    candidate: &'a CandidateFacts,
+    stage: RetrievalStage,
+    fallback: &FuzzyFallbackPolicy,
+    allow_fuzzy: bool,
+) -> Option<InternalRankedMatch<'a>> {
+    let candidate = PreparedCandidate::new(candidate);
+    let mut match_kind = MatchKind::Exact;
+    let mut field_boost = 0u32;
+    let mut fuzzy_score = 0i64;
+    let mut term_explanations = Vec::with_capacity(terms.len());
+    let mut used_fuzzy = false;
+
+    for (term_index, term) in terms.iter().enumerate() {
+        let term_match = best_term_match(term_index, term, &candidate, fallback, allow_fuzzy)?;
+        match_kind = match_kind.worse_of(term_match.kind);
+        field_boost = field_boost.saturating_add(term_match.field.boost());
+        fuzzy_score = fuzzy_score.saturating_add(term_match.fuzzy_score);
+        used_fuzzy |= term_match.kind == MatchKind::Fuzzy;
+        term_explanations.push(TermExplanation {
+            term: term.source.text.clone(),
+            quoted: term.source.quoted,
+            kind: term_match.kind,
+            field: term_match.field,
+        });
+    }
+
+    if terms.is_empty() {
+        match_kind = MatchKind::None;
+    }
+    let stable_key = candidate.facts.stable_key.clone();
+    let retrieval_score = candidate.facts.retrieval_score;
+    let source_path = candidate.path.source;
+    let source_name = candidate.name.source;
+    let normalized_path = candidate.path.normalized;
+    let normalized_name = candidate.name.normalized;
+
+    Some(InternalRankedMatch {
+        match_: RankedMatch {
+            rank: 0,
+            stable_key,
+            match_kind,
+            ranking_signals: RankingSignals {
+                field_boost,
+                fuzzy_score,
+                retrieval_stage: stage,
+                retrieval_score,
+            },
+            explanation: MatchExplanation {
+                terms: term_explanations,
+                fuzzy_fallback: used_fuzzy,
+            },
+            highlight_path_ranges: Vec::new(),
+            highlight_name_ranges: Vec::new(),
+            highlight_path: None,
+            highlight_name: None,
+        },
+        normalized_path,
+        normalized_name,
+        source_path,
+        source_name,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TermMatch {
+    kind: MatchKind,
+    field: MatchField,
+    fuzzy_score: i64,
+}
+
+fn best_term_match(
+    term_index: usize,
+    term: &PreparedQueryTerm<'_>,
+    candidate: &PreparedCandidate<'_>,
+    fallback: &FuzzyFallbackPolicy,
+    allow_fuzzy: bool,
+) -> Option<TermMatch> {
+    let name = match_term_in_field(
+        term,
+        &candidate.name,
+        MatchField::Name,
+        fallback,
+        allow_fuzzy,
+    );
+    let path = match_term_in_field(
+        term,
+        &candidate.path,
+        MatchField::Path,
+        fallback,
+        allow_fuzzy,
+    );
+    let kind = match_term_in_field(
+        term,
+        &candidate.kind,
+        MatchField::Kind,
+        fallback,
+        allow_fuzzy,
+    );
+    let evidence = candidate
+        .facts
+        .evidence
+        .iter()
+        .filter(|evidence| evidence.term_index == term_index)
+        .filter(|evidence| allow_fuzzy || evidence.kind != MatchKind::Fuzzy)
+        .map(|evidence| TermMatch {
+            kind: evidence.kind,
+            field: evidence.field,
+            fuzzy_score: 0,
+        })
+        .min_by(compare_term_match);
+
+    [name, path, kind, evidence]
+        .into_iter()
+        .flatten()
+        .min_by(compare_term_match)
+}
+
+fn compare_term_match(left: &TermMatch, right: &TermMatch) -> Ordering {
+    left.kind
+        .ranking_cmp(right.kind)
+        .then_with(|| right.field.boost().cmp(&left.field.boost()))
+        .then_with(|| right.fuzzy_score.cmp(&left.fuzzy_score))
+}
+
+fn match_term_in_field(
+    term: &PreparedQueryTerm<'_>,
+    field_text: &PreparedField<'_>,
+    field: MatchField,
+    fallback: &FuzzyFallbackPolicy,
+    allow_fuzzy: bool,
+) -> Option<TermMatch> {
+    if let Some(kind) = strict_match_kind(term, field_text) {
+        return Some(TermMatch {
+            kind,
+            field,
+            fuzzy_score: 0,
+        });
+    }
+    if !allow_fuzzy || term.source.quoted {
         return None;
     }
-    for i in 0..=(haystack.len() - needle.len()) {
-        if haystack[i..i + needle.len()] == *needle {
-            return Some((i, i + needle.len()));
-        }
+
+    fuzzy_match_score(term, field_text, fallback).map(|fuzzy_score| TermMatch {
+        kind: MatchKind::Fuzzy,
+        field,
+        fuzzy_score,
+    })
+}
+
+fn strict_match_kind(
+    term: &PreparedQueryTerm<'_>,
+    field_text: &PreparedField<'_>,
+) -> Option<MatchKind> {
+    if term.source.quoted {
+        return classify_normalized_match(&term.tokenized, &field_text.tokenized, false);
+    }
+
+    let raw_match = classify_normalized_match(&term.normalized, &field_text.normalized, true);
+    let term_match = classify_normalized_match(&term.tokenized, &field_text.tokenized, true);
+    match (raw_match, term_match) {
+        (Some(left), Some(right)) => Some(if left.ranking_cmp(right).is_le() {
+            left
+        } else {
+            right
+        }),
+        (Some(kind), None) | (None, Some(kind)) => Some(kind),
+        (None, None) => None,
+    }
+}
+
+fn classify_normalized_match(
+    query: &str,
+    field: &str,
+    allow_abbreviation: bool,
+) -> Option<MatchKind> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    if query == field {
+        return Some(MatchKind::Exact);
+    }
+    if field.starts_with(query) {
+        return Some(MatchKind::Prefix);
+    }
+    if field.split_whitespace().any(|token| token == query) {
+        return Some(MatchKind::Token);
+    }
+    if field.contains(query) {
+        return Some(MatchKind::Substring);
+    }
+    if allow_abbreviation && is_abbreviation_match(query, field) {
+        return Some(MatchKind::Abbreviation);
     }
     None
 }
 
-fn is_abbreviation_match(query_norm: &str, text: &str) -> bool {
-    if query_norm.is_empty() {
+fn is_abbreviation_match(query: &str, text: &str) -> bool {
+    let query = query.split_whitespace().collect::<String>();
+    if query.is_empty() {
+        return false;
+    }
+    let initials = text
+        .split_whitespace()
+        .filter_map(|term| term.chars().next())
+        .collect::<String>();
+    initials.contains(&query)
+}
+
+fn should_use_fuzzy_fallback(
+    query: &QuerySpec,
+    strict_kinds: impl IntoIterator<Item = MatchKind>,
+    fallback: FuzzyFallbackPolicy,
+) -> bool {
+    if !query.terms.iter().any(|term| {
+        if term.quoted {
+            return false;
+        }
+        let chars = normalize_for_match(&term.text).chars().count();
+        chars >= fallback.minimum_query_chars && chars <= fallback.maximum_query_chars
+    }) {
         return false;
     }
 
-    let terms = to_terms(text);
-    let initials = terms
-        .split_whitespace()
-        .filter_map(|t| t.chars().next())
-        .collect::<String>();
+    let confident_matches = strict_kinds
+        .into_iter()
+        .filter(|kind| kind.meets(fallback.minimum_confident_kind))
+        .count();
+    confident_matches < fallback.minimum_confident_matches
+}
 
-    initials.contains(query_norm)
+fn fuzzy_match_score(
+    query: &PreparedQueryTerm<'_>,
+    field: &PreparedField<'_>,
+    fallback: &FuzzyFallbackPolicy,
+) -> Option<i64> {
+    let query_chars = query.normalized.chars().count();
+    if query_chars < fallback.minimum_query_chars || query_chars > fallback.maximum_query_chars {
+        return None;
+    }
+
+    let matcher_score = SkimMatcherV2::default()
+        .fuzzy_match(&field.fuzzy_normalized, &query.normalized)
+        .filter(|score| *score > 0);
+
+    let maximum_distance = fallback
+        .maximum_edit_distance
+        .min(if query_chars <= 7 { 1 } else { 2 });
+    let edit_score = field
+        .fuzzy_tokenized
+        .split_whitespace()
+        .filter_map(|token| {
+            edit_distance_with_limit(&query.normalized, token, maximum_distance).map(|distance| {
+                10_000i64
+                    .saturating_sub((distance as i64).saturating_mul(1_000))
+                    .saturating_sub(token.chars().count().abs_diff(query_chars) as i64)
+            })
+        })
+        .max();
+
+    matcher_score.into_iter().chain(edit_score).max()
+}
+
+fn edit_distance_with_limit(left: &str, right: &str, limit: usize) -> Option<usize> {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    if left.len().abs_diff(right.len()) > limit {
+        return None;
+    }
+
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0usize; right.len() + 1];
+    for (left_index, left_char) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        let mut row_minimum = current[0];
+        for (right_index, right_char) in right.iter().enumerate() {
+            let substitution = previous[right_index]
+                + usize::from(left_char.to_lowercase().ne(right_char.to_lowercase()));
+            current[right_index + 1] = substitution
+                .min(previous[right_index + 1] + 1)
+                .min(current[right_index] + 1);
+            row_minimum = row_minimum.min(current[right_index + 1]);
+        }
+        if row_minimum > limit {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    (previous[right.len()] <= limit).then_some(previous[right.len()])
+}
+
+fn compare_ranked(left: &InternalRankedMatch, right: &InternalRankedMatch) -> Ordering {
+    left.match_
+        .match_kind
+        .ranking_cmp(right.match_.match_kind)
+        .then_with(|| {
+            right
+                .match_
+                .ranking_signals
+                .field_boost
+                .cmp(&left.match_.ranking_signals.field_boost)
+        })
+        .then_with(|| {
+            right
+                .match_
+                .ranking_signals
+                .fuzzy_score
+                .cmp(&left.match_.ranking_signals.fuzzy_score)
+        })
+        .then_with(|| {
+            left.match_
+                .ranking_signals
+                .retrieval_stage
+                .ranking_priority()
+                .cmp(
+                    &right
+                        .match_
+                        .ranking_signals
+                        .retrieval_stage
+                        .ranking_priority(),
+                )
+        })
+        .then_with(|| {
+            if left.match_.ranking_signals.retrieval_stage
+                == right.match_.ranking_signals.retrieval_stage
+            {
+                right
+                    .match_
+                    .ranking_signals
+                    .retrieval_score
+                    .cmp(&left.match_.ranking_signals.retrieval_score)
+            } else {
+                Ordering::Equal
+            }
+        })
+        .then_with(|| left.normalized_path.cmp(&right.normalized_path))
+        .then_with(|| left.normalized_name.cmp(&right.normalized_name))
+        .then_with(|| left.match_.stable_key.cmp(&right.match_.stable_key))
+}
+
+pub fn highlight_html(text: &str, query_tokens: &[String]) -> Option<String> {
+    let ranges = highlight_ranges(text, query_tokens);
+    highlight_html_from_ranges(text, &ranges)
+}
+
+fn highlight_html_from_ranges(text: &str, ranges: &[HighlightRange]) -> Option<String> {
+    if ranges.is_empty() {
+        return None;
+    }
+
+    let mut out = String::with_capacity(text.len() + ranges.len().saturating_mul(9));
+    let mut cursor = 0usize;
+    for &HighlightRange { start, end } in ranges {
+        push_html_escaped(&mut out, text.get(cursor..start)?);
+        out.push_str("<em>");
+        push_html_escaped(&mut out, text.get(start..end)?);
+        out.push_str("</em>");
+        cursor = end;
+    }
+    push_html_escaped(&mut out, text.get(cursor..)?);
+    Some(out)
+}
+
+fn push_html_escaped(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+pub fn highlight_ranges(text: &str, query_tokens: &[String]) -> Vec<HighlightRange> {
+    highlight_ranges_for(text, query_tokens)
+}
+
+fn highlight_ranges_for<T: AsRef<str>>(text: &str, query_tokens: &[T]) -> Vec<HighlightRange> {
+    if text.len() > MAX_HIGHLIGHT_FIELD_BYTES
+        || query_tokens
+            .iter()
+            .try_fold(0usize, |total, token| {
+                total.checked_add(token.as_ref().len())
+            })
+            .is_none_or(|total| total > MAX_HIGHLIGHT_QUERY_BYTES)
+    {
+        return Vec::new();
+    }
+    let normalized = NormalizedText::new(text);
+    let mut ranges = Vec::new();
+
+    for token in query_tokens
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|token| !token.is_empty())
+    {
+        let needle = normalize_for_match(token);
+        if needle.is_empty() {
+            continue;
+        }
+        let Some(start) = normalized.text.find(&needle) else {
+            continue;
+        };
+        let end = start + needle.len();
+        let Some(range) = normalized.source_range(start, end) else {
+            continue;
+        };
+        if ranges.iter().any(|existing: &HighlightRange| {
+            range.end > existing.start && range.start < existing.end
+        }) {
+            continue;
+        }
+        ranges.push(range);
+    }
+
+    ranges.sort_by_key(|range| range.start);
+    ranges
+}
+
+#[derive(Debug)]
+struct NormalizedText {
+    text: String,
+    source_start: Vec<usize>,
+    source_end: Vec<usize>,
+}
+
+impl NormalizedText {
+    fn new(source: &str) -> Self {
+        let normalized_full = normalize_for_match(source);
+        let mut text = String::with_capacity(normalized_full.len());
+        let mut source_start = Vec::new();
+        let mut source_end = Vec::new();
+
+        let mut cluster_start = 0usize;
+        for (start, ch) in source.char_indices().skip(1) {
+            if canonical_combining_class(ch) == 0 {
+                push_normalized_cluster(
+                    source,
+                    cluster_start,
+                    start,
+                    &mut text,
+                    &mut source_start,
+                    &mut source_end,
+                );
+                cluster_start = start;
+            }
+        }
+        if !source.is_empty() {
+            push_normalized_cluster(
+                source,
+                cluster_start,
+                source.len(),
+                &mut text,
+                &mut source_start,
+                &mut source_end,
+            );
+        }
+
+        if text != normalized_full {
+            text = normalized_full;
+            source_start = vec![0; text.len()];
+            source_end = vec![source.len(); text.len()];
+        }
+
+        Self {
+            text,
+            source_start,
+            source_end,
+        }
+    }
+
+    fn source_range(&self, start: usize, end: usize) -> Option<HighlightRange> {
+        if start >= end || end > self.text.len() {
+            return None;
+        }
+        Some(HighlightRange {
+            start: *self.source_start.get(start)?,
+            end: *self.source_end.get(end - 1)?,
+        })
+    }
+}
+
+fn push_normalized_cluster(
+    source: &str,
+    start: usize,
+    end: usize,
+    normalized: &mut String,
+    source_start: &mut Vec<usize>,
+    source_end: &mut Vec<usize>,
+) {
+    let normalized_start = normalized.len();
+    normalized.extend(source[start..end].nfkc().flat_map(char::to_lowercase));
+    let normalized_len = normalized.len() - normalized_start;
+    source_start.extend(std::iter::repeat_n(start, normalized_len));
+    source_end.extend(std::iter::repeat_n(end, normalized_len));
 }
 
 #[cfg(test)]
@@ -349,36 +2171,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terms_split_paths() {
+    fn terms_split_paths_camel_case_and_digits() {
         assert_eq!(
-            to_terms("Assets/UI/MainMenu/Button.prefab"),
-            "assets ui main menu button prefab"
+            to_terms("Assets/UI/MainMenu/Button2D.prefab"),
+            "assets ui main menu button 2 d prefab"
         );
     }
 
     #[test]
-    fn ranking_prefers_prefix() {
-        let a = rank_match("but", "button", "assets/ui/button.prefab");
-        assert_eq!(a.kind, MatchKind::Prefix);
-    }
-
-    #[test]
     fn abbreviation_matches_camel_case_terms() {
-        let a = rank_match("mm", "MainMenu", "Assets/UI/MainMenu.prefab");
-        assert_eq!(a.kind, MatchKind::Abbreviation);
+        let outcome = SearchPolicy::default()
+            .prepare(SearchRequest::new("mm", 10))
+            .execute([CandidateFacts::new(
+                "main-menu",
+                "MainMenu",
+                "Assets/UI/MainMenu.prefab",
+                "Prefab",
+                1,
+            )]);
+        assert_eq!(outcome.matches[0].match_kind, MatchKind::Abbreviation);
     }
 
     #[test]
-    fn parse_query_extracts_filters() {
-        let q = parse_query("t:prefab in:\"Assets/UI\" \"Start Button\"");
-        assert_eq!(q.type_filter.as_deref(), Some("prefab"));
-        assert_eq!(q.path_prefix.as_deref(), Some("Assets/UI"));
-        assert_eq!(q.free_text, "\"Start Button\"");
+    fn parse_query_extracts_and_canonicalizes_filters() {
+        let query = parse_query("t:prefab in:\"Assets/UI\" \"Start Button\"");
+        assert_eq!(query.type_filter.as_deref(), Some("Prefab"));
+        assert_eq!(query.path_prefix.as_deref(), Some("Assets/UI"));
+        assert_eq!(query.terms.len(), 1);
+        assert_eq!(query.terms[0].text, "Start Button");
+        assert!(query.terms[0].quoted);
     }
 
     #[test]
     fn highlight_html_wraps_tokens() {
-        let out = highlight_html("Assets/UI/Button.prefab", &[String::from("ui")]).unwrap();
-        assert!(out.contains("<em>UI</em>") || out.contains("<em>ui</em>"));
+        let output = highlight_html("Assets/UI/Button.prefab", &[String::from("ui")]).unwrap();
+        assert!(output.contains("<em>UI</em>") || output.contains("<em>ui</em>"));
     }
 }

@@ -23,6 +23,8 @@ pub struct DigestV1Builder {
 }
 
 impl DigestV1Builder {
+    const FRAME_LENGTH_BYTES: u64 = 8;
+
     #[must_use]
     pub fn new(declared_length: u64) -> Self {
         Self {
@@ -32,18 +34,32 @@ impl DigestV1Builder {
         }
     }
 
+    /// Returns the encoded length of a byte slice framed by its little-endian `u64` length.
+    pub fn framed_len(bytes: &[u8]) -> Result<u64, DigestBuildError> {
+        let payload_length = Self::byte_len(bytes)?;
+        Self::FRAME_LENGTH_BYTES
+            .checked_add(payload_length)
+            .ok_or(DigestBuildError::LengthOverflow)
+    }
+
     pub fn update(&mut self, bytes: &[u8]) -> Result<(), DigestBuildError> {
-        let amount = u64::try_from(bytes.len()).map_err(|_| DigestBuildError::LengthOverflow)?;
-        let requested = self
-            .consumed_length
-            .checked_add(amount)
-            .ok_or(DigestBuildError::LengthOverflow)?;
-        if requested > self.declared_length {
-            return Err(DigestBuildError::DeclaredLengthExceeded {
-                declared: self.declared_length,
-                requested,
-            });
-        }
+        let requested = self.requested_length(Self::byte_len(bytes)?)?;
+        self.hasher.update(bytes);
+        self.consumed_length = requested;
+        Ok(())
+    }
+
+    /// Adds a byte slice after its little-endian `u64` length prefix.
+    ///
+    /// The complete frame is checked before the builder state changes.
+    pub fn update_framed(&mut self, bytes: &[u8]) -> Result<(), DigestBuildError> {
+        let payload_length = Self::byte_len(bytes)?;
+        let requested = self.requested_length(
+            Self::FRAME_LENGTH_BYTES
+                .checked_add(payload_length)
+                .ok_or(DigestBuildError::LengthOverflow)?,
+        )?;
+        self.hasher.update(&payload_length.to_le_bytes());
         self.hasher.update(bytes);
         self.consumed_length = requested;
         Ok(())
@@ -62,6 +78,24 @@ impl DigestV1Builder {
     #[must_use]
     pub const fn consumed_bytes(&self) -> u64 {
         self.consumed_length
+    }
+
+    fn byte_len(bytes: &[u8]) -> Result<u64, DigestBuildError> {
+        u64::try_from(bytes.len()).map_err(|_| DigestBuildError::LengthOverflow)
+    }
+
+    fn requested_length(&self, amount: u64) -> Result<u64, DigestBuildError> {
+        let requested = self
+            .consumed_length
+            .checked_add(amount)
+            .ok_or(DigestBuildError::LengthOverflow)?;
+        if requested > self.declared_length {
+            return Err(DigestBuildError::DeclaredLengthExceeded {
+                declared: self.declared_length,
+                requested,
+            });
+        }
+        Ok(requested)
     }
 }
 

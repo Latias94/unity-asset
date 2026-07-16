@@ -82,6 +82,41 @@ fn digest_builder_is_exact_and_failure_atomic() {
 }
 
 #[test]
+fn framed_digest_builder_is_unambiguous_and_failure_atomic() {
+    let first_components = [b"ab".as_slice(), b"c".as_slice()];
+    let second_components = [b"a".as_slice(), b"bc".as_slice()];
+
+    let hash_components = |components: &[&[u8]]| {
+        let declared_length = components
+            .iter()
+            .try_fold(0_u64, |total, component| {
+                total
+                    .checked_add(DigestV1Builder::framed_len(component)?)
+                    .ok_or(DigestBuildError::LengthOverflow)
+            })
+            .unwrap();
+        let mut builder = DigestV1Builder::new(declared_length);
+        for component in components {
+            builder.update_framed(component).unwrap();
+        }
+        builder.finalize().unwrap()
+    };
+
+    assert_ne!(
+        hash_components(&first_components),
+        hash_components(&second_components)
+    );
+
+    let framed_length = DigestV1Builder::framed_len(b"payload").unwrap();
+    let mut short = DigestV1Builder::new(framed_length - 1);
+    assert!(matches!(
+        short.update_framed(b"payload"),
+        Err(DigestBuildError::DeclaredLengthExceeded { .. })
+    ));
+    assert_eq!(short.consumed_bytes(), 0);
+}
+
+#[test]
 fn digest_parser_checks_fixed_length_before_hex_allocation() {
     let oversized = format!("blake3-v1:{}", "00".repeat(1_000_000));
     assert!(matches!(

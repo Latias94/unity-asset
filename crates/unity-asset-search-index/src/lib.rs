@@ -1,3 +1,5 @@
+use std::cmp::{Ordering as CmpOrdering, Reverse};
+use std::collections::BinaryHeap;
 use std::fs;
 use std::io;
 use std::io::Read as _;
@@ -7,31 +9,39 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
+use columnar::StrColumn;
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Collector, SegmentCollector, TopDocs};
 use tantivy::query::{
-    AllQuery, BooleanQuery, BoostQuery, Occur, PhrasePrefixQuery, Query, TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, EnableScoring, FuzzyTermQuery, PhrasePrefixQuery,
+    PhraseQuery, Query, RegexQuery, TermQuery, Weight,
 };
-use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value as _};
-use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
+use tantivy::schema::{FAST, Field, STORED, STRING, Schema, TEXT, Value as _};
+use tantivy::{
+    DocAddress, DocId, DocSet, Index, IndexReader, IndexWriter, Score, TantivyDocument, Term,
+};
 
+use unity_asset_core::DigestV1Builder;
 use unity_asset_search_core::{
-    HighlightRange, MatchKind, highlight_html, highlight_ranges, normalize_for_match, parse_query,
-    rank_match, to_terms,
+    CandidateFacts, CandidateField, HighlightRange, MatchCount, MatchExplanation, MatchField,
+    MatchKind, QuerySpec, RankingSignals, RetrievalEvidence, RetrievalStage, RetrievalTerm,
+    SearchDiagnostic, SearchLimits, SearchPolicy, SearchRequest, normalize_for_match, to_terms,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
+    pub rank: usize,
     pub guid: Option<String>,
     pub path: String,
     pub name: String,
     pub kind: String,
     pub stable_id: String,
     pub location: Location,
-    pub score: f32,
+    pub ranking_signals: RankingSignals,
     pub match_kind: MatchKind,
+    pub explanation: MatchExplanation,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_hierarchy_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -44,8 +54,6 @@ pub struct SearchHit {
     pub highlight_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub highlight_name: Option<String>,
-    #[serde(skip_serializing)]
-    rank_fuzzy_score: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,8 +71,14 @@ pub struct Location {
 pub struct SearchResponse {
     pub query: String,
     pub took_ms: u128,
-    pub total_hits: usize,
+    pub match_count: MatchCount,
+    pub returned_hits: usize,
+    pub request_limit_truncated: bool,
     pub hits: Vec<SearchHit>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<SearchDiagnostic>,
+    #[serde(default)]
+    pub fallback_used: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,9 +254,9 @@ impl IndexPaths {
         };
         let scan_roots = normalize_scan_roots(&project_root, scan_roots)?;
 
-        let index_data_dir = index_root_dir.join("tantivy-v2");
-        let refs_index_data_dir = index_root_dir.join("refs-tantivy-v1");
-        let state_path = index_root_dir.join("state-v2.json");
+        let index_data_dir = index_root_dir.join("tantivy-v4");
+        let refs_index_data_dir = index_root_dir.join("refs-tantivy-v2");
+        let state_path = index_root_dir.join("state-v4.json");
 
         Ok(Self {
             project_root,
@@ -319,6 +333,12 @@ pub struct SearchIndex {
     enrich_cache: Arc<std::sync::Mutex<EnrichCache>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SearchProjection<'a> {
+    Base,
+    Enriched(&'a Path),
+}
+
 struct SearchIndexInner {
     options: SearchIndexOptions,
     reader: IndexReader,
@@ -337,10 +357,12 @@ struct SearchFields {
     id: Field,
     guid: Field,
     path: Field,
+    path_filter: Field,
     path_terms: Field,
     name: Field,
     name_terms: Field,
     kind: Field,
+    kind_filter: Field,
     kind_terms: Field,
     content_terms: Field,
     container_source_path: Field,
@@ -543,12 +565,13 @@ impl SearchIndex {
             )
         })?;
 
-        let schema = build_schema();
+        let expected_schema = build_schema();
         let index = Index::open_in_dir(&paths.index_data_dir)
-            .or_else(|_| Index::create_in_dir(&paths.index_data_dir, schema.clone()))?;
+            .or_else(|_| Index::create_in_dir(&paths.index_data_dir, expected_schema.clone()))?;
 
         let schema = index.schema();
-        let fields = build_fields(&schema);
+        validate_schema(&schema, &expected_schema, "search", "tantivy-v4")?;
+        let fields = build_fields(&schema).context("validate search index schema")?;
         let reader = index
             .reader_builder()
             .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
@@ -558,11 +581,18 @@ impl SearchIndex {
             .writer_with_num_threads(4, 128 * 1024 * 1024)
             .context("create index writer")?;
 
-        let refs_schema = build_refs_schema();
-        let refs_index = Index::open_in_dir(&paths.refs_index_data_dir)
-            .or_else(|_| Index::create_in_dir(&paths.refs_index_data_dir, refs_schema.clone()))?;
+        let expected_refs_schema = build_refs_schema();
+        let refs_index = Index::open_in_dir(&paths.refs_index_data_dir).or_else(|_| {
+            Index::create_in_dir(&paths.refs_index_data_dir, expected_refs_schema.clone())
+        })?;
         let refs_schema = refs_index.schema();
-        let refs_fields = build_refs_fields(&refs_schema);
+        validate_schema(
+            &refs_schema,
+            &expected_refs_schema,
+            "reference",
+            "refs-tantivy-v2",
+        )?;
+        let refs_fields = build_refs_fields(&refs_schema).context("validate refs index schema")?;
         let refs_reader = refs_index
             .reader_builder()
             .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
@@ -922,11 +952,9 @@ impl SearchIndex {
                     inner.refs_writer.add_document(ref_doc)?;
                 }
                 for asset_path in container_paths {
-                    inner.writer.add_document(build_bundle_container_doc(
-                        &fields,
-                        &file.rel_path,
-                        &asset_path,
-                    ))?;
+                    let document =
+                        build_bundle_container_doc(&fields, &file.rel_path, &asset_path)?;
+                    inner.writer.add_document(document)?;
                 }
 
                 state.files.insert(file.rel_path.clone(), file.fingerprint);
@@ -1121,11 +1149,8 @@ impl SearchIndex {
                     inner.refs_writer.add_document(ref_doc)?;
                 }
                 for asset_path in container_paths {
-                    inner.writer.add_document(build_bundle_container_doc(
-                        &fields,
-                        rel_path,
-                        &asset_path,
-                    ))?;
+                    let document = build_bundle_container_doc(&fields, rel_path, &asset_path)?;
+                    inner.writer.add_document(document)?;
                 }
 
                 state.files.insert(rel_path.clone(), file.fingerprint);
@@ -1180,144 +1205,7 @@ impl SearchIndex {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<SearchResponse> {
-        let start = Instant::now();
-        let query = query.trim();
-        let spec = parse_query(query);
-        if spec.raw.trim().is_empty() {
-            return Ok(SearchResponse {
-                query: String::new(),
-                took_ms: 0,
-                total_hits: 0,
-                hits: Vec::new(),
-            });
-        }
-
-        let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
-        let searcher = inner.reader.searcher();
-
-        let terms = to_terms(&spec.free_text);
-        let tokens: Vec<&str> = terms.split_whitespace().collect();
-        let mut base_query: Box<dyn Query> = build_retrieval_query(&inner.fields, &tokens);
-
-        if let Some(kind) = spec
-            .type_filter
-            .as_deref()
-            .and_then(canonicalize_kind_filter)
-        {
-            let term = Term::from_field_text(inner.fields.kind, &kind);
-            let term_query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
-            base_query = Box::new(BooleanQuery::intersection(vec![
-                base_query,
-                Box::new(term_query),
-            ]));
-        }
-
-        let fetch_limit = if spec.type_filter.is_some() || spec.path_prefix.is_some() {
-            limit * 30
-        } else {
-            limit * 5
-        };
-
-        let top_docs = searcher.search(&base_query, &TopDocs::with_limit(fetch_limit))?;
-
-        let mut hits = Vec::with_capacity(top_docs.len());
-        for (bm25, address) in top_docs {
-            let retrieved: TantivyDocument = searcher.doc(address)?;
-
-            let guid = retrieved
-                .get_first(inner.fields.guid)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-
-            let path = retrieved
-                .get_first(inner.fields.path)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-
-            let name = retrieved
-                .get_first(inner.fields.name)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-
-            let kind = retrieved
-                .get_first(inner.fields.kind)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-
-            let container_source_path = retrieved
-                .get_first(inner.fields.container_source_path)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-
-            let rank_query = if spec.free_text.is_empty() {
-                spec.raw.as_str()
-            } else {
-                spec.free_text.as_str()
-            };
-            let rank = rank_match(rank_query, &name, &path);
-            let stable_id = if let Some(src) = container_source_path.as_deref() {
-                stable_id_for(None, &format!("container:{src}|{path}"), None)
-            } else {
-                stable_id_for(guid.as_deref(), &path, None)
-            };
-            let location = Location {
-                path: container_source_path.unwrap_or_else(|| path.clone()),
-                guid: guid.clone(),
-                file_id: None,
-                class_id: None,
-            };
-
-            hits.push(SearchHit {
-                guid,
-                path,
-                name,
-                kind,
-                stable_id,
-                location,
-                score: bm25,
-                match_kind: rank.kind,
-                matched_hierarchy_paths: Vec::new(),
-                matched_script_symbols: Vec::new(),
-                highlight_path_ranges: Vec::new(),
-                highlight_name_ranges: Vec::new(),
-                highlight_path: None,
-                highlight_name: None,
-                rank_fuzzy_score: rank.fuzzy_score,
-            });
-        }
-
-        if let Some(prefix) = spec.path_prefix.as_deref() {
-            let prefix_norm = normalize_for_match(prefix);
-            hits.retain(|h| normalize_for_match(&h.path).starts_with(&prefix_norm));
-        }
-
-        hits.sort_by(|a, b| {
-            (a.match_kind as u8, -a.rank_fuzzy_score, -a.score)
-                .partial_cmp(&(b.match_kind as u8, -b.rank_fuzzy_score, -b.score))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        hits.truncate(limit);
-
-        let tokens = spec.tokens.clone();
-        for hit in &mut hits {
-            hit.highlight_path_ranges = highlight_ranges(&hit.path, &tokens);
-            hit.highlight_name_ranges = highlight_ranges(&hit.name, &tokens);
-            hit.highlight_path = highlight_html(&hit.path, &tokens);
-            hit.highlight_name = highlight_html(&hit.name, &tokens);
-        }
-
-        Ok(SearchResponse {
-            query: query.to_string(),
-            took_ms: start.elapsed().as_millis(),
-            total_hits: hits.len(),
-            hits,
-        })
+        self.execute_search(query, limit, SearchProjection::Base)
     }
 
     pub fn search_enriched(
@@ -1326,149 +1214,115 @@ impl SearchIndex {
         query: &str,
         limit: usize,
     ) -> Result<SearchResponse> {
+        self.execute_search(query, limit, SearchProjection::Enriched(project_root))
+    }
+
+    fn execute_search(
+        &self,
+        query: &str,
+        limit: usize,
+        projection: SearchProjection<'_>,
+    ) -> Result<SearchResponse> {
         let start = Instant::now();
         let query = query.trim();
-        let spec = parse_query(query);
-        if spec.raw.trim().is_empty() {
+        let policy = SearchPolicy::default();
+        let mut projection_budget = CandidateProjectionBudget::new(policy.limits);
+        let prepared = policy.prepare(SearchRequest::new(query, limit));
+        let fetch_limit = prepared.candidate_limit();
+        if fetch_limit == 0 {
+            let outcome = prepared.execute(Vec::new());
             return Ok(SearchResponse {
-                query: String::new(),
-                took_ms: 0,
-                total_hits: 0,
+                query: query.to_string(),
+                took_ms: start.elapsed().as_millis(),
+                match_count: outcome.match_count,
+                returned_hits: 0,
+                request_limit_truncated: false,
                 hits: Vec::new(),
+                diagnostics: outcome.diagnostics,
+                fallback_used: outcome.fallback_used,
             });
         }
 
         let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
         let searcher = inner.reader.searcher();
+        let strict_terms = prepared.retrieval_terms(RetrievalStage::Strict);
+        let strict_query =
+            build_search_retrieval_query(&inner.fields, prepared.query(), &strict_terms)?;
+        let retrieval_limit = fetch_limit.saturating_add(1);
+        let strict_docs =
+            collect_stable_top_docs(&searcher, strict_query.as_ref(), retrieval_limit)?;
+        let strict_evidence =
+            EvidencePlan::new(&searcher, &inner.fields, prepared.query(), &strict_terms)?;
+        let no_excluded_keys = std::collections::BTreeSet::new();
+        let mut candidates_by_key = collect_search_candidates(
+            &searcher,
+            &inner.fields,
+            strict_docs,
+            &strict_evidence,
+            &no_excluded_keys,
+            &mut projection_budget,
+        )?;
 
-        let terms = to_terms(&spec.free_text);
-        let tokens: Vec<&str> = terms.split_whitespace().collect();
-        let mut base_query: Box<dyn Query> = build_retrieval_query(&inner.fields, &tokens);
-
-        if let Some(kind) = spec
-            .type_filter
-            .as_deref()
-            .and_then(canonicalize_kind_filter)
-        {
-            let term = Term::from_field_text(inner.fields.kind, &kind);
-            let term_query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
-            base_query = Box::new(BooleanQuery::intersection(vec![
-                base_query,
-                Box::new(term_query),
-            ]));
-        }
-
-        let fetch_limit = if spec.type_filter.is_some() || spec.path_prefix.is_some() {
-            limit * 30
-        } else {
-            limit * 5
-        };
-
-        let top_docs = searcher.search(&base_query, &TopDocs::with_limit(fetch_limit))?;
+        let strict_facts: Vec<_> = candidates_by_key
+            .values()
+            .map(|candidate| candidate.facts.clone())
+            .collect();
+        let mut fallback_candidates = std::collections::BTreeMap::new();
+        let mut outcome = prepared.execute_with_fallback(
+            strict_facts,
+            |strict_match_keys| -> Result<Vec<_>> {
+                let fallback_terms = prepared.retrieval_terms(RetrievalStage::FuzzyFallback);
+                let fallback_query =
+                    build_search_retrieval_query(&inner.fields, prepared.query(), &fallback_terms)?;
+                let fallback_retrieval_limit =
+                    retrieval_limit.saturating_add(strict_match_keys.len());
+                let fallback_docs = collect_stable_top_docs(
+                    &searcher,
+                    fallback_query.as_ref(),
+                    fallback_retrieval_limit,
+                )?;
+                let fallback_evidence =
+                    EvidencePlan::new(&searcher, &inner.fields, prepared.query(), &fallback_terms)?;
+                fallback_candidates = collect_search_candidates(
+                    &searcher,
+                    &inner.fields,
+                    fallback_docs,
+                    &fallback_evidence,
+                    strict_match_keys,
+                    &mut projection_budget,
+                )?;
+                Ok(fallback_candidates
+                    .values()
+                    .map(|candidate| candidate.facts.clone())
+                    .collect())
+            },
+        )?;
+        outcome.extend_diagnostics(std::mem::take(&mut projection_budget.diagnostics));
+        candidates_by_key.extend(fallback_candidates);
         drop(inner);
 
-        let inner = self.inner.read().map_err(|_| anyhow!("poisoned lock"))?;
-        let searcher = inner.reader.searcher();
-
-        let mut hits = Vec::with_capacity(top_docs.len());
-        for (bm25, address) in top_docs {
-            let retrieved: TantivyDocument = searcher.doc(address)?;
-
-            let guid = retrieved
-                .get_first(inner.fields.guid)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-
-            let path = retrieved
-                .get_first(inner.fields.path)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-
-            let name = retrieved
-                .get_first(inner.fields.name)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-
-            let kind = retrieved
-                .get_first(inner.fields.kind)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-
-            let container_source_path = retrieved
-                .get_first(inner.fields.container_source_path)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-
-            let rank_query = if spec.free_text.is_empty() {
-                spec.raw.as_str()
-            } else {
-                spec.free_text.as_str()
+        let mut hits = Vec::with_capacity(outcome.matches.len());
+        for ranked in outcome.matches {
+            let Some(candidate) = candidates_by_key.remove(&ranked.stable_key) else {
+                continue;
             };
-            let rank = rank_match(rank_query, &name, &path);
-            let stable_id = if let Some(src) = container_source_path.as_deref() {
-                stable_id_for(None, &format!("container:{src}|{path}"), None)
-            } else {
-                stable_id_for(guid.as_deref(), &path, None)
-            };
-            let location = Location {
-                path: container_source_path.unwrap_or_else(|| path.clone()),
-                guid: guid.clone(),
-                file_id: None,
-                class_id: None,
-            };
-
-            hits.push(SearchHit {
-                guid,
-                path,
-                name,
-                kind,
-                stable_id,
-                location,
-                score: bm25,
-                match_kind: rank.kind,
-                matched_hierarchy_paths: Vec::new(),
-                matched_script_symbols: Vec::new(),
-                highlight_path_ranges: Vec::new(),
-                highlight_name_ranges: Vec::new(),
-                highlight_path: None,
-                highlight_name: None,
-                rank_fuzzy_score: rank.fuzzy_score,
-            });
+            hits.push(build_search_hit(candidate, ranked));
         }
 
-        if let Some(prefix) = spec.path_prefix.as_deref() {
-            let prefix_norm = normalize_for_match(prefix);
-            hits.retain(|h| normalize_for_match(&h.path).starts_with(&prefix_norm));
+        if let SearchProjection::Enriched(project_root) = projection {
+            enrich_hits_with_context(self, project_root, prepared.query(), &mut hits);
         }
-
-        hits.sort_by(|a, b| {
-            (a.match_kind as u8, -a.rank_fuzzy_score, -a.score)
-                .partial_cmp(&(b.match_kind as u8, -b.rank_fuzzy_score, -b.score))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        hits.truncate(limit);
-
-        enrich_hits_with_context(self, project_root, &spec, &mut hits);
-
-        let tokens = spec.tokens.clone();
-        for hit in &mut hits {
-            hit.highlight_path_ranges = highlight_ranges(&hit.path, &tokens);
-            hit.highlight_name_ranges = highlight_ranges(&hit.name, &tokens);
-            hit.highlight_path = highlight_html(&hit.path, &tokens);
-            hit.highlight_name = highlight_html(&hit.name, &tokens);
-        }
+        let returned_hits = hits.len();
 
         Ok(SearchResponse {
             query: query.to_string(),
             took_ms: start.elapsed().as_millis(),
-            total_hits: hits.len(),
+            match_count: outcome.match_count,
+            returned_hits,
+            request_limit_truncated: outcome.request_limit_truncated,
             hits,
+            diagnostics: outcome.diagnostics,
+            fallback_used: outcome.fallback_used,
         })
     }
 
@@ -1746,70 +1600,794 @@ fn stable_id_for(guid: Option<&str>, path: &str, file_id: Option<u64>) -> String
     out
 }
 
-fn canonicalize_kind_filter(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
+fn ranking_candidate_key(stable_id: &str, path: &str, name: &str, kind: &str) -> Result<String> {
+    let components = [
+        b"unity-asset-search-candidate-v1".as_slice(),
+        stable_id.as_bytes(),
+        path.as_bytes(),
+        name.as_bytes(),
+        kind.as_bytes(),
+    ];
+    let declared_length = components.iter().try_fold(0_u64, |total, component| {
+        let component_length = DigestV1Builder::framed_len(component)
+            .context("measure framed candidate identity component")?;
+        total
+            .checked_add(component_length)
+            .ok_or_else(|| anyhow!("candidate identity length overflow"))
+    })?;
+    let mut digest = DigestV1Builder::new(declared_length);
+    for component in components {
+        digest
+            .update_framed(component)
+            .context("hash candidate identity component")?;
     }
-    let raw = raw.to_lowercase();
-    let out = match raw.as_str() {
-        "prefab" => "Prefab",
-        "scene" => "Scene",
-        "material" | "mat" => "Material",
-        "script" | "cs" => "Script",
-        "asset" => "Asset",
-        "shader" => "Shader",
-        "texture" | "tex" => "Texture",
-        "audio" => "Audio",
-        "bundlecontainer" | "container" | "bundle-container" => "BundleContainer",
-        "file" => "File",
-        _ => return None,
-    };
-    Some(out.to_string())
+    let digest = digest.finalize().context("finalize candidate identity")?;
+    Ok(format!("candidate-v1:{}", hex::encode(digest.as_bytes())))
 }
 
-fn build_retrieval_query(fields: &SearchFields, tokens: &[&str]) -> Box<dyn Query> {
-    if tokens.is_empty() {
+fn quantize_retrieval_score(score: f32) -> i64 {
+    if !score.is_finite() {
+        return i64::MIN;
+    }
+    (f64::from(score) * 1_000_000.0).round() as i64
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StableTopHit {
+    retrieval_score: i64,
+    stable_id: String,
+    address: DocAddress,
+}
+
+impl Ord for StableTopHit {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        compare_stable_top_parts(
+            self.retrieval_score,
+            &self.stable_id,
+            self.address,
+            other.retrieval_score,
+            &other.stable_id,
+            other.address,
+        )
+    }
+}
+
+impl PartialOrd for StableTopHit {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn compare_stable_top_parts(
+    left_score: i64,
+    left_stable_id: &str,
+    left_address: DocAddress,
+    right_score: i64,
+    right_stable_id: &str,
+    right_address: DocAddress,
+) -> CmpOrdering {
+    left_score
+        .cmp(&right_score)
+        .then_with(|| right_stable_id.cmp(left_stable_id))
+        .then_with(|| compare_doc_address(right_address, left_address))
+}
+
+fn compare_doc_address(left: DocAddress, right: DocAddress) -> CmpOrdering {
+    left.segment_ord
+        .cmp(&right.segment_ord)
+        .then_with(|| left.doc_id.cmp(&right.doc_id))
+}
+
+struct StableTopDocs {
+    limit: usize,
+}
+
+impl Collector for StableTopDocs {
+    type Fruit = Vec<(i64, DocAddress)>;
+    type Child = StableTopSegmentCollector;
+
+    fn for_segment(
+        &self,
+        segment_local_id: u32,
+        segment_reader: &tantivy::SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        let stable_ids = segment_reader
+            .fast_fields()
+            .str("id")?
+            .ok_or_else(|| tantivy::TantivyError::SchemaError("id fast field missing".into()))?;
+        Ok(StableTopSegmentCollector {
+            limit: self.limit,
+            segment_ord: segment_local_id,
+            stable_ids,
+            scratch: String::new(),
+            heap: BinaryHeap::with_capacity(self.limit),
+            error: None,
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        true
+    }
+
+    fn merge_fruits(
+        &self,
+        child_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
+    ) -> tantivy::Result<Self::Fruit> {
+        let mut heap = BinaryHeap::with_capacity(self.limit);
+        for child_fruit in child_fruits {
+            for hit in child_fruit? {
+                push_stable_hit(&mut heap, hit, self.limit);
+            }
+        }
+        let mut hits: Vec<_> = heap.into_iter().map(|Reverse(hit)| hit).collect();
+        hits.sort_unstable_by(|left, right| right.cmp(left));
+        Ok(hits
+            .into_iter()
+            .map(|hit| (hit.retrieval_score, hit.address))
+            .collect())
+    }
+}
+
+struct StableTopSegmentCollector {
+    limit: usize,
+    segment_ord: u32,
+    stable_ids: StrColumn,
+    scratch: String,
+    heap: BinaryHeap<Reverse<StableTopHit>>,
+    error: Option<tantivy::TantivyError>,
+}
+
+impl SegmentCollector for StableTopSegmentCollector {
+    type Fruit = tantivy::Result<Vec<StableTopHit>>;
+
+    fn collect(&mut self, doc: DocId, score: Score) {
+        if self.error.is_some() {
+            return;
+        }
+        let retrieval_score = quantize_retrieval_score(score);
+
+        self.scratch.clear();
+        let Some(term_ord) = self.stable_ids.term_ords(doc).next() else {
+            self.error = Some(tantivy::TantivyError::InternalError(
+                "indexed document is missing its stable id".into(),
+            ));
+            return;
+        };
+        match self.stable_ids.ord_to_str(term_ord, &mut self.scratch) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.error = Some(tantivy::TantivyError::InternalError(
+                    "indexed document has an invalid stable id ordinal".into(),
+                ));
+                return;
+            }
+            Err(error) => {
+                self.error = Some(error.into());
+                return;
+            }
+        }
+
+        let address = DocAddress::new(self.segment_ord, doc);
+        if self.heap.len() == self.limit
+            && self.heap.peek().is_some_and(|worst| {
+                compare_stable_top_parts(
+                    retrieval_score,
+                    &self.scratch,
+                    address,
+                    worst.0.retrieval_score,
+                    &worst.0.stable_id,
+                    worst.0.address,
+                )
+                .is_le()
+            })
+        {
+            return;
+        }
+        push_stable_hit(
+            &mut self.heap,
+            StableTopHit {
+                retrieval_score,
+                stable_id: self.scratch.clone(),
+                address,
+            },
+            self.limit,
+        );
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        Ok(self.heap.into_iter().map(|Reverse(hit)| hit).collect())
+    }
+}
+
+fn push_stable_hit(heap: &mut BinaryHeap<Reverse<StableTopHit>>, hit: StableTopHit, limit: usize) {
+    if heap.len() < limit {
+        heap.push(Reverse(hit));
+        return;
+    }
+    if heap.peek().is_some_and(|worst| hit.cmp(&worst.0).is_gt()) {
+        heap.pop();
+        heap.push(Reverse(hit));
+    }
+}
+
+fn collect_stable_top_docs(
+    searcher: &tantivy::Searcher,
+    query: &dyn Query,
+    limit: usize,
+) -> Result<Vec<(i64, DocAddress)>> {
+    Ok(searcher.search(query, &StableTopDocs { limit })?)
+}
+
+struct EvidencePlan {
+    terms: Vec<TermEvidencePlan>,
+}
+
+struct TermEvidencePlan {
+    term_index: usize,
+    fields: Vec<FieldEvidencePlan>,
+}
+
+struct FieldEvidencePlan {
+    field: MatchField,
+    exact: Box<dyn Weight>,
+    prefix: Box<dyn Weight>,
+    fuzzy: Option<Box<dyn Weight>>,
+}
+
+impl EvidencePlan {
+    fn new(
+        searcher: &tantivy::Searcher,
+        fields: &SearchFields,
+        query: &QuerySpec,
+        retrieval_terms: &[RetrievalTerm],
+    ) -> Result<Self> {
+        let mut grouped = std::collections::BTreeMap::<usize, Vec<&RetrievalTerm>>::new();
+        for term in retrieval_terms {
+            grouped.entry(term.term_index).or_default().push(term);
+        }
+
+        let mut terms = Vec::new();
+        for term_index in 0..query.terms().len() {
+            let Some(tokens) = grouped.get(&term_index) else {
+                continue;
+            };
+            let mut field_plans = Vec::with_capacity(1);
+            for field in MatchField::ALL
+                .into_iter()
+                .filter(|field| field.requires_retrieval_evidence())
+            {
+                let index_field = retrieval_field(fields, field);
+                let exact = build_exact_field_query(index_field, tokens)
+                    .weight(EnableScoring::disabled_from_searcher(searcher))?;
+                let prefix = build_prefix_field_query(index_field, tokens)
+                    .weight(EnableScoring::disabled_from_searcher(searcher))?;
+                let fuzzy = build_fuzzy_field_query(index_field, tokens)
+                    .map(|query| query.weight(EnableScoring::disabled_from_searcher(searcher)))
+                    .transpose()?;
+                field_plans.push(FieldEvidencePlan {
+                    field,
+                    exact,
+                    prefix,
+                    fuzzy,
+                });
+            }
+            terms.push(TermEvidencePlan {
+                term_index,
+                fields: field_plans,
+            });
+        }
+        Ok(Self { terms })
+    }
+
+    fn apply(
+        &self,
+        searcher: &tantivy::Searcher,
+        candidates: &mut [RetrievedCandidate],
+    ) -> Result<()> {
+        let mut ordered_addresses: Vec<_> = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (candidate.address, index))
+            .collect();
+        ordered_addresses
+            .sort_unstable_by_key(|(address, _)| (address.segment_ord, address.doc_id));
+        for term in &self.terms {
+            let mut best = vec![None; candidates.len()];
+            for field in &term.fields {
+                let exact = weight_matches_candidates(
+                    &*field.exact,
+                    searcher,
+                    candidates.len(),
+                    &ordered_addresses,
+                )?;
+                let prefix = weight_matches_candidates(
+                    &*field.prefix,
+                    searcher,
+                    candidates.len(),
+                    &ordered_addresses,
+                )?;
+                let fuzzy = field
+                    .fuzzy
+                    .as_deref()
+                    .map(|weight| {
+                        weight_matches_candidates(
+                            weight,
+                            searcher,
+                            candidates.len(),
+                            &ordered_addresses,
+                        )
+                    })
+                    .transpose()?;
+                for candidate_index in 0..candidates.len() {
+                    let kind = if exact[candidate_index] {
+                        Some(MatchKind::Token)
+                    } else if prefix[candidate_index] {
+                        Some(if field.field == MatchField::Content {
+                            MatchKind::Substring
+                        } else {
+                            MatchKind::Prefix
+                        })
+                    } else if fuzzy
+                        .as_ref()
+                        .is_some_and(|matches| matches[candidate_index])
+                    {
+                        Some(MatchKind::Fuzzy)
+                    } else {
+                        None
+                    };
+                    let Some(kind) = kind else {
+                        continue;
+                    };
+                    let evidence = RetrievalEvidence::new(term.term_index, field.field, kind);
+                    if best[candidate_index].is_none_or(|current| evidence.is_better_than(current))
+                    {
+                        best[candidate_index] = Some(evidence);
+                    }
+                }
+            }
+            for (candidate, evidence) in candidates.iter_mut().zip(best) {
+                candidate.facts.evidence.extend(evidence);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn build_exact_field_query(field: Field, terms: &[&RetrievalTerm]) -> Box<dyn Query> {
+    let terms: Vec<_> = terms
+        .iter()
+        .map(|term| Term::from_field_text(field, &term.text))
+        .collect();
+    if let [term] = terms.as_slice() {
+        Box::new(TermQuery::new(
+            term.clone(),
+            tantivy::schema::IndexRecordOption::Basic,
+        ))
+    } else {
+        Box::new(PhraseQuery::new(terms))
+    }
+}
+
+fn build_prefix_field_query(field: Field, terms: &[&RetrievalTerm]) -> Box<dyn Query> {
+    Box::new(PhrasePrefixQuery::new(
+        terms
+            .iter()
+            .map(|term| Term::from_field_text(field, &term.text))
+            .collect(),
+    ))
+}
+
+fn build_fuzzy_field_query(field: Field, terms: &[&RetrievalTerm]) -> Option<Box<dyn Query>> {
+    terms
+        .iter()
+        .any(|term| term.fuzzy_distance.is_some())
+        .then(|| {
+            let queries = terms
+                .iter()
+                .map(|term| {
+                    let term_value = Term::from_field_text(field, &term.text);
+                    if let Some(distance) = term.fuzzy_distance {
+                        Box::new(FuzzyTermQuery::new(term_value, distance, true)) as Box<dyn Query>
+                    } else {
+                        Box::new(TermQuery::new(
+                            term_value,
+                            tantivy::schema::IndexRecordOption::Basic,
+                        )) as Box<dyn Query>
+                    }
+                })
+                .collect();
+            Box::new(BooleanQuery::intersection(queries)) as Box<dyn Query>
+        })
+}
+
+fn weight_matches_candidates(
+    weight: &dyn Weight,
+    searcher: &tantivy::Searcher,
+    candidate_count: usize,
+    ordered: &[(tantivy::DocAddress, usize)],
+) -> Result<Vec<bool>> {
+    let mut matches = vec![false; candidate_count];
+    let mut cursor = 0usize;
+    while cursor < ordered.len() {
+        let segment_ord = ordered[cursor].0.segment_ord;
+        let mut scorer = weight.scorer(searcher.segment_reader(segment_ord), 1.0)?;
+        let mut current_doc = scorer.doc();
+        while cursor < ordered.len() && ordered[cursor].0.segment_ord == segment_ord {
+            let (address, candidate_index) = ordered[cursor];
+            if current_doc < address.doc_id {
+                current_doc = scorer.seek(address.doc_id);
+            }
+            matches[candidate_index] = current_doc == address.doc_id;
+            cursor += 1;
+        }
+    }
+    Ok(matches)
+}
+
+struct HitProjection {
+    guid: Option<String>,
+    stable_id: String,
+    location: Location,
+}
+
+struct RetrievedCandidate {
+    address: tantivy::DocAddress,
+    facts: CandidateFacts,
+    projection: HitProjection,
+}
+
+struct CandidateProjectionBudget {
+    limits: SearchLimits,
+    retained_bytes: usize,
+    diagnostics: Vec<SearchDiagnostic>,
+    exhausted: bool,
+}
+
+impl CandidateProjectionBudget {
+    fn new(limits: SearchLimits) -> Self {
+        Self {
+            limits,
+            retained_bytes: 0,
+            diagnostics: Vec::new(),
+            exhausted: false,
+        }
+    }
+
+    fn reject(&mut self, diagnostic: SearchDiagnostic) {
+        self.diagnostics.push(diagnostic);
+    }
+
+    fn try_reserve(&mut self, candidate_bytes: usize) -> bool {
+        let Some(next_total) = self.retained_bytes.checked_add(candidate_bytes) else {
+            self.reject(SearchDiagnostic::CandidateTotalByteLimitExceeded {
+                consumed: usize::MAX,
+                limit: self.limits.max_total_candidate_bytes,
+            });
+            self.exhausted = true;
+            return false;
+        };
+        if next_total > self.limits.max_total_candidate_bytes {
+            self.reject(SearchDiagnostic::CandidateTotalByteLimitExceeded {
+                consumed: next_total,
+                limit: self.limits.max_total_candidate_bytes,
+            });
+            self.exhausted = true;
+            return false;
+        }
+        self.retained_bytes = next_total;
+        true
+    }
+}
+
+fn required_stored_text<'a>(
+    document: &'a TantivyDocument,
+    field: Field,
+    field_name: &str,
+) -> Result<&'a str> {
+    document
+        .get_first(field)
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow!("indexed document is missing required stored field `{field_name}`"))
+}
+
+fn optional_stored_text<'a>(
+    document: &'a TantivyDocument,
+    field: Field,
+    field_name: &str,
+) -> Result<Option<&'a str>> {
+    document
+        .get_first(field)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("indexed document stored field `{field_name}` is not text"))
+        })
+        .transpose()
+}
+
+fn candidate_projection_size(
+    limits: SearchLimits,
+    stable_key: &str,
+    name: &str,
+    path: &str,
+    kind: &str,
+    guid: Option<&str>,
+    container_source_path: Option<&str>,
+) -> std::result::Result<usize, SearchDiagnostic> {
+    validate_projection_fields(limits, name, path, kind, guid, container_source_path)?;
+    limits
+        .measure_candidate(stable_key, name, path, kind, 0)?
+        .checked_add(guid.map_or(0, str::len))
+        .and_then(|size| size.checked_add(container_source_path.map_or(0, str::len)))
+        .ok_or(SearchDiagnostic::CandidateTotalByteLimitExceeded {
+            consumed: usize::MAX,
+            limit: limits.max_total_candidate_bytes,
+        })
+}
+
+fn validate_projection_fields(
+    limits: SearchLimits,
+    name: &str,
+    path: &str,
+    kind: &str,
+    guid: Option<&str>,
+    container_source_path: Option<&str>,
+) -> std::result::Result<(), SearchDiagnostic> {
+    limits.validate_field_bytes(CandidateField::Name, name.len())?;
+    limits.validate_field_bytes(CandidateField::Path, path.len())?;
+    limits.validate_field_bytes(CandidateField::Kind, kind.len())?;
+    if let Some(guid) = guid {
+        limits.validate_field_bytes(CandidateField::Guid, guid.len())?;
+    }
+    if let Some(container_source_path) = container_source_path {
+        limits.validate_field_bytes(
+            CandidateField::ContainerSourcePath,
+            container_source_path.len(),
+        )?;
+    }
+    Ok(())
+}
+
+fn candidate_budget_error(diagnostic: SearchDiagnostic) -> anyhow::Error {
+    match diagnostic {
+        SearchDiagnostic::CandidateFieldByteLimitExceeded {
+            field,
+            actual,
+            limit,
+        } => anyhow!(
+            "candidate field `{}` is {actual} bytes, exceeding the {limit}-byte limit",
+            candidate_field_name(field)
+        ),
+        diagnostic => anyhow!("candidate violates search budget: {diagnostic:?}"),
+    }
+}
+
+fn candidate_field_name(field: CandidateField) -> &'static str {
+    match field {
+        CandidateField::StableKey => "stable_key",
+        CandidateField::Name => "name",
+        CandidateField::Path => "path",
+        CandidateField::Kind => "kind",
+        CandidateField::Guid => "guid",
+        CandidateField::ContainerSourcePath => "container_source_path",
+    }
+}
+
+fn collect_search_candidates(
+    searcher: &tantivy::Searcher,
+    fields: &SearchFields,
+    documents: impl IntoIterator<Item = (i64, tantivy::DocAddress)>,
+    evidence_plan: &EvidencePlan,
+    excluded_keys: &std::collections::BTreeSet<String>,
+    budget: &mut CandidateProjectionBudget,
+) -> Result<std::collections::BTreeMap<String, RetrievedCandidate>> {
+    let mut candidates_by_key = std::collections::BTreeMap::<String, RetrievedCandidate>::new();
+    for (retrieval_score, address) in documents {
+        if budget.exhausted {
+            break;
+        }
+        let retrieved: TantivyDocument = searcher.doc(address)?;
+        let guid = optional_stored_text(&retrieved, fields.guid, "guid")?
+            .filter(|value| !value.is_empty());
+        let path = required_stored_text(&retrieved, fields.path, "path")?;
+        let name = required_stored_text(&retrieved, fields.name, "name")?;
+        let kind = required_stored_text(&retrieved, fields.kind, "kind")?;
+        let container_source_path = optional_stored_text(
+            &retrieved,
+            fields.container_source_path,
+            "container_source_path",
+        )?
+        .filter(|value| !value.is_empty());
+
+        let field_validation = validate_projection_fields(
+            budget.limits,
+            name,
+            path,
+            kind,
+            guid,
+            container_source_path,
+        );
+        if let Err(diagnostic) = field_validation {
+            budget.reject(diagnostic);
+            continue;
+        }
+
+        let stable_id = if let Some(source) = container_source_path {
+            stable_id_for(None, &format!("container:{source}|{path}"), None)
+        } else {
+            stable_id_for(guid, path, None)
+        };
+        let candidate_key = ranking_candidate_key(&stable_id, path, name, kind)?;
+        if excluded_keys.contains(&candidate_key) {
+            continue;
+        }
+        let replacing_existing = if let Some(existing) = candidates_by_key.get(&candidate_key) {
+            if existing.projection.stable_id != stable_id
+                || existing.facts.path != path
+                || existing.facts.name != name
+                || existing.facts.kind != kind
+            {
+                return Err(anyhow!(
+                    "candidate identity digest collision for `{candidate_key}`"
+                ));
+            }
+            if existing.facts.retrieval_score >= retrieval_score {
+                continue;
+            }
+            true
+        } else {
+            false
+        };
+        if !replacing_existing {
+            let candidate_bytes = match candidate_projection_size(
+                budget.limits,
+                &candidate_key,
+                name,
+                path,
+                kind,
+                guid,
+                container_source_path,
+            ) {
+                Ok(candidate_bytes) => candidate_bytes,
+                Err(diagnostic) => {
+                    budget.reject(diagnostic);
+                    continue;
+                }
+            };
+            if !budget.try_reserve(candidate_bytes) {
+                continue;
+            }
+        }
+
+        let location = Location {
+            path: container_source_path.unwrap_or(path).to_string(),
+            guid: guid.map(str::to_string),
+            file_id: None,
+            class_id: None,
+        };
+        candidates_by_key.insert(
+            candidate_key.clone(),
+            RetrievedCandidate {
+                address,
+                facts: CandidateFacts::new(&candidate_key, name, path, kind, retrieval_score),
+                projection: HitProjection {
+                    guid: guid.map(str::to_string),
+                    stable_id,
+                    location,
+                },
+            },
+        );
+    }
+
+    let mut candidates: Vec<_> = candidates_by_key.into_values().collect();
+    evidence_plan.apply(searcher, &mut candidates)?;
+    Ok(candidates
+        .into_iter()
+        .map(|candidate| (candidate.facts.stable_key.clone(), candidate))
+        .collect())
+}
+
+fn build_search_hit(
+    candidate: RetrievedCandidate,
+    ranked: unity_asset_search_core::RankedMatch,
+) -> SearchHit {
+    SearchHit {
+        rank: ranked.rank,
+        guid: candidate.projection.guid,
+        path: candidate.facts.path,
+        name: candidate.facts.name,
+        kind: candidate.facts.kind,
+        stable_id: candidate.projection.stable_id,
+        location: candidate.projection.location,
+        ranking_signals: ranked.ranking_signals,
+        match_kind: ranked.match_kind,
+        explanation: ranked.explanation,
+        matched_hierarchy_paths: Vec::new(),
+        matched_script_symbols: Vec::new(),
+        highlight_path_ranges: ranked.highlight_path_ranges,
+        highlight_name_ranges: ranked.highlight_name_ranges,
+        highlight_path: ranked.highlight_path,
+        highlight_name: ranked.highlight_name,
+    }
+}
+
+fn build_search_retrieval_query(
+    fields: &SearchFields,
+    query: &QuerySpec,
+    terms: &[RetrievalTerm],
+) -> Result<Box<dyn Query>> {
+    let retrieval_query = build_retrieval_query(fields, terms);
+    let mut intersection = vec![retrieval_query];
+    if let Some(kind) = query.type_filter() {
+        let term = Term::from_field_text(fields.kind_filter, &normalize_for_match(kind));
+        let term_query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+        intersection.push(Box::new(term_query));
+    }
+    if let Some(path_prefix) = query.path_prefix() {
+        let pattern = format!("{}.*", regex::escape(&normalize_for_match(path_prefix)));
+        intersection.push(Box::new(RegexQuery::from_pattern(
+            &pattern,
+            fields.path_filter,
+        )?));
+    }
+    Ok(if intersection.len() == 1 {
+        intersection.remove(0)
+    } else {
+        Box::new(BooleanQuery::intersection(intersection))
+    })
+}
+
+fn build_retrieval_query(fields: &SearchFields, terms: &[RetrievalTerm]) -> Box<dyn Query> {
+    if terms.is_empty() {
         return Box::new(AllQuery);
     }
 
-    let mut must = Vec::new();
-    for token in tokens {
-        let token = token.trim();
-        if token.is_empty() {
-            continue;
-        }
-        must.push((Occur::Must, per_token_query(fields, token)));
-    }
-
-    if must.is_empty() {
+    let queries: Vec<_> = terms
+        .iter()
+        .filter_map(|term| {
+            let token = term.text.trim();
+            (!token.is_empty()).then(|| per_token_query(fields, token, term.fuzzy_distance))
+        })
+        .collect();
+    if queries.is_empty() {
         Box::new(AllQuery)
     } else {
-        Box::new(BooleanQuery::new(must))
+        Box::new(BooleanQuery::intersection(queries))
     }
 }
 
-fn per_token_query(fields: &SearchFields, token: &str) -> Box<dyn Query> {
-    let should = vec![
-        (
-            Occur::Should,
-            boosted_text_queries(fields.name_terms, token, 3.0, 2.0),
-        ),
-        (
-            Occur::Should,
-            boosted_text_queries(fields.path_terms, token, 2.0, 1.5),
-        ),
-        (
-            Occur::Should,
-            boosted_text_queries(fields.kind_terms, token, 1.0, 1.0),
-        ),
-        (
-            Occur::Should,
-            boosted_text_queries(fields.content_terms, token, 1.2, 1.0),
-        ),
-    ];
+fn retrieval_field(fields: &SearchFields, field: MatchField) -> Field {
+    match field {
+        MatchField::Name => fields.name_terms,
+        MatchField::Path => fields.path_terms,
+        MatchField::Kind => fields.kind_terms,
+        MatchField::Content => fields.content_terms,
+    }
+}
 
-    Box::new(BooleanQuery::new(should))
+fn per_token_query(
+    fields: &SearchFields,
+    token: &str,
+    fuzzy_distance: Option<u8>,
+) -> Box<dyn Query> {
+    let queries = MatchField::ALL
+        .into_iter()
+        .map(|field| {
+            let policy = field.retrieval_policy();
+            boosted_text_queries(
+                retrieval_field(fields, field),
+                token,
+                policy.exact_boost(),
+                policy.prefix_boost(),
+                policy.fuzzy_boost(),
+                fuzzy_distance,
+            )
+        })
+        .collect();
+    Box::new(BooleanQuery::union(queries))
 }
 
 fn boosted_text_queries(
@@ -1817,23 +2395,23 @@ fn boosted_text_queries(
     token: &str,
     exact_boost: f32,
     prefix_boost: f32,
+    fuzzy_boost: f32,
+    fuzzy_distance: Option<u8>,
 ) -> Box<dyn Query> {
-    let mut should = Vec::new();
+    let mut queries = Vec::new();
 
     let term = Term::from_field_text(field, token);
     let exact = TermQuery::new(term.clone(), tantivy::schema::IndexRecordOption::Basic);
-    let prefix = PhrasePrefixQuery::new(vec![term]);
+    let prefix = PhrasePrefixQuery::new(vec![term.clone()]);
 
-    should.push((
-        Occur::Should,
-        Box::new(BoostQuery::new(Box::new(exact), exact_boost)) as Box<dyn Query>,
-    ));
-    should.push((
-        Occur::Should,
-        Box::new(BoostQuery::new(Box::new(prefix), prefix_boost)) as Box<dyn Query>,
-    ));
+    queries.push(Box::new(BoostQuery::new(Box::new(exact), exact_boost)) as Box<dyn Query>);
+    queries.push(Box::new(BoostQuery::new(Box::new(prefix), prefix_boost)) as Box<dyn Query>);
+    if let Some(distance) = fuzzy_distance {
+        let fuzzy = FuzzyTermQuery::new(term, distance, true);
+        queries.push(Box::new(BoostQuery::new(Box::new(fuzzy), fuzzy_boost)) as Box<dyn Query>);
+    }
 
-    Box::new(BooleanQuery::new(should))
+    Box::new(BooleanQuery::union(queries))
 }
 
 fn suggest_in_paths(state: &IndexState, raw_prefix: &str, limit: usize) -> Vec<String> {
@@ -1846,7 +2424,7 @@ fn suggest_in_paths(state: &IndexState, raw_prefix: &str, limit: usize) -> Vec<S
     let mut scanned = 0usize;
 
     if prefix.is_empty() {
-        for (path, _) in state.files.iter() {
+        for path in state.files.keys() {
             if scanned >= 2000 {
                 break;
             }
@@ -1891,36 +2469,54 @@ fn suggest_in_paths(state: &IndexState, raw_prefix: &str, limit: usize) -> Vec<S
 
 fn build_schema() -> Schema {
     let mut builder = Schema::builder();
-    builder.add_text_field("id", STRING | STORED);
+    builder.add_text_field("id", STRING | STORED | FAST);
     builder.add_text_field("guid", STRING | STORED);
     builder.add_text_field("path", STORED);
+    builder.add_text_field("path_filter", STRING);
     builder.add_text_field("path_terms", TEXT);
     builder.add_text_field("name", STORED);
     builder.add_text_field("name_terms", TEXT);
     builder.add_text_field("kind", STRING | STORED);
+    builder.add_text_field("kind_filter", STRING);
     builder.add_text_field("kind_terms", TEXT);
     builder.add_text_field("content_terms", TEXT);
     builder.add_text_field("container_source_path", STRING | STORED);
     builder.build()
 }
 
-fn build_fields(schema: &Schema) -> SearchFields {
-    SearchFields {
-        id: schema.get_field("id").expect("id field"),
-        guid: schema.get_field("guid").expect("guid field"),
-        path: schema.get_field("path").expect("path field"),
-        path_terms: schema.get_field("path_terms").expect("path_terms field"),
-        name: schema.get_field("name").expect("name field"),
-        name_terms: schema.get_field("name_terms").expect("name_terms field"),
-        kind: schema.get_field("kind").expect("kind field"),
-        kind_terms: schema.get_field("kind_terms").expect("kind_terms field"),
-        content_terms: schema
-            .get_field("content_terms")
-            .expect("content_terms field"),
-        container_source_path: schema
-            .get_field("container_source_path")
-            .expect("container_source_path field"),
+fn validate_schema(
+    actual: &Schema,
+    expected: &Schema,
+    index_kind: &str,
+    version: &str,
+) -> Result<()> {
+    if actual == expected {
+        return Ok(());
     }
+    Err(anyhow!(
+        "{index_kind} index schema does not match the {version} contract"
+    ))
+}
+
+fn build_fields(schema: &Schema) -> Result<SearchFields> {
+    let id = schema.get_field("id")?;
+    if !schema.get_field_entry(id).is_fast() {
+        return Err(anyhow!("search index field `id` must be a fast field"));
+    }
+    Ok(SearchFields {
+        id,
+        guid: schema.get_field("guid")?,
+        path: schema.get_field("path")?,
+        path_filter: schema.get_field("path_filter")?,
+        path_terms: schema.get_field("path_terms")?,
+        name: schema.get_field("name")?,
+        name_terms: schema.get_field("name_terms")?,
+        kind: schema.get_field("kind")?,
+        kind_filter: schema.get_field("kind_filter")?,
+        kind_terms: schema.get_field("kind_terms")?,
+        content_terms: schema.get_field("content_terms")?,
+        container_source_path: schema.get_field("container_source_path")?,
+    })
 }
 
 fn build_refs_schema() -> Schema {
@@ -1933,16 +2529,14 @@ fn build_refs_schema() -> Schema {
     builder.build()
 }
 
-fn build_refs_fields(schema: &Schema) -> ReferenceFields {
-    ReferenceFields {
-        source_id: schema.get_field("source_id").expect("source_id"),
-        source_path: schema.get_field("source_path").expect("source_path"),
-        source_kind: schema.get_field("source_kind").expect("source_kind"),
-        ref_guid: schema.get_field("ref_guid").expect("ref_guid"),
-        ref_guid_fileid: schema
-            .get_field("ref_guid_fileid")
-            .expect("ref_guid_fileid"),
-    }
+fn build_refs_fields(schema: &Schema) -> Result<ReferenceFields> {
+    Ok(ReferenceFields {
+        source_id: schema.get_field("source_id")?,
+        source_path: schema.get_field("source_path")?,
+        source_kind: schema.get_field("source_kind")?,
+        ref_guid: schema.get_field("ref_guid")?,
+        ref_guid_fileid: schema.get_field("ref_guid_fileid")?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -2561,6 +3155,10 @@ fn script_terms_for_source(file: &ScannedFile, text: &str) -> String {
     ))
 }
 
+fn add_document_identity(document: &mut TantivyDocument, fields: &SearchFields, id: &str) {
+    document.add_text(fields.id, id);
+}
+
 fn build_doc(
     fields: &SearchFields,
     file: &ScannedFile,
@@ -2575,15 +3173,41 @@ fn build_doc(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&file.name)
         .to_string();
+    let limits = SearchLimits::default();
+    let guid_value = (!guid.is_empty()).then_some(guid.as_str());
+    validate_projection_fields(
+        limits,
+        &display_name,
+        &file.rel_path,
+        &file.kind,
+        guid_value,
+        None,
+    )
+    .map_err(candidate_budget_error)?;
+    let stable_id = stable_id_for(guid_value, &file.rel_path, None);
+    let candidate_key =
+        ranking_candidate_key(&stable_id, &file.rel_path, &display_name, &file.kind)?;
+    candidate_projection_size(
+        limits,
+        &candidate_key,
+        &display_name,
+        &file.rel_path,
+        &file.kind,
+        guid_value,
+        None,
+    )
+    .map_err(candidate_budget_error)?;
 
     let mut document = TantivyDocument::default();
-    document.add_text(fields.id, file.rel_path.clone());
+    add_document_identity(&mut document, fields, &file.rel_path);
     document.add_text(fields.guid, guid);
     document.add_text(fields.path, file.rel_path.clone());
+    document.add_text(fields.path_filter, normalize_for_match(&file.rel_path));
     document.add_text(fields.path_terms, to_terms(&file.rel_path));
     document.add_text(fields.name, display_name.clone());
     document.add_text(fields.name_terms, to_terms(&display_name));
     document.add_text(fields.kind, file.kind.clone());
+    document.add_text(fields.kind_filter, normalize_for_match(&file.kind));
     document.add_text(fields.kind_terms, to_terms(&file.kind));
 
     if let Some(content_terms) = extracted.content_terms.filter(|s| !s.trim().is_empty()) {
@@ -2614,26 +3238,56 @@ fn build_bundle_container_doc(
     fields: &SearchFields,
     bundle_rel_path: &str,
     asset_path: &str,
-) -> TantivyDocument {
+) -> Result<TantivyDocument> {
     let asset_path = asset_path.trim();
     let bundle_rel_path = bundle_rel_path.trim();
     let display_name = container_name_from_asset_path(asset_path);
+    let limits = SearchLimits::default();
+    validate_projection_fields(
+        limits,
+        &display_name,
+        asset_path,
+        "BundleContainer",
+        None,
+        Some(bundle_rel_path),
+    )
+    .map_err(candidate_budget_error)?;
+    let stable_id = stable_id_for(
+        None,
+        &format!("container:{bundle_rel_path}|{asset_path}"),
+        None,
+    );
+    let candidate_key =
+        ranking_candidate_key(&stable_id, asset_path, &display_name, "BundleContainer")?;
+    candidate_projection_size(
+        limits,
+        &candidate_key,
+        &display_name,
+        asset_path,
+        "BundleContainer",
+        None,
+        Some(bundle_rel_path),
+    )
+    .map_err(candidate_budget_error)?;
 
     let mut document = TantivyDocument::default();
-    document.add_text(
-        fields.id,
-        format!("container:{bundle_rel_path}:{asset_path}"),
+    add_document_identity(
+        &mut document,
+        fields,
+        &format!("container:{bundle_rel_path}:{asset_path}"),
     );
     document.add_text(fields.guid, "");
     document.add_text(fields.path, asset_path);
+    document.add_text(fields.path_filter, normalize_for_match(asset_path));
     document.add_text(fields.path_terms, to_terms(asset_path));
     document.add_text(fields.name, display_name.clone());
     document.add_text(fields.name_terms, to_terms(&display_name));
     document.add_text(fields.kind, "BundleContainer");
+    document.add_text(fields.kind_filter, normalize_for_match("BundleContainer"));
     document.add_text(fields.kind_terms, to_terms("BundleContainer"));
     document.add_text(fields.content_terms, to_terms(bundle_rel_path));
     document.add_text(fields.container_source_path, bundle_rel_path);
-    document
+    Ok(document)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -3913,10 +4567,15 @@ fn extract_csharp_symbols(text: &str) -> Vec<String> {
 fn enrich_hits_with_context(
     index: &SearchIndex,
     project_root: &Path,
-    spec: &unity_asset_search_core::QuerySpec,
+    spec: &QuerySpec,
     hits: &mut [SearchHit],
 ) {
-    let query_terms = to_terms(&spec.free_text);
+    let query_terms = spec
+        .terms()
+        .iter()
+        .map(|term| to_terms(term.text()))
+        .collect::<Vec<_>>()
+        .join(" ");
     let query_tokens: Vec<&str> = query_terms.split_whitespace().collect();
     if query_tokens.is_empty() {
         return;
@@ -3962,7 +4621,7 @@ fn enrich_hits_with_context(
         })
         .unwrap_or_default();
 
-    for (hit, info) in hits.iter_mut().zip(extracted.into_iter()) {
+    for (hit, info) in hits.iter_mut().zip(extracted) {
         let Some((hierarchy_paths, script_guids)) = info else {
             continue;
         };
@@ -4172,6 +4831,436 @@ fn meta_path_for_asset(asset_path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_prefab(project_root: &Path, relative_path: &str, name: &str) -> PathBuf {
+        let path = project_root.join(relative_path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: {name}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn base_and_enriched_search_share_one_ranking_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        write_prefab(temp.path(), "Assets/UI/a.prefab", "Button");
+        write_prefab(temp.path(), "Assets/UI/b.prefab", "Button");
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        index.reindex_full(&paths).unwrap();
+
+        let base = index.search("button", 20).unwrap();
+        let enriched = index
+            .search_enriched(paths.project_root.as_path(), "button", 20)
+            .unwrap();
+        let base_policy: Vec<_> = base
+            .hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.stable_id.clone(),
+                    hit.match_kind,
+                    hit.explanation.clone(),
+                    hit.highlight_name_ranges.clone(),
+                )
+            })
+            .collect();
+        let enriched_policy: Vec<_> = enriched
+            .hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.stable_id.clone(),
+                    hit.match_kind,
+                    hit.explanation.clone(),
+                    hit.highlight_name_ranges.clone(),
+                )
+            })
+            .collect();
+
+        assert_eq!(base_policy, enriched_policy);
+        assert_eq!(base_policy.len(), 2);
+        assert!(
+            base_policy
+                .iter()
+                .all(|(_, kind, explanation, _)| *kind == MatchKind::Exact
+                    && !explanation.fuzzy_fallback)
+        );
+
+        let typo = index.search("buton", 20).unwrap();
+        assert!(typo.fallback_used);
+        assert_eq!(typo.hits.len(), 2);
+        assert!(
+            typo.hits
+                .iter()
+                .all(|hit| hit.match_kind == MatchKind::Fuzzy && hit.explanation.fuzzy_fallback)
+        );
+    }
+
+    #[test]
+    fn content_only_script_symbols_are_ranked_with_typed_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("Assets/Scripts/EnemySpawner.cs");
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        fs::write(
+            &script,
+            "public sealed class EnemySpawner { public void SpawnEnemy() {} }\n",
+        )
+        .unwrap();
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        index.reindex_full(&paths).unwrap();
+
+        let response = index.search("SpawnEnemy", 10).unwrap();
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.hits[0].path, "Assets/Scripts/EnemySpawner.cs");
+        assert_eq!(response.hits[0].match_kind, MatchKind::Token);
+        assert_eq!(
+            response.hits[0].explanation.terms[0].field,
+            unity_asset_search_core::MatchField::Content
+        );
+    }
+
+    #[test]
+    fn exact_content_tokens_outrank_content_prefixes() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts = temp.path().join("Assets/Scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::write(
+            scripts.join("Alpha.cs"),
+            "public sealed class Alpha { public void spawnexact() {} }\n",
+        )
+        .unwrap();
+        fs::write(
+            scripts.join("Beta.cs"),
+            "public sealed class Beta { public void spawnexactmore() {} }\n",
+        )
+        .unwrap();
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        index.reindex_full(&paths).unwrap();
+
+        let response = index.search("spawnexact", 10).unwrap();
+        assert_eq!(response.hits.len(), 2);
+        assert_eq!(response.hits[0].path, "Assets/Scripts/Alpha.cs");
+        assert_eq!(response.hits[0].match_kind, MatchKind::Token);
+        assert_eq!(response.hits[1].path, "Assets/Scripts/Beta.cs");
+        assert_eq!(response.hits[1].match_kind, MatchKind::Substring);
+    }
+
+    #[test]
+    fn fallback_can_enrich_a_document_seen_by_strict_retrieval() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        fs::create_dir_all(&paths.index_data_dir).unwrap();
+
+        let schema = build_schema();
+        let fields = build_fields(&schema).unwrap();
+        let raw_index = Index::create_in_dir(&paths.index_data_dir, schema).unwrap();
+        let mut writer = raw_index
+            .writer_with_num_threads::<TantivyDocument>(1, 20 * 1024 * 1024)
+            .unwrap();
+        let mut document = TantivyDocument::default();
+        add_document_identity(&mut document, &fields, "content-gap");
+        document.add_text(fields.guid, "");
+        document.add_text(fields.path, "Assets/ContentGap.asset");
+        document.add_text(fields.path_filter, "assets/contentgap.asset");
+        document.add_text(fields.path_terms, "assets content gap asset");
+        document.add_text(fields.name, "Unrelated");
+        document.add_text(fields.name_terms, "unrelated");
+        document.add_text(fields.kind, "TextAsset");
+        document.add_text(fields.kind_filter, "textasset");
+        document.add_text(fields.kind_terms, "text asset");
+        document.add_text(fields.content_terms, "alpha noise beta");
+        writer.add_document(document).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        drop(raw_index);
+
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        let response = index.search("alphaBeta", 10).unwrap();
+
+        assert!(response.fallback_used);
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.hits[0].path, "Assets/ContentGap.asset");
+        assert_eq!(response.hits[0].match_kind, MatchKind::Fuzzy);
+        assert_eq!(
+            response.hits[0].explanation.terms[0].field,
+            MatchField::Content
+        );
+    }
+
+    #[test]
+    fn indexing_rejects_oversized_candidate_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let limits = unity_asset_search_core::SearchLimits::default();
+        write_prefab(
+            temp.path(),
+            "Assets/Oversized.prefab",
+            &"x".repeat(limits.max_name_bytes + 1),
+        );
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        let error = index.reindex_full(&paths).unwrap_err();
+
+        assert!(error.to_string().contains("candidate field `name`"));
+    }
+
+    #[test]
+    fn search_projection_budget_is_cumulative_across_documents() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        fs::create_dir_all(&paths.index_data_dir).unwrap();
+
+        let schema = build_schema();
+        let fields = build_fields(&schema).unwrap();
+        let raw_index = Index::create_in_dir(&paths.index_data_dir, schema).unwrap();
+        let mut writer = raw_index
+            .writer_with_num_threads::<TantivyDocument>(1, 64 * 1024 * 1024)
+            .unwrap();
+        let limits = SearchLimits::default();
+        let name = format!(
+            "Needle{}",
+            "n".repeat(limits.max_name_bytes - "Needle".len())
+        );
+        let path_padding = "p".repeat(20 * 1024);
+        for index in 0..140 {
+            let path = format!("Assets/{index:03}-{path_padding}.asset");
+            let mut document = TantivyDocument::default();
+            add_document_identity(&mut document, &fields, &format!("budget-{index:03}"));
+            document.add_text(fields.guid, "");
+            document.add_text(fields.path, &path);
+            document.add_text(fields.path_filter, normalize_for_match(&path));
+            document.add_text(fields.path_terms, "assets");
+            document.add_text(fields.name, &name);
+            document.add_text(fields.name_terms, "needle");
+            document.add_text(fields.kind, "TextAsset");
+            document.add_text(fields.kind_filter, "textasset");
+            document.add_text(fields.kind_terms, "text asset");
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().unwrap();
+        drop(writer);
+        drop(raw_index);
+
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        let response = index.search("needle", 200).unwrap();
+
+        assert!(response.returned_hits < 140);
+        assert_eq!(
+            response.match_count.relation,
+            unity_asset_search_core::MatchCountRelation::LowerBound
+        );
+        assert!(response.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            SearchDiagnostic::CandidateTotalByteLimitExceeded { .. }
+        )));
+    }
+
+    #[test]
+    fn missing_required_stored_candidate_fields_are_corruption_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        fs::create_dir_all(&paths.index_data_dir).unwrap();
+
+        let schema = build_schema();
+        let fields = build_fields(&schema).unwrap();
+        let raw_index = Index::create_in_dir(&paths.index_data_dir, schema).unwrap();
+        let mut writer = raw_index
+            .writer_with_num_threads::<TantivyDocument>(1, 20 * 1024 * 1024)
+            .unwrap();
+        let mut document = TantivyDocument::default();
+        add_document_identity(&mut document, &fields, "missing-path");
+        document.add_text(fields.name, "Needle");
+        document.add_text(fields.name_terms, "needle");
+        document.add_text(fields.kind, "TextAsset");
+        document.add_text(fields.kind_filter, "textasset");
+        document.add_text(fields.kind_terms, "text asset");
+        writer.add_document(document).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        drop(raw_index);
+
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        let error = index.search("needle", 10).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing required stored field `path`")
+        );
+    }
+
+    #[test]
+    fn candidate_keys_are_fixed_size_digests_of_the_identity_tuple() {
+        let long = "x".repeat(32 * 1024);
+        let first = ranking_candidate_key(&long, &long, &long, "Prefab").unwrap();
+        let second = ranking_candidate_key(&long, &long, &long, "Material").unwrap();
+
+        assert!(first.starts_with("candidate-v1:"));
+        assert_eq!(first.len(), "candidate-v1:".len() + 64);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn path_filters_are_applied_before_tantivy_candidate_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..40 {
+            write_prefab(
+                temp.path(),
+                &format!("Assets/Noise/Noise{index:03}.prefab"),
+                "Noise",
+            );
+        }
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        index.reindex_full(&paths).unwrap();
+
+        let target = write_prefab(temp.path(), "Assets/Target/OnlyTarget.prefab", "OnlyTarget");
+        index
+            .reindex_changed_paths(&paths, std::slice::from_ref(&target))
+            .unwrap();
+
+        let response = index.search("type:prefab in:Assets/Target", 1).unwrap();
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.hits[0].path, "Assets/Target/OnlyTarget.prefab");
+    }
+
+    #[test]
+    fn tantivy_candidate_truncation_is_reported_by_the_core_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..6 {
+            write_prefab(
+                temp.path(),
+                &format!("Assets/Items/Item{index}.prefab"),
+                "Common",
+            );
+        }
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        index.reindex_full(&paths).unwrap();
+
+        let response = index.search("common", 1).unwrap();
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.match_count.value, 5);
+        assert_eq!(response.returned_hits, 1);
+        assert_eq!(
+            response.match_count.relation,
+            unity_asset_search_core::MatchCountRelation::LowerBound
+        );
+        assert!(response.request_limit_truncated);
+        assert!(
+            response
+                .diagnostics
+                .contains(&SearchDiagnostic::CandidateLimitExceeded {
+                    stage: RetrievalStage::Strict,
+                    provided: 6,
+                    limit: 5,
+                })
+        );
+    }
+
+    #[test]
+    fn response_distinguishes_total_returned_and_request_limited_hits() {
+        let temp = tempfile::tempdir().unwrap();
+        write_prefab(temp.path(), "Assets/UI/A.prefab", "Button");
+        write_prefab(temp.path(), "Assets/UI/B.prefab", "Button");
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        index.reindex_full(&paths).unwrap();
+
+        let response = index.search("button", 1).unwrap();
+        assert_eq!(response.match_count.value, 2);
+        assert_eq!(response.returned_hits, 1);
+        assert_eq!(
+            response.match_count.relation,
+            unity_asset_search_core::MatchCountRelation::Exact
+        );
+        assert!(response.request_limit_truncated);
+        assert_eq!(response.hits[0].rank, 1);
+    }
+
+    #[test]
+    fn search_hit_exposes_the_final_structured_ranking_score() {
+        let temp = tempfile::tempdir().unwrap();
+        write_prefab(temp.path(), "Assets/UI/Button.prefab", "Button");
+
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+        index.reindex_full(&paths).unwrap();
+
+        let response = index.search("buton", 10).unwrap();
+        assert!(response.fallback_used);
+        assert_eq!(response.hits.len(), 1);
+        let signals = serde_json::to_value(&response.hits[0].ranking_signals).unwrap();
+        assert!(signals.is_object());
+        assert_eq!(signals["retrieval_stage"], "fuzzy_fallback");
+        assert!(signals["retrieval_score"].is_i64());
+        assert_eq!(response.hits[0].rank, 1);
+    }
+
+    #[test]
+    fn candidate_boundary_is_stable_across_incremental_index_histories() {
+        let complete = tempfile::tempdir().unwrap();
+        for index in 0..64 {
+            write_prefab(
+                complete.path(),
+                &format!("Assets/Items/Item{index:03}.prefab"),
+                "SharedName",
+            );
+        }
+        let complete_paths =
+            IndexPaths::for_project(complete.path().to_path_buf(), None, None).unwrap();
+        let complete_index = SearchIndex::open_or_create(&complete_paths).unwrap();
+        complete_index.reindex_full(&complete_paths).unwrap();
+
+        let incremental = tempfile::tempdir().unwrap();
+        for index in 32..64 {
+            write_prefab(
+                incremental.path(),
+                &format!("Assets/Items/Item{index:03}.prefab"),
+                "SharedName",
+            );
+        }
+        let incremental_paths =
+            IndexPaths::for_project(incremental.path().to_path_buf(), None, None).unwrap();
+        let incremental_index = SearchIndex::open_or_create(&incremental_paths).unwrap();
+        incremental_index.reindex_full(&incremental_paths).unwrap();
+        let changed_paths: Vec<_> = (0..32)
+            .rev()
+            .map(|index| {
+                write_prefab(
+                    incremental.path(),
+                    &format!("Assets/Items/Item{index:03}.prefab"),
+                    "SharedName",
+                )
+            })
+            .collect();
+        incremental_index
+            .reindex_changed_paths(&incremental_paths, &changed_paths)
+            .unwrap();
+
+        let complete_response = complete_index.search("type:prefab", 1).unwrap();
+        let incremental_response = incremental_index.search("type:prefab", 1).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&complete_response.hits).unwrap(),
+            serde_json::to_vec(&incremental_response.hits).unwrap()
+        );
+    }
 
     #[test]
     fn bundle_container_entries_are_indexed_when_enabled() {
@@ -4383,6 +5472,121 @@ Transform:
             stable_id_for(None, "Assets/a.prefab", Some(10)),
             "path:Assets/a.prefab#10"
         );
+    }
+
+    #[test]
+    fn incompatible_search_field_options_are_rejected_during_open() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        fs::create_dir_all(&paths.index_data_dir).unwrap();
+
+        let mut builder = Schema::builder();
+        builder.add_text_field("id", STRING | STORED);
+        builder.add_text_field("guid", STRING | STORED);
+        builder.add_text_field("path", STORED);
+        builder.add_text_field("path_filter", STRING);
+        builder.add_text_field("path_terms", TEXT);
+        builder.add_text_field("name", STORED);
+        builder.add_text_field("name_terms", TEXT);
+        builder.add_text_field("kind", STRING | STORED);
+        builder.add_text_field("kind_filter", STRING);
+        builder.add_text_field("kind_terms", TEXT);
+        builder.add_text_field("content_terms", TEXT);
+        builder.add_text_field("container_source_path", STRING | STORED);
+        Index::create_in_dir(&paths.index_data_dir, builder.build()).unwrap();
+
+        let error = match SearchIndex::open_or_create(&paths) {
+            Ok(_) => panic!("incompatible schema unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("search index schema does not match the tantivy-v4 contract")
+        );
+    }
+
+    #[test]
+    fn stable_collector_merge_uses_score_identity_and_address_order() {
+        let hit = |retrieval_score, stable_id: &str, segment_ord, doc_id| StableTopHit {
+            retrieval_score,
+            stable_id: stable_id.to_string(),
+            address: DocAddress::new(segment_ord, doc_id),
+        };
+        let collector = StableTopDocs { limit: 3 };
+        let merged = collector
+            .merge_fruits(vec![
+                Ok(vec![hit(10, "b", 0, 0), hit(9, "z", 0, 1)]),
+                Ok(vec![hit(10, "a", 1, 1), hit(10, "a", 1, 0)]),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            merged,
+            [
+                (10, DocAddress::new(1, 0)),
+                (10, DocAddress::new(1, 1)),
+                (10, DocAddress::new(0, 0)),
+            ]
+        );
+
+        let mut empty = BinaryHeap::new();
+        push_stable_hit(&mut empty, hit(10, "a", 0, 0), 0);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn stable_collector_reports_missing_identity_before_score_pruning() {
+        let schema = build_schema();
+        let fields = build_fields(&schema).unwrap();
+        let index = Index::create_in_ram(schema);
+        let mut writer = index
+            .writer_with_num_threads::<TantivyDocument>(1, 20 * 1024 * 1024)
+            .unwrap();
+
+        let mut valid = TantivyDocument::default();
+        valid.add_text(fields.id, "valid");
+        valid.add_text(fields.name_terms, "needle");
+        writer.add_document(valid).unwrap();
+
+        let mut invalid = TantivyDocument::default();
+        invalid.add_text(
+            fields.name_terms,
+            format!("needle {}", "noise ".repeat(256)),
+        );
+        writer.add_document(invalid).unwrap();
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(fields.name_terms, "needle"),
+            tantivy::schema::IndexRecordOption::Basic,
+        );
+        let error = collect_stable_top_docs(&searcher, &query, 1).unwrap_err();
+        assert!(error.to_string().contains("missing its stable id"));
+    }
+
+    #[test]
+    fn previous_v3_index_is_isolated_by_versioned_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets")).unwrap();
+        let index_root = temp.path().join("search-index");
+        let old_index_dir = index_root.join("tantivy-v3");
+        fs::create_dir_all(&old_index_dir).unwrap();
+
+        let mut builder = Schema::builder();
+        builder.add_text_field("id", STRING | STORED);
+        Index::create_in_dir(&old_index_dir, builder.build()).unwrap();
+        fs::write(index_root.join("state-v3.json"), b"not-current-state").unwrap();
+
+        let paths =
+            IndexPaths::for_project(temp.path().to_path_buf(), Some(index_root.clone()), None)
+                .unwrap();
+        assert_eq!(paths.index_data_dir, index_root.join("tantivy-v4"));
+        assert_eq!(paths.state_path, index_root.join("state-v4.json"));
+        SearchIndex::open_or_create(&paths).unwrap();
     }
 
     #[test]
