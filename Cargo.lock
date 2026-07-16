@@ -3650,7 +3650,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tantivy",
- "tantivy-columnar",
  "tempfile",
  "unity-asset-binary",
  "unity-asset-core",

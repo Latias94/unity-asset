@@ -18,7 +18,6 @@ serde_json.workspace = true
 regex.workspace = true
 hex.workspace = true
 tantivy.workspace = true
-columnar = { package = "tantivy-columnar", version = "0.6" }
 ignore.workspace = true
 once_cell.workspace = true
 unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }

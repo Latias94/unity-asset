@@ -9,11 +9,11 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
-use columnar::StrColumn;
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tantivy::collector::{Collector, SegmentCollector, TopDocs};
+use tantivy::columnar::StrColumn;
 use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, EnableScoring, FuzzyTermQuery, PhrasePrefixQuery,
     PhraseQuery, Query, RegexQuery, TermQuery, Weight,
@@ -27,7 +27,7 @@ use unity_asset_core::DigestV1Builder;
 use unity_asset_search_core::{
     CandidateFacts, CandidateField, FuzzyWorkUsage, HighlightRange, MatchCount, MatchExplanation,
     MatchField, MatchKind, QuerySpec, RankingSignals, RetrievalEvidence, RetrievalStage,
-    RetrievalTerm, SearchDiagnostic, SearchLimits, SearchPolicy, SearchRequest,
+    RetrievalTerm, SearchDiagnostic, SearchKind, SearchLimits, SearchPolicy, SearchRequest,
     normalize_for_match, to_terms,
 };
 
@@ -1059,7 +1059,7 @@ impl SearchIndex {
         let script_total: u64 = scan
             .files
             .values()
-            .filter(|f| f.kind == "Script")
+            .filter(|file| file.kind == SearchKind::Script)
             .count()
             .try_into()
             .unwrap_or(u64::MAX);
@@ -1356,12 +1356,10 @@ impl SearchIndex {
 
         if want_kind {
             let lower = rest.to_lowercase();
-            for kind in [
-                "Prefab", "Scene", "Material", "Script", "Asset", "Shader", "Texture", "Audio",
-                "File",
-            ] {
-                if kind.to_lowercase().starts_with(&lower) {
-                    out.push(format!("t:{kind}"));
+            for &kind in SearchKind::ALL {
+                let canonical = kind.canonical_name();
+                if canonical.to_lowercase().starts_with(&lower) {
+                    out.push(format!("t:{canonical}"));
                     if out.len() >= limit {
                         return Ok(SuggestResponse {
                             prefix: prefix.to_string(),
@@ -1636,23 +1634,48 @@ fn quantize_retrieval_score(score: f32) -> i64 {
     (f64::from(score) * 1_000_000.0).round() as i64
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StableTopKey<'a> {
+    retrieval_score: i64,
+    document_id: &'a str,
+    address: DocAddress,
+}
+
+impl Ord for StableTopKey<'_> {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.retrieval_score
+            .cmp(&other.retrieval_score)
+            .then_with(|| other.document_id.cmp(self.document_id))
+            .then_with(|| compare_doc_address(other.address, self.address))
+    }
+}
+
+impl PartialOrd for StableTopKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StableTopHit {
     retrieval_score: i64,
-    stable_id: String,
+    document_id: String,
     address: DocAddress,
+}
+
+impl StableTopHit {
+    fn key(&self) -> StableTopKey<'_> {
+        StableTopKey {
+            retrieval_score: self.retrieval_score,
+            document_id: &self.document_id,
+            address: self.address,
+        }
+    }
 }
 
 impl Ord for StableTopHit {
     fn cmp(&self, other: &Self) -> CmpOrdering {
-        compare_stable_top_parts(
-            self.retrieval_score,
-            &self.stable_id,
-            self.address,
-            other.retrieval_score,
-            &other.stable_id,
-            other.address,
-        )
+        self.key().cmp(&other.key())
     }
 }
 
@@ -1660,20 +1683,6 @@ impl PartialOrd for StableTopHit {
     fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
         Some(self.cmp(other))
     }
-}
-
-fn compare_stable_top_parts(
-    left_score: i64,
-    left_stable_id: &str,
-    left_address: DocAddress,
-    right_score: i64,
-    right_stable_id: &str,
-    right_address: DocAddress,
-) -> CmpOrdering {
-    left_score
-        .cmp(&right_score)
-        .then_with(|| right_stable_id.cmp(left_stable_id))
-        .then_with(|| compare_doc_address(right_address, left_address))
 }
 
 fn compare_doc_address(left: DocAddress, right: DocAddress) -> CmpOrdering {
@@ -1695,14 +1704,14 @@ impl Collector for StableTopDocs {
         segment_local_id: u32,
         segment_reader: &tantivy::SegmentReader,
     ) -> tantivy::Result<Self::Child> {
-        let stable_ids = segment_reader
+        let document_ids = segment_reader
             .fast_fields()
             .str("id")?
             .ok_or_else(|| tantivy::TantivyError::SchemaError("id fast field missing".into()))?;
         Ok(StableTopSegmentCollector {
             limit: self.limit,
             segment_ord: segment_local_id,
-            stable_ids,
+            document_ids,
             scratch: String::new(),
             heap: BinaryHeap::with_capacity(self.limit),
             error: None,
@@ -1735,7 +1744,7 @@ impl Collector for StableTopDocs {
 struct StableTopSegmentCollector {
     limit: usize,
     segment_ord: u32,
-    stable_ids: StrColumn,
+    document_ids: StrColumn,
     scratch: String,
     heap: BinaryHeap<Reverse<StableTopHit>>,
     error: Option<tantivy::TantivyError>,
@@ -1751,13 +1760,13 @@ impl SegmentCollector for StableTopSegmentCollector {
         let retrieval_score = quantize_retrieval_score(score);
 
         self.scratch.clear();
-        let Some(term_ord) = self.stable_ids.term_ords(doc).next() else {
+        let Some(term_ord) = self.document_ids.term_ords(doc).next() else {
             self.error = Some(tantivy::TantivyError::InternalError(
                 "indexed document is missing its stable id".into(),
             ));
             return;
         };
-        match self.stable_ids.ord_to_str(term_ord, &mut self.scratch) {
+        match self.document_ids.ord_to_str(term_ord, &mut self.scratch) {
             Ok(true) => {}
             Ok(false) => {
                 self.error = Some(tantivy::TantivyError::InternalError(
@@ -1774,14 +1783,12 @@ impl SegmentCollector for StableTopSegmentCollector {
         let address = DocAddress::new(self.segment_ord, doc);
         if self.heap.len() == self.limit
             && self.heap.peek().is_some_and(|worst| {
-                compare_stable_top_parts(
+                StableTopKey {
                     retrieval_score,
-                    &self.scratch,
+                    document_id: &self.scratch,
                     address,
-                    worst.0.retrieval_score,
-                    &worst.0.stable_id,
-                    worst.0.address,
-                )
+                }
+                .cmp(&worst.0.key())
                 .is_le()
             })
         {
@@ -1791,7 +1798,7 @@ impl SegmentCollector for StableTopSegmentCollector {
             &mut self.heap,
             StableTopHit {
                 retrieval_score,
-                stable_id: self.scratch.clone(),
+                document_id: self.scratch.clone(),
                 address,
             },
             self.limit,
@@ -2112,47 +2119,66 @@ fn optional_stored_text<'a>(
         .transpose()
 }
 
-fn candidate_projection_size(
+#[derive(Debug, Clone, Copy)]
+struct ValidatedProjectionFields<'a> {
     limits: SearchLimits,
-    stable_key: &str,
-    name: &str,
-    path: &str,
-    kind: &str,
-    guid: Option<&str>,
-    container_source_path: Option<&str>,
-) -> std::result::Result<usize, SearchDiagnostic> {
-    validate_projection_fields(limits, name, path, kind, guid, container_source_path)?;
-    limits
-        .measure_candidate(stable_key, name, path, kind, 0)?
-        .checked_add(guid.map_or(0, str::len))
-        .and_then(|size| size.checked_add(container_source_path.map_or(0, str::len)))
-        .ok_or(SearchDiagnostic::CandidateTotalByteLimitExceeded {
-            consumed: usize::MAX,
-            limit: limits.max_total_candidate_bytes,
-        })
+    name: &'a str,
+    path: &'a str,
+    kind: &'a str,
+    guid: Option<&'a str>,
+    container_source_path: Option<&'a str>,
+    bytes_without_key: usize,
 }
 
-fn validate_projection_fields(
-    limits: SearchLimits,
-    name: &str,
-    path: &str,
-    kind: &str,
-    guid: Option<&str>,
-    container_source_path: Option<&str>,
-) -> std::result::Result<(), SearchDiagnostic> {
-    limits.validate_field_bytes(CandidateField::Name, name.len())?;
-    limits.validate_field_bytes(CandidateField::Path, path.len())?;
-    limits.validate_field_bytes(CandidateField::Kind, kind.len())?;
-    if let Some(guid) = guid {
-        limits.validate_field_bytes(CandidateField::Guid, guid.len())?;
+impl<'a> ValidatedProjectionFields<'a> {
+    fn new(
+        limits: SearchLimits,
+        name: &'a str,
+        path: &'a str,
+        kind: &'a str,
+        guid: Option<&'a str>,
+        container_source_path: Option<&'a str>,
+    ) -> std::result::Result<Self, SearchDiagnostic> {
+        let base_bytes = limits.measure_candidate("", name, path, kind, 0)?;
+        if let Some(guid) = guid {
+            limits.validate_field_bytes(CandidateField::Guid, guid.len())?;
+        }
+        if let Some(container_source_path) = container_source_path {
+            limits.validate_field_bytes(
+                CandidateField::ContainerSourcePath,
+                container_source_path.len(),
+            )?;
+        }
+
+        let bytes_without_key = base_bytes
+            .checked_add(guid.map_or(0, str::len))
+            .and_then(|size| size.checked_add(container_source_path.map_or(0, str::len)))
+            .ok_or(SearchDiagnostic::CandidateTotalByteLimitExceeded {
+                consumed: usize::MAX,
+                limit: limits.max_total_candidate_bytes,
+            })?;
+
+        Ok(Self {
+            limits,
+            name,
+            path,
+            kind,
+            guid,
+            container_source_path,
+            bytes_without_key,
+        })
     }
-    if let Some(container_source_path) = container_source_path {
-        limits.validate_field_bytes(
-            CandidateField::ContainerSourcePath,
-            container_source_path.len(),
-        )?;
+
+    fn measure_with_key(self, stable_key: &str) -> std::result::Result<usize, SearchDiagnostic> {
+        self.limits
+            .validate_field_bytes(CandidateField::StableKey, stable_key.len())?;
+        stable_key.len().checked_add(self.bytes_without_key).ok_or(
+            SearchDiagnostic::CandidateTotalByteLimitExceeded {
+                consumed: usize::MAX,
+                limit: self.limits.max_total_candidate_bytes,
+            },
+        )
     }
-    Ok(())
 }
 
 fn candidate_budget_error(diagnostic: SearchDiagnostic) -> anyhow::Error {
@@ -2206,7 +2232,7 @@ fn collect_search_candidates(
         )?
         .filter(|value| !value.is_empty());
 
-        let field_validation = validate_projection_fields(
+        let projection_fields = ValidatedProjectionFields::new(
             budget.limits,
             name,
             path,
@@ -2214,25 +2240,37 @@ fn collect_search_candidates(
             guid,
             container_source_path,
         );
-        if let Err(diagnostic) = field_validation {
-            budget.reject(diagnostic);
-            continue;
-        }
-
-        let stable_id = if let Some(source) = container_source_path {
-            stable_id_for(None, &format!("container:{source}|{path}"), None)
-        } else {
-            stable_id_for(guid, path, None)
+        let projection_fields = match projection_fields {
+            Ok(projection_fields) => projection_fields,
+            Err(diagnostic) => {
+                budget.reject(diagnostic);
+                continue;
+            }
         };
-        let candidate_key = ranking_candidate_key(&stable_id, path, name, kind)?;
+
+        let stable_id = if let Some(source) = projection_fields.container_source_path {
+            stable_id_for(
+                None,
+                &format!("container:{source}|{}", projection_fields.path),
+                None,
+            )
+        } else {
+            stable_id_for(projection_fields.guid, projection_fields.path, None)
+        };
+        let candidate_key = ranking_candidate_key(
+            &stable_id,
+            projection_fields.path,
+            projection_fields.name,
+            projection_fields.kind,
+        )?;
         if excluded_keys.contains(&candidate_key) {
             continue;
         }
         let replacing_existing = if let Some(existing) = candidates_by_key.get(&candidate_key) {
             if existing.projection.stable_id != stable_id
-                || existing.facts.path != path
-                || existing.facts.name != name
-                || existing.facts.kind != kind
+                || existing.facts.path != projection_fields.path
+                || existing.facts.name != projection_fields.name
+                || existing.facts.kind != projection_fields.kind
             {
                 return Err(anyhow!(
                     "candidate identity digest collision for `{candidate_key}`"
@@ -2246,15 +2284,7 @@ fn collect_search_candidates(
             false
         };
         if !replacing_existing {
-            let candidate_bytes = match candidate_projection_size(
-                budget.limits,
-                &candidate_key,
-                name,
-                path,
-                kind,
-                guid,
-                container_source_path,
-            ) {
+            let candidate_bytes = match projection_fields.measure_with_key(&candidate_key) {
                 Ok(candidate_bytes) => candidate_bytes,
                 Err(diagnostic) => {
                     budget.reject(diagnostic);
@@ -2267,8 +2297,11 @@ fn collect_search_candidates(
         }
 
         let location = Location {
-            path: container_source_path.unwrap_or(path).to_string(),
-            guid: guid.map(str::to_string),
+            path: projection_fields
+                .container_source_path
+                .unwrap_or(projection_fields.path)
+                .to_string(),
+            guid: projection_fields.guid.map(str::to_string),
             file_id: None,
             class_id: None,
         };
@@ -2276,9 +2309,15 @@ fn collect_search_candidates(
             candidate_key.clone(),
             RetrievedCandidate {
                 address,
-                facts: CandidateFacts::new(&candidate_key, name, path, kind, retrieval_score),
+                facts: CandidateFacts::new(
+                    &candidate_key,
+                    projection_fields.name,
+                    projection_fields.path,
+                    projection_fields.kind,
+                    retrieval_score,
+                ),
                 projection: HitProjection {
-                    guid: guid.map(str::to_string),
+                    guid: projection_fields.guid.map(str::to_string),
                     stable_id,
                     location,
                 },
@@ -2549,7 +2588,7 @@ struct ScannedFile {
     abs_path: PathBuf,
     fingerprint: Fingerprint,
     name: String,
-    kind: String,
+    kind: SearchKind,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3048,7 +3087,11 @@ fn build_script_guid_map(
 ) -> Result<std::collections::BTreeMap<String, ScriptGuidEntry>> {
     let mut out = std::collections::BTreeMap::new();
 
-    for file in scan.files.values().filter(|f| f.kind == "Script") {
+    for file in scan
+        .files
+        .values()
+        .filter(|file| file.kind == SearchKind::Script)
+    {
         let guid = read_guid_from_meta(asset_meta_path(&file.abs_path)).unwrap_or_default();
         if guid.trim().is_empty() {
             continue;
@@ -3089,7 +3132,7 @@ fn update_script_map_for_file(
     scripts: &mut std::collections::BTreeMap<String, ScriptGuidEntry>,
     file: &ScannedFile,
 ) -> Result<()> {
-    if file.kind != "Script" {
+    if file.kind != SearchKind::Script {
         return Ok(());
     }
 
@@ -3179,28 +3222,21 @@ fn build_doc(
         .to_string();
     let limits = SearchLimits::default();
     let guid_value = (!guid.is_empty()).then_some(guid.as_str());
-    validate_projection_fields(
+    let kind = file.kind.canonical_name();
+    let projection_fields = ValidatedProjectionFields::new(
         limits,
         &display_name,
         &file.rel_path,
-        &file.kind,
+        kind,
         guid_value,
         None,
     )
     .map_err(candidate_budget_error)?;
     let stable_id = stable_id_for(guid_value, &file.rel_path, None);
-    let candidate_key =
-        ranking_candidate_key(&stable_id, &file.rel_path, &display_name, &file.kind)?;
-    candidate_projection_size(
-        limits,
-        &candidate_key,
-        &display_name,
-        &file.rel_path,
-        &file.kind,
-        guid_value,
-        None,
-    )
-    .map_err(candidate_budget_error)?;
+    let candidate_key = ranking_candidate_key(&stable_id, &file.rel_path, &display_name, kind)?;
+    projection_fields
+        .measure_with_key(&candidate_key)
+        .map_err(candidate_budget_error)?;
 
     let mut document = TantivyDocument::default();
     add_document_identity(&mut document, fields, &file.rel_path);
@@ -3210,9 +3246,9 @@ fn build_doc(
     document.add_text(fields.path_terms, to_terms(&file.rel_path));
     document.add_text(fields.name, display_name.clone());
     document.add_text(fields.name_terms, to_terms(&display_name));
-    document.add_text(fields.kind, file.kind.clone());
-    document.add_text(fields.kind_filter, normalize_for_match(&file.kind));
-    document.add_text(fields.kind_terms, to_terms(&file.kind));
+    document.add_text(fields.kind, kind);
+    document.add_text(fields.kind_filter, normalize_for_match(kind));
+    document.add_text(fields.kind_terms, to_terms(kind));
 
     if let Some(content_terms) = extracted.content_terms.filter(|s| !s.trim().is_empty()) {
         document.add_text(fields.content_terms, content_terms);
@@ -3247,11 +3283,11 @@ fn build_bundle_container_doc(
     let bundle_rel_path = bundle_rel_path.trim();
     let display_name = container_name_from_asset_path(asset_path);
     let limits = SearchLimits::default();
-    validate_projection_fields(
+    let projection_fields = ValidatedProjectionFields::new(
         limits,
         &display_name,
         asset_path,
-        "BundleContainer",
+        SearchKind::BundleContainer.canonical_name(),
         None,
         Some(bundle_rel_path),
     )
@@ -3261,18 +3297,15 @@ fn build_bundle_container_doc(
         &format!("container:{bundle_rel_path}|{asset_path}"),
         None,
     );
-    let candidate_key =
-        ranking_candidate_key(&stable_id, asset_path, &display_name, "BundleContainer")?;
-    candidate_projection_size(
-        limits,
-        &candidate_key,
-        &display_name,
+    let candidate_key = ranking_candidate_key(
+        &stable_id,
         asset_path,
-        "BundleContainer",
-        None,
-        Some(bundle_rel_path),
-    )
-    .map_err(candidate_budget_error)?;
+        &display_name,
+        SearchKind::BundleContainer.canonical_name(),
+    )?;
+    projection_fields
+        .measure_with_key(&candidate_key)
+        .map_err(candidate_budget_error)?;
 
     let mut document = TantivyDocument::default();
     add_document_identity(
@@ -3286,9 +3319,10 @@ fn build_bundle_container_doc(
     document.add_text(fields.path_terms, to_terms(asset_path));
     document.add_text(fields.name, display_name.clone());
     document.add_text(fields.name_terms, to_terms(&display_name));
-    document.add_text(fields.kind, "BundleContainer");
-    document.add_text(fields.kind_filter, normalize_for_match("BundleContainer"));
-    document.add_text(fields.kind_terms, to_terms("BundleContainer"));
+    let kind = SearchKind::BundleContainer.canonical_name();
+    document.add_text(fields.kind, kind);
+    document.add_text(fields.kind_filter, normalize_for_match(kind));
+    document.add_text(fields.kind_terms, to_terms(kind));
     document.add_text(fields.content_terms, to_terms(bundle_rel_path));
     document.add_text(fields.container_source_path, bundle_rel_path);
     Ok(document)
@@ -3318,7 +3352,7 @@ fn build_refs_doc_and_container_entries(
     let mut container_asset_paths: Vec<String> = Vec::new();
 
     let (source_kind, extracted) = if let Some(extracted) = yaml_extracted {
-        (file.kind.clone(), extracted)
+        (file.kind.canonical_name().to_string(), extracted)
     } else {
         let extracted = extract_unity_binary_extraction(file, options)?;
         let Some(extracted) = extracted else {
@@ -3656,11 +3690,11 @@ fn extract_content_for_file(
         .unwrap_or("")
         .to_lowercase();
 
-    if matches!(
-        file.kind.as_str(),
-        "Prefab" | "Scene" | "Material" | "Asset"
-    ) && is_probably_unity_yaml(&file.abs_path)?
-    {
+    let is_yaml_kind = matches!(
+        file.kind,
+        SearchKind::Prefab | SearchKind::Scene | SearchKind::Material | SearchKind::Asset
+    );
+    if is_yaml_kind && is_probably_unity_yaml(&file.abs_path)? {
         let text = read_text_limited(&file.abs_path, 2 * 1024 * 1024)?;
         let Some(text) = text else {
             return Ok(ExtractedContent::default());
@@ -4589,7 +4623,9 @@ fn enrich_hits_with_context(
     let mut needed_guids = std::collections::BTreeSet::<String>::new();
 
     for hit in hits.iter() {
-        if !matches!(hit.kind.as_str(), "Prefab" | "Scene") {
+        if hit.kind != SearchKind::Prefab.canonical_name()
+            && hit.kind != SearchKind::Scene.canonical_name()
+        {
             extracted.push(None);
             continue;
         }
@@ -4797,26 +4833,25 @@ fn should_skip_file(path: &Path) -> bool {
         .is_some_and(|n| n.starts_with('.'))
 }
 
-fn classify_kind(path: &Path) -> String {
+fn classify_kind(path: &Path) -> SearchKind {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
     match ext.as_str() {
-        "prefab" => "Prefab",
-        "unity" => "Scene",
-        "mat" => "Material",
-        "cs" => "Script",
-        "anim" => "AnimationClip",
-        "controller" => "AnimatorController",
-        "asset" => "Asset",
-        "shader" => "Shader",
-        "png" | "jpg" | "jpeg" | "tga" | "psd" => "Texture",
-        "wav" | "mp3" | "ogg" => "Audio",
-        _ => "File",
+        "prefab" => SearchKind::Prefab,
+        "unity" => SearchKind::Scene,
+        "mat" => SearchKind::Material,
+        "cs" => SearchKind::Script,
+        "anim" => SearchKind::AnimationClip,
+        "controller" => SearchKind::AnimatorController,
+        "asset" => SearchKind::Asset,
+        "shader" => SearchKind::Shader,
+        "png" | "jpg" | "jpeg" | "tga" | "psd" => SearchKind::Texture,
+        "wav" | "mp3" | "ogg" => SearchKind::Audio,
+        _ => SearchKind::File,
     }
-    .to_string()
 }
 
 fn meta_path_for_asset(asset_path: &Path) -> Option<PathBuf> {
@@ -5515,10 +5550,78 @@ Transform:
     }
 
     #[test]
+    fn type_suggestions_cover_the_core_search_kind_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(temp.path().to_path_buf(), None, None).unwrap();
+        let index = SearchIndex::open_or_create(&paths).unwrap();
+
+        let response = index.suggest("t:", SearchKind::ALL.len()).unwrap();
+        let expected = SearchKind::ALL
+            .iter()
+            .copied()
+            .map(|kind| format!("t:{}", kind.canonical_name()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(response.suggestions, expected);
+    }
+
+    #[test]
+    fn validated_projection_fields_measure_every_retained_field_once() {
+        let limits = SearchLimits {
+            max_stable_key_bytes: 3,
+            max_guid_bytes: 4,
+            max_container_source_path_bytes: 9,
+            ..SearchLimits::default()
+        };
+        let fields = ValidatedProjectionFields::new(
+            limits,
+            "name",
+            "path",
+            "kind",
+            Some("guid"),
+            Some("container"),
+        )
+        .unwrap();
+        assert_eq!(fields.measure_with_key("key"), Ok(3 + 4 + 4 + 4 + 4 + 9));
+        assert!(matches!(
+            fields.measure_with_key("wide"),
+            Err(SearchDiagnostic::CandidateFieldByteLimitExceeded {
+                field: CandidateField::StableKey,
+                actual: 4,
+                limit: 3,
+            })
+        ));
+        assert!(matches!(
+            ValidatedProjectionFields::new(limits, "name", "path", "kind", Some("large"), None,),
+            Err(SearchDiagnostic::CandidateFieldByteLimitExceeded {
+                field: CandidateField::Guid,
+                actual: 5,
+                limit: 4,
+            })
+        ));
+        assert!(matches!(
+            ValidatedProjectionFields::new(
+                limits,
+                "name",
+                "path",
+                "kind",
+                None,
+                Some("containers"),
+            ),
+            Err(SearchDiagnostic::CandidateFieldByteLimitExceeded {
+                field: CandidateField::ContainerSourcePath,
+                actual: 10,
+                limit: 9,
+            })
+        ));
+    }
+
+    #[test]
     fn stable_collector_merge_uses_score_identity_and_address_order() {
-        let hit = |retrieval_score, stable_id: &str, segment_ord, doc_id| StableTopHit {
+        let hit = |retrieval_score, document_id: &str, segment_ord, doc_id| StableTopHit {
             retrieval_score,
-            stable_id: stable_id.to_string(),
+            document_id: document_id.to_string(),
             address: DocAddress::new(segment_ord, doc_id),
         };
         let collector = StableTopDocs { limit: 3 };

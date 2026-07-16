@@ -2,9 +2,57 @@ use std::cell::Cell;
 
 use unity_asset_search_core::{
     CandidateFacts, CandidateField, FuzzyFallbackPolicy, MatchCountRelation, MatchField, MatchKind,
-    RetrievalEvidence, RetrievalStage, SearchDiagnostic, SearchLimits, SearchOutcome, SearchPolicy,
-    SearchRequest, highlight_html,
+    RetrievalEvidence, RetrievalStage, SearchDiagnostic, SearchKind, SearchLimits, SearchOutcome,
+    SearchPolicy, SearchRequest, highlight_html,
 };
+
+#[test]
+fn search_kind_catalog_owns_canonical_names_and_filter_aliases() {
+    let canonical_names = SearchKind::ALL
+        .iter()
+        .copied()
+        .map(SearchKind::canonical_name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        canonical_names,
+        vec![
+            "Prefab",
+            "Scene",
+            "Material",
+            "Script",
+            "AnimationClip",
+            "AnimatorController",
+            "Asset",
+            "Shader",
+            "Texture",
+            "Audio",
+            "BundleContainer",
+            "File",
+        ]
+    );
+    for &kind in SearchKind::ALL {
+        assert_eq!(SearchKind::from_filter(kind.canonical_name()), Some(kind));
+        assert_eq!(
+            serde_json::to_value(kind).unwrap(),
+            serde_json::json!(kind.canonical_name())
+        );
+        let prepared = SearchPolicy::default().prepare(SearchRequest::new(
+            format!("t:{}", kind.canonical_name()),
+            1,
+        ));
+        assert_eq!(prepared.query().type_filter_kind(), Some(kind));
+        assert_eq!(
+            serde_json::to_value(prepared.query()).unwrap()["type_filter"],
+            kind.canonical_name()
+        );
+    }
+    assert_eq!(SearchKind::from_filter("mat"), Some(SearchKind::Material));
+    assert_eq!(
+        SearchKind::from_filter("bundle-container"),
+        Some(SearchKind::BundleContainer)
+    );
+    assert_eq!(SearchKind::from_filter("unknown-kind"), None);
+}
 
 fn candidate(
     stable_key: &str,
@@ -115,6 +163,11 @@ fn quoted_phrase_is_one_term_and_filters_are_policy_owned() {
 
     assert!(outcome.diagnostics.is_empty());
     assert_eq!(outcome.query.type_filter(), Some("Prefab"));
+    assert_eq!(outcome.query.type_filter_kind(), Some(SearchKind::Prefab));
+    assert_eq!(
+        serde_json::to_value(&outcome.query).unwrap()["type_filter"],
+        "Prefab"
+    );
     assert_eq!(outcome.query.path_prefix(), Some("Assets/UI"));
     assert_eq!(outcome.query.terms().len(), 1);
     assert!(outcome.query.terms()[0].is_quoted());
@@ -1062,6 +1115,234 @@ fn duplicate_keys_cannot_consume_the_candidate_boundary() {
                 stable_key: "same".to_string(),
             })
     );
+}
+
+#[test]
+fn every_known_diagnostic_has_an_independent_golden_wire_contract() {
+    let cases = vec![
+        (
+            SearchDiagnostic::EmptyQuery,
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "empty_query",
+                "severity": "error",
+                "blocks_execution": true,
+                "details": {},
+            }),
+        ),
+        (
+            SearchDiagnostic::UnterminatedQuote { byte_offset: 7 },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "unterminated_quote",
+                "severity": "error",
+                "blocks_execution": true,
+                "details": { "byte_offset": 7 },
+            }),
+        ),
+        (
+            SearchDiagnostic::EmptyQuotedTerm { byte_offset: 11 },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "empty_quoted_term",
+                "severity": "error",
+                "blocks_execution": true,
+                "details": { "byte_offset": 11 },
+            }),
+        ),
+        (
+            SearchDiagnostic::MissingFilterValue {
+                field: "type".to_string(),
+            },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "missing_filter_value",
+                "severity": "error",
+                "blocks_execution": true,
+                "details": { "field": "type" },
+            }),
+        ),
+        (
+            SearchDiagnostic::DuplicateFilter {
+                field: "in".to_string(),
+            },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "duplicate_filter",
+                "severity": "error",
+                "blocks_execution": true,
+                "details": { "field": "in" },
+            }),
+        ),
+        (
+            SearchDiagnostic::UnsupportedTypeFilter {
+                value: "FutureKind".to_string(),
+            },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "unsupported_type_filter",
+                "severity": "error",
+                "blocks_execution": true,
+                "details": { "value": "FutureKind" },
+            }),
+        ),
+        (
+            SearchDiagnostic::CandidateLimitExceeded {
+                stage: RetrievalStage::Strict,
+                provided: 6,
+                limit: 5,
+            },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "candidate_limit_exceeded",
+                "severity": "warning",
+                "blocks_execution": false,
+                "details": { "stage": "strict", "provided": 6, "limit": 5 },
+            }),
+        ),
+        (
+            SearchDiagnostic::QueryByteLimitExceeded {
+                actual: 4_097,
+                limit: 4_096,
+            },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "query_byte_limit_exceeded",
+                "severity": "error",
+                "blocks_execution": true,
+                "details": { "actual": 4097, "limit": 4096 },
+            }),
+        ),
+        (
+            SearchDiagnostic::QueryTermLimitExceeded {
+                actual: 129,
+                limit: 128,
+            },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "query_term_limit_exceeded",
+                "severity": "error",
+                "blocks_execution": true,
+                "details": { "actual": 129, "limit": 128 },
+            }),
+        ),
+        (
+            SearchDiagnostic::RetrievalTermLimitExceeded {
+                actual: 257,
+                limit: 256,
+            },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "retrieval_term_limit_exceeded",
+                "severity": "error",
+                "blocks_execution": true,
+                "details": { "actual": 257, "limit": 256 },
+            }),
+        ),
+        (
+            SearchDiagnostic::CandidateFieldByteLimitExceeded {
+                field: CandidateField::ContainerSourcePath,
+                actual: 33,
+                limit: 32,
+            },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "candidate_field_byte_limit_exceeded",
+                "severity": "warning",
+                "blocks_execution": false,
+                "details": {
+                    "field": "container_source_path",
+                    "actual": 33,
+                    "limit": 32,
+                },
+            }),
+        ),
+        (
+            SearchDiagnostic::CandidateTotalByteLimitExceeded {
+                consumed: 1_025,
+                limit: 1_024,
+            },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "candidate_total_byte_limit_exceeded",
+                "severity": "warning",
+                "blocks_execution": false,
+                "details": { "consumed": 1025, "limit": 1024 },
+            }),
+        ),
+        (
+            SearchDiagnostic::CandidateInputLimitExceeded { limit: 4_096 },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "candidate_input_limit_exceeded",
+                "severity": "warning",
+                "blocks_execution": false,
+                "details": { "limit": 4096 },
+            }),
+        ),
+        (
+            SearchDiagnostic::CandidateEvidenceLimitExceeded {
+                actual: 257,
+                limit: 256,
+            },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "candidate_evidence_limit_exceeded",
+                "severity": "warning",
+                "blocks_execution": false,
+                "details": { "actual": 257, "limit": 256 },
+            }),
+        ),
+        (
+            SearchDiagnostic::FuzzyWorkLimitExceeded {
+                attempted: 10_240,
+                limit: 10_000,
+            },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "fuzzy_work_limit_exceeded",
+                "severity": "warning",
+                "blocks_execution": false,
+                "details": { "attempted": 10240, "limit": 10000 },
+            }),
+        ),
+        (
+            SearchDiagnostic::InvalidRetrievalEvidence { term_index: 3 },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "invalid_retrieval_evidence",
+                "severity": "warning",
+                "blocks_execution": false,
+                "details": { "term_index": 3 },
+            }),
+        ),
+        (
+            SearchDiagnostic::DuplicateCandidateKey {
+                stable_key: "candidate-v1:abc".to_string(),
+            },
+            serde_json::json!({
+                "contract_version": 1,
+                "code": "duplicate_candidate_key",
+                "severity": "warning",
+                "blocks_execution": false,
+                "details": { "stable_key": "candidate-v1:abc" },
+            }),
+        ),
+    ];
+
+    for (diagnostic, expected_wire) in cases {
+        let actual_wire = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(
+            actual_wire,
+            expected_wire,
+            "wire drift for diagnostic {}",
+            diagnostic.code()
+        );
+        assert_eq!(
+            serde_json::from_value::<SearchDiagnostic>(actual_wire).unwrap(),
+            diagnostic
+        );
+    }
 }
 
 #[test]
