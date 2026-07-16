@@ -100,7 +100,7 @@ wait_idle() {
 count_hits() {
   local query="$1"
   target/release/unity-asset-search-cli --base-url "${base_url}" search "${query}" --limit 5000 \
-    | python3 -c 'import json,sys; r=json.load(sys.stdin); print(int(r.get("total_hits") or 0))'
+    | python3 -c 'import json,sys; r=json.load(sys.stdin); print(int(r.get("match_count", {}).get("value") or 0))'
 }
 
 echo "Creating ${files} YAML assets in dir A..."
