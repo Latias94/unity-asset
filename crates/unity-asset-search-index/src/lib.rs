@@ -25,9 +25,10 @@ use tantivy::{
 
 use unity_asset_core::DigestV1Builder;
 use unity_asset_search_core::{
-    CandidateFacts, CandidateField, HighlightRange, MatchCount, MatchExplanation, MatchField,
-    MatchKind, QuerySpec, RankingSignals, RetrievalEvidence, RetrievalStage, RetrievalTerm,
-    SearchDiagnostic, SearchLimits, SearchPolicy, SearchRequest, normalize_for_match, to_terms,
+    CandidateFacts, CandidateField, FuzzyWorkUsage, HighlightRange, MatchCount, MatchExplanation,
+    MatchField, MatchKind, QuerySpec, RankingSignals, RetrievalEvidence, RetrievalStage,
+    RetrievalTerm, SearchDiagnostic, SearchLimits, SearchPolicy, SearchRequest,
+    normalize_for_match, to_terms,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +75,7 @@ pub struct SearchResponse {
     pub match_count: MatchCount,
     pub returned_hits: usize,
     pub request_limit_truncated: bool,
+    pub fuzzy_work: FuzzyWorkUsage,
     pub hits: Vec<SearchHit>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<SearchDiagnostic>,
@@ -1237,6 +1239,7 @@ impl SearchIndex {
                 match_count: outcome.match_count,
                 returned_hits: 0,
                 request_limit_truncated: false,
+                fuzzy_work: outcome.fuzzy_work,
                 hits: Vec::new(),
                 diagnostics: outcome.diagnostics,
                 fallback_used: outcome.fallback_used,
@@ -1320,6 +1323,7 @@ impl SearchIndex {
             match_count: outcome.match_count,
             returned_hits,
             request_limit_truncated: outcome.request_limit_truncated,
+            fuzzy_work: outcome.fuzzy_work,
             hits,
             diagnostics: outcome.diagnostics,
             fallback_used: outcome.fallback_used,
@@ -5211,6 +5215,9 @@ mod tests {
         assert_eq!(signals["retrieval_stage"], "fuzzy_fallback");
         assert!(signals["retrieval_score"].is_i64());
         assert_eq!(response.hits[0].rank, 1);
+        assert!(response.fuzzy_work.consumed > 0);
+        assert!(response.fuzzy_work.consumed <= response.fuzzy_work.limit);
+        assert!(!response.fuzzy_work.exhausted);
     }
 
     #[test]

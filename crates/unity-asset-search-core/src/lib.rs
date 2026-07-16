@@ -352,6 +352,10 @@ pub enum SearchDiagnostic {
         actual: usize,
         limit: usize,
     },
+    FuzzyWorkLimitExceeded {
+        attempted: usize,
+        limit: usize,
+    },
     InvalidRetrievalEvidence {
         term_index: usize,
     },
@@ -386,6 +390,7 @@ impl SearchDiagnostic {
             Self::CandidateTotalByteLimitExceeded { .. } => "candidate_total_byte_limit_exceeded",
             Self::CandidateInputLimitExceeded { .. } => "candidate_input_limit_exceeded",
             Self::CandidateEvidenceLimitExceeded { .. } => "candidate_evidence_limit_exceeded",
+            Self::FuzzyWorkLimitExceeded { .. } => "fuzzy_work_limit_exceeded",
             Self::InvalidRetrievalEvidence { .. } => "invalid_retrieval_evidence",
             Self::DuplicateCandidateKey { .. } => "duplicate_candidate_key",
             Self::Unknown { code, .. } => code,
@@ -417,6 +422,7 @@ impl SearchDiagnostic {
                 | Self::CandidateTotalByteLimitExceeded { .. }
                 | Self::CandidateInputLimitExceeded { .. }
                 | Self::CandidateEvidenceLimitExceeded { .. }
+                | Self::FuzzyWorkLimitExceeded { .. }
                 | Self::InvalidRetrievalEvidence { .. }
                 | Self::DuplicateCandidateKey { .. }
         )
@@ -430,6 +436,7 @@ impl SearchDiagnostic {
                 | Self::CandidateTotalByteLimitExceeded { .. }
                 | Self::CandidateInputLimitExceeded { .. }
                 | Self::CandidateEvidenceLimitExceeded { .. }
+                | Self::FuzzyWorkLimitExceeded { .. }
                 | Self::InvalidRetrievalEvidence { .. }
                 | Self::Unknown { .. }
         )
@@ -468,6 +475,9 @@ impl SearchDiagnostic {
             | Self::RetrievalTermLimitExceeded { actual, limit }
             | Self::CandidateEvidenceLimitExceeded { actual, limit } => {
                 serde_json::json!({ "actual": actual, "limit": limit })
+            }
+            Self::FuzzyWorkLimitExceeded { attempted, limit } => {
+                serde_json::json!({ "attempted": attempted, "limit": limit })
             }
             Self::CandidateFieldByteLimitExceeded {
                 field,
@@ -588,6 +598,10 @@ impl<'de> Deserialize<'de> for SearchDiagnostic {
                 actual: diagnostic_detail(&wire.details, "actual")?,
                 limit: diagnostic_detail(&wire.details, "limit")?,
             },
+            "fuzzy_work_limit_exceeded" => Self::FuzzyWorkLimitExceeded {
+                attempted: diagnostic_detail(&wire.details, "attempted")?,
+                limit: diagnostic_detail(&wire.details, "limit")?,
+            },
             "invalid_retrieval_evidence" => Self::InvalidRetrievalEvidence {
                 term_index: diagnostic_detail(&wire.details, "term_index")?,
             },
@@ -690,6 +704,7 @@ pub struct SearchLimits {
     pub max_container_source_path_bytes: usize,
     pub max_evidence_items: usize,
     pub max_total_candidate_bytes: usize,
+    pub max_fuzzy_work_units: usize,
 }
 
 impl Default for SearchLimits {
@@ -707,6 +722,7 @@ impl Default for SearchLimits {
             max_container_source_path_bytes: 32 * 1024,
             max_evidence_items: 256,
             max_total_candidate_bytes: 4 * 1024 * 1024,
+            max_fuzzy_work_units: 2_000_000,
         }
     }
 }
@@ -889,18 +905,15 @@ impl PreparedSearch {
             let normalized = to_terms(&query_term.text);
             for term in normalized.split_whitespace() {
                 let char_count = term.chars().count();
-                let fuzzy_distance = (stage == RetrievalStage::FuzzyFallback
-                    && !query_term.quoted
-                    && char_count >= self.policy.fuzzy_fallback.minimum_query_chars
-                    && char_count <= self.policy.fuzzy_fallback.maximum_query_chars)
+                let fuzzy_distance = (stage == RetrievalStage::FuzzyFallback)
                     .then(|| {
-                        self.policy
-                            .fuzzy_fallback
-                            .maximum_edit_distance
-                            .min(if char_count <= 7 { 1 } else { 2 })
-                            .min(u8::MAX as usize) as u8
+                        fuzzy_retrieval_distance(
+                            query_term.quoted,
+                            char_count,
+                            self.policy.fuzzy_fallback,
+                        )
                     })
-                    .filter(|distance| *distance > 0);
+                    .flatten();
                 retrieval_terms.push(RetrievalTerm {
                     term_index,
                     text: term.to_string(),
@@ -922,6 +935,7 @@ impl PreparedSearch {
             candidates,
             RetrievalStage::Strict,
             &self.query,
+            self.policy.fuzzy_fallback,
             self.policy.limits,
             &mut diagnostics,
         );
@@ -949,6 +963,7 @@ impl PreparedSearch {
             strict_candidates,
             RetrievalStage::Strict,
             &self.query,
+            self.policy.fuzzy_fallback,
             self.policy.limits,
             &mut diagnostics,
         );
@@ -958,6 +973,7 @@ impl PreparedSearch {
                 retrieve_fallback(&strict.matching_keys)?,
                 RetrievalStage::FuzzyFallback,
                 &self.query,
+                self.policy.fuzzy_fallback,
                 self.policy.limits,
                 &mut diagnostics,
             );
@@ -983,6 +999,7 @@ impl PreparedSearch {
             candidates_provided: 0,
             candidates_eligible: 0,
             candidates_considered: 0,
+            fuzzy_work: FuzzyWorkUsage::new(self.policy.limits.max_fuzzy_work_units),
         })
     }
 
@@ -996,8 +1013,7 @@ impl PreparedSearch {
         let mut matching_keys = BTreeSet::new();
         let mut strict_kinds = Vec::new();
         for candidate in selection.bounded_strict() {
-            if let Some(kind) =
-                rank_candidate_kind(&terms, candidate, &self.policy.fuzzy_fallback, false)
+            if let Some(kind) = rank_candidate_kind(&terms, candidate, &self.policy.fuzzy_fallback)
             {
                 matching_keys.insert(candidate.stable_key.clone());
                 strict_kinds.push(kind);
@@ -1031,12 +1047,16 @@ impl PreparedSearch {
                     .flatten()
                     .map(|candidate| (RetrievalStage::FuzzyFallback, candidate)),
             );
-        let mut ranked = rank_candidates(
+        let (mut ranked, fuzzy_work, fuzzy_diagnostic) = rank_candidates(
             &self.query,
             active_candidates,
             &self.policy.fuzzy_fallback,
             fallback_used,
+            self.policy.limits.max_fuzzy_work_units,
         );
+        if let Some(diagnostic) = fuzzy_diagnostic {
+            diagnostics.push(diagnostic);
+        }
 
         ranked.sort_by(compare_ranked);
         let mut seen = BTreeSet::new();
@@ -1067,6 +1087,7 @@ impl PreparedSearch {
             candidates_eligible: selection.eligible,
             candidates_considered: selection.strict.len()
                 + usize::from(fallback_used) * selection.fallback.len(),
+            fuzzy_work,
         }
     }
 }
@@ -1084,6 +1105,23 @@ pub struct MatchCount {
     pub relation: MatchCountRelation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FuzzyWorkUsage {
+    pub consumed: usize,
+    pub limit: usize,
+    pub exhausted: bool,
+}
+
+impl FuzzyWorkUsage {
+    const fn new(limit: usize) -> Self {
+        Self {
+            consumed: 0,
+            limit,
+            exhausted: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SearchOutcome {
     pub query: QuerySpec,
@@ -1095,6 +1133,7 @@ pub struct SearchOutcome {
     pub candidates_provided: usize,
     pub candidates_eligible: usize,
     pub candidates_considered: usize,
+    pub fuzzy_work: FuzzyWorkUsage,
 }
 
 impl SearchOutcome {
@@ -1397,12 +1436,18 @@ impl CandidateSelection {
         candidates: impl IntoIterator<Item = CandidateFacts>,
         stage: RetrievalStage,
         query: &QuerySpec,
+        fuzzy_policy: FuzzyFallbackPolicy,
         limits: SearchLimits,
         diagnostics: &mut Vec<SearchDiagnostic>,
     ) {
         if self.byte_budget_exhausted {
             return;
         }
+        let fuzzy_evidence_terms: Vec<_> = query
+            .terms
+            .iter()
+            .map(|term| query_term_supports_fuzzy_retrieval(term, fuzzy_policy))
+            .collect();
         let mut candidates = candidates.into_iter();
         while self.provided < limits.max_candidate_inputs {
             let Some(candidate) = candidates.next() else {
@@ -1434,17 +1479,12 @@ impl CandidateSelection {
             }
             self.total_bytes = next_total;
 
-            if candidate.evidence.iter().any(|evidence| {
-                evidence.term_index >= query.terms.len()
-                    || evidence.field != MatchField::Content
-                    || matches!(evidence.kind, MatchKind::None)
+            if let Some(invalid) = candidate.evidence.iter().find(|evidence| {
+                !retrieval_evidence_is_valid(evidence, query.terms.len(), &fuzzy_evidence_terms)
             }) {
-                let term_index = candidate
-                    .evidence
-                    .iter()
-                    .find(|evidence| evidence.term_index >= query.terms.len())
-                    .map_or(usize::MAX, |evidence| evidence.term_index);
-                diagnostics.push(SearchDiagnostic::InvalidRetrievalEvidence { term_index });
+                diagnostics.push(SearchDiagnostic::InvalidRetrievalEvidence {
+                    term_index: invalid.term_index,
+                });
                 continue;
             }
             if !candidate_matches_filters(query, &candidate) {
@@ -1536,14 +1576,17 @@ fn candidate_size(
 struct PreparedQueryTerm<'a> {
     source: &'a QueryTerm,
     normalized: String,
+    normalized_chars: Vec<char>,
     tokenized: String,
 }
 
 impl<'a> PreparedQueryTerm<'a> {
     fn new(source: &'a QueryTerm) -> Self {
+        let normalized = normalize_for_match(source.text.trim());
         Self {
             source,
-            normalized: normalize_for_match(source.text.trim()),
+            normalized_chars: normalized.chars().collect(),
+            normalized,
             tokenized: to_terms(&source.text),
         }
     }
@@ -1555,18 +1598,25 @@ struct PreparedField<'a> {
     normalized: String,
     tokenized: String,
     fuzzy_normalized: String,
-    fuzzy_tokenized: String,
+    fuzzy_char_count: usize,
+    fuzzy_tokens: Vec<Vec<char>>,
 }
 
 impl<'a> PreparedField<'a> {
     fn new(source: &'a str) -> Self {
         let fuzzy_source = prefix_by_chars(source, MAX_FUZZY_FIELD_CHARS);
+        let fuzzy_normalized = normalize_for_match(fuzzy_source);
+        let fuzzy_tokenized = to_terms(fuzzy_source);
         Self {
             source,
             normalized: normalize_for_match(source),
             tokenized: to_terms(source),
-            fuzzy_normalized: normalize_for_match(fuzzy_source),
-            fuzzy_tokenized: to_terms(fuzzy_source),
+            fuzzy_char_count: fuzzy_normalized.chars().count(),
+            fuzzy_normalized,
+            fuzzy_tokens: fuzzy_tokenized
+                .split_whitespace()
+                .map(|token| token.chars().collect())
+                .collect(),
         }
     }
 }
@@ -1621,21 +1671,34 @@ fn rank_candidates<'a>(
     candidates: impl IntoIterator<Item = (RetrievalStage, &'a CandidateFacts)>,
     fallback: &FuzzyFallbackPolicy,
     allow_fuzzy: bool,
-) -> Vec<InternalRankedMatch<'a>> {
+    fuzzy_work_limit: usize,
+) -> (
+    Vec<InternalRankedMatch<'a>>,
+    FuzzyWorkUsage,
+    Option<SearchDiagnostic>,
+) {
     let terms: Vec<_> = query.terms.iter().map(PreparedQueryTerm::new).collect();
-    candidates
-        .into_iter()
-        .filter_map(|(stage, candidate)| {
-            rank_candidate(&terms, candidate, stage, fallback, allow_fuzzy)
-        })
-        .collect()
+    let mut fuzzy = FuzzyScorer::new(fuzzy_work_limit);
+    let mut ranked = Vec::new();
+    for (stage, candidate) in candidates {
+        if let Some(candidate) = rank_candidate(
+            &terms,
+            candidate,
+            stage,
+            fallback,
+            allow_fuzzy.then_some(&mut fuzzy),
+        ) {
+            ranked.push(candidate);
+        }
+    }
+    let (usage, diagnostic) = fuzzy.finish();
+    (ranked, usage, diagnostic)
 }
 
 fn rank_candidate_kind(
     terms: &[PreparedQueryTerm<'_>],
     candidate: &CandidateFacts,
     fallback: &FuzzyFallbackPolicy,
-    allow_fuzzy: bool,
 ) -> Option<MatchKind> {
     if terms.is_empty() {
         return Some(MatchKind::None);
@@ -1643,7 +1706,7 @@ fn rank_candidate_kind(
     let candidate = PreparedCandidate::new(candidate);
     let mut match_kind = MatchKind::Exact;
     for (term_index, term) in terms.iter().enumerate() {
-        let term_match = best_term_match(term_index, term, &candidate, fallback, allow_fuzzy)?;
+        let term_match = best_term_match(term_index, term, &candidate, fallback, None)?;
         match_kind = match_kind.worse_of(term_match.kind);
     }
     Some(match_kind)
@@ -1668,7 +1731,7 @@ fn rank_candidate<'a>(
     candidate: &'a CandidateFacts,
     stage: RetrievalStage,
     fallback: &FuzzyFallbackPolicy,
-    allow_fuzzy: bool,
+    mut fuzzy: Option<&mut FuzzyScorer>,
 ) -> Option<InternalRankedMatch<'a>> {
     let candidate = PreparedCandidate::new(candidate);
     let mut match_kind = MatchKind::Exact;
@@ -1678,7 +1741,8 @@ fn rank_candidate<'a>(
     let mut used_fuzzy = false;
 
     for (term_index, term) in terms.iter().enumerate() {
-        let term_match = best_term_match(term_index, term, &candidate, fallback, allow_fuzzy)?;
+        let term_match =
+            best_term_match(term_index, term, &candidate, fallback, fuzzy.as_deref_mut())?;
         match_kind = match_kind.worse_of(term_match.kind);
         field_boost = field_boost.saturating_add(term_match.field.boost());
         fuzzy_score = fuzzy_score.saturating_add(term_match.fuzzy_score);
@@ -1740,46 +1804,64 @@ fn best_term_match(
     term: &PreparedQueryTerm<'_>,
     candidate: &PreparedCandidate<'_>,
     fallback: &FuzzyFallbackPolicy,
-    allow_fuzzy: bool,
+    fuzzy: Option<&mut FuzzyScorer>,
 ) -> Option<TermMatch> {
-    let name = match_term_in_field(
-        term,
-        &candidate.name,
-        MatchField::Name,
-        fallback,
-        allow_fuzzy,
-    );
-    let path = match_term_in_field(
-        term,
-        &candidate.path,
-        MatchField::Path,
-        fallback,
-        allow_fuzzy,
-    );
-    let kind = match_term_in_field(
-        term,
-        &candidate.kind,
-        MatchField::Kind,
-        fallback,
-        allow_fuzzy,
-    );
-    let evidence = candidate
+    let strict_evidence = candidate
         .facts
         .evidence
         .iter()
         .filter(|evidence| evidence.term_index == term_index)
-        .filter(|evidence| allow_fuzzy || evidence.kind != MatchKind::Fuzzy)
+        .filter(|evidence| evidence.kind != MatchKind::Fuzzy)
         .map(|evidence| TermMatch {
             kind: evidence.kind,
             field: evidence.field,
             fuzzy_score: 0,
         })
         .min_by(compare_term_match);
+    let strict = [
+        strict_match_in_field(term, &candidate.name, MatchField::Name),
+        strict_match_in_field(term, &candidate.path, MatchField::Path),
+        strict_match_in_field(term, &candidate.kind, MatchField::Kind),
+        strict_evidence,
+    ]
+    .into_iter()
+    .flatten()
+    .min_by(compare_term_match);
+    if strict.is_some() || term.source.quoted {
+        return strict;
+    }
 
-    [name, path, kind, evidence]
-        .into_iter()
-        .flatten()
-        .min_by(compare_term_match)
+    let fuzzy = fuzzy?;
+    let evidence = candidate
+        .facts
+        .evidence
+        .iter()
+        .filter(|evidence| evidence.term_index == term_index && evidence.kind == MatchKind::Fuzzy)
+        .map(|evidence| TermMatch {
+            kind: evidence.kind,
+            field: evidence.field,
+            fuzzy_score: 0,
+        })
+        .min_by(compare_term_match);
+    let name = fuzzy.match_field(term, &candidate.name, MatchField::Name, fallback);
+    if fuzzy.is_exhausted() {
+        return evidence;
+    }
+    if name.is_some() {
+        return name;
+    }
+    let path = fuzzy.match_field(term, &candidate.path, MatchField::Path, fallback);
+    if fuzzy.is_exhausted() {
+        return evidence;
+    }
+    if path.is_some() {
+        return path;
+    }
+    let kind = fuzzy.match_field(term, &candidate.kind, MatchField::Kind, fallback);
+    if fuzzy.is_exhausted() {
+        return evidence;
+    }
+    kind.or(evidence)
 }
 
 fn compare_term_match(left: &TermMatch, right: &TermMatch) -> Ordering {
@@ -1789,28 +1871,15 @@ fn compare_term_match(left: &TermMatch, right: &TermMatch) -> Ordering {
         .then_with(|| right.fuzzy_score.cmp(&left.fuzzy_score))
 }
 
-fn match_term_in_field(
+fn strict_match_in_field(
     term: &PreparedQueryTerm<'_>,
     field_text: &PreparedField<'_>,
     field: MatchField,
-    fallback: &FuzzyFallbackPolicy,
-    allow_fuzzy: bool,
 ) -> Option<TermMatch> {
-    if let Some(kind) = strict_match_kind(term, field_text) {
-        return Some(TermMatch {
-            kind,
-            field,
-            fuzzy_score: 0,
-        });
-    }
-    if !allow_fuzzy || term.source.quoted {
-        return None;
-    }
-
-    fuzzy_match_score(term, field_text, fallback).map(|fuzzy_score| TermMatch {
-        kind: MatchKind::Fuzzy,
+    strict_match_kind(term, field_text).map(|kind| TermMatch {
+        kind,
         field,
-        fuzzy_score,
+        fuzzy_score: 0,
     })
 }
 
@@ -1874,17 +1943,55 @@ fn is_abbreviation_match(query: &str, text: &str) -> bool {
     initials.contains(&query)
 }
 
+fn fuzzy_char_count_is_eligible(char_count: usize, fallback: FuzzyFallbackPolicy) -> bool {
+    char_count >= fallback.minimum_query_chars && char_count <= fallback.maximum_query_chars
+}
+
+fn fuzzy_retrieval_distance(
+    quoted: bool,
+    char_count: usize,
+    fallback: FuzzyFallbackPolicy,
+) -> Option<u8> {
+    (!quoted && fuzzy_char_count_is_eligible(char_count, fallback))
+        .then(|| {
+            fallback
+                .maximum_edit_distance
+                .min(if char_count <= 7 { 1 } else { 2 })
+                .min(u8::MAX as usize) as u8
+        })
+        .filter(|distance| *distance > 0)
+}
+
+fn query_term_supports_fuzzy_retrieval(term: &QueryTerm, fallback: FuzzyFallbackPolicy) -> bool {
+    let normalized = to_terms(&term.text);
+    normalized.split_whitespace().any(|token| {
+        fuzzy_retrieval_distance(term.quoted, token.chars().count(), fallback).is_some()
+    })
+}
+
+fn retrieval_evidence_is_valid(
+    evidence: &RetrievalEvidence,
+    query_term_count: usize,
+    fuzzy_evidence_terms: &[bool],
+) -> bool {
+    evidence.term_index < query_term_count
+        && evidence.field == MatchField::Content
+        && evidence.kind != MatchKind::None
+        && (evidence.kind != MatchKind::Fuzzy
+            || fuzzy_evidence_terms
+                .get(evidence.term_index)
+                .copied()
+                .unwrap_or(false))
+}
+
 fn should_use_fuzzy_fallback(
     query: &QuerySpec,
     strict_kinds: impl IntoIterator<Item = MatchKind>,
     fallback: FuzzyFallbackPolicy,
 ) -> bool {
     if !query.terms.iter().any(|term| {
-        if term.quoted {
-            return false;
-        }
         let chars = normalize_for_match(&term.text).chars().count();
-        chars >= fallback.minimum_query_chars && chars <= fallback.maximum_query_chars
+        !term.quoted && fuzzy_char_count_is_eligible(chars, fallback)
     }) {
         return false;
     }
@@ -1896,65 +2003,209 @@ fn should_use_fuzzy_fallback(
     confident_matches < fallback.minimum_confident_matches
 }
 
-fn fuzzy_match_score(
-    query: &PreparedQueryTerm<'_>,
-    field: &PreparedField<'_>,
-    fallback: &FuzzyFallbackPolicy,
-) -> Option<i64> {
-    let query_chars = query.normalized.chars().count();
-    if query_chars < fallback.minimum_query_chars || query_chars > fallback.maximum_query_chars {
-        return None;
-    }
-
-    let matcher_score = SkimMatcherV2::default()
-        .fuzzy_match(&field.fuzzy_normalized, &query.normalized)
-        .filter(|score| *score > 0);
-
-    let maximum_distance = fallback
-        .maximum_edit_distance
-        .min(if query_chars <= 7 { 1 } else { 2 });
-    let edit_score = field
-        .fuzzy_tokenized
-        .split_whitespace()
-        .filter_map(|token| {
-            edit_distance_with_limit(&query.normalized, token, maximum_distance).map(|distance| {
-                10_000i64
-                    .saturating_sub((distance as i64).saturating_mul(1_000))
-                    .saturating_sub(token.chars().count().abs_diff(query_chars) as i64)
-            })
-        })
-        .max();
-
-    matcher_score.into_iter().chain(edit_score).max()
+struct FuzzyWorkBudget {
+    usage: FuzzyWorkUsage,
+    first_failed_attempt: Option<usize>,
 }
 
-fn edit_distance_with_limit(left: &str, right: &str, limit: usize) -> Option<usize> {
-    let left: Vec<char> = left.chars().collect();
-    let right: Vec<char> = right.chars().collect();
-    if left.len().abs_diff(right.len()) > limit {
-        return None;
+impl FuzzyWorkBudget {
+    const fn new(limit: usize) -> Self {
+        Self {
+            usage: FuzzyWorkUsage::new(limit),
+            first_failed_attempt: None,
+        }
     }
 
-    let mut previous: Vec<usize> = (0..=right.len()).collect();
-    let mut current = vec![0usize; right.len() + 1];
-    for (left_index, left_char) in left.iter().enumerate() {
-        current[0] = left_index + 1;
-        let mut row_minimum = current[0];
-        for (right_index, right_char) in right.iter().enumerate() {
-            let substitution = previous[right_index]
-                + usize::from(left_char.to_lowercase().ne(right_char.to_lowercase()));
-            current[right_index + 1] = substitution
-                .min(previous[right_index + 1] + 1)
-                .min(current[right_index] + 1);
-            row_minimum = row_minimum.min(current[right_index + 1]);
+    fn charge(&mut self, units: usize) -> bool {
+        if self.usage.exhausted {
+            return false;
         }
-        if row_minimum > limit {
+        let Some(attempted) = self.usage.consumed.checked_add(units) else {
+            self.exhaust(usize::MAX);
+            return false;
+        };
+        if attempted > self.usage.limit {
+            self.exhaust(attempted);
+            return false;
+        }
+        self.usage.consumed = attempted;
+        true
+    }
+
+    fn exhaust(&mut self, attempted: usize) {
+        self.usage.exhausted = true;
+        self.first_failed_attempt.get_or_insert(attempted);
+    }
+
+    fn finish(self) -> (FuzzyWorkUsage, Option<SearchDiagnostic>) {
+        let diagnostic =
+            self.first_failed_attempt
+                .map(|attempted| SearchDiagnostic::FuzzyWorkLimitExceeded {
+                    attempted,
+                    limit: self.usage.limit,
+                });
+        (self.usage, diagnostic)
+    }
+}
+
+struct FuzzyScorer {
+    budget: FuzzyWorkBudget,
+    matcher: SkimMatcherV2,
+    previous: Vec<usize>,
+    current: Vec<usize>,
+}
+
+impl FuzzyScorer {
+    fn new(work_limit: usize) -> Self {
+        Self {
+            budget: FuzzyWorkBudget::new(work_limit),
+            matcher: SkimMatcherV2::default(),
+            previous: Vec::new(),
+            current: Vec::new(),
+        }
+    }
+
+    fn finish(self) -> (FuzzyWorkUsage, Option<SearchDiagnostic>) {
+        self.budget.finish()
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.budget.usage.exhausted
+    }
+
+    fn match_field(
+        &mut self,
+        query: &PreparedQueryTerm<'_>,
+        field: &PreparedField<'_>,
+        match_field: MatchField,
+        fallback: &FuzzyFallbackPolicy,
+    ) -> Option<TermMatch> {
+        self.score(query, field, fallback)
+            .map(|fuzzy_score| TermMatch {
+                kind: MatchKind::Fuzzy,
+                field: match_field,
+                fuzzy_score,
+            })
+    }
+
+    fn score(
+        &mut self,
+        query: &PreparedQueryTerm<'_>,
+        field: &PreparedField<'_>,
+        fallback: &FuzzyFallbackPolicy,
+    ) -> Option<i64> {
+        let query_chars = query.normalized_chars.len();
+        if !fuzzy_char_count_is_eligible(query_chars, *fallback) {
             return None;
         }
-        std::mem::swap(&mut previous, &mut current);
+
+        let Some(matcher_units) = matrix_work_units(query_chars, field.fuzzy_char_count) else {
+            self.budget.exhaust(usize::MAX);
+            return None;
+        };
+        if !self.budget.charge(matcher_units) {
+            return None;
+        }
+        let matcher_score = self
+            .matcher
+            .fuzzy_match(&field.fuzzy_normalized, &query.normalized)
+            .filter(|score| *score > 0);
+
+        let maximum_distance =
+            fallback
+                .maximum_edit_distance
+                .min(if query_chars <= 7 { 1 } else { 2 });
+        let mut edit_score = None;
+        for token in &field.fuzzy_tokens {
+            let distance =
+                self.edit_distance_with_limit(&query.normalized_chars, token, maximum_distance);
+            if self.budget.usage.exhausted {
+                return None;
+            }
+            if let Some(distance) = distance {
+                let score = 10_000i64
+                    .saturating_sub((distance as i64).saturating_mul(1_000))
+                    .saturating_sub(token.len().abs_diff(query_chars) as i64);
+                edit_score = Some(edit_score.map_or(score, |current: i64| current.max(score)));
+            }
+        }
+
+        matcher_score.into_iter().chain(edit_score).max()
     }
 
-    (previous[right.len()] <= limit).then_some(previous[right.len()])
+    fn edit_distance_with_limit(
+        &mut self,
+        left: &[char],
+        right: &[char],
+        limit: usize,
+    ) -> Option<usize> {
+        if left.len().abs_diff(right.len()) > limit {
+            return None;
+        }
+        let Some(work_units) = banded_edit_work_units(left.len(), right.len(), limit) else {
+            self.budget.exhaust(usize::MAX);
+            return None;
+        };
+        if !self.budget.charge(work_units) {
+            return None;
+        }
+
+        let row_length = right.len().saturating_add(1);
+        let outside_band = limit.saturating_add(1);
+        self.previous.resize(row_length, outside_band);
+        self.current.resize(row_length, outside_band);
+
+        let initial_end = right.len().min(limit);
+        for (index, value) in self.previous[..=initial_end].iter_mut().enumerate() {
+            *value = index;
+        }
+        if initial_end < right.len() {
+            self.previous[initial_end + 1] = outside_band;
+        }
+
+        for (left_index, left_char) in left.iter().enumerate() {
+            let row = left_index + 1;
+            let start = row.saturating_sub(limit).max(1);
+            let end = row.saturating_add(limit).min(right.len());
+            if start == 1 {
+                self.current[0] = row;
+            } else {
+                self.current[start - 1] = outside_band;
+            }
+            for column in start..=end {
+                let substitution =
+                    self.previous[column - 1] + usize::from(*left_char != right[column - 1]);
+                self.current[column] = substitution
+                    .min(self.previous[column].saturating_add(1))
+                    .min(self.current[column - 1].saturating_add(1));
+            }
+            if end < right.len() {
+                self.current[end + 1] = outside_band;
+            }
+            std::mem::swap(&mut self.previous, &mut self.current);
+        }
+
+        (self.previous[right.len()] <= limit).then_some(self.previous[right.len()])
+    }
+}
+
+fn matrix_work_units(query_chars: usize, field_chars: usize) -> Option<usize> {
+    query_chars
+        .checked_mul(field_chars)
+        .and_then(|units| units.checked_add(query_chars))
+        .and_then(|units| units.checked_add(field_chars))
+}
+
+fn banded_edit_work_units(left_len: usize, right_len: usize, limit: usize) -> Option<usize> {
+    let mut units = right_len.min(limit).checked_add(1)?;
+    for row in 1..=left_len {
+        let start = row.saturating_sub(limit).max(1);
+        let end = row.saturating_add(limit).min(right_len);
+        if start <= end {
+            units = units.checked_add(end - start + 1)?;
+        }
+    }
+    Some(units)
 }
 
 fn compare_ranked(left: &InternalRankedMatch, right: &InternalRankedMatch) -> Ordering {
@@ -2206,5 +2457,99 @@ mod tests {
     fn highlight_html_wraps_tokens() {
         let output = highlight_html("Assets/UI/Button.prefab", &[String::from("ui")]).unwrap();
         assert!(output.contains("<em>UI</em>") || output.contains("<em>ui</em>"));
+    }
+
+    #[test]
+    fn banded_edit_distance_preserves_limit_boundaries() {
+        let chars = |value: &str| value.chars().collect::<Vec<_>>();
+        let mut scorer = FuzzyScorer::new(10_000);
+
+        assert_eq!(
+            scorer.edit_distance_with_limit(&chars("kitten"), &chars("sitten"), 1),
+            Some(1)
+        );
+        assert_eq!(
+            scorer.edit_distance_with_limit(&chars("kitten"), &chars("kitten"), 0),
+            Some(0)
+        );
+        assert_eq!(
+            scorer.edit_distance_with_limit(&chars("kitten"), &chars("sitting"), 2),
+            None
+        );
+        assert_eq!(
+            scorer.edit_distance_with_limit(&[], &chars("ab"), 2),
+            Some(2)
+        );
+        assert_eq!(
+            scorer.edit_distance_with_limit(&chars("按钮"), &chars("按鈕"), 1),
+            Some(1)
+        );
+        assert!(scorer.budget.usage.consumed <= scorer.budget.usage.limit);
+    }
+
+    #[test]
+    fn banded_edit_distance_matches_full_dp_for_small_inputs() {
+        fn strings(max_length: usize) -> Vec<Vec<char>> {
+            let mut values = vec![Vec::new()];
+            for length in 1..=max_length {
+                for bits in 0..(1usize << length) {
+                    values.push(
+                        (0..length)
+                            .map(|index| if bits & (1 << index) == 0 { 'a' } else { 'b' })
+                            .collect(),
+                    );
+                }
+            }
+            values
+        }
+
+        fn full_distance(left: &[char], right: &[char]) -> usize {
+            let mut previous: Vec<_> = (0..=right.len()).collect();
+            let mut current = vec![0; right.len() + 1];
+            for (left_index, left_char) in left.iter().enumerate() {
+                current[0] = left_index + 1;
+                for (right_index, right_char) in right.iter().enumerate() {
+                    current[right_index + 1] = (previous[right_index]
+                        + usize::from(left_char != right_char))
+                    .min(previous[right_index + 1] + 1)
+                    .min(current[right_index] + 1);
+                }
+                std::mem::swap(&mut previous, &mut current);
+            }
+            previous[right.len()]
+        }
+
+        let values = strings(4);
+        let mut scorer = FuzzyScorer::new(1_000_000);
+        for left in &values {
+            for right in &values {
+                let distance = full_distance(left, right);
+                for limit in 0..=2 {
+                    assert_eq!(
+                        scorer.edit_distance_with_limit(left, right, limit),
+                        (distance <= limit).then_some(distance),
+                        "left={left:?}, right={right:?}, limit={limit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fuzzy_work_budget_fails_closed_on_arithmetic_overflow() {
+        let mut budget = FuzzyWorkBudget::new(usize::MAX);
+
+        assert!(budget.charge(1));
+        assert!(!budget.charge(usize::MAX));
+        let (usage, diagnostic) = budget.finish();
+        assert!(usage.exhausted);
+        assert_eq!(usage.consumed, 1);
+        assert_eq!(
+            diagnostic,
+            Some(SearchDiagnostic::FuzzyWorkLimitExceeded {
+                attempted: usize::MAX,
+                limit: usize::MAX,
+            })
+        );
     }
 }

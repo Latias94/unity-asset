@@ -494,6 +494,32 @@ fn retrieval_scores_are_only_compared_within_the_same_stage() {
 }
 
 #[test]
+fn fuzzy_retrieval_evidence_cannot_bypass_short_term_policy() {
+    let candidate = candidate(
+        "invalid-short-fuzzy",
+        "LongNeedle",
+        "Assets/LongNeedle.asset",
+        "Asset",
+        10,
+    )
+    .with_evidence([RetrievalEvidence::new(
+        0,
+        MatchField::Content,
+        MatchKind::Fuzzy,
+    )]);
+
+    let outcome = execute("q longneedle", vec![candidate]);
+
+    assert!(outcome.fallback_used);
+    assert!(outcome.matches.is_empty());
+    assert!(
+        outcome
+            .diagnostics
+            .contains(&SearchDiagnostic::InvalidRetrievalEvidence { term_index: 0 })
+    );
+}
+
+#[test]
 fn query_and_candidate_fields_are_rejected_before_normalization() {
     let limits = SearchLimits {
         max_query_bytes: 4,
@@ -573,6 +599,60 @@ fn candidate_input_and_total_bytes_are_hard_bounded() {
     assert!(outcome.diagnostics.iter().any(|diagnostic| matches!(
         diagnostic,
         SearchDiagnostic::CandidateTotalByteLimitExceeded { limit: 20, .. }
+    )));
+}
+
+#[test]
+fn fuzzy_work_budget_bounds_adversarial_candidates_without_hiding_strict_matches() {
+    let work_limit = 10_000;
+    let policy = SearchPolicy {
+        fuzzy_fallback: FuzzyFallbackPolicy {
+            minimum_confident_matches: 2,
+            ..FuzzyFallbackPolicy::default()
+        },
+        limits: SearchLimits {
+            max_fuzzy_work_units: work_limit,
+            ..SearchLimits::default()
+        },
+        ..SearchPolicy::default()
+    };
+    let mut candidates: Vec<_> = (0..10)
+        .map(|index| {
+            candidate(
+                &format!("noise-{index}"),
+                &"x".repeat(512),
+                &format!("Assets/Noise/{}/{}.asset", "x".repeat(480), index),
+                "File",
+                100 - index,
+            )
+        })
+        .collect();
+    candidates.push(candidate(
+        "exact",
+        "abcdefgh",
+        "Assets/Exact.asset",
+        "Asset",
+        0,
+    ));
+
+    let outcome = policy
+        .prepare(SearchRequest::new("abcdefgh", 20))
+        .execute(candidates);
+
+    assert!(outcome.fallback_used);
+    assert_eq!(outcome.matches.len(), 1);
+    assert_eq!(outcome.matches[0].stable_key, "exact");
+    assert_eq!(outcome.matches[0].match_kind, MatchKind::Exact);
+    assert!(outcome.fuzzy_work.consumed <= work_limit);
+    assert_eq!(outcome.fuzzy_work.limit, work_limit);
+    assert!(outcome.fuzzy_work.exhausted);
+    assert_eq!(outcome.match_count.relation, MatchCountRelation::LowerBound);
+    assert!(outcome.diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic,
+        SearchDiagnostic::FuzzyWorkLimitExceeded {
+            attempted,
+            limit,
+        } if *attempted > work_limit && *limit == work_limit
     )));
 }
 
@@ -1009,6 +1089,20 @@ fn diagnostic_wire_contract_is_versioned_and_unknown_codes_fail_closed() {
     assert_eq!(
         serde_json::from_value::<SearchDiagnostic>(wire).unwrap(),
         diagnostic
+    );
+
+    let exhausted = SearchDiagnostic::FuzzyWorkLimitExceeded {
+        attempted: 10_240,
+        limit: 10_000,
+    };
+    let exhausted_wire = serde_json::to_value(&exhausted).unwrap();
+    assert_eq!(exhausted_wire["code"], "fuzzy_work_limit_exceeded");
+    assert_eq!(exhausted_wire["severity"], "warning");
+    assert_eq!(exhausted_wire["blocks_execution"], false);
+    assert_eq!(exhausted_wire["details"]["attempted"], 10_240);
+    assert_eq!(
+        serde_json::from_value::<SearchDiagnostic>(exhausted_wire).unwrap(),
+        exhausted
     );
 
     let unknown = serde_json::json!({
