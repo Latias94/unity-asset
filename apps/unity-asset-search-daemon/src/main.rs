@@ -352,7 +352,7 @@ async fn reindex(
 
     let full = q.full.unwrap_or(false);
     let wait = q.wait.unwrap_or(true);
-    let paths: Vec<String> = q.path.into_iter().chain(q.paths.into_iter()).collect();
+    let paths: Vec<String> = q.path.into_iter().chain(q.paths).collect();
 
     if !wait {
         let indexing = state

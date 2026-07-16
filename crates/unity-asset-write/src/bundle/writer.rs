@@ -82,7 +82,7 @@ impl BundleWriter {
             .iter()
             .filter(|(name, _)| !existing_names.contains(*name))
             .collect();
-        extra.sort_by(|(a, _), (b, _)| a.cmp(b));
+        extra.sort_by_key(|(name, _)| *name);
         for (name, bytes) in extra {
             let len_u64 = bytes.len() as u64;
             data_writer.write(bytes);
@@ -227,7 +227,7 @@ impl BundleWriter {
             .iter()
             .filter(|(name, _)| !existing_names.contains(*name))
             .collect();
-        extra.sort_by(|(a, _), (b, _)| a.cmp(b));
+        extra.sort_by_key(|(name, _)| *name);
         for (name, bytes) in extra {
             files.push((name.to_string(), bytes.to_vec()));
         }
