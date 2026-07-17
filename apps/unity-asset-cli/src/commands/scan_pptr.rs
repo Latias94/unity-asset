@@ -119,7 +119,7 @@ fn scan_pptr_scan_file(
             asset_index_hint: asset_index_key,
             path_id: handle.path_id(),
             type_id: handle.class_id(),
-            byte_size: info.byte_size,
+            byte_size: info.byte_size(),
             name: obj_name,
             internal,
             external: external

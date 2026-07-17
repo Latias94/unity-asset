@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use unity_asset::environment::{BinaryObjectKey, BinarySource, BinarySourceKind, Environment};
-use unity_asset_core::UnityValue;
+use unity_asset_core::{AssetLoadBudget, UnityValue};
 use unity_asset_decode::audio::AudioClipConverter;
 use unity_asset_decode::unity_version::UnityVersion;
 
@@ -139,13 +139,13 @@ fn object_type_info(env: &Environment, key: &BinaryObjectKey) -> (i32, u32) {
             .get(&key.source)
             .and_then(|b| key.asset_index.and_then(|i| b.assets.get(i)))
             .and_then(|f| f.find_object(key.path_id))
-            .map(|info| (info.type_id, info.byte_size))
+            .map(|info| (info.class_id(), info.byte_size()))
             .unwrap_or((0, 0)),
         BinarySourceKind::SerializedFile => env
             .binary_assets()
             .get(&key.source)
             .and_then(|f| f.find_object(key.path_id))
-            .map(|info| (info.type_id, info.byte_size))
+            .map(|info| (info.class_id(), info.byte_size()))
             .unwrap_or((0, 0)),
     }
 }
@@ -189,6 +189,7 @@ fn golden_regression_smoke() {
     let mut env = Environment::new();
     env.load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples"))
         .expect("load samples");
+    let mut budget = AssetLoadBudget::default();
 
     for case in golden.cases {
         let source_kind = match case.source_kind.as_str() {
@@ -212,7 +213,7 @@ fn golden_regression_smoke() {
         // Container entry existence is part of the discovery contract.
         if source_kind == BinarySourceKind::AssetBundle {
             let entries = env
-                .bundle_container_entries(&source_path)
+                .bundle_container_entries(&source_path, &mut budget)
                 .unwrap_or_else(|_| panic!("bundle_container_entries failed (case={})", case.id));
             assert!(
                 entries

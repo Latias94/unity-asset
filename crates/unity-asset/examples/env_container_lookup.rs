@@ -7,7 +7,7 @@
 //! If omitted, it defaults to `Assets/`.
 
 use std::path::PathBuf;
-use unity_asset::environment::Environment;
+use unity_asset::{AssetLoadBudget, environment::Environment};
 
 fn main() -> unity_asset::Result<()> {
     let path = std::env::args_os()
@@ -21,7 +21,8 @@ fn main() -> unity_asset::Result<()> {
     let mut env = Environment::new();
     env.load(&path)?;
 
-    let mut entries = env.find_binary_object_keys_in_bundle_container(&pattern);
+    let mut budget = AssetLoadBudget::default();
+    let mut entries = env.find_binary_object_keys_in_bundle_container(&pattern, &mut budget)?;
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     println!("loaded: {}", path.display());

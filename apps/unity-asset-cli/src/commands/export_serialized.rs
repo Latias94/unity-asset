@@ -695,7 +695,7 @@ type ExportOneInnerResult = (
 
 fn export_one_inner(env: &Environment, job: &ExportJob) -> Result<ExportOneInnerResult> {
     let obj = env.read_binary_object_key(&job.key)?;
-    let class_id = obj.info.type_id;
+    let class_id = obj.info.class_id();
     let class_name = best_effort_class_name(
         env.binary_assets().get(&job.key.source).ok_or_else(|| {
             anyhow::anyhow!("SerializedFile source not loaded: {}", job.key.source)
@@ -817,7 +817,7 @@ fn try_decode_export_best_effort(
         .map(|f| UnityVersion::parse_version(&f.unity_version).unwrap_or_default())
         .unwrap_or_default();
 
-    let class_id = obj.info.type_id;
+    let class_id = obj.info.class_id();
 
     match class_id {
         class_ids::AUDIO_CLIP => {

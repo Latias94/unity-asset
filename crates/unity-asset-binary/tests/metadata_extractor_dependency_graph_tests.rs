@@ -33,7 +33,7 @@ fn metadata_extractor_populates_dependency_graph_nodes() {
     );
     assert_eq!(
         result.metadata.dependencies.dependency_graph.nodes.len(),
-        asset.objects.len(),
+        asset.objects().len(),
         "dependency graph nodes should cover analyzed objects"
     );
 }

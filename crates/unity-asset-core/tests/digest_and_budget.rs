@@ -172,6 +172,101 @@ fn budget_failures_leave_usage_unchanged() {
 }
 
 #[test]
+fn compressed_input_preflight_is_cumulative_and_does_not_charge_usage() {
+    let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_compressed_bytes: 4,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    budget.begin_decompression().consume(3, 0).unwrap();
+    let before = budget.usage();
+
+    budget.check_compressed_bytes(1).unwrap();
+    assert_eq!(budget.usage(), before);
+    assert!(matches!(
+        budget.check_compressed_bytes(2),
+        Err(BudgetError::Exceeded {
+            resource: "compressed_bytes",
+            limit: 4,
+            requested: 5,
+        })
+    ));
+    assert_eq!(budget.usage(), before);
+}
+
+#[test]
+fn byte_allocation_preflight_is_cumulative_and_does_not_charge_usage() {
+    let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: 4,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    budget.consume_bytes(3).unwrap();
+    let before = budget.usage();
+
+    budget.check_bytes(1).unwrap();
+    assert_eq!(budget.usage(), before);
+    assert!(matches!(
+        budget.check_bytes(2),
+        Err(BudgetError::Exceeded {
+            resource: "bytes",
+            limit: 4,
+            requested: 5,
+        })
+    ));
+    assert_eq!(budget.usage(), before);
+}
+
+#[test]
+fn decompression_preflight_checks_cumulative_limits_without_charging() {
+    let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_compressed_bytes: 5,
+        max_decompressed_bytes: 8,
+        max_expansion_ratio: 2,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    budget.begin_decompression().consume(3, 6).unwrap();
+    let before = budget.usage();
+
+    budget.check_decompression(2, 2).unwrap();
+    assert_eq!(budget.usage(), before);
+
+    assert!(matches!(
+        budget.check_decompression(2, 3),
+        Err(BudgetError::Exceeded {
+            resource: "decompressed_bytes",
+            limit: 8,
+            requested: 9,
+        })
+    ));
+    assert_eq!(budget.usage(), before);
+}
+
+#[test]
+fn decompression_preflight_checks_each_stream_ratio_without_charging() {
+    let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_compressed_bytes: 1_000,
+        max_decompressed_bytes: 1_000,
+        max_expansion_ratio: 4,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    budget.begin_decompression().consume(100, 100).unwrap();
+    let before = budget.usage();
+
+    assert!(matches!(
+        budget.check_decompression(2, 9),
+        Err(BudgetError::ExpansionRatioExceeded {
+            compressed_bytes: 2,
+            decompressed_bytes: 9,
+            max_ratio: 4,
+        })
+    ));
+    assert_eq!(budget.usage(), before);
+}
+
+#[test]
 fn budgeted_json_bounds_the_encoded_document_before_serde_allocations() {
     let mut budget = AssetLoadBudget::new(constrained_limits()).unwrap();
     let value: String = budget.deserialize_json(Cursor::new(br#""small""#)).unwrap();

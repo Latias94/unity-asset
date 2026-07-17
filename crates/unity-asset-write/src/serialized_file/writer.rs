@@ -4,7 +4,11 @@ use crate::serialized_file::edit::SerializedFileEdits;
 use crate::serialized_file::types_write::{
     write_file_identifier, write_local_serialized_object_identifier, write_serialized_type,
 };
-use unity_asset_binary::asset::{ObjectInfo, SerializedFile};
+use unity_asset_binary::asset::{
+    HeaderLayout, MetadataField, MetadataPlacement, ObjectInfo, ObjectMetadata,
+    ObjectOffsetEncoding, ObjectTailEncoding, ObjectTypeReference, PathIdEncoding, SerializedFile,
+    SerializedFileFormat,
+};
 use unity_asset_core::UnityAssetError;
 
 #[derive(Debug, Clone, Copy)]
@@ -35,7 +39,25 @@ impl SerializedFileWriter {
         edits: &SerializedFileEdits,
         options: SerializedFileSaveOptions,
     ) -> Result<Vec<u8>> {
-        let version = file.header.version;
+        let format = file.format();
+        if file.header.version != format.version() {
+            return Err(UnityAssetError::format(format!(
+                "SerializedFile header version {} disagrees with format {}",
+                file.header.version,
+                format.version()
+            )));
+        }
+        file.validate().map_err(|error| {
+            UnityAssetError::with_source("Invalid SerializedFile wire state", error)
+        })?;
+        validate_representable_file_state(file, format)?;
+        for path_id in edits.object_bytes.keys() {
+            if file.find_object(*path_id).is_none() {
+                return Err(UnityAssetError::format(format!(
+                    "SerializedFile edit references unknown object path ID {path_id}"
+                )));
+            }
+        }
 
         let endian = match file.header.byte_order() {
             unity_asset_binary::reader::ByteOrder::Little => Endian::Little,
@@ -45,322 +67,360 @@ impl SerializedFileWriter {
         let mut meta = BinaryWriter::new(endian);
         let mut data = BinaryWriter::new(endian);
 
-        // Unity version string (v>=7)
-        if version >= 7 {
+        if format.has_metadata_field(MetadataField::UnityVersion) {
             meta.write_string_to_null(&file.unity_version);
         }
 
-        // Target platform (v>=8)
-        if version >= 8 {
+        if format.has_metadata_field(MetadataField::TargetPlatform) {
             meta.write_i32(file.target_platform);
         }
 
-        // enableTypeTree (v>=13)
-        if version >= 13 {
+        if format.has_metadata_field(MetadataField::EnableTypeTree) {
             meta.write_bool(file.enable_type_tree);
+        } else if !file.enable_type_tree {
+            return Err(UnityAssetError::format(format!(
+                "SerializedFile v{} has implicit TypeTree enablement",
+                format.version()
+            )));
         }
 
-        // Types
-        let type_count_i32: i32 = file.types.len().try_into().map_err(|_| {
-            UnityAssetError::format(format!("type count too large: {}", file.types.len()))
-        })?;
-        meta.write_i32(type_count_i32);
+        write_count(&mut meta, "SerializedType", file.types.len())?;
         for st in &file.types {
-            write_serialized_type(st, &mut meta, version, file.enable_type_tree, false)?;
+            write_serialized_type(st, &mut meta, format, file.enable_type_tree, false)?;
         }
 
-        // bigIdEnabled (7<=v<14)
-        if (7..14).contains(&version) {
-            meta.write_i32(if file.big_id_enabled { 1 } else { 0 });
+        if format.has_metadata_field(MetadataField::BigIdEnabled) {
+            let raw = file.legacy_big_id().ok_or_else(|| {
+                UnityAssetError::format(format!(
+                    "SerializedFile v{} is missing its raw bigIdEnabled value",
+                    format.version()
+                ))
+            })?;
+            meta.write_i32(raw);
+        } else if file.legacy_big_id().is_some() {
+            return Err(UnityAssetError::format(format!(
+                "SerializedFile v{} cannot encode bigIdEnabled",
+                format.version()
+            )));
         }
 
-        // Objects: table in metadata, payloads in data stream.
-        let obj_count_i32: i32 = file.objects.len().try_into().map_err(|_| {
-            UnityAssetError::format(format!("object count too large: {}", file.objects.len()))
-        })?;
-        meta.write_i32(obj_count_i32);
+        write_count(&mut meta, "object", file.objects().len())?;
 
-        for info in &file.objects {
-            write_object_entry(file, info, edits, &mut meta, &mut data, options)?;
-            // UnityPy aligns object data stream to 8 after each object.
+        for info in file.objects() {
+            write_object_entry(file, format, info, edits, &mut meta, &mut data, options)?;
             data.align_stream(8);
         }
 
-        // Script types (v>=11)
-        if version >= 11 {
-            let script_count_i32: i32 = file.script_types.len().try_into().map_err(|_| {
-                UnityAssetError::format(format!(
-                    "script type count too large: {}",
-                    file.script_types.len()
-                ))
-            })?;
-            meta.write_i32(script_count_i32);
+        if format.has_metadata_field(MetadataField::ScriptTypes) {
+            write_count(&mut meta, "script type", file.script_types.len())?;
             for s in &file.script_types {
-                write_local_serialized_object_identifier(s, &mut meta, version)?;
+                write_local_serialized_object_identifier(s, &mut meta, format)?;
             }
+        } else if !file.script_types.is_empty() {
+            return Err(UnityAssetError::format(format!(
+                "SerializedFile v{} cannot encode script types",
+                format.version()
+            )));
         }
 
-        // Externals
         let mut externals = file.externals.clone();
         for ext in &edits.additional_externals {
-            if !externals.iter().any(|e| e.path == ext.path) {
+            if let Some(existing) = externals.iter().find(|existing| existing.path == ext.path) {
+                if existing != ext {
+                    return Err(UnityAssetError::format(format!(
+                        "Conflicting external metadata for path {}",
+                        ext.path
+                    )));
+                }
+            } else {
                 externals.push(ext.clone());
             }
         }
 
-        let ext_count_i32: i32 = externals.len().try_into().map_err(|_| {
-            UnityAssetError::format(format!("external count too large: {}", externals.len()))
-        })?;
-        meta.write_i32(ext_count_i32);
+        write_count(&mut meta, "external", externals.len())?;
         for e in &externals {
-            write_file_identifier(e, &mut meta, version)?;
+            write_file_identifier(e, &mut meta, format)?;
         }
 
-        // Ref types (v>=20)
-        if version >= 20 {
-            let ref_count_i32: i32 = file.ref_types.len().try_into().map_err(|_| {
-                UnityAssetError::format(format!(
-                    "ref type count too large: {}",
-                    file.ref_types.len()
-                ))
-            })?;
-            meta.write_i32(ref_count_i32);
+        if format.has_metadata_field(MetadataField::RefTypes) {
+            write_count(&mut meta, "reference type", file.ref_types.len())?;
             for st in &file.ref_types {
-                write_serialized_type(st, &mut meta, version, file.enable_type_tree, true)?;
+                write_serialized_type(st, &mut meta, format, file.enable_type_tree, true)?;
             }
+        } else if !file.ref_types.is_empty() {
+            return Err(UnityAssetError::format(format!(
+                "SerializedFile v{} cannot encode reference types",
+                format.version()
+            )));
         }
 
-        // userInformation (v>=5)
-        if version >= 5 {
+        if format.has_metadata_field(MetadataField::UserInformation) {
             meta.write_string_to_null(&file.user_information);
+        } else if !file.user_information.is_empty() {
+            return Err(UnityAssetError::format(format!(
+                "SerializedFile v{} cannot encode user information",
+                format.version()
+            )));
         }
 
-        // Header + layout
-        let mut metadata_size = meta.len();
-        let data_size = data.len();
+        meta.ensure_valid()?;
+        data.ensure_valid()?;
 
-        let header_size: usize = if version >= 22 {
-            48
-        } else if version >= 9 {
-            20
-        } else {
-            16
-        };
+        let metadata_body_size = u64::try_from(meta.len())
+            .map_err(|_| UnityAssetError::format("metadata size does not fit u64"))?;
+        let data_size = u64::try_from(data.len())
+            .map_err(|_| UnityAssetError::format("data size does not fit u64"))?;
+        let legacy_hint = matches!(
+            format.metadata_placement(),
+            MetadataPlacement::TailWithEndianPrefix
+        )
+        .then_some(file.header.data_offset);
+        let layout = format
+            .plan_layout(metadata_body_size, data_size, legacy_hint)
+            .map_err(|error| {
+                UnityAssetError::with_source("Failed to plan SerializedFile layout", error)
+            })?;
 
-        // v<9 stores metadata at the end of the file and includes a 1-byte endian boolean prefix.
-        let data_offset: usize = if version < 9 {
-            let header_data_offset: usize = file.header.data_offset.try_into().unwrap_or(0usize);
-            let default_offset = 32usize;
-            let mut out = header_data_offset.max(default_offset);
-            if out < header_size {
-                out = header_size;
-            }
-            metadata_size = metadata_size
-                .checked_add(1)
-                .ok_or_else(|| UnityAssetError::format("metadata_size overflow"))?;
-            out
-        } else {
-            let mut out = header_size + metadata_size;
-            out += (16 - (out % 16)) % 16;
-            out
-        };
-
-        let file_size: usize = if version < 9 {
-            data_offset
-                .checked_add(data_size)
-                .and_then(|v| v.checked_add(metadata_size))
-                .ok_or_else(|| UnityAssetError::format("file size overflow"))?
-        } else {
-            data_offset
-                .checked_add(data_size)
-                .ok_or_else(|| UnityAssetError::format("file size overflow"))?
-        };
-
-        let metadata_size_u32: u32 = metadata_size.try_into().map_err(|_| {
-            UnityAssetError::format(format!("metadata_size does not fit u32: {}", metadata_size))
-        })?;
-        let file_size_u32: u32 = if version < 9 {
-            file_size.try_into().map_err(|_| {
-                UnityAssetError::format(format!("file_size does not fit u32: {}", file_size))
-            })?
-        } else if version < 22 {
-            file_size.try_into().map_err(|_| {
-                UnityAssetError::format(format!("file_size does not fit u32: {}", file_size))
-            })?
-        } else {
-            0
-        };
-        let data_offset_u32: u32 = if version < 9 {
-            data_offset.try_into().map_err(|_| {
-                UnityAssetError::format(format!("data_offset does not fit u32: {}", data_offset))
-            })?
-        } else if version < 22 {
-            data_offset.try_into().map_err(|_| {
-                UnityAssetError::format(format!("data_offset does not fit u32: {}", data_offset))
-            })?
-        } else {
-            0
-        };
-
-        // Unity SerializedFile header fields are always written in big-endian order.
-        // UnityPy uses `EndianBinaryWriter()` default (`">"`).
         let mut out = BinaryWriter::new(Endian::Big);
-        if version < 9 {
-            // Legacy layout:
-            // - header is 16 bytes
-            // - data starts at `data_offset`
-            // - then 1-byte endian boolean
-            // - then metadata
-            out.write_u32(metadata_size_u32);
-            out.write_u32(file_size_u32);
-            out.write_u32(version);
-            out.write_u32(data_offset_u32);
-
-            if out.position() > data_offset {
-                return Err(UnityAssetError::format(format!(
-                    "Legacy data_offset {} is smaller than header size {}",
-                    data_offset,
-                    out.position()
-                )));
+        match format.header_layout() {
+            HeaderLayout::Legacy16 => {
+                out.write_u32(layout.metadata_size);
+                out.write_u32(u32_field(layout.file_size, "file size")?);
+                out.write_u32(format.version());
+                out.write_u32(u32_field(layout.data_offset, "data offset")?);
+                pad_to(&mut out, layout.data_offset, "legacy data offset")?;
+                out.write(data.bytes());
+                out.write_u8(file.header.endian);
+                out.write(meta.bytes());
             }
-            if out.position() < data_offset {
-                out.write(&vec![0u8; data_offset - out.position()]);
+            HeaderLayout::Standard20 => {
+                out.write_u32(layout.metadata_size);
+                out.write_u32(u32_field(layout.file_size, "file size")?);
+                out.write_u32(format.version());
+                out.write_u32(u32_field(layout.data_offset, "data offset")?);
+                out.write_u8(file.header.endian);
+                out.write(&file.header.reserved);
+                out.write(meta.bytes());
+                pad_to(&mut out, layout.data_offset, "data offset")?;
+                out.write(data.bytes());
             }
-
-            out.write(data.bytes());
-            out.write_bool(file.header.endian != 0);
-            out.write(meta.bytes());
-        } else if version < 22 {
-            out.write_u32(metadata_size_u32);
-            out.write_u32(file_size_u32);
-            out.write_u32(version);
-            out.write_u32(data_offset_u32);
-            out.write_bool(file.header.endian != 0);
-            out.write(&file.header.reserved);
-
-            out.write(meta.bytes());
-            out.align_stream(16);
-            out.write(data.bytes());
-        } else {
-            // UnityPy writes an "old" header with zeros, followed by the extended fields.
-            out.write_u32(0);
-            out.write_u32(0);
-            out.write_u32(version);
-            out.write_u32(0);
-            out.write_bool(file.header.endian != 0);
-            out.write(&file.header.reserved);
-            out.write_u32(metadata_size_u32);
-            out.write_i64(file_size as i64);
-            out.write_i64(data_offset as i64);
-            out.write_i64(file.header.unknown);
-
-            out.write(meta.bytes());
-            out.align_stream(16);
-            out.write(data.bytes());
+            HeaderLayout::LargeFiles48 => {
+                out.write_u32(0);
+                out.write_u32(0);
+                out.write_u32(format.version());
+                out.write_u32(0);
+                out.write_u8(file.header.endian);
+                out.write(&file.header.reserved);
+                out.write_u32(layout.metadata_size);
+                out.write_i64(i64_field(layout.file_size, "file size")?);
+                out.write_i64(i64_field(layout.data_offset, "data offset")?);
+                out.write_i64(file.header.unknown);
+                out.write(meta.bytes());
+                pad_to(&mut out, layout.data_offset, "data offset")?;
+                out.write(data.bytes());
+            }
         }
 
-        Ok(out.into_bytes())
+        out.ensure_valid()?;
+        let actual_size = u64::try_from(out.len())
+            .map_err(|_| UnityAssetError::format("encoded file size does not fit u64"))?;
+        if actual_size != layout.file_size {
+            return Err(UnityAssetError::format(format!(
+                "SerializedFile layout planned {} bytes but encoded {actual_size}",
+                layout.file_size
+            )));
+        }
+
+        out.into_result()
     }
 }
 
 fn write_object_entry(
     file: &SerializedFile,
+    format: SerializedFileFormat,
     info: &ObjectInfo,
     edits: &SerializedFileEdits,
     meta: &mut BinaryWriter,
     data: &mut BinaryWriter,
     options: SerializedFileSaveOptions,
 ) -> Result<()> {
-    let version = file.header.version;
-
-    // Path ID
-    if file.big_id_enabled {
-        meta.write_i64(info.path_id);
-    } else if version < 14 {
-        let pid_i32: i32 = info.path_id.try_into().map_err(|_| {
-            UnityAssetError::format(format!("path_id does not fit i32: {}", info.path_id))
-        })?;
-        meta.write_i32(pid_i32);
-    } else {
-        meta.align_stream(4);
-        meta.write_i64(info.path_id);
+    info.validate().map_err(|error| {
+        UnityAssetError::with_source(format!("Invalid object path ID {}", info.path_id()), error)
+    })?;
+    match format.path_id_encoding() {
+        PathIdEncoding::I32 => meta.write_i32(i32_field(info.path_id(), "path ID")?),
+        PathIdEncoding::BigIdFlag if file.uses_big_ids() => meta.write_i64(info.path_id()),
+        PathIdEncoding::BigIdFlag => meta.write_i32(i32_field(info.path_id(), "path ID")?),
+        PathIdEncoding::AlignedI64 => {
+            meta.align_stream(4);
+            meta.write_i64(info.path_id());
+        }
     }
 
-    // Object bytes (override -> inline -> slice)
-    let obj_bytes: Vec<u8> = if let Some(override_bytes) = edits.get(info.path_id) {
-        override_bytes.to_vec()
-    } else if !info.data.is_empty() {
-        info.data.clone()
+    let obj_bytes = if let Some(override_bytes) = edits.get(info.path_id()) {
+        override_bytes
+    } else if let Some(loaded_data) = info.loaded_data() {
+        loaded_data
     } else if options.allow_lazy_object_reads {
         file.object_bytes(info)
             .map_err(|e| UnityAssetError::with_source("Failed to read object bytes", e))?
-            .to_vec()
     } else {
         return Err(UnityAssetError::format(format!(
             "Object {} bytes not loaded (path_id={})",
-            info.type_id, info.path_id
+            info.class_id(),
+            info.path_id()
         )));
     };
 
-    // Byte start (relative to data stream, NOT including header.data_offset)
-    if version >= 22 {
-        meta.write_i64(data.position() as i64);
-    } else {
-        let pos_u32: u32 = data.position().try_into().map_err(|_| {
-            UnityAssetError::format(format!(
-                "data stream position does not fit u32: {}",
-                data.position()
-            ))
-        })?;
-        meta.write_u32(pos_u32);
+    let relative_offset = u64::try_from(data.position())
+        .map_err(|_| UnityAssetError::format("data stream position does not fit u64"))?;
+    match format.object_offset_encoding() {
+        ObjectOffsetEncoding::U32 => {
+            meta.write_u32(u32_field(relative_offset, "object data offset")?)
+        }
+        ObjectOffsetEncoding::I64 => {
+            meta.write_i64(i64_field(relative_offset, "object data offset")?)
+        }
     }
 
-    // Byte size
-    meta.write_u32(obj_bytes.len() as u32);
+    meta.write_u32(u32::try_from(obj_bytes.len()).map_err(|_| {
+        UnityAssetError::format(format!(
+            "object {} byte size {} does not fit u32",
+            info.path_id(),
+            obj_bytes.len()
+        ))
+    })?);
 
-    // Type ID / type index in object table
-    let raw_type_id = if version >= 16 && info.type_index >= 0 {
-        info.type_index
-    } else {
-        info.type_id
-    };
-    meta.write_i32(raw_type_id);
-
-    if version < 16 {
-        meta.write_u16(info.type_id as u16);
+    let type_reference = info.type_reference();
+    let raw_type_reference = type_reference.raw_value().map_err(|error| {
+        UnityAssetError::with_source(
+            format!("Invalid type reference for object {}", info.path_id()),
+            error,
+        )
+    })?;
+    meta.write_i32(raw_type_reference);
+    if let ObjectTypeReference::Legacy { class_id_bits, .. } = type_reference {
+        meta.write_u16(class_id_bits);
     }
+    write_object_metadata(format, info.metadata(), info.path_id(), meta)?;
 
-    if version < 11 {
-        meta.write_u16(0);
-    }
-
-    if (11..17).contains(&version) {
-        let script_type_index = if version < 16 {
-            file.types
-                .iter()
-                .find(|t| t.class_id == raw_type_id)
-                .map(|t| t.script_type_index)
-                .unwrap_or(-1)
-        } else {
-            file.types
-                .get(raw_type_id as usize)
-                .map(|t| t.script_type_index)
-                .unwrap_or(-1)
-        };
-        meta.write_i16(script_type_index);
-    }
-
-    if version == 15 || version == 16 {
-        meta.write_u8(0);
-    }
-
-    data.write(obj_bytes.as_slice());
+    data.write(obj_bytes);
     Ok(())
+}
+
+fn write_count(writer: &mut BinaryWriter, label: &str, count: usize) -> Result<()> {
+    let count = i32::try_from(count)
+        .map_err(|_| UnityAssetError::format(format!("{label} count too large: {count}")))?;
+    writer.write_i32(count);
+    Ok(())
+}
+
+fn validate_representable_file_state(
+    file: &SerializedFile,
+    format: SerializedFileFormat,
+) -> Result<()> {
+    if file.header.endian > 1 {
+        return Err(UnityAssetError::format(format!(
+            "Invalid SerializedFile endian flag {}",
+            file.header.endian
+        )));
+    }
+    if !format.has_metadata_field(MetadataField::UnityVersion) && !file.unity_version.is_empty() {
+        return Err(UnityAssetError::format(format!(
+            "SerializedFile v{} cannot encode a Unity version string",
+            format.version()
+        )));
+    }
+    if !format.has_metadata_field(MetadataField::TargetPlatform) && file.target_platform != 0 {
+        return Err(UnityAssetError::format(format!(
+            "SerializedFile v{} cannot encode a target platform",
+            format.version()
+        )));
+    }
+    match format.header_layout() {
+        HeaderLayout::Legacy16 => {
+            if file.header.reserved != [0; 3] || file.header.unknown != 0 {
+                return Err(UnityAssetError::format(format!(
+                    "SerializedFile v{} cannot encode reserved or extended header fields",
+                    format.version()
+                )));
+            }
+        }
+        HeaderLayout::Standard20 if file.header.unknown != 0 => {
+            return Err(UnityAssetError::format(format!(
+                "SerializedFile v{} cannot encode the extended unknown header field",
+                format.version()
+            )));
+        }
+        HeaderLayout::Standard20 | HeaderLayout::LargeFiles48 => {}
+    }
+    Ok(())
+}
+
+fn write_object_metadata(
+    format: SerializedFileFormat,
+    metadata: ObjectMetadata,
+    path_id: i64,
+    writer: &mut BinaryWriter,
+) -> Result<()> {
+    match (format.object_tail_encoding(), metadata) {
+        (ObjectTailEncoding::Destroyed, ObjectMetadata::Destroyed { value }) => {
+            writer.write_u16(value)
+        }
+        (ObjectTailEncoding::ScriptTypeIndex, ObjectMetadata::ScriptTypeIndex { index }) => {
+            writer.write_i16(index)
+        }
+        (
+            ObjectTailEncoding::ScriptTypeIndexAndStripped,
+            ObjectMetadata::ScriptTypeIndexAndStripped { index, stripped },
+        ) => {
+            writer.write_i16(index);
+            writer.write_u8(stripped);
+        }
+        (ObjectTailEncoding::None, ObjectMetadata::None) => {}
+        (expected, actual) => {
+            return Err(UnityAssetError::format(format!(
+                "Object {path_id} metadata {actual:?} is incompatible with {expected:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn pad_to(writer: &mut BinaryWriter, offset: u64, label: &str) -> Result<()> {
+    let target = usize::try_from(offset)
+        .map_err(|_| UnityAssetError::format(format!("{label} does not fit usize: {offset}")))?;
+    if writer.position() > target {
+        return Err(UnityAssetError::format(format!(
+            "{label} {target} precedes encoded position {}",
+            writer.position()
+        )));
+    }
+    writer.set_position(target);
+    Ok(())
+}
+
+fn i32_field(value: i64, label: &str) -> Result<i32> {
+    i32::try_from(value)
+        .map_err(|_| UnityAssetError::format(format!("{label} does not fit i32: {value}")))
+}
+
+fn u32_field(value: u64, label: &str) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| UnityAssetError::format(format!("{label} does not fit u32: {value}")))
+}
+
+fn i64_field(value: u64, label: &str) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| UnityAssetError::format(format!("{label} does not fit i64: {value}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const V22_FIXTURE: &[u8] =
+        include_bytes!("../../tests/fixtures/serialized_file_wire/v22.assets.bin");
 
     #[test]
     fn can_save_serialized_file_extracted_from_bundle_and_reload() {
@@ -379,8 +439,41 @@ mod tests {
         assert_eq!(reparsed.target_platform, sf.target_platform);
         assert_eq!(reparsed.enable_type_tree, sf.enable_type_tree);
         assert_eq!(reparsed.types.len(), sf.types.len());
-        assert_eq!(reparsed.objects.len(), sf.objects.len());
+        assert_eq!(reparsed.objects().len(), sf.objects().len());
         assert_eq!(reparsed.externals.len(), sf.externals.len());
         assert_eq!(reparsed.ref_types.len(), sf.ref_types.len());
+    }
+
+    #[test]
+    fn loaded_empty_payload_is_distinct_from_unloaded_for_strict_saves() {
+        let mut file =
+            unity_asset_binary::asset::SerializedFileParser::from_bytes(V22_FIXTURE.to_vec())
+                .unwrap();
+        let path_id = file.objects()[0].path_id();
+        file.find_object_mut(path_id).unwrap().set_data(Vec::new());
+
+        let options = SerializedFileSaveOptions {
+            allow_lazy_object_reads: false,
+        };
+        let encoded =
+            SerializedFileWriter::save_with_options(&file, &SerializedFileEdits::new(), options)
+                .expect("an explicitly loaded empty payload is savable");
+        let reparsed =
+            unity_asset_binary::asset::SerializedFileParser::from_bytes(encoded).unwrap();
+        assert_eq!(reparsed.objects()[0].byte_size(), 0);
+        assert!(
+            reparsed
+                .find_object_handle(path_id)
+                .unwrap()
+                .raw_data()
+                .unwrap()
+                .is_empty()
+        );
+
+        file.find_object_mut(path_id).unwrap().clear_data();
+        let error =
+            SerializedFileWriter::save_with_options(&file, &SerializedFileEdits::new(), options)
+                .expect_err("an unloaded payload cannot be saved when lazy reads are disabled");
+        assert!(error.to_string().contains("bytes not loaded"));
     }
 }

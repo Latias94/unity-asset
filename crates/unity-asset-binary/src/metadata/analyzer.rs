@@ -56,7 +56,7 @@ impl DependencyAnalyzer {
 
         // First pass: collect all object IDs
         for obj in objects {
-            all_nodes.insert(obj.path_id);
+            all_nodes.insert(obj.path_id());
         }
 
         // Placeholder implementation (kept for backward compatibility).
@@ -104,7 +104,7 @@ impl DependencyAnalyzer {
         let mut edges = Vec::new();
 
         for obj in objects {
-            all_nodes.insert(obj.path_id);
+            all_nodes.insert(obj.path_id());
         }
 
         for obj in objects {
@@ -113,16 +113,16 @@ impl DependencyAnalyzer {
             for dep_id in deps.internal {
                 if all_nodes.contains(&dep_id) {
                     internal_refs.push(InternalReference {
-                        from_object: obj.path_id,
+                        from_object: obj.path_id(),
                         to_object: dep_id,
                         reference_type: "Direct".to_string(),
                     });
-                    edges.push((obj.path_id, dep_id));
+                    edges.push((obj.path_id(), dep_id));
                 } else {
                     external_ref_map
                         .entry((0, dep_id))
                         .or_default()
-                        .push(obj.path_id);
+                        .push(obj.path_id());
                 }
             }
 
@@ -130,7 +130,7 @@ impl DependencyAnalyzer {
                 external_ref_map
                     .entry((file_id, path_id))
                     .or_default()
-                    .push(obj.path_id);
+                    .push(obj.path_id());
             }
         }
 
@@ -179,7 +179,7 @@ impl DependencyAnalyzer {
     ) -> Result<ExtractedDependencies> {
         let file_key = asset.data_identity_key();
 
-        if let Some(cached) = self.pptr_dependency_cache.get(&(file_key, obj.path_id)) {
+        if let Some(cached) = self.pptr_dependency_cache.get(&(file_key, obj.path_id())) {
             return Ok(cached.clone());
         }
 
@@ -206,7 +206,7 @@ impl DependencyAnalyzer {
         deps.external.dedup();
 
         self.pptr_dependency_cache
-            .insert((file_key, obj.path_id), deps.clone());
+            .insert((file_key, obj.path_id()), deps.clone());
 
         Ok(deps)
     }
@@ -340,17 +340,15 @@ fn type_tree_for_object<'a>(
     asset: &'a SerializedFile,
     info: &crate::asset::ObjectInfo,
 ) -> Option<&'a TypeTree> {
-    if info.type_index >= 0 {
-        return asset
-            .types
-            .get(info.type_index as usize)
-            .map(|t| &t.type_tree);
+    if let Some(index) = info.serialized_type_index() {
+        let index = usize::try_from(index).ok()?;
+        return asset.types.get(index).map(|t| &t.type_tree);
     }
 
     asset
         .types
         .iter()
-        .find(|t| t.class_id == info.type_id)
+        .find(|t| t.class_id == info.class_id())
         .map(|t| &t.type_tree)
 }
 
@@ -575,7 +573,7 @@ impl RelationshipAnalyzer {
         let mut assets = Vec::new();
 
         for obj in objects {
-            match obj.type_id {
+            match obj.class_id() {
                 class_ids::GAME_OBJECT => gameobjects.push(obj),
                 class_ids::TRANSFORM => transforms.push(obj),
                 class_ids::COMPONENT | class_ids::BEHAVIOUR | class_ids::MONO_BEHAVIOUR => {
@@ -588,8 +586,8 @@ impl RelationshipAnalyzer {
         // Analyze GameObject hierarchy (simplified for now)
         for go in gameobjects {
             let hierarchy = GameObjectHierarchy {
-                gameobject_id: go.path_id,
-                name: format!("GameObject_{}", go.path_id),
+                gameobject_id: go.path_id(),
+                name: format!("GameObject_{}", go.path_id()),
                 parent_id: None,
                 children_ids: Vec::new(),
                 transform_id: 0,
@@ -636,7 +634,7 @@ impl RelationshipAnalyzer {
 
         let mut by_path_id: HashMap<i64, &crate::asset::ObjectInfo> = HashMap::new();
         for obj in objects {
-            by_path_id.insert(obj.path_id, *obj);
+            by_path_id.insert(obj.path_id(), *obj);
         }
 
         let mut gameobject_props: HashMap<i64, indexmap::IndexMap<String, UnityValue>> =
@@ -645,13 +643,13 @@ impl RelationshipAnalyzer {
             HashMap::new();
 
         for obj in objects {
-            match obj.type_id {
+            match obj.class_id() {
                 class_ids::GAME_OBJECT => {
                     if let Some(tree) = type_tree_for_object(asset, obj)
                         && !tree.is_empty()
                         && let Ok(values) = parse_object_with_typetree(asset, obj, tree)
                     {
-                        gameobject_props.insert(obj.path_id, values);
+                        gameobject_props.insert(obj.path_id(), values);
                     }
                 }
                 class_ids::TRANSFORM => {
@@ -659,7 +657,7 @@ impl RelationshipAnalyzer {
                         && !tree.is_empty()
                         && let Ok(values) = parse_object_with_typetree(asset, obj, tree)
                     {
-                        transform_props.insert(obj.path_id, values);
+                        transform_props.insert(obj.path_id(), values);
                     }
                 }
                 _ => {}
@@ -688,7 +686,7 @@ impl RelationshipAnalyzer {
                 // Heuristic: the Transform component (class_id=4) is the GameObject's Transform.
                 for component_id in components {
                     if let Some(info) = by_path_id.get(&component_id)
-                        && info.type_id == class_ids::TRANSFORM
+                        && info.class_id() == class_ids::TRANSFORM
                     {
                         go_transform.insert(*go_id, component_id);
                         break;
@@ -802,7 +800,7 @@ impl RelationshipAnalyzer {
             for comp_id in comp_ids {
                 let component_type = by_path_id
                     .get(comp_id)
-                    .map(|info| self.get_component_type_name(info.type_id))
+                    .map(|info| self.get_component_type_name(info.class_id()))
                     .unwrap_or_else(|| format!("Component_{}", comp_id));
 
                 component_relationships.push(ComponentRelationship {
@@ -834,8 +832,8 @@ impl RelationshipAnalyzer {
         // This would require parsing the GameObject's serialized data
 
         Ok(GameObjectHierarchy {
-            gameobject_id: gameobject.path_id,
-            name: format!("GameObject_{}", gameobject.path_id),
+            gameobject_id: gameobject.path_id(),
+            name: format!("GameObject_{}", gameobject.path_id()),
             parent_id: None,
             children_ids: Vec::new(),
             transform_id: 0, // TODO: Find associated Transform
@@ -852,8 +850,8 @@ impl RelationshipAnalyzer {
         // TODO: Implement proper component relationship analysis
 
         Ok(ComponentRelationship {
-            component_id: component.path_id,
-            component_type: self.get_component_type_name(component.type_id),
+            component_id: component.path_id(),
+            component_type: self.get_component_type_name(component.class_id()),
             gameobject_id: 0, // TODO: Find associated GameObject
             dependencies: Vec::new(),
             external_dependencies: Vec::new(),
@@ -865,31 +863,31 @@ impl RelationshipAnalyzer {
         // TODO: Implement proper asset reference analysis
 
         Ok(AssetReference {
-            asset_id: asset.path_id,
-            asset_type: self.get_asset_type_name(asset.type_id),
+            asset_id: asset.path_id(),
+            asset_type: self.get_asset_type_name(asset.class_id()),
             referenced_by: Vec::new(),
             file_path: None,
         })
     }
 
     /// Get component type name from type ID
-    fn get_component_type_name(&self, type_id: i32) -> String {
-        match type_id {
+    fn get_component_type_name(&self, class_id: i32) -> String {
+        match class_id {
             class_ids::TRANSFORM => "Transform".to_string(),
             class_ids::MONO_BEHAVIOUR => "MonoBehaviour".to_string(),
-            _ => format!("Component_{}", type_id),
+            _ => format!("Component_{}", class_id),
         }
     }
 
     /// Get asset type name from type ID
-    fn get_asset_type_name(&self, type_id: i32) -> String {
-        match type_id {
+    fn get_asset_type_name(&self, class_id: i32) -> String {
+        match class_id {
             class_ids::TEXTURE_2D => "Texture2D".to_string(),
             class_ids::MESH => "Mesh".to_string(),
             class_ids::MATERIAL => "Material".to_string(),
             class_ids::AUDIO_CLIP => "AudioClip".to_string(),
             class_ids::SPRITE => "Sprite".to_string(),
-            _ => format!("Asset_{}", type_id),
+            _ => format!("Asset_{}", class_id),
         }
     }
 

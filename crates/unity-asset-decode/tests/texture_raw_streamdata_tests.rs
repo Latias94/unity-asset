@@ -44,7 +44,7 @@ fn texture2d_raw_parsing_can_extract_streamdata() {
         data.push(0);
     }
 
-    let obj = UnityObject::from_raw(28, 1, data);
+    let obj = UnityObject::from_raw(28, 1, data).expect("valid standalone texture object");
     let converter = Texture2DConverter::new(UnityVersion::default());
     let tex = converter.from_unity_object(&obj).unwrap();
 

@@ -470,6 +470,7 @@ fn export_bundle_command(
         })
         .collect();
     bundle_sources.sort();
+    let mut container_budget = AssetLoadBudget::default();
 
     if bundle_sources.is_empty() && retry_failed_from.is_none() {
         println!("⚠ No AssetBundles found in {:?}", input);
@@ -515,7 +516,8 @@ fn export_bundle_command(
         }
     } else {
         for bundle_source in bundle_sources {
-            let entries = env.bundle_container_entries_source(&bundle_source)?;
+            let entries =
+                env.bundle_container_entries_source(&bundle_source, &mut container_budget)?;
             let mut entries: Vec<_> = entries
                 .into_iter()
                 .filter(|e| container_asset_path_matches_ci(&e.asset_path, &pattern))
@@ -993,7 +995,7 @@ fn export_one_entry(
     skip_existing: bool,
 ) -> Result<ExportOutcome> {
     let obj = env.read_binary_object_key(key)?;
-    let type_id = obj.info.type_id;
+    let type_id = obj.info.class_id();
     let class_name = if type_id == 0 {
         None
     } else {
@@ -1017,7 +1019,9 @@ fn export_one_entry(
                     order,
                     message: format!(
                         "✓ {} -> {:?} (decoded, class_id={})",
-                        asset_path, dest, obj.info.type_id
+                        asset_path,
+                        dest,
+                        obj.info.class_id()
                     ),
                     did_export: true,
                     did_skip_existing: false,
@@ -1100,7 +1104,7 @@ fn export_one_entry(
             "✓ {} -> {:?} (raw, class_id={}, bytes={})",
             asset_path,
             dest,
-            obj.info.type_id,
+            obj.info.class_id(),
             bytes.len()
         ),
         did_export: true,
@@ -1158,7 +1162,7 @@ fn try_decode_export_best_effort(
             .unwrap_or_default(),
     };
 
-    match obj.info.type_id {
+    match obj.info.class_id() {
         class_ids::AUDIO_CLIP => (|| -> anyhow::Result<DecodeAttempt> {
             let converter = AudioClipConverter::new(unity_version.clone());
             let clip = converter.from_unity_object(obj)?;

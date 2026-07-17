@@ -656,7 +656,7 @@ mod tests {
         original_w.write_i32(1);
         original_w.write_i32(0x11223344);
         original_w.write_i32(2);
-        let original_bytes = original_w.into_bytes();
+        let original_bytes = original_w.into_result().unwrap();
 
         let mut props = IndexMap::new();
         props.insert("m_A".to_string(), UnityValue::Integer(10));
@@ -708,7 +708,7 @@ mod tests {
         original_w.write_i32(1);
         original_w.write_i32(77);
         original_w.write_i32(2);
-        let original_bytes = original_w.into_bytes();
+        let original_bytes = original_w.into_result().unwrap();
 
         let mut foo_obj = IndexMap::new();
         foo_obj.insert("x".to_string(), UnityValue::Integer(10));

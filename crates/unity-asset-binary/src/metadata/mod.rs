@@ -235,9 +235,9 @@ impl MetadataProcessor {
         {
             let objects: Vec<&crate::asset::ObjectInfo> =
                 if let Some(max) = self.extractor.config().max_objects {
-                    asset.objects.iter().take(max).collect()
+                    asset.objects().iter().take(max).collect()
                 } else {
-                    asset.objects.iter().collect()
+                    asset.objects().iter().collect()
                 };
 
             match analyzer.analyze_dependencies_in_asset(asset, &objects) {
@@ -282,9 +282,9 @@ impl MetadataProcessor {
         {
             let objects: Vec<&crate::asset::ObjectInfo> =
                 if let Some(max) = self.extractor.config().max_objects {
-                    asset.objects.iter().take(max).collect()
+                    asset.objects().iter().take(max).collect()
                 } else {
-                    asset.objects.iter().collect()
+                    asset.objects().iter().collect()
                 };
 
             match analyzer.analyze_relationships_in_asset(asset, &objects) {
@@ -414,7 +414,7 @@ pub fn extract_metadata_with_config(
 /// Get quick statistics for an asset
 pub fn get_asset_statistics(asset: &SerializedFile) -> AssetStatistics {
     AssetStatistics {
-        object_count: asset.objects.len(),
+        object_count: asset.objects().len(),
         type_count: asset.types.len(),
         external_count: asset.externals.len(),
         file_size: asset.header.file_size,
@@ -462,7 +462,7 @@ pub fn is_extraction_supported(asset: &SerializedFile) -> bool {
 
 /// Get recommended extraction configuration for an asset
 pub fn get_recommended_config(asset: &SerializedFile) -> ExtractionConfig {
-    let object_count = asset.objects.len();
+    let object_count = asset.objects().len();
 
     if object_count > 10000 {
         // Large asset - performance focused

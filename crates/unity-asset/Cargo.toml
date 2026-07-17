@@ -33,7 +33,7 @@ thiserror = { workspace = true }
 
 [features]
 default = ["mmap"]
-async = ["unity-asset-core/async", "unity-asset-yaml/async", "unity-asset-binary/async"]
+async = ["unity-asset-core/async", "unity-asset-yaml/async"]
 mmap = ["unity-asset-binary/mmap"]
 
 [dev-dependencies]

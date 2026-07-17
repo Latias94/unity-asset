@@ -7,8 +7,8 @@ use crate::shared::{
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
-use unity_asset::UnityValue;
 use unity_asset::environment::{BinaryObjectKey, BinarySource, Environment};
+use unity_asset::{AssetLoadBudget, UnityValue};
 use unity_asset_binary::bundle::AssetBundle;
 use unity_asset_binary::object::UnityObject;
 use unity_asset_binary::typetree::{TypeTreeParseMode, TypeTreeParseOptions, TypeTreeRegistry};
@@ -89,6 +89,7 @@ fn find_object_env_fallback(
         })
         .collect();
     bundle_sources.sort();
+    let mut budget = AssetLoadBudget::default();
 
     if bundle_sources.is_empty() {
         println!("⚠ No AssetBundles found in {:?}", input);
@@ -97,7 +98,7 @@ fn find_object_env_fallback(
 
     let mut count = 0usize;
     for bundle_source in bundle_sources {
-        let mut entries = env.bundle_container_entries_source(&bundle_source)?;
+        let mut entries = env.bundle_container_entries_source(&bundle_source, &mut budget)?;
         entries.sort_by(|a, b| a.asset_path.cmp(&b.asset_path));
 
         for entry in entries {
@@ -241,6 +242,7 @@ fn find_object_fast(
 
     let mut processed_any_bundle = false;
     let mut count = 0usize;
+    let mut budget = AssetLoadBudget::default();
 
     for path in candidate_paths {
         if let Some(max) = limit {
@@ -254,8 +256,13 @@ fn find_object_fast(
         }
 
         let options = fast_path::bundle_list_options();
-        let mut bundle = match fast_path::load_bundle_for_list(&path, options) {
+        let mut bundle = match unity_asset_binary::file::load_bundle_file_with_options_and_budget(
+            &path,
+            options,
+            &mut budget,
+        ) {
             Ok(v) => v,
+            Err(error) if error.is_resource_error() => return Err(error.into()),
             Err(_) => continue,
         };
         processed_any_bundle = true;
@@ -272,6 +279,7 @@ fn find_object_fast(
             registry.as_ref(),
             typetree_options,
             show_warnings,
+            &mut budget,
         );
 
         let mut entries = match entries {
@@ -451,13 +459,15 @@ fn extract_bundle_container_entries_fast(
     registry: Option<&Arc<dyn TypeTreeRegistry>>,
     typetree_options: TypeTreeParseOptions,
     show_warnings: bool,
+    budget: &mut AssetLoadBudget,
 ) -> Result<Vec<unity_asset::environment::BundleContainerEntry>> {
     for (asset_index, node) in asset_nodes.iter().enumerate() {
         let bytes = bundle
-            .extract_node_data(node)
+            .extract_node_data_with_budget(node, budget)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let mut file = unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let mut file =
+            unity_asset_binary::asset::SerializedFileParser::from_bytes_with_budget(bytes, budget)
+                .map_err(|e| anyhow::anyhow!(e))?;
         if let Some(registry) = registry.cloned() {
             file.set_type_tree_registry(Some(registry));
         }
@@ -508,32 +518,36 @@ fn extract_bundle_container_entries_fast(
                 }
             }
 
-            if let Ok(raw_entries) = file.assetbundle_container_raw(object.info()) {
-                for (asset_path, file_id, path_id) in raw_entries {
-                    let key = if path_id == 0 {
-                        None
-                    } else {
-                        resolve_pptr_in_bundle(
-                            bundle_source,
+            match file.assetbundle_container_raw(object.info(), budget) {
+                Ok(raw_entries) => {
+                    for (asset_path, file_id, path_id) in raw_entries {
+                        let key = if path_id == 0 {
+                            None
+                        } else {
+                            resolve_pptr_in_bundle(
+                                bundle_source,
+                                asset_index,
+                                &file,
+                                asset_names,
+                                file_id,
+                                path_id,
+                            )
+                        };
+                        out.push(unity_asset::environment::BundleContainerEntry {
+                            bundle_source: bundle_source.clone(),
                             asset_index,
-                            &file,
-                            asset_names,
+                            asset_path,
                             file_id,
                             path_id,
-                        )
-                    };
-                    out.push(unity_asset::environment::BundleContainerEntry {
-                        bundle_source: bundle_source.clone(),
-                        asset_index,
-                        asset_path,
-                        file_id,
-                        path_id,
-                        key,
-                    });
+                            key,
+                        });
+                    }
+                    if !out.is_empty() {
+                        return Ok(out);
+                    }
                 }
-                if !out.is_empty() {
-                    return Ok(out);
-                }
+                Err(error) if error.is_resource_error() => return Err(error.into()),
+                Err(_) => {}
             }
         }
     }
@@ -704,7 +718,7 @@ fn lookup_object_type_info_fast(
     cache[asset_index]
         .as_ref()
         .and_then(|f| f.find_object(key.path_id))
-        .map(|info| (info.type_id, info.byte_size))
+        .map(|info| (info.class_id(), info.byte_size()))
         .unwrap_or((0, 0))
 }
 
@@ -764,13 +778,13 @@ fn lookup_object_type_info(env: &Environment, key: &BinaryObjectKey) -> (i32, u3
             .get(&key.source)
             .and_then(|b| key.asset_index.and_then(|i| b.assets.get(i)))
             .and_then(|f| f.find_object(key.path_id))
-            .map(|info| (info.type_id, info.byte_size))
+            .map(|info| (info.class_id(), info.byte_size()))
             .unwrap_or((0, 0)),
         unity_asset::environment::BinarySourceKind::SerializedFile => env
             .binary_assets()
             .get(&key.source)
             .and_then(|f| f.find_object(key.path_id))
-            .map(|info| (info.type_id, info.byte_size))
+            .map(|info| (info.class_id(), info.byte_size()))
             .unwrap_or((0, 0)),
     }
 }

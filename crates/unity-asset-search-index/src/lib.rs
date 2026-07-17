@@ -23,7 +23,7 @@ use tantivy::{
     DocAddress, DocId, DocSet, Index, IndexReader, IndexWriter, Score, TantivyDocument, Term,
 };
 
-use unity_asset_core::DigestV1Builder;
+use unity_asset_core::{AssetLoadBudget, DigestV1Builder};
 use unity_asset_search_core::{
     CandidateFacts, CandidateField, FuzzyWorkUsage, HighlightRange, MatchCount, MatchExplanation,
     MatchField, MatchKind, QuerySpec, RankingSignals, RetrievalEvidence, RetrievalStage,
@@ -3417,7 +3417,9 @@ fn extract_unity_binary_extraction(
         .map(|g| normalize_guid_string(&g))
         .filter(|g| !g.is_empty());
 
-    let unity_file = unity_asset_binary::file::load_unity_file(&file.abs_path);
+    let mut budget = AssetLoadBudget::default();
+    let unity_file =
+        unity_asset_binary::file::load_unity_file_with_budget(&file.abs_path, &mut budget);
     let Ok(unity_file) = unity_file else {
         return Ok(None);
     };
@@ -3450,12 +3452,14 @@ fn extract_unity_binary_extraction(
                 let max_entries = options.max_bundle_container_entries_per_bundle.max(1);
                 let mut out = std::collections::BTreeSet::<String>::new();
                 for asset in &bundle.assets {
-                    for info in asset.objects.iter() {
-                        if info.type_id != 142 {
+                    for info in asset.objects() {
+                        if info.class_id() != 142 {
                             continue;
                         }
-                        let Ok(entries) = asset.assetbundle_container_raw(info) else {
-                            continue;
+                        let entries = match asset.assetbundle_container_raw(info, &mut budget) {
+                            Ok(entries) => entries,
+                            Err(error) if error.is_resource_error() => return Err(error.into()),
+                            Err(_) => continue,
                         };
                         for (asset_path, _file_id, _path_id) in entries {
                             if asset_path.trim().is_empty() {
@@ -3508,7 +3512,9 @@ fn extract_assetbundle_container_asset_paths(
         return Ok(Vec::new());
     }
 
-    let unity_file = unity_asset_binary::file::load_unity_file(bundle_path);
+    let mut budget = AssetLoadBudget::default();
+    let unity_file =
+        unity_asset_binary::file::load_unity_file_with_budget(bundle_path, &mut budget);
     let Ok(unity_file) = unity_file else {
         return Ok(Vec::new());
     };
@@ -3519,12 +3525,14 @@ fn extract_assetbundle_container_asset_paths(
 
     let mut out = std::collections::BTreeSet::<String>::new();
     for asset in &bundle.assets {
-        for info in asset.objects.iter() {
-            if info.type_id != 142 {
+        for info in asset.objects() {
+            if info.class_id() != 142 {
                 continue;
             }
-            let Ok(entries) = asset.assetbundle_container_raw(info) else {
-                continue;
+            let entries = match asset.assetbundle_container_raw(info, &mut budget) {
+                Ok(entries) => entries,
+                Err(error) if error.is_resource_error() => return Err(error.into()),
+                Err(_) => continue,
             };
             for (asset_path, _file_id, _path_id) in entries {
                 if asset_path.trim().is_empty() {
@@ -3569,7 +3577,7 @@ fn extract_refs_from_serialized_file(
         })
         .collect();
 
-    for info in file.objects.iter().take(MAX_OBJECTS) {
+    for info in file.objects().iter().take(MAX_OBJECTS) {
         let handle = unity_asset_binary::object::ObjectHandle::new(file, info);
         let Ok(Some(pptrs)) = handle.scan_pptrs() else {
             continue;
@@ -4040,7 +4048,7 @@ fn extract_reference_contexts_from_serialized_file(
         .collect();
 
     let mut out = Vec::new();
-    for info in file.objects.iter().take(MAX_OBJECTS) {
+    for info in file.objects().iter().take(MAX_OBJECTS) {
         if out.len() >= MAX_CONTEXTS {
             break;
         }

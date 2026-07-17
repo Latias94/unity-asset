@@ -18,6 +18,7 @@ pub struct BinaryWriter {
     endian: Endian,
     buf: Vec<u8>,
     pos: usize,
+    error: Option<String>,
 }
 
 impl BinaryWriter {
@@ -26,6 +27,7 @@ impl BinaryWriter {
             endian,
             buf: Vec::new(),
             pos: 0,
+            error: None,
         }
     }
 
@@ -35,6 +37,7 @@ impl BinaryWriter {
             endian,
             buf: bytes,
             pos,
+            error: None,
         }
     }
 
@@ -51,8 +54,18 @@ impl BinaryWriter {
     }
 
     pub fn set_position(&mut self, pos: usize) {
+        if self.error.is_some() {
+            return;
+        }
         self.pos = pos;
         if self.pos > self.buf.len() {
+            if let Err(error) = self
+                .buf
+                .try_reserve(self.pos.saturating_sub(self.buf.len()))
+            {
+                self.record_error(format!("Failed to reserve writer buffer: {error}"));
+                return;
+            }
             self.buf.resize(self.pos, 0);
         }
     }
@@ -69,13 +82,39 @@ impl BinaryWriter {
         self.buf.as_slice()
     }
 
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.buf
+    /// Returns an error recorded by a checked write or allocation operation.
+    pub fn ensure_valid(&self) -> Result<()> {
+        match &self.error {
+            Some(message) => Err(UnityAssetError::format(message.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Finishes the writer only if every checked write succeeded.
+    pub fn into_result(self) -> Result<Vec<u8>> {
+        if let Some(message) = self.error {
+            return Err(UnityAssetError::format(message));
+        }
+        Ok(self.buf)
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
-        let end = self.pos.saturating_add(bytes.len());
+        if self.error.is_some() {
+            return;
+        }
+        let Some(end) = self.pos.checked_add(bytes.len()) else {
+            self.record_error(format!(
+                "Writer position overflow: {} + {}",
+                self.pos,
+                bytes.len()
+            ));
+            return;
+        };
         if end > self.buf.len() {
+            if let Err(error) = self.buf.try_reserve(end - self.buf.len()) {
+                self.record_error(format!("Failed to reserve writer buffer: {error}"));
+                return;
+            }
             self.buf.resize(end, 0);
         }
         self.buf[self.pos..end].copy_from_slice(bytes);
@@ -83,7 +122,7 @@ impl BinaryWriter {
     }
 
     pub fn align_stream(&mut self, alignment: usize) {
-        if alignment == 0 {
+        if alignment == 0 || self.error.is_some() {
             return;
         }
         let pos = self.pos;
@@ -92,13 +131,26 @@ impl BinaryWriter {
             return;
         }
 
-        let end = self.pos.saturating_add(pad);
+        let Some(end) = self.pos.checked_add(pad) else {
+            self.record_error(format!("Writer alignment overflow: {} + {pad}", self.pos));
+            return;
+        };
         if end > self.buf.len() {
+            if let Err(error) = self.buf.try_reserve(end - self.buf.len()) {
+                self.record_error(format!("Failed to reserve writer buffer: {error}"));
+                return;
+            }
             self.buf.resize(end, 0);
         } else {
             self.buf[self.pos..end].fill(0);
         }
         self.pos = end;
+    }
+
+    fn record_error(&mut self, message: String) {
+        if self.error.is_none() {
+            self.error = Some(message);
+        }
     }
 
     pub fn write_u8(&mut self, value: u8) {
@@ -260,6 +312,22 @@ mod tests {
         w.set_position(4);
         w.write_u8(2);
         assert_eq!(w.bytes(), &[1, 0, 0, 0, 2]);
+    }
+
+    #[test]
+    fn set_position_reports_capacity_overflow_without_allocating() {
+        let mut writer = BinaryWriter::default();
+        writer.set_position(usize::MAX);
+
+        let error = writer
+            .ensure_valid()
+            .expect_err("impossible capacity must be reported");
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to reserve writer buffer")
+        );
+        assert!(writer.into_result().is_err());
     }
 
     #[test]

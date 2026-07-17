@@ -1,17 +1,44 @@
 //! Binary data reader for Unity files
 
+pub use crate::byte_order::ByteOrder;
 use crate::error::{BinaryError, Result};
+use crate::random_access::ByteCursor;
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
-/// Byte order for reading binary data
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ByteOrder {
-    /// Big endian (network byte order)
-    Big,
-    /// Little endian (most common on x86/x64)
-    #[default]
-    Little,
+/// Primitive binary reading without resource-allocation semantics.
+pub(crate) trait BinaryRead {
+    fn position(&self) -> u64;
+    fn remaining(&self) -> u64;
+    fn set_position(&mut self, position: u64) -> Result<()>;
+    fn align_to(&mut self, alignment: u64) -> Result<()>;
+    fn read_u8(&mut self) -> Result<u8>;
+    fn read_u16(&mut self) -> Result<u16>;
+    fn read_i16(&mut self) -> Result<i16>;
+    fn read_u32(&mut self) -> Result<u32>;
+    fn read_i32(&mut self) -> Result<i32>;
+    fn read_u64(&mut self) -> Result<u64>;
+    fn read_i64(&mut self) -> Result<i64>;
+    fn read_bytes(&mut self, count: usize) -> Result<Vec<u8>>;
+    fn read_cstring_limited(&mut self, max_len: usize) -> Result<String>;
+    fn read_bool(&mut self) -> Result<bool> {
+        Ok(self.read_u8()? != 0)
+    }
+
+    fn align(&mut self) -> Result<()> {
+        self.align_to(4)
+    }
+}
+
+/// Parser input that must account for allocations, hierarchy, and collection growth.
+///
+/// Allocation-bearing parsers accept this trait, so a plain [`BinaryReader`] cannot silently
+/// bypass a caller-owned `AssetLoadBudget`.
+pub(crate) trait BinaryInput: BinaryRead {
+    fn consume_bytes(&mut self, amount: u64) -> Result<()>;
+    fn consume_entries(&mut self, amount: u64) -> Result<()>;
+    fn consume_members(&mut self, amount: u64) -> Result<()>;
+    fn observe_depth(&mut self, depth: u32) -> Result<()>;
 }
 
 /// Binary reader for Unity file formats
@@ -42,6 +69,13 @@ impl<'a> BinaryReader<'a> {
 
     /// Set position in the stream
     pub fn set_position(&mut self, pos: u64) -> Result<()> {
+        let len = u64::try_from(self.len())
+            .map_err(|_| BinaryError::invalid_data("reader length does not fit in u64"))?;
+        if pos > len {
+            return Err(BinaryError::invalid_data(format!(
+                "reader position {pos} is outside 0..{len}"
+            )));
+        }
         self.cursor.set_position(pos);
         Ok(())
     }
@@ -78,8 +112,19 @@ impl<'a> BinaryReader<'a> {
 
     /// Align to the specified byte boundary
     pub fn align_to(&mut self, alignment: u64) -> Result<()> {
+        if alignment == 0 {
+            return Err(BinaryError::invalid_data(
+                "reader alignment must be nonzero",
+            ));
+        }
         let pos = self.position();
-        let aligned = (pos + alignment - 1) & !(alignment - 1);
+        let remainder = pos % alignment;
+        let aligned = if remainder == 0 {
+            pos
+        } else {
+            pos.checked_add(alignment - remainder)
+                .ok_or_else(|| BinaryError::invalid_data("reader alignment overflows u64"))?
+        };
         if aligned != pos {
             self.set_position(aligned)?;
         }
@@ -220,14 +265,27 @@ impl<'a> BinaryReader<'a> {
 
     /// Read a null-terminated string
     pub fn read_cstring(&mut self) -> Result<String> {
-        let mut bytes = Vec::new();
-        loop {
-            let byte = self.read_u8()?;
-            if byte == 0 {
-                break;
-            }
-            bytes.push(byte);
-        }
+        self.read_cstring_limited(Self::DEFAULT_MAX_STRING_LEN)
+    }
+
+    /// Read a null-terminated string without scanning past an explicit format limit.
+    pub fn read_cstring_limited(&mut self, max_len: usize) -> Result<String> {
+        let remaining = self.remaining_slice();
+        let scan_len = remaining.len().min(max_len.saturating_add(1));
+        let Some(length) = remaining[..scan_len].iter().position(|byte| *byte == 0) else {
+            return if remaining.len() > max_len {
+                Err(BinaryError::invalid_data(format!(
+                    "C string exceeds maximum length {max_len}"
+                )))
+            } else {
+                Err(BinaryError::invalid_data(
+                    "unterminated C string in bounded input",
+                ))
+            };
+        };
+        let bytes = self.read_bytes(length)?;
+        let terminator = self.read_u8()?;
+        debug_assert_eq!(terminator, 0);
         Ok(String::from_utf8(bytes)?)
     }
 
@@ -308,6 +366,145 @@ impl<'a> BinaryReader<'a> {
             &data[offset..offset + length],
             self.byte_order,
         ))
+    }
+}
+
+impl BinaryRead for BinaryReader<'_> {
+    fn position(&self) -> u64 {
+        BinaryReader::position(self)
+    }
+
+    fn remaining(&self) -> u64 {
+        self.remaining() as u64
+    }
+
+    fn set_position(&mut self, position: u64) -> Result<()> {
+        BinaryReader::set_position(self, position)
+    }
+
+    fn align_to(&mut self, alignment: u64) -> Result<()> {
+        BinaryReader::align_to(self, alignment)
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        BinaryReader::read_u8(self)
+    }
+
+    fn read_u16(&mut self) -> Result<u16> {
+        BinaryReader::read_u16(self)
+    }
+
+    fn read_i16(&mut self) -> Result<i16> {
+        BinaryReader::read_i16(self)
+    }
+
+    fn read_u32(&mut self) -> Result<u32> {
+        BinaryReader::read_u32(self)
+    }
+
+    fn read_i32(&mut self) -> Result<i32> {
+        BinaryReader::read_i32(self)
+    }
+
+    fn read_u64(&mut self) -> Result<u64> {
+        BinaryReader::read_u64(self)
+    }
+
+    fn read_i64(&mut self) -> Result<i64> {
+        BinaryReader::read_i64(self)
+    }
+
+    fn read_bytes(&mut self, count: usize) -> Result<Vec<u8>> {
+        BinaryReader::read_bytes(self, count)
+    }
+
+    fn read_cstring_limited(&mut self, max_len: usize) -> Result<String> {
+        BinaryReader::read_cstring_limited(self, max_len)
+    }
+}
+
+impl BinaryRead for ByteCursor<'_, '_> {
+    fn position(&self) -> u64 {
+        ByteCursor::position(self)
+    }
+
+    fn remaining(&self) -> u64 {
+        ByteCursor::remaining(self)
+    }
+
+    fn set_position(&mut self, position: u64) -> Result<()> {
+        ByteCursor::set_position(self, position)
+    }
+
+    fn align_to(&mut self, alignment: u64) -> Result<()> {
+        ByteCursor::align_to(self, alignment)
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        ByteCursor::read_u8(self)
+    }
+
+    fn read_u16(&mut self) -> Result<u16> {
+        ByteCursor::read_u16(self)
+    }
+
+    fn read_i16(&mut self) -> Result<i16> {
+        ByteCursor::read_i16(self)
+    }
+
+    fn read_u32(&mut self) -> Result<u32> {
+        ByteCursor::read_u32(self)
+    }
+
+    fn read_i32(&mut self) -> Result<i32> {
+        ByteCursor::read_i32(self)
+    }
+
+    fn read_u64(&mut self) -> Result<u64> {
+        ByteCursor::read_u64(self)
+    }
+
+    fn read_i64(&mut self) -> Result<i64> {
+        ByteCursor::read_i64(self)
+    }
+
+    fn read_bytes(&mut self, count: usize) -> Result<Vec<u8>> {
+        let count = u64::try_from(count)
+            .map_err(|_| BinaryError::invalid_data("read length does not fit in u64"))?;
+        ByteCursor::read_bytes(self, count)
+    }
+
+    fn read_cstring_limited(&mut self, max_len: usize) -> Result<String> {
+        let max_len = u64::try_from(max_len)
+            .map_err(|_| BinaryError::invalid_data("C string limit does not fit in u64"))?;
+        ByteCursor::read_cstring(self, max_len)
+    }
+}
+
+impl BinaryInput for ByteCursor<'_, '_> {
+    fn consume_bytes(&mut self, amount: u64) -> Result<()> {
+        ByteCursor::consume_bytes(self, amount)
+    }
+
+    fn consume_entries(&mut self, amount: u64) -> Result<()> {
+        ByteCursor::consume_entries(self, amount)
+    }
+
+    fn consume_members(&mut self, amount: u64) -> Result<()> {
+        ByteCursor::consume_members(self, amount)
+    }
+
+    fn observe_depth(&mut self, depth: u32) -> Result<()> {
+        ByteCursor::observe_depth(self, depth)
+    }
+}
+
+pub(crate) fn not_enough_data_u64(expected: u64, actual: u64) -> BinaryError {
+    match (usize::try_from(expected), usize::try_from(actual)) {
+        (Ok(expected), Ok(actual)) => BinaryError::not_enough_data(expected, actual),
+        _ => BinaryError::invalid_data(format!(
+            "input requires {expected} bytes but only {actual} remain"
+        )),
     }
 }
 

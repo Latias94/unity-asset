@@ -36,7 +36,8 @@ regex = { workspace = true }
 # Compression support
 flate2 = { workspace = true }
 lz4_flex = { workspace = true }
-lzma-rs = "0.3"
+# The decoder scratch budget mirrors lzma-rs 0.3.0's allocation model.
+lzma-rs = "=0.3.0"
 brotli = "3.4"
 memmap2 = { version = "0.9", optional = true }
 
@@ -44,18 +45,8 @@ memmap2 = { version = "0.9", optional = true }
 once_cell = { workspace = true }
 num_cpus = "1.16"
 
-# Async support (optional)
-tokio = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-async-trait = { workspace = true, optional = true }
-tokio-stream = { workspace = true, optional = true }
-async-stream = { workspace = true, optional = true }
-
 [features]
 default = []
-
-# 异步支持
-async = ["unity-asset-core/async", "tokio", "futures", "async-trait", "tokio-stream", "async-stream"]
 mmap = ["dep:memmap2"]
 
 [dev-dependencies]

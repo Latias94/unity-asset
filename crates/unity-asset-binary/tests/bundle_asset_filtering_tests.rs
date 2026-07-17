@@ -12,8 +12,8 @@ fn sample_bundle_path() -> PathBuf {
 fn collect_present_type_ids(bundle: &AssetBundle) -> HashSet<i32> {
     let mut ids = HashSet::new();
     for asset in &bundle.assets {
-        for obj in &asset.objects {
-            ids.insert(obj.type_id);
+        for obj in asset.objects() {
+            ids.insert(obj.class_id());
         }
     }
     ids

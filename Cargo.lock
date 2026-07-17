@@ -3519,13 +3519,10 @@ dependencies = [
 name = "unity-asset-binary"
 version = "0.3.0"
 dependencies = [
- "async-stream",
- "async-trait",
  "binrw",
  "brotli",
  "byteorder",
  "flate2",
- "futures",
  "hex",
  "indexmap",
  "lz4_flex 0.12.0",
@@ -3538,8 +3535,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.16",
- "tokio",
- "tokio-stream",
  "unity-asset-core",
 ]
 
@@ -3666,6 +3661,7 @@ dependencies = [
  "indexmap",
  "lz4_flex 0.12.0",
  "lzma-rs",
+ "serde_json",
  "tempfile",
  "unity-asset-binary",
  "unity-asset-core",

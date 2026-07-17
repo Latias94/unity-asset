@@ -30,7 +30,7 @@ fn deps_analyze_and_print(
 ) -> Result<()> {
     use unity_asset_binary::metadata::DependencyAnalyzer;
 
-    let objects: Vec<&unity_asset_binary::asset::ObjectInfo> = file.objects.iter().collect();
+    let objects: Vec<&unity_asset_binary::asset::ObjectInfo> = file.objects().iter().collect();
     let mut analyzer = DependencyAnalyzer::new();
     let deps = analyzer.analyze_dependencies_in_asset(file, &objects)?;
 
@@ -42,7 +42,7 @@ fn deps_analyze_and_print(
                 resolved_source, source_kind, asset_index
             );
             println!("Unity: {}", file.unity_version);
-            println!("Objects: {}", file.objects.len());
+            println!("Objects: {}", file.objects().len());
             println!(
                 "Internal refs: {} (edges={})",
                 deps.internal_references.len(),
@@ -63,7 +63,7 @@ fn deps_analyze_and_print(
                 .to_string(),
                 asset_index,
                 unity_version: file.unity_version.clone(),
-                object_count: file.objects.len(),
+                object_count: file.objects().len(),
                 deps,
             };
             println!("{}", serde_json::to_string_pretty(&out)?);

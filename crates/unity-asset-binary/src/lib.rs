@@ -31,8 +31,8 @@
 //! for asset in &bundle.assets {
 //!     println!("Asset with {} objects", asset.object_count());
 //!     // Access objects in the asset
-//!     for object in &asset.objects {
-//!         println!("  Object: {} (type_id: {})", object.path_id, object.type_id);
+//!     for object in asset.objects() {
+//!         println!("  Object: {} (class_id: {})", object.path_id(), object.class_id());
 //!     }
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -41,6 +41,7 @@
 // Core modules (always available)
 pub mod asset;
 pub mod bundle;
+mod byte_order;
 pub mod compression;
 pub mod data_view;
 pub mod error;
@@ -49,6 +50,7 @@ pub mod formats;
 pub mod metadata;
 pub mod object;
 pub mod performance;
+mod random_access;
 pub mod reader;
 pub mod shared_bytes;
 pub mod typetree;
@@ -57,6 +59,8 @@ pub mod unity_version;
 pub mod webfile;
 
 pub use error::{BinaryError, Result};
+#[doc(hidden)]
+pub use random_access::{ByteSegment, SegmentedBytes};
 
 // Intentionally avoid massive top-level re-exports.
 //
@@ -64,27 +68,3 @@ pub use error::{BinaryError, Result};
 // - `unity_asset_binary::formats::{bundle, serialized, web}`
 // - `unity_asset_binary::{bundle, asset, webfile, object, typetree, ...}`
 // - `unity_asset_binary::file::{load_unity_file, load_unity_file_from_memory}`
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_basic_functionality() {
-        // Basic smoke test
-        assert_eq!(2 + 2, 4);
-    }
-
-    #[cfg(feature = "async")]
-    #[tokio::test]
-    async fn test_async_functionality() {
-        // Test that async features compile
-        let dummy_data = [0u8; 32];
-
-        // Test basic async functionality - for now just verify the feature compiles
-        // TODO: Implement actual async methods when needed
-        let _result = tokio::task::yield_now().await;
-
-        // Note: AssetBundle::from_bytes_async and SerializedFile::from_bytes_async
-        // are not yet implemented. They would be added when async support is needed.
-        assert!(!dummy_data.is_empty());
-    }
-}

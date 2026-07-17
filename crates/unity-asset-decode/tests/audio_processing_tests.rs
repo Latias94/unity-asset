@@ -152,7 +152,7 @@ fn test_audio_processing_from_files() {
             match load_bundle_from_memory(data) {
                 Ok(bundle) => {
                     for asset in &bundle.assets {
-                        for asset_object_info in &asset.objects {
+                        for asset_object_info in asset.objects() {
                             total_objects += 1;
 
                             let unity_object =
@@ -163,10 +163,11 @@ fn test_audio_processing_from_files() {
                                             .map(|b| b.to_vec())
                                             .unwrap_or_default();
                                         UnityObject::from_raw(
-                                            asset_object_info.type_id,
-                                            asset_object_info.path_id,
+                                            asset_object_info.class_id(),
+                                            asset_object_info.path_id(),
                                             fallback_data,
                                         )
+                                        .expect("fallback object metadata should be constructible")
                                     });
                             let class_name = unity_object.class_name().to_string();
 
@@ -319,7 +320,7 @@ fn test_advanced_audio_extraction() {
             match load_bundle_from_memory(data) {
                 Ok(bundle) => {
                     for asset in &bundle.assets {
-                        for asset_object_info in &asset.objects {
+                        for asset_object_info in asset.objects() {
                             total_objects += 1;
 
                             let unity_object =
@@ -330,10 +331,11 @@ fn test_advanced_audio_extraction() {
                                             .map(|b| b.to_vec())
                                             .unwrap_or_default();
                                         UnityObject::from_raw(
-                                            asset_object_info.type_id,
-                                            asset_object_info.path_id,
+                                            asset_object_info.class_id(),
+                                            asset_object_info.path_id(),
                                             fallback_data,
                                         )
+                                        .expect("fallback object metadata should be constructible")
                                     });
                             let class_name = unity_object.class_name().to_string();
                             let unity_class = unity_object.as_unity_class();

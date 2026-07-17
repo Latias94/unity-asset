@@ -1,6 +1,7 @@
 //! Error types for Unity binary parsing
 
 use thiserror::Error;
+use unity_asset_core::BudgetError;
 
 /// Result type for Unity binary operations
 pub type Result<T> = std::result::Result<T, BinaryError>;
@@ -59,6 +60,10 @@ pub enum BinaryError {
     /// Resource limit exceeded
     #[error("Resource limit exceeded: {0}")]
     ResourceLimitExceeded(String),
+
+    /// Shared asset load budget exhausted or invalid
+    #[error(transparent)]
+    Budget(#[from] BudgetError),
 
     /// Corrupted data
     #[error("Corrupted data detected: {0}")]
@@ -135,6 +140,14 @@ impl BinaryError {
     /// Create a new I/O error (alias for generic)
     pub fn io_error<S: Into<String>>(msg: S) -> Self {
         Self::Generic(msg.into())
+    }
+
+    /// Returns whether retrying requires a larger resource budget or available memory.
+    pub fn is_resource_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Budget(_) | Self::MemoryError(_) | Self::ResourceLimitExceeded(_)
+        )
     }
 }
 
@@ -213,6 +226,7 @@ impl BinaryError {
             BinaryError::MemoryError(_) => false,
             BinaryError::Timeout(_) => true, // Might retry
             BinaryError::ResourceLimitExceeded(_) => true, // Might reduce limits
+            BinaryError::Budget(_) => true,  // Might retry with a larger load budget
             BinaryError::CorruptedData(_) => true, // Might skip corrupted section
             BinaryError::VersionCompatibility(_) => true, // Might use compatibility mode
             BinaryError::Generic(_) => true, // Generic errors are usually recoverable
@@ -235,6 +249,7 @@ impl BinaryError {
             BinaryError::MemoryError(_) => ErrorSeverity::Critical,
             BinaryError::Timeout(_) => ErrorSeverity::Medium,
             BinaryError::ResourceLimitExceeded(_) => ErrorSeverity::Medium,
+            BinaryError::Budget(_) => ErrorSeverity::Medium,
             BinaryError::CorruptedData(_) => ErrorSeverity::Medium,
             BinaryError::VersionCompatibility(_) => ErrorSeverity::Low,
             BinaryError::Generic(_) => ErrorSeverity::Medium,
@@ -251,6 +266,7 @@ impl BinaryError {
             BinaryError::Unsupported(_) => Some("Skip unsupported feature"),
             BinaryError::Timeout(_) => Some("Retry with longer timeout"),
             BinaryError::ResourceLimitExceeded(_) => Some("Reduce processing limits"),
+            BinaryError::Budget(_) => Some("Increase load limits or reduce the input scope"),
             BinaryError::CorruptedData(_) => Some("Skip corrupted section"),
             BinaryError::VersionCompatibility(_) => Some("Enable compatibility mode"),
             _ => None,

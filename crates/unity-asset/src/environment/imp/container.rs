@@ -169,15 +169,18 @@ impl Environment {
     pub fn bundle_container_entries<P: AsRef<Path>>(
         &self,
         bundle_path: P,
+        budget: &mut AssetLoadBudget,
     ) -> Result<Vec<BundleContainerEntry>> {
         let bundle_path = canonicalize_if_exists(bundle_path.as_ref());
         let bundle_source = BinarySource::path(&bundle_path);
-        self.bundle_container_entries_source(&bundle_source)
+        self.bundle_container_entries_source(&bundle_source, budget)
     }
 
+    /// Extracts container entries while charging raw fallback work to `budget`.
     pub fn bundle_container_entries_source(
         &self,
         bundle_source: &BinarySource,
+        budget: &mut AssetLoadBudget,
     ) -> Result<Vec<BundleContainerEntry>> {
         match self.bundle_container_cache.read() {
             Ok(cache) => {
@@ -231,34 +234,51 @@ impl Environment {
                 }
 
                 // Fallback: raw parsing for stripped TypeTree bundles.
-                if let Ok(raw_entries) = object.file().assetbundle_container_raw(object.info()) {
-                    for (asset_path, file_id, path_id) in raw_entries {
-                        let key = if path_id == 0 {
-                            None
-                        } else {
-                            self.resolve_binary_pptr(&obj_ref, file_id, path_id)
-                                .or_else(|| {
-                                    // Fallback: if external mapping fails, try to locate the object by `path_id`
-                                    // within the same bundle. This is best-effort and only used when `file_id`
-                                    // can't be resolved.
-                                    let matches = self
-                                        .find_binary_objects_in_source_id(obj_ref.source, path_id);
-                                    if matches.len() == 1 {
-                                        Some(matches[0].key())
-                                    } else {
-                                        None
-                                    }
-                                })
-                        };
-                        out.push(BundleContainerEntry {
-                            bundle_source: obj_ref.source.clone(),
-                            asset_index,
-                            asset_path,
-                            file_id,
-                            path_id,
-                            key,
-                        });
+                match object
+                    .file()
+                    .assetbundle_container_raw(object.info(), budget)
+                {
+                    Ok(raw_entries) => {
+                        for (asset_path, file_id, path_id) in raw_entries {
+                            let key = if path_id == 0 {
+                                None
+                            } else {
+                                self.resolve_binary_pptr(&obj_ref, file_id, path_id)
+                                    .or_else(|| {
+                                        // Fallback: if external mapping fails, try to locate the object by `path_id`
+                                        // within the same bundle. This is best-effort and only used when `file_id`
+                                        // can't be resolved.
+                                        let matches = self.find_binary_objects_in_source_id(
+                                            obj_ref.source,
+                                            path_id,
+                                        );
+                                        if matches.len() == 1 {
+                                            Some(matches[0].key())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                            };
+                            out.push(BundleContainerEntry {
+                                bundle_source: obj_ref.source.clone(),
+                                asset_index,
+                                asset_path,
+                                file_id,
+                                path_id,
+                                key,
+                            });
+                        }
                     }
+                    Err(error) if error.is_resource_error() => {
+                        return Err(UnityAssetError::with_source(
+                            format!(
+                                "AssetBundle container budget exhausted for {}",
+                                bundle_source.describe()
+                            ),
+                            error,
+                        ));
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -278,7 +298,11 @@ impl Environment {
     ///
     /// - When `pattern` contains `*` or `?`, it is treated as a glob.
     /// - Otherwise it is treated as a substring match.
-    pub fn find_bundle_container_entries(&self, pattern: &str) -> Vec<BundleContainerEntry> {
+    pub fn find_bundle_container_entries(
+        &self,
+        pattern: &str,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<BundleContainerEntry>> {
         let mut bundle_sources: Vec<&BinarySource> = self.bundles.keys().collect();
         bundle_sources.sort();
 
@@ -288,32 +312,33 @@ impl Environment {
 
         let mut out = Vec::new();
         for bundle_source in bundle_sources {
-            if let Ok(entries) = self.bundle_container_entries_source(bundle_source) {
-                out.extend(entries.into_iter().filter(|e| {
-                    if pattern_lc.is_empty() {
-                        return true;
-                    }
-                    let asset_path_lc = e.asset_path.to_ascii_lowercase();
-                    if let Some(glob) = glob.as_ref() {
-                        Self::glob_match(glob, &asset_path_lc)
-                    } else {
-                        asset_path_lc.contains(&pattern_lc)
-                    }
-                }));
-            }
+            let entries = self.bundle_container_entries_source(bundle_source, budget)?;
+            out.extend(entries.into_iter().filter(|e| {
+                if pattern_lc.is_empty() {
+                    return true;
+                }
+                let asset_path_lc = e.asset_path.to_ascii_lowercase();
+                if let Some(glob) = glob.as_ref() {
+                    Self::glob_match(glob, &asset_path_lc)
+                } else {
+                    asset_path_lc.contains(&pattern_lc)
+                }
+            }));
         }
-        out
+        Ok(out)
     }
 
     /// Find resolved `BinaryObjectKey`s from bundle containers by path substring.
     pub fn find_binary_object_keys_in_bundle_container(
         &self,
         pattern: &str,
-    ) -> Vec<(String, BinaryObjectKey)> {
-        self.find_bundle_container_entries(pattern)
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<(String, BinaryObjectKey)>> {
+        Ok(self
+            .find_bundle_container_entries(pattern, budget)?
             .into_iter()
             .filter_map(|e| e.key.map(|k| (e.asset_path, k)))
-            .collect()
+            .collect())
     }
 
     /// Return unique, sorted object keys resolved from all bundle `m_Container` entries that match `pattern`.
@@ -321,9 +346,10 @@ impl Environment {
         &self,
         pattern: &str,
         limit: Option<usize>,
-    ) -> Vec<BinaryObjectKey> {
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<BinaryObjectKey>> {
         let mut keys: Vec<BinaryObjectKey> = self
-            .find_binary_object_keys_in_bundle_container(pattern)
+            .find_binary_object_keys_in_bundle_container(pattern, budget)?
             .into_iter()
             .map(|(_path, key)| key)
             .collect();
@@ -332,7 +358,7 @@ impl Environment {
         if let Some(max) = limit {
             keys.truncate(max);
         }
-        keys
+        Ok(keys)
     }
 }
 

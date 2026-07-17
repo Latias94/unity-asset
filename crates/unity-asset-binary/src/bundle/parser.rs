@@ -13,6 +13,7 @@ use crate::reader::{BinaryReader, ByteOrder};
 use crate::shared_bytes::SharedBytes;
 use crate::unity_version::UnityVersion;
 use std::ops::Range;
+use unity_asset_core::AssetLoadBudget;
 
 /// Main bundle parser
 ///
@@ -26,6 +27,13 @@ impl BundleParser {
         Self::from_bytes_with_options(data, BundleLoadOptions::default())
     }
 
+    pub fn from_bytes_with_budget(
+        data: Vec<u8>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<AssetBundle> {
+        Self::from_bytes_with_options_and_budget(data, BundleLoadOptions::default(), budget)
+    }
+
     /// Parse an AssetBundle from a byte slice.
     ///
     /// This avoids copying when the input bytes already live in a shared buffer (e.g. WebFile entries).
@@ -33,9 +41,29 @@ impl BundleParser {
         Self::from_slice_with_options(data, BundleLoadOptions::default())
     }
 
+    pub fn from_slice_with_budget(
+        data: &[u8],
+        budget: &mut AssetLoadBudget,
+    ) -> Result<AssetBundle> {
+        Self::from_slice_with_options_and_budget(data, BundleLoadOptions::default(), budget)
+    }
+
     /// Parse an AssetBundle from a shared backing buffer + byte range (zero-copy view).
     pub fn from_shared_range(data: SharedBytes, range: Range<usize>) -> Result<AssetBundle> {
         Self::from_shared_range_with_options(data, range, BundleLoadOptions::default())
+    }
+
+    pub fn from_shared_range_with_budget(
+        data: SharedBytes,
+        range: Range<usize>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<AssetBundle> {
+        Self::from_shared_range_with_options_and_budget(
+            data,
+            range,
+            BundleLoadOptions::default(),
+            budget,
+        )
     }
 
     /// Parse an AssetBundle from a shared backing buffer + byte range (zero-copy view), with options.
@@ -44,8 +72,18 @@ impl BundleParser {
         range: Range<usize>,
         options: BundleLoadOptions,
     ) -> Result<AssetBundle> {
+        let mut budget = AssetLoadBudget::default();
+        Self::from_shared_range_with_options_and_budget(data, range, options, &mut budget)
+    }
+
+    pub fn from_shared_range_with_options_and_budget(
+        data: SharedBytes,
+        range: Range<usize>,
+        options: BundleLoadOptions,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<AssetBundle> {
         let view = DataView::from_shared_range(data, range)?;
-        Self::from_view_with_options(view, options)
+        Self::from_view_with_options_and_budget(view, options, budget)
     }
 
     /// Parse an AssetBundle from binary data with options
@@ -53,36 +91,77 @@ impl BundleParser {
         data: Vec<u8>,
         options: BundleLoadOptions,
     ) -> Result<AssetBundle> {
+        let mut budget = AssetLoadBudget::default();
+        Self::from_bytes_with_options_and_budget(data, options, &mut budget)
+    }
+
+    pub fn from_bytes_with_options_and_budget(
+        data: Vec<u8>,
+        options: BundleLoadOptions,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<AssetBundle> {
         let shared = SharedBytes::from_vec(data);
         let len = shared.len();
-        Self::from_shared_range_with_options(shared, 0..len, options)
+        Self::from_shared_range_with_options_and_budget(shared, 0..len, options, budget)
     }
 
     /// Parse an AssetBundle from a byte slice with options.
     pub fn from_slice_with_options(data: &[u8], options: BundleLoadOptions) -> Result<AssetBundle> {
-        // `&[u8]` has no ownership, so we need to copy to support on-demand access later.
-        // Prefer `from_shared_range` for true zero-copy parsing (e.g. mmap/WebFile views).
-        let shared = SharedBytes::from_vec(data.to_vec());
-        let len = shared.len();
-        Self::from_shared_range_with_options(shared, 0..len, options)
+        let mut budget = AssetLoadBudget::default();
+        Self::from_slice_with_options_and_budget(data, options, &mut budget)
     }
 
-    fn from_view_with_options(view: DataView, options: BundleLoadOptions) -> Result<AssetBundle> {
+    pub fn from_slice_with_options_and_budget(
+        data: &[u8],
+        options: BundleLoadOptions,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<AssetBundle> {
+        let source_len = u64::try_from(data.len())
+            .map_err(|_| BinaryError::invalid_data("Bundle source length does not fit in u64"))?;
+        if source_len > budget.remaining_bytes() {
+            budget.consume_bytes(source_len)?;
+            return Err(BinaryError::invalid_data(
+                "Bundle byte budget accepted a request beyond its remaining allowance",
+            ));
+        }
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(data.len()).map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {} bytes for a bundle source: {error}",
+                data.len()
+            ))
+        })?;
+        owned.extend_from_slice(data);
+        let shared = SharedBytes::from_vec(owned);
+        let len = shared.len();
+        Self::from_shared_range_with_options_and_budget(shared, 0..len, options, budget)
+    }
+
+    fn from_view_with_options_and_budget(
+        view: DataView,
+        options: BundleLoadOptions,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<AssetBundle> {
+        budget.consume_bytes(u64::try_from(view.len()).map_err(|_| {
+            BinaryError::invalid_data("Bundle source length does not fit in u64")
+        })?)?;
         let bytes = view.as_bytes();
         let mut reader = BinaryReader::new(bytes, ByteOrder::Big);
 
         // Parse header (reader position is preserved for subsequent parsing).
         let header = BundleHeader::from_reader(&mut reader)?;
 
-        if options.validate {
-            header.validate()?;
-            if header.size > bytes.len() as u64 {
-                return Err(BinaryError::invalid_data(format!(
-                    "Bundle header size {} exceeds available bytes {}",
-                    header.size,
-                    bytes.len()
-                )));
-            }
+        header.validate()?;
+        Self::validate_declared_header_limits(&header, &options)?;
+        if header.size
+            > u64::try_from(bytes.len())
+                .map_err(|_| BinaryError::invalid_data("Bundle length does not fit in u64"))?
+        {
+            return Err(BinaryError::invalid_data(format!(
+                "Bundle header size {} exceeds available bytes {}",
+                header.size,
+                bytes.len()
+            )));
         }
 
         let mut bundle = AssetBundle::new_empty(header);
@@ -92,10 +171,10 @@ impl BundleParser {
 
         match bundle.header.signature.as_str() {
             "UnityFS" => {
-                Self::parse_unity_fs(&mut bundle, &view, &mut reader, &options)?;
+                Self::parse_unity_fs(&mut bundle, &view, &mut reader, &options, budget)?;
             }
             "UnityWeb" | "UnityRaw" => {
-                Self::parse_legacy(&mut bundle, &mut reader, &options)?;
+                Self::parse_legacy(&mut bundle, &mut reader, &options, budget)?;
             }
             _ => {
                 return Err(BinaryError::unsupported(format!(
@@ -112,43 +191,136 @@ impl BundleParser {
         Ok(bundle)
     }
 
+    fn validate_declared_header_limits(
+        header: &BundleHeader,
+        options: &BundleLoadOptions,
+    ) -> Result<()> {
+        if let Some(legacy) = &header.legacy_web_raw {
+            if let Some(limit) = options.max_legacy_directory_compressed_size
+                && u64::from(legacy.compressed_size) > limit as u64
+            {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Legacy bundle directory compressed size {} exceeds limit {}",
+                    legacy.compressed_size, limit
+                )));
+            }
+            if let Some(limit) = options.max_memory
+                && u64::from(legacy.uncompressed_size) > limit as u64
+            {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Legacy bundle directory uncompressed size {} exceeds max_memory {}",
+                    legacy.uncompressed_size, limit
+                )));
+            }
+        }
+
+        if header.is_unity_fs() {
+            if let Some(limit) = options.max_compressed_blocks_info_size
+                && u64::from(header.compressed_blocks_info_size) > limit as u64
+            {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Blocks info compressed size {} exceeds limit {}",
+                    header.compressed_blocks_info_size, limit
+                )));
+            }
+            if let Some(limit) = options.max_blocks_info_size
+                && u64::from(header.uncompressed_blocks_info_size) > limit as u64
+            {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Blocks info uncompressed size {} exceeds limit {}",
+                    header.uncompressed_blocks_info_size, limit
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Parse UnityFS format bundle
     fn parse_unity_fs(
         bundle: &mut AssetBundle,
         source: &DataView,
         reader: &mut BinaryReader,
         options: &BundleLoadOptions,
+        budget: &mut AssetLoadBudget,
     ) -> Result<()> {
         // Read blocks info
-        let block_data_start = Self::read_blocks_info(bundle, reader, options)?;
+        let block_data_start = Self::read_blocks_info(bundle, reader, options, budget)?;
+        let block_data = Self::unityfs_block_data_view(bundle, source, block_data_start)?;
 
         // Decompress data blocks if requested OR if we need to load assets
         if options.decompress_blocks || options.load_assets {
-            let blocks_data = Self::read_blocks(bundle, reader, options)?;
+            let mut block_reader = BinaryReader::new(block_data.as_bytes(), ByteOrder::Big);
+            let blocks_data = Self::read_blocks(bundle, &mut block_reader, options, budget)?;
             Self::parse_files(bundle, blocks_data)?;
 
             // Load assets if requested
             if options.load_assets {
-                Self::load_assets(bundle, options)?;
+                Self::load_assets(bundle, options, budget)?;
             }
         } else {
-            let start_usize = usize::try_from(block_data_start).map_err(|_| {
-                BinaryError::ResourceLimitExceeded(
-                    "UnityFS block data start does not fit in usize".to_string(),
-                )
-            })?;
             bundle.set_lazy_unityfs_source(
-                source.clone(),
-                start_usize,
+                block_data,
+                0,
                 options.max_memory,
                 options.max_unityfs_block_cache_memory,
                 options.max_compressed_block_size,
             )?;
-            // Just parse directory structure without decompressing all data
-            Self::parse_directory_lazy(bundle, reader)?;
         }
 
         Ok(())
+    }
+
+    fn unityfs_block_data_view(
+        bundle: &AssetBundle,
+        source: &DataView,
+        block_data_start: u64,
+    ) -> Result<DataView> {
+        let block_data_end = if bundle.header.block_info_at_end() {
+            bundle
+                .header
+                .size
+                .checked_sub(u64::from(bundle.header.compressed_blocks_info_size))
+                .ok_or_else(|| {
+                    BinaryError::invalid_data(
+                        "UnityFS blocks-info size exceeds the declared bundle size",
+                    )
+                })?
+        } else {
+            bundle.header.size
+        };
+        if block_data_start > block_data_end {
+            return Err(BinaryError::invalid_data(format!(
+                "UnityFS block data starts at {block_data_start} after its physical end {block_data_end}"
+            )));
+        }
+
+        let declared_compressed = bundle.blocks.iter().try_fold(0_u64, |total, block| {
+            total
+                .checked_add(u64::from(block.compressed_size))
+                .ok_or_else(|| BinaryError::invalid_data("UnityFS compressed block total overflow"))
+        })?;
+        let available = block_data_end - block_data_start;
+        if declared_compressed > available {
+            return Err(BinaryError::invalid_data(format!(
+                "UnityFS compressed block total {declared_compressed} exceeds physical payload range {available}"
+            )));
+        }
+
+        let relative_start = usize::try_from(block_data_start).map_err(|_| {
+            BinaryError::invalid_data("UnityFS block data start does not fit usize")
+        })?;
+        let relative_end = usize::try_from(block_data_end)
+            .map_err(|_| BinaryError::invalid_data("UnityFS block data end does not fit usize"))?;
+        let absolute_start = source
+            .base_offset()
+            .checked_add(relative_start)
+            .ok_or_else(|| BinaryError::invalid_data("UnityFS block data start overflow"))?;
+        let absolute_end = source
+            .base_offset()
+            .checked_add(relative_end)
+            .ok_or_else(|| BinaryError::invalid_data("UnityFS block data end overflow"))?;
+        DataView::from_shared_range(source.backing_shared(), absolute_start..absolute_end)
     }
 
     /// Parse legacy format bundle
@@ -156,6 +328,7 @@ impl BundleParser {
         bundle: &mut AssetBundle,
         reader: &mut BinaryReader,
         options: &BundleLoadOptions,
+        budget: &mut AssetLoadBudget,
     ) -> Result<()> {
         let legacy = bundle.header.legacy_web_raw.as_ref().ok_or_else(|| {
             BinaryError::invalid_data("Legacy bundle header fields were not parsed")
@@ -164,47 +337,29 @@ impl BundleParser {
         let header_size = legacy.header_size as usize;
         let compressed_size = legacy.compressed_size;
         let uncompressed_size = legacy.uncompressed_size;
-
-        if let Some(max_memory) = options.max_memory
-            && (uncompressed_size as u64) > (max_memory as u64)
-        {
-            return Err(BinaryError::ResourceLimitExceeded(format!(
-                "Legacy bundle directory uncompressed size {} exceeds max_memory {}",
-                uncompressed_size, max_memory
-            )));
-        }
+        budget.check_compressed_bytes(u64::from(compressed_size))?;
 
         // Seek to the (compressed) directory+file-content blob (UnityPy uses `reader.Position = headerSize`).
         reader.set_position(header_size as u64)?;
 
         // Read and decompress the directory data
-        if let Some(max) = options.max_legacy_directory_compressed_size
-            && (compressed_size as usize) > max
-        {
-            return Err(BinaryError::ResourceLimitExceeded(format!(
-                "Legacy bundle directory compressed size {} exceeds limit {}",
-                compressed_size, max
-            )));
-        }
         let compressed_data = reader.read_bytes(compressed_size as usize)?;
+        let uncompressed_size = usize::try_from(uncompressed_size).map_err(|_| {
+            BinaryError::invalid_data("Legacy bundle uncompressed size does not fit usize")
+        })?;
         let directory_data = if bundle.header.signature == "UnityWeb" {
-            // UnityWeb uses LZMA compression; prefer the explicit uncompressed size when available.
-            crate::compression::decompress(
+            crate::compression::decompress_lzma_size_stream_with_budget(
                 &compressed_data,
-                CompressionType::Lzma,
-                uncompressed_size as usize,
-            )
-            .or_else(|_| {
-                // Last-resort fallback for malformed headers.
-                crate::compression::decompress(
-                    &compressed_data,
-                    CompressionType::Lzma,
-                    compressed_data.len().saturating_mul(4),
-                )
-            })?
+                uncompressed_size,
+                budget,
+            )?
         } else {
-            // UnityRaw is uncompressed
-            compressed_data
+            crate::compression::decompress_with_budget(
+                &compressed_data,
+                CompressionType::None,
+                uncompressed_size,
+                budget,
+            )?
         };
 
         // Legacy bundles store directory entries + file content in the same blob.
@@ -213,11 +368,11 @@ impl BundleParser {
         bundle.set_legacy_source(directory_view.clone());
 
         // Parse directory information from the uncompressed blob.
-        Self::parse_legacy_directory(bundle, directory_view.as_bytes(), 0, options)?;
+        Self::parse_legacy_directory(bundle, directory_view.as_bytes(), 0, options, budget)?;
 
         // Load assets if requested
         if options.load_assets {
-            Self::load_assets(bundle, options)?;
+            Self::load_assets(bundle, options, budget)?;
         }
 
         Ok(())
@@ -228,7 +383,16 @@ impl BundleParser {
         bundle: &mut AssetBundle,
         reader: &mut BinaryReader,
         options: &BundleLoadOptions,
+        budget: &mut AssetLoadBudget,
     ) -> Result<u64> {
+        let compressed_size =
+            usize::try_from(bundle.header.compressed_blocks_info_size).map_err(|_| {
+                BinaryError::ResourceLimitExceeded(
+                    "Blocks info compressed size does not fit in usize".to_string(),
+                )
+            })?;
+        budget.check_compressed_bytes(u64::from(bundle.header.compressed_blocks_info_size))?;
+
         // Apply version-specific alignment.
         // UnityFS uses 16-byte alignment in newer bundle formats (>=7).
         // For some older bundle formats, alignment may still be present (e.g. Unity 2019.4+),
@@ -247,23 +411,16 @@ impl BundleParser {
         }
 
         let start = reader.position();
-        let compressed_size = bundle.header.compressed_blocks_info_size as usize;
-
-        if let Some(max) = options.max_compressed_blocks_info_size
-            && compressed_size > max
-        {
-            return Err(BinaryError::ResourceLimitExceeded(format!(
-                "Blocks info compressed size {} exceeds limit {}",
-                compressed_size, max
-            )));
-        }
-
         let blocks_info_data = if bundle.header.block_info_at_end() {
-            let len = reader.len();
-            if compressed_size > len {
-                return Err(BinaryError::not_enough_data(compressed_size, len));
+            let declared_len = usize::try_from(bundle.header.size).map_err(|_| {
+                BinaryError::invalid_data("Bundle declared size does not fit in usize")
+            })?;
+            if compressed_size > declared_len {
+                return Err(BinaryError::not_enough_data(compressed_size, declared_len));
             }
-            let pos = (len - compressed_size) as u64;
+            let pos = u64::try_from(declared_len - compressed_size).map_err(|_| {
+                BinaryError::invalid_data("Bundle block-info position does not fit in u64")
+            })?;
             reader.set_position(pos)?;
             let bytes = reader.read_bytes(compressed_size)?;
             reader.set_position(start)?;
@@ -273,24 +430,19 @@ impl BundleParser {
         };
 
         // Decompress blocks info
-        if let Some(max_blocks_info_size) = options.max_blocks_info_size {
-            let expected = bundle.header.uncompressed_blocks_info_size as usize;
-            if expected > max_blocks_info_size {
-                return Err(BinaryError::ResourceLimitExceeded(format!(
-                    "Blocks info uncompressed size {} exceeds limit {}",
-                    expected, max_blocks_info_size
-                )));
-            }
-        }
-        let uncompressed_data = BundleCompression::decompress_blocks_info_limited(
+        let uncompressed_data = BundleCompression::decompress_blocks_info_limited_with_budget(
             &bundle.header,
             &blocks_info_data,
             options.max_blocks_info_size,
+            budget,
         )?;
 
         // Parse compression blocks
-        bundle.blocks =
-            BundleCompression::parse_compression_blocks_limited(&uncompressed_data, options)?;
+        bundle.blocks = BundleCompression::parse_compression_blocks_limited_with_budget(
+            &uncompressed_data,
+            options,
+            budget,
+        )?;
 
         // Validate blocks
         BundleCompression::validate_blocks(&bundle.blocks)?;
@@ -305,7 +457,7 @@ impl BundleParser {
         bundle.set_decompressed_len(total_uncompressed);
 
         // Parse directory information from the same blocks info data
-        Self::parse_directory_from_blocks_info(bundle, &uncompressed_data, options)?;
+        Self::parse_directory_from_blocks_info(bundle, &uncompressed_data, options, budget)?;
 
         // Some UnityFS variants require padding/alignment before block data starts.
         if (bundle.header.flags
@@ -338,6 +490,7 @@ impl BundleParser {
         bundle: &AssetBundle,
         reader: &mut BinaryReader,
         options: &BundleLoadOptions,
+        budget: &mut AssetLoadBudget,
     ) -> Result<Vec<u8>> {
         if let Some(limit) = options.max_compressed_block_size {
             for block in &bundle.blocks {
@@ -349,11 +502,12 @@ impl BundleParser {
                 }
             }
         }
-        BundleCompression::decompress_data_blocks_limited(
+        BundleCompression::decompress_data_blocks_limited_with_budget(
             &bundle.header,
             &bundle.blocks,
             reader,
             options.max_memory,
+            budget,
         )
     }
 
@@ -363,6 +517,15 @@ impl BundleParser {
         bundle.set_decompressed_data(blocks_data);
 
         // Create file info for each node
+        bundle
+            .files
+            .try_reserve_exact(bundle.nodes.len())
+            .map_err(|error| {
+                BinaryError::memory_error(format!(
+                    "Failed to reserve {} bundle file records: {error}",
+                    bundle.nodes.len()
+                ))
+            })?;
         for node in &bundle.nodes {
             let file_info = BundleFileInfo::new(node.name.clone(), node.offset, node.size);
             bundle.files.push(file_info);
@@ -371,23 +534,12 @@ impl BundleParser {
         Ok(())
     }
 
-    /// Parse directory structure without full decompression (lazy loading)
-    fn parse_directory_lazy(_bundle: &mut AssetBundle, _reader: &mut BinaryReader) -> Result<()> {
-        // For lazy loading, we only parse the directory structure
-        // without decompressing all data blocks
-
-        // The directory information has already been parsed in read_blocks_info()
-        // so there's nothing more to do here for lazy loading.
-
-        // The directory nodes are already populated in bundle.nodes
-        Ok(())
-    }
-
     /// Parse directory structure from blocks info data
     fn parse_directory_from_blocks_info(
         bundle: &mut AssetBundle,
         blocks_info_data: &[u8],
         options: &BundleLoadOptions,
+        budget: &mut AssetLoadBudget,
     ) -> Result<()> {
         let mut reader = BinaryReader::new(blocks_info_data, ByteOrder::Big);
 
@@ -429,12 +581,32 @@ impl BundleParser {
                 node_count, options.max_nodes
             )));
         }
+        let minimum_node_bytes = node_count
+            .checked_mul(21)
+            .ok_or_else(|| BinaryError::invalid_data("Directory node table size overflow"))?;
+        if minimum_node_bytes > reader.remaining() {
+            return Err(BinaryError::not_enough_data(
+                minimum_node_bytes,
+                reader.remaining(),
+            ));
+        }
+        budget.consume_entries(u64::try_from(node_count).map_err(|_| {
+            BinaryError::invalid_data("Directory node count does not fit in u64")
+        })?)?;
+        bundle
+            .nodes
+            .try_reserve_exact(node_count)
+            .map_err(|error| {
+                BinaryError::memory_error(format!(
+                    "Failed to reserve {node_count} directory nodes: {error}"
+                ))
+            })?;
 
-        let total_uncompressed: u64 = bundle
-            .blocks
-            .iter()
-            .map(|b| b.uncompressed_size as u64)
-            .sum();
+        let total_uncompressed = bundle.blocks.iter().try_fold(0_u64, |total, block| {
+            total
+                .checked_add(u64::from(block.uncompressed_size))
+                .ok_or_else(|| BinaryError::invalid_data("Bundle block size total overflow"))
+        })?;
 
         // Read directory nodes (UnityFS format)
         for _i in 0..node_count {
@@ -473,45 +645,13 @@ impl BundleParser {
         Ok(())
     }
 
-    /// Parse directory structure from data (legacy method, kept for compatibility)
-    #[allow(dead_code)]
-    fn parse_directory_from_data(bundle: &mut AssetBundle, data: &[u8]) -> Result<()> {
-        let mut reader = BinaryReader::new(data, ByteOrder::Big);
-
-        // Skip to directory info (this offset varies by bundle version)
-        // This is a simplified implementation
-        reader.set_position(0)?;
-
-        // Read directory node count
-        let node_count_i32 = reader.read_i32()?;
-        if node_count_i32 < 0 {
-            return Err(BinaryError::invalid_data(format!(
-                "Negative directory node count: {}",
-                node_count_i32
-            )));
-        }
-        let node_count = node_count_i32 as usize;
-
-        // Read directory nodes
-        for _ in 0..node_count {
-            let offset = reader.read_u64()?;
-            let size = reader.read_u64()?;
-            let flags = reader.read_u32()?;
-            let name = reader.read_cstring()?;
-
-            let node = DirectoryNode::new(name, offset, size, flags);
-            bundle.nodes.push(node);
-        }
-
-        Ok(())
-    }
-
     /// Parse legacy bundle directory
     fn parse_legacy_directory(
         bundle: &mut AssetBundle,
         directory_data: &[u8],
         header_size: usize,
         options: &BundleLoadOptions,
+        budget: &mut AssetLoadBudget,
     ) -> Result<()> {
         let _ = header_size; // legacy offsets are relative to the uncompressed blob
 
@@ -525,13 +665,42 @@ impl BundleParser {
                 file_count_i32
             )));
         }
-        let file_count: usize = file_count_i32 as usize;
+        let file_count = usize::try_from(file_count_i32)
+            .map_err(|_| BinaryError::invalid_data("Negative legacy bundle file count"))?;
         if file_count > options.max_nodes {
             return Err(BinaryError::ResourceLimitExceeded(format!(
                 "Legacy bundle file count {} exceeds limit {}",
                 file_count, options.max_nodes
             )));
         }
+        let minimum_bytes = file_count
+            .checked_mul(9)
+            .ok_or_else(|| BinaryError::invalid_data("Legacy file table size overflow"))?;
+        if minimum_bytes > dir_reader.remaining() {
+            return Err(BinaryError::not_enough_data(
+                minimum_bytes,
+                dir_reader.remaining(),
+            ));
+        }
+        budget.consume_entries(u64::try_from(file_count).map_err(|_| {
+            BinaryError::invalid_data("Legacy bundle file count does not fit in u64")
+        })?)?;
+        bundle
+            .nodes
+            .try_reserve_exact(file_count)
+            .map_err(|error| {
+                BinaryError::memory_error(format!(
+                    "Failed to reserve {file_count} legacy directory nodes: {error}"
+                ))
+            })?;
+        bundle
+            .files
+            .try_reserve_exact(file_count)
+            .map_err(|error| {
+                BinaryError::memory_error(format!(
+                    "Failed to reserve {file_count} legacy file records: {error}"
+                ))
+            })?;
 
         // Read file entries
         for _ in 0..file_count {
@@ -551,7 +720,11 @@ impl BundleParser {
     }
 
     /// Load assets from the bundle files
-    fn load_assets(bundle: &mut AssetBundle, options: &BundleLoadOptions) -> Result<()> {
+    fn load_assets(
+        bundle: &mut AssetBundle,
+        options: &BundleLoadOptions,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
         let (backing, base_offset, visible_len) = if bundle.header.is_unity_fs() {
             let backing = crate::shared_bytes::SharedBytes::from_arc(bundle.data_arc()?);
             let visible_len = backing.len() as u64;
@@ -577,7 +750,12 @@ impl BundleParser {
                 continue;
             }
 
-            let end = node.offset.saturating_add(node.size);
+            let end = node.offset.checked_add(node.size).ok_or_else(|| {
+                BinaryError::invalid_data(format!(
+                    "Bundle node '{}' offset+size overflow",
+                    node.name
+                ))
+            })?;
             if end > visible_len {
                 return Err(BinaryError::invalid_data(format!(
                     "Bundle node '{}' exceeds decompressed data: end {} > {}",
@@ -621,12 +799,27 @@ impl BundleParser {
             })?;
 
             // Parse as a zero-copy view into the backing buffer (UnityFS decompressed buffer or legacy source).
-            if let Ok(serialized_file) = crate::asset::SerializedFileParser::from_shared_range(
+            match crate::asset::SerializedFileParser::from_shared_range_with_budget(
                 backing.clone(),
                 abs_start..abs_end,
+                budget,
             ) {
-                bundle.assets.push(serialized_file);
-                bundle.asset_names.push(node.name.clone());
+                Ok(serialized_file) => {
+                    bundle.assets.try_reserve(1).map_err(|error| {
+                        BinaryError::memory_error(format!(
+                            "Failed to reserve a bundle asset: {error}"
+                        ))
+                    })?;
+                    bundle.asset_names.try_reserve(1).map_err(|error| {
+                        BinaryError::memory_error(format!(
+                            "Failed to reserve a bundle asset name: {error}"
+                        ))
+                    })?;
+                    bundle.assets.push(serialized_file);
+                    bundle.asset_names.push(node.name.clone());
+                }
+                Err(error) if error.is_resource_error() => return Err(error),
+                Err(_) => {}
             }
         }
 
@@ -635,6 +828,17 @@ impl BundleParser {
 
     /// Estimate parsing complexity
     pub fn estimate_complexity(data: &[u8]) -> Result<ParsingComplexity> {
+        let mut budget = AssetLoadBudget::default();
+        Self::estimate_complexity_with_budget(data, &mut budget)
+    }
+
+    pub fn estimate_complexity_with_budget(
+        data: &[u8],
+        budget: &mut AssetLoadBudget,
+    ) -> Result<ParsingComplexity> {
+        budget.consume_bytes(u64::try_from(data.len()).map_err(|_| {
+            BinaryError::invalid_data("Bundle source length does not fit in u64")
+        })?)?;
         let mut reader = BinaryReader::new(data, ByteOrder::Big);
         let header = BundleHeader::from_reader(&mut reader)?;
 
@@ -683,6 +887,7 @@ pub struct ParsingComplexity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unity_asset_core::{AssetLoadLimits, BudgetError};
 
     #[test]
     fn test_parser_creation() {
@@ -703,8 +908,30 @@ mod tests {
             .nodes
             .push(DirectoryNode::new("a.assets".to_string(), 1024, 4, 0x4));
 
+        let mut budget = AssetLoadBudget::default();
         let err =
-            BundleParser::load_assets(&mut bundle, &BundleLoadOptions::default()).unwrap_err();
+            BundleParser::load_assets(&mut bundle, &BundleLoadOptions::default(), &mut budget)
+                .unwrap_err();
         assert!(matches!(err, BinaryError::InvalidData(_)));
+    }
+
+    #[test]
+    fn bundle_source_is_charged_before_header_parsing() {
+        let bytes = b"UnityFS\0".to_vec();
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: u64::try_from(bytes.len() - 1).unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let error = BundleParser::from_bytes_with_budget(bytes, &mut budget).unwrap_err();
+        assert!(matches!(
+            error,
+            BinaryError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            })
+        ));
+        assert_eq!(budget.usage().bytes, 0);
     }
 }

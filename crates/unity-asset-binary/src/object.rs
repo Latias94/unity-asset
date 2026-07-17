@@ -36,25 +36,25 @@ impl<'a> ObjectHandle<'a> {
     }
 
     pub fn path_id(&self) -> i64 {
-        self.info.path_id
+        self.info.path_id()
     }
 
     pub fn class_id(&self) -> i32 {
-        self.info.type_id
+        self.info.class_id()
     }
 
     pub fn byte_start(&self) -> u64 {
-        self.info.byte_start
+        self.info.byte_start()
     }
 
     pub fn byte_size(&self) -> u32 {
-        self.info.byte_size
+        self.info.byte_size()
     }
 
     /// Get the raw bytes for this object (preloaded if available, otherwise sliced from the file).
     pub fn raw_data(&self) -> Result<&'a [u8]> {
-        if !self.info.data.is_empty() {
-            return Ok(self.info.data.as_slice());
+        if let Some(data) = self.info.loaded_data() {
+            return Ok(data);
         }
         self.file.object_bytes(self.info)
     }
@@ -123,6 +123,21 @@ impl<'a> ObjectHandle<'a> {
     }
 }
 
+impl SerializedFile {
+    /// Iterate all objects as lightweight handles.
+    pub fn object_handles(&self) -> impl Iterator<Item = ObjectHandle<'_>> {
+        self.objects()
+            .iter()
+            .map(|info| ObjectHandle::new(self, info))
+    }
+
+    /// Find an object by `path_id` and return a lightweight handle.
+    pub fn find_object_handle(&self, path_id: i64) -> Option<ObjectHandle<'_>> {
+        self.find_object(path_id)
+            .map(|info| ObjectHandle::new(self, info))
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ObjectBytes {
     Empty,
@@ -138,6 +153,18 @@ const RAW_DATA_INLINE_LIMIT: usize = 4 * 1024;
 const RAW_DATA_PREVIEW_LEN: usize = 256;
 
 impl ObjectBytes {
+    fn copy_from_slice(bytes: &[u8]) -> Result<Self> {
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(bytes.len()).map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {} bytes for an owned object payload: {error}",
+                bytes.len()
+            ))
+        })?;
+        copy.extend_from_slice(bytes);
+        Ok(Self::Inline(copy))
+    }
+
     fn as_slice(&self) -> &[u8] {
         match self {
             ObjectBytes::Empty => &[],
@@ -177,8 +204,14 @@ impl UnityObject {
     ///
     /// For large objects, this intentionally avoids expanding all bytes into a `UnityValue::Array`
     /// to reduce memory pressure and parsing time; use `raw_data()` instead.
-    pub fn from_raw(class_id: i32, path_id: i64, data: Vec<u8>) -> Self {
-        let info = ObjectInfo::new(path_id, 0, data.len() as u32, class_id, -1);
+    pub fn from_raw(class_id: i32, path_id: i64, data: Vec<u8>) -> Result<Self> {
+        let byte_size = u32::try_from(data.len()).map_err(|_| {
+            BinaryError::invalid_data(format!(
+                "Raw object payload is too large for the u32 wire size: {} bytes",
+                data.len()
+            ))
+        })?;
+        let info = ObjectInfo::for_standalone_class(path_id, 0, byte_size, class_id)?;
         let raw = ObjectBytes::Inline(data);
         let mut class =
             UnityClass::new(class_id, class_name_from_id(class_id), path_id.to_string());
@@ -208,13 +241,13 @@ impl UnityObject {
                 .collect();
             class.set("_raw_data_preview".to_string(), UnityValue::Array(preview));
         }
-        Self {
+        Ok(Self {
             info,
             class,
             byte_order: ByteOrder::Little,
             raw,
             typetree_warnings: Vec::new(),
-        }
+        })
     }
 
     /// Create a UnityObject from a SerializedFile + ObjectInfo, using TypeTree when available.
@@ -227,21 +260,26 @@ impl UnityObject {
         info: &ObjectInfo,
         options: TypeTreeParseOptions,
     ) -> Result<Self> {
-        let class_id = info.type_id;
+        let class_id = info.class_id();
         let type_tree = type_tree_for_object(file, info);
         let byte_order = file.header.byte_order();
-        let (start, end) = object_range(file, info)?;
-        let base = file.data_base_offset();
-        let raw = ObjectBytes::Shared {
-            data: file.data_shared(),
-            start: base + start,
-            end: base + end,
+        let raw = match info.loaded_data() {
+            Some(data) => ObjectBytes::copy_from_slice(data)?,
+            None => {
+                let (start, end) = object_range(file, info)?;
+                let base = file.data_base_offset();
+                ObjectBytes::Shared {
+                    data: file.data_shared(),
+                    start: base + start,
+                    end: base + end,
+                }
+            }
         };
 
         let mut class = UnityClass::new(
             class_id,
             class_name_from_id(class_id),
-            info.path_id.to_string(),
+            info.path_id().to_string(),
         );
 
         let mut warnings: Vec<TypeTreeParseWarning> = Vec::new();
@@ -269,11 +307,7 @@ impl UnityObject {
         }
 
         Ok(Self {
-            info: {
-                let mut cloned = info.clone();
-                cloned.data.clear();
-                cloned
-            },
+            info: info.clone_without_loaded_data(),
             class,
             byte_order,
             raw,
@@ -282,11 +316,11 @@ impl UnityObject {
     }
 
     pub fn path_id(&self) -> i64 {
-        self.info.path_id
+        self.info.path_id()
     }
 
     pub fn class_id(&self) -> i32 {
-        self.info.type_id
+        self.info.class_id()
     }
 
     pub fn class_name(&self) -> &str {
@@ -372,11 +406,11 @@ impl UnityObject {
     }
 
     pub fn byte_size(&self) -> u32 {
-        self.info.byte_size
+        self.info.byte_size()
     }
 
     pub fn byte_start(&self) -> u64 {
-        self.info.byte_start
+        self.info.byte_start()
     }
 
     pub fn byte_order(&self) -> ByteOrder {
@@ -410,10 +444,11 @@ fn type_tree_for_object<'a>(
         file: &'a SerializedFile,
         info: &ObjectInfo,
     ) -> Option<&'a SerializedType> {
-        if info.type_index >= 0 {
-            return file.types.get(info.type_index as usize);
+        if let Some(index) = info.serialized_type_index() {
+            let index = usize::try_from(index).ok()?;
+            return file.types.get(index);
         }
-        file.types.iter().find(|t| t.class_id == info.type_id)
+        file.types.iter().find(|t| t.class_id == info.class_id())
     }
 
     if file.enable_type_tree
@@ -435,29 +470,32 @@ fn type_tree_for_object<'a>(
             }
         }
 
-        r.resolve(&file.unity_version, info.type_id)
+        r.resolve(&file.unity_version, info.class_id())
             .map(TypeTreeSource::Shared)
     })
 }
 
 fn object_bytes<'a>(file: &'a SerializedFile, info: &'a ObjectInfo) -> Result<&'a [u8]> {
-    if !info.data.is_empty() {
-        return Ok(&info.data);
+    if let Some(data) = info.loaded_data() {
+        return Ok(data);
     }
     file.object_bytes(info)
 }
 
 fn object_range(file: &SerializedFile, info: &ObjectInfo) -> Result<(usize, usize)> {
-    let start: usize = info.byte_start.try_into().map_err(|_| {
-        BinaryError::invalid_data(format!("Object byte_start overflow: {}", info.byte_start))
+    let start: usize = info.byte_start().try_into().map_err(|_| {
+        BinaryError::invalid_data(format!("Object byte_start overflow: {}", info.byte_start()))
     })?;
-    let end = start.saturating_add(info.byte_size as usize);
+    let byte_end = info.byte_end()?;
+    let end: usize = byte_end
+        .try_into()
+        .map_err(|_| BinaryError::invalid_data(format!("Object byte_end overflow: {byte_end}")))?;
     if end > file.data().len() {
         return Err(BinaryError::invalid_data(format!(
             "Object data out of bounds (path_id={}, start={}, size={}, file_len={})",
-            info.path_id,
+            info.path_id(),
             start,
-            info.byte_size,
+            info.byte_size(),
             file.data().len()
         )));
     }
@@ -494,6 +532,49 @@ fn apply_raw_preview(class: &mut UnityClass, bytes: &[u8]) {
         class.set(
             "_raw_data_preview".to_string(),
             UnityValue::Bytes(bytes[..preview_len].to_vec()),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::asset::SerializedFileParser;
+
+    const V22_FIXTURE: &[u8] = include_bytes!(
+        "../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin"
+    );
+
+    #[test]
+    fn loaded_payload_state_drives_handles_and_owned_objects() {
+        let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let path_id = file.objects()[0].path_id();
+        let original = file
+            .find_object_handle(path_id)
+            .unwrap()
+            .raw_data()
+            .unwrap()
+            .to_vec();
+        assert!(!original.is_empty());
+
+        file.find_object_mut(path_id).unwrap().set_data(Vec::new());
+        let handle = file.find_object_handle(path_id).unwrap();
+        assert!(handle.raw_data().unwrap().is_empty());
+        assert!(handle.read().unwrap().raw_data().is_empty());
+
+        file.find_object_mut(path_id)
+            .unwrap()
+            .set_data(vec![0xD0, 0xAD]);
+        let handle = file.find_object_handle(path_id).unwrap();
+        assert_eq!(handle.raw_data().unwrap(), [0xD0, 0xAD]);
+        assert_eq!(handle.read().unwrap().raw_data(), [0xD0, 0xAD]);
+
+        file.find_object_mut(path_id).unwrap().clear_data();
+        assert_eq!(
+            file.find_object_handle(path_id)
+                .unwrap()
+                .raw_data()
+                .unwrap(),
+            original
         );
     }
 }

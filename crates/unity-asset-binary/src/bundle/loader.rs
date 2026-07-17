@@ -5,18 +5,16 @@
 
 use super::parser::BundleParser;
 use super::types::{AssetBundle, BundleLoadOptions};
-use crate::asset::Asset;
+use crate::asset::SerializedFile;
 use crate::error::{BinaryError, Result};
 use std::collections::HashMap;
 use std::path::Path;
-
-#[cfg(feature = "async")]
-use tokio::fs;
+use unity_asset_core::AssetLoadBudget;
 
 /// Bundle resource loader
 ///
 /// This struct provides high-level functionality for loading and managing
-/// AssetBundle resources, including caching and async loading support.
+/// AssetBundle resources, including caching and synchronous budget-aware loading.
 pub struct BundleLoader {
     /// Loaded bundles cache
     bundles: HashMap<String, AssetBundle>,
@@ -43,6 +41,16 @@ impl BundleLoader {
 
     /// Load a bundle from file path
     pub fn load_from_file<P: AsRef<Path>>(&mut self, path: P) -> Result<&AssetBundle> {
+        let mut budget = AssetLoadBudget::default();
+        self.load_from_file_with_budget(path, &mut budget)
+    }
+
+    /// Load a bundle path through a caller-owned cumulative budget.
+    pub fn load_from_file_with_budget<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<&AssetBundle> {
         let path_ref = path.as_ref();
         let path_str = path_ref.to_string_lossy().to_string();
 
@@ -51,12 +59,11 @@ impl BundleLoader {
             return Ok(self.bundles.get(&path_str).unwrap());
         }
 
-        // Read file data
-        let data = std::fs::read(path_ref)
-            .map_err(|e| BinaryError::generic(format!("Failed to read bundle file: {}", e)))?;
-
-        // Parse bundle
-        let bundle = BundleParser::from_bytes_with_options(data, self.options.clone())?;
+        let bundle = crate::file::load_bundle_file_with_options_and_budget(
+            path_ref,
+            self.options.clone(),
+            budget,
+        )?;
 
         // Cache and return
         self.bundles.insert(path_str.clone(), bundle);
@@ -65,41 +72,29 @@ impl BundleLoader {
 
     /// Load a bundle from memory
     pub fn load_from_memory(&mut self, name: String, data: Vec<u8>) -> Result<&AssetBundle> {
+        let mut budget = AssetLoadBudget::default();
+        self.load_from_memory_with_budget(name, data, &mut budget)
+    }
+
+    /// Load a memory image through a caller-owned cumulative budget.
+    pub fn load_from_memory_with_budget(
+        &mut self,
+        name: String,
+        data: Vec<u8>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<&AssetBundle> {
         // Check if already loaded
         if self.bundles.contains_key(&name) {
             return Ok(self.bundles.get(&name).unwrap());
         }
 
         // Parse bundle
-        let bundle = BundleParser::from_bytes_with_options(data, self.options.clone())?;
+        let bundle =
+            BundleParser::from_bytes_with_options_and_budget(data, self.options.clone(), budget)?;
 
         // Cache and return
         self.bundles.insert(name.clone(), bundle);
         Ok(self.bundles.get(&name).unwrap())
-    }
-
-    /// Async load a bundle from file path
-    #[cfg(feature = "async")]
-    pub async fn load_from_file_async<P: AsRef<Path>>(&mut self, path: P) -> Result<&AssetBundle> {
-        let path_ref = path.as_ref();
-        let path_str = path_ref.to_string_lossy().to_string();
-
-        // Check if already loaded
-        if self.bundles.contains_key(&path_str) {
-            return Ok(self.bundles.get(&path_str).unwrap());
-        }
-
-        // Read file data asynchronously
-        let data = fs::read(path_ref)
-            .await
-            .map_err(|e| BinaryError::generic(format!("Failed to read bundle file: {}", e)))?;
-
-        // Parse bundle
-        let bundle = BundleParser::from_bytes_with_options(data, self.options.clone())?;
-
-        // Cache and return
-        self.bundles.insert(path_str.clone(), bundle);
-        Ok(self.bundles.get(&path_str).unwrap())
     }
 
     /// Get a loaded bundle by name
@@ -136,7 +131,7 @@ impl BundleLoader {
     }
 
     /// Find assets by name across all loaded bundles
-    pub fn find_assets_by_name(&self, name: &str) -> Vec<(&str, &Asset)> {
+    pub fn find_assets_by_name(&self, name: &str) -> Vec<(&str, &SerializedFile)> {
         let mut results = Vec::new();
 
         for (bundle_name, bundle) in &self.bundles {
@@ -155,7 +150,7 @@ impl BundleLoader {
     }
 
     /// Find assets by type ID across all loaded bundles
-    pub fn find_assets_by_type(&self, type_id: i32) -> Vec<(&str, &Asset)> {
+    pub fn find_assets_by_type(&self, type_id: i32) -> Vec<(&str, &SerializedFile)> {
         let mut results = Vec::new();
 
         for (bundle_name, bundle) in &self.bundles {
@@ -238,6 +233,17 @@ impl BundleResourceManager {
         path: P,
         dependencies: Vec<String>,
     ) -> Result<()> {
+        let mut budget = AssetLoadBudget::default();
+        self.load_bundle_with_budget(path, dependencies, &mut budget)
+    }
+
+    /// Load a bundle and its bookkeeping through a caller-owned cumulative budget.
+    pub fn load_bundle_with_budget<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        dependencies: Vec<String>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
         let path_str = path.as_ref().to_string_lossy().to_string();
 
         // Load dependencies first
@@ -253,7 +259,7 @@ impl BundleResourceManager {
         }
 
         // Load the bundle
-        self.loader.load_from_file(path)?;
+        self.loader.load_from_file_with_budget(path, budget)?;
 
         // Track dependencies
         self.dependencies.insert(path_str.clone(), dependencies);
@@ -333,9 +339,7 @@ pub struct LoaderStatistics {
 /// Convenience functions for quick bundle loading
 /// Load a single bundle from file
 pub fn load_bundle<P: AsRef<Path>>(path: P) -> Result<AssetBundle> {
-    let data = std::fs::read(path)
-        .map_err(|e| BinaryError::generic(format!("Failed to read bundle file: {}", e)))?;
-    BundleParser::from_bytes(data)
+    crate::file::load_bundle_file_with_options(path, BundleLoadOptions::default())
 }
 
 /// Load a bundle from memory
@@ -348,18 +352,7 @@ pub fn load_bundle_with_options<P: AsRef<Path>>(
     path: P,
     options: BundleLoadOptions,
 ) -> Result<AssetBundle> {
-    let data = std::fs::read(path)
-        .map_err(|e| BinaryError::generic(format!("Failed to read bundle file: {}", e)))?;
-    BundleParser::from_bytes_with_options(data, options)
-}
-
-#[cfg(feature = "async")]
-/// Async load a single bundle from file
-pub async fn load_bundle_async<P: AsRef<Path>>(path: P) -> Result<AssetBundle> {
-    let data = fs::read(path)
-        .await
-        .map_err(|e| BinaryError::generic(format!("Failed to read bundle file: {}", e)))?;
-    BundleParser::from_bytes(data)
+    crate::file::load_bundle_file_with_options(path, options)
 }
 
 #[cfg(test)]

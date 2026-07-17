@@ -31,7 +31,8 @@ fn texture2d_converter_parses_streamdata_from_typetree() {
     stream_obj.insert("size".to_string(), UnityValue::Integer(16));
     class.set("m_StreamData".to_string(), UnityValue::Object(stream_obj));
 
-    let info = ObjectInfo::new(1, 0, 0, class_ids::TEXTURE_2D, -1);
+    let info = ObjectInfo::for_standalone_class(1, 0, 0, class_ids::TEXTURE_2D)
+        .expect("valid standalone texture object");
     let obj = UnityObject::from_info_and_class(info, class);
 
     let converter = Texture2DConverter::new(UnityVersion::default());

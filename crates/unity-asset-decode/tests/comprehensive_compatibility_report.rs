@@ -50,9 +50,9 @@ fn test_comprehensive_compatibility_report() {
 
                     for asset in &bundle.assets {
                         report.total_assets += 1;
-                        println!("    📄 Asset with {} objects", asset.objects.len());
+                        println!("    📄 Asset with {} objects", asset.objects().len());
 
-                        for asset_object_info in &asset.objects {
+                        for asset_object_info in asset.objects() {
                             report.total_objects += 1;
                             let unity_object =
                                 UnityObject::from_serialized_file(asset, asset_object_info)
@@ -62,10 +62,11 @@ fn test_comprehensive_compatibility_report() {
                                             .map(|b| b.to_vec())
                                             .unwrap_or_default();
                                         UnityObject::from_raw(
-                                            asset_object_info.type_id,
-                                            asset_object_info.path_id,
+                                            asset_object_info.class_id(),
+                                            asset_object_info.path_id(),
                                             fallback_data,
                                         )
+                                        .expect("fallback object metadata should be constructible")
                                     });
 
                             let class_name = unity_object.class_name().to_string();

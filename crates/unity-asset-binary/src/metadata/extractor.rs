@@ -125,9 +125,9 @@ impl MetadataExtractor {
         // Get objects to analyze
         let objects_to_analyze: Vec<&crate::asset::ObjectInfo> =
             if let Some(max) = self.config.max_objects {
-                asset.objects.iter().take(max).collect()
+                asset.objects().iter().take(max).collect()
             } else {
-                asset.objects.iter().collect()
+                asset.objects().iter().collect()
             };
 
         // Extract basic file info
@@ -251,24 +251,24 @@ impl MetadataExtractor {
         let mut object_summaries = Vec::new();
 
         for obj in objects {
-            // Get class name from type_id (simplified mapping)
-            let class_name = self.get_class_name_from_type_id(obj.type_id);
+            // Get class name from the canonical class ID (simplified mapping)
+            let class_name = self.get_class_name_from_class_id(obj.class_id());
 
             // Count objects by type
             *objects_by_type.entry(class_name.clone()).or_insert(0) += 1;
 
             // Sum memory by type
-            let byte_size = obj.byte_size as u64;
+            let byte_size = u64::from(obj.byte_size());
             *memory_by_type.entry(class_name.clone()).or_insert(0u64) += byte_size;
             total_memory += byte_size;
 
             // Create object summary if detailed extraction is enabled
             if self.config.include_object_details {
                 object_summaries.push(ObjectSummary {
-                    path_id: obj.path_id,
+                    path_id: obj.path_id(),
                     class_name: class_name.clone(),
-                    name: Some(format!("Object_{}", obj.path_id)), // Simplified name
-                    byte_size: obj.byte_size,
+                    name: Some(format!("Object_{}", obj.path_id())), // Simplified name
+                    byte_size: obj.byte_size(),
                     dependencies: Vec::new(), // TODO: Extract dependencies
                 });
             }
@@ -312,7 +312,7 @@ impl MetadataExtractor {
         asset: &SerializedFile,
         parse_time_ms: f64,
     ) -> PerformanceMetrics {
-        let object_count = asset.objects.len() as f64;
+        let object_count = asset.objects().len() as f64;
         let object_parse_rate = if parse_time_ms > 0.0 {
             (object_count * 1000.0) / parse_time_ms
         } else {
@@ -332,7 +332,7 @@ impl MetadataExtractor {
 
     /// Calculate complexity score for the asset
     fn calculate_complexity_score(&self, asset: &SerializedFile) -> f64 {
-        let object_count = asset.objects.len() as f64;
+        let object_count = asset.objects().len() as f64;
         let type_count = asset.types.len() as f64;
         let external_count = asset.externals.len() as f64;
 
@@ -344,8 +344,8 @@ impl MetadataExtractor {
     }
 
     /// Get class name from Unity type ID
-    fn get_class_name_from_type_id(&self, type_id: i32) -> String {
-        match type_id {
+    fn get_class_name_from_class_id(&self, class_id: i32) -> String {
+        match class_id {
             class_ids::GAME_OBJECT => "GameObject".to_string(),
             class_ids::TRANSFORM => "Transform".to_string(),
             class_ids::MATERIAL => "Material".to_string(),
@@ -357,7 +357,7 @@ impl MetadataExtractor {
             class_ids::ANIMATOR_CONTROLLER => "AnimatorController".to_string(),
             class_ids::MONO_BEHAVIOUR => "MonoBehaviour".to_string(),
             class_ids::SPRITE => "Sprite".to_string(),
-            _ => format!("UnknownType_{}", type_id),
+            _ => format!("UnknownType_{}", class_id),
         }
     }
 
@@ -392,10 +392,10 @@ mod tests {
     #[test]
     fn test_class_name_mapping() {
         let extractor = MetadataExtractor::new();
-        assert_eq!(extractor.get_class_name_from_type_id(1), "GameObject");
-        assert_eq!(extractor.get_class_name_from_type_id(28), "Texture2D");
+        assert_eq!(extractor.get_class_name_from_class_id(1), "GameObject");
+        assert_eq!(extractor.get_class_name_from_class_id(28), "Texture2D");
         assert_eq!(
-            extractor.get_class_name_from_type_id(999),
+            extractor.get_class_name_from_class_id(999),
             "UnknownType_999"
         );
     }

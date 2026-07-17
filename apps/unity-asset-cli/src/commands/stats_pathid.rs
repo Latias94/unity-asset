@@ -43,14 +43,16 @@ impl PathIdStats {
 
         let mut file_duplicate_count = 0usize;
         let mut seen: Option<HashSet<i64>> = if check_duplicates {
-            Some(HashSet::with_capacity(file.objects.len().saturating_mul(2)))
+            Some(HashSet::with_capacity(
+                file.objects().len().saturating_mul(2),
+            ))
         } else {
             None
         };
 
-        for obj in &file.objects {
+        for obj in file.objects() {
             self.objects_total += 1;
-            let pid = obj.path_id;
+            let pid = obj.path_id();
             match pid.cmp(&0) {
                 std::cmp::Ordering::Less => self.counts.negative += 1,
                 std::cmp::Ordering::Equal => self.counts.zero += 1,

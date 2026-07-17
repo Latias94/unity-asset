@@ -91,14 +91,14 @@ fn type_tree_for_object<'a>(file: &'a SerializedFile, info: &ObjectInfo) -> Opti
         return None;
     }
 
-    if info.type_index >= 0 {
-        let idx = info.type_index as usize;
+    if let Some(type_index) = info.serialized_type_index() {
+        let idx = usize::try_from(type_index).ok()?;
         return file.types.get(idx).map(|t| &t.type_tree);
     }
 
     file.types
         .iter()
-        .find(|t| t.class_id == info.type_id)
+        .find(|t| t.class_id == info.class_id())
         .map(|t| &t.type_tree)
 }
 
@@ -106,10 +106,10 @@ fn serialized_type_for_object<'a>(
     file: &'a SerializedFile,
     info: &ObjectInfo,
 ) -> Option<&'a unity_asset_binary::asset::SerializedType> {
-    if info.type_index >= 0 {
-        return file.types.get(info.type_index as usize);
+    if let Some(type_index) = info.serialized_type_index() {
+        return file.types.get(usize::try_from(type_index).ok()?);
     }
-    file.types.iter().find(|t| t.class_id == info.type_id)
+    file.types.iter().find(|t| t.class_id == info.class_id())
 }
 
 fn find_first_serialized_node(
@@ -197,7 +197,7 @@ fn build_minimal_legacy_bundle(
     }
     directory_info_writer.write(&vec![0u8; file_info_header_size - dir_len]);
 
-    let mut blob = directory_info_writer.into_bytes();
+    let mut blob = directory_info_writer.into_result()?;
     blob.extend_from_slice(file_bytes);
 
     let uncompressed_size_u32 = u32::try_from(blob.len())?;
@@ -245,7 +245,7 @@ fn build_minimal_legacy_bundle(
     );
 
     writer.write(&compressed_blob);
-    Ok(writer.into_bytes())
+    Ok(writer.into_result()?)
 }
 
 #[test]
@@ -458,6 +458,22 @@ fn push_cstring(out: &mut Vec<u8>, s: &str) {
     out.push(0);
 }
 
+fn decode_hex_fixture(contents: &str) -> Vec<u8> {
+    let digits: Vec<u8> = contents
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    assert_eq!(digits.len() % 2, 0, "hex fixture must contain byte pairs");
+    digits
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16).expect("valid hex digit");
+            let low = (pair[1] as char).to_digit(16).expect("valid hex digit");
+            u8::try_from((high << 4) | low).expect("hex pair fits u8")
+        })
+        .collect()
+}
+
 fn make_minimal_serialized_file_v8_le() -> Vec<u8> {
     let version: u32 = 8;
     // UnityPy's file type detection skips AssetsFile checks for files < 128 bytes.
@@ -531,6 +547,171 @@ assert len(f.objects) == 0
 }
 
 #[test]
+fn unitypy_loads_independent_serialized_file_wire_goldens() -> anyhow::Result<()> {
+    if std::env::var("UNITYPY_E2E").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    let fixture_dir = repo_root()
+        .join("crates")
+        .join("unity-asset-write")
+        .join("tests")
+        .join("fixtures")
+        .join("serialized_file_wire");
+    let rewritten_dir = tempfile::tempdir()?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture_dir.join("manifest.json"))?)?;
+    for case in manifest["cases"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("wire manifest cases must be an array"))?
+    {
+        let version = case["expected"]["version"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("wire case version must be an integer"))?;
+        let file_name = case["file"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("wire case file must be a string"))?;
+        let serialized = unity_asset_binary::asset::SerializedFileParser::from_bytes(
+            std::fs::read(fixture_dir.join(file_name))?,
+        )?;
+        let no_op = SerializedFileWriter::save(&serialized, &SerializedFileEdits::default())?;
+        std::fs::write(
+            rewritten_dir
+                .path()
+                .join(format!("v{version}_noop.assets.bin")),
+            no_op,
+        )?;
+
+        let object = serialized
+            .objects()
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("wire case v{version} has no object"))?;
+        let mut edits = SerializedFileEdits::default();
+        edits.set_object_bytes(
+            object.path_id(),
+            vec![0xD0, version as u8, 0xAD, 0xBE, 0xEF],
+        );
+        let edited = SerializedFileWriter::save(&serialized, &edits)?;
+        std::fs::write(
+            rewritten_dir
+                .path()
+                .join(format!("v{version}_edited.assets.bin")),
+            edited,
+        )?;
+    }
+    let legacy_script = unity_asset_binary::asset::SerializedFileParser::from_bytes(
+        std::fs::read(fixture_dir.join("legacy_v15_monobehaviour.assets.bin"))?,
+    )?;
+    std::fs::write(
+        rewritten_dir
+            .path()
+            .join("legacy_v15_monobehaviour.assets.bin"),
+        SerializedFileWriter::save(&legacy_script, &SerializedFileEdits::default())?,
+    )?;
+    let collision_bytes = decode_hex_fixture(include_str!(
+        "fixtures/serialized_file_wire/v16_type_index_collision.assets.hex"
+    ));
+    std::fs::write(
+        rewritten_dir.path().join("collision_input.assets.bin"),
+        &collision_bytes,
+    )?;
+    let collision = unity_asset_binary::asset::SerializedFileParser::from_bytes(collision_bytes)?;
+    std::fs::write(
+        rewritten_dir.path().join("collision_rewritten.assets.bin"),
+        SerializedFileWriter::save(&collision, &SerializedFileEdits::default())?,
+    )?;
+    let py = r#"
+import os, re, sys
+from pathlib import Path
+
+repo_root = sys.argv[1]
+fixture_dir = Path(sys.argv[2])
+rewritten_dir = Path(sys.argv[3])
+sys.path.insert(0, os.path.join(repo_root, "repo-ref", "UnityPy"))
+import UnityPy  # noqa: E402
+
+paths = sorted(
+    fixture_dir.glob("v*.assets.bin"),
+    key=lambda path: int(re.fullmatch(r"v(\d+)\.assets\.bin", path.name).group(1)),
+)
+assert len(paths) == 20, len(paths)
+rewritten_paths = sorted(rewritten_dir.glob("v*_*.assets.bin"))
+assert len(rewritten_paths) == 40, len(rewritten_paths)
+
+def validate(path, version, expected_payload):
+    file = UnityPy.load(str(path)).file
+    assert file.header.version == version, (path, file.header.version)
+    assert file._enable_type_tree is True, path
+    assert len(file.types) == 1, path
+    assert len(file.objects) == 1, path
+
+    obj = next(iter(file.objects.values()))
+    assert obj.path_id == (0x000000010000002A if version == 8 else 42), path
+    expected_type_id = 0 if version >= 16 else (0x13572468 if version == 8 else 28)
+    assert obj.type_id == expected_type_id, path
+    assert obj.class_id == 28, path
+    assert obj.byte_size == len(expected_payload), (path, obj.byte_size, len(expected_payload))
+    assert obj.get_raw_data() == expected_payload, (path, obj.get_raw_data(), expected_payload)
+    assert obj.is_destroyed == (0x1234 if version < 11 else None), path
+    assert obj.is_stripped == (1 if version in (15, 16) else None), path
+    if 11 <= version < 17:
+        assert obj.serialized_type.script_type_index == -3, path
+
+    assert len(file.externals) == 1, path
+    assert file.externals[0].path == "archive:/fixture-dependency.assets", path
+    assert len(getattr(file, "ref_types", []) or []) == (1 if version >= 20 else 0), path
+
+for path in paths:
+    version = int(re.fullmatch(r"v(\d+)\.assets\.bin", path.name).group(1))
+    validate(path, version, bytes((version, 0xAA, 0xBB, 0xCC)))
+
+for path in rewritten_paths:
+    match = re.fullmatch(r"v(\d+)_(noop|edited)\.assets\.bin", path.name)
+    version = int(match.group(1))
+    expected_payload = (
+        bytes((version, 0xAA, 0xBB, 0xCC))
+        if match.group(2) == "noop"
+        else bytes((0xD0, version, 0xAD, 0xBE, 0xEF))
+    )
+    validate(path, version, expected_payload)
+
+for script_path in (
+    fixture_dir / "legacy_v15_monobehaviour.assets.bin",
+    rewritten_dir / "legacy_v15_monobehaviour.assets.bin",
+):
+    script_file = UnityPy.load(str(script_path)).file
+    script_obj = next(iter(script_file.objects.values()))
+    assert script_obj.type_id == -1, script_path
+    assert script_obj.class_id == 114, script_path
+    assert script_obj.serialized_type is not None, script_path
+    assert script_obj.serialized_type.class_id == -1, script_path
+    assert script_obj.serialized_type.script_type_index == 7, script_path
+
+for collision_path in (
+    rewritten_dir / "collision_input.assets.bin",
+    rewritten_dir / "collision_rewritten.assets.bin",
+):
+    collision_file = UnityPy.load(str(collision_path)).file
+    assert [typ.class_id for typ in collision_file.types] == [1, 28], collision_path
+    collision_obj = next(iter(collision_file.objects.values()))
+    assert collision_obj.type_id == 1, collision_path
+    assert collision_obj.class_id == 28, collision_path
+    assert collision_obj.get_raw_data() == bytes((0x10, 0xAA, 0xBB, 0xCC)), collision_path
+"#;
+
+    unitypy_check(
+        py,
+        &[
+            repo_root().display().to_string(),
+            fixture_dir.display().to_string(),
+            rewritten_dir.path().display().to_string(),
+        ],
+    )?;
+
+    Ok(())
+}
+
+#[test]
 fn unitypy_can_load_saved_webfile() -> anyhow::Result<()> {
     if std::env::var("UNITYPY_E2E").ok().as_deref() != Some("1") {
         return Ok(());
@@ -591,11 +772,11 @@ fn unitypy_observes_rust_typetree_edit_in_repacked_bundle() -> anyhow::Result<()
 
     // Find a named object with a TypeTree so we can patch `m_Name` and roundtrip it.
     let mut chosen: Option<(i64, String)> = None;
-    for info in &serialized.objects {
+    for info in serialized.objects() {
         let handle = unity_asset_binary::object::ObjectHandle::new(&serialized, info);
         if let Ok(Some(name)) = handle.peek_name() {
             if !name.is_empty() {
-                chosen = Some((info.path_id, name));
+                chosen = Some((info.path_id(), name));
                 break;
             }
         }
@@ -604,9 +785,9 @@ fn unitypy_observes_rust_typetree_edit_in_repacked_bundle() -> anyhow::Result<()
     let new_name = format!("RUST_E2E_{}", old_name);
 
     let info = serialized
-        .objects
+        .objects()
         .iter()
-        .find(|o| o.path_id == path_id)
+        .find(|o| o.path_id() == path_id)
         .expect("chosen object must exist");
 
     let handle = unity_asset_binary::object::ObjectHandle::new(&serialized, info);
@@ -642,7 +823,7 @@ fn unitypy_observes_rust_typetree_edit_in_repacked_bundle() -> anyhow::Result<()
             allow_missing_fields: false,
         },
     )?;
-    let patched_bytes = w.into_bytes();
+    let patched_bytes = w.into_result()?;
 
     let mut sf_edits = SerializedFileEdits::default();
     sf_edits.set_object_bytes(path_id, patched_bytes);
@@ -751,8 +932,8 @@ fn unitypy_script_typetree_registry_enables_monobehaviour_parse() -> anyhow::Res
     };
 
     let mut chosen: Option<usize> = None;
-    for (idx, info) in serialized.objects.iter().enumerate() {
-        if info.type_id != 114 {
+    for (idx, info) in serialized.objects().iter().enumerate() {
+        if info.class_id() != 114 {
             continue;
         }
 
@@ -778,7 +959,7 @@ fn unitypy_script_typetree_registry_enables_monobehaviour_parse() -> anyhow::Res
     })?;
 
     {
-        let info = &serialized.objects[idx];
+        let info = &serialized.objects()[idx];
         let before = unity_asset_binary::object::ObjectHandle::new(&serialized, info).read()?;
         assert!(
             before.has_property("_raw_data_len"),
@@ -788,7 +969,7 @@ fn unitypy_script_typetree_registry_enables_monobehaviour_parse() -> anyhow::Res
 
     serialized.set_type_tree_registry(Some(registry));
     {
-        let info = &serialized.objects[idx];
+        let info = &serialized.objects()[idx];
         let after = unity_asset_binary::object::ObjectHandle::new(&serialized, info).read()?;
         assert!(
             !after.has_property("_raw_data_len"),

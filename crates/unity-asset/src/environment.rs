@@ -25,7 +25,7 @@ mod imp {
         TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseWarning,
     };
     use unity_asset_binary::webfile::WebFile;
-    use unity_asset_core::UnityValue;
+    use unity_asset_core::{AssetLoadBudget, UnityValue};
     use unity_asset_core::{UnityAssetError, UnityClass, UnityDocument};
 
     mod container;

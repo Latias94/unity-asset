@@ -118,7 +118,7 @@ impl WebFileWriter {
             writer.write(data);
         }
 
-        let payload = writer.into_bytes();
+        let payload = writer.into_result()?;
 
         let resolved = match packer {
             WebFilePacker::Original => match web.compression {

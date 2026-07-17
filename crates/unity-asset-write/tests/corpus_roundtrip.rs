@@ -135,7 +135,7 @@ fn corpus_roundtrip_noop_save_is_loadable() -> anyhow::Result<()> {
                     let reparsed =
                         unity_asset_binary::asset::SerializedFileParser::from_bytes(out)?;
                     assert_eq!(reparsed.header.version, sf.header.version);
-                    assert_eq!(reparsed.objects.len(), sf.objects.len());
+                    assert_eq!(reparsed.objects().len(), sf.objects().len());
                     assert_eq!(
                         reparsed.externals.len(),
                         sf.externals.len(),
@@ -149,7 +149,7 @@ fn corpus_roundtrip_noop_save_is_loadable() -> anyhow::Result<()> {
                 let out = SerializedFileWriter::save(&sf, &SerializedFileEdits::default())?;
                 let reparsed = unity_asset_binary::asset::SerializedFileParser::from_bytes(out)?;
                 assert_eq!(reparsed.header.version, sf.header.version);
-                assert_eq!(reparsed.objects.len(), sf.objects.len());
+                assert_eq!(reparsed.objects().len(), sf.objects().len());
             }
             UnityFile::WebFile(web) => {
                 // Corpus currently doesn't vendor WebFile samples, but keep this branch for completeness.

@@ -84,6 +84,15 @@ impl AssetLoadBudget {
         )
     }
 
+    /// Checks whether parser or codec scratch memory can be reserved without charging usage.
+    ///
+    /// Callers that proceed with the allocation must still charge it through
+    /// [`Self::consume_bytes`]. The byte ledger is monotonic, so temporary allocations remain
+    /// accounted for after they are released.
+    pub fn check_bytes(&self, amount: u64) -> Result<(), BudgetError> {
+        check_charge("bytes", self.usage.bytes, amount, self.limits.max_bytes).map(|_| ())
+    }
+
     pub fn observe_depth(&mut self, depth: u32) -> Result<(), BudgetError> {
         if depth > self.limits.max_depth {
             return Err(BudgetError::Exceeded {
@@ -103,6 +112,40 @@ impl AssetLoadBudget {
             amount,
             self.limits.max_members,
         )
+    }
+
+    /// Checks whether encoded input can be charged before it is copied or decoded.
+    ///
+    /// A successful check does not mutate usage. The decoder must still charge the bytes through
+    /// [`Self::begin_decompression`] when it starts processing the stream.
+    pub fn check_compressed_bytes(&self, amount: u64) -> Result<(), BudgetError> {
+        check_charge(
+            "compressed_bytes",
+            self.usage.compressed_bytes,
+            amount,
+            self.limits.max_compressed_bytes,
+        )
+        .map(|_| ())
+    }
+
+    /// Checks a planned decompression against the remaining load limits without charging usage.
+    ///
+    /// The compressed and decompressed values describe one decoder stream. Its expansion ratio is
+    /// checked independently so one stream cannot borrow allowance from earlier streams. A decoder
+    /// must still charge its actual work through [`Self::begin_decompression`].
+    pub fn check_decompression(
+        &self,
+        compressed_bytes: u64,
+        decompressed_bytes: u64,
+    ) -> Result<(), BudgetError> {
+        checked_decompression_usage(
+            self.usage,
+            DecompressionUsage::default(),
+            self.limits,
+            compressed_bytes,
+            decompressed_bytes,
+        )
+        .map(|_| ())
     }
 
     #[must_use]
@@ -152,6 +195,12 @@ impl AssetLoadBudget {
     pub const fn usage(&self) -> AssetLoadUsage {
         self.usage
     }
+
+    /// Returns the byte allowance that has not yet been consumed by this load.
+    #[must_use]
+    pub const fn remaining_bytes(&self) -> u64 {
+        self.limits.max_bytes - self.usage.bytes
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -173,65 +222,15 @@ impl DecompressionBudget<'_> {
         compressed_bytes: u64,
         decompressed_bytes: u64,
     ) -> Result<(), BudgetError> {
-        let stream_compressed = self
-            .usage
-            .compressed_bytes
-            .checked_add(compressed_bytes)
-            .ok_or(BudgetError::ArithmeticOverflow {
-                resource: "compressed_bytes",
-            })?;
-        let stream_decompressed = self
-            .usage
-            .decompressed_bytes
-            .checked_add(decompressed_bytes)
-            .ok_or(BudgetError::ArithmeticOverflow {
-                resource: "decompressed_bytes",
-            })?;
-        let allowed =
-            u128::from(stream_compressed) * u128::from(self.load.limits.max_expansion_ratio);
-        if u128::from(stream_decompressed) > allowed {
-            return Err(BudgetError::ExpansionRatioExceeded {
-                compressed_bytes: stream_compressed,
-                decompressed_bytes: stream_decompressed,
-                max_ratio: self.load.limits.max_expansion_ratio,
-            });
-        }
-
-        let load_compressed = self
-            .load
-            .usage
-            .compressed_bytes
-            .checked_add(compressed_bytes)
-            .ok_or(BudgetError::ArithmeticOverflow {
-                resource: "compressed_bytes",
-            })?;
-        let load_decompressed = self
-            .load
-            .usage
-            .decompressed_bytes
-            .checked_add(decompressed_bytes)
-            .ok_or(BudgetError::ArithmeticOverflow {
-                resource: "decompressed_bytes",
-            })?;
-        if load_compressed > self.load.limits.max_compressed_bytes {
-            return Err(BudgetError::Exceeded {
-                resource: "compressed_bytes",
-                limit: self.load.limits.max_compressed_bytes,
-                requested: load_compressed,
-            });
-        }
-        if load_decompressed > self.load.limits.max_decompressed_bytes {
-            return Err(BudgetError::Exceeded {
-                resource: "decompressed_bytes",
-                limit: self.load.limits.max_decompressed_bytes,
-                requested: load_decompressed,
-            });
-        }
-
-        self.usage.compressed_bytes = stream_compressed;
-        self.usage.decompressed_bytes = stream_decompressed;
-        self.load.usage.compressed_bytes = load_compressed;
-        self.load.usage.decompressed_bytes = load_decompressed;
+        let (load_usage, stream_usage) = checked_decompression_usage(
+            self.load.usage,
+            self.usage,
+            self.load.limits,
+            compressed_bytes,
+            decompressed_bytes,
+        )?;
+        self.usage = stream_usage;
+        self.load.usage = load_usage;
         Ok(())
     }
 
@@ -239,6 +238,74 @@ impl DecompressionBudget<'_> {
     pub const fn usage(&self) -> DecompressionUsage {
         self.usage
     }
+}
+
+fn checked_decompression_usage(
+    load_usage: AssetLoadUsage,
+    stream_usage: DecompressionUsage,
+    limits: AssetLoadLimits,
+    compressed_bytes: u64,
+    decompressed_bytes: u64,
+) -> Result<(AssetLoadUsage, DecompressionUsage), BudgetError> {
+    let stream_compressed = stream_usage
+        .compressed_bytes
+        .checked_add(compressed_bytes)
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "compressed_bytes",
+        })?;
+    let stream_decompressed = stream_usage
+        .decompressed_bytes
+        .checked_add(decompressed_bytes)
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "decompressed_bytes",
+        })?;
+    let allowed = u128::from(stream_compressed) * u128::from(limits.max_expansion_ratio);
+    if u128::from(stream_decompressed) > allowed {
+        return Err(BudgetError::ExpansionRatioExceeded {
+            compressed_bytes: stream_compressed,
+            decompressed_bytes: stream_decompressed,
+            max_ratio: limits.max_expansion_ratio,
+        });
+    }
+
+    let next_load_compressed = load_usage
+        .compressed_bytes
+        .checked_add(compressed_bytes)
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "compressed_bytes",
+        })?;
+    let next_load_decompressed = load_usage
+        .decompressed_bytes
+        .checked_add(decompressed_bytes)
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "decompressed_bytes",
+        })?;
+    if next_load_compressed > limits.max_compressed_bytes {
+        return Err(BudgetError::Exceeded {
+            resource: "compressed_bytes",
+            limit: limits.max_compressed_bytes,
+            requested: next_load_compressed,
+        });
+    }
+    if next_load_decompressed > limits.max_decompressed_bytes {
+        return Err(BudgetError::Exceeded {
+            resource: "decompressed_bytes",
+            limit: limits.max_decompressed_bytes,
+            requested: next_load_decompressed,
+        });
+    }
+
+    Ok((
+        AssetLoadUsage {
+            compressed_bytes: next_load_compressed,
+            decompressed_bytes: next_load_decompressed,
+            ..load_usage
+        },
+        DecompressionUsage {
+            compressed_bytes: stream_compressed,
+            decompressed_bytes: stream_decompressed,
+        },
+    ))
 }
 
 fn validate_limit(resource: &'static str, value: u128) -> Result<(), BudgetError> {
@@ -254,6 +321,17 @@ fn charge(
     amount: u64,
     limit: u64,
 ) -> Result<(), BudgetError> {
+    let requested = check_charge(resource, *used, amount, limit)?;
+    *used = requested;
+    Ok(())
+}
+
+fn check_charge(
+    resource: &'static str,
+    used: u64,
+    amount: u64,
+    limit: u64,
+) -> Result<u64, BudgetError> {
     let requested = used
         .checked_add(amount)
         .ok_or(BudgetError::ArithmeticOverflow { resource })?;
@@ -264,8 +342,7 @@ fn charge(
             requested,
         });
     }
-    *used = requested;
-    Ok(())
+    Ok(requested)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

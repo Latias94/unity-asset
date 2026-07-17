@@ -87,7 +87,7 @@ pub enum ObjectOffsetEncoding {
 pub enum ObjectTypeEncoding {
     /// A type ID followed by a 16-bit class ID.
     Legacy,
-    /// The unresolved format-16 transition; an independent fixture must decide its meaning.
+    /// Format 16's raw type-table index, retained separately from later indexed encodings.
     TransitionalV16,
     /// An index into the SerializedType table.
     Indexed,
@@ -601,6 +601,20 @@ impl SerializedFileFormat {
     /// Returns whether SerializedType records carry a script-type index.
     pub const fn serialized_types_have_script_type_index(self) -> bool {
         self.serialized_type_fields & TYPE_SCRIPT_INDEX != 0
+    }
+
+    /// Returns whether this SerializedType record carries a 16-byte script ID.
+    pub const fn serialized_type_has_script_id(
+        self,
+        class_id: i32,
+        script_type_index: i16,
+        is_ref_type: bool,
+    ) -> bool {
+        self.serialized_types_have_hashes()
+            && ((is_ref_type && script_type_index >= 0)
+                || (!self.serialized_types_have_stripped_flag() && class_id < 0)
+                || (self.serialized_types_have_stripped_flag()
+                    && class_id == unity_asset_core::class_ids::MONO_BEHAVIOUR))
     }
 
     /// Returns whether ordinary TypeTrees are followed by type dependencies.

@@ -22,7 +22,7 @@
 //! println!("Loaded bundle with {} assets", bundle.asset_count());
 //!
 //! // Advanced loading with options
-//! let mut loader = BundleLoader::with_options(BundleLoadOptions::fast());
+//! let mut loader = BundleLoader::with_options(BundleLoadOptions::lazy());
 //! let bundle = loader.load_from_file("example.bundle")?;
 //!
 //! // Find specific assets
@@ -45,9 +45,6 @@ pub use loader::{
 };
 pub use parser::{BundleParser, ParsingComplexity};
 pub use types::{AssetBundle, BundleFileInfo, BundleLoadOptions, BundleStatistics, DirectoryNode};
-
-#[cfg(feature = "async")]
-pub use loader::load_bundle_async;
 
 /// Main bundle processing facade
 ///
@@ -100,7 +97,10 @@ impl BundleProcessor {
     }
 
     /// Extract all assets from a bundle
-    pub fn extract_all_assets(&self, bundle_name: &str) -> Option<Vec<&crate::asset::Asset>> {
+    pub fn extract_all_assets(
+        &self,
+        bundle_name: &str,
+    ) -> Option<Vec<&crate::asset::SerializedFile>> {
         self.loader
             .get_bundle(bundle_name)
             .map(|bundle| bundle.assets.iter().collect())
@@ -111,7 +111,7 @@ impl BundleProcessor {
         &self,
         bundle_name: &str,
         type_id: i32,
-    ) -> Option<Vec<&crate::asset::Asset>> {
+    ) -> Option<Vec<&crate::asset::SerializedFile>> {
         self.loader.get_bundle(bundle_name).map(|bundle| {
             bundle
                 .assets
@@ -178,12 +178,7 @@ pub fn create_processor() -> BundleProcessor {
 
 /// Quick function to get bundle information
 pub fn get_bundle_info<P: AsRef<std::path::Path>>(path: P) -> crate::error::Result<BundleInfo> {
-    let data = std::fs::read(&path).map_err(|e| {
-        crate::error::BinaryError::generic(format!("Failed to read bundle file: {}", e))
-    })?;
-
-    let complexity = BundleParser::estimate_complexity(&data)?;
-    let bundle = BundleParser::from_bytes(data)?;
+    let bundle = load_bundle(&path)?;
     let stats = bundle.statistics();
 
     Ok(BundleInfo {
@@ -193,11 +188,11 @@ pub fn get_bundle_info<P: AsRef<std::path::Path>>(path: P) -> crate::error::Resu
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string(),
-        format: complexity.format,
+        format: bundle.header.signature.clone(),
         version: bundle.header.version,
         unity_version: bundle.header.unity_version.clone(),
         size: bundle.size(),
-        compressed: complexity.has_compression,
+        compressed: bundle.is_compressed(),
         file_count: bundle.file_count(),
         asset_count: bundle.asset_count(),
         compression_ratio: stats.compression_ratio,
@@ -235,18 +230,14 @@ pub fn extract_file_from_bundle<P: AsRef<std::path::Path>>(
 
 /// Check if a file is a valid Unity bundle
 pub fn is_valid_bundle<P: AsRef<std::path::Path>>(path: P) -> bool {
-    match std::fs::read(path) {
-        Ok(data) => {
-            if data.len() < 20 {
-                return false;
-            }
-
-            // Check for known bundle signatures
-            let signature = String::from_utf8_lossy(&data[..8]);
-            matches!(signature.as_ref(), "UnityFS\0" | "UnityWeb" | "UnityRaw")
-        }
-        Err(_) => false,
-    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut prefix = [0_u8; 16];
+    let Ok(read) = std::io::Read::read(&mut file, &mut prefix) else {
+        return false;
+    };
+    crate::file::looks_like_bundle_prefix(&prefix[..read])
 }
 
 /// Get supported bundle formats
@@ -298,11 +289,6 @@ mod tests {
         assert!(!lazy_options.load_assets);
         assert!(!lazy_options.decompress_blocks);
         assert!(lazy_options.validate);
-
-        let fast_options = BundleLoadOptions::fast();
-        assert!(!fast_options.load_assets);
-        assert!(!fast_options.decompress_blocks);
-        assert!(!fast_options.validate);
 
         let complete_options = BundleLoadOptions::complete();
         assert!(complete_options.load_assets);

@@ -123,7 +123,8 @@ fn encode_object_typetree(
     let Some(tree) = type_tree_for_object(file, info) else {
         return Err(UnityAssetError::format(format!(
             "TypeTree is unavailable for object write: path_id={} class_id={}",
-            info.path_id, info.type_id
+            info.path_id(),
+            info.class_id()
         )));
     };
 
@@ -143,7 +144,8 @@ fn encode_object_typetree(
         UnityAssetError::with_source(
             format!(
                 "Failed to read original object bytes for TypeTree write: path_id={} class_id={}",
-                info.path_id, info.type_id
+                info.path_id(),
+                info.class_id()
             ),
             e,
         )
@@ -157,7 +159,7 @@ fn encode_object_typetree(
             allow_missing_fields: false,
         },
     )?;
-    Ok(w.into_bytes())
+    w.into_result()
 }
 
 enum TypeTreeSource<'a> {
@@ -182,12 +184,12 @@ fn type_tree_for_object<'a>(
         file: &'a SerializedFile,
         info: &ObjectInfo,
     ) -> Option<&'a SerializedType> {
-        if info.type_index >= 0 {
-            let idx = info.type_index as usize;
+        if let Some(type_index) = info.serialized_type_index() {
+            let idx = usize::try_from(type_index).ok()?;
             return file.types.get(idx);
         }
 
-        file.types.iter().find(|t| t.class_id == info.type_id)
+        file.types.iter().find(|t| t.class_id == info.class_id())
     }
 
     if file.enable_type_tree
@@ -209,7 +211,7 @@ fn type_tree_for_object<'a>(
             }
         }
 
-        r.resolve(&file.unity_version, info.type_id)
+        r.resolve(&file.unity_version, info.class_id())
             .map(TypeTreeSource::Shared)
     })
 }

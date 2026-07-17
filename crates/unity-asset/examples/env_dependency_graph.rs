@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use unity_asset::AssetLoadBudget;
 use unity_asset::environment::{
     DependencyGraphBuildOptions, DependencyGraphTraversalOptions, Environment,
 };
@@ -36,7 +37,8 @@ fn main() -> unity_asset::Result<()> {
     // Rebuilding should reuse cached scans internally.
     let _ = env.build_dependency_graph(DependencyGraphBuildOptions::default());
 
-    let roots: Vec<_> = env.bundle_container_root_keys(&pattern, Some(16));
+    let mut budget = AssetLoadBudget::default();
+    let roots: Vec<_> = env.bundle_container_root_keys(&pattern, Some(16), &mut budget)?;
 
     if roots.is_empty() {
         println!("container_roots=0 (pattern={})", pattern);

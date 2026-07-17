@@ -270,7 +270,8 @@ fn test_sprite_typetree_texture_pptr_uses_path_id() {
     props.insert("m_RD".to_string(), UnityValue::Object(rd));
 
     let obj = unity_asset_decode::object::UnityObject::from_info_and_class(
-        unity_asset_decode::asset::ObjectInfo::new(1, 0, 0, 213, -1),
+        unity_asset_decode::asset::ObjectInfo::for_standalone_class(1, 0, 0, 213)
+            .expect("valid standalone sprite object"),
         unity_asset_core::UnityClass::new(213, "Sprite".to_string(), "1".to_string()),
     );
     let mut obj = obj;

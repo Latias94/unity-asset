@@ -48,45 +48,45 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
         .values()
         .next()
         .and_then(|b| b.assets.first())
-        .and_then(|a| a.objects.first())
+        .and_then(|a| a.objects().first())
         .expect("bundle has at least one object");
 
-    let found = env.find_binary_objects(first.path_id);
+    let found = env.find_binary_objects(first.path_id());
     assert!(!found.is_empty());
 
     // Disambiguation helpers should work on the same source path.
     assert!(
-        env.find_binary_object_in_source(&path, first.path_id)
+        env.find_binary_object_in_source(&path, first.path_id())
             .is_some()
     );
     let obj_ref = env
-        .find_binary_object_in_bundle_asset(&path, 0, first.path_id)
+        .find_binary_object_in_bundle_asset(&path, 0, first.path_id())
         .expect("can find object in bundle asset 0");
 
     let key = obj_ref.key();
     assert_eq!(key.source, BinarySource::path(&path));
     assert_eq!(key.source_kind, BinarySourceKind::AssetBundle);
     assert_eq!(key.asset_index, Some(0));
-    assert_eq!(key.path_id, first.path_id);
+    assert_eq!(key.path_id, first.path_id());
 
     let parsed = env.read_binary_object_key(&key).unwrap();
-    assert_eq!(parsed.info.path_id, first.path_id);
+    assert_eq!(parsed.info.path_id(), first.path_id());
 
-    let keys = env.find_binary_object_keys(first.path_id);
+    let keys = env.find_binary_object_keys(first.path_id());
     assert!(!keys.is_empty());
 
-    let keys_in_source = env.find_binary_object_keys_in_source(&path, first.path_id);
+    let keys_in_source = env.find_binary_object_keys_in_source(&path, first.path_id());
     assert!(keys_in_source.contains(&key));
 
     // PPtr resolution closure:
     // fileID=0 must resolve to the current serialized file (same source + asset_index).
     let pptr_key = env
-        .resolve_binary_pptr(&obj_ref, 0, first.path_id)
+        .resolve_binary_pptr(&obj_ref, 0, first.path_id())
         .expect("resolve PPtr with fileID=0");
     assert_eq!(pptr_key, key);
 
-    let pptr_obj = env.read_binary_pptr(&obj_ref, 0, first.path_id).unwrap();
-    assert_eq!(pptr_obj.info.path_id, first.path_id);
+    let pptr_obj = env.read_binary_pptr(&obj_ref, 0, first.path_id()).unwrap();
+    assert_eq!(pptr_obj.info.path_id(), first.path_id());
 
     // If externals are present, pick an out-of-range fileID; otherwise use 1.
     let invalid_file_id = if obj_ref.object.file().externals.is_empty() {
@@ -95,7 +95,7 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
         (obj_ref.object.file().externals.len() as i32) + 1
     };
     assert!(
-        env.resolve_binary_pptr(&obj_ref, invalid_file_id, first.path_id)
+        env.resolve_binary_pptr(&obj_ref, invalid_file_id, first.path_id())
             .is_none()
     );
 
@@ -106,13 +106,14 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
     let has_assetbundle_object = bundle
         .assets
         .iter()
-        .any(|f| f.objects.iter().any(|o| o.type_id == 142));
+        .any(|f| f.objects().iter().any(|o| o.class_id() == 142));
     assert!(
         has_assetbundle_object,
         "expected at least one AssetBundle (class id 142) object in sample bundle"
     );
 
-    let entries = env.bundle_container_entries(&path).unwrap();
+    let mut budget = AssetLoadBudget::default();
+    let entries = env.bundle_container_entries(&path, &mut budget).unwrap();
     assert!(
         !entries.is_empty(),
         "expected at least one m_Container entry in sample bundle"
@@ -120,7 +121,9 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
     assert!(entries.iter().any(|e| !e.asset_path.is_empty()));
     assert!(entries.iter().any(|e| e.key.is_some()));
 
-    let found = env.find_bundle_container_entries(&entries[0].asset_path);
+    let found = env
+        .find_bundle_container_entries(&entries[0].asset_path, &mut budget)
+        .unwrap();
     assert!(!found.is_empty());
 
     let file_name = entries[0]
@@ -129,13 +132,15 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
         .next()
         .unwrap_or(&entries[0].asset_path);
     let glob = format!("*{}*", file_name);
-    let found_glob = env.find_bundle_container_entries(&glob);
+    let found_glob = env
+        .find_bundle_container_entries(&glob, &mut budget)
+        .unwrap();
     assert!(
         !found_glob.is_empty(),
         "glob pattern should match at least one container entry"
     );
 
-    let entries = env.bundle_container_entries(&path).unwrap();
+    let entries = env.bundle_container_entries(&path, &mut budget).unwrap();
     let cn_001 = entries
         .iter()
         .find(|e| e.asset_path.to_ascii_lowercase().ends_with("/cn_001.ogg"))
@@ -621,11 +626,14 @@ fn environment_dependency_graph_builds_and_closure_from_container_is_non_empty()
     let graph = env.build_dependency_graph(DependencyGraphBuildOptions::default());
     assert!(!graph.nodes().is_empty());
 
-    let entries = env.bundle_container_entries(&path).unwrap();
+    let mut budget = AssetLoadBudget::default();
+    let entries = env.bundle_container_entries(&path, &mut budget).unwrap();
     let roots: Vec<_> = entries.into_iter().filter_map(|e| e.key).take(8).collect();
     assert!(!roots.is_empty());
 
-    let roots_from_helper = env.bundle_container_root_keys("Assets/", Some(8));
+    let roots_from_helper = env
+        .bundle_container_root_keys("Assets/", Some(8), &mut budget)
+        .unwrap();
     assert!(!roots_from_helper.is_empty());
 
     let closure = graph.internal_closure(&roots, Some(2), Some(10_000));
@@ -668,7 +676,7 @@ fn environment_dependency_graph_can_rebuild_single_source_subgraph() {
             DependencyGraphBuildOptions::default(),
         )
         .unwrap();
-    assert_eq!(sub.nodes().len(), file.objects.len());
+    assert_eq!(sub.nodes().len(), file.objects().len());
 
     env.invalidate_dependency_scan_cache_for_source(&source, BinarySourceKind::AssetBundle, None);
     let sub2 = env
@@ -679,7 +687,7 @@ fn environment_dependency_graph_can_rebuild_single_source_subgraph() {
             DependencyGraphBuildOptions::default(),
         )
         .unwrap();
-    assert_eq!(sub2.nodes().len(), file.objects.len());
+    assert_eq!(sub2.nodes().len(), file.objects().len());
 }
 
 #[test]
@@ -1060,7 +1068,10 @@ fn environment_can_load_split_assetbundle() {
         .cloned()
         .expect("expected split bundle to be loaded");
 
-    let entries = env.bundle_container_entries_source(&source).unwrap();
+    let mut budget = AssetLoadBudget::default();
+    let entries = env
+        .bundle_container_entries_source(&source, &mut budget)
+        .unwrap();
     assert!(!entries.is_empty());
 }
 
@@ -1092,7 +1103,10 @@ fn environment_can_load_zip_assetbundle_entry() {
         entry_name: "inner/char_118_yuki.ab".to_string(),
     };
 
-    let entries = env.bundle_container_entries_source(&source).unwrap();
+    let mut budget = AssetLoadBudget::default();
+    let entries = env
+        .bundle_container_entries_source(&source, &mut budget)
+        .unwrap();
     assert!(!entries.is_empty());
 }
 
@@ -1190,7 +1204,8 @@ fn environment_assetbundle_container_raw_matches_typetree_when_stripped() {
     );
     env.load_file(&path).unwrap();
 
-    let baseline = env.bundle_container_entries(&path).unwrap();
+    let mut budget = AssetLoadBudget::default();
+    let baseline = env.bundle_container_entries(&path, &mut budget).unwrap();
     assert!(
         !baseline.is_empty(),
         "expected at least one m_Container entry in sample bundle"
@@ -1212,7 +1227,7 @@ fn environment_assetbundle_container_raw_matches_typetree_when_stripped() {
     }
     env.bundle_container_cache.write().unwrap().remove(&source);
 
-    let stripped = env.bundle_container_entries(&path).unwrap();
+    let stripped = env.bundle_container_entries(&path, &mut budget).unwrap();
     assert!(
         !stripped.is_empty(),
         "expected container entries via raw fallback when TypeTree is stripped"
@@ -1411,13 +1426,13 @@ fn environment_can_find_yaml_pptr_references_to_binary_object_with_paths() {
         let Some(file) = unity_file.as_serialized() else {
             continue;
         };
-        let Some(first) = file.objects.first() else {
+        let Some(first) = file.objects().first() else {
             continue;
         };
-        if first.path_id == 0 {
+        if first.path_id() == 0 {
             continue;
         }
-        extracted = Some((bytes, first.path_id));
+        extracted = Some((bytes, first.path_id()));
         break;
     }
 
@@ -1495,13 +1510,13 @@ fn environment_object_graph_resolves_yaml_guid_to_loaded_serialized_file_object(
         let Some(file) = unity_file.as_serialized() else {
             continue;
         };
-        let Some(first) = file.objects.first() else {
+        let Some(first) = file.objects().first() else {
             continue;
         };
-        if first.path_id == 0 {
+        if first.path_id() == 0 {
             continue;
         }
-        extracted = Some((bytes, first.path_id));
+        extracted = Some((bytes, first.path_id()));
         break;
     }
 
@@ -2002,9 +2017,10 @@ fn environment_typed_audio_clip_helper_can_repoint_streamed_resource_and_reload(
 
     let mut env = Environment::new();
     env.load_file(&path).unwrap();
+    let mut budget = AssetLoadBudget::default();
 
     let entry = env
-        .bundle_container_entries(&path)
+        .bundle_container_entries(&path, &mut budget)
         .unwrap()
         .into_iter()
         .find(|e| e.asset_path.to_ascii_lowercase().ends_with("/cn_001.ogg"))
@@ -2034,9 +2050,10 @@ fn environment_typed_audio_clip_helper_can_repoint_streamed_resource_and_reload(
 
     let mut env2 = Environment::new();
     env2.load_file(&out_bundle_path).unwrap();
+    let mut budget2 = AssetLoadBudget::default();
 
     let entry2 = env2
-        .bundle_container_entries(&out_bundle_path)
+        .bundle_container_entries(&out_bundle_path, &mut budget2)
         .unwrap()
         .into_iter()
         .find(|e| e.asset_path.to_ascii_lowercase().ends_with("/cn_001.ogg"))

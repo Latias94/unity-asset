@@ -646,7 +646,7 @@ impl Environment {
             }
 
             let mut path_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
-            path_ids.extend(file.objects.iter().map(|o| o.path_id));
+            path_ids.extend(file.objects().iter().map(|o| o.path_id()));
 
             for handle in file.object_handles() {
                 if remaining == 0 {

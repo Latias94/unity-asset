@@ -90,7 +90,7 @@ impl BundleWriter {
             files.push((name.to_string(), flags, len_u64));
         }
 
-        let file_data = data_writer.into_bytes();
+        let file_data = data_writer.into_result()?;
 
         // Compress the file data into UnityFS blocks (UnityPy chunk_based_compress).
         let (file_data, block_info) = chunk_based_compress(&file_data, block_info_flag)?;
@@ -131,7 +131,7 @@ impl BundleWriter {
             block_writer.write_string_to_null(name);
         }
 
-        let uncompressed_block_data = block_writer.into_bytes();
+        let uncompressed_block_data = block_writer.into_result()?;
 
         let block_data = compress_unityfs_blob(&uncompressed_block_data, data_flag & 0x3F)?;
 
@@ -184,7 +184,7 @@ impl BundleWriter {
         writer.write_i64(writer_end_pos as i64);
         writer.set_position(writer_end_pos);
 
-        Ok(writer.into_bytes())
+        writer.into_result()
     }
 
     /// UnityWeb / UnityRaw (`BundleFile.save_web_raw`) implementation.
@@ -288,8 +288,8 @@ impl BundleWriter {
         directory_info_writer.write(&vec![0u8; (file_info_header_size - dir_len_u32) as usize]);
 
         let mut uncompressed_content = Vec::new();
-        uncompressed_content.extend_from_slice(&directory_info_writer.into_bytes());
-        uncompressed_content.extend_from_slice(&file_content_writer.into_bytes());
+        uncompressed_content.extend_from_slice(&directory_info_writer.into_result()?);
+        uncompressed_content.extend_from_slice(&file_content_writer.into_result()?);
 
         let uncompressed_size_u32 = u32::try_from(uncompressed_content.len()).map_err(|_| {
             UnityAssetError::format(format!(
@@ -356,7 +356,7 @@ impl BundleWriter {
         writer.align_stream(4);
         writer.write(&compressed_content);
 
-        Ok(writer.into_bytes())
+        writer.into_result()
     }
 }
 
@@ -500,7 +500,7 @@ mod tests {
             .expect("expected at least one serialized file node in saved bundle");
         let node_bytes = bundle.extract_node_data(node).unwrap();
         let sf = unity_asset_binary::asset::SerializedFileParser::from_bytes(node_bytes).unwrap();
-        assert!(!sf.objects.is_empty());
+        assert!(!sf.objects().is_empty());
     }
 
     #[test]
