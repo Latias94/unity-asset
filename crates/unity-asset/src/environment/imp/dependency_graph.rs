@@ -239,20 +239,20 @@ impl EnvironmentDependencyGraph {
         }
 
         while let Some((node, depth)) = queue.pop_front() {
-            if let Some(max) = options.max_nodes {
-                if visited.len() >= max {
-                    break;
-                }
+            if let Some(max) = options.max_nodes
+                && visited.len() >= max
+            {
+                break;
             }
 
             if !visited.insert(node.clone()) {
                 continue;
             }
 
-            if let Some(max) = options.max_depth {
-                if depth >= max {
-                    continue;
-                }
+            if let Some(max) = options.max_depth
+                && depth >= max
+            {
+                continue;
             }
 
             for next in self.neighbors_from(&node, options.follow_resolved_external) {

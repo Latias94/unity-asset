@@ -171,10 +171,10 @@ fn deps_fast(
                 if !fast_path::is_unityfs_bundle_path(path) {
                     continue;
                 }
-                if let Some(req) = requested_source.as_ref() {
-                    if !fast_path::path_matches_requested(path, req) {
-                        continue;
-                    }
+                if let Some(req) = requested_source.as_ref()
+                    && !fast_path::path_matches_requested(path, req)
+                {
+                    continue;
                 }
                 matching.push(path.clone());
             }
@@ -184,10 +184,10 @@ fn deps_fast(
                 if !fast_path::is_serialized_file_path(path) {
                     continue;
                 }
-                if let Some(req) = requested_source.as_ref() {
-                    if !fast_path::path_matches_requested(path, req) {
-                        continue;
-                    }
+                if let Some(req) = requested_source.as_ref()
+                    && !fast_path::path_matches_requested(path, req)
+                {
+                    continue;
                 }
                 matching.push(path.clone());
             }

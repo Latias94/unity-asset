@@ -82,11 +82,11 @@ impl DependencyFileIndex {
             }
 
             stats.files_visited += 1;
-            if let Some(max) = max_files {
-                if stats.files_visited > max {
-                    stats.truncated = true;
-                    break;
-                }
+            if let Some(max) = max_files
+                && stats.files_visited > max
+            {
+                stats.truncated = true;
+                break;
             }
 
             let path = canonicalize_if_exists(entry.path());
@@ -187,10 +187,10 @@ impl Environment {
         if joined.exists() {
             return Some(canonicalize_if_exists(&joined));
         }
-        if let Some(found) = find_sensitive_path(&self.base_path, p) {
-            if found.exists() {
-                return Some(canonicalize_if_exists(&found));
-            }
+        if let Some(found) = find_sensitive_path(&self.base_path, p)
+            && found.exists()
+        {
+            return Some(canonicalize_if_exists(&found));
         }
 
         let simple = simplify_name_str_for_lookup(raw)?;

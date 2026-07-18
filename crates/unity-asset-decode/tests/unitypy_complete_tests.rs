@@ -257,57 +257,56 @@ fn test_save_dict() {
     if let Ok(entries) = fs::read_dir(samples_path) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() {
-                if let Ok(data) = fs::read(&path) {
-                    let mut budget = AssetLoadBudget::default();
-                    // Try to load as AssetBundle
-                    if let Ok(bundle) =
-                        BundleParser::from_bytes_with_budget(data.clone(), &mut budget)
-                    {
-                        for asset in &bundle.assets {
-                            let objects = asset.objects();
-                            for obj in objects.iter().take(10) {
-                                // Limit to first 10 objects per file
-                                objects_tested += 1;
+            if path.is_file()
+                && let Ok(data) = fs::read(&path)
+            {
+                let mut budget = AssetLoadBudget::default();
+                // Try to load as AssetBundle
+                if let Ok(bundle) = BundleParser::from_bytes_with_budget(data.clone(), &mut budget)
+                {
+                    for asset in &bundle.assets {
+                        let objects = asset.objects();
+                        for obj in objects.iter().take(10) {
+                            // Limit to first 10 objects per file
+                            objects_tested += 1;
 
-                                // Get raw data (like obj.get_raw_data())
-                                let raw_data = asset.object_bytes(obj).unwrap_or(&[]);
+                            // Get raw data (like obj.get_raw_data())
+                            let raw_data = asset.object_bytes(obj).unwrap_or(&[]);
 
-                                // In UnityPy: obj.read_typetree(wrap=False) returns dict
-                                // For now, we simulate this operation
-                                // TODO: Implement actual TypeTree parsing
-                                let _properties: HashMap<String, String> = HashMap::new();
+                            // In UnityPy: obj.read_typetree(wrap=False) returns dict
+                            // For now, we simulate this operation
+                            // TODO: Implement actual TypeTree parsing
+                            let _properties: HashMap<String, String> = HashMap::new();
 
-                                // Simulate successful roundtrip for now
-                                // In a full implementation, we would:
-                                // 1. Parse object with TypeTree -> dict
-                                // 2. Serialize dict back to binary
-                                // 3. Compare with original raw_data
-                                successful_roundtrips += 1;
+                            // Simulate successful roundtrip for now
+                            // In a full implementation, we would:
+                            // 1. Parse object with TypeTree -> dict
+                            // 2. Serialize dict back to binary
+                            // 3. Compare with original raw_data
+                            successful_roundtrips += 1;
 
-                                if successful_roundtrips <= 3 {
-                                    println!(
-                                        "  ✓ Dict roundtrip for Class{} (PathID: {}) - {} bytes",
-                                        obj.class_id(),
-                                        obj.path_id(),
-                                        raw_data.len()
-                                    );
-                                }
-
-                                // Don't test too many objects to keep test fast
-                                if objects_tested >= 50 {
-                                    break;
-                                }
+                            if successful_roundtrips <= 3 {
+                                println!(
+                                    "  ✓ Dict roundtrip for Class{} (PathID: {}) - {} bytes",
+                                    obj.class_id(),
+                                    obj.path_id(),
+                                    raw_data.len()
+                                );
                             }
+
+                            // Don't test too many objects to keep test fast
                             if objects_tested >= 50 {
                                 break;
                             }
                         }
+                        if objects_tested >= 50 {
+                            break;
+                        }
                     }
+                }
 
-                    if objects_tested >= 50 {
-                        break;
-                    }
+                if objects_tested >= 50 {
+                    break;
                 }
             }
         }
@@ -392,18 +391,17 @@ fn test_typetree() {
                     // Try SerializedFile
                     else if let Ok(asset) =
                         SerializedFileParser::from_bytes_with_budget(data, &mut budget)
+                        && !asset.types().is_empty()
                     {
-                        if !asset.types().is_empty() {
-                            files_with_typetree += 1;
-                            total_typetree_nodes += asset.types().len();
-                            successful_parses += 1;
+                        files_with_typetree += 1;
+                        total_typetree_nodes += asset.types().len();
+                        successful_parses += 1;
 
-                            println!(
-                                "  ✓ {} - TypeTree nodes: {}",
-                                file_name,
-                                asset.types().len()
-                            );
-                        }
+                        println!(
+                            "  ✓ {} - TypeTree nodes: {}",
+                            file_name,
+                            asset.types().len()
+                        );
                     }
                 }
             }

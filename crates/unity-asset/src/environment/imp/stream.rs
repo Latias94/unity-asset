@@ -364,12 +364,11 @@ impl Environment {
                 // `canonicalize_if_exists` resolves symlinks. For streamed resources, Unity's
                 // on-disk lookup is relative to the *path the user opened* (e.g. a symlinked
                 // bundle next to its `.resource` file). Try the original path as a fallback.
-                if source_path != canonical {
-                    if let Ok(bytes) =
+                if source_path != canonical
+                    && let Ok(bytes) =
                         self.read_stream_data_from_fs(source_path, stream_path, offset, size)
-                    {
-                        return Ok(bytes);
-                    }
+                {
+                    return Ok(bytes);
                 }
                 Err(primary)
             }

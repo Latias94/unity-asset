@@ -314,10 +314,10 @@ async fn fetch_json(req: RequestBuilder, ctx: &str) -> Result<serde_json::Value>
 
     let parsed: Result<serde_json::Value, _> = serde_json::from_str(&body);
     if !status.is_success() {
-        if let Ok(json) = &parsed {
-            if let Some(msg) = json.get("error").and_then(|v| v.as_str()) {
-                anyhow::bail!("{ctx} failed: {status}: {msg}");
-            }
+        if let Ok(json) = &parsed
+            && let Some(msg) = json.get("error").and_then(|v| v.as_str())
+        {
+            anyhow::bail!("{ctx} failed: {status}: {msg}");
         }
         anyhow::bail!("{ctx} failed: {status}: {body}");
     }

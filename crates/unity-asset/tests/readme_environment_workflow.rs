@@ -30,11 +30,11 @@ fn readme_environment_workflow() -> unity_asset::Result<()> {
     env.load("tests/samples", &mut budget)?;
 
     let sources = env.binary_sources();
-    if let Some((_kind, source)) = sources.first() {
-        if let Some(object_ref) = env.find_binary_object_in_source_id(source, 1) {
-            let key = object_ref.key();
-            let _parsed = env.read_binary_object_key(&key, &mut budget)?;
-        }
+    if let Some((_kind, source)) = sources.first()
+        && let Some(object_ref) = env.find_binary_object_in_source_id(source, 1)
+    {
+        let key = object_ref.key();
+        let _parsed = env.read_binary_object_key(&key, &mut budget)?;
     }
 
     if let Some(object_ref) = env.find_binary_object(1) {

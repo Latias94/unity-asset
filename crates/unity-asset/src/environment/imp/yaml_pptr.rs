@@ -231,27 +231,26 @@ impl Environment {
 
                         let mut resolved: Option<EnvironmentObjectKey> = None;
                         if let Some(asset_source_path) = &asset_path {
-                            if let Some(targets) = anchor_index.get(asset_source_path) {
-                                if let Some(target) = targets.get(&file_id_str) {
-                                    resolved = Some(EnvironmentObjectKey::Yaml(target.clone()));
-                                }
+                            if let Some(targets) = anchor_index.get(asset_source_path)
+                                && let Some(target) = targets.get(&file_id_str)
+                            {
+                                resolved = Some(EnvironmentObjectKey::Yaml(target.clone()));
                             }
-                            if resolved.is_none() {
-                                if let Some(obj_ref) = self
+                            if resolved.is_none()
+                                && let Some(obj_ref) = self
                                     .find_binary_object_in_source(asset_source_path, pptr.file_id)
-                                {
-                                    resolved = Some(EnvironmentObjectKey::Binary(obj_ref.key()));
-                                }
+                            {
+                                resolved = Some(EnvironmentObjectKey::Binary(obj_ref.key()));
                             }
                         }
 
                         (asset_path, resolved)
                     } else {
                         let mut resolved: Option<EnvironmentObjectKey> = None;
-                        if let Some(anchors) = anchors {
-                            if let Some(target) = anchors.get(&file_id_str) {
-                                resolved = Some(EnvironmentObjectKey::Yaml(target.clone()));
-                            }
+                        if let Some(anchors) = anchors
+                            && let Some(target) = anchors.get(&file_id_str)
+                        {
+                            resolved = Some(EnvironmentObjectKey::Yaml(target.clone()));
                         }
                         (None, resolved)
                     };

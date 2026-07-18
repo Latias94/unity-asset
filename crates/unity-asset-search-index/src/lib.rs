@@ -708,14 +708,14 @@ impl SearchIndex {
         let mut cache = self.enrich_cache.lock().ok()?;
         let now = cache.touch();
 
-        if let Some(entry) = cache.files.get_mut(rel_path) {
-            if entry.fingerprint == fingerprint {
-                entry.last_used = now;
-                if entry.is_yaml {
-                    return Some((entry.hierarchy_paths.clone(), entry.script_guids.clone()));
-                }
-                return None;
+        if let Some(entry) = cache.files.get_mut(rel_path)
+            && entry.fingerprint == fingerprint
+        {
+            entry.last_used = now;
+            if entry.is_yaml {
+                return Some((entry.hierarchy_paths.clone(), entry.script_guids.clone()));
             }
+            return None;
         }
 
         let text = read_text_limited(&abs, 2 * 1024 * 1024).ok().flatten();
@@ -2981,10 +2981,10 @@ where
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    if let Ok(mut err) = err.lock() {
-                        if err.is_none() {
-                            *err = Some(e);
-                        }
+                    if let Ok(mut err) = err.lock()
+                        && err.is_none()
+                    {
+                        *err = Some(e);
                     }
                     return WalkState::Quit;
                 }
@@ -2993,10 +2993,10 @@ where
         })
     });
 
-    if let Ok(mut err) = err.lock() {
-        if let Some(e) = err.take() {
-            return Err(e);
-        }
+    if let Ok(mut err) = err.lock()
+        && let Some(e) = err.take()
+    {
+        return Err(e);
     }
 
     let mut locked = out.lock().map_err(|_| anyhow!("poisoned lock"))?;
@@ -3097,11 +3097,12 @@ fn build_script_guid_map(
             continue;
         }
 
-        if let Some(prev) = previous.get(&guid) {
-            if prev.fingerprint == file.fingerprint && prev.rel_path == file.rel_path {
-                out.insert(guid, prev.clone());
-                continue;
-            }
+        if let Some(prev) = previous.get(&guid)
+            && prev.fingerprint == file.fingerprint
+            && prev.rel_path == file.rel_path
+        {
+            out.insert(guid, prev.clone());
+            continue;
         }
 
         let text = read_text_limited(&file.abs_path, 256 * 1024)?;
@@ -3143,10 +3144,11 @@ fn update_script_map_for_file(
         return Ok(());
     }
 
-    if let Some(existing) = scripts.get(&guid) {
-        if existing.rel_path == file.rel_path && existing.fingerprint == file.fingerprint {
-            return Ok(());
-        }
+    if let Some(existing) = scripts.get(&guid)
+        && existing.rel_path == file.rel_path
+        && existing.fingerprint == file.fingerprint
+    {
+        return Ok(());
     }
 
     let text = read_text_limited(&file.abs_path, 256 * 1024)?;
@@ -3812,10 +3814,10 @@ fn extract_reference_contexts_from_yaml(
         if !line.contains(guid_needle) {
             continue;
         }
-        if let Some(fid) = fileid_needle.as_deref() {
-            if !line.contains(fid) {
-                continue;
-            }
+        if let Some(fid) = fileid_needle.as_deref()
+            && !line.contains(fid)
+        {
+            continue;
         }
 
         let field_hint = guess_field_hint(line);
@@ -3936,10 +3938,10 @@ fn group_reference_contexts_and_objects(
             }
         }
 
-        if let Some(hint) = ctx.field_hint {
-            if !hint.trim().is_empty() {
-                entry.1.insert(hint);
-            }
+        if let Some(hint) = ctx.field_hint
+            && !hint.trim().is_empty()
+        {
+            entry.1.insert(hint);
         }
     }
 
@@ -4226,16 +4228,16 @@ fn analyze_unity_yaml_docs(text: &str) -> YamlAnalysis {
 
         match header.class_id {
             1 => {
-                if let Some(name) = parse_unity_yaml_scalar(line, "m_Name") {
-                    if !name.trim().is_empty() {
-                        analysis
-                            .go_names
-                            .entry(header.file_id)
-                            .or_insert(name.clone());
-                        analysis.docs.entry(header.file_id).and_modify(|d| {
-                            d.name.get_or_insert(name);
-                        });
-                    }
+                if let Some(name) = parse_unity_yaml_scalar(line, "m_Name")
+                    && !name.trim().is_empty()
+                {
+                    analysis
+                        .go_names
+                        .entry(header.file_id)
+                        .or_insert(name.clone());
+                    analysis.docs.entry(header.file_id).and_modify(|d| {
+                        d.name.get_or_insert(name);
+                    });
                 }
             }
             4 | 224 => {
@@ -4262,12 +4264,11 @@ fn analyze_unity_yaml_docs(text: &str) -> YamlAnalysis {
                         name: None,
                         game_object_id: None,
                     });
-                if doc.name.is_none() {
-                    if let Some(name) = parse_unity_yaml_scalar(line, "m_Name") {
-                        if !name.trim().is_empty() {
-                            doc.name = Some(name);
-                        }
-                    }
+                if doc.name.is_none()
+                    && let Some(name) = parse_unity_yaml_scalar(line, "m_Name")
+                    && !name.trim().is_empty()
+                {
+                    doc.name = Some(name);
                 }
                 if doc.game_object_id.is_none() && line.contains("m_GameObject:") {
                     doc.game_object_id = parse_file_id(line);
@@ -4473,10 +4474,10 @@ fn extract_unity_yaml_hierarchy_paths(text: &str) -> Vec<String> {
 
         match class_id {
             1 => {
-                if let Some(name) = parse_unity_yaml_scalar(line, "m_Name") {
-                    if !name.trim().is_empty() {
-                        go_names.entry(file_id).or_insert(name);
-                    }
+                if let Some(name) = parse_unity_yaml_scalar(line, "m_Name")
+                    && !name.trim().is_empty()
+                {
+                    go_names.entry(file_id).or_insert(name);
                 }
             }
             4 | 224 => {

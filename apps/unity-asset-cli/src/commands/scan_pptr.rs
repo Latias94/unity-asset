@@ -197,10 +197,10 @@ fn scan_pptr_fast(
             if remaining == 0 {
                 break;
             }
-            if let Some(req) = requested_source.as_ref() {
-                if !fast_path::path_matches_requested(path, req) {
-                    continue;
-                }
+            if let Some(req) = requested_source.as_ref()
+                && !fast_path::path_matches_requested(path, req)
+            {
+                continue;
             }
 
             if !fast_path::is_unityfs_bundle_path(path) {
@@ -352,10 +352,10 @@ fn scan_pptr_fast(
             if remaining == 0 {
                 break;
             }
-            if let Some(req) = requested_source.as_ref() {
-                if !fast_path::path_matches_requested(path, req) {
-                    continue;
-                }
+            if let Some(req) = requested_source.as_ref()
+                && !fast_path::path_matches_requested(path, req)
+            {
+                continue;
             }
 
             if !fast_path::is_serialized_file_path(path) {
@@ -460,20 +460,20 @@ fn scan_pptr_env_fallback(
             if remaining == 0 {
                 break;
             }
-            if let Some(resolved) = &resolved_bundle_source {
-                if resolved != bundle_key {
-                    continue;
-                }
+            if let Some(resolved) = &resolved_bundle_source
+                && resolved != bundle_key
+            {
+                continue;
             }
 
             for (idx, file) in bundle.assets.iter().enumerate() {
                 if remaining == 0 {
                     break;
                 }
-                if let Some(filter_idx) = asset_index {
-                    if filter_idx != idx {
-                        continue;
-                    }
+                if let Some(filter_idx) = asset_index
+                    && filter_idx != idx
+                {
+                    continue;
                 }
                 scan_pptr_scan_file(
                     &input,
@@ -499,10 +499,10 @@ fn scan_pptr_env_fallback(
             if remaining == 0 {
                 break;
             }
-            if let Some(resolved) = &resolved_serialized_source {
-                if resolved != asset_key {
-                    continue;
-                }
+            if let Some(resolved) = &resolved_serialized_source
+                && resolved != asset_key
+            {
+                continue;
             }
             scan_pptr_scan_file(
                 &input,

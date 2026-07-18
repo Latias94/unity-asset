@@ -643,10 +643,10 @@ pub(crate) fn resolve_loaded_source(
     if let Some(requested_canon) = requested_canon {
         let mut matches = Vec::new();
         for k in &keys {
-            if let Ok(k_canon) = std::fs::canonicalize(k) {
-                if k_canon == requested_canon {
-                    matches.push((*k).clone());
-                }
+            if let Ok(k_canon) = std::fs::canonicalize(k)
+                && k_canon == requested_canon
+            {
+                matches.push((*k).clone());
             }
         }
         if matches.len() == 1 {

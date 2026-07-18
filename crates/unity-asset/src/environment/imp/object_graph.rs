@@ -153,20 +153,20 @@ impl EnvironmentObjectGraph {
         }
 
         while let Some((node, depth)) = queue.pop_front() {
-            if let Some(max) = options.max_nodes {
-                if visited.len() >= max {
-                    break;
-                }
+            if let Some(max) = options.max_nodes
+                && visited.len() >= max
+            {
+                break;
             }
 
             if !visited.insert(node.clone()) {
                 continue;
             }
 
-            if let Some(max) = options.max_depth {
-                if depth >= max {
-                    continue;
-                }
+            if let Some(max) = options.max_depth
+                && depth >= max
+            {
+                continue;
             }
 
             for next in self.neighbors_from(&node, options.follow_resolved_external) {
@@ -499,20 +499,20 @@ impl Environment {
                             let asset_path = self.asset_path_for_guid(guid);
                             let mut resolved: Option<EnvironmentObjectKey> = None;
                             if let Some(p) = &asset_path {
-                                if let Some(targets) = anchor_index.get(p) {
-                                    if let Some(target) = targets.get(&r.file_id.to_string()) {
-                                        resolved = Some(EnvironmentObjectKey::Yaml(target.clone()));
-                                    }
+                                if let Some(targets) = anchor_index.get(p)
+                                    && let Some(target) = targets.get(&r.file_id.to_string())
+                                {
+                                    resolved = Some(EnvironmentObjectKey::Yaml(target.clone()));
                                 }
 
-                                if resolved.is_none() && options.include_binary {
-                                    if let Some(obj_ref) =
+                                if resolved.is_none()
+                                    && options.include_binary
+                                    && let Some(obj_ref) =
                                         self.find_binary_object_in_source(p, r.file_id)
-                                    {
-                                        let key = EnvironmentObjectKey::Binary(obj_ref.key());
-                                        nodes_set.insert(key.clone());
-                                        resolved = Some(key);
-                                    }
+                                {
+                                    let key = EnvironmentObjectKey::Binary(obj_ref.key());
+                                    nodes_set.insert(key.clone());
+                                    resolved = Some(key);
                                 }
                             }
                             external_from.entry(from_key.clone()).or_default().push(

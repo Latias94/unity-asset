@@ -106,10 +106,10 @@ fn find_object_env_fallback(
         entries.sort_by(|a, b| a.asset_path.cmp(&b.asset_path));
 
         for entry in entries {
-            if let Some(max) = limit {
-                if count >= max {
-                    return Ok(());
-                }
+            if let Some(max) = limit
+                && count >= max
+            {
+                return Ok(());
             }
 
             if !container_asset_path_matches_ci(&entry.asset_path, &pattern) {
@@ -247,10 +247,10 @@ fn find_object_fast(
     let mut processed_any_bundle = false;
     let mut count = 0usize;
     for path in candidate_paths {
-        if let Some(max) = limit {
-            if count >= max {
-                break;
-            }
+        if let Some(max) = limit
+            && count >= max
+        {
+            break;
         }
 
         if !fast_path::is_unityfs_bundle_path(&path) {
@@ -308,10 +308,10 @@ fn find_object_fast(
         };
 
         for entry in entries {
-            if let Some(max) = limit {
-                if count >= max {
-                    return Ok(true);
-                }
+            if let Some(max) = limit
+                && count >= max
+            {
+                return Ok(true);
             }
 
             if !container_asset_path_matches_ci(&entry.asset_path, pattern) {

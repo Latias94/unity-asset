@@ -114,16 +114,16 @@ fn magic_based_extension(asset_path: &str, bytes: &[u8]) -> Option<&'static str>
 
 #[cfg(feature = "decode")]
 fn text_asset_bytes(obj: &UnityObject) -> Vec<u8> {
-    if let Some(UnityValue::String(s)) = obj.get("m_Script") {
-        if !s.is_empty() {
-            return s.as_bytes().to_vec();
-        }
+    if let Some(UnityValue::String(s)) = obj.get("m_Script")
+        && !s.is_empty()
+    {
+        return s.as_bytes().to_vec();
     }
 
-    if let Some(UnityValue::String(s)) = obj.get("m_Text") {
-        if !s.is_empty() {
-            return s.as_bytes().to_vec();
-        }
+    if let Some(UnityValue::String(s)) = obj.get("m_Text")
+        && !s.is_empty()
+    {
+        return s.as_bytes().to_vec();
     }
 
     for key in ["m_Bytes", "m_Data"] {
@@ -330,10 +330,10 @@ fn file_len(path: &Path) -> Option<u64> {
 }
 
 fn write_export_manifest(path: &Path, manifest: ExportManifest) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     let tmp = path.with_extension("tmp");
@@ -492,10 +492,10 @@ fn export_bundle_command(
 
     if let Some(jobs) = retry_failed_jobs.take() {
         for mut job in jobs {
-            if let Some(max) = limit {
-                if planned >= max {
-                    break;
-                }
+            if let Some(max) = limit
+                && planned >= max
+            {
+                break;
             }
 
             if !class_ids.is_empty() || !class_name_lc.is_empty() {
@@ -529,10 +529,10 @@ fn export_bundle_command(
             entries.sort_by(|a, b| a.asset_path.cmp(&b.asset_path));
 
             for entry in entries {
-                if let Some(max) = limit {
-                    if planned >= max {
-                        break;
-                    }
+                if let Some(max) = limit
+                    && planned >= max
+                {
+                    break;
                 }
                 let Some(key) = entry.key else {
                     skipped += 1;
@@ -542,45 +542,42 @@ fn export_bundle_command(
                 let address = object_address_for_key(&env, &input, &key)?;
                 let resume_key = (entry.asset_path.clone(), address.clone());
                 let effective_skip_existing = skip_existing || resume.is_some();
-                if effective_skip_existing && !overwrite {
-                    if let Some(prev) = resume_map.get(&resume_key) {
-                        if let Some(p) = prev.output_path.as_ref() {
-                            let prev_path = PathBuf::from(p);
-                            if prev_path.exists()
-                                && matches!(
-                                    prev.status,
-                                    ExportStatus::ExportedRaw
-                                        | ExportStatus::ExportedDecoded
-                                        | ExportStatus::SkippedExisting
-                                        | ExportStatus::Resumed
-                                )
-                            {
-                                resumed += 1;
-                                planned += 1;
-                                pre_outcomes.push(ExportOutcome {
-                                    order,
-                                    message: format!(
-                                        "↷ {} -> {:?} (resumed)",
-                                        entry.asset_path, prev_path
-                                    ),
-                                    did_export: false,
-                                    did_skip_existing: true,
-                                    entry: ExportManifestEntry {
-                                        order,
-                                        asset_path: entry.asset_path.clone(),
-                                        address,
-                                        type_id: prev.type_id,
-                                        class_name: prev.class_name.clone(),
-                                        status: ExportStatus::Resumed,
-                                        output_path: Some(prev_path.to_string_lossy().to_string()),
-                                        output_bytes: prev.output_bytes,
-                                        error: None,
-                                    },
-                                });
-                                order += 1;
-                                continue;
-                            }
-                        }
+                if effective_skip_existing
+                    && !overwrite
+                    && let Some(prev) = resume_map.get(&resume_key)
+                    && let Some(p) = prev.output_path.as_ref()
+                {
+                    let prev_path = PathBuf::from(p);
+                    if prev_path.exists()
+                        && matches!(
+                            prev.status,
+                            ExportStatus::ExportedRaw
+                                | ExportStatus::ExportedDecoded
+                                | ExportStatus::SkippedExisting
+                                | ExportStatus::Resumed
+                        )
+                    {
+                        resumed += 1;
+                        planned += 1;
+                        pre_outcomes.push(ExportOutcome {
+                            order,
+                            message: format!("↷ {} -> {:?} (resumed)", entry.asset_path, prev_path),
+                            did_export: false,
+                            did_skip_existing: true,
+                            entry: ExportManifestEntry {
+                                order,
+                                asset_path: entry.asset_path.clone(),
+                                address,
+                                type_id: prev.type_id,
+                                class_name: prev.class_name.clone(),
+                                status: ExportStatus::Resumed,
+                                output_path: Some(prev_path.to_string_lossy().to_string()),
+                                output_bytes: prev.output_bytes,
+                                error: None,
+                            },
+                        });
+                        order += 1;
+                        continue;
                     }
                 }
 
@@ -1079,11 +1076,9 @@ fn export_one_entry(
     let mut dest = output.join(sanitize_asset_path(asset_path));
     dest.set_extension("bin");
 
-    if decode {
-        if let Some(ext) = magic_based_extension(asset_path, bytes) {
-            dest = output.join(sanitize_asset_path(asset_path));
-            dest.set_extension(ext);
-        }
+    if decode && let Some(ext) = magic_based_extension(asset_path, bytes) {
+        dest = output.join(sanitize_asset_path(asset_path));
+        dest.set_extension(ext);
     }
 
     if skip_existing && dest.exists() && !overwrite {
@@ -1248,15 +1243,15 @@ fn try_decode_export_best_effort(
                     })
                 }
                 _ => {
-                    if clip.is_streamed() {
-                        if let Ok(bytes) = env.read_stream_data_source(
+                    if clip.is_streamed()
+                        && let Ok(bytes) = env.read_stream_data_source(
                             &key.source,
                             key.source_kind,
                             &clip.stream_info.path,
                             clip.stream_info.offset,
                             clip.stream_info.size,
-                        ) {
-                            if !bytes.is_empty() {
+                        )
+                            && !bytes.is_empty() {
                                 let ext = std::path::Path::new(asset_path)
                                     .extension()
                                     .and_then(|e| e.to_str())
@@ -1276,8 +1271,6 @@ fn try_decode_export_best_effort(
                                     output_bytes: Some(bytes.len() as u64),
                                 });
                             }
-                        }
-                    }
 
                     dest.set_extension("wav");
                     if skip_existing && dest.exists() && !overwrite {
@@ -1310,20 +1303,18 @@ fn try_decode_export_best_effort(
 
             let texture_processor = TextureProcessor::new(unity_version);
             let mut texture = texture_processor.convert_object(obj)?;
-            if texture.image_data.is_empty() && texture.is_streamed() {
-                if let Ok(bytes) = env.read_stream_data_source(
+            if texture.image_data.is_empty() && texture.is_streamed()
+                && let Ok(bytes) = env.read_stream_data_source(
                     &key.source,
                     key.source_kind,
                     &texture.stream_info.path,
                     texture.stream_info.offset,
                     texture.stream_info.size,
-                ) {
-                    if !bytes.is_empty() {
+                )
+                    && !bytes.is_empty() {
                         texture.data_size = bytes.len() as i32;
                         texture.image_data = bytes;
                     }
-                }
-            }
 
             let image = texture_processor.decode_texture(&texture)?;
             TextureExporter::export_auto(&image, &dest)?;
@@ -1393,20 +1384,18 @@ fn try_decode_export_best_effort(
 
             let texture_processor = TextureProcessor::new(unity_version);
             let mut texture = texture_processor.convert_object(&texture_obj)?;
-            if texture.image_data.is_empty() && texture.is_streamed() {
-                if let Ok(bytes) = env.read_stream_data_source(
+            if texture.image_data.is_empty() && texture.is_streamed()
+                && let Ok(bytes) = env.read_stream_data_source(
                     &key.source,
                     key.source_kind,
                     &texture.stream_info.path,
                     texture.stream_info.offset,
                     texture.stream_info.size,
-                ) {
-                    if !bytes.is_empty() {
+                )
+                    && !bytes.is_empty() {
                         texture.data_size = bytes.len() as i32;
                         texture.image_data = bytes;
                     }
-                }
-            }
 
             let png_bytes = sprite_processor.extract_sprite_image(&sprite, &texture)?;
 

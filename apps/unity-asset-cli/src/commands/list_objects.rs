@@ -25,10 +25,10 @@ struct ListObjectRecord {
 
 fn best_effort_class_name(file: &SerializedFile, class_id: i32) -> String {
     if let Some(t) = file.find_type(class_id) {
-        if let Some(root) = t.type_tree.nodes.first() {
-            if !root.type_name.is_empty() {
-                return root.type_name.clone();
-            }
+        if let Some(root) = t.type_tree.nodes.first()
+            && !root.type_name.is_empty()
+        {
+            return root.type_name.clone();
         }
         if !t.class_name.is_empty() {
             return t.class_name.clone();
@@ -273,10 +273,10 @@ fn list_bundles(
             if *printed >= limit {
                 return Ok(());
             }
-            if let Some(filter_idx) = asset_index {
-                if idx != filter_idx {
-                    continue;
-                }
+            if let Some(filter_idx) = asset_index
+                && idx != filter_idx
+            {
+                continue;
             }
 
             for handle in asset.object_handles() {

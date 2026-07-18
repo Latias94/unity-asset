@@ -55,10 +55,10 @@ fn sanitize_asset_path(asset_path: &str) -> PathBuf {
 
 fn best_effort_class_name(file: &SerializedFile, class_id: i32) -> String {
     if let Some(t) = file.find_type(class_id) {
-        if let Some(root) = t.type_tree.nodes.first() {
-            if !root.type_name.is_empty() {
-                return root.type_name.clone();
-            }
+        if let Some(root) = t.type_tree.nodes.first()
+            && !root.type_name.is_empty()
+        {
+            return root.type_name.clone();
         }
         if !t.class_name.is_empty() {
             return t.class_name.clone();
@@ -82,12 +82,11 @@ fn source_rel_for_output(input: &Path, source: &BinarySource) -> String {
             .to_string();
     }
 
-    if let Ok(rel) = p.strip_prefix(input) {
-        if let Some(s) = rel.to_str() {
-            if !s.is_empty() {
-                return s.to_string();
-            }
-        }
+    if let Ok(rel) = p.strip_prefix(input)
+        && let Some(s) = rel.to_str()
+        && !s.is_empty()
+    {
+        return s.to_string();
     }
 
     p.file_name()
@@ -168,10 +167,10 @@ fn now_unix_ms() -> u128 {
 }
 
 fn write_export_manifest(path: &Path, manifest: &ExportManifest) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     let tmp = path.with_extension("tmp");
@@ -367,10 +366,10 @@ pub(crate) fn run(
             let src_dir = sanitize_asset_path(&src_rel);
 
             for handle in file.object_handles() {
-                if let Some(max) = limit {
-                    if export_jobs.len() + pre_entries.len() >= max {
-                        break;
-                    }
+                if let Some(max) = limit
+                    && export_jobs.len() + pre_entries.len() >= max
+                {
+                    break;
                 }
 
                 let cid = handle.class_id();
@@ -419,35 +418,35 @@ pub(crate) fn run(
                 };
                 let address = object_address_for_key(&env, &input, &key)?;
 
-                if effective_skip_existing && !overwrite {
-                    if let Some(prev) = resume_map.get(&address) {
-                        if let Some(p) = prev.output_path.as_ref() {
-                            let prev_path = PathBuf::from(p);
-                            if prev_path.exists()
-                                && matches!(
-                                    prev.status,
-                                    ExportStatus::ExportedRaw
-                                        | ExportStatus::ExportedDecoded
-                                        | ExportStatus::SkippedExisting
-                                        | ExportStatus::Resumed
-                                )
-                            {
-                                resumed += 1;
-                                pre_entries.push(ExportManifestEntry {
-                                    order,
-                                    address,
-                                    class_id: Some(cid),
-                                    class_name: Some(class.clone()),
-                                    name: peek_name.clone(),
-                                    status: ExportStatus::Resumed,
-                                    output_path: Some(prev_path.to_string_lossy().to_string()),
-                                    output_bytes: prev.output_bytes,
-                                    error: None,
-                                });
-                                order += 1;
-                                continue;
-                            }
-                        }
+                if effective_skip_existing
+                    && !overwrite
+                    && let Some(prev) = resume_map.get(&address)
+                    && let Some(p) = prev.output_path.as_ref()
+                {
+                    let prev_path = PathBuf::from(p);
+                    if prev_path.exists()
+                        && matches!(
+                            prev.status,
+                            ExportStatus::ExportedRaw
+                                | ExportStatus::ExportedDecoded
+                                | ExportStatus::SkippedExisting
+                                | ExportStatus::Resumed
+                        )
+                    {
+                        resumed += 1;
+                        pre_entries.push(ExportManifestEntry {
+                            order,
+                            address,
+                            class_id: Some(cid),
+                            class_name: Some(class.clone()),
+                            name: peek_name.clone(),
+                            status: ExportStatus::Resumed,
+                            output_path: Some(prev_path.to_string_lossy().to_string()),
+                            output_bytes: prev.output_bytes,
+                            error: None,
+                        });
+                        order += 1;
+                        continue;
                     }
                 }
 
@@ -775,16 +774,16 @@ fn export_one_inner(
 
 #[cfg(feature = "decode")]
 fn text_asset_bytes(obj: &UnityObject) -> Vec<u8> {
-    if let Some(UnityValue::String(s)) = obj.get("m_Script") {
-        if !s.is_empty() {
-            return s.as_bytes().to_vec();
-        }
+    if let Some(UnityValue::String(s)) = obj.get("m_Script")
+        && !s.is_empty()
+    {
+        return s.as_bytes().to_vec();
     }
 
-    if let Some(UnityValue::String(s)) = obj.get("m_Text") {
-        if !s.is_empty() {
-            return s.as_bytes().to_vec();
-        }
+    if let Some(UnityValue::String(s)) = obj.get("m_Text")
+        && !s.is_empty()
+    {
+        return s.as_bytes().to_vec();
     }
 
     for key in ["m_Bytes", "m_Data"] {
@@ -863,28 +862,26 @@ fn try_decode_export_best_effort(
                     return Ok(Some((dest, true, Some(audio_bytes.len() as u64))));
                 }
                 _ => {
-                    if clip.is_streamed() {
-                        if let Ok(bytes) = env.read_stream_data_source(
+                    if clip.is_streamed()
+                        && let Ok(bytes) = env.read_stream_data_source(
                             &job.key.source,
                             job.key.source_kind,
                             &clip.stream_info.path,
                             clip.stream_info.offset,
                             clip.stream_info.size,
-                        ) {
-                            if !bytes.is_empty() {
-                                dest.set_extension(clip.compression_format().extension());
-                                if job.effective_skip_existing && dest.exists() && !job.overwrite {
-                                    let existing_len =
-                                        std::fs::metadata(&dest).map(|m| m.len()).ok();
-                                    return Ok(Some((dest, false, existing_len)));
-                                }
-                                if let Some(parent) = dest.parent() {
-                                    std::fs::create_dir_all(parent)?;
-                                }
-                                std::fs::write(&dest, &bytes)?;
-                                return Ok(Some((dest, true, Some(bytes.len() as u64))));
-                            }
+                        )
+                        && !bytes.is_empty()
+                    {
+                        dest.set_extension(clip.compression_format().extension());
+                        if job.effective_skip_existing && dest.exists() && !job.overwrite {
+                            let existing_len = std::fs::metadata(&dest).map(|m| m.len()).ok();
+                            return Ok(Some((dest, false, existing_len)));
                         }
+                        if let Some(parent) = dest.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::write(&dest, &bytes)?;
+                        return Ok(Some((dest, true, Some(bytes.len() as u64))));
                     }
 
                     dest.set_extension("wav");
@@ -915,19 +912,19 @@ fn try_decode_export_best_effort(
 
             let texture_processor = TextureProcessor::new(unity_version);
             let mut texture = texture_processor.convert_object(obj)?;
-            if texture.image_data.is_empty() && texture.is_streamed() {
-                if let Ok(bytes) = env.read_stream_data_source(
+            if texture.image_data.is_empty()
+                && texture.is_streamed()
+                && let Ok(bytes) = env.read_stream_data_source(
                     &job.key.source,
                     job.key.source_kind,
                     &texture.stream_info.path,
                     texture.stream_info.offset,
                     texture.stream_info.size,
-                ) {
-                    if !bytes.is_empty() {
-                        texture.data_size = bytes.len() as i32;
-                        texture.image_data = bytes;
-                    }
-                }
+                )
+                && !bytes.is_empty()
+            {
+                texture.data_size = bytes.len() as i32;
+                texture.image_data = bytes;
             }
 
             let image = texture_processor.decode_texture(&texture)?;
@@ -985,19 +982,19 @@ fn try_decode_export_best_effort(
 
             let texture_processor = TextureProcessor::new(unity_version);
             let mut texture = texture_processor.convert_object(&texture_obj)?;
-            if texture.image_data.is_empty() && texture.is_streamed() {
-                if let Ok(bytes) = env.read_stream_data_source(
+            if texture.image_data.is_empty()
+                && texture.is_streamed()
+                && let Ok(bytes) = env.read_stream_data_source(
                     &job.key.source,
                     job.key.source_kind,
                     &texture.stream_info.path,
                     texture.stream_info.offset,
                     texture.stream_info.size,
-                ) {
-                    if !bytes.is_empty() {
-                        texture.data_size = bytes.len() as i32;
-                        texture.image_data = bytes;
-                    }
-                }
+                )
+                && !bytes.is_empty()
+            {
+                texture.data_size = bytes.len() as i32;
+                texture.image_data = bytes;
             }
 
             let png_bytes = sprite_processor.extract_sprite_image(&sprite, &texture)?;

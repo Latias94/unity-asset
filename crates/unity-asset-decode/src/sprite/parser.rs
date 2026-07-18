@@ -215,10 +215,10 @@ impl SpriteParser {
     ) -> Result<()> {
         if let UnityValue::Object(rd_obj) = render_data_value {
             // Extract texture reference
-            if let Some(UnityValue::Object(texture_obj)) = rd_obj.get("texture") {
-                if let Some(UnityValue::Integer(path_id)) = texture_obj.get("m_PathID") {
-                    sprite.render_data.texture_path_id = *path_id;
-                }
+            if let Some(UnityValue::Object(texture_obj)) = rd_obj.get("texture")
+                && let Some(UnityValue::Integer(path_id)) = texture_obj.get("m_PathID")
+            {
+                sprite.render_data.texture_path_id = *path_id;
             }
 
             // Extract texture rect
@@ -264,10 +264,10 @@ impl SpriteParser {
         sprite: &mut Sprite,
         sprite_atlas_value: &UnityValue,
     ) -> Result<()> {
-        if let UnityValue::Object(atlas_obj) = sprite_atlas_value {
-            if let Some(UnityValue::Integer(path_id)) = atlas_obj.get("m_PathID") {
-                sprite.sprite_atlas_path_id = Some(*path_id);
-            }
+        if let UnityValue::Object(atlas_obj) = sprite_atlas_value
+            && let Some(UnityValue::Integer(path_id)) = atlas_obj.get("m_PathID")
+        {
+            sprite.sprite_atlas_path_id = Some(*path_id);
         }
         Ok(())
     }

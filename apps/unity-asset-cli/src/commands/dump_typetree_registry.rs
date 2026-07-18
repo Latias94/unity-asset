@@ -82,10 +82,10 @@ pub(crate) fn run(
         };
 
         for t in file.types() {
-            if let Some(filter) = class_filter.as_ref() {
-                if !filter.contains(&t.class_id) {
-                    continue;
-                }
+            if let Some(filter) = class_filter.as_ref()
+                && !filter.contains(&t.class_id)
+            {
+                continue;
             }
 
             if t.type_tree.is_empty() {

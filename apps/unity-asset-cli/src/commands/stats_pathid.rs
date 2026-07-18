@@ -63,10 +63,10 @@ impl PathIdStats {
             self.min = Some(self.min.map_or(pid, |m| m.min(pid)));
             self.max = Some(self.max.map_or(pid, |m| m.max(pid)));
 
-            if let Some(ref mut set) = seen {
-                if !set.insert(pid) {
-                    file_duplicate_count += 1;
-                }
+            if let Some(ref mut set) = seen
+                && !set.insert(pid)
+            {
+                file_duplicate_count += 1;
             }
         }
 
