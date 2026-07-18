@@ -237,6 +237,98 @@ fn structural_preflights_are_cumulative_and_do_not_charge_usage() {
 }
 
 #[test]
+fn depth_scopes_compose_and_restore_the_outer_base() {
+    let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_depth: 8,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+
+    {
+        let mut outer = budget.enter_depth(2).unwrap();
+        outer.observe_depth(1).unwrap();
+        assert_eq!(outer.usage().max_observed_depth, 3);
+
+        {
+            let mut inner = outer.enter_depth(3).unwrap();
+            inner.observe_depth(1).unwrap();
+            assert_eq!(inner.usage().max_observed_depth, 6);
+        }
+
+        outer.observe_depth(3).unwrap();
+        assert_eq!(outer.usage().max_observed_depth, 6);
+    }
+
+    budget.observe_depth(5).unwrap();
+    assert_eq!(budget.usage().max_observed_depth, 6);
+}
+
+#[test]
+fn rejected_depth_scopes_and_observations_are_failure_atomic() {
+    let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_depth: 5,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    budget.consume_entries(1).unwrap();
+    budget.consume_bytes(2).unwrap();
+
+    {
+        let mut outer = budget.enter_depth(4).unwrap();
+        let before = outer.usage();
+        assert!(matches!(
+            outer.enter_depth(2),
+            Err(BudgetError::Exceeded {
+                resource: "depth",
+                limit: 5,
+                requested: 6,
+            })
+        ));
+        assert_eq!(outer.usage(), before);
+
+        outer.observe_depth(1).unwrap();
+        let before = outer.usage();
+        assert!(matches!(
+            outer.observe_depth(2),
+            Err(BudgetError::Exceeded {
+                resource: "depth",
+                limit: 5,
+                requested: 6,
+            })
+        ));
+        assert_eq!(outer.usage(), before);
+    }
+
+    budget.observe_depth(3).unwrap();
+    assert_eq!(budget.usage().max_observed_depth, 5);
+    assert_eq!(budget.usage().entries, 1);
+    assert_eq!(budget.usage().bytes, 2);
+}
+
+#[test]
+fn overflowing_nested_depth_scope_preserves_the_active_base() {
+    let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_depth: u32::MAX,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+
+    {
+        let mut outer = budget.enter_depth(u32::MAX).unwrap();
+        let before = outer.usage();
+        assert!(matches!(
+            outer.enter_depth(1),
+            Err(BudgetError::ArithmeticOverflow { resource: "depth" })
+        ));
+        assert_eq!(outer.usage(), before);
+        outer.observe_depth(0).unwrap();
+    }
+
+    budget.observe_depth(1).unwrap();
+    assert_eq!(budget.usage().max_observed_depth, u32::MAX);
+}
+
+#[test]
 fn decompression_preflight_checks_cumulative_limits_without_charging() {
     let mut budget = AssetLoadBudget::new(AssetLoadLimits {
         max_compressed_bytes: 5,

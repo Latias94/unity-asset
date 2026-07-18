@@ -58,7 +58,7 @@ pub mod unity_objects;
 pub mod unity_version;
 pub mod webfile;
 
-pub use error::{BinaryError, Result};
+pub use error::{BinaryError, BinaryObjectIdentityError, Result};
 #[doc(hidden)]
 pub use random_access::{ByteSegment, SegmentedBytes};
 

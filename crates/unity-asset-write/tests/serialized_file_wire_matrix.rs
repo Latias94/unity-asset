@@ -2,7 +2,7 @@ use std::ops::Range;
 use std::sync::OnceLock;
 
 use unity_asset_binary::asset::{ObjectMetadata, ObjectTypeReference, SerializedFileParser};
-use unity_asset_binary::error::BinaryError;
+use unity_asset_binary::error::{BinaryError, BinaryObjectIdentityError};
 use unity_asset_core::UnityAssetError;
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
 
@@ -753,7 +753,10 @@ fn rejects_negative_and_huge_table_counts_before_allocation() {
 #[test]
 fn rejects_invalid_identity_type_tree_and_object_ranges_at_parse_entry() {
     let zero_path = parse_mutation(22, |bytes| write_i64(bytes, 22, "object_path_id", 0));
-    assert!(matches!(zero_path, BinaryError::InvalidData(_)));
+    assert!(matches!(
+        zero_path,
+        BinaryError::ObjectIdentity(BinaryObjectIdentityError::ZeroPathId)
+    ));
 
     let zero_class = parse_mutation(22, |bytes| {
         write_i32(bytes, 22, "serialized_type_class_id", 0)

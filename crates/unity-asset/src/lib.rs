@@ -70,11 +70,11 @@
 
 // Re-export from core crate
 pub use unity_asset_core::{
-    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BudgetError, BudgetedJsonError,
-    BundleMemberId, ChangeSet, ChangeSetError, ContainmentKind, ContractError, DecompressionBudget,
-    DecompressionUsage, Diagnostic, DiagnosticError, DiagnosticSeverity, DigestBuildError,
-    DigestParseError, DigestV1, DigestV1Builder, DocumentFormat, FieldPath, FieldPathError,
-    FieldPathSegment, IdentityRemap, ObjectAddress, ObjectId, ObjectKind, Result,
+    AssetLoadBudget, AssetLoadDepthScope, AssetLoadLimits, AssetLoadUsage, BudgetError,
+    BudgetedJsonError, BundleMemberId, ChangeSet, ChangeSetError, ContainmentKind, ContractError,
+    DecompressionBudget, DecompressionUsage, Diagnostic, DiagnosticError, DiagnosticSeverity,
+    DigestBuildError, DigestParseError, DigestV1, DigestV1Builder, DocumentFormat, FieldPath,
+    FieldPathError, FieldPathSegment, IdentityRemap, ObjectAddress, ObjectId, ObjectKind, Result,
     RevisionedObjectHandle, SourceAlias, SourceFingerprint, SourceId, SourceKind, SourceLocator,
     SourceMemberId, TransactionId, UnityAssetError, UnityClass, UnityClassRegistry, UnityDocument,
     UnityValue, WorkspaceId, WorkspaceRevision, YamlAnchor, YamlDocumentSelector, constants::*,
@@ -91,6 +91,7 @@ pub use unity_asset_binary::asset::SerializedFile;
 pub use unity_asset_binary::bundle::{
     AssetBundle, load_bundle, load_bundle_from_memory, load_bundle_with_options,
 };
+pub use unity_asset_binary::error::{BinaryError, BinaryObjectIdentityError};
 
 // Re-export async traits when async feature is enabled
 #[cfg(feature = "async")]

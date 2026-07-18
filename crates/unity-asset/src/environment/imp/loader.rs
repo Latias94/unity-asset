@@ -750,13 +750,13 @@ impl Environment {
                 let entry_path = entry.path();
 
                 if entry_path.is_dir() {
-                    if let Some(dir_name) = entry_path.file_name().and_then(|n| n.to_str()) {
-                        if matches!(
+                    if let Some(dir_name) = entry_path.file_name().and_then(|n| n.to_str())
+                        && matches!(
                             dir_name,
                             "Library" | "Temp" | "Logs" | ".git" | ".vs" | "obj" | "bin"
-                        ) {
-                            continue;
-                        }
+                        )
+                    {
+                        continue;
                     }
                     stack.push(entry_path);
                     continue;
@@ -838,15 +838,6 @@ impl Environment {
         child_depth: u32,
         budget: &mut AssetLoadBudget,
     ) -> Result<Vec<(String, UnityFile)>> {
-        let member_count = u64::try_from(web.files().len()).map_err(|_| {
-            budgeted_allocation_error("WebFile staging members", "count does not fit in u64")
-        })?;
-        budget.consume_members(member_count).map_err(|error| {
-            UnityAssetError::with_source(
-                format!("WebFile {:?} exceeds the staging member budget", web_path),
-                error,
-            )
-        })?;
         let mut entry_indices = Vec::new();
         let mut entry_index_capacity = 0;
         reserve_budgeted_vec(
@@ -1038,10 +1029,10 @@ impl Environment {
             }
 
             stats.files_visited += 1;
-            if let Some(max) = options.max_files {
-                if stats.files_visited > max {
-                    break;
-                }
+            if let Some(max) = options.max_files
+                && stats.files_visited > max
+            {
+                break;
             }
 
             let path = canonicalize_if_exists(entry.path());
@@ -1065,18 +1056,16 @@ impl Environment {
                 continue;
             }
 
-            if matches!(ext, "asset" | "prefab" | "unity") {
-                if options.load_yaml_documents {
-                    match self.load_file_impl(&path, budget, FileLoadMode::ConservativeScan) {
-                        Ok(()) => {
-                            stats.files_loaded += 1;
-                            stats.yaml_loaded += 1;
-                        }
-                        Err(error) if super::pptr::is_resource_error(&error) => return Err(error),
-                        Err(_) => {}
+            if matches!(ext, "asset" | "prefab" | "unity") && options.load_yaml_documents {
+                match self.load_file_impl(&path, budget, FileLoadMode::ConservativeScan) {
+                    Ok(()) => {
+                        stats.files_loaded += 1;
+                        stats.yaml_loaded += 1;
                     }
-                    continue;
+                    Err(error) if super::pptr::is_resource_error(&error) => return Err(error),
+                    Err(_) => {}
                 }
+                continue;
             }
 
             if !options.load_binary_files {
@@ -1992,7 +1981,7 @@ mod tests {
 
         assert!(entries.is_empty());
         assert_eq!(budget.usage().bytes, index_bytes);
-        assert_eq!(budget.usage().members, 2);
+        assert_eq!(budget.usage().members, 0);
     }
 
     #[test]

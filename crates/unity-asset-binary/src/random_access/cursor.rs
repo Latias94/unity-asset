@@ -348,6 +348,22 @@ impl<'source, 'budget> ByteCursor<'source, 'budget> {
         self.budget.consume_bytes(amount).map_err(Into::into)
     }
 
+    pub(crate) fn check_bytes(&self, amount: u64) -> Result<()> {
+        self.budget.check_bytes(amount).map_err(Into::into)
+    }
+
+    pub(crate) fn check_entries(&self, amount: u64) -> Result<()> {
+        self.budget.check_entries(amount).map_err(Into::into)
+    }
+
+    pub(crate) fn check_members(&self, amount: u64) -> Result<()> {
+        self.budget.check_members(amount).map_err(Into::into)
+    }
+
+    pub(crate) fn check_depth(&self, depth: u32) -> Result<()> {
+        self.budget.check_depth(depth).map_err(Into::into)
+    }
+
     pub(crate) fn consume_bytes(&mut self, amount: u64) -> Result<()> {
         self.charge_bytes(amount)
     }

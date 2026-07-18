@@ -3,6 +3,17 @@
 use thiserror::Error;
 use unity_asset_core::BudgetError;
 
+/// Invalid identity topology in a SerializedFile object table.
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryObjectIdentityError {
+    /// Unity reserves path ID zero as an invalid object identity.
+    #[error("object path ID cannot be zero")]
+    ZeroPathId,
+    /// Two object table entries use the same path ID.
+    #[error("duplicate object path ID {path_id}")]
+    DuplicatePathId { path_id: i64 },
+}
+
 /// Result type for Unity binary operations
 pub type Result<T> = std::result::Result<T, BinaryError>;
 
@@ -32,6 +43,10 @@ pub enum BinaryError {
     /// Invalid data
     #[error("Invalid data: {0}")]
     InvalidData(String),
+
+    /// Invalid object identity topology.
+    #[error("Invalid object identity: {0}")]
+    ObjectIdentity(#[from] BinaryObjectIdentityError),
 
     /// Parsing error
     #[error("Parse error: {0}")]
@@ -223,6 +238,7 @@ impl BinaryError {
             BinaryError::UnsupportedCompression(_) => true, // Might try different compression
             BinaryError::DecompressionFailed(_) => true,    // Might retry or skip
             BinaryError::InvalidData(_) => true,            // Might skip corrupted object
+            BinaryError::ObjectIdentity(_) => true,         // Might skip a malformed file
             BinaryError::ParseError(_) => true,             // Might skip problematic object
             BinaryError::NotEnoughData { .. } => false,
             BinaryError::InvalidSignature { .. } => false,
@@ -246,6 +262,7 @@ impl BinaryError {
             BinaryError::UnsupportedCompression(_) => ErrorSeverity::Medium,
             BinaryError::DecompressionFailed(_) => ErrorSeverity::Medium,
             BinaryError::InvalidData(_) => ErrorSeverity::Medium,
+            BinaryError::ObjectIdentity(_) => ErrorSeverity::Medium,
             BinaryError::ParseError(_) => ErrorSeverity::Medium,
             BinaryError::NotEnoughData { .. } => ErrorSeverity::High,
             BinaryError::InvalidSignature { .. } => ErrorSeverity::High,
@@ -273,6 +290,7 @@ impl BinaryError {
             BinaryError::Budget(_) => Some("Increase load limits or reduce the input scope"),
             BinaryError::CorruptedData(_) => Some("Skip corrupted section"),
             BinaryError::VersionCompatibility(_) => Some("Enable compatibility mode"),
+            BinaryError::ObjectIdentity(_) => Some("Skip malformed SerializedFile"),
             _ => None,
         }
     }
@@ -312,6 +330,15 @@ mod tests {
                 limit: 1,
                 requested: 2,
             })
+        ));
+    }
+
+    #[test]
+    fn object_identity_error_remains_structurally_matchable() {
+        let error = BinaryError::from(BinaryObjectIdentityError::DuplicatePathId { path_id: 42 });
+        assert!(matches!(
+            error,
+            BinaryError::ObjectIdentity(BinaryObjectIdentityError::DuplicatePathId { path_id: 42 })
         ));
     }
 

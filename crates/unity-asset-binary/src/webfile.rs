@@ -9,7 +9,9 @@ use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::shared_bytes::SharedBytes;
+use std::mem::size_of;
 use std::ops::Range;
+use thiserror::Error;
 use unity_asset_core::AssetLoadBudget;
 
 /// Magic bytes for different compression formats
@@ -23,6 +25,47 @@ pub enum WebFileCompression {
     None,
     Gzip,
     Brotli,
+}
+
+/// Staged WebFile probe failure.
+///
+/// A mismatch means the encoded stream or its decoded payload did not establish a WebFile
+/// signature. Once a WebFile signature is recognized, every later parser failure is reported as
+/// recognized corruption so callers cannot silently reinterpret malformed containers as raw data.
+#[derive(Debug, Error)]
+pub enum WebFileProbeError {
+    #[error("input is not a recognized Unity WebFile: {source}")]
+    Mismatch {
+        #[source]
+        source: BinaryError,
+    },
+    #[error("recognized Unity WebFile is malformed: {source}")]
+    Recognized {
+        #[source]
+        source: BinaryError,
+    },
+}
+
+impl WebFileProbeError {
+    fn mismatch(source: BinaryError) -> Self {
+        if source.is_resource_error() {
+            Self::Recognized { source }
+        } else {
+            Self::Mismatch { source }
+        }
+    }
+
+    fn recognized(source: BinaryError) -> Self {
+        Self::Recognized { source }
+    }
+
+    /// Recovers the parser error used by the compatibility `from_*` APIs.
+    #[must_use]
+    pub fn into_source(self) -> BinaryError {
+        match self {
+            Self::Mismatch { source } | Self::Recognized { source } => source,
+        }
+    }
 }
 
 /// A Unity WebFile that can contain other files
@@ -62,55 +105,98 @@ impl WebFile {
         range: Range<usize>,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self> {
-        let view = DataView::from_shared_range(data, range)?;
-        Self::from_view_with_budget(view, budget)
+        Self::probe_from_shared_range_with_budget(data, range, budget)
+            .map_err(WebFileProbeError::into_source)
     }
 
-    fn from_view_with_budget(view: DataView, budget: &mut AssetLoadBudget) -> Result<Self> {
-        budget.consume_bytes(u64::try_from(view.len()).map_err(|_| {
-            BinaryError::invalid_data("WebFile source length does not fit in u64")
-        })?)?;
+    /// Probes and parses a shared byte range while preserving format-recognition state.
+    ///
+    /// Decompression and source accounting happen exactly once. Resource failures are always
+    /// classified as [`WebFileProbeError::Recognized`] because retrying requires a larger caller
+    /// budget rather than trying a different format.
+    pub fn probe_from_shared_range_with_budget(
+        data: SharedBytes,
+        range: Range<usize>,
+        budget: &mut AssetLoadBudget,
+    ) -> std::result::Result<Self, WebFileProbeError> {
+        let view =
+            DataView::from_shared_range(data, range).map_err(WebFileProbeError::recognized)?;
+        Self::probe_from_view_with_budget(view, budget)
+    }
+
+    fn probe_from_view_with_budget(
+        view: DataView,
+        budget: &mut AssetLoadBudget,
+    ) -> std::result::Result<Self, WebFileProbeError> {
+        let source_len = u64::try_from(view.len())
+            .map_err(|_| BinaryError::invalid_data("WebFile source length does not fit in u64"))
+            .map_err(WebFileProbeError::recognized)?;
+        budget
+            .consume_bytes(source_len)
+            .map_err(BinaryError::from)
+            .map_err(WebFileProbeError::recognized)?;
 
         // Detect compression with cheap heuristics first (UnityPy-style).
         let mut probe = BinaryReader::new(view.as_bytes(), ByteOrder::Little);
-        let probed = Self::detect_compression(&mut probe)?;
+        let probed = Self::detect_compression(&mut probe).map_err(WebFileProbeError::mismatch)?;
 
         // Decompress if necessary, with a brotli fallback for non-heuristic streams.
         let (compression, decompressed_data, signature) = match probed {
             WebFileCompression::Gzip => {
-                let decompressed = DataView::from_shared(SharedBytes::from_vec(
-                    decompress_gzip_with_budget(view.as_bytes(), budget)?,
-                ));
-                let signature = read_webfile_signature(decompressed.as_bytes())?;
+                let decompressed = decompress_gzip_with_budget(view.as_bytes(), budget)
+                    .map(SharedBytes::from_vec)
+                    .map(DataView::from_shared)
+                    .map_err(WebFileProbeError::mismatch)?;
+                let signature = probe_webfile_signature(decompressed.as_bytes(), budget)?;
                 (WebFileCompression::Gzip, decompressed, signature)
             }
             WebFileCompression::Brotli => {
-                let decompressed = DataView::from_shared(SharedBytes::from_vec(
-                    decompress_brotli_with_budget(view.as_bytes(), budget)?,
-                ));
-                let signature = read_webfile_signature(decompressed.as_bytes())?;
+                let decompressed = decompress_brotli_with_budget(view.as_bytes(), budget)
+                    .map(SharedBytes::from_vec)
+                    .map(DataView::from_shared)
+                    .map_err(WebFileProbeError::mismatch)?;
+                let signature = probe_webfile_signature(decompressed.as_bytes(), budget)?;
                 (WebFileCompression::Brotli, decompressed, signature)
             }
             WebFileCompression::None => {
                 // Attempt uncompressed parse first.
-                if let Ok(signature) = read_webfile_signature(view.as_bytes()) {
-                    (WebFileCompression::None, view, signature)
-                } else {
-                    // Some brotli streams (including UnityPy's own WebFile.save output) do not
-                    // match the 0x20 marker heuristic. Try brotli decompression as a fallback.
-                    let decompressed = DataView::from_shared(SharedBytes::from_vec(
-                        decompress_brotli_with_budget(view.as_bytes(), budget)?,
-                    ));
-                    let signature = read_webfile_signature(decompressed.as_bytes())?;
-                    (WebFileCompression::Brotli, decompressed, signature)
+                match probe_webfile_signature(view.as_bytes(), budget) {
+                    Ok(signature) => (WebFileCompression::None, view, signature),
+                    Err(WebFileProbeError::Recognized { source }) => {
+                        return Err(WebFileProbeError::Recognized { source });
+                    }
+                    Err(WebFileProbeError::Mismatch { .. }) => {
+                        // Some brotli streams (including UnityPy's own WebFile.save output) do not
+                        // match the 0x20 marker heuristic. Try brotli decompression as a fallback.
+                        let decompressed = decompress_brotli_with_budget(view.as_bytes(), budget)
+                            .map(SharedBytes::from_vec)
+                            .map(DataView::from_shared)
+                            .map_err(WebFileProbeError::mismatch)?;
+                        let signature = probe_webfile_signature(decompressed.as_bytes(), budget)?;
+                        (WebFileCompression::Brotli, decompressed, signature)
+                    }
                 }
             }
         };
 
-        // Create reader for decompressed data
+        Self::parse_recognized_view_with_budget(compression, decompressed_data, signature, budget)
+            .map_err(WebFileProbeError::recognized)
+    }
+
+    fn parse_recognized_view_with_budget(
+        compression: WebFileCompression,
+        decompressed_data: DataView,
+        signature: String,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self> {
         let mut reader = BinaryReader::new(decompressed_data.as_bytes(), ByteOrder::Little);
-        // Consume the signature we already validated.
-        let _ = reader.read_cstring()?;
+        let signature_end = signature
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile signature range overflow"))?;
+        reader.set_position(u64::try_from(signature_end).map_err(|_| {
+            BinaryError::invalid_data("WebFile signature end does not fit in u64")
+        })?)?;
 
         // Read header length
         let head_length_i32 = reader.read_i32()?;
@@ -136,8 +222,34 @@ impl WebFile {
             )));
         }
 
+        let directory_start = usize::try_from(reader.position()).map_err(|_| {
+            BinaryError::invalid_data("WebFile directory start does not fit in usize")
+        })?;
+        let directory = preflight_webfile_directory(
+            decompressed_data.as_bytes(),
+            directory_start,
+            head_length,
+        )?;
+        let entry_count = u64::try_from(directory.entry_count).map_err(|_| {
+            BinaryError::invalid_data("WebFile directory entry count does not fit in u64")
+        })?;
+        budget.check_entries(entry_count)?;
+        budget.check_members(entry_count)?;
+        budget.check_bytes(directory.retained_bytes)?;
+        budget.consume_entries(entry_count)?;
+        budget.consume_members(entry_count)?;
+        budget.consume_bytes(directory.retained_bytes)?;
+
         // Read file entries
         let mut files = Vec::new();
+        files
+            .try_reserve_exact(directory.entry_count)
+            .map_err(|error| {
+                BinaryError::memory_error(format!(
+                    "Failed to reserve {} WebFile directory entries: {error}",
+                    directory.entry_count
+                ))
+            })?;
         while reader.position() < head_length as u64 {
             let fixed_end = reader
                 .position()
@@ -190,12 +302,6 @@ impl WebFile {
                     "WebFile entry data range {offset}..{entry_end} is outside payload {head_length}..{total_len}"
                 )));
             }
-            budget.consume_entries(1)?;
-            files.try_reserve(1).map_err(|error| {
-                BinaryError::memory_error(format!(
-                    "Failed to reserve a WebFile directory entry: {error}"
-                ))
-            })?;
             let name_bytes = reader.read_bytes(path_length)?;
             let name = String::from_utf8(name_bytes).map_err(|e| {
                 BinaryError::invalid_data(format!("Invalid UTF-8 in file name: {}", e))
@@ -206,6 +312,11 @@ impl WebFile {
                 offset,
                 size: length,
             });
+        }
+        if files.len() != directory.entry_count {
+            return Err(BinaryError::invalid_data(
+                "WebFile directory entry count changed after preflight",
+            ));
         }
 
         Ok(WebFile {
@@ -365,6 +476,118 @@ impl WebFile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WebFileDirectoryPreflight {
+    entry_count: usize,
+    retained_bytes: u64,
+}
+
+fn preflight_webfile_directory(
+    data: &[u8],
+    directory_start: usize,
+    head_length: usize,
+) -> Result<WebFileDirectoryPreflight> {
+    if directory_start > head_length || head_length > data.len() {
+        return Err(BinaryError::invalid_data(
+            "WebFile directory range is outside the decompressed image",
+        ));
+    }
+
+    let mut cursor = directory_start;
+    let mut entry_count = 0_usize;
+    let mut name_bytes = 0_usize;
+    while cursor < head_length {
+        let fixed_end = cursor
+            .checked_add(12)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile entry header overflow"))?;
+        if fixed_end > head_length {
+            return Err(BinaryError::invalid_data(
+                "WebFile entry header crosses head_length",
+            ));
+        }
+
+        let offset_i32 = webfile_i32_at(data, cursor, "entry offset")?;
+        let length_i32 = webfile_i32_at(data, cursor + 4, "entry length")?;
+        let path_len_i32 = webfile_i32_at(data, cursor + 8, "entry path length")?;
+        if offset_i32 < 0 || length_i32 < 0 || path_len_i32 < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative WebFile entry values: offset={} length={} path_len={}",
+                offset_i32, length_i32, path_len_i32
+            )));
+        }
+
+        let offset = u64::try_from(offset_i32)
+            .map_err(|_| BinaryError::invalid_data("Negative WebFile entry offset"))?;
+        let length = u64::try_from(length_i32)
+            .map_err(|_| BinaryError::invalid_data("Negative WebFile entry length"))?;
+        let path_length = usize::try_from(path_len_i32)
+            .map_err(|_| BinaryError::invalid_data("Negative WebFile entry path length"))?;
+        if path_length > 16 * 1024 {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "WebFile entry name too large: {}",
+                path_length
+            )));
+        }
+
+        let path_end = fixed_end
+            .checked_add(path_length)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile entry name range overflow"))?;
+        if path_end > head_length {
+            return Err(BinaryError::invalid_data(
+                "WebFile entry name crosses head_length",
+            ));
+        }
+        let entry_end = offset
+            .checked_add(length)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile entry data range overflow"))?;
+        if offset < head_length as u64 || entry_end > data.len() as u64 {
+            return Err(BinaryError::invalid_data(format!(
+                "WebFile entry data range {offset}..{entry_end} is outside payload {head_length}..{}",
+                data.len()
+            )));
+        }
+        let name = data
+            .get(fixed_end..path_end)
+            .ok_or_else(|| BinaryError::not_enough_data(path_end, data.len()))?;
+        std::str::from_utf8(name).map_err(|error| {
+            BinaryError::invalid_data(format!("Invalid UTF-8 in file name: {error}"))
+        })?;
+
+        entry_count = entry_count
+            .checked_add(1)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile entry count overflow"))?;
+        name_bytes = name_bytes
+            .checked_add(path_length)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile entry name byte total overflow"))?;
+        cursor = path_end;
+    }
+
+    let table_bytes = size_of::<BundleFileInfo>()
+        .checked_mul(entry_count)
+        .ok_or_else(|| BinaryError::invalid_data("WebFile directory table size overflow"))?;
+    let retained_bytes = table_bytes
+        .checked_add(name_bytes)
+        .ok_or_else(|| BinaryError::invalid_data("WebFile retained directory size overflow"))?;
+    Ok(WebFileDirectoryPreflight {
+        entry_count,
+        retained_bytes: u64::try_from(retained_bytes).map_err(|_| {
+            BinaryError::invalid_data("WebFile retained directory size does not fit in u64")
+        })?,
+    })
+}
+
+fn webfile_i32_at(data: &[u8], offset: usize, field: &'static str) -> Result<i32> {
+    let end = offset
+        .checked_add(size_of::<i32>())
+        .ok_or_else(|| BinaryError::invalid_data(format!("WebFile {field} range overflow")))?;
+    let bytes: [u8; 4] = data
+        .get(offset..end)
+        .ok_or_else(|| BinaryError::not_enough_data(end, data.len()))?
+        .try_into()
+        .map_err(|_| BinaryError::invalid_data(format!("Invalid WebFile {field} width")))?;
+    Ok(i32::from_le_bytes(bytes))
+}
+
 fn checked_entry_range(info: &BundleFileInfo, total_len: usize) -> Result<Range<usize>> {
     let start = usize::try_from(info.offset).map_err(|_| {
         BinaryError::invalid_data(format!(
@@ -390,16 +613,60 @@ fn checked_entry_range(info: &BundleFileInfo, total_len: usize) -> Result<Range<
     Ok(start..end)
 }
 
-fn read_webfile_signature(data: &[u8]) -> Result<String> {
-    let mut reader = BinaryReader::new(data, ByteOrder::Little);
-    let signature = reader.read_cstring()?;
+fn probe_webfile_signature(
+    data: &[u8],
+    budget: &mut AssetLoadBudget,
+) -> std::result::Result<String, WebFileProbeError> {
+    let has_recognized_prefix = has_webfile_signature_prefix(data);
+    read_webfile_signature_with_budget(data, budget).map_err(|source| {
+        if has_recognized_prefix || source.is_resource_error() {
+            WebFileProbeError::recognized(source)
+        } else {
+            WebFileProbeError::mismatch(source)
+        }
+    })
+}
+
+fn read_webfile_signature_with_budget(data: &[u8], budget: &mut AssetLoadBudget) -> Result<String> {
+    let max_len = BinaryReader::DEFAULT_MAX_STRING_LEN;
+    let scan_len = data.len().min(max_len.saturating_add(1));
+    let signature_end = data[..scan_len]
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| {
+            if data.len() > max_len {
+                BinaryError::invalid_data(format!(
+                    "WebFile signature exceeds maximum length {max_len}"
+                ))
+            } else {
+                BinaryError::invalid_data("unterminated WebFile signature")
+            }
+        })?;
+    let signature = std::str::from_utf8(&data[..signature_end])?;
     if !signature.starts_with("UnityWebData") && !signature.starts_with("TuanjieWebData") {
         return Err(BinaryError::invalid_signature(
             "UnityWebData or TuanjieWebData",
-            &signature,
+            signature,
         ));
     }
-    Ok(signature)
+
+    let retained_bytes = u64::try_from(signature.len())
+        .map_err(|_| BinaryError::invalid_data("WebFile signature length does not fit in u64"))?;
+    budget.check_bytes(retained_bytes)?;
+    budget.consume_bytes(retained_bytes)?;
+    let mut owned = String::new();
+    owned.try_reserve_exact(signature.len()).map_err(|error| {
+        BinaryError::memory_error(format!(
+            "Failed to reserve {} WebFile signature bytes: {error}",
+            signature.len()
+        ))
+    })?;
+    owned.push_str(signature);
+    Ok(owned)
+}
+
+fn has_webfile_signature_prefix(data: &[u8]) -> bool {
+    data.starts_with(b"UnityWebData") || data.starts_with(b"TuanjieWebData")
 }
 
 #[cfg(test)]
@@ -482,6 +749,33 @@ mod tests {
         bytes
     }
 
+    fn retained_directory_bytes(names: &[&str]) -> u64 {
+        u64::try_from(
+            names.len() * std::mem::size_of::<BundleFileInfo>()
+                + names.iter().map(|name| name.len()).sum::<usize>(),
+        )
+        .expect("test WebFile retained directory size fits in u64")
+    }
+
+    fn retained_signature_bytes() -> u64 {
+        u64::try_from("UnityWebData1.0".len()).expect("test WebFile signature size fits in u64")
+    }
+
+    fn gzip_compress(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        std::io::Write::write_all(&mut encoder, bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn webfile_with_corrupt_directory() -> Vec<u8> {
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&33_i32.to_le_bytes());
+        entry.extend_from_slice(&0_i32.to_le_bytes());
+        entry.extend_from_slice(&4_i32.to_le_bytes());
+        entry.push(b'x');
+        minimal_webfile(33, &entry)
+    }
+
     fn minimal_unityfs_bundle(revision: &str) -> Vec<u8> {
         let mut blocks_info = vec![0_u8; 16];
         blocks_info.extend_from_slice(&1_i32.to_be_bytes());
@@ -525,6 +819,73 @@ mod tests {
         let mut reader = BinaryReader::new(&gzip_data, ByteOrder::Little);
         let compression = WebFile::detect_compression(&mut reader).unwrap();
         assert_eq!(compression, WebFileCompression::Gzip);
+    }
+
+    #[test]
+    fn compressed_recognized_corruption_is_not_a_probe_mismatch() {
+        for decoded in [
+            minimal_webfile(-1, &[]),
+            minimal_webfile(1024, &[]),
+            webfile_with_corrupt_directory(),
+        ] {
+            let encoded = gzip_compress(&decoded);
+            let shared = SharedBytes::from_vec(encoded);
+            let len = shared.len();
+            let mut budget = AssetLoadBudget::default();
+
+            let error = WebFile::probe_from_shared_range_with_budget(shared, 0..len, &mut budget)
+                .expect_err("recognized corrupt WebFile must fail its parse");
+
+            assert!(matches!(
+                error,
+                WebFileProbeError::Recognized {
+                    source: BinaryError::InvalidData(_),
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn compressed_non_webfile_payload_is_a_probe_mismatch() {
+        let decoded = b"ordinary gzip payload";
+        let encoded = gzip_compress(decoded);
+        let encoded_len = u64::try_from(encoded.len()).unwrap();
+        let shared = SharedBytes::from_vec(encoded);
+        let len = shared.len();
+        let mut budget = AssetLoadBudget::default();
+
+        let error = WebFile::probe_from_shared_range_with_budget(shared, 0..len, &mut budget)
+            .expect_err("gzip alone does not establish a WebFile");
+
+        assert!(matches!(error, WebFileProbeError::Mismatch { .. }));
+        assert_eq!(budget.usage().compressed_bytes, encoded_len);
+        assert_eq!(
+            budget.usage().decompressed_bytes,
+            u64::try_from(decoded.len()).unwrap()
+        );
+    }
+
+    #[test]
+    fn probe_resource_failure_is_always_recognized() {
+        let encoded = gzip_compress(b"ordinary gzip payload");
+        let source_len = u64::try_from(encoded.len()).unwrap();
+        let shared = SharedBytes::from_vec(encoded);
+        let len = shared.len();
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: source_len - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let error = WebFile::probe_from_shared_range_with_budget(shared, 0..len, &mut budget)
+            .expect_err("resource failure cannot prove a format mismatch");
+
+        assert!(matches!(
+            error,
+            WebFileProbeError::Recognized {
+                source: BinaryError::Budget(_),
+            }
+        ));
     }
 
     #[test]
@@ -592,7 +953,92 @@ mod tests {
                 requested: 2,
             })
         ));
-        assert_eq!(budget.usage().entries, 1);
+        assert_eq!(budget.usage().entries, 0);
+    }
+
+    #[test]
+    fn member_limit_precedes_webfile_directory_allocations() {
+        let bytes = webfile_with_entries(&[("left", b"a"), ("right", b"b")]);
+        let source_len = u64::try_from(bytes.len()).unwrap();
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_members: 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let error = WebFile::from_bytes_with_budget(bytes, &mut budget).unwrap_err();
+
+        assert!(matches!(
+            error,
+            BinaryError::Budget(BudgetError::Exceeded {
+                resource: "members",
+                limit: 1,
+                requested: 2,
+            })
+        ));
+        assert_eq!(budget.usage().members, 0);
+        assert_eq!(budget.usage().entries, 0);
+        assert_eq!(
+            budget.usage().bytes,
+            source_len + retained_signature_bytes()
+        );
+    }
+
+    #[test]
+    fn compressed_member_preflight_decompresses_exactly_once() {
+        let decoded = webfile_with_entries(&[("left", b"a"), ("right", b"b")]);
+        let encoded = gzip_compress(&decoded);
+        let encoded_len = u64::try_from(encoded.len()).unwrap();
+        let decoded_len = u64::try_from(decoded.len()).unwrap();
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_members: 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let error = WebFile::from_bytes_with_budget(encoded, &mut budget).unwrap_err();
+
+        assert!(matches!(
+            error,
+            BinaryError::Budget(BudgetError::Exceeded {
+                resource: "members",
+                limit: 1,
+                requested: 2,
+            })
+        ));
+        assert_eq!(budget.usage().compressed_bytes, encoded_len);
+        assert_eq!(budget.usage().decompressed_bytes, decoded_len);
+        assert_eq!(budget.usage().members, 0);
+        assert_eq!(budget.usage().entries, 0);
+    }
+
+    #[test]
+    fn retained_directory_bytes_are_preflighted_before_allocation() {
+        let entries = [("left", b"a".as_slice()), ("right", b"b".as_slice())];
+        let bytes = webfile_with_entries(&entries);
+        let source_len = u64::try_from(bytes.len()).unwrap();
+        let retained = retained_directory_bytes(&["left", "right"]);
+        let retained_signature = retained_signature_bytes();
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: source_len + retained_signature + retained - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let error = WebFile::from_bytes_with_budget(bytes, &mut budget).unwrap_err();
+
+        assert!(matches!(
+            error,
+            BinaryError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            }) if limit == source_len + retained_signature + retained - 1
+                && requested == source_len + retained_signature + retained
+        ));
+        assert_eq!(budget.usage().bytes, source_len + retained_signature);
+        assert_eq!(budget.usage().members, 0);
+        assert_eq!(budget.usage().entries, 0);
     }
 
     #[test]
@@ -621,8 +1067,11 @@ mod tests {
             .join("tests/samples/char_118_yuki.ab");
         let bundle_bytes = std::fs::read(bundle_path).expect("read sample bundle");
         let webfile_bytes = webfile_with_entry("sample.bundle", &bundle_bytes);
-        let requested = u64::try_from(webfile_bytes.len() + bundle_bytes.len())
-            .expect("test source sizes fit in u64");
+        let outer_cost = u64::try_from(webfile_bytes.len()).expect("test WebFile size fits in u64")
+            + retained_signature_bytes()
+            + retained_directory_bytes(&["sample.bundle"]);
+        let requested =
+            outer_cost + u64::try_from(bundle_bytes.len()).expect("test bundle size fits in u64");
         let mut budget = AssetLoadBudget::new(AssetLoadLimits {
             max_bytes: requested - 1,
             ..AssetLoadLimits::default()
@@ -640,10 +1089,7 @@ mod tests {
                 requested: actual,
             }) if limit == requested - 1 && actual == requested
         ));
-        assert_eq!(
-            budget.usage().bytes,
-            u64::try_from(webfile_bytes.len()).unwrap()
-        );
+        assert_eq!(budget.usage().bytes, outer_cost);
     }
 
     #[test]
@@ -784,10 +1230,12 @@ mod tests {
             ("duplicate.bundle", first.as_slice()),
             ("duplicate.bundle", second.as_slice()),
         ]);
-        let outer_len = u64::try_from(webfile_bytes.len()).unwrap();
+        let outer_cost = u64::try_from(webfile_bytes.len()).unwrap()
+            + retained_signature_bytes()
+            + retained_directory_bytes(&["duplicate.bundle", "duplicate.bundle"]);
         let first_len = u64::try_from(first.len()).unwrap();
         let second_len = u64::try_from(second.len()).unwrap();
-        let limit = outer_len + first_len;
+        let limit = outer_cost + first_len;
         let mut budget = AssetLoadBudget::new(AssetLoadLimits {
             max_bytes: limit,
             ..AssetLoadLimits::default()
@@ -806,7 +1254,7 @@ mod tests {
                 resource: "bytes",
                 limit: actual_limit,
                 requested,
-            }) if actual_limit == limit && requested == outer_len + first_len + second_len
+            }) if actual_limit == limit && requested == outer_cost + first_len + second_len
         ));
         assert_eq!(budget.usage().bytes, limit);
     }

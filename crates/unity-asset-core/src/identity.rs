@@ -1,4 +1,5 @@
 use std::fmt;
+use std::mem::size_of;
 use std::num::{NonZeroI64, NonZeroU128};
 use std::str::FromStr;
 
@@ -199,6 +200,11 @@ impl SourceAlias {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    #[must_use]
+    pub const fn retained_clone_bytes(&self) -> usize {
+        self.0.len()
+    }
 }
 
 impl fmt::Display for SourceAlias {
@@ -260,6 +266,11 @@ impl SourceMemberId {
     #[must_use]
     pub const fn same_name_occurrence(&self) -> u32 {
         self.same_name_occurrence
+    }
+
+    #[must_use]
+    pub const fn retained_clone_bytes(&self) -> usize {
+        self.name.len()
     }
 }
 
@@ -411,6 +422,18 @@ impl SourceLocator {
         &self.members
     }
 
+    /// Heap bytes retained by an ordinary clone of this locator.
+    #[must_use]
+    pub fn retained_clone_bytes(&self) -> Option<usize> {
+        self.members
+            .len()
+            .checked_mul(size_of::<ContainmentStep>())?
+            .checked_add(self.root_alias.retained_clone_bytes())?
+            .checked_add(self.members.iter().try_fold(0_usize, |total, step| {
+                total.checked_add(step.member().retained_clone_bytes())
+            })?)
+    }
+
     #[must_use]
     pub fn bundle_member(&self) -> Option<&BundleMemberId> {
         self.members
@@ -503,17 +526,22 @@ impl<'de> Deserialize<'de> for SourceLocator {
 pub struct YamlAnchor(String);
 
 impl YamlAnchor {
-    pub fn new(value: impl Into<String>) -> Result<Self, ContractError> {
-        let value = value.into();
+    pub fn new(value: impl AsRef<str> + Into<String>) -> Result<Self, ContractError> {
+        Self::validate(value.as_ref())?;
+        Ok(Self(value.into()))
+    }
+
+    /// Validates a borrowed anchor without allocating.
+    pub fn validate(value: &str) -> Result<(), ContractError> {
         if value.is_empty()
             || value.len() > MAX_YAML_ANCHOR_BYTES
             || !value
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
         {
-            return Err(ContractError::InvalidYamlAnchor(value));
+            return Err(ContractError::InvalidYamlAnchor);
         }
-        Ok(Self(value))
+        Ok(())
     }
 
     #[must_use]
@@ -556,7 +584,7 @@ pub enum YamlDocumentSelector {
 }
 
 impl YamlDocumentSelector {
-    pub fn anchor(value: impl Into<String>) -> Result<Self, ContractError> {
+    pub fn anchor(value: impl AsRef<str> + Into<String>) -> Result<Self, ContractError> {
         Ok(Self::Anchored {
             anchor: YamlAnchor::new(value)?,
         })
@@ -622,7 +650,10 @@ impl ObjectId {
         })
     }
 
-    pub fn yaml(source: SourceId, anchor: impl Into<String>) -> Result<Self, ContractError> {
+    pub fn yaml(
+        source: SourceId,
+        anchor: impl AsRef<str> + Into<String>,
+    ) -> Result<Self, ContractError> {
         validate_object_source_kind(source, SourceKind::Yaml)?;
         Ok(Self {
             source,
@@ -685,6 +716,11 @@ impl ObjectId {
             ObjectKey::YamlDocumentOrdinal(index) => Some(*index),
             ObjectKey::BinaryPathId(_) | ObjectKey::YamlAnchor(_) => None,
         }
+    }
+
+    #[must_use]
+    pub fn retained_clone_bytes(&self) -> usize {
+        self.yaml_anchor().map_or(0, str::len)
     }
 }
 
@@ -831,6 +867,11 @@ impl RevisionedObjectHandle {
     pub const fn revision(&self) -> WorkspaceRevision {
         self.revision
     }
+
+    #[must_use]
+    pub fn retained_clone_bytes(&self) -> usize {
+        self.object.retained_clone_bytes()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -871,7 +912,10 @@ impl ObjectAddress {
         Self::binary_at(locator.child(ContainmentKind::Bundle, member)?, path_id)
     }
 
-    pub fn yaml(locator: SourceLocator, anchor: impl Into<String>) -> Result<Self, ContractError> {
+    pub fn yaml(
+        locator: SourceLocator,
+        anchor: impl AsRef<str> + Into<String>,
+    ) -> Result<Self, ContractError> {
         Self::yaml_with_selector(locator, YamlDocumentSelector::anchor(anchor)?)
     }
 
@@ -914,6 +958,15 @@ impl ObjectAddress {
             ObjectAddressKey::BinaryPathId(_) => None,
             ObjectAddressKey::Yaml(selector) => Some(selector),
         }
+    }
+
+    #[must_use]
+    pub fn retained_clone_bytes(&self) -> Option<usize> {
+        self.source.retained_clone_bytes()?.checked_add(
+            self.yaml_selector()
+                .and_then(YamlDocumentSelector::anchor_str)
+                .map_or(0, str::len),
+        )
     }
 
     #[must_use]
@@ -1151,8 +1204,8 @@ pub enum ContractError {
     BundleAddressMissingMember,
     #[error("{kind} is not a valid portable path: {value:?}")]
     InvalidPortablePath { kind: &'static str, value: String },
-    #[error("invalid YAML anchor: {0:?}")]
-    InvalidYamlAnchor(String),
+    #[error("invalid YAML anchor")]
+    InvalidYamlAnchor,
     #[error("source containment exceeds the maximum depth of {max_depth}")]
     ContainmentDepthExceeded { max_depth: usize },
     #[error("source locator text exceeds the maximum of {max_text_bytes} bytes")]

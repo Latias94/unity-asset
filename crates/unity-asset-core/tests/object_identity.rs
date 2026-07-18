@@ -1,9 +1,10 @@
+use std::mem::size_of;
 use std::str::FromStr;
 
 use unity_asset_core::{
-    BundleMemberId, ContainmentKind, ContractError, DigestV1, ObjectAddress, ObjectId, ObjectKind,
-    RevisionedObjectHandle, SourceId, SourceKind, SourceLocator, WorkspaceId, WorkspaceRevision,
-    YamlDocumentSelector,
+    BundleMemberId, ContainmentKind, ContainmentStep, ContractError, DigestV1, ObjectAddress,
+    ObjectId, ObjectKind, RevisionedObjectHandle, SourceAlias, SourceId, SourceKind, SourceLocator,
+    SourceMemberId, WorkspaceId, WorkspaceRevision, YamlAnchor, YamlDocumentSelector,
 };
 
 fn source(workspace: WorkspaceId, kind: SourceKind, local: u64) -> SourceId {
@@ -110,6 +111,71 @@ fn source_locators_preserve_nested_container_ownership() {
         serde_json::from_str::<SourceLocator>(&json).unwrap(),
         nested
     );
+}
+
+#[test]
+fn identity_clone_sizes_include_all_owned_backing_allocations() {
+    let alias = "build/game.apk";
+    let archive_name = "assets/data.web";
+    let bundle_name = "CAB-main";
+    let locator = SourceLocator::archive_member(alias, archive_name)
+        .unwrap()
+        .child(
+            ContainmentKind::Bundle,
+            BundleMemberId::new(bundle_name).unwrap(),
+        )
+        .unwrap();
+    let locator_bytes =
+        alias.len() + 2 * size_of::<ContainmentStep>() + archive_name.len() + bundle_name.len();
+
+    assert_eq!(
+        SourceAlias::new(alias).unwrap().retained_clone_bytes(),
+        alias.len()
+    );
+    assert_eq!(
+        SourceMemberId::new(archive_name)
+            .unwrap()
+            .retained_clone_bytes(),
+        archive_name.len()
+    );
+    assert_eq!(locator.retained_clone_bytes(), Some(locator_bytes));
+
+    let workspace = WorkspaceId::from_u128(7).unwrap();
+    let anchor = "1158508787625206";
+    let object = ObjectId::yaml(source(workspace, SourceKind::Yaml, 1), anchor).unwrap();
+    let revision = WorkspaceRevision::new(DigestV1::hash_bytes(b"clone-size"));
+    let handle = RevisionedObjectHandle::new(workspace, revision, object.clone()).unwrap();
+    let address = ObjectAddress::yaml(locator, anchor).unwrap();
+
+    assert_eq!(object.retained_clone_bytes(), anchor.len());
+    assert_eq!(handle.retained_clone_bytes(), anchor.len());
+    assert_eq!(
+        address.retained_clone_bytes(),
+        Some(locator_bytes + anchor.len())
+    );
+}
+
+#[test]
+fn yaml_anchor_borrowed_validation_rejects_unrepresentable_input() {
+    let oversized = [b'a'; 1_025];
+    let oversized = std::str::from_utf8(&oversized).unwrap();
+    assert_eq!(
+        YamlAnchor::validate(oversized),
+        Err(ContractError::InvalidYamlAnchor)
+    );
+
+    for invalid in ["", "has space", "bad,anchor", "bad\0anchor", "anchoré"] {
+        assert_eq!(
+            YamlAnchor::validate(invalid),
+            Err(ContractError::InvalidYamlAnchor),
+            "accepted {invalid:?}"
+        );
+    }
+
+    for valid in ["0", "1158508787625206", "doc_0", "doc-0"] {
+        YamlAnchor::validate(valid).unwrap();
+        assert_eq!(YamlAnchor::new(valid).unwrap().as_str(), valid);
+    }
 }
 
 #[test]

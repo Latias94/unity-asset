@@ -1,4 +1,5 @@
 use super::*;
+use crate::BinaryObjectIdentityError;
 use crate::asset::{ObjectMetadata, ObjectTypeReference, SerializedFileRegions};
 use crate::random_access::ByteSegment;
 use std::sync::Arc;
@@ -23,6 +24,12 @@ const SEGMENTED_CASES: &[(u32, &[u8])] = &[
         ),
     ),
 ];
+
+const V22_OBJECT_PATH_ID_OFFSET: usize = 160;
+const MULTI_V22_SECOND_OBJECT_PATH_ID_OFFSET: usize = 184;
+const MULTI_V22: &[u8] = include_bytes!(
+    "../../../unity-asset-write/tests/fixtures/serialized_file_wire/multi_v22.assets.bin"
+);
 
 #[derive(Debug, PartialEq, Eq)]
 struct ObjectSnapshot {
@@ -168,7 +175,7 @@ fn complete_parser_budget_usage_has_fixed_oracles() {
             8,
             unity_asset_core::AssetLoadUsage {
                 entries: 4,
-                bytes: 194,
+                bytes: 666,
                 max_observed_depth: 0,
                 members: 0,
                 compressed_bytes: 0,
@@ -179,7 +186,7 @@ fn complete_parser_budget_usage_has_fixed_oracles() {
             22,
             unity_asset_core::AssetLoadUsage {
                 entries: 8,
-                bytes: 430,
+                bytes: 1_770,
                 max_observed_depth: 0,
                 members: 0,
                 compressed_bytes: 0,
@@ -361,6 +368,88 @@ fn table_and_byte_budgets_fail_before_unbounded_work() {
             limit: 15,
             requested: 16,
         })
+    ));
+}
+
+#[test]
+fn zero_path_id_in_v22_wire_data_is_rejected_as_structured_identity_error() {
+    let mut bytes = SEGMENTED_CASES
+        .iter()
+        .find(|(version, _)| *version == 22)
+        .unwrap()
+        .1
+        .to_vec();
+    assert_eq!(
+        &bytes[V22_OBJECT_PATH_ID_OFFSET..V22_OBJECT_PATH_ID_OFFSET + size_of::<i64>()],
+        42_i64.to_be_bytes()
+    );
+    bytes[V22_OBJECT_PATH_ID_OFFSET..V22_OBJECT_PATH_ID_OFFSET + size_of::<i64>()]
+        .copy_from_slice(&0_i64.to_be_bytes());
+
+    let error = SerializedFileParser::from_bytes(bytes).unwrap_err();
+    assert!(matches!(
+        error,
+        BinaryError::ObjectIdentity(BinaryObjectIdentityError::ZeroPathId)
+    ));
+}
+
+#[test]
+fn duplicate_path_id_uses_budgeted_sort_scratch_and_preserves_wire_order() {
+    let original = SerializedFileParser::from_bytes(MULTI_V22.to_vec()).unwrap();
+    assert_eq!(
+        original
+            .objects()
+            .iter()
+            .map(ObjectInfo::path_id)
+            .collect::<Vec<_>>(),
+        [42, 84]
+    );
+
+    let first = V22_OBJECT_PATH_ID_OFFSET..V22_OBJECT_PATH_ID_OFFSET + size_of::<i64>();
+    let second = MULTI_V22_SECOND_OBJECT_PATH_ID_OFFSET
+        ..MULTI_V22_SECOND_OBJECT_PATH_ID_OFFSET + size_of::<i64>();
+    assert_eq!(&MULTI_V22[first.clone()], 42_i64.to_be_bytes());
+    assert_eq!(&MULTI_V22[second.clone()], 84_i64.to_be_bytes());
+    let mut duplicate = MULTI_V22.to_vec();
+    duplicate[second].copy_from_slice(&42_i64.to_be_bytes());
+
+    let mut probe = AssetLoadBudget::default();
+    let error =
+        SerializedFileParser::from_bytes_with_budget(duplicate.clone(), &mut probe).unwrap_err();
+    assert!(matches!(
+        error,
+        BinaryError::ObjectIdentity(BinaryObjectIdentityError::DuplicatePathId { path_id: 42 })
+    ));
+    let exact_usage = probe.usage();
+
+    let mut exact = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
+        max_entries: exact_usage.entries,
+        max_bytes: exact_usage.bytes,
+        ..Default::default()
+    })
+    .unwrap();
+    let error =
+        SerializedFileParser::from_bytes_with_budget(duplicate.clone(), &mut exact).unwrap_err();
+    assert!(matches!(
+        error,
+        BinaryError::ObjectIdentity(BinaryObjectIdentityError::DuplicatePathId { path_id: 42 })
+    ));
+    assert_eq!(exact.usage(), exact_usage);
+
+    let mut short = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
+        max_entries: exact_usage.entries,
+        max_bytes: exact_usage.bytes - 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let error = SerializedFileParser::from_bytes_with_budget(duplicate, &mut short).unwrap_err();
+    assert!(matches!(
+        error,
+        BinaryError::Budget(unity_asset_core::BudgetError::Exceeded {
+            resource: "bytes",
+            limit,
+            requested,
+        }) if limit == exact_usage.bytes - 1 && requested == exact_usage.bytes
     ));
 }
 

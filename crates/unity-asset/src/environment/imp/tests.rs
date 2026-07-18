@@ -3135,17 +3135,11 @@ fn environment_webfile_member_limit_fails_before_staging_allocations() {
         ("first.bin".to_string(), b"first".to_vec()),
         ("second.bin".to_string(), b"second".to_vec()),
     ]);
-    let mut parse_only_budget = AssetLoadBudget::default();
-    unity_asset_binary::file::load_unity_file_from_memory_with_budget(
-        web_bytes.clone(),
-        &mut parse_only_budget,
-    )
-    .unwrap();
+    let encoded_len = u64::try_from(web_bytes.len()).unwrap();
 
     let temp = tempfile::tempdir().unwrap();
     let web_path = temp.path().join("member-limit.web");
     fs::write(&web_path, web_bytes).unwrap();
-    let loaded_path = canonicalize_path(web_path.clone());
     let original_base_path = temp.path().join("original-base");
     let mut env = Environment::new();
     env.base_path = original_base_path.clone();
@@ -3159,11 +3153,10 @@ fn environment_webfile_member_limit_fails_before_staging_allocations() {
         .load_file(&web_path, &mut budget)
         .expect_err("the complete WebFile member count must be preflighted");
 
-    assert!(error.to_string().contains("staging member budget"));
+    assert!(error.to_string().contains("members"), "{error:?}");
     assert_eq!(
         budget.usage().bytes,
-        parse_only_budget.usage().bytes
-            + u64::try_from(loaded_path.as_os_str().as_encoded_bytes().len()).unwrap()
+        encoded_len + u64::try_from("UnityWebData1.0".len()).unwrap()
     );
     assert_eq!(budget.usage().members, 0);
     assert_eq!(env.base_path, original_base_path);
@@ -3336,11 +3329,11 @@ fn environment_save_repacks_webfile_after_editing_embedded_bundle() {
         if r.source != &bundle_source || r.source_kind != BinarySourceKind::AssetBundle {
             continue;
         }
-        if let Ok(Some(name)) = r.object.peek_name(&mut name_budget) {
-            if !name.is_empty() {
-                chosen = Some((r.key(), name));
-                break;
-            }
+        if let Ok(Some(name)) = r.object.peek_name(&mut name_budget)
+            && !name.is_empty()
+        {
+            chosen = Some((r.key(), name));
+            break;
         }
     }
 

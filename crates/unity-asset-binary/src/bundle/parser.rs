@@ -12,6 +12,7 @@ use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::shared_bytes::SharedBytes;
 use crate::unity_version::UnityVersion;
+use std::mem::size_of;
 use std::ops::Range;
 use unity_asset_core::AssetLoadBudget;
 
@@ -252,7 +253,7 @@ impl BundleParser {
         if options.decompress_blocks || options.load_assets {
             let mut block_reader = BinaryReader::new(block_data.as_bytes(), ByteOrder::Big);
             let blocks_data = Self::read_blocks(bundle, &mut block_reader, options, budget)?;
-            Self::parse_files(bundle, blocks_data)?;
+            Self::parse_files(bundle, blocks_data, budget)?;
 
             // Load assets if requested
             if options.load_assets {
@@ -512,13 +513,20 @@ impl BundleParser {
     }
 
     /// Parse files from decompressed block data
-    fn parse_files(bundle: &mut AssetBundle, blocks_data: Vec<u8>) -> Result<()> {
-        // Store the decompressed data
-        bundle.set_decompressed_data(blocks_data);
-
-        // Create file info for each node
-        bundle
-            .files
+    fn parse_files(
+        bundle: &mut AssetBundle,
+        blocks_data: Vec<u8>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
+        let retained_bytes = retained_record_bytes::<BundleFileInfo>(
+            bundle.nodes.len(),
+            bundle.nodes.iter().map(|node| node.name.len()),
+            "bundle file table",
+        )?;
+        budget.check_bytes(retained_bytes)?;
+        budget.consume_bytes(retained_bytes)?;
+        let mut files = Vec::new();
+        files
             .try_reserve_exact(bundle.nodes.len())
             .map_err(|error| {
                 BinaryError::memory_error(format!(
@@ -528,8 +536,12 @@ impl BundleParser {
             })?;
         for node in &bundle.nodes {
             let file_info = BundleFileInfo::new(node.name.clone(), node.offset, node.size);
-            bundle.files.push(file_info);
+            files.push(file_info);
         }
+
+        // Publish the prepared data and directory mirror together.
+        bundle.set_decompressed_data(blocks_data);
+        bundle.files = files;
 
         Ok(())
     }
@@ -590,22 +602,26 @@ impl BundleParser {
                 reader.remaining(),
             ));
         }
-        budget.consume_entries(u64::try_from(node_count).map_err(|_| {
-            BinaryError::invalid_data("Directory node count does not fit in u64")
-        })?)?;
-        bundle
-            .nodes
-            .try_reserve_exact(node_count)
-            .map_err(|error| {
-                BinaryError::memory_error(format!(
-                    "Failed to reserve {node_count} directory nodes: {error}"
-                ))
-            })?;
-
         let total_uncompressed = bundle.blocks.iter().try_fold(0_u64, |total, block| {
             total
                 .checked_add(u64::from(block.uncompressed_size))
                 .ok_or_else(|| BinaryError::invalid_data("Bundle block size total overflow"))
+        })?;
+        let node_start = usize::try_from(reader.position()).map_err(|_| {
+            BinaryError::invalid_data("UnityFS directory start does not fit in usize")
+        })?;
+        let retained_bytes = preflight_unityfs_directory(
+            blocks_info_data,
+            node_start,
+            node_count,
+            total_uncompressed,
+        )?;
+        consume_directory_budget(node_count, retained_bytes, budget)?;
+        let mut nodes = Vec::new();
+        nodes.try_reserve_exact(node_count).map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {node_count} directory nodes: {error}"
+            ))
         })?;
 
         // Read directory nodes (UnityFS format)
@@ -639,8 +655,9 @@ impl BundleParser {
             let name = reader.read_cstring()?;
 
             let node = DirectoryNode::new(name, offset, size, flags);
-            bundle.nodes.push(node);
+            nodes.push(node);
         }
+        bundle.nodes = nodes;
 
         Ok(())
     }
@@ -682,25 +699,24 @@ impl BundleParser {
                 dir_reader.remaining(),
             ));
         }
-        budget.consume_entries(u64::try_from(file_count).map_err(|_| {
-            BinaryError::invalid_data("Legacy bundle file count does not fit in u64")
-        })?)?;
-        bundle
-            .nodes
-            .try_reserve_exact(file_count)
-            .map_err(|error| {
-                BinaryError::memory_error(format!(
-                    "Failed to reserve {file_count} legacy directory nodes: {error}"
-                ))
-            })?;
-        bundle
-            .files
-            .try_reserve_exact(file_count)
-            .map_err(|error| {
-                BinaryError::memory_error(format!(
-                    "Failed to reserve {file_count} legacy file records: {error}"
-                ))
-            })?;
+        let directory_start = usize::try_from(dir_reader.position()).map_err(|_| {
+            BinaryError::invalid_data("Legacy bundle directory start does not fit in usize")
+        })?;
+        let retained_bytes =
+            preflight_legacy_directory(directory_data, directory_start, file_count)?;
+        consume_directory_budget(file_count, retained_bytes, budget)?;
+        let mut nodes = Vec::new();
+        nodes.try_reserve_exact(file_count).map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {file_count} legacy directory nodes: {error}"
+            ))
+        })?;
+        let mut files = Vec::new();
+        files.try_reserve_exact(file_count).map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {file_count} legacy file records: {error}"
+            ))
+        })?;
 
         // Read file entries
         for _ in 0..file_count {
@@ -709,12 +725,14 @@ impl BundleParser {
             let size = dir_reader.read_u32()? as u64;
 
             let file_info = BundleFileInfo::new(name.clone(), offset, size);
-            bundle.files.push(file_info);
+            files.push(file_info);
 
             // Also create a directory node for consistency
             let node = DirectoryNode::new(name, offset, size, 0x4); // Flag 0x4 = file
-            bundle.nodes.push(node);
+            nodes.push(node);
         }
+        bundle.nodes = nodes;
+        bundle.files = files;
 
         Ok(())
     }
@@ -874,6 +892,183 @@ impl BundleParser {
     }
 }
 
+fn consume_directory_budget(
+    count: usize,
+    retained_bytes: u64,
+    budget: &mut AssetLoadBudget,
+) -> Result<()> {
+    let count = u64::try_from(count)
+        .map_err(|_| BinaryError::invalid_data("Bundle member count does not fit in u64"))?;
+    budget.check_entries(count)?;
+    budget.check_members(count)?;
+    budget.check_bytes(retained_bytes)?;
+    budget.consume_entries(count)?;
+    budget.consume_members(count)?;
+    budget.consume_bytes(retained_bytes)?;
+    Ok(())
+}
+
+fn retained_record_bytes<T>(
+    count: usize,
+    name_lengths: impl IntoIterator<Item = usize>,
+    resource: &'static str,
+) -> Result<u64> {
+    let mut bytes = size_of::<T>()
+        .checked_mul(count)
+        .ok_or_else(|| BinaryError::invalid_data(format!("{resource} size overflow")))?;
+    for name_length in name_lengths {
+        bytes = bytes
+            .checked_add(name_length)
+            .ok_or_else(|| BinaryError::invalid_data(format!("{resource} name size overflow")))?;
+    }
+    u64::try_from(bytes)
+        .map_err(|_| BinaryError::invalid_data(format!("{resource} size does not fit in u64")))
+}
+
+fn preflight_unityfs_directory(
+    data: &[u8],
+    start: usize,
+    node_count: usize,
+    total_uncompressed: u64,
+) -> Result<u64> {
+    let mut cursor = start;
+    let mut name_bytes = 0_usize;
+    for _ in 0..node_count {
+        let fixed_end = cursor
+            .checked_add(20)
+            .ok_or_else(|| BinaryError::invalid_data("Directory node header overflow"))?;
+        if fixed_end > data.len() {
+            return Err(BinaryError::not_enough_data(fixed_end, data.len()));
+        }
+        let offset = bundle_i64_at(data, cursor, "directory node offset")?;
+        let size = bundle_i64_at(data, cursor + 8, "directory node size")?;
+        if offset < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative directory node offset: {offset}"
+            )));
+        }
+        if size < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative directory node size: {size}"
+            )));
+        }
+        let end = u64::try_from(offset)
+            .map_err(|_| BinaryError::invalid_data("Negative directory node offset"))?
+            .checked_add(
+                u64::try_from(size)
+                    .map_err(|_| BinaryError::invalid_data("Negative directory node size"))?,
+            )
+            .ok_or_else(|| BinaryError::invalid_data("Directory node offset+size overflow"))?;
+        if end > total_uncompressed {
+            return Err(BinaryError::invalid_data(format!(
+                "Directory node exceeds decompressed data: end {end} > {total_uncompressed}"
+            )));
+        }
+        let (name_length, next) = preflight_bundle_cstring(data, fixed_end)?;
+        name_bytes = name_bytes
+            .checked_add(name_length)
+            .ok_or_else(|| BinaryError::invalid_data("Directory node name size overflow"))?;
+        cursor = next;
+    }
+
+    retained_directory_bytes(
+        size_of::<DirectoryNode>(),
+        node_count,
+        name_bytes,
+        1,
+        "UnityFS directory",
+    )
+}
+
+fn preflight_legacy_directory(data: &[u8], start: usize, file_count: usize) -> Result<u64> {
+    let mut cursor = start;
+    let mut name_bytes = 0_usize;
+    for _ in 0..file_count {
+        let (name_length, after_name) = preflight_bundle_cstring(data, cursor)?;
+        let fixed_end = after_name
+            .checked_add(8)
+            .ok_or_else(|| BinaryError::invalid_data("Legacy file entry range overflow"))?;
+        if fixed_end > data.len() {
+            return Err(BinaryError::not_enough_data(fixed_end, data.len()));
+        }
+        name_bytes = name_bytes
+            .checked_add(name_length)
+            .ok_or_else(|| BinaryError::invalid_data("Legacy file name size overflow"))?;
+        cursor = fixed_end;
+    }
+
+    let record_bytes = size_of::<DirectoryNode>()
+        .checked_add(size_of::<BundleFileInfo>())
+        .ok_or_else(|| BinaryError::invalid_data("Legacy directory record size overflow"))?;
+    retained_directory_bytes(
+        record_bytes,
+        file_count,
+        name_bytes,
+        2,
+        "legacy bundle directory",
+    )
+}
+
+fn retained_directory_bytes(
+    record_bytes: usize,
+    count: usize,
+    name_bytes: usize,
+    name_copies: usize,
+    resource: &'static str,
+) -> Result<u64> {
+    let table_bytes = record_bytes
+        .checked_mul(count)
+        .ok_or_else(|| BinaryError::invalid_data(format!("{resource} table size overflow")))?;
+    let names = name_bytes
+        .checked_mul(name_copies)
+        .ok_or_else(|| BinaryError::invalid_data(format!("{resource} name size overflow")))?;
+    let retained = table_bytes
+        .checked_add(names)
+        .ok_or_else(|| BinaryError::invalid_data(format!("{resource} retained size overflow")))?;
+    u64::try_from(retained).map_err(|_| {
+        BinaryError::invalid_data(format!("{resource} retained size does not fit in u64"))
+    })
+}
+
+fn preflight_bundle_cstring(data: &[u8], start: usize) -> Result<(usize, usize)> {
+    let remaining = data
+        .get(start..)
+        .ok_or_else(|| BinaryError::not_enough_data(start, data.len()))?;
+    let scan_len = remaining
+        .len()
+        .min(BinaryReader::DEFAULT_MAX_STRING_LEN.saturating_add(1));
+    let Some(length) = remaining[..scan_len].iter().position(|byte| *byte == 0) else {
+        return if remaining.len() > BinaryReader::DEFAULT_MAX_STRING_LEN {
+            Err(BinaryError::invalid_data(format!(
+                "C string exceeds maximum length {}",
+                BinaryReader::DEFAULT_MAX_STRING_LEN
+            )))
+        } else {
+            Err(BinaryError::invalid_data(
+                "unterminated C string in bounded input",
+            ))
+        };
+    };
+    std::str::from_utf8(&remaining[..length])?;
+    let next = start
+        .checked_add(length)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| BinaryError::invalid_data("C string range overflow"))?;
+    Ok((length, next))
+}
+
+fn bundle_i64_at(data: &[u8], offset: usize, field: &'static str) -> Result<i64> {
+    let end = offset
+        .checked_add(size_of::<i64>())
+        .ok_or_else(|| BinaryError::invalid_data(format!("{field} range overflow")))?;
+    let bytes: [u8; 8] = data
+        .get(offset..end)
+        .ok_or_else(|| BinaryError::not_enough_data(end, data.len()))?
+        .try_into()
+        .map_err(|_| BinaryError::invalid_data(format!("Invalid {field} width")))?;
+    Ok(i64::from_be_bytes(bytes))
+}
+
 /// Parsing complexity information
 #[derive(Debug, Clone)]
 pub struct ParsingComplexity {
@@ -888,6 +1083,38 @@ pub struct ParsingComplexity {
 mod tests {
     use super::*;
     use unity_asset_core::{AssetLoadLimits, BudgetError};
+
+    fn blocks_info_with_nodes(names: &[&str]) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 16];
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(
+            &i32::try_from(names.len())
+                .expect("test node count fits in i32")
+                .to_be_bytes(),
+        );
+        for name in names {
+            bytes.extend_from_slice(&0_i64.to_be_bytes());
+            bytes.extend_from_slice(&0_i64.to_be_bytes());
+            bytes.extend_from_slice(&0x4_u32.to_be_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    fn legacy_directory_with_files(names: &[&str]) -> Vec<u8> {
+        let mut bytes = i32::try_from(names.len())
+            .expect("test file count fits in i32")
+            .to_be_bytes()
+            .to_vec();
+        for name in names {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(&0_u32.to_be_bytes());
+            bytes.extend_from_slice(&0_u32.to_be_bytes());
+        }
+        bytes
+    }
 
     #[test]
     fn test_parser_creation() {
@@ -933,5 +1160,107 @@ mod tests {
             })
         ));
         assert_eq!(budget.usage().bytes, 0);
+    }
+
+    #[test]
+    fn unityfs_member_limit_precedes_directory_allocations() {
+        let data = blocks_info_with_nodes(&["left", "right"]);
+        let mut bundle = AssetBundle::new_empty(BundleHeader::default());
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_members: 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let error = BundleParser::parse_directory_from_blocks_info(
+            &mut bundle,
+            &data,
+            &BundleLoadOptions::default(),
+            &mut budget,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BinaryError::Budget(BudgetError::Exceeded {
+                resource: "members",
+                limit: 1,
+                requested: 2,
+            })
+        ));
+        assert!(bundle.nodes.is_empty());
+        assert_eq!(budget.usage().members, 0);
+        assert_eq!(budget.usage().entries, 0);
+    }
+
+    #[test]
+    fn unityfs_retained_node_bytes_are_preflighted_before_allocation() {
+        let names = ["left", "right"];
+        let data = blocks_info_with_nodes(&names);
+        let retained = u64::try_from(
+            names.len() * std::mem::size_of::<DirectoryNode>()
+                + names.iter().map(|name| name.len()).sum::<usize>(),
+        )
+        .unwrap();
+        let mut bundle = AssetBundle::new_empty(BundleHeader::default());
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: retained - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let error = BundleParser::parse_directory_from_blocks_info(
+            &mut bundle,
+            &data,
+            &BundleLoadOptions::default(),
+            &mut budget,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BinaryError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            }) if limit == retained - 1 && requested == retained
+        ));
+        assert!(bundle.nodes.is_empty());
+        assert_eq!(budget.usage().bytes, 0);
+        assert_eq!(budget.usage().members, 0);
+        assert_eq!(budget.usage().entries, 0);
+    }
+
+    #[test]
+    fn legacy_member_limit_precedes_both_directory_tables() {
+        let data = legacy_directory_with_files(&["left", "right"]);
+        let mut bundle = AssetBundle::new_empty(BundleHeader::default());
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_members: 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let error = BundleParser::parse_legacy_directory(
+            &mut bundle,
+            &data,
+            0,
+            &BundleLoadOptions::default(),
+            &mut budget,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BinaryError::Budget(BudgetError::Exceeded {
+                resource: "members",
+                limit: 1,
+                requested: 2,
+            })
+        ));
+        assert!(bundle.nodes.is_empty());
+        assert!(bundle.files.is_empty());
+        assert_eq!(budget.usage().members, 0);
+        assert_eq!(budget.usage().entries, 0);
     }
 }

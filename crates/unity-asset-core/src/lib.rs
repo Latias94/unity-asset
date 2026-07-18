@@ -21,8 +21,8 @@ pub mod unity_value;
 
 // Re-export main types
 pub use budget::{
-    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BudgetError, BudgetedJsonError,
-    DecompressionBudget, DecompressionUsage,
+    AssetLoadBudget, AssetLoadDepthScope, AssetLoadLimits, AssetLoadUsage, BudgetError,
+    BudgetedJsonError, DecompressionBudget, DecompressionUsage,
 };
 pub use change::{ChangeSet, ChangeSetError, IdentityRemap, TransactionId};
 pub use constants::*;

@@ -35,6 +35,10 @@ pub(crate) trait BinaryRead {
 /// Allocation-bearing parsers accept this trait, so a plain [`BinaryReader`] cannot silently
 /// bypass a caller-owned `AssetLoadBudget`.
 pub(crate) trait BinaryInput: BinaryRead {
+    fn check_bytes(&self, amount: u64) -> Result<()>;
+    fn check_entries(&self, amount: u64) -> Result<()>;
+    fn check_members(&self, amount: u64) -> Result<()>;
+    fn check_depth(&self, depth: u32) -> Result<()>;
     fn consume_bytes(&mut self, amount: u64) -> Result<()>;
     fn consume_entries(&mut self, amount: u64) -> Result<()>;
     fn consume_members(&mut self, amount: u64) -> Result<()>;
@@ -482,6 +486,22 @@ impl BinaryRead for ByteCursor<'_, '_> {
 }
 
 impl BinaryInput for ByteCursor<'_, '_> {
+    fn check_bytes(&self, amount: u64) -> Result<()> {
+        ByteCursor::check_bytes(self, amount)
+    }
+
+    fn check_entries(&self, amount: u64) -> Result<()> {
+        ByteCursor::check_entries(self, amount)
+    }
+
+    fn check_members(&self, amount: u64) -> Result<()> {
+        ByteCursor::check_members(self, amount)
+    }
+
+    fn check_depth(&self, depth: u32) -> Result<()> {
+        ByteCursor::check_depth(self, depth)
+    }
+
     fn consume_bytes(&mut self, amount: u64) -> Result<()> {
         ByteCursor::consume_bytes(self, amount)
     }

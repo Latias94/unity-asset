@@ -18,8 +18,9 @@ use crate::error::{BinaryError, Result};
 use crate::random_access::{ByteCursor, ByteSource, SegmentedBytes};
 use crate::reader::{BinaryInput, BinaryReader, ByteOrder, not_enough_data_u64};
 use crate::shared_bytes::SharedBytes;
+use std::mem::size_of;
 use std::ops::Range;
-use unity_asset_core::AssetLoadBudget;
+use unity_asset_core::{AssetLoadBudget, BudgetError};
 
 /// SerializedFile parser.
 ///
@@ -182,7 +183,7 @@ impl SerializedFileParser {
             ref_types: metadata.ref_types,
             user_information: metadata.user_information,
         };
-        validation::validate_parts(&parts, source_len)?;
+        validation::validate_parts(&parts, source_len, budget)?;
         Ok(parts)
     }
 
@@ -212,7 +213,7 @@ impl SerializedFileParser {
             .ok_or_else(|| BinaryError::invalid_data("Missing explicit enableTypeTree flag"))?;
 
         let type_count = read_table_count(input, "SerializedType", 4)?;
-        reserve_entries(&mut metadata.types, type_count, "SerializedType")?;
+        reserve_entries(&mut metadata.types, type_count, "SerializedType", input)?;
         for _ in 0..type_count {
             metadata.types.push(SerializedType::from_input(
                 input,
@@ -234,7 +235,7 @@ impl SerializedFileParser {
         )?;
         let type_resolver =
             ObjectTypeResolver::new(format.object_type_encoding(), &metadata.types)?;
-        reserve_entries(&mut metadata.objects, object_count, "object")?;
+        reserve_entries(&mut metadata.objects, object_count, "object", input)?;
         for _ in 0..object_count {
             metadata.objects.push(Self::parse_object_info(
                 format,
@@ -248,7 +249,12 @@ impl SerializedFileParser {
 
         if format.has_metadata_field(MetadataField::ScriptTypes) {
             let script_count = read_table_count(input, "script type", 8)?;
-            reserve_entries(&mut metadata.script_types, script_count, "script type")?;
+            reserve_entries(
+                &mut metadata.script_types,
+                script_count,
+                "script type",
+                input,
+            )?;
             for _ in 0..script_count {
                 metadata
                     .script_types
@@ -257,7 +263,7 @@ impl SerializedFileParser {
         }
 
         let external_count = read_table_count(input, "external", 1)?;
-        reserve_entries(&mut metadata.externals, external_count, "external")?;
+        reserve_entries(&mut metadata.externals, external_count, "external", input)?;
         for _ in 0..external_count {
             metadata
                 .externals
@@ -266,7 +272,12 @@ impl SerializedFileParser {
 
         if format.has_metadata_field(MetadataField::RefTypes) {
             let ref_type_count = read_table_count(input, "reference type", 4)?;
-            reserve_entries(&mut metadata.ref_types, ref_type_count, "reference type")?;
+            reserve_entries(
+                &mut metadata.ref_types,
+                ref_type_count,
+                "reference type",
+                input,
+            )?;
             for _ in 0..ref_type_count {
                 metadata.ref_types.push(SerializedType::from_input(
                     input,
@@ -392,12 +403,31 @@ fn read_table_count(
         .map_err(|_| BinaryError::memory_error(format!("{label} count does not fit in usize")))
 }
 
-fn reserve_entries<T>(entries: &mut Vec<T>, count: usize, label: &str) -> Result<()> {
+fn reserve_entries<T>(
+    entries: &mut Vec<T>,
+    count: usize,
+    label: &str,
+    input: &mut (impl BinaryInput + ?Sized),
+) -> Result<()> {
+    let allocation = checked_storage_bytes::<T>(count)?;
+    input.check_bytes(allocation)?;
     entries.try_reserve_exact(count).map_err(|error| {
         BinaryError::memory_error(format!(
             "Failed to reserve {count} {label} entries: {error}"
         ))
-    })
+    })?;
+    input.consume_bytes(allocation)?;
+    Ok(())
+}
+
+fn checked_storage_bytes<T>(count: usize) -> Result<u64> {
+    let count =
+        u64::try_from(count).map_err(|_| BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+    let entry_size = u64::try_from(size_of::<T>())
+        .map_err(|_| BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+    count
+        .checked_mul(entry_size)
+        .ok_or_else(|| BudgetError::ArithmeticOverflow { resource: "bytes" }.into())
 }
 
 fn minimum_object_record_size(format: SerializedFileFormat, uses_big_ids: bool) -> usize {

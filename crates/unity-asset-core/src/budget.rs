@@ -1,4 +1,5 @@
 use std::io::{self, Read};
+use std::ops::{Deref, DerefMut};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,7 @@ pub struct AssetLoadUsage {
 pub struct AssetLoadBudget {
     limits: AssetLoadLimits,
     usage: AssetLoadUsage,
+    depth_base: u32,
 }
 
 impl AssetLoadBudget {
@@ -63,6 +65,7 @@ impl AssetLoadBudget {
         Ok(Self {
             limits,
             usage: AssetLoadUsage::default(),
+            depth_base: 0,
         })
     }
 
@@ -105,13 +108,41 @@ impl AssetLoadBudget {
     }
 
     pub fn observe_depth(&mut self, depth: u32) -> Result<(), BudgetError> {
-        self.check_depth(depth)?;
-        self.usage.max_observed_depth = self.usage.max_observed_depth.max(depth);
+        let absolute = self.absolute_depth(depth)?;
+        self.check_absolute_depth(absolute)?;
+        self.usage.max_observed_depth = self.usage.max_observed_depth.max(absolute);
         Ok(())
     }
 
     /// Checks a recursion depth without changing the maximum observed depth.
     pub fn check_depth(&self, depth: u32) -> Result<(), BudgetError> {
+        self.check_absolute_depth(self.absolute_depth(depth)?)
+    }
+
+    /// Enters a parser whose local depth zero starts at `base` below the current parser.
+    ///
+    /// Parsers continue to report local depths through [`Self::observe_depth`]. The scope adds the
+    /// complete outer-container depth and restores the previous base when dropped.
+    pub fn enter_depth(&mut self, base: u32) -> Result<AssetLoadDepthScope<'_>, BudgetError> {
+        let previous = self.depth_base;
+        let combined = previous
+            .checked_add(base)
+            .ok_or(BudgetError::ArithmeticOverflow { resource: "depth" })?;
+        self.check_absolute_depth(combined)?;
+        self.depth_base = combined;
+        Ok(AssetLoadDepthScope {
+            budget: self,
+            previous,
+        })
+    }
+
+    fn absolute_depth(&self, depth: u32) -> Result<u32, BudgetError> {
+        self.depth_base
+            .checked_add(depth)
+            .ok_or(BudgetError::ArithmeticOverflow { resource: "depth" })
+    }
+
+    fn check_absolute_depth(&self, depth: u32) -> Result<(), BudgetError> {
         if depth > self.limits.max_depth {
             return Err(BudgetError::Exceeded {
                 resource: "depth",
@@ -228,6 +259,34 @@ impl AssetLoadBudget {
     #[must_use]
     pub const fn remaining_bytes(&self) -> u64 {
         self.limits.max_bytes - self.usage.bytes
+    }
+}
+
+/// RAII scope that composes a parser's local depth with its owning container depth.
+#[derive(Debug)]
+#[must_use = "keep the scope alive while the nested parser uses the budget"]
+pub struct AssetLoadDepthScope<'budget> {
+    budget: &'budget mut AssetLoadBudget,
+    previous: u32,
+}
+
+impl Deref for AssetLoadDepthScope<'_> {
+    type Target = AssetLoadBudget;
+
+    fn deref(&self) -> &Self::Target {
+        self.budget
+    }
+}
+
+impl DerefMut for AssetLoadDepthScope<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.budget
+    }
+}
+
+impl Drop for AssetLoadDepthScope<'_> {
+    fn drop(&mut self) {
+        self.budget.depth_base = self.previous;
     }
 }
 

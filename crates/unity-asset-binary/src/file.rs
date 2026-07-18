@@ -14,6 +14,7 @@ use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::shared_bytes::SharedBytes;
+use crate::webfile::WebFileProbeError;
 use std::io::Read;
 use std::ops::Range;
 use std::path::Path;
@@ -240,14 +241,14 @@ pub fn load_unity_file_from_shared_range_with_budget(
         return load_recognized_unity_file_view_with_budget(view, kind, budget);
     }
 
-    match crate::webfile::WebFile::from_shared_range_with_budget(
+    match crate::webfile::WebFile::probe_from_shared_range_with_budget(
         view.backing_shared(),
         view.absolute_range(),
         budget,
     ) {
         Ok(web) => return Ok(UnityFile::WebFile(web)),
-        Err(error) if error.is_resource_error() => return Err(error),
-        Err(_) => {}
+        Err(WebFileProbeError::Mismatch { .. }) => {}
+        Err(WebFileProbeError::Recognized { source }) => return Err(source),
     }
 
     Err(BinaryError::invalid_format(
@@ -315,14 +316,14 @@ fn try_load_probed_unity_file_view_with_budget(
             Ok(UnityFileLoadOutcome::Recognized(file))
         }
         UnityFileProbe::CompressedWebFileCandidate => {
-            match crate::webfile::WebFile::from_shared_range_with_budget(
+            match crate::webfile::WebFile::probe_from_shared_range_with_budget(
                 view.backing_shared(),
                 view.absolute_range(),
                 budget,
             ) {
                 Ok(web) => Ok(UnityFileLoadOutcome::Recognized(UnityFile::WebFile(web))),
-                Err(error) if error.is_resource_error() => Err(error),
-                Err(_) => Ok(UnityFileLoadOutcome::Unrecognized),
+                Err(WebFileProbeError::Mismatch { .. }) => Ok(UnityFileLoadOutcome::Unrecognized),
+                Err(WebFileProbeError::Recognized { source }) => Err(source),
             }
         }
     }
@@ -644,6 +645,10 @@ mod tests {
         bytes
     }
 
+    fn retained_webfile_signature_bytes() -> u64 {
+        u64::try_from("UnityWebData1.0".len()).unwrap()
+    }
+
     fn gzip_compress(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
         encoder.write_all(bytes).unwrap();
@@ -734,6 +739,34 @@ mod tests {
     }
 
     #[test]
+    fn strict_loader_propagates_recognized_compressed_webfile_corruption() {
+        let mut decoded = b"UnityWebData1.0\0".to_vec();
+        decoded.extend_from_slice(&(-1_i32).to_le_bytes());
+        let encoded = gzip_compress(&decoded);
+
+        let error =
+            load_unity_file_from_memory_with_budget(encoded, &mut AssetLoadBudget::default())
+                .expect_err("recognized compressed WebFile corruption must remain visible");
+
+        assert!(matches!(error, BinaryError::InvalidData(_)));
+    }
+
+    #[test]
+    fn conservative_loader_propagates_recognized_compressed_webfile_corruption() {
+        let mut decoded = b"UnityWebData1.0\0".to_vec();
+        decoded.extend_from_slice(&(-1_i32).to_le_bytes());
+        let encoded = gzip_compress(&decoded);
+
+        let error =
+            try_load_unity_file_from_memory_with_budget(encoded, &mut AssetLoadBudget::default())
+                .expect_err(
+                    "recognized compressed WebFile corruption must not become unrecognized",
+                );
+
+        assert!(matches!(error, BinaryError::InvalidData(_)));
+    }
+
+    #[test]
     fn candidate_path_loader_skips_unrecognized_sources_before_mapping_or_preflight() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(b"ordinary data larger than the configured byte budget")
@@ -758,8 +791,9 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(&bytes).unwrap();
         file.flush().unwrap();
+        let retained_bytes = source_len + retained_webfile_signature_bytes();
         let mut budget = AssetLoadBudget::new(AssetLoadLimits {
-            max_bytes: source_len,
+            max_bytes: retained_bytes,
             ..AssetLoadLimits::default()
         })
         .unwrap();
@@ -770,7 +804,7 @@ mod tests {
             outcome,
             UnityFileLoadOutcome::Recognized(UnityFile::WebFile(_))
         ));
-        assert_eq!(budget.usage().bytes, source_len);
+        assert_eq!(budget.usage().bytes, retained_bytes);
     }
 
     #[test]
@@ -787,7 +821,10 @@ mod tests {
             outcome,
             UnityFileLoadOutcome::Recognized(UnityFile::WebFile(_))
         ));
-        assert_eq!(budget.usage().bytes, u64::try_from(bytes.len()).unwrap());
+        assert_eq!(
+            budget.usage().bytes,
+            u64::try_from(bytes.len()).unwrap() + retained_webfile_signature_bytes()
+        );
     }
 
     #[test]
