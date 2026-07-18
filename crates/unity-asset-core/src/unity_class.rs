@@ -28,12 +28,24 @@ pub struct UnityClass {
 impl UnityClass {
     /// Create a new Unity class instance
     pub fn new(class_id: i32, class_name: String, anchor: String) -> Self {
+        Self::with_properties(class_id, class_name, anchor, IndexMap::new())
+    }
+
+    /// Creates a class by taking ownership of an already materialized property map.
+    ///
+    /// Parsers should prefer this constructor so a budgeted map is not reallocated field by field.
+    pub fn with_properties(
+        class_id: i32,
+        class_name: String,
+        anchor: String,
+        properties: IndexMap<String, UnityValue>,
+    ) -> Self {
         Self {
             class_id,
             class_name,
             anchor,
             extra_anchor_data: String::new(),
-            properties: IndexMap::new(),
+            properties,
         }
     }
 
@@ -168,6 +180,22 @@ mod tests {
         class.set("m_Name".to_string(), "TestObject");
 
         assert_eq!(class.class_name, "GameObject");
+        assert_eq!(class.name(), Some("TestObject"));
+    }
+
+    #[test]
+    fn with_properties_reuses_the_materialized_map() {
+        let mut properties = IndexMap::with_capacity(4);
+        properties.insert(
+            "m_Name".to_string(),
+            UnityValue::String("TestObject".to_string()),
+        );
+        let capacity = properties.capacity();
+
+        let class =
+            UnityClass::with_properties(1, "GameObject".to_string(), "123".to_string(), properties);
+
+        assert_eq!(class.properties().capacity(), capacity);
         assert_eq!(class.name(), Some("TestObject"));
     }
 

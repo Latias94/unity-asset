@@ -5,7 +5,7 @@
 //!
 //! This module provides the same workflow in Rust, built on:
 //! - `unity-asset-binary` for reading/parsing
-//! - `TypeTreeWriter` for encoding
+//! - canonical TypeTree schema rewriting for encoding
 //! - `SerializedFileEdits` for capturing overridden bytes
 
 mod serialized_file_session;

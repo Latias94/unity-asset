@@ -7,7 +7,7 @@
 //! `cargo run -p unity-asset-decode --example export_textures --features texture-advanced -- <path> <out_dir>`
 
 use std::path::PathBuf;
-use unity_asset_core::constants::class_ids;
+use unity_asset_core::{AssetLoadBudget, constants::class_ids};
 use unity_asset_decode::file::load_unity_file;
 use unity_asset_decode::texture::Texture2DConverter;
 use unity_asset_decode::{object::ObjectHandle, unity_version::UnityVersion};
@@ -32,6 +32,7 @@ fn main() -> unity_asset_decode::Result<()> {
 
     let file = load_unity_file(&path)?;
     let converter = Texture2DConverter::new(UnityVersion::default());
+    let mut budget = AssetLoadBudget::default();
 
     let mut exported = 0usize;
     let mut seen = 0usize;
@@ -41,7 +42,7 @@ fn main() -> unity_asset_decode::Result<()> {
             return Ok(());
         }
         seen += 1;
-        let obj = handle.read()?;
+        let obj = handle.read(&mut budget)?;
         let tex = converter.from_unity_object(&obj)?;
         let image = converter.decode_to_image(&tex)?;
 

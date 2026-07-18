@@ -14,12 +14,11 @@ mod imp {
     use std::sync::{Arc, Mutex, RwLock};
     use unity_asset_binary::asset::SerializedFile;
     use unity_asset_binary::bundle::AssetBundle;
-    use unity_asset_binary::file::{UnityFile, load_unity_file, load_unity_file_from_shared_range};
+    use unity_asset_binary::file::UnityFile;
     use unity_asset_binary::object::{ObjectHandle, UnityObject};
-    use unity_asset_binary::typetree::TypeTreeRegistry;
     use unity_asset_binary::typetree::{
-        CompositeTypeTreeRegistry, JsonTypeTreeRegistry, ScriptTypeTreeGenerator,
-        ScriptTypeTreeGeneratorRegistry, TpkTypeTreeRegistry,
+        CompositeTypeTreeRegistry, ScriptTypeTreeGenerator, ScriptTypeTreeGeneratorRegistry,
+        TypeTreeRegistry,
     };
     use unity_asset_binary::typetree::{
         TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseWarning,
@@ -146,11 +145,11 @@ mod imp {
         /// re-packed on save), so we keep this distinct from `WebEntry` which represents entries
         /// inside a Unity `WebFile` container.
         ArchiveEntry {
-            archive_path: PathBuf,
+            archive_path: Arc<PathBuf>,
             entry_name: String,
         },
         WebEntry {
-            web_path: PathBuf,
+            web_path: Arc<PathBuf>,
             entry_name: String,
         },
     }
@@ -174,6 +173,23 @@ mod imp {
     impl BinarySource {
         pub fn path<P: AsRef<Path>>(path: P) -> Self {
             Self::Path(path.as_ref().to_path_buf())
+        }
+
+        pub fn web_entry<P: AsRef<Path>>(web_path: P, entry_name: impl Into<String>) -> Self {
+            Self::WebEntry {
+                web_path: Arc::new(web_path.as_ref().to_path_buf()),
+                entry_name: entry_name.into(),
+            }
+        }
+
+        pub fn archive_entry<P: AsRef<Path>>(
+            archive_path: P,
+            entry_name: impl Into<String>,
+        ) -> Self {
+            Self::ArchiveEntry {
+                archive_path: Arc::new(archive_path.as_ref().to_path_buf()),
+                entry_name: entry_name.into(),
+            }
         }
 
         pub fn describe(&self) -> String {
@@ -216,13 +232,11 @@ mod imp {
     }
 
     impl<'a> BinaryObjectRef<'a> {
-        pub fn read(&self) -> Result<UnityObject> {
+        pub fn read(&self, budget: &mut AssetLoadBudget) -> Result<UnityObject> {
             let obj = self
                 .object
-                .read_with_options(self.typetree_options)
-                .map_err(|e| {
-                    UnityAssetError::format(format!("Failed to parse binary object: {}", e))
-                })?;
+                .read_with_options(budget, self.typetree_options)
+                .map_err(|e| UnityAssetError::with_source("Failed to parse binary object", e))?;
 
             if let Some(reporter) = &self.reporter {
                 let key = self.key();
@@ -338,20 +352,23 @@ mod imp {
         }
 
         fn rebuild_type_tree_registry(&mut self) {
-            let mut composite = CompositeTypeTreeRegistry::default();
-            if let Some(script) = self.script_type_tree_registry.clone() {
-                composite.push(script);
-            }
-            if let Some(base) = self.base_type_tree_registry.clone() {
-                composite.push(base);
-            }
-
-            let effective: Option<Arc<dyn TypeTreeRegistry>> = if composite.is_empty() {
-                None
-            } else {
-                Some(Arc::new(composite))
+            let effective = match (
+                self.script_type_tree_registry.as_ref(),
+                self.base_type_tree_registry.as_ref(),
+            ) {
+                (None, None) => None,
+                (Some(registry), None) | (None, Some(registry)) => Some(registry.clone()),
+                (Some(script), Some(base)) => Some(Arc::new(CompositeTypeTreeRegistry::new(vec![
+                    script.clone(),
+                    base.clone(),
+                ]))
+                    as Arc<dyn TypeTreeRegistry>),
             };
 
+            self.publish_type_tree_registry(effective);
+        }
+
+        fn publish_type_tree_registry(&mut self, effective: Option<Arc<dyn TypeTreeRegistry>>) {
             self.type_tree_registry = effective.clone();
 
             for file in self.binary_assets.values_mut() {
@@ -390,45 +407,32 @@ mod imp {
         /// - `.json` (this project's JSON registry format)
         ///
         /// When multiple paths are provided, they are composed in the given order (first match wins).
-        pub fn set_type_tree_registry_from_paths(&mut self, paths: &[PathBuf]) -> Result<()> {
-            if paths.is_empty() {
-                self.set_type_tree_registry(None);
-                return Ok(());
-            }
-
-            let mut composite = CompositeTypeTreeRegistry::default();
-            for path in paths {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-
-                if ext == "tpk" {
-                    let registry = TpkTypeTreeRegistry::from_path(path).map_err(|e| {
-                        UnityAssetError::format(format!(
-                            "Failed to load TypeTree registry {:?}: {}",
-                            path, e
-                        ))
-                    })?;
-                    composite.push(Arc::new(registry));
-                } else {
-                    let registry = JsonTypeTreeRegistry::from_path(path).map_err(|e| {
-                        UnityAssetError::format(format!(
-                            "Failed to load TypeTree registry {:?}: {}",
-                            path, e
-                        ))
-                    })?;
-                    composite.push(Arc::new(registry));
+        /// Parsing is prepared locally under `budget`; failures leave the current registry and all
+        /// loaded `SerializedFile` attachments unchanged.
+        pub fn set_type_tree_registry_from_paths(
+            &mut self,
+            paths: &[PathBuf],
+            budget: &mut AssetLoadBudget,
+        ) -> Result<()> {
+            let base = CompositeTypeTreeRegistry::from_paths(paths, budget).map_err(|error| {
+                UnityAssetError::with_source("Failed to load TypeTree registry paths", error)
+            })?;
+            let effective = match (self.script_type_tree_registry.as_ref(), base.as_ref()) {
+                (None, None) => None,
+                (Some(registry), None) | (None, Some(registry)) => Some(registry.clone()),
+                (Some(script), Some(base)) => {
+                    CompositeTypeTreeRegistry::compose(&[script.clone(), base.clone()], budget)
+                        .map_err(|error| {
+                            UnityAssetError::with_source(
+                                "Failed to compose script and base TypeTree registries",
+                                error,
+                            )
+                        })?
                 }
-            }
+            };
 
-            if composite.is_empty() {
-                self.set_type_tree_registry(None);
-                return Ok(());
-            }
-
-            self.set_type_tree_registry(Some(Arc::new(composite)));
+            self.base_type_tree_registry = base;
+            self.publish_type_tree_registry(effective);
             Ok(())
         }
 
@@ -481,8 +485,12 @@ mod imp {
         }
 
         /// Iterate parsed binary `UnityObject`s (best-effort).
-        pub fn binary_objects(&self) -> impl Iterator<Item = Result<UnityObject>> + '_ {
-            self.binary_object_infos().map(|r| r.read())
+        pub fn binary_objects<'a>(
+            &'a self,
+            budget: &'a mut AssetLoadBudget,
+        ) -> impl Iterator<Item = Result<UnityObject>> + 'a {
+            self.binary_object_infos()
+                .map(move |reference| reference.read(&mut *budget))
         }
 
         /// Filter YAML objects by class name.

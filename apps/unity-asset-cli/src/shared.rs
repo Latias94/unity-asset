@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -8,12 +8,10 @@ use unity_asset::environment::{
     EnvironmentReporter, EnvironmentWarning,
 };
 use unity_asset::{
-    BundleMemberId, ContainmentKind, ObjectAddress, ObjectKind, SourceAlias, SourceLocator,
-    SourceMemberId,
+    AssetLoadBudget, BundleMemberId, ContainmentKind, ObjectAddress, ObjectKind, SourceAlias,
+    SourceLocator, SourceMemberId,
 };
-use unity_asset_binary::typetree::{
-    CompositeTypeTreeRegistry, JsonTypeTreeRegistry, TpkTypeTreeRegistry, TypeTreeRegistry,
-};
+use unity_asset_binary::typetree::{CompositeTypeTreeRegistry, TypeTreeRegistry};
 
 pub(crate) fn cli_warn(show: bool, msg: impl std::fmt::Display) {
     let msg = msg.to_string();
@@ -27,12 +25,16 @@ fn looks_like_unity_project_root(dir: &Path) -> bool {
     dir.join("Assets").is_dir() && dir.join("ProjectSettings").is_dir()
 }
 
-pub(crate) fn load_environment_input(env: &mut Environment, input: &Path) -> Result<()> {
+pub(crate) fn load_environment_input(
+    env: &mut Environment,
+    input: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<()> {
     if input.is_dir() && looks_like_unity_project_root(input) {
         let mut loaded_any = false;
         for root in [input.join("Assets"), input.join("ProjectSettings")] {
             if root.exists() {
-                env.load(&root)?;
+                env.load(&root, budget)?;
                 loaded_any = true;
             }
         }
@@ -40,7 +42,7 @@ pub(crate) fn load_environment_input(env: &mut Environment, input: &Path) -> Res
             return Ok(());
         }
     }
-    env.load(input)?;
+    env.load(input, budget)?;
     Ok(())
 }
 
@@ -549,7 +551,21 @@ pub(crate) fn build_environment(
     strict: bool,
     show_warnings: bool,
     typetree_registries: &[PathBuf],
+    budget: &mut AssetLoadBudget,
 ) -> Result<Environment> {
+    let registry = load_typetree_registry(typetree_registries, budget)?;
+    Ok(build_environment_with_registry(
+        strict,
+        show_warnings,
+        registry,
+    ))
+}
+
+pub(crate) fn build_environment_with_registry(
+    strict: bool,
+    show_warnings: bool,
+    registry: Option<Arc<dyn TypeTreeRegistry>>,
+) -> Environment {
     let mut env = if strict {
         Environment::with_options(EnvironmentOptions::strict())
     } else {
@@ -562,51 +578,23 @@ pub(crate) fn build_environment(
         None
     };
     env.set_reporter(reporter);
-
-    let registry = load_typetree_registry(typetree_registries)?;
     env.set_type_tree_registry(registry);
-
-    Ok(env)
+    env
 }
 
 pub(crate) fn load_typetree_registry(
     typetree_registries: &[PathBuf],
+    budget: &mut AssetLoadBudget,
 ) -> Result<Option<Arc<dyn TypeTreeRegistry>>> {
-    if typetree_registries.is_empty() {
-        return Ok(None);
-    };
-
-    let mut composite = CompositeTypeTreeRegistry::default();
-    for path in typetree_registries {
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ext == "tpk" {
-            let registry = TpkTypeTreeRegistry::from_path(path).map_err(|e| {
-                anyhow::anyhow!("Failed to load --typetree-registry {:?}: {}", path, e)
-            })?;
-            composite.push(Arc::new(registry));
-        } else {
-            let registry = JsonTypeTreeRegistry::from_path(path).map_err(|e| {
-                anyhow::anyhow!("Failed to load --typetree-registry {:?}: {}", path, e)
-            })?;
-            composite.push(Arc::new(registry));
-        }
-    }
-
-    if composite.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(Arc::new(composite)))
+    CompositeTypeTreeRegistry::from_paths(typetree_registries, budget)
+        .context("Failed to load --typetree-registry paths")
 }
 
 pub(crate) fn load_serialized_file_for_scan(
     path: &Path,
-) -> Result<unity_asset_binary::asset::SerializedFile> {
-    Ok(unity_asset_binary::file::load_serialized_file(path, false)?)
+    budget: &mut unity_asset::AssetLoadBudget,
+) -> unity_asset_binary::error::Result<unity_asset_binary::asset::SerializedFile> {
+    unity_asset_binary::file::load_serialized_file_with_budget(path, false, budget)
 }
 
 /// Resolves legacy `--source` flags. Persisted identities must use
@@ -717,6 +705,13 @@ pub(crate) fn lookup_object_type_info(env: &Environment, key: &BinaryObjectKey) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unity_asset::{AssetLoadLimits, BudgetError};
+
+    fn budget_error_in_chain(error: &anyhow::Error) -> Option<&BudgetError> {
+        error
+            .chain()
+            .find_map(|source| source.downcast_ref::<BudgetError>())
+    }
 
     fn bundle_key(source: &Path, asset_index: Option<usize>, path_id: i64) -> BinaryObjectKey {
         BinaryObjectKey {
@@ -732,6 +727,50 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, b"fixture").unwrap();
+    }
+
+    #[test]
+    fn typetree_registry_table_preserves_member_budget_error() {
+        let limits = AssetLoadLimits {
+            max_members: 1,
+            ..AssetLoadLimits::default()
+        };
+        let mut budget = AssetLoadBudget::new(limits).unwrap();
+        let paths = vec![PathBuf::from("first.json"), PathBuf::from("second.json")];
+
+        let error = load_typetree_registry(&paths, &mut budget).unwrap_err();
+
+        assert!(matches!(
+            budget_error_in_chain(&error),
+            Some(BudgetError::Exceeded {
+                resource: "members",
+                limit: 1,
+                requested: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn typetree_registry_table_preserves_byte_budget_error() {
+        let registry_table_bytes = 2 * std::mem::size_of::<Arc<dyn TypeTreeRegistry>>();
+        let limits = AssetLoadLimits {
+            max_bytes: u64::try_from(registry_table_bytes - 1).unwrap(),
+            ..AssetLoadLimits::default()
+        };
+        let mut budget = AssetLoadBudget::new(limits).unwrap();
+        let paths = vec![PathBuf::from("first.json"), PathBuf::from("second.json")];
+
+        let error = load_typetree_registry(&paths, &mut budget).unwrap_err();
+
+        assert!(matches!(
+            budget_error_in_chain(&error),
+            Some(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            }) if *limit == u64::try_from(registry_table_bytes - 1).unwrap()
+                && *requested == u64::try_from(registry_table_bytes).unwrap()
+        ));
     }
 
     #[test]
@@ -798,7 +837,7 @@ mod tests {
         create_source(&web_path);
         let key = BinaryObjectKey {
             source: BinarySource::WebEntry {
-                web_path,
+                web_path: Arc::new(web_path),
                 entry_name: "embedded/game.ab".into(),
             },
             source_kind: BinarySourceKind::AssetBundle,

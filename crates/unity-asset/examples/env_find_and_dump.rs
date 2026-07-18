@@ -9,6 +9,7 @@
 //!   dumps the first match.
 
 use std::path::PathBuf;
+use unity_asset::AssetLoadBudget;
 use unity_asset::environment::Environment;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,7 +23,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()?;
 
     let mut env = Environment::new();
-    env.load(&path)?;
+    let mut budget = AssetLoadBudget::default();
+    env.load(&path, &mut budget)?;
 
     let keys = env.find_binary_object_keys(path_id);
     if keys.is_empty() {
@@ -42,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let obj = env.read_binary_object_key(&keys[0])?;
+    let obj = env.read_binary_object_key(&keys[0], &mut budget)?;
     println!();
     println!(
         "dump: class_id={} class_name={} path_id={}",

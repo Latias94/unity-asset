@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
+use unity_asset::AssetLoadBudget;
 use unity_asset::environment::{
     EnvironmentWarning, ExternalObjectEdge, ObjectGraphBuildOptions, ProjectLoadOptions,
 };
@@ -67,7 +68,13 @@ pub(crate) fn run(
     follow_symlinks: bool,
     ctx: &AppContext,
 ) -> Result<()> {
-    let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
+    let mut budget = AssetLoadBudget::default();
+    let mut env = build_environment(
+        ctx.strict,
+        ctx.show_warnings,
+        ctx.typetree_registries(),
+        &mut budget,
+    )?;
 
     let mut options = if yaml {
         ProjectLoadOptions::everything()
@@ -78,7 +85,7 @@ pub(crate) fn run(
     options.respect_ignores = !no_ignore;
     options.follow_symlinks = follow_symlinks;
 
-    let stats = env.load_project(&input, options)?;
+    let stats = env.load_project(&input, options, &mut budget)?;
 
     if let Some(path) = warnings_jsonl.as_ref() {
         #[derive(Debug, Serialize)]
@@ -150,11 +157,14 @@ pub(crate) fn run(
         return Ok(());
     }
 
-    let graph = env.build_object_graph(ObjectGraphBuildOptions {
-        include_yaml: yaml,
-        include_binary: true,
-        ..ObjectGraphBuildOptions::default()
-    });
+    let graph = env.build_object_graph(
+        ObjectGraphBuildOptions {
+            include_yaml: yaml,
+            include_binary: true,
+            ..ObjectGraphBuildOptions::default()
+        },
+        &mut budget,
+    )?;
 
     let internal_edges: usize = graph
         .nodes()

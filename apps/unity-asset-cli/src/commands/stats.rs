@@ -3,6 +3,7 @@ use anyhow::Result;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use unity_asset::AssetLoadBudget;
 use unity_asset::environment::{BinarySource, BinarySourceKind, Environment};
 
 #[derive(Debug, Serialize)]
@@ -39,8 +40,14 @@ pub(crate) fn run(
     json: &bool,
     ctx: &AppContext,
 ) -> Result<()> {
-    let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
-    load_environment_input(&mut env, input)?;
+    let mut budget = AssetLoadBudget::default();
+    let mut env = build_environment(
+        ctx.strict,
+        ctx.show_warnings,
+        ctx.typetree_registries(),
+        &mut budget,
+    )?;
+    load_environment_input(&mut env, input, &mut budget)?;
 
     let k = kind.to_ascii_lowercase();
     let limit = limit.unwrap_or(usize::MAX);
@@ -254,13 +261,13 @@ fn visit_serialized_files(
             serialized_version: file.header.version,
             unity_version: file.unity_version.clone(),
             target_platform: file.target_platform,
-            enable_type_tree: file.enable_type_tree,
+            enable_type_tree: file.type_tree_enabled(),
             big_id_enabled: file.uses_big_ids(),
             object_count: file.objects().len(),
-            type_count: file.types.len(),
+            type_count: file.types().len(),
             script_type_count: file.script_types.len(),
             external_count: file.externals.len(),
-            ref_type_count: file.ref_types.len(),
+            ref_type_count: file.ref_types().len(),
         };
 
         on_record(record)?;
@@ -317,13 +324,13 @@ fn visit_bundles(
                 serialized_version: file.header.version,
                 unity_version: file.unity_version.clone(),
                 target_platform: file.target_platform,
-                enable_type_tree: file.enable_type_tree,
+                enable_type_tree: file.type_tree_enabled(),
                 big_id_enabled: file.uses_big_ids(),
                 object_count: file.objects().len(),
-                type_count: file.types.len(),
+                type_count: file.types().len(),
                 script_type_count: file.script_types.len(),
                 external_count: file.externals.len(),
-                ref_type_count: file.ref_types.len(),
+                ref_type_count: file.ref_types().len(),
             };
 
             on_record(record)?;

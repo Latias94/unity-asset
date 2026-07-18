@@ -218,6 +218,25 @@ fn byte_allocation_preflight_is_cumulative_and_does_not_charge_usage() {
 }
 
 #[test]
+fn structural_preflights_are_cumulative_and_do_not_charge_usage() {
+    let mut budget = AssetLoadBudget::new(constrained_limits()).unwrap();
+    budget.consume_entries(3).unwrap();
+    budget.consume_members(1).unwrap();
+    budget.observe_depth(2).unwrap();
+    let before = budget.usage();
+
+    budget.check_entries(1).unwrap();
+    budget.check_members(1).unwrap();
+    budget.check_depth(3).unwrap();
+    assert_eq!(budget.usage(), before);
+
+    assert!(budget.check_entries(2).is_err());
+    assert!(budget.check_members(2).is_err());
+    assert!(budget.check_depth(4).is_err());
+    assert_eq!(budget.usage(), before);
+}
+
+#[test]
 fn decompression_preflight_checks_cumulative_limits_without_charging() {
     let mut budget = AssetLoadBudget::new(AssetLoadLimits {
         max_compressed_bytes: 5,

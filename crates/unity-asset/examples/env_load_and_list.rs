@@ -6,6 +6,7 @@
 //! `<path>` can be a file or directory. If omitted, `tests/samples` is used.
 
 use std::path::PathBuf;
+use unity_asset::AssetLoadBudget;
 use unity_asset::environment::{Environment, EnvironmentObjectRef};
 
 fn main() -> unity_asset::Result<()> {
@@ -15,7 +16,8 @@ fn main() -> unity_asset::Result<()> {
         .unwrap_or_else(|| PathBuf::from("tests/samples"));
 
     let mut env = Environment::new();
-    env.load(&path)?;
+    let mut budget = AssetLoadBudget::default();
+    env.load(&path, &mut budget)?;
 
     println!("loaded: {}", path.display());
     println!("yaml_documents: {}", env.yaml_documents().len());
@@ -39,7 +41,10 @@ fn main() -> unity_asset::Result<()> {
             }
             EnvironmentObjectRef::Binary(v) => {
                 let key = v.key();
-                let name = env.peek_binary_object_name(&key).ok().flatten();
+                let name = env
+                    .peek_binary_object_name(&key, &mut budget)
+                    .ok()
+                    .flatten();
                 println!(
                     "bin: kind={:?} source={} path_id={} class_id={} name={}",
                     key.source_kind,

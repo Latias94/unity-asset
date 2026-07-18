@@ -4,6 +4,7 @@
 //! `cargo run -p unity-asset --example env_webfile_list_entries -- <path-to-UnityWebData>`
 
 use std::path::PathBuf;
+use unity_asset::AssetLoadBudget;
 use unity_asset::environment::Environment;
 
 fn main() -> unity_asset::Result<()> {
@@ -13,7 +14,8 @@ fn main() -> unity_asset::Result<()> {
         .ok_or_else(|| unity_asset::UnityAssetError::format("missing <path>"))?;
 
     let mut env = Environment::new();
-    env.load(&path)?;
+    let mut budget = AssetLoadBudget::default();
+    env.load(&path, &mut budget)?;
 
     println!("loaded: {}", path.display());
     println!("webfiles: {}", env.webfiles().len());

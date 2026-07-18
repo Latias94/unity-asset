@@ -396,8 +396,14 @@ fn export_bundle_command(
     show_warnings: bool,
     typetree_registries: &[PathBuf],
 ) -> Result<()> {
-    let mut env = build_environment(strict, show_warnings, typetree_registries)?;
-    load_environment_input(&mut env, &input)?;
+    let mut operation_budget = AssetLoadBudget::default();
+    let mut env = build_environment(
+        strict,
+        show_warnings,
+        typetree_registries,
+        &mut operation_budget,
+    )?;
+    load_environment_input(&mut env, &input, &mut operation_budget)?;
 
     let mut resume_map: std::collections::HashMap<(String, ObjectAddress), ExportManifestEntry> =
         std::collections::HashMap::new();
@@ -470,8 +476,6 @@ fn export_bundle_command(
         })
         .collect();
     bundle_sources.sort();
-    let mut container_budget = AssetLoadBudget::default();
-
     if bundle_sources.is_empty() && retry_failed_from.is_none() {
         println!("⚠ No AssetBundles found in {:?}", input);
         return Ok(());
@@ -517,7 +521,7 @@ fn export_bundle_command(
     } else {
         for bundle_source in bundle_sources {
             let entries =
-                env.bundle_container_entries_source(&bundle_source, &mut container_budget)?;
+                env.bundle_container_entries_source(&bundle_source, &mut operation_budget)?;
             let mut entries: Vec<_> = entries
                 .into_iter()
                 .filter(|e| container_asset_path_matches_ci(&e.asset_path, &pattern))
@@ -810,6 +814,7 @@ fn export_bundle_command(
     };
 
     let env = Arc::new(env);
+    let object_budget = Arc::new(Mutex::new(operation_budget));
     let export_jobs = Arc::new(export_jobs);
     let next = Arc::new(AtomicUsize::new(0));
     let abort = Arc::new(AtomicBool::new(false));
@@ -831,6 +836,7 @@ fn export_bundle_command(
             let results = Arc::clone(&results);
             let first_error = Arc::clone(&first_error);
             let allocator = Arc::clone(&allocator);
+            let object_budget = Arc::clone(&object_budget);
             let output = output.clone();
 
             scope.spawn(move || {
@@ -847,6 +853,7 @@ fn export_bundle_command(
                     let job = &export_jobs[idx];
                     let outcome = match export_one_entry(
                         &env,
+                        &object_budget,
                         &allocator,
                         &output,
                         &job.asset_path,
@@ -984,6 +991,7 @@ fn export_bundle_command(
 #[allow(clippy::too_many_arguments)]
 fn export_one_entry(
     env: &Environment,
+    budget: &Mutex<AssetLoadBudget>,
     allocator: &PathAllocator,
     output: &Path,
     asset_path: &str,
@@ -994,7 +1002,12 @@ fn export_one_entry(
     overwrite: bool,
     skip_existing: bool,
 ) -> Result<ExportOutcome> {
-    let obj = env.read_binary_object_key(key)?;
+    let obj = {
+        let mut budget = budget
+            .lock()
+            .map_err(|_| anyhow::anyhow!("asset load budget lock poisoned"))?;
+        env.read_binary_object_key(key, &mut budget)?
+    };
     let type_id = obj.info.class_id();
     let class_name = if type_id == 0 {
         None
@@ -1006,6 +1019,7 @@ fn export_one_entry(
         #[cfg(feature = "decode")]
         match try_decode_export_best_effort(
             env,
+            budget,
             allocator,
             output,
             asset_path,
@@ -1140,6 +1154,7 @@ enum DecodeAttempt {
 #[allow(clippy::too_many_arguments)]
 fn try_decode_export_best_effort(
     env: &Environment,
+    budget: &Mutex<AssetLoadBudget>,
     allocator: &PathAllocator,
     output: &Path,
     asset_path: &str,
@@ -1369,7 +1384,12 @@ fn try_decode_export_best_effort(
                 return Ok(DecodeAttempt::NotApplicable);
             };
 
-            let texture_obj = env.read_binary_pptr(&obj_ref, file_id, texture_path_id)?;
+            let texture_obj = {
+                let mut budget = budget
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("asset load budget lock poisoned"))?;
+                env.read_binary_pptr(&obj_ref, file_id, texture_path_id, &mut budget)?
+            };
 
             let texture_processor = TextureProcessor::new(unity_version);
             let mut texture = texture_processor.convert_object(&texture_obj)?;

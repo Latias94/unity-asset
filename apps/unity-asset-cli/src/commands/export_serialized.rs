@@ -247,8 +247,14 @@ pub(crate) fn run(
         );
     }
 
-    let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
-    load_environment_input(&mut env, &input)?;
+    let mut object_budget = AssetLoadBudget::default();
+    let mut env = build_environment(
+        ctx.strict,
+        ctx.show_warnings,
+        ctx.typetree_registries(),
+        &mut object_budget,
+    )?;
+    load_environment_input(&mut env, &input, &mut object_budget)?;
 
     let mut resume_map: std::collections::HashMap<ObjectAddress, ExportManifestEntry> =
         std::collections::HashMap::new();
@@ -378,7 +384,11 @@ pub(crate) fn run(
                     continue;
                 }
 
-                let peek_name = handle.peek_name().ok().flatten();
+                let peek_name = match handle.peek_name(&mut object_budget) {
+                    Ok(name) => name,
+                    Err(error) if error.is_resource_error() => return Err(error.into()),
+                    Err(_) => None,
+                };
                 if has_name_filter
                     && !peek_name
                         .as_deref()
@@ -550,6 +560,7 @@ pub(crate) fn run(
     };
 
     let env = Arc::new(env);
+    let object_budget = Arc::new(std::sync::Mutex::new(object_budget));
     let exported = Arc::new(AtomicUsize::new(0));
     let skipped_existing_count = Arc::new(AtomicUsize::new(0));
     let failed = Arc::new(AtomicUsize::new(0));
@@ -569,6 +580,7 @@ pub(crate) fn run(
         let cancelled = Arc::clone(&cancelled);
         let job_queue = Arc::clone(&job_queue);
         let manifest_entries = Arc::clone(&manifest_entries);
+        let object_budget = Arc::clone(&object_budget);
         handles.push(thread::spawn(move || {
             loop {
                 if cancelled.load(Ordering::Relaxed) {
@@ -582,7 +594,7 @@ pub(crate) fn run(
                     break;
                 };
 
-                match export_one_inner(&env, &job) {
+                match export_one_inner(&env, &job, &object_budget) {
                     Ok((dest, true, status, bytes, class_id, class_name, obj_name)) => {
                         println!("✓ {} -> {:?}", job.label, dest);
                         exported.fetch_add(1, Ordering::Relaxed);
@@ -693,8 +705,17 @@ type ExportOneInnerResult = (
     Option<String>,
 );
 
-fn export_one_inner(env: &Environment, job: &ExportJob) -> Result<ExportOneInnerResult> {
-    let obj = env.read_binary_object_key(&job.key)?;
+fn export_one_inner(
+    env: &Environment,
+    job: &ExportJob,
+    budget: &std::sync::Mutex<AssetLoadBudget>,
+) -> Result<ExportOneInnerResult> {
+    let obj = {
+        let mut budget = budget
+            .lock()
+            .map_err(|_| anyhow::anyhow!("asset load budget lock poisoned"))?;
+        env.read_binary_object_key(&job.key, &mut budget)?
+    };
     let class_id = obj.info.class_id();
     let class_name = best_effort_class_name(
         env.binary_assets().get(&job.key.source).ok_or_else(|| {
@@ -706,7 +727,9 @@ fn export_one_inner(env: &Environment, job: &ExportJob) -> Result<ExportOneInner
 
     if job.decode {
         #[cfg(feature = "decode")]
-        if let Some((dest, exported, bytes)) = try_decode_export_best_effort(env, job, &obj)? {
+        if let Some((dest, exported, bytes)) =
+            try_decode_export_best_effort(env, job, &obj, budget)?
+        {
             let status = if exported {
                 ExportStatus::ExportedDecoded
             } else {
@@ -810,6 +833,7 @@ fn try_decode_export_best_effort(
     env: &Environment,
     job: &ExportJob,
     obj: &UnityObject,
+    budget: &std::sync::Mutex<AssetLoadBudget>,
 ) -> Result<Option<(PathBuf, bool, Option<u64>)>> {
     let unity_version = env
         .binary_assets()
@@ -952,7 +976,12 @@ fn try_decode_export_best_effort(
                     return Ok(None);
                 };
 
-            let texture_obj = env.read_binary_pptr(&obj_ref, file_id, texture_path_id)?;
+            let texture_obj = {
+                let mut budget = budget
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("asset load budget lock poisoned"))?;
+                env.read_binary_pptr(&obj_ref, file_id, texture_path_id, &mut budget)?
+            };
 
             let texture_processor = TextureProcessor::new(unity_version);
             let mut texture = texture_processor.convert_object(&texture_obj)?;

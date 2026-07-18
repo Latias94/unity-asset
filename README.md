@@ -1,6 +1,6 @@
 # Unity Asset Parser
 
-A Rust implementation of Unity asset parsing, inspired by and learning from [UnityPy](https://github.com/K0lb3/UnityPy). This project focuses on parsing Unity YAML and binary formats with Rust's memory safety and performance characteristics.
+A Rust implementation of Unity asset parsing, querying, targeted editing, and repacking, inspired by and learning from [UnityPy](https://github.com/K0lb3/UnityPy). The project applies Rust's memory safety and performance characteristics to Unity YAML and binary formats.
 
 ## Project Status
 
@@ -8,13 +8,13 @@ A Rust implementation of Unity asset parsing, inspired by and learning from [Uni
 
 ### What This Project Is
 - **Learning Exercise**: Understanding Unity's file formats through Rust implementation
-- **Parser Focus**: Emphasis on parsing and data extraction rather than manipulation
+- **Format Tooling Focus**: Parsing and data extraction first, with schema-aware edits and repacking for supported existing assets
 - **Rust Exploration**: Exploring how Rust's type system can help with binary parsing
 - **Reference Implementation**: Code that others can learn from and build upon
 
 ### What This Project Is NOT
 - **UnityPy Replacement**: UnityPy remains the most mature Python solution
-- **Asset Editor**: This is a read-only parser, not an asset creation/editing tool
+- **Full Asset Authoring Tool**: Write support targets existing assets and containers; it is not a replacement for the Unity Editor or a general asset-creation API
 
 ## Architecture
 
@@ -26,6 +26,7 @@ unity-asset/
 │   ├── unity-asset-core/  # Core data structures and traits
 │   ├── unity-asset-yaml/  # YAML file parsing (stable)
 │   ├── unity-asset-binary/ # Binary asset parsing (advanced, WIP)
+│   ├── unity-asset-write/ # Object editing and SerializedFile/Bundle/WebFile repacking
 │   ├── unity-asset-decode/ # Optional decode/export helpers (Texture/Audio/Sprite/Mesh)
 │   ├── unity-asset/       # Main library crate (published as `unity-asset`)
 │   └── unity-asset-search-*/ # Search indexing core (daemon uses these)
@@ -38,14 +39,21 @@ unity-asset/
 
 ### Crates
 
-- `unity-asset` (library): main user-facing API. Start here for `Environment` (YAML + binary) and `YamlDocument`.
-- `unity-asset-binary` (parser): low-level binary parsers (AssetBundle/SerializedFile/WebFile) plus fast object helpers (`ObjectHandle`).
+- `unity-asset` (library): high-level loading, querying, and editing API. Start here for `Environment` (YAML + binary) and `YamlDocument`.
+- `unity-asset-binary` (parser): low-level binary parsers (AssetBundle/SerializedFile/WebFile), TypeTree schemas, and fast object helpers (`ObjectHandle`).
+- `unity-asset-write` (edit/repack): TypeTree object edits, SerializedFile rebuilds, Bundle/WebFile repacking, and streamed-resource writes.
 - `unity-asset-decode` (decode/export): optional decode/export helpers behind feature flags (Texture/Audio/Sprite/Mesh).
 - `unity-asset-yaml` (YAML): YAML-specific parsing/serialization; also re-exported via `unity-asset`.
 - `unity-asset-core` (core): shared data structures, errors, and dynamic `UnityValue` types.
 - `unity-asset-cli` (CLI): command-line tools (not required for library integration).
 - `unity-asset-search-daemon` (app): local HTTP search daemon (indexing + query).
 - `unity-asset-search-cli` (app): CLI client for the search daemon.
+
+Rust does not make transitive crates importable. Use `unity_asset` for its re-exported high-level
+API, and add a direct dependency on `unity-asset-write`, `unity-asset-binary`, or
+`unity-asset-decode` when using APIs owned by those crates. In particular, high-level
+`Environment` edit methods live in `unity-asset`, while save/repack controls such as
+`PackerOptions` are imported from `unity_asset_write`.
 
 Examples are maintained per-crate and are built in CI. For instance:
 `cargo run -p unity-asset --example env_load_and_list -- tests/samples`
@@ -69,6 +77,12 @@ See `docs/README.md` for documentation entry points, and `docs/EXAMPLES.md` for 
 - Metadata extraction and analysis (experimental; includes dependency graph, best-effort hierarchy/component mapping, and external reference resolution via `externals`)
 - Performance monitoring and basic statistics
 
+#### Editing and Repacking (Advanced, WIP)
+- TypeTree-backed object mutation through `Environment` or `SerializedFileEditSession`
+- SerializedFile rebuilds and AssetBundle/WebFile repacking via `unity-asset-write`
+- Streamed `.resS`/`.resource` writes for supported object fields and container layouts
+- YAML serialization through `YamlDocument`
+
 #### Object Processing (Partial)
 - **AudioClip**: Full format support (Vorbis, MP3, WAV, AAC) via `unity-asset-decode` (Symphonia-based decoder)
 - **Texture2D**: Complete parsing + best-effort decoding + PNG export via `unity-asset-decode`
@@ -87,7 +101,7 @@ See `docs/README.md` for documentation entry points, and `docs/EXAMPLES.md` for 
 
 **Known Limitations**
 - Some advanced Unity asset types not yet implemented (MonoBehaviour scripts, complex shaders)
-- Object manipulation is read-only (no writing back to Unity formats)
+- Write coverage is limited to supported existing schemas and container layouts; arbitrary asset creation and full Unity serialization parity are not implemented
 - Some edge cases in LZMA decompression may fail on corrupted data
 - Advanced texture formats require `unity-asset-decode` `texture-advanced` feature (DXT, ETC, ASTC)
 - Audio decoding requires `unity-asset-decode` `audio` feature (Symphonia integration)
@@ -113,7 +127,13 @@ This project is published on crates.io. Install it with:
 # Add to your Cargo.toml
 [dependencies]
 unity-asset = "0.3.0"
+# Add when calling edit/save/repack APIs that use writer-owned types.
+unity-asset-write = "0.3.0"
 ```
+
+`unity-asset` is sufficient for the high-level read/query API. Keep `unity-asset-write` as a direct
+dependency when calling `Environment::save` or importing edit/repack types; those types are not
+re-exported from `unity-asset`.
 
 ```bash
 # Install CLI tools
@@ -153,7 +173,7 @@ We have basic tests for core functionality, but this is not a comprehensive test
 [UnityPy](https://github.com/K0lb3/UnityPy) is a mature, feature-complete Python library for Unity asset manipulation. This Rust project is:
 
 - **Much less mature**: UnityPy has years of development and community contributions
-- **More limited**: We focus on parsing, not manipulation or export
+- **More limited**: Format and object coverage is narrower, with targeted edit/repack support rather than UnityPy's full manipulation surface
 - **Learning-oriented**: This project helps understand Unity formats through Rust
 - **Experimental**: Many features are incomplete or missing
 
@@ -183,59 +203,69 @@ if let Ok(settings) = doc.get(Some("PlayerSettings"), None) {
 
 ### UnityPy-like Environment (YAML + Binary)
 
-```rust
+```rust,no_run
 use unity_asset::environment::{Environment, EnvironmentObjectRef};
-use unity_asset_binary::typetree::JsonTypeTreeRegistry;
-use std::sync::Arc;
+use unity_asset::AssetLoadBudget;
 
-let mut env = Environment::new();
+fn main() -> unity_asset::Result<()> {
+    let mut env = Environment::new();
 
-// Optional: provide an external TypeTree registry for stripped assets (best-effort).
-// This can improve coverage when `enableTypeTree = false` in serialized files.
-// let registry = JsonTypeTreeRegistry::from_path("typetree_registry.json")?;
-// env.set_type_tree_registry(Some(Arc::new(registry)));
+    // One caller-owned budget accounts for binary source loading and binary discovery/reads.
+    // YAML document materialization is not yet part of this budget contract.
+    let mut budget = AssetLoadBudget::default();
+    env.load("tests/samples", &mut budget)?;
 
-env.load("tests/samples")?;
-
-// `path_id` is only unique within a single SerializedFile.
-// `BinaryObjectKey` is a legacy runtime locator; do not persist or parse its Display output.
-// Persisted workflows use the versioned `ObjectAddress` contract.
-let sources = env.binary_sources();
-if let Some((_kind, source_path)) = sources.first() {
-    let keys = env.find_binary_object_keys_in_source(source_path, 1);
-    if let Some(key) = keys.first() {
-        let _parsed = env.read_binary_object_key(key)?;
-    }
-}
-
-// Unity `PPtr` resolution needs a context object because `fileID` indexes into the context file's externals.
-// For the common case `fileID=0`, it points to the same SerializedFile as the context.
-if let Some(obj_ref) = env.find_binary_object(1) {
-    let _pptr_obj = env.read_binary_pptr(&obj_ref, 0, 1)?;
-}
-
-// AssetBundles often expose a container mapping from asset paths to objects.
-// This is the primary discovery mechanism in UnityPy.
-// Note: This is best-effort; when TypeTree is stripped, we fall back to a raw binary parser for `m_Container`.
-let container = env.find_binary_object_keys_in_bundle_container("Assets/");
-for (asset_path, key) in container.into_iter().take(10) {
-    let _obj = env.read_binary_object_key(&key)?;
-    println!("{} -> path_id={}", asset_path, key.path_id);
-}
-
-for obj in env.objects() {
-    match obj {
-        EnvironmentObjectRef::Yaml(class) => {
-            let _ = &class.class_name;
-        }
-        EnvironmentObjectRef::Binary(obj_ref) => {
-            // Parse on-demand (best-effort)
-            let _parsed = obj_ref.read()?;
-            let _key = obj_ref.key();
+    // `path_id` is only unique within a single SerializedFile.
+    // `BinaryObjectKey` is a legacy runtime locator; do not persist or parse its Display output.
+    // Persisted workflows use the versioned `ObjectAddress` contract.
+    let sources = env.binary_sources();
+    if let Some((_kind, source)) = sources.first() {
+        if let Some(object_ref) = env.find_binary_object_in_source_id(source, 1) {
+            let key = object_ref.key();
+            let _parsed = env.read_binary_object_key(&key, &mut budget)?;
         }
     }
+
+    // Unity `PPtr` resolution needs a context object because `fileID` indexes into the context
+    // file's externals. `fileID=0` points to the same SerializedFile as the context.
+    if let Some(obj_ref) = env.find_binary_object(1) {
+        let _pptr_obj = env.read_binary_pptr(&obj_ref, 0, 1, &mut budget)?;
+    }
+
+    // AssetBundles often expose a container mapping from asset paths to objects.
+    // When TypeTree is stripped, discovery can fall back to a raw `m_Container` parser.
+    let container =
+        env.find_binary_object_keys_in_bundle_container("Assets/", &mut budget)?;
+    for (asset_path, key) in container.into_iter().take(10) {
+        let _object = env.read_binary_object_key(&key, &mut budget)?;
+        println!("{} -> path_id={}", asset_path, key.path_id);
+    }
+
+    for object in env.objects() {
+        match object {
+            EnvironmentObjectRef::Yaml(class) => {
+                let _ = &class.class_name;
+            }
+            EnvironmentObjectRef::Binary(object_ref) => {
+                let _parsed = object_ref.read(&mut budget)?;
+                let _key = object_ref.key();
+            }
+        }
+    }
+
+    Ok(())
 }
 ```
+
+All binary TypeTree operations use one compiled
+`unity_asset_binary::typetree::TypeTreeSchema` contract, obtained through
+`unity_asset_binary::object::ObjectHandle::schema(&mut AssetLoadBudget)`. The schema owns the
+semantics for materialized reads (`read_object` and `read_value`), allocation-free skips
+(`skip_value`), and zero-materialization PPtr scans (`scan_pptrs`). Object writes do not use a
+separate serializer facade: `unity_asset_write::object::SerializedFileEditSession::edit_object`
+and `save_typetree` accept the same caller-owned budget, reuse the canonical schema, and rewrite
+changed fields while preserving untouched original bytes. Keep one budget for the whole logical
+operation so schema compilation, traversal, and rewrite are accounted cumulatively.
 
 ### CLI Usage
 
@@ -328,6 +358,7 @@ This project is organized as a Rust workspace with separate crates for different
 - **`unity-asset-core`**: Core data structures and traits
 - **`unity-asset-yaml`**: YAML format parsing
 - **`unity-asset-binary`**: Binary format parsing (AssetBundle, SerializedFile)
+- **`unity-asset-write`**: TypeTree edits and SerializedFile/Bundle/WebFile rebuilding
 - **`unity-asset-decode`**: Optional decode/export helpers (Texture/Audio/Sprite/Mesh)
 - **`unity-asset`**: Main library crate (published as `unity-asset`)
 - **`unity-asset-cli`**: Command-line tools (published as `unity-asset-cli`)

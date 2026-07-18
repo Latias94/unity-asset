@@ -248,7 +248,11 @@ impl Environment {
     }
 
     /// Read a `UnityObject` from a globally-unique key.
-    pub fn read_binary_object_key(&self, key: &BinaryObjectKey) -> Result<UnityObject> {
+    pub fn read_binary_object_key(
+        &self,
+        key: &BinaryObjectKey,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<UnityObject> {
         let typetree_options = self.options.typetree;
         match key.source_kind {
             BinarySourceKind::SerializedFile => {
@@ -273,9 +277,11 @@ impl Environment {
                         key.path_id
                     ))
                 })?;
-                let obj = object.read_with_options(typetree_options).map_err(|e| {
-                    UnityAssetError::with_source("Failed to parse binary object", e)
-                })?;
+                let obj = object
+                    .read_with_options(budget, typetree_options)
+                    .map_err(|e| {
+                        UnityAssetError::with_source("Failed to parse binary object", e)
+                    })?;
                 if let Some(reporter) = &self.reporter {
                     for w in obj.typetree_warnings() {
                         reporter.typetree_warning(key, w);
@@ -319,9 +325,11 @@ impl Environment {
                         key.path_id
                     ))
                 })?;
-                let obj = object.read_with_options(typetree_options).map_err(|e| {
-                    UnityAssetError::with_source("Failed to parse binary object", e)
-                })?;
+                let obj = object
+                    .read_with_options(budget, typetree_options)
+                    .map_err(|e| {
+                        UnityAssetError::with_source("Failed to parse binary object", e)
+                    })?;
                 if let Some(reporter) = &self.reporter {
                     for w in obj.typetree_warnings() {
                         reporter.typetree_warning(key, w);
@@ -336,7 +344,11 @@ impl Environment {
     ///
     /// This uses a TypeTree prefix fast path (when possible) and returns `Ok(None)` when the
     /// object has no TypeTree or does not expose a name field.
-    pub fn peek_binary_object_name(&self, key: &BinaryObjectKey) -> Result<Option<String>> {
+    pub fn peek_binary_object_name(
+        &self,
+        key: &BinaryObjectKey,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Option<String>> {
         let typetree_options = self.options.typetree;
         match key.source_kind {
             BinarySourceKind::SerializedFile => {
@@ -362,7 +374,7 @@ impl Environment {
                     ))
                 })?;
                 object
-                    .peek_name_with_options(typetree_options)
+                    .peek_name_with_options(budget, typetree_options)
                     .map_err(|e| {
                         UnityAssetError::with_source("Failed to peek binary object name", e)
                     })
@@ -404,7 +416,7 @@ impl Environment {
                     ))
                 })?;
                 object
-                    .peek_name_with_options(typetree_options)
+                    .peek_name_with_options(budget, typetree_options)
                     .map_err(|e| {
                         UnityAssetError::with_source("Failed to peek binary object name", e)
                     })

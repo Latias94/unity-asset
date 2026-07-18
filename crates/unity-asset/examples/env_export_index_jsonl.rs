@@ -8,7 +8,7 @@
 use serde::Serialize;
 use std::path::PathBuf;
 use unity_asset::environment::Environment;
-use unity_asset::get_class_name;
+use unity_asset::{AssetLoadBudget, get_class_name};
 
 #[derive(Debug, Serialize)]
 struct BinaryIndexEntry {
@@ -34,13 +34,16 @@ fn main() -> unity_asset::Result<()> {
         .unwrap_or(0);
 
     let mut env = Environment::new();
-    env.load(&path)?;
-
+    let mut budget = AssetLoadBudget::default();
+    env.load(&path, &mut budget)?;
     let mut entries: Vec<BinaryIndexEntry> = env
         .binary_object_infos()
         .map(|obj_ref| {
             let key = obj_ref.key();
-            let name = env.peek_binary_object_name(&key).ok().flatten();
+            let name = env
+                .peek_binary_object_name(&key, &mut budget)
+                .ok()
+                .flatten();
             let class_id = obj_ref.object.class_id();
             BinaryIndexEntry {
                 source_kind: format!("{:?}", key.source_kind),

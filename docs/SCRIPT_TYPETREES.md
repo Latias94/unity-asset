@@ -35,7 +35,7 @@ The exporter writes a JSON file like:
 
 Notes:
 - `script_id` is a 16-byte `Hash128`, encoded as 32 lowercase hex chars.
-- Extra fields may be present (e.g. `assembly`, `fullname`) and are ignored by the loader.
+- Unknown and duplicate fields are rejected so malformed registries cannot silently change meaning.
 
 ## Prerequisites
 
@@ -81,14 +81,25 @@ You can repeat `--input` to scan multiple bundles / `.assets` files. The exporte
 The simplest is to load the JSON registry into the `Environment` so `ObjectHandle` can resolve stripped TypeTrees:
 
 ```rust
-use unity_asset::Environment;
+use std::path::PathBuf;
+use unity_asset::AssetLoadBudget;
+use unity_asset::environment::Environment;
 
-let mut env = Environment::new();
-env.set_type_tree_registry_from_paths(&["D:\\tmp\\script-typetrees.json"])?;
-env.load("D:\\path\\to\\bundles")?;
+fn load_with_script_typetrees() -> unity_asset::Result<Environment> {
+    let mut env = Environment::new();
+    let registry_paths = [PathBuf::from("D:\\tmp\\script-typetrees.json")];
+    let mut budget = AssetLoadBudget::default();
+    env.set_type_tree_registry_from_paths(&registry_paths, &mut budget)?;
+    env.load("D:\\path\\to\\bundles", &mut budget)?;
+    Ok(env)
+}
 ```
 
-If you only need the lower-level loader, use `unity_asset_binary::typetree::JsonTypeTreeRegistry` and attach it to a `SerializedFile` via `set_type_tree_registry(...)`.
+If you only need the lower-level loader, use
+`unity_asset_binary::typetree::JsonTypeTreeRegistry` and attach it to a `SerializedFile` via
+`set_type_tree_registry(...)`. Registry ingestion is budgeted as well: pass the same caller-owned
+`AssetLoadBudget` to JSON `from_reader`/`from_path` or TPK `from_bytes`/`from_path` and the later
+asset operation.
 
 ## Validation checklist
 

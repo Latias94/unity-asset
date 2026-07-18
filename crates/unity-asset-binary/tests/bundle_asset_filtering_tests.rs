@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions, BundleLoader, BundleProcessor};
 use unity_asset_binary::compression::CompressionType;
 use unity_asset_binary::metadata::MetadataExtractor;
+use unity_asset_core::AssetLoadBudget;
 
 fn sample_bundle_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/samples/char_118_yuki.ab")
@@ -146,13 +147,16 @@ fn bundle_processor_extract_assets_by_type_filters_results() {
 fn metadata_extractor_from_bundle_sets_bundle_compression_type() {
     let path = sample_bundle_path();
     let bytes = std::fs::read(&path).expect("read sample bundle");
-    let bundle = unity_asset_binary::bundle::BundleParser::from_bytes(bytes).expect("parse bundle");
+    let mut budget = AssetLoadBudget::default();
+    let bundle =
+        unity_asset_binary::bundle::BundleParser::from_bytes_with_budget(bytes, &mut budget)
+            .expect("parse bundle");
 
     let expected = expected_bundle_compression_summary(&bundle);
 
     let extractor = MetadataExtractor::new();
     let results = extractor
-        .extract_from_bundle(&bundle)
+        .extract_from_bundle(&bundle, &mut budget)
         .expect("extract metadata");
     assert!(
         !results.is_empty(),

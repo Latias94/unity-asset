@@ -9,8 +9,10 @@ use super::validation;
 use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
 use crate::shared_bytes::SharedBytes;
-use crate::typetree::TypeTreeRegistry;
+use crate::typetree::{ManagedReferenceCatalog, TypeTree, TypeTreeRegistry, TypeTreeSchema};
+use once_cell::sync::OnceCell;
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use unity_asset_core::AssetLoadBudget;
@@ -50,11 +52,11 @@ pub struct SerializedFile {
     /// Target platform.
     pub target_platform: i32,
     /// Whether type tree is enabled.
-    pub enable_type_tree: bool,
+    enable_type_tree: bool,
     /// Optional external TypeTree registry for stripped files (best-effort).
-    pub type_tree_registry: Option<Arc<dyn TypeTreeRegistry>>,
+    type_tree_registry: Option<Arc<dyn TypeTreeRegistry>>,
     /// Type information.
-    pub types: Vec<SerializedType>,
+    types: Vec<SerializedType>,
     /// Exact legacy `bigIdEnabled` value when the format stores it.
     legacy_big_id: Option<i32>,
     /// Object information in immutable table order.
@@ -64,12 +66,48 @@ pub struct SerializedFile {
     /// External file references.
     pub externals: Vec<FileIdentifier>,
     /// Reference types.
-    pub ref_types: Vec<SerializedType>,
+    ref_types: Vec<SerializedType>,
     /// User information.
     pub user_information: String,
     /// Raw file data.
     data: DataView,
     object_index_by_path_id: OnceLock<HashMap<i64, usize>>,
+    schema_cache: SerializedFileSchemaCache,
+}
+
+#[derive(Debug, Default)]
+struct SerializedFileSchemaCache {
+    managed: SchemaCacheCell<Arc<ManagedReferenceCatalog>>,
+    internal: SchemaCacheCell<Box<[SchemaCacheCell<TypeTreeSchema>]>>,
+}
+
+type SchemaCacheCell<T> = OnceCell<SchemaCacheOutcome<T>>;
+
+#[derive(Debug)]
+enum SchemaCacheOutcome<T> {
+    Value(T),
+    InvalidData(String),
+}
+
+impl<T> SchemaCacheOutcome<T> {
+    fn as_result(&self) -> Result<&T> {
+        match self {
+            Self::Value(value) => Ok(value),
+            Self::InvalidData(message) => Err(BinaryError::invalid_data(message.clone())),
+        }
+    }
+}
+
+fn get_or_try_cache<T>(
+    cell: &SchemaCacheCell<T>,
+    initialize: impl FnOnce() -> Result<T>,
+) -> Result<&T> {
+    cell.get_or_try_init(|| match initialize() {
+        Ok(value) => Ok(SchemaCacheOutcome::Value(value)),
+        Err(BinaryError::InvalidData(message)) => Ok(SchemaCacheOutcome::InvalidData(message)),
+        Err(error) => Err(error),
+    })?
+    .as_result()
 }
 
 impl SerializedFile {
@@ -102,6 +140,7 @@ impl SerializedFile {
             user_information: parts.user_information,
             data,
             object_index_by_path_id: OnceLock::new(),
+            schema_cache: SerializedFileSchemaCache::default(),
         })
     }
 
@@ -111,6 +150,46 @@ impl SerializedFile {
     /// of this snapshot's identity contract. Payload overrides use [`Self::find_object_mut`].
     pub fn objects(&self) -> &[ObjectInfo] {
         &self.objects
+    }
+
+    /// Returns whether embedded TypeTrees may be used for object schemas.
+    pub const fn type_tree_enabled(&self) -> bool {
+        self.enable_type_tree
+    }
+
+    /// Enables or disables embedded TypeTree lookup without mutating the retained type table.
+    pub fn set_type_tree_enabled(&mut self, enabled: bool) {
+        self.enable_type_tree = enabled;
+    }
+
+    /// Returns the validated SerializedType table in wire order.
+    pub fn types(&self) -> &[SerializedType] {
+        &self.types
+    }
+
+    /// Returns mutable type metadata after invalidating every derived schema.
+    ///
+    /// This exists for format construction and adversarial tests. Normal object consumers should
+    /// treat a parsed SerializedFile as an immutable snapshot and use [`Self::types`].
+    pub fn types_mut(&mut self) -> &mut Vec<SerializedType> {
+        self.invalidate_schema_cache();
+        &mut self.types
+    }
+
+    /// Returns the managed-reference type catalog in wire order.
+    pub fn ref_types(&self) -> &[SerializedType] {
+        &self.ref_types
+    }
+
+    /// Returns mutable managed-reference metadata after invalidating every derived schema.
+    pub fn ref_types_mut(&mut self) -> &mut Vec<SerializedType> {
+        self.invalidate_schema_cache();
+        &mut self.ref_types
+    }
+
+    /// Returns the external registry used when an embedded TypeTree is unavailable.
+    pub fn type_tree_registry(&self) -> Option<&Arc<dyn TypeTreeRegistry>> {
+        self.type_tree_registry.as_ref()
     }
 
     /// Returns the validated format capability profile.
@@ -135,6 +214,10 @@ impl SerializedFile {
 
     pub fn set_type_tree_registry(&mut self, registry: Option<Arc<dyn TypeTreeRegistry>>) {
         self.type_tree_registry = registry;
+    }
+
+    fn invalidate_schema_cache(&mut self) {
+        self.schema_cache = SerializedFileSchemaCache::default();
     }
 
     /// Get the raw file data.
@@ -228,6 +311,63 @@ impl SerializedFile {
             registry.add_type(serialized_type.clone());
         }
         registry
+    }
+
+    pub(crate) fn cached_internal_schema(
+        &self,
+        type_index: usize,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<TypeTreeSchema> {
+        let tree = &self
+            .types
+            .get(type_index)
+            .ok_or_else(|| {
+                BinaryError::invalid_data(format!(
+                    "SerializedType index {type_index} has no schema cache cell"
+                ))
+            })?
+            .type_tree;
+        let cells = get_or_try_cache(&self.schema_cache.internal, || {
+            let count = self.types.len();
+            let allocation = count
+                .checked_mul(size_of::<SchemaCacheCell<TypeTreeSchema>>())
+                .ok_or_else(|| {
+                    BinaryError::memory_error("SerializedFile schema cache size overflow")
+                })?;
+            let allocation = u64::try_from(allocation).map_err(|_| {
+                BinaryError::memory_error("SerializedFile schema cache size does not fit u64")
+            })?;
+            budget.check_bytes(allocation)?;
+
+            let mut cells = Vec::new();
+            cells.try_reserve_exact(count).map_err(|error| {
+                BinaryError::memory_error(format!(
+                    "Failed to reserve {count} SerializedFile schema cache cells: {error}"
+                ))
+            })?;
+            cells.resize_with(count, SchemaCacheCell::new);
+            budget.consume_bytes(allocation)?;
+            Ok(cells.into_boxed_slice())
+        })?;
+        let cell = cells.get(type_index).ok_or_else(|| {
+            BinaryError::invalid_data(format!(
+                "SerializedType index {type_index} has no schema cache cell"
+            ))
+        })?;
+        get_or_try_cache(cell, || self.compile_schema(tree, budget)).cloned()
+    }
+
+    pub(crate) fn compile_schema(
+        &self,
+        tree: &TypeTree,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<TypeTreeSchema> {
+        TypeTreeSchema::compile_with_catalog(tree, budget, |budget| {
+            get_or_try_cache(&self.schema_cache.managed, || {
+                ManagedReferenceCatalog::compile(&self.ref_types, budget).map(Arc::new)
+            })
+            .cloned()
+        })
     }
 
     /// Get file statistics.
@@ -326,4 +466,117 @@ pub struct FileStatistics {
     pub external_count: usize,
     pub has_type_tree: bool,
     pub target_platform: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::thread;
+
+    #[test]
+    fn schema_cache_initializes_once_across_concurrent_callers() {
+        const CALLERS: usize = 8;
+        let cache = Arc::new(SchemaCacheCell::<usize>::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(CALLERS));
+
+        thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..CALLERS {
+                let cache = Arc::clone(&cache);
+                let calls = Arc::clone(&calls);
+                let start = Arc::clone(&start);
+                workers.push(scope.spawn(move || {
+                    start.wait();
+                    *get_or_try_cache(&cache, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(42)
+                    })
+                    .unwrap()
+                }));
+            }
+
+            for worker in workers {
+                assert_eq!(worker.join().unwrap(), 42);
+            }
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn waiter_retries_after_a_resource_failure() {
+        let cache = Arc::new(SchemaCacheCell::<usize>::new());
+        let retry_calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        thread::scope(|scope| {
+            let first_cache = Arc::clone(&cache);
+            let first = scope.spawn(move || {
+                get_or_try_cache(&first_cache, || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Err(BinaryError::memory_error("temporary allocation failure"))
+                })
+                .copied()
+            });
+
+            entered_rx.recv().unwrap();
+            let second_cache = Arc::clone(&cache);
+            let second_calls = Arc::clone(&retry_calls);
+            let second = scope.spawn(move || {
+                *get_or_try_cache(&second_cache, || {
+                    second_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(7)
+                })
+                .unwrap()
+            });
+
+            release_tx.send(()).unwrap();
+            assert!(matches!(
+                first.join().unwrap(),
+                Err(BinaryError::MemoryError(_))
+            ));
+            assert_eq!(second.join().unwrap(), 7);
+        });
+
+        assert_eq!(retry_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn initializer_panic_leaves_the_schema_cache_retryable() {
+        let cache = Arc::new(SchemaCacheCell::<usize>::new());
+        let panic_target = Arc::clone(&cache);
+        assert!(
+            thread::spawn(move || {
+                let _ = get_or_try_cache(&panic_target, || -> Result<usize> {
+                    panic!("panic during schema initialization");
+                });
+            })
+            .join()
+            .is_err()
+        );
+
+        assert_eq!(*get_or_try_cache(&cache, || Ok(11)).unwrap(), 11);
+    }
+
+    #[test]
+    fn deterministic_schema_failure_is_cached() {
+        let cache = SchemaCacheCell::<usize>::new();
+        let calls = AtomicUsize::new(0);
+
+        for _ in 0..2 {
+            let error = get_or_try_cache(&cache, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(BinaryError::invalid_data("malformed schema"))
+            })
+            .unwrap_err();
+            assert!(matches!(error, BinaryError::InvalidData(_)));
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }

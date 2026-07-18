@@ -71,6 +71,7 @@ def to_rust_typetree_node(node: Any) -> Dict[str, Any]:
         "type_name": getattr(node, "m_Type", "") or "",
         "name": getattr(node, "m_Name", "") or "",
         "byte_size": int(getattr(node, "m_ByteSize", 0) or 0),
+        "variable_count": int(getattr(node, "m_VariableCount", 0) or 0),
         "index": int(getattr(node, "m_Index", 0) or 0),
         "type_flags": int(getattr(node, "m_TypeFlags", 0) or 0),
         "version": int(getattr(node, "m_Version", 0) or 0),
@@ -237,8 +238,6 @@ def main() -> int:
             "class_id": 114,
             "script_id": key.script_id_hex,
             "type_tree": info.type_tree,
-            "assembly": info.assembly,
-            "fullname": info.fullname,
         }
         entries.append(entry)
 

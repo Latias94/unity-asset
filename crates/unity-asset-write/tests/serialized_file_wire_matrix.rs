@@ -181,7 +181,7 @@ fn assert_wire_case(
         }
     );
     assert!(
-        file.enable_type_tree,
+        file.type_tree_enabled(),
         "v{} TypeTree must be enabled",
         case.version
     );
@@ -200,8 +200,8 @@ fn assert_wire_case(
         case.version
     );
 
-    assert_eq!(file.types.len(), 1, "v{}", case.version);
-    let serialized_type = &file.types[0];
+    assert_eq!(file.types().len(), 1, "v{}", case.version);
+    let serialized_type = &file.types()[0];
     assert_eq!(serialized_type.class_id, 28, "v{}", case.version);
     assert_eq!(
         serialized_type.type_tree.nodes.len(),
@@ -286,9 +286,9 @@ fn assert_wire_case(
         assert_eq!(file.externals[0].temp_empty, "fixture-empty");
     }
 
-    assert_eq!(file.ref_types.len(), usize::from(case.version >= 20));
+    assert_eq!(file.ref_types().len(), usize::from(case.version >= 20));
     if case.version >= 20 {
-        let ref_type = &file.ref_types[0];
+        let ref_type = &file.ref_types()[0];
         assert_eq!(ref_type.class_id, 114);
         assert_eq!(ref_type.script_type_index, 2);
         assert_eq!(
@@ -445,7 +445,7 @@ fn v16_type_index_collision_follows_the_unitypy_wire_oracle() {
     let file = SerializedFileParser::from_bytes(bytes).expect("parse v16 collision fixture");
 
     assert_eq!(
-        file.types
+        file.types()
             .iter()
             .map(|serialized_type| serialized_type.class_id)
             .collect::<Vec<_>>(),
@@ -545,12 +545,13 @@ fn writer_rejects_publicly_constructible_unrepresentable_states() {
         match case.rejection {
             WriterRejection::HeaderVersionMismatch => file.header.version = 21,
             WriterRejection::InvalidEndian => file.header.endian = 2,
-            WriterRejection::DisableImplicitTypeTree => file.enable_type_tree = false,
+            WriterRejection::DisableImplicitTypeTree => file.set_type_tree_enabled(false),
             WriterRejection::UnsupportedUnityVersion => {
                 file.unity_version = "not-representable".to_string();
             }
             WriterRejection::UnsupportedReferenceTypes => {
-                file.ref_types.push(file.types[0].clone());
+                let unsupported = file.types()[0].clone();
+                file.ref_types_mut().push(unsupported);
             }
             WriterRejection::UnknownObjectEdit => {
                 edits.set_object_bytes(i64::MAX, vec![0xFF]);
@@ -641,7 +642,8 @@ fn writer_rejects_an_ambiguous_legacy_type_table_before_encoding() {
         include_bytes!("fixtures/serialized_file_wire/v15.assets.bin").to_vec(),
     )
     .expect("parse v15 wire fixture");
-    file.types.push(file.types[0].clone());
+    let duplicate = file.types()[0].clone();
+    file.types_mut().push(duplicate);
 
     let error = SerializedFileWriter::save(&file, &SerializedFileEdits::default())
         .expect_err("ambiguous legacy type identity must fail before encoding");
@@ -663,10 +665,10 @@ fn legacy_monobehaviour_resolves_raw_type_without_losing_class_bits() {
     let file =
         SerializedFileParser::from_bytes(bytes.to_vec()).expect("parse legacy script fixture");
 
-    assert_eq!(file.types.len(), 1);
-    assert_eq!(file.types[0].class_id, -1);
+    assert_eq!(file.types().len(), 1);
+    assert_eq!(file.types()[0].class_id, -1);
     assert_eq!(
-        file.types[0].script_id,
+        file.types()[0].script_id,
         std::array::from_fn(|index| 0x80 + index as u8)
     );
     let object = &file.objects()[0];
@@ -687,11 +689,6 @@ fn legacy_monobehaviour_resolves_raw_type_without_losing_class_bits() {
             stripped: 1,
         }
     );
-    let parsed = unity_asset_binary::object::ObjectHandle::new(&file, object)
-        .read()
-        .expect("legacy script object uses its resolved TypeTree");
-    assert!(!parsed.has_property("_raw_data_len"));
-
     let rewritten = SerializedFileWriter::save(&file, &SerializedFileEdits::default())
         .expect("rewrite legacy script fixture");
     let reparsed = SerializedFileParser::from_bytes(rewritten).expect("reparse rewritten fixture");

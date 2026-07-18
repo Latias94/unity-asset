@@ -77,6 +77,35 @@ jobs:
     - name: Run tests (decode/export)
       run: cargo nextest run -p unity-asset-decode --features full
 
+  binary-loader-features:
+    name: Binary loader / ${{ matrix.mode }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - mode: buffered
+          feature-args: --no-default-features
+        - mode: mmap
+          feature-args: --no-default-features --features mmap
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
+
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: binary-loader-${{ matrix.mode }}
+
+    - name: Run binary loader tests (${{ matrix.mode }})
+      run: cargo nextest run -p unity-asset-binary ${{ matrix.feature-args }}
+
   docs:
     name: Documentation
     runs-on: ubuntu-latest

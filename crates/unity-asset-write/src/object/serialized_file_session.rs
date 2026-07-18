@@ -1,13 +1,12 @@
 use indexmap::IndexMap;
-use unity_asset_binary::asset::{ObjectInfo, SerializedFile, SerializedType};
+use unity_asset_binary::asset::{ObjectInfo, SerializedFile};
+use unity_asset_binary::object::ObjectHandle;
 use unity_asset_binary::reader::ByteOrder;
-use unity_asset_binary::typetree::TypeTree;
-use unity_asset_core::{UnityAssetError, UnityClass, UnityValue};
+use unity_asset_core::{AssetLoadBudget, UnityAssetError, UnityClass, UnityValue};
 
 use crate::serialized_file::SerializedFileEdits;
-use crate::typetree::{TypeTreeWriteOptions, TypeTreeWriter};
-use crate::{BinaryWriter, ChangeTracker, Endian, Result};
-use std::sync::Arc;
+use crate::typetree::rewrite_object;
+use crate::{ChangeTracker, Endian, Result};
 
 /// A UnityPy-like edit session for a single `SerializedFile`.
 ///
@@ -52,6 +51,7 @@ impl<'a> SerializedFileEditSession<'a> {
     pub fn edit_object(
         &mut self,
         path_id: i64,
+        budget: &mut AssetLoadBudget,
         f: impl FnOnce(&mut UnityClass) -> Result<()>,
     ) -> Result<()> {
         let handle = self.file.find_object_handle(path_id).ok_or_else(|| {
@@ -61,7 +61,7 @@ impl<'a> SerializedFileEditSession<'a> {
             ))
         })?;
 
-        let mut obj = handle.read().map_err(|e| {
+        let mut obj = handle.read(budget).map_err(|e| {
             UnityAssetError::with_source(
                 format!("Failed to parse object for edit: path_id={}", path_id),
                 e,
@@ -70,7 +70,8 @@ impl<'a> SerializedFileEditSession<'a> {
 
         f(&mut obj.class)?;
 
-        let bytes = encode_object_typetree(self.file, handle.info(), obj.class.properties())?;
+        let bytes =
+            encode_object_typetree(self.file, handle.info(), obj.class.properties(), budget)?;
         self.edits.set_object_bytes(path_id, bytes);
         self.mark_changed();
         Ok(())
@@ -81,6 +82,7 @@ impl<'a> SerializedFileEditSession<'a> {
         &mut self,
         path_id: i64,
         properties: &IndexMap<String, UnityValue>,
+        budget: &mut AssetLoadBudget,
     ) -> Result<()> {
         let info = self.file.find_object(path_id).ok_or_else(|| {
             UnityAssetError::format(format!(
@@ -88,7 +90,7 @@ impl<'a> SerializedFileEditSession<'a> {
                 path_id
             ))
         })?;
-        let bytes = encode_object_typetree(self.file, info, properties)?;
+        let bytes = encode_object_typetree(self.file, info, properties, budget)?;
         self.edits.set_object_bytes(path_id, bytes);
         self.mark_changed();
         Ok(())
@@ -119,25 +121,30 @@ fn encode_object_typetree(
     file: &SerializedFile,
     info: &ObjectInfo,
     properties: &IndexMap<String, UnityValue>,
+    budget: &mut AssetLoadBudget,
 ) -> Result<Vec<u8>> {
-    let Some(tree) = type_tree_for_object(file, info) else {
+    let endian = match file.header.byte_order() {
+        ByteOrder::Big => Endian::Big,
+        ByteOrder::Little => Endian::Little,
+    };
+    let schema = ObjectHandle::new(file, info)
+        .schema(budget)
+        .map_err(|error| {
+            UnityAssetError::with_source(
+                format!(
+                    "Failed to compile TypeTree for object write: path_id={} class_id={}",
+                    info.path_id(),
+                    info.class_id()
+                ),
+                error,
+            )
+        })?;
+    let Some(schema) = schema else {
         return Err(UnityAssetError::format(format!(
             "TypeTree is unavailable for object write: path_id={} class_id={}",
             info.path_id(),
             info.class_id()
         )));
-    };
-
-    let endian = match file.header.byte_order() {
-        ByteOrder::Big => Endian::Big,
-        ByteOrder::Little => Endian::Little,
-    };
-    let mut w = BinaryWriter::new(endian);
-
-    let writer = if file.ref_types.is_empty() {
-        TypeTreeWriter::new(tree.as_ref())
-    } else {
-        TypeTreeWriter::with_ref_types(tree.as_ref(), &file.ref_types)
     };
 
     let original = file.object_bytes(info).map_err(|e| {
@@ -151,67 +158,6 @@ fn encode_object_typetree(
         )
     })?;
 
-    writer.write_object_with_original_bytes(
-        &mut w,
-        properties,
-        original,
-        TypeTreeWriteOptions {
-            allow_missing_fields: false,
-        },
-    )?;
-    w.into_result()
-}
-
-enum TypeTreeSource<'a> {
-    Borrowed(&'a TypeTree),
-    Shared(Arc<TypeTree>),
-}
-
-impl TypeTreeSource<'_> {
-    fn as_ref(&self) -> &TypeTree {
-        match self {
-            Self::Borrowed(t) => t,
-            Self::Shared(t) => t.as_ref(),
-        }
-    }
-}
-
-fn type_tree_for_object<'a>(
-    file: &'a SerializedFile,
-    info: &ObjectInfo,
-) -> Option<TypeTreeSource<'a>> {
-    fn from_internal<'a>(
-        file: &'a SerializedFile,
-        info: &ObjectInfo,
-    ) -> Option<&'a SerializedType> {
-        if let Some(type_index) = info.serialized_type_index() {
-            let idx = usize::try_from(type_index).ok()?;
-            return file.types.get(idx);
-        }
-
-        file.types.iter().find(|t| t.class_id == info.class_id())
-    }
-
-    if file.enable_type_tree
-        && let Some(typ) = from_internal(file, info)
-        && !typ.type_tree.is_empty()
-    {
-        return Some(TypeTreeSource::Borrowed(&typ.type_tree));
-    }
-
-    // Best-effort fallback: stripped files can supply a registry externally.
-    // We also allow this fallback even when `enableTypeTree=true` but the internal entry is missing/empty.
-    file.type_tree_registry.as_ref().and_then(|r| {
-        if let Some(typ) = from_internal(file, info)
-            && typ.is_script_type()
-            && typ.script_id != [0u8; 16]
-        {
-            if let Some(tree) = r.resolve_script(&file.unity_version, typ.class_id, typ.script_id) {
-                return Some(TypeTreeSource::Shared(tree));
-            }
-        }
-
-        r.resolve(&file.unity_version, info.class_id())
-            .map(TypeTreeSource::Shared)
-    })
+    let (bytes, _stats) = rewrite_object(&schema, properties, original, endian, budget)?;
+    Ok(bytes)
 }

@@ -1,3 +1,4 @@
+use unity_asset_core::AssetLoadBudget;
 use unity_asset_write::ChangeTracker;
 use unity_asset_write::object::SerializedFileEditSession;
 use unity_asset_write::serialized_file::SerializedFileWriter;
@@ -13,10 +14,16 @@ fn serialized_file_edit_session_can_edit_name_and_roundtrip() {
         .expect("expected at least one serialized file node in test sample");
     let node_bytes = bundle.extract_node_data(node).unwrap();
     let sf = unity_asset_binary::asset::SerializedFileParser::from_bytes(node_bytes).unwrap();
+    let mut budget = AssetLoadBudget::default();
 
     let (path_id, old_name) = sf
         .object_handles()
-        .filter_map(|h| h.peek_name().ok().flatten().map(|n| (h.path_id(), n)))
+        .filter_map(|h| {
+            h.peek_name(&mut budget)
+                .ok()
+                .flatten()
+                .map(|n| (h.path_id(), n))
+        })
         .find(|(_id, name)| !name.is_empty())
         .expect("expected at least one object with peekable name");
 
@@ -24,7 +31,7 @@ fn serialized_file_edit_session_can_edit_name_and_roundtrip() {
 
     let mut session = SerializedFileEditSession::new(&sf);
     session
-        .edit_object(path_id, |class| {
+        .edit_object(path_id, &mut budget, |class| {
             if let Some(v) = class.get_mut("m_Name") {
                 *v = unity_asset_core::UnityValue::String(new_name.clone());
                 return Ok(());
@@ -47,6 +54,6 @@ fn serialized_file_edit_session_can_edit_name_and_roundtrip() {
     let reparsed_handle = reparsed
         .find_object_handle(path_id)
         .expect("edited object must exist after save");
-    let reparsed_name = reparsed_handle.peek_name().unwrap().unwrap();
+    let reparsed_name = reparsed_handle.peek_name(&mut budget).unwrap().unwrap();
     assert_eq!(reparsed_name, new_name);
 }

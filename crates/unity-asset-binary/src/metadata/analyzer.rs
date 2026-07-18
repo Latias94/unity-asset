@@ -6,23 +6,15 @@
 use super::types::*;
 use crate::asset::SerializedFile;
 use crate::error::Result;
+use crate::object::ObjectHandle;
 use crate::reader::BinaryReader;
-use crate::typetree::{TypeTree, TypeTreeSerializer};
+use crate::typetree::{TypeTreeParseMode, TypeTreeParseOptions, TypeTreeSchema};
 use std::collections::{HashMap, HashSet};
-use unity_asset_core::UnityValue;
+use unity_asset_core::{AssetLoadBudget, UnityValue};
 
-/// Dependency analyzer for Unity assets
-///
-/// This struct provides methods for analyzing dependencies and relationships
-/// between Unity objects within and across assets.
-pub struct DependencyAnalyzer {
-    /// Cache for analyzed dependencies
-    dependency_cache: HashMap<i64, Vec<i64>>,
-    /// Cache for analyzed dependencies (TypeTree + PPtr scan), keyed by (asset identity, path_id)
-    pptr_dependency_cache: HashMap<((usize, usize, usize), i64), ExtractedDependencies>,
-    /// Cache for reverse dependencies
-    reverse_dependency_cache: HashMap<i64, Vec<i64>>,
-}
+/// Stateless dependency analyzer for Unity assets.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DependencyAnalyzer;
 
 #[derive(Debug, Clone, Default)]
 struct ExtractedDependencies {
@@ -30,63 +22,10 @@ struct ExtractedDependencies {
     external: Vec<(i32, i64)>,
 }
 
-type CachedPptrDependencies = (Vec<i64>, Vec<(i32, i64)>);
-
 impl DependencyAnalyzer {
     /// Create a new dependency analyzer
-    pub fn new() -> Self {
-        Self {
-            dependency_cache: HashMap::new(),
-            pptr_dependency_cache: HashMap::new(),
-            reverse_dependency_cache: HashMap::new(),
-        }
-    }
-
-    /// Analyze dependencies for a set of objects
-    ///
-    /// Note: this legacy API is a placeholder and returns no dependencies.
-    /// Use `analyze_dependencies_in_asset` for real TypeTree-based scanning.
-    pub fn analyze_dependencies(
-        &mut self,
-        objects: &[&crate::asset::ObjectInfo],
-    ) -> Result<DependencyInfo> {
-        let mut internal_refs = Vec::new();
-        let mut all_nodes = HashSet::new();
-        let mut edges = Vec::new();
-
-        // First pass: collect all object IDs
-        for obj in objects {
-            all_nodes.insert(obj.path_id());
-        }
-
-        // Placeholder implementation (kept for backward compatibility).
-        // Previously this always returned empty dependencies.
-        let _ = &mut internal_refs;
-        let _ = &mut edges;
-
-        let external_refs = Vec::new();
-
-        // Build dependency graph
-        let nodes: Vec<i64> = all_nodes.into_iter().collect();
-        let root_objects = self.find_root_objects(&nodes, &edges);
-        let leaf_objects = self.find_leaf_objects(&nodes, &edges);
-
-        let dependency_graph = DependencyGraph {
-            nodes,
-            edges,
-            root_objects,
-            leaf_objects,
-        };
-
-        // Detect circular dependencies
-        let circular_deps = self.detect_circular_dependencies(&dependency_graph)?;
-
-        Ok(DependencyInfo {
-            external_references: external_refs,
-            internal_references: internal_refs,
-            dependency_graph,
-            circular_dependencies: circular_deps,
-        })
+    pub const fn new() -> Self {
+        Self
     }
 
     /// Analyze dependencies for a set of objects within a specific asset.
@@ -94,9 +33,10 @@ impl DependencyAnalyzer {
     /// This parses object data with TypeTree (when available) and scans for PPtr references
     /// (`fileID`/`pathID` pairs) to build a dependency graph.
     pub fn analyze_dependencies_in_asset(
-        &mut self,
+        &self,
         asset: &SerializedFile,
         objects: &[&crate::asset::ObjectInfo],
+        budget: &mut AssetLoadBudget,
     ) -> Result<DependencyInfo> {
         let mut external_ref_map: HashMap<(i32, i64), Vec<i64>> = HashMap::new();
         let mut internal_refs = Vec::new();
@@ -108,7 +48,7 @@ impl DependencyAnalyzer {
         }
 
         for obj in objects {
-            let deps = self.extract_object_dependencies_in_asset(asset, obj)?;
+            let deps = self.extract_object_dependencies_in_asset(asset, obj, budget)?;
 
             for dep_id in deps.internal {
                 if all_nodes.contains(&dep_id) {
@@ -173,40 +113,30 @@ impl DependencyAnalyzer {
 
     /// Extract dependencies from a single object by parsing its TypeTree and scanning PPtr-like fields.
     fn extract_object_dependencies_in_asset(
-        &mut self,
+        &self,
         asset: &SerializedFile,
         obj: &crate::asset::ObjectInfo,
+        budget: &mut AssetLoadBudget,
     ) -> Result<ExtractedDependencies> {
-        let file_key = asset.data_identity_key();
-
-        if let Some(cached) = self.pptr_dependency_cache.get(&(file_key, obj.path_id())) {
-            return Ok(cached.clone());
-        }
-
         let mut deps = ExtractedDependencies::default();
 
-        if asset.enable_type_tree
-            && let Some(tree) = type_tree_for_object(asset, obj)
-            && !tree.is_empty()
-        {
-            // Prefer a zero-allocation scan that still consumes the object stream
-            // according to the TypeTree. This keeps dependency analysis fast even for
-            // large objects with big buffers/arrays.
-            if let Ok(scanned) = scan_object_pptrs_with_typetree(asset, obj, tree) {
-                deps = scanned;
-            } else if let Ok(values) = parse_object_with_typetree(asset, obj, tree) {
-                // Fallback: legacy full parse + recursive scan.
-                scan_pptr_in_value(&UnityValue::Object(values), &mut deps);
+        match ObjectHandle::new(asset, obj).schema(budget) {
+            Ok(Some(schema)) => {
+                match scan_object_pptrs_with_typetree(asset, obj, &schema, budget) {
+                    Ok(scanned) => deps = scanned,
+                    Err(error) if error.is_resource_error() => return Err(error),
+                    Err(_) => {}
+                }
             }
+            Ok(None) => {}
+            Err(error) if error.is_resource_error() => return Err(error),
+            Err(_) => {}
         }
 
         deps.internal.sort_unstable();
         deps.internal.dedup();
         deps.external.sort_unstable();
         deps.external.dedup();
-
-        self.pptr_dependency_cache
-            .insert((file_key, obj.path_id()), deps.clone());
 
         Ok(deps)
     }
@@ -304,87 +234,60 @@ impl DependencyAnalyzer {
         path.pop();
         rec_stack.remove(&node);
     }
-
-    /// Clear internal caches
-    pub fn clear_cache(&mut self) {
-        self.dependency_cache.clear();
-        self.pptr_dependency_cache.clear();
-        self.reverse_dependency_cache.clear();
-    }
-
-    /// Get cached dependencies for an object
-    pub fn get_cached_dependencies(&self, object_id: i64) -> Option<&Vec<i64>> {
-        self.dependency_cache.get(&object_id)
-    }
-
-    /// Get cached TypeTree-based dependencies for an object within an asset.
-    pub fn get_cached_dependencies_in_asset(
-        &self,
-        asset: &SerializedFile,
-        object_id: i64,
-    ) -> Option<CachedPptrDependencies> {
-        let file_key = asset.data_identity_key();
-        self.pptr_dependency_cache
-            .get(&(file_key, object_id))
-            .map(|deps| (deps.internal.clone(), deps.external.clone()))
-    }
-}
-
-impl Default for DependencyAnalyzer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn type_tree_for_object<'a>(
-    asset: &'a SerializedFile,
-    info: &crate::asset::ObjectInfo,
-) -> Option<&'a TypeTree> {
-    if let Some(index) = info.serialized_type_index() {
-        let index = usize::try_from(index).ok()?;
-        return asset.types.get(index).map(|t| &t.type_tree);
-    }
-
-    asset
-        .types
-        .iter()
-        .find(|t| t.class_id == info.class_id())
-        .map(|t| &t.type_tree)
 }
 
 fn parse_object_with_typetree(
     asset: &SerializedFile,
     info: &crate::asset::ObjectInfo,
-    tree: &TypeTree,
+    schema: &TypeTreeSchema,
+    budget: &mut AssetLoadBudget,
 ) -> Result<indexmap::IndexMap<String, UnityValue>> {
-    let bytes = asset.object_bytes(info)?;
+    let bytes = ObjectHandle::new(asset, info).raw_data()?;
     let mut reader = BinaryReader::new(bytes, asset.header.byte_order());
-    let serializer = TypeTreeSerializer::new(tree);
-    if asset.ref_types.is_empty() {
-        serializer.parse_object(&mut reader)
-    } else {
-        serializer.parse_object_with_ref_types(&mut reader, &asset.ref_types)
-    }
+    Ok(schema
+        .read_object(&mut reader, budget, TypeTreeParseOptions::default())?
+        .properties)
 }
 
 fn scan_object_pptrs_with_typetree(
     asset: &SerializedFile,
     info: &crate::asset::ObjectInfo,
-    tree: &TypeTree,
+    schema: &TypeTreeSchema,
+    budget: &mut AssetLoadBudget,
 ) -> Result<ExtractedDependencies> {
-    let bytes = asset.object_bytes(info)?;
+    let bytes = ObjectHandle::new(asset, info).raw_data()?;
     let mut reader = BinaryReader::new(bytes, asset.header.byte_order());
-    let serializer = TypeTreeSerializer::new(tree);
-    let scan = if asset.ref_types.is_empty() {
-        serializer.scan_pptrs(&mut reader)?
-    } else {
-        serializer.scan_pptrs_with_ref_types(&mut reader, Some(&asset.ref_types))?
-    };
+    let scan = schema.scan_pptrs_with_options(
+        &mut reader,
+        budget,
+        TypeTreeParseOptions {
+            mode: TypeTreeParseMode::Lenient,
+        },
+    )?;
 
     Ok(ExtractedDependencies {
         internal: scan.internal,
         external: scan.external,
     })
+}
+
+fn parse_object_best_effort(
+    asset: &SerializedFile,
+    info: &crate::asset::ObjectInfo,
+    budget: &mut AssetLoadBudget,
+) -> Result<Option<indexmap::IndexMap<String, UnityValue>>> {
+    let schema = match ObjectHandle::new(asset, info).schema(budget) {
+        Ok(Some(schema)) => schema,
+        Ok(None) => return Ok(None),
+        Err(error) if error.is_resource_error() => return Err(error),
+        Err(_) => return Ok(None),
+    };
+
+    match parse_object_with_typetree(asset, info, &schema, budget) {
+        Ok(values) => Ok(Some(values)),
+        Err(error) if error.is_resource_error() => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 fn resolve_external_file(
@@ -407,32 +310,6 @@ fn resolve_external_file(
     };
     let guid = Some(ext.guid);
     (file_path, guid)
-}
-
-fn scan_pptr_in_value(value: &UnityValue, deps: &mut ExtractedDependencies) {
-    match value {
-        UnityValue::Array(items) => {
-            for item in items {
-                scan_pptr_in_value(item, deps);
-            }
-        }
-        UnityValue::Object(obj) => {
-            if let Some((file_id, path_id)) = try_read_pptr(obj)
-                && path_id != 0
-            {
-                if file_id == 0 {
-                    deps.internal.push(path_id);
-                } else {
-                    deps.external.push((file_id, path_id));
-                }
-            }
-
-            for (_, v) in obj.iter() {
-                scan_pptr_in_value(v, deps);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn try_read_pptr(map: &indexmap::IndexMap<String, UnityValue>) -> Option<(i32, i64)> {
@@ -540,82 +417,14 @@ fn get_i64_ci(map: &indexmap::IndexMap<String, UnityValue>, keys: &[&str]) -> Op
     None
 }
 
-/// Relationship analyzer for Unity assets
-///
-/// This struct provides methods for analyzing relationships between
-/// GameObjects, Components, and other Unity objects.
-pub struct RelationshipAnalyzer {
-    /// Cache for GameObject hierarchies
-    hierarchy_cache: HashMap<i64, GameObjectHierarchy>,
-}
+/// Stateless relationship analyzer for Unity assets.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RelationshipAnalyzer;
 
 impl RelationshipAnalyzer {
     /// Create a new relationship analyzer
-    pub fn new() -> Self {
-        Self {
-            hierarchy_cache: HashMap::new(),
-        }
-    }
-
-    /// Analyze relationships for a set of objects
-    pub fn analyze_relationships(
-        &mut self,
-        objects: &[&crate::asset::ObjectInfo],
-    ) -> Result<AssetRelationships> {
-        let mut gameobject_hierarchy = Vec::new();
-        let mut component_relationships = Vec::new();
-        let mut asset_references = Vec::new();
-
-        // Separate objects by type
-        let mut gameobjects = Vec::new();
-        let mut transforms = Vec::new();
-        let mut components = Vec::new();
-        let mut assets = Vec::new();
-
-        for obj in objects {
-            match obj.class_id() {
-                class_ids::GAME_OBJECT => gameobjects.push(obj),
-                class_ids::TRANSFORM => transforms.push(obj),
-                class_ids::COMPONENT | class_ids::BEHAVIOUR | class_ids::MONO_BEHAVIOUR => {
-                    components.push(obj)
-                }
-                _ => assets.push(obj),
-            }
-        }
-
-        // Analyze GameObject hierarchy (simplified for now)
-        for go in gameobjects {
-            let hierarchy = GameObjectHierarchy {
-                gameobject_id: go.path_id(),
-                name: format!("GameObject_{}", go.path_id()),
-                parent_id: None,
-                children_ids: Vec::new(),
-                transform_id: 0,
-                components: Vec::new(),
-                depth: 0,
-            };
-            gameobject_hierarchy.push(hierarchy);
-        }
-
-        // Analyze component relationships
-        for comp in components {
-            if let Ok(relationship) = self.analyze_component_relationship(comp) {
-                component_relationships.push(relationship);
-            }
-        }
-
-        // Analyze asset references
-        for asset in assets {
-            if let Ok(reference) = self.analyze_asset_reference(asset) {
-                asset_references.push(reference);
-            }
-        }
-
-        Ok(AssetRelationships {
-            gameobject_hierarchy,
-            component_relationships,
-            asset_references,
-        })
+    pub const fn new() -> Self {
+        Self
     }
 
     /// Analyze relationships for a set of objects within a specific asset.
@@ -624,14 +433,11 @@ impl RelationshipAnalyzer {
     /// - GameObject hierarchy (parent/children/depth)
     /// - Component relationships (GameObject -> Component)
     pub fn analyze_relationships_in_asset(
-        &mut self,
+        &self,
         asset: &SerializedFile,
         objects: &[&crate::asset::ObjectInfo],
+        budget: &mut AssetLoadBudget,
     ) -> Result<AssetRelationships> {
-        if !asset.enable_type_tree {
-            return self.analyze_relationships(objects);
-        }
-
         let mut by_path_id: HashMap<i64, &crate::asset::ObjectInfo> = HashMap::new();
         for obj in objects {
             by_path_id.insert(obj.path_id(), *obj);
@@ -645,18 +451,12 @@ impl RelationshipAnalyzer {
         for obj in objects {
             match obj.class_id() {
                 class_ids::GAME_OBJECT => {
-                    if let Some(tree) = type_tree_for_object(asset, obj)
-                        && !tree.is_empty()
-                        && let Ok(values) = parse_object_with_typetree(asset, obj, tree)
-                    {
+                    if let Some(values) = parse_object_best_effort(asset, obj, budget)? {
                         gameobject_props.insert(obj.path_id(), values);
                     }
                 }
                 class_ids::TRANSFORM => {
-                    if let Some(tree) = type_tree_for_object(asset, obj)
-                        && !tree.is_empty()
-                        && let Ok(values) = parse_object_with_typetree(asset, obj, tree)
-                    {
+                    if let Some(values) = parse_object_best_effort(asset, obj, budget)? {
                         transform_props.insert(obj.path_id(), values);
                     }
                 }
@@ -821,55 +621,6 @@ impl RelationshipAnalyzer {
         })
     }
 
-    /// Analyze GameObject hierarchy (simplified implementation)
-    #[allow(dead_code)]
-    fn analyze_gameobject_hierarchy(
-        &mut self,
-        gameobject: &crate::asset::ObjectInfo,
-        _transforms: &[&crate::asset::ObjectInfo],
-    ) -> Result<GameObjectHierarchy> {
-        // TODO: Implement proper GameObject hierarchy analysis
-        // This would require parsing the GameObject's serialized data
-
-        Ok(GameObjectHierarchy {
-            gameobject_id: gameobject.path_id(),
-            name: format!("GameObject_{}", gameobject.path_id()),
-            parent_id: None,
-            children_ids: Vec::new(),
-            transform_id: 0, // TODO: Find associated Transform
-            components: Vec::new(),
-            depth: 0,
-        })
-    }
-
-    /// Analyze component relationship (simplified implementation)
-    fn analyze_component_relationship(
-        &self,
-        component: &crate::asset::ObjectInfo,
-    ) -> Result<ComponentRelationship> {
-        // TODO: Implement proper component relationship analysis
-
-        Ok(ComponentRelationship {
-            component_id: component.path_id(),
-            component_type: self.get_component_type_name(component.class_id()),
-            gameobject_id: 0, // TODO: Find associated GameObject
-            dependencies: Vec::new(),
-            external_dependencies: Vec::new(),
-        })
-    }
-
-    /// Analyze asset reference (simplified implementation)
-    fn analyze_asset_reference(&self, asset: &crate::asset::ObjectInfo) -> Result<AssetReference> {
-        // TODO: Implement proper asset reference analysis
-
-        Ok(AssetReference {
-            asset_id: asset.path_id(),
-            asset_type: self.get_asset_type_name(asset.class_id()),
-            referenced_by: Vec::new(),
-            file_path: None,
-        })
-    }
-
     /// Get component type name from type ID
     fn get_component_type_name(&self, class_id: i32) -> String {
         match class_id {
@@ -878,46 +629,177 @@ impl RelationshipAnalyzer {
             _ => format!("Component_{}", class_id),
         }
     }
-
-    /// Get asset type name from type ID
-    fn get_asset_type_name(&self, class_id: i32) -> String {
-        match class_id {
-            class_ids::TEXTURE_2D => "Texture2D".to_string(),
-            class_ids::MESH => "Mesh".to_string(),
-            class_ids::MATERIAL => "Material".to_string(),
-            class_ids::AUDIO_CLIP => "AudioClip".to_string(),
-            class_ids::SPRITE => "Sprite".to_string(),
-            _ => format!("Asset_{}", class_id),
-        }
-    }
-
-    /// Clear internal caches
-    pub fn clear_cache(&mut self) {
-        self.hierarchy_cache.clear();
-    }
-}
-
-impl Default for RelationshipAnalyzer {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asset::{ObjectInfo, SerializedFileParser};
+    use crate::typetree::{InMemoryTypeTreeRegistry, TypeTree, TypeTreeNode};
     use indexmap::IndexMap;
+    use std::sync::Arc;
 
-    #[test]
-    fn test_dependency_analyzer_creation() {
-        let analyzer = DependencyAnalyzer::new();
-        assert!(analyzer.dependency_cache.is_empty());
+    const V22_FIXTURE: &[u8] = include_bytes!(
+        "../../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin"
+    );
+
+    fn node(type_name: &str, name: &str) -> TypeTreeNode {
+        TypeTreeNode::with_info(type_name.to_owned(), name.to_owned(), -1)
+    }
+
+    fn tree_with_root(root: TypeTreeNode) -> TypeTree {
+        let mut tree = TypeTree::new();
+        tree.add_node(root);
+        tree
+    }
+
+    fn pptr_node(name: &str, path_type: &str) -> TypeTreeNode {
+        let mut pointer = node("PPtr<Object>", name);
+        pointer.children = vec![node("int", "m_FileID"), node(path_type, "m_PathID")];
+        pointer
     }
 
     #[test]
-    fn test_relationship_analyzer_creation() {
+    fn stripped_file_dependency_analysis_uses_external_registry() {
+        let mut root = node("Source", "Source");
+        root.children.push(pptr_node("m_Target", "long long"));
+        let mut registry = InMemoryTypeTreeRegistry::default();
+        registry.insert_any(1, tree_with_root(root));
+
+        let mut asset = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        asset.set_type_tree_enabled(false);
+        asset.set_type_tree_registry(Some(Arc::new(registry)));
+
+        let mut source = ObjectInfo::for_standalone_class(101, 0, 12, 1).unwrap();
+        let mut bytes = match asset.header.byte_order() {
+            crate::reader::ByteOrder::Little => 0_i32.to_le_bytes().to_vec(),
+            crate::reader::ByteOrder::Big => 0_i32.to_be_bytes().to_vec(),
+        };
+        match asset.header.byte_order() {
+            crate::reader::ByteOrder::Little => bytes.extend_from_slice(&202_i64.to_le_bytes()),
+            crate::reader::ByteOrder::Big => bytes.extend_from_slice(&202_i64.to_be_bytes()),
+        }
+        source.set_data(bytes);
+        let mut target = ObjectInfo::for_standalone_class(202, 0, 0, 28).unwrap();
+        target.set_data(Vec::new());
+
+        let mut direct_budget = AssetLoadBudget::default();
+        let schema = ObjectHandle::new(&asset, &source)
+            .schema(&mut direct_budget)
+            .unwrap()
+            .expect("external registry should resolve the stripped schema");
+        let direct =
+            scan_object_pptrs_with_typetree(&asset, &source, &schema, &mut direct_budget).unwrap();
+        assert_eq!(direct.internal, [202]);
+
+        let analyzer = DependencyAnalyzer::new();
+        let dependencies = analyzer
+            .analyze_dependencies_in_asset(
+                &asset,
+                &[&source, &target],
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        assert!(
+            dependencies
+                .internal_references
+                .iter()
+                .any(|reference| reference.from_object == 101 && reference.to_object == 202)
+        );
+        assert!(dependencies.dependency_graph.edges.contains(&(101, 202)));
+    }
+
+    #[test]
+    fn dependency_analysis_recovers_proven_extents_without_materializing_objects() {
+        let mut root = node("Source", "Source");
+        root.children.push(pptr_node("m_Broken", "UInt64"));
+        root.children.push(pptr_node("m_Target", "long long"));
+        let mut registry = InMemoryTypeTreeRegistry::default();
+        registry.insert_any(1, tree_with_root(root));
+
+        let mut asset = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        asset.set_type_tree_enabled(false);
+        asset.set_type_tree_registry(Some(Arc::new(registry)));
+
+        let mut source = ObjectInfo::for_standalone_class(101, 0, 24, 1).unwrap();
+        let mut bytes = match asset.header.byte_order() {
+            crate::reader::ByteOrder::Little => 0_i32.to_le_bytes().to_vec(),
+            crate::reader::ByteOrder::Big => 0_i32.to_be_bytes().to_vec(),
+        };
+        match asset.header.byte_order() {
+            crate::reader::ByteOrder::Little => {
+                bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+                bytes.extend_from_slice(&0_i32.to_le_bytes());
+                bytes.extend_from_slice(&202_i64.to_le_bytes());
+            }
+            crate::reader::ByteOrder::Big => {
+                bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+                bytes.extend_from_slice(&0_i32.to_be_bytes());
+                bytes.extend_from_slice(&202_i64.to_be_bytes());
+            }
+        }
+        source.set_data(bytes);
+        let mut target = ObjectInfo::for_standalone_class(202, 0, 0, 28).unwrap();
+        target.set_data(Vec::new());
+
+        let schema = ObjectHandle::new(&asset, &source)
+            .schema(&mut AssetLoadBudget::default())
+            .unwrap()
+            .unwrap();
+        let mut strict_reader = BinaryReader::new(
+            ObjectHandle::new(&asset, &source).raw_data().unwrap(),
+            asset.header.byte_order(),
+        );
+        assert!(
+            schema
+                .scan_pptrs(&mut strict_reader, &mut AssetLoadBudget::default())
+                .is_err()
+        );
+
+        let dependencies = DependencyAnalyzer::new()
+            .analyze_dependencies_in_asset(
+                &asset,
+                &[&source, &target],
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        assert!(dependencies.dependency_graph.edges.contains(&(101, 202)));
+    }
+
+    #[test]
+    fn stripped_file_relationship_analysis_uses_external_registry() {
+        let mut root = node("GameObject", "GameObject");
+        root.children.push(node("int", "m_Value"));
+        let mut registry = InMemoryTypeTreeRegistry::default();
+        registry.insert_any(1, tree_with_root(root));
+
+        let mut asset = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        asset.set_type_tree_enabled(false);
+        asset.set_type_tree_registry(Some(Arc::new(registry)));
+
+        let mut game_object = ObjectInfo::for_standalone_class(303, 0, 4, 1).unwrap();
+        game_object.set_data(match asset.header.byte_order() {
+            crate::reader::ByteOrder::Little => 1_i32.to_le_bytes().to_vec(),
+            crate::reader::ByteOrder::Big => 1_i32.to_be_bytes().to_vec(),
+        });
+        assert!(
+            parse_object_best_effort(&asset, &game_object, &mut AssetLoadBudget::default())
+                .unwrap()
+                .is_some()
+        );
         let analyzer = RelationshipAnalyzer::new();
-        assert!(analyzer.hierarchy_cache.is_empty());
+        let relationships = analyzer
+            .analyze_relationships_in_asset(
+                &asset,
+                &[&game_object],
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        assert_eq!(relationships.gameobject_hierarchy.len(), 1);
+        assert_eq!(relationships.gameobject_hierarchy[0].gameobject_id, 303);
     }
 
     #[test]
@@ -932,37 +814,6 @@ mod tests {
         assert!(roots.contains(&1));
         assert!(roots.contains(&4));
         assert!(leaves.contains(&3));
-    }
-
-    #[test]
-    fn test_scan_pptr_variants() {
-        let mut deps = ExtractedDependencies::default();
-
-        // Internal reference: fileID=0
-        let mut pptr_internal = IndexMap::new();
-        pptr_internal.insert("fileID".to_string(), UnityValue::Integer(0));
-        pptr_internal.insert("pathID".to_string(), UnityValue::Integer(123));
-
-        // External reference: fileID=2
-        let mut pptr_external = IndexMap::new();
-        pptr_external.insert("m_FileID".to_string(), UnityValue::Integer(2));
-        pptr_external.insert("m_PathID".to_string(), UnityValue::Integer(999));
-
-        let mut root = IndexMap::new();
-        root.insert("a".to_string(), UnityValue::Object(pptr_internal));
-        root.insert(
-            "b".to_string(),
-            UnityValue::Array(vec![UnityValue::Object(pptr_external)]),
-        );
-
-        scan_pptr_in_value(&UnityValue::Object(root), &mut deps);
-        deps.internal.sort_unstable();
-        deps.internal.dedup();
-        deps.external.sort_unstable();
-        deps.external.dedup();
-
-        assert_eq!(deps.internal, vec![123]);
-        assert_eq!(deps.external, vec![(2, 999)]);
     }
 
     #[test]

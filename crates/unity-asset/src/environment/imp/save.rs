@@ -14,7 +14,7 @@ impl Environment {
     /// Save changed assets to `out_dir` (UnityPy-style).
     ///
     /// This writes sources that have pending edits recorded via `Environment::edit_binary_object_key`
-    /// (or `Environment::edit_session()`).
+    /// (or `Environment::edit_session(budget)`).
     ///
     /// Current scope:
     /// - standalone `SerializedFile` save
@@ -104,7 +104,7 @@ fn save_impl(
                 entry_name,
             } => {
                 webfile_edits
-                    .entry(web_path.clone())
+                    .entry(web_path.as_ref().clone())
                     .or_default()
                     .replace_file_bytes(entry_name.clone(), bytes);
             }
@@ -172,7 +172,7 @@ fn save_impl(
                 entry_name,
             } => {
                 webfile_edits
-                    .entry(web_path.clone())
+                    .entry(web_path.as_ref().clone())
                     .or_default()
                     .replace_file_bytes(entry_name.clone(), bytes);
             }

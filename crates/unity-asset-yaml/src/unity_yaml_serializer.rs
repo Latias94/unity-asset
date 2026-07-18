@@ -178,6 +178,11 @@ impl UnityYamlSerializer {
                     UnityAssetError::format(format!("Failed to write integer value: {}", e))
                 })?;
             }
+            UnityValue::Unsigned(i) => {
+                write!(writer, "{}{}", i, self.line_ending.as_str()).map_err(|e| {
+                    UnityAssetError::format(format!("Failed to write unsigned value: {}", e))
+                })?;
+            }
             UnityValue::Float(f) => {
                 write!(writer, "{}{}", f, self.line_ending.as_str()).map_err(|e| {
                     UnityAssetError::format(format!("Failed to write float value: {}", e))
@@ -363,6 +368,11 @@ impl UnityYamlSerializer {
                     UnityAssetError::format(format!("Failed to write integer value: {}", e))
                 })?;
             }
+            UnityValue::Unsigned(i) => {
+                write!(writer, "{}", i).map_err(|e| {
+                    UnityAssetError::format(format!("Failed to write unsigned value: {}", e))
+                })?;
+            }
             UnityValue::Float(f) => {
                 write!(writer, "{}", f).map_err(|e| {
                     UnityAssetError::format(format!("Failed to write float value: {}", e))
@@ -433,7 +443,10 @@ impl UnityYamlSerializer {
     fn is_simple_array(&self, arr: &[UnityValue]) -> bool {
         arr.len() <= 3
             && arr.iter().all(|v| match v {
-                UnityValue::Integer(_) | UnityValue::Float(_) | UnityValue::Bool(_) => true,
+                UnityValue::Integer(_)
+                | UnityValue::Unsigned(_)
+                | UnityValue::Float(_)
+                | UnityValue::Bool(_) => true,
                 UnityValue::String(s) => s.len() < 20,
                 _ => false,
             })
@@ -443,7 +456,10 @@ impl UnityYamlSerializer {
     fn is_simple_object(&self, obj: &indexmap::IndexMap<String, UnityValue>) -> bool {
         obj.len() <= 3
             && obj.values().all(|v| match v {
-                UnityValue::Integer(_) | UnityValue::Float(_) | UnityValue::Bool(_) => true,
+                UnityValue::Integer(_)
+                | UnityValue::Unsigned(_)
+                | UnityValue::Float(_)
+                | UnityValue::Bool(_) => true,
                 UnityValue::String(s) => s.len() < 20,
                 _ => false,
             })

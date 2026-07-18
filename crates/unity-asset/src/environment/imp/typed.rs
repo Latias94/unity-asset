@@ -696,26 +696,27 @@ impl<'a> EnvironmentEditSession<'a> {
         cab_name: Option<&str>,
         data: &[u8],
     ) -> Result<StreamedResourceWrite> {
-        let write = match self.write_streamed_resource_to_field(key, "m_Resource", cab_name, data) {
-            Ok(write) => write,
-            Err(err_primary) => self
-                .write_streamed_resource_to_field(key, "m_StreamData", cab_name, data)
+        self.write_streamed_resource_transaction(key, cab_name, data, |class, write| {
+            if let Err(err_primary) =
+                super::streamed_write::apply_streamed_resource_write(class, "m_Resource", write)
+            {
+                super::streamed_write::apply_streamed_resource_write(
+                    class,
+                    "m_StreamData",
+                    write,
+                )
                 .map_err(|err_fallback| {
                     unity_asset_core::UnityAssetError::format(format!(
                         "Failed to update AudioClip stream field: m_Resource={}; m_StreamData={}",
                         err_primary, err_fallback
                     ))
-                })?,
-        };
-
-        self.edit_binary_object_key(key, |class| {
+                })?;
+            }
             if let Some(v) = class.get_mut("m_AudioData") {
                 *v = UnityValue::Bytes(Vec::new());
             }
             Ok(())
-        })?;
-
-        Ok(write)
+        })
     }
 
     /// Write `data` into a cab and configure a Texture2D to stream from it (UnityPy-style).
@@ -727,10 +728,9 @@ impl<'a> EnvironmentEditSession<'a> {
         cab_name: Option<&str>,
         data: &[u8],
     ) -> Result<StreamedResourceWrite> {
-        let write = self.write_streamed_resource_to_field(key, "m_StreamData", cab_name, data)?;
-
         let len_i64: i64 = data.len().try_into().unwrap_or(i64::MAX);
-        self.edit_binary_object_key(key, |class| {
+        self.write_streamed_resource_transaction(key, cab_name, data, |class, write| {
+            super::streamed_write::apply_streamed_resource_write(class, "m_StreamData", write)?;
             for name in ["image_data", "image data", "m_ImageData"] {
                 clear_bytes_field(class, name);
             }
@@ -743,9 +743,7 @@ impl<'a> EnvironmentEditSession<'a> {
             }
 
             Ok(())
-        })?;
-
-        Ok(write)
+        })
     }
 
     /// Write `data` into a cab and configure a Mesh to stream from it (UnityPy-style).
@@ -757,9 +755,9 @@ impl<'a> EnvironmentEditSession<'a> {
         cab_name: Option<&str>,
         data: &[u8],
     ) -> Result<StreamedResourceWrite> {
-        let write = self.write_to_cab(key, cab_name, data)?;
-        self.edit_binary_object_key(key, |class| apply_mesh_streaming_write(class, &write))?;
-        Ok(write)
+        self.write_streamed_resource_transaction(key, cab_name, data, |class, write| {
+            apply_mesh_streaming_write(class, write)
+        })
     }
 
     /// Write `data` into a cab and configure a VideoClip to stream from it (UnityPy-style).
@@ -771,11 +769,9 @@ impl<'a> EnvironmentEditSession<'a> {
         cab_name: Option<&str>,
         data: &[u8],
     ) -> Result<StreamedResourceWrite> {
-        let write = self.write_to_cab(key, cab_name, data)?;
-        self.edit_binary_object_key(key, |class| {
-            apply_video_clip_external_resources_write(class, &write)
-        })?;
-        Ok(write)
+        self.write_streamed_resource_transaction(key, cab_name, data, |class, write| {
+            apply_video_clip_external_resources_write(class, write)
+        })
     }
 
     /// Set the `m_Script` string on a TextAsset (UnityPy-like convenience helper).

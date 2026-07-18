@@ -14,8 +14,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use unity_asset_core::AssetLoadBudget;
 use unity_asset_decode::asset::SerializedFileParser;
-use unity_asset_decode::bundle::load_bundle_from_memory;
+use unity_asset_decode::bundle::BundleParser;
 use unity_asset_decode::object::UnityObject;
 use unity_asset_decode::unity_version::UnityVersion;
 use unity_asset_decode::{
@@ -68,8 +69,9 @@ fn test_read_single() {
 
         match fs::read(file_path) {
             Ok(data) => {
+                let mut budget = AssetLoadBudget::default();
                 // Try to load as AssetBundle first
-                match load_bundle_from_memory(data.clone()) {
+                match BundleParser::from_bytes_with_budget(data.clone(), &mut budget) {
                     Ok(bundle) => {
                         successful_reads += 1;
                         println!("  ✓ Successfully loaded as AssetBundle");
@@ -92,7 +94,7 @@ fn test_read_single() {
                     }
                     Err(_) => {
                         // Try to load as SerializedFile
-                        match SerializedFileParser::from_bytes(data) {
+                        match SerializedFileParser::from_bytes_with_budget(data, &mut budget) {
                             Ok(asset) => {
                                 successful_reads += 1;
                                 println!("  ✓ Successfully loaded as SerializedFile");
@@ -170,8 +172,11 @@ fn test_read_batch() {
                 let file_name = path.file_name().unwrap().to_string_lossy();
 
                 if let Ok(data) = fs::read(&path) {
+                    let mut budget = AssetLoadBudget::default();
                     // Try AssetBundle first
-                    if let Ok(bundle) = load_bundle_from_memory(data.clone()) {
+                    if let Ok(bundle) =
+                        BundleParser::from_bytes_with_budget(data.clone(), &mut budget)
+                    {
                         successful_reads += 1;
                         for asset in &bundle.assets {
                             let objects = asset.objects();
@@ -186,7 +191,9 @@ fn test_read_batch() {
                         }
                     }
                     // Try SerializedFile
-                    else if let Ok(asset) = SerializedFileParser::from_bytes(data) {
+                    else if let Ok(asset) =
+                        SerializedFileParser::from_bytes_with_budget(data, &mut budget)
+                    {
                         successful_reads += 1;
                         let objects = asset.objects();
                         total_objects += objects.len();
@@ -252,8 +259,11 @@ fn test_save_dict() {
             let path = entry.path();
             if path.is_file() {
                 if let Ok(data) = fs::read(&path) {
+                    let mut budget = AssetLoadBudget::default();
                     // Try to load as AssetBundle
-                    if let Ok(bundle) = load_bundle_from_memory(data.clone()) {
+                    if let Ok(bundle) =
+                        BundleParser::from_bytes_with_budget(data.clone(), &mut budget)
+                    {
                         for asset in &bundle.assets {
                             let objects = asset.objects();
                             for obj in objects.iter().take(10) {
@@ -349,23 +359,26 @@ fn test_typetree() {
                 let file_name = path.file_name().unwrap().to_string_lossy();
 
                 if let Ok(data) = fs::read(&path) {
+                    let mut budget = AssetLoadBudget::default();
                     // Try to load as AssetBundle
-                    if let Ok(bundle) = load_bundle_from_memory(data.clone()) {
+                    if let Ok(bundle) =
+                        BundleParser::from_bytes_with_budget(data.clone(), &mut budget)
+                    {
                         for asset in &bundle.assets {
                             // Check if asset has TypeTree information
-                            if !asset.types.is_empty() {
+                            if !asset.types().is_empty() {
                                 files_with_typetree += 1;
-                                total_typetree_nodes += asset.types.len();
+                                total_typetree_nodes += asset.types().len();
                                 successful_parses += 1;
 
                                 println!(
                                     "  ✓ {} - TypeTree nodes: {}",
                                     file_name,
-                                    asset.types.len()
+                                    asset.types().len()
                                 );
 
                                 // Validate TypeTree structure
-                                for (i, type_info) in asset.types.iter().enumerate().take(3) {
+                                for (i, type_info) in asset.types().iter().enumerate().take(3) {
                                     println!(
                                         "    Node {}: Class {} - {} fields",
                                         i,
@@ -377,13 +390,19 @@ fn test_typetree() {
                         }
                     }
                     // Try SerializedFile
-                    else if let Ok(asset) = SerializedFileParser::from_bytes(data) {
-                        if !asset.types.is_empty() {
+                    else if let Ok(asset) =
+                        SerializedFileParser::from_bytes_with_budget(data, &mut budget)
+                    {
+                        if !asset.types().is_empty() {
                             files_with_typetree += 1;
-                            total_typetree_nodes += asset.types.len();
+                            total_typetree_nodes += asset.types().len();
                             successful_parses += 1;
 
-                            println!("  ✓ {} - TypeTree nodes: {}", file_name, asset.types.len());
+                            println!(
+                                "  ✓ {} - TypeTree nodes: {}",
+                                file_name,
+                                asset.types().len()
+                            );
                         }
                     }
                 }
@@ -428,8 +447,11 @@ fn test_extractor() {
                 let file_name = path.file_name().unwrap().to_string_lossy();
 
                 if let Ok(data) = fs::read(&path) {
+                    let mut budget = AssetLoadBudget::default();
                     // Try to load as AssetBundle
-                    if let Ok(bundle) = load_bundle_from_memory(data.clone()) {
+                    if let Ok(bundle) =
+                        BundleParser::from_bytes_with_budget(data.clone(), &mut budget)
+                    {
                         for asset in &bundle.assets {
                             for obj in asset.objects() {
                                 total_objects += 1;
@@ -476,7 +498,9 @@ fn test_extractor() {
                         }
                     }
                     // Try SerializedFile
-                    else if let Ok(asset) = SerializedFileParser::from_bytes(data) {
+                    else if let Ok(asset) =
+                        SerializedFileParser::from_bytes_with_budget(data, &mut budget)
+                    {
                         for obj in asset.objects() {
                             total_objects += 1;
 
@@ -736,7 +760,8 @@ fn test_unitypy_compatibility() {
         println!("Testing compatibility for: {}", file_name);
 
         if let Ok(data) = fs::read(file_path) {
-            match load_bundle_from_memory(data.clone()) {
+            let mut budget = AssetLoadBudget::default();
+            match BundleParser::from_bytes_with_budget(data.clone(), &mut budget) {
                 Ok(bundle) => {
                     let mut file_result = HashMap::new();
                     file_result.insert("file_name".to_string(), file_name.to_string());
@@ -892,26 +917,30 @@ fn test_object_type_identification() {
         println!("  Analyzing file: {}", file_name);
 
         if let Ok(data) = fs::read(&file_path) {
-            match load_bundle_from_memory(data) {
+            let mut budget = AssetLoadBudget::default();
+            match BundleParser::from_bytes_with_budget(data, &mut budget) {
                 Ok(bundle) => {
                     // Access assets from the bundle
                     for asset in &bundle.assets {
                         for asset_object_info in asset.objects() {
                             total_objects += 1;
-                            let unity_object =
-                                UnityObject::from_serialized_file(asset, asset_object_info)
-                                    .unwrap_or_else(|_| {
-                                        let fallback_data = asset
-                                            .object_bytes(asset_object_info)
-                                            .map(|b| b.to_vec())
-                                            .unwrap_or_default();
-                                        UnityObject::from_raw(
-                                            asset_object_info.class_id(),
-                                            asset_object_info.path_id(),
-                                            fallback_data,
-                                        )
-                                        .expect("fallback object metadata should be constructible")
-                                    });
+                            let unity_object = UnityObject::from_serialized_file(
+                                asset,
+                                asset_object_info,
+                                &mut budget,
+                            )
+                            .unwrap_or_else(|_| {
+                                let fallback_data = asset
+                                    .object_bytes(asset_object_info)
+                                    .map(|b| b.to_vec())
+                                    .unwrap_or_default();
+                                UnityObject::from_raw(
+                                    asset_object_info.class_id(),
+                                    asset_object_info.path_id(),
+                                    fallback_data,
+                                )
+                                .expect("fallback object metadata should be constructible")
+                            });
                             let class_name = unity_object.class_name().to_string();
 
                             // Count object types

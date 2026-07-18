@@ -211,12 +211,17 @@ UnityPy:
   - alignment driven by `MetaFlag` (`kAlignBytes`)
 
 Rust (current):
-- `crates/unity-asset-binary/src/typetree/serializer.rs`
-  - parse + scan fast paths
-  - `TypeTreeSerializer` drives parsing and PPtr scanning (read-only)
+- `crates/unity-asset-binary/src/typetree/execution.rs`
+  - `ObjectHandle::schema(&mut AssetLoadBudget)` selects and compiles the canonical
+    `TypeTreeSchema` for an object
+  - `TypeTreeSchema` drives materialized read, allocation-free skip, and zero-materialization
+    PPtr scan traversal under the caller-owned cumulative budget
 - `crates/unity-asset-write/src/typetree/`
-  - TypeTree-driven writer (UnityPy `TypeTreeHelper.write_value` parity)
-  - includes best-effort template writes for rare unnamed children (preserve original byte slices)
+  - encode and byte-preserving rewrite use the same compiled `TypeTreeSchema`; there is no separate
+    serializer facade with independent semantics
+  - `SerializedFileEditSession::edit_object` / `save_typetree` carry the caller's budget through
+    schema compilation, read, write, and rewrite
+  - untouched fields, padding, and rare unnamed children retain their original byte slices
 
 ### SerializedFile save/rebuild
 

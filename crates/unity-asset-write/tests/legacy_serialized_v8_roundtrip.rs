@@ -48,14 +48,14 @@ fn legacy_v8_serialized_file_can_roundtrip_save_and_reparse() -> anyhow::Result<
     let file = SerializedFileParser::from_bytes(bytes)?;
     assert_eq!(file.header.version, 8);
     assert_eq!(file.header.endian, 0);
-    assert_eq!(file.types.len(), 0);
+    assert_eq!(file.types().len(), 0);
     assert_eq!(file.objects().len(), 0);
 
     let saved = SerializedFileWriter::save(&file, &SerializedFileEdits::default())?;
     let reparsed = SerializedFileParser::from_bytes(saved)?;
     assert_eq!(reparsed.header.version, 8);
     assert_eq!(reparsed.header.endian, 0);
-    assert_eq!(reparsed.types.len(), 0);
+    assert_eq!(reparsed.types().len(), 0);
     assert_eq!(reparsed.objects().len(), 0);
 
     Ok(())

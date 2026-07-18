@@ -1,9 +1,11 @@
 //! Compression support for Unity binary files
 
 use crate::error::{BinaryError, Result};
+use brotli::{Allocator, SliceWrapper, SliceWrapperMut};
 use flate2::bufread::GzDecoder;
+use std::cell::Cell;
 use std::io::{BufRead, Read, Write};
-use unity_asset_core::{AssetLoadBudget, DecompressionBudget};
+use unity_asset_core::{AssetLoadBudget, BudgetError, DecompressionBudget};
 
 /// Compression types supported by Unity
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +344,14 @@ const LZMA_LITERAL_PROBABILITY_COLUMNS: usize = 0x300;
 // Four position-slot trees, one alignment tree, and two length decoders in lzma-rs 0.3.0.
 const LZMA_FIXED_PROBABILITY_BYTES: usize = 2_592;
 const VEC_U8_MIN_HEAP_CAPACITY: usize = 8;
+const BROTLI_INPUT_BUFFER_SIZE: usize = 64 * 1024;
+const BROTLI_MAX_WINDOW_BITS: u32 = 30;
+
+// These sizes mirror the conservative no-std preallocation strategy in
+// brotli-decompressor 2.5.1. The input buffer is additional reader-owned scratch.
+const BROTLI_PREALLOC_U8_FIXED_BYTES: u64 = 64 * 1024 + (256 + 704) * 256;
+const BROTLI_PREALLOC_U32_ELEMENTS: u64 = 12 * 1024 * 6;
+const BROTLI_PREALLOC_HUFFMAN_ELEMENTS: u64 = 128 * (704 + 256) + 6 * 26 * 1_080;
 
 #[derive(Debug, Clone, Copy)]
 struct LzmaMemoryPlan {
@@ -404,11 +414,79 @@ pub(crate) fn decompressor_scratch_bytes(
         CompressionType::Lzham => Err(BinaryError::unsupported_compression(
             "LZHAM compression not yet supported",
         )),
-        CompressionType::None
-        | CompressionType::Lz4
-        | CompressionType::Lz4Hc
-        | CompressionType::Brotli => Ok(0),
+        CompressionType::Brotli => brotli_planning_scratch_bytes(data),
+        CompressionType::None | CompressionType::Lz4 | CompressionType::Lz4Hc => Ok(0),
     }
+}
+
+fn brotli_planning_scratch_bytes(data: &[u8]) -> Result<u64> {
+    // Brotli's exact allocation sequence depends on encoded metablock tables. Planning uses the
+    // upstream reusable-pool peak bound; the custom allocator below charges every runtime
+    // allocation monotonically. Invalid or truncated headers take the maximum 30-bit window.
+    let window_bytes = 1_u64
+        .checked_shl(brotli_window_bits(data))
+        .ok_or_else(|| BinaryError::memory_error("Brotli window size overflow"))?;
+    let window_pool_bytes = window_bytes
+        .checked_add(window_bytes / 4)
+        .ok_or_else(|| BinaryError::memory_error("Brotli window scratch size overflow"))?;
+    let u32_bytes = BROTLI_PREALLOC_U32_ELEMENTS
+        .checked_mul(usize_to_u64(
+            std::mem::size_of::<u32>(),
+            "u32 element size",
+        )?)
+        .ok_or_else(|| BinaryError::memory_error("Brotli u32 scratch size overflow"))?;
+    let huffman_bytes = BROTLI_PREALLOC_HUFFMAN_ELEMENTS
+        .checked_mul(usize_to_u64(
+            std::mem::size_of::<brotli::HuffmanCode>(),
+            "Brotli Huffman element size",
+        )?)
+        .ok_or_else(|| BinaryError::memory_error("Brotli Huffman scratch size overflow"))?;
+
+    usize_to_u64(BROTLI_INPUT_BUFFER_SIZE, "Brotli input buffer size")?
+        .checked_add(BROTLI_PREALLOC_U8_FIXED_BYTES)
+        .and_then(|bytes| bytes.checked_add(window_pool_bytes))
+        .and_then(|bytes| bytes.checked_add(u32_bytes))
+        .and_then(|bytes| bytes.checked_add(huffman_bytes))
+        .ok_or_else(|| BinaryError::memory_error("Brotli planning scratch size overflow"))
+}
+
+fn brotli_window_bits(data: &[u8]) -> u32 {
+    let Some(&first) = data.first() else {
+        return BROTLI_MAX_WINDOW_BITS;
+    };
+    if first & 1 == 0 {
+        return 16;
+    }
+
+    let standard = match first & 0x0f {
+        0x03 => Some(18),
+        0x05 => Some(19),
+        0x07 => Some(20),
+        0x09 => Some(21),
+        0x0b => Some(22),
+        0x0d => Some(23),
+        0x0f => Some(24),
+        _ => match first & 0x7f {
+            0x71 => Some(15),
+            0x61 => Some(14),
+            0x51 => Some(13),
+            0x41 => Some(12),
+            0x31 => Some(11),
+            0x21 => Some(10),
+            0x01 => Some(17),
+            _ => None,
+        },
+    };
+    if let Some(bits) = standard {
+        return bits;
+    }
+
+    data.get(1)
+        .copied()
+        .filter(|_| first & 0x80 == 0)
+        .map(|second| u32::from(second & 0x3f))
+        .filter(|bits| (10..=BROTLI_MAX_WINDOW_BITS).contains(bits))
+        .unwrap_or(BROTLI_MAX_WINDOW_BITS)
 }
 
 fn lzma_alone_header(
@@ -454,8 +532,7 @@ pub fn decompress_brotli(data: &[u8]) -> Result<Vec<u8>> {
 /// Decompress Brotli data with bounded streaming output.
 pub fn decompress_brotli_with_budget(data: &[u8], budget: &mut AssetLoadBudget) -> Result<Vec<u8>> {
     budget.check_compressed_bytes(usize_to_u64(data.len(), "Brotli input size")?)?;
-    let decoder = brotli::Decompressor::new(data, 64 * 1024);
-    decompress_reader_with_budget(decoder, "Brotli", data.len(), None, budget)
+    decompress_brotli_stream_with_budget(data, None, budget)
 }
 
 fn decompress_brotli_exact_with_budget(
@@ -463,10 +540,192 @@ fn decompress_brotli_exact_with_budget(
     expected_size: usize,
     budget: &mut AssetLoadBudget,
 ) -> Result<Vec<u8>> {
-    let decoder = brotli::Decompressor::new(data, 64 * 1024);
-    let output =
-        decompress_reader_with_budget(decoder, "Brotli", data.len(), Some(expected_size), budget)?;
+    let output = decompress_brotli_stream_with_budget(data, Some(expected_size), budget)?;
     validate_declared_size("Brotli", output, expected_size)
+}
+
+fn decompress_brotli_stream_with_budget(
+    data: &[u8],
+    maximum_output: Option<usize>,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<u8>> {
+    let scratch = BrotliScratchReservation::new(budget);
+    let mut alloc_u8 = BrotliScratchAllocator::new(&scratch);
+    let input_buffer = <BrotliScratchAllocator<'_> as Allocator<u8>>::alloc_cell(
+        &mut alloc_u8,
+        BROTLI_INPUT_BUFFER_SIZE,
+    );
+    let decoder = brotli::reader::DecompressorCustomAlloc::new(
+        data,
+        input_buffer,
+        alloc_u8,
+        BrotliScratchAllocator::new(&scratch),
+        BrotliScratchAllocator::new(&scratch),
+    );
+
+    let decode_result = if scratch.has_failure() {
+        drop(decoder);
+        None
+    } else {
+        Some(decompress_reader_with_budget(
+            decoder,
+            "Brotli",
+            data.len(),
+            maximum_output,
+            budget,
+        ))
+    };
+    let scratch_result = scratch.commit(budget);
+
+    match (scratch_result, decode_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Some(result)) => result,
+        (Ok(()), None) => Err(BinaryError::memory_error(
+            "Brotli scratch allocation failed without an allocator error",
+        )),
+    }
+}
+
+struct BrotliScratchMemory<T>(Vec<T>);
+
+impl<T> Default for BrotliScratchMemory<T> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<T> SliceWrapper<T> for BrotliScratchMemory<T> {
+    fn slice(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T> SliceWrapperMut<T> for BrotliScratchMemory<T> {
+    fn slice_mut(&mut self) -> &mut [T] {
+        &mut self.0
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BrotliScratchAllocator<'a> {
+    reservation: &'a BrotliScratchReservation,
+}
+
+impl<'a> BrotliScratchAllocator<'a> {
+    fn new(reservation: &'a BrotliScratchReservation) -> Self {
+        Self { reservation }
+    }
+}
+
+impl<T: Default> Allocator<T> for BrotliScratchAllocator<'_> {
+    type AllocatedMemory = BrotliScratchMemory<T>;
+
+    fn alloc_cell(&mut self, len: usize) -> Self::AllocatedMemory {
+        self.reservation
+            .allocate(len)
+            .map(BrotliScratchMemory)
+            .unwrap_or_default()
+    }
+
+    fn free_cell(&mut self, _memory: Self::AllocatedMemory) {}
+}
+
+struct BrotliScratchReservation {
+    initial_bytes: u64,
+    max_bytes: u64,
+    successful_bytes: Cell<u64>,
+    failed: Cell<bool>,
+    failure: Cell<Option<BrotliScratchFailure>>,
+}
+
+impl BrotliScratchReservation {
+    fn new(budget: &AssetLoadBudget) -> Self {
+        Self {
+            initial_bytes: budget.usage().bytes,
+            max_bytes: budget.limits().max_bytes,
+            successful_bytes: Cell::new(0),
+            failed: Cell::new(false),
+            failure: Cell::new(None),
+        }
+    }
+
+    fn allocate<T: Default>(&self, len: usize) -> Option<Vec<T>> {
+        if self.has_failure() {
+            return None;
+        }
+
+        let allocation_bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .and_then(|bytes| u64::try_from(bytes).ok());
+        let Some(allocation_bytes) = allocation_bytes else {
+            self.record_failure(BrotliScratchFailure::Budget(
+                BudgetError::ArithmeticOverflow { resource: "bytes" },
+            ));
+            return None;
+        };
+        let requested = self
+            .initial_bytes
+            .checked_add(self.successful_bytes.get())
+            .and_then(|bytes| bytes.checked_add(allocation_bytes));
+        let Some(requested) = requested else {
+            self.record_failure(BrotliScratchFailure::Budget(
+                BudgetError::ArithmeticOverflow { resource: "bytes" },
+            ));
+            return None;
+        };
+        if requested > self.max_bytes {
+            self.record_failure(BrotliScratchFailure::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit: self.max_bytes,
+                requested,
+            }));
+            return None;
+        }
+
+        let mut memory = Vec::new();
+        if let Err(error) = memory.try_reserve_exact(len) {
+            self.record_failure(BrotliScratchFailure::Allocation {
+                requested: allocation_bytes,
+                error,
+            });
+            return None;
+        }
+        memory.resize_with(len, T::default);
+        self.successful_bytes
+            .set(self.successful_bytes.get() + allocation_bytes);
+        Some(memory)
+    }
+
+    fn has_failure(&self) -> bool {
+        self.failed.get()
+    }
+
+    fn record_failure(&self, failure: BrotliScratchFailure) {
+        if !self.failed.replace(true) {
+            self.failure.set(Some(failure));
+        }
+    }
+
+    fn commit(&self, budget: &mut AssetLoadBudget) -> Result<()> {
+        budget.consume_bytes(self.successful_bytes.get())?;
+        match self.failure.take() {
+            Some(BrotliScratchFailure::Budget(error)) => Err(BinaryError::Budget(error)),
+            Some(BrotliScratchFailure::Allocation { requested, error }) => {
+                Err(BinaryError::memory_error(format!(
+                    "Failed to reserve {requested} bytes for Brotli decoder scratch: {error}"
+                )))
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+enum BrotliScratchFailure {
+    Budget(BudgetError),
+    Allocation {
+        requested: u64,
+        error: std::collections::TryReserveError,
+    },
 }
 
 /// Decompress GZIP data (used in some Unity formats)
@@ -878,6 +1137,97 @@ mod tests {
         ));
         assert_eq!(budget.usage().compressed_bytes, compressed.len() as u64);
         assert_eq!(budget.usage().decompressed_bytes, 0);
+    }
+
+    #[test]
+    fn brotli_input_buffer_is_preflighted_against_the_byte_budget() {
+        const INPUT_BUFFER_BYTES: u64 = 64 * 1024;
+        const PREEXISTING_BYTES: u64 = 17;
+        const EXPECTED_BYTES: u64 = PREEXISTING_BYTES + INPUT_BUFFER_BYTES;
+
+        let compressed = brotli_compress(b"budgeted Brotli input buffer");
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: EXPECTED_BYTES - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        budget.consume_bytes(PREEXISTING_BYTES).unwrap();
+
+        let error = decompress_brotli_with_budget(&compressed, &mut budget).unwrap_err();
+
+        assert!(matches!(
+            error,
+            BinaryError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            }) if limit == EXPECTED_BYTES - 1 && requested == EXPECTED_BYTES
+        ));
+        assert_eq!(budget.usage().bytes, PREEXISTING_BYTES);
+        assert_eq!(budget.usage().compressed_bytes, 0);
+        assert_eq!(budget.usage().decompressed_bytes, 0);
+    }
+
+    #[test]
+    fn brotli_dynamic_allocations_are_preflighted_against_the_byte_budget() {
+        const INPUT_BUFFER_BYTES: u64 = 64 * 1024;
+        // Locks the full allocation sequence for this brotli-decompressor 2.5.1 fixture.
+        const ALLOCATION_BOUNDARIES: &[u64] = &[
+            69_856, 82_816, 95_776, 99_938, 99_939, 100_003, 100_007, 100_011, 104_331, 104_335,
+            108_655, 108_659, 112_979,
+        ];
+        const EXPECTED_SCRATCH_BYTES: u64 = 112_979;
+
+        let original = vec![0x5a; 4096];
+        let compressed = brotli_compress(&original);
+        for &expected in ALLOCATION_BOUNDARIES {
+            let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+                max_bytes: expected - 1,
+                ..AssetLoadLimits::default()
+            })
+            .unwrap();
+
+            let error = decompress_brotli_with_budget(&compressed, &mut budget).unwrap_err();
+
+            assert!(matches!(
+                error,
+                BinaryError::Budget(BudgetError::Exceeded {
+                    resource: "bytes",
+                    limit,
+                    requested,
+                }) if limit == expected - 1 && requested == expected
+            ));
+            assert!(budget.usage().bytes >= INPUT_BUFFER_BYTES);
+            assert!(budget.usage().bytes < expected);
+            assert_eq!(budget.usage().decompressed_bytes, 0);
+        }
+
+        let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: EXPECTED_SCRATCH_BYTES,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert_eq!(
+            decompress_brotli_with_budget(&compressed, &mut exact).unwrap(),
+            original
+        );
+        assert_eq!(exact.usage().bytes, EXPECTED_SCRATCH_BYTES);
+    }
+
+    #[test]
+    fn brotli_planning_scratch_uses_the_upstream_preallocation_bound() {
+        const STANDARD_WINDOW_SCRATCH_BYTES: u64 = 7_080_064;
+        const LARGE_WINDOW_SCRATCH_BYTES: u64 = 1_344_014_464;
+
+        assert_eq!(std::mem::size_of::<brotli::HuffmanCode>(), 4);
+        assert_eq!(
+            decompressor_scratch_bytes(&[0x0b, 0], CompressionType::Brotli, 1).unwrap(),
+            STANDARD_WINDOW_SCRATCH_BYTES
+        );
+        assert_eq!(
+            decompressor_scratch_bytes(&[0x11, 30], CompressionType::Brotli, 1).unwrap(),
+            LARGE_WINDOW_SCRATCH_BYTES
+        );
     }
 
     #[test]

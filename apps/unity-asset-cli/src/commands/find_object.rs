@@ -1,8 +1,9 @@
 use crate::fast_path;
 use crate::pattern::container_asset_path_matches_ci;
 use crate::shared::{
-    AppContext, build_environment, class_name_for_id, cli_warn, load_environment_input,
-    load_typetree_registry, object_address_for_key, object_address_for_key_with_bundle_names,
+    AppContext, build_environment_with_registry, class_name_for_id, cli_warn,
+    load_environment_input, load_typetree_registry, object_address_for_key,
+    object_address_for_key_with_bundle_names,
 };
 use anyhow::Result;
 use std::path::PathBuf;
@@ -25,6 +26,8 @@ pub(crate) fn run(
     verbose: bool,
     ctx: &AppContext,
 ) -> Result<()> {
+    let mut budget = AssetLoadBudget::default();
+    let registry = load_typetree_registry(ctx.typetree_registries(), &mut budget)?;
     if find_object_fast(
         &input,
         &pattern,
@@ -36,7 +39,8 @@ pub(crate) fn run(
         verbose,
         ctx.strict,
         ctx.show_warnings,
-        ctx.typetree_registries(),
+        &registry,
+        &mut budget,
     )? {
         return Ok(());
     }
@@ -52,7 +56,8 @@ pub(crate) fn run(
         verbose,
         ctx.strict,
         ctx.show_warnings,
-        ctx.typetree_registries(),
+        registry,
+        &mut budget,
     )
 }
 
@@ -68,10 +73,11 @@ fn find_object_env_fallback(
     verbose: bool,
     strict: bool,
     show_warnings: bool,
-    typetree_registries: &[PathBuf],
+    registry: Option<Arc<dyn TypeTreeRegistry>>,
+    budget: &mut AssetLoadBudget,
 ) -> Result<()> {
-    let mut env = build_environment(strict, show_warnings, typetree_registries)?;
-    load_environment_input(&mut env, &input)?;
+    let mut env = build_environment_with_registry(strict, show_warnings, registry);
+    load_environment_input(&mut env, &input, budget)?;
 
     let name_lc = name.to_ascii_lowercase();
     let class_name_lc = class_name.to_ascii_lowercase();
@@ -89,8 +95,6 @@ fn find_object_env_fallback(
         })
         .collect();
     bundle_sources.sort();
-    let mut budget = AssetLoadBudget::default();
-
     if bundle_sources.is_empty() {
         println!("⚠ No AssetBundles found in {:?}", input);
         return Ok(());
@@ -98,7 +102,7 @@ fn find_object_env_fallback(
 
     let mut count = 0usize;
     for bundle_source in bundle_sources {
-        let mut entries = env.bundle_container_entries_source(&bundle_source, &mut budget)?;
+        let mut entries = env.bundle_container_entries_source(&bundle_source, budget)?;
         entries.sort_by(|a, b| a.asset_path.cmp(&b.asset_path));
 
         for entry in entries {
@@ -134,7 +138,7 @@ fn find_object_env_fallback(
                     if !name_lc.is_empty() {
                         let address =
                             object_address_for_key(&env, &input, key)?.to_compact_string()?;
-                        let matches = match env.peek_binary_object_name(key) {
+                        let matches = match env.peek_binary_object_name(key, budget) {
                             Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
                             Ok(None) => false,
                             Err(e) => {
@@ -182,7 +186,7 @@ fn find_object_env_fallback(
                 }
                 if !name_lc.is_empty() {
                     let address = object_address_for_key(&env, &input, key)?.to_compact_string()?;
-                    let matches = match env.peek_binary_object_name(key) {
+                    let matches = match env.peek_binary_object_name(key, budget) {
                         Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
                         Ok(None) => false,
                         Err(e) => {
@@ -222,9 +226,9 @@ fn find_object_fast(
     verbose: bool,
     strict: bool,
     show_warnings: bool,
-    typetree_registries: &[PathBuf],
+    registry: &Option<Arc<dyn TypeTreeRegistry>>,
+    budget: &mut AssetLoadBudget,
 ) -> Result<bool> {
-    let registry = load_typetree_registry(typetree_registries)?;
     let typetree_options = if strict {
         TypeTreeParseOptions {
             mode: TypeTreeParseMode::Strict,
@@ -242,8 +246,6 @@ fn find_object_fast(
 
     let mut processed_any_bundle = false;
     let mut count = 0usize;
-    let mut budget = AssetLoadBudget::default();
-
     for path in candidate_paths {
         if let Some(max) = limit {
             if count >= max {
@@ -257,9 +259,7 @@ fn find_object_fast(
 
         let options = fast_path::bundle_list_options();
         let mut bundle = match unity_asset_binary::file::load_bundle_file_with_options_and_budget(
-            &path,
-            options,
-            &mut budget,
+            &path, options, budget,
         ) {
             Ok(v) => v,
             Err(error) if error.is_resource_error() => return Err(error.into()),
@@ -279,11 +279,12 @@ fn find_object_fast(
             registry.as_ref(),
             typetree_options,
             show_warnings,
-            &mut budget,
+            budget,
         );
 
         let mut entries = match entries {
             Ok(v) => v,
+            Err(error) if error.is_resource_error() => return Err(error.into()),
             Err(e) => {
                 if show_warnings {
                     eprintln!(
@@ -331,7 +332,8 @@ fn find_object_fast(
                         &mut file_cache,
                         key,
                         registry.as_ref(),
-                    );
+                        budget,
+                    )?;
 
                     if !class_id.is_empty() && !class_id.contains(&type_id) {
                         continue;
@@ -356,9 +358,13 @@ fn find_object_fast(
                             key,
                             registry.as_ref(),
                             typetree_options,
+                            budget,
                         ) {
                             Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
                             Ok(None) => false,
+                            Err(error) if error.is_resource_error() => {
+                                return Err(error.into());
+                            }
                             Err(e) => {
                                 cli_warn(
                                     show_warnings,
@@ -398,7 +404,8 @@ fn find_object_fast(
                         &mut file_cache,
                         key,
                         registry.as_ref(),
-                    )
+                        budget,
+                    )?
                 };
 
                 if !class_id.is_empty() && !class_id.contains(&type_id) {
@@ -421,9 +428,11 @@ fn find_object_fast(
                         key,
                         registry.as_ref(),
                         typetree_options,
+                        budget,
                     ) {
                         Ok(Some(found)) => found.to_ascii_lowercase().contains(&name_lc),
                         Ok(None) => false,
+                        Err(error) if error.is_resource_error() => return Err(error.into()),
                         Err(e) => {
                             cli_warn(
                                 show_warnings,
@@ -460,14 +469,11 @@ fn extract_bundle_container_entries_fast(
     typetree_options: TypeTreeParseOptions,
     show_warnings: bool,
     budget: &mut AssetLoadBudget,
-) -> Result<Vec<unity_asset::environment::BundleContainerEntry>> {
+) -> unity_asset_binary::error::Result<Vec<unity_asset::environment::BundleContainerEntry>> {
     for (asset_index, node) in asset_nodes.iter().enumerate() {
-        let bytes = bundle
-            .extract_node_data_with_budget(node, budget)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let bytes = bundle.extract_node_data_with_budget(node, budget)?;
         let mut file =
-            unity_asset_binary::asset::SerializedFileParser::from_bytes_with_budget(bytes, budget)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            unity_asset_binary::asset::SerializedFileParser::from_bytes_with_budget(bytes, budget)?;
         if let Some(registry) = registry.cloned() {
             file.set_type_tree_registry(Some(registry));
         }
@@ -478,8 +484,8 @@ fn extract_bundle_container_entries_fast(
                 continue;
             }
 
-            if file.enable_type_tree {
-                match object.read_with_options(typetree_options) {
+            if file.type_tree_enabled() {
+                match object.read_with_options(budget, typetree_options) {
                     Ok(obj) => {
                         if show_warnings {
                             for w in obj.typetree_warnings() {
@@ -504,6 +510,7 @@ fn extract_bundle_container_entries_fast(
                             return Ok(out);
                         }
                     }
+                    Err(error) if error.is_resource_error() => return Err(error),
                     Err(e) => {
                         if show_warnings {
                             eprintln!(
@@ -546,7 +553,7 @@ fn extract_bundle_container_entries_fast(
                         return Ok(out);
                     }
                 }
-                Err(error) if error.is_resource_error() => return Err(error.into()),
+                Err(error) if error.is_resource_error() => return Err(error),
                 Err(_) => {}
             }
         }
@@ -690,36 +697,43 @@ fn lookup_object_type_info_fast(
     cache: &mut [Option<unity_asset_binary::asset::SerializedFile>],
     key: &BinaryObjectKey,
     registry: Option<&Arc<dyn TypeTreeRegistry>>,
-) -> (i32, u32) {
+    budget: &mut AssetLoadBudget,
+) -> Result<(i32, u32)> {
     if key.source_kind != unity_asset::environment::BinarySourceKind::AssetBundle {
-        return (0, 0);
+        return Ok((0, 0));
     }
     let Some(asset_index) = key.asset_index else {
-        return (0, 0);
+        return Ok((0, 0));
     };
     if asset_index >= asset_nodes.len() || asset_index >= cache.len() {
-        return (0, 0);
+        return Ok((0, 0));
     }
 
     if cache[asset_index].is_none() {
         let node = &asset_nodes[asset_index];
-        let bytes = match bundle.extract_node_data(node) {
+        let bytes = match bundle.extract_node_data_with_budget(node, budget) {
             Ok(v) => v,
-            Err(_) => return (0, 0),
+            Err(error) if error.is_resource_error() => return Err(error.into()),
+            Err(_) => return Ok((0, 0)),
         };
-        if let Ok(mut file) = unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes) {
-            if let Some(registry) = registry.cloned() {
-                file.set_type_tree_registry(Some(registry));
+        match unity_asset_binary::asset::SerializedFileParser::from_bytes_with_budget(bytes, budget)
+        {
+            Ok(mut file) => {
+                if let Some(registry) = registry.cloned() {
+                    file.set_type_tree_registry(Some(registry));
+                }
+                cache[asset_index] = Some(file);
             }
-            cache[asset_index] = Some(file);
+            Err(error) if error.is_resource_error() => return Err(error.into()),
+            Err(_) => return Ok((0, 0)),
         }
     }
 
-    cache[asset_index]
+    Ok(cache[asset_index]
         .as_ref()
         .and_then(|f| f.find_object(key.path_id))
         .map(|info| (info.class_id(), info.byte_size()))
-        .unwrap_or((0, 0))
+        .unwrap_or((0, 0)))
 }
 
 fn peek_object_name_fast(
@@ -729,7 +743,8 @@ fn peek_object_name_fast(
     key: &BinaryObjectKey,
     registry: Option<&Arc<dyn TypeTreeRegistry>>,
     options: TypeTreeParseOptions,
-) -> Result<Option<String>> {
+    budget: &mut AssetLoadBudget,
+) -> unity_asset_binary::error::Result<Option<String>> {
     if key.source_kind != unity_asset::environment::BinarySourceKind::AssetBundle {
         return Ok(None);
     }
@@ -742,11 +757,9 @@ fn peek_object_name_fast(
 
     if cache[asset_index].is_none() {
         let node = &asset_nodes[asset_index];
-        let bytes = bundle
-            .extract_node_data(node)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let mut file = unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let bytes = bundle.extract_node_data_with_budget(node, budget)?;
+        let mut file =
+            unity_asset_binary::asset::SerializedFileParser::from_bytes_with_budget(bytes, budget)?;
         if let Some(registry) = registry.cloned() {
             file.set_type_tree_registry(Some(registry));
         }
@@ -754,21 +767,18 @@ fn peek_object_name_fast(
     }
 
     let file = cache[asset_index].as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
+        unity_asset_binary::error::BinaryError::invalid_data(format!(
             "failed to parse serialized file for asset_index={}",
             asset_index
-        )
+        ))
     })?;
     let handle = file.find_object_handle(key.path_id).ok_or_else(|| {
-        anyhow::anyhow!(
+        unity_asset_binary::error::BinaryError::invalid_data(format!(
             "object not found: path_id={} (asset_index={})",
-            key.path_id,
-            asset_index
-        )
+            key.path_id, asset_index
+        ))
     })?;
-    handle
-        .peek_name_with_options(options)
-        .map_err(|e| anyhow::anyhow!(e))
+    handle.peek_name_with_options(budget, options)
 }
 
 fn lookup_object_type_info(env: &Environment, key: &BinaryObjectKey) -> (i32, u32) {

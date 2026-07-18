@@ -5,6 +5,7 @@ use crate::shared::{
 use anyhow::Result;
 use serde::Serialize;
 use std::path::PathBuf;
+use unity_asset::AssetLoadBudget;
 use unity_asset::environment::{BinaryObjectKey, BinarySource, BinarySourceKind, Environment};
 use unity_asset_binary::asset::SerializedFile;
 
@@ -49,9 +50,14 @@ pub(crate) fn run(
     json: bool,
     ctx: &AppContext,
 ) -> Result<()> {
-    let mut env =
-        crate::shared::build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
-    load_environment_input(&mut env, &input)?;
+    let mut budget = AssetLoadBudget::default();
+    let mut env = crate::shared::build_environment(
+        ctx.strict,
+        ctx.show_warnings,
+        ctx.typetree_registries(),
+        &mut budget,
+    )?;
+    load_environment_input(&mut env, &input, &mut budget)?;
 
     let kind_lc = kind.to_ascii_lowercase();
     let want_bundle = kind_lc == "all" || kind_lc == "bundle";
@@ -65,7 +71,6 @@ pub(crate) fn run(
 
     let mut printed = 0usize;
     let limit = limit.unwrap_or(usize::MAX);
-
     if want_serialized {
         list_serialized(
             &env,
@@ -77,6 +82,7 @@ pub(crate) fn run(
             limit,
             json,
             &mut printed,
+            &mut budget,
         )?;
     }
 
@@ -92,6 +98,7 @@ pub(crate) fn run(
             limit,
             json,
             &mut printed,
+            &mut budget,
         )?;
     }
 
@@ -131,6 +138,7 @@ fn list_serialized(
     limit: usize,
     json: bool,
     printed: &mut usize,
+    budget: &mut AssetLoadBudget,
 ) -> Result<()> {
     let sources: Vec<BinarySource> = if let Some(source) = source {
         let resolved = resolve_loaded_source(
@@ -159,7 +167,11 @@ fn list_serialized(
                 .find_type(class_id)
                 .map(|t| t.has_type_tree())
                 .unwrap_or(false);
-            let peek = handle.peek_name().ok().flatten();
+            let peek = match handle.peek_name(budget) {
+                Ok(name) => name,
+                Err(error) if error.is_resource_error() => return Err(error.into()),
+                Err(_) => None,
+            };
 
             if !matches_filters(
                 class_id_filter,
@@ -239,6 +251,7 @@ fn list_bundles(
     limit: usize,
     json: bool,
     printed: &mut usize,
+    budget: &mut AssetLoadBudget,
 ) -> Result<()> {
     let sources: Vec<BinarySource> = if let Some(source) = source {
         let resolved = resolve_loaded_source(
@@ -277,7 +290,11 @@ fn list_bundles(
                     .find_type(class_id)
                     .map(|t| t.has_type_tree())
                     .unwrap_or(false);
-                let peek = handle.peek_name().ok().flatten();
+                let peek = match handle.peek_name(budget) {
+                    Ok(name) => name,
+                    Err(error) if error.is_resource_error() => return Err(error.into()),
+                    Err(_) => None,
+                };
 
                 if !matches_filters(
                     class_id_filter,

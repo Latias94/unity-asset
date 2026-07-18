@@ -76,17 +76,17 @@ impl SerializedFileWriter {
         }
 
         if format.has_metadata_field(MetadataField::EnableTypeTree) {
-            meta.write_bool(file.enable_type_tree);
-        } else if !file.enable_type_tree {
+            meta.write_bool(file.type_tree_enabled());
+        } else if !file.type_tree_enabled() {
             return Err(UnityAssetError::format(format!(
                 "SerializedFile v{} has implicit TypeTree enablement",
                 format.version()
             )));
         }
 
-        write_count(&mut meta, "SerializedType", file.types.len())?;
-        for st in &file.types {
-            write_serialized_type(st, &mut meta, format, file.enable_type_tree, false)?;
+        write_count(&mut meta, "SerializedType", file.types().len())?;
+        for st in file.types() {
+            write_serialized_type(st, &mut meta, format, file.type_tree_enabled(), false)?;
         }
 
         if format.has_metadata_field(MetadataField::BigIdEnabled) {
@@ -143,11 +143,11 @@ impl SerializedFileWriter {
         }
 
         if format.has_metadata_field(MetadataField::RefTypes) {
-            write_count(&mut meta, "reference type", file.ref_types.len())?;
-            for st in &file.ref_types {
-                write_serialized_type(st, &mut meta, format, file.enable_type_tree, true)?;
+            write_count(&mut meta, "reference type", file.ref_types().len())?;
+            for st in file.ref_types() {
+                write_serialized_type(st, &mut meta, format, file.type_tree_enabled(), true)?;
             }
-        } else if !file.ref_types.is_empty() {
+        } else if !file.ref_types().is_empty() {
             return Err(UnityAssetError::format(format!(
                 "SerializedFile v{} cannot encode reference types",
                 format.version()
@@ -437,11 +437,11 @@ mod tests {
         assert_eq!(reparsed.header.version, sf.header.version);
         assert_eq!(reparsed.unity_version, sf.unity_version);
         assert_eq!(reparsed.target_platform, sf.target_platform);
-        assert_eq!(reparsed.enable_type_tree, sf.enable_type_tree);
-        assert_eq!(reparsed.types.len(), sf.types.len());
+        assert_eq!(reparsed.type_tree_enabled(), sf.type_tree_enabled());
+        assert_eq!(reparsed.types().len(), sf.types().len());
         assert_eq!(reparsed.objects().len(), sf.objects().len());
         assert_eq!(reparsed.externals.len(), sf.externals.len());
-        assert_eq!(reparsed.ref_types.len(), sf.ref_types.len());
+        assert_eq!(reparsed.ref_types().len(), sf.ref_types().len());
     }
 
     #[test]

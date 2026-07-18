@@ -40,10 +40,10 @@ pub(super) fn validate_file(file: &SerializedFile) -> Result<()> {
         format: file.format(),
         header: &file.header,
         regions: file.regions(),
-        enable_type_tree: file.enable_type_tree,
-        types: &file.types,
+        enable_type_tree: file.type_tree_enabled(),
+        types: file.types(),
         objects: file.objects(),
-        ref_types: &file.ref_types,
+        ref_types: file.ref_types(),
         source_len,
     })
 }

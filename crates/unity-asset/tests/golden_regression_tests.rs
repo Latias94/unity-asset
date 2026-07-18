@@ -150,19 +150,23 @@ fn object_type_info(env: &Environment, key: &BinaryObjectKey) -> (i32, u32) {
     }
 }
 
-fn scan_pptrs(env: &Environment, key: &BinaryObjectKey) -> (Vec<i64>, Vec<[i64; 2]>) {
+fn scan_pptrs(
+    env: &Environment,
+    key: &BinaryObjectKey,
+    budget: &mut AssetLoadBudget,
+) -> (Vec<i64>, Vec<[i64; 2]>) {
     let scan = match key.source_kind {
         BinarySourceKind::AssetBundle => env
             .bundles()
             .get(&key.source)
             .and_then(|b| key.asset_index.and_then(|i| b.assets.get(i)))
             .and_then(|f| f.find_object_handle(key.path_id))
-            .and_then(|h| h.scan_pptrs().ok().flatten()),
+            .and_then(|h| h.scan_pptrs(budget).ok().flatten()),
         BinarySourceKind::SerializedFile => env
             .binary_assets()
             .get(&key.source)
             .and_then(|f| f.find_object_handle(key.path_id))
-            .and_then(|h| h.scan_pptrs().ok().flatten()),
+            .and_then(|h| h.scan_pptrs(budget).ok().flatten()),
     };
 
     let Some(scan) = scan else {
@@ -187,9 +191,12 @@ fn scan_pptrs(env: &Environment, key: &BinaryObjectKey) -> (Vec<i64>, Vec<[i64; 
 fn golden_regression_smoke() {
     let golden = load_golden();
     let mut env = Environment::new();
-    env.load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples"))
-        .expect("load samples");
     let mut budget = AssetLoadBudget::default();
+    env.load(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples"),
+        &mut budget,
+    )
+    .expect("load samples");
 
     for case in golden.cases {
         let source_kind = match case.source_kind.as_str() {
@@ -233,7 +240,7 @@ fn golden_regression_smoke() {
         );
 
         let peek = env
-            .peek_binary_object_name(&key)
+            .peek_binary_object_name(&key, &mut budget)
             .unwrap_or_else(|_| panic!("peek_binary_object_name failed (case={})", case.id));
         assert_eq!(
             peek.as_deref(),
@@ -247,7 +254,7 @@ fn golden_regression_smoke() {
                 pptr_internal,
                 pptr_external,
             } => {
-                let (internal, external) = scan_pptrs(&env, &key);
+                let (internal, external) = scan_pptrs(&env, &key, &mut budget);
                 assert_eq!(
                     internal, pptr_internal,
                     "scan_pptrs internal mismatch (case={})",
@@ -267,7 +274,7 @@ fn golden_regression_smoke() {
                 compression_format,
             } => {
                 let obj = env
-                    .read_binary_object_key(&key)
+                    .read_binary_object_key(&key, &mut budget)
                     .unwrap_or_else(|_| panic!("read_binary_object_key failed (case={})", case.id));
                 assert_eq!(
                     obj.name().as_deref(),
@@ -355,7 +362,7 @@ fn golden_regression_smoke() {
                 complete_image_size,
             } => {
                 let obj = env
-                    .read_binary_object_key(&key)
+                    .read_binary_object_key(&key, &mut budget)
                     .unwrap_or_else(|_| panic!("read_binary_object_key failed (case={})", case.id));
                 assert_eq!(
                     obj.name().as_deref(),
@@ -446,7 +453,7 @@ fn golden_regression_smoke() {
                 pptr_internal,
                 pptr_external,
             } => {
-                let (internal, external) = scan_pptrs(&env, &key);
+                let (internal, external) = scan_pptrs(&env, &key, &mut budget);
                 assert_eq!(
                     internal, pptr_internal,
                     "scan_pptrs internal mismatch (case={})",
@@ -459,7 +466,7 @@ fn golden_regression_smoke() {
                 );
 
                 let obj = env
-                    .read_binary_object_key(&key)
+                    .read_binary_object_key(&key, &mut budget)
                     .unwrap_or_else(|_| panic!("read_binary_object_key failed (case={})", case.id));
                 assert_eq!(
                     obj.name().as_deref(),
@@ -651,7 +658,7 @@ fn golden_regression_smoke() {
                 pptr_internal,
                 pptr_external,
             } => {
-                let (internal, external) = scan_pptrs(&env, &key);
+                let (internal, external) = scan_pptrs(&env, &key, &mut budget);
                 assert_eq!(
                     internal, pptr_internal,
                     "scan_pptrs internal mismatch (case={})",
@@ -664,7 +671,7 @@ fn golden_regression_smoke() {
                 );
 
                 let obj = env
-                    .read_binary_object_key(&key)
+                    .read_binary_object_key(&key, &mut budget)
                     .unwrap_or_else(|_| panic!("read_binary_object_key failed (case={})", case.id));
                 assert_eq!(
                     obj.name().as_deref(),
@@ -779,7 +786,7 @@ fn golden_regression_smoke() {
                 pptr_internal,
                 pptr_external,
             } => {
-                let (internal, external) = scan_pptrs(&env, &key);
+                let (internal, external) = scan_pptrs(&env, &key, &mut budget);
                 assert_eq!(
                     internal, pptr_internal,
                     "scan_pptrs internal mismatch (case={})",
@@ -792,7 +799,7 @@ fn golden_regression_smoke() {
                 );
 
                 let obj = env
-                    .read_binary_object_key(&key)
+                    .read_binary_object_key(&key, &mut budget)
                     .unwrap_or_else(|_| panic!("read_binary_object_key failed (case={})", case.id));
                 assert_eq!(
                     obj.name().as_deref(),

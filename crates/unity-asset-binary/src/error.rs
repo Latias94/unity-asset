@@ -62,8 +62,12 @@ pub enum BinaryError {
     ResourceLimitExceeded(String),
 
     /// Shared asset load budget exhausted or invalid
-    #[error(transparent)]
-    Budget(#[from] BudgetError),
+    #[error("{0}")]
+    Budget(
+        #[from]
+        #[source]
+        BudgetError,
+    ),
 
     /// Corrupted data
     #[error("Corrupted data detected: {0}")]
@@ -290,6 +294,25 @@ mod tests {
         let err = BinaryError::not_enough_data(100, 50);
         assert!(matches!(err, BinaryError::NotEnoughData { .. }));
         assert_eq!(err.to_string(), "Not enough data: expected 100, got 50");
+    }
+
+    #[test]
+    fn budget_error_remains_available_in_the_source_chain() {
+        let error = BinaryError::from(BudgetError::Exceeded {
+            resource: "bytes",
+            limit: 1,
+            requested: 2,
+        });
+        let source = std::error::Error::source(&error).expect("budget error is the source");
+
+        assert!(matches!(
+            source.downcast_ref::<BudgetError>(),
+            Some(BudgetError::Exceeded {
+                resource: "bytes",
+                limit: 1,
+                requested: 2,
+            })
+        ));
     }
 
     #[test]

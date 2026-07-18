@@ -8,9 +8,11 @@
 //! - If `path_id` is provided, this example uses that object.
 //! - Otherwise, it scans for the first object that contains stream metadata.
 
+use std::error::Error as StdError;
 use std::path::PathBuf;
-use unity_asset::UnityValue;
 use unity_asset::environment::{BinaryObjectKey, Environment};
+use unity_asset::{AssetLoadBudget, Result, UnityAssetError, UnityValue};
+use unity_asset_binary::BinaryError;
 
 #[derive(Debug, Clone)]
 struct StreamDescriptor {
@@ -20,9 +22,6 @@ struct StreamDescriptor {
 }
 
 fn extract_stream(obj: &unity_asset_binary::object::UnityObject) -> Option<StreamDescriptor> {
-    fn as_u64(v: &UnityValue) -> Option<u64> {
-        v.as_i64().and_then(|n| u64::try_from(n).ok())
-    }
     fn as_u32(v: &UnityValue) -> Option<u32> {
         v.as_i64().and_then(|n| u32::try_from(n).ok())
     }
@@ -33,7 +32,10 @@ fn extract_stream(obj: &unity_asset_binary::object::UnityObject) -> Option<Strea
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let offset = res.get("m_Offset").and_then(as_u64).unwrap_or(0);
+        let offset = res
+            .get("m_Offset")
+            .and_then(UnityValue::as_u64)
+            .unwrap_or(0);
         let size = res.get("m_Size").and_then(as_u32).unwrap_or(0);
         if !path.is_empty() && size > 0 {
             return Some(StreamDescriptor { path, offset, size });
@@ -46,7 +48,10 @@ fn extract_stream(obj: &unity_asset_binary::object::UnityObject) -> Option<Strea
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let offset = stream.get("offset").and_then(as_u64).unwrap_or(0);
+        let offset = stream
+            .get("offset")
+            .and_then(UnityValue::as_u64)
+            .unwrap_or(0);
         let size = stream.get("size").and_then(as_u32).unwrap_or(0);
         if !path.is_empty() && size > 0 {
             return Some(StreamDescriptor { path, offset, size });
@@ -56,7 +61,54 @@ fn extract_stream(obj: &unity_asset_binary::object::UnityObject) -> Option<Strea
     None
 }
 
-fn first_streamed_object_key(env: &Environment) -> Option<BinaryObjectKey> {
+fn is_skippable_binary_object_error(error: &BinaryError) -> bool {
+    matches!(
+        error,
+        BinaryError::InvalidFormat(_)
+            | BinaryError::UnsupportedVersion(_)
+            | BinaryError::InvalidData(_)
+            | BinaryError::ParseError(_)
+            | BinaryError::NotEnoughData { .. }
+            | BinaryError::InvalidSignature { .. }
+            | BinaryError::Unsupported(_)
+            | BinaryError::CorruptedData(_)
+            | BinaryError::VersionCompatibility(_)
+    )
+}
+
+fn is_skippable_object_error(error: &UnityAssetError) -> bool {
+    let mut current: Option<&(dyn StdError + 'static)> = Some(error);
+    while let Some(source) = current {
+        if let Some(binary) = source.downcast_ref::<BinaryError>() {
+            return is_skippable_binary_object_error(binary);
+        }
+        current = source.source();
+    }
+    false
+}
+
+fn read_stream_descriptor(
+    env: &Environment,
+    key: &BinaryObjectKey,
+    budget: &mut AssetLoadBudget,
+) -> Result<Option<StreamDescriptor>> {
+    match env.read_binary_object_key(key, budget) {
+        Ok(object) => Ok(extract_stream(&object)),
+        Err(error) if is_skippable_object_error(&error) => {
+            eprintln!(
+                "warning: skipping path_id={} while looking for stream metadata: {error}",
+                key.path_id
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn first_streamed_object_key(
+    env: &Environment,
+    budget: &mut AssetLoadBudget,
+) -> Result<Option<BinaryObjectKey>> {
     let preferred_class_ids = [83, 28];
     for class_id in preferred_class_ids {
         for obj_ref in env
@@ -64,27 +116,28 @@ fn first_streamed_object_key(env: &Environment) -> Option<BinaryObjectKey> {
             .filter(|r| r.object.class_id() == class_id)
         {
             let key = obj_ref.key();
-            if let Ok(obj) = env.read_binary_object_key(&key)
-                && extract_stream(&obj).is_some()
-            {
-                return Some(key);
+            if read_stream_descriptor(env, &key, budget)?.is_some() {
+                return Ok(Some(key));
             }
         }
     }
 
-    for obj_ref in env.binary_object_infos() {
+    for obj_ref in env
+        .binary_object_infos()
+        .filter(|obj_ref| !preferred_class_ids.contains(&obj_ref.object.class_id()))
+    {
         let key = obj_ref.key();
-        if let Ok(obj) = env.read_binary_object_key(&key)
-            && extract_stream(&obj).is_some()
-        {
-            return Some(key);
+        // Unsupported or malformed objects are local misses. Resource and I/O failures propagate
+        // from `read_stream_descriptor` instead of masquerading as "no streamed objects".
+        if read_stream_descriptor(env, &key, budget)?.is_some() {
+            return Ok(Some(key));
         }
     }
 
-    None
+    Ok(None)
 }
 
-fn main() -> unity_asset::Result<()> {
+fn main() -> Result<()> {
     let path = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
@@ -92,7 +145,8 @@ fn main() -> unity_asset::Result<()> {
     let path_id = std::env::args().nth(2).and_then(|s| s.parse::<i64>().ok());
 
     let mut env = Environment::new();
-    env.load(&path)?;
+    let mut budget = AssetLoadBudget::default();
+    env.load(&path, &mut budget)?;
 
     let key = if let Some(path_id) = path_id {
         env.find_binary_object_keys(path_id)
@@ -102,12 +156,12 @@ fn main() -> unity_asset::Result<()> {
                 unity_asset::UnityAssetError::format(format!("Object not found: path_id={path_id}"))
             })?
     } else {
-        first_streamed_object_key(&env).ok_or_else(|| {
+        first_streamed_object_key(&env, &mut budget)?.ok_or_else(|| {
             unity_asset::UnityAssetError::format("No streamed objects found in this input")
         })?
     };
 
-    let obj = env.read_binary_object_key(&key)?;
+    let obj = env.read_binary_object_key(&key, &mut budget)?;
     let Some(stream) = extract_stream(&obj) else {
         return Err(unity_asset::UnityAssetError::format(
             "Object does not contain stream metadata (m_Resource/m_StreamData)",

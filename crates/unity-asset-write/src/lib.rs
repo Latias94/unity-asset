@@ -16,7 +16,7 @@ pub mod object;
 mod packer;
 pub mod resources;
 pub mod serialized_file;
-pub mod typetree;
+mod typetree;
 pub mod webfile;
 
 pub use binary_writer::{BinaryWriter, Endian};

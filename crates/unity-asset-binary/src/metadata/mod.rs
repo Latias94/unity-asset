@@ -69,6 +69,7 @@ pub use types::{
 
 use crate::asset::SerializedFile;
 use crate::bundle::AssetBundle;
+use unity_asset_core::AssetLoadBudget;
 
 /// Main metadata processing facade
 ///
@@ -76,8 +77,6 @@ use crate::bundle::AssetBundle;
 /// combining extraction and analysis functionality.
 pub struct MetadataProcessor {
     extractor: MetadataExtractor,
-    dependency_analyzer: Option<DependencyAnalyzer>,
-    relationship_analyzer: Option<RelationshipAnalyzer>,
 }
 
 fn apply_dependency_info_to_relationships(
@@ -192,133 +191,32 @@ impl MetadataProcessor {
     pub fn new() -> Self {
         Self {
             extractor: MetadataExtractor::new(),
-            dependency_analyzer: None,
-            relationship_analyzer: None,
         }
     }
 
     /// Create a metadata processor with custom configuration
     pub fn with_config(config: ExtractionConfig) -> Self {
-        let enable_advanced = config.include_dependencies || config.include_hierarchy;
-
         Self {
             extractor: MetadataExtractor::with_config(config),
-            dependency_analyzer: if enable_advanced {
-                Some(DependencyAnalyzer::new())
-            } else {
-                None
-            },
-            relationship_analyzer: if enable_advanced {
-                Some(RelationshipAnalyzer::new())
-            } else {
-                None
-            },
         }
     }
 
     /// Process metadata from a SerializedFile
     pub fn process_asset(
-        &mut self,
+        &self,
         asset: &SerializedFile,
+        budget: &mut AssetLoadBudget,
     ) -> crate::error::Result<ExtractionResult> {
-        let mut result = self.extractor.extract_from_asset(asset)?;
-
-        // Enhanced dependency analysis if analyzer is available
-        if let Some(ref mut analyzer) = self.dependency_analyzer
-            && self.extractor.config().include_dependencies
-            && result
-                .metadata
-                .dependencies
-                .dependency_graph
-                .nodes
-                .is_empty()
-        {
-            let objects: Vec<&crate::asset::ObjectInfo> =
-                if let Some(max) = self.extractor.config().max_objects {
-                    asset.objects().iter().take(max).collect()
-                } else {
-                    asset.objects().iter().collect()
-                };
-
-            match analyzer.analyze_dependencies_in_asset(asset, &objects) {
-                Ok(deps) => {
-                    if self.extractor.config().include_object_details {
-                        let mut by_from: std::collections::HashMap<i64, Vec<i64>> =
-                            std::collections::HashMap::new();
-                        for r in &deps.internal_references {
-                            by_from.entry(r.from_object).or_default().push(r.to_object);
-                        }
-                        for v in by_from.values_mut() {
-                            v.sort_unstable();
-                            v.dedup();
-                        }
-                        for summary in &mut result.metadata.object_stats.largest_objects {
-                            summary.dependencies =
-                                by_from.get(&summary.path_id).cloned().unwrap_or_default();
-                        }
-                    }
-                    result.metadata.dependencies = deps;
-                }
-                Err(e) => {
-                    result.add_warning(format!("Enhanced dependency analysis failed: {}", e));
-                }
-            }
-        }
-
-        // Enhanced relationship analysis if analyzer is available
-        if let Some(ref mut analyzer) = self.relationship_analyzer
-            && self.extractor.config().include_hierarchy
-            && result
-                .metadata
-                .relationships
-                .gameobject_hierarchy
-                .is_empty()
-            && result
-                .metadata
-                .relationships
-                .component_relationships
-                .is_empty()
-            && result.metadata.relationships.asset_references.is_empty()
-        {
-            let objects: Vec<&crate::asset::ObjectInfo> =
-                if let Some(max) = self.extractor.config().max_objects {
-                    asset.objects().iter().take(max).collect()
-                } else {
-                    asset.objects().iter().collect()
-                };
-
-            match analyzer.analyze_relationships_in_asset(asset, &objects) {
-                Ok(mut rels) => {
-                    if self.extractor.config().include_dependencies {
-                        apply_dependency_info_to_relationships(
-                            &result.metadata.dependencies,
-                            &mut rels,
-                        );
-                    }
-                    result.metadata.relationships = rels;
-                }
-                Err(e) => {
-                    result.add_warning(format!("Enhanced relationship analysis failed: {}", e));
-                }
-            }
-        }
-
-        Ok(result)
+        self.extractor.extract_from_asset(asset, budget)
     }
 
     /// Process metadata from an AssetBundle
     pub fn process_bundle(
-        &mut self,
+        &self,
         bundle: &AssetBundle,
+        budget: &mut AssetLoadBudget,
     ) -> crate::error::Result<Vec<ExtractionResult>> {
-        let mut results = Vec::new();
-
-        for asset in &bundle.assets {
-            let result = self.process_asset(asset)?;
-            results.push(result);
-        }
-
-        Ok(results)
+        self.extractor.extract_from_bundle(bundle, budget)
     }
 
     /// Get the current extraction configuration
@@ -328,34 +226,13 @@ impl MetadataProcessor {
 
     /// Update the extraction configuration
     pub fn set_config(&mut self, config: ExtractionConfig) {
-        let enable_advanced = config.include_dependencies || config.include_hierarchy;
-
         self.extractor.set_config(config);
-
-        // Initialize analyzers if needed
-        if enable_advanced {
-            if self.dependency_analyzer.is_none() {
-                self.dependency_analyzer = Some(DependencyAnalyzer::new());
-            }
-            if self.relationship_analyzer.is_none() {
-                self.relationship_analyzer = Some(RelationshipAnalyzer::new());
-            }
-        }
-    }
-
-    /// Clear internal caches
-    pub fn clear_caches(&mut self) {
-        if let Some(ref mut analyzer) = self.dependency_analyzer {
-            analyzer.clear_cache();
-        }
-        if let Some(ref mut analyzer) = self.relationship_analyzer {
-            analyzer.clear_cache();
-        }
     }
 
     /// Check if advanced analysis is enabled
     pub fn has_advanced_analysis(&self) -> bool {
-        self.dependency_analyzer.is_some() || self.relationship_analyzer.is_some()
+        let config = self.extractor.config();
+        config.include_dependencies || config.include_hierarchy
     }
 }
 
@@ -396,9 +273,12 @@ pub fn create_comprehensive_processor() -> MetadataProcessor {
 }
 
 /// Extract basic metadata from an asset
-pub fn extract_basic_metadata(asset: &SerializedFile) -> crate::error::Result<AssetMetadata> {
-    let mut processor = MetadataProcessor::with_config(ExtractionConfig::default());
-    let result = processor.process_asset(asset)?;
+pub fn extract_basic_metadata(
+    asset: &SerializedFile,
+    budget: &mut AssetLoadBudget,
+) -> crate::error::Result<AssetMetadata> {
+    let processor = MetadataProcessor::with_config(ExtractionConfig::default());
+    let result = processor.process_asset(asset, budget)?;
     Ok(result.metadata)
 }
 
@@ -406,16 +286,17 @@ pub fn extract_basic_metadata(asset: &SerializedFile) -> crate::error::Result<As
 pub fn extract_metadata_with_config(
     asset: &SerializedFile,
     config: ExtractionConfig,
+    budget: &mut AssetLoadBudget,
 ) -> crate::error::Result<ExtractionResult> {
-    let mut processor = MetadataProcessor::with_config(config);
-    processor.process_asset(asset)
+    let processor = MetadataProcessor::with_config(config);
+    processor.process_asset(asset, budget)
 }
 
 /// Get quick statistics for an asset
 pub fn get_asset_statistics(asset: &SerializedFile) -> AssetStatistics {
     AssetStatistics {
         object_count: asset.objects().len(),
-        type_count: asset.types.len(),
+        type_count: asset.types().len(),
         external_count: asset.externals.len(),
         file_size: asset.header.file_size,
         unity_version: asset.unity_version.clone(),
@@ -432,26 +313,6 @@ pub struct AssetStatistics {
     pub file_size: u64,
     pub unity_version: String,
     pub format_version: u32,
-}
-
-/// Metadata processing options
-#[derive(Debug, Clone)]
-pub struct ProcessingOptions {
-    pub enable_caching: bool,
-    pub max_cache_size: usize,
-    pub parallel_processing: bool,
-    pub memory_limit_mb: Option<usize>,
-}
-
-impl Default for ProcessingOptions {
-    fn default() -> Self {
-        Self {
-            enable_caching: true,
-            max_cache_size: 1000,
-            parallel_processing: false,
-            memory_limit_mb: None,
-        }
-    }
 }
 
 /// Check if metadata extraction is supported for an asset
@@ -629,7 +490,9 @@ mod tests {
     #[test]
     fn test_processor_creation() {
         let processor = create_processor();
-        assert!(!processor.has_advanced_analysis());
+        assert!(processor.has_advanced_analysis());
+        assert!(processor.config().include_dependencies);
+        assert!(processor.config().include_hierarchy);
     }
 
     #[test]
@@ -643,14 +506,23 @@ mod tests {
     #[test]
     fn test_performance_processor() {
         let processor = create_performance_processor();
+        assert!(!processor.has_advanced_analysis());
         assert!(!processor.config().include_dependencies);
         assert!(!processor.config().include_hierarchy);
         assert_eq!(processor.config().max_objects, Some(1000));
     }
 
     #[test]
-    fn test_extraction_support() {
-        // This would need a mock SerializedFile for proper testing
-        // For now, just test that the function exists
+    fn advanced_analysis_tracks_current_config() {
+        let mut processor = create_comprehensive_processor();
+        processor.set_config(ExtractionConfig {
+            include_dependencies: false,
+            include_hierarchy: false,
+            max_objects: None,
+            include_performance: true,
+            include_object_details: true,
+        });
+
+        assert!(!processor.has_advanced_analysis());
     }
 }

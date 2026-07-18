@@ -14,7 +14,6 @@ use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::shared_bytes::SharedBytes;
-#[cfg(not(feature = "mmap"))]
 use std::io::Read;
 use std::ops::Range;
 use std::path::Path;
@@ -33,6 +32,23 @@ pub enum UnityFile {
     AssetBundle(crate::bundle::AssetBundle),
     SerializedFile(crate::asset::SerializedFile),
     WebFile(crate::webfile::WebFile),
+}
+
+/// Result of conservatively probing and loading a possible Unity binary source.
+///
+/// A recognized signature is always parsed, so malformed recognized inputs are returned as
+/// errors rather than being downgraded to [`Self::Unrecognized`].
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum UnityFileLoadOutcome {
+    Recognized(UnityFile),
+    Unrecognized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnityFileProbe {
+    Confirmed(UnityFileKind),
+    CompressedWebFileCandidate,
 }
 
 impl UnityFile {
@@ -64,10 +80,6 @@ impl UnityFile {
             _ => None,
         }
     }
-}
-
-fn sniff_bundle(data: &[u8]) -> bool {
-    looks_like_bundle_prefix(data)
 }
 
 /// Return true if the provided byte prefix looks like an AssetBundle container signature.
@@ -123,6 +135,27 @@ pub fn sniff_unity_file_kind_prefix(prefix: &[u8]) -> Option<UnityFileKind> {
         return Some(UnityFileKind::SerializedFile);
     }
     None
+}
+
+fn probe_unity_file_prefix(prefix: &[u8]) -> Option<UnityFileProbe> {
+    if let Some(kind) = sniff_unity_file_kind_prefix(prefix) {
+        return Some(UnityFileProbe::Confirmed(kind));
+    }
+    if looks_like_compressed_webfile_candidate(prefix) {
+        return Some(UnityFileProbe::CompressedWebFileCandidate);
+    }
+    None
+}
+
+fn looks_like_compressed_webfile_candidate(prefix: &[u8]) -> bool {
+    const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
+    const BROTLI_MARKER_OFFSET: usize = 0x20;
+    const BROTLI_MARKER: &[u8] = b"brotli";
+
+    prefix.starts_with(GZIP_MAGIC)
+        || prefix
+            .get(BROTLI_MARKER_OFFSET..BROTLI_MARKER_OFFSET + BROTLI_MARKER.len())
+            .is_some_and(|marker| marker == BROTLI_MARKER)
 }
 
 fn sniff_serialized_file(data: &[u8]) -> bool {
@@ -194,30 +227,17 @@ pub fn load_unity_file_from_shared_range(
 }
 
 /// Parse a shared byte range through a caller-owned cumulative load budget.
+///
+/// This is the strict, full-detection entry point. It attempts WebFile parsing even when Brotli
+/// has no recognizable encoded prefix, as is the case for output produced by the project writer.
 pub fn load_unity_file_from_shared_range_with_budget(
     data: SharedBytes,
     range: Range<usize>,
     budget: &mut AssetLoadBudget,
 ) -> Result<UnityFile> {
     let view = DataView::from_shared_range(data, range)?;
-    let bytes = view.as_bytes();
-
-    if sniff_bundle(bytes) {
-        let bundle = crate::bundle::BundleParser::from_shared_range_with_budget(
-            view.backing_shared(),
-            view.absolute_range(),
-            budget,
-        )?;
-        return Ok(UnityFile::AssetBundle(bundle));
-    }
-
-    if sniff_serialized_file(bytes) {
-        let file = crate::asset::SerializedFileParser::from_shared_range_with_budget(
-            view.backing_shared(),
-            view.absolute_range(),
-            budget,
-        )?;
-        return Ok(UnityFile::SerializedFile(file));
+    if let Some(kind) = sniff_unity_file_view(&view) {
+        return load_recognized_unity_file_view_with_budget(view, kind, budget);
     }
 
     match crate::webfile::WebFile::from_shared_range_with_budget(
@@ -233,6 +253,112 @@ pub fn load_unity_file_from_shared_range_with_budget(
     Err(BinaryError::invalid_format(
         "Unrecognized Unity binary file (not AssetBundle/SerializedFile/WebFile)",
     ))
+}
+
+/// Conservatively probe and load an in-memory source through a caller-owned cumulative budget.
+///
+/// Unlike [`load_unity_file_from_memory_with_budget`], this function only attempts WebFile
+/// decompression for gzip or Unity's marked-Brotli candidates. A compression header alone does not
+/// confirm the format: non-WebFile streams return [`UnityFileLoadOutcome::Unrecognized`].
+pub fn try_load_unity_file_from_memory_with_budget(
+    data: Vec<u8>,
+    budget: &mut AssetLoadBudget,
+) -> Result<UnityFileLoadOutcome> {
+    let shared = SharedBytes::from_vec(data);
+    let len = shared.len();
+    try_load_unity_file_from_shared_range_with_budget(shared, 0..len, budget)
+}
+
+/// Conservatively probe and load a shared byte range through a caller-owned cumulative budget.
+///
+/// Positive signatures are parsed and propagate parse errors. Inputs without a recognized
+/// signature or compression marker return [`UnityFileLoadOutcome::Unrecognized`] without charging
+/// source bytes. Parsing a compressed candidate charges the caller-owned budget; resource failures
+/// are propagated so repeated probes cannot bypass cumulative decompression limits.
+pub fn try_load_unity_file_from_shared_range_with_budget(
+    data: SharedBytes,
+    range: Range<usize>,
+    budget: &mut AssetLoadBudget,
+) -> Result<UnityFileLoadOutcome> {
+    let view = DataView::from_shared_range(data, range)?;
+    try_load_unity_file_view_with_budget(view, budget)
+}
+
+fn try_load_unity_file_view_with_budget(
+    view: DataView,
+    budget: &mut AssetLoadBudget,
+) -> Result<UnityFileLoadOutcome> {
+    let Some(probe) = probe_unity_file_view(&view) else {
+        return Ok(UnityFileLoadOutcome::Unrecognized);
+    };
+    try_load_probed_unity_file_view_with_budget(view, probe, budget)
+}
+
+fn sniff_unity_file_view(view: &DataView) -> Option<UnityFileKind> {
+    let prefix_len = view.len().min(64);
+    sniff_unity_file_kind_prefix(&view.as_bytes()[..prefix_len])
+}
+
+fn probe_unity_file_view(view: &DataView) -> Option<UnityFileProbe> {
+    let prefix_len = view.len().min(64);
+    probe_unity_file_prefix(&view.as_bytes()[..prefix_len])
+}
+
+fn try_load_probed_unity_file_view_with_budget(
+    view: DataView,
+    probe: UnityFileProbe,
+    budget: &mut AssetLoadBudget,
+) -> Result<UnityFileLoadOutcome> {
+    match probe {
+        UnityFileProbe::Confirmed(kind) => {
+            let file = load_recognized_unity_file_view_with_budget(view, kind, budget)?;
+            Ok(UnityFileLoadOutcome::Recognized(file))
+        }
+        UnityFileProbe::CompressedWebFileCandidate => {
+            match crate::webfile::WebFile::from_shared_range_with_budget(
+                view.backing_shared(),
+                view.absolute_range(),
+                budget,
+            ) {
+                Ok(web) => Ok(UnityFileLoadOutcome::Recognized(UnityFile::WebFile(web))),
+                Err(error) if error.is_resource_error() => Err(error),
+                Err(_) => Ok(UnityFileLoadOutcome::Unrecognized),
+            }
+        }
+    }
+}
+
+fn load_recognized_unity_file_view_with_budget(
+    view: DataView,
+    kind: UnityFileKind,
+    budget: &mut AssetLoadBudget,
+) -> Result<UnityFile> {
+    match kind {
+        UnityFileKind::AssetBundle => {
+            let bundle = crate::bundle::BundleParser::from_shared_range_with_budget(
+                view.backing_shared(),
+                view.absolute_range(),
+                budget,
+            )?;
+            Ok(UnityFile::AssetBundle(bundle))
+        }
+        UnityFileKind::SerializedFile => {
+            let file = crate::asset::SerializedFileParser::from_shared_range_with_budget(
+                view.backing_shared(),
+                view.absolute_range(),
+                budget,
+            )?;
+            Ok(UnityFile::SerializedFile(file))
+        }
+        UnityFileKind::WebFile => {
+            let web = crate::webfile::WebFile::from_shared_range_with_budget(
+                view.backing_shared(),
+                view.absolute_range(),
+                budget,
+            )?;
+            Ok(UnityFile::WebFile(web))
+        }
+    }
 }
 
 /// Parse a Unity binary file from a filesystem path.
@@ -257,6 +383,56 @@ pub fn load_unity_file_with_budget<P: AsRef<Path>>(
     {
         let data = read_file_with_budget(path.as_ref(), budget)?;
         load_unity_file_from_memory_with_budget(data, budget)
+    }
+}
+
+/// Probe and load a possible Unity binary path through a caller-owned cumulative budget.
+///
+/// The path is opened exactly once. With the `mmap` feature, the same handle is mapped only after
+/// recognition and complete-source preflight. Without `mmap`, the signature prefix and remaining
+/// bytes are read from that handle. Inputs without a Unity signature or supported compressed
+/// WebFile marker are neither mapped nor charged. Compressed candidates are only recognized after
+/// their decompressed WebFile signature has been validated.
+pub fn try_load_unity_file_with_budget<P: AsRef<Path>>(
+    path: P,
+    budget: &mut AssetLoadBudget,
+) -> Result<UnityFileLoadOutcome> {
+    #[cfg(feature = "mmap")]
+    {
+        let path = path.as_ref();
+        let (mut file, declared_len) = open_file(path)?;
+        let mut prefix = [0_u8; 64];
+        let prefix_len = read_signature_prefix(&mut file, path, &mut prefix)?;
+        let Some(probe) = probe_unity_file_prefix(&prefix[..prefix_len]) else {
+            return Ok(UnityFileLoadOutcome::Unrecognized);
+        };
+        // Do not create a mapping for arbitrary scan candidates. The same open handle is mapped
+        // only after a supported Unity or compressed-WebFile prefix and complete length preflight.
+        check_source_fits_byte_budget(declared_len, budget)?;
+        let shared = mmap_open_file(file, declared_len, path)?;
+        let len = shared.len();
+        check_source_fits_byte_budget(
+            u64::try_from(len)
+                .map_err(|_| BinaryError::invalid_data("File length does not fit in u64"))?,
+            budget,
+        )?;
+        let view = DataView::from_shared_range(shared, 0..len)?;
+        try_load_probed_unity_file_view_with_budget(view, probe, budget)
+    }
+
+    #[cfg(not(feature = "mmap"))]
+    {
+        let path = path.as_ref();
+        let (mut file, declared_len) = open_file(path)?;
+        let mut prefix = [0_u8; 64];
+        let prefix_len = read_signature_prefix(&mut file, path, &mut prefix)?;
+        let Some(probe) = probe_unity_file_prefix(&prefix[..prefix_len]) else {
+            return Ok(UnityFileLoadOutcome::Unrecognized);
+        };
+        let data =
+            read_open_file_with_budget(file, path, declared_len, &prefix[..prefix_len], budget)?;
+        let view = DataView::from_shared(SharedBytes::from_vec(data));
+        try_load_probed_unity_file_view_with_budget(view, probe, budget)
     }
 }
 
@@ -329,13 +505,26 @@ pub fn load_serialized_file_with_budget<P: AsRef<Path>>(
 
 #[cfg(feature = "mmap")]
 fn mmap_file_with_budget(path: &Path, budget: &AssetLoadBudget) -> Result<SharedBytes> {
+    let (file, declared_len) = open_file(path)?;
+    check_source_fits_byte_budget(declared_len, budget)?;
+    mmap_open_file(file, declared_len, path)
+}
+
+fn open_file(path: &Path) -> Result<(std::fs::File, u64)> {
     let file = std::fs::File::open(path)
         .map_err(|error| BinaryError::generic(format!("Failed to open file {path:?}: {error}")))?;
     let declared_len = file
         .metadata()
         .map_err(|error| BinaryError::generic(format!("Failed to inspect file {path:?}: {error}")))?
         .len();
-    check_source_fits_byte_budget(declared_len, budget)?;
+    Ok((file, declared_len))
+}
+
+#[cfg(feature = "mmap")]
+fn mmap_open_file(file: std::fs::File, declared_len: u64, path: &Path) -> Result<SharedBytes> {
+    if declared_len == 0 {
+        return Ok(SharedBytes::from_vec(Vec::new()));
+    }
     let mmap = unsafe { memmap2::Mmap::map(&file) }
         .map_err(|error| BinaryError::generic(format!("Failed to mmap file {path:?}: {error}")))?;
     Ok(SharedBytes::Mmap(std::sync::Arc::new(mmap)))
@@ -343,16 +532,45 @@ fn mmap_file_with_budget(path: &Path, budget: &AssetLoadBudget) -> Result<Shared
 
 #[cfg(not(feature = "mmap"))]
 fn read_file_with_budget(path: &Path, budget: &mut AssetLoadBudget) -> Result<Vec<u8>> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| BinaryError::generic(format!("Failed to open file {path:?}: {error}")))?;
-    let declared_len = file
-        .metadata()
-        .map_err(|error| BinaryError::generic(format!("Failed to inspect file {path:?}: {error}")))?
-        .len();
-    check_source_fits_byte_budget(declared_len, budget)?;
-    let capacity = usize::try_from(declared_len).map_err(|_| {
+    let (file, declared_len) = open_file(path)?;
+    read_open_file_with_budget(file, path, declared_len, &[], budget)
+}
+
+fn read_signature_prefix(
+    file: &mut std::fs::File,
+    path: &Path,
+    prefix: &mut [u8; 64],
+) -> Result<usize> {
+    let mut prefix_len = 0;
+    while prefix_len < prefix.len() {
+        let read = file.read(&mut prefix[prefix_len..]).map_err(|error| {
+            BinaryError::generic(format!(
+                "Failed to read Unity binary signature from {path:?}: {error}"
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        prefix_len += read;
+    }
+    Ok(prefix_len)
+}
+
+#[cfg(not(feature = "mmap"))]
+fn read_open_file_with_budget(
+    mut file: std::fs::File,
+    path: &Path,
+    declared_len: u64,
+    prefix: &[u8],
+    budget: &AssetLoadBudget,
+) -> Result<Vec<u8>> {
+    let prefix_len = u64::try_from(prefix.len())
+        .map_err(|_| BinaryError::invalid_data("File prefix length does not fit in u64"))?;
+    let planned_len = declared_len.max(prefix_len);
+    check_source_fits_byte_budget(planned_len, budget)?;
+    let capacity = usize::try_from(planned_len).map_err(|_| {
         BinaryError::ResourceLimitExceeded(format!(
-            "File {path:?} length {declared_len} does not fit in usize"
+            "File {path:?} length {planned_len} does not fit in usize"
         ))
     })?;
     let mut bytes = Vec::new();
@@ -361,6 +579,7 @@ fn read_file_with_budget(path: &Path, budget: &mut AssetLoadBudget) -> Result<Ve
             "Failed to reserve {capacity} bytes for file {path:?}: {error}"
         ))
     })?;
+    bytes.extend_from_slice(prefix);
 
     let mut chunk = [0_u8; 64 * 1024];
     loop {
@@ -410,11 +629,176 @@ fn check_source_fits_byte_budget(amount: u64, budget: &AssetLoadBudget) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use unity_asset_core::{AssetLoadBudget, AssetLoadLimits, BudgetError};
 
     fn resize_to_scan_prefix(mut bytes: Vec<u8>) -> Vec<u8> {
         bytes.resize(64, 0);
         bytes
+    }
+
+    fn minimal_uncompressed_webfile() -> Vec<u8> {
+        let mut bytes = b"UnityWebData1.0\0".to_vec();
+        let header_len = i32::try_from(bytes.len() + std::mem::size_of::<i32>()).unwrap();
+        bytes.extend_from_slice(&header_len.to_le_bytes());
+        bytes
+    }
+
+    fn gzip_compress(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn brotli_compress_like_writer(bytes: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = brotli::CompressorWriter::new(&mut encoded, 4_096, 11, 22);
+            encoder.write_all(bytes).unwrap();
+        }
+        encoded
+    }
+
+    #[test]
+    fn strict_loader_recognizes_project_writer_webfile_compression() {
+        let webfile = minimal_uncompressed_webfile();
+        let gzip = gzip_compress(&webfile);
+        let brotli = brotli_compress_like_writer(&webfile);
+        assert!(!looks_like_compressed_webfile_candidate(&brotli));
+
+        for (encoded, expected_compression) in [
+            (gzip, crate::webfile::WebFileCompression::Gzip),
+            (brotli, crate::webfile::WebFileCompression::Brotli),
+        ] {
+            let loaded =
+                load_unity_file_from_memory_with_budget(encoded, &mut AssetLoadBudget::default())
+                    .unwrap();
+            let web = loaded.as_web().expect("compressed input is a WebFile");
+
+            assert_eq!(web.compression, expected_compression);
+            assert_eq!(web.signature, "UnityWebData1.0");
+        }
+    }
+
+    #[test]
+    fn conservative_loader_recognizes_gzip_webfile_after_validation() {
+        let encoded = gzip_compress(&minimal_uncompressed_webfile());
+        assert_eq!(sniff_unity_file_kind_prefix(&encoded), None);
+
+        let outcome =
+            try_load_unity_file_from_memory_with_budget(encoded, &mut AssetLoadBudget::default())
+                .unwrap();
+
+        assert!(matches!(
+            outcome,
+            UnityFileLoadOutcome::Recognized(UnityFile::WebFile(_))
+        ));
+    }
+
+    #[test]
+    fn conservative_loader_does_not_confirm_arbitrary_compressed_candidates() {
+        let ordinary_gzip = gzip_compress(b"ordinary gzip payload");
+        let mut marked_brotli_candidate = vec![0_u8; 64];
+        marked_brotli_candidate[0x20..0x26].copy_from_slice(b"brotli");
+
+        for encoded in [ordinary_gzip, marked_brotli_candidate] {
+            let mut budget = AssetLoadBudget::default();
+            let outcome = try_load_unity_file_from_memory_with_budget(encoded, &mut budget)
+                .expect("invalid compressed candidates are not fatal");
+
+            assert!(matches!(outcome, UnityFileLoadOutcome::Unrecognized));
+            assert_ne!(budget.usage(), Default::default());
+        }
+    }
+
+    #[test]
+    fn conservative_compressed_probe_propagates_decompression_budget_errors() {
+        let webfile = minimal_uncompressed_webfile();
+        let encoded = gzip_compress(&webfile);
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_decompressed_bytes: u64::try_from(webfile.len() - 1).unwrap(),
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let error = try_load_unity_file_from_memory_with_budget(encoded, &mut budget)
+            .expect_err("compressed probing must not hide a resource limit");
+
+        assert!(matches!(
+            error,
+            BinaryError::Budget(BudgetError::Exceeded {
+                resource: "decompressed_bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn candidate_path_loader_skips_unrecognized_sources_before_mapping_or_preflight() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"ordinary data larger than the configured byte budget")
+            .unwrap();
+        file.flush().unwrap();
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let outcome = try_load_unity_file_with_budget(file.path(), &mut budget).unwrap();
+
+        assert!(matches!(outcome, UnityFileLoadOutcome::Unrecognized));
+        assert_eq!(budget.usage(), Default::default());
+    }
+
+    #[test]
+    fn candidate_path_loader_charges_a_recognized_source_once() {
+        let bytes = minimal_uncompressed_webfile();
+        let source_len = u64::try_from(bytes.len()).unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        file.flush().unwrap();
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: source_len,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let outcome = try_load_unity_file_with_budget(file.path(), &mut budget).unwrap();
+
+        assert!(matches!(
+            outcome,
+            UnityFileLoadOutcome::Recognized(UnityFile::WebFile(_))
+        ));
+        assert_eq!(budget.usage().bytes, source_len);
+    }
+
+    #[test]
+    fn candidate_path_loader_recognizes_gzip_webfiles() {
+        let bytes = gzip_compress(&minimal_uncompressed_webfile());
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        file.flush().unwrap();
+        let mut budget = AssetLoadBudget::default();
+
+        let outcome = try_load_unity_file_with_budget(file.path(), &mut budget).unwrap();
+
+        assert!(matches!(
+            outcome,
+            UnityFileLoadOutcome::Recognized(UnityFile::WebFile(_))
+        ));
+        assert_eq!(budget.usage().bytes, u64::try_from(bytes.len()).unwrap());
+    }
+
+    #[test]
+    fn candidate_path_loader_propagates_positive_signature_parse_errors() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"UnityFS\0").unwrap();
+        file.flush().unwrap();
+        let mut budget = AssetLoadBudget::default();
+
+        try_load_unity_file_with_budget(file.path(), &mut budget)
+            .expect_err("a recognized malformed bundle must not become unrecognized");
     }
 
     #[test]
@@ -503,7 +887,7 @@ mod tests {
     #[test]
     fn sniff_bundle_excludes_uncompressed_webfile() {
         let data = b"UnityWebData1.0\0";
-        assert!(!sniff_bundle(data));
+        assert!(!looks_like_bundle_prefix(data));
     }
 
     #[test]
@@ -529,8 +913,6 @@ mod tests {
     #[cfg(feature = "mmap")]
     #[test]
     fn mmap_path_loaders_reject_oversized_sources_without_charging_budget() {
-        use std::io::Write;
-
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(&[0; 64]).unwrap();
         file.flush().unwrap();

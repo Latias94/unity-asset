@@ -395,9 +395,13 @@ impl Environment {
                     BinarySource::Path(p) => {
                         self.read_stream_data_from_fs(p, stream_path, offset, size)
                     }
-                    BinarySource::ArchiveEntry { archive_path, .. } => {
-                        self.read_stream_data_from_fs(archive_path, stream_path, offset, size)
-                    }
+                    BinarySource::ArchiveEntry { archive_path, .. } => self
+                        .read_stream_data_from_fs(
+                            archive_path.as_path(),
+                            stream_path,
+                            offset,
+                            size,
+                        ),
                     BinarySource::WebEntry { web_path, .. } => {
                         self.read_webfile_stream_data(web_path, stream_path, offset, size)
                     }
@@ -407,7 +411,7 @@ impl Environment {
                     self.read_stream_data_from_fs(p, stream_path, offset, size)
                 }
                 BinarySource::ArchiveEntry { archive_path, .. } => {
-                    self.read_stream_data_from_fs(archive_path, stream_path, offset, size)
+                    self.read_stream_data_from_fs(archive_path.as_path(), stream_path, offset, size)
                 }
                 BinarySource::WebEntry { web_path, .. } => {
                     self.read_webfile_stream_data(web_path, stream_path, offset, size)

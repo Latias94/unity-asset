@@ -329,6 +329,7 @@ impl Environment {
         context: &BinaryObjectRef<'_>,
         file_id: i32,
         path_id: i64,
+        budget: &mut AssetLoadBudget,
     ) -> Result<UnityObject> {
         let key = self
             .resolve_binary_pptr(context, file_id, path_id)
@@ -338,7 +339,7 @@ impl Environment {
                     file_id, path_id
                 ))
             })?;
-        self.read_binary_object_key(&key)
+        self.read_binary_object_key(&key, budget)
     }
 
     fn binary_object_ref_for_key(&self, key: &BinaryObjectKey) -> Result<BinaryObjectRef<'_>> {
@@ -378,9 +379,10 @@ impl Environment {
         &self,
         context_key: &BinaryObjectKey,
         pptr_path: &str,
+        budget: &mut AssetLoadBudget,
     ) -> Result<Option<BinaryObjectKey>> {
         let obj_ref = self.binary_object_ref_for_key(context_key)?;
-        let obj = obj_ref.read()?;
+        let obj = obj_ref.read(budget)?;
 
         let Some(v) = super::pptr_path::get_value_at_path(obj.as_unity_class(), pptr_path) else {
             return Ok(None);
@@ -403,10 +405,11 @@ impl Environment {
         &mut self,
         context_key: &BinaryObjectKey,
         pptr_path: &str,
+        budget: &mut AssetLoadBudget,
     ) -> Result<Option<BinaryObjectKey>> {
         let (file_id, path_id, hint) = {
             let obj_ref = self.binary_object_ref_for_key(context_key)?;
-            let obj = obj_ref.read()?;
+            let obj = obj_ref.read(budget)?;
 
             let Some(v) = super::pptr_path::get_value_at_path(obj.as_unity_class(), pptr_path)
             else {
@@ -454,54 +457,79 @@ impl Environment {
 
         // Best-effort: load dependency by GUID or path and retry.
         if let Some(hint) = hint {
-            self.try_load_dependency_for_external_hint(&hint);
+            self.try_load_dependency_for_external_hint(&hint, budget)?;
         }
 
         let obj_ref = self.binary_object_ref_for_key(context_key)?;
         Ok(self.resolve_binary_pptr(&obj_ref, file_id, path_id))
     }
 
-    fn try_load_dependency_for_external_hint(&mut self, hint: &impl ExternalHintLike) {
-        // Preserve base_path (UnityPy's Environment.path does not change during dependency loads).
+    fn try_load_dependency_for_external_hint(
+        &mut self,
+        hint: &impl ExternalHintLike,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
+        if let Some(guid) = hint.guid()
+            && let Some(asset_path) = self.asset_path_for_guid(guid)
+        {
+            self.try_load_dependency_path_best_effort(&asset_path, budget)?;
+        }
+
+        if let Some(path) = hint.path()
+            && let Some(found) = self.find_dependency_path_best_effort(path)
+        {
+            self.try_load_dependency_path_best_effort(&found, budget)?;
+        }
+
+        Ok(())
+    }
+
+    fn try_load_dependency_path_best_effort(
+        &mut self,
+        path: &Path,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
+        if self.is_dependency_path_loaded(path) {
+            return Ok(());
+        }
+
+        // UnityPy's Environment.path does not change during implicit dependency loads.
         let saved_base_path = self.base_path.clone();
-
-        if let Some(guid) = hint.guid() {
-            if let Some(asset_path) = self.asset_path_for_guid(guid) {
-                let source = BinarySource::path(&asset_path);
-                if !self.binary_assets.contains_key(&source) && !self.bundles.contains_key(&source)
-                {
-                    if let Err(e) = self.load_file(&asset_path) {
-                        self.push_warning(EnvironmentWarning::LoadFailed {
-                            path: asset_path,
-                            error: e.to_string(),
-                        });
-                    }
-                }
-            }
-        }
-
-        if let Some(path) = hint.path() {
-            if let Some(found) = self.find_dependency_path_best_effort(path) {
-                let source = BinarySource::path(&found);
-                if !self.binary_assets.contains_key(&source) && !self.bundles.contains_key(&source)
-                {
-                    if let Err(e) = self.load_file(&found) {
-                        self.push_warning(EnvironmentWarning::LoadFailed {
-                            path: found,
-                            error: e.to_string(),
-                        });
-                    }
-                }
-            }
-        }
-
+        let result = self.load_file(path, budget);
         self.base_path = saved_base_path;
+
+        match result {
+            Ok(()) if self.is_dependency_path_loaded(path) => Ok(()),
+            Ok(()) => {
+                self.push_warning(EnvironmentWarning::LoadFailed {
+                    path: path.to_path_buf(),
+                    error: "Dependency candidate is not a loadable Unity binary source".to_string(),
+                });
+                Ok(())
+            }
+            Err(error) if is_resource_error(&error) => Err(error),
+            Err(error) => {
+                self.push_warning(EnvironmentWarning::LoadFailed {
+                    path: path.to_path_buf(),
+                    error: error.to_string(),
+                });
+                Ok(())
+            }
+        }
+    }
+
+    fn is_dependency_path_loaded(&self, path: &Path) -> bool {
+        let source = BinarySource::path(path);
+        self.binary_assets.contains_key(&source)
+            || self.bundles.contains_key(&source)
+            || self.webfiles.contains_key(path)
     }
 
     pub fn find_binary_pptr_references_to(
         &self,
         target_key: &BinaryObjectKey,
         options: PptrReferenceSearchOptions,
+        budget: &mut AssetLoadBudget,
     ) -> Result<Vec<BinaryPptrReference>> {
         let mut out: Vec<BinaryPptrReference> = Vec::new();
 
@@ -528,9 +556,12 @@ impl Environment {
                     {
                         class.clone()
                     } else {
-                        match obj_ref.read() {
+                        match obj_ref.read(budget) {
                             Ok(obj) => obj.class,
                             Err(e) => {
+                                if is_resource_error(&e) {
+                                    return Err(e);
+                                }
                                 if options.continue_on_error {
                                     continue;
                                 }
@@ -555,9 +586,12 @@ impl Environment {
                     {
                         class.clone()
                     } else {
-                        match obj_ref.read() {
+                        match obj_ref.read(budget) {
                             Ok(obj) => obj.class,
                             Err(e) => {
+                                if is_resource_error(&e) {
+                                    return Err(e);
+                                }
                                 if options.continue_on_error {
                                     continue;
                                 }
@@ -604,4 +638,27 @@ impl Environment {
         });
         Ok(out)
     }
+}
+
+pub(super) fn is_resource_error(error: &UnityAssetError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if let Some(binary) = source.downcast_ref::<unity_asset_binary::error::BinaryError>() {
+            return binary.is_resource_error();
+        }
+        if source
+            .downcast_ref::<unity_asset_core::BudgetError>()
+            .is_some()
+        {
+            return true;
+        }
+        if source
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::OutOfMemory)
+        {
+            return true;
+        }
+        current = source.source();
+    }
+    false
 }

@@ -28,6 +28,8 @@ pub enum DynamicValue {
     String(String),
     /// Integer value
     Integer(i64),
+    /// Unsigned integer value
+    Unsigned(u64),
     /// Float value
     Float(f64),
     /// Boolean value
@@ -48,6 +50,7 @@ impl DynamicValue {
         match value {
             UnityValue::String(s) => DynamicValue::String(s.clone()),
             UnityValue::Integer(i) => DynamicValue::Integer(*i),
+            UnityValue::Unsigned(i) => DynamicValue::Unsigned(*i),
             UnityValue::Float(f) => DynamicValue::Float(*f),
             UnityValue::Bool(b) => DynamicValue::Bool(*b),
             UnityValue::Array(arr) => {
@@ -72,6 +75,7 @@ impl DynamicValue {
         match self {
             DynamicValue::String(s) => UnityValue::String(s.clone()),
             DynamicValue::Integer(i) => UnityValue::Integer(*i),
+            DynamicValue::Unsigned(i) => UnityValue::Unsigned(*i),
             DynamicValue::Float(f) => UnityValue::Float(*f),
             DynamicValue::Bool(b) => UnityValue::Bool(*b),
             DynamicValue::Array(arr) => {
@@ -103,8 +107,22 @@ impl DynamicValue {
     pub fn as_integer(&self) -> Option<i64> {
         match self {
             DynamicValue::Integer(i) => Some(*i),
+            DynamicValue::Unsigned(i) => i64::try_from(*i).ok(),
             DynamicValue::Float(f) => Some(*f as i64),
             DynamicValue::Bool(b) => Some(if *b { 1 } else { 0 }),
+            _ => None,
+        }
+    }
+
+    /// Get as an unsigned integer without truncating values above `i64::MAX`.
+    pub fn as_unsigned(&self) -> Option<u64> {
+        match self {
+            DynamicValue::Integer(i) => u64::try_from(*i).ok(),
+            DynamicValue::Unsigned(i) => Some(*i),
+            DynamicValue::Float(f) if f.is_finite() && *f >= 0.0 && *f < u64::MAX as f64 => {
+                Some(*f as u64)
+            }
+            DynamicValue::Bool(b) => Some(u64::from(*b)),
             _ => None,
         }
     }
@@ -114,6 +132,7 @@ impl DynamicValue {
         match self {
             DynamicValue::Float(f) => Some(*f),
             DynamicValue::Integer(i) => Some(*i as f64),
+            DynamicValue::Unsigned(i) => Some(*i as f64),
             _ => None,
         }
     }
@@ -123,6 +142,7 @@ impl DynamicValue {
         match self {
             DynamicValue::Bool(b) => Some(*b),
             DynamicValue::Integer(i) => Some(*i != 0),
+            DynamicValue::Unsigned(i) => Some(*i != 0),
             _ => None,
         }
     }
@@ -248,6 +268,12 @@ impl DynamicValue {
                 *i += other as i64;
                 Ok(())
             }
+            DynamicValue::Unsigned(i) if other >= 0.0 => {
+                *i = i
+                    .checked_add(other as u64)
+                    .ok_or_else(|| UnityAssetError::format("Unsigned numeric addition overflow"))?;
+                Ok(())
+            }
             DynamicValue::Float(f) => {
                 *f += other;
                 Ok(())
@@ -262,6 +288,7 @@ impl std::fmt::Display for DynamicValue {
         match self {
             DynamicValue::String(s) => write!(f, "\"{}\"", s),
             DynamicValue::Integer(i) => write!(f, "{}", i),
+            DynamicValue::Unsigned(i) => write!(f, "{}", i),
             DynamicValue::Float(fl) => write!(f, "{}", fl),
             DynamicValue::Bool(b) => write!(f, "{}", b),
             DynamicValue::Array(arr) => {
@@ -317,5 +344,25 @@ mod tests {
         val.add_numeric(5.0).unwrap();
 
         assert_eq!(val.as_integer(), Some(15));
+    }
+
+    #[test]
+    fn float_to_unsigned_requires_a_finite_in_range_value() {
+        let exclusive_upper_bound = u64::MAX as f64;
+        let largest_in_range = f64::from_bits(exclusive_upper_bound.to_bits() - 1);
+
+        assert_eq!(DynamicValue::Float(42.75).as_unsigned(), Some(42));
+        assert_eq!(
+            DynamicValue::Float(largest_in_range).as_unsigned(),
+            Some(18_446_744_073_709_549_568)
+        );
+        assert_eq!(
+            DynamicValue::Float(exclusive_upper_bound).as_unsigned(),
+            None
+        );
+        assert_eq!(DynamicValue::Float(f64::INFINITY).as_unsigned(), None);
+        assert_eq!(DynamicValue::Float(f64::NEG_INFINITY).as_unsigned(), None);
+        assert_eq!(DynamicValue::Float(f64::NAN).as_unsigned(), None);
+        assert_eq!(DynamicValue::Float(-1.0).as_unsigned(), None);
     }
 }

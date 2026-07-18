@@ -9,7 +9,8 @@
 
 use std::fs;
 use std::path::Path;
-use unity_asset_decode::bundle::load_bundle_from_memory;
+use unity_asset_core::AssetLoadBudget;
+use unity_asset_decode::bundle::BundleParser;
 use unity_asset_decode::object::UnityObject;
 use unity_asset_decode::texture::TextureProcessor;
 
@@ -50,25 +51,29 @@ fn test_texture_format_detection() {
         println!("  Processing file: {}", file_name);
 
         if let Ok(data) = fs::read(&file_path) {
-            match load_bundle_from_memory(data) {
+            let mut budget = AssetLoadBudget::default();
+            match BundleParser::from_bytes_with_budget(data, &mut budget) {
                 Ok(bundle) => {
                     for asset in &bundle.assets {
                         for asset_object_info in asset.objects() {
                             total_objects += 1;
-                            let unity_object =
-                                UnityObject::from_serialized_file(asset, asset_object_info)
-                                    .unwrap_or_else(|_| {
-                                        let fallback_data = asset
-                                            .object_bytes(asset_object_info)
-                                            .map(|b| b.to_vec())
-                                            .unwrap_or_default();
-                                        UnityObject::from_raw(
-                                            asset_object_info.class_id(),
-                                            asset_object_info.path_id(),
-                                            fallback_data,
-                                        )
-                                        .expect("fallback object metadata should be constructible")
-                                    });
+                            let unity_object = UnityObject::from_serialized_file(
+                                asset,
+                                asset_object_info,
+                                &mut budget,
+                            )
+                            .unwrap_or_else(|_| {
+                                let fallback_data = asset
+                                    .object_bytes(asset_object_info)
+                                    .map(|b| b.to_vec())
+                                    .unwrap_or_default();
+                                UnityObject::from_raw(
+                                    asset_object_info.class_id(),
+                                    asset_object_info.path_id(),
+                                    fallback_data,
+                                )
+                                .expect("fallback object metadata should be constructible")
+                            });
                             let class_name = unity_object.class_name().to_string();
 
                             // Look for Texture2D objects (Class ID 28) or texture-related objects
@@ -240,24 +245,28 @@ fn test_texture_data_extraction() {
         println!("  Analyzing file: {}", file_name);
 
         if let Ok(data) = fs::read(&file_path) {
-            match load_bundle_from_memory(data) {
+            let mut budget = AssetLoadBudget::default();
+            match BundleParser::from_bytes_with_budget(data, &mut budget) {
                 Ok(bundle) => {
                     for asset in &bundle.assets {
                         for asset_object_info in asset.objects() {
-                            let unity_object =
-                                UnityObject::from_serialized_file(asset, asset_object_info)
-                                    .unwrap_or_else(|_| {
-                                        let fallback_data = asset
-                                            .object_bytes(asset_object_info)
-                                            .map(|b| b.to_vec())
-                                            .unwrap_or_default();
-                                        UnityObject::from_raw(
-                                            asset_object_info.class_id(),
-                                            asset_object_info.path_id(),
-                                            fallback_data,
-                                        )
-                                        .expect("fallback object metadata should be constructible")
-                                    });
+                            let unity_object = UnityObject::from_serialized_file(
+                                asset,
+                                asset_object_info,
+                                &mut budget,
+                            )
+                            .unwrap_or_else(|_| {
+                                let fallback_data = asset
+                                    .object_bytes(asset_object_info)
+                                    .map(|b| b.to_vec())
+                                    .unwrap_or_default();
+                                UnityObject::from_raw(
+                                    asset_object_info.class_id(),
+                                    asset_object_info.path_id(),
+                                    fallback_data,
+                                )
+                                .expect("fallback object metadata should be constructible")
+                            });
                             let class_name = unity_object.class_name().to_string();
 
                             if class_name == "Texture2D" {

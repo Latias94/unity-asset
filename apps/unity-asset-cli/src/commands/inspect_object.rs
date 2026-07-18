@@ -5,7 +5,7 @@ use crate::shared::{
 use anyhow::Result;
 use std::path::PathBuf;
 use unity_asset::environment::BinarySource;
-use unity_asset::{ObjectAddress, UnityValue};
+use unity_asset::{AssetLoadBudget, ObjectAddress, UnityValue};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
@@ -21,8 +21,14 @@ pub(crate) fn run(
     filter: String,
     ctx: &AppContext,
 ) -> Result<()> {
-    let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
-    load_environment_input(&mut env, &input)?;
+    let mut budget = AssetLoadBudget::default();
+    let mut env = build_environment(
+        ctx.strict,
+        ctx.show_warnings,
+        ctx.typetree_registries(),
+        &mut budget,
+    )?;
+    load_environment_input(&mut env, &input, &mut budget)?;
 
     let key = if let Some(address) = address {
         let address = address.parse::<ObjectAddress>()?;
@@ -62,7 +68,7 @@ pub(crate) fn run(
     let resolved_source = key.source.clone();
     let address = object_address_for_key(&env, &input, &key)?;
 
-    let obj = env.read_binary_object_key(&key)?;
+    let obj = env.read_binary_object_key(&key, &mut budget)?;
 
     println!(
         "Object: {} (class_id={}, byte_size={}, byte_start={}, byte_order={:?})",
@@ -179,6 +185,10 @@ fn print_unity_value_tree(
         }
         UnityValue::Integer(i) => {
             println!("{}{}: Integer({})", indent, path, i);
+            *printed += 1;
+        }
+        UnityValue::Unsigned(i) => {
+            println!("{}{}: Unsigned({})", indent, path, i);
             *printed += 1;
         }
         UnityValue::Float(f) => {

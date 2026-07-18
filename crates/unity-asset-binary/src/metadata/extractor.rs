@@ -9,8 +9,8 @@ use crate::bundle::AssetBundle;
 use crate::compression::CompressionType;
 use crate::error::Result;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Instant;
+use unity_asset_core::AssetLoadBudget;
 
 /// Metadata extractor for Unity assets
 ///
@@ -18,8 +18,6 @@ use std::time::Instant;
 /// from Unity assets including statistics, dependencies, and relationships.
 pub struct MetadataExtractor {
     config: ExtractionConfig,
-    dependency_analyzer: Mutex<DependencyAnalyzer>,
-    relationship_analyzer: Mutex<RelationshipAnalyzer>,
 }
 
 impl MetadataExtractor {
@@ -27,18 +25,12 @@ impl MetadataExtractor {
     pub fn new() -> Self {
         Self {
             config: ExtractionConfig::default(),
-            dependency_analyzer: Mutex::new(DependencyAnalyzer::new()),
-            relationship_analyzer: Mutex::new(RelationshipAnalyzer::new()),
         }
     }
 
     /// Create a metadata extractor with custom configuration
     pub fn with_config(config: ExtractionConfig) -> Self {
-        Self {
-            config,
-            dependency_analyzer: Mutex::new(DependencyAnalyzer::new()),
-            relationship_analyzer: Mutex::new(RelationshipAnalyzer::new()),
-        }
+        Self { config }
     }
 
     /// Create a metadata extractor with custom settings (legacy API)
@@ -48,27 +40,27 @@ impl MetadataExtractor {
         include_performance: bool,
         max_objects: Option<usize>,
     ) -> Self {
-        Self {
-            config: ExtractionConfig {
-                include_dependencies,
-                include_hierarchy,
-                max_objects,
-                include_performance,
-                include_object_details: true,
-            },
-            dependency_analyzer: Mutex::new(DependencyAnalyzer::new()),
-            relationship_analyzer: Mutex::new(RelationshipAnalyzer::new()),
-        }
+        Self::with_config(ExtractionConfig {
+            include_dependencies,
+            include_hierarchy,
+            max_objects,
+            include_performance,
+            include_object_details: true,
+        })
     }
 
     /// Extract metadata from an AssetBundle
-    pub fn extract_from_bundle(&self, bundle: &AssetBundle) -> Result<Vec<ExtractionResult>> {
+    pub fn extract_from_bundle(
+        &self,
+        bundle: &AssetBundle,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<ExtractionResult>> {
         let start_time = Instant::now();
         let mut results = Vec::new();
         let compression_type = Self::bundle_compression_summary(bundle);
 
         for asset in &bundle.assets {
-            let mut result = self.extract_from_asset(asset)?;
+            let mut result = self.extract_from_asset(asset, budget)?;
             result.metadata.file_info.compression_type = compression_type.clone();
             results.push(result);
         }
@@ -118,7 +110,11 @@ impl MetadataExtractor {
     }
 
     /// Extract metadata from a SerializedFile
-    pub fn extract_from_asset(&self, asset: &SerializedFile) -> Result<ExtractionResult> {
+    pub fn extract_from_asset(
+        &self,
+        asset: &SerializedFile,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<ExtractionResult> {
         let start_time = Instant::now();
         let mut result = ExtractionResult::new(AssetMetadata::new());
 
@@ -140,19 +136,17 @@ impl MetadataExtractor {
 
         // Extract dependencies if enabled
         if self.config.include_dependencies {
-            let analyzed = match self.dependency_analyzer.lock() {
-                Ok(mut analyzer) => {
-                    analyzer.analyze_dependencies_in_asset(asset, &objects_to_analyze)
-                }
-                Err(e) => e
-                    .into_inner()
-                    .analyze_dependencies_in_asset(asset, &objects_to_analyze),
-            };
+            let analyzed = DependencyAnalyzer::new().analyze_dependencies_in_asset(
+                asset,
+                &objects_to_analyze,
+                budget,
+            );
 
             match analyzed {
                 Ok(deps) => {
                     dependencies = Some(deps);
                 }
+                Err(e) if e.is_resource_error() => return Err(e),
                 Err(e) => {
                     result.add_warning(format!("Failed to extract dependencies: {}", e));
                     dependencies = Some(Self::empty_dependency_info());
@@ -162,14 +156,11 @@ impl MetadataExtractor {
 
         // Extract relationships if enabled
         if self.config.include_hierarchy {
-            let analyzed = match self.relationship_analyzer.lock() {
-                Ok(mut analyzer) => {
-                    analyzer.analyze_relationships_in_asset(asset, &objects_to_analyze)
-                }
-                Err(e) => e
-                    .into_inner()
-                    .analyze_relationships_in_asset(asset, &objects_to_analyze),
-            };
+            let analyzed = RelationshipAnalyzer::new().analyze_relationships_in_asset(
+                asset,
+                &objects_to_analyze,
+                budget,
+            );
 
             match analyzed {
                 Ok(mut rels) => {
@@ -178,6 +169,7 @@ impl MetadataExtractor {
                     }
                     result.metadata.relationships = rels;
                 }
+                Err(e) if e.is_resource_error() => return Err(e),
                 Err(e) => {
                     result.add_warning(format!("Failed to extract relationships: {}", e));
                     result.metadata.relationships = AssetRelationships {
@@ -333,7 +325,7 @@ impl MetadataExtractor {
     /// Calculate complexity score for the asset
     fn calculate_complexity_score(&self, asset: &SerializedFile) -> f64 {
         let object_count = asset.objects().len() as f64;
-        let type_count = asset.types.len() as f64;
+        let type_count = asset.types().len() as f64;
         let external_count = asset.externals.len() as f64;
 
         // Simple complexity calculation
@@ -381,6 +373,17 @@ impl Default for MetadataExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asset::{SerializedFileParser, SerializedType};
+    use crate::typetree::{TypeTree, TypeTreeNode};
+    use unity_asset_core::AssetLoadLimits;
+
+    const V22_FIXTURE: &[u8] = include_bytes!(
+        "../../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin"
+    );
+
+    fn node(type_name: &str, name: &str) -> TypeTreeNode {
+        TypeTreeNode::with_info(type_name.to_owned(), name.to_owned(), -1)
+    }
 
     #[test]
     fn test_extractor_creation() {
@@ -401,9 +404,28 @@ mod tests {
     }
 
     #[test]
-    fn test_complexity_calculation() {
-        let _extractor = MetadataExtractor::new();
-        // This would need a mock SerializedFile for proper testing
-        // For now, just test that the method exists and doesn't panic
+    fn resource_errors_are_not_downgraded_to_warnings() {
+        let mut pointer = node("PPtr<Object>", "m_Target");
+        pointer.children = vec![node("int", "m_FileID"), node("long long", "m_PathID")];
+        let mut root = node("Source", "Source");
+        root.children.push(pointer);
+        let mut tree = TypeTree::new();
+        tree.add_node(root);
+
+        let mut asset = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let mut object_type = SerializedType::new(28);
+        object_type.type_tree = tree;
+        *asset.types_mut() = vec![object_type];
+
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_entries: 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        let error = MetadataExtractor::new()
+            .extract_from_asset(&asset, &mut budget)
+            .expect_err("schema traversal should exceed the entry budget");
+
+        assert!(error.is_resource_error());
     }
 }

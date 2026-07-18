@@ -298,6 +298,8 @@ impl SerdeUnityLoader {
             Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     Ok(UnityValue::Integer(i))
+                } else if let Some(i) = n.as_u64() {
+                    Ok(UnityValue::Unsigned(i))
                 } else if let Some(f) = n.as_f64() {
                     Ok(UnityValue::Float(f))
                 } else {

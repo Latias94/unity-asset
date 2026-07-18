@@ -1,14 +1,18 @@
 use crate::fast_path;
 use crate::shared::{
-    AppContext, build_environment, cli_warn, load_environment_input, load_serialized_file_for_scan,
-    load_typetree_registry, object_address_for_key_with_bundle_names, resolve_loaded_source,
+    AppContext, build_environment_with_registry, cli_warn, load_environment_input,
+    load_serialized_file_for_scan, load_typetree_registry,
+    object_address_for_key_with_bundle_names, resolve_loaded_source,
 };
 use anyhow::Result;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::Arc;
+use unity_asset::AssetLoadBudget;
 use unity_asset::environment::{BinaryObjectKey, BinarySource};
 use unity_asset_binary::bundle::BundleLoadOptions;
 use unity_asset_binary::shared_bytes::SharedBytes;
+use unity_asset_binary::typetree::TypeTreeRegistry;
 
 #[derive(Debug, Serialize)]
 struct ScanPPtrRecord {
@@ -56,6 +60,7 @@ fn scan_pptr_scan_file(
     include_no_typetree: bool,
     json: bool,
     remaining: &mut usize,
+    budget: &mut AssetLoadBudget,
 ) -> Result<()> {
     if *remaining == 0 {
         return Ok(());
@@ -70,7 +75,11 @@ fn scan_pptr_scan_file(
         }
 
         let obj_name = if has_name_filter {
-            handle.peek_name().unwrap_or_default()
+            match handle.peek_name(budget) {
+                Ok(name) => name,
+                Err(error) if error.is_resource_error() => return Err(error.into()),
+                Err(_) => None,
+            }
         } else {
             None
         };
@@ -93,7 +102,7 @@ fn scan_pptr_scan_file(
             .to_compact_string()?;
 
         let info = handle.info();
-        let scan = handle.scan_pptrs()?;
+        let scan = handle.scan_pptrs(budget)?;
 
         let (typetree_ok, mut internal, mut external) = match scan {
             Some(v) => (true, v.internal, v.external),
@@ -164,10 +173,9 @@ fn scan_pptr_fast(
     include_no_typetree: bool,
     json: bool,
     show_warnings: bool,
-    typetree_registries: &[PathBuf],
+    registry: &Option<Arc<dyn TypeTreeRegistry>>,
+    budget: &mut AssetLoadBudget,
 ) -> Result<bool> {
-    let registry = load_typetree_registry(typetree_registries)?;
-
     let kind_lc = kind.to_ascii_lowercase();
     let scan_bundles = kind_lc == "all" || kind_lc == "bundle";
     let scan_serialized = kind_lc == "all" || kind_lc == "serialized";
@@ -200,8 +208,11 @@ fn scan_pptr_fast(
             }
 
             let options = BundleLoadOptions::lazy();
-            let bundle = match fast_path::load_bundle_for_list(path, options) {
+            let bundle = match unity_asset_binary::file::load_bundle_file_with_options_and_budget(
+                path, options, budget,
+            ) {
                 Ok(v) => v,
+                Err(error) if error.is_resource_error() => return Err(error.into()),
                 Err(e) => {
                     cli_warn(
                         show_warnings,
@@ -219,8 +230,9 @@ fn scan_pptr_fast(
                 let mut asset_names = Vec::new();
                 let mut matched = false;
                 for node in &asset_nodes {
-                    let bytes = match bundle.extract_node_data(node) {
+                    let bytes = match bundle.extract_node_data_with_budget(node, budget) {
                         Ok(v) => v,
+                        Err(error) if error.is_resource_error() => return Err(error.into()),
                         Err(e) => {
                             cli_warn(
                                 show_warnings,
@@ -232,11 +244,14 @@ fn scan_pptr_fast(
                             continue;
                         }
                     };
-                    let mut file =
-                        match unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
+                    let mut file = match unity_asset_binary::asset::SerializedFileParser::from_bytes_with_budget(
+                        bytes,
+                        budget,
+                    ) {
+                        Ok(v) => v,
+                        Err(error) if error.is_resource_error() => return Err(error.into()),
+                        Err(_) => continue,
+                    };
                     let parsed_index = register_parsed_bundle_member(&mut asset_names, node);
                     if parsed_index != filter_idx {
                         continue;
@@ -257,6 +272,7 @@ fn scan_pptr_fast(
                         include_no_typetree,
                         json,
                         &mut remaining,
+                        budget,
                     )?;
                     matched = true;
                     break;
@@ -267,8 +283,9 @@ fn scan_pptr_fast(
                 continue;
             }
 
-            let shared = match bundle.data_arc() {
+            let shared = match bundle.data_arc_with_budget(budget) {
                 Ok(v) => SharedBytes::from_arc(v),
+                Err(error) if error.is_resource_error() => return Err(error.into()),
                 Err(e) => {
                     cli_warn(
                         show_warnings,
@@ -297,14 +314,15 @@ fn scan_pptr_fast(
                     }
                 };
 
-                let mut file =
-                    match unity_asset_binary::asset::SerializedFileParser::from_shared_range(
-                        shared.clone(),
-                        start..end,
-                    ) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
+                let mut file = match unity_asset_binary::asset::SerializedFileParser::from_shared_range_with_budget(
+                    shared.clone(),
+                    start..end,
+                    budget,
+                ) {
+                    Ok(v) => v,
+                    Err(error) if error.is_resource_error() => return Err(error.into()),
+                    Err(_) => continue,
+                };
                 let parsed_index = register_parsed_bundle_member(&mut asset_names, node);
                 if let Some(registry) = registry.clone() {
                     file.set_type_tree_registry(Some(registry));
@@ -323,6 +341,7 @@ fn scan_pptr_fast(
                     include_no_typetree,
                     json,
                     &mut remaining,
+                    budget,
                 )?;
             }
         }
@@ -343,8 +362,9 @@ fn scan_pptr_fast(
                 continue;
             }
 
-            let mut file = match load_serialized_file_for_scan(path) {
+            let mut file = match load_serialized_file_for_scan(path, budget) {
                 Ok(v) => v,
+                Err(error) if error.is_resource_error() => return Err(error.into()),
                 Err(_) => continue,
             };
             if let Some(registry) = registry.clone() {
@@ -366,6 +386,7 @@ fn scan_pptr_fast(
                 include_no_typetree,
                 json,
                 &mut remaining,
+                budget,
             )?;
         }
     }
@@ -386,10 +407,11 @@ fn scan_pptr_env_fallback(
     json: bool,
     strict: bool,
     show_warnings: bool,
-    typetree_registries: &[PathBuf],
+    registry: Option<Arc<dyn TypeTreeRegistry>>,
+    budget: &mut AssetLoadBudget,
 ) -> Result<()> {
-    let mut env = build_environment(strict, show_warnings, typetree_registries)?;
-    load_environment_input(&mut env, &input)?;
+    let mut env = build_environment_with_registry(strict, show_warnings, registry);
+    load_environment_input(&mut env, &input, budget)?;
 
     let kind_lc = kind.to_ascii_lowercase();
     let scan_bundles = kind_lc == "all" || kind_lc == "bundle";
@@ -466,6 +488,7 @@ fn scan_pptr_env_fallback(
                     include_no_typetree,
                     json,
                     &mut remaining,
+                    budget,
                 )?;
             }
         }
@@ -494,6 +517,7 @@ fn scan_pptr_env_fallback(
                 include_no_typetree,
                 json,
                 &mut remaining,
+                budget,
             )?;
         }
     }
@@ -514,6 +538,8 @@ pub(crate) fn run(
     json: bool,
     ctx: &AppContext,
 ) -> Result<()> {
+    let mut budget = AssetLoadBudget::default();
+    let registry = load_typetree_registry(ctx.typetree_registries(), &mut budget)?;
     if scan_pptr_fast(
         &input,
         &kind,
@@ -525,7 +551,8 @@ pub(crate) fn run(
         include_no_typetree,
         json,
         ctx.show_warnings,
-        ctx.typetree_registries(),
+        &registry,
+        &mut budget,
     )? {
         return Ok(());
     }
@@ -542,7 +569,8 @@ pub(crate) fn run(
         json,
         ctx.strict,
         ctx.show_warnings,
-        ctx.typetree_registries(),
+        registry,
+        &mut budget,
     )
 }
 

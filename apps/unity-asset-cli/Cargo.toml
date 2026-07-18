@@ -23,6 +23,8 @@ exclude = [
 [[bin]]
 name = "unity-asset"
 path = "src/main.rs"
+# The binary's rustdoc output collides with the `unity-asset` library crate.
+doc = false
 
 [[bin]]
 name = "unity-asset-async"

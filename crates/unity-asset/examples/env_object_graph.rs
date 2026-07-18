@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use unity_asset::AssetLoadBudget;
 use unity_asset::environment::{Environment, ObjectGraphBuildOptions, ObjectGraphTraversalOptions};
 
 fn main() -> unity_asset::Result<()> {
@@ -13,9 +14,9 @@ fn main() -> unity_asset::Result<()> {
     });
 
     let mut env = Environment::new();
-    env.load_file(&input)?;
-
-    let graph = env.build_object_graph(ObjectGraphBuildOptions::default());
+    let mut budget = AssetLoadBudget::default();
+    env.load_file(&input, &mut budget)?;
+    let graph = env.build_object_graph(ObjectGraphBuildOptions::default(), &mut budget)?;
 
     let internal_edges: usize = graph
         .nodes()

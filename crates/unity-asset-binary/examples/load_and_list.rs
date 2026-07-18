@@ -3,10 +3,14 @@
 //! Run:
 //! `cargo run -p unity-asset-binary --example load_and_list -- <path>`
 
-use std::path::PathBuf;
-use unity_asset_binary::file::{UnityFile, load_unity_file};
+mod common;
 
-fn main() -> unity_asset_binary::Result<()> {
+use std::path::PathBuf;
+use unity_asset_binary::Result;
+use unity_asset_binary::file::{UnityFile, load_unity_file_with_budget};
+use unity_asset_core::AssetLoadBudget;
+
+fn main() -> Result<()> {
     let path = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
@@ -18,7 +22,8 @@ fn main() -> unity_asset_binary::Result<()> {
         ));
     }
 
-    let file = load_unity_file(&path)?;
+    let mut budget = AssetLoadBudget::default();
+    let file = load_unity_file_with_budget(&path, &mut budget)?;
     println!("path: {}", path.display());
     println!("kind: {:?}", file.kind());
 
@@ -31,12 +36,14 @@ fn main() -> unity_asset_binary::Result<()> {
             println!("types: {}", stats.type_count);
 
             for h in sf.object_handles().take(10) {
-                let name = h.peek_name().ok().flatten();
+                // A malformed or unsupported TypeTree is local to this optional name lookup.
+                // Resource, I/O, and other operation-wide failures still terminate the example.
+                let name = common::peek_name_best_effort(&h, &mut budget)?;
                 println!(
                     "  - path_id={} class_id={} name={}",
                     h.path_id(),
                     h.class_id(),
-                    name.unwrap_or_default()
+                    name.as_deref().unwrap_or("<unavailable>")
                 );
             }
         }

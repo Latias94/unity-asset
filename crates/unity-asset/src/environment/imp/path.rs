@@ -58,9 +58,9 @@ pub(crate) fn canonicalize_source_if_possible(source: &BinarySource) -> Option<B
             entry_name,
         } => {
             let canon = canonicalize_if_exists(archive_path);
-            if &canon != archive_path {
+            if &canon != archive_path.as_ref() {
                 Some(BinarySource::ArchiveEntry {
-                    archive_path: canon,
+                    archive_path: Arc::new(canon),
                     entry_name: entry_name.clone(),
                 })
             } else {
@@ -72,9 +72,9 @@ pub(crate) fn canonicalize_source_if_possible(source: &BinarySource) -> Option<B
             entry_name,
         } => {
             let canon = canonicalize_if_exists(web_path);
-            if &canon != web_path {
+            if &canon != web_path.as_ref() {
                 Some(BinarySource::WebEntry {
-                    web_path: canon,
+                    web_path: Arc::new(canon),
                     entry_name: entry_name.clone(),
                 })
             } else {

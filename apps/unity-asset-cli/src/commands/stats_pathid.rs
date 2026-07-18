@@ -3,6 +3,7 @@ use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use unity_asset::AssetLoadBudget;
 use unity_asset::environment::{BinarySource, BinarySourceKind, Environment};
 use unity_asset_binary::asset::SerializedFile;
 
@@ -98,8 +99,14 @@ pub(crate) fn run(
     json: bool,
     ctx: &AppContext,
 ) -> Result<()> {
-    let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
-    load_environment_input(&mut env, &input)?;
+    let mut budget = AssetLoadBudget::default();
+    let mut env = build_environment(
+        ctx.strict,
+        ctx.show_warnings,
+        ctx.typetree_registries(),
+        &mut budget,
+    )?;
+    load_environment_input(&mut env, &input, &mut budget)?;
 
     let k = kind.to_ascii_lowercase();
     let mut remaining = limit.unwrap_or(usize::MAX);

@@ -42,9 +42,6 @@ impl AudioClipConverter {
         fn as_i32(v: &UnityValue) -> Option<i32> {
             v.as_i64().and_then(|n| i32::try_from(n).ok())
         }
-        fn as_u64(v: &UnityValue) -> Option<u64> {
-            v.as_i64().and_then(|n| u64::try_from(n).ok())
-        }
         fn as_u32(v: &UnityValue) -> Option<u32> {
             v.as_i64().and_then(|n| u32::try_from(n).ok())
         }
@@ -133,7 +130,10 @@ impl AudioClipConverter {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let offset = res.get("m_Offset").and_then(as_u64).unwrap_or(0);
+            let offset = res
+                .get("m_Offset")
+                .and_then(UnityValue::as_u64)
+                .unwrap_or(0);
             let size = res.get("m_Size").and_then(as_u32).unwrap_or(0);
 
             if !source.is_empty() && size > 0 {
@@ -394,3 +394,41 @@ impl AudioClipConverter {
 
 // Legacy compatibility - alias for the old processor name
 pub type AudioClipProcessor = AudioClipConverter;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::asset::{ObjectInfo, class_ids};
+    use indexmap::IndexMap;
+    use unity_asset_core::UnityClass;
+
+    #[test]
+    fn typetree_stream_offset_preserves_unsigned_range() {
+        let mut class = UnityClass::new(
+            class_ids::AUDIO_CLIP,
+            "AudioClip".to_string(),
+            "1".to_string(),
+        );
+        class.set("m_Name".to_string(), UnityValue::String("Clip".to_string()));
+        class.set(
+            "m_Resource".to_string(),
+            UnityValue::Object(IndexMap::from([
+                (
+                    "m_Source".to_string(),
+                    UnityValue::String("archive:/CAB-a/CAB-a.resS".to_string()),
+                ),
+                ("m_Offset".to_string(), UnityValue::from(u64::MAX)),
+                ("m_Size".to_string(), UnityValue::Integer(1)),
+            ])),
+        );
+        let info = ObjectInfo::for_standalone_class(1, 0, 0, class_ids::AUDIO_CLIP)
+            .expect("valid standalone audio object");
+        let object = UnityObject::from_info_and_class(info, class);
+
+        let clip = AudioClipConverter::new(UnityVersion::default())
+            .from_unity_object(&object)
+            .unwrap();
+
+        assert_eq!(clip.stream_info.offset, u64::MAX);
+    }
+}

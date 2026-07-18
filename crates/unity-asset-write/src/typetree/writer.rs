@@ -1,801 +1,897 @@
-use crate::Result;
-use crate::binary_writer::BinaryWriter;
-use crate::typetree::context::TypeTreeWriteContext;
-use crate::typetree::primitives::write_primitive;
-use crate::typetree::referenced_object::write_referenced_object;
 use indexmap::IndexMap;
-use unity_asset_binary::asset::SerializedType;
-use unity_asset_binary::typetree::{TypeTree, TypeTreeNode};
-use unity_asset_core::{UnityAssetError, UnityValue};
+use unity_asset_binary::reader::BinaryReader;
+use unity_asset_binary::typetree::{
+    PPtrLayout, PairLayout, PrimitiveKind, ReferencedObjectLayout, SchemaNode, SemanticKind,
+    SemanticLayout, SequenceLayout, TypeTreeSchema, TypeTreeTraversalContext,
+    TypeTreeTraversalStats,
+};
+use unity_asset_core::{AssetLoadBudget, Result, UnityAssetError, UnityValue};
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TypeTreeWriteOptions {
-    pub allow_missing_fields: bool,
+use super::output::TypeTreeOutput;
+use super::primitives::{
+    checked_i32_length, expect_pair, usize_to_u64, write_primitive, write_primitive_run,
+};
+use crate::binary_writer::Endian;
+
+pub(crate) fn encode_object(
+    schema: &TypeTreeSchema,
+    properties: &IndexMap<String, UnityValue>,
+    endian: Endian,
+    budget: &mut AssetLoadBudget,
+) -> Result<(Vec<u8>, TypeTreeTraversalStats)> {
+    let mut output = TypeTreeOutput::new(endian, budget);
+    write_object_node(
+        schema,
+        schema.root(),
+        properties,
+        endian,
+        &mut output,
+        TypeTreeTraversalContext::root(),
+        0,
+    )?;
+    Ok(output.finish())
 }
 
-/// A TypeTree-driven writer, targeting UnityPy's `TypeTreeHelper.write_value` behavior.
-pub struct TypeTreeWriter<'a> {
-    tree: &'a TypeTree,
-    ref_types: Option<&'a [SerializedType]>,
-}
-
-impl<'a> TypeTreeWriter<'a> {
-    pub fn new(tree: &'a TypeTree) -> Self {
-        Self {
-            tree,
-            ref_types: None,
-        }
-    }
-
-    pub fn with_ref_types(tree: &'a TypeTree, ref_types: &'a [SerializedType]) -> Self {
-        Self {
-            tree,
-            ref_types: Some(ref_types),
-        }
-    }
-
-    pub fn tree(&self) -> &'a TypeTree {
-        self.tree
-    }
-
-    /// Encode an object as a byte blob using the root node's children as the field list.
-    pub fn write_object(
-        &self,
-        writer: &mut BinaryWriter,
-        properties: &IndexMap<String, UnityValue>,
-        options: TypeTreeWriteOptions,
-    ) -> Result<()> {
-        let root = self.tree.nodes.first().ok_or_else(|| {
-            UnityAssetError::format("TypeTreeWriter requires a non-empty TypeTree")
-        })?;
-
-        let mut ctx = TypeTreeWriteContext {
-            ref_types: self.ref_types,
-            ..Default::default()
-        };
-        for child in &root.children {
-            if child.name.is_empty() {
-                return Err(UnityAssetError::format(
-                    "TypeTree write encountered an unnamed child node; use write_object_with_original_bytes(...) to preserve template bytes",
-                ));
-            }
-            let Some(v) = properties.get(&child.name) else {
-                if options.allow_missing_fields {
-                    continue;
-                }
-                return Err(UnityAssetError::format(format!(
-                    "Missing field '{}' for TypeTree write",
-                    child.name
-                )));
-            };
-            write_value(writer, child, v, &mut ctx, options)?;
-        }
-        Ok(())
-    }
-
-    /// Encode an object as a byte blob, preserving any unknown/unnamed fields by copying their
-    /// original byte slices from `original_bytes`.
-    ///
-    /// This is required for rare TypeTrees that contain unnamed child nodes (`m_Name == ""`).
-    pub fn write_object_with_original_bytes(
-        &self,
-        writer: &mut BinaryWriter,
-        properties: &IndexMap<String, UnityValue>,
-        original_bytes: &[u8],
-        options: TypeTreeWriteOptions,
-    ) -> Result<()> {
-        super::template::write_object_with_original_bytes(
-            writer,
-            self.tree,
-            self.ref_types,
-            properties,
-            original_bytes,
-            options,
-        )
-    }
-}
-
+/// Writes one canonical schema node into a caller-owned, budgeted output.
+///
+/// Template rewriting uses this adapter for every value that does not need byte preservation.
+/// `endian` must match the byte order used to construct `output`.
 pub(crate) fn write_value(
-    writer: &mut BinaryWriter,
-    node: &TypeTreeNode,
+    schema: &TypeTreeSchema,
+    node: SchemaNode<'_>,
     value: &UnityValue,
-    ctx: &mut TypeTreeWriteContext<'_>,
-    options: TypeTreeWriteOptions,
+    endian: Endian,
+    output: &mut TypeTreeOutput<'_>,
+    context: TypeTreeTraversalContext,
+    depth: u32,
 ) -> Result<()> {
-    // UnityPy alignment: node meta flag, plus array child meta flag.
-    let mut align = node.is_aligned();
-    if node
-        .children
-        .iter()
-        .any(|c| c.type_name == "Array" && c.is_aligned())
-    {
-        align = true;
+    output.enter_node(depth)?;
+    write_value_body(schema, node, value, endian, output, context, depth)?;
+    align_after_node(node, output)
+}
+
+fn write_value_body(
+    schema: &TypeTreeSchema,
+    node: SchemaNode<'_>,
+    value: &UnityValue,
+    endian: Endian,
+    output: &mut TypeTreeOutput<'_>,
+    context: TypeTreeTraversalContext,
+    depth: u32,
+) -> Result<()> {
+    match node.semantic_layout() {
+        SemanticLayout::Scalar(kind) => write_primitive(output, kind, value, endian),
+        SemanticLayout::String => write_string(output, value),
+        SemanticLayout::TypelessData => write_sized_bytes(output, node, value),
+        SemanticLayout::Sequence(layout) | SemanticLayout::Map(layout) => {
+            write_sequence(schema, node, layout, value, endian, output, context, depth)
+        }
+        SemanticLayout::Pair(layout) => {
+            write_pair(schema, node, layout, value, endian, output, context, depth)
+        }
+        SemanticLayout::PPtr(layout) => {
+            write_pptr(schema, node, layout, value, endian, output, context, depth)
+        }
+        SemanticLayout::ReferencedObject(layout) => {
+            write_referenced_object(schema, node, layout, value, endian, output, context, depth)
+        }
+        SemanticLayout::ManagedPayload => Err(UnityAssetError::format(format!(
+            "Dynamic managed payload '{}' requires a ReferencedObject type dispatch",
+            node.name()
+        ))),
+        SemanticLayout::ManagedRegistry | SemanticLayout::Record => {
+            let object = expect_object(node, value)?;
+            write_record_body(schema, node, object, endian, output, context, depth)
+        }
+        SemanticLayout::OpaqueFixed { byte_size } => {
+            write_fixed_bytes(output, node, value, byte_size)
+        }
+    }
+}
+
+fn write_object_node(
+    schema: &TypeTreeSchema,
+    node: SchemaNode<'_>,
+    properties: &IndexMap<String, UnityValue>,
+    endian: Endian,
+    output: &mut TypeTreeOutput<'_>,
+    context: TypeTreeTraversalContext,
+    depth: u32,
+) -> Result<()> {
+    if !matches!(
+        node.kind(),
+        SemanticKind::Record | SemanticKind::ManagedRegistry
+    ) {
+        return Err(UnityAssetError::format(format!(
+            "TypeTree object root must be a record, got {:?}",
+            node.kind()
+        )));
     }
 
-    if write_primitive(writer, node.type_name.as_str(), value)? {
-        if align {
-            writer.align_stream(4);
+    output.enter_node(depth)?;
+    write_record_body(schema, node, properties, endian, output, context, depth)?;
+    align_after_node(node, output)
+}
+
+fn write_record_body(
+    schema: &TypeTreeSchema,
+    node: SchemaNode<'_>,
+    object: &IndexMap<String, UnityValue>,
+    endian: Endian,
+    output: &mut TypeTreeOutput<'_>,
+    mut context: TypeTreeTraversalContext,
+    depth: u32,
+) -> Result<()> {
+    output.consume_members(usize_to_u64(
+        node.child_count(),
+        "TypeTree record child count",
+    )?)?;
+    let child_depth = child_depth(depth)?;
+    for child in node.children() {
+        let Some(child_context) = context.descend(node, child) else {
+            continue;
+        };
+
+        let value = required_property(object, child, node)?;
+        write_value(
+            schema,
+            child,
+            value,
+            endian,
+            output,
+            child_context,
+            child_depth,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_sequence(
+    schema: &TypeTreeSchema,
+    node: SchemaNode<'_>,
+    layout: SequenceLayout<'_>,
+    value: &UnityValue,
+    endian: Endian,
+    output: &mut TypeTreeOutput<'_>,
+    context: TypeTreeTraversalContext,
+    depth: u32,
+) -> Result<()> {
+    let element = layout.element();
+    let child_depth = child_depth(depth)?;
+
+    if let UnityValue::Bytes(bytes) = value {
+        if !matches!(
+            layout.bulk_primitive(),
+            Some(PrimitiveKind::I8 | PrimitiveKind::U8)
+        ) {
+            return Err(UnityAssetError::format(format!(
+                "TypeTree Bytes value is only valid for I8/U8 sequences, '{}' contains {:?}",
+                node.name(),
+                element.kind()
+            )));
+        }
+
+        let length = checked_i32_length(bytes.len(), "TypeTree byte sequence")?;
+        let members = usize_to_u64(bytes.len(), "TypeTree byte sequence length")?;
+        output.consume_members(members)?;
+        output.write_i32(length)?;
+        if members != 0 {
+            output.enter_nodes(child_depth, members)?;
+            output.write_bulk_bytes(bytes)?;
         }
         return Ok(());
     }
 
-    // Array-like layout: any child "Array" node means the field is a vector/array container.
-    if node.children.iter().any(|c| c.type_name == "Array") {
-        write_array(writer, node, value, ctx, options)?;
-        if align {
-            writer.align_stream(4);
-        }
-        return Ok(());
-    }
-
-    if node.type_name == "pair" && node.children.len() == 2 {
-        match value {
-            UnityValue::Array(v) if v.len() == 2 => {
-                write_value(writer, &node.children[0], &v[0], ctx, options)?;
-                write_value(writer, &node.children[1], &v[1], ctx, options)?;
-            }
-            UnityValue::Object(map) => {
-                let k0 = if node.children[0].name.is_empty() {
-                    "first"
-                } else {
-                    node.children[0].name.as_str()
-                };
-                let k1 = if node.children[1].name.is_empty() {
-                    "second"
-                } else {
-                    node.children[1].name.as_str()
-                };
-
-                let Some(v0) = map.get(k0) else {
-                    if options.allow_missing_fields {
-                        return Ok(());
-                    }
-                    return Err(UnityAssetError::format(format!(
-                        "Missing pair field '{}' for TypeTree write",
-                        k0
-                    )));
-                };
-                let Some(v1) = map.get(k1) else {
-                    if options.allow_missing_fields {
-                        return Ok(());
-                    }
-                    return Err(UnityAssetError::format(format!(
-                        "Missing pair field '{}' for TypeTree write",
-                        k1
-                    )));
-                };
-
-                write_value(writer, &node.children[0], v0, ctx, options)?;
-                write_value(writer, &node.children[1], v1, ctx, options)?;
-            }
-            _ => {
-                return Err(UnityAssetError::format(format!(
-                    "TypeTree write type mismatch: expected pair as Array(len=2) or Object(first/second), got {:?}",
-                    value
-                )));
-            }
-        }
-        if align {
-            writer.align_stream(4);
-        }
-        return Ok(());
-    }
-
-    // Unity `PPtr<T>`: allow a small amount of normalization to match UnityPy ergonomics.
-    //
-    // UnityPy writes PPtr values either from dicts with `m_FileID/m_PathID`, or from `PPtr` objects
-    // whose attributes follow the same naming scheme. In this project, YAML uses `fileID/pathID`,
-    // so we accept both spellings when writing binary TypeTrees.
-    let is_pptr = node.type_name == "PPtr" || node.type_name.starts_with("PPtr<");
-    if is_pptr {
-        // Null PPtr shorthand.
-        if matches!(value, UnityValue::Null) {
-            for child in &node.children {
-                if child.name.is_empty() {
-                    return Err(UnityAssetError::format(
-                        "TypeTree write encountered an unnamed child node; use write_object_with_original_bytes(...) to preserve template bytes",
-                    ));
-                }
-                write_value(writer, child, &UnityValue::Integer(0), ctx, options)?;
-            }
-            if align {
-                writer.align_stream(4);
-            }
-            return Ok(());
-        }
-
-        let obj = value.as_object().ok_or_else(|| {
-            UnityAssetError::format(format!(
-                "TypeTree write type mismatch: expected object/null for PPtr, got {:?}",
-                value
-            ))
-        })?;
-
-        for child in &node.children {
-            if child.name.is_empty() {
-                return Err(UnityAssetError::format(
-                    "TypeTree write encountered an unnamed child node; use write_object_with_original_bytes(...) to preserve template bytes",
-                ));
-            }
-
-            let v = if is_pptr_file_id_field(&child.name) {
-                pptr_get_field(obj, &child.name, &["m_FileID", "fileID"])
-            } else if is_pptr_path_id_field(&child.name) {
-                pptr_get_field(obj, &child.name, &["m_PathID", "pathID"])
-            } else {
-                obj.get(&child.name)
-            };
-
-            let Some(v) = v else {
-                if options.allow_missing_fields {
-                    continue;
-                }
-                return Err(UnityAssetError::format(format!(
-                    "Missing field '{}' for TypeTree write (parent type '{}')",
-                    child.name, node.type_name
-                )));
-            };
-            write_value(writer, child, v, ctx, options)?;
-        }
-
-        if align {
-            writer.align_stream(4);
-        }
-        return Ok(());
-    }
-
-    if node.type_name == "ReferencedObject" {
-        let referenced = value.as_object().ok_or_else(|| {
-            UnityAssetError::format(format!(
-                "TypeTree write type mismatch: expected object for ReferencedObject, got {:?}",
-                value
-            ))
-        })?;
-        write_referenced_object(referenced, writer, node, ctx, options)?;
-        return Ok(());
-    }
-
-    // UnityPy behavior: skip extra ManagedReferencesRegistry nodes after the first.
-    if node.type_name == "ManagedReferencesRegistry" {
-        if ctx.has_managed_registry {
-            return Ok(());
-        }
-        ctx.has_managed_registry = true;
-    }
-
-    // Complex object: write children in declared order.
-    let obj = match value {
-        UnityValue::Object(m) => m,
+    let values = match value {
+        UnityValue::Array(values) => values,
         _ => {
             return Err(UnityAssetError::format(format!(
-                "TypeTree write type mismatch: expected object for type '{}', got {:?}",
-                node.type_name, value
+                "TypeTree write expected an array for sequence '{}', got {value:?}",
+                node.name()
             )));
         }
     };
+    let length = checked_i32_length(values.len(), "TypeTree sequence")?;
+    let members = usize_to_u64(values.len(), "TypeTree sequence length")?;
+    output.consume_members(members)?;
+    output.write_i32(length)?;
 
-    for child in &node.children {
-        if child.name.is_empty() {
-            return Err(UnityAssetError::format(
-                "TypeTree write encountered an unnamed child node; use write_object_with_original_bytes(...) to preserve template bytes",
-            ));
+    if let Some(kind) = layout.bulk_primitive() {
+        if members != 0 {
+            output.enter_nodes(child_depth, members)?;
+            write_primitive_run(output, kind, values, endian)?;
         }
-        let Some(v) = obj.get(&child.name) else {
-            if options.allow_missing_fields {
+        return Ok(());
+    }
+
+    for value in values {
+        write_value(schema, element, value, endian, output, context, child_depth)?;
+    }
+    Ok(())
+}
+
+fn write_pair(
+    schema: &TypeTreeSchema,
+    node: SchemaNode<'_>,
+    layout: PairLayout<'_>,
+    value: &UnityValue,
+    endian: Endian,
+    output: &mut TypeTreeOutput<'_>,
+    context: TypeTreeTraversalContext,
+    depth: u32,
+) -> Result<()> {
+    let values = expect_pair(node, value)?;
+    output.consume_members(2)?;
+    let child_depth = child_depth(depth)?;
+    write_value(
+        schema,
+        layout.first(),
+        &values[0],
+        endian,
+        output,
+        context,
+        child_depth,
+    )?;
+    write_value(
+        schema,
+        layout.second(),
+        &values[1],
+        endian,
+        output,
+        context,
+        child_depth,
+    )
+}
+
+fn write_pptr(
+    schema: &TypeTreeSchema,
+    node: SchemaNode<'_>,
+    layout: PPtrLayout<'_>,
+    value: &UnityValue,
+    endian: Endian,
+    output: &mut TypeTreeOutput<'_>,
+    mut context: TypeTreeTraversalContext,
+    depth: u32,
+) -> Result<()> {
+    output.consume_members(usize_to_u64(
+        node.child_count(),
+        "TypeTree PPtr child count",
+    )?)?;
+    let child_depth = child_depth(depth)?;
+    let object = match value {
+        UnityValue::Null => None,
+        UnityValue::Object(object) => Some(object),
+        _ => {
+            return Err(UnityAssetError::format(format!(
+                "TypeTree PPtr '{}' requires an Object or Null, got {value:?}",
+                node.name()
+            )));
+        }
+    };
+    let zero = UnityValue::Integer(0);
+
+    for child in node.children() {
+        let Some(child_context) = context.descend(node, child) else {
+            continue;
+        };
+        let field = match object {
+            Some(object) => required_property(object, child, node)?,
+            None if child == layout.file_child() || child == layout.path_child() => &zero,
+            None => {
+                return Err(UnityAssetError::format(format!(
+                    "Null PPtr '{}' cannot synthesize extra field '{}'",
+                    node.name(),
+                    child.name()
+                )));
+            }
+        };
+
+        if child == layout.file_child() {
+            validate_pptr_file_id(node, field)?;
+        } else if child == layout.path_child() {
+            validate_pptr_path_id(node, field)?;
+        }
+        write_value(
+            schema,
+            child,
+            field,
+            endian,
+            output,
+            child_context,
+            child_depth,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_pptr_file_id(node: SchemaNode<'_>, value: &UnityValue) -> Result<()> {
+    let valid = value
+        .as_i64()
+        .is_some_and(|value| i32::try_from(value).is_ok());
+    if valid {
+        return Ok(());
+    }
+    Err(UnityAssetError::format(format!(
+        "PPtr '{}' file ID must fit in i32, got {value:?}",
+        node.name()
+    )))
+}
+
+fn validate_pptr_path_id(node: SchemaNode<'_>, value: &UnityValue) -> Result<()> {
+    let valid = value.as_i64().is_some();
+    if valid {
+        return Ok(());
+    }
+    Err(UnityAssetError::format(format!(
+        "PPtr '{}' path ID must fit in i64, got {value:?}",
+        node.name()
+    )))
+}
+
+fn write_referenced_object(
+    schema: &TypeTreeSchema,
+    node: SchemaNode<'_>,
+    layout: ReferencedObjectLayout<'_>,
+    value: &UnityValue,
+    endian: Endian,
+    output: &mut TypeTreeOutput<'_>,
+    mut context: TypeTreeTraversalContext,
+    depth: u32,
+) -> Result<()> {
+    let object = expect_object(node, value)?;
+    output.consume_members(usize_to_u64(
+        node.child_count(),
+        "ReferencedObject child count",
+    )?)?;
+    let type_value = required_property(object, layout.type_node(), node)?;
+    let type_object = expect_object(layout.type_node(), type_value)?;
+    let class_name = required_string(type_object, layout.class_field(), layout.type_node())?;
+    let namespace = required_string(type_object, layout.namespace_field(), layout.type_node())?;
+    let assembly_name = required_string(type_object, layout.assembly_field(), layout.type_node())?;
+    let child_depth = child_depth(depth)?;
+
+    for child in node.children() {
+        let child_context = context.descend(node, child).ok_or_else(|| {
+            UnityAssetError::format(format!(
+                "ReferencedObject '{}' unexpectedly suppressed child '{}'",
+                node.name(),
+                child.name()
+            ))
+        })?;
+        if layout.is_type_node(child) {
+            write_value(
+                schema,
+                child,
+                type_value,
+                endian,
+                output,
+                child_context,
+                child_depth,
+            )?;
+            continue;
+        }
+        if layout.is_payload(child) {
+            if class_name.is_empty() {
+                output.enter_node(child_depth)?;
                 continue;
             }
-            return Err(UnityAssetError::format(format!(
-                "Missing field '{}' for TypeTree write (parent type '{}')",
-                child.name, node.type_name
-            )));
-        };
-        write_value(writer, child, v, ctx, options)?;
-    }
 
-    if align {
-        writer.align_stream(4);
+            let target = schema
+                .resolve_managed_root(class_name, namespace, assembly_name)
+                .or_else(|| layout.payload().fallback())
+                .ok_or_else(|| {
+                    UnityAssetError::format(format!(
+                        "Managed type '{class_name}' in namespace '{namespace}' from '{assembly_name}' has no schema or writable fallback"
+                    ))
+                })?;
+            let payload = required_property(object, child, node)?;
+            write_value(
+                schema,
+                target,
+                payload,
+                endian,
+                output,
+                child_context,
+                child_depth,
+            )?;
+            continue;
+        }
+
+        let child_value = required_property(object, child, node)?;
+        write_value(
+            schema,
+            child,
+            child_value,
+            endian,
+            output,
+            child_context,
+            child_depth,
+        )?;
     }
     Ok(())
 }
 
-fn write_array(
-    writer: &mut BinaryWriter,
-    node: &TypeTreeNode,
-    value: &UnityValue,
-    ctx: &mut TypeTreeWriteContext<'_>,
-    options: TypeTreeWriteOptions,
-) -> Result<()> {
-    let array_node = node
-        .children
-        .iter()
-        .find(|c| c.type_name == "Array")
-        .ok_or_else(|| UnityAssetError::format("TypeTree array node missing 'Array' child"))?;
-
-    // Unity TypeTree convention: Array children are [size, data].
-    let elem_node = array_node.children.get(1).ok_or_else(|| {
-        UnityAssetError::format("TypeTree array node missing element child at index 1")
-    })?;
-
-    // UnityPy-like optimization: treat byte-like arrays as a single bytes payload.
-    //
-    // In this project, `vector<UInt8/SInt8/char>` is parsed into `UnityValue::Bytes` for
-    // performance. Accept both `Bytes` and `Array<Integer>` so callers can round-trip without
-    // manual conversions.
-    if matches!(elem_node.type_name.as_str(), "UInt8" | "SInt8" | "char") {
-        match value {
-            UnityValue::Bytes(bytes) => {
-                let len_i32: i32 = bytes.len().try_into().map_err(|_| {
-                    UnityAssetError::format(format!(
-                        "Array too large for i32 length: {}",
-                        bytes.len()
-                    ))
-                })?;
-                writer.write_i32(len_i32);
-                writer.write(bytes.as_slice());
-                return Ok(());
-            }
-            UnityValue::Array(elements) => {
-                let len_i32: i32 = elements.len().try_into().map_err(|_| {
-                    UnityAssetError::format(format!(
-                        "Array too large for i32 length: {}",
-                        elements.len()
-                    ))
-                })?;
-                writer.write_i32(len_i32);
-                for e in elements {
-                    write_value(writer, elem_node, e, ctx, options)?;
-                }
-                return Ok(());
-            }
-            _ => {
-                return Err(UnityAssetError::format(format!(
-                    "TypeTree write type mismatch: expected bytes/array for byte-like '{}', got {:?}",
-                    node.name, value
-                )));
-            }
-        }
-    }
-
-    let elements = match value {
-        UnityValue::Array(v) => v,
+fn write_string(output: &mut TypeTreeOutput<'_>, value: &UnityValue) -> Result<()> {
+    let value = match value {
+        UnityValue::String(value) => value,
         _ => {
             return Err(UnityAssetError::format(format!(
-                "TypeTree write type mismatch: expected array for '{}', got {:?}",
-                node.name, value
+                "TypeTree string requires a String value, got {value:?}"
             )));
         }
     };
+    if value.len() > BinaryReader::DEFAULT_MAX_STRING_LEN {
+        return Err(UnityAssetError::format(format!(
+            "TypeTree string length {} exceeds reader limit {}",
+            value.len(),
+            BinaryReader::DEFAULT_MAX_STRING_LEN
+        )));
+    }
+    let length = checked_i32_length(value.len(), "TypeTree string")?;
+    output.write_i32(length)?;
+    output.write_bytes(value.as_bytes())
+}
 
-    let len_i32: i32 = elements.len().try_into().map_err(|_| {
+fn write_sized_bytes(
+    output: &mut TypeTreeOutput<'_>,
+    node: SchemaNode<'_>,
+    value: &UnityValue,
+) -> Result<()> {
+    let bytes = expect_bytes(node, value)?;
+    let length = checked_i32_length(bytes.len(), "TypeTree byte payload")?;
+    output.write_i32(length)?;
+    output.write_bytes(bytes)
+}
+
+fn write_fixed_bytes(
+    output: &mut TypeTreeOutput<'_>,
+    node: SchemaNode<'_>,
+    value: &UnityValue,
+    byte_size: u64,
+) -> Result<()> {
+    let bytes = expect_bytes(node, value)?;
+    let expected = usize::try_from(byte_size).map_err(|_| {
         UnityAssetError::format(format!(
-            "Array too large for i32 length: {}",
-            elements.len()
+            "Fixed TypeTree extent for '{}' does not fit usize: {byte_size}",
+            node.name()
         ))
     })?;
-    writer.write_i32(len_i32);
-
-    for e in elements {
-        write_value(writer, elem_node, e, ctx, options)?;
+    if bytes.len() != expected {
+        return Err(UnityAssetError::format(format!(
+            "Fixed TypeTree node '{}' requires {expected} bytes, got {}",
+            node.name(),
+            bytes.len()
+        )));
     }
+    output.write_bytes(bytes)
+}
 
-    // UnityPy aligns for arrays based on node/alignment meta flags; higher-level `write_value`
-    // handles the final alignment. Keep element-level alignment inside `write_value`.
+fn required_property<'value>(
+    object: &'value IndexMap<String, UnityValue>,
+    child: SchemaNode<'_>,
+    parent: SchemaNode<'_>,
+) -> Result<&'value UnityValue> {
+    if child.name().is_empty() {
+        return Err(UnityAssetError::format(format!(
+            "Fresh TypeTree encoding cannot represent an unnamed child of '{}'",
+            parent.name()
+        )));
+    }
+    object.get(child.name()).ok_or_else(|| {
+        UnityAssetError::format(format!(
+            "Missing required field '{}' while encoding '{}'",
+            child.name(),
+            parent.name()
+        ))
+    })
+}
+
+fn required_string<'value>(
+    object: &'value IndexMap<String, UnityValue>,
+    field: SchemaNode<'_>,
+    parent: SchemaNode<'_>,
+) -> Result<&'value str> {
+    let value = required_property(object, field, parent)?;
+    match value {
+        UnityValue::String(value) => Ok(value),
+        _ => Err(UnityAssetError::format(format!(
+            "Managed type field '{}' requires a String, got {value:?}",
+            field.name()
+        ))),
+    }
+}
+
+fn expect_object<'value>(
+    node: SchemaNode<'_>,
+    value: &'value UnityValue,
+) -> Result<&'value IndexMap<String, UnityValue>> {
+    match value {
+        UnityValue::Object(value) => Ok(value),
+        _ => Err(UnityAssetError::format(format!(
+            "TypeTree node '{}' ({:?}) requires an Object, got {value:?}",
+            node.name(),
+            node.kind()
+        ))),
+    }
+}
+
+fn expect_bytes<'value>(node: SchemaNode<'_>, value: &'value UnityValue) -> Result<&'value [u8]> {
+    match value {
+        UnityValue::Bytes(value) => Ok(value),
+        _ => Err(UnityAssetError::format(format!(
+            "TypeTree node '{}' ({:?}) requires Bytes, got {value:?}",
+            node.name(),
+            node.kind()
+        ))),
+    }
+}
+
+fn align_after_node(node: SchemaNode<'_>, output: &mut TypeTreeOutput<'_>) -> Result<()> {
+    if node.align_after() {
+        output.align_to(4)?;
+    }
     Ok(())
 }
 
-fn is_pptr_file_id_field(name: &str) -> bool {
-    name.eq_ignore_ascii_case("fileID") || name.eq_ignore_ascii_case("m_FileID")
-}
-
-fn is_pptr_path_id_field(name: &str) -> bool {
-    name.eq_ignore_ascii_case("pathID") || name.eq_ignore_ascii_case("m_PathID")
-}
-
-fn pptr_get_field<'a>(
-    obj: &'a IndexMap<String, UnityValue>,
-    primary: &str,
-    aliases: &[&str],
-) -> Option<&'a UnityValue> {
-    if let Some(v) = obj.get(primary) {
-        return Some(v);
-    }
-    for alias in aliases {
-        if let Some(v) = obj.get(*alias) {
-            return Some(v);
-        }
-        if let Some((_, v)) = obj.iter().find(|(k, _)| k.eq_ignore_ascii_case(alias)) {
-            return Some(v);
-        }
-    }
-    None
+fn child_depth(depth: u32) -> Result<u32> {
+    depth
+        .checked_add(1)
+        .ok_or_else(|| UnityAssetError::format("TypeTree write depth overflow"))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{node, sequence};
     use super::*;
-    use crate::binary_writer::{BinaryWriter, Endian};
     use unity_asset_binary::asset::SerializedType;
-    use unity_asset_binary::reader::{BinaryReader, ByteOrder};
-    use unity_asset_binary::typetree::TypeTreeSerializer;
+    use unity_asset_binary::typetree::{TypeTree, TypeTreeNode};
 
-    fn node(type_name: &str, name: &str) -> TypeTreeNode {
-        TypeTreeNode {
-            type_name: type_name.to_string(),
-            name: name.to_string(),
-            byte_size: -1,
-            variable_count: 0,
-            index: 0,
-            type_flags: 0,
-            version: 0,
-            meta_flags: 0,
-            level: 0,
-            type_str_offset: 0,
-            name_str_offset: 0,
-            ref_type_hash: 0,
-            children: Vec::new(),
+    const ALIGN_BYTES: i32 = 0x4000;
+
+    fn aligned(mut node: TypeTreeNode) -> TypeTreeNode {
+        node.meta_flags |= ALIGN_BYTES;
+        node
+    }
+
+    fn record(name: &str, children: Vec<TypeTreeNode>) -> TypeTreeNode {
+        let mut root = node("TestObject", name);
+        root.children = children;
+        root
+    }
+
+    fn compile(root: TypeTreeNode, ref_types: &[SerializedType]) -> TypeTreeSchema {
+        let mut tree = TypeTree::new();
+        tree.add_node(root);
+        TypeTreeSchema::compile(&tree, ref_types, &mut AssetLoadBudget::default()).unwrap()
+    }
+
+    fn encode(
+        schema: &TypeTreeSchema,
+        properties: IndexMap<String, UnityValue>,
+        endian: Endian,
+    ) -> Result<Vec<u8>> {
+        let mut budget = AssetLoadBudget::default();
+        encode_object(schema, &properties, endian, &mut budget).map(|(bytes, _)| bytes)
+    }
+
+    #[test]
+    fn primitive_endian_and_root_alignment_are_schema_driven() {
+        let schema = compile(
+            aligned(record("Base", vec![node("UInt16", "m_Value")])),
+            &[],
+        );
+        let properties = IndexMap::from([("m_Value".to_owned(), UnityValue::Integer(0x0102))]);
+
+        assert_eq!(
+            encode(&schema, properties.clone(), Endian::Little).unwrap(),
+            [0x02, 0x01, 0, 0]
+        );
+        assert_eq!(
+            encode(&schema, properties, Endian::Big).unwrap(),
+            [0x01, 0x02, 0, 0]
+        );
+    }
+
+    #[test]
+    fn unsigned_u64_is_lossless_and_narrow_integers_are_checked() {
+        let wide = compile(record("Base", vec![node("UInt64", "m_Value")]), &[]);
+        let properties = IndexMap::from([("m_Value".to_owned(), UnityValue::Unsigned(u64::MAX))]);
+        assert_eq!(
+            encode(&wide, properties, Endian::Little).unwrap(),
+            u64::MAX.to_le_bytes()
+        );
+
+        let narrow = compile(record("Base", vec![node("UInt8", "m_Value")]), &[]);
+        for value in [UnityValue::Integer(-1), UnityValue::Integer(256)] {
+            let properties = IndexMap::from([("m_Value".to_owned(), value)]);
+            assert!(encode(&narrow, properties, Endian::Little).is_err());
         }
     }
 
     #[test]
-    fn roundtrip_primitives_and_string() {
-        let mut root = node("TestObject", "Base");
-        root.children.push(node("int", "m_Int"));
-        root.children.push(node("bool", "m_Bool"));
-        root.children.push(node("string", "m_Name"));
+    fn string_rejects_payload_above_reader_limit() {
+        let schema = compile(record("Base", vec![node("string", "m_Value")]), &[]);
+        let value = "x".repeat(BinaryReader::DEFAULT_MAX_STRING_LEN + 1);
+        let properties = IndexMap::from([("m_Value".to_owned(), UnityValue::String(value))]);
 
-        let mut tree = TypeTree::new();
-        tree.add_node(root);
-
-        let mut props = IndexMap::new();
-        props.insert("m_Int".to_string(), UnityValue::Integer(123));
-        props.insert("m_Bool".to_string(), UnityValue::Bool(true));
-        props.insert("m_Name".to_string(), UnityValue::String("abc".to_string()));
-
-        let writer_impl = TypeTreeWriter::new(&tree);
-        let mut out = BinaryWriter::new(Endian::Little);
-        writer_impl
-            .write_object(&mut out, &props, TypeTreeWriteOptions::default())
-            .unwrap();
-
-        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
-        let serializer = TypeTreeSerializer::new(&tree);
-        let parsed = serializer.parse_object(&mut reader).unwrap();
-        assert_eq!(parsed.get("m_Int"), Some(&UnityValue::Integer(123)));
-        assert_eq!(parsed.get("m_Bool"), Some(&UnityValue::Bool(true)));
-        assert_eq!(
-            parsed.get("m_Name"),
-            Some(&UnityValue::String("abc".to_string()))
-        );
+        assert!(encode(&schema, properties, Endian::Little).is_err());
     }
 
     #[test]
-    fn roundtrip_array_of_u8_as_unityvalue_array() {
-        // Layout similar to `vector<UInt8>` / `Array` node conventions.
-        let mut root = node("TestObject", "Base");
+    fn pair_requires_a_two_element_array_and_honors_alignment() {
+        let mut pair = aligned(node("pair", "m_Pair"));
+        pair.children = vec![node("UInt8", "first"), node("UInt16", "second")];
+        let schema = compile(record("Base", vec![pair]), &[]);
+        let properties = IndexMap::from([(
+            "m_Pair".to_owned(),
+            UnityValue::Array(vec![UnityValue::Integer(1), UnityValue::Integer(0x0203)]),
+        )]);
+        assert_eq!(
+            encode(&schema, properties, Endian::Little).unwrap(),
+            [1, 3, 2, 0]
+        );
 
-        let mut field = node("vector", "m_Data");
+        let invalid = IndexMap::from([(
+            "m_Pair".to_owned(),
+            UnityValue::Object(IndexMap::from([
+                ("first".to_owned(), UnityValue::Integer(1)),
+                ("second".to_owned(), UnityValue::Integer(2)),
+            ])),
+        )]);
+        assert!(encode(&schema, invalid, Endian::Little).is_err());
+    }
+
+    #[test]
+    fn map_writes_pair_entries_in_input_order() {
+        let mut pair = node("pair", "data");
+        pair.children = vec![node("UInt8", "first"), node("UInt8", "second")];
         let mut array = node("Array", "Array");
-        array.children.push(node("int", "size"));
-        array.children.push(node("UInt8", "data"));
-        field.children.push(array);
-        root.children.push(field);
-
-        let mut tree = TypeTree::new();
-        tree.add_node(root);
-
-        let mut props = IndexMap::new();
-        props.insert(
-            "m_Data".to_string(),
+        array.children = vec![node("int", "size"), pair];
+        let mut map = node("map", "m_Map");
+        map.children.push(array);
+        let schema = compile(record("Base", vec![map]), &[]);
+        let properties = IndexMap::from([(
+            "m_Map".to_owned(),
             UnityValue::Array(vec![
-                UnityValue::Integer(1),
-                UnityValue::Integer(2),
-                UnityValue::Integer(3),
+                UnityValue::Array(vec![UnityValue::Integer(1), UnityValue::Integer(10)]),
+                UnityValue::Array(vec![UnityValue::Integer(2), UnityValue::Integer(20)]),
             ]),
-        );
-
-        let writer_impl = TypeTreeWriter::new(&tree);
-        let mut out = BinaryWriter::new(Endian::Little);
-        writer_impl
-            .write_object(&mut out, &props, TypeTreeWriteOptions::default())
-            .unwrap();
-
-        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
-        let serializer = TypeTreeSerializer::new(&tree);
-        let parsed = serializer.parse_object(&mut reader).unwrap();
+        )]);
 
         assert_eq!(
-            parsed.get("m_Data"),
-            Some(&UnityValue::Bytes(vec![1, 2, 3]))
+            encode(&schema, properties, Endian::Little).unwrap(),
+            [2, 0, 0, 0, 1, 10, 2, 20]
         );
     }
 
     #[test]
-    fn roundtrip_array_of_u8_as_unityvalue_bytes() {
-        let mut root = node("TestObject", "Base");
+    fn pptr_uses_exact_schema_fields_and_null_writes_zero_ids() {
+        let mut pointer = node("PPtr<Texture2D>", "m_Texture");
+        pointer.children = vec![node("int", "m_FileID"), node("long long", "m_PathID")];
+        let schema = compile(record("Base", vec![pointer]), &[]);
 
-        let mut field = node("vector", "m_Data");
-        let mut array = node("Array", "Array");
-        array.children.push(node("int", "size"));
-        array.children.push(node("UInt8", "data"));
-        field.children.push(array);
-        root.children.push(field);
+        let null = IndexMap::from([("m_Texture".to_owned(), UnityValue::Null)]);
+        assert_eq!(encode(&schema, null, Endian::Little).unwrap(), [0_u8; 12]);
 
-        let mut tree = TypeTree::new();
-        tree.add_node(root);
-
-        let mut props = IndexMap::new();
-        props.insert("m_Data".to_string(), UnityValue::Bytes(vec![9, 8, 7]));
-
-        let writer_impl = TypeTreeWriter::new(&tree);
-        let mut out = BinaryWriter::new(Endian::Little);
-        writer_impl
-            .write_object(&mut out, &props, TypeTreeWriteOptions::default())
-            .unwrap();
-
-        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
-        let serializer = TypeTreeSerializer::new(&tree);
-        let parsed = serializer.parse_object(&mut reader).unwrap();
+        let pointer = UnityValue::Object(IndexMap::from([
+            ("m_FileID".to_owned(), UnityValue::Integer(1)),
+            (
+                "m_PathID".to_owned(),
+                UnityValue::Integer(0x0102_0304_0506_0708),
+            ),
+        ]));
+        let properties = IndexMap::from([("m_Texture".to_owned(), pointer)]);
         assert_eq!(
-            parsed.get("m_Data"),
-            Some(&UnityValue::Bytes(vec![9, 8, 7]))
+            encode(&schema, properties, Endian::Little).unwrap(),
+            [1, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1]
+        );
+
+        let aliases = UnityValue::Object(IndexMap::from([
+            ("fileID".to_owned(), UnityValue::Integer(1)),
+            ("pathID".to_owned(), UnityValue::Integer(2)),
+        ]));
+        let properties = IndexMap::from([("m_Texture".to_owned(), aliases)]);
+        assert!(encode(&schema, properties, Endian::Little).is_err());
+    }
+
+    #[test]
+    fn pptr_writes_every_child_in_schema_order() {
+        let mut pointer = node("PPtr<Texture2D>", "m_Texture");
+        pointer.children = vec![
+            node("long long", "m_PathID"),
+            node("UInt8", "m_Tag"),
+            node("int", "m_FileID"),
+        ];
+        let schema = compile(record("Base", vec![pointer]), &[]);
+        let pointer = UnityValue::Object(IndexMap::from([
+            (
+                "m_PathID".to_owned(),
+                UnityValue::Integer(0x0102_0304_0506_0708),
+            ),
+            ("m_Tag".to_owned(), UnityValue::Integer(0xAA)),
+            ("m_FileID".to_owned(), UnityValue::Integer(1)),
+        ]));
+
+        assert_eq!(
+            encode(
+                &schema,
+                IndexMap::from([("m_Texture".to_owned(), pointer)]),
+                Endian::Little,
+            )
+            .unwrap(),
+            [8, 7, 6, 5, 4, 3, 2, 1, 0xAA, 1, 0, 0, 0]
         );
     }
 
     #[test]
-    fn roundtrip_referenced_object_uses_ref_types_layout_when_available() {
-        // Outer TypeTree with a ReferencedObject field.
-        let mut outer_root = node("Outer", "Base");
-        let mut ro = node("ReferencedObject", "m_Ref");
+    fn pptr_null_rejects_unspecified_extra_children() {
+        let mut pointer = node("PPtr<Texture2D>", "m_Texture");
+        pointer.children = vec![
+            node("int", "m_FileID"),
+            node("UInt8", "m_Tag"),
+            node("long long", "m_PathID"),
+        ];
+        let schema = compile(record("Base", vec![pointer]), &[]);
 
-        let mut ro_type = node("ReferencedObjectType", "type");
-        ro_type.children.push(node("string", "class"));
-        ro_type.children.push(node("string", "ns"));
-        ro_type.children.push(node("string", "asm"));
-
-        let ro_data = node("ReferencedObjectData", "data");
-        ro.children.push(ro_type);
-        ro.children.push(ro_data);
-        outer_root.children.push(ro);
-
-        let mut outer_tree = TypeTree::new();
-        outer_tree.add_node(outer_root);
-
-        // Referenced payload TypeTree registered in ref_types.
-        let mut payload_root = node("MyRefType", "Base");
-        payload_root.children.push(node("int", "x"));
-        let mut payload_tree = TypeTree::new();
-        payload_tree.add_node(payload_root);
-
-        let mut ref_type = SerializedType::new(0);
-        ref_type.class_name = "C".to_string();
-        ref_type.namespace = "N".to_string();
-        ref_type.assembly_name = "A".to_string();
-        ref_type.type_tree = payload_tree;
-
-        let ref_types = vec![ref_type];
-
-        let mut props = IndexMap::new();
-        let mut type_obj = IndexMap::new();
-        type_obj.insert("class".to_string(), UnityValue::String("C".to_string()));
-        type_obj.insert("ns".to_string(), UnityValue::String("N".to_string()));
-        type_obj.insert("asm".to_string(), UnityValue::String("A".to_string()));
-
-        let mut data_obj = IndexMap::new();
-        data_obj.insert("x".to_string(), UnityValue::Integer(7));
-
-        let mut ref_obj = IndexMap::new();
-        ref_obj.insert("type".to_string(), UnityValue::Object(type_obj));
-        ref_obj.insert("data".to_string(), UnityValue::Object(data_obj));
-        props.insert("m_Ref".to_string(), UnityValue::Object(ref_obj));
-
-        let writer_impl = TypeTreeWriter::with_ref_types(&outer_tree, &ref_types);
-        let mut out = BinaryWriter::new(Endian::Little);
-        writer_impl
-            .write_object(&mut out, &props, TypeTreeWriteOptions::default())
-            .unwrap();
-
-        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
-        let serializer = TypeTreeSerializer::new(&outer_tree);
-        let parsed = serializer
-            .parse_object_with_ref_types(&mut reader, &ref_types)
-            .unwrap();
-
-        let m_ref = parsed.get("m_Ref").and_then(|v| v.as_object()).unwrap();
-        let data = m_ref.get("data").and_then(|v| v.as_object()).unwrap();
-        assert_eq!(data.get("x"), Some(&UnityValue::Integer(7)));
-    }
-
-    #[test]
-    fn roundtrip_pair_accepts_object_shape() {
-        let mut root = node("TestObject", "Base");
-
-        let mut pair = node("pair", "m_Pair");
-        pair.children.push(node("string", "first"));
-        pair.children.push(node("int", "second"));
-        root.children.push(pair);
-
-        let mut tree = TypeTree::new();
-        tree.add_node(root);
-
-        let mut pair_obj = IndexMap::new();
-        pair_obj.insert("first".to_string(), UnityValue::String("hello".to_string()));
-        pair_obj.insert("second".to_string(), UnityValue::Integer(123));
-
-        let mut props = IndexMap::new();
-        props.insert("m_Pair".to_string(), UnityValue::Object(pair_obj));
-
-        let writer_impl = TypeTreeWriter::new(&tree);
-        let mut out = BinaryWriter::new(Endian::Little);
-        writer_impl
-            .write_object(&mut out, &props, TypeTreeWriteOptions::default())
-            .unwrap();
-
-        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
-        let serializer = TypeTreeSerializer::new(&tree);
-        let parsed = serializer.parse_object(&mut reader).unwrap();
-
-        let pair_val = parsed.get("m_Pair").unwrap();
-        let UnityValue::Array(arr) = pair_val else {
-            panic!("expected m_Pair to parse as array, got {:?}", pair_val);
-        };
-        assert_eq!(arr.first().and_then(|v| v.as_str()), Some("hello"));
-        assert_eq!(arr.get(1).and_then(|v| v.as_i64()), Some(123));
-    }
-
-    #[test]
-    fn template_write_preserves_unnamed_root_children() {
-        let mut root = node("TestObject", "Base");
-        root.children.push(node("int", "m_A"));
-        root.children.push(node("int", ""));
-        root.children.push(node("int", "m_B"));
-
-        let mut tree = TypeTree::new();
-        tree.add_node(root);
-
-        let mut original_w = BinaryWriter::new(Endian::Little);
-        original_w.write_i32(1);
-        original_w.write_i32(0x11223344);
-        original_w.write_i32(2);
-        let original_bytes = original_w.into_result().unwrap();
-
-        let mut props = IndexMap::new();
-        props.insert("m_A".to_string(), UnityValue::Integer(10));
-        props.insert("m_B".to_string(), UnityValue::Integer(20));
-
-        let writer_impl = TypeTreeWriter::new(&tree);
-
-        // Non-template mode must fail instead of silently dropping bytes.
-        let mut out = BinaryWriter::new(Endian::Little);
         assert!(
-            writer_impl
-                .write_object(&mut out, &props, TypeTreeWriteOptions::default())
+            encode(
+                &schema,
+                IndexMap::from([("m_Texture".to_owned(), UnityValue::Null)]),
+                Endian::Little,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pptr_roles_reject_ids_outside_reader_ranges() {
+        let mut pointer = node("PPtr<Texture2D>", "m_Texture");
+        pointer.children = vec![node("UInt32", "m_FileID"), node("UInt64", "m_PathID")];
+        let schema = compile(record("Base", vec![pointer]), &[]);
+
+        for pointer in [
+            UnityValue::Object(IndexMap::from([
+                (
+                    "m_FileID".to_owned(),
+                    UnityValue::Unsigned(i32::MAX as u64 + 1),
+                ),
+                ("m_PathID".to_owned(), UnityValue::Unsigned(0)),
+            ])),
+            UnityValue::Object(IndexMap::from([
+                ("m_FileID".to_owned(), UnityValue::Unsigned(0)),
+                ("m_PathID".to_owned(), UnityValue::Unsigned(u64::MAX)),
+            ])),
+        ] {
+            assert!(
+                encode(
+                    &schema,
+                    IndexMap::from([("m_Texture".to_owned(), pointer)]),
+                    Endian::Little,
+                )
                 .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn managed_payload_uses_schema_resolution_and_empty_class_is_zero_extent() {
+        let mut managed_type = SerializedType::new(114);
+        managed_type.class_name = "C".to_owned();
+        managed_type.namespace = "N".to_owned();
+        managed_type.assembly_name = "A".to_owned();
+        managed_type.type_tree.add_node(aligned(record(
+            "ManagedBase",
+            vec![node("UInt8", "m_Value")],
+        )));
+
+        let mut type_node = node("ReferencedObjectType", "type");
+        type_node.children = vec![
+            node("string", "class"),
+            node("string", "ns"),
+            node("string", "asm"),
+        ];
+        let mut referenced = node("ReferencedObject", "m_Ref");
+        referenced.children = vec![type_node, node("ReferencedObjectData", "data")];
+        let schema = compile(record("Base", vec![referenced]), &[managed_type]);
+
+        let resolved = UnityValue::Object(IndexMap::from([
+            (
+                "type".to_owned(),
+                UnityValue::Object(IndexMap::from([
+                    ("class".to_owned(), UnityValue::String("C".to_owned())),
+                    ("ns".to_owned(), UnityValue::String("N".to_owned())),
+                    ("asm".to_owned(), UnityValue::String("A".to_owned())),
+                ])),
+            ),
+            (
+                "data".to_owned(),
+                UnityValue::Object(IndexMap::from([(
+                    "m_Value".to_owned(),
+                    UnityValue::Integer(7),
+                )])),
+            ),
+        ]));
+        let bytes = encode(
+            &schema,
+            IndexMap::from([("m_Ref".to_owned(), resolved)]),
+            Endian::Little,
+        )
+        .unwrap();
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(&bytes[24..], &[7, 0, 0, 0]);
+
+        let empty = UnityValue::Object(IndexMap::from([(
+            "type".to_owned(),
+            UnityValue::Object(IndexMap::from([
+                ("class".to_owned(), UnityValue::String(String::new())),
+                ("ns".to_owned(), UnityValue::String(String::new())),
+                ("asm".to_owned(), UnityValue::String(String::new())),
+            ])),
+        )]));
+        assert_eq!(
+            encode(
+                &schema,
+                IndexMap::from([("m_Ref".to_owned(), empty)]),
+                Endian::Little,
+            )
+            .unwrap(),
+            [0_u8; 12]
         );
 
-        let mut out = BinaryWriter::new(Endian::Little);
-        writer_impl
-            .write_object_with_original_bytes(
-                &mut out,
-                &props,
-                original_bytes.as_slice(),
-                TypeTreeWriteOptions::default(),
+        let unresolved = UnityValue::Object(IndexMap::from([(
+            "type".to_owned(),
+            UnityValue::Object(IndexMap::from([
+                ("class".to_owned(), UnityValue::String("Missing".to_owned())),
+                ("ns".to_owned(), UnityValue::String("N".to_owned())),
+                ("asm".to_owned(), UnityValue::String("A".to_owned())),
+            ])),
+        )]));
+        assert!(
+            encode(
+                &schema,
+                IndexMap::from([("m_Ref".to_owned(), unresolved)]),
+                Endian::Little,
             )
-            .unwrap();
-
-        assert_eq!(&out.bytes()[4..8], &original_bytes[4..8]);
-
-        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
-        let serializer = TypeTreeSerializer::new(&tree);
-        let parsed = serializer.parse_object(&mut reader).unwrap();
-        assert_eq!(parsed.get("m_A"), Some(&UnityValue::Integer(10)));
-        assert_eq!(parsed.get("m_B"), Some(&UnityValue::Integer(20)));
+            .is_err()
+        );
     }
 
     #[test]
-    fn template_write_preserves_unnamed_nested_children() {
-        let mut root = node("TestObject", "Base");
+    fn duplicate_managed_registry_requires_no_property_and_writes_no_bytes() {
+        let mut first = node("ManagedReferencesRegistry", "first");
+        first.children.push(node("UInt8", "value"));
+        let mut duplicate = node("ManagedReferencesRegistry", "duplicate");
+        duplicate.children.push(node("UInt8", "ignored"));
+        let schema = compile(record("Base", vec![first, duplicate]), &[]);
+        let properties = IndexMap::from([(
+            "first".to_owned(),
+            UnityValue::Object(IndexMap::from([(
+                "value".to_owned(),
+                UnityValue::Integer(9),
+            )])),
+        )]);
 
-        let mut foo = node("Foo", "m_Foo");
-        foo.children.push(node("int", "x"));
-        foo.children.push(node("int", ""));
-        foo.children.push(node("int", "y"));
-        root.children.push(foo);
-
-        let mut tree = TypeTree::new();
-        tree.add_node(root);
-
-        let mut original_w = BinaryWriter::new(Endian::Little);
-        original_w.write_i32(1);
-        original_w.write_i32(77);
-        original_w.write_i32(2);
-        let original_bytes = original_w.into_result().unwrap();
-
-        let mut foo_obj = IndexMap::new();
-        foo_obj.insert("x".to_string(), UnityValue::Integer(10));
-        foo_obj.insert("y".to_string(), UnityValue::Integer(20));
-        let mut props = IndexMap::new();
-        props.insert("m_Foo".to_string(), UnityValue::Object(foo_obj));
-
-        let writer_impl = TypeTreeWriter::new(&tree);
-        let mut out = BinaryWriter::new(Endian::Little);
-        writer_impl
-            .write_object_with_original_bytes(
-                &mut out,
-                &props,
-                original_bytes.as_slice(),
-                TypeTreeWriteOptions::default(),
-            )
-            .unwrap();
-
-        assert_eq!(&out.bytes()[4..8], &original_bytes[4..8]);
-
-        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
-        let serializer = TypeTreeSerializer::new(&tree);
-        let parsed = serializer.parse_object(&mut reader).unwrap();
-        let foo_parsed = parsed.get("m_Foo").and_then(|v| v.as_object()).unwrap();
-        assert_eq!(foo_parsed.get("x"), Some(&UnityValue::Integer(10)));
-        assert_eq!(foo_parsed.get("y"), Some(&UnityValue::Integer(20)));
+        assert_eq!(encode(&schema, properties, Endian::Little).unwrap(), [9]);
     }
 
     #[test]
-    fn write_pptr_accepts_fileid_pathid_aliases() {
-        let mut root = node("TestObject", "Base");
+    fn bytes_are_only_accepted_for_i8_and_u8_sequences() {
+        let bytes_schema = compile(
+            record("Base", vec![sequence("m_Data", node("UInt8", "data"))]),
+            &[],
+        );
+        let properties = IndexMap::from([("m_Data".to_owned(), UnityValue::Bytes(vec![1, 2, 3]))]);
+        assert_eq!(
+            encode(&bytes_schema, properties, Endian::Little).unwrap(),
+            [3, 0, 0, 0, 1, 2, 3]
+        );
 
-        let mut tex = node("PPtr<Texture2D>", "m_Tex");
-        tex.children.push(node("int", "m_FileID"));
-        tex.children.push(node("long long", "m_PathID"));
-        root.children.push(tex);
-
-        let mut tree = TypeTree::new();
-        tree.add_node(root);
-
-        let mut pptr = IndexMap::new();
-        pptr.insert("fileID".to_string(), UnityValue::Integer(0));
-        pptr.insert("pathID".to_string(), UnityValue::Integer(1234));
-
-        let mut props = IndexMap::new();
-        props.insert("m_Tex".to_string(), UnityValue::Object(pptr));
-
-        let writer_impl = TypeTreeWriter::new(&tree);
-        let mut out = BinaryWriter::new(Endian::Little);
-        writer_impl
-            .write_object(&mut out, &props, TypeTreeWriteOptions::default())
-            .unwrap();
-
-        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
-        let serializer = TypeTreeSerializer::new(&tree);
-        let parsed = serializer.parse_object(&mut reader).unwrap();
-        let tex = parsed.get("m_Tex").and_then(|v| v.as_object()).unwrap();
-        assert_eq!(tex.get("m_FileID"), Some(&UnityValue::Integer(0)));
-        assert_eq!(tex.get("m_PathID"), Some(&UnityValue::Integer(1234)));
-    }
-
-    #[test]
-    fn write_pptr_accepts_null_as_zero_ptr() {
-        let mut root = node("TestObject", "Base");
-
-        let mut tex = node("PPtr<Texture2D>", "m_Tex");
-        tex.children.push(node("int", "m_FileID"));
-        tex.children.push(node("long long", "m_PathID"));
-        root.children.push(tex);
-
-        let mut tree = TypeTree::new();
-        tree.add_node(root);
-
-        let mut props = IndexMap::new();
-        props.insert("m_Tex".to_string(), UnityValue::Null);
-
-        let writer_impl = TypeTreeWriter::new(&tree);
-        let mut out = BinaryWriter::new(Endian::Little);
-        writer_impl
-            .write_object(&mut out, &props, TypeTreeWriteOptions::default())
-            .unwrap();
-
-        let mut reader = BinaryReader::new(out.bytes(), ByteOrder::Little);
-        let serializer = TypeTreeSerializer::new(&tree);
-        let parsed = serializer.parse_object(&mut reader).unwrap();
-        let tex = parsed.get("m_Tex").and_then(|v| v.as_object()).unwrap();
-        assert_eq!(tex.get("m_FileID"), Some(&UnityValue::Integer(0)));
-        assert_eq!(tex.get("m_PathID"), Some(&UnityValue::Integer(0)));
+        let words_schema = compile(
+            record("Base", vec![sequence("m_Data", node("UInt16", "data"))]),
+            &[],
+        );
+        let properties = IndexMap::from([("m_Data".to_owned(), UnityValue::Bytes(vec![1, 2, 3]))]);
+        assert!(encode(&words_schema, properties, Endian::Little).is_err());
     }
 }

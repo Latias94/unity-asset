@@ -222,14 +222,20 @@ impl Environment {
                 };
 
                 // First, try TypeTree extraction when available.
-                if object.file().enable_type_tree
-                    && let Ok(parsed) = obj_ref.read()
-                {
-                    let extracted =
-                        self.extract_assetbundle_container_from_typetree(&obj_ref, &parsed);
-                    if !extracted.is_empty() {
-                        out.extend(extracted);
-                        continue;
+                if object.file().type_tree_enabled() {
+                    match obj_ref.read(budget) {
+                        Ok(parsed) => {
+                            let extracted =
+                                self.extract_assetbundle_container_from_typetree(&obj_ref, &parsed);
+                            if !extracted.is_empty() {
+                                out.extend(extracted);
+                                continue;
+                            }
+                        }
+                        Err(error) if super::pptr::is_resource_error(&error) => {
+                            return Err(error);
+                        }
+                        Err(_) => {}
                     }
                 }
 

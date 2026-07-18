@@ -52,9 +52,6 @@ impl Texture2DConverter {
         fn as_u32(v: &UnityValue) -> Option<u32> {
             v.as_i64().and_then(|n| u32::try_from(n).ok())
         }
-        fn as_u64(v: &UnityValue) -> Option<u64> {
-            v.as_i64().and_then(|n| u64::try_from(n).ok())
-        }
         fn as_f32(v: &UnityValue) -> Option<f32> {
             v.as_f64().map(|n| n as f32)
         }
@@ -157,7 +154,10 @@ impl Texture2DConverter {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            texture.stream_info.offset = stream_obj.get("offset").and_then(as_u64).unwrap_or(0);
+            texture.stream_info.offset = stream_obj
+                .get("offset")
+                .and_then(UnityValue::as_u64)
+                .unwrap_or(0);
             texture.stream_info.size = stream_obj.get("size").and_then(as_u32).unwrap_or(0);
         }
 

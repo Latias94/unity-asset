@@ -14,8 +14,9 @@
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use unity_asset_binary::file::{UnityFile, load_unity_file};
+use unity_asset_binary::file::{UnityFile, load_unity_file_with_budget};
 use unity_asset_binary::typetree::JsonTypeTreeRegistry;
+use unity_asset_core::AssetLoadBudget;
 
 #[derive(Debug, Serialize)]
 struct Dump {
@@ -37,7 +38,8 @@ fn main() -> unity_asset_binary::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("tests/samples/banner_1"));
 
-    let mut file = load_unity_file(&path)?;
+    let mut budget = AssetLoadBudget::default();
+    let mut file = load_unity_file_with_budget(&path, &mut budget)?;
     let sf = match &mut file {
         UnityFile::SerializedFile(sf) => sf,
         UnityFile::AssetBundle(bundle) => bundle.assets.get_mut(0).ok_or_else(|| {
@@ -57,7 +59,7 @@ fn main() -> unity_asset_binary::Result<()> {
     let path_id = texture.path_id();
 
     let type_tree = sf
-        .types
+        .types()
         .iter()
         .find(|t| t.class_id == 28)
         .ok_or_else(|| unity_asset_binary::BinaryError::invalid_data("no Texture2D type"))?
@@ -71,12 +73,12 @@ fn main() -> unity_asset_binary::Result<()> {
         "peek_name (typetree): {}",
         sf.find_object_handle(path_id)
             .ok_or_else(|| unity_asset_binary::BinaryError::invalid_data("object not found"))?
-            .peek_name()?
+            .peek_name(&mut budget)?
             .unwrap_or_default()
     );
 
-    sf.enable_type_tree = false;
-    for t in sf.types.iter_mut() {
+    sf.set_type_tree_enabled(false);
+    for t in sf.types_mut().iter_mut() {
         t.type_tree.clear();
     }
     sf.set_type_tree_registry(None);
@@ -84,7 +86,7 @@ fn main() -> unity_asset_binary::Result<()> {
     let stripped = sf
         .find_object_handle(path_id)
         .ok_or_else(|| unity_asset_binary::BinaryError::invalid_data("object not found"))?
-        .peek_name()?;
+        .peek_name(&mut budget)?;
     println!("peek_name (stripped): {:?}", stripped);
 
     let tmp = tempfile::tempdir().map_err(|e| {
@@ -103,19 +105,19 @@ fn main() -> unity_asset_binary::Result<()> {
         unity_asset_binary::BinaryError::generic(format!("Failed to write registry JSON: {}", e))
     })?;
 
-    let registry = JsonTypeTreeRegistry::from_path(&reg_path)?;
+    let registry = JsonTypeTreeRegistry::from_path(&reg_path, &mut budget)?;
     sf.set_type_tree_registry(Some(Arc::new(registry)));
 
     let restored = sf
         .find_object_handle(path_id)
         .ok_or_else(|| unity_asset_binary::BinaryError::invalid_data("object not found"))?
-        .peek_name()?;
+        .peek_name(&mut budget)?;
     println!("peek_name (registry): {:?}", restored);
 
     let obj = sf
         .find_object_handle(path_id)
         .ok_or_else(|| unity_asset_binary::BinaryError::invalid_data("object not found"))?
-        .read()?;
+        .read(&mut budget)?;
     let w = obj.get("m_Width").and_then(|v| v.as_i64());
     let h = obj.get("m_Height").and_then(|v| v.as_i64());
     println!("parsed dimensions: width={:?} height={:?}", w, h);

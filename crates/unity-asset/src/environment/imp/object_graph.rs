@@ -411,7 +411,11 @@ impl EnvironmentObjectGraph {
 use super::yaml_pptr::{YamlPptrRef, scan_yaml_pptrs};
 
 impl Environment {
-    pub fn build_object_graph(&self, options: ObjectGraphBuildOptions) -> EnvironmentObjectGraph {
+    pub fn build_object_graph(
+        &self,
+        options: ObjectGraphBuildOptions,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<EnvironmentObjectGraph> {
         use std::collections::{HashMap, HashSet};
 
         let mut nodes_set: HashSet<EnvironmentObjectKey> = HashSet::new();
@@ -423,7 +427,7 @@ impl Environment {
             HashMap::new();
 
         if options.include_binary {
-            let graph = self.build_dependency_graph(options.binary);
+            let graph = self.build_dependency_graph(options.binary, budget)?;
             for node in graph.nodes() {
                 nodes_set.insert(EnvironmentObjectKey::Binary(node.clone()));
             }
@@ -562,11 +566,11 @@ impl Environment {
         let mut nodes: Vec<EnvironmentObjectKey> = nodes_set.into_iter().collect();
         nodes.sort_by_key(|a| a.to_string());
 
-        EnvironmentObjectGraph {
+        Ok(EnvironmentObjectGraph {
             nodes,
             internal_from,
             internal_to,
             external_from,
-        }
+        })
     }
 }

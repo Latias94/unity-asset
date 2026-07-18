@@ -22,9 +22,9 @@ fn main() -> unity_asset::Result<()> {
         .unwrap_or_else(|| "Assets/".to_string());
 
     let mut env = Environment::new();
-    env.load_file(&input)?;
-
-    let graph = env.build_dependency_graph(DependencyGraphBuildOptions::default());
+    let mut budget = AssetLoadBudget::default();
+    env.load_file(&input, &mut budget)?;
+    let graph = env.build_dependency_graph(DependencyGraphBuildOptions::default(), &mut budget)?;
 
     println!("nodes={}", graph.nodes().len());
     println!("internal_edges={}", graph.internal_edge_count());
@@ -35,9 +35,8 @@ fn main() -> unity_asset::Result<()> {
     );
     println!("warnings={}", graph.warnings().len());
     // Rebuilding should reuse cached scans internally.
-    let _ = env.build_dependency_graph(DependencyGraphBuildOptions::default());
+    let _ = env.build_dependency_graph(DependencyGraphBuildOptions::default(), &mut budget)?;
 
-    let mut budget = AssetLoadBudget::default();
     let roots: Vec<_> = env.bundle_container_root_keys(&pattern, Some(16), &mut budget)?;
 
     if roots.is_empty() {

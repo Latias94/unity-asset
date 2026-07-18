@@ -19,9 +19,8 @@ fn main() -> unity_asset::Result<()> {
         .unwrap_or_else(|| "Assets/".to_string());
 
     let mut env = Environment::new();
-    env.load(&path)?;
-
     let mut budget = AssetLoadBudget::default();
+    env.load(&path, &mut budget)?;
     let mut entries = env.find_binary_object_keys_in_bundle_container(&pattern, &mut budget)?;
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -30,7 +29,10 @@ fn main() -> unity_asset::Result<()> {
     println!("matches: {}", entries.len());
 
     for (asset_path, key) in entries.into_iter().take(20) {
-        let name = env.peek_binary_object_name(&key).ok().flatten();
+        let name = env
+            .peek_binary_object_name(&key, &mut budget)
+            .ok()
+            .flatten();
         println!(
             "{} -> source={} path_id={} name={}",
             asset_path,

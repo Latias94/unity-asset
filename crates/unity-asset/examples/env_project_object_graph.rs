@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use unity_asset::AssetLoadBudget;
 use unity_asset::environment::{
     Environment, ObjectGraphBuildOptions, ObjectGraphTraversalOptions, ProjectLoadOptions,
 };
@@ -27,7 +28,8 @@ fn main() -> unity_asset::Result<()> {
     };
 
     let mut env = Environment::new();
-    let stats = env.load_project(&root, options)?;
+    let mut budget = AssetLoadBudget::default();
+    let stats = env.load_project(&root, options, &mut budget)?;
 
     eprintln!(
         "load_project: visited={} loaded={} yaml_loaded={} binary_loaded={} meta_seen={} meta_indexed={}",
@@ -39,11 +41,14 @@ fn main() -> unity_asset::Result<()> {
         stats.meta_guids_indexed
     );
 
-    let graph = env.build_object_graph(ObjectGraphBuildOptions {
-        include_yaml: load_yaml,
-        include_binary: true,
-        ..ObjectGraphBuildOptions::default()
-    });
+    let graph = env.build_object_graph(
+        ObjectGraphBuildOptions {
+            include_yaml: load_yaml,
+            include_binary: true,
+            ..ObjectGraphBuildOptions::default()
+        },
+        &mut budget,
+    )?;
 
     let internal_edges: usize = graph
         .nodes()

@@ -239,6 +239,45 @@ fn test_yaml_document_serialization() {
     println!("YamlDocument YAML:\n{}", yaml_content);
 }
 
+#[test]
+fn yaml_document_preserves_u64_max_exactly() {
+    let mut doc = YamlDocument::new();
+    let mut class = UnityClass::new(114, "MonoBehaviour".to_string(), "123".to_string());
+    class.set("m_StreamOffset".to_string(), UnityValue::from(u64::MAX));
+    doc.add_entry(class);
+
+    let yaml = doc.dump_yaml().unwrap();
+    assert!(yaml.contains(&format!("m_StreamOffset: {}", u64::MAX)));
+
+    let classes = SerdeUnityLoader::new().load_from_str(&yaml).unwrap();
+    assert_eq!(
+        classes[0].get("m_StreamOffset"),
+        Some(&UnityValue::Unsigned(u64::MAX))
+    );
+}
+
+#[test]
+fn unsigned_values_remain_simple_inline_scalars() {
+    let mut class = UnityClass::new(114, "MonoBehaviour".to_string(), "123".to_string());
+    class.set(
+        "m_Offsets".to_string(),
+        UnityValue::Array(vec![UnityValue::Unsigned(u64::MAX)]),
+    );
+    class.set(
+        "m_StreamData".to_string(),
+        UnityValue::Object(indexmap::indexmap! {
+            "offset".to_string() => UnityValue::Unsigned(u64::MAX),
+        }),
+    );
+
+    let yaml = UnityYamlSerializer::new()
+        .serialize_to_string(&[class])
+        .unwrap();
+
+    assert!(yaml.contains(&format!("m_Offsets: [{}]", u64::MAX)));
+    assert!(yaml.contains(&format!("m_StreamData: {{offset: {}}}", u64::MAX)));
+}
+
 /// Test serialization with special characters and edge cases
 #[test]
 fn test_serialize_special_cases() {

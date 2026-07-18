@@ -14,6 +14,8 @@ pub enum UnityValue {
     Null,
     Bool(bool),
     Integer(i64),
+    /// An unsigned integer that cannot be represented by [`Self::Integer`].
+    Unsigned(u64),
     Float(f64),
     String(String),
     Array(Vec<UnityValue>),
@@ -40,6 +42,16 @@ impl UnityValue {
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             UnityValue::Integer(i) => Some(*i),
+            UnityValue::Unsigned(i) => i64::try_from(*i).ok(),
+            _ => None,
+        }
+    }
+
+    /// Get as an unsigned integer without losing range information.
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            UnityValue::Integer(i) => u64::try_from(*i).ok(),
+            UnityValue::Unsigned(i) => Some(*i),
             _ => None,
         }
     }
@@ -49,6 +61,7 @@ impl UnityValue {
         match self {
             UnityValue::Float(f) => Some(*f),
             UnityValue::Integer(i) => Some(*i as f64),
+            UnityValue::Unsigned(i) => Some(*i as f64),
             _ => None,
         }
     }
@@ -100,6 +113,7 @@ impl fmt::Display for UnityValue {
             UnityValue::Null => write!(f, "null"),
             UnityValue::Bool(b) => write!(f, "{}", b),
             UnityValue::Integer(i) => write!(f, "{}", i),
+            UnityValue::Unsigned(i) => write!(f, "{}", i),
             UnityValue::Float(fl) => write!(f, "{}", fl),
             UnityValue::String(s) => write!(f, "{}", s),
             UnityValue::Array(arr) => {
@@ -143,6 +157,14 @@ impl From<i32> for UnityValue {
 impl From<i64> for UnityValue {
     fn from(i: i64) -> Self {
         UnityValue::Integer(i)
+    }
+}
+
+impl From<u64> for UnityValue {
+    fn from(i: u64) -> Self {
+        i64::try_from(i)
+            .map(UnityValue::Integer)
+            .unwrap_or(UnityValue::Unsigned(i))
     }
 }
 
@@ -222,5 +244,18 @@ mod tests {
 
         let val = UnityValue::Bool(true);
         assert_eq!(format!("{}", val), "true");
+    }
+
+    #[test]
+    fn unsigned_values_above_i64_max_round_trip_without_sign_loss() {
+        let value = UnityValue::Unsigned(u64::MAX);
+
+        assert_eq!(value.as_u64(), Some(u64::MAX));
+        assert_eq!(format!("{value}"), u64::MAX.to_string());
+
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert_eq!(encoded, u64::MAX.to_string());
+        assert_eq!(serde_json::from_str::<UnityValue>(&encoded).unwrap(), value);
+        assert_eq!(UnityValue::from(42_u64), UnityValue::Integer(42));
     }
 }

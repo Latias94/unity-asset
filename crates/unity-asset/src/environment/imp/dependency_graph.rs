@@ -503,6 +503,7 @@ impl Environment {
         source_kind: BinarySourceKind,
         asset_index: Option<usize>,
         options: DependencyGraphBuildOptions,
+        budget: &mut AssetLoadBudget,
     ) -> Result<EnvironmentDependencyGraph> {
         let file = match source_kind {
             BinarySourceKind::SerializedFile => {
@@ -535,29 +536,34 @@ impl Environment {
             }
         };
 
-        Ok(self.build_dependency_graph_from_files(
+        self.build_dependency_graph_from_files(
             vec![(source, source_kind, asset_index, file)],
             options,
-        ))
+            budget,
+        )
     }
 
-    fn dependency_scan_cached(&self, obj_ref: &BinaryObjectRef<'_>) -> CachedScanEntry {
+    fn dependency_scan_cached(
+        &self,
+        obj_ref: &BinaryObjectRef<'_>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<CachedScanEntry> {
         let key = obj_ref.key();
         match self.dependency_scan_cache.read() {
             Ok(cache) => {
                 if let Some(v) = cache.get(&key) {
-                    return v.clone();
+                    return Ok(v.clone());
                 }
             }
             Err(e) => {
                 let cache = e.into_inner();
                 if let Some(v) = cache.get(&key) {
-                    return v.clone();
+                    return Ok(v.clone());
                 }
             }
         }
 
-        let computed = match obj_ref.object.scan_pptrs() {
+        let computed = match obj_ref.object.scan_pptrs(budget) {
             Ok(Some(mut scan)) => {
                 scan.internal.sort_unstable();
                 scan.internal.dedup();
@@ -569,6 +575,12 @@ impl Environment {
                 }))
             }
             Ok(None) => CachedScanEntry::Value(None),
+            Err(e) if e.is_resource_error() => {
+                return Err(UnityAssetError::with_source(
+                    "TypeTree dependency scan exhausted its load budget",
+                    e,
+                ));
+            }
             Err(e) => CachedScanEntry::Error(format!("scan_pptrs failed: {}", e)),
         };
 
@@ -581,13 +593,14 @@ impl Environment {
             }
         }
 
-        computed
+        Ok(computed)
     }
 
     pub fn build_dependency_graph(
         &self,
         options: DependencyGraphBuildOptions,
-    ) -> EnvironmentDependencyGraph {
+        budget: &mut AssetLoadBudget,
+    ) -> Result<EnvironmentDependencyGraph> {
         let mut sources: Vec<(
             &BinarySource,
             BinarySourceKind,
@@ -608,7 +621,7 @@ impl Environment {
             }
         }
 
-        self.build_dependency_graph_from_files(sources, options)
+        self.build_dependency_graph_from_files(sources, options, budget)
     }
 
     fn build_dependency_graph_from_files(
@@ -620,7 +633,8 @@ impl Environment {
             &SerializedFile,
         )>,
         options: DependencyGraphBuildOptions,
-    ) -> EnvironmentDependencyGraph {
+        budget: &mut AssetLoadBudget,
+    ) -> Result<EnvironmentDependencyGraph> {
         let mut nodes: Vec<BinaryObjectKey> = Vec::new();
         let mut internal_from: std::collections::HashMap<BinaryObjectKey, Vec<BinaryObjectKey>> =
             std::collections::HashMap::new();
@@ -670,7 +684,7 @@ impl Environment {
                     reporter: self.reporter.clone(),
                 };
 
-                let scan_entry = self.dependency_scan_cached(&obj_ref);
+                let scan_entry = self.dependency_scan_cached(&obj_ref, budget)?;
                 let scan = match scan_entry {
                     CachedScanEntry::Value(Some(v)) => v,
                     CachedScanEntry::Value(None) => {
@@ -804,12 +818,12 @@ impl Environment {
             });
         }
 
-        EnvironmentDependencyGraph {
+        Ok(EnvironmentDependencyGraph {
             nodes,
             internal_from,
             internal_to,
             external_from,
             warnings,
-        }
+        })
     }
 }

@@ -1492,7 +1492,7 @@ impl SearchIndex {
                 };
                 hit.contexts = extract_reference_contexts_from_yaml(&text, &guid, file_id);
             } else {
-                hit.contexts = extract_reference_contexts_from_binary(&abs, &guid, file_id);
+                hit.contexts = extract_reference_contexts_from_binary(&abs, &guid, file_id)?;
             }
             let (contexts, objects) = group_reference_contexts_and_objects(
                 std::mem::take(&mut hit.contexts),
@@ -3407,6 +3407,15 @@ fn extract_unity_binary_extraction(
     file: &ScannedFile,
     options: SearchIndexOptions,
 ) -> Result<Option<BinaryExtraction>> {
+    let mut budget = AssetLoadBudget::default();
+    extract_unity_binary_extraction_with_budget(file, options, &mut budget)
+}
+
+fn extract_unity_binary_extraction_with_budget(
+    file: &ScannedFile,
+    options: SearchIndexOptions,
+    budget: &mut AssetLoadBudget,
+) -> Result<Option<BinaryExtraction>> {
     let prefix = read_prefix(&file.abs_path, 256).unwrap_or_default();
     let kind = unity_asset_binary::file::sniff_unity_file_kind_prefix(&prefix);
     let Some(kind) = kind else {
@@ -3417,12 +3426,12 @@ fn extract_unity_binary_extraction(
         .map(|g| normalize_guid_string(&g))
         .filter(|g| !g.is_empty());
 
-    let mut budget = AssetLoadBudget::default();
     let unity_file =
-        unity_asset_binary::file::load_unity_file_with_budget(&file.abs_path, &mut budget);
-    let Ok(unity_file) = unity_file else {
-        return Ok(None);
-    };
+        match unity_asset_binary::file::load_unity_file_with_budget(&file.abs_path, budget) {
+            Ok(unity_file) => unity_file,
+            Err(error) if error.is_resource_error() => return Err(error.into()),
+            Err(_) => return Ok(None),
+        };
 
     let mut refs = ExtractedReferences::default();
     let mut container_asset_paths: Vec<String> = Vec::new();
@@ -3431,7 +3440,7 @@ fn extract_unity_binary_extraction(
         unity_asset_binary::file::UnityFile::SerializedFile(sf) => {
             refs = merge_refs(
                 refs,
-                extract_refs_from_serialized_file(&sf, this_guid.as_deref()),
+                extract_refs_from_serialized_file(&sf, this_guid.as_deref(), budget)?,
             );
             Ok(Some(BinaryExtraction {
                 source_kind: "SerializedFile".to_string(),
@@ -3441,7 +3450,10 @@ fn extract_unity_binary_extraction(
         }
         unity_asset_binary::file::UnityFile::AssetBundle(bundle) => {
             for asset in &bundle.assets {
-                refs = merge_refs(refs, extract_refs_from_serialized_file(asset, None));
+                refs = merge_refs(
+                    refs,
+                    extract_refs_from_serialized_file(asset, None, budget)?,
+                );
                 if refs.guids.len() >= 50_000 {
                     break;
                 }
@@ -3456,7 +3468,7 @@ fn extract_unity_binary_extraction(
                         if info.class_id() != 142 {
                             continue;
                         }
-                        let entries = match asset.assetbundle_container_raw(info, &mut budget) {
+                        let entries = match asset.assetbundle_container_raw(info, budget) {
                             Ok(entries) => entries,
                             Err(error) if error.is_resource_error() => return Err(error.into()),
                             Err(_) => continue,
@@ -3562,7 +3574,8 @@ fn merge_refs(mut a: ExtractedReferences, b: ExtractedReferences) -> ExtractedRe
 fn extract_refs_from_serialized_file(
     file: &unity_asset_binary::asset::SerializedFile,
     self_guid: Option<&str>,
-) -> ExtractedReferences {
+    budget: &mut AssetLoadBudget,
+) -> Result<ExtractedReferences> {
     const MAX_OBJECTS: usize = 20_000;
 
     let mut guids = std::collections::BTreeSet::<String>::new();
@@ -3579,8 +3592,11 @@ fn extract_refs_from_serialized_file(
 
     for info in file.objects().iter().take(MAX_OBJECTS) {
         let handle = unity_asset_binary::object::ObjectHandle::new(file, info);
-        let Ok(Some(pptrs)) = handle.scan_pptrs() else {
-            continue;
+        let pptrs = match handle.scan_pptrs(budget) {
+            Ok(Some(pptrs)) => pptrs,
+            Ok(None) => continue,
+            Err(error) if error.is_resource_error() => return Err(error.into()),
+            Err(_) => continue,
         };
 
         if let Some(self_guid) = self_guid {
@@ -3613,10 +3629,10 @@ fn extract_refs_from_serialized_file(
         }
     }
 
-    ExtractedReferences {
+    Ok(ExtractedReferences {
         guids: guids.into_iter().collect(),
         guid_fileids: guid_fileids.into_iter().collect(),
-    }
+    })
 }
 
 fn extract_unity_yaml_references(text: &str) -> ExtractedReferences {
@@ -3975,26 +3991,29 @@ fn extract_reference_contexts_from_binary(
     abs_path: &Path,
     guid: &str,
     file_id: Option<u64>,
-) -> Vec<ReferenceContext> {
+) -> Result<Vec<ReferenceContext>> {
     let guid = normalize_guid_string(guid);
     if guid.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let prefix = read_prefix(abs_path, 256).unwrap_or_default();
     let kind = unity_asset_binary::file::sniff_unity_file_kind_prefix(&prefix);
     if kind.is_none() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let self_guid = read_guid_from_meta(asset_meta_path(abs_path))
         .map(|g| normalize_guid_string(&g))
         .filter(|g| !g.is_empty());
 
-    let unity_file = unity_asset_binary::file::load_unity_file(abs_path);
-    let Ok(unity_file) = unity_file else {
-        return Vec::new();
-    };
+    let mut budget = AssetLoadBudget::default();
+    let unity_file =
+        match unity_asset_binary::file::load_unity_file_with_budget(abs_path, &mut budget) {
+            Ok(unity_file) => unity_file,
+            Err(error) if error.is_resource_error() => return Err(error.into()),
+            Err(_) => return Ok(Vec::new()),
+        };
 
     match unity_file {
         unity_asset_binary::file::UnityFile::SerializedFile(sf) => {
@@ -4003,14 +4022,20 @@ fn extract_reference_contexts_from_binary(
                 self_guid.as_deref(),
                 &guid,
                 file_id,
+                &mut budget,
             )
         }
         unity_asset_binary::file::UnityFile::AssetBundle(bundle) => {
             let mut out = Vec::new();
             for (idx, asset) in bundle.assets.iter().enumerate() {
                 let asset_name = bundle.asset_names.get(idx).cloned().unwrap_or_default();
-                let mut ctx =
-                    extract_reference_contexts_from_serialized_file(asset, None, &guid, file_id);
+                let mut ctx = extract_reference_contexts_from_serialized_file(
+                    asset,
+                    None,
+                    &guid,
+                    file_id,
+                    &mut budget,
+                )?;
                 if !asset_name.trim().is_empty() {
                     for c in &mut ctx {
                         let hint = c.field_hint.clone().unwrap_or_else(|| "PPtr".to_string());
@@ -4023,9 +4048,9 @@ fn extract_reference_contexts_from_binary(
                 }
             }
             out.truncate(20);
-            out
+            Ok(out)
         }
-        unity_asset_binary::file::UnityFile::WebFile(_) => Vec::new(),
+        unity_asset_binary::file::UnityFile::WebFile(_) => Ok(Vec::new()),
     }
 }
 
@@ -4034,7 +4059,8 @@ fn extract_reference_contexts_from_serialized_file(
     self_guid: Option<&str>,
     target_guid: &str,
     target_file_id: Option<u64>,
-) -> Vec<ReferenceContext> {
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<ReferenceContext>> {
     const MAX_OBJECTS: usize = 50_000;
     const MAX_CONTEXTS: usize = 20;
 
@@ -4054,8 +4080,11 @@ fn extract_reference_contexts_from_serialized_file(
         }
 
         let handle = unity_asset_binary::object::ObjectHandle::new(file, info);
-        let Ok(Some(pptrs)) = handle.scan_pptrs() else {
-            continue;
+        let pptrs = match handle.scan_pptrs(budget) {
+            Ok(Some(pptrs)) => pptrs,
+            Ok(None) => continue,
+            Err(error) if error.is_resource_error() => return Err(error.into()),
+            Err(_) => continue,
         };
 
         let mut matched = false;
@@ -4109,7 +4138,11 @@ fn extract_reference_contexts_from_serialized_file(
 
         let doc_file_id = u64::try_from(handle.path_id()).ok();
         let doc_class_id = u32::try_from(handle.class_id()).ok();
-        let object_name = handle.peek_name().ok().flatten();
+        let object_name = match handle.peek_name(budget) {
+            Ok(name) => name,
+            Err(error) if error.is_resource_error() => return Err(error.into()),
+            Err(_) => None,
+        };
 
         out.push(ReferenceContext {
             doc_file_id,
@@ -4122,7 +4155,7 @@ fn extract_reference_contexts_from_serialized_file(
         });
     }
 
-    out
+    Ok(out)
 }
 
 fn guess_field_hint(line: &str) -> Option<String> {
@@ -4878,6 +4911,33 @@ fn meta_path_for_asset(asset_path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_extraction_propagates_load_budget_exhaustion() {
+        let abs_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab");
+        let file = ScannedFile {
+            rel_path: "Assets/char_118_yuki.ab".to_owned(),
+            fingerprint: fingerprint_for_path(&abs_path).unwrap(),
+            name: "char_118_yuki".to_owned(),
+            kind: classify_kind(&abs_path),
+            abs_path,
+        };
+        let mut budget = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
+            max_bytes: 1,
+            ..unity_asset_core::AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        assert!(
+            extract_unity_binary_extraction_with_budget(
+                &file,
+                SearchIndexOptions::default(),
+                &mut budget,
+            )
+            .is_err()
+        );
+    }
 
     fn write_prefab(project_root: &Path, relative_path: &str, name: &str) -> PathBuf {
         let path = project_root.join(relative_path);

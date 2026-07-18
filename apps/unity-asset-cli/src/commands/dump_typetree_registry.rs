@@ -3,6 +3,7 @@ use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use unity_asset::AssetLoadBudget;
 use unity_asset_binary::typetree::TypeTree;
 
 #[derive(Debug, Serialize)]
@@ -41,8 +42,14 @@ pub(crate) fn run(
         );
     }
 
-    let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
-    load_environment_input(&mut env, &input)?;
+    let mut budget = AssetLoadBudget::default();
+    let mut env = build_environment(
+        ctx.strict,
+        ctx.show_warnings,
+        ctx.typetree_registries(),
+        &mut budget,
+    )?;
+    load_environment_input(&mut env, &input, &mut budget)?;
 
     let class_filter: Option<HashSet<i32>> = if class_id.is_empty() {
         None
@@ -64,7 +71,7 @@ pub(crate) fn run(
     }
 
     for file in files {
-        if !file.enable_type_tree {
+        if !file.type_tree_enabled() {
             continue;
         }
         let version_raw = file.unity_version.clone();
@@ -74,7 +81,7 @@ pub(crate) fn run(
             version_raw
         };
 
-        for t in &file.types {
+        for t in file.types() {
             if let Some(filter) = class_filter.as_ref() {
                 if !filter.contains(&t.class_id) {
                     continue;

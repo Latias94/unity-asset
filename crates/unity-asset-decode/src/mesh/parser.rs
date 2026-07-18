@@ -272,8 +272,8 @@ impl MeshParser {
         if let UnityValue::Object(stream_obj) = value {
             let mut stream_info = StreamingInfo::default();
 
-            if let Some(UnityValue::Integer(offset)) = stream_obj.get("offset") {
-                stream_info.offset = *offset as u64;
+            if let Some(offset) = stream_obj.get("offset").and_then(UnityValue::as_u64) {
+                stream_info.offset = offset;
             }
             if let Some(UnityValue::Integer(size)) = stream_obj.get("size") {
                 stream_info.size = *size as u32;
@@ -375,5 +375,25 @@ mod tests {
         assert_eq!(mesh.local_aabb.extent_x, 0.5);
         assert_eq!(mesh.local_aabb.extent_y, 1.0);
         assert_eq!(mesh.local_aabb.extent_z, 1.5);
+    }
+
+    #[test]
+    fn typetree_stream_offset_preserves_unsigned_range() {
+        let parser = MeshParser::default();
+        let properties = IndexMap::from([(
+            "m_StreamData".to_string(),
+            UnityValue::Object(IndexMap::from([
+                ("offset".to_string(), UnityValue::from(u64::MAX)),
+                ("size".to_string(), UnityValue::Integer(1)),
+                (
+                    "path".to_string(),
+                    UnityValue::String("archive:/CAB-a/CAB-a.resS".to_string()),
+                ),
+            ])),
+        )]);
+
+        let mesh = parser.parse_from_typetree(&properties).unwrap();
+
+        assert_eq!(mesh.stream_data.unwrap().offset, u64::MAX);
     }
 }

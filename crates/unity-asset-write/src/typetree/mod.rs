@@ -1,13 +1,13 @@
-//! TypeTree-driven writing utilities (UnityPy parity target).
-//!
-//! This module is intentionally split into small submodules so the write pipeline doesn't grow
-//! into a monolithic `lib.rs`.
+//! Canonical TypeTree writing adapters.
 
-mod context;
+mod output;
 mod primitives;
-mod referenced_object;
 mod template;
 mod writer;
 
-pub use context::TypeTreeWriteContext;
-pub use writer::{TypeTreeWriteOptions, TypeTreeWriter};
+#[cfg(test)]
+mod characterization;
+#[cfg(test)]
+mod test_support;
+
+pub(crate) use template::rewrite_object;

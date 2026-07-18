@@ -75,6 +75,17 @@ impl AssetLoadBudget {
         )
     }
 
+    /// Checks whether entries can be visited without charging usage.
+    pub fn check_entries(&self, amount: u64) -> Result<(), BudgetError> {
+        check_charge(
+            "entries",
+            self.usage.entries,
+            amount,
+            self.limits.max_entries,
+        )
+        .map(|_| ())
+    }
+
     pub fn consume_bytes(&mut self, amount: u64) -> Result<(), BudgetError> {
         charge(
             "bytes",
@@ -94,6 +105,13 @@ impl AssetLoadBudget {
     }
 
     pub fn observe_depth(&mut self, depth: u32) -> Result<(), BudgetError> {
+        self.check_depth(depth)?;
+        self.usage.max_observed_depth = self.usage.max_observed_depth.max(depth);
+        Ok(())
+    }
+
+    /// Checks a recursion depth without changing the maximum observed depth.
+    pub fn check_depth(&self, depth: u32) -> Result<(), BudgetError> {
         if depth > self.limits.max_depth {
             return Err(BudgetError::Exceeded {
                 resource: "depth",
@@ -101,7 +119,6 @@ impl AssetLoadBudget {
                 requested: u64::from(depth),
             });
         }
-        self.usage.max_observed_depth = self.usage.max_observed_depth.max(depth);
         Ok(())
     }
 
@@ -112,6 +129,17 @@ impl AssetLoadBudget {
             amount,
             self.limits.max_members,
         )
+    }
+
+    /// Checks whether collection members can be traversed without charging usage.
+    pub fn check_members(&self, amount: u64) -> Result<(), BudgetError> {
+        check_charge(
+            "members",
+            self.usage.members,
+            amount,
+            self.limits.max_members,
+        )
+        .map(|_| ())
     }
 
     /// Checks whether encoded input can be charged before it is copied or decoded.

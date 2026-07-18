@@ -9,8 +9,9 @@ use unity_asset::workspace::{
     SourceLocationKind,
 };
 use unity_asset_core::{
-    BundleMemberId, ChangeSetError, IdentityRemap, ObjectAddress, ObjectId, SourceAlias,
-    SourceFingerprint, SourceKind, SourceLocator, UnityAssetError, UnityValue, WorkspaceId,
+    AssetLoadBudget, BundleMemberId, ChangeSetError, IdentityRemap, ObjectAddress, ObjectId,
+    SourceAlias, SourceFingerprint, SourceKind, SourceLocator, UnityAssetError, UnityValue,
+    WorkspaceId,
 };
 
 fn fingerprint(kind: SourceKind, bytes: &[u8]) -> SourceFingerprint {
@@ -803,7 +804,8 @@ fn real_bundle_repack_and_relocation_preserve_the_logical_address() {
     let input = fs::canonicalize(input).unwrap();
 
     let mut environment = Environment::new();
-    environment.load_file(&input).unwrap();
+    let mut budget = AssetLoadBudget::default();
+    environment.load_file(&input, &mut budget).unwrap();
     let bundle_source = BinarySource::path(&input);
 
     let (key, old_name) = environment
@@ -814,7 +816,7 @@ fn real_bundle_repack_and_relocation_preserve_the_logical_address() {
         .find_map(|object| {
             object
                 .object
-                .peek_name()
+                .peek_name(&mut budget)
                 .ok()
                 .flatten()
                 .filter(|name| !name.is_empty())
@@ -873,7 +875,7 @@ fn real_bundle_repack_and_relocation_preserve_the_logical_address() {
 
     let new_name = format!("IDENTITY_REPACK_{old_name}");
     environment
-        .edit_binary_object_key(&key, |class| {
+        .edit_binary_object_key(&key, &mut budget, |class| {
             if let Some(value) = class.get_mut("m_Name") {
                 *value = UnityValue::String(new_name.clone());
             } else if let Some(value) = class.get_mut("name") {
@@ -893,7 +895,7 @@ fn real_bundle_repack_and_relocation_preserve_the_logical_address() {
     let output = fs::canonicalize(output_dir.join(file_name(&input))).unwrap();
 
     let mut reopened = Environment::new();
-    reopened.load_file(&output).unwrap();
+    reopened.load_file(&output, &mut budget).unwrap();
     let output_source = BinarySource::path(&output);
     let (new_member_bytes, new_asset_index) = {
         let bundle = reopened.bundles().get(&output_source).unwrap();
@@ -924,7 +926,7 @@ fn real_bundle_repack_and_relocation_preserve_the_logical_address() {
         })
         .expect("repack must preserve the local pathID")
         .object
-        .peek_name()
+        .peek_name(&mut budget)
         .unwrap()
         .unwrap();
     assert_eq!(observed_name, new_name);

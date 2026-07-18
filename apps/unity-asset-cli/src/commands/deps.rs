@@ -1,13 +1,16 @@
 use crate::fast_path;
 use crate::shared::{
-    AppContext, build_environment, cli_warn, load_environment_input, load_serialized_file_for_scan,
-    load_typetree_registry, resolve_loaded_source,
+    AppContext, build_environment_with_registry, cli_warn, load_environment_input,
+    load_serialized_file_for_scan, load_typetree_registry, resolve_loaded_source,
 };
 use anyhow::Result;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::Arc;
+use unity_asset::AssetLoadBudget;
 use unity_asset::environment::BinarySource;
 use unity_asset_binary::bundle::BundleLoadOptions;
+use unity_asset_binary::typetree::TypeTreeRegistry;
 
 #[derive(Debug, Serialize)]
 struct DepsOutput {
@@ -19,6 +22,29 @@ struct DepsOutput {
     deps: unity_asset_binary::metadata::DependencyInfo,
 }
 
+fn cached_object_name(
+    file: &unity_asset_binary::asset::SerializedFile,
+    path_id: i64,
+    cache: &mut std::collections::HashMap<i64, String>,
+    budget: &mut AssetLoadBudget,
+) -> Result<String> {
+    if let Some(name) = cache.get(&path_id) {
+        return Ok(name.clone());
+    }
+
+    let name = match file.find_object_handle(path_id) {
+        Some(handle) => match handle.peek_name(budget) {
+            Ok(Some(name)) => name,
+            Ok(None) => String::new(),
+            Err(error) if error.is_resource_error() => return Err(error.into()),
+            Err(_) => String::new(),
+        },
+        None => String::new(),
+    };
+    cache.insert(path_id, name.clone());
+    Ok(name)
+}
+
 fn deps_analyze_and_print(
     resolved_source: &BinarySource,
     source_kind: unity_asset::environment::BinarySourceKind,
@@ -27,12 +53,13 @@ fn deps_analyze_and_print(
     format: &str,
     names: bool,
     max_edges: usize,
+    budget: &mut AssetLoadBudget,
 ) -> Result<()> {
     use unity_asset_binary::metadata::DependencyAnalyzer;
 
     let objects: Vec<&unity_asset_binary::asset::ObjectInfo> = file.objects().iter().collect();
-    let mut analyzer = DependencyAnalyzer::new();
-    let deps = analyzer.analyze_dependencies_in_asset(file, &objects)?;
+    let analyzer = DependencyAnalyzer::new();
+    let deps = analyzer.analyze_dependencies_in_asset(file, &objects, budget)?;
 
     let fmt = format.to_ascii_lowercase();
     match fmt.as_str() {
@@ -74,22 +101,8 @@ fn deps_analyze_and_print(
 
             for (from, to) in deps.dependency_graph.edges.iter().take(max_edges) {
                 if names {
-                    let from_name = name_cache.get(from).cloned().unwrap_or_else(|| {
-                        let n = file
-                            .find_object_handle(*from)
-                            .and_then(|h| h.peek_name().ok().flatten())
-                            .unwrap_or_default();
-                        name_cache.insert(*from, n.clone());
-                        n
-                    });
-                    let to_name = name_cache.get(to).cloned().unwrap_or_else(|| {
-                        let n = file
-                            .find_object_handle(*to)
-                            .and_then(|h| h.peek_name().ok().flatten())
-                            .unwrap_or_default();
-                        name_cache.insert(*to, n.clone());
-                        n
-                    });
+                    let from_name = cached_object_name(file, *from, &mut name_cache, budget)?;
+                    let to_name = cached_object_name(file, *to, &mut name_cache, budget)?;
                     println!("{}({}) -> {}({})", from, from_name, to, to_name);
                 } else {
                     println!("{} -> {}", from, to);
@@ -136,10 +149,9 @@ fn deps_fast(
     names: bool,
     max_edges: usize,
     show_warnings: bool,
-    typetree_registries: &[PathBuf],
+    registry: &Option<Arc<dyn TypeTreeRegistry>>,
+    budget: &mut AssetLoadBudget,
 ) -> Result<bool> {
-    let registry = load_typetree_registry(typetree_registries)?;
-
     let kind_lc = kind.to_ascii_lowercase();
     let source_kind = match kind_lc.as_str() {
         "bundle" => unity_asset::environment::BinarySourceKind::AssetBundle,
@@ -191,8 +203,11 @@ fn deps_fast(
     match source_kind {
         unity_asset::environment::BinarySourceKind::AssetBundle => {
             let options = BundleLoadOptions::lazy();
-            let bundle = match fast_path::load_bundle_for_list(&path, options) {
+            let bundle = match unity_asset_binary::file::load_bundle_file_with_options_and_budget(
+                &path, options, budget,
+            ) {
                 Ok(v) => v,
+                Err(error) if error.is_resource_error() => return Err(error.into()),
                 Err(e) => {
                     cli_warn(
                         show_warnings,
@@ -214,8 +229,9 @@ fn deps_fast(
 
             let source_key = BinarySource::path(&path);
             let node = &asset_nodes[idx];
-            let bytes = match bundle.extract_node_data(node) {
+            let bytes = match bundle.extract_node_data_with_budget(node, budget) {
                 Ok(v) => v,
+                Err(error) if error.is_resource_error() => return Err(error.into()),
                 Err(e) => {
                     cli_warn(
                         show_warnings,
@@ -224,8 +240,10 @@ fn deps_fast(
                     return Ok(false);
                 }
             };
-            let mut file = unity_asset_binary::asset::SerializedFileParser::from_bytes(bytes)?;
-            if let Some(registry) = registry {
+            let mut file = unity_asset_binary::asset::SerializedFileParser::from_bytes_with_budget(
+                bytes, budget,
+            )?;
+            if let Some(registry) = registry.clone() {
                 file.set_type_tree_registry(Some(registry));
             }
 
@@ -237,11 +255,13 @@ fn deps_fast(
                 format,
                 names,
                 max_edges,
+                budget,
             )?;
         }
         unity_asset::environment::BinarySourceKind::SerializedFile => {
-            let mut file = match load_serialized_file_for_scan(&path) {
+            let mut file = match load_serialized_file_for_scan(&path, budget) {
                 Ok(v) => v,
+                Err(error) if error.is_resource_error() => return Err(error.into()),
                 Err(e) => {
                     cli_warn(
                         show_warnings,
@@ -250,7 +270,7 @@ fn deps_fast(
                     return Ok(false);
                 }
             };
-            if let Some(registry) = registry {
+            if let Some(registry) = registry.clone() {
                 file.set_type_tree_registry(Some(registry));
             }
 
@@ -263,6 +283,7 @@ fn deps_fast(
                 format,
                 names,
                 max_edges,
+                budget,
             )?;
         }
     }
@@ -289,7 +310,9 @@ pub(crate) fn run(
         anyhow::bail!("--asset-index only applies to --kind bundle");
     }
 
-    if let Ok(true) = deps_fast(
+    let mut budget = AssetLoadBudget::default();
+    let registry = load_typetree_registry(ctx.typetree_registries(), &mut budget)?;
+    if deps_fast(
         &input,
         &kind,
         source.as_ref(),
@@ -298,13 +321,14 @@ pub(crate) fn run(
         names,
         max_edges,
         ctx.show_warnings,
-        ctx.typetree_registries(),
-    ) {
+        &registry,
+        &mut budget,
+    )? {
         return Ok(());
     }
 
-    let mut env = build_environment(ctx.strict, ctx.show_warnings, ctx.typetree_registries())?;
-    load_environment_input(&mut env, &input)?;
+    let mut env = build_environment_with_registry(ctx.strict, ctx.show_warnings, registry);
+    load_environment_input(&mut env, &input, &mut budget)?;
 
     let source_kind = match kind_lc.as_str() {
         "bundle" => unity_asset::environment::BinarySourceKind::AssetBundle,
@@ -395,5 +419,6 @@ pub(crate) fn run(
         &format,
         names,
         max_edges,
+        &mut budget,
     )
 }

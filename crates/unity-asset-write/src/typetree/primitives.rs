@@ -1,127 +1,240 @@
-use crate::Result;
-use crate::binary_writer::BinaryWriter;
-use unity_asset_core::{UnityAssetError, UnityValue};
+use unity_asset_binary::typetree::{PrimitiveKind, SchemaNode};
+use unity_asset_core::{Result, UnityAssetError, UnityValue};
 
-pub fn write_primitive(
-    writer: &mut BinaryWriter,
-    type_name: &str,
+use super::output::TypeTreeOutput;
+use crate::binary_writer::Endian;
+
+const BULK_STACK_BYTES: usize = 4 * 1024;
+
+pub(crate) fn checked_i32_length(length: usize, label: &str) -> Result<i32> {
+    i32::try_from(length)
+        .map_err(|_| UnityAssetError::format(format!("{label} length exceeds i32: {length}")))
+}
+
+pub(crate) fn usize_to_u64(value: usize, label: &str) -> Result<u64> {
+    u64::try_from(value)
+        .map_err(|_| UnityAssetError::format(format!("{label} does not fit u64: {value}")))
+}
+
+pub(crate) fn expect_pair<'value>(
+    node: SchemaNode<'_>,
+    value: &'value UnityValue,
+) -> Result<&'value [UnityValue]> {
+    match value {
+        UnityValue::Array(values) if values.len() == 2 => Ok(values),
+        _ => Err(UnityAssetError::format(format!(
+            "TypeTree pair '{}' requires an Array with exactly two values, got {value:?}",
+            node.name()
+        ))),
+    }
+}
+
+pub(crate) fn write_primitive(
+    output: &mut TypeTreeOutput<'_>,
+    kind: PrimitiveKind,
     value: &UnityValue,
-) -> Result<bool> {
-    match type_name {
-        "SInt8" => {
-            writer.write_i8(as_i64(value, type_name)? as i8);
-            Ok(true)
+    endian: Endian,
+) -> Result<()> {
+    let (bytes, width) = encode_primitive(kind, value, endian)?;
+    output.write_scalar_bytes(&bytes[..width])
+}
+
+pub(crate) fn write_primitive_run(
+    output: &mut TypeTreeOutput<'_>,
+    kind: PrimitiveKind,
+    values: &[UnityValue],
+    endian: Endian,
+) -> Result<()> {
+    let width = usize::from(kind.width());
+    let values_per_chunk = BULK_STACK_BYTES / width;
+    let mut chunk = [0_u8; BULK_STACK_BYTES];
+
+    for values in values.chunks(values_per_chunk) {
+        let mut used = 0;
+        for value in values {
+            let (encoded, encoded_width) = encode_primitive(kind, value, endian)?;
+            debug_assert_eq!(encoded_width, width);
+            let end = used + encoded_width;
+            chunk[used..end].copy_from_slice(&encoded[..encoded_width]);
+            used = end;
         }
-        "UInt8" | "char" => {
-            writer.write_u8(as_i64(value, type_name)? as u8);
-            Ok(true)
-        }
-        "short" | "SInt16" => {
-            writer.write_i16(as_i64(value, type_name)? as i16);
-            Ok(true)
-        }
-        "unsigned short" | "UInt16" => {
-            writer.write_u16(as_i64(value, type_name)? as u16);
-            Ok(true)
-        }
-        "int" | "SInt32" => {
-            writer.write_i32(as_i64(value, type_name)? as i32);
-            Ok(true)
-        }
-        "unsigned int" | "UInt32" | "Type*" => {
-            writer.write_u32(as_i64(value, type_name)? as u32);
-            Ok(true)
-        }
-        "long long" | "SInt64" => {
-            writer.write_i64(as_i64(value, type_name)?);
-            Ok(true)
-        }
-        "unsigned long long" | "UInt64" | "FileSize" => {
-            writer.write_u64(as_u64(value, type_name)?);
-            Ok(true)
-        }
-        "float" => {
-            let f = as_f64(value, type_name)? as f32;
-            writer.write_f32(f);
-            Ok(true)
-        }
-        "double" => {
-            let f = as_f64(value, type_name)?;
-            writer.write_f64(f);
-            Ok(true)
-        }
-        "bool" => {
-            let b = match value {
-                UnityValue::Bool(v) => *v,
-                UnityValue::Integer(v) => *v != 0,
-                _ => {
-                    return Err(UnityAssetError::format(format!(
-                        "TypeTree write type mismatch: expected bool-like for {}, got {:?}",
-                        type_name, value
-                    )));
-                }
-            };
-            writer.write_bool(b);
-            Ok(true)
-        }
-        "string" => {
-            let s = match value {
-                UnityValue::String(v) => v.as_str(),
-                _ => {
-                    return Err(UnityAssetError::format(format!(
-                        "TypeTree write type mismatch: expected string for {}, got {:?}",
-                        type_name, value
-                    )));
-                }
-            };
-            writer.write_aligned_string(s)?;
-            Ok(true)
-        }
-        "TypelessData" => {
-            let bytes = match value {
-                UnityValue::Bytes(v) => v.as_slice(),
-                _ => {
-                    return Err(UnityAssetError::format(format!(
-                        "TypeTree write type mismatch: expected bytes for {}, got {:?}",
-                        type_name, value
-                    )));
-                }
-            };
-            writer.write_byte_array(bytes)?;
-            Ok(true)
-        }
-        _ => Ok(false),
+        output.write_bulk_bytes(&chunk[..used])?;
     }
+
+    Ok(())
 }
 
-fn as_i64(v: &UnityValue, type_name: &str) -> Result<i64> {
-    match v {
-        UnityValue::Integer(n) => Ok(*n),
-        UnityValue::Bool(b) => Ok(if *b { 1 } else { 0 }),
-        _ => Err(UnityAssetError::format(format!(
-            "TypeTree write type mismatch: expected integer-like for {}, got {:?}",
-            type_name, v
-        ))),
+fn encode_primitive(
+    kind: PrimitiveKind,
+    value: &UnityValue,
+    endian: Endian,
+) -> Result<([u8; 8], usize)> {
+    let mut encoded = [0_u8; 8];
+    let width = usize::from(kind.width());
+
+    match kind {
+        PrimitiveKind::Bool => {
+            let value = match value {
+                UnityValue::Bool(value) => *value,
+                _ => return Err(type_mismatch(kind, "bool", value)),
+            };
+            encoded[0] = u8::from(value);
+        }
+        PrimitiveKind::I8 => {
+            let value =
+                i8::try_from(as_i64(kind, value)?).map_err(|_| out_of_range(kind, value))?;
+            encoded[0] = value.to_ne_bytes()[0];
+        }
+        PrimitiveKind::U8 => {
+            encoded[0] =
+                u8::try_from(as_u64(kind, value)?).map_err(|_| out_of_range(kind, value))?;
+        }
+        PrimitiveKind::I16 => {
+            let value =
+                i16::try_from(as_i64(kind, value)?).map_err(|_| out_of_range(kind, value))?;
+            encoded[..width].copy_from_slice(&match endian {
+                Endian::Little => value.to_le_bytes(),
+                Endian::Big => value.to_be_bytes(),
+            });
+        }
+        PrimitiveKind::U16 => {
+            let value =
+                u16::try_from(as_u64(kind, value)?).map_err(|_| out_of_range(kind, value))?;
+            encoded[..width].copy_from_slice(&match endian {
+                Endian::Little => value.to_le_bytes(),
+                Endian::Big => value.to_be_bytes(),
+            });
+        }
+        PrimitiveKind::I32 => {
+            let value =
+                i32::try_from(as_i64(kind, value)?).map_err(|_| out_of_range(kind, value))?;
+            encoded[..width].copy_from_slice(&match endian {
+                Endian::Little => value.to_le_bytes(),
+                Endian::Big => value.to_be_bytes(),
+            });
+        }
+        PrimitiveKind::U32 => {
+            let value =
+                u32::try_from(as_u64(kind, value)?).map_err(|_| out_of_range(kind, value))?;
+            encoded[..width].copy_from_slice(&match endian {
+                Endian::Little => value.to_le_bytes(),
+                Endian::Big => value.to_be_bytes(),
+            });
+        }
+        PrimitiveKind::I64 => {
+            let value = as_i64(kind, value)?;
+            encoded[..width].copy_from_slice(&match endian {
+                Endian::Little => value.to_le_bytes(),
+                Endian::Big => value.to_be_bytes(),
+            });
+        }
+        PrimitiveKind::U64 => {
+            let value = as_u64(kind, value)?;
+            encoded[..width].copy_from_slice(&match endian {
+                Endian::Little => value.to_le_bytes(),
+                Endian::Big => value.to_be_bytes(),
+            });
+        }
+        PrimitiveKind::F32 => {
+            let source = as_f64(kind, value)?;
+            let converted = source as f32;
+            if source.is_finite() && !converted.is_finite() {
+                return Err(out_of_range(kind, value));
+            }
+            encoded[..width].copy_from_slice(&match endian {
+                Endian::Little => converted.to_le_bytes(),
+                Endian::Big => converted.to_be_bytes(),
+            });
+        }
+        PrimitiveKind::F64 => {
+            let value = as_f64(kind, value)?;
+            encoded[..width].copy_from_slice(&match endian {
+                Endian::Little => value.to_le_bytes(),
+                Endian::Big => value.to_be_bytes(),
+            });
+        }
     }
+
+    Ok((encoded, width))
 }
 
-fn as_u64(v: &UnityValue, type_name: &str) -> Result<u64> {
-    let n = as_i64(v, type_name)?;
-    u64::try_from(n).map_err(|_| {
-        UnityAssetError::format(format!(
-            "TypeTree write out of range: expected unsigned for {}, got {}",
-            type_name, n
-        ))
-    })
+fn as_i64(kind: PrimitiveKind, input: &UnityValue) -> Result<i64> {
+    if !matches!(input, UnityValue::Integer(_) | UnityValue::Unsigned(_)) {
+        return Err(type_mismatch(kind, "integer", input));
+    }
+    input.as_i64().ok_or_else(|| out_of_range(kind, input))
 }
 
-fn as_f64(v: &UnityValue, type_name: &str) -> Result<f64> {
-    match v {
-        UnityValue::Float(f) => Ok(*f),
-        UnityValue::Integer(n) => Ok(*n as f64),
-        _ => Err(UnityAssetError::format(format!(
-            "TypeTree write type mismatch: expected float-like for {}, got {:?}",
-            type_name, v
-        ))),
+fn as_u64(kind: PrimitiveKind, input: &UnityValue) -> Result<u64> {
+    if !matches!(input, UnityValue::Integer(_) | UnityValue::Unsigned(_)) {
+        return Err(type_mismatch(kind, "unsigned integer", input));
+    }
+    input.as_u64().ok_or_else(|| out_of_range(kind, input))
+}
+
+fn as_f64(kind: PrimitiveKind, value: &UnityValue) -> Result<f64> {
+    if !matches!(
+        value,
+        UnityValue::Float(_) | UnityValue::Integer(_) | UnityValue::Unsigned(_)
+    ) {
+        return Err(type_mismatch(kind, "number", value));
+    }
+    value.as_f64().ok_or_else(|| out_of_range(kind, value))
+}
+
+fn type_mismatch(
+    kind: PrimitiveKind,
+    expected: &'static str,
+    value: &UnityValue,
+) -> UnityAssetError {
+    UnityAssetError::format(format!(
+        "TypeTree write expected {expected} for {kind:?}, got {value:?}"
+    ))
+}
+
+fn out_of_range(kind: PrimitiveKind, value: &UnityValue) -> UnityAssetError {
+    UnityAssetError::format(format!(
+        "TypeTree write value {value:?} is out of range for {kind:?}"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numeric_accessors_distinguish_type_mismatch_from_range_failure() {
+        let text = UnityValue::String("1".to_owned());
+        assert!(
+            as_i64(PrimitiveKind::I64, &text)
+                .unwrap_err()
+                .to_string()
+                .contains("expected integer")
+        );
+        assert!(
+            as_u64(PrimitiveKind::U64, &text)
+                .unwrap_err()
+                .to_string()
+                .contains("expected unsigned integer")
+        );
+        assert!(
+            as_f64(PrimitiveKind::F64, &text)
+                .unwrap_err()
+                .to_string()
+                .contains("expected number")
+        );
+
+        assert!(
+            as_i64(PrimitiveKind::I64, &UnityValue::Unsigned(u64::MAX))
+                .unwrap_err()
+                .to_string()
+                .contains("out of range")
+        );
+        assert!(
+            as_u64(PrimitiveKind::U64, &UnityValue::Integer(-1))
+                .unwrap_err()
+                .to_string()
+                .contains("out of range")
+        );
     }
 }

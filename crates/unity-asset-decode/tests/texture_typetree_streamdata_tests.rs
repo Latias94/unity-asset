@@ -27,7 +27,7 @@ fn texture2d_converter_parses_streamdata_from_typetree() {
         "path".to_string(),
         UnityValue::String("archive:/CAB-abc/CAB-abc.resS".to_string()),
     );
-    stream_obj.insert("offset".to_string(), UnityValue::Integer(4096));
+    stream_obj.insert("offset".to_string(), UnityValue::from(u64::MAX));
     stream_obj.insert("size".to_string(), UnityValue::Integer(16));
     class.set("m_StreamData".to_string(), UnityValue::Object(stream_obj));
 
@@ -43,7 +43,7 @@ fn texture2d_converter_parses_streamdata_from_typetree() {
     assert_eq!(tex.height, 2);
     assert!(tex.image_data.is_empty());
     assert!(tex.is_streamed());
-    assert_eq!(tex.stream_info.offset, 4096);
+    assert_eq!(tex.stream_info.offset, u64::MAX);
     assert_eq!(tex.stream_info.size, 16);
     assert!(tex.stream_info.path.contains("CAB-abc"));
 }

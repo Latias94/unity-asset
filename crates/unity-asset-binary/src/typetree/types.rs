@@ -4,7 +4,6 @@
 //! TypeTree provides dynamic type information for Unity objects.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// A node in the Unity TypeTree
 ///
@@ -387,84 +386,4 @@ pub struct TypeTreeStatistics {
     pub primitive_count: usize,
     pub array_count: usize,
     pub string_buffer_size: usize,
-}
-
-/// Type information for Unity classes
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TypeInfo {
-    pub class_id: i32,
-    pub class_name: String,
-    pub type_tree: TypeTree,
-    pub script_type_index: Option<i16>,
-    pub script_id: [u8; 16],
-    pub old_type_hash: [u8; 16],
-}
-
-impl TypeInfo {
-    /// Create new type info
-    pub fn new(class_id: i32, class_name: String) -> Self {
-        Self {
-            class_id,
-            class_name,
-            type_tree: TypeTree::new(),
-            script_type_index: None,
-            script_id: [0; 16],
-            old_type_hash: [0; 16],
-        }
-    }
-
-    /// Check if this is a script type
-    pub fn is_script_type(&self) -> bool {
-        self.script_type_index.is_some()
-    }
-}
-
-/// Type registry for managing multiple types
-#[derive(Debug, Clone, Default)]
-pub struct TypeRegistry {
-    types: HashMap<i32, TypeInfo>,
-}
-
-impl TypeRegistry {
-    /// Create a new type registry
-    pub fn new() -> Self {
-        Self {
-            types: HashMap::new(),
-        }
-    }
-
-    /// Add a type to the registry
-    pub fn add_type(&mut self, type_info: TypeInfo) {
-        self.types.insert(type_info.class_id, type_info);
-    }
-
-    /// Get a type by class ID
-    pub fn get_type(&self, class_id: i32) -> Option<&TypeInfo> {
-        self.types.get(&class_id)
-    }
-
-    /// Get all registered class IDs
-    pub fn class_ids(&self) -> Vec<i32> {
-        self.types.keys().copied().collect()
-    }
-
-    /// Check if a class ID is registered
-    pub fn has_type(&self, class_id: i32) -> bool {
-        self.types.contains_key(&class_id)
-    }
-
-    /// Clear all types
-    pub fn clear(&mut self) {
-        self.types.clear();
-    }
-
-    /// Get the number of registered types
-    pub fn len(&self) -> usize {
-        self.types.len()
-    }
-
-    /// Check if the registry is empty
-    pub fn is_empty(&self) -> bool {
-        self.types.is_empty()
-    }
 }

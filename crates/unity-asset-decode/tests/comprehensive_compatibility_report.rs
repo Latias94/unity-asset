@@ -10,8 +10,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use unity_asset_core::AssetLoadBudget;
 use unity_asset_decode::audio::AudioCompressionFormat;
-use unity_asset_decode::bundle::load_bundle_from_memory;
+use unity_asset_decode::bundle::BundleParser;
 use unity_asset_decode::object::UnityObject;
 use unity_asset_decode::unity_version::UnityVersion;
 
@@ -40,7 +41,8 @@ fn test_comprehensive_compatibility_report() {
         println!("📁 Processing: {}", file_name);
 
         if let Ok(data) = fs::read(&file_path) {
-            match load_bundle_from_memory(data) {
+            let mut budget = AssetLoadBudget::default();
+            match BundleParser::from_bytes_with_budget(data, &mut budget) {
                 Ok(bundle) => {
                     report.successful_files += 1;
 
@@ -54,20 +56,23 @@ fn test_comprehensive_compatibility_report() {
 
                         for asset_object_info in asset.objects() {
                             report.total_objects += 1;
-                            let unity_object =
-                                UnityObject::from_serialized_file(asset, asset_object_info)
-                                    .unwrap_or_else(|_| {
-                                        let fallback_data = asset
-                                            .object_bytes(asset_object_info)
-                                            .map(|b| b.to_vec())
-                                            .unwrap_or_default();
-                                        UnityObject::from_raw(
-                                            asset_object_info.class_id(),
-                                            asset_object_info.path_id(),
-                                            fallback_data,
-                                        )
-                                        .expect("fallback object metadata should be constructible")
-                                    });
+                            let unity_object = UnityObject::from_serialized_file(
+                                asset,
+                                asset_object_info,
+                                &mut budget,
+                            )
+                            .unwrap_or_else(|_| {
+                                let fallback_data = asset
+                                    .object_bytes(asset_object_info)
+                                    .map(|b| b.to_vec())
+                                    .unwrap_or_default();
+                                UnityObject::from_raw(
+                                    asset_object_info.class_id(),
+                                    asset_object_info.path_id(),
+                                    fallback_data,
+                                )
+                                .expect("fallback object metadata should be constructible")
+                            });
 
                             let class_name = unity_object.class_name().to_string();
                             *report.object_types.entry(class_name.clone()).or_insert(0) += 1;
