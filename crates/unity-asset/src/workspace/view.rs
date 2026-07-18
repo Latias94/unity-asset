@@ -21,7 +21,11 @@ use crate::schema::SchemaProvenance;
 use crate::{BinaryError, BinaryObjectIdentityError};
 
 pub(crate) mod sealed {
-    pub trait Sealed {}
+    use super::super::ReferenceViewParts;
+
+    pub trait Sealed {
+        fn reference_view_parts(&self) -> ReferenceViewParts<'_>;
+    }
 }
 
 /// Immutable source metadata projected from one workspace revision.

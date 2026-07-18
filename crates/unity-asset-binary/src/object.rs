@@ -3,6 +3,7 @@
 use crate::asset::{ObjectInfo, SerializedFile, SerializedType};
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
+use crate::reference::BinaryReferenceScan;
 use crate::shared_bytes::SharedBytes;
 use crate::typetree::{
     PPtrScanResult, TypeTree, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput,
@@ -225,6 +226,39 @@ impl<'a> ObjectHandle<'a> {
         let bytes = self.raw_data()?;
         let mut reader = BinaryReader::new(bytes, self.file.header.byte_order());
         Ok(Some(schema.scan_pptrs(&mut reader, budget)?))
+    }
+
+    /// Scans this object's canonical TypeTree without materializing a `UnityValue` tree.
+    ///
+    /// Occurrences retain their traversal order, field paths, null pointers, and raw file IDs.
+    pub fn scan_reference_occurrences(
+        &self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Option<BinaryReferenceScan>> {
+        self.scan_reference_occurrences_with_options(
+            budget,
+            TypeTreeParseOptions {
+                mode: TypeTreeParseMode::Strict,
+            },
+        )
+    }
+
+    /// Scans this object's references under an explicit TypeTree recovery policy.
+    pub fn scan_reference_occurrences_with_options(
+        &self,
+        budget: &mut AssetLoadBudget,
+        options: TypeTreeParseOptions,
+    ) -> Result<Option<BinaryReferenceScan>> {
+        let Some(schema) = self.schema(budget)? else {
+            return Ok(None);
+        };
+        let bytes = self.raw_data()?;
+        let mut reader = BinaryReader::new(bytes, self.file.header.byte_order());
+        Ok(Some(schema.scan_reference_occurrences_with_options(
+            &mut reader,
+            budget,
+            options,
+        )?))
     }
 }
 

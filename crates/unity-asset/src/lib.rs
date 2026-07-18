@@ -100,5 +100,6 @@ pub use unity_asset_core::document::AsyncUnityDocument;
 /// Environment for managing multiple Unity assets
 pub mod environment;
 
+pub mod reference;
 pub mod schema;
 pub mod workspace;

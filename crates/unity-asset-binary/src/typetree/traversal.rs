@@ -1,5 +1,6 @@
 //! Budgeted cursor and metrics shared by TypeTree traversal adapters.
 
+use std::fmt::{self, Display};
 use std::hash::Hash;
 use std::mem::size_of;
 
@@ -379,12 +380,40 @@ impl<'reader, 'data, 'budget> TraversalCursor<'reader, 'data, 'budget> {
     /// Clones output text through the owned-byte ledger.
     pub(crate) fn clone_string(&mut self, value: &str, label: &str) -> Result<String> {
         let mut owned = String::new();
-        self.reserve_string(&mut owned, value.len())
-            .map_err(|error| {
-                BinaryError::memory_error(format!("Failed to reserve {label}: {error}"))
-            })?;
+        if let Err(error) = self.reserve_string(&mut owned, value.len()) {
+            if error.is_resource_error() {
+                return Err(error);
+            }
+            return Err(BinaryError::memory_error(format!(
+                "Failed to reserve {label}: {error}"
+            )));
+        }
         owned.push_str(value);
         Ok(owned)
+    }
+
+    /// Renders a display value directly into budgeted owned storage.
+    pub(crate) fn display_string(
+        &mut self,
+        value: &impl Display,
+        label: &'static str,
+    ) -> Result<String> {
+        let mut output = String::new();
+        let mut allocation_error = None;
+        let formatted = {
+            let mut writer = BudgetedStringWriter {
+                cursor: self,
+                output: &mut output,
+                allocation_error: &mut allocation_error,
+            };
+            fmt::write(&mut writer, format_args!("{value}"))
+        };
+        if formatted.is_err() {
+            return Err(allocation_error.unwrap_or_else(|| {
+                BinaryError::invalid_data(format!("failed to format {label}"))
+            }));
+        }
+        Ok(output)
     }
 
     fn reserve_map<K, V>(
@@ -528,6 +557,26 @@ impl<'reader, 'data, 'budget> TraversalCursor<'reader, 'data, 'budget> {
         self.budget.consume_bytes(allocation)?;
         self.stats.owned_bytes = owned_bytes;
         *accounted_capacity = target_capacity;
+        Ok(())
+    }
+}
+
+struct BudgetedStringWriter<'cursor, 'reader, 'data, 'budget> {
+    cursor: &'cursor mut TraversalCursor<'reader, 'data, 'budget>,
+    output: &'cursor mut String,
+    allocation_error: &'cursor mut Option<BinaryError>,
+}
+
+impl fmt::Write for BudgetedStringWriter<'_, '_, '_, '_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.allocation_error.is_some() {
+            return Err(fmt::Error);
+        }
+        if let Err(error) = self.cursor.reserve_string(self.output, value.len()) {
+            *self.allocation_error = Some(error);
+            return Err(fmt::Error);
+        }
+        self.output.push_str(value);
         Ok(())
     }
 }

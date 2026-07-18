@@ -74,7 +74,8 @@ See `docs/README.md` for documentation entry points, and `docs/EXAMPLES.md` for 
 - SerializedFile parsing with full object extraction
 - TypeTree structure parsing and dynamic object reading
 - Compression support (LZ4, LZMA, Brotli)
-- Metadata extraction and analysis (experimental; includes dependency graph, best-effort hierarchy/component mapping, and external reference resolution via `externals`)
+- Metadata extraction and analysis (experimental hierarchy/component mapping)
+- Revision-bound binary + YAML Reference Graph with typed paths, six-state resolution, traversal, and deterministic projections
 - Performance monitoring and basic statistics
 
 #### Editing and Repacking (Advanced, WIP)
@@ -309,9 +310,9 @@ cargo run --bin unity-asset -- inspect-object -i tests/samples --address '<oa1-a
 cargo run --bin unity-asset -- scan-pptr -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --limit 5
 cargo run --bin unity-asset -- scan-pptr -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --class-id 114 --json
 
-# Build a best-effort dependency graph via TypeTree PPtr scanning
-cargo run --bin unity-asset -- deps -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --format summary
-cargo run --bin unity-asset -- deps -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --format dot --max-edges 2000 > graph.dot
+# Build one revision-bound Reference Graph without hidden source loading
+cargo run --bin unity-asset -- deps -i tests/samples/char_118_yuki.ab --format summary
+cargo run --bin unity-asset -- deps -i tests/samples/char_118_yuki.ab --format dot --max-edges 2000 > graph.dot
 
 # Export objects from AssetBundles via `m_Container` (UnityPy-like workflow)
 cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --limit 50

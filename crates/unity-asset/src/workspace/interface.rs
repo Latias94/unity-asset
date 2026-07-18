@@ -161,6 +161,7 @@ impl SourceOpenRequest {
 pub struct AssetWorkspace {
     state: Arc<WorkspaceState>,
     config: Arc<WorkspaceConfig>,
+    reference_store: Arc<crate::reference::ReferenceStore>,
     binary: BinaryWorkspaceAdapter,
     source_registry: Option<Arc<dyn TypeTreeRegistry>>,
 }
@@ -201,6 +202,7 @@ impl AssetWorkspace {
             config: Arc::new(WorkspaceConfig {
                 typetree: options.typetree,
             }),
+            reference_store: Arc::new(crate::reference::ReferenceStore::new()),
             binary: BinaryWorkspaceAdapter::new(),
             source_registry: options.type_tree_registry,
         })
@@ -218,7 +220,11 @@ impl AssetWorkspace {
 
     #[must_use]
     pub fn snapshot(&self) -> WorkspaceSnapshot {
-        WorkspaceSnapshot::new(Arc::clone(&self.state), Arc::clone(&self.config))
+        WorkspaceSnapshot::new(
+            Arc::clone(&self.state),
+            Arc::clone(&self.config),
+            Arc::clone(&self.reference_store),
+        )
     }
 
     pub fn load_path(

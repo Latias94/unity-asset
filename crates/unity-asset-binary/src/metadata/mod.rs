@@ -8,7 +8,7 @@
 //! The module is organized into several sub-modules:
 //! - `types` - Core data structures for metadata representation
 //! - `extractor` - Main metadata extraction functionality
-//! - `analyzer` - Advanced dependency and relationship analysis
+//! - `analyzer` - GameObject and component hierarchy analysis
 //!
 //! # Examples
 //!
@@ -18,7 +18,6 @@
 //!
 //! // Create extractor with custom configuration
 //! let config = ExtractionConfig {
-//!     include_dependencies: true,
 //!     include_hierarchy: true,
 //!     max_objects: Some(1000),
 //!     include_performance: true,
@@ -38,26 +37,19 @@ pub mod extractor;
 pub mod types;
 
 // Re-export main types for easy access
-pub use analyzer::{DependencyAnalyzer, RelationshipAnalyzer};
+pub use analyzer::RelationshipAnalyzer;
 pub use extractor::MetadataExtractor;
 pub use types::{
     // Core metadata types
     AssetMetadata,
-    AssetReference,
     // Relationship types
     AssetRelationships,
     ComponentRelationship,
-    DependencyGraph,
-    // Dependency types
-    DependencyInfo,
-    ExternalObjectRef,
-    ExternalReference,
     ExtractionConfig,
     ExtractionResult,
     ExtractionStats,
     FileInfo,
     GameObjectHierarchy,
-    InternalReference,
     MemoryUsage,
     ObjectStatistics,
     ObjectSummary,
@@ -77,113 +69,6 @@ use unity_asset_core::AssetLoadBudget;
 /// combining extraction and analysis functionality.
 pub struct MetadataProcessor {
     extractor: MetadataExtractor,
-}
-
-fn apply_dependency_info_to_relationships(
-    dependencies: &DependencyInfo,
-    relationships: &mut AssetRelationships,
-) {
-    let mut by_from: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
-    for r in &dependencies.internal_references {
-        by_from.entry(r.from_object).or_default().push(r.to_object);
-    }
-    for v in by_from.values_mut() {
-        v.sort_unstable();
-        v.dedup();
-    }
-
-    let mut by_from_external: std::collections::HashMap<i64, Vec<ExternalObjectRef>> =
-        std::collections::HashMap::new();
-    for r in &dependencies.external_references {
-        let ext = ExternalObjectRef {
-            file_id: r.file_id,
-            path_id: r.path_id,
-            file_path: r.file_path.clone(),
-            guid: r.guid,
-        };
-        for from in &r.referenced_by {
-            by_from_external.entry(*from).or_default().push(ext.clone());
-        }
-    }
-    for v in by_from_external.values_mut() {
-        v.sort_by_key(|e| (e.file_id, e.path_id));
-        v.dedup_by_key(|e| (e.file_id, e.path_id));
-    }
-
-    for rel in &mut relationships.component_relationships {
-        rel.dependencies = by_from.get(&rel.component_id).cloned().unwrap_or_default();
-        rel.external_dependencies = by_from_external
-            .get(&rel.component_id)
-            .cloned()
-            .unwrap_or_default();
-    }
-
-    // Build asset reference summary (internal targets + external targets).
-    let gameobject_ids: std::collections::HashSet<i64> = relationships
-        .gameobject_hierarchy
-        .iter()
-        .map(|h| h.gameobject_id)
-        .collect();
-    let component_ids: std::collections::HashSet<i64> = relationships
-        .component_relationships
-        .iter()
-        .map(|c| c.component_id)
-        .collect();
-
-    let mut referenced_by_internal: std::collections::HashMap<i64, Vec<i64>> =
-        std::collections::HashMap::new();
-    for r in &dependencies.internal_references {
-        referenced_by_internal
-            .entry(r.to_object)
-            .or_default()
-            .push(r.from_object);
-    }
-    for v in referenced_by_internal.values_mut() {
-        v.sort_unstable();
-        v.dedup();
-    }
-
-    let mut refs: Vec<AssetReference> = Vec::new();
-
-    for (asset_id, referenced_by) in referenced_by_internal {
-        let asset_type = if gameobject_ids.contains(&asset_id) {
-            "GameObject".to_string()
-        } else if component_ids.contains(&asset_id) {
-            "Component".to_string()
-        } else {
-            "Object".to_string()
-        };
-        refs.push(AssetReference {
-            asset_id,
-            asset_type,
-            referenced_by,
-            file_path: None,
-        });
-    }
-
-    for r in &dependencies.external_references {
-        refs.push(AssetReference {
-            asset_id: r.path_id,
-            asset_type: format!("ExternalObject(file_id={})", r.file_id),
-            referenced_by: r.referenced_by.clone(),
-            file_path: r.file_path.clone(),
-        });
-    }
-
-    refs.sort_by(|a, b| {
-        // Prefer refs with known file path, then by ref count desc, then asset_id asc.
-        match (b.file_path.is_some()).cmp(&a.file_path.is_some()) {
-            std::cmp::Ordering::Equal => {}
-            ord => return ord,
-        }
-        match b.referenced_by.len().cmp(&a.referenced_by.len()) {
-            std::cmp::Ordering::Equal => {}
-            ord => return ord,
-        }
-        a.asset_id.cmp(&b.asset_id)
-    });
-
-    relationships.asset_references = refs;
 }
 
 impl MetadataProcessor {
@@ -231,8 +116,7 @@ impl MetadataProcessor {
 
     /// Check if advanced analysis is enabled
     pub fn has_advanced_analysis(&self) -> bool {
-        let config = self.extractor.config();
-        config.include_dependencies || config.include_hierarchy
+        self.extractor.config().include_hierarchy
     }
 }
 
@@ -251,7 +135,6 @@ pub fn create_processor() -> MetadataProcessor {
 /// Create a metadata processor with performance-focused configuration
 pub fn create_performance_processor() -> MetadataProcessor {
     let config = ExtractionConfig {
-        include_dependencies: false,
         include_hierarchy: false,
         max_objects: Some(1000),
         include_performance: true,
@@ -263,7 +146,6 @@ pub fn create_performance_processor() -> MetadataProcessor {
 /// Create a metadata processor with comprehensive analysis
 pub fn create_comprehensive_processor() -> MetadataProcessor {
     let config = ExtractionConfig {
-        include_dependencies: true,
         include_hierarchy: true,
         max_objects: None,
         include_performance: true,
@@ -328,7 +210,6 @@ pub fn get_recommended_config(asset: &SerializedFile) -> ExtractionConfig {
     if object_count > 10000 {
         // Large asset - performance focused
         ExtractionConfig {
-            include_dependencies: false,
             include_hierarchy: false,
             max_objects: Some(5000),
             include_performance: true,
@@ -337,7 +218,6 @@ pub fn get_recommended_config(asset: &SerializedFile) -> ExtractionConfig {
     } else if object_count > 1000 {
         // Medium asset - balanced
         ExtractionConfig {
-            include_dependencies: true,
             include_hierarchy: false,
             max_objects: Some(2000),
             include_performance: true,
@@ -350,140 +230,6 @@ pub fn get_recommended_config(asset: &SerializedFile) -> ExtractionConfig {
 }
 
 #[cfg(test)]
-mod processor_tests {
-    use super::*;
-
-    #[test]
-    fn test_apply_dependency_info_to_relationships_fills_component_dependencies() {
-        let dependencies = DependencyInfo {
-            external_references: vec![ExternalReference {
-                file_id: 2,
-                path_id: 999,
-                referenced_by: vec![11],
-                file_path: Some("library/external.assets".to_string()),
-                guid: Some([7u8; 16]),
-            }],
-            internal_references: vec![
-                InternalReference {
-                    from_object: 10,
-                    to_object: 1,
-                    reference_type: "Direct".to_string(),
-                },
-                InternalReference {
-                    from_object: 10,
-                    to_object: 2,
-                    reference_type: "Direct".to_string(),
-                },
-                InternalReference {
-                    from_object: 11,
-                    to_object: 3,
-                    reference_type: "Direct".to_string(),
-                },
-            ],
-            dependency_graph: DependencyGraph {
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                root_objects: Vec::new(),
-                leaf_objects: Vec::new(),
-            },
-            circular_dependencies: Vec::new(),
-        };
-
-        let mut relationships = AssetRelationships {
-            gameobject_hierarchy: Vec::new(),
-            component_relationships: vec![
-                ComponentRelationship {
-                    component_id: 10,
-                    component_type: "Transform".to_string(),
-                    gameobject_id: 100,
-                    dependencies: Vec::new(),
-                    external_dependencies: Vec::new(),
-                },
-                ComponentRelationship {
-                    component_id: 11,
-                    component_type: "MeshRenderer".to_string(),
-                    gameobject_id: 100,
-                    dependencies: Vec::new(),
-                    external_dependencies: Vec::new(),
-                },
-                ComponentRelationship {
-                    component_id: 12,
-                    component_type: "Unknown".to_string(),
-                    gameobject_id: 100,
-                    dependencies: Vec::new(),
-                    external_dependencies: Vec::new(),
-                },
-            ],
-            asset_references: Vec::new(),
-        };
-
-        apply_dependency_info_to_relationships(&dependencies, &mut relationships);
-
-        assert_eq!(
-            relationships.component_relationships[0].dependencies,
-            vec![1, 2]
-        );
-        assert_eq!(
-            relationships.component_relationships[1].dependencies,
-            vec![3]
-        );
-        assert_eq!(
-            relationships.component_relationships[2].dependencies,
-            Vec::<i64>::new()
-        );
-
-        assert_eq!(
-            relationships.component_relationships[0]
-                .external_dependencies
-                .len(),
-            0
-        );
-        assert_eq!(
-            relationships.component_relationships[1]
-                .external_dependencies
-                .len(),
-            1
-        );
-        assert_eq!(
-            relationships.component_relationships[1].external_dependencies[0],
-            ExternalObjectRef {
-                file_id: 2,
-                path_id: 999,
-                file_path: Some("library/external.assets".to_string()),
-                guid: Some([7u8; 16]),
-            }
-        );
-
-        let ext_ref = relationships
-            .asset_references
-            .iter()
-            .find(|r| r.asset_id == 999)
-            .expect("external asset reference exists");
-        assert_eq!(ext_ref.asset_type, "ExternalObject(file_id=2)");
-        assert_eq!(
-            ext_ref.file_path,
-            Some("library/external.assets".to_string())
-        );
-        assert_eq!(ext_ref.referenced_by, vec![11]);
-
-        let internal_ref_1 = relationships
-            .asset_references
-            .iter()
-            .find(|r| r.asset_id == 1)
-            .expect("internal asset reference 1 exists");
-        assert_eq!(internal_ref_1.file_path, None);
-        assert_eq!(internal_ref_1.referenced_by, vec![10]);
-
-        let internal_ref_3 = relationships
-            .asset_references
-            .iter()
-            .find(|r| r.asset_id == 3)
-            .expect("internal asset reference 3 exists");
-        assert_eq!(internal_ref_3.referenced_by, vec![11]);
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -491,7 +237,6 @@ mod tests {
     fn test_processor_creation() {
         let processor = create_processor();
         assert!(processor.has_advanced_analysis());
-        assert!(processor.config().include_dependencies);
         assert!(processor.config().include_hierarchy);
     }
 
@@ -499,7 +244,6 @@ mod tests {
     fn test_comprehensive_processor() {
         let processor = create_comprehensive_processor();
         assert!(processor.has_advanced_analysis());
-        assert!(processor.config().include_dependencies);
         assert!(processor.config().include_hierarchy);
     }
 
@@ -507,7 +251,6 @@ mod tests {
     fn test_performance_processor() {
         let processor = create_performance_processor();
         assert!(!processor.has_advanced_analysis());
-        assert!(!processor.config().include_dependencies);
         assert!(!processor.config().include_hierarchy);
         assert_eq!(processor.config().max_objects, Some(1000));
     }
@@ -516,7 +259,6 @@ mod tests {
     fn advanced_analysis_tracks_current_config() {
         let mut processor = create_comprehensive_processor();
         processor.set_config(ExtractionConfig {
-            include_dependencies: false,
             include_hierarchy: false,
             max_objects: None,
             include_performance: true,

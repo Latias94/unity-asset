@@ -635,11 +635,6 @@ impl Environment {
                             file.set_type_tree_registry(Some(registry.clone()));
                         }
                     }
-                    self.invalidate_dependency_scan_cache_for_source(
-                        &source,
-                        BinarySourceKind::AssetBundle,
-                        None,
-                    );
                     self.bundles.insert(source.clone(), bundle);
                     match self.bundle_container_cache.write() {
                         Ok(mut cache) => {
@@ -654,11 +649,6 @@ impl Environment {
                     if let Some(registry) = self.type_tree_registry.clone() {
                         asset.set_type_tree_registry(Some(registry));
                     }
-                    self.invalidate_dependency_scan_cache_for_source(
-                        &source,
-                        BinarySourceKind::SerializedFile,
-                        None,
-                    );
                     self.binary_assets.insert(source, asset);
                     match self.bundle_container_cache.write() {
                         Ok(mut cache) => cache.clear(),
@@ -705,7 +695,6 @@ impl Environment {
             Ok(mut cache) => cache.clear(),
             Err(error) => error.into_inner().clear(),
         }
-        self.invalidate_dependency_scan_cache();
     }
 
     /// Recursively index `.meta` GUIDs under a directory (without loading YAML/binary assets).

@@ -32,11 +32,20 @@ use super::view::{
 pub struct WorkspaceSnapshot {
     state: Arc<WorkspaceState>,
     config: Arc<WorkspaceConfig>,
+    reference_store: Arc<crate::reference::ReferenceStore>,
 }
 
 impl WorkspaceSnapshot {
-    pub(crate) fn new(state: Arc<WorkspaceState>, config: Arc<WorkspaceConfig>) -> Self {
-        Self { state, config }
+    pub(crate) fn new(
+        state: Arc<WorkspaceState>,
+        config: Arc<WorkspaceConfig>,
+        reference_store: Arc<crate::reference::ReferenceStore>,
+    ) -> Self {
+        Self {
+            state,
+            config,
+            reference_store,
+        }
     }
 
     #[must_use]
@@ -47,6 +56,14 @@ impl WorkspaceSnapshot {
     #[must_use]
     pub fn revision(&self) -> WorkspaceRevision {
         self.state.revision()
+    }
+
+    pub fn reference_graph(
+        &self,
+        options: crate::reference::ReferenceGraphBuildOptions,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<crate::reference::ReferenceGraph, crate::reference::ReferenceGraphError> {
+        crate::reference::ReferenceGraph::build(self, options, budget)
     }
 
     fn project_source(
@@ -153,7 +170,15 @@ impl fmt::Debug for WorkspaceSnapshot {
     }
 }
 
-impl view::sealed::Sealed for WorkspaceSnapshot {}
+impl view::sealed::Sealed for WorkspaceSnapshot {
+    fn reference_view_parts(&self) -> super::ReferenceViewParts<'_> {
+        super::ReferenceViewParts {
+            state: &self.state,
+            store: &self.reference_store,
+            typetree: self.config.typetree,
+        }
+    }
+}
 
 impl WorkspaceView for WorkspaceSnapshot {
     fn workspace_id(&self) -> WorkspaceId {

@@ -846,7 +846,10 @@ fn parse_plain_number(value: &str) -> Option<UnityValue> {
     if let Ok(unsigned) = value.strip_prefix('+').unwrap_or(value).parse::<u64>() {
         return Some(UnityValue::from(unsigned));
     }
-    value.parse::<f64>().ok().map(UnityValue::Float)
+    if value.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
+        return value.parse::<f64>().ok().map(UnityValue::Float);
+    }
+    None
 }
 
 fn parse_radix_number(value: &str, radix: u32) -> Option<UnityValue> {
@@ -1111,6 +1114,7 @@ GameObject:
   empty:
   signed: -42
   maximum: 18446744073709551615
+  oversizedInteger: 22222222222222222222222222222222
   quotedNull: "null"
   literal: |-
     first
@@ -1139,6 +1143,12 @@ MonoBehaviour:
             entries[0].get("maximum"),
             Some(UnityValue::Unsigned(value)) if *value == u64::MAX
         ));
+        assert_eq!(
+            entries[0]
+                .get("oversizedInteger")
+                .and_then(UnityValue::as_str),
+            Some("22222222222222222222222222222222")
+        );
         assert_eq!(
             entries[0].get("quotedNull").and_then(UnityValue::as_str),
             Some("null")

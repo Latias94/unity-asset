@@ -4,7 +4,7 @@ This repository maintains runnable examples per crate (built in CI).
 
 ## Crate Guide
 
-- `unity-asset` (library): main user-facing API. Use this if you want an `Environment` that can load YAML + binary sources and iterate objects across bundles/serialized files/webfiles.
+- `unity-asset` (library): main user-facing API. Use `AssetWorkspace` for immutable revision-bound YAML and binary inspection; legacy `Environment` remains for workflows not yet migrated.
 - Examples live in `crates/unity-asset/examples/`.
 - `unity-asset-binary` (parser): low-level binary parsers (AssetBundle / SerializedFile / WebFile) plus fast helpers (`sniff_*`, `ObjectHandle::peek_name`, `ObjectHandle::scan_pptrs`).
   - Examples live in `crates/unity-asset-binary/examples/`.
@@ -24,25 +24,14 @@ This repository maintains runnable examples per crate (built in CI).
   - `cargo run -p unity-asset --example env_load_and_list -- tests/samples`
 - Load a Unity project root (index `.meta` GUIDs + scan binaries, skip `.meta` documents by default):
   - `cargo run -p unity-asset --example env_load_and_list -- repo-ref/BoatAttack` (or use `Environment::load_project` in code)
-- Build a project-wide object graph (fast project scan + graph build):
-  - Binaries only (recommended for big projects):
-    - `cargo run -p unity-asset --example env_project_object_graph -- repo-ref/BoatAttack`
-  - Include YAML documents too (heavier):
-    - `cargo run -p unity-asset --example env_project_object_graph -- repo-ref/BoatAttack yaml`
-  - Print DOT:
-    - `cargo run -p unity-asset --example env_project_object_graph -- repo-ref/BoatAttack yaml dot > graph.dot`
+- Build and project one revision-bound Reference Graph for a source:
+  - JSON Lines: `cargo run -p unity-asset --example workspace_reference_graph -- tests/samples/char_118_yuki.ab jsonl`
+  - DOT: `cargo run -p unity-asset --example workspace_reference_graph -- tests/samples/char_118_yuki.ab dot > graph.dot`
+- Build a project Reference Graph with deterministic discovery:
+  - Binaries and `.meta`: `cargo run --bin unity-asset -- project-graph -i repo-ref/BoatAttack --format summary`
+  - Include YAML documents: `cargo run --bin unity-asset -- project-graph -i repo-ref/BoatAttack --yaml --format jsonl`
 - Bundle container lookup (UnityPy-like discovery):
   - `cargo run -p unity-asset --example env_container_lookup -- tests/samples Assets/`
-- Build an Environment-wide dependency graph (TypeTree required for edges):
-  - `cargo run -p unity-asset --example env_dependency_graph -- tests/samples/char_118_yuki.ab "Assets/*"`
-  - Print DOT (includes resolved external edges):
-    - `cargo run -p unity-asset --example env_dependency_graph -- tests/samples/char_118_yuki.ab "Assets/*" dot > graph.dot`
-  - Incremental rebuild (core API):
-    - Use `Environment::build_dependency_graph_for_source` plus `Environment::invalidate_dependency_scan_cache_for_source` when reloading a single bundle entry.
-- Build a unified object graph (YAML + binary, best-effort resolution):
-  - `cargo run -p unity-asset --example env_object_graph -- crates/unity-asset-yaml/tests/fixtures/MinimalGameObjectTransform.prefab`
-  - Print DOT:
-    - `cargo run -p unity-asset --example env_object_graph -- crates/unity-asset-yaml/tests/fixtures/MinimalGameObjectTransform.prefab dot > graph.dot`
 - Find by `path_id` and dump JSON:
   - `cargo run -p unity-asset --example env_find_and_dump -- <path> <path_id>`
 - Export a stable binary object index (JSONL):

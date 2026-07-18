@@ -45,6 +45,7 @@ serde_json = { workspace = true }
 memmap2 = { version = "0.9.9", optional = true }
 tracing = { version = "0.1.41" }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tempfile = { workspace = true }
 
 # Async CLI dependencies (optional)
 tokio = { version = "1.0", features = ["fs", "io-util", "rt-multi-thread", "macros"], optional = true }
@@ -57,9 +58,6 @@ async = ["unity-asset/async", "tokio", "futures", "indicatif"]
 decode = ["dep:unity-asset-decode"]
 mmap = ["unity-asset/mmap", "unity-asset-binary/mmap", "dep:memmap2"]
 full = ["decode", "mmap"]
-
-[dev-dependencies]
-tempfile = { workspace = true }
 
 [package.metadata.docs.rs]
 no-default-features = true

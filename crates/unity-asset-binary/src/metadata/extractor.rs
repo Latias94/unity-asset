@@ -2,8 +2,8 @@
 //!
 //! This module provides the main metadata extraction functionality for Unity assets.
 
+use super::RelationshipAnalyzer;
 use super::types::*;
-use super::{DependencyAnalyzer, RelationshipAnalyzer};
 use crate::asset::SerializedFile;
 use crate::bundle::AssetBundle;
 use crate::compression::CompressionType;
@@ -14,8 +14,8 @@ use unity_asset_core::AssetLoadBudget;
 
 /// Metadata extractor for Unity assets
 ///
-/// This struct provides methods for extracting comprehensive metadata
-/// from Unity assets including statistics, dependencies, and relationships.
+/// This struct provides methods for extracting file statistics, object
+/// summaries, performance metrics, and GameObject hierarchy relationships.
 pub struct MetadataExtractor {
     config: ExtractionConfig,
 }
@@ -31,22 +31,6 @@ impl MetadataExtractor {
     /// Create a metadata extractor with custom configuration
     pub fn with_config(config: ExtractionConfig) -> Self {
         Self { config }
-    }
-
-    /// Create a metadata extractor with custom settings (legacy API)
-    pub fn with_settings(
-        include_dependencies: bool,
-        include_hierarchy: bool,
-        include_performance: bool,
-        max_objects: Option<usize>,
-    ) -> Self {
-        Self::with_config(ExtractionConfig {
-            include_dependencies,
-            include_hierarchy,
-            max_objects,
-            include_performance,
-            include_object_details: true,
-        })
     }
 
     /// Extract metadata from an AssetBundle
@@ -132,28 +116,6 @@ impl MetadataExtractor {
         // Extract object statistics
         result.metadata.object_stats = self.extract_object_statistics(&objects_to_analyze);
 
-        let mut dependencies: Option<DependencyInfo> = None;
-
-        // Extract dependencies if enabled
-        if self.config.include_dependencies {
-            let analyzed = DependencyAnalyzer::new().analyze_dependencies_in_asset(
-                asset,
-                &objects_to_analyze,
-                budget,
-            );
-
-            match analyzed {
-                Ok(deps) => {
-                    dependencies = Some(deps);
-                }
-                Err(e) if e.is_resource_error() => return Err(e),
-                Err(e) => {
-                    result.add_warning(format!("Failed to extract dependencies: {}", e));
-                    dependencies = Some(Self::empty_dependency_info());
-                }
-            }
-        }
-
         // Extract relationships if enabled
         if self.config.include_hierarchy {
             let analyzed = RelationshipAnalyzer::new().analyze_relationships_in_asset(
@@ -163,42 +125,16 @@ impl MetadataExtractor {
             );
 
             match analyzed {
-                Ok(mut rels) => {
-                    if let Some(deps) = dependencies.as_ref() {
-                        super::apply_dependency_info_to_relationships(deps, &mut rels);
-                    }
-                    result.metadata.relationships = rels;
-                }
+                Ok(relationships) => result.metadata.relationships = relationships,
                 Err(e) if e.is_resource_error() => return Err(e),
                 Err(e) => {
                     result.add_warning(format!("Failed to extract relationships: {}", e));
                     result.metadata.relationships = AssetRelationships {
                         gameobject_hierarchy: Vec::new(),
                         component_relationships: Vec::new(),
-                        asset_references: Vec::new(),
                     };
                 }
             }
-        }
-
-        if let Some(deps) = dependencies {
-            if self.config.include_object_details {
-                let mut by_from: std::collections::HashMap<i64, Vec<i64>> =
-                    std::collections::HashMap::new();
-                for r in &deps.internal_references {
-                    by_from.entry(r.from_object).or_default().push(r.to_object);
-                }
-                for v in by_from.values_mut() {
-                    v.sort_unstable();
-                    v.dedup();
-                }
-                for summary in &mut result.metadata.object_stats.largest_objects {
-                    summary.dependencies =
-                        by_from.get(&summary.path_id).cloned().unwrap_or_default();
-                }
-            }
-
-            result.metadata.dependencies = deps;
         }
 
         // Extract performance metrics if enabled
@@ -208,20 +144,6 @@ impl MetadataExtractor {
         }
 
         Ok(result)
-    }
-
-    fn empty_dependency_info() -> DependencyInfo {
-        DependencyInfo {
-            external_references: Vec::new(),
-            internal_references: Vec::new(),
-            dependency_graph: DependencyGraph {
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                root_objects: Vec::new(),
-                leaf_objects: Vec::new(),
-            },
-            circular_dependencies: Vec::new(),
-        }
     }
 
     /// Extract basic file information
@@ -261,7 +183,6 @@ impl MetadataExtractor {
                     class_name: class_name.clone(),
                     name: Some(format!("Object_{}", obj.path_id())), // Simplified name
                     byte_size: obj.byte_size(),
-                    dependencies: Vec::new(), // TODO: Extract dependencies
                 });
             }
         }
@@ -373,22 +294,10 @@ impl Default for MetadataExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asset::{SerializedFileParser, SerializedType};
-    use crate::typetree::{TypeTree, TypeTreeNode};
-    use unity_asset_core::AssetLoadLimits;
-
-    const V22_FIXTURE: &[u8] = include_bytes!(
-        "../../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin"
-    );
-
-    fn node(type_name: &str, name: &str) -> TypeTreeNode {
-        TypeTreeNode::with_info(type_name.to_owned(), name.to_owned(), -1)
-    }
 
     #[test]
     fn test_extractor_creation() {
         let extractor = MetadataExtractor::new();
-        assert!(extractor.config().include_dependencies);
         assert!(extractor.config().include_hierarchy);
     }
 
@@ -401,31 +310,5 @@ mod tests {
             extractor.get_class_name_from_class_id(999),
             "UnknownType_999"
         );
-    }
-
-    #[test]
-    fn resource_errors_are_not_downgraded_to_warnings() {
-        let mut pointer = node("PPtr<Object>", "m_Target");
-        pointer.children = vec![node("int", "m_FileID"), node("long long", "m_PathID")];
-        let mut root = node("Source", "Source");
-        root.children.push(pointer);
-        let mut tree = TypeTree::new();
-        tree.add_node(root);
-
-        let mut asset = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
-        let mut object_type = SerializedType::new(28);
-        object_type.type_tree = tree;
-        *asset.types_mut() = vec![object_type];
-
-        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
-            max_entries: 1,
-            ..AssetLoadLimits::default()
-        })
-        .unwrap();
-        let error = MetadataExtractor::new()
-            .extract_from_asset(&asset, &mut budget)
-            .expect_err("schema traversal should exceed the entry budget");
-
-        assert!(error.is_resource_error());
     }
 }

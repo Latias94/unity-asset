@@ -835,7 +835,7 @@ impl SourceCatalog {
     }
 
     pub(crate) fn revision(&self) -> Result<WorkspaceRevision, CatalogError> {
-        const PREFIX: &[u8] = b"unity-asset:source-catalog:v2\0";
+        const PREFIX: &[u8] = b"unity-asset:source-catalog:v3\0";
 
         let mut logical_length = checked_len(PREFIX.len())?;
         logical_length = checked_add(logical_length, 16)?;
@@ -850,6 +850,15 @@ impl SourceCatalog {
                 DigestV1Builder::framed_len(&record.canonical_key)?,
             )?;
             logical_length = checked_add(logical_length, DigestV1::BYTE_LEN as u64)?;
+            logical_length = checked_add(logical_length, 1)?;
+            if record.descriptor.parent().is_none() {
+                logical_length = checked_add(
+                    logical_length,
+                    DigestV1Builder::framed_len(
+                        record.physical_origin.path().as_os_str().as_encoded_bytes(),
+                    )?,
+                )?;
+            }
         }
 
         let mut digest = DigestV1Builder::new(logical_length);
@@ -860,6 +869,12 @@ impl SourceCatalog {
             digest.update_framed(source.kind().tag().as_bytes())?;
             digest.update_framed(&record.canonical_key)?;
             digest.update(record.fingerprint.digest().as_bytes())?;
+            let is_root = record.descriptor.parent().is_none();
+            digest.update(&[u8::from(is_root)])?;
+            if is_root {
+                digest
+                    .update_framed(record.physical_origin.path().as_os_str().as_encoded_bytes())?;
+            }
         }
         Ok(WorkspaceRevision::new(digest.finalize()?))
     }
@@ -1897,6 +1912,47 @@ mod tests {
             ..unity_asset_core::AssetLoadLimits::default()
         };
         AssetLoadBudget::new(limits).unwrap()
+    }
+
+    #[test]
+    fn revision_includes_root_physical_binding_without_changing_logical_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first.assets");
+        let second_path = directory.path().join("second.assets");
+        fs::write(&first_path, b"same bytes").unwrap();
+        fs::write(&second_path, b"same bytes").unwrap();
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let source_fingerprint = fingerprint(SourceKind::SerializedFile, b"same bytes");
+
+        let mut first = SourceCatalog::new(workspace);
+        let first_source = first
+            .register(
+                SourceDescriptor::root(
+                    SourceKind::SerializedFile,
+                    SourceAlias::new("logical.assets").unwrap(),
+                    PhysicalOrigin::from_existing_path(&first_path).unwrap(),
+                ),
+                source_fingerprint,
+            )
+            .unwrap();
+        let mut second = SourceCatalog::new(workspace);
+        let second_source = second
+            .register(
+                SourceDescriptor::root(
+                    SourceKind::SerializedFile,
+                    SourceAlias::new("logical.assets").unwrap(),
+                    PhysicalOrigin::from_existing_path(&second_path).unwrap(),
+                ),
+                source_fingerprint,
+            )
+            .unwrap();
+
+        assert_eq!(first_source, second_source);
+        assert_eq!(
+            first.source_locator(first_source).unwrap(),
+            second.source_locator(second_source).unwrap()
+        );
+        assert_ne!(first.revision().unwrap(), second.revision().unwrap());
     }
 
     #[test]

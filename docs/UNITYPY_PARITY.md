@@ -427,9 +427,9 @@ Acceptance:
 - [x] Provide a generic `PPtr` path helper (Unity-style references):
   - [x] resolve via `Environment::resolve_pptr_path_key(...)`
   - [x] set via `EnvironmentEditSession::set_pptr_path_to_key(...)` (best-effort externals)
-- [x] Provide best-effort "find references" for binary `PPtr` fields:
-  - [x] `Environment::find_binary_pptr_references_to(...)` returns `(from, pptr_path, file_id, path_id, resolved)`
-- [x] Implement YAML-side "find references" for YAML PPtr-like objects (prefab/scene YAML), returning `(YamlObjectKey, pptr_path, file_id/guid/type, resolved?)`
+- [x] Provide one revision-bound binary + YAML Reference Graph for "find references":
+  - [x] format-local scanners preserve typed `FieldPath` plus raw file ID, path ID, GUID, and type
+  - [x] `ReferenceGraph::incoming` and `outgoing` expose Null, Resolved, Unloaded, Missing, Ambiguous, and Invalid states without hidden loading
 - [x] Introduce schema-aware mutation recipes instead of class-specific shallow setters:
   - [x] `SchemaRecipePlanner` inspection is bound to an immutable workspace revision and exact binary/YAML schema provenance
   - [x] Capability discovery reports supported recipe variants and structured rejection reasons

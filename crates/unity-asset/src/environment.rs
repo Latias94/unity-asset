@@ -29,12 +29,10 @@ mod imp {
 
     mod container;
     mod dependency_files;
-    mod dependency_graph;
     mod edit;
     mod key;
     mod loader;
     mod meta_guid;
-    mod object_graph;
     mod object_query;
     mod path;
     mod pptr;
@@ -43,21 +41,11 @@ mod imp {
     mod stream;
     mod streamed_write;
     mod yaml_edit;
-    mod yaml_pptr;
     mod yaml_query;
 
-    pub use dependency_graph::{
-        DependencyGraphBuildOptions, DependencyGraphTraversalOptions, DependencyGraphWarning,
-        EnvironmentDependencyGraph, ExternalDependencyEdge,
-    };
     pub use edit::{EnvironmentEditSession, StreamedResourceWrite};
     pub use loader::{ProjectLoadOptions, ProjectLoadStats};
-    pub use object_graph::{
-        EnvironmentObjectGraph, EnvironmentObjectKey, ExternalObjectEdge, ObjectGraphBuildOptions,
-        ObjectGraphTraversalOptions, YamlExternalEdge, YamlObjectKey,
-    };
-    pub use pptr::{BinaryPptrReference, PptrReferenceSearchOptions};
-    pub use yaml_pptr::{YamlPptrReference, YamlPptrReferenceSearchOptions};
+    pub use yaml_query::YamlObjectKey;
 
     #[derive(Debug, Clone)]
     pub enum EnvironmentWarning {
@@ -303,7 +291,6 @@ mod imp {
         bundles: HashMap<BinarySource, AssetBundle>,
         webfiles: HashMap<PathBuf, WebFile>,
         bundle_container_cache: RwLock<HashMap<BinarySource, Vec<BundleContainerEntry>>>,
-        dependency_scan_cache: RwLock<dependency_graph::DependencyScanCache>,
         dependency_file_index: RwLock<dependency_files::DependencyFileIndex>,
         meta_guid_cache: RwLock<HashMap<[u8; 16], PathBuf>>,
         warnings: Mutex<Vec<EnvironmentWarning>>,
@@ -331,7 +318,6 @@ mod imp {
                 bundles: HashMap::new(),
                 webfiles: HashMap::new(),
                 bundle_container_cache: RwLock::new(HashMap::new()),
-                dependency_scan_cache: RwLock::new(HashMap::new()),
                 dependency_file_index: RwLock::new(dependency_files::DependencyFileIndex::default()),
                 meta_guid_cache: RwLock::new(HashMap::new()),
                 warnings: Mutex::new(Vec::new()),

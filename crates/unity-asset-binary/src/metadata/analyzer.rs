@@ -1,240 +1,17 @@
-//! Dependency and relationship analysis
+//! GameObject and component relationship analysis
 //!
-//! This module provides advanced analysis capabilities for Unity assets,
-//! including dependency tracking and relationship mapping.
+//! This module extracts hierarchy relationships from serialized GameObject and
+//! Transform data. Cross-object references are handled by the reference graph
+//! API instead.
 
 use super::types::*;
 use crate::asset::SerializedFile;
 use crate::error::Result;
 use crate::object::ObjectHandle;
 use crate::reader::BinaryReader;
-use crate::typetree::{TypeTreeParseMode, TypeTreeParseOptions, TypeTreeSchema};
+use crate::typetree::{TypeTreeParseOptions, TypeTreeSchema};
 use std::collections::{HashMap, HashSet};
 use unity_asset_core::{AssetLoadBudget, UnityValue};
-
-/// Stateless dependency analyzer for Unity assets.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DependencyAnalyzer;
-
-#[derive(Debug, Clone, Default)]
-struct ExtractedDependencies {
-    internal: Vec<i64>,
-    external: Vec<(i32, i64)>,
-}
-
-impl DependencyAnalyzer {
-    /// Create a new dependency analyzer
-    pub const fn new() -> Self {
-        Self
-    }
-
-    /// Analyze dependencies for a set of objects within a specific asset.
-    ///
-    /// This parses object data with TypeTree (when available) and scans for PPtr references
-    /// (`fileID`/`pathID` pairs) to build a dependency graph.
-    pub fn analyze_dependencies_in_asset(
-        &self,
-        asset: &SerializedFile,
-        objects: &[&crate::asset::ObjectInfo],
-        budget: &mut AssetLoadBudget,
-    ) -> Result<DependencyInfo> {
-        let mut external_ref_map: HashMap<(i32, i64), Vec<i64>> = HashMap::new();
-        let mut internal_refs = Vec::new();
-        let mut all_nodes = HashSet::new();
-        let mut edges = Vec::new();
-
-        for obj in objects {
-            all_nodes.insert(obj.path_id());
-        }
-
-        for obj in objects {
-            let deps = self.extract_object_dependencies_in_asset(asset, obj, budget)?;
-
-            for dep_id in deps.internal {
-                if all_nodes.contains(&dep_id) {
-                    internal_refs.push(InternalReference {
-                        from_object: obj.path_id(),
-                        to_object: dep_id,
-                        reference_type: "Direct".to_string(),
-                    });
-                    edges.push((obj.path_id(), dep_id));
-                } else {
-                    external_ref_map
-                        .entry((0, dep_id))
-                        .or_default()
-                        .push(obj.path_id());
-                }
-            }
-
-            for (file_id, path_id) in deps.external {
-                external_ref_map
-                    .entry((file_id, path_id))
-                    .or_default()
-                    .push(obj.path_id());
-            }
-        }
-
-        let external_refs = external_ref_map
-            .into_iter()
-            .map(|((file_id, path_id), mut referenced_by)| {
-                referenced_by.sort_unstable();
-                referenced_by.dedup();
-                let (file_path, guid) = resolve_external_file(asset, file_id);
-                ExternalReference {
-                    file_id,
-                    path_id,
-                    referenced_by,
-                    file_path,
-                    guid,
-                }
-            })
-            .collect();
-
-        let nodes: Vec<i64> = all_nodes.into_iter().collect();
-        let root_objects = self.find_root_objects(&nodes, &edges);
-        let leaf_objects = self.find_leaf_objects(&nodes, &edges);
-
-        let dependency_graph = DependencyGraph {
-            nodes,
-            edges,
-            root_objects,
-            leaf_objects,
-        };
-
-        let circular_deps = self.detect_circular_dependencies(&dependency_graph)?;
-
-        Ok(DependencyInfo {
-            external_references: external_refs,
-            internal_references: internal_refs,
-            dependency_graph,
-            circular_dependencies: circular_deps,
-        })
-    }
-
-    /// Extract dependencies from a single object by parsing its TypeTree and scanning PPtr-like fields.
-    fn extract_object_dependencies_in_asset(
-        &self,
-        asset: &SerializedFile,
-        obj: &crate::asset::ObjectInfo,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<ExtractedDependencies> {
-        let mut deps = ExtractedDependencies::default();
-
-        match ObjectHandle::new(asset, obj).schema(budget) {
-            Ok(Some(schema)) => {
-                match scan_object_pptrs_with_typetree(asset, obj, &schema, budget) {
-                    Ok(scanned) => deps = scanned,
-                    Err(error) if error.is_resource_error() => return Err(error),
-                    Err(_) => {}
-                }
-            }
-            Ok(None) => {}
-            Err(error) if error.is_resource_error() => return Err(error),
-            Err(_) => {}
-        }
-
-        deps.internal.sort_unstable();
-        deps.internal.dedup();
-        deps.external.sort_unstable();
-        deps.external.dedup();
-
-        Ok(deps)
-    }
-
-    /// Find root objects (objects with no incoming dependencies)
-    fn find_root_objects(&self, nodes: &[i64], edges: &[(i64, i64)]) -> Vec<i64> {
-        let mut has_incoming: HashSet<i64> = HashSet::new();
-
-        for (_, to) in edges {
-            has_incoming.insert(*to);
-        }
-
-        nodes
-            .iter()
-            .filter(|node| !has_incoming.contains(node))
-            .copied()
-            .collect()
-    }
-
-    /// Find leaf objects (objects with no outgoing dependencies)
-    fn find_leaf_objects(&self, nodes: &[i64], edges: &[(i64, i64)]) -> Vec<i64> {
-        let mut has_outgoing: HashSet<i64> = HashSet::new();
-
-        for (from, _) in edges {
-            has_outgoing.insert(*from);
-        }
-
-        nodes
-            .iter()
-            .filter(|node| !has_outgoing.contains(node))
-            .copied()
-            .collect()
-    }
-
-    /// Detect circular dependencies using DFS
-    fn detect_circular_dependencies(&self, graph: &DependencyGraph) -> Result<Vec<Vec<i64>>> {
-        let mut visited = HashSet::new();
-        let mut rec_stack = HashSet::new();
-        let mut cycles = Vec::new();
-
-        // Build adjacency list
-        let mut adj_list: HashMap<i64, Vec<i64>> = HashMap::new();
-        for node in &graph.nodes {
-            adj_list.insert(*node, Vec::new());
-        }
-        for (from, to) in &graph.edges {
-            adj_list.get_mut(from).unwrap().push(*to);
-        }
-
-        // DFS for each unvisited node
-        for &node in &graph.nodes {
-            if !visited.contains(&node) {
-                let mut path = Vec::new();
-                Self::dfs_detect_cycle(
-                    node,
-                    &adj_list,
-                    &mut visited,
-                    &mut rec_stack,
-                    &mut path,
-                    &mut cycles,
-                );
-            }
-        }
-
-        Ok(cycles)
-    }
-
-    /// DFS helper for cycle detection
-    fn dfs_detect_cycle(
-        node: i64,
-        adj_list: &HashMap<i64, Vec<i64>>,
-        visited: &mut HashSet<i64>,
-        rec_stack: &mut HashSet<i64>,
-        path: &mut Vec<i64>,
-        cycles: &mut Vec<Vec<i64>>,
-    ) {
-        visited.insert(node);
-        rec_stack.insert(node);
-        path.push(node);
-
-        if let Some(neighbors) = adj_list.get(&node) {
-            for &neighbor in neighbors {
-                if !visited.contains(&neighbor) {
-                    Self::dfs_detect_cycle(neighbor, adj_list, visited, rec_stack, path, cycles);
-                } else if rec_stack.contains(&neighbor) {
-                    // Found a cycle
-                    if let Some(cycle_start) = path.iter().position(|&x| x == neighbor) {
-                        let cycle = path[cycle_start..].to_vec();
-                        cycles.push(cycle);
-                    }
-                }
-            }
-        }
-
-        path.pop();
-        rec_stack.remove(&node);
-    }
-}
 
 fn parse_object_with_typetree(
     asset: &SerializedFile,
@@ -247,28 +24,6 @@ fn parse_object_with_typetree(
     Ok(schema
         .read_object(&mut reader, budget, TypeTreeParseOptions::default())?
         .properties)
-}
-
-fn scan_object_pptrs_with_typetree(
-    asset: &SerializedFile,
-    info: &crate::asset::ObjectInfo,
-    schema: &TypeTreeSchema,
-    budget: &mut AssetLoadBudget,
-) -> Result<ExtractedDependencies> {
-    let bytes = ObjectHandle::new(asset, info).raw_data()?;
-    let mut reader = BinaryReader::new(bytes, asset.header.byte_order());
-    let scan = schema.scan_pptrs_with_options(
-        &mut reader,
-        budget,
-        TypeTreeParseOptions {
-            mode: TypeTreeParseMode::Lenient,
-        },
-    )?;
-
-    Ok(ExtractedDependencies {
-        internal: scan.internal,
-        external: scan.external,
-    })
 }
 
 fn parse_object_best_effort(
@@ -288,28 +43,6 @@ fn parse_object_best_effort(
         Err(error) if error.is_resource_error() => Err(error),
         Err(_) => Ok(None),
     }
-}
-
-fn resolve_external_file(
-    asset: &SerializedFile,
-    file_id: i32,
-) -> (Option<String>, Option<[u8; 16]>) {
-    if file_id <= 0 {
-        return (None, None);
-    }
-
-    let idx = (file_id - 1) as usize;
-    let Some(ext) = asset.externals.get(idx) else {
-        return (None, None);
-    };
-
-    let file_path = if ext.path.is_empty() {
-        None
-    } else {
-        Some(ext.path.clone())
-    };
-    let guid = Some(ext.guid);
-    (file_path, guid)
 }
 
 fn try_read_pptr(map: &indexmap::IndexMap<String, UnityValue>) -> Option<(i32, i64)> {
@@ -607,17 +340,13 @@ impl RelationshipAnalyzer {
                     component_id: *comp_id,
                     component_type,
                     gameobject_id: *go_id,
-                    dependencies: Vec::new(),
-                    external_dependencies: Vec::new(),
                 });
             }
         }
 
-        // We still keep asset references as placeholder for now.
         Ok(AssetRelationships {
             gameobject_hierarchy: hierarchies.into_values().collect(),
             component_relationships,
-            asset_references: Vec::new(),
         })
     }
 
@@ -653,121 +382,6 @@ mod tests {
         tree
     }
 
-    fn pptr_node(name: &str, path_type: &str) -> TypeTreeNode {
-        let mut pointer = node("PPtr<Object>", name);
-        pointer.children = vec![node("int", "m_FileID"), node(path_type, "m_PathID")];
-        pointer
-    }
-
-    #[test]
-    fn stripped_file_dependency_analysis_uses_external_registry() {
-        let mut root = node("Source", "Source");
-        root.children.push(pptr_node("m_Target", "long long"));
-        let mut registry = InMemoryTypeTreeRegistry::default();
-        registry.insert_any(1, tree_with_root(root));
-
-        let mut asset = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
-        asset.set_type_tree_enabled(false);
-        asset.set_type_tree_registry(Some(Arc::new(registry)));
-
-        let mut source = ObjectInfo::for_standalone_class(101, 0, 12, 1).unwrap();
-        let mut bytes = match asset.header.byte_order() {
-            crate::reader::ByteOrder::Little => 0_i32.to_le_bytes().to_vec(),
-            crate::reader::ByteOrder::Big => 0_i32.to_be_bytes().to_vec(),
-        };
-        match asset.header.byte_order() {
-            crate::reader::ByteOrder::Little => bytes.extend_from_slice(&202_i64.to_le_bytes()),
-            crate::reader::ByteOrder::Big => bytes.extend_from_slice(&202_i64.to_be_bytes()),
-        }
-        source.set_data(bytes);
-        let mut target = ObjectInfo::for_standalone_class(202, 0, 0, 28).unwrap();
-        target.set_data(Vec::new());
-
-        let mut direct_budget = AssetLoadBudget::default();
-        let schema = ObjectHandle::new(&asset, &source)
-            .schema(&mut direct_budget)
-            .unwrap()
-            .expect("external registry should resolve the stripped schema");
-        let direct =
-            scan_object_pptrs_with_typetree(&asset, &source, &schema, &mut direct_budget).unwrap();
-        assert_eq!(direct.internal, [202]);
-
-        let analyzer = DependencyAnalyzer::new();
-        let dependencies = analyzer
-            .analyze_dependencies_in_asset(
-                &asset,
-                &[&source, &target],
-                &mut AssetLoadBudget::default(),
-            )
-            .unwrap();
-
-        assert!(
-            dependencies
-                .internal_references
-                .iter()
-                .any(|reference| reference.from_object == 101 && reference.to_object == 202)
-        );
-        assert!(dependencies.dependency_graph.edges.contains(&(101, 202)));
-    }
-
-    #[test]
-    fn dependency_analysis_recovers_proven_extents_without_materializing_objects() {
-        let mut root = node("Source", "Source");
-        root.children.push(pptr_node("m_Broken", "UInt64"));
-        root.children.push(pptr_node("m_Target", "long long"));
-        let mut registry = InMemoryTypeTreeRegistry::default();
-        registry.insert_any(1, tree_with_root(root));
-
-        let mut asset = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
-        asset.set_type_tree_enabled(false);
-        asset.set_type_tree_registry(Some(Arc::new(registry)));
-
-        let mut source = ObjectInfo::for_standalone_class(101, 0, 24, 1).unwrap();
-        let mut bytes = match asset.header.byte_order() {
-            crate::reader::ByteOrder::Little => 0_i32.to_le_bytes().to_vec(),
-            crate::reader::ByteOrder::Big => 0_i32.to_be_bytes().to_vec(),
-        };
-        match asset.header.byte_order() {
-            crate::reader::ByteOrder::Little => {
-                bytes.extend_from_slice(&u64::MAX.to_le_bytes());
-                bytes.extend_from_slice(&0_i32.to_le_bytes());
-                bytes.extend_from_slice(&202_i64.to_le_bytes());
-            }
-            crate::reader::ByteOrder::Big => {
-                bytes.extend_from_slice(&u64::MAX.to_be_bytes());
-                bytes.extend_from_slice(&0_i32.to_be_bytes());
-                bytes.extend_from_slice(&202_i64.to_be_bytes());
-            }
-        }
-        source.set_data(bytes);
-        let mut target = ObjectInfo::for_standalone_class(202, 0, 0, 28).unwrap();
-        target.set_data(Vec::new());
-
-        let schema = ObjectHandle::new(&asset, &source)
-            .schema(&mut AssetLoadBudget::default())
-            .unwrap()
-            .unwrap();
-        let mut strict_reader = BinaryReader::new(
-            ObjectHandle::new(&asset, &source).raw_data().unwrap(),
-            asset.header.byte_order(),
-        );
-        assert!(
-            schema
-                .scan_pptrs(&mut strict_reader, &mut AssetLoadBudget::default())
-                .is_err()
-        );
-
-        let dependencies = DependencyAnalyzer::new()
-            .analyze_dependencies_in_asset(
-                &asset,
-                &[&source, &target],
-                &mut AssetLoadBudget::default(),
-            )
-            .unwrap();
-
-        assert!(dependencies.dependency_graph.edges.contains(&(101, 202)));
-    }
-
     #[test]
     fn stripped_file_relationship_analysis_uses_external_registry() {
         let mut root = node("GameObject", "GameObject");
@@ -800,20 +414,6 @@ mod tests {
 
         assert_eq!(relationships.gameobject_hierarchy.len(), 1);
         assert_eq!(relationships.gameobject_hierarchy[0].gameobject_id, 303);
-    }
-
-    #[test]
-    fn test_root_leaf_detection() {
-        let analyzer = DependencyAnalyzer::new();
-        let nodes = vec![1, 2, 3, 4];
-        let edges = vec![(1, 2), (2, 3), (4, 3)];
-
-        let roots = analyzer.find_root_objects(&nodes, &edges);
-        let leaves = analyzer.find_leaf_objects(&nodes, &edges);
-
-        assert!(roots.contains(&1));
-        assert!(roots.contains(&4));
-        assert!(leaves.contains(&3));
     }
 
     #[test]

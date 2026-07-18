@@ -23,3 +23,17 @@ pub use view::{
     WorkspaceObjectValue, WorkspaceSource, WorkspaceSourceContainer, WorkspaceSourceIdentityError,
     WorkspaceSourceMemberIdentityError, WorkspaceView, WorkspaceYamlObject,
 };
+
+pub(crate) use state::WorkspaceState;
+pub(crate) use store::SourceEntry;
+
+#[doc(hidden)]
+pub struct ReferenceViewParts<'a> {
+    pub(crate) state: &'a std::sync::Arc<WorkspaceState>,
+    pub(crate) store: &'a std::sync::Arc<crate::reference::ReferenceStore>,
+    pub(crate) typetree: unity_asset_binary::typetree::TypeTreeParseOptions,
+}
+
+pub(crate) fn reference_view_parts(view: &dyn WorkspaceView) -> ReferenceViewParts<'_> {
+    view::sealed::Sealed::reference_view_parts(view)
+}

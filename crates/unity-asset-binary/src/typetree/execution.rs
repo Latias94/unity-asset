@@ -1,8 +1,9 @@
 //! Budgeted semantic traversal adapters for compiled TypeTree schemas.
 
 use indexmap::IndexMap;
-use unity_asset_core::{AssetLoadBudget, UnityValue};
+use unity_asset_core::{AssetLoadBudget, FieldPath, FieldPathSegment, UnityValue};
 
+use super::parser::MAX_TYPE_TREE_DEPTH;
 use super::schema::{
     ManagedPayload, PPtrLayout, PairLayout, PrimitiveKind, ReferencedObjectLayout, SchemaNode,
     SemanticKind, SemanticLayout, SequenceLayout, TypeTreeSchema, TypeTreeTraversalContext,
@@ -12,6 +13,7 @@ use super::traversal::{
 };
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
+use crate::reference::{BinaryReferenceDiagnostic, BinaryReferenceOccurrence, BinaryReferenceScan};
 
 /// PPtr references found by a semantic TypeTree scan.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -332,6 +334,77 @@ impl TypeTreeSchema {
                     }
                     TypeTreeParseMode::Lenient => {
                         "Lenient TypeTree PPtr scan could not prove the remaining wire extent"
+                    }
+                };
+                Err(BinaryError::invalid_data(message))
+            }
+        }
+    }
+
+    /// Scans the complete root for depth-first, completion-ordered binary references.
+    ///
+    /// The traversal retains null pointers and negative file IDs exactly as encoded. It does not
+    /// construct any [`UnityValue`] instances.
+    pub fn scan_reference_occurrences(
+        &self,
+        reader: &mut BinaryReader<'_>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<BinaryReferenceScan> {
+        self.scan_reference_occurrences_with_options(
+            reader,
+            budget,
+            TypeTreeParseOptions {
+                mode: TypeTreeParseMode::Strict,
+            },
+        )
+    }
+
+    /// Scans ordered, path-aware references under the requested recovery policy.
+    ///
+    /// Lenient scans return a diagnostic for each field whose exact wire extent was proven and
+    /// skipped. Resource errors are never converted into diagnostics.
+    pub fn scan_reference_occurrences_with_options(
+        &self,
+        reader: &mut BinaryReader<'_>,
+        budget: &mut AssetLoadBudget,
+        options: TypeTreeParseOptions,
+    ) -> Result<BinaryReferenceScan> {
+        self.scan_reference_occurrences_internal(reader, budget, options)
+    }
+
+    fn scan_reference_occurrences_internal(
+        &self,
+        reader: &mut BinaryReader<'_>,
+        budget: &mut AssetLoadBudget,
+        options: TypeTreeParseOptions,
+    ) -> Result<BinaryReferenceScan> {
+        let mut cursor = TraversalCursor::new(reader, budget)?;
+        let mut adapter =
+            UnitAdapter::with_mode(CollectReferences::new(&mut cursor)?, options.mode);
+        match traverse_value(
+            self,
+            &mut cursor,
+            &mut adapter,
+            self.root(),
+            TypeTreeTraversalContext::root(),
+            0,
+        )? {
+            TraverseOutcome::Complete(()) => {
+                let stats = cursor.stats();
+                let (occurrences, diagnostics) = adapter.into_sink().into_parts();
+                Ok(BinaryReferenceScan {
+                    occurrences,
+                    diagnostics,
+                    stats,
+                })
+            }
+            TraverseOutcome::Terminal => {
+                let message = match options.mode {
+                    TypeTreeParseMode::Strict => {
+                        "Strict TypeTree reference scan terminated without an error"
+                    }
+                    TypeTreeParseMode::Lenient => {
+                        "Lenient TypeTree reference scan could not prove the remaining wire extent"
                     }
                 };
                 Err(BinaryError::invalid_data(message))
@@ -975,7 +1048,7 @@ impl WirePrimitive {
     }
 }
 
-trait TraversalAdapter {
+trait TraversalAdapter<'schema> {
     type Value;
     type Sequence;
     type Record;
@@ -1044,7 +1117,7 @@ trait TraversalAdapter {
         &mut self,
         cursor: &mut TraversalCursor<'_, '_, '_>,
         record: &mut Self::Record,
-        child: SchemaNode<'_>,
+        child: SchemaNode<'schema>,
         value: Self::Value,
     ) -> Result<()>;
 
@@ -1052,7 +1125,7 @@ trait TraversalAdapter {
         &mut self,
         cursor: &mut TraversalCursor<'_, '_, '_>,
         record: &mut Self::Record,
-        child: SchemaNode<'_>,
+        child: SchemaNode<'schema>,
     ) -> Result<()>;
 
     fn finish_record(
@@ -1070,10 +1143,28 @@ trait TraversalAdapter {
         path_id: i64,
     ) -> Result<()>;
 
+    fn enter_record_child(
+        &mut self,
+        cursor: &mut TraversalCursor<'_, '_, '_>,
+        kind: SemanticKind,
+        index: usize,
+        child: SchemaNode<'schema>,
+    ) -> Result<()>;
+
+    fn enter_sequence_element(
+        &mut self,
+        cursor: &mut TraversalCursor<'_, '_, '_>,
+        index: usize,
+    ) -> Result<()>;
+
+    fn path_checkpoint(&self) -> usize;
+
+    fn restore_path(&mut self, checkpoint: usize);
+
     fn warning(
         &mut self,
         cursor: &mut TraversalCursor<'_, '_, '_>,
-        child: SchemaNode<'_>,
+        child: SchemaNode<'schema>,
         error: &BinaryError,
     ) -> Result<()>;
 }
@@ -1112,7 +1203,7 @@ impl ReadAdapter {
     }
 }
 
-impl TraversalAdapter for ReadAdapter {
+impl<'schema> TraversalAdapter<'schema> for ReadAdapter {
     type Value = UnityValue;
     type Sequence = TraversalVec<UnityValue>;
     type Record = ReadRecord;
@@ -1243,7 +1334,7 @@ impl TraversalAdapter for ReadAdapter {
         &mut self,
         cursor: &mut TraversalCursor<'_, '_, '_>,
         record: &mut Self::Record,
-        child: SchemaNode<'_>,
+        child: SchemaNode<'schema>,
         value: Self::Value,
     ) -> Result<()> {
         match record {
@@ -1263,7 +1354,7 @@ impl TraversalAdapter for ReadAdapter {
         &mut self,
         cursor: &mut TraversalCursor<'_, '_, '_>,
         record: &mut Self::Record,
-        _child: SchemaNode<'_>,
+        _child: SchemaNode<'schema>,
     ) -> Result<()> {
         if let ReadRecord::Pair(values) = record {
             cursor.record_materialized(1)?;
@@ -1298,16 +1389,39 @@ impl TraversalAdapter for ReadAdapter {
         Ok(())
     }
 
+    fn enter_record_child(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        _kind: SemanticKind,
+        _index: usize,
+        _child: SchemaNode<'schema>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn enter_sequence_element(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        _index: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn path_checkpoint(&self) -> usize {
+        0
+    }
+
+    fn restore_path(&mut self, _checkpoint: usize) {}
+
     fn warning(
         &mut self,
         cursor: &mut TraversalCursor<'_, '_, '_>,
-        child: SchemaNode<'_>,
+        child: SchemaNode<'schema>,
         error: &BinaryError,
     ) -> Result<()> {
         cursor.consume_members(1)?;
-        let rendered = error.to_string();
         let field = cursor.clone_string(child.name(), "TypeTree warning field")?;
-        let error = cursor.clone_string(&rendered, "TypeTree warning message")?;
+        let error = cursor.display_string(error, "TypeTree warning message")?;
         self.warnings
             .push(cursor, TypeTreeParseWarning { field, error })
     }
@@ -1332,18 +1446,50 @@ impl<S> UnitAdapter<S> {
     }
 }
 
-trait PPtrSink {
+trait ReferenceSink<'schema> {
     fn emit(
         &mut self,
         cursor: &mut TraversalCursor<'_, '_, '_>,
         file_id: i32,
         path_id: i64,
     ) -> Result<()>;
+
+    fn enter_record_child(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        _kind: SemanticKind,
+        _index: usize,
+        _child: SchemaNode<'schema>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn enter_sequence_element(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        _index: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn path_checkpoint(&self) -> usize {
+        0
+    }
+
+    fn restore_path(&mut self, _checkpoint: usize) {}
+
+    fn warning(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        _error: &BinaryError,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct IgnorePPtrs;
 
-impl PPtrSink for IgnorePPtrs {
+impl<'schema> ReferenceSink<'schema> for IgnorePPtrs {
     fn emit(
         &mut self,
         _cursor: &mut TraversalCursor<'_, '_, '_>,
@@ -1372,7 +1518,7 @@ impl CollectPPtrs {
     }
 }
 
-impl PPtrSink for CollectPPtrs {
+impl<'schema> ReferenceSink<'schema> for CollectPPtrs {
     fn emit(
         &mut self,
         cursor: &mut TraversalCursor<'_, '_, '_>,
@@ -1392,7 +1538,157 @@ impl PPtrSink for CollectPPtrs {
     }
 }
 
-impl<S: PPtrSink> TraversalAdapter for UnitAdapter<S> {
+#[derive(Clone, Copy)]
+enum BorrowedPathSegment<'schema> {
+    Field(&'schema str),
+    Index(u32),
+}
+
+struct CollectReferences<'schema> {
+    occurrences: TraversalVec<BinaryReferenceOccurrence>,
+    diagnostics: TraversalVec<BinaryReferenceDiagnostic>,
+    path: [BorrowedPathSegment<'schema>; MAX_TYPE_TREE_DEPTH],
+    path_len: usize,
+}
+
+impl<'schema> CollectReferences<'schema> {
+    fn new(cursor: &mut TraversalCursor<'_, '_, '_>) -> Result<Self> {
+        Ok(Self {
+            occurrences: cursor.vector(0, "binary reference occurrences")?,
+            diagnostics: cursor.vector(0, "binary reference diagnostics")?,
+            path: [BorrowedPathSegment::Index(0); MAX_TYPE_TREE_DEPTH],
+            path_len: 0,
+        })
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        Vec<BinaryReferenceOccurrence>,
+        Vec<BinaryReferenceDiagnostic>,
+    ) {
+        (self.occurrences.into_vec(), self.diagnostics.into_vec())
+    }
+
+    fn push_path(&mut self, segment: BorrowedPathSegment<'schema>) -> Result<()> {
+        let Some(slot) = self.path.get_mut(self.path_len) else {
+            return Err(BinaryError::invalid_data(format!(
+                "binary reference field path exceeds {MAX_TYPE_TREE_DEPTH} segments"
+            )));
+        };
+        *slot = segment;
+        self.path_len += 1;
+        Ok(())
+    }
+
+    fn snapshot_path(&self, cursor: &mut TraversalCursor<'_, '_, '_>) -> Result<FieldPath> {
+        cursor.consume_members(usize_to_u64(
+            self.path_len,
+            "binary reference field path length",
+        )?)?;
+        let mut segments = cursor.vector(self.path_len, "binary reference field path")?;
+        for segment in &self.path[..self.path_len] {
+            let segment = match segment {
+                BorrowedPathSegment::Field(name) => {
+                    let name = cursor.clone_string(name, "binary reference field name")?;
+                    FieldPathSegment::field(name).map_err(|error| {
+                        BinaryError::invalid_data(format!(
+                            "invalid binary reference field path: {error}"
+                        ))
+                    })?
+                }
+                BorrowedPathSegment::Index(index) => FieldPathSegment::Index(*index),
+            };
+            segments.push(cursor, segment)?;
+        }
+        FieldPath::from_segments(segments.into_vec()).map_err(|error| {
+            BinaryError::invalid_data(format!("invalid binary reference field path: {error}"))
+        })
+    }
+}
+
+impl<'schema> ReferenceSink<'schema> for CollectReferences<'schema> {
+    fn emit(
+        &mut self,
+        cursor: &mut TraversalCursor<'_, '_, '_>,
+        file_id: i32,
+        path_id: i64,
+    ) -> Result<()> {
+        cursor.consume_members(1)?;
+        let field_path = self.snapshot_path(cursor)?;
+        self.occurrences.push(
+            cursor,
+            BinaryReferenceOccurrence {
+                field_path,
+                file_id,
+                path_id,
+            },
+        )?;
+        if path_id != 0 {
+            cursor.record_pptrs(1)?;
+        }
+        Ok(())
+    }
+
+    fn enter_record_child(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        kind: SemanticKind,
+        index: usize,
+        child: SchemaNode<'schema>,
+    ) -> Result<()> {
+        if kind == SemanticKind::Pair {
+            let index = u32::try_from(index)
+                .map_err(|_| BinaryError::invalid_data("pair index does not fit in u32"))?;
+            return self.push_path(BorrowedPathSegment::Index(index));
+        }
+        if child.name().is_empty() {
+            let index = u32::try_from(index).map_err(|_| {
+                BinaryError::invalid_data("unnamed record child index does not fit in u32")
+            })?;
+            return self.push_path(BorrowedPathSegment::Index(index));
+        }
+        self.push_path(BorrowedPathSegment::Field(child.name()))
+    }
+
+    fn enter_sequence_element(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        index: usize,
+    ) -> Result<()> {
+        let index = u32::try_from(index)
+            .map_err(|_| BinaryError::invalid_data("sequence index does not fit in u32"))?;
+        self.push_path(BorrowedPathSegment::Index(index))
+    }
+
+    fn path_checkpoint(&self) -> usize {
+        self.path_len
+    }
+
+    fn restore_path(&mut self, checkpoint: usize) {
+        debug_assert!(checkpoint <= self.path_len);
+        self.path_len = checkpoint;
+    }
+
+    fn warning(
+        &mut self,
+        cursor: &mut TraversalCursor<'_, '_, '_>,
+        error: &BinaryError,
+    ) -> Result<()> {
+        cursor.consume_members(1)?;
+        let field_path = self.snapshot_path(cursor)?;
+        let message = cursor.display_string(error, "binary reference diagnostic")?;
+        self.diagnostics.push(
+            cursor,
+            BinaryReferenceDiagnostic {
+                field_path,
+                message,
+            },
+        )
+    }
+}
+
+impl<'schema, S: ReferenceSink<'schema>> TraversalAdapter<'schema> for UnitAdapter<S> {
     type Value = ();
     type Sequence = ();
     type Record = ();
@@ -1481,7 +1777,7 @@ impl<S: PPtrSink> TraversalAdapter for UnitAdapter<S> {
         &mut self,
         _cursor: &mut TraversalCursor<'_, '_, '_>,
         _record: &mut Self::Record,
-        _child: SchemaNode<'_>,
+        _child: SchemaNode<'schema>,
         _value: Self::Value,
     ) -> Result<()> {
         Ok(())
@@ -1491,7 +1787,7 @@ impl<S: PPtrSink> TraversalAdapter for UnitAdapter<S> {
         &mut self,
         _cursor: &mut TraversalCursor<'_, '_, '_>,
         _record: &mut Self::Record,
-        _child: SchemaNode<'_>,
+        _child: SchemaNode<'schema>,
     ) -> Result<()> {
         Ok(())
     }
@@ -1517,21 +1813,47 @@ impl<S: PPtrSink> TraversalAdapter for UnitAdapter<S> {
         self.sink.emit(cursor, file_id, path_id)
     }
 
+    fn enter_record_child(
+        &mut self,
+        cursor: &mut TraversalCursor<'_, '_, '_>,
+        kind: SemanticKind,
+        index: usize,
+        child: SchemaNode<'schema>,
+    ) -> Result<()> {
+        self.sink.enter_record_child(cursor, kind, index, child)
+    }
+
+    fn enter_sequence_element(
+        &mut self,
+        cursor: &mut TraversalCursor<'_, '_, '_>,
+        index: usize,
+    ) -> Result<()> {
+        self.sink.enter_sequence_element(cursor, index)
+    }
+
+    fn path_checkpoint(&self) -> usize {
+        self.sink.path_checkpoint()
+    }
+
+    fn restore_path(&mut self, checkpoint: usize) {
+        self.sink.restore_path(checkpoint);
+    }
+
     fn warning(
         &mut self,
-        _cursor: &mut TraversalCursor<'_, '_, '_>,
-        _child: SchemaNode<'_>,
-        _error: &BinaryError,
+        cursor: &mut TraversalCursor<'_, '_, '_>,
+        _child: SchemaNode<'schema>,
+        error: &BinaryError,
     ) -> Result<()> {
-        Ok(())
+        self.sink.warning(cursor, error)
     }
 }
 
-fn traverse_value<A: TraversalAdapter>(
-    schema: &TypeTreeSchema,
+fn traverse_value<'schema, A: TraversalAdapter<'schema>>(
+    schema: &'schema TypeTreeSchema,
     cursor: &mut TraversalCursor<'_, '_, '_>,
     adapter: &mut A,
-    node: SchemaNode<'_>,
+    node: SchemaNode<'schema>,
     context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<TraverseOutcome<A::Value>> {
@@ -1585,12 +1907,12 @@ fn traverse_value<A: TraversalAdapter>(
     }
 }
 
-fn traverse_sequence<A: TraversalAdapter>(
-    schema: &TypeTreeSchema,
+fn traverse_sequence<'schema, A: TraversalAdapter<'schema>>(
+    schema: &'schema TypeTreeSchema,
     cursor: &mut TraversalCursor<'_, '_, '_>,
     adapter: &mut A,
-    node: SchemaNode<'_>,
-    layout: SequenceLayout<'_>,
+    node: SchemaNode<'schema>,
+    layout: SequenceLayout<'schema>,
     context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<TraverseOutcome<A::Value>> {
@@ -1618,15 +1940,19 @@ fn traverse_sequence<A: TraversalAdapter>(
     }
 
     let mut sequence = adapter.begin_sequence(cursor, length)?;
-    for _ in 0..length {
-        match traverse_value(
+    for index in 0..length {
+        let path_checkpoint = adapter.path_checkpoint();
+        adapter.enter_sequence_element(cursor, index)?;
+        let outcome = traverse_value(
             schema,
             cursor,
             adapter,
             layout.element(),
             context,
             child_depth,
-        )? {
+        )?;
+        adapter.restore_path(path_checkpoint);
+        match outcome {
             TraverseOutcome::Complete(value) => {
                 adapter.push_sequence(cursor, &mut sequence, value)?;
             }
@@ -1638,11 +1964,11 @@ fn traverse_sequence<A: TraversalAdapter>(
     Ok(TraverseOutcome::Complete(value))
 }
 
-fn traverse_record<A: TraversalAdapter>(
-    schema: &TypeTreeSchema,
+fn traverse_record<'schema, A: TraversalAdapter<'schema>>(
+    schema: &'schema TypeTreeSchema,
     cursor: &mut TraversalCursor<'_, '_, '_>,
     adapter: &mut A,
-    node: SchemaNode<'_>,
+    node: SchemaNode<'schema>,
     context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<TraverseOutcome<A::Value>> {
@@ -1659,12 +1985,12 @@ fn traverse_record<A: TraversalAdapter>(
     )
 }
 
-fn traverse_pair<A: TraversalAdapter>(
-    schema: &TypeTreeSchema,
+fn traverse_pair<'schema, A: TraversalAdapter<'schema>>(
+    schema: &'schema TypeTreeSchema,
     cursor: &mut TraversalCursor<'_, '_, '_>,
     adapter: &mut A,
-    node: SchemaNode<'_>,
-    layout: PairLayout<'_>,
+    node: SchemaNode<'schema>,
+    layout: PairLayout<'schema>,
     context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<TraverseOutcome<A::Value>> {
@@ -1683,7 +2009,7 @@ fn traverse_pair<A: TraversalAdapter>(
 
 #[allow(clippy::too_many_arguments)]
 fn traverse_record_children<'schema, A, I>(
-    schema: &TypeTreeSchema,
+    schema: &'schema TypeTreeSchema,
     cursor: &mut TraversalCursor<'_, '_, '_>,
     adapter: &mut A,
     node: SchemaNode<'schema>,
@@ -1694,7 +2020,7 @@ fn traverse_record_children<'schema, A, I>(
     depth: u32,
 ) -> Result<TraverseOutcome<A::Value>>
 where
-    A: TraversalAdapter,
+    A: TraversalAdapter<'schema>,
     I: IntoIterator<Item = SchemaNode<'schema>>,
 {
     cursor.consume_members(usize_to_u64(child_count, "record child count")?)?;
@@ -1702,13 +2028,15 @@ where
         adapter.begin_record(cursor, kind, child_count, "TypeTree record properties")?;
     let child_depth = next_depth(depth)?;
 
-    for child in children {
+    for (index, child) in children.into_iter().enumerate() {
         let Some(child_context) = context.descend(node, child) else {
             continue;
         };
+        let path_checkpoint = adapter.path_checkpoint();
+        adapter.enter_record_child(cursor, kind, index, child)?;
         let checkpoint = cursor.checkpoint();
         let attempt = traverse_value(schema, cursor, adapter, child, child_context, child_depth);
-        match recover_record_child(
+        let child_result = recover_record_child(
             schema,
             cursor,
             adapter,
@@ -1717,7 +2045,9 @@ where
             child_depth,
             checkpoint,
             attempt,
-        )? {
+        )?;
+        adapter.restore_path(path_checkpoint);
+        match child_result {
             ChildResult::Value(value) => {
                 adapter.push_record(cursor, &mut record, child, value)?;
             }
@@ -1733,12 +2063,12 @@ where
     Ok(TraverseOutcome::Complete(value))
 }
 
-fn traverse_pptr<A: TraversalAdapter>(
-    schema: &TypeTreeSchema,
+fn traverse_pptr<'schema, A: TraversalAdapter<'schema>>(
+    schema: &'schema TypeTreeSchema,
     cursor: &mut TraversalCursor<'_, '_, '_>,
     adapter: &mut A,
-    node: SchemaNode<'_>,
-    layout: PPtrLayout<'_>,
+    node: SchemaNode<'schema>,
+    layout: PPtrLayout<'schema>,
     mut context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<TraverseOutcome<A::Value>> {
@@ -1753,10 +2083,12 @@ fn traverse_pptr<A: TraversalAdapter>(
     let mut file_id = None;
     let mut path_id = None;
 
-    for child in node.children() {
+    for (index, child) in node.children().enumerate() {
         let Some(child_context) = context.descend(node, child) else {
             continue;
         };
+        let path_checkpoint = adapter.path_checkpoint();
+        adapter.enter_record_child(cursor, SemanticKind::PPtr, index, child)?;
         let checkpoint = cursor.checkpoint();
         if child == layout.file_child() || child == layout.path_child() {
             let primitive = if child == layout.file_child() {
@@ -1776,7 +2108,7 @@ fn traverse_pptr<A: TraversalAdapter>(
                     }
                     TraverseOutcome::Terminal => Ok(TraverseOutcome::Terminal),
                 });
-            match recover_record_child(
+            let child_result = recover_record_child(
                 schema,
                 cursor,
                 adapter,
@@ -1785,7 +2117,9 @@ fn traverse_pptr<A: TraversalAdapter>(
                 child_depth,
                 checkpoint,
                 attempt,
-            )? {
+            )?;
+            adapter.restore_path(path_checkpoint);
+            match child_result {
                 ChildResult::Value((value, converted)) => {
                     match converted {
                         PPtrInteger::File(value) => file_id = Some(value),
@@ -1802,7 +2136,7 @@ fn traverse_pptr<A: TraversalAdapter>(
         }
 
         let attempt = traverse_value(schema, cursor, adapter, child, child_context, child_depth);
-        match recover_record_child(
+        let child_result = recover_record_child(
             schema,
             cursor,
             adapter,
@@ -1811,7 +2145,9 @@ fn traverse_pptr<A: TraversalAdapter>(
             child_depth,
             checkpoint,
             attempt,
-        )? {
+        )?;
+        adapter.restore_path(path_checkpoint);
+        match child_result {
             ChildResult::Value(value) => {
                 adapter.push_record(cursor, &mut record, child, value)?;
             }
@@ -1835,10 +2171,10 @@ enum PPtrInteger {
     Path(i64),
 }
 
-fn traverse_integer_node<A: TraversalAdapter>(
+fn traverse_integer_node<'schema, A: TraversalAdapter<'schema>>(
     cursor: &mut TraversalCursor<'_, '_, '_>,
     adapter: &mut A,
-    node: SchemaNode<'_>,
+    node: SchemaNode<'schema>,
     expected: PrimitiveKind,
     depth: u32,
 ) -> Result<TraverseOutcome<(A::Value, WirePrimitive)>> {
@@ -1856,12 +2192,12 @@ struct ManagedTypeKey {
     assembly_name: Option<String>,
 }
 
-fn traverse_referenced_object<A: TraversalAdapter>(
-    schema: &TypeTreeSchema,
+fn traverse_referenced_object<'schema, A: TraversalAdapter<'schema>>(
+    schema: &'schema TypeTreeSchema,
     cursor: &mut TraversalCursor<'_, '_, '_>,
     adapter: &mut A,
-    node: SchemaNode<'_>,
-    layout: ReferencedObjectLayout<'_>,
+    node: SchemaNode<'schema>,
+    layout: ReferencedObjectLayout<'schema>,
     context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<TraverseOutcome<A::Value>> {
@@ -1878,12 +2214,14 @@ fn traverse_referenced_object<A: TraversalAdapter>(
     let child_depth = next_depth(depth)?;
     let mut key = ManagedTypeKey::default();
 
-    for child in node.children() {
+    for (index, child) in node.children().enumerate() {
+        let path_checkpoint = adapter.path_checkpoint();
+        adapter.enter_record_child(cursor, SemanticKind::ReferencedObject, index, child)?;
         let checkpoint = cursor.checkpoint();
         if layout.is_type_node(child) {
             let attempt =
                 traverse_managed_type(schema, cursor, adapter, child, layout, context, child_depth);
-            match recover_record_child(
+            let child_result = recover_record_child(
                 schema,
                 cursor,
                 adapter,
@@ -1892,7 +2230,9 @@ fn traverse_referenced_object<A: TraversalAdapter>(
                 child_depth,
                 checkpoint,
                 attempt,
-            )? {
+            )?;
+            adapter.restore_path(path_checkpoint);
+            match child_result {
                 ChildResult::Value((value, parsed_key)) => {
                     key = parsed_key;
                     adapter.push_record(cursor, &mut record, child, value)?;
@@ -1918,7 +2258,7 @@ fn traverse_referenced_object<A: TraversalAdapter>(
         } else {
             traverse_value(schema, cursor, adapter, child, context, child_depth)
         };
-        match recover_record_child(
+        let child_result = recover_record_child(
             schema,
             cursor,
             adapter,
@@ -1927,7 +2267,9 @@ fn traverse_referenced_object<A: TraversalAdapter>(
             child_depth,
             checkpoint,
             attempt,
-        )? {
+        )?;
+        adapter.restore_path(path_checkpoint);
+        match child_result {
             ChildResult::Value(value) => {
                 adapter.push_record(cursor, &mut record, child, value)?;
             }
@@ -1943,12 +2285,12 @@ fn traverse_referenced_object<A: TraversalAdapter>(
     Ok(TraverseOutcome::Complete(value))
 }
 
-fn traverse_managed_type<A: TraversalAdapter>(
-    schema: &TypeTreeSchema,
+fn traverse_managed_type<'schema, A: TraversalAdapter<'schema>>(
+    schema: &'schema TypeTreeSchema,
     cursor: &mut TraversalCursor<'_, '_, '_>,
     adapter: &mut A,
-    node: SchemaNode<'_>,
-    layout: super::schema::ReferencedObjectLayout<'_>,
+    node: SchemaNode<'schema>,
+    layout: super::schema::ReferencedObjectLayout<'schema>,
     mut context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<TraverseOutcome<(A::Value, ManagedTypeKey)>> {
@@ -1966,17 +2308,19 @@ fn traverse_managed_type<A: TraversalAdapter>(
     let child_depth = next_depth(depth)?;
     let mut key = ManagedTypeKey::default();
 
-    for child in node.children() {
+    for (index, child) in node.children().enumerate() {
         let Some(child_context) = context.descend(node, child) else {
             continue;
         };
+        let path_checkpoint = adapter.path_checkpoint();
+        adapter.enter_record_child(cursor, node.kind(), index, child)?;
         let checkpoint = cursor.checkpoint();
         let is_key_field = child == layout.class_field()
             || child == layout.namespace_field()
             || child == layout.assembly_field();
         if is_key_field {
             let attempt = traverse_captured_string(cursor, adapter, child, child_depth);
-            match recover_record_child(
+            let child_result = recover_record_child(
                 schema,
                 cursor,
                 adapter,
@@ -1985,7 +2329,9 @@ fn traverse_managed_type<A: TraversalAdapter>(
                 child_depth,
                 checkpoint,
                 attempt,
-            )? {
+            )?;
+            adapter.restore_path(path_checkpoint);
+            match child_result {
                 ChildResult::Value((value, text)) => {
                     if child == layout.class_field() {
                         key.class_name = Some(text);
@@ -2005,7 +2351,7 @@ fn traverse_managed_type<A: TraversalAdapter>(
         }
 
         let attempt = traverse_value(schema, cursor, adapter, child, child_context, child_depth);
-        match recover_record_child(
+        let child_result = recover_record_child(
             schema,
             cursor,
             adapter,
@@ -2014,7 +2360,9 @@ fn traverse_managed_type<A: TraversalAdapter>(
             child_depth,
             checkpoint,
             attempt,
-        )? {
+        )?;
+        adapter.restore_path(path_checkpoint);
+        match child_result {
             ChildResult::Value(value) => {
                 adapter.push_record(cursor, &mut record, child, value)?;
             }
@@ -2030,10 +2378,10 @@ fn traverse_managed_type<A: TraversalAdapter>(
     Ok(TraverseOutcome::Complete((value, key)))
 }
 
-fn traverse_captured_string<A: TraversalAdapter>(
+fn traverse_captured_string<'schema, A: TraversalAdapter<'schema>>(
     cursor: &mut TraversalCursor<'_, '_, '_>,
     adapter: &mut A,
-    node: SchemaNode<'_>,
+    node: SchemaNode<'schema>,
     depth: u32,
 ) -> Result<TraverseOutcome<(A::Value, String)>> {
     cursor.enter_node(depth)?;
@@ -2053,11 +2401,11 @@ fn traverse_captured_string<A: TraversalAdapter>(
     Ok(TraverseOutcome::Complete((value, text)))
 }
 
-fn traverse_managed_payload<A: TraversalAdapter>(
-    schema: &TypeTreeSchema,
+fn traverse_managed_payload<'schema, A: TraversalAdapter<'schema>>(
+    schema: &'schema TypeTreeSchema,
     cursor: &mut TraversalCursor<'_, '_, '_>,
     adapter: &mut A,
-    payload: ManagedPayload<'_>,
+    payload: ManagedPayload<'schema>,
     key: &ManagedTypeKey,
     context: TypeTreeTraversalContext,
     depth: u32,
@@ -2096,11 +2444,11 @@ fn traverse_managed_payload<A: TraversalAdapter>(
     )))
 }
 
-fn recover_record_child<A: TraversalAdapter, T>(
-    schema: &TypeTreeSchema,
+fn recover_record_child<'schema, A: TraversalAdapter<'schema>, T>(
+    schema: &'schema TypeTreeSchema,
     cursor: &mut TraversalCursor<'_, '_, '_>,
     adapter: &mut A,
-    child: SchemaNode<'_>,
+    child: SchemaNode<'schema>,
     context: TypeTreeTraversalContext,
     depth: u32,
     checkpoint: TraversalCheckpoint,

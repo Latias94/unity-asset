@@ -31,11 +31,17 @@ pub use unity_asset_core::{
 // Core modules
 pub mod constants;
 pub mod python_like_api;
+pub mod reference;
 pub mod serde_unity_loader;
 pub mod unity_yaml_serializer;
 pub mod yaml_document;
 
 // Re-export main types
+pub use reference::{
+    YamlReferenceDiagnostic, YamlReferenceField, YamlReferenceOccurrence, YamlReferenceRawTarget,
+    YamlReferenceRawTargetRef, YamlReferenceScan, YamlReferenceScanError, YamlReferenceScanStats,
+    YamlReferenceShape, YamlReferenceTarget, YamlValueKind, scan_reference_occurrences,
+};
 pub use serde_unity_loader::SerdeUnityLoader;
 pub use unity_yaml_serializer::UnityYamlSerializer;
 pub use yaml_document::YamlDocument;

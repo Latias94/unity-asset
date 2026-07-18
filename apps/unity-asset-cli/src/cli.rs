@@ -439,42 +439,23 @@ pub(crate) enum Commands {
         json: bool,
     },
 
-    /// Build a best-effort dependency graph using TypeTree PPtr scanning
-    ///
-    /// This is intentionally optimized for large assets: it prefers the zero-allocation PPtr scan
-    /// path (no full object parsing).
+    /// Build one revision-bound reference graph for Unity YAML and binary sources.
     #[command(name = "deps")]
     Deps {
-        /// Input file or directory path (assets/bundles will be auto-detected)
+        /// Input Unity source or directory.
         #[arg(short, long)]
         input: PathBuf,
 
-        /// Source kind: `bundle` or `serialized`
-        #[arg(long, default_value = "bundle")]
-        kind: String,
-
-        /// Source file path that contains the objects (an AssetBundle or a standalone SerializedFile)
-        #[arg(long)]
-        source: Option<PathBuf>,
-
-        /// Asset index inside the bundle (required when `--kind bundle`)
-        #[arg(long)]
-        asset_index: Option<usize>,
-
-        /// Output format: `summary`, `edges`, `dot`, or `json`
+        /// Output format: `summary`, `edges`, `dot`, `json`, or `jsonl`.
         #[arg(long, default_value = "summary")]
         format: String,
 
-        /// Include best-effort object names in `edges` output (uses TypeTree prefix peek)
-        #[arg(long)]
-        names: bool,
-
-        /// Maximum edges to print for `edges`/`dot` output (prevents huge dumps)
+        /// Maximum reference facts to emit without limiting graph construction.
         #[arg(long, default_value_t = 2000)]
         max_edges: usize,
     },
 
-    /// Build a best-effort object graph for a Unity project root (fast scan + `.meta` GUID indexing).
+    /// Build one revision-bound reference graph for a Unity project directory.
     #[command(name = "project-graph")]
     ProjectGraph {
         /// Unity project root directory.
@@ -485,40 +466,20 @@ pub(crate) enum Commands {
         #[arg(long)]
         output: Option<PathBuf>,
 
-        /// Also load YAML documents (`.asset`, `.prefab`, `.unity`) (heavier).
+        /// Include Unity YAML documents (`.asset`, `.prefab`, `.unity`).
         #[arg(long)]
         yaml: bool,
 
-        /// Output format (summary, dot, jsonl, json).
+        /// Output format: `summary`, `edges`, `dot`, `json`, or `jsonl`.
         #[arg(long, default_value = "summary", value_name = "FORMAT")]
         format: String,
 
-        /// Only run the project scan (load project + collect warnings), skip object graph build.
-        #[arg(long)]
-        scan_only: bool,
-
-        /// Write environment warnings to a JSONL file (one JSON object per warning).
-        #[arg(long)]
-        warnings_jsonl: Option<PathBuf>,
-
-        /// Limit visited files during scan (best-effort).
+        /// Limit supported root sources loaded after deterministic discovery.
         #[arg(long)]
         max_files: Option<usize>,
 
-        /// Maximum edges to emit for dot/jsonl.
+        /// Maximum reference facts to emit without limiting graph construction.
         #[arg(long, default_value_t = 200_000)]
         max_edges: usize,
-
-        /// Follow resolved external edges when emitting dot/jsonl.
-        #[arg(long)]
-        follow_external: bool,
-
-        /// Do not respect ignore files (`.gitignore`, `.ignore`).
-        #[arg(long)]
-        no_ignore: bool,
-
-        /// Follow symlinks during project scan.
-        #[arg(long)]
-        follow_symlinks: bool,
     },
 }

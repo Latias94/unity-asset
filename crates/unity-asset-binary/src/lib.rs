@@ -52,6 +52,7 @@ pub mod object;
 pub mod performance;
 mod random_access;
 pub mod reader;
+pub mod reference;
 pub mod shared_bytes;
 pub mod typetree;
 pub mod unity_objects;

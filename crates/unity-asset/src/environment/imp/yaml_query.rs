@@ -1,6 +1,12 @@
-use super::object_graph::YamlObjectKey;
 use super::path::canonicalize_if_exists;
 use super::*;
+
+/// A stable identifier for an object in a loaded YAML document.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct YamlObjectKey {
+    pub path: PathBuf,
+    pub anchor: String,
+}
 
 fn value_matches_string(value: &UnityValue, expected: &str) -> bool {
     value.as_str() == Some(expected)
