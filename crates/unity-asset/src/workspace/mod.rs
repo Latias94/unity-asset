@@ -12,8 +12,9 @@ mod view;
 pub use interface::{AssetWorkspace, SourceOpenRequest, WorkspaceOptions};
 pub use plan::{
     FieldGuard, Float64Bits, GenericMutation, MutationField, MutationOperation, MutationPlan,
-    MutationPlanError, MutationPlanReadError, MutationValue, MutationValueRef, ObjectGuard,
-    PlanBytes, PlanPayload, ReferenceTarget, SourceExpectation, UnsafeRawAcknowledgement,
+    MutationPlanBuilder, MutationPlanBuilderError, MutationPlanError, MutationPlanFragment,
+    MutationPlanReadError, MutationValue, MutationValueRef, ObjectGuard, PlanBytes, PlanPayload,
+    ReferenceTarget, SequenceMutation, SourceExpectation, UnsafeRawAcknowledgement,
 };
 pub use snapshot::WorkspaceSnapshot;
 pub use source_catalog::SourceLocationKind;

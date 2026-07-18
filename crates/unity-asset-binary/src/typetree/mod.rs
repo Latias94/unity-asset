@@ -28,7 +28,7 @@ pub(crate) use schema::ManagedReferenceCatalog;
 pub use schema::{
     IntegerSignedness, ManagedPayload, PPtrLayout, PairLayout, PrimitiveKind,
     ReferencedObjectLayout, SchemaChildren, SchemaNode, SemanticKind, SemanticLayout,
-    SequenceLayout, TypeTreeSchema, TypeTreeTraversalContext,
+    SequenceLayout, TypeTreeSchema, TypeTreeSemanticDigestError, TypeTreeTraversalContext,
 };
 pub use tpk::TpkTypeTreeRegistry;
 pub use traversal::{TypeTreeTraversalStats, TypeTreeTraversalStatsOverflow};

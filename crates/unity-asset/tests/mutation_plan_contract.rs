@@ -3,7 +3,7 @@ use std::io::{self, Read};
 use unity_asset::workspace::{
     FieldGuard, GenericMutation, MutationField, MutationPlan, MutationPlanError,
     MutationPlanReadError, MutationValue, MutationValueRef, ObjectGuard, PlanBytes, PlanPayload,
-    ReferenceTarget, SourceExpectation, UnsafeRawAcknowledgement,
+    ReferenceTarget, SequenceMutation, SourceExpectation, UnsafeRawAcknowledgement,
 };
 use unity_asset::{
     AssetLoadBudget, AssetLoadLimits, BudgetError, ContainmentKind, DigestV1, FieldPath,
@@ -62,6 +62,25 @@ fn expectations() -> Vec<SourceExpectation> {
     ]
 }
 
+fn sequence_action(edit: SequenceMutation) -> GenericMutation {
+    GenericMutation::SequenceEdit {
+        target: binary_address(),
+        path: FieldPath::root().push_field("m_Items").unwrap(),
+        guard: FieldGuard::new(digest(b"sequence schema"), digest(b"sequence values")),
+        edit,
+    }
+}
+
+fn sequence_plan(edit: SequenceMutation) -> MutationPlan {
+    MutationPlan::new(
+        WorkspaceRevision::new(digest(b"sequence revision")),
+        vec![expectations().remove(0)],
+        Vec::new(),
+        vec![sequence_action(edit)],
+    )
+    .unwrap()
+}
+
 fn sample_plan() -> MutationPlan {
     let resource = PlanPayload::new(PlanBytes::new(vec![0, 1, 2, 0xfe, 0xff]));
     let raw = PlanPayload::new(PlanBytes::new(vec![0x13, 0x37, 0, 0xaa]));
@@ -107,6 +126,42 @@ fn sample_plan() -> MutationPlan {
                 guard: FieldGuard::new(digest(b"stream schema"), digest(b"old stream")),
                 payload: resource_digest,
             },
+            GenericMutation::SequenceEdit {
+                target: binary_address(),
+                path: FieldPath::root().push_field("m_InsertItems").unwrap(),
+                guard: FieldGuard::new(digest(b"insert schema"), digest(b"insert values")),
+                edit: SequenceMutation::Insert {
+                    index: 2,
+                    value: MutationValue::string("third").unwrap(),
+                },
+            },
+            GenericMutation::SequenceEdit {
+                target: binary_address(),
+                path: FieldPath::root().push_field("m_ReplaceItems").unwrap(),
+                guard: FieldGuard::new(digest(b"replace schema"), digest(b"replace values")),
+                edit: SequenceMutation::Replace {
+                    index: 0,
+                    value: MutationValue::reference(ReferenceTarget::object(yaml_address())),
+                },
+            },
+            GenericMutation::SequenceEdit {
+                target: binary_address(),
+                path: FieldPath::root().push_field("m_RemoveItems").unwrap(),
+                guard: FieldGuard::new(digest(b"remove schema"), digest(b"remove values")),
+                edit: SequenceMutation::Remove { index: 4 },
+            },
+            GenericMutation::SequenceEdit {
+                target: binary_address(),
+                path: FieldPath::root().push_field("m_MoveItems").unwrap(),
+                guard: FieldGuard::new(digest(b"move schema"), digest(b"move values")),
+                edit: SequenceMutation::Move { from: 3, to: 1 },
+            },
+            GenericMutation::SequenceEdit {
+                target: binary_address(),
+                path: FieldPath::root().push_field("m_ClearItems").unwrap(),
+                guard: FieldGuard::new(digest(b"clear schema"), digest(b"clear values")),
+                edit: SequenceMutation::Clear,
+            },
             GenericMutation::UnsafeRawReplace {
                 target: binary_address(),
                 expected_raw_digest: digest(b"old raw object"),
@@ -128,7 +183,7 @@ fn all_mutation_primitives_have_stable_canonical_json_and_digest() {
     assert_eq!(bytes, golden.as_bytes());
     assert_eq!(
         plan.digest().unwrap().to_string(),
-        "blake3-v1:7f747ebe148dfc947f119b1dbd2fb4e478d6b39cf5b5d007f0cf753ab1d7d9e1"
+        "blake3-v1:24f2a46f6a9d190184cbab071f56f923cd0e865ad21003a38e89c01dfb72097b"
     );
     assert_eq!(serde_json::to_vec(&plan).unwrap(), bytes);
     assert_eq!(read_json_plan(&bytes).unwrap(), plan);
@@ -137,8 +192,100 @@ fn all_mutation_primitives_have_stable_canonical_json_and_digest() {
             .iter()
             .map(|operation| operation.ordinal())
             .collect::<Vec<_>>(),
-        [0, 1, 2, 3, 4]
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
+}
+
+#[test]
+fn every_sequence_edit_round_trips_through_json_and_yaml() {
+    let variants = [
+        (
+            "insert",
+            SequenceMutation::Insert {
+                index: 2,
+                value: MutationValue::string("inserted").unwrap(),
+            },
+        ),
+        (
+            "replace",
+            SequenceMutation::Replace {
+                index: 1,
+                value: MutationValue::reference(ReferenceTarget::object(yaml_address())),
+            },
+        ),
+        ("remove", SequenceMutation::Remove { index: 4 }),
+        ("move", SequenceMutation::Move { from: 3, to: 1 }),
+        ("clear", SequenceMutation::Clear),
+    ];
+
+    for (name, edit) in variants {
+        let plan = sequence_plan(edit);
+        let canonical = plan.canonical_json().unwrap();
+        assert_eq!(serde_json::to_vec(&plan).unwrap(), canonical, "{name}");
+        assert_eq!(read_json_plan(&canonical).unwrap(), plan, "{name}");
+
+        let mut yaml_budget = AssetLoadBudget::default();
+        let from_yaml = MutationPlan::from_yaml_slice(&canonical, &mut yaml_budget).unwrap();
+        assert_eq!(from_yaml, plan, "{name}");
+        assert_eq!(from_yaml.canonical_json().unwrap(), canonical, "{name}");
+    }
+}
+
+#[test]
+fn sequence_move_rejects_a_noop_with_a_structured_error() {
+    let error = MutationPlan::new(
+        WorkspaceRevision::new(digest(b"sequence revision")),
+        vec![expectations().remove(0)],
+        Vec::new(),
+        vec![sequence_action(SequenceMutation::Move { from: 7, to: 7 })],
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        MutationPlanError::NoopSequenceMove { index: 7 }
+    ));
+
+    let mut value =
+        serde_json::to_value(sequence_plan(SequenceMutation::Move { from: 7, to: 8 })).unwrap();
+    value["operations"][0]["action"]["edit"]["to"] = serde_json::json!(7);
+    assert!(matches!(
+        read_json_value(value),
+        Err(MutationPlanReadError::Contract(
+            MutationPlanError::NoopSequenceMove { index: 7 }
+        ))
+    ));
+}
+
+#[test]
+fn maximum_depth_reference_value_round_trips_through_json_and_yaml() {
+    let deepest_reference = (0..58).fold(
+        MutationValue::reference(ReferenceTarget::object(binary_address())),
+        |value, level| {
+            MutationValue::object(vec![
+                MutationField::new(format!("level_{level:02}"), value).unwrap(),
+            ])
+            .unwrap()
+        },
+    );
+    assert_eq!(deepest_reference.depth(), 59);
+    let plan = sequence_plan(SequenceMutation::Insert {
+        index: 0,
+        value: deepest_reference,
+    });
+    let canonical = plan.canonical_json().unwrap();
+
+    let mut json_budget = AssetLoadBudget::default();
+    assert_eq!(
+        MutationPlan::from_json_slice(&canonical, &mut json_budget).unwrap(),
+        plan
+    );
+    assert_eq!(json_budget.usage().max_observed_depth, 186);
+    let mut yaml_budget = AssetLoadBudget::default();
+    assert_eq!(
+        MutationPlan::from_yaml_slice(&canonical, &mut yaml_budget).unwrap(),
+        plan
+    );
+    assert_eq!(yaml_budget.usage().max_observed_depth, 186);
 }
 
 #[test]
@@ -391,10 +538,16 @@ fn field_operations_reject_the_whole_object_root() {
             replacement: ReferenceTarget::null(),
         },
         GenericMutation::ResourceReplace {
-            target,
+            target: target.clone(),
             path: FieldPath::root(),
             guard,
             payload: digest(b"payload"),
+        },
+        GenericMutation::SequenceEdit {
+            target,
+            path: FieldPath::root(),
+            guard,
+            edit: SequenceMutation::Clear,
         },
     ];
 

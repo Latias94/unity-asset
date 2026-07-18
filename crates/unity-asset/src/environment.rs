@@ -42,11 +42,9 @@ mod imp {
     mod save;
     mod stream;
     mod streamed_write;
-    mod typed;
     mod yaml_edit;
     mod yaml_pptr;
     mod yaml_query;
-    mod yaml_ui;
 
     pub use dependency_graph::{
         DependencyGraphBuildOptions, DependencyGraphTraversalOptions, DependencyGraphWarning,

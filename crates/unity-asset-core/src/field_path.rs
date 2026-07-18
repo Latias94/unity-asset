@@ -1,4 +1,5 @@
 use std::fmt;
+use std::mem::size_of;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -29,9 +30,40 @@ impl FieldPath {
         Ok(self)
     }
 
+    /// Constructs a path from already owned segments without reallocating their backing storage.
+    pub fn from_segments(segments: Vec<FieldPathSegment>) -> Result<Self, FieldPathError> {
+        if segments.len() > MAX_FIELD_PATH_SEGMENTS {
+            return Err(FieldPathError::TooManySegments {
+                maximum: MAX_FIELD_PATH_SEGMENTS,
+            });
+        }
+        for segment in &segments {
+            if let FieldPathSegment::Field(name) = segment
+                && !is_valid_field_name(name)
+            {
+                return Err(FieldPathError::InvalidField(name.clone()));
+            }
+        }
+        Ok(Self(segments))
+    }
+
     #[must_use]
     pub fn segments(&self) -> &[FieldPathSegment] {
         &self.0
+    }
+
+    /// Returns the heap bytes retained by an ordinary clone of this path.
+    #[must_use]
+    pub fn retained_clone_bytes(&self) -> Option<usize> {
+        self.0
+            .len()
+            .checked_mul(size_of::<FieldPathSegment>())?
+            .checked_add(self.0.iter().try_fold(0_usize, |total, segment| {
+                total.checked_add(match segment {
+                    FieldPathSegment::Field(name) => name.len(),
+                    FieldPathSegment::Index(_) => 0,
+                })
+            })?)
     }
 
     fn ensure_capacity(&self) -> Result<(), FieldPathError> {
@@ -73,11 +105,15 @@ pub enum FieldPathSegment {
 impl FieldPathSegment {
     pub fn field(name: impl Into<String>) -> Result<Self, FieldPathError> {
         let name = name.into();
-        if name.is_empty() || name.len() > MAX_FIELD_NAME_BYTES || name.contains('\0') {
+        if !is_valid_field_name(&name) {
             return Err(FieldPathError::InvalidField(name));
         }
         Ok(Self::Field(name))
     }
+}
+
+fn is_valid_field_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAX_FIELD_NAME_BYTES && !name.contains('\0')
 }
 
 #[derive(Serialize)]

@@ -13,6 +13,48 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use unity_asset_core::{AssetLoadBudget, UnityClass, UnityValue};
 
+/// Origin of the canonical schema selected for an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectSchemaOrigin {
+    EmbeddedTypeTree,
+    ExternalRegistry,
+}
+
+/// One object materialization together with the exact schema selection used to parse it.
+#[derive(Debug)]
+pub struct MaterializedObject {
+    object: UnityObject,
+    selected_schema: Option<SelectedObjectSchema>,
+}
+
+impl MaterializedObject {
+    #[must_use]
+    pub const fn object(&self) -> &UnityObject {
+        &self.object
+    }
+
+    #[must_use]
+    pub const fn schema(&self) -> Option<&TypeTreeSchema> {
+        match &self.selected_schema {
+            Some(selected) => Some(&selected.schema),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn schema_origin(&self) -> Option<ObjectSchemaOrigin> {
+        match &self.selected_schema {
+            Some(selected) => Some(selected.origin),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub fn into_object(self) -> UnityObject {
+        self.object
+    }
+}
+
 /// A lightweight reference to a binary object within a [`SerializedFile`].
 ///
 /// This is conceptually similar to UnityPy's `ObjectReader`: it carries just enough context
@@ -62,7 +104,7 @@ impl<'a> ObjectHandle<'a> {
 
     /// Parse this object into an owned [`UnityObject`] under a caller-owned resource budget.
     pub fn read(&self, budget: &mut AssetLoadBudget) -> Result<UnityObject> {
-        UnityObject::from_serialized_file(self.file, self.info, budget)
+        self.read_with_options(budget, TypeTreeParseOptions::default())
     }
 
     pub fn read_with_options(
@@ -70,7 +112,33 @@ impl<'a> ObjectHandle<'a> {
         budget: &mut AssetLoadBudget,
         options: TypeTreeParseOptions,
     ) -> Result<UnityObject> {
-        UnityObject::from_serialized_file_with_options(self.file, self.info, budget, options)
+        Ok(self
+            .materialize_with_options(budget, options)?
+            .into_object())
+    }
+
+    /// Parses the object and retains the exact schema selection used for that parse.
+    pub fn materialize(&self, budget: &mut AssetLoadBudget) -> Result<MaterializedObject> {
+        self.materialize_with_options(budget, TypeTreeParseOptions::default())
+    }
+
+    pub fn materialize_with_options(
+        &self,
+        budget: &mut AssetLoadBudget,
+        options: TypeTreeParseOptions,
+    ) -> Result<MaterializedObject> {
+        let selected = self.selected_schema(budget)?;
+        let object = UnityObject::from_serialized_file_with_compiled_schema(
+            self.file,
+            self.info,
+            selected.as_ref().map(|selected| &selected.schema),
+            budget,
+            options,
+        )?;
+        Ok(MaterializedObject {
+            object,
+            selected_schema: selected,
+        })
     }
 
     /// Returns the canonical TypeTree schema selected for this object.
@@ -79,18 +147,38 @@ impl<'a> ObjectHandle<'a> {
     /// same type. External registry results are compiled per lookup because registries may change
     /// the returned tree without exposing a revision identity.
     pub fn schema(&self, budget: &mut AssetLoadBudget) -> Result<Option<TypeTreeSchema>> {
+        Ok(self
+            .selected_schema(budget)?
+            .map(|selected| selected.schema))
+    }
+
+    /// Reports where [`Self::schema`] obtains its canonical TypeTree without compiling it.
+    #[must_use]
+    pub fn schema_origin(&self) -> Option<ObjectSchemaOrigin> {
+        type_tree_for_object(self.file, self.info).map(|source| match source {
+            TypeTreeSource::Internal(_) => ObjectSchemaOrigin::EmbeddedTypeTree,
+            TypeTreeSource::External(_) => ObjectSchemaOrigin::ExternalRegistry,
+        })
+    }
+
+    fn selected_schema(
+        &self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Option<SelectedObjectSchema>> {
         let Some(source) = type_tree_for_object(self.file, self.info) else {
             return Ok(None);
         };
-        match source {
-            TypeTreeSource::Internal(type_index) => self
-                .file
-                .cached_internal_schema(type_index, budget)
-                .map(Some),
-            TypeTreeSource::External(tree) => {
-                self.file.compile_schema(tree.as_ref(), budget).map(Some)
-            }
-        }
+        let (schema, origin) = match source {
+            TypeTreeSource::Internal(type_index) => (
+                self.file.cached_internal_schema(type_index, budget)?,
+                ObjectSchemaOrigin::EmbeddedTypeTree,
+            ),
+            TypeTreeSource::External(tree) => (
+                self.file.compile_schema(tree.as_ref(), budget)?,
+                ObjectSchemaOrigin::ExternalRegistry,
+            ),
+        };
+        Ok(Some(SelectedObjectSchema { schema, origin }))
     }
 
     /// Peek the object's name (`m_Name`/`name`) without parsing the full TypeTree.
@@ -260,14 +348,23 @@ impl UnityObject {
         budget: &mut AssetLoadBudget,
         options: TypeTreeParseOptions,
     ) -> Result<Self> {
+        ObjectHandle::new(file, info).read_with_options(budget, options)
+    }
+
+    fn from_serialized_file_with_compiled_schema(
+        file: &SerializedFile,
+        info: &ObjectInfo,
+        schema: Option<&TypeTreeSchema>,
+        budget: &mut AssetLoadBudget,
+        options: TypeTreeParseOptions,
+    ) -> Result<Self> {
         let class_id = info.class_id();
         let byte_order = file.header.byte_order();
         let anchor = anchor_from_path_id(info.path_id(), budget)?;
         let class_name = class_name_from_id_with_budget(class_id, budget)?;
-        let schema = ObjectHandle::new(file, info).schema(budget)?;
         let (class, warnings, stats) = match schema {
             Some(schema) => {
-                let out = parse_object_data(file, info, byte_order, &schema, budget, options)?;
+                let out = parse_object_data(file, info, byte_order, schema, budget, options)?;
                 (
                     UnityClass::with_properties(class_id, class_name, anchor, out.properties),
                     out.warnings,
@@ -456,6 +553,12 @@ fn string_with_capacity(
 enum TypeTreeSource {
     Internal(usize),
     External(Arc<TypeTree>),
+}
+
+#[derive(Debug)]
+struct SelectedObjectSchema {
+    schema: TypeTreeSchema,
+    origin: ObjectSchemaOrigin,
 }
 
 fn type_tree_for_object(file: &SerializedFile, info: &ObjectInfo) -> Option<TypeTreeSource> {

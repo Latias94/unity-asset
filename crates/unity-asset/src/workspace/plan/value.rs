@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use super::MutationPlanError;
+use super::{MutationPlanError, ReferenceTarget};
 
 const MAX_FIELD_NAME_BYTES: usize = 64 * 1024;
 const MAX_VALUE_STRING_BYTES: usize = 64 * 1024 * 1024;
@@ -228,6 +228,7 @@ enum MutationValueKind {
     Float64 { bits: Float64Bits },
     String { value: String },
     Bytes { value: PlanBytes },
+    Reference { target: ReferenceTarget },
     Array { values: Vec<MutationValue> },
     Object { fields: Vec<MutationField> },
 }
@@ -242,6 +243,7 @@ pub enum MutationValueRef<'value> {
     Float64(Float64Bits),
     String(&'value str),
     Bytes(&'value PlanBytes),
+    Reference(&'value ReferenceTarget),
     Array(&'value [MutationValue]),
     Object(&'value [MutationField]),
 }
@@ -317,12 +319,29 @@ impl MutationValue {
         })
     }
 
+    pub(crate) fn validate_string_value(value: &str) -> Result<(), MutationPlanError> {
+        validate_string(value)
+    }
+
     #[must_use]
     pub fn bytes(value: impl Into<PlanBytes>) -> Self {
         Self {
             kind: MutationValueKind::Bytes {
                 value: value.into(),
             },
+            depth: 1,
+        }
+    }
+
+    /// Stores a logical object reference inside a larger semantic replacement.
+    ///
+    /// This is used for schema-bound structures such as hierarchy child arrays and UnityEvent
+    /// calls. Format adapters resolve the logical target to binary or YAML pointer spelling during
+    /// prepare; recipes never persist raw file IDs.
+    #[must_use]
+    pub const fn reference(target: ReferenceTarget) -> Self {
+        Self {
+            kind: MutationValueKind::Reference { target },
             depth: 1,
         }
     }
@@ -350,6 +369,7 @@ impl MutationValue {
             MutationValueKind::Float64 { bits } => MutationValueRef::Float64(*bits),
             MutationValueKind::String { value } => MutationValueRef::String(value),
             MutationValueKind::Bytes { value } => MutationValueRef::Bytes(value),
+            MutationValueKind::Reference { target } => MutationValueRef::Reference(target),
             MutationValueKind::Array { values } => MutationValueRef::Array(values),
             MutationValueKind::Object { fields } => MutationValueRef::Object(fields),
         }
@@ -386,7 +406,8 @@ impl MutationValue {
             | MutationValueKind::Signed { .. }
             | MutationValueKind::Unsigned { .. }
             | MutationValueKind::Float64 { .. }
-            | MutationValueKind::Bytes { .. } => 1,
+            | MutationValueKind::Bytes { .. }
+            | MutationValueKind::Reference { .. } => 1,
         };
         Ok(Self { kind, depth })
     }

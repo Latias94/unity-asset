@@ -14,6 +14,286 @@ fn tree_with_root(root: TypeTreeNode) -> TypeTree {
     tree
 }
 
+fn compile_schema(root: TypeTreeNode, ref_types: &[SerializedType]) -> TypeTreeSchema {
+    TypeTreeSchema::compile(
+        &tree_with_root(root),
+        ref_types,
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap()
+}
+
+fn referenced_object_root() -> TypeTreeNode {
+    let mut type_node = node("ReferencedObjectType", "type");
+    type_node.children = vec![
+        node("string", "class"),
+        node("string", "ns"),
+        node("string", "asm"),
+    ];
+    let mut referenced = node("ReferencedObject", "m_Reference");
+    referenced.children = vec![type_node, node("ReferencedObjectData", "data")];
+    let mut root = node("Root", "Root");
+    root.children.push(referenced);
+    root
+}
+
+fn managed_type(class_name: &str, field_type: &str, field_name: &str) -> SerializedType {
+    let mut root = node("Managed", "Managed");
+    root.children.push(node(field_type, field_name));
+    let mut managed = SerializedType::new(114);
+    managed.class_name = class_name.to_owned();
+    managed.namespace = "Tests".to_owned();
+    managed.assembly_name = "Tests".to_owned();
+    managed.type_tree = tree_with_root(root);
+    managed
+}
+
+fn collection(type_name: &str, element: TypeTreeNode) -> TypeTreeNode {
+    let mut array = node("Array", "Array");
+    array.children = vec![node("int", "size"), element];
+    let mut collection = node(type_name, "items");
+    collection.children.push(array);
+    collection
+}
+
+#[test]
+fn semantic_digest_is_clone_stable_and_sensitive_to_node_contracts() {
+    let mut root = node("Root", "Root");
+    root.children.push(node("int", "m_Value"));
+    let schema = compile_schema(root.clone(), &[]);
+    assert_eq!(
+        schema.semantic_digest().unwrap(),
+        schema.clone().semantic_digest().unwrap()
+    );
+
+    let mut renamed = root.clone();
+    renamed.children[0].name = "m_Renamed".to_owned();
+    let mut retyped = root.clone();
+    retyped.children[0].type_name = "UInt32".to_owned();
+    let mut realigned = root;
+    realigned.children[0].meta_flags = 0x4000;
+
+    let digest = schema.semantic_digest().unwrap();
+    assert_ne!(
+        digest,
+        compile_schema(renamed, &[]).semantic_digest().unwrap()
+    );
+    assert_ne!(
+        digest,
+        compile_schema(retyped, &[]).semantic_digest().unwrap()
+    );
+    assert_ne!(
+        digest,
+        compile_schema(realigned, &[]).semantic_digest().unwrap()
+    );
+}
+
+#[test]
+fn semantic_digest_has_a_fixed_wire_identity() {
+    let mut root = node("Root", "Root");
+    root.children.push(node("int", "m_Value"));
+
+    assert_eq!(
+        compile_schema(root, &[])
+            .semantic_digest()
+            .unwrap()
+            .to_string(),
+        "blake3-v1:6c4309882d33cc957d202664a95c50094ac9930d1d066e2310c437ed7e1e1ebd"
+    );
+}
+
+#[test]
+fn semantic_digest_covers_child_order_and_pptr_integer_widths() {
+    let mut ordered = node("Root", "Root");
+    ordered.children = vec![node("int", "first"), node("UInt32", "second")];
+    let mut reversed = ordered.clone();
+    reversed.children.reverse();
+    assert_ne!(
+        compile_schema(ordered, &[]).semantic_digest().unwrap(),
+        compile_schema(reversed, &[]).semantic_digest().unwrap()
+    );
+
+    let pointer = |file_type: &str, path_type: &str| {
+        let mut pointer = node("PPtr<Object>", "target");
+        pointer.children = vec![node(file_type, "m_FileID"), node(path_type, "m_PathID")];
+        pointer
+    };
+    let narrow = compile_schema(pointer("short", "int"), &[]);
+    let wide = compile_schema(pointer("int", "long long"), &[]);
+    assert_ne!(
+        narrow.semantic_digest().unwrap(),
+        wide.semantic_digest().unwrap()
+    );
+}
+
+#[test]
+fn semantic_digest_charges_one_complete_schema_traversal() {
+    let mut root = node("Root", "Root");
+    root.children.push(node("int", "m_Value"));
+    let schema = compile_schema(root, &[]);
+    let required_entries = u64::try_from(schema.node_count() + 1).unwrap();
+
+    let limits = AssetLoadLimits {
+        max_entries: required_entries,
+        ..AssetLoadLimits::default()
+    };
+    let mut exact = AssetLoadBudget::new(limits).unwrap();
+    schema.semantic_digest_with_budget(&mut exact).unwrap();
+    assert_eq!(exact.usage().entries, required_entries);
+
+    let limits = AssetLoadLimits {
+        max_entries: required_entries - 1,
+        ..AssetLoadLimits::default()
+    };
+    let mut one_short = AssetLoadBudget::new(limits).unwrap();
+    assert!(matches!(
+        schema.semantic_digest_with_budget(&mut one_short),
+        Err(TypeTreeSemanticDigestError::Budget(_))
+    ));
+    assert_eq!(one_short.usage().entries, 0);
+}
+
+#[test]
+fn semantic_digest_covers_opaque_width() {
+    let mut four_bytes = node("OpaquePayload", "payload");
+    four_bytes.byte_size = 4;
+    let mut eight_bytes = four_bytes.clone();
+    eight_bytes.byte_size = 8;
+
+    assert_ne!(
+        compile_schema(four_bytes, &[]).semantic_digest().unwrap(),
+        compile_schema(eight_bytes, &[]).semantic_digest().unwrap()
+    );
+}
+
+#[test]
+fn semantic_digest_canonicalizes_and_covers_managed_catalogs() {
+    let alpha = managed_type("Alpha", "int", "m_Value");
+    let zulu = managed_type("Zulu", "int", "m_Value");
+    let forward = compile_schema(referenced_object_root(), &[zulu.clone(), alpha.clone()]);
+    let reverse = compile_schema(referenced_object_root(), &[alpha.clone(), zulu.clone()]);
+    assert_eq!(
+        forward.semantic_digest().unwrap(),
+        reverse.semantic_digest().unwrap()
+    );
+
+    let changed_key = managed_type("Beta", "int", "m_Value");
+    let changed_type = managed_type("Alpha", "UInt32", "m_Value");
+    let changed_name = managed_type("Alpha", "int", "m_Renamed");
+    let digest = forward.semantic_digest().unwrap();
+    for changed in [changed_key, changed_type, changed_name] {
+        let schema = compile_schema(referenced_object_root(), &[zulu.clone(), changed]);
+        assert_ne!(digest, schema.semantic_digest().unwrap());
+    }
+}
+
+#[test]
+fn semantic_digest_distinguishes_collection_and_pair_semantics() {
+    let mut pair = node("pair", "data");
+    pair.children = vec![node("int", "first"), node("UInt32", "second")];
+
+    let sequence = compile_schema(collection("vector", pair.clone()), &[]);
+    let map = compile_schema(collection("map", pair.clone()), &[]);
+    let pair_schema = compile_schema(pair.clone(), &[]);
+    let mut record = pair;
+    record.type_name = "Entry".to_owned();
+    let record = compile_schema(record, &[]);
+    let scalar_sequence = compile_schema(collection("vector", node("int", "data")), &[]);
+
+    assert_eq!(sequence.root().kind(), SemanticKind::Sequence);
+    assert_eq!(map.root().kind(), SemanticKind::Map);
+    assert_eq!(pair_schema.root().kind(), SemanticKind::Pair);
+    assert_eq!(record.root().kind(), SemanticKind::Record);
+    assert_ne!(
+        sequence.semantic_digest().unwrap(),
+        map.semantic_digest().unwrap()
+    );
+    assert_ne!(
+        pair_schema.semantic_digest().unwrap(),
+        record.semantic_digest().unwrap()
+    );
+    assert_ne!(
+        sequence.semantic_digest().unwrap(),
+        scalar_sequence.semantic_digest().unwrap()
+    );
+}
+
+#[test]
+fn semantic_digest_distinguishes_dynamic_and_fallback_managed_payloads() {
+    let dynamic = compile_schema(referenced_object_root(), &[]);
+    let mut fallback_root = referenced_object_root();
+    fallback_root.children[0].children[1]
+        .children
+        .push(node("int", "m_Value"));
+    let fallback = compile_schema(fallback_root, &[]);
+
+    let SemanticLayout::ReferencedObject(dynamic_layout) =
+        dynamic.root().child(0).unwrap().semantic_layout()
+    else {
+        panic!("expected a referenced-object layout");
+    };
+    let SemanticLayout::ReferencedObject(fallback_layout) =
+        fallback.root().child(0).unwrap().semantic_layout()
+    else {
+        panic!("expected a referenced-object layout");
+    };
+    assert!(matches!(
+        dynamic_layout.payload(),
+        ManagedPayload::Dynamic(_)
+    ));
+    assert!(matches!(
+        fallback_layout.payload(),
+        ManagedPayload::Fallback(_)
+    ));
+    assert_ne!(
+        dynamic.semantic_digest().unwrap(),
+        fallback.semantic_digest().unwrap()
+    );
+}
+
+#[test]
+fn semantic_digest_distinguishes_absent_and_present_empty_managed_catalogs() {
+    let mut plain_root = node("Root", "Root");
+    plain_root.children.push(node("int", "m_Value"));
+    let absent = compile_schema(plain_root, &[]);
+    let present_empty = compile_schema(referenced_object_root(), &[]);
+
+    assert!(absent.managed.is_none());
+    assert!(
+        present_empty
+            .managed
+            .as_deref()
+            .is_some_and(|catalog| catalog.reference_index.is_empty())
+    );
+    assert_ne!(
+        absent.semantic_digest().unwrap(),
+        present_empty.semantic_digest().unwrap()
+    );
+}
+
+#[test]
+fn semantic_digest_covers_managed_namespace_and_assembly_independently() {
+    let base = managed_type("Example", "int", "m_Value");
+    let mut changed_namespace = base.clone();
+    changed_namespace.namespace = "Changed".to_owned();
+    let mut changed_assembly = base.clone();
+    changed_assembly.assembly_name = "Changed".to_owned();
+
+    let base_digest = compile_schema(referenced_object_root(), &[base])
+        .semantic_digest()
+        .unwrap();
+    let namespace_digest = compile_schema(referenced_object_root(), &[changed_namespace])
+        .semantic_digest()
+        .unwrap();
+    let assembly_digest = compile_schema(referenced_object_root(), &[changed_assembly])
+        .semantic_digest()
+        .unwrap();
+
+    assert_ne!(base_digest, namespace_digest);
+    assert_ne!(base_digest, assembly_digest);
+    assert_ne!(namespace_digest, assembly_digest);
+}
+
 #[test]
 fn primitive_aliases_compile_to_one_kind() {
     let mut root = node("Root", "Root");

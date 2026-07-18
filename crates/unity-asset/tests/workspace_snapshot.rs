@@ -5,13 +5,19 @@ use std::path::PathBuf;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use unity_asset::schema::{
+    DeclaredUnityVersion, RecipeApplicabilityStatus, RecipeError, RecipeRejectionCode,
+    SchemaOrigin, SchemaRecipePlanner,
+};
 use unity_asset::workspace::{
-    AssetWorkspace, SourceOpenRequest, WorkspaceError, WorkspaceLookup, WorkspaceObjectValue,
-    WorkspaceOptions, WorkspaceSourceContainer, WorkspaceSourceMemberIdentityError, WorkspaceView,
+    AssetWorkspace, ReferenceTarget, SourceOpenRequest, WorkspaceError, WorkspaceLookup,
+    WorkspaceObjectValue, WorkspaceOptions, WorkspaceSourceContainer,
+    WorkspaceSourceMemberIdentityError, WorkspaceView,
 };
 use unity_asset::{
-    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BinaryError, ContainmentKind, ContractError,
-    ObjectAddress, SourceAlias, SourceKind, SourceLocator, SourceMemberId,
+    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BinaryError, BudgetError, ContainmentKind,
+    ContractError, FieldPath, ObjectAddress, SourceAlias, SourceKind, SourceLocator,
+    SourceMemberId,
 };
 use unity_asset_binary::asset::SerializedFileParser;
 use unity_asset_binary::bundle::BundleParser;
@@ -23,6 +29,9 @@ const V22_SERIALIZED_FIXTURE: &[u8] =
     include_bytes!("../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin");
 const MULTI_V22_SERIALIZED_FIXTURE: &[u8] = include_bytes!(
     "../../unity-asset-write/tests/fixtures/serialized_file_wire/multi_v22.assets.bin"
+);
+const TRANSFORM_HIERARCHY_V22_SERIALIZED_FIXTURE: &[u8] = include_bytes!(
+    "../../unity-asset-write/tests/fixtures/serialized_file_wire/transform_hierarchy_v22.assets.bin"
 );
 
 const EXTERNAL_TYPE_TREE_REGISTRY: &str = r#"{
@@ -89,6 +98,19 @@ GameObject:
 --- !u!4 &100
 Transform:
   m_GameObject: {fileID: 100}
+"#;
+
+const MULTI_OBJECT_YAML: &str = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100
+GameObject:
+  m_Name: First
+--- !u!1 &200
+GameObject:
+  m_Name: Second
+--- !u!1 &300
+GameObject:
+  m_Name: Third
 "#;
 
 fn workspace(_test_case: u128) -> AssetWorkspace {
@@ -183,6 +205,21 @@ fn stripped_serialized_fixture_bytes() -> Vec<u8> {
     SerializedFileWriter::save(&file, &SerializedFileEdits::default()).unwrap()
 }
 
+fn transform_fixture_with_unity_version(unity_version: &str) -> Vec<u8> {
+    let mut file =
+        SerializedFileParser::from_bytes(TRANSFORM_HIERARCHY_V22_SERIALIZED_FIXTURE.to_vec())
+            .unwrap();
+    assert_eq!(file.format().version(), 22);
+    file.unity_version = unity_version.to_owned();
+
+    let rewritten = SerializedFileWriter::save(&file, &SerializedFileEdits::default()).unwrap();
+    let reparsed = SerializedFileParser::from_bytes(rewritten.clone()).unwrap();
+    assert_eq!(reparsed.format().version(), 22);
+    assert_eq!(reparsed.unity_version, unity_version);
+    assert_eq!(reparsed.object_count(), 2);
+    rewritten
+}
+
 fn yaml_with_anchor(anchor: &str) -> String {
     format!(
         "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &{anchor}\nGameObject:\n  m_Name: Invalid\n"
@@ -225,11 +262,13 @@ fn load_usage(path: &std::path::Path, bytes: &[u8], max_bytes: u64) -> AssetLoad
 
 fn assert_single_result_is_budgeted<T>(
     mut query: impl FnMut(&mut AssetLoadBudget) -> Result<T, WorkspaceError>,
+    expected_entries: u64,
+    expected_entries_before_byte_limit: u64,
 ) {
     let mut successful = AssetLoadBudget::default();
     query(&mut successful).unwrap();
     let successful_usage = successful.usage();
-    assert_eq!(successful_usage.entries, 1);
+    assert_eq!(successful_usage.entries, expected_entries);
     assert!(successful_usage.bytes > 0);
 
     let mut entry_limited = AssetLoadBudget::new(AssetLoadLimits {
@@ -257,7 +296,10 @@ fn assert_single_result_is_budgeted<T>(
         query(&mut byte_limited),
         Err(WorkspaceError::Budget(_))
     ));
-    assert_eq!(byte_limited.usage().entries, 0);
+    assert_eq!(
+        byte_limited.usage().entries,
+        expected_entries_before_byte_limit
+    );
     assert_eq!(byte_limited.usage().bytes, successful_usage.bytes);
 }
 
@@ -714,9 +756,143 @@ fn single_query_results_respect_entry_and_byte_budgets() {
         other => panic!("expected resolved object, got {other:?}"),
     };
 
-    assert_single_result_is_budgeted(|budget| snapshot.source(root, budget));
-    assert_single_result_is_budgeted(|budget| snapshot.resolve_object(&address, budget));
-    assert_single_result_is_budgeted(|budget| snapshot.read_object(&handle, budget));
+    assert_single_result_is_budgeted(|budget| snapshot.source(root, budget), 1, 0);
+    assert_single_result_is_budgeted(|budget| snapshot.resolve_object(&address, budget), 2, 1);
+    assert_single_result_is_budgeted(|budget| snapshot.read_object(&handle, budget), 4, 1);
+}
+
+#[test]
+fn binary_object_table_scans_charge_each_cached_candidate_visit() {
+    const CANDIDATE_COUNT: u64 = 2;
+
+    let directory = tempfile::tempdir().unwrap();
+    let file_name = "transform-hierarchy.assets";
+    let path = directory.path().join(file_name);
+    fs::write(&path, TRANSFORM_HIERARCHY_V22_SERIALIZED_FIXTURE).unwrap();
+    let mut workspace = workspace(18);
+    workspace
+        .load_path(&path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let locator = SourceLocator::path(file_name).unwrap();
+    let missing = ObjectAddress::binary_direct(locator.clone(), 999).unwrap();
+
+    let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+        max_entries: CANDIDATE_COUNT,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    assert!(matches!(
+        snapshot.resolve_object(&missing, &mut exact).unwrap(),
+        WorkspaceLookup::Missing
+    ));
+    assert_eq!(exact.usage().entries, CANDIDATE_COUNT);
+
+    let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+        max_entries: CANDIDATE_COUNT - 1,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    assert!(matches!(
+        snapshot.resolve_object(&missing, &mut one_short),
+        Err(WorkspaceError::Budget(BudgetError::Exceeded {
+            resource: "entries",
+            limit: 1,
+            requested: CANDIDATE_COUNT,
+        }))
+    ));
+    assert_eq!(one_short.usage(), AssetLoadUsage::default());
+
+    let address = ObjectAddress::binary_direct(locator, 1).unwrap();
+    let mut resolve_then_read = AssetLoadBudget::new(AssetLoadLimits {
+        max_entries: CANDIDATE_COUNT * 2,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    let handle = match snapshot
+        .resolve_object(&address, &mut resolve_then_read)
+        .unwrap()
+    {
+        WorkspaceLookup::Resolved(handle) => handle,
+        other => panic!("expected resolved object, got {other:?}"),
+    };
+    assert_eq!(resolve_then_read.usage().entries, CANDIDATE_COUNT + 1);
+    assert!(matches!(
+        snapshot.read_object(&handle, &mut resolve_then_read),
+        Err(WorkspaceError::Budget(BudgetError::Exceeded {
+            resource: "entries",
+            limit: 4,
+            requested: 5,
+        }))
+    ));
+    assert_eq!(resolve_then_read.usage().entries, CANDIDATE_COUNT + 1);
+}
+
+#[test]
+fn yaml_object_table_scans_charge_each_cached_candidate_visit() {
+    const CANDIDATE_COUNT: u64 = 3;
+
+    let directory = tempfile::tempdir().unwrap();
+    let file_name = "multi.prefab";
+    let path = directory.path().join(file_name);
+    fs::write(&path, MULTI_OBJECT_YAML).unwrap();
+    let mut workspace = workspace(19);
+    workspace
+        .load_path(&path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let locator = SourceLocator::path(file_name).unwrap();
+    let missing = ObjectAddress::yaml(locator.clone(), "999").unwrap();
+
+    let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+        max_entries: CANDIDATE_COUNT,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    assert!(matches!(
+        snapshot.resolve_object(&missing, &mut exact).unwrap(),
+        WorkspaceLookup::Missing
+    ));
+    assert_eq!(exact.usage().entries, CANDIDATE_COUNT);
+
+    let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+        max_entries: CANDIDATE_COUNT - 1,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    assert!(matches!(
+        snapshot.resolve_object(&missing, &mut one_short),
+        Err(WorkspaceError::Budget(BudgetError::Exceeded {
+            resource: "entries",
+            limit: 2,
+            requested: CANDIDATE_COUNT,
+        }))
+    ));
+    assert_eq!(one_short.usage(), AssetLoadUsage::default());
+
+    let address = ObjectAddress::yaml(locator, "200").unwrap();
+    let mut resolve_then_read = AssetLoadBudget::new(AssetLoadLimits {
+        max_entries: CANDIDATE_COUNT * 2,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    let handle = match snapshot
+        .resolve_object(&address, &mut resolve_then_read)
+        .unwrap()
+    {
+        WorkspaceLookup::Resolved(handle) => handle,
+        other => panic!("expected resolved object, got {other:?}"),
+    };
+    assert_eq!(resolve_then_read.usage().entries, CANDIDATE_COUNT + 1);
+    assert!(matches!(
+        snapshot.read_object(&handle, &mut resolve_then_read),
+        Err(WorkspaceError::Budget(BudgetError::Exceeded {
+            resource: "entries",
+            limit: 6,
+            requested: 7,
+        }))
+    ));
+    assert_eq!(resolve_then_read.usage().entries, CANDIDATE_COUNT + 1);
 }
 
 #[test]
@@ -1063,6 +1239,99 @@ fn empty_nested_container_is_valid_at_the_exact_depth_limit() {
 }
 
 #[test]
+fn embedded_binary_schema_provenance_records_declared_version_and_wire_format() {
+    let directory = tempfile::tempdir().unwrap();
+    let file_name = "transform-hierarchy.assets";
+    let asset_path = directory.path().join(file_name);
+    fs::write(&asset_path, TRANSFORM_HIERARCHY_V22_SERIALIZED_FIXTURE).unwrap();
+    let mut workspace = workspace(16);
+    workspace
+        .load_path(&asset_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+    let address = ObjectAddress::binary_direct(SourceLocator::path(file_name).unwrap(), 1).unwrap();
+    let object = planner
+        .inspect(&address, &mut AssetLoadBudget::default())
+        .unwrap();
+
+    assert_eq!(object.class().class_name, "Transform");
+    assert_eq!(object.provenance().origin(), SchemaOrigin::EmbeddedTypeTree);
+    assert!(object.provenance().schema_digest().is_some());
+    let binary_version = object.provenance().binary_version().unwrap();
+    assert_eq!(binary_version.serialized_file_format(), 22);
+    let DeclaredUnityVersion::Parsed { version } = binary_version.declared_unity() else {
+        panic!("expected a parsed Unity version");
+    };
+    assert_eq!(version.to_string(), "2020.1.0f1");
+}
+
+#[test]
+fn rewritten_unknown_unity_versions_remain_readable_but_reject_all_recipes() {
+    let directory = tempfile::tempdir().unwrap();
+    for (file_name, raw_version, expected_version) in [
+        (
+            "absent-unity-version.assets",
+            "",
+            DeclaredUnityVersion::Absent,
+        ),
+        (
+            "unparseable-unity-version.assets",
+            "not-a-unity-version",
+            DeclaredUnityVersion::Unparseable,
+        ),
+    ] {
+        let asset_path = directory.path().join(file_name);
+        fs::write(
+            &asset_path,
+            transform_fixture_with_unity_version(raw_version),
+        )
+        .unwrap();
+        let mut workspace = workspace(17);
+        workspace
+            .load_path(&asset_path, &mut AssetLoadBudget::default())
+            .unwrap();
+        let snapshot = workspace.snapshot();
+        let planner = SchemaRecipePlanner::new(&snapshot);
+        let locator = SourceLocator::path(file_name).unwrap();
+        let address = ObjectAddress::binary_direct(locator.clone(), 1).unwrap();
+        let object = planner
+            .inspect(&address, &mut AssetLoadBudget::default())
+            .unwrap();
+
+        assert_eq!(object.class().class_name, "Transform");
+        assert!(object.class().has_property("m_Father"));
+        assert_eq!(object.provenance().origin(), SchemaOrigin::EmbeddedTypeTree);
+        assert!(object.provenance().schema_digest().is_some());
+        let binary_version = object.provenance().binary_version().unwrap();
+        assert_eq!(binary_version.serialized_file_format(), 22);
+        assert_eq!(binary_version.declared_unity(), &expected_version);
+
+        let capabilities = planner
+            .capabilities_for(&object, &mut AssetLoadBudget::default())
+            .unwrap();
+        assert!(capabilities.iter().all(|capability| {
+            capability.status() == RecipeApplicabilityStatus::Rejected
+                && capability.rejection() == Some(RecipeRejectionCode::UnsupportedVersion)
+        }));
+
+        let error = planner
+            .lower_reference(
+                &object,
+                FieldPath::root().push_field("m_Father").unwrap(),
+                ReferenceTarget::null(),
+                ReferenceTarget::object(ObjectAddress::binary_direct(locator, 2).unwrap()),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, RecipeError::UnsupportedVersion),
+            "expected UnsupportedVersion, got {error:?}"
+        );
+    }
+}
+
+#[test]
 fn registry_paths_are_loaded_once_and_snapshot_reads_use_frozen_type_trees() {
     let directory = tempfile::tempdir().unwrap();
     let registry_path = directory.path().join("registry.json");
@@ -1096,4 +1365,10 @@ fn registry_paths_are_loaded_once_and_snapshot_reads_use_frozen_type_trees() {
         .unwrap();
     assert!(first.class().has_property("m_Value"));
     assert_eq!(second.class().properties(), first.class().properties());
+    assert_eq!(
+        first.schema_provenance().origin(),
+        SchemaOrigin::FrozenRegistry
+    );
+    assert!(first.schema_provenance().schema_digest().is_some());
+    assert_eq!(second.schema_provenance(), first.schema_provenance());
 }

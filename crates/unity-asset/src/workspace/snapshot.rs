@@ -5,12 +5,18 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use unity_asset_binary::asset::SerializedFile;
+use unity_asset_binary::object::ObjectSchemaOrigin;
+use unity_asset_binary::unity_version::UnityVersion;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, Diagnostic, DiagnosticSeverity, ObjectAddress,
     ObjectId, ObjectKind, RevisionedObjectHandle, SourceId, SourceKind, SourceLocator, UnityClass,
     UnityDocument, WorkspaceId, WorkspaceRevision, YamlDocumentSelector,
 };
 use unity_asset_yaml::YamlDocument;
+
+use crate::schema::{
+    BinarySchemaVersion, DeclaredUnityVersion, SchemaOrigin, SchemaProvenance, digest_yaml_schema,
+};
 
 use super::interface::WorkspaceConfig;
 use super::source_catalog::LocatorResolution;
@@ -351,8 +357,9 @@ impl WorkspaceView for WorkspaceSnapshot {
                         std::io::Error::other("binary address has no path ID"),
                     )
                 })?;
-                self.cached_serialized(entry, budget)?
-                    .objects()
+                let file = self.cached_serialized(entry, budget)?;
+                consume_object_table_scan(file.object_count(), budget)?;
+                file.objects()
                     .iter()
                     .filter(|object| object.path_id() == path_id)
                     .count()
@@ -364,7 +371,9 @@ impl WorkspaceView for WorkspaceSnapshot {
                         std::io::Error::other("YAML address has no document selector"),
                     )
                 })?;
-                self.cached_yaml(entry, budget)?
+                let document = self.cached_yaml(entry, budget)?;
+                consume_object_table_scan(document.entries().len(), budget)?;
+                document
                     .entries()
                     .iter()
                     .enumerate()
@@ -424,88 +433,124 @@ impl WorkspaceView for WorkspaceSnapshot {
             .store()
             .get(source)
             .ok_or(WorkspaceError::MissingSource(source))?;
-        let value =
-            match object.kind() {
-                ObjectKind::Binary => {
-                    let path_id = object.binary_path_id().ok_or_else(|| {
-                        WorkspaceError::operation(
-                            "binary object identity",
-                            std::io::Error::other("binary object has no path ID"),
-                        )
+        let (value, schema) = match object.kind() {
+            ObjectKind::Binary => {
+                let path_id = object.binary_path_id().ok_or_else(|| {
+                    WorkspaceError::operation(
+                        "binary object identity",
+                        std::io::Error::other("binary object has no path ID"),
+                    )
+                })?;
+                let file = self.cached_serialized(entry, budget)?;
+                consume_object_table_scan(file.object_count(), budget)?;
+                let mut matches = 0_usize;
+                let mut matched = None;
+                for candidate in file.object_handles() {
+                    if candidate.path_id() == path_id {
+                        matches =
+                            matches
+                                .checked_add(1)
+                                .ok_or(BudgetError::ArithmeticOverflow {
+                                    resource: "binary_object_matches",
+                                })?;
+                        matched.get_or_insert(candidate);
+                    }
+                }
+                let candidate = match (matches, matched) {
+                    (1, Some(candidate)) => candidate,
+                    (0, _) => {
+                        return Err(self.missing_object_error(object, budget)?);
+                    }
+                    _ => {
+                        return Err(WorkspaceError::AmbiguousObject {
+                            source_id: source,
+                            matches,
+                        });
+                    }
+                };
+                consume_single_result(
+                    handle.retained_clone_bytes(),
+                    "workspace_object_projection",
+                    budget,
+                )?;
+                let materialized =
+                    candidate.materialize_with_options(budget, self.config.typetree)?;
+                let schema_digest = materialized
+                    .schema()
+                    .map(|schema| schema.semantic_digest_with_budget(budget))
+                    .transpose()
+                    .map_err(|error| {
+                        WorkspaceError::operation("TypeTree semantic digest", error)
                     })?;
-                    let file = self.cached_serialized(entry, budget)?;
-                    let mut matches = 0_usize;
-                    let mut matched = None;
-                    for candidate in file.object_handles() {
-                        if candidate.path_id() == path_id {
-                            matches =
-                                matches
-                                    .checked_add(1)
-                                    .ok_or(BudgetError::ArithmeticOverflow {
-                                        resource: "binary_object_matches",
-                                    })?;
-                            matched.get_or_insert(candidate);
-                        }
-                    }
-                    let candidate = match (matches, matched) {
-                        (1, Some(candidate)) => candidate,
-                        (0, _) => {
-                            return Err(self.missing_object_error(object, budget)?);
-                        }
-                        _ => {
-                            return Err(WorkspaceError::AmbiguousObject {
-                                source_id: source,
-                                matches,
-                            });
-                        }
-                    };
-                    consume_single_result(
-                        handle.retained_clone_bytes(),
-                        "workspace_object_projection",
-                        budget,
-                    )?;
-                    let object = candidate.read_with_options(budget, self.config.typetree)?;
-                    budget.consume_bytes(
-                        u64::try_from(size_of::<unity_asset_binary::object::UnityObject>())
-                            .map_err(|_| BudgetError::ArithmeticOverflow {
-                                resource: "workspace_binary_object_box",
-                            })?,
-                    )?;
-                    WorkspaceObjectValue::Binary(Box::new(object))
-                }
-                ObjectKind::Yaml => {
-                    let document = Arc::clone(self.cached_yaml(entry, budget)?);
-                    let mut match_count = 0_usize;
-                    let mut matched_index = 0_usize;
-                    for (index, class) in document.entries().iter().enumerate() {
-                        if yaml_object_matches(object, index, class) {
-                            match_count = match_count.checked_add(1).ok_or(
-                                BudgetError::ArithmeticOverflow {
+                let origin = match materialized.schema_origin() {
+                    Some(ObjectSchemaOrigin::EmbeddedTypeTree) => SchemaOrigin::EmbeddedTypeTree,
+                    Some(ObjectSchemaOrigin::ExternalRegistry) => SchemaOrigin::FrozenRegistry,
+                    None => SchemaOrigin::Unavailable,
+                };
+                let version = declared_unity_version(&file.unity_version, budget)?;
+                let script_id = object_script_id(file, candidate.info());
+                let provenance = SchemaProvenance::binary(
+                    candidate.class_id(),
+                    origin,
+                    schema_digest,
+                    BinarySchemaVersion::new(version, file.format().version()),
+                    script_id,
+                );
+                let object = materialized.into_object();
+                budget.consume_bytes(
+                    u64::try_from(size_of::<unity_asset_binary::object::UnityObject>()).map_err(
+                        |_| BudgetError::ArithmeticOverflow {
+                            resource: "workspace_binary_object_box",
+                        },
+                    )?,
+                )?;
+                (WorkspaceObjectValue::Binary(Box::new(object)), provenance)
+            }
+            ObjectKind::Yaml => {
+                let document = self.cached_yaml(entry, budget)?;
+                consume_object_table_scan(document.entries().len(), budget)?;
+                let document = Arc::clone(document);
+                let mut match_count = 0_usize;
+                let mut matched_index = 0_usize;
+                for (index, class) in document.entries().iter().enumerate() {
+                    if yaml_object_matches(object, index, class) {
+                        match_count =
+                            match_count
+                                .checked_add(1)
+                                .ok_or(BudgetError::ArithmeticOverflow {
                                     resource: "yaml_object_matches",
-                                },
-                            )?;
-                            matched_index = index;
-                        }
+                                })?;
+                        matched_index = index;
                     }
-                    if match_count != 1 {
-                        return if match_count == 0 {
-                            Err(self.missing_object_error(object, budget)?)
-                        } else {
-                            Err(WorkspaceError::AmbiguousObject {
-                                source_id: source,
-                                matches: match_count,
-                            })
-                        };
-                    }
-                    consume_single_result(
-                        handle.retained_clone_bytes(),
-                        "workspace_object_projection",
-                        budget,
-                    )?;
-                    WorkspaceObjectValue::Yaml(WorkspaceYamlObject::new(document, matched_index))
                 }
-            };
-        Ok(WorkspaceObject::new(handle.clone(), value))
+                if match_count != 1 {
+                    return if match_count == 0 {
+                        Err(self.missing_object_error(object, budget)?)
+                    } else {
+                        Err(WorkspaceError::AmbiguousObject {
+                            source_id: source,
+                            matches: match_count,
+                        })
+                    };
+                }
+                consume_single_result(
+                    handle.retained_clone_bytes(),
+                    "workspace_object_projection",
+                    budget,
+                )?;
+                let provenance = SchemaProvenance::yaml(
+                    document.entries()[matched_index].class_id,
+                    digest_yaml_schema(&document.entries()[matched_index], budget).map_err(
+                        |error| WorkspaceError::operation("YAML semantic schema digest", error),
+                    )?,
+                );
+                (
+                    WorkspaceObjectValue::Yaml(WorkspaceYamlObject::new(document, matched_index)),
+                    provenance,
+                )
+            }
+        };
+        Ok(WorkspaceObject::new(handle.clone(), value, schema))
     }
 
     fn read_source_range(
@@ -560,6 +605,54 @@ impl WorkspaceView for WorkspaceSnapshot {
     }
 }
 
+fn object_script_id(
+    file: &SerializedFile,
+    object: &unity_asset_binary::asset::ObjectInfo,
+) -> Option<[u8; 16]> {
+    let serialized_type = object
+        .serialized_type_index()
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| file.types().get(index))
+        .or_else(|| {
+            file.types()
+                .iter()
+                .find(|candidate| candidate.class_id == object.class_id())
+        })?;
+    serialized_type
+        .is_script_type()
+        .then_some(serialized_type.script_id)
+        .filter(|script_id| *script_id != [0; 16])
+}
+
+fn declared_unity_version(
+    raw: &str,
+    budget: &mut AssetLoadBudget,
+) -> Result<DeclaredUnityVersion, WorkspaceError> {
+    if raw.trim().is_empty() {
+        return Ok(DeclaredUnityVersion::Absent);
+    }
+    let raw_bytes = u64::try_from(raw.len()).map_err(|_| BudgetError::ArithmeticOverflow {
+        resource: "workspace_unity_version",
+    })?;
+    budget.check_bytes(raw_bytes)?;
+    match UnityVersion::parse_version(raw) {
+        Ok(version) => {
+            if let Some(custom) = version.type_str.as_deref() {
+                budget.consume_bytes(u64::try_from(custom.len()).map_err(|_| {
+                    BudgetError::ArithmeticOverflow {
+                        resource: "workspace_unity_version",
+                    }
+                })?)?;
+            }
+            Ok(DeclaredUnityVersion::Parsed { version })
+        }
+        Err(_) => {
+            budget.consume_bytes(raw_bytes)?;
+            Ok(DeclaredUnityVersion::Unparseable)
+        }
+    }
+}
+
 fn consume_single_result(
     retained_bytes: usize,
     resource: &'static str,
@@ -583,6 +676,19 @@ fn consume_retained_bytes(
         u64::try_from(retained_bytes).map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
     budget.check_bytes(retained_bytes)?;
     budget.consume_bytes(retained_bytes)?;
+    Ok(())
+}
+
+fn consume_object_table_scan(
+    candidate_count: usize,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), WorkspaceError> {
+    let candidate_count =
+        u64::try_from(candidate_count).map_err(|_| BudgetError::ArithmeticOverflow {
+            resource: "workspace_object_table_scan",
+        })?;
+    budget.check_entries(candidate_count)?;
+    budget.consume_entries(candidate_count)?;
     Ok(())
 }
 

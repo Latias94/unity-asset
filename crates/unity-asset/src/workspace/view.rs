@@ -17,6 +17,7 @@ use unity_asset_yaml::YamlDocument;
 use super::source_catalog::{CatalogAllocationUnit, CatalogError, SourceLocationKind};
 use super::state::WorkspaceStateError;
 use super::store::SourceStoreError;
+use crate::schema::SchemaProvenance;
 use crate::{BinaryError, BinaryObjectIdentityError};
 
 pub(crate) mod sealed {
@@ -177,11 +178,20 @@ impl WorkspaceYamlObject {
 pub struct WorkspaceObject {
     handle: RevisionedObjectHandle,
     value: WorkspaceObjectValue,
+    schema: SchemaProvenance,
 }
 
 impl WorkspaceObject {
-    pub(crate) fn new(handle: RevisionedObjectHandle, value: WorkspaceObjectValue) -> Self {
-        Self { handle, value }
+    pub(crate) fn new(
+        handle: RevisionedObjectHandle,
+        value: WorkspaceObjectValue,
+        schema: SchemaProvenance,
+    ) -> Self {
+        Self {
+            handle,
+            value,
+            schema,
+        }
     }
 
     #[must_use]
@@ -200,6 +210,12 @@ impl WorkspaceObject {
             WorkspaceObjectValue::Binary(object) => object.as_unity_class(),
             WorkspaceObjectValue::Yaml(object) => object.class(),
         }
+    }
+
+    /// Returns the trusted schema identity used to materialize this object.
+    #[must_use]
+    pub const fn schema_provenance(&self) -> &SchemaProvenance {
+        &self.schema
     }
 
     #[must_use]

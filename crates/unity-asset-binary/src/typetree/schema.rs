@@ -5,10 +5,15 @@ use std::iter::FusedIterator;
 use std::ops::Range;
 use std::sync::Arc;
 
+use thiserror::Error;
+use unity_asset_core::{AssetLoadBudget, BudgetError, DigestBuildError, DigestV1, DigestV1Builder};
+
 mod compile;
 
 #[cfg(test)]
 mod tests;
+
+const SEMANTIC_DIGEST_PREFIX: &[u8] = b"unity-asset:typetree-schema:semantic:v1\0";
 
 /// Canonical primitive kinds understood by every TypeTree traversal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -134,6 +139,14 @@ pub struct TypeTreeSchema {
     managed: Option<Arc<ManagedReferenceCatalog>>,
 }
 
+#[derive(Debug, Error)]
+pub enum TypeTreeSemanticDigestError {
+    #[error(transparent)]
+    Budget(#[from] BudgetError),
+    #[error(transparent)]
+    Digest(#[from] DigestBuildError),
+}
+
 impl TypeTreeSchema {
     #[must_use]
     pub fn root(&self) -> SchemaNode<'_> {
@@ -147,6 +160,67 @@ impl TypeTreeSchema {
                 .managed
                 .as_deref()
                 .map_or(0, |catalog| catalog.arena.nodes.len())
+    }
+
+    /// Returns the versioned digest of this schema's complete compiled semantic contract.
+    ///
+    /// The digest covers the primary tree, every managed-reference type, semantic layouts,
+    /// alignment, and ordered child relationships. Encoding runs twice without recursion or
+    /// allocation: once to determine its exact length and once to stream into [`DigestV1Builder`].
+    pub fn semantic_digest(&self) -> Result<DigestV1, DigestBuildError> {
+        let mut length = SemanticDigestLength::default();
+        self.encode_semantic_digest(&mut length)?;
+
+        let mut stream = SemanticDigestStream::new(length.encoded_length());
+        self.encode_semantic_digest(&mut stream)?;
+        stream.finalize()
+    }
+
+    /// Computes the semantic digest while charging one complete schema traversal.
+    pub fn semantic_digest_with_budget(
+        &self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<DigestV1, TypeTreeSemanticDigestError> {
+        let managed_entries = self
+            .managed
+            .as_deref()
+            .map_or(0, |catalog| catalog.reference_index.len());
+        let entries = self
+            .node_count()
+            .checked_add(managed_entries)
+            .and_then(|entries| entries.checked_add(1))
+            .ok_or(BudgetError::ArithmeticOverflow {
+                resource: "typetree_semantic_digest",
+            })?;
+        budget.consume_entries(u64::try_from(entries).map_err(|_| {
+            BudgetError::ArithmeticOverflow {
+                resource: "typetree_semantic_digest",
+            }
+        })?)?;
+        Ok(self.semantic_digest()?)
+    }
+
+    fn encode_semantic_digest(
+        &self,
+        sink: &mut impl SemanticDigestSink,
+    ) -> Result<(), DigestBuildError> {
+        sink.write_raw(SEMANTIC_DIGEST_PREFIX)?;
+        encode_schema_tree(&self.program.arena, self.program.root, sink)?;
+
+        match self.managed.as_deref() {
+            None => sink.write_u8(digest_tag::CATALOG_ABSENT),
+            Some(catalog) => {
+                sink.write_u8(digest_tag::CATALOG_PRESENT)?;
+                sink.write_count(catalog.reference_index.len())?;
+                for reference in &catalog.reference_index {
+                    sink.write_framed(reference.key.class_name.as_bytes())?;
+                    sink.write_framed(reference.key.namespace.as_bytes())?;
+                    sink.write_framed(reference.key.assembly_name.as_bytes())?;
+                    encode_schema_tree(&catalog.arena, reference.root, sink)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn node(&self, id: NodeId) -> SchemaNode<'_> {
@@ -189,6 +263,293 @@ impl TypeTreeSchema {
                 id: catalog.reference_index[index].root,
             })
     }
+}
+
+fn encode_schema_tree(
+    arena: &SchemaArena,
+    root: NodeId,
+    sink: &mut impl SemanticDigestSink,
+) -> Result<(), DigestBuildError> {
+    let tree = schema_tree_range(arena, root)?;
+    sink.write_count(tree.len())?;
+    sink.write_node_id(root, tree)?;
+
+    for (local_index, node) in arena.nodes[tree.start..tree.end].iter().enumerate() {
+        sink.write_count(local_index)?;
+        sink.write_framed(node.name.as_bytes())?;
+        sink.write_framed(node.type_name.as_bytes())?;
+        sink.write_u8(u8::from(node.align_after))?;
+        encode_semantics(node.semantics, tree, sink)?;
+
+        let children = arena
+            .edges
+            .get(node.children.clone())
+            .ok_or(DigestBuildError::LengthOverflow)?;
+        sink.write_count(children.len())?;
+        for child in children {
+            sink.write_node_id(*child, tree)?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_semantics(
+    semantics: CompiledSemantics,
+    tree: SchemaTreeRange,
+    sink: &mut impl SemanticDigestSink,
+) -> Result<(), DigestBuildError> {
+    match semantics {
+        CompiledSemantics::Scalar(primitive) => {
+            sink.write_u8(digest_tag::SCALAR)?;
+            sink.write_primitive(primitive)
+        }
+        CompiledSemantics::String => sink.write_u8(digest_tag::STRING),
+        CompiledSemantics::TypelessData => sink.write_u8(digest_tag::TYPELESS_DATA),
+        CompiledSemantics::Sequence(layout) => {
+            sink.write_u8(digest_tag::SEQUENCE)?;
+            sink.write_node_id(layout.element, tree)?;
+            sink.write_optional_primitive(layout.bulk_primitive)
+        }
+        CompiledSemantics::Map(layout) => {
+            sink.write_u8(digest_tag::MAP)?;
+            sink.write_node_id(layout.element, tree)?;
+            sink.write_optional_primitive(layout.bulk_primitive)
+        }
+        CompiledSemantics::Pair(layout) => {
+            sink.write_u8(digest_tag::PAIR)?;
+            sink.write_node_id(layout.first, tree)?;
+            sink.write_node_id(layout.second, tree)
+        }
+        CompiledSemantics::PPtr(layout) => {
+            sink.write_u8(digest_tag::PPTR)?;
+            sink.write_node_id(layout.file_child, tree)?;
+            sink.write_primitive(layout.file_integer.primitive)?;
+            sink.write_node_id(layout.path_child, tree)?;
+            sink.write_primitive(layout.path_integer.primitive)
+        }
+        CompiledSemantics::ReferencedObject(layout) => {
+            sink.write_u8(digest_tag::REFERENCED_OBJECT)?;
+            sink.write_node_id(layout.type_node, tree)?;
+            sink.write_node_id(layout.class_field, tree)?;
+            sink.write_node_id(layout.namespace_field, tree)?;
+            sink.write_node_id(layout.assembly_field, tree)?;
+            match layout.payload {
+                ManagedPayloadNode::Dynamic(node) => {
+                    sink.write_u8(digest_tag::DYNAMIC_PAYLOAD)?;
+                    sink.write_node_id(node, tree)
+                }
+                ManagedPayloadNode::Fallback(node) => {
+                    sink.write_u8(digest_tag::FALLBACK_PAYLOAD)?;
+                    sink.write_node_id(node, tree)
+                }
+            }
+        }
+        CompiledSemantics::ManagedPayload => sink.write_u8(digest_tag::MANAGED_PAYLOAD),
+        CompiledSemantics::ManagedRegistry => sink.write_u8(digest_tag::MANAGED_REGISTRY),
+        CompiledSemantics::Record => sink.write_u8(digest_tag::RECORD),
+        CompiledSemantics::OpaqueFixed { byte_size } => {
+            sink.write_u8(digest_tag::OPAQUE_FIXED)?;
+            sink.write_u64(byte_size)
+        }
+    }
+}
+
+fn schema_tree_range(
+    arena: &SchemaArena,
+    root: NodeId,
+) -> Result<SchemaTreeRange, DigestBuildError> {
+    let mut cursor = root.0;
+    let mut start = cursor;
+    arena
+        .nodes
+        .get(cursor)
+        .ok_or(DigestBuildError::LengthOverflow)?;
+
+    loop {
+        let node = &arena.nodes[cursor];
+        let children = arena
+            .edges
+            .get(node.children.clone())
+            .ok_or(DigestBuildError::LengthOverflow)?;
+        for child in children {
+            if child.0 >= cursor {
+                return Err(DigestBuildError::LengthOverflow);
+            }
+            start = start.min(child.0);
+        }
+        if cursor == start {
+            break;
+        }
+        cursor = cursor
+            .checked_sub(1)
+            .ok_or(DigestBuildError::LengthOverflow)?;
+    }
+
+    let end = root
+        .0
+        .checked_add(1)
+        .ok_or(DigestBuildError::LengthOverflow)?;
+    Ok(SchemaTreeRange { start, end })
+}
+
+#[derive(Clone, Copy)]
+struct SchemaTreeRange {
+    start: usize,
+    end: usize,
+}
+
+impl SchemaTreeRange {
+    fn len(self) -> usize {
+        self.end - self.start
+    }
+
+    fn local_id(self, node: NodeId) -> Result<u64, DigestBuildError> {
+        if node.0 < self.start || node.0 >= self.end {
+            return Err(DigestBuildError::LengthOverflow);
+        }
+        usize_to_digest_u64(node.0 - self.start)
+    }
+}
+
+trait SemanticDigestSink {
+    fn write_raw(&mut self, bytes: &[u8]) -> Result<(), DigestBuildError>;
+
+    fn write_framed(&mut self, bytes: &[u8]) -> Result<(), DigestBuildError>;
+
+    fn write_u8(&mut self, value: u8) -> Result<(), DigestBuildError> {
+        self.write_raw(&[value])
+    }
+
+    fn write_u64(&mut self, value: u64) -> Result<(), DigestBuildError> {
+        self.write_raw(&value.to_le_bytes())
+    }
+
+    fn write_count(&mut self, value: usize) -> Result<(), DigestBuildError> {
+        self.write_u64(usize_to_digest_u64(value)?)
+    }
+
+    fn write_node_id(
+        &mut self,
+        node: NodeId,
+        tree: SchemaTreeRange,
+    ) -> Result<(), DigestBuildError> {
+        self.write_u64(tree.local_id(node)?)
+    }
+
+    fn write_primitive(&mut self, primitive: PrimitiveKind) -> Result<(), DigestBuildError> {
+        self.write_u8(primitive_digest_tag(primitive))?;
+        self.write_u8(primitive.width())
+    }
+
+    fn write_optional_primitive(
+        &mut self,
+        primitive: Option<PrimitiveKind>,
+    ) -> Result<(), DigestBuildError> {
+        match primitive {
+            None => self.write_u8(digest_tag::OPTION_NONE),
+            Some(primitive) => {
+                self.write_u8(digest_tag::OPTION_SOME)?;
+                self.write_primitive(primitive)
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct SemanticDigestLength {
+    encoded_length: u64,
+}
+
+impl SemanticDigestLength {
+    const fn encoded_length(&self) -> u64 {
+        self.encoded_length
+    }
+
+    fn add(&mut self, amount: u64) -> Result<(), DigestBuildError> {
+        self.encoded_length = self
+            .encoded_length
+            .checked_add(amount)
+            .ok_or(DigestBuildError::LengthOverflow)?;
+        Ok(())
+    }
+}
+
+impl SemanticDigestSink for SemanticDigestLength {
+    fn write_raw(&mut self, bytes: &[u8]) -> Result<(), DigestBuildError> {
+        self.add(usize_to_digest_u64(bytes.len())?)
+    }
+
+    fn write_framed(&mut self, bytes: &[u8]) -> Result<(), DigestBuildError> {
+        self.add(DigestV1Builder::framed_len(bytes)?)
+    }
+}
+
+struct SemanticDigestStream {
+    builder: DigestV1Builder,
+}
+
+impl SemanticDigestStream {
+    fn new(encoded_length: u64) -> Self {
+        Self {
+            builder: DigestV1Builder::new(encoded_length),
+        }
+    }
+
+    fn finalize(self) -> Result<DigestV1, DigestBuildError> {
+        self.builder.finalize()
+    }
+}
+
+impl SemanticDigestSink for SemanticDigestStream {
+    fn write_raw(&mut self, bytes: &[u8]) -> Result<(), DigestBuildError> {
+        self.builder.update(bytes)
+    }
+
+    fn write_framed(&mut self, bytes: &[u8]) -> Result<(), DigestBuildError> {
+        self.builder.update_framed(bytes)
+    }
+}
+
+fn primitive_digest_tag(primitive: PrimitiveKind) -> u8 {
+    match primitive {
+        PrimitiveKind::Bool => 0,
+        PrimitiveKind::I8 => 1,
+        PrimitiveKind::U8 => 2,
+        PrimitiveKind::I16 => 3,
+        PrimitiveKind::U16 => 4,
+        PrimitiveKind::I32 => 5,
+        PrimitiveKind::U32 => 6,
+        PrimitiveKind::I64 => 7,
+        PrimitiveKind::U64 => 8,
+        PrimitiveKind::F32 => 9,
+        PrimitiveKind::F64 => 10,
+    }
+}
+
+fn usize_to_digest_u64(value: usize) -> Result<u64, DigestBuildError> {
+    u64::try_from(value).map_err(|_| DigestBuildError::LengthOverflow)
+}
+
+mod digest_tag {
+    pub(super) const CATALOG_ABSENT: u8 = 0;
+    pub(super) const CATALOG_PRESENT: u8 = 1;
+    pub(super) const OPTION_NONE: u8 = 0;
+    pub(super) const OPTION_SOME: u8 = 1;
+    pub(super) const DYNAMIC_PAYLOAD: u8 = 0;
+    pub(super) const FALLBACK_PAYLOAD: u8 = 1;
+
+    pub(super) const SCALAR: u8 = 0;
+    pub(super) const STRING: u8 = 1;
+    pub(super) const TYPELESS_DATA: u8 = 2;
+    pub(super) const SEQUENCE: u8 = 3;
+    pub(super) const MAP: u8 = 4;
+    pub(super) const PAIR: u8 = 5;
+    pub(super) const PPTR: u8 = 6;
+    pub(super) const REFERENCED_OBJECT: u8 = 7;
+    pub(super) const MANAGED_PAYLOAD: u8 = 8;
+    pub(super) const MANAGED_REGISTRY: u8 = 9;
+    pub(super) const RECORD: u8 = 10;
+    pub(super) const OPAQUE_FIXED: u8 = 11;
 }
 
 /// A borrowed, read-only view into a compiled TypeTree schema.

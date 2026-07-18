@@ -144,6 +144,7 @@ fn class_id_name(class_id: i32) -> Option<&'static str> {
         184 => Some("RenderTexture"),
         212 => Some("SpriteRenderer"),
         213 => Some("Sprite"),
+        224 => Some("RectTransform"),
         328 => Some("VideoPlayer"),
         329 => Some("VideoClip"),
         1001 => Some("PrefabInstance"),
@@ -194,6 +195,7 @@ pub mod class_ids {
     pub const ASSET_BUNDLE: i32 = 142;
     pub const SPRITE_RENDERER: i32 = 212;
     pub const SPRITE: i32 = 213;
+    pub const RECT_TRANSFORM: i32 = 224;
     pub const PREFAB_INSTANCE: i32 = 1001;
     pub const SPRITE_ATLAS: i32 = 687078895;
 }
@@ -206,12 +208,14 @@ pub mod class_names {
     pub const TRANSFORM: &str = "Transform";
     pub const CAMERA: &str = "Camera";
     pub const MATERIAL: &str = "Material";
+    pub const AUDIO_CLIP: &str = "AudioClip";
     pub const MESH_RENDERER: &str = "MeshRenderer";
     pub const TEXTURE_2D: &str = "Texture2D";
     pub const MESH: &str = "Mesh";
     pub const SHADER: &str = "Shader";
     pub const TEXTURE: &str = "Texture";
     pub const SPRITE: &str = "Sprite";
+    pub const RECT_TRANSFORM: &str = "RectTransform";
     pub const MONO_BEHAVIOUR: &str = "MonoBehaviour";
     pub const MONO_SCRIPT: &str = "MonoScript";
     pub const PREFAB_INSTANCE: &str = "PrefabInstance";

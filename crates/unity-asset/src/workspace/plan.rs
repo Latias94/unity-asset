@@ -1,5 +1,6 @@
 //! Versioned, deterministic mutation intent for one workspace revision.
 
+mod builder;
 mod input;
 mod value;
 
@@ -12,14 +13,15 @@ use unity_asset_core::{
     SourceLocator, WorkspaceRevision,
 };
 
+pub use builder::{MutationPlanBuilder, MutationPlanBuilderError};
 pub use input::MutationPlanReadError;
 pub use value::{Float64Bits, MutationField, MutationValue, MutationValueRef, PlanBytes};
 
 pub(crate) const MAX_PLAN_DEPTH: u32 = 59;
-// Tagged object values add at most three wire containers per semantic level. The plan envelope
-// adds the remaining three levels, so this remains a fixed bound rather than unbounded Serde
-// recursion while preserving round trips for every valid semantic value.
-pub(crate) const MAX_PLAN_WIRE_DEPTH: u32 = MAX_PLAN_DEPTH * 3 + 3;
+// Tagged object values add at most three wire containers per semantic level. The fixed envelope
+// allowance covers a sequence edit plus a nested logical ObjectAddress, the deepest supported
+// operation shape. This remains bounded while every valid in-memory value can round-trip.
+pub(crate) const MAX_PLAN_WIRE_DEPTH: u32 = MAX_PLAN_DEPTH * 3 + 9;
 const MUTATION_PLAN_VERSION: u8 = 1;
 
 /// Expected identity of one source modified by a plan.
@@ -236,6 +238,12 @@ pub enum GenericMutation {
         guard: FieldGuard,
         payload: DigestV1,
     },
+    SequenceEdit {
+        target: ObjectAddress,
+        path: FieldPath,
+        guard: FieldGuard,
+        edit: SequenceMutation,
+    },
     UnsafeRawReplace {
         target: ObjectAddress,
         expected_raw_digest: DigestV1,
@@ -252,6 +260,7 @@ impl GenericMutation {
             | Self::ReferenceReplace { target, .. }
             | Self::SchemaReplace { target, .. }
             | Self::ResourceReplace { target, .. }
+            | Self::SequenceEdit { target, .. }
             | Self::UnsafeRawReplace { target, .. } => target,
         }
     }
@@ -261,6 +270,10 @@ impl GenericMutation {
             Self::FieldReplace { path, .. } => require_field_path("field_replace", path),
             Self::ReferenceReplace { path, .. } => require_field_path("reference_replace", path),
             Self::ResourceReplace { path, .. } => require_field_path("resource_replace", path),
+            Self::SequenceEdit { path, edit, .. } => {
+                require_field_path("sequence_edit", path)?;
+                edit.validate()
+            }
             Self::SchemaReplace { .. } | Self::UnsafeRawReplace { .. } => Ok(()),
         }
     }
@@ -273,7 +286,47 @@ impl GenericMutation {
             Self::FieldReplace { .. }
             | Self::ReferenceReplace { .. }
             | Self::SchemaReplace { .. } => None,
+            Self::SequenceEdit { .. } => None,
         }
+    }
+}
+
+/// One schema-aware edit to an existing ordered sequence.
+///
+/// Sequence edits preserve every element they do not name. Format adapters validate the guarded
+/// collection and lower the edit through its observed element schema during prepare.
+/// `from` identifies an element in the observed sequence; `to` is that element's final index after
+/// the move completes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SequenceMutation {
+    Insert {
+        index: u32,
+        value: MutationValue,
+    },
+    Replace {
+        index: u32,
+        value: MutationValue,
+    },
+    Remove {
+        index: u32,
+    },
+    /// Moves one element so that it occupies `to` in the resulting sequence.
+    Move {
+        from: u32,
+        to: u32,
+    },
+    Clear,
+}
+
+impl SequenceMutation {
+    fn validate(&self) -> Result<(), MutationPlanError> {
+        if let Self::Move { from, to } = self
+            && from == to
+        {
+            return Err(MutationPlanError::NoopSequenceMove { index: *from });
+        }
+        Ok(())
     }
 }
 
@@ -306,6 +359,65 @@ pub struct MutationPlan {
     operations: Box<[MutationOperation]>,
 }
 
+/// A revision-bound group of generic mutations produced atomically by one schema recipe.
+///
+/// Fragments are not part of the persisted plan wire contract. They retain recipe ordering until
+/// a [`MutationPlanBuilder`] assigns the final continuous operation ordinals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationPlanFragment {
+    base_revision: WorkspaceRevision,
+    sources: Vec<SourceExpectation>,
+    payloads: Vec<PlanPayload>,
+    actions: Vec<GenericMutation>,
+}
+
+impl MutationPlanFragment {
+    pub(crate) fn from_recipe(
+        base_revision: WorkspaceRevision,
+        sources: Vec<SourceExpectation>,
+        payloads: Vec<PlanPayload>,
+        actions: Vec<GenericMutation>,
+    ) -> Result<Self, MutationPlanError> {
+        if actions.is_empty() {
+            return Err(MutationPlanError::NoOperations);
+        }
+        validate_operation_count(actions.len())?;
+        for action in &actions {
+            action.validate()?;
+        }
+        let sources = normalize_sources(sources)?;
+        let payloads = normalize_payloads(payloads)?;
+        validate_source_coverage_without_scratch(&sources, &actions)?;
+        validate_payload_coverage_without_scratch(&payloads, &actions)?;
+        Ok(Self {
+            base_revision,
+            sources,
+            payloads,
+            actions,
+        })
+    }
+
+    #[must_use]
+    pub const fn base_revision(&self) -> WorkspaceRevision {
+        self.base_revision
+    }
+
+    #[must_use]
+    pub fn sources(&self) -> &[SourceExpectation] {
+        &self.sources
+    }
+
+    #[must_use]
+    pub fn payloads(&self) -> &[PlanPayload] {
+        &self.payloads
+    }
+
+    #[must_use]
+    pub fn actions(&self) -> &[GenericMutation] {
+        &self.actions
+    }
+}
+
 impl MutationPlan {
     pub fn new(
         base_revision: WorkspaceRevision,
@@ -316,6 +428,7 @@ impl MutationPlan {
         if actions.is_empty() {
             return Err(MutationPlanError::NoOperations);
         }
+        validate_operation_count(actions.len())?;
 
         for action in &actions {
             action.validate()?;
@@ -390,6 +503,13 @@ impl MutationPlan {
             .finalize()
             .map_err(|error| MutationPlanError::CanonicalJson(error.to_string()))
     }
+}
+
+fn validate_operation_count(count: usize) -> Result<(), MutationPlanError> {
+    if count != 0 && u32::try_from(count - 1).is_err() {
+        return Err(MutationPlanError::OperationCountOverflow { count });
+    }
+    Ok(())
 }
 
 fn require_field_path(operation: &'static str, path: &FieldPath) -> Result<(), MutationPlanError> {
@@ -498,56 +618,32 @@ fn normalize_sources(
     mut sources: Vec<SourceExpectation>,
 ) -> Result<Vec<SourceExpectation>, MutationPlanError> {
     sources.sort_unstable_by(|left, right| left.locator.cmp(&right.locator));
-    let mut normalized: Vec<SourceExpectation> = Vec::new();
-    normalized
-        .try_reserve_exact(sources.len())
-        .map_err(|error| MutationPlanError::AllocationFailed {
-            resource: "source expectations",
-            requested: sources.len(),
-            message: error.to_string(),
-        })?;
-    for source in sources {
-        if let Some(previous) = normalized.last()
-            && previous.locator == source.locator
-        {
-            if previous.fingerprint != source.fingerprint {
-                return Err(MutationPlanError::ConflictingSourceExpectation {
-                    locator: source.locator,
-                    first: previous.fingerprint,
-                    second: source.fingerprint,
-                });
-            }
-            continue;
-        }
-        normalized.push(source);
+    if let Some(index) = sources.windows(2).position(|pair| {
+        pair[0].locator == pair[1].locator && pair[0].fingerprint != pair[1].fingerprint
+    }) {
+        let first = sources[index].fingerprint;
+        let second = sources.remove(index + 1);
+        return Err(MutationPlanError::ConflictingSourceExpectation {
+            locator: second.locator,
+            first,
+            second: second.fingerprint,
+        });
     }
-    Ok(normalized)
+    sources.dedup_by(|right, left| right.locator == left.locator);
+    Ok(sources)
 }
 
 fn normalize_payloads(
     mut payloads: Vec<PlanPayload>,
 ) -> Result<Vec<PlanPayload>, MutationPlanError> {
     payloads.sort_unstable_by_key(PlanPayload::digest);
-    let mut normalized: Vec<PlanPayload> = Vec::new();
-    normalized
-        .try_reserve_exact(payloads.len())
-        .map_err(|error| MutationPlanError::AllocationFailed {
-            resource: "plan payloads",
-            requested: payloads.len(),
-            message: error.to_string(),
-        })?;
-    for payload in payloads {
-        if let Some(previous) = normalized.last()
-            && previous.digest == payload.digest
-        {
-            if previous.bytes != payload.bytes {
-                return Err(MutationPlanError::ConflictingPayload(payload.digest));
-            }
-            continue;
+    for pair in payloads.windows(2) {
+        if pair[0].digest == pair[1].digest && pair[0].bytes != pair[1].bytes {
+            return Err(MutationPlanError::ConflictingPayload(pair[1].digest));
         }
-        normalized.push(payload);
     }
-    Ok(normalized)
+    payloads.dedup_by(|right, left| right.digest == left.digest);
+    Ok(payloads)
 }
 
 fn validate_source_coverage(
@@ -571,23 +667,7 @@ fn validate_source_coverage(
     targets.dedup();
 
     for action in actions {
-        let target = action.target();
-        let locator = target.source_locator();
-        let index = sources
-            .binary_search_by(|source| source.locator.cmp(locator))
-            .map_err(|_| MutationPlanError::MissingSourceExpectation(locator.clone()))?;
-        let expected_kind = match target.kind() {
-            ObjectKind::Binary => SourceKind::SerializedFile,
-            ObjectKind::Yaml => SourceKind::Yaml,
-        };
-        let actual_kind = sources[index].fingerprint.kind();
-        if actual_kind != expected_kind {
-            return Err(MutationPlanError::SourceKindMismatch {
-                locator: locator.clone(),
-                expected: expected_kind,
-                actual: actual_kind,
-            });
-        }
+        validate_action_source(sources, action)?;
     }
 
     for source in sources {
@@ -596,6 +676,50 @@ fn validate_source_coverage(
                 source.locator.clone(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_source_coverage_without_scratch(
+    sources: &[SourceExpectation],
+    actions: &[GenericMutation],
+) -> Result<(), MutationPlanError> {
+    for action in actions {
+        validate_action_source(sources, action)?;
+    }
+    for source in sources {
+        if !actions
+            .iter()
+            .any(|action| action.target().source_locator() == &source.locator)
+        {
+            return Err(MutationPlanError::UnusedSourceExpectation(
+                source.locator.clone(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_action_source(
+    sources: &[SourceExpectation],
+    action: &GenericMutation,
+) -> Result<(), MutationPlanError> {
+    let target = action.target();
+    let locator = target.source_locator();
+    let index = sources
+        .binary_search_by(|source| source.locator.cmp(locator))
+        .map_err(|_| MutationPlanError::MissingSourceExpectation(locator.clone()))?;
+    let expected_kind = match target.kind() {
+        ObjectKind::Binary => SourceKind::SerializedFile,
+        ObjectKind::Yaml => SourceKind::Yaml,
+    };
+    let actual_kind = sources[index].fingerprint.kind();
+    if actual_kind != expected_kind {
+        return Err(MutationPlanError::SourceKindMismatch {
+            locator: locator.clone(),
+            expected: expected_kind,
+            actual: actual_kind,
+        });
     }
     Ok(())
 }
@@ -626,6 +750,29 @@ fn validate_payload_coverage(
     }
     for payload in payloads {
         if referenced.binary_search(&payload.digest).is_err() {
+            return Err(MutationPlanError::UnusedPayload(payload.digest));
+        }
+    }
+    Ok(())
+}
+
+fn validate_payload_coverage_without_scratch(
+    payloads: &[PlanPayload],
+    actions: &[GenericMutation],
+) -> Result<(), MutationPlanError> {
+    for digest in actions.iter().filter_map(GenericMutation::payload) {
+        if payloads
+            .binary_search_by_key(&digest, PlanPayload::digest)
+            .is_err()
+        {
+            return Err(MutationPlanError::MissingPayload(digest));
+        }
+    }
+    for payload in payloads {
+        if !actions
+            .iter()
+            .any(|action| action.payload() == Some(payload.digest))
+        {
             return Err(MutationPlanError::UnusedPayload(payload.digest));
         }
     }
@@ -686,6 +833,8 @@ pub enum MutationPlanError {
     ValueDepthExceeded { maximum: u32, actual: u32 },
     #[error("mutation value depth arithmetic overflow")]
     ValueDepthOverflow,
+    #[error("sequence move at index {index} does not change collection order")]
+    NoopSequenceMove { index: u32 },
     #[error("{operation} requires a non-root field path; use schema_replace for whole objects")]
     RootFieldPath { operation: &'static str },
     #[error("failed to allocate {resource} capacity for {requested} elements: {message}")]

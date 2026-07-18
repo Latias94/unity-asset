@@ -2067,7 +2067,7 @@
   ],
   "differential_verification": {
     "implementation": "UnityPy 1.25.2 (vendored commit 5567c5e)",
-    "observation": "All generated fixtures parse with one type and one object.",
+    "observation": "All version-matrix fixtures parse with one type and one object; dedicated fixtures additionally exercise multiple-object layouts.",
     "scope_limit": "The synthetic v16 fixture validates the index-only example accepted by UnityPy; it does not settle the conflicting general v16 raw32 interpretation."
   },
   "evidence_limits": [
@@ -2128,5 +2128,47 @@
       "purpose": "Legacy raw type ID resolves to a MonoBehaviour class-bit identity",
       "sha256": "0ddc6f538d689a5c28c8ef071212618c7b16dc281ae1a1b585e725af676d204c"
     }
-  ]
+  ],
+  "transform_hierarchy_case": {
+    "expected": {
+      "class_id": 4,
+      "embedded_type_tree": true,
+      "endian": 0,
+      "objects": [
+        {
+          "children": [
+            {
+              "file_id": 0,
+              "path_id": 2
+            }
+          ],
+          "father": {
+            "file_id": 0,
+            "path_id": 0
+          },
+          "path_id": 1,
+          "payload_hex": "00000000000000000000000001000000000000000200000000000000",
+          "payload_offset": 0
+        },
+        {
+          "children": [],
+          "father": {
+            "file_id": 0,
+            "path_id": 1
+          },
+          "path_id": 2,
+          "payload_hex": "00000000010000000000000000000000",
+          "payload_offset": 32
+        }
+      ],
+      "raw_type_reference": 0,
+      "type_tree_node_count": 10,
+      "unity_version": "2020.1.0f1",
+      "version": 22
+    },
+    "file": "transform_hierarchy_v22.assets.bin",
+    "length": 672,
+    "purpose": "Embedded Transform TypeTree preserves a complete parent-child topology",
+    "sha256": "f9e405832788f10099352732010d6353910461fdd44d6770692b724b2e6bfda7"
+  }
 }

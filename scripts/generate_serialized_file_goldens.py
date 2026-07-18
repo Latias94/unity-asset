@@ -452,6 +452,141 @@ def build_multi_object_fixture(version: int) -> tuple[bytes, list[dict[str, obje
     return bytes(output), expected_objects
 
 
+def write_transform_hierarchy_type_tree(writer: WireWriter) -> None:
+    nodes = (
+        (0, "Transform", "Base", -1),
+        (1, "PPtr<Transform>", "m_Father", 12),
+        (2, "int", "m_FileID", 4),
+        (2, "SInt64", "m_PathID", 8),
+        (1, "vector", "m_Children", -1),
+        (2, "Array", "Array", -1),
+        (3, "int", "size", 4),
+        (3, "PPtr<Transform>", "data", 12),
+        (4, "int", "m_FileID", 4),
+        (4, "SInt64", "m_PathID", 8),
+    )
+
+    string_offsets: dict[str, int] = {}
+    string_buffer = bytearray()
+    for _, type_name, name, _ in nodes:
+        for value in (type_name, name):
+            if value in string_offsets:
+                continue
+            string_offsets[value] = len(string_buffer)
+            string_buffer.extend(value.encode("utf-8"))
+            string_buffer.append(0)
+
+    writer.i32(len(nodes))
+    writer.i32(len(string_buffer))
+    for index, (level, type_name, name, byte_size) in enumerate(nodes):
+        writer.i16(1)
+        writer.u8(level)
+        writer.u8(0)
+        writer.u32(string_offsets[type_name])
+        writer.u32(string_offsets[name])
+        writer.i32(byte_size)
+        writer.i32(index)
+        writer.i32(0)
+        writer.u64(0)
+    writer.raw(bytes(string_buffer))
+
+
+def build_transform_hierarchy_fixture() -> tuple[bytes, dict[str, object]]:
+    version = 22
+    big_endian = False
+
+    parent_payload = WireWriter(big_endian)
+    parent_payload.i32(0)
+    parent_payload.i64(0)
+    parent_payload.i32(1)
+    parent_payload.i32(0)
+    parent_payload.i64(2)
+
+    child_payload = WireWriter(big_endian)
+    child_payload.i32(0)
+    child_payload.i64(1)
+    child_payload.i32(0)
+
+    payloads = (bytes(parent_payload.data), bytes(child_payload.data))
+    payload_offsets = (0, 32)
+    payload_stream = bytearray(payloads[0])
+    payload_stream.extend(bytes(payload_offsets[1] - len(payload_stream)))
+    payload_stream.extend(payloads[1])
+
+    metadata = WireWriter(big_endian)
+    metadata.cstring("2020.1.0f1")
+    metadata.i32(13)
+    metadata.u8(1)
+    metadata.i32(1)
+    metadata.i32(4)
+    metadata.u8(0)
+    metadata.i16(-1)
+    metadata.raw(TYPE_HASH)
+    write_transform_hierarchy_type_tree(metadata)
+    metadata.i32(0)
+
+    metadata.i32(2)
+    for path_id, payload, payload_offset in zip((1, 2), payloads, payload_offsets):
+        metadata.align(4)
+        metadata.i64(path_id)
+        metadata.i64(payload_offset)
+        metadata.u32(len(payload))
+        metadata.i32(0)
+
+    metadata.i32(0)
+    metadata.i32(0)
+    metadata.i32(0)
+    metadata.cstring("transform-hierarchy-fixture")
+
+    header_size = 48
+    data_offset = header_size + len(metadata.data)
+    data_offset += (-data_offset) % 16
+    file_size = data_offset + len(payload_stream)
+    header = WireWriter(True)
+    header.u32(0)
+    header.u32(0)
+    header.u32(version)
+    header.u32(0)
+    header.u8(0)
+    header.raw(RESERVED)
+    header.u32(len(metadata.data))
+    header.i64(file_size)
+    header.i64(data_offset)
+    header.i64(0x0112233445566778)
+
+    output = bytearray(header.data)
+    output.extend(metadata.data)
+    output.extend(bytes(data_offset - len(output)))
+    output.extend(payload_stream)
+
+    expected = {
+        "version": version,
+        "endian": 0,
+        "unity_version": "2020.1.0f1",
+        "class_id": 4,
+        "raw_type_reference": 0,
+        "embedded_type_tree": True,
+        "type_tree_node_count": 10,
+        "objects": [
+            {
+                "path_id": 1,
+                "payload_offset": payload_offsets[0],
+                "payload_hex": payloads[0].hex(),
+                "father": {"file_id": 0, "path_id": 0},
+                "children": [{"file_id": 0, "path_id": 2}],
+            },
+            {
+                "path_id": 2,
+                "payload_offset": payload_offsets[1],
+                "payload_hex": payloads[1].hex(),
+                "father": {"file_id": 0, "path_id": 1},
+                "children": [],
+            },
+        ],
+    }
+    return bytes(output), expected
+
+
 def build_legacy_monobehaviour_fixture() -> bytes:
     version = 15
     metadata = WireWriter(False)
@@ -544,6 +679,12 @@ def main() -> None:
             }
         )
 
+    transform_hierarchy_file = "transform_hierarchy_v22.assets.bin"
+    transform_hierarchy_fixture, transform_hierarchy_expected = (
+        build_transform_hierarchy_fixture()
+    )
+    (output_dir / transform_hierarchy_file).write_bytes(transform_hierarchy_fixture)
+
     manifest = {
         "schema": 1,
         "generator": "scripts/generate_serialized_file_goldens.py",
@@ -556,7 +697,10 @@ def main() -> None:
         ],
         "differential_verification": {
             "implementation": "UnityPy 1.25.2 (vendored commit 5567c5e)",
-            "observation": "All generated fixtures parse with one type and one object.",
+            "observation": (
+                "All version-matrix fixtures parse with one type and one object; "
+                "dedicated fixtures additionally exercise multiple-object layouts."
+            ),
             "scope_limit": (
                 "The synthetic v16 fixture validates the index-only example accepted by UnityPy; "
                 "it does not settle the conflicting general v16 raw32 interpretation."
@@ -575,6 +719,13 @@ def main() -> None:
         ],
         "cases": cases,
         "multi_object_cases": multi_object_cases,
+        "transform_hierarchy_case": {
+            "file": transform_hierarchy_file,
+            "length": len(transform_hierarchy_fixture),
+            "sha256": hashlib.sha256(transform_hierarchy_fixture).hexdigest(),
+            "purpose": "Embedded Transform TypeTree preserves a complete parent-child topology",
+            "expected": transform_hierarchy_expected,
+        },
         "special_cases": [
             {
                 "file": legacy_script_file,

@@ -32,7 +32,7 @@ Non-goals (for now):
 - Perfect editor-level semantics for all asset types (parity targets file-format correctness first)
 
 Future parity targets (post edit-pipeline):
-- UnityPy's typed object layer (`repo-ref/UnityPy/UnityPy/classes/*`, especially `generated.py`) for ergonomic field access and safe edits
+- Broader schema-recipe coverage for UnityPy's typed object layer (`repo-ref/UnityPy/UnityPy/classes/*`, especially `generated.py`), with capability discovery and deterministic mutation-plan lowering
 - Export/convenience helpers (`repo-ref/UnityPy/UnityPy/tools/extractor.py`, `repo-ref/UnityPy/UnityPy/export/*`)
 
 ## Current Gap Shortlist
@@ -51,7 +51,7 @@ P1 (important, but not blocking most modern samples):
 
 P2 / future:
 - Bundle encryption save support (UnityPy explicitly has a TODO here too; it clears encryption flags on save).
-- Broader typed helper coverage for UI/editor workflows (RectTransform/Canvas/Text/etc), including YAML prefab/scene editing ergonomics.
+- Broader schema-recipe coverage for UI/editor workflows (RectTransform/Canvas/Text/etc), including additional binary and YAML schema variants.
 
 ## Finding Legacy Samples (v<9 / UnityWeb / UnityRaw)
 
@@ -76,9 +76,16 @@ To avoid destabilizing the existing parser crates, the write/edit pipeline shoul
   - `BundleFile`/`WebFile` rebuild/save
   - Resource (`.resS`) write & external registration
   - “changed” tracking akin to UnityPy’s `mark_changed()`
+- Schema mutation layer: `crates/unity-asset/src/schema`
+  - inspect immutable workspace objects and retain their exact schema provenance
+  - report structured recipe capabilities and rejection reasons
+  - lower domain mutations to guarded `MutationPlanFragment` values
+- Workspace contract: `crates/unity-asset/src/workspace`
+  - immutable `WorkspaceView` observations with revision-bound object addresses
+  - deterministic, serializable `MutationPlan` values as the mutation boundary
 
 Integration:
-- `crates/unity-asset` should expose UnityPy-like ergonomic methods (e.g. `Environment::save(...)`) on top of `unity-asset-write`.
+- `crates/unity-asset` exposes `SchemaRecipePlanner` and `MutationPlan` as the agent-facing planning API on top of immutable workspace observations.
 
 ## Module Mapping (UnityPy → Rust)
 
@@ -148,9 +155,15 @@ UnityPy:
 
 Rust (current):
 - `crates/unity-asset-binary/src/object.rs`
-  - `ObjectHandle` (UnityPy `ObjectReader`-like) is read-only today
+  - `ObjectHandle::materialize(...)` resolves and retains the exact compiled `TypeTreeSchema` and schema origin used for the object
+- `crates/unity-asset/src/workspace/view.rs`
+  - `WorkspaceView` provides immutable, revision-bound object resolution for deterministic inspection
+- `crates/unity-asset/src/schema/`
+  - `SchemaRecipePlanner::inspect(...)` validates object identity and records binary/YAML schema provenance
+  - `SchemaRecipePlanner::capabilities_for(...)` reports supported recipes and structured rejection reasons without attempting mutation
+  - schema recipes lower supported domain operations to guarded `MutationPlanFragment` values; callers assemble these into a canonical `MutationPlan`
 - `crates/unity-asset/src/environment/imp/edit.rs`
-  - `EnvironmentEditSession` provides UnityPy-like edit + save hooks on top of `ObjectHandle`:
+  - `EnvironmentEditSession` provides low-level edit + save hooks on top of `ObjectHandle`:
     - `edit_binary_object_key(...)` (mutate in a closure)
     - `save_binary_object_class(...)` (UnityPy `Object.save()`-style: mutate outside, then persist)
 - `crates/unity-asset-write/src/object/serialized_file_session.rs`
@@ -417,54 +430,16 @@ Acceptance:
 - [x] Provide best-effort "find references" for binary `PPtr` fields:
   - [x] `Environment::find_binary_pptr_references_to(...)` returns `(from, pptr_path, file_id, path_id, resolved)`
 - [x] Implement YAML-side "find references" for YAML PPtr-like objects (prefab/scene YAML), returning `(YamlObjectKey, pptr_path, file_id/guid/type, resolved?)`
-- [x] Provide typed convenience helpers for common streamed asset types:
-  - [x] AudioClip (`m_Resource`)
-  - [x] Texture2D (`m_StreamData`)
-  - [x] Mesh (`m_StreamData`)
-  - [x] VideoClip (`m_ExternalResources`)
-- [x] Provide a typed convenience helper for a common non-streamed edit:
-  - [x] TextAsset (`m_Script`)
-- [x] Expand typed helpers (UnityPy-like ergonomics):
-  - [x] MeshFilter (`m_Mesh`)
-  - [x] MeshRenderer (`m_Materials`, `m_AdditionalVertexStreams`)
-  - [x] SpriteRenderer (`m_Sprite`)
-  - [x] Sprite (`m_RD.texture`, `m_RD.alphaTexture`)
-  - [x] SpriteAtlas (`m_RenderDataMap[*].texture`, `m_RenderDataMap[*].alphaTexture`)
-  - [x] Material:
-    - [x] TexEnv texture (`m_SavedProperties.m_TexEnvs[*].m_Texture`) by name
-    - [x] TexEnv scale/offset (`m_SavedProperties.m_TexEnvs[*].m_Scale/m_Offset`) by name
-    - [x] Floats/Colors/Ints (`m_SavedProperties.m_Floats/m_Colors/m_Ints`) by name
-  - [x] VideoPlayer (`m_Url`, `m_VideoClip`)
-- [x] Add YAML prefab/scene editing helpers (UI-focused baseline):
-  - [x] Query YAML objects by `class_name` + dot-path + string value, returning `YamlObjectKey`
-  - [x] Resolve `GameObject.m_Component[*].component.fileID` to component anchors within the same YAML file
-  - [x] Find MonoBehaviour components by `m_Script.guid` (script GUID)
-  - [x] RectTransform setters (`m_AnchoredPosition`, `m_SizeDelta`, `m_AnchorMin`, `m_AnchorMax`, `m_Pivot`, `m_OffsetMin`, `m_OffsetMax`)
-  - [x] Transform setters (`m_LocalPosition`, `m_LocalRotation`, `m_LocalScale`)
-  - [x] Hierarchy helpers:
-    - [x] Find child GameObject by name path (traverse `m_Children` → `m_GameObject`)
-    - [x] Reparent GameObjects (update `m_Father` / `m_Children`)
-  - [x] Generic YAML setters for common UI fields:
-    - [x] PPtr-like refs (`{fileID,guid,type}`) and internal anchor refs
-    - [x] Color (`{r,g,b,a}`) and GameObject active (`m_IsActive`)
-  - [ ] TODO: expand typed helpers further (more classes + deeper editor semantics)
-  - [ ] YAML UI helpers:
-    - [x] Image/RawImage: sprite/texture refs, color, raycast target
-    - [x] Text/TMP_Text: text, color, font size (best-effort)
-    - [x] Button: interactable + persistent onClick calls (best-effort)
-    - [x] Canvas/CanvasScaler (best-effort)
-    - [x] Layout groups (best-effort)
-    - [x] Toggle: isOn, interactable, persistent onValueChanged calls (best-effort)
-    - [x] Slider: value, min/max, wholeNumbers, interactable, persistent onValueChanged calls (best-effort)
-    - [x] Dropdown: value, interactable, persistent onValueChanged calls (best-effort)
-    - [x] InputField: text, interactable, persistent onValueChanged/onEndEdit calls (best-effort)
-    - [x] TMP_InputField: text, interactable, persistent onValueChanged/onEndEdit calls (best-effort)
-    - [x] ScrollRect: content/viewport refs, axis toggles, normalizedPosition/velocity, persistent onValueChanged calls (best-effort)
-    - [x] CanvasGroup: alpha, interactable, raycast flags (best-effort)
-    - [x] ContentSizeFitter: horizontal/vertical fit modes (best-effort)
-    - [x] LayoutElement: sizes + ignoreLayout + priority (best-effort)
-    - [x] ToggleGroup: allowSwitchOff (best-effort)
-    - [x] Scrollbar: value/size/steps/interactable + persistent onValueChanged calls (best-effort)
+- [x] Introduce schema-aware mutation recipes instead of class-specific shallow setters:
+  - [x] `SchemaRecipePlanner` inspection is bound to an immutable workspace revision and exact binary/YAML schema provenance
+  - [x] Capability discovery reports supported recipe variants and structured rejection reasons
+  - [x] Material texture environment references preserve the observed serialized shape
+  - [x] UnityEvent persistent-call add/replace/clear operations preserve stable sequence order
+  - [x] Transform and RectTransform edits validate expected class/field shapes
+  - [x] Hierarchy reparenting validates the complete supplied topology and lowers both parent and child updates atomically
+  - [x] AudioClip streamed-resource edits distinguish `m_Resource`, `m_StreamData`, both, and neither
+  - [x] Recipe output is a guarded `MutationPlanFragment`; callers compose fragments into a deterministic `MutationPlan`
+- [ ] Expand the recipe catalog for additional Unity classes and editor semantics without returning to one public method per field.
 
 Acceptance:
 - [x] A bundle can be modified to point `m_StreamData` at a newly written cab and reloaded.
