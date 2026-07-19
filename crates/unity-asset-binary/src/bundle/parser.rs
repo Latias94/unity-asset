@@ -68,6 +68,7 @@ pub struct BundleBlockInspection {
     compressed_size: u32,
     flags: u16,
     compression: CompressionType,
+    encoded_range: Range<u64>,
 }
 
 /// One bundle directory record in wire order.
@@ -238,6 +239,10 @@ impl BundleBlockInspection {
     pub const fn compression(&self) -> CompressionType {
         self.compression
     }
+
+    pub fn encoded_range(&self) -> Range<u64> {
+        self.encoded_range.clone()
+    }
 }
 
 impl BundleDirectoryInspection {
@@ -341,7 +346,8 @@ impl BundleParser {
             .ok_or_else(|| BinaryError::invalid_data("UnityFS blocks info is missing its hash"))?
             .try_into()
             .map_err(|_| BinaryError::invalid_data("Invalid UnityFS blocks-info hash width"))?;
-        let tables = parse_file_stream_inspection_tables(&blocks_info_decoded, &options, budget)?;
+        let mut tables =
+            parse_file_stream_inspection_tables(&blocks_info_decoded, &options, budget)?;
         let total_uncompressed = tables.total_uncompressed;
         let declared_compressed = tables.total_compressed;
         if declared_compressed != block_data_range.end - block_data_range.start {
@@ -358,10 +364,11 @@ impl BundleParser {
         drop(blocks_info_decoded);
         drop(blocks_info);
         let mut block_offset = block_data_range.start;
-        for block in &tables.blocks {
+        for block in &mut tables.blocks {
             let block_end = block_offset
                 .checked_add(u64::from(block.compressed_size))
                 .ok_or_else(|| BinaryError::invalid_data("Block source range overflow"))?;
+            block.encoded_range = block_offset..block_end;
             let encoded = {
                 let mut reader = ByteCursor::with_range(
                     source,
@@ -395,6 +402,12 @@ impl BundleParser {
                 .ok_or_else(|| BinaryError::invalid_data("Block working set overflow"))?;
             max_temporary_bytes = max_temporary_bytes.max(working_set);
             block_offset = block_end;
+        }
+        if block_offset != block_data_range.end {
+            return Err(BinaryError::invalid_data(format!(
+                "FileStream block ranges end at {block_offset}, expected physical payload end {}",
+                block_data_range.end
+            )));
         }
 
         let compressed_bytes = u64::from(header.compressed_blocks_info_size)
@@ -1569,6 +1582,7 @@ fn parse_file_stream_inspection_tables(
             compressed_size: bundle_u32_at(data, offset + 4, "block compressed size")?,
             flags,
             compression: CompressionType::from_flags(u32::from(flags))?,
+            encoded_range: 0..0,
         });
     }
 

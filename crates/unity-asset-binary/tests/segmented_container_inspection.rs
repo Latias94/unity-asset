@@ -1,4 +1,5 @@
 use std::io::{Cursor, Write};
+use std::ops::Range;
 use std::sync::Arc;
 
 use flate2::Compression;
@@ -271,6 +272,112 @@ fn file_stream_v6_with_duplicate_nodes(
     let total_len = i64::try_from(bytes.len()).expect("bundle size fits i64");
     bytes[size_offset..size_offset + 8].copy_from_slice(&total_len.to_be_bytes());
     bytes
+}
+
+struct FileStreamBlocksFixture {
+    bytes: Vec<u8>,
+    payload_range: Range<u64>,
+}
+
+fn file_stream_v6_with_mixed_blocks(
+    signature: &str,
+    blocks_info_at_end: bool,
+) -> FileStreamBlocksFixture {
+    let blocks: [(&[u8], CompressionType); 3] = [
+        (b"raw-block", CompressionType::None),
+        (b"lz4-lz4-lz4-lz4-lz4-lz4-lz4-lz4", CompressionType::Lz4),
+        (
+            b"brotli-brotli-brotli-brotli-brotli-brotli",
+            CompressionType::Brotli,
+        ),
+    ];
+    let encoded_blocks = blocks
+        .iter()
+        .map(|(decoded, compression)| encode_bundle_section(decoded, *compression))
+        .collect::<Vec<_>>();
+    let encoded_payload = encoded_blocks.concat();
+    let decoded_payload_len = blocks
+        .iter()
+        .map(|(decoded, _)| decoded.len())
+        .sum::<usize>();
+
+    let mut blocks_info = vec![0xa9_u8; 16];
+    blocks_info.extend_from_slice(
+        &i32::try_from(blocks.len())
+            .expect("block count fits i32")
+            .to_be_bytes(),
+    );
+    for (index, (decoded, compression)) in blocks.iter().copied().enumerate() {
+        blocks_info.extend_from_slice(
+            &u32::try_from(decoded.len())
+                .expect("decoded block size fits u32")
+                .to_be_bytes(),
+        );
+        blocks_info.extend_from_slice(
+            &u32::try_from(encoded_blocks[index].len())
+                .expect("encoded block size fits u32")
+                .to_be_bytes(),
+        );
+        blocks_info.extend_from_slice(&(compression as u16).to_be_bytes());
+    }
+    blocks_info.extend_from_slice(&1_i32.to_be_bytes());
+    blocks_info.extend_from_slice(&0_i64.to_be_bytes());
+    blocks_info.extend_from_slice(
+        &i64::try_from(decoded_payload_len)
+            .expect("decoded payload size fits i64")
+            .to_be_bytes(),
+    );
+    blocks_info.extend_from_slice(&4_u32.to_be_bytes());
+    blocks_info.extend_from_slice(b"payload.assets\0");
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(signature.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&6_u32.to_be_bytes());
+    bytes.extend_from_slice(b"5.x.x\0");
+    bytes.extend_from_slice(b"0.0.0f1\0");
+    let size_offset = bytes.len();
+    bytes.extend_from_slice(&0_i64.to_be_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(blocks_info.len())
+            .expect("blocks-info size fits u32")
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(
+        &u32::try_from(blocks_info.len())
+            .expect("decoded blocks-info size fits u32")
+            .to_be_bytes(),
+    );
+    let mut flags = 0x40_u32;
+    if blocks_info_at_end {
+        flags |= 0x80;
+    }
+    bytes.extend_from_slice(&flags.to_be_bytes());
+    if signature != "UnityFS" {
+        bytes.push(0x5a);
+    }
+
+    let payload_start;
+    if blocks_info_at_end {
+        payload_start = bytes.len();
+        bytes.extend_from_slice(&encoded_payload);
+        bytes.extend_from_slice(&blocks_info);
+    } else {
+        bytes.extend_from_slice(&blocks_info);
+        payload_start = bytes.len();
+        bytes.extend_from_slice(&encoded_payload);
+    }
+    let payload_end = payload_start
+        .checked_add(encoded_payload.len())
+        .expect("payload range does not overflow");
+    let total_len = i64::try_from(bytes.len()).expect("bundle size fits i64");
+    bytes[size_offset..size_offset + 8].copy_from_slice(&total_len.to_be_bytes());
+
+    FileStreamBlocksFixture {
+        bytes,
+        payload_range: u64::try_from(payload_start).expect("payload start fits u64")
+            ..u64::try_from(payload_end).expect("payload end fits u64"),
+    }
 }
 
 fn webfile_with_duplicate_entries(second_offset_delta: i32) -> Vec<u8> {
@@ -671,6 +778,52 @@ fn unityweb_and_unityraw_v6_use_file_stream_layout_in_both_blocks_info_positions
             assert_eq!(parsed.header.signature, signature);
             assert_eq!(parsed.nodes.len(), 2);
             assert_eq!(parsed.nodes[1].offset, 4);
+        }
+    }
+}
+
+#[test]
+fn file_stream_v6_mixed_block_encoded_ranges_exactly_cover_the_physical_payload() {
+    let expected_compressions = [
+        CompressionType::None,
+        CompressionType::Lz4,
+        CompressionType::Brotli,
+    ];
+
+    for signature in ["UnityFS", "UnityWeb"] {
+        for blocks_info_at_end in [false, true] {
+            let fixture = file_stream_v6_with_mixed_blocks(signature, blocks_info_at_end);
+            let image = one_byte_segments(&fixture.bytes);
+            let contiguous = BundleParser::inspect_slice_with_budget(
+                &fixture.bytes,
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("inspect contiguous v6 file-stream bundle with mixed compression");
+            let inspection = BundleParser::inspect_segmented_with_budget(
+                &image,
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("inspect v6 file-stream bundle with mixed block compression");
+
+            assert!(image.contiguous().is_none());
+            assert_eq!(inspection, contiguous);
+            assert_eq!(inspection.blocks().len(), expected_compressions.len());
+            let mut expected_start = fixture.payload_range.start;
+            for (block, expected_compression) in inspection
+                .blocks()
+                .iter()
+                .zip(expected_compressions.iter().copied())
+            {
+                let encoded_range = block.encoded_range();
+                assert_eq!(encoded_range.start, expected_start);
+                assert_eq!(
+                    encoded_range.end - encoded_range.start,
+                    u64::from(block.compressed_size())
+                );
+                assert_eq!(block.compression(), expected_compression);
+                expected_start = encoded_range.end;
+            }
+            assert_eq!(expected_start, fixture.payload_range.end);
         }
     }
 }
