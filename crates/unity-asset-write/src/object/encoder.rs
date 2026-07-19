@@ -522,6 +522,27 @@ pub struct SerializedObjectEncoder<'file> {
     handle: ObjectHandle<'file>,
 }
 
+/// One parsed SerializedFile object receiving guarded mutations in plan order.
+///
+/// The candidate retains semantic state between calls to [`Self::apply`]. This lets a workspace
+/// interleave operations for several objects without grouping them ahead of validation, while the
+/// final object is still rewritten exactly once by [`Self::finish`].
+#[derive(Debug)]
+#[must_use = "finish the candidate to produce encoded object bytes"]
+pub struct SerializedObjectCandidate<'file> {
+    handle: ObjectHandle<'file>,
+    schema: TypeTreeSchema,
+    schema_digest: DigestV1,
+    original: &'file [u8],
+    original_digest: DigestV1,
+    root: UnityValue,
+    endian: Endian,
+    parse_stats: TypeTreeTraversalStats,
+    previous_ordinal: Option<u32>,
+    operation_count: u64,
+    validation_stats: OperationValidationStats,
+}
+
 impl<'file> SerializedObjectEncoder<'file> {
     pub fn new(
         file: &'file SerializedFile,
@@ -543,16 +564,11 @@ impl<'file> SerializedObjectEncoder<'file> {
         self.handle.class_id()
     }
 
-    /// Applies all operations in ordinal order and rewrites the object exactly once.
-    pub fn encode_semantic(
+    /// Parses the original object once and opens an ordered semantic candidate.
+    pub fn begin_semantic(
         self,
-        operations: impl IntoIterator<Item = SerializedObjectMutation>,
         budget: &mut AssetLoadBudget,
-    ) -> Result<EncodedSerializedObject, SerializedObjectEncodeError> {
-        let mut operations = operations.into_iter();
-        let first = operations
-            .next()
-            .ok_or(SerializedObjectEncodeError::NoOperations)?;
+    ) -> Result<SerializedObjectCandidate<'file>, SerializedObjectEncodeError> {
         let path_id = self.path_id();
         let class_id = self.class_id();
         let schema = self
@@ -582,51 +598,36 @@ impl<'file> SerializedObjectEncoder<'file> {
             return Err(SerializedObjectEncodeError::IncompleteParse { path_id });
         }
 
-        let parse_stats = parsed.stats;
-        let mut root = UnityValue::Object(parsed.properties);
-        let endian = endian_for(self.handle.file().header.byte_order());
-        let mut previous_ordinal = None;
-        let mut operation_count = 0_u64;
-        let mut validation_stats = OperationValidationStats::default();
-        for operation in std::iter::once(first).chain(operations) {
-            apply_operation(
-                operation,
-                path_id,
-                &schema,
-                schema_digest,
-                endian,
-                &mut root,
-                &mut previous_ordinal,
-                &mut validation_stats,
-                budget,
-            )?;
-            operation_count = operation_count
-                .checked_add(1)
-                .ok_or(SerializedObjectEncodeError::OperationCountOverflow)?;
-        }
-        let actual = root.kind();
-        let UnityValue::Object(properties) = root else {
-            return Err(SerializedObjectEncodeError::RootTypeInvariant { actual });
-        };
-        let (bytes, rewrite_stats) = rewrite_object(&schema, &properties, original, endian, budget)
-            .map_err(|error| map_rewrite_error(path_id, error))?;
-        let output_digest = DigestV1::hash_bytes(&bytes);
-
-        Ok(EncodedSerializedObject {
-            path_id,
-            class_id,
-            mode: SerializedObjectEncodingMode::Semantic,
-            schema_digest: Some(schema_digest),
+        Ok(SerializedObjectCandidate {
+            handle: self.handle,
+            schema,
+            schema_digest,
+            original,
             original_digest,
-            output_digest,
-            bytes,
-            stats: semantic_stats(
-                parse_stats,
-                validation_stats,
-                rewrite_stats,
-                operation_count,
-            ),
+            root: UnityValue::Object(parsed.properties),
+            endian: endian_for(self.handle.file().header.byte_order()),
+            parse_stats: parsed.stats,
+            previous_ordinal: None,
+            operation_count: 0,
+            validation_stats: OperationValidationStats::default(),
         })
+    }
+
+    /// Applies all operations in ordinal order and rewrites the object exactly once.
+    pub fn encode_semantic(
+        self,
+        operations: impl IntoIterator<Item = SerializedObjectMutation>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<EncodedSerializedObject, SerializedObjectEncodeError> {
+        let mut operations = operations.into_iter();
+        let first = operations
+            .next()
+            .ok_or(SerializedObjectEncodeError::NoOperations)?;
+        let mut candidate = self.begin_semantic(budget)?;
+        for operation in std::iter::once(first).chain(operations) {
+            candidate.apply(operation, budget)?;
+        }
+        candidate.finish(budget)
     }
 
     /// Replaces raw bytes only after verifying the original digest and explicit acknowledgement.
@@ -674,6 +675,100 @@ impl<'file> SerializedObjectEncoder<'file> {
                 operations_applied: 1,
                 ..SerializedObjectEncodingStats::default()
             },
+        })
+    }
+}
+
+impl SerializedObjectCandidate<'_> {
+    #[must_use]
+    pub fn path_id(&self) -> i64 {
+        self.handle.path_id()
+    }
+
+    #[must_use]
+    pub fn class_id(&self) -> i32 {
+        self.handle.class_id()
+    }
+
+    #[must_use]
+    pub const fn schema_digest(&self) -> DigestV1 {
+        self.schema_digest
+    }
+
+    /// Returns the current staged semantic value at a field path without allocating.
+    pub fn value_at_path(&self, path: &FieldPath) -> Result<&UnityValue, ValuePathError> {
+        self.root.value_at_path(path)
+    }
+
+    /// Applies one operation immediately, preserving this candidate for later plan operations.
+    pub fn apply(
+        &mut self,
+        operation: SerializedObjectMutation,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<(), SerializedObjectEncodeError> {
+        apply_operation(
+            operation,
+            self.path_id(),
+            &self.schema,
+            self.schema_digest,
+            self.endian,
+            &mut self.root,
+            &mut self.previous_ordinal,
+            &mut self.validation_stats,
+            budget,
+        )?;
+        self.operation_count = self
+            .operation_count
+            .checked_add(1)
+            .ok_or(SerializedObjectEncodeError::OperationCountOverflow)?;
+        Ok(())
+    }
+
+    /// Rewrites the fully validated candidate exactly once.
+    pub fn finish(
+        self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<EncodedSerializedObject, SerializedObjectEncodeError> {
+        if self.operation_count == 0 {
+            return Err(SerializedObjectEncodeError::NoOperations);
+        }
+        let Self {
+            handle,
+            schema,
+            schema_digest,
+            original,
+            original_digest,
+            root,
+            endian,
+            parse_stats,
+            operation_count,
+            validation_stats,
+            ..
+        } = self;
+        let path_id = handle.path_id();
+        let class_id = handle.class_id();
+        let actual = root.kind();
+        let UnityValue::Object(properties) = root else {
+            return Err(SerializedObjectEncodeError::RootTypeInvariant { actual });
+        };
+        let (bytes, rewrite_stats) = rewrite_object(&schema, &properties, original, endian, budget)
+            .map_err(|error| map_rewrite_error(path_id, error))?;
+        let output_digest = DigestV1::hash_bytes(&bytes);
+
+        Ok(EncodedSerializedObject {
+            path_id,
+            class_id,
+            mode: SerializedObjectEncodingMode::Semantic,
+            schema_digest: Some(schema_digest),
+            original_digest,
+            output_digest,
+            bytes,
+            stats: semantic_stats(
+                parse_stats,
+                validation_stats,
+                rewrite_stats,
+                operation_count,
+            ),
         })
     }
 }

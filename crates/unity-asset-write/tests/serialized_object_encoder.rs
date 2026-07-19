@@ -181,6 +181,66 @@ fn ordered_mutations_observe_prior_results_and_rewrite_once() {
 }
 
 #[test]
+fn incremental_candidate_exposes_read_after_write_and_matches_batch_encoding() {
+    let file = sample_serialized_file();
+    let observed = observe_name(&file);
+    let path = name_path(observed.field);
+    let first_name = "CANDIDATE_FIRST_RESULT";
+    let final_name = "CANDIDATE_FINAL_RESULT";
+    let mut budget = AssetLoadBudget::default();
+    let mut candidate = SerializedObjectEncoder::new(&file, observed.path_id)
+        .expect("bind candidate encoder")
+        .begin_semantic(&mut budget)
+        .expect("open semantic candidate");
+
+    assert_eq!(
+        candidate.value_at_path(&path),
+        Ok(&observed.value),
+        "the candidate begins at the immutable source value"
+    );
+    let mut operations = rename_operations(&observed, first_name, final_name).into_iter();
+    candidate
+        .apply(operations.next().expect("first operation"), &mut budget)
+        .expect("apply first operation");
+    assert_eq!(
+        candidate.value_at_path(&path),
+        Ok(&UnityValue::String(first_name.to_owned())),
+        "later plan operations observe the staged value"
+    );
+    candidate
+        .apply(operations.next().expect("second operation"), &mut budget)
+        .expect("apply second operation");
+    let incremental = candidate.finish(&mut budget).expect("finish candidate");
+
+    let batch = SerializedObjectEncoder::new(&file, observed.path_id)
+        .expect("bind batch encoder")
+        .encode_semantic(
+            rename_operations(&observed, first_name, final_name),
+            &mut AssetLoadBudget::default(),
+        )
+        .expect("encode batch operations");
+    assert_eq!(incremental.bytes(), batch.bytes());
+    assert_eq!(incremental.output_digest(), batch.output_digest());
+    assert_eq!(incremental.stats(), batch.stats());
+}
+
+#[test]
+fn empty_incremental_candidate_cannot_produce_an_artifact() {
+    let file = sample_serialized_file();
+    let observed = observe_name(&file);
+    let mut budget = AssetLoadBudget::default();
+    let candidate = SerializedObjectEncoder::new(&file, observed.path_id)
+        .expect("bind candidate encoder")
+        .begin_semantic(&mut budget)
+        .expect("open semantic candidate");
+
+    assert!(matches!(
+        candidate.finish(&mut budget),
+        Err(SerializedObjectEncodeError::NoOperations)
+    ));
+}
+
+#[test]
 fn later_guard_failure_returns_no_encoded_output() {
     let file = sample_serialized_file();
     let observed = observe_name(&file);
