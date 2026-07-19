@@ -77,6 +77,29 @@ fn generated_vec_backing_and_subranges_are_zero_copy() {
 }
 
 #[test]
+fn segments_rebase_complete_and_partial_ranges_without_copying() {
+    let backing: Arc<[u8]> = Arc::from(b"0123456789abcdef".as_slice());
+    let segment = ByteSegment::from_arc_range(10, Arc::clone(&backing), 2..14).unwrap();
+
+    let rebased = segment.rebase(100).unwrap();
+    assert_eq!(rebased.logical_range(), 100..112);
+    assert_eq!(rebased.as_slice(), b"23456789abcd");
+    assert_eq!(rebased.as_slice().as_ptr(), segment.as_slice().as_ptr());
+
+    let partial = segment.rebase_subrange(13..18, 200).unwrap();
+    assert_eq!(partial.logical_range(), 200..205);
+    assert_eq!(partial.as_slice(), b"56789");
+    assert_eq!(
+        partial.as_slice().as_ptr(),
+        segment.as_slice()[3..].as_ptr()
+    );
+
+    for range in [9..10, 10..23, std::ops::Range { start: 18, end: 17 }] {
+        assert!(segment.rebase_subrange(range, 0).is_err());
+    }
+}
+
+#[test]
 fn subrange_is_zero_copy_and_rebased_across_segment_boundaries() {
     let backing: Arc<[u8]> = Arc::from(&b"0123456789"[..]);
     let image = SegmentedBytes::new(vec![

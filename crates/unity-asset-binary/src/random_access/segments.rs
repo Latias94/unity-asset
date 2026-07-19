@@ -119,6 +119,52 @@ impl ByteSegment {
         &self.backing.as_slice()[self.backing_range.clone()]
     }
 
+    /// Repositions this complete segment without copying its immutable backing.
+    pub fn rebase(&self, logical_start: u64) -> Result<Self> {
+        Self::from_backing_range(
+            logical_start,
+            self.backing.clone(),
+            self.backing_range.clone(),
+        )
+    }
+
+    /// Repositions a contained logical range without copying its immutable backing.
+    pub fn rebase_subrange(&self, source_range: Range<u64>, logical_start: u64) -> Result<Self> {
+        if source_range.start > source_range.end
+            || source_range.start < self.logical_start()
+            || source_range.end > self.logical_end()
+        {
+            return Err(BinaryError::invalid_data(format!(
+                "byte segment range {}..{} is outside logical range {}..{}",
+                source_range.start,
+                source_range.end,
+                self.logical_start(),
+                self.logical_end()
+            )));
+        }
+        let relative_start =
+            usize::try_from(source_range.start - self.logical_start()).map_err(|_| {
+                BinaryError::invalid_data("byte segment range start does not fit usize")
+            })?;
+        let relative_end = usize::try_from(source_range.end - self.logical_start())
+            .map_err(|_| BinaryError::invalid_data("byte segment range end does not fit usize"))?;
+        let backing_start = self
+            .backing_range
+            .start
+            .checked_add(relative_start)
+            .ok_or_else(|| BinaryError::invalid_data("byte segment backing start overflow"))?;
+        let backing_end = self
+            .backing_range
+            .start
+            .checked_add(relative_end)
+            .ok_or_else(|| BinaryError::invalid_data("byte segment backing end overflow"))?;
+        Self::from_backing_range(
+            logical_start,
+            self.backing.clone(),
+            backing_start..backing_end,
+        )
+    }
+
     pub(super) fn logical_start(&self) -> u64 {
         self.logical_range.start
     }
