@@ -1,6 +1,6 @@
 use serde::Serialize;
 use thiserror::Error;
-use unity_asset_binary::unity_version::UnityVersion;
+use unity_asset_binary::{typetree::TypeTreeSemanticDigestError, unity_version::UnityVersion};
 use unity_asset_core::{
     BudgetError, DigestBuildError, DigestV1, FieldPath, FieldPathError, ObjectAddress, ObjectKind,
     SemanticDigestError,
@@ -613,18 +613,31 @@ pub enum RecipeError {
 
 impl From<WorkspaceError> for RecipeError {
     fn from(error: WorkspaceError) -> Self {
-        let mut source: &(dyn std::error::Error + 'static) = &error;
-        loop {
-            if let Some(budget) = source.downcast_ref::<BudgetError>() {
+        if let WorkspaceError::Budget(budget) = &error {
+            return Self::Budget(budget.clone());
+        }
+
+        let mut source: Option<&(dyn std::error::Error + 'static)> = match &error {
+            WorkspaceError::Operation { source, .. } => Some(source.as_ref()),
+            _ => Some(&error),
+        };
+        while let Some(current) = source {
+            if let Some(budget) = current.downcast_ref::<BudgetError>() {
                 return Self::Budget(budget.clone());
             }
-            if let Some(Self::Budget(budget)) = source.downcast_ref::<Self>() {
+            if let Some(semantic) = current.downcast_ref::<SemanticDigestError>() {
+                return Self::from(semantic.clone());
+            }
+            if let Some(semantic) = current.downcast_ref::<TypeTreeSemanticDigestError>() {
+                return match semantic {
+                    TypeTreeSemanticDigestError::Budget(error) => Self::Budget(error.clone()),
+                    TypeTreeSemanticDigestError::Digest(error) => Self::Digest(error.clone()),
+                };
+            }
+            if let Some(Self::Budget(budget)) = current.downcast_ref::<Self>() {
                 return Self::Budget(budget.clone());
             }
-            let Some(next) = source.source() else {
-                break;
-            };
-            source = next;
+            source = current.source();
         }
         Self::Workspace(error)
     }

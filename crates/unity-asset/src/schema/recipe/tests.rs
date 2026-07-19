@@ -1,10 +1,13 @@
 use std::mem::size_of;
 
 use indexmap::IndexMap;
+use unity_asset_binary::typetree::TypeTreeSemanticDigestError;
 use unity_asset_core::{
-    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, DigestV1, FieldPath, SemanticDigestError,
-    UnityClass, UnityValue, semantic_value_digest, yaml_field_schema_digest,
+    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BudgetError, DigestV1, FieldPath,
+    SemanticDigestError, UnityClass, UnityValue, semantic_value_digest, yaml_field_schema_digest,
 };
+
+use crate::workspace::WorkspaceError;
 
 use super::contract::RecipeError;
 use super::output::RecipeOutputBuilder;
@@ -310,4 +313,30 @@ fn recipe_output_builder_budgeted_clone_handles_deep_paths() {
         Err(RecipeError::Budget(_))
     ));
     assert_eq!(one_short.usage(), AssetLoadUsage::default());
+}
+
+#[test]
+fn workspace_schema_digest_budgets_remain_typed_recipe_errors() {
+    let expected = BudgetError::Exceeded {
+        resource: "schema digest test",
+        limit: 4,
+        requested: 5,
+    };
+    let errors = [
+        WorkspaceError::operation(
+            "YAML semantic schema digest",
+            SemanticDigestError::Budget(expected.clone()),
+        ),
+        WorkspaceError::operation(
+            "TypeTree semantic digest",
+            TypeTreeSemanticDigestError::Budget(expected.clone()),
+        ),
+    ];
+
+    for error in errors {
+        assert!(matches!(
+            RecipeError::from(error),
+            RecipeError::Budget(actual) if actual == expected
+        ));
+    }
 }

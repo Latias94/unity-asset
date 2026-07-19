@@ -23,5 +23,3 @@ pub use recipe::{
     SchemaVariantId, recipe_capabilities,
 };
 pub use resource::AudioClipResourceRecipe;
-
-pub(crate) use recipe::digest_yaml_schema;
