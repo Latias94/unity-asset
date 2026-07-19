@@ -205,7 +205,8 @@ mod tests {
 
     use super::*;
     use crate::workspace::source_catalog::{PhysicalOrigin, SourceDescriptor};
-    use crate::workspace::store::{FrozenSourceParse, SourceImage};
+    use crate::workspace::store::FrozenSourceParse;
+    use unity_asset_core::VerifiedSourceImage;
 
     fn root_descriptor(kind: SourceKind, alias: &str, bytes: &[u8]) -> SourceDescriptor {
         let directory = tempfile::tempdir().unwrap();
@@ -231,7 +232,7 @@ mod tests {
         store
             .insert(
                 source,
-                SourceImage::from_vec(SourceKind::Archive, bytes.to_vec()),
+                VerifiedSourceImage::verify(SourceKind::Archive, bytes.to_vec().into()),
                 FrozenSourceParse::None,
                 &mut AssetLoadBudget::default(),
             )
@@ -258,7 +259,7 @@ mod tests {
         store
             .insert(
                 source,
-                SourceImage::from_vec(SourceKind::Archive, b"store".to_vec()),
+                VerifiedSourceImage::verify(SourceKind::Archive, b"store".to_vec().into()),
                 FrozenSourceParse::None,
                 &mut AssetLoadBudget::default(),
             )
@@ -278,7 +279,7 @@ mod tests {
         store
             .insert(
                 source,
-                SourceImage::from_vec(SourceKind::Archive, b"orphan".to_vec()),
+                VerifiedSourceImage::verify(SourceKind::Archive, b"orphan".to_vec().into()),
                 FrozenSourceParse::None,
                 &mut AssetLoadBudget::default(),
             )

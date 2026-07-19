@@ -21,6 +21,7 @@ use unity_asset::{
 };
 use unity_asset_binary::asset::SerializedFileParser;
 use unity_asset_binary::bundle::BundleParser;
+use unity_asset_core::arc_slice_allocation_bytes;
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -227,8 +228,7 @@ fn yaml_with_anchor(anchor: &str) -> String {
 }
 
 fn root_image_budget_bytes(length: usize) -> u64 {
-    let header = size_of::<usize>() * 2;
-    u64::try_from(length * 2 + header).unwrap()
+    u64::try_from(length).unwrap() + arc_slice_allocation_bytes::<u8>(length).unwrap()
 }
 
 fn assert_load_budget_error(path: &std::path::Path, bytes: &[u8]) {

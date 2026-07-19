@@ -166,7 +166,7 @@ impl ReferenceStore {
         let Ok(position) = state.facts.binary_search_by_key(&key, |entry| entry.key) else {
             return Ok(None);
         };
-        state.facts[position].owner = Arc::downgrade(owner.image().bytes_arc());
+        state.facts[position].owner = Arc::downgrade(owner.image().backing());
         Ok(Some(Arc::clone(&state.facts[position].occurrences)))
     }
 
@@ -238,7 +238,7 @@ impl ReferenceStore {
                                 merged.push(cache_entry(candidate_entry));
                             } else {
                                 existing_entry.owner =
-                                    Arc::downgrade(candidate_entry.owner.image().bytes_arc());
+                                    Arc::downgrade(candidate_entry.owner.image().backing());
                                 merged.push(existing_entry);
                             }
                             current = existing.next();
@@ -327,7 +327,7 @@ impl ReferenceStore {
 fn cache_entry(candidate: FactCacheCandidate) -> FactCacheEntry {
     FactCacheEntry {
         key: FactCacheKey::new(candidate.fingerprint),
-        owner: Arc::downgrade(candidate.owner.image().bytes_arc()),
+        owner: Arc::downgrade(candidate.owner.image().backing()),
         occurrences: candidate.occurrences,
     }
 }

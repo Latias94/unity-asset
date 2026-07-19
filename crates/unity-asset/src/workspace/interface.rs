@@ -13,8 +13,9 @@ use unity_asset_binary::typetree::{
     TypeTreeRegistry,
 };
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, SourceAlias, SourceFingerprint, SourceId, SourceKind,
-    SourceMemberId, UnityClass, UnityDocument, WorkspaceId, WorkspaceRevision, YamlAnchor,
+    AssetLoadBudget, BudgetError, SourceAlias, SourceId, SourceKind, SourceMemberId, UnityClass,
+    UnityDocument, WorkspaceId, WorkspaceRevision, YamlAnchor, arc_slice_allocation_bytes,
+    arc_value_allocation_bytes,
 };
 use unity_asset_yaml::YamlDocument;
 
@@ -29,7 +30,7 @@ use super::adapter::yaml::{ParsedYamlSource, YamlAdapterError, parse_yaml_source
 use super::snapshot::WorkspaceSnapshot;
 use super::source_catalog::{PhysicalOrigin, SourceDescriptor};
 use super::state::WorkspaceState;
-use super::store::{FrozenSourceParse, SourceImage, SourceStore};
+use super::store::{FrozenSourceParse, SourceStore};
 use super::view::{
     WorkspaceAllocationUnit, WorkspaceError, WorkspaceSourceContainer,
     WorkspaceSourceIdentityError, WorkspaceSourceMemberIdentityError,
@@ -774,12 +775,11 @@ fn freeze_serialized_registry(
         return Ok(());
     }
 
-    let allocation = size_of::<FrozenTypeTreeRegistry>()
-        .checked_add(size_of::<usize>() * 2)
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or(BudgetError::ArithmeticOverflow {
+    let allocation = arc_value_allocation_bytes::<FrozenTypeTreeRegistry>().map_err(|_| {
+        BudgetError::ArithmeticOverflow {
             resource: "frozen_typetree_registry",
-        })?;
+        }
+    })?;
     budget.consume_bytes(allocation)?;
     file.set_type_tree_registry(Some(Arc::new(FrozenTypeTreeRegistry { entries })));
     Ok(())
@@ -930,7 +930,8 @@ fn register_prepared(
         parsed,
         children,
     } = prepared;
-    let fingerprint = SourceFingerprint::from_bytes(kind, &image);
+    let image = unity_asset_core::VerifiedSourceImage::verify(kind, image);
+    let fingerprint = image.fingerprint();
     let source = catalog.register(descriptor, fingerprint, budget)?;
     let parse = match parsed {
         PreparedParse::None => FrozenSourceParse::None,
@@ -938,7 +939,7 @@ fn register_prepared(
         PreparedParse::Yaml(document) => FrozenSourceParse::Yaml(document),
     };
     store
-        .insert(source, SourceImage::from_arc(kind, image), parse, budget)
+        .insert(source, image, parse, budget)
         .map_err(WorkspaceError::from)?;
 
     for child in children {
@@ -1186,10 +1187,8 @@ fn consume_arc_allocation<T>(
     budget: &mut AssetLoadBudget,
     resource: &'static str,
 ) -> Result<(), WorkspaceError> {
-    let bytes = size_of::<T>()
-        .checked_add(size_of::<usize>() * 2)
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or(BudgetError::ArithmeticOverflow { resource })?;
+    let bytes = arc_value_allocation_bytes::<T>()
+        .map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
     budget.check_bytes(bytes)?;
     budget.consume_bytes(bytes)?;
     Ok(())
@@ -1280,15 +1279,11 @@ fn read_owned_image(
             path: path.to_path_buf(),
         });
     }
-    let arc_allocation = length
-        .checked_add(u64::try_from(size_of::<usize>() * 2).map_err(|_| {
-            BudgetError::ArithmeticOverflow {
-                resource: "workspace_source_arc",
-            }
-        })?)
-        .ok_or(BudgetError::ArithmeticOverflow {
+    let arc_allocation = arc_slice_allocation_bytes::<u8>(length_usize).map_err(|_| {
+        BudgetError::ArithmeticOverflow {
             resource: "workspace_source_arc",
-        })?;
+        }
+    })?;
     budget.check_bytes(arc_allocation)?;
     budget.consume_bytes(arc_allocation)?;
     Ok(Arc::from(bytes))
@@ -1411,7 +1406,7 @@ mod tests {
         let path = directory.path().join("payload.resource");
         fs::write(&path, b"four").unwrap();
         let origin = PhysicalOrigin::from_existing_path(&path).unwrap();
-        let arc_bytes = u64::try_from(4 + size_of::<usize>() * 2).unwrap();
+        let arc_bytes = arc_slice_allocation_bytes::<u8>(4).unwrap();
         let exact_bytes = 4 + arc_bytes;
 
         let mut short = AssetLoadBudget::new(AssetLoadLimits {

@@ -1,70 +1,21 @@
 use std::collections::BTreeMap;
-use std::mem::{align_of, size_of};
+use std::mem::size_of;
 use std::sync::Arc;
 
 use thiserror::Error;
 use unity_asset_binary::asset::SerializedFile;
+use unity_asset_binary::shared_bytes::SharedBytes;
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, DigestV1, SourceFingerprint, SourceId, SourceKind, WorkspaceId,
+    AssetLoadBudget, BudgetError, DigestV1, SourceId, SourceKind, VerifiedSourceImage,
+    VerifiedSourceRebinding, WorkspaceId, arc_value_allocation_bytes, vec_allocation_bytes,
 };
 use unity_asset_yaml::YamlDocument;
-
-/// Immutable bytes and their internally derived source fingerprint.
-#[derive(Debug, Clone)]
-pub(crate) struct SourceImage {
-    kind: SourceKind,
-    bytes: Arc<[u8]>,
-    fingerprint: SourceFingerprint,
-}
-
-impl SourceImage {
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn from_vec(kind: SourceKind, bytes: Vec<u8>) -> Self {
-        Self::from_arc(kind, bytes.into())
-    }
-
-    #[must_use]
-    pub(crate) fn from_arc(kind: SourceKind, bytes: Arc<[u8]>) -> Self {
-        let fingerprint = SourceFingerprint::from_bytes(kind, &bytes);
-        Self {
-            kind,
-            bytes,
-            fingerprint,
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn kind(&self) -> SourceKind {
-        self.kind
-    }
-
-    #[must_use]
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    #[must_use]
-    pub(crate) fn bytes_arc(&self) -> &Arc<[u8]> {
-        &self.bytes
-    }
-
-    #[must_use]
-    pub(crate) const fn fingerprint(&self) -> SourceFingerprint {
-        self.fingerprint
-    }
-
-    fn with_backing(self, bytes: Arc<[u8]>) -> Self {
-        debug_assert_eq!(self.bytes.as_ref(), bytes.as_ref());
-        Self { bytes, ..self }
-    }
-}
 
 /// One immutable source entry and the parse state proven before publication.
 #[derive(Debug)]
 pub(crate) struct SourceEntry {
     source: SourceId,
-    image: SourceImage,
+    image: VerifiedSourceImage,
     parse: FrozenSourceParse,
 }
 
@@ -99,12 +50,28 @@ impl FrozenSourceParse {
                 )
         )
     }
+
+    fn rebind_verified_image(
+        &mut self,
+        source: SourceId,
+        rebinding: VerifiedSourceRebinding,
+    ) -> Result<VerifiedSourceImage, SourceStoreError> {
+        match self {
+            Self::Serialized(parsed) => Arc::get_mut(parsed)
+                .ok_or(SourceStoreError::FrozenSerializedParseShared { source_id: source })?
+                .rebind_verified_source(rebinding)
+                .map_err(|_| SourceStoreError::FrozenSerializedBackingMismatch {
+                    source_id: source,
+                }),
+            Self::None | Self::Yaml(_) => Ok(rebinding.into_image()),
+        }
+    }
 }
 
 impl SourceEntry {
     fn validate_parts(
         source: SourceId,
-        image: &SourceImage,
+        image: &VerifiedSourceImage,
         parse: &FrozenSourceParse,
     ) -> Result<(), SourceStoreError> {
         if source.kind() != image.kind() {
@@ -121,10 +88,24 @@ impl SourceEntry {
                 parse_kind: parse.label(),
             });
         }
+        if let FrozenSourceParse::Serialized(parsed) = parse {
+            let complete_backing = parsed.data_base_offset() == 0
+                && parsed.data().len() == image.as_bytes().len()
+                && match parsed.data_shared() {
+                    SharedBytes::Arc(backing) => Arc::ptr_eq(&backing, image.backing()),
+                    #[cfg(feature = "mmap")]
+                    SharedBytes::Mmap(_) => false,
+                };
+            if !complete_backing {
+                return Err(SourceStoreError::FrozenSerializedBackingMismatch {
+                    source_id: source,
+                });
+            }
+        }
         Ok(())
     }
 
-    fn new(source: SourceId, image: SourceImage, parse: FrozenSourceParse) -> Self {
+    fn new(source: SourceId, image: VerifiedSourceImage, parse: FrozenSourceParse) -> Self {
         Self {
             source,
             image,
@@ -138,7 +119,7 @@ impl SourceEntry {
     }
 
     #[must_use]
-    pub(crate) fn image(&self) -> &SourceImage {
+    pub(crate) fn image(&self) -> &VerifiedSourceImage {
         &self.image
     }
 
@@ -187,8 +168,8 @@ impl SourceStore {
     pub(crate) fn insert(
         &mut self,
         source: SourceId,
-        image: SourceImage,
-        parse: FrozenSourceParse,
+        image: VerifiedSourceImage,
+        mut parse: FrozenSourceParse,
         budget: &mut AssetLoadBudget,
     ) -> Result<Arc<SourceEntry>, SourceStoreError> {
         self.ensure_workspace(source)?;
@@ -197,25 +178,37 @@ impl SourceStore {
         let previous = self.by_id.get(&source);
         if let Some(existing) = previous
             && existing.image.fingerprint() == image.fingerprint()
-            && existing.image.bytes() == image.bytes()
         {
+            let digest = image.fingerprint().digest();
+            let _rebinding = image
+                .rebind_equivalent_with_proof(Arc::clone(existing.image.backing()))
+                .map_err(|_| SourceStoreError::DigestCollision { digest })?;
             self.validate_content_reference(source, existing)?;
             return Ok(Arc::clone(existing));
         }
 
         let digest = image.fingerprint().digest();
-        let (shared_bytes, next_source_count) = match self.by_digest.get(&digest) {
-            Some(existing) if existing.bytes.as_ref() == image.bytes() => (
-                Arc::clone(&existing.bytes),
-                existing
+        let (image, next_source_count) = match self.by_digest.get(&digest) {
+            Some(existing) => {
+                let canonical = Arc::clone(&existing.bytes);
+                let needs_parse_rebind = !Arc::ptr_eq(image.backing(), &canonical);
+                let rebinding = image
+                    .rebind_equivalent_with_proof(canonical)
+                    .map_err(|_| SourceStoreError::DigestCollision { digest })?;
+                let image = if needs_parse_rebind {
+                    parse.rebind_verified_image(source, rebinding)?
+                } else {
+                    rebinding.into_image()
+                };
+                let next_source_count = existing
                     .source_count
                     .checked_add(1)
-                    .ok_or(SourceStoreError::ContentReferenceCountOverflow { digest })?,
-            ),
-            Some(_) => return Err(SourceStoreError::DigestCollision { digest }),
-            None => (Arc::clone(image.bytes_arc()), 1),
+                    .ok_or(SourceStoreError::ContentReferenceCountOverflow { digest })?;
+                (image, next_source_count)
+            }
+            None => (image, 1),
         };
-        let image = image.with_backing(shared_bytes);
+        SourceEntry::validate_parts(source, &image, &parse)?;
         let previous_digest = previous
             .map(|entry| self.validate_content_reference(source, entry))
             .transpose()?;
@@ -242,7 +235,7 @@ impl SourceStore {
             self.by_digest.insert(
                 digest,
                 ContentBacking {
-                    bytes: Arc::clone(entry.image.bytes_arc()),
+                    bytes: Arc::clone(entry.image.backing()),
                     source_count: next_source_count,
                 },
             );
@@ -457,7 +450,7 @@ impl SourceStore {
                 source_id: source,
                 digest,
             })?;
-        if !Arc::ptr_eq(&indexed.bytes, entry.image.bytes_arc()) {
+        if !Arc::ptr_eq(&indexed.bytes, entry.image.backing()) {
             return Err(SourceStoreError::BackingNotCanonical {
                 source_id: source,
                 digest,
@@ -506,6 +499,10 @@ pub(crate) enum SourceStoreError {
         source_kind: SourceKind,
         parse_kind: &'static str,
     },
+    #[error("serialized parse for source {source_id:?} does not use its verified complete backing")]
+    FrozenSerializedBackingMismatch { source_id: SourceId },
+    #[error("serialized parse for source {source_id:?} is shared and cannot be rebound atomically")]
+    FrozenSerializedParseShared { source_id: SourceId },
     #[error("unknown source image: {0:?}")]
     UnknownSource(SourceId),
     #[error("source removal batch contains duplicate source {0:?}")]
@@ -562,11 +559,7 @@ fn retained_insert_bytes(new_digest: bool) -> Result<u64, SourceStoreError> {
 }
 
 fn checked_arc_allocation_bytes<T>() -> Result<u64, SourceStoreError> {
-    let bytes = size_of::<T>()
-        .checked_add(size_of::<usize>().saturating_mul(2))
-        .and_then(|value| value.checked_add(align_of::<T>().max(align_of::<usize>())))
-        .ok_or(SourceStoreError::RetainedSizeOverflow)?;
-    usize_to_u64(bytes)
+    arc_value_allocation_bytes::<T>().map_err(|_| SourceStoreError::RetainedSizeOverflow)
 }
 
 fn checked_btree_entry_bytes<K, V>() -> Result<u64, SourceStoreError> {
@@ -591,10 +584,7 @@ fn checked_btree_entries_bytes<K, V>(count: usize) -> Result<u64, SourceStoreErr
 }
 
 fn checked_vec_bytes<T>(count: usize) -> Result<u64, SourceStoreError> {
-    size_of::<T>()
-        .checked_mul(count)
-        .ok_or(SourceStoreError::RetainedSizeOverflow)
-        .and_then(usize_to_u64)
+    vec_allocation_bytes::<T>(count).map_err(|_| SourceStoreError::RetainedSizeOverflow)
 }
 
 fn checked_byte_add(left: u64, right: u64) -> Result<u64, SourceStoreError> {
@@ -609,14 +599,36 @@ fn usize_to_u64(value: usize) -> Result<u64, SourceStoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unity_asset_binary::asset::SerializedFileParser;
+    use unity_asset_binary::shared_bytes::SharedBytes;
     use unity_asset_core::AssetLoadLimits;
+
+    const V22_FIXTURE: &[u8] = include_bytes!(
+        "../../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin"
+    );
 
     fn source(workspace: WorkspaceId, local: u128) -> SourceId {
         SourceId::new(workspace, SourceKind::Archive, local).unwrap()
     }
 
-    fn image(bytes: &[u8]) -> SourceImage {
-        SourceImage::from_vec(SourceKind::Archive, bytes.to_vec())
+    fn image(bytes: &[u8]) -> VerifiedSourceImage {
+        VerifiedSourceImage::verify(SourceKind::Archive, bytes.to_vec().into())
+    }
+
+    fn serialized_source(workspace: WorkspaceId, local: u128) -> SourceId {
+        SourceId::new(workspace, SourceKind::SerializedFile, local).unwrap()
+    }
+
+    fn serialized_image(backing: Arc<[u8]>) -> VerifiedSourceImage {
+        VerifiedSourceImage::verify(SourceKind::SerializedFile, backing)
+    }
+
+    fn serialized_parse(backing: Arc<[u8]>) -> Arc<SerializedFile> {
+        let len = backing.len();
+        Arc::new(
+            SerializedFileParser::from_shared_range(SharedBytes::from_arc(backing), 0..len)
+                .expect("SerializedFile fixture parses"),
+        )
     }
 
     fn insert(
@@ -652,8 +664,8 @@ mod tests {
         let second = insert(&mut store, source(workspace, 2), b"same", &mut budget);
 
         assert!(Arc::ptr_eq(
-            first.image().bytes_arc(),
-            second.image().bytes_arc()
+            first.image().backing(),
+            second.image().backing()
         ));
         assert_eq!(store.by_digest.len(), 1);
         assert_eq!(
@@ -664,6 +676,229 @@ mod tests {
                 .source_count,
             2
         );
+        validate(&store).unwrap();
+    }
+
+    #[test]
+    fn serialized_parse_must_share_the_verified_image_backing() {
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let source = serialized_source(workspace, 1);
+        let image_backing: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let parsed_backing: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let mut store = SourceStore::new(workspace);
+        let mut budget = AssetLoadBudget::default();
+        let usage = budget.usage();
+
+        let error = store
+            .insert(
+                source,
+                serialized_image(image_backing),
+                FrozenSourceParse::Serialized(serialized_parse(parsed_backing)),
+                &mut budget,
+            )
+            .expect_err("equal bytes in different allocations are not one proven source");
+
+        assert_eq!(
+            error,
+            SourceStoreError::FrozenSerializedBackingMismatch { source_id: source }
+        );
+        assert_eq!(budget.usage(), usage);
+        assert!(store.is_empty());
+        assert!(store.by_digest.is_empty());
+    }
+
+    #[test]
+    fn serialized_parse_rebinds_to_the_canonical_content_backing() {
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let first_source = serialized_source(workspace, 1);
+        let second_source = serialized_source(workspace, 2);
+        let first_backing: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let second_backing: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let mut store = SourceStore::new(workspace);
+        let mut budget = AssetLoadBudget::default();
+
+        let first = store
+            .insert(
+                first_source,
+                serialized_image(Arc::clone(&first_backing)),
+                FrozenSourceParse::Serialized(serialized_parse(Arc::clone(&first_backing))),
+                &mut budget,
+            )
+            .unwrap();
+        let second = store
+            .insert(
+                second_source,
+                serialized_image(Arc::clone(&second_backing)),
+                FrozenSourceParse::Serialized(serialized_parse(Arc::clone(&second_backing))),
+                &mut budget,
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(
+            first.image().backing(),
+            second.image().backing()
+        ));
+        assert!(Arc::ptr_eq(first.image().backing(), &first_backing));
+        let parsed = second
+            .cached_serialized()
+            .expect("serialized parse is cached");
+        assert_eq!(
+            parsed.data_identity_key(),
+            (first_backing.as_ptr() as usize, 0, first_backing.len())
+        );
+        match parsed.data_shared() {
+            SharedBytes::Arc(parsed_backing) => {
+                assert!(Arc::ptr_eq(&parsed_backing, &first_backing));
+            }
+            #[cfg(feature = "mmap")]
+            SharedBytes::Mmap(_) => panic!("the cached parse must use the canonical Arc"),
+        }
+        assert_eq!(Arc::strong_count(&second_backing), 1);
+        validate(&store).unwrap();
+    }
+
+    #[test]
+    fn shared_serialized_parse_rebind_failure_is_atomic_and_uncharged() {
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let first_source = serialized_source(workspace, 1);
+        let second_source = serialized_source(workspace, 2);
+        let canonical: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let candidate: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let mut store = SourceStore::new(workspace);
+        let mut budget = AssetLoadBudget::default();
+        let first = store
+            .insert(
+                first_source,
+                serialized_image(Arc::clone(&canonical)),
+                FrozenSourceParse::Serialized(serialized_parse(Arc::clone(&canonical))),
+                &mut budget,
+            )
+            .unwrap();
+        let parsed = serialized_parse(Arc::clone(&candidate));
+        let parsed_observer = Arc::clone(&parsed);
+        let usage = budget.usage();
+
+        let error = store
+            .insert(
+                second_source,
+                serialized_image(Arc::clone(&candidate)),
+                FrozenSourceParse::Serialized(parsed),
+                &mut budget,
+            )
+            .expect_err("a shared parsed object cannot be mutated for canonicalization");
+
+        assert_eq!(
+            error,
+            SourceStoreError::FrozenSerializedParseShared {
+                source_id: second_source,
+            }
+        );
+        assert_eq!(budget.usage(), usage);
+        assert_eq!(store.len(), 1);
+        assert!(store.get(second_source).is_none());
+        assert_eq!(
+            store.by_digest[&first.image().fingerprint().digest()].source_count,
+            1
+        );
+        assert_eq!(
+            parsed_observer.data_identity_key(),
+            (candidate.as_ptr() as usize, 0, candidate.len())
+        );
+        validate(&store).unwrap();
+    }
+
+    #[test]
+    fn post_rebind_budget_failure_preserves_store_and_backing_lifetimes() {
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let first_source = serialized_source(workspace, 1);
+        let second_source = serialized_source(workspace, 2);
+        let canonical: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let candidate: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let mut store = SourceStore::new(workspace);
+        let first = store
+            .insert(
+                first_source,
+                serialized_image(Arc::clone(&canonical)),
+                FrozenSourceParse::Serialized(serialized_parse(Arc::clone(&canonical))),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let digest = first.image().fingerprint().digest();
+        let canonical_strong_count = Arc::strong_count(&canonical);
+        let retained_bytes = retained_insert_bytes(false).unwrap();
+        let mut budget = budget_with(retained_bytes - 1, 1);
+
+        let error = store
+            .insert(
+                second_source,
+                serialized_image(Arc::clone(&candidate)),
+                FrozenSourceParse::Serialized(serialized_parse(Arc::clone(&candidate))),
+                &mut budget,
+            )
+            .expect_err("retained entry backing must fit before publication");
+
+        assert!(matches!(
+            error,
+            SourceStoreError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            }) if limit == retained_bytes - 1 && requested == retained_bytes
+        ));
+        assert_eq!(budget.usage(), Default::default());
+        assert_eq!(store.len(), 1);
+        assert!(store.get(second_source).is_none());
+        assert_eq!(store.by_digest[&digest].source_count, 1);
+        assert_eq!(Arc::strong_count(&canonical), canonical_strong_count);
+        assert_eq!(Arc::strong_count(&candidate), 1);
+        validate(&store).unwrap();
+    }
+
+    #[test]
+    fn same_source_fast_path_validates_backing_and_does_not_charge_budget() {
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let source = serialized_source(workspace, 1);
+        let canonical: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let candidate: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let mismatched_parse_backing: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let mut store = SourceStore::new(workspace);
+        let mut budget = AssetLoadBudget::default();
+        let existing = store
+            .insert(
+                source,
+                serialized_image(Arc::clone(&canonical)),
+                FrozenSourceParse::Serialized(serialized_parse(Arc::clone(&canonical))),
+                &mut budget,
+            )
+            .unwrap();
+        let usage = budget.usage();
+
+        let error = store
+            .insert(
+                source,
+                serialized_image(Arc::clone(&candidate)),
+                FrozenSourceParse::Serialized(serialized_parse(mismatched_parse_backing)),
+                &mut budget,
+            )
+            .expect_err("the fast path must validate the incoming parsed backing");
+        assert_eq!(
+            error,
+            SourceStoreError::FrozenSerializedBackingMismatch { source_id: source }
+        );
+        assert_eq!(budget.usage(), usage);
+        assert!(Arc::ptr_eq(store.get(source).unwrap(), &existing));
+
+        let unchanged = store
+            .insert(
+                source,
+                serialized_image(Arc::clone(&candidate)),
+                FrozenSourceParse::Serialized(serialized_parse(Arc::clone(&candidate))),
+                &mut budget,
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&unchanged, &existing));
+        assert_eq!(budget.usage(), usage);
+        assert_eq!(Arc::strong_count(&candidate), 1);
         validate(&store).unwrap();
     }
 
@@ -725,8 +960,8 @@ mod tests {
         assert!(!store.by_digest.contains_key(&first_digest));
         assert_eq!(store.by_digest[&second_digest].source_count, 2);
         assert!(Arc::ptr_eq(
-            replaced.image().bytes_arc(),
-            second.image().bytes_arc()
+            replaced.image().backing(),
+            second.image().backing()
         ));
         validate(&store).unwrap();
     }
@@ -845,8 +1080,8 @@ mod tests {
         let cloned = candidate.get(source).unwrap();
         assert!(Arc::ptr_eq(&entry, cloned));
         assert!(Arc::ptr_eq(
-            entry.image().bytes_arc(),
-            cloned.image().bytes_arc()
+            entry.image().backing(),
+            cloned.image().backing()
         ));
     }
 

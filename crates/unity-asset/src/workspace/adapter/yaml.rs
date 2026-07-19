@@ -9,6 +9,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, UnityClass, UnityDocument, UnityValue, YamlAnchor,
+    arc_value_allocation_bytes,
 };
 use yaml_rust2::ScanError;
 use yaml_rust2::parser::{Event, Parser, Tag};
@@ -179,12 +180,10 @@ pub(crate) fn parse_yaml_source(
         }
     }
 
-    charge_fixed_allocation(
-        size_of::<YamlDocument>()
-            .checked_add(size_of::<usize>() * 2)
-            .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?,
-        budget,
-    )?;
+    let document_allocation = arc_value_allocation_bytes::<YamlDocument>()
+        .map_err(|_| BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+    budget.check_bytes(document_allocation)?;
+    budget.consume_bytes(document_allocation)?;
     Ok(ParsedYamlSource {
         encoded,
         document: Arc::new(document),
@@ -1065,16 +1064,6 @@ fn charge_retained_string(
     budget: &mut AssetLoadBudget,
 ) -> Result<(), YamlAdapterError> {
     budget.consume_bytes(usize_to_u64(value.len())?)?;
-    Ok(())
-}
-
-fn charge_fixed_allocation(
-    bytes: usize,
-    budget: &mut AssetLoadBudget,
-) -> Result<(), YamlAdapterError> {
-    let bytes = usize_to_u64(bytes)?;
-    budget.check_bytes(bytes)?;
-    budget.consume_bytes(bytes)?;
     Ok(())
 }
 

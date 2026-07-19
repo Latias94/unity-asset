@@ -9,8 +9,8 @@ use thiserror::Error;
 use unity_asset_binary::object::UnityObject;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, Diagnostic, ObjectAddress, RevisionedObjectHandle,
-    SourceFingerprint, SourceId, SourceKind, SourceLocator, UnityClass, UnityDocument, WorkspaceId,
-    WorkspaceRevision,
+    SourceFingerprint, SourceId, SourceKind, SourceLocator, UnityClass, UnityDocument,
+    VerifiedSourceImage, WorkspaceId, WorkspaceRevision,
 };
 use unity_asset_yaml::YamlDocument;
 
@@ -100,16 +100,17 @@ impl WorkspaceSource {
 #[derive(Debug, Clone)]
 pub struct WorkspaceBytes {
     source: SourceId,
-    backing: Arc<[u8]>,
+    image: VerifiedSourceImage,
     range: Range<usize>,
 }
 
 impl WorkspaceBytes {
-    pub(crate) fn new(source: SourceId, backing: Arc<[u8]>, range: Range<usize>) -> Self {
-        debug_assert!(range.start <= range.end && range.end <= backing.len());
+    pub(crate) fn new(source: SourceId, image: VerifiedSourceImage, range: Range<usize>) -> Self {
+        debug_assert_eq!(source.kind(), image.kind());
+        debug_assert!(range.start <= range.end && range.end <= image.as_bytes().len());
         Self {
             source,
-            backing,
+            image,
             range,
         }
     }
@@ -120,8 +121,13 @@ impl WorkspaceBytes {
     }
 
     #[must_use]
+    pub const fn fingerprint(&self) -> SourceFingerprint {
+        self.image.fingerprint()
+    }
+
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.backing[self.range.clone()]
+        &self.image.as_bytes()[self.range.clone()]
     }
 
     #[must_use]

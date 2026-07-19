@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
-use std::mem::{align_of, size_of};
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use unity_asset_core::{
     AssetLoadBudget, BudgetError, BundleMemberId, ContainmentKind, ContainmentStep, ContractError,
     DigestBuildError, DigestV1, DigestV1Builder, ObjectAddress, ObjectId, ObjectKind, SourceAlias,
     SourceFingerprint, SourceId, SourceKind, SourceLocator, SourceMemberId, WorkspaceId,
-    WorkspaceRevision,
+    WorkspaceRevision, arc_value_allocation_bytes,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1773,13 +1773,9 @@ fn checked_usize_add(left: usize, right: usize) -> Result<usize, CatalogError> {
 }
 
 fn checked_arc_allocation_bytes<T>() -> Result<u64, CatalogError> {
-    let bytes = size_of::<T>()
-        .checked_add(size_of::<usize>().saturating_mul(2))
-        .and_then(|value| value.checked_add(align_of::<T>().max(align_of::<usize>())))
-        .ok_or(CatalogError::AllocationSizeOverflow {
-            resource: "source catalog Arc allocation",
-        })?;
-    checked_usize_to_u64(bytes)
+    arc_value_allocation_bytes::<T>().map_err(|_| CatalogError::AllocationSizeOverflow {
+        resource: "source catalog Arc allocation",
+    })
 }
 
 fn checked_btree_entry_bytes<K, V>() -> Result<u64, CatalogError> {

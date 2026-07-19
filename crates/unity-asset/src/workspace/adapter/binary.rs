@@ -9,7 +9,9 @@ use unity_asset_binary::error::BinaryError;
 use unity_asset_binary::file::{UnityFileKind, sniff_unity_file_kind_prefix};
 use unity_asset_binary::shared_bytes::SharedBytes;
 use unity_asset_binary::webfile::{WebFile, WebFileProbeError};
-use unity_asset_core::{AssetLoadBudget, BudgetError, ContractError, SourceMemberId};
+use unity_asset_core::{
+    AssetLoadBudget, BudgetError, ContractError, SourceMemberId, arc_slice_allocation_bytes,
+};
 
 const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
 const BROTLI_MARKER_OFFSET: usize = 0x20;
@@ -505,7 +507,7 @@ fn copy_member_identity(
 }
 
 fn copy_member_image(bytes: &[u8], budget: &mut AssetLoadBudget) -> Result<Arc<[u8]>, BinaryError> {
-    let byte_count = arc_slice_allocation_bytes(bytes.len())?;
+    let byte_count = checked_arc_slice_allocation_bytes(bytes.len())?;
     budget.check_bytes(byte_count)?;
     budget.consume_bytes(byte_count)?;
     Ok(Arc::from(bytes))
@@ -515,7 +517,7 @@ fn promote_member_image(
     bytes: Vec<u8>,
     budget: &mut AssetLoadBudget,
 ) -> Result<Arc<[u8]>, BinaryError> {
-    let byte_count = arc_slice_allocation_bytes(bytes.len())?;
+    let byte_count = checked_arc_slice_allocation_bytes(bytes.len())?;
     // Bundle extraction owns a temporary Vec. Promoting it to Arc allocates the retained image,
     // so both allocations remain visible in the monotonic budget.
     budget.check_bytes(byte_count)?;
@@ -523,15 +525,9 @@ fn promote_member_image(
     Ok(Arc::from(bytes))
 }
 
-fn arc_slice_allocation_bytes(length: usize) -> Result<u64, BinaryError> {
-    let header = size_of::<usize>()
-        .checked_mul(2)
-        .ok_or_else(|| BinaryError::invalid_data("Arc header size overflows usize"))?;
-    let allocation = length
-        .checked_add(header)
-        .ok_or_else(|| BinaryError::invalid_data("Member Arc allocation size overflows usize"))?;
-    u64::try_from(allocation)
-        .map_err(|_| BinaryError::invalid_data("Member Arc allocation size does not fit in u64"))
+fn checked_arc_slice_allocation_bytes(length: usize) -> Result<u64, BinaryError> {
+    arc_slice_allocation_bytes::<u8>(length)
+        .map_err(|error| BinaryError::invalid_data(error.to_string()))
 }
 
 fn boxed_payload<T>(value: T, budget: &mut AssetLoadBudget) -> Result<Box<T>, BinaryError> {
@@ -834,7 +830,7 @@ mod tests {
                 limit: 3,
                 requested,
             })
-            if requested == u64::try_from(4 + size_of::<usize>() * 2).unwrap()
+            if requested == arc_slice_allocation_bytes::<u8>(4).unwrap()
         ));
         assert_eq!(budget.usage().bytes, 0);
     }

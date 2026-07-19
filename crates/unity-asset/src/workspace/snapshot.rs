@@ -600,7 +600,7 @@ impl WorkspaceView for WorkspaceSnapshot {
         let end = offset
             .checked_add(size)
             .ok_or(WorkspaceError::RangeOverflow { offset, size })?;
-        let source_len = entry.image().bytes().len();
+        let source_len = entry.image().as_bytes().len();
         let start = usize::try_from(offset).map_err(|_| WorkspaceError::RangeOutOfBounds {
             source_id: source,
             offset,
@@ -624,7 +624,7 @@ impl WorkspaceView for WorkspaceSnapshot {
         budget.consume_bytes(size)?;
         Ok(WorkspaceBytes::new(
             source,
-            Arc::clone(entry.image().bytes_arc()),
+            entry.image().clone(),
             start..end_usize,
         ))
     }
