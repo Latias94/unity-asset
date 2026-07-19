@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use unity_asset_binary::asset::FileIdentifier;
 
+use super::external_table::ExternalTableMutation;
+
 /// In-memory edits to apply when saving a `SerializedFile`.
 ///
 /// This mirrors UnityPy's model where edited objects store overridden raw bytes and the file is
@@ -10,8 +12,7 @@ use unity_asset_binary::asset::FileIdentifier;
 pub struct SerializedFileEdits {
     /// `path_id -> raw object bytes`
     pub object_bytes: HashMap<i64, Vec<u8>>,
-    /// Additional external file identifiers to append when saving.
-    pub additional_externals: Vec<FileIdentifier>,
+    pub(crate) external_table: Option<ExternalTableMutation>,
 }
 
 impl SerializedFileEdits {
@@ -27,11 +28,15 @@ impl SerializedFileEdits {
         self.object_bytes.get(&path_id).map(|v| v.as_slice())
     }
 
-    pub fn add_external(&mut self, external: FileIdentifier) {
-        self.additional_externals.push(external);
+    /// Returns validated external identifiers appended by an external-table allocator.
+    #[must_use]
+    pub fn external_additions(&self) -> &[FileIdentifier] {
+        self.external_table
+            .as_ref()
+            .map_or(&[], ExternalTableMutation::additions)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.object_bytes.is_empty() && self.additional_externals.is_empty()
+        self.object_bytes.is_empty() && self.external_additions().is_empty()
     }
 }

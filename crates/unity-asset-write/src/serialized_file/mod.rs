@@ -7,6 +7,7 @@
 
 mod artifact_writer;
 mod edit;
+mod external_table;
 mod sink;
 mod types_write;
 mod typetree_dump;
@@ -14,4 +15,7 @@ mod writer;
 
 pub use artifact_writer::SerializedFileSource;
 pub use edit::SerializedFileEdits;
+pub use external_table::{
+    ExternalIdentifierField, ExternalMetadataField, ExternalTableAllocator, ExternalTableError,
+};
 pub use writer::{SerializedFileSaveOptions, SerializedFileWriter};

@@ -16,6 +16,7 @@ use crate::artifact::{
     ArtifactBatch, ArtifactBuildError, ArtifactHandle, ArtifactPayload, ArtifactPayloadProvenance,
 };
 use crate::serialized_file::edit::SerializedFileEdits;
+use crate::serialized_file::external_table::PlannedExternalTable;
 use crate::serialized_file::sink::{CountingSink, EndianSink, IoSink, SinkBackend};
 use crate::serialized_file::types_write::{
     write_file_identifier_to, write_local_serialized_object_identifier_to, write_serialized_type_to,
@@ -188,7 +189,7 @@ struct SerializedFilePlan<'source> {
     endian: Endian,
     layout: SerializedFileLayout,
     data_size: u64,
-    external_count: usize,
+    external_table: PlannedExternalTable<'source>,
 }
 
 enum ObjectData<'source> {
@@ -228,14 +229,9 @@ impl<'source> SerializedFilePlan<'source> {
             }
         }
 
-        let mut external_count = file.externals.len();
-        for (index, external) in edits.additional_externals.iter().enumerate() {
-            if is_new_external(file, &edits.additional_externals, index, external)? {
-                external_count = external_count.checked_add(1).ok_or_else(|| {
-                    UnityAssetError::format("SerializedFile external count overflow")
-                })?;
-            }
-        }
+        let external_table = PlannedExternalTable::build(file, edits).map_err(|error| {
+            UnityAssetError::with_source("Invalid SerializedFile external table", error)
+        })?;
 
         let endian = match file.header.byte_order() {
             unity_asset_binary::reader::ByteOrder::Little => Endian::Little,
@@ -278,7 +274,7 @@ impl<'source> SerializedFilePlan<'source> {
                 file_size: 0,
             },
             data_size: data_cursor,
-            external_count,
+            external_table,
         };
         let mut metadata = EndianSink::new(CountingSink::default(), endian);
         write_metadata(&mut metadata, &plan)?;
@@ -351,39 +347,6 @@ fn select_object_data<'source>(
         payload: source.payload,
         range: start..end,
     })
-}
-
-fn is_new_external(
-    file: &SerializedFile,
-    additions: &[unity_asset_binary::asset::FileIdentifier],
-    index: usize,
-    external: &unity_asset_binary::asset::FileIdentifier,
-) -> Result<bool> {
-    if let Some(existing) = file
-        .externals
-        .iter()
-        .find(|existing| existing.path == external.path)
-    {
-        if existing != external {
-            return Err(UnityAssetError::format(format!(
-                "Conflicting external metadata for path {}",
-                external.path
-            )));
-        }
-        return Ok(false);
-    }
-    for previous in &additions[..index] {
-        if previous.path == external.path {
-            if previous != external {
-                return Err(UnityAssetError::format(format!(
-                    "Conflicting external metadata for path {}",
-                    external.path
-                )));
-            }
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 fn validate_source_binding(
@@ -512,14 +475,9 @@ fn write_metadata<B: SinkBackend>(
         }
     }
 
-    write_count(writer, "external", plan.external_count)?;
-    for external in &file.externals {
+    write_count(writer, "external", plan.external_table.len())?;
+    for external in plan.external_table.iter() {
         write_file_identifier_to(external, writer, format)?;
-    }
-    for (index, external) in plan.edits.additional_externals.iter().enumerate() {
-        if is_new_external(file, &plan.edits.additional_externals, index, external)? {
-            write_file_identifier_to(external, writer, format)?;
-        }
     }
 
     if format.has_metadata_field(MetadataField::RefTypes) {

@@ -1,7 +1,9 @@
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
-use unity_asset_binary::asset::{ObjectMetadata, ObjectTypeReference, SerializedFileParser};
+use unity_asset_binary::asset::{
+    FileIdentifier, ObjectMetadata, ObjectTypeReference, SerializedFileParser,
+};
 use unity_asset_binary::error::{BinaryError, BinaryObjectIdentityError};
 use unity_asset_core::{
     AssetLoadBudget, SourceId, SourceKind, UnityAssetError, VerifiedSourceImage, WorkspaceId,
@@ -10,7 +12,8 @@ use unity_asset_write::artifact::{
     ArtifactBatchDeclaration, ArtifactBudget, ArtifactLimits, ArtifactPayload, LogicalArtifactName,
 };
 use unity_asset_write::serialized_file::{
-    SerializedFileEdits, SerializedFileSource, SerializedFileWriter,
+    ExternalMetadataField, ExternalTableAllocator, ExternalTableError, SerializedFileEdits,
+    SerializedFileSource, SerializedFileWriter,
 };
 
 struct WireCase {
@@ -520,7 +523,6 @@ enum WriterRejection {
     UnsupportedUnityVersion,
     UnsupportedReferenceTypes,
     UnknownObjectEdit,
-    ConflictingExternal,
 }
 
 struct WriterRejectionCase {
@@ -569,12 +571,6 @@ fn writer_rejects_publicly_constructible_unrepresentable_states() {
             rejection: WriterRejection::UnknownObjectEdit,
             expected_fragment: "unknown object path ID",
         },
-        WriterRejectionCase {
-            name: "conflicting external metadata",
-            version: 22,
-            rejection: WriterRejection::ConflictingExternal,
-            expected_fragment: "Conflicting external metadata",
-        },
     ];
 
     for case in cases {
@@ -595,11 +591,6 @@ fn writer_rejects_publicly_constructible_unrepresentable_states() {
             WriterRejection::UnknownObjectEdit => {
                 edits.set_object_bytes(i64::MAX, vec![0xFF]);
             }
-            WriterRejection::ConflictingExternal => {
-                let mut external = file.externals[0].clone();
-                external.guid[0] ^= 0xFF;
-                edits.add_external(external);
-            }
         }
 
         let error = match SerializedFileWriter::save(&file, &edits) {
@@ -616,6 +607,55 @@ fn writer_rejects_publicly_constructible_unrepresentable_states() {
             case.name
         );
     }
+}
+
+#[test]
+fn external_allocator_rejects_conflicting_metadata_before_writer_planning() {
+    let wire_case = wire_case(22);
+    let file = parse_case(wire_case, wire_case.bytes.to_vec());
+    let mut external = file.externals[0].clone();
+    external.guid[0] ^= 0xff;
+    let mut allocator = ExternalTableAllocator::new(&file).unwrap();
+
+    let error = allocator
+        .intern(external, &mut AssetLoadBudget::default())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ExternalTableError::CanonicalPathConflict {
+            field: ExternalMetadataField::Guid,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn legacy_and_artifact_writers_share_the_external_table_plan() {
+    let wire_case = wire_case(22);
+    let file = parse_case(wire_case, wire_case.bytes.to_vec());
+    let addition = FileIdentifier {
+        temp_empty: String::new(),
+        guid: [0x5a; 16],
+        type_: 3,
+        path: "first-seen-dependency.assets".to_owned(),
+    };
+    let mut allocator = ExternalTableAllocator::new(&file).unwrap();
+    assert_eq!(
+        allocator
+            .intern(addition.clone(), &mut AssetLoadBudget::default())
+            .unwrap(),
+        2
+    );
+    let edits = allocator.finish();
+
+    let legacy = SerializedFileWriter::save(&file, &edits).unwrap();
+    let artifact = prepare_serialized_file(&file, &edits).unwrap();
+    let legacy_file = SerializedFileParser::from_bytes(legacy.clone()).unwrap();
+    let artifact_file = SerializedFileParser::from_bytes(artifact.clone()).unwrap();
+
+    assert_eq!(legacy_file.externals, artifact_file.externals);
+    assert_eq!(legacy_file.externals.last(), Some(&addition));
+    assert_eq!(legacy, artifact);
 }
 
 #[test]

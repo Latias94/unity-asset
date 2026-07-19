@@ -2,12 +2,12 @@ use super::path::canonicalize_source_if_possible;
 use super::*;
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use unity_asset_binary::asset::FileIdentifier;
 use unity_asset_core::{UnityAssetError, UnityClass};
 use unity_asset_write::object::SerializedFileEditSession;
-use unity_asset_write::serialized_file::SerializedFileEdits;
+use unity_asset_write::serialized_file::{
+    ExternalTableAllocator, ExternalTableError, SerializedFileEdits,
+};
 
 #[derive(Debug, Default)]
 pub struct EnvironmentWriteState {
@@ -160,7 +160,8 @@ impl<'a> EnvironmentEditSession<'a> {
         context_key: &BinaryObjectKey,
         target_key: &BinaryObjectKey,
     ) -> Result<i32> {
-        self.env.file_id_for_target(context_key, target_key)
+        self.env
+            .file_id_for_target(context_key, target_key, self.budget)
     }
 
     fn read_binary_object_class_for_view(&mut self, key: &BinaryObjectKey) -> Result<UnityClass> {
@@ -327,17 +328,16 @@ impl Environment {
                     resolve_serialized_file_source(&self.binary_assets, &context_key.source)?;
                 let source_key = source_key.clone();
                 let existing = self.write_state.standalone.get(&source_key);
-                let external_plan = if same_file {
+                let external = if same_file {
                     None
                 } else {
-                    let path = external_path_for_target(None, target_key)?;
-                    Some(plan_external_file_id(
-                        file,
-                        existing.map(|state| &state.edits),
-                        &path,
-                    )?)
+                    Some(external_path_for_target(None, target_key)?)
                 };
-                let file_id = external_plan.as_ref().map_or(0, |plan| plan.file_id);
+                let file_id = planned_external_file_id(
+                    file,
+                    existing.map(|state| &state.edits),
+                    external.as_deref(),
+                )?;
 
                 let prepared = prepare_serialized_file_edit(
                     file,
@@ -353,11 +353,38 @@ impl Environment {
                         )
                     },
                 )?;
-                let state = self.write_state.standalone.entry(source_key).or_default();
-                if let Some(plan) = external_plan {
-                    apply_external_file_id_plan(&mut state.edits, plan);
+                if existing.is_some() {
+                    let state = self
+                        .write_state
+                        .standalone
+                        .get_mut(&source_key)
+                        .ok_or_else(|| {
+                            UnityAssetError::format(
+                                "Standalone edit state disappeared during PPtr transaction",
+                            )
+                        })?;
+                    commit_external_and_object_edit(
+                        file,
+                        state,
+                        external,
+                        file_id,
+                        context_key.path_id,
+                        prepared,
+                        budget,
+                    )?;
+                } else {
+                    let mut state = SerializedFileWriteState::default();
+                    commit_external_and_object_edit(
+                        file,
+                        &mut state,
+                        external,
+                        file_id,
+                        context_key.path_id,
+                        prepared,
+                        budget,
+                    )?;
+                    self.write_state.standalone.insert(source_key, state);
                 }
-                apply_serialized_file_edit(state, context_key.path_id, prepared);
 
                 Ok((file_id, target_key.path_id))
             }
@@ -382,17 +409,19 @@ impl Environment {
                     .bundles
                     .get(&bundle_source_key)
                     .and_then(|state| state.assets.get(&asset_index));
-                let external_plan = if same_file {
+                let external = if same_file {
                     None
                 } else {
-                    let path = external_path_for_target(Some((bundle_source, bundle)), target_key)?;
-                    Some(plan_external_file_id(
-                        asset,
-                        existing.map(|state| &state.edits),
-                        &path,
+                    Some(external_path_for_target(
+                        Some((bundle_source, bundle)),
+                        target_key,
                     )?)
                 };
-                let file_id = external_plan.as_ref().map_or(0, |plan| plan.file_id);
+                let file_id = planned_external_file_id(
+                    asset,
+                    existing.map(|state| &state.edits),
+                    external.as_deref(),
+                )?;
 
                 let prepared = prepare_serialized_file_edit(
                     asset,
@@ -408,18 +437,44 @@ impl Environment {
                         )
                     },
                 )?;
-                let state = self
-                    .write_state
-                    .bundles
-                    .entry(bundle_source_key)
-                    .or_default()
-                    .assets
-                    .entry(asset_index)
-                    .or_default();
-                if let Some(plan) = external_plan {
-                    apply_external_file_id_plan(&mut state.edits, plan);
+                if existing.is_some() {
+                    let state = self
+                        .write_state
+                        .bundles
+                        .get_mut(&bundle_source_key)
+                        .and_then(|state| state.assets.get_mut(&asset_index))
+                        .ok_or_else(|| {
+                            UnityAssetError::format(
+                                "Bundle asset edit state disappeared during PPtr transaction",
+                            )
+                        })?;
+                    commit_external_and_object_edit(
+                        asset,
+                        state,
+                        external,
+                        file_id,
+                        context_key.path_id,
+                        prepared,
+                        budget,
+                    )?;
+                } else {
+                    let mut state = SerializedFileWriteState::default();
+                    commit_external_and_object_edit(
+                        asset,
+                        &mut state,
+                        external,
+                        file_id,
+                        context_key.path_id,
+                        prepared,
+                        budget,
+                    )?;
+                    self.write_state
+                        .bundles
+                        .entry(bundle_source_key)
+                        .or_default()
+                        .assets
+                        .insert(asset_index, state);
                 }
-                apply_serialized_file_edit(state, context_key.path_id, prepared);
 
                 Ok((file_id, target_key.path_id))
             }
@@ -434,6 +489,7 @@ impl Environment {
         &mut self,
         context_key: &BinaryObjectKey,
         target_key: &BinaryObjectKey,
+        budget: &mut AssetLoadBudget,
     ) -> Result<i32> {
         let same_file = context_key.source_kind == target_key.source_kind
             && context_key.source == target_key.source
@@ -447,10 +503,18 @@ impl Environment {
                 let (source_key, file) =
                     resolve_serialized_file_source(&self.binary_assets, &context_key.source)?;
                 let source_key = source_key.clone();
-                let state = self.write_state.standalone.entry(source_key).or_default();
-
                 let path = external_path_for_target(None, target_key)?;
-                get_or_add_external_file_id(file, &mut state.edits, &path)
+                if let Some(state) = self.write_state.standalone.get_mut(&source_key) {
+                    intern_external_path_file_id(file, &mut state.edits, path, budget)
+                } else {
+                    let mut state = SerializedFileWriteState::default();
+                    let file_id =
+                        intern_external_path_file_id(file, &mut state.edits, path, budget)?;
+                    if !state.edits.is_empty() {
+                        self.write_state.standalone.insert(source_key, state);
+                    }
+                    Ok(file_id)
+                }
             }
             BinarySourceKind::AssetBundle => {
                 let asset_index = context_key.asset_index.ok_or_else(|| {
@@ -468,15 +532,28 @@ impl Environment {
                     ))
                 })?;
 
-                let bundle_state = self
+                let path = external_path_for_target(Some((bundle_source, bundle)), target_key)?;
+                if let Some(state) = self
                     .write_state
                     .bundles
-                    .entry(bundle_source_key)
-                    .or_default();
-                let state = bundle_state.assets.entry(asset_index).or_default();
-
-                let path = external_path_for_target(Some((bundle_source, bundle)), target_key)?;
-                get_or_add_external_file_id(asset, &mut state.edits, &path)
+                    .get_mut(&bundle_source_key)
+                    .and_then(|state| state.assets.get_mut(&asset_index))
+                {
+                    intern_external_path_file_id(asset, &mut state.edits, path, budget)
+                } else {
+                    let mut state = SerializedFileWriteState::default();
+                    let file_id =
+                        intern_external_path_file_id(asset, &mut state.edits, path, budget)?;
+                    if !state.edits.is_empty() {
+                        self.write_state
+                            .bundles
+                            .entry(bundle_source_key)
+                            .or_default()
+                            .assets
+                            .insert(asset_index, state);
+                    }
+                    Ok(file_id)
+                }
             }
         }
     }
@@ -614,84 +691,63 @@ fn resolve_bundle_source<'a>(
     )))
 }
 
-struct ExternalFileIdPlan {
-    file_id: i32,
-    external: Option<FileIdentifier>,
-}
-
-fn plan_external_file_id(
+fn planned_external_file_id(
     file: &SerializedFile,
     edits: Option<&SerializedFileEdits>,
-    path: &str,
-) -> Result<ExternalFileIdPlan> {
-    if let Some((idx, _)) = file
-        .externals
-        .iter()
-        .enumerate()
-        .find(|(_, e)| e.path == path)
-    {
-        return Ok(ExternalFileIdPlan {
-            file_id: external_index_to_file_id(idx)?,
-            external: None,
-        });
-    }
-
-    if let Some((idx, _)) = edits.and_then(|edits| {
-        edits
-            .additional_externals
-            .iter()
-            .enumerate()
-            .find(|(_, external)| external.path == path)
-    }) {
-        let index = file
-            .externals
-            .len()
-            .checked_add(idx)
-            .ok_or_else(|| UnityAssetError::format("External file index overflow"))?;
-        return Ok(ExternalFileIdPlan {
-            file_id: external_index_to_file_id(index)?,
-            external: None,
-        });
-    }
-
-    let pending = edits.map_or(0, |edits| edits.additional_externals.len());
-    let index = file
-        .externals
-        .len()
-        .checked_add(pending)
-        .ok_or_else(|| UnityAssetError::format("External file index overflow"))?;
-    Ok(ExternalFileIdPlan {
-        file_id: external_index_to_file_id(index)?,
-        external: Some(FileIdentifier {
-            temp_empty: String::new(),
-            guid: pseudo_guid(),
-            type_: 0,
-            path: path.to_string(),
-        }),
-    })
+    external_path: Option<&str>,
+) -> Result<i32> {
+    let Some(external_path) = external_path else {
+        return Ok(0);
+    };
+    let empty = SerializedFileEdits::default();
+    ExternalTableAllocator::planned_file_id_for_path(file, edits.unwrap_or(&empty), external_path)
+        .map_err(external_table_error)
 }
 
-fn apply_external_file_id_plan(edits: &mut SerializedFileEdits, plan: ExternalFileIdPlan) -> i32 {
-    if let Some(external) = plan.external {
-        edits.add_external(external);
-    }
-    plan.file_id
-}
-
-fn get_or_add_external_file_id(
+fn intern_external_path_file_id(
     file: &SerializedFile,
     edits: &mut SerializedFileEdits,
-    path: &str,
+    external_path: String,
+    budget: &mut AssetLoadBudget,
 ) -> Result<i32> {
-    let plan = plan_external_file_id(file, Some(edits), path)?;
-    Ok(apply_external_file_id_plan(edits, plan))
+    ExternalTableAllocator::intern_path_into_edits(file, edits, external_path, budget)
+        .map_err(external_table_error)
 }
 
-fn external_index_to_file_id(index: usize) -> Result<i32> {
-    index
-        .checked_add(1)
-        .and_then(|file_id| i32::try_from(file_id).ok())
-        .ok_or_else(|| UnityAssetError::format("External file ID does not fit i32"))
+fn commit_external_and_object_edit(
+    file: &SerializedFile,
+    state: &mut SerializedFileWriteState,
+    external_path: Option<String>,
+    planned_file_id: i32,
+    path_id: i64,
+    prepared: PreparedSerializedFileEdit,
+    budget: &mut AssetLoadBudget,
+) -> Result<()> {
+    if let Some(external_path) = external_path {
+        ExternalTableAllocator::commit_planned_path_into_edits(
+            file,
+            &mut state.edits,
+            external_path,
+            planned_file_id,
+            budget,
+        )
+        .map_err(external_table_error)?;
+    }
+    apply_serialized_file_edit(state, path_id, prepared);
+    Ok(())
+}
+
+fn external_table_error(error: ExternalTableError) -> UnityAssetError {
+    match error {
+        ExternalTableError::Budget(error) => UnityAssetError::with_source(
+            "Failed to allocate SerializedFile external file ID",
+            error,
+        ),
+        error => UnityAssetError::with_source(
+            "Failed to allocate SerializedFile external file ID",
+            error,
+        ),
+    }
 }
 
 fn external_path_for_target(
@@ -720,22 +776,4 @@ fn external_path_for_target(
             .unwrap_or_else(|| entry_name.clone())),
         BinarySource::WebEntry { entry_name, .. } => Ok(entry_name.clone()),
     }
-}
-
-fn pseudo_guid() -> [u8; 16] {
-    let mut guid = [0u8; 16];
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut x = nanos as u64 ^ (nanos >> 64) as u64;
-    for chunk in guid.chunks_mut(8) {
-        // xorshift64*
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        x = x.wrapping_mul(0x2545F4914F6CDD1D);
-        chunk.copy_from_slice(&x.to_le_bytes());
-    }
-    guid
 }

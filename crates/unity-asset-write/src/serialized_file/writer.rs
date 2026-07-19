@@ -1,6 +1,7 @@
 use crate::Result;
 use crate::binary_writer::{BinaryWriter, Endian};
 use crate::serialized_file::edit::SerializedFileEdits;
+use crate::serialized_file::external_table::PlannedExternalTable;
 use crate::serialized_file::types_write::{
     write_file_identifier, write_local_serialized_object_identifier, write_serialized_type,
 };
@@ -51,6 +52,9 @@ impl SerializedFileWriter {
             UnityAssetError::with_source("Invalid SerializedFile wire state", error)
         })?;
         validate_representable_file_state(file, format)?;
+        let external_table = PlannedExternalTable::build(file, edits).map_err(|error| {
+            UnityAssetError::with_source("Invalid SerializedFile external table", error)
+        })?;
         for path_id in edits.object_bytes.keys() {
             if file.find_object(*path_id).is_none() {
                 return Err(UnityAssetError::format(format!(
@@ -123,22 +127,8 @@ impl SerializedFileWriter {
             )));
         }
 
-        let mut externals = file.externals.clone();
-        for ext in &edits.additional_externals {
-            if let Some(existing) = externals.iter().find(|existing| existing.path == ext.path) {
-                if existing != ext {
-                    return Err(UnityAssetError::format(format!(
-                        "Conflicting external metadata for path {}",
-                        ext.path
-                    )));
-                }
-            } else {
-                externals.push(ext.clone());
-            }
-        }
-
-        write_count(&mut meta, "external", externals.len())?;
-        for e in &externals {
+        write_count(&mut meta, "external", external_table.len())?;
+        for e in external_table.iter() {
             write_file_identifier(e, &mut meta, format)?;
         }
 

@@ -18,7 +18,9 @@ use unity_asset::{
 };
 use unity_asset_binary::asset::{FileIdentifier, SerializedFileParser};
 use unity_asset_write::object::SerializedFileEditSession;
-use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
+use unity_asset_write::serialized_file::{
+    ExternalTableAllocator, SerializedFileEdits, SerializedFileWriter,
+};
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -323,13 +325,20 @@ fn external_transform_fixture(guid: [u8; 16]) -> Vec<u8> {
             Ok(())
         })
         .unwrap();
-    session.edits_mut().add_external(FileIdentifier {
-        temp_empty: String::new(),
-        guid,
-        type_: 3,
-        path: INCREMENTAL_TARGET_ALIAS.to_owned(),
-    });
-    SerializedFileWriter::save(&file, session.edits()).unwrap()
+    let mut allocator = ExternalTableAllocator::new(&file).unwrap();
+    allocator
+        .intern(
+            FileIdentifier {
+                temp_empty: String::new(),
+                guid,
+                type_: 3,
+                path: INCREMENTAL_TARGET_ALIAS.to_owned(),
+            },
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let edits = allocator.into_edits(session.into_edits()).unwrap();
+    SerializedFileWriter::save(&file, &edits).unwrap()
 }
 
 fn replace_external_guid(bytes: Vec<u8>, guid: [u8; 16]) -> Vec<u8> {
