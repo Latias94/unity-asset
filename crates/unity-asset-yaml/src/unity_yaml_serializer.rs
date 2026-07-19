@@ -10,7 +10,9 @@
 use crate::constants::{LineEnding, UNITY_TAG_URI, UNITY_YAML_VERSION};
 use std::fmt::{self, Write as FmtWrite};
 use std::io::{self, Write as IoWrite};
-use unity_asset_core::{Result, UnityAssetError, UnityClass, UnityValue};
+use unity_asset_core::{
+    AssetLoadBudget, BudgetError, Result, UnityAssetError, UnityClass, UnityValue,
+};
 
 /// Unity YAML serializer
 pub struct UnityYamlSerializer {
@@ -43,8 +45,21 @@ impl UnityYamlSerializer {
     where
         I: IntoIterator<Item = &'class UnityClass>,
     {
+        let mut budget = AssetLoadBudget::default();
+        self.serialize_to_string_with_budget(classes, &mut budget)
+    }
+
+    /// Serialize borrowed Unity classes while charging one caller-owned budget.
+    pub fn serialize_to_string_with_budget<'class, I>(
+        &mut self,
+        classes: I,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<String>
+    where
+        I: IntoIterator<Item = &'class UnityClass>,
+    {
         let mut output = String::new();
-        self.serialize_to_fmt_writer(&mut output, classes)?;
+        self.serialize_to_fmt_writer(&mut output, classes, budget)?;
         Ok(output)
     }
 
@@ -58,15 +73,37 @@ impl UnityYamlSerializer {
         W: IoWrite + ?Sized,
         I: IntoIterator<Item = &'class UnityClass>,
     {
+        let mut budget = AssetLoadBudget::default();
+        self.serialize_to_writer_with_budget(writer, classes, &mut budget)
+    }
+
+    /// Stream borrowed Unity classes while charging one caller-owned budget.
+    ///
+    /// Budget usage accumulates across every class, property, and nested value in the stream.
+    pub fn serialize_to_writer_with_budget<'class, W, I>(
+        &mut self,
+        writer: &mut W,
+        classes: I,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()>
+    where
+        W: IoWrite + ?Sized,
+        I: IntoIterator<Item = &'class UnityClass>,
+    {
         let mut adapter = IoWriterAdapter::new(writer);
-        let result = self.serialize_to_fmt_writer(&mut adapter, classes);
+        let result = self.serialize_to_fmt_writer(&mut adapter, classes, budget);
         match adapter.take_error() {
             Some(error) => Err(error.into()),
             None => result,
         }
     }
 
-    fn serialize_to_fmt_writer<'class, W, I>(&mut self, writer: &mut W, classes: I) -> Result<()>
+    fn serialize_to_fmt_writer<'class, W, I>(
+        &mut self,
+        writer: &mut W,
+        classes: I,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()>
     where
         W: FmtWrite,
         I: IntoIterator<Item = &'class UnityClass>,
@@ -81,7 +118,7 @@ impl UnityYamlSerializer {
 
         // Serialize each Unity class as a separate document
         for class in classes {
-            self.serialize_unity_class(writer, class)?;
+            self.serialize_unity_class(writer, class, budget)?;
         }
 
         Ok(())
@@ -116,7 +153,14 @@ impl UnityYamlSerializer {
         &mut self,
         writer: &mut W,
         class: &UnityClass,
+        budget: &mut AssetLoadBudget,
     ) -> Result<()> {
+        observe_serialization_entry(budget, 0)?;
+        charge_serialization_members(budget, class.properties().len())?;
+        charge_serialization_bytes(budget, class.anchor.len())?;
+        charge_serialization_bytes(budget, class.extra_anchor_data.len())?;
+        charge_serialization_bytes(budget, class.class_name.len())?;
+
         // Write document separator with Unity tag and anchor
         write!(writer, "--- !u!{} &{}", class.class_id, class.anchor).map_err(|e| {
             UnityAssetError::format(format!("Failed to write document header: {}", e))
@@ -139,7 +183,7 @@ impl UnityYamlSerializer {
         // Serialize properties
         self.indent_level = 1;
         for (key, value) in class.properties() {
-            self.serialize_property(writer, key, value)?;
+            self.serialize_property(writer, key, value, budget, 1)?;
         }
 
         Ok(())
@@ -151,7 +195,11 @@ impl UnityYamlSerializer {
         writer: &mut W,
         key: &str,
         value: &UnityValue,
+        budget: &mut AssetLoadBudget,
+        depth: u32,
     ) -> Result<()> {
+        charge_serialization_bytes(budget, key.len())?;
+
         // Write indentation
         self.write_indent(writer)?;
 
@@ -160,7 +208,7 @@ impl UnityYamlSerializer {
             .map_err(|e| UnityAssetError::format(format!("Failed to write property key: {}", e)))?;
 
         // Write property value
-        self.serialize_value(writer, value, false)?;
+        self.serialize_value(writer, value, false, budget, depth)?;
 
         Ok(())
     }
@@ -171,7 +219,11 @@ impl UnityYamlSerializer {
         writer: &mut W,
         value: &UnityValue,
         inline: bool,
+        budget: &mut AssetLoadBudget,
+        depth: u32,
     ) -> Result<()> {
+        observe_serialization_entry(budget, depth)?;
+
         match value {
             UnityValue::Null => {
                 write!(writer, "{{fileID: 0}}{}", self.line_ending.as_str()).map_err(|e| {
@@ -205,22 +257,15 @@ impl UnityYamlSerializer {
                 })?;
             }
             UnityValue::String(s) => {
-                // Handle string quoting based on content
-                if self.needs_quoting(s) {
-                    write!(
-                        writer,
-                        "\"{}\"{}",
-                        self.escape_string(s),
-                        self.line_ending.as_str()
-                    )
-                } else {
-                    write!(writer, "{}{}", s, self.line_ending.as_str())
-                }
-                .map_err(|e| {
-                    UnityAssetError::format(format!("Failed to write string value: {}", e))
+                charge_serialization_bytes(budget, s.len())?;
+                self.write_string_inline(writer, s)?;
+                write!(writer, "{}", self.line_ending.as_str()).map_err(|e| {
+                    UnityAssetError::format(format!("Failed to write string line ending: {}", e))
                 })?;
             }
             UnityValue::Array(arr) => {
+                charge_serialization_members(budget, arr.len())?;
+                let child_depth = next_serialization_depth(depth)?;
                 if arr.is_empty() {
                     write!(writer, "[]{}", self.line_ending.as_str()).map_err(|e| {
                         UnityAssetError::format(format!("Failed to write empty array: {}", e))
@@ -239,7 +284,7 @@ impl UnityYamlSerializer {
                                 ))
                             })?;
                         }
-                        self.serialize_value_inline(writer, item)?;
+                        self.serialize_value_inline(writer, item, budget, child_depth)?;
                     }
                     write!(writer, "]{}", self.line_ending.as_str()).map_err(|e| {
                         UnityAssetError::format(format!("Failed to write inline array end: {}", e))
@@ -262,20 +307,21 @@ impl UnityYamlSerializer {
                             UnityValue::Array(inner)
                                 if !inner.is_empty() && !self.is_simple_array(inner) =>
                             {
-                                self.serialize_value(writer, item, false)?
+                                self.serialize_value(writer, item, false, budget, child_depth)?
                             }
                             UnityValue::Object(inner)
                                 if !inner.is_empty() && !self.is_simple_object(inner) =>
                             {
-                                self.serialize_value(writer, item, false)?
+                                self.serialize_value(writer, item, false, budget, child_depth)?
                             }
-                            _ => self.serialize_value(writer, item, true)?,
+                            _ => self.serialize_value(writer, item, true, budget, child_depth)?,
                         }
                     }
                     self.indent_level -= 1;
                 }
             }
             UnityValue::Bytes(b) => {
+                charge_serialization_bytes(budget, b.len())?;
                 if b.is_empty() {
                     write!(writer, "[]{}", self.line_ending.as_str()).map_err(|e| {
                         UnityAssetError::format(format!("Failed to write empty bytes: {}", e))
@@ -324,6 +370,8 @@ impl UnityYamlSerializer {
                 }
             }
             UnityValue::Object(obj) => {
+                charge_serialization_members(budget, obj.len())?;
+                let child_depth = next_serialization_depth(depth)?;
                 if obj.is_empty() {
                     write!(writer, "{{}}{}", self.line_ending.as_str()).map_err(|e| {
                         UnityAssetError::format(format!("Failed to write empty object: {}", e))
@@ -342,10 +390,12 @@ impl UnityYamlSerializer {
                                 ))
                             })?;
                         }
-                        write!(writer, "{}: ", key).map_err(|e| {
+                        charge_serialization_bytes(budget, key.len())?;
+                        self.write_string_inline(writer, key)?;
+                        write!(writer, ": ").map_err(|e| {
                             UnityAssetError::format(format!("Failed to write object key: {}", e))
                         })?;
-                        self.serialize_value_inline(writer, value)?;
+                        self.serialize_value_inline(writer, value, budget, child_depth)?;
                     }
                     write!(writer, "}}{}", self.line_ending.as_str()).map_err(|e| {
                         UnityAssetError::format(format!("Failed to write inline object end: {}", e))
@@ -357,7 +407,7 @@ impl UnityYamlSerializer {
                     })?;
                     self.indent_level += 1;
                     for (key, value) in obj {
-                        self.serialize_property(writer, key, value)?;
+                        self.serialize_property(writer, key, value, budget, child_depth)?;
                     }
                     self.indent_level -= 1;
                 }
@@ -371,7 +421,11 @@ impl UnityYamlSerializer {
         &self,
         writer: &mut W,
         value: &UnityValue,
+        budget: &mut AssetLoadBudget,
+        depth: u32,
     ) -> Result<()> {
+        observe_serialization_entry(budget, depth)?;
+
         match value {
             UnityValue::Null => {
                 write!(writer, "{{fileID: 0}}").map_err(|e| {
@@ -399,28 +453,116 @@ impl UnityYamlSerializer {
                 })?;
             }
             UnityValue::String(s) => {
-                if self.needs_quoting(s) {
-                    write!(writer, "\"{}\"", self.escape_string(s)).map_err(|e| {
-                        UnityAssetError::format(format!("Failed to write quoted string: {}", e))
-                    })?;
-                } else {
-                    write!(writer, "{}", s).map_err(|e| {
-                        UnityAssetError::format(format!("Failed to write string: {}", e))
-                    })?;
-                }
+                charge_serialization_bytes(budget, s.len())?;
+                self.write_string_inline(writer, s)?;
             }
             UnityValue::Bytes(b) => {
-                write!(writer, "<bytes len={}>", b.len()).map_err(|e| {
-                    UnityAssetError::format(format!("Failed to write bytes: {}", e))
+                charge_serialization_bytes(budget, b.len())?;
+                write!(writer, "[").map_err(|e| {
+                    UnityAssetError::format(format!("Failed to write bytes start: {}", e))
+                })?;
+                for (index, byte) in b.iter().enumerate() {
+                    if index > 0 {
+                        write!(writer, ", ").map_err(|e| {
+                            UnityAssetError::format(format!(
+                                "Failed to write bytes separator: {}",
+                                e
+                            ))
+                        })?;
+                    }
+                    write!(writer, "{}", byte).map_err(|e| {
+                        UnityAssetError::format(format!("Failed to write byte value: {}", e))
+                    })?;
+                }
+                write!(writer, "]").map_err(|e| {
+                    UnityAssetError::format(format!("Failed to write bytes end: {}", e))
                 })?;
             }
-            UnityValue::Array(_) | UnityValue::Object(_) => {
-                // For complex nested structures, we might need more sophisticated handling
-                write!(writer, "{{...}}").map_err(|e| {
-                    UnityAssetError::format(format!("Failed to write complex value: {}", e))
+            UnityValue::Array(values) => {
+                charge_serialization_members(budget, values.len())?;
+                let child_depth = next_serialization_depth(depth)?;
+                write!(writer, "[").map_err(|e| {
+                    UnityAssetError::format(format!("Failed to write array start: {}", e))
+                })?;
+                for (index, item) in values.iter().enumerate() {
+                    if index > 0 {
+                        write!(writer, ", ").map_err(|e| {
+                            UnityAssetError::format(format!(
+                                "Failed to write array separator: {}",
+                                e
+                            ))
+                        })?;
+                    }
+                    self.serialize_value_inline(writer, item, budget, child_depth)?;
+                }
+                write!(writer, "]").map_err(|e| {
+                    UnityAssetError::format(format!("Failed to write array end: {}", e))
+                })?;
+            }
+            UnityValue::Object(fields) => {
+                charge_serialization_members(budget, fields.len())?;
+                let child_depth = next_serialization_depth(depth)?;
+                write!(writer, "{{").map_err(|e| {
+                    UnityAssetError::format(format!("Failed to write object start: {}", e))
+                })?;
+                for (index, (key, item)) in fields.iter().enumerate() {
+                    if index > 0 {
+                        write!(writer, ", ").map_err(|e| {
+                            UnityAssetError::format(format!(
+                                "Failed to write object separator: {}",
+                                e
+                            ))
+                        })?;
+                    }
+                    charge_serialization_bytes(budget, key.len())?;
+                    self.write_string_inline(writer, key)?;
+                    write!(writer, ": ").map_err(|e| {
+                        UnityAssetError::format(format!("Failed to write object key: {}", e))
+                    })?;
+                    self.serialize_value_inline(writer, item, budget, child_depth)?;
+                }
+                write!(writer, "}}").map_err(|e| {
+                    UnityAssetError::format(format!("Failed to write object end: {}", e))
                 })?;
             }
         }
+        Ok(())
+    }
+
+    fn write_string_inline<W: FmtWrite>(&self, writer: &mut W, value: &str) -> Result<()> {
+        if !self.needs_quoting(value) {
+            write!(writer, "{}", value)
+                .map_err(|e| UnityAssetError::format(format!("Failed to write string: {}", e)))?;
+            return Ok(());
+        }
+
+        writer.write_char('"').map_err(|e| {
+            UnityAssetError::format(format!("Failed to write quoted string start: {}", e))
+        })?;
+        for character in value.chars() {
+            let escaped = match character {
+                '\\' => "\\\\",
+                '"' => "\\\"",
+                '\n' => "\\n",
+                '\r' => "\\r",
+                '\t' => "\\t",
+                _ => {
+                    writer.write_char(character).map_err(|e| {
+                        UnityAssetError::format(format!(
+                            "Failed to write quoted string character: {}",
+                            e
+                        ))
+                    })?;
+                    continue;
+                }
+            };
+            writer.write_str(escaped).map_err(|e| {
+                UnityAssetError::format(format!("Failed to write escaped string character: {}", e))
+            })?;
+        }
+        writer.write_char('"').map_err(|e| {
+            UnityAssetError::format(format!("Failed to write quoted string end: {}", e))
+        })?;
         Ok(())
     }
 
@@ -446,17 +588,21 @@ impl UnityYamlSerializer {
             || s.contains(']')
             || s.contains('{')
             || s.contains('}')
+            || s.contains(',')
+            || s.contains('#')
             || s.starts_with(' ')
             || s.ends_with(' ')
-    }
-
-    /// Escape a string for YAML
-    fn escape_string(&self, s: &str) -> String {
-        s.replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-            .replace('\t', "\\t")
+            || s.starts_with(|character: char| {
+                character.is_ascii_digit()
+                    || matches!(
+                        character,
+                        '-' | '?' | ':' | '&' | '*' | '!' | '|' | '>' | '%' | '@' | '`' | '+' | '.'
+                    )
+            })
+            || ["null", "true", "false", "yes", "no", "on", "off"]
+                .iter()
+                .any(|keyword| s.eq_ignore_ascii_case(keyword))
+            || s == "~"
     }
 
     /// Check if an array should be written inline
@@ -484,6 +630,46 @@ impl UnityYamlSerializer {
                 _ => false,
             })
     }
+}
+
+fn observe_serialization_entry(budget: &mut AssetLoadBudget, depth: u32) -> Result<()> {
+    budget
+        .consume_entries(1)
+        .map_err(serialization_budget_error)?;
+    budget
+        .observe_depth(depth)
+        .map_err(serialization_budget_error)
+}
+
+fn charge_serialization_bytes(budget: &mut AssetLoadBudget, amount: usize) -> Result<()> {
+    let amount = u64::try_from(amount)
+        .map_err(|_| BudgetError::ArithmeticOverflow { resource: "bytes" })
+        .map_err(serialization_budget_error)?;
+    budget
+        .consume_bytes(amount)
+        .map_err(serialization_budget_error)
+}
+
+fn charge_serialization_members(budget: &mut AssetLoadBudget, amount: usize) -> Result<()> {
+    let amount = u64::try_from(amount)
+        .map_err(|_| BudgetError::ArithmeticOverflow {
+            resource: "members",
+        })
+        .map_err(serialization_budget_error)?;
+    budget
+        .consume_members(amount)
+        .map_err(serialization_budget_error)
+}
+
+fn next_serialization_depth(depth: u32) -> Result<u32> {
+    depth
+        .checked_add(1)
+        .ok_or(BudgetError::ArithmeticOverflow { resource: "depth" })
+        .map_err(serialization_budget_error)
+}
+
+fn serialization_budget_error(error: BudgetError) -> UnityAssetError {
+    UnityAssetError::with_source("YAML serialization budget exceeded", error)
 }
 
 struct IoWriterAdapter<'writer, W: IoWrite + ?Sized> {
@@ -519,5 +705,160 @@ impl<W: IoWrite + ?Sized> FmtWrite for IoWriterAdapter<'_, W> {
 impl Default for UnityYamlSerializer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SerdeUnityLoader;
+    use indexmap::indexmap;
+    use unity_asset_core::AssetLoadLimits;
+
+    #[test]
+    fn complex_inline_values_round_trip_without_placeholders() {
+        let value = UnityValue::Object(indexmap! {
+            "nested".to_string() => UnityValue::Array(vec![
+                UnityValue::Object(indexmap! {
+                    "payload".to_string() => UnityValue::Bytes(vec![0, 127, 255]),
+                    "metadata".to_string() => UnityValue::Object(indexmap! {
+                        "label".to_string() => UnityValue::String("value:quoted".to_string()),
+                        "flow,key".to_string() => UnityValue::String("true".to_string()),
+                    }),
+                }),
+                UnityValue::Array(vec![
+                    UnityValue::Integer(-1),
+                    UnityValue::Unsigned(u64::MAX),
+                ]),
+            ]),
+        });
+        let mut encoded = String::new();
+        let mut budget = AssetLoadBudget::default();
+        UnityYamlSerializer::new()
+            .serialize_value_inline(&mut encoded, &value, &mut budget, 0)
+            .unwrap();
+
+        assert!(!encoded.contains("{...}"));
+        assert!(!encoded.contains("<bytes len="));
+        assert!(encoded.contains("payload: [0, 127, 255]"));
+        assert!(encoded.contains("metadata: {label: \"value:quoted\","));
+        assert!(encoded.contains("\"flow,key\": \"true\""));
+
+        let first = SerdeUnityLoader::new()
+            .load_from_str(&format!("Container:\n  value: {encoded}\n"))
+            .unwrap();
+        let reparsed_yaml = UnityYamlSerializer::new()
+            .serialize_to_string(first.iter())
+            .unwrap();
+        let second = SerdeUnityLoader::new()
+            .load_from_str(&reparsed_yaml)
+            .unwrap();
+
+        assert_eq!(first[0].get("value"), second[0].get("value"));
+    }
+
+    #[test]
+    fn complex_inline_values_share_one_depth_budget() {
+        let value = UnityValue::Object(indexmap! {
+            "first".to_string() => UnityValue::Array(vec![UnityValue::Object(indexmap! {
+                "too_deep".to_string() => UnityValue::Integer(1),
+            })]),
+        });
+        let limits = AssetLoadLimits {
+            max_depth: 2,
+            ..AssetLoadLimits::default()
+        };
+        let mut budget = AssetLoadBudget::new(limits).unwrap();
+        let mut encoded = String::new();
+
+        let error = UnityYamlSerializer::new()
+            .serialize_value_inline(&mut encoded, &value, &mut budget, 1)
+            .unwrap_err();
+
+        assert_budget_exceeded(error, "depth", 2, 3);
+    }
+
+    #[test]
+    fn complex_inline_values_check_member_budget_before_writing_container() {
+        let value = UnityValue::Array(vec![
+            UnityValue::Integer(1),
+            UnityValue::Integer(2),
+            UnityValue::Integer(3),
+        ]);
+        let limits = AssetLoadLimits {
+            max_members: 2,
+            ..AssetLoadLimits::default()
+        };
+        let mut budget = AssetLoadBudget::new(limits).unwrap();
+        let mut encoded = String::new();
+
+        let error = UnityYamlSerializer::new()
+            .serialize_value_inline(&mut encoded, &value, &mut budget, 0)
+            .unwrap_err();
+
+        assert!(encoded.is_empty());
+        assert_budget_exceeded(error, "members", 2, 3);
+    }
+
+    #[test]
+    fn budgeted_writer_accumulates_entries_across_fields() {
+        let mut class = UnityClass::new(1, "GameObject".into(), "1".into());
+        class.set("first".into(), UnityValue::Integer(1));
+        class.set("second".into(), UnityValue::Integer(2));
+        let limits = AssetLoadLimits {
+            max_entries: 2,
+            ..AssetLoadLimits::default()
+        };
+        let mut budget = AssetLoadBudget::new(limits).unwrap();
+        let mut encoded = Vec::new();
+
+        let error = UnityYamlSerializer::new()
+            .serialize_to_writer_with_budget(&mut encoded, std::iter::once(&class), &mut budget)
+            .unwrap_err();
+
+        assert_budget_exceeded(error, "entries", 2, 3);
+        assert_eq!(budget.usage().entries, 2);
+    }
+
+    #[test]
+    fn budgeted_writer_accumulates_entries_across_documents() {
+        let mut first = UnityClass::new(1, "GameObject".into(), "1".into());
+        first.set("value".into(), UnityValue::Integer(1));
+        let mut second = UnityClass::new(1, "GameObject".into(), "2".into());
+        second.set("value".into(), UnityValue::Integer(2));
+        let limits = AssetLoadLimits {
+            max_entries: 3,
+            ..AssetLoadLimits::default()
+        };
+        let mut budget = AssetLoadBudget::new(limits).unwrap();
+        let mut encoded = Vec::new();
+
+        let error = UnityYamlSerializer::new()
+            .serialize_to_writer_with_budget(&mut encoded, [&first, &second], &mut budget)
+            .unwrap_err();
+
+        assert_budget_exceeded(error, "entries", 3, 4);
+        assert_eq!(budget.usage().entries, 3);
+    }
+
+    fn assert_budget_exceeded(
+        error: UnityAssetError,
+        resource: &'static str,
+        limit: u64,
+        requested: u64,
+    ) {
+        let UnityAssetError::WithSource { source, .. } = error else {
+            panic!("expected a budget source, got {error:?}");
+        };
+        assert!(matches!(
+            source.downcast_ref::<BudgetError>(),
+            Some(BudgetError::Exceeded {
+                resource: actual_resource,
+                limit: actual_limit,
+                requested: actual_requested,
+            }) if *actual_resource == resource
+                && *actual_limit == limit
+                && *actual_requested == requested
+        ));
     }
 }
