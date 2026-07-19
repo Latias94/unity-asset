@@ -560,30 +560,79 @@ pub enum WorkspaceObjectValue {
     Yaml(WorkspaceYamlObject),
 }
 
-/// Copy-free YAML object view retaining its immutable source document.
-#[derive(Debug, Clone)]
+/// Copy-free YAML object view retaining either its committed document or one prepared class.
+#[derive(Clone)]
 pub struct WorkspaceYamlObject {
-    document: Arc<YamlDocument>,
-    document_index: usize,
+    backing: WorkspaceYamlObjectBacking,
+}
+
+#[derive(Clone)]
+enum WorkspaceYamlObjectBacking {
+    Committed {
+        document: Arc<YamlDocument>,
+        document_index: usize,
+    },
+    Prepared {
+        class: Arc<UnityClass>,
+        document_index: usize,
+    },
 }
 
 impl WorkspaceYamlObject {
     pub(crate) fn new(document: Arc<YamlDocument>, document_index: usize) -> Self {
         debug_assert!(document_index < document.entries().len());
         Self {
-            document,
-            document_index,
+            backing: WorkspaceYamlObjectBacking::Committed {
+                document,
+                document_index,
+            },
+        }
+    }
+
+    pub(crate) fn from_prepared(class: Arc<UnityClass>, document_index: usize) -> Self {
+        Self {
+            backing: WorkspaceYamlObjectBacking::Prepared {
+                class,
+                document_index,
+            },
         }
     }
 
     #[must_use]
     pub fn document_index(&self) -> usize {
-        self.document_index
+        match &self.backing {
+            WorkspaceYamlObjectBacking::Committed { document_index, .. }
+            | WorkspaceYamlObjectBacking::Prepared { document_index, .. } => *document_index,
+        }
     }
 
     #[must_use]
     pub fn class(&self) -> &UnityClass {
-        &self.document.entries()[self.document_index]
+        match &self.backing {
+            WorkspaceYamlObjectBacking::Committed {
+                document,
+                document_index,
+            } => &document.entries()[*document_index],
+            WorkspaceYamlObjectBacking::Prepared { class, .. } => class,
+        }
+    }
+}
+
+impl fmt::Debug for WorkspaceYamlObject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let backing = match &self.backing {
+            WorkspaceYamlObjectBacking::Committed { .. } => "committed",
+            WorkspaceYamlObjectBacking::Prepared { .. } => "prepared",
+        };
+        let class = self.class();
+        formatter
+            .debug_struct("WorkspaceYamlObject")
+            .field("backing", &backing)
+            .field("document_index", &self.document_index())
+            .field("class_id", &class.class_id)
+            .field("class_name", &class.class_name)
+            .field("anchor", &class.anchor)
+            .finish()
     }
 }
 

@@ -3,8 +3,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use unity_asset_core::{
-    AssetLoadBudget, DigestV1, SourceFingerprint, SourceId, SourceKind, VerifiedSourceImage,
-    WorkspaceId,
+    AssetLoadBudget, DigestV1, SourceFingerprint, SourceId, SourceKind, UnityClass, UnityDocument,
+    VerifiedSourceImage, WorkspaceId,
 };
 use unity_asset_write::artifact::{
     ArtifactBatchDeclaration, ArtifactBudget, ArtifactBuildError, ArtifactHandle, ArtifactLimits,
@@ -13,8 +13,9 @@ use unity_asset_write::artifact::{
 use unity_asset_write::resources::{
     StreamedResourceExtent, StreamedResourceFlags, StreamedResourcePlan,
 };
+use unity_asset_yaml::YamlDocument;
 
-use super::{WorkspaceByteRange, WorkspaceError};
+use super::{WorkspaceByteRange, WorkspaceError, WorkspaceYamlObject};
 
 struct PreparedFixture {
     artifacts: Arc<PreparedArtifactSet>,
@@ -92,6 +93,82 @@ fn verbatim_fixture(workspace_local: u128) -> PreparedFixture {
 
 fn byte_range(start: u64, end: u64) -> Range<u64> {
     Range { start, end }
+}
+
+#[test]
+fn committed_yaml_object_borrows_its_document_class_without_cloning_it() {
+    let mut document = YamlDocument::new();
+    document.add_entry(UnityClass::new(
+        1,
+        "GameObject".to_owned(),
+        "1001".to_owned(),
+    ));
+    let document = Arc::new(document);
+    let expected_class = std::ptr::from_ref(&document.entries()[0]);
+
+    let object = WorkspaceYamlObject::new(Arc::clone(&document), 0);
+    let cloned = object.clone();
+
+    assert_eq!(object.document_index(), 0);
+    assert_eq!(std::ptr::from_ref(object.class()), expected_class);
+    assert_eq!(std::ptr::from_ref(cloned.class()), expected_class);
+    assert_eq!(Arc::strong_count(&document), 3);
+}
+
+#[test]
+fn prepared_yaml_object_and_its_clone_retain_the_class_after_owners_are_dropped() {
+    let class = Arc::new(UnityClass::new(
+        114,
+        "MonoBehaviour".to_owned(),
+        "4201".to_owned(),
+    ));
+    let expected_class = Arc::as_ptr(&class);
+    let object = WorkspaceYamlObject::from_prepared(Arc::clone(&class), 7);
+    let retained = object.clone();
+
+    drop(class);
+    assert_eq!(object.document_index(), 7);
+    assert_eq!(std::ptr::from_ref(object.class()), expected_class);
+    drop(object);
+
+    assert_eq!(retained.document_index(), 7);
+    assert_eq!(retained.class().class_name, "MonoBehaviour");
+    assert_eq!(std::ptr::from_ref(retained.class()), expected_class);
+}
+
+#[test]
+fn yaml_object_debug_is_bounded_and_consistent_across_backings() {
+    let mut class = UnityClass::new(114, "MonoBehaviour".to_owned(), "4201".to_owned());
+    class.set("m_Secret".to_owned(), "selected-object-sensitive-property");
+    let prepared_class = Arc::new(class.clone());
+    let mut sibling = UnityClass::new(1, "SiblingObject".to_owned(), "9001".to_owned());
+    sibling.set("m_Secret".to_owned(), "sibling-sensitive-property");
+    let mut document = YamlDocument::new();
+    document.add_entry(class);
+    document.add_entry(sibling);
+
+    let committed = WorkspaceYamlObject::new(Arc::new(document), 0);
+    let prepared = WorkspaceYamlObject::from_prepared(prepared_class, 0);
+    let committed_debug = format!("{committed:?}");
+    let prepared_debug = format!("{prepared:?}");
+
+    assert_eq!(
+        committed_debug,
+        "WorkspaceYamlObject { backing: \"committed\", document_index: 0, class_id: 114, class_name: \"MonoBehaviour\", anchor: \"4201\" }"
+    );
+    assert_eq!(
+        prepared_debug,
+        "WorkspaceYamlObject { backing: \"prepared\", document_index: 0, class_id: 114, class_name: \"MonoBehaviour\", anchor: \"4201\" }"
+    );
+    for sensitive in [
+        "m_Secret",
+        "selected-object-sensitive-property",
+        "SiblingObject",
+        "sibling-sensitive-property",
+    ] {
+        assert!(!committed_debug.contains(sensitive));
+        assert!(!prepared_debug.contains(sensitive));
+    }
 }
 
 #[test]
