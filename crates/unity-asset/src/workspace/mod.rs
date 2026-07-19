@@ -19,9 +19,10 @@ pub use plan::{
 pub use snapshot::WorkspaceSnapshot;
 pub use source_catalog::SourceLocationKind;
 pub use view::{
-    WorkspaceAllocationUnit, WorkspaceBytes, WorkspaceError, WorkspaceLookup, WorkspaceObject,
-    WorkspaceObjectValue, WorkspaceSource, WorkspaceSourceContainer, WorkspaceSourceIdentityError,
-    WorkspaceSourceMemberIdentityError, WorkspaceView, WorkspaceYamlObject,
+    WorkspaceAllocationUnit, WorkspaceByteRange, WorkspaceByteRangeReader, WorkspaceError,
+    WorkspaceLookup, WorkspaceObject, WorkspaceObjectValue, WorkspaceSource,
+    WorkspaceSourceContainer, WorkspaceSourceIdentityError, WorkspaceSourceMemberIdentityError,
+    WorkspaceView, WorkspaceYamlObject,
 };
 
 pub(crate) use state::WorkspaceState;

@@ -147,6 +147,27 @@ fn empty_contiguous_and_invalid_ranges_have_explicit_behavior() {
 }
 
 #[test]
+fn contiguous_ranges_never_materialize_across_segment_boundaries() {
+    let image = SegmentedBytes::from_arcs([
+        Arc::<[u8]>::from(b"abc".as_slice()),
+        Arc::<[u8]>::from(b"def".as_slice()),
+    ])
+    .unwrap();
+
+    assert_eq!(image.contiguous_range(1..3), Some(b"bc".as_slice()));
+    assert_eq!(image.contiguous_range(3..5), Some(b"de".as_slice()));
+    assert_eq!(image.contiguous_range(2..2), Some(b"".as_slice()));
+    assert_eq!(image.contiguous_range(6..6), Some(b"".as_slice()));
+    assert!(image.contiguous_range(2..4).is_none());
+    assert!(
+        image
+            .contiguous_range(std::ops::Range { start: 5, end: 4 })
+            .is_none()
+    );
+    assert!(image.contiguous_range(0..7).is_none());
+}
+
+#[test]
 fn public_segmented_validation_accepts_a_wire_golden_without_materialization() {
     let bytes = include_bytes!(
         "../../unity-asset-write/tests/fixtures/serialized_file_wire/v16.assets.bin"

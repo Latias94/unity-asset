@@ -180,6 +180,43 @@ fn prepared_set_resolves_only_handles_from_its_own_graph() {
 }
 
 #[test]
+fn prepared_artifact_contiguous_ranges_borrow_only_one_segment() {
+    let first = resource_payload(b"abc", 109);
+    let second = resource_payload(b"def", 110);
+    let extents = [
+        StreamedResourceExtentInspection::new(DigestV1::hash_bytes(b"abc"), 0, 3, 1),
+        StreamedResourceExtentInspection::new(DigestV1::hash_bytes(b"def"), 3, 3, 1),
+    ];
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let mut declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    let output = declaration.declare_output(name("segmented.resS")).unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+    let handle = batch
+        .prepare_streamed_resource_extents(extents, |encoder| {
+            encoder.push_payload_full(&first)?;
+            encoder.push_payload_full(&second)
+        })
+        .unwrap();
+    batch.bind_output(output, handle).unwrap();
+    let set = batch.finish().unwrap();
+    let artifact = set.artifact(handle).unwrap();
+
+    assert_eq!(artifact.contiguous_range(0..3), Some(b"abc".as_slice()));
+    assert_eq!(artifact.contiguous_range(3..6), Some(b"def".as_slice()));
+    assert_eq!(artifact.contiguous_range(6..6), Some(b"".as_slice()));
+    assert!(artifact.contiguous_range(0..6).is_none());
+    assert!(artifact.contiguous_range(2..4).is_none());
+    assert!(
+        artifact
+            .contiguous_range(std::ops::Range { start: 5, end: 4 })
+            .is_none()
+    );
+    assert!(artifact.contiguous_range(0..7).is_none());
+}
+
+#[test]
 fn verbatim_source_leaf_retains_exact_provenance_without_generated_bytes() {
     let backing = Arc::<[u8]>::from(b"unchanged bundle member".as_slice());
     let source = SourceId::new(

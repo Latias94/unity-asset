@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Cursor, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::PathBuf;
 
@@ -333,7 +333,7 @@ fn old_snapshots_survive_reload_unload_and_physical_file_changes() {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-    assert_eq!(first_bytes.as_bytes(), FIRST_YAML.as_bytes());
+    assert_eq!(first_bytes.contiguous(), Some(FIRST_YAML.as_bytes()));
 
     fs::write(&path, SECOND_YAML).unwrap();
     let reloaded = workspace
@@ -342,7 +342,7 @@ fn old_snapshots_survive_reload_unload_and_physical_file_changes() {
     assert_eq!(reloaded, root);
     assert_ne!(workspace.revision(), first_revision);
     let second = workspace.snapshot();
-    assert_eq!(first_bytes.as_bytes(), FIRST_YAML.as_bytes());
+    assert_eq!(first_bytes.contiguous(), Some(FIRST_YAML.as_bytes()));
     assert_eq!(
         second
             .read_source_range(
@@ -352,18 +352,18 @@ fn old_snapshots_survive_reload_unload_and_physical_file_changes() {
                 &mut AssetLoadBudget::default(),
             )
             .unwrap()
-            .as_bytes(),
-        SECOND_YAML.as_bytes()
+            .contiguous(),
+        Some(SECOND_YAML.as_bytes())
     );
 
     fs::remove_file(&path).unwrap();
-    assert_eq!(first_bytes.as_bytes(), FIRST_YAML.as_bytes());
+    assert_eq!(first_bytes.contiguous(), Some(FIRST_YAML.as_bytes()));
     assert_eq!(
         second
             .read_source_range(root, 0, 5, &mut AssetLoadBudget::default())
             .unwrap()
-            .as_bytes(),
-        &SECOND_YAML.as_bytes()[..5]
+            .contiguous(),
+        Some(&SECOND_YAML.as_bytes()[..5])
     );
 
     workspace
@@ -385,6 +385,96 @@ fn old_snapshots_survive_reload_unload_and_physical_file_changes() {
             .source(root, &mut AssetLoadBudget::default())
             .unwrap(),
         WorkspaceLookup::Resolved(_)
+    ));
+}
+
+#[test]
+fn source_ranges_support_bounded_read_seek_and_streaming_copy() {
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed sink"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("scene.prefab");
+    fs::write(&path, FIRST_YAML).unwrap();
+    let mut asset_workspace = workspace(41);
+    let source = asset_workspace
+        .load_path(&path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = asset_workspace.snapshot();
+    let bytes = snapshot
+        .read_source_range(source, 2, 7, &mut AssetLoadBudget::default())
+        .unwrap();
+    let expected = &FIRST_YAML.as_bytes()[2..9];
+    let source_fingerprint = match snapshot
+        .source(source, &mut AssetLoadBudget::default())
+        .unwrap()
+    {
+        WorkspaceLookup::Resolved(source) => source.fingerprint(),
+        other => panic!("expected resolved source, got {other:?}"),
+    };
+
+    assert_eq!(bytes.source(), source);
+    assert_eq!(bytes.fingerprint(), source_fingerprint);
+    assert_eq!(bytes.len(), 7);
+    assert!(!bytes.is_empty());
+    assert_eq!(bytes.contiguous(), Some(expected));
+
+    let cloned = bytes.clone();
+    assert!(std::ptr::eq(
+        bytes.contiguous().unwrap().as_ptr(),
+        cloned.contiguous().unwrap().as_ptr(),
+    ));
+
+    let mut reader = bytes.reader();
+    assert_eq!(reader.seek(SeekFrom::Start(2)).unwrap(), 2);
+    let mut selected = [0; 3];
+    reader.read_exact(&mut selected).unwrap();
+    assert_eq!(selected.as_slice(), &expected[2..5]);
+    assert_eq!(reader.seek(SeekFrom::End(-1)).unwrap(), 6);
+    let mut tail = [0; 1];
+    reader.read_exact(&mut tail).unwrap();
+    assert_eq!(tail.as_slice(), &expected[6..]);
+    let error = reader.seek(SeekFrom::Start(bytes.len() + 1)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(reader.stream_position().unwrap(), bytes.len());
+
+    let mut copied = Vec::new();
+    assert_eq!(bytes.copy_to(&mut copied).unwrap(), bytes.len());
+    assert_eq!(copied, expected);
+
+    let error = bytes.copy_to(&mut FailingWriter).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+
+    let mut invalid_budget = AssetLoadBudget::default();
+    assert!(matches!(
+        snapshot.read_source_range(source, u64::MAX, 1, &mut invalid_budget),
+        Err(WorkspaceError::RangeOverflow { .. })
+    ));
+    assert_eq!(invalid_budget.usage().bytes, 0);
+    assert_eq!(invalid_budget.usage().entries, 0);
+    assert!(matches!(
+        snapshot.read_source_range(source, 0, u64::MAX, &mut invalid_budget),
+        Err(WorkspaceError::RangeOutOfBounds { .. })
+    ));
+    assert_eq!(invalid_budget.usage().bytes, 0);
+    assert_eq!(invalid_budget.usage().entries, 0);
+
+    assert!(matches!(
+        workspace(42)
+            .snapshot()
+            .read_source_range(source, 0, 1, &mut AssetLoadBudget::default(),),
+        Err(WorkspaceError::Contract(
+            ContractError::WorkspaceMismatch { .. }
+        ))
     ));
 }
 
@@ -534,8 +624,8 @@ fn one_view_resolves_archive_webfile_yaml_and_streamed_members_without_io() {
         snapshot
             .read_source_range(resource, 2, 4, &mut AssetLoadBudget::default())
             .unwrap()
-            .as_bytes(),
-        b"2345"
+            .contiguous(),
+        Some(b"2345".as_slice())
     );
     assert!(matches!(
         snapshot

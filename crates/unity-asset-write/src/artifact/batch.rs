@@ -1211,6 +1211,15 @@ impl PreparedArtifact {
         self.image.reader()
     }
 
+    /// Returns a contained logical range when it occupies one immutable segment.
+    ///
+    /// Invalid ranges and ranges crossing segment boundaries return `None`. This
+    /// method never concatenates or allocates an artifact-sized buffer.
+    #[must_use]
+    pub fn contiguous_range(&self, range: Range<u64>) -> Option<&[u8]> {
+        self.image.contiguous_range(range)
+    }
+
     pub fn stream_verified_to(
         &self,
         sink: &mut impl std::io::Write,

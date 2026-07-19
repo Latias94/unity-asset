@@ -355,7 +355,14 @@ impl SegmentedBytes {
         (index < self.segments.len()).then_some(index)
     }
 
-    pub(super) fn contiguous_range(&self, range: Range<u64>) -> Option<&[u8]> {
+    /// Returns a contained logical range when it occupies one backing segment.
+    ///
+    /// Invalid ranges and ranges crossing segment boundaries return `None` without
+    /// allocating or concatenating the image. Empty ranges at any valid boundary
+    /// return an empty slice.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn contiguous_range(&self, range: Range<u64>) -> Option<&[u8]> {
         if validate_range("contiguous byte range", &range, self.len).is_err() {
             return None;
         }

@@ -10,20 +10,18 @@ use unity_asset_binary::unity_version::UnityVersion;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, Diagnostic, DiagnosticSeverity, ObjectAddress,
     ObjectId, ObjectKind, RevisionedObjectHandle, SourceId, SourceKind, SourceLocator, UnityClass,
-    UnityDocument, WorkspaceId, WorkspaceRevision, YamlDocumentSelector,
+    UnityDocument, WorkspaceId, WorkspaceRevision, YamlDocumentSelector, yaml_schema_digest,
 };
 use unity_asset_yaml::YamlDocument;
 
-use crate::schema::{
-    BinarySchemaVersion, DeclaredUnityVersion, SchemaOrigin, SchemaProvenance, digest_yaml_schema,
-};
+use crate::schema::{BinarySchemaVersion, DeclaredUnityVersion, SchemaOrigin, SchemaProvenance};
 
 use super::interface::WorkspaceConfig;
 use super::source_catalog::LocatorResolution;
 use super::state::WorkspaceState;
 use super::store::SourceEntry;
 use super::view::{
-    self, WorkspaceAllocationUnit, WorkspaceBytes, WorkspaceError, WorkspaceLookup,
+    self, WorkspaceAllocationUnit, WorkspaceByteRange, WorkspaceError, WorkspaceLookup,
     WorkspaceObject, WorkspaceObjectValue, WorkspaceSource, WorkspaceView, WorkspaceYamlObject,
 };
 
@@ -565,7 +563,7 @@ impl WorkspaceView for WorkspaceSnapshot {
                 )?;
                 let provenance = SchemaProvenance::yaml(
                     document.entries()[matched_index].class_id,
-                    digest_yaml_schema(&document.entries()[matched_index], budget).map_err(
+                    yaml_schema_digest(&document.entries()[matched_index], budget).map_err(
                         |error| WorkspaceError::operation("YAML semantic schema digest", error),
                     )?,
                 );
@@ -584,7 +582,7 @@ impl WorkspaceView for WorkspaceSnapshot {
         offset: u64,
         size: u64,
         budget: &mut AssetLoadBudget,
-    ) -> Result<WorkspaceBytes, WorkspaceError> {
+    ) -> Result<WorkspaceByteRange, WorkspaceError> {
         if source.workspace() != self.workspace_id() {
             return Err(ContractError::WorkspaceMismatch {
                 expected: self.workspace_id(),
@@ -600,7 +598,19 @@ impl WorkspaceView for WorkspaceSnapshot {
         let end = offset
             .checked_add(size)
             .ok_or(WorkspaceError::RangeOverflow { offset, size })?;
-        let source_len = entry.image().as_bytes().len();
+        let source_len = u64::try_from(entry.image().as_bytes().len()).map_err(|_| {
+            BudgetError::ArithmeticOverflow {
+                resource: "workspace_source_length",
+            }
+        })?;
+        if end > source_len {
+            return Err(WorkspaceError::RangeOutOfBounds {
+                source_id: source,
+                offset,
+                end,
+                source_len,
+            });
+        }
         let start = usize::try_from(offset).map_err(|_| WorkspaceError::RangeOutOfBounds {
             source_id: source,
             offset,
@@ -613,20 +623,8 @@ impl WorkspaceView for WorkspaceSnapshot {
             end,
             source_len,
         })?;
-        if end_usize > source_len {
-            return Err(WorkspaceError::RangeOutOfBounds {
-                source_id: source,
-                offset,
-                end,
-                source_len,
-            });
-        }
         budget.consume_bytes(size)?;
-        Ok(WorkspaceBytes::new(
-            source,
-            entry.image().clone(),
-            start..end_usize,
-        ))
+        WorkspaceByteRange::from_committed_source(source, entry.image().clone(), start..end_usize)
     }
 }
 

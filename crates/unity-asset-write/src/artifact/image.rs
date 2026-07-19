@@ -674,6 +674,10 @@ impl ValidatedImage {
         }
     }
 
+    pub(crate) fn contiguous_range(&self, range: Range<u64>) -> Option<&[u8]> {
+        self.image.contiguous_range(range)
+    }
+
     pub(crate) fn stream_verified_to(
         &self,
         sink: &mut impl Write,
