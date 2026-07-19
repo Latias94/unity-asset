@@ -18,7 +18,7 @@ mod payload;
 
 pub use batch::{
     ArtifactBatch, ArtifactBatchDeclaration, ArtifactBuildError, ArtifactHandle, OutputSlot,
-    PreparedArtifact, PreparedArtifactSet, PreparedOutput, PreparedOutputIter,
+    PreparedArtifact, PreparedArtifactSet, PreparedOutput, PreparedOutputIter, YamlArtifactWriter,
 };
 pub use budget::{ArtifactBudget, ArtifactBudgetError, ArtifactBudgetUsage, ArtifactLimits};
 pub(crate) use budget::{CodecScratchBudget, CodecScratchLease};
@@ -28,7 +28,8 @@ pub use footprint::{
 };
 pub use format::{
     PreparedArtifactFormat, PreparedArtifactKind, ResourceLayoutDigest,
-    StreamedResourceExtentInspection, StreamedResourceInspection,
+    StreamedResourceExtentInspection, StreamedResourceInspection, VerbatimSourceInspection,
+    YamlInspection,
 };
 pub use image::ArtifactReader;
 pub use name::{ArtifactNameError, LogicalArtifactName};

@@ -34,6 +34,10 @@ fn resource_payload(bytes: &[u8], local: u128) -> ArtifactPayload {
     source_payload(bytes.to_vec(), SourceKind::StreamedResource, local)
 }
 
+fn yaml_payload(bytes: &[u8], local: u128) -> ArtifactPayload {
+    source_payload(bytes.to_vec(), SourceKind::Yaml, local)
+}
+
 fn minimal_serialized_file_v8_le() -> Vec<u8> {
     let version = 8_u32;
     let data_offset = 128_u32;
@@ -126,6 +130,310 @@ fn serialized_format_is_produced_only_by_the_fixed_binary_inspector() {
         set.outputs().next().unwrap().artifact().format(),
         PreparedArtifactFormat::SerializedFile(proof)
             if proof.version() == 8 && proof.byte_order() == ByteOrder::Little
+    ));
+}
+
+#[test]
+fn prepared_set_resolves_only_handles_from_its_own_graph() {
+    let first_payload = resource_payload(b"first", 100);
+    let mut first_artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut first_inspection_budget = AssetLoadBudget::default();
+    let mut first_declaration =
+        ArtifactBatchDeclaration::begin(&mut first_artifact_budget, &mut first_inspection_budget)
+            .unwrap();
+    let first_output = first_declaration
+        .declare_output(name("first.resS"))
+        .unwrap();
+    let mut first_batch = first_declaration.seal_output_names().unwrap();
+    let first_handle = prepare_resource(&mut first_batch, &first_payload).unwrap();
+    first_batch.bind_output(first_output, first_handle).unwrap();
+    let first_set = first_batch.finish().unwrap();
+
+    let second_payload = resource_payload(b"second", 101);
+    let mut second_artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut second_inspection_budget = AssetLoadBudget::default();
+    let mut second_declaration =
+        ArtifactBatchDeclaration::begin(&mut second_artifact_budget, &mut second_inspection_budget)
+            .unwrap();
+    let second_output = second_declaration
+        .declare_output(name("second.resS"))
+        .unwrap();
+    let mut second_batch = second_declaration.seal_output_names().unwrap();
+    let second_handle = prepare_resource(&mut second_batch, &second_payload).unwrap();
+    second_batch
+        .bind_output(second_output, second_handle)
+        .unwrap();
+    let second_set = second_batch.finish().unwrap();
+
+    assert!(std::ptr::eq(
+        first_set.artifact(first_handle).unwrap(),
+        first_set.outputs().next().unwrap().artifact()
+    ));
+    assert!(matches!(
+        first_set.artifact(second_handle),
+        Err(ArtifactBuildError::ForeignArtifactHandle { artifact: 0 })
+    ));
+    assert!(matches!(
+        second_set.artifact(first_handle),
+        Err(ArtifactBuildError::ForeignArtifactHandle { artifact: 0 })
+    ));
+}
+
+#[test]
+fn verbatim_source_leaf_retains_exact_provenance_without_generated_bytes() {
+    let backing = Arc::<[u8]>::from(b"unchanged bundle member".as_slice());
+    let source = SourceId::new(
+        WorkspaceId::from_u128(17).unwrap(),
+        SourceKind::AssetBundle,
+        102,
+    )
+    .unwrap();
+    let image = VerifiedSourceImage::verify(SourceKind::AssetBundle, Arc::clone(&backing));
+    let fingerprint = image.fingerprint();
+    let payload = ArtifactPayload::source_backed(source, image).unwrap();
+    let initial_strong_count = Arc::strong_count(&backing);
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let mut declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    let output = declaration
+        .declare_output(name("unchanged.bundle"))
+        .unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+    let handle = batch.prepare_verbatim_source(&payload).unwrap();
+    batch.bind_output(output, handle).unwrap();
+    let set = batch.finish().unwrap();
+    let artifact = set.artifact(handle).unwrap();
+
+    let PreparedArtifactFormat::VerbatimSource(proof) = artifact.format() else {
+        panic!("verbatim preparation must retain a source proof");
+    };
+    assert_eq!(
+        artifact.format().kind(),
+        PreparedArtifactKind::VerbatimSource
+    );
+    assert_eq!(proof.source_id(), source);
+    assert_eq!(proof.fingerprint(), fingerprint);
+    assert_eq!(proof.length(), backing.len() as u64);
+    assert_eq!(artifact.digest(), fingerprint.digest());
+    assert_eq!(artifact.source_dependencies().len(), 1);
+    assert_eq!(artifact.source_dependencies()[0].source(), source);
+    assert_eq!(
+        artifact.source_dependencies()[0].referenced_bytes(),
+        backing.len() as u64
+    );
+    assert_eq!(artifact.footprint().generated_bytes(), 0);
+    assert_eq!(artifact.build_counters().generated_chunks(), 0);
+    assert_eq!(artifact.build_counters().source_ranges(), 1);
+    assert_eq!(artifact.build_counters().digest_reuses(), 1);
+    assert!(Arc::strong_count(&backing) > initial_strong_count);
+}
+
+#[test]
+fn verbatim_source_rejects_generated_payload_and_rolls_back() {
+    let generated = ArtifactPayload::from_generated_vec(Arc::new(b"generated".to_vec())).unwrap();
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    {
+        let mut declaration =
+            ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+        declaration.declare_output(name("generated.bin")).unwrap();
+        let mut batch = declaration.seal_output_names().unwrap();
+        assert!(matches!(
+            batch.prepare_verbatim_source(&generated),
+            Err(ArtifactBuildError::VerbatimSourceRequiresSourcePayload)
+        ));
+        assert!(matches!(
+            batch.finish(),
+            Err(ArtifactBuildError::PoisonedBatch)
+        ));
+    }
+    assert_eq!(
+        artifact_budget.committed_usage(),
+        ArtifactBudgetUsage::default()
+    );
+}
+
+#[test]
+fn yaml_leaf_reparses_valid_source_bytes_and_retains_syntax_proof() {
+    let payload = yaml_payload(b"root:\n  values: [1, 2, 3]\n", 103);
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let mut declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    let output = declaration.declare_output(name("scene.yaml")).unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+    let handle = batch.prepare_yaml(&payload).unwrap();
+    batch.bind_output(output, handle).unwrap();
+    let set = batch.finish().unwrap();
+    let artifact = set.artifact(handle).unwrap();
+
+    let PreparedArtifactFormat::Yaml(proof) = artifact.format() else {
+        panic!("YAML preparation must retain a syntax proof");
+    };
+    assert_eq!(artifact.format().kind(), PreparedArtifactKind::Yaml);
+    assert_eq!(proof.encoded_bytes(), payload.len());
+    assert_eq!(proof.documents(), 1);
+    assert!(proof.events() >= 10);
+    assert_eq!(proof.max_depth(), 3);
+    assert_eq!(artifact.source_dependencies().len(), 1);
+}
+
+#[test]
+fn yaml_leaf_accepts_unity_directives_tags_and_document_anchors() {
+    let payload = yaml_payload(
+        b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Example\n",
+        110,
+    );
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let mut declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    let output = declaration
+        .declare_output(name("unity-scene.yaml"))
+        .unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+    let handle = batch.prepare_yaml(&payload).unwrap();
+    batch.bind_output(output, handle).unwrap();
+    let set = batch.finish().unwrap();
+
+    assert!(matches!(
+        set.artifact(handle).unwrap().format(),
+        PreparedArtifactFormat::Yaml(proof)
+            if proof.documents() == 1 && proof.encoded_bytes() == payload.len()
+    ));
+}
+
+#[test]
+fn yaml_writer_promotes_budgeted_generated_bytes_only_after_reparse() {
+    let encoded = b"root:\n  generated: true\n";
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let mut declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    let output = declaration.declare_output(name("generated.yaml")).unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+    let mut writer = batch.yaml_writer().unwrap();
+    writer.write_all(encoded).unwrap();
+    let handle = batch.prepare_yaml_writer(writer).unwrap();
+    batch.bind_output(output, handle).unwrap();
+    let set = batch.finish().unwrap();
+    let artifact = set.artifact(handle).unwrap();
+
+    assert!(matches!(
+        artifact.format(),
+        PreparedArtifactFormat::Yaml(proof)
+            if proof.encoded_bytes() == encoded.len() as u64 && proof.documents() == 1
+    ));
+    assert!(artifact.source_dependencies().is_empty());
+    assert_eq!(artifact.footprint().proof_bytes(), encoded.len() as u64);
+    assert!(artifact.footprint().generated_bytes() >= encoded.len() as u64);
+    assert_eq!(artifact.build_counters().generated_chunks(), 1);
+    let mut actual = Vec::new();
+    artifact.reader().read_to_end(&mut actual).unwrap();
+    assert_eq!(actual, encoded);
+}
+
+#[test]
+fn yaml_reparse_accepts_utf8_code_points_split_across_source_segments() {
+    let first = yaml_payload(b"root: caf\xc3", 104);
+    let second = yaml_payload(b"\xa9\n", 105);
+    let declared_len = first.len() + second.len();
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let mut declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    let output = declaration.declare_output(name("unicode.yaml")).unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+    let handle = batch
+        .prepare_yaml_encoded(declared_len, |encoder| {
+            encoder.push_payload_full(&first)?;
+            encoder.push_payload_full(&second)
+        })
+        .unwrap();
+    batch.bind_output(output, handle).unwrap();
+    let set = batch.finish().unwrap();
+    let artifact = set.artifact(handle).unwrap();
+
+    assert!(matches!(
+        artifact.format(),
+        PreparedArtifactFormat::Yaml(proof)
+            if proof.encoded_bytes() == declared_len && proof.documents() == 1
+    ));
+    assert_eq!(artifact.footprint().segments(), 2);
+    assert_eq!(artifact.source_dependencies().len(), 2);
+}
+
+#[test]
+fn yaml_leaf_rejects_invalid_syntax_without_committing_artifact_usage() {
+    let payload = yaml_payload(b"root: [1, 2\n", 106);
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    {
+        let mut declaration =
+            ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+        declaration.declare_output(name("invalid.yaml")).unwrap();
+        let mut batch = declaration.seal_output_names().unwrap();
+        assert!(matches!(
+            batch.prepare_yaml(&payload),
+            Err(ArtifactBuildError::InvalidYaml(_))
+        ));
+        assert!(matches!(
+            batch.finish(),
+            Err(ArtifactBuildError::PoisonedBatch)
+        ));
+    }
+    assert_eq!(
+        artifact_budget.committed_usage(),
+        ArtifactBudgetUsage::default()
+    );
+}
+
+#[test]
+fn yaml_leaf_rejects_invalid_segmented_utf8_with_a_typed_offset() {
+    let first = yaml_payload(b"root: \xf0\x9f", 107);
+    let second = yaml_payload(b"x\n", 108);
+    let declared_len = first.len() + second.len();
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let mut declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    declaration
+        .declare_output(name("invalid-utf8.yaml"))
+        .unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+
+    assert!(matches!(
+        batch.prepare_yaml_encoded(declared_len, |encoder| {
+            encoder.push_payload_full(&first)?;
+            encoder.push_payload_full(&second)
+        }),
+        Err(ArtifactBuildError::InvalidYamlUtf8 { offset: 6 })
+    ));
+}
+
+#[test]
+fn yaml_reparse_charges_parser_work_before_parsing() {
+    let payload = yaml_payload(b"root: value\n", 109);
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let load_limits = unity_asset_core::AssetLoadLimits {
+        max_bytes: 8 * 1024,
+        ..unity_asset_core::AssetLoadLimits::default()
+    };
+    let mut inspection_budget = AssetLoadBudget::new(load_limits).unwrap();
+    let mut declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    declaration.declare_output(name("budgeted.yaml")).unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+
+    assert!(matches!(
+        batch.prepare_yaml(&payload),
+        Err(ArtifactBuildError::LoadBudget(
+            unity_asset_core::BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }
+        ))
     ));
 }
 

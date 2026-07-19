@@ -3703,6 +3703,7 @@ dependencies = [
  "unicode-normalization",
  "unity-asset-binary",
  "unity-asset-core",
+ "yaml-rust2",
 ]
 
 [[package]]

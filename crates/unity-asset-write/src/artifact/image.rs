@@ -601,6 +601,14 @@ impl SealedImage {
         &self.image
     }
 
+    pub(crate) const fn digest(&self) -> DigestV1 {
+        self.digest
+    }
+
+    pub(crate) fn dependencies(&self) -> &[ArtifactSourceDependency] {
+        &self.dependencies
+    }
+
     pub(crate) fn into_validated(
         mut self,
         inspection_bytes: u64,

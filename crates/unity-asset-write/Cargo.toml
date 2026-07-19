@@ -23,6 +23,7 @@ flate2 = { workspace = true }
 libc = "0.2"
 thiserror = { workspace = true }
 unicode-normalization = { workspace = true }
+yaml-rust2 = { workspace = true }
 
 [build-dependencies]
 cc = "1"

@@ -2,11 +2,18 @@ use unity_asset_binary::SegmentedBytes;
 use unity_asset_binary::asset::{SerializedFileInspection, SerializedFileParser};
 use unity_asset_binary::bundle::{BundleInspection, BundleParser};
 use unity_asset_binary::webfile::{WebFile, WebFileInspection};
-use unity_asset_core::{AssetLoadBudget, DigestV1, DigestV1Builder, vec_allocation_bytes};
+use unity_asset_core::{
+    AssetLoadBudget, DigestV1, DigestV1Builder, SourceFingerprint, SourceId, vec_allocation_bytes,
+};
+use yaml_rust2::parser::{Event, Parser};
 
-use super::{ArtifactBudgetError, ArtifactBuildError};
+use super::{ArtifactBudgetError, ArtifactBuildError, ArtifactSourceDependency};
 
 const RESOURCE_LAYOUT_DOMAIN: &[u8] = b"unity-asset:resource-layout:v1\0";
+// yaml-rust2 owns scanner stacks, token strings, and anchor/tag tables. Charge a conservative
+// linear allowance plus small-input overhead before entering its infallible allocation paths.
+const YAML_PARSER_WORK_MULTIPLIER: u64 = 32;
+const YAML_PARSER_FIXED_WORK_BYTES: u64 = 8 * 1024;
 
 /// The independently inspected wire family of a prepared artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +23,8 @@ pub enum PreparedArtifactKind {
     AssetBundle,
     WebFile,
     StreamedResource,
+    Yaml,
+    VerbatimSource,
 }
 
 /// Opaque parser proof retained with one exact byte image.
@@ -26,6 +35,8 @@ pub enum PreparedArtifactFormat {
     AssetBundle(BundleInspection),
     WebFile(WebFileInspection),
     StreamedResource(StreamedResourceInspection),
+    Yaml(YamlInspection),
+    VerbatimSource(VerbatimSourceInspection),
 }
 
 impl PreparedArtifactFormat {
@@ -36,12 +47,16 @@ impl PreparedArtifactFormat {
             Self::AssetBundle(_) => PreparedArtifactKind::AssetBundle,
             Self::WebFile(_) => PreparedArtifactKind::WebFile,
             Self::StreamedResource(_) => PreparedArtifactKind::StreamedResource,
+            Self::Yaml(_) => PreparedArtifactKind::Yaml,
+            Self::VerbatimSource(_) => PreparedArtifactKind::VerbatimSource,
         }
     }
 
     pub(crate) fn inspect(
         expected: ExpectedArtifactFormat,
         image: &SegmentedBytes,
+        image_digest: DigestV1,
+        source_dependencies: &[ArtifactSourceDependency],
         budget: &mut AssetLoadBudget,
     ) -> Result<(Self, u64), ArtifactBuildError> {
         match expected {
@@ -66,6 +81,13 @@ impl PreparedArtifactFormat {
                     preaccounted_heap_bytes,
                 ))
             }
+            ExpectedArtifactFormat::Yaml => {
+                Ok((Self::Yaml(YamlInspection::inspect(image, budget)?), 0))
+            }
+            ExpectedArtifactFormat::VerbatimSource(proof) => {
+                proof.validate(image, image_digest, source_dependencies)?;
+                Ok((Self::VerbatimSource(proof), 0))
+            }
         }
     }
 
@@ -75,8 +97,281 @@ impl PreparedArtifactFormat {
             Self::AssetBundle(proof) => Ok(proof.retained_heap_bytes()?),
             Self::WebFile(proof) => Ok(proof.retained_heap_bytes()?),
             Self::StreamedResource(proof) => proof.retained_heap_bytes(),
+            Self::Yaml(_) | Self::VerbatimSource(_) => Ok(0),
         }
     }
+}
+
+/// Syntax proof produced by reparsing the exact segmented YAML image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YamlInspection {
+    encoded_bytes: u64,
+    documents: u64,
+    events: u64,
+    max_depth: u32,
+}
+
+impl YamlInspection {
+    fn inspect(
+        image: &SegmentedBytes,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, ArtifactBuildError> {
+        let parser_work = image
+            .len()
+            .checked_mul(YAML_PARSER_WORK_MULTIPLIER)
+            .and_then(|bytes| bytes.checked_add(YAML_PARSER_FIXED_WORK_BYTES))
+            .ok_or(ArtifactBuildError::ArithmeticOverflow {
+                resource: "yaml_parser_work_bytes",
+            })?;
+        let charged_bytes =
+            image
+                .len()
+                .checked_add(parser_work)
+                .ok_or(ArtifactBuildError::ArithmeticOverflow {
+                    resource: "yaml_parser_work_bytes",
+                })?;
+        budget.consume_bytes(charged_bytes)?;
+        validate_segmented_utf8(image)?;
+
+        let mut parser = Parser::new(SegmentedChars::new(image)).keep_tags(true);
+        let mut documents = 0_u64;
+        let mut events = 0_u64;
+        let mut depth = 0_u32;
+        let mut max_depth = 0_u32;
+        loop {
+            let (event, _) = parser
+                .next_token()
+                .map_err(ArtifactBuildError::InvalidYaml)?;
+            budget.consume_entries(1)?;
+            events = events
+                .checked_add(1)
+                .ok_or(ArtifactBuildError::ArithmeticOverflow {
+                    resource: "yaml_event_count",
+                })?;
+            match event {
+                Event::DocumentStart => {
+                    documents =
+                        documents
+                            .checked_add(1)
+                            .ok_or(ArtifactBuildError::ArithmeticOverflow {
+                                resource: "yaml_document_count",
+                            })?;
+                }
+                Event::SequenceStart(..) | Event::MappingStart(..) => {
+                    depth = depth
+                        .checked_add(1)
+                        .ok_or(ArtifactBuildError::ArithmeticOverflow {
+                            resource: "yaml_depth",
+                        })?;
+                    budget.observe_depth(depth)?;
+                    max_depth = max_depth.max(depth);
+                }
+                Event::SequenceEnd | Event::MappingEnd => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or(ArtifactBuildError::InternalInvariant {
+                            message: "YAML parser emitted an unmatched collection end",
+                        })?;
+                }
+                Event::StreamEnd => break,
+                Event::Nothing => {
+                    return Err(ArtifactBuildError::InternalInvariant {
+                        message: "YAML parser emitted its reserved Nothing event",
+                    });
+                }
+                Event::StreamStart | Event::DocumentEnd | Event::Alias(_) | Event::Scalar(..) => {}
+            }
+        }
+        if depth != 0 {
+            return Err(ArtifactBuildError::InternalInvariant {
+                message: "YAML parser ended with open collections",
+            });
+        }
+        Ok(Self {
+            encoded_bytes: image.len(),
+            documents,
+            events,
+            max_depth,
+        })
+    }
+
+    #[must_use]
+    pub const fn encoded_bytes(&self) -> u64 {
+        self.encoded_bytes
+    }
+
+    #[must_use]
+    pub const fn documents(&self) -> u64 {
+        self.documents
+    }
+
+    #[must_use]
+    pub const fn events(&self) -> u64 {
+        self.events
+    }
+
+    #[must_use]
+    pub const fn max_depth(&self) -> u32 {
+        self.max_depth
+    }
+}
+
+/// Identity proof for an unchanged artifact that retains its complete verified source image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerbatimSourceInspection {
+    source_id: SourceId,
+    fingerprint: SourceFingerprint,
+    length: u64,
+}
+
+impl VerbatimSourceInspection {
+    pub(crate) const fn new(
+        source_id: SourceId,
+        fingerprint: SourceFingerprint,
+        length: u64,
+    ) -> Self {
+        Self {
+            source_id,
+            fingerprint,
+            length,
+        }
+    }
+
+    fn validate(
+        self,
+        image: &SegmentedBytes,
+        image_digest: DigestV1,
+        dependencies: &[ArtifactSourceDependency],
+    ) -> Result<(), ArtifactBuildError> {
+        if image.len() != self.length {
+            return Err(ArtifactBuildError::VerbatimSourceLengthMismatch {
+                expected: self.length,
+                actual: image.len(),
+            });
+        }
+        if image_digest != self.fingerprint.digest() {
+            return Err(ArtifactBuildError::VerbatimSourceDigestMismatch {
+                expected: self.fingerprint.digest(),
+                actual: image_digest,
+            });
+        }
+        let [dependency] = dependencies else {
+            return Err(ArtifactBuildError::VerbatimSourceProvenanceMismatch);
+        };
+        if dependency.source() != self.source_id
+            || dependency.fingerprint() != self.fingerprint
+            || dependency.referenced_bytes() != self.length
+        {
+            return Err(ArtifactBuildError::VerbatimSourceProvenanceMismatch);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
+    #[must_use]
+    pub const fn fingerprint(&self) -> SourceFingerprint {
+        self.fingerprint
+    }
+
+    #[must_use]
+    pub const fn length(&self) -> u64 {
+        self.length
+    }
+}
+
+struct SegmentedByteCursor<'image> {
+    image: &'image SegmentedBytes,
+    segment: usize,
+    byte: usize,
+    position: u64,
+}
+
+impl<'image> SegmentedByteCursor<'image> {
+    const fn new(image: &'image SegmentedBytes) -> Self {
+        Self {
+            image,
+            segment: 0,
+            byte: 0,
+            position: 0,
+        }
+    }
+
+    fn next_byte(&mut self) -> Option<u8> {
+        loop {
+            let segment = self.image.segments().get(self.segment)?;
+            if let Some(value) = segment.as_slice().get(self.byte).copied() {
+                self.byte += 1;
+                self.position += 1;
+                return Some(value);
+            }
+            self.segment += 1;
+            self.byte = 0;
+        }
+    }
+
+    fn next_char(&mut self) -> Result<Option<char>, u64> {
+        let start = self.position;
+        let Some(first) = self.next_byte() else {
+            return Ok(None);
+        };
+        let width = match first {
+            0x00..=0x7f => 1,
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => return Err(start),
+        };
+        let mut encoded = [0_u8; 4];
+        encoded[0] = first;
+        for slot in &mut encoded[1..width] {
+            *slot = self.next_byte().ok_or(start)?;
+        }
+        let encoded = std::str::from_utf8(&encoded[..width]).map_err(|_| start)?;
+        encoded.chars().next().map(Some).ok_or(start)
+    }
+}
+
+struct SegmentedChars<'image> {
+    bytes: SegmentedByteCursor<'image>,
+}
+
+impl<'image> SegmentedChars<'image> {
+    const fn new(image: &'image SegmentedBytes) -> Self {
+        Self {
+            bytes: SegmentedByteCursor::new(image),
+        }
+    }
+}
+
+impl Iterator for SegmentedChars<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.bytes.next_char() {
+            Ok(value) => value,
+            Err(_) => {
+                debug_assert!(
+                    false,
+                    "segmented YAML was validated before character iteration"
+                );
+                None
+            }
+        }
+    }
+}
+
+fn validate_segmented_utf8(image: &SegmentedBytes) -> Result<(), ArtifactBuildError> {
+    let mut cursor = SegmentedByteCursor::new(image);
+    while cursor
+        .next_char()
+        .map_err(|offset| ArtifactBuildError::InvalidYamlUtf8 { offset })?
+        .is_some()
+    {}
+    Ok(())
 }
 
 /// Digest of canonical resource extents, independent from artifact content identity.
@@ -352,6 +647,8 @@ pub(crate) enum ExpectedArtifactFormat {
     AssetBundle,
     WebFile,
     StreamedResource(StreamedResourceLayoutProof),
+    Yaml,
+    VerbatimSource(VerbatimSourceInspection),
 }
 
 fn align_up(value: u64, alignment: u32) -> Result<u64, ArtifactBuildError> {
