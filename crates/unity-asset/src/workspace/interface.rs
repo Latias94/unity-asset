@@ -289,7 +289,7 @@ impl AssetWorkspace {
         store
             .remove_all(&removed, budget)
             .map_err(WorkspaceError::from)?;
-        let catalog = catalog.commit()?;
+        let catalog = catalog.commit(budget)?;
         let next = WorkspaceState::new(self.workspace_id(), catalog, store, budget)
             .map_err(WorkspaceError::from)?;
         consume_arc_allocation::<WorkspaceState>(budget, "workspace_state")?;
@@ -321,7 +321,7 @@ impl AssetWorkspace {
 
         let root_descriptor = SourceDescriptor::root(prepared.kind, alias, origin);
         let root = register_prepared(prepared, root_descriptor, &mut catalog, &mut store, budget)?;
-        let catalog = catalog.commit()?;
+        let catalog = catalog.commit(budget)?;
         let next = WorkspaceState::new(self.workspace_id(), catalog, store, budget)
             .map_err(WorkspaceError::from)?;
         if next.revision() != self.state.revision() {

@@ -114,6 +114,24 @@ fn source_locators_preserve_nested_container_ownership() {
 }
 
 #[test]
+fn source_locators_encode_companion_relationships_explicitly() {
+    let locator = SourceLocator::path("main.assets")
+        .unwrap()
+        .child(
+            ContainmentKind::Companion,
+            SourceMemberId::new("main.resS").unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(locator.members()[0].container(), ContainmentKind::Companion);
+    assert_eq!(ContainmentKind::Companion.tag(), "companion");
+    assert_eq!(
+        serde_json::from_str::<SourceLocator>(&serde_json::to_string(&locator).unwrap()).unwrap(),
+        locator
+    );
+}
+
+#[test]
 fn identity_clone_sizes_include_all_owned_backing_allocations() {
     let alias = "build/game.apk";
     let archive_name = "assets/data.web";

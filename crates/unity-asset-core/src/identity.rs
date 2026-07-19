@@ -321,6 +321,7 @@ pub enum ContainmentKind {
     Archive,
     WebFile,
     Bundle,
+    Companion,
 }
 
 impl ContainmentKind {
@@ -330,6 +331,7 @@ impl ContainmentKind {
             Self::Archive => "archive",
             Self::WebFile => "web_file",
             Self::Bundle => "bundle",
+            Self::Companion => "companion",
         }
     }
 }
