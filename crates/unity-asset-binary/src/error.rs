@@ -14,6 +14,38 @@ pub enum BinaryObjectIdentityError {
     DuplicatePathId { path_id: i64 },
 }
 
+/// Invalid use of replacement bytes with an existing SerializedFile object identity.
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryObjectReplacementError {
+    /// Replacement bytes cannot be interpreted without the object's canonical TypeTree.
+    #[error("object {path_id} (class {class_id}) has no TypeTree schema for replacement parsing")]
+    MissingSchema { path_id: i64, class_id: i32 },
+    /// Lenient traversal reached the end of the replacement extent without completing the schema.
+    #[error(
+        "replacement traversal for object {path_id} stopped before completing its TypeTree after consuming all {consumed} bytes"
+    )]
+    Incomplete { path_id: i64, consumed: usize },
+    /// One field-level read required more bytes than remained in the replacement extent.
+    #[error(
+        "replacement traversal for object {path_id} requires {required_at_failure} bytes at the failing read but only {available_at_failure} bytes remain"
+    )]
+    Truncated {
+        path_id: i64,
+        required_at_failure: usize,
+        available_at_failure: usize,
+    },
+    /// A complete schema traversal did not consume the caller-declared replacement extent.
+    #[error(
+        "replacement bytes for object {path_id} contain {remaining} trailing bytes after consuming {consumed} of {total} bytes"
+    )]
+    TrailingBytes {
+        path_id: i64,
+        consumed: usize,
+        total: usize,
+        remaining: usize,
+    },
+}
+
 /// Result type for Unity binary operations
 pub type Result<T> = std::result::Result<T, BinaryError>;
 
@@ -47,6 +79,10 @@ pub enum BinaryError {
     /// Invalid object identity topology.
     #[error("Invalid object identity: {0}")]
     ObjectIdentity(#[from] BinaryObjectIdentityError),
+
+    /// Invalid replacement payload for an existing object identity.
+    #[error("Invalid object replacement: {0}")]
+    ObjectReplacement(#[from] BinaryObjectReplacementError),
 
     /// Parsing error
     #[error("Parse error: {0}")]
@@ -239,6 +275,7 @@ impl BinaryError {
             BinaryError::DecompressionFailed(_) => true,    // Might retry or skip
             BinaryError::InvalidData(_) => true,            // Might skip corrupted object
             BinaryError::ObjectIdentity(_) => true,         // Might skip a malformed file
+            BinaryError::ObjectReplacement(_) => true,      // Might reject one prepared mutation
             BinaryError::ParseError(_) => true,             // Might skip problematic object
             BinaryError::NotEnoughData { .. } => false,
             BinaryError::InvalidSignature { .. } => false,
@@ -263,6 +300,7 @@ impl BinaryError {
             BinaryError::DecompressionFailed(_) => ErrorSeverity::Medium,
             BinaryError::InvalidData(_) => ErrorSeverity::Medium,
             BinaryError::ObjectIdentity(_) => ErrorSeverity::Medium,
+            BinaryError::ObjectReplacement(_) => ErrorSeverity::Medium,
             BinaryError::ParseError(_) => ErrorSeverity::Medium,
             BinaryError::NotEnoughData { .. } => ErrorSeverity::High,
             BinaryError::InvalidSignature { .. } => ErrorSeverity::High,
@@ -291,6 +329,7 @@ impl BinaryError {
             BinaryError::CorruptedData(_) => Some("Skip corrupted section"),
             BinaryError::VersionCompatibility(_) => Some("Enable compatibility mode"),
             BinaryError::ObjectIdentity(_) => Some("Skip malformed SerializedFile"),
+            BinaryError::ObjectReplacement(_) => Some("Reject the invalid object replacement"),
             _ => None,
         }
     }

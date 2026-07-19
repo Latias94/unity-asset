@@ -1,7 +1,7 @@
 //! Unity object representation and helpers.
 
 use crate::asset::{ObjectInfo, SerializedFile, SerializedType};
-use crate::error::{BinaryError, Result};
+use crate::error::{BinaryError, BinaryObjectReplacementError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::reference::BinaryReferenceScan;
 use crate::shared_bytes::SharedBytes;
@@ -142,6 +142,78 @@ impl<'a> ObjectHandle<'a> {
         })
     }
 
+    /// Parses caller-provided replacement bytes with this object's canonical schema and identity.
+    ///
+    /// The replacement extent must contain exactly one complete object. The original
+    /// [`ObjectInfo`] and SerializedFile backing remain untouched.
+    pub fn read_replacement(
+        &self,
+        replacement: &[u8],
+        budget: &mut AssetLoadBudget,
+    ) -> Result<UnityObject> {
+        self.read_replacement_with_options(
+            replacement,
+            budget,
+            TypeTreeParseOptions {
+                mode: TypeTreeParseMode::Strict,
+            },
+        )
+    }
+
+    /// Parses replacement bytes under an explicit TypeTree recovery policy.
+    pub fn read_replacement_with_options(
+        &self,
+        replacement: &[u8],
+        budget: &mut AssetLoadBudget,
+        options: TypeTreeParseOptions,
+    ) -> Result<UnityObject> {
+        Ok(self
+            .materialize_replacement_with_options(replacement, budget, options)?
+            .into_object())
+    }
+
+    /// Parses replacement bytes and retains the exact schema selected for that parse.
+    pub fn materialize_replacement(
+        &self,
+        replacement: &[u8],
+        budget: &mut AssetLoadBudget,
+    ) -> Result<MaterializedObject> {
+        self.materialize_replacement_with_options(
+            replacement,
+            budget,
+            TypeTreeParseOptions {
+                mode: TypeTreeParseMode::Strict,
+            },
+        )
+    }
+
+    /// Parses replacement bytes and retains the schema under an explicit recovery policy.
+    pub fn materialize_replacement_with_options(
+        &self,
+        replacement: &[u8],
+        budget: &mut AssetLoadBudget,
+        options: TypeTreeParseOptions,
+    ) -> Result<MaterializedObject> {
+        let selected =
+            self.selected_schema(budget)?
+                .ok_or(BinaryObjectReplacementError::MissingSchema {
+                    path_id: self.path_id(),
+                    class_id: self.class_id(),
+                })?;
+        let object = UnityObject::from_replacement_with_compiled_schema(
+            self.file,
+            self.info,
+            replacement,
+            &selected.schema,
+            budget,
+            options,
+        )?;
+        Ok(MaterializedObject {
+            object,
+            selected_schema: Some(selected),
+        })
+    }
+
     /// Returns the canonical TypeTree schema selected for this object.
     ///
     /// Schemas backed by this file's SerializedType table are shared across every handle for the
@@ -228,6 +300,27 @@ impl<'a> ObjectHandle<'a> {
         Ok(Some(schema.scan_pptrs(&mut reader, budget)?))
     }
 
+    /// Scans caller-provided replacement bytes for PPtrs without materializing a UnityValue tree.
+    ///
+    /// Returns `None` when this object has no canonical TypeTree schema. A successful scan
+    /// consumes the complete replacement extent.
+    pub fn scan_replacement_pptrs(
+        &self,
+        replacement: &[u8],
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Option<PPtrScanResult>> {
+        let Some(schema) = self.schema(budget)? else {
+            return Ok(None);
+        };
+        parse_replacement_extent(
+            replacement,
+            self.file.header.byte_order(),
+            self.path_id(),
+            |reader| schema.scan_pptrs(reader, budget),
+        )
+        .map(Some)
+    }
+
     /// Scans this object's canonical TypeTree without materializing a `UnityValue` tree.
     ///
     /// Occurrences retain their traversal order, field paths, null pointers, and raw file IDs.
@@ -259,6 +352,40 @@ impl<'a> ObjectHandle<'a> {
             budget,
             options,
         )?))
+    }
+
+    /// Scans path-aware references from replacement bytes without materializing a UnityValue tree.
+    pub fn scan_replacement_reference_occurrences(
+        &self,
+        replacement: &[u8],
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Option<BinaryReferenceScan>> {
+        self.scan_replacement_reference_occurrences_with_options(
+            replacement,
+            budget,
+            TypeTreeParseOptions {
+                mode: TypeTreeParseMode::Strict,
+            },
+        )
+    }
+
+    /// Scans path-aware replacement references under an explicit TypeTree recovery policy.
+    pub fn scan_replacement_reference_occurrences_with_options(
+        &self,
+        replacement: &[u8],
+        budget: &mut AssetLoadBudget,
+        options: TypeTreeParseOptions,
+    ) -> Result<Option<BinaryReferenceScan>> {
+        let Some(schema) = self.schema(budget)? else {
+            return Ok(None);
+        };
+        parse_replacement_extent(
+            replacement,
+            self.file.header.byte_order(),
+            self.path_id(),
+            |reader| schema.scan_reference_occurrences_with_options(reader, budget, options),
+        )
+        .map(Some)
     }
 }
 
@@ -315,6 +442,19 @@ impl ObjectBytes {
     }
 }
 
+/// Origin of the payload currently owned or referenced by a [`UnityObject`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectPayloadProvenance {
+    /// Bytes are a range of the parsed SerializedFile's immutable backing image.
+    Committed,
+    /// Bytes came from the authoritative `ObjectInfo::loaded_data` payload.
+    Loaded,
+    /// Bytes were supplied to an [`ObjectHandle`] replacement API.
+    Replacement,
+    /// The object was constructed independently of a SerializedFile payload.
+    Synthetic,
+}
+
 /// A parsed Unity object.
 ///
 /// This is an owned wrapper which carries:
@@ -326,6 +466,7 @@ pub struct UnityObject {
     pub class: UnityClass,
     byte_order: ByteOrder,
     raw: ObjectBytes,
+    payload_provenance: ObjectPayloadProvenance,
     typetree_warnings: Vec<TypeTreeParseWarning>,
     typetree_stats: TypeTreeTraversalStats,
 }
@@ -338,6 +479,7 @@ impl UnityObject {
             info,
             class,
             raw: ObjectBytes::Empty,
+            payload_provenance: ObjectPayloadProvenance::Synthetic,
             typetree_warnings: Vec::new(),
             typetree_stats: TypeTreeTraversalStats::default(),
         }
@@ -362,6 +504,7 @@ impl UnityObject {
             class,
             byte_order: ByteOrder::Little,
             raw,
+            payload_provenance: ObjectPayloadProvenance::Synthetic,
             typetree_warnings: Vec::new(),
             typetree_stats: TypeTreeTraversalStats::default(),
         })
@@ -412,14 +555,54 @@ impl UnityObject {
             ),
         };
         let raw = owned_object_bytes(file, info, budget)?;
+        let payload_provenance = if info.loaded_data().is_some() {
+            ObjectPayloadProvenance::Loaded
+        } else {
+            ObjectPayloadProvenance::Committed
+        };
 
         Ok(Self {
             info: info.clone_without_loaded_data(),
             class,
             byte_order,
             raw,
+            payload_provenance,
             typetree_warnings: warnings,
             typetree_stats: stats,
+        })
+    }
+
+    fn from_replacement_with_compiled_schema(
+        file: &SerializedFile,
+        info: &ObjectInfo,
+        replacement: &[u8],
+        schema: &TypeTreeSchema,
+        budget: &mut AssetLoadBudget,
+        options: TypeTreeParseOptions,
+    ) -> Result<Self> {
+        let byte_order = file.header.byte_order();
+        let out = parse_replacement_extent(replacement, byte_order, info.path_id(), |reader| {
+            schema.read_object(reader, budget, options)
+        })?;
+        if !out.complete {
+            return Err(BinaryObjectReplacementError::Incomplete {
+                path_id: info.path_id(),
+                consumed: replacement.len(),
+            }
+            .into());
+        }
+        let class_name = class_name_from_id_with_budget(info.class_id(), budget)?;
+        let anchor = anchor_from_path_id(info.path_id(), budget)?;
+        let raw = ObjectBytes::copy_from_slice(replacement, budget)?;
+
+        Ok(Self {
+            info: info.clone_without_loaded_data(),
+            class: UnityClass::with_properties(info.class_id(), class_name, anchor, out.properties),
+            byte_order,
+            raw,
+            payload_provenance: ObjectPayloadProvenance::Replacement,
+            typetree_warnings: out.warnings,
+            typetree_stats: out.stats,
         })
     }
 
@@ -505,8 +688,19 @@ impl UnityObject {
         )
     }
 
+    /// Returns the current payload, which may differ from the source object-table extent.
     pub fn raw_data(&self) -> &[u8] {
         self.raw.as_slice()
+    }
+
+    /// Returns the current payload length independently of source object-table metadata.
+    pub fn payload_len(&self) -> usize {
+        self.raw.as_slice().len()
+    }
+
+    /// Returns how the current payload entered this owned object.
+    pub const fn payload_provenance(&self) -> ObjectPayloadProvenance {
+        self.payload_provenance
     }
 
     pub fn typetree_warnings(&self) -> &[TypeTreeParseWarning] {
@@ -517,10 +711,17 @@ impl UnityObject {
         self.typetree_stats
     }
 
+    /// Returns the source object-table byte size, not necessarily [`Self::payload_len`].
+    ///
+    /// Synthetic objects carry constructor metadata here. Replacement parsing intentionally
+    /// preserves the source metadata instead of fabricating an on-disk extent.
     pub fn byte_size(&self) -> u32 {
         self.info.byte_size()
     }
 
+    /// Returns the source object-table offset, which is not changed by replacement parsing.
+    ///
+    /// Synthetic objects carry their constructor-provided offset here.
     pub fn byte_start(&self) -> u64 {
         self.info.byte_start()
     }
@@ -695,6 +896,39 @@ fn parse_object_data(
     schema.read_object(&mut reader, budget, options)
 }
 
+fn parse_replacement_extent<T>(
+    replacement: &[u8],
+    byte_order: ByteOrder,
+    path_id: i64,
+    parse: impl FnOnce(&mut BinaryReader<'_>) -> Result<T>,
+) -> Result<T> {
+    let mut reader = BinaryReader::new(replacement, byte_order);
+    let output = match parse(&mut reader) {
+        Ok(output) => output,
+        Err(BinaryError::NotEnoughData { expected, actual }) => {
+            return Err(BinaryObjectReplacementError::Truncated {
+                path_id,
+                required_at_failure: expected,
+                available_at_failure: actual,
+            }
+            .into());
+        }
+        Err(error) => return Err(error),
+    };
+    let remaining = reader.remaining();
+    if remaining != 0 {
+        let consumed = replacement.len().saturating_sub(remaining);
+        return Err(BinaryObjectReplacementError::TrailingBytes {
+            path_id,
+            consumed,
+            total: replacement.len(),
+            remaining,
+        }
+        .into());
+    }
+    Ok(output)
+}
+
 fn name_peek_prefix(schema: &TypeTreeSchema) -> Option<(usize, &str)> {
     schema
         .root()
@@ -710,7 +944,7 @@ mod tests {
     use crate::asset::{ObjectMetadata, ObjectTypeReference, SerializedFileParser, SerializedType};
     use crate::typetree::{TypeTree, TypeTreeNode, TypeTreeRegistry};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use unity_asset_core::AssetLoadLimits;
+    use unity_asset_core::{AssetLoadLimits, BudgetError};
 
     const V22_FIXTURE: &[u8] = include_bytes!(
         "../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin"
@@ -719,6 +953,346 @@ mod tests {
     fn read(handle: ObjectHandle<'_>) -> UnityObject {
         let mut budget = AssetLoadBudget::default();
         handle.read(&mut budget).unwrap()
+    }
+
+    fn replacement_fixture() -> SerializedFile {
+        fn node(type_name: &str, name: &str) -> TypeTreeNode {
+            TypeTreeNode::with_info(type_name.to_owned(), name.to_owned(), -1)
+        }
+
+        let mut target = node("PPtr<Object>", "m_Target");
+        target.children = vec![node("int", "m_FileID"), node("long long", "m_PathID")];
+
+        let mut array = node("Array", "Array");
+        array.children = vec![node("int", "size"), node("int", "data")];
+        let mut values = node("vector", "m_Values");
+        values.children.push(array);
+
+        let mut root = node("ReplacementRoot", "ReplacementRoot");
+        root.children = vec![node("int", "m_Value"), target, values];
+        let mut tree = TypeTree::new();
+        tree.add_node(root);
+
+        let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        file.types_mut()
+            .first_mut()
+            .expect("wire fixture has one serialized type")
+            .type_tree = tree;
+        file
+    }
+
+    fn push_i32(bytes: &mut Vec<u8>, value: i32, byte_order: ByteOrder) {
+        match byte_order {
+            ByteOrder::Big => bytes.extend_from_slice(&value.to_be_bytes()),
+            ByteOrder::Little => bytes.extend_from_slice(&value.to_le_bytes()),
+        }
+    }
+
+    fn push_i64(bytes: &mut Vec<u8>, value: i64, byte_order: ByteOrder) {
+        match byte_order {
+            ByteOrder::Big => bytes.extend_from_slice(&value.to_be_bytes()),
+            ByteOrder::Little => bytes.extend_from_slice(&value.to_le_bytes()),
+        }
+    }
+
+    fn valid_replacement(file: &SerializedFile) -> Vec<u8> {
+        let byte_order = file.header.byte_order();
+        let mut bytes = Vec::new();
+        push_i32(&mut bytes, 42, byte_order);
+        push_i32(&mut bytes, 2, byte_order);
+        push_i64(&mut bytes, 73, byte_order);
+        push_i32(&mut bytes, 1, byte_order);
+        push_i32(&mut bytes, 9, byte_order);
+        bytes
+    }
+
+    #[test]
+    fn replacement_materialization_reuses_identity_schema_and_byte_order() {
+        let file = replacement_fixture();
+        let handle = file.object_handles().next().unwrap();
+        let original_raw = handle.raw_data().unwrap().to_vec();
+        let original_identity = (
+            handle.path_id(),
+            handle.class_id(),
+            handle.byte_start(),
+            handle.byte_size(),
+            handle.info().type_reference(),
+            handle.info().metadata(),
+        );
+        let replacement = valid_replacement(&file);
+        let mut budget = AssetLoadBudget::default();
+
+        let materialized = handle
+            .materialize_replacement(&replacement, &mut budget)
+            .unwrap();
+        let selected_root = materialized.schema().unwrap().root();
+        let selected_origin = materialized.schema_origin();
+        let object = materialized.object();
+
+        assert_eq!(selected_root.type_name(), "ReplacementRoot");
+        assert_eq!(selected_origin, handle.schema_origin());
+        assert_eq!(object.path_id(), handle.path_id());
+        assert_eq!(object.class_id(), handle.class_id());
+        assert_eq!(object.byte_order(), file.header.byte_order());
+        assert_eq!(object.raw_data(), replacement);
+        assert_eq!(object.payload_len(), replacement.len());
+        assert_eq!(
+            object.payload_provenance(),
+            ObjectPayloadProvenance::Replacement
+        );
+        assert_ne!(
+            usize::try_from(object.byte_size()).unwrap(),
+            object.payload_len()
+        );
+        assert_eq!(object.get("m_Value").and_then(UnityValue::as_i64), Some(42));
+        assert!(object.typetree_stats().unity_values_materialized > 0);
+
+        assert_eq!(
+            (
+                handle.path_id(),
+                handle.class_id(),
+                handle.byte_start(),
+                handle.byte_size(),
+                handle.info().type_reference(),
+                handle.info().metadata(),
+            ),
+            original_identity
+        );
+        assert_eq!(handle.raw_data().unwrap(), original_raw);
+        assert_eq!(object.info.byte_start(), original_identity.2);
+        assert_eq!(object.info.byte_size(), original_identity.3);
+        assert!(object.info.loaded_data().is_none());
+    }
+
+    #[test]
+    fn replacement_reference_scans_consume_exactly_without_materializing_values() {
+        let file = replacement_fixture();
+        let handle = file.object_handles().next().unwrap();
+        let replacement = valid_replacement(&file);
+
+        let scan = handle
+            .scan_replacement_pptrs(&replacement, &mut AssetLoadBudget::default())
+            .unwrap()
+            .unwrap();
+        assert!(scan.internal.is_empty());
+        assert_eq!(scan.external, vec![(2, 73)]);
+        assert_eq!(scan.stats.wire_bytes, replacement.len() as u64);
+        assert_eq!(scan.stats.unity_values_materialized, 0);
+
+        let occurrences = handle
+            .scan_replacement_reference_occurrences(&replacement, &mut AssetLoadBudget::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(occurrences.occurrences.len(), 1);
+        assert_eq!(occurrences.occurrences[0].file_id, 2);
+        assert_eq!(occurrences.occurrences[0].path_id, 73);
+        assert_eq!(occurrences.stats.wire_bytes, replacement.len() as u64);
+        assert_eq!(occurrences.stats.unity_values_materialized, 0);
+    }
+
+    #[test]
+    fn replacement_extent_rejects_typed_trailing_and_truncated_payloads() {
+        let file = replacement_fixture();
+        let handle = file.object_handles().next().unwrap();
+        let replacement = valid_replacement(&file);
+        let mut trailing = replacement.clone();
+        trailing.push(0xFF);
+
+        let read_error = handle
+            .read_replacement(&trailing, &mut AssetLoadBudget::default())
+            .unwrap_err();
+        assert!(matches!(
+            read_error,
+            BinaryError::ObjectReplacement(BinaryObjectReplacementError::TrailingBytes {
+                path_id,
+                consumed,
+                total,
+                remaining: 1,
+            }) if path_id == handle.path_id()
+                && consumed == replacement.len()
+                && total == trailing.len()
+        ));
+
+        let scan_error = handle
+            .scan_replacement_pptrs(&trailing, &mut AssetLoadBudget::default())
+            .unwrap_err();
+        assert!(matches!(
+            scan_error,
+            BinaryError::ObjectReplacement(BinaryObjectReplacementError::TrailingBytes {
+                remaining: 1,
+                ..
+            })
+        ));
+
+        let truncated = &replacement[..replacement.len() - 1];
+        let truncated_error = handle
+            .read_replacement(truncated, &mut AssetLoadBudget::default())
+            .unwrap_err();
+        assert!(truncated_error.is_recoverable());
+        assert_eq!(
+            truncated_error.severity(),
+            crate::error::ErrorSeverity::Medium
+        );
+        assert!(matches!(
+            truncated_error,
+            BinaryError::ObjectReplacement(BinaryObjectReplacementError::Truncated {
+                path_id,
+                required_at_failure: 4,
+                available_at_failure: 3,
+            }) if path_id == handle.path_id()
+        ));
+
+        for scan_error in [
+            handle
+                .scan_replacement_pptrs(truncated, &mut AssetLoadBudget::default())
+                .unwrap_err(),
+            handle
+                .scan_replacement_reference_occurrences(truncated, &mut AssetLoadBudget::default())
+                .unwrap_err(),
+        ] {
+            assert!(matches!(
+                scan_error,
+                BinaryError::ObjectReplacement(BinaryObjectReplacementError::Truncated {
+                    path_id,
+                    required_at_failure: 4,
+                    available_at_failure: 3,
+                }) if path_id == handle.path_id()
+            ));
+        }
+    }
+
+    #[test]
+    fn lenient_replacement_rejects_incomplete_sequence_at_exact_eof() {
+        let file = replacement_fixture();
+        let handle = file.object_handles().next().unwrap();
+        let byte_order = file.header.byte_order();
+        let mut incomplete = valid_replacement(&file)[..16].to_vec();
+        push_i32(&mut incomplete, 1, byte_order);
+
+        let error = handle
+            .read_replacement_with_options(
+                &incomplete,
+                &mut AssetLoadBudget::default(),
+                TypeTreeParseOptions {
+                    mode: TypeTreeParseMode::Lenient,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BinaryError::ObjectReplacement(BinaryObjectReplacementError::Incomplete {
+                path_id,
+                consumed,
+            }) if path_id == handle.path_id() && consumed == incomplete.len()
+        ));
+    }
+
+    #[test]
+    fn replacement_extent_rejects_invalid_sequence_shape() {
+        let file = replacement_fixture();
+        let handle = file.object_handles().next().unwrap();
+        let byte_order = file.header.byte_order();
+        let mut invalid = Vec::new();
+        push_i32(&mut invalid, 42, byte_order);
+        push_i32(&mut invalid, 2, byte_order);
+        push_i64(&mut invalid, 73, byte_order);
+        push_i32(&mut invalid, -1, byte_order);
+
+        let error = handle
+            .read_replacement(&invalid, &mut AssetLoadBudget::default())
+            .unwrap_err();
+        assert!(matches!(error, BinaryError::InvalidData(_)));
+    }
+
+    #[test]
+    fn replacement_scan_propagates_structured_budget_failure() {
+        let file = replacement_fixture();
+        let handle = file.object_handles().next().unwrap();
+        let replacement = valid_replacement(&file);
+        handle
+            .schema(&mut AssetLoadBudget::default())
+            .unwrap()
+            .expect("warm the immutable internal schema cache");
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_entries: 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let error = handle
+            .scan_replacement_pptrs(&replacement, &mut budget)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BinaryError::Budget(BudgetError::Exceeded {
+                resource: "entries",
+                limit: 1,
+                requested: 2,
+            })
+        ));
+        assert_eq!(budget.usage().entries, 1);
+    }
+
+    #[test]
+    fn replacement_raw_copy_checks_the_last_payload_byte_before_allocation() {
+        let file = replacement_fixture();
+        let handle = file.object_handles().next().unwrap();
+        let replacement = valid_replacement(&file);
+        handle
+            .schema(&mut AssetLoadBudget::default())
+            .unwrap()
+            .expect("warm the immutable internal schema cache");
+
+        let mut baseline = AssetLoadBudget::default();
+        handle
+            .read_replacement(&replacement, &mut baseline)
+            .unwrap();
+        let total = baseline.usage().bytes;
+        let payload_bytes = u64::try_from(replacement.len()).unwrap();
+        let before_copy = total.checked_sub(payload_bytes).unwrap();
+        let one_short = total.checked_sub(1).unwrap();
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: one_short,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let error = handle
+            .read_replacement(&replacement, &mut budget)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BinaryError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            }) if limit == one_short && requested == total
+        ));
+        assert_eq!(budget.usage().bytes, before_copy);
+    }
+
+    #[test]
+    fn replacement_read_requires_a_canonical_schema() {
+        let mut file = replacement_fixture();
+        file.set_type_tree_enabled(false);
+        let handle = file.object_handles().next().unwrap();
+
+        let error = handle
+            .read_replacement(&[], &mut AssetLoadBudget::default())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BinaryError::ObjectReplacement(BinaryObjectReplacementError::MissingSchema {
+                path_id,
+                class_id,
+            }) if path_id == handle.path_id() && class_id == handle.class_id()
+        ));
+        assert!(
+            handle
+                .scan_replacement_pptrs(&[0xFF], &mut AssetLoadBudget::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -739,22 +1313,33 @@ mod tests {
         file.find_object_mut(path_id).unwrap().set_data(Vec::new());
         let handle = file.find_object_handle(path_id).unwrap();
         assert!(handle.raw_data().unwrap().is_empty());
-        assert!(read(handle).raw_data().is_empty());
+        let loaded_empty = read(handle);
+        assert!(loaded_empty.raw_data().is_empty());
+        assert_eq!(loaded_empty.payload_len(), 0);
+        assert_eq!(
+            loaded_empty.payload_provenance(),
+            ObjectPayloadProvenance::Loaded
+        );
 
         file.find_object_mut(path_id)
             .unwrap()
             .set_data(vec![0xD0, 0xAD]);
         let handle = file.find_object_handle(path_id).unwrap();
         assert_eq!(handle.raw_data().unwrap(), [0xD0, 0xAD]);
-        assert_eq!(read(handle).raw_data(), [0xD0, 0xAD]);
+        let loaded = read(handle);
+        assert_eq!(loaded.raw_data(), [0xD0, 0xAD]);
+        assert_eq!(loaded.payload_len(), 2);
+        assert_eq!(loaded.payload_provenance(), ObjectPayloadProvenance::Loaded);
 
         file.find_object_mut(path_id).unwrap().clear_data();
+        let handle = file.find_object_handle(path_id).unwrap();
+        assert_eq!(handle.raw_data().unwrap(), original);
+        let committed = read(handle);
+        assert_eq!(committed.raw_data(), original);
+        assert_eq!(committed.payload_len(), original.len());
         assert_eq!(
-            file.find_object_handle(path_id)
-                .unwrap()
-                .raw_data()
-                .unwrap(),
-            original
+            committed.payload_provenance(),
+            ObjectPayloadProvenance::Committed
         );
     }
 
@@ -763,6 +1348,11 @@ mod tests {
         let object = UnityObject::from_raw(1, 7, vec![0xAA, 0xBB]).unwrap();
 
         assert_eq!(object.raw_data(), [0xAA, 0xBB]);
+        assert_eq!(object.payload_len(), 2);
+        assert_eq!(
+            object.payload_provenance(),
+            ObjectPayloadProvenance::Synthetic
+        );
         assert!(object.class.properties().is_empty());
         assert_eq!(object.typetree_stats(), TypeTreeTraversalStats::default());
     }
@@ -1156,6 +1746,45 @@ mod tests {
             tree.add_node(root);
             Some(Arc::new(tree))
         }
+    }
+
+    #[test]
+    fn replacement_materialization_uses_the_exact_external_registry_schema() {
+        let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        file.set_type_tree_enabled(false);
+        let registry = Arc::new(ChangingRegistry {
+            calls: AtomicUsize::new(0),
+        });
+        file.set_type_tree_registry(Some(registry.clone()));
+        let handle = file.object_handles().next().unwrap();
+        let mut replacement = Vec::new();
+        push_i32(&mut replacement, 77, file.header.byte_order());
+
+        let materialized = handle
+            .materialize_replacement(&replacement, &mut AssetLoadBudget::default())
+            .unwrap();
+
+        assert_eq!(
+            materialized.schema_origin(),
+            Some(ObjectSchemaOrigin::ExternalRegistry)
+        );
+        assert_eq!(
+            materialized.schema().unwrap().root().type_name(),
+            "FirstExternal"
+        );
+        assert_eq!(
+            materialized
+                .object()
+                .get("m_Value")
+                .and_then(UnityValue::as_i64),
+            Some(77)
+        );
+        assert_eq!(materialized.object().raw_data(), replacement);
+        assert_eq!(
+            materialized.object().payload_provenance(),
+            ObjectPayloadProvenance::Replacement
+        );
+        assert_eq!(registry.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
