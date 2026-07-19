@@ -1,6 +1,7 @@
 //! Compression support for Unity binary files
 
 use crate::error::{BinaryError, Result};
+use crate::random_access::{BorrowedBytes, ByteSource, FallibleBufReader};
 use brotli::{Allocator, SliceWrapper, SliceWrapperMut};
 use flate2::bufread::GzDecoder;
 use std::cell::Cell;
@@ -256,6 +257,90 @@ impl Write for BudgetedOutput<'_> {
     }
 }
 
+struct PrefixBudgetedOutput<'a> {
+    budget: DecompressionBudget<'a>,
+    prefix: Vec<u8>,
+    prefix_limit: usize,
+    decoded_len: u64,
+    expected_len: u64,
+    write_failure: Option<BinaryError>,
+}
+
+impl<'a> PrefixBudgetedOutput<'a> {
+    fn new(
+        load_budget: &'a mut AssetLoadBudget,
+        compressed_size: u64,
+        expected_len: u64,
+        prefix_limit: usize,
+        prefix: Vec<u8>,
+    ) -> Result<Self> {
+        let mut budget = load_budget.begin_decompression();
+        budget.consume(compressed_size, 0)?;
+        Ok(Self {
+            budget,
+            prefix,
+            prefix_limit,
+            decoded_len: 0,
+            expected_len,
+            write_failure: None,
+        })
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        let chunk_len = usize_to_u64(bytes.len(), "LZMA decoded chunk size")?;
+        let decoded_len = self
+            .decoded_len
+            .checked_add(chunk_len)
+            .ok_or_else(|| BinaryError::invalid_data("LZMA decoded length overflow"))?;
+        if decoded_len > self.expected_len {
+            return Err(BinaryError::decompression_failed(format!(
+                "LZMA decompression exceeded declared size {}",
+                self.expected_len
+            )));
+        }
+        self.budget.consume(0, chunk_len)?;
+
+        let remaining_prefix = self.prefix_limit.saturating_sub(self.prefix.len());
+        let retained = remaining_prefix.min(bytes.len());
+        self.prefix.extend_from_slice(&bytes[..retained]);
+        self.decoded_len = decoded_len;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<PrefixOutput> {
+        if let Some(error) = self.write_failure {
+            return Err(error);
+        }
+        Ok(PrefixOutput {
+            prefix: self.prefix,
+            decoded_len: self.decoded_len,
+        })
+    }
+}
+
+impl Write for PrefixBudgetedOutput<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.write_failure.is_some() {
+            return Err(std::io::Error::other("decompression output already failed"));
+        }
+        if let Err(error) = self.append(buffer) {
+            let message = error.to_string();
+            self.write_failure = Some(error);
+            return Err(std::io::Error::other(message));
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct PrefixOutput {
+    prefix: Vec<u8>,
+    decoded_len: u64,
+}
+
 fn usize_to_u64(value: usize, label: &str) -> Result<u64> {
     u64::try_from(value)
         .map_err(|_| BinaryError::invalid_data(format!("{label} does not fit in u64")))
@@ -279,7 +364,7 @@ fn decompress_lzma_with_budget(
 ) -> Result<Vec<u8>> {
     let (properties, dictionary_size) = parse_lzma_properties(data)?;
     let memory = lzma_memory_plan(properties, dictionary_size, uncompressed_size)?;
-    let header = lzma_alone_header(properties, dictionary_size, uncompressed_size)?;
+    let header = lzma_alone_header(properties, dictionary_size);
     let encoded = std::io::Cursor::new(header).chain(std::io::Cursor::new(&data[5..]));
     decode_lzma_stream(encoded, data.len(), uncompressed_size, memory, budget)
 }
@@ -316,6 +401,136 @@ pub(crate) fn decompress_lzma_size_stream_with_budget(
         memory,
         budget,
     )
+}
+
+const LZMA_INSPECTION_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Bounded result for callers that only need the metadata prefix of a legacy LZMA stream.
+pub(crate) struct LzmaStreamInspection {
+    pub(crate) prefix: Vec<u8>,
+    pub(crate) decoded_len: u64,
+    pub(crate) max_temporary_bytes: u64,
+}
+
+/// Streams a legacy LZMA-alone payload while retaining only its declared metadata prefix.
+pub(crate) fn inspect_lzma_size_stream_with_budget(
+    mut input: impl Read,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    retained_prefix_size: usize,
+    budget: &mut AssetLoadBudget,
+) -> Result<LzmaStreamInspection> {
+    let compressed_size_usize = usize::try_from(compressed_size)
+        .map_err(|_| BinaryError::invalid_data("LZMA input size does not fit usize"))?;
+    let uncompressed_size_usize = usize::try_from(uncompressed_size)
+        .map_err(|_| BinaryError::invalid_data("LZMA output size does not fit usize"))?;
+    if compressed_size_usize < 13 {
+        return Err(BinaryError::invalid_data(
+            "Unity LZMA size stream is shorter than its 13-byte header",
+        ));
+    }
+    if retained_prefix_size > uncompressed_size_usize {
+        return Err(BinaryError::invalid_data(format!(
+            "LZMA metadata prefix {retained_prefix_size} exceeds declared output {uncompressed_size_usize}"
+        )));
+    }
+    budget.check_decompression(compressed_size, uncompressed_size)?;
+
+    let mut header = [0_u8; 13];
+    input.read_exact(&mut header).map_err(|error| {
+        BinaryError::decompression_failed(format!("Failed to read the Unity LZMA header: {error}"))
+    })?;
+    let properties = header[0];
+    let dictionary_size = u32::from_le_bytes(
+        header[1..5]
+            .try_into()
+            .map_err(|_| BinaryError::invalid_data("Invalid LZMA dictionary size width"))?,
+    );
+    let declared_size = u64::from_le_bytes(
+        header[5..13]
+            .try_into()
+            .map_err(|_| BinaryError::invalid_data("Invalid LZMA declared size width"))?,
+    );
+    if declared_size != uncompressed_size && declared_size != u64::MAX {
+        return Err(BinaryError::invalid_data(format!(
+            "LZMA header declares {declared_size} bytes but the container declares {uncompressed_size}"
+        )));
+    }
+
+    let memory = lzma_memory_plan(properties, dictionary_size, uncompressed_size_usize)?;
+    let input_buffer_bytes = usize_to_u64(
+        LZMA_INSPECTION_BUFFER_SIZE,
+        "LZMA inspection input buffer size",
+    )?;
+    let retained_prefix_bytes = usize_to_u64(retained_prefix_size, "LZMA metadata prefix size")?;
+    let max_temporary_bytes = memory
+        .scratch_bytes
+        .checked_add(input_buffer_bytes)
+        .and_then(|bytes| bytes.checked_add(retained_prefix_bytes))
+        .ok_or_else(|| BinaryError::memory_error("LZMA inspection working set overflow"))?;
+    budget.consume_bytes(max_temporary_bytes)?;
+
+    let mut prefix = Vec::new();
+    prefix
+        .try_reserve_exact(retained_prefix_size)
+        .map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {retained_prefix_size} legacy metadata bytes: {error}"
+            ))
+        })?;
+    let reconstructed = std::io::Cursor::new(header).chain(input);
+    let mut encoded =
+        FallibleBufReader::try_with_capacity(LZMA_INSPECTION_BUFFER_SIZE, reconstructed)?;
+    let options = lzma_rs::decompress::Options {
+        memlimit: Some(memory.dictionary_limit),
+        ..Default::default()
+    };
+    let mut output = PrefixBudgetedOutput::new(
+        budget,
+        compressed_size,
+        uncompressed_size,
+        retained_prefix_size,
+        prefix,
+    )?;
+    let decoded = lzma_rs::lzma_decompress_with_options(&mut encoded, &mut output, &options);
+    let output = output.finish()?;
+    decoded.map_err(|error| {
+        let message = error.to_string();
+        if message.contains("Found end-of-stream marker but more bytes are available") {
+            BinaryError::decompression_failed("LZMA stream contains trailing bytes")
+        } else {
+            BinaryError::decompression_failed(format!("LZMA decompression failed: {message}"))
+        }
+    })?;
+    if output.decoded_len != uncompressed_size {
+        return Err(BinaryError::decompression_failed(format!(
+            "LZMA decompression size mismatch: expected {uncompressed_size}, got {}",
+            output.decoded_len
+        )));
+    }
+    if output.prefix.len() != retained_prefix_size {
+        return Err(BinaryError::decompression_failed(format!(
+            "LZMA metadata prefix size mismatch: expected {retained_prefix_size}, got {}",
+            output.prefix.len()
+        )));
+    }
+    let trailing = encoded.fill_buf().map_err(|error| {
+        BinaryError::decompression_failed(format!(
+            "Failed to inspect the end of the LZMA stream: {error}"
+        ))
+    })?;
+    if !trailing.is_empty() {
+        return Err(BinaryError::decompression_failed(format!(
+            "LZMA stream contains {} trailing bytes",
+            trailing.len()
+        )));
+    }
+
+    Ok(LzmaStreamInspection {
+        prefix: output.prefix,
+        decoded_len: output.decoded_len,
+        max_temporary_bytes,
+    })
 }
 
 fn parse_lzma_properties(data: &[u8]) -> Result<(u8, u32)> {
@@ -489,17 +704,14 @@ fn brotli_window_bits(data: &[u8]) -> u32 {
         .unwrap_or(BROTLI_MAX_WINDOW_BITS)
 }
 
-fn lzma_alone_header(
-    properties: u8,
-    dictionary_size: u32,
-    expected_size: usize,
-) -> Result<[u8; 13]> {
+fn lzma_alone_header(properties: u8, dictionary_size: u32) -> [u8; 13] {
     let mut header = [0_u8; 13];
     header[0] = properties;
     header[1..5].copy_from_slice(&dictionary_size.to_le_bytes());
-    header[5..13]
-        .copy_from_slice(&usize_to_u64(expected_size, "LZMA expected size")?.to_le_bytes());
-    Ok(header)
+    // Unity's five-byte layout stores the output size in the container. Requiring
+    // the LZMA end marker makes the codec consume and validate its entire range.
+    header[5..13].copy_from_slice(&u64::MAX.to_le_bytes());
+    header
 }
 
 fn decode_lzma_stream(
@@ -518,9 +730,26 @@ fn decode_lzma_stream(
     let decoded = lzma_rs::lzma_decompress_with_options(&mut encoded, &mut output, &options);
     let output = output.finish()?;
     decoded.map_err(|error| {
-        BinaryError::decompression_failed(format!("LZMA decompression failed: {error}"))
+        let message = error.to_string();
+        if message.contains("Found end-of-stream marker but more bytes are available") {
+            BinaryError::decompression_failed("LZMA stream contains trailing bytes")
+        } else {
+            BinaryError::decompression_failed(format!("LZMA decompression failed: {message}"))
+        }
     })?;
-    validate_declared_size("LZMA", output, expected_size)
+    let output = validate_declared_size("LZMA", output, expected_size)?;
+    let trailing = encoded.fill_buf().map_err(|error| {
+        BinaryError::decompression_failed(format!(
+            "Failed to inspect the end of the LZMA stream: {error}"
+        ))
+    })?;
+    if !trailing.is_empty() {
+        return Err(BinaryError::decompression_failed(format!(
+            "LZMA stream contains {} trailing bytes",
+            trailing.len()
+        )));
+    }
+    Ok(output)
 }
 
 /// Decompress Brotli compressed data (used in WebGL builds)
@@ -550,21 +779,10 @@ fn decompress_brotli_stream_with_budget(
     budget: &mut AssetLoadBudget,
 ) -> Result<Vec<u8>> {
     let scratch = BrotliScratchReservation::new(budget);
-    let mut alloc_u8 = BrotliScratchAllocator::new(&scratch);
-    let input_buffer = <BrotliScratchAllocator<'_> as Allocator<u8>>::alloc_cell(
-        &mut alloc_u8,
-        BROTLI_INPUT_BUFFER_SIZE,
-    );
-    let decoder = brotli::reader::DecompressorCustomAlloc::new(
-        data,
-        input_buffer,
-        alloc_u8,
-        BrotliScratchAllocator::new(&scratch),
-        BrotliScratchAllocator::new(&scratch),
-    );
+    let source = BorrowedBytes::new(data);
+    let decoder = SegmentedBrotliDecoder::new(&source, &scratch);
 
     let decode_result = if scratch.has_failure() {
-        drop(decoder);
         None
     } else {
         Some(decompress_reader_with_budget(
@@ -606,18 +824,114 @@ impl<T> SliceWrapperMut<T> for BrotliScratchMemory<T> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct BrotliScratchAllocator<'a> {
-    reservation: &'a BrotliScratchReservation,
+/// Deferred byte accounting shared by a parser and its codec allocator.
+///
+/// Reservations are checked against one combined total before allocation and
+/// committed to the caller-owned budget in one operation.
+pub(crate) struct DeferredByteReservation {
+    initial_bytes: u64,
+    max_bytes: u64,
+    metadata_bytes: Cell<u64>,
+    scratch_bytes: Cell<u64>,
 }
 
-impl<'a> BrotliScratchAllocator<'a> {
-    fn new(reservation: &'a BrotliScratchReservation) -> Self {
+impl DeferredByteReservation {
+    pub(crate) fn new(budget: &AssetLoadBudget) -> Self {
+        Self {
+            initial_bytes: budget.usage().bytes,
+            max_bytes: budget.limits().max_bytes,
+            metadata_bytes: Cell::new(0),
+            scratch_bytes: Cell::new(0),
+        }
+    }
+
+    pub(crate) fn reserve_metadata(&self, amount: u64) -> Result<()> {
+        self.check_additional(amount)?;
+        self.metadata_bytes
+            .set(
+                self.metadata_bytes
+                    .get()
+                    .checked_add(amount)
+                    .ok_or(BinaryError::Budget(BudgetError::ArithmeticOverflow {
+                        resource: "bytes",
+                    }))?,
+            );
+        Ok(())
+    }
+
+    pub(crate) fn reserve_scratch(&self, amount: u64) -> Result<()> {
+        self.check_scratch(amount)?;
+        self.record_scratch(amount)?;
+        Ok(())
+    }
+
+    fn check_scratch(&self, amount: u64) -> std::result::Result<(), BudgetError> {
+        self.check_additional_budget(amount)
+    }
+
+    fn record_scratch(&self, amount: u64) -> std::result::Result<(), BudgetError> {
+        let scratch = self
+            .scratch_bytes
+            .get()
+            .checked_add(amount)
+            .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+        self.scratch_bytes.set(scratch);
+        Ok(())
+    }
+
+    fn check_additional(&self, amount: u64) -> Result<()> {
+        self.check_additional_budget(amount).map_err(Into::into)
+    }
+
+    fn check_additional_budget(&self, amount: u64) -> std::result::Result<(), BudgetError> {
+        let deferred = self
+            .metadata_bytes
+            .get()
+            .checked_add(self.scratch_bytes.get())
+            .and_then(|bytes| bytes.checked_add(amount))
+            .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+        let requested = self
+            .initial_bytes
+            .checked_add(deferred)
+            .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+        if requested > self.max_bytes {
+            return Err(BudgetError::Exceeded {
+                resource: "bytes",
+                limit: self.max_bytes,
+                requested,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn metadata_bytes(&self) -> u64 {
+        self.metadata_bytes.get()
+    }
+
+    pub(crate) fn commit(&self, budget: &mut AssetLoadBudget) -> Result<()> {
+        let total = self
+            .metadata_bytes
+            .get()
+            .checked_add(self.scratch_bytes.get())
+            .ok_or(BinaryError::Budget(BudgetError::ArithmeticOverflow {
+                resource: "bytes",
+            }))?;
+        budget.consume_bytes(total).map_err(Into::into)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BrotliScratchAllocator<'reservation, 'ledger> {
+    reservation: &'reservation BrotliScratchReservation<'ledger>,
+}
+
+impl<'reservation, 'ledger> BrotliScratchAllocator<'reservation, 'ledger> {
+    fn new(reservation: &'reservation BrotliScratchReservation<'ledger>) -> Self {
         Self { reservation }
     }
 }
 
-impl<T: Default> Allocator<T> for BrotliScratchAllocator<'_> {
+impl<T: Default> Allocator<T> for BrotliScratchAllocator<'_, '_> {
     type AllocatedMemory = BrotliScratchMemory<T>;
 
     fn alloc_cell(&mut self, len: usize) -> Self::AllocatedMemory {
@@ -630,20 +944,35 @@ impl<T: Default> Allocator<T> for BrotliScratchAllocator<'_> {
     fn free_cell(&mut self, _memory: Self::AllocatedMemory) {}
 }
 
-struct BrotliScratchReservation {
+pub(crate) struct BrotliScratchReservation<'ledger> {
     initial_bytes: u64,
     max_bytes: u64,
     successful_bytes: Cell<u64>,
+    deferred: Option<&'ledger DeferredByteReservation>,
     failed: Cell<bool>,
     failure: Cell<Option<BrotliScratchFailure>>,
 }
 
-impl BrotliScratchReservation {
-    fn new(budget: &AssetLoadBudget) -> Self {
+impl BrotliScratchReservation<'static> {
+    pub(crate) fn new(budget: &AssetLoadBudget) -> Self {
         Self {
             initial_bytes: budget.usage().bytes,
             max_bytes: budget.limits().max_bytes,
             successful_bytes: Cell::new(0),
+            deferred: None,
+            failed: Cell::new(false),
+            failure: Cell::new(None),
+        }
+    }
+}
+
+impl<'ledger> BrotliScratchReservation<'ledger> {
+    pub(crate) fn with_deferred(deferred: &'ledger DeferredByteReservation) -> Self {
+        Self {
+            initial_bytes: 0,
+            max_bytes: 0,
+            successful_bytes: Cell::new(0),
+            deferred: Some(deferred),
             failed: Cell::new(false),
             failure: Cell::new(None),
         }
@@ -663,23 +992,30 @@ impl BrotliScratchReservation {
             ));
             return None;
         };
-        let requested = self
-            .initial_bytes
-            .checked_add(self.successful_bytes.get())
-            .and_then(|bytes| bytes.checked_add(allocation_bytes));
-        let Some(requested) = requested else {
-            self.record_failure(BrotliScratchFailure::Budget(
-                BudgetError::ArithmeticOverflow { resource: "bytes" },
-            ));
-            return None;
-        };
-        if requested > self.max_bytes {
-            self.record_failure(BrotliScratchFailure::Budget(BudgetError::Exceeded {
-                resource: "bytes",
-                limit: self.max_bytes,
-                requested,
-            }));
-            return None;
+        if let Some(deferred) = self.deferred {
+            if let Err(error) = deferred.check_scratch(allocation_bytes) {
+                self.record_failure(BrotliScratchFailure::Budget(error));
+                return None;
+            }
+        } else {
+            let requested = self
+                .initial_bytes
+                .checked_add(self.successful_bytes.get())
+                .and_then(|bytes| bytes.checked_add(allocation_bytes));
+            let Some(requested) = requested else {
+                self.record_failure(BrotliScratchFailure::Budget(
+                    BudgetError::ArithmeticOverflow { resource: "bytes" },
+                ));
+                return None;
+            };
+            if requested > self.max_bytes {
+                self.record_failure(BrotliScratchFailure::Budget(BudgetError::Exceeded {
+                    resource: "bytes",
+                    limit: self.max_bytes,
+                    requested,
+                }));
+                return None;
+            }
         }
 
         let mut memory = Vec::new();
@@ -691,8 +1027,15 @@ impl BrotliScratchReservation {
             return None;
         }
         memory.resize_with(len, T::default);
-        self.successful_bytes
-            .set(self.successful_bytes.get() + allocation_bytes);
+        if let Some(deferred) = self.deferred {
+            if let Err(error) = deferred.record_scratch(allocation_bytes) {
+                self.record_failure(BrotliScratchFailure::Budget(error));
+                return None;
+            }
+        } else {
+            self.successful_bytes
+                .set(self.successful_bytes.get() + allocation_bytes);
+        }
         Some(memory)
     }
 
@@ -706,8 +1049,14 @@ impl BrotliScratchReservation {
         }
     }
 
-    fn commit(&self, budget: &mut AssetLoadBudget) -> Result<()> {
-        budget.consume_bytes(self.successful_bytes.get())?;
+    pub(crate) fn commit(&self, budget: &mut AssetLoadBudget) -> Result<()> {
+        if self.deferred.is_none() {
+            budget.consume_bytes(self.successful_bytes.get())?;
+        }
+        self.finish()
+    }
+
+    pub(crate) fn finish(&self) -> Result<()> {
         match self.failure.take() {
             Some(BrotliScratchFailure::Budget(error)) => Err(BinaryError::Budget(error)),
             Some(BrotliScratchFailure::Allocation { requested, error }) => {
@@ -716,6 +1065,212 @@ impl BrotliScratchReservation {
                 )))
             }
             None => Ok(()),
+        }
+    }
+}
+
+/// Streaming Brotli decoder that retains exact input-consumption state.
+pub(crate) struct SegmentedBrotliDecoder<'source, 'scratch, 'ledger> {
+    source: &'source dyn ByteSource,
+    source_offset: u64,
+    input: BrotliScratchMemory<u8>,
+    available_in: usize,
+    input_offset: usize,
+    total_out: usize,
+    state: brotli::BrotliState<
+        BrotliScratchAllocator<'scratch, 'ledger>,
+        BrotliScratchAllocator<'scratch, 'ledger>,
+        BrotliScratchAllocator<'scratch, 'ledger>,
+    >,
+    done: bool,
+    pending_error: Option<String>,
+}
+
+impl<'source, 'scratch, 'ledger> SegmentedBrotliDecoder<'source, 'scratch, 'ledger> {
+    pub(crate) fn new(
+        source: &'source dyn ByteSource,
+        scratch: &'scratch BrotliScratchReservation<'ledger>,
+    ) -> Self {
+        let mut input_allocator = BrotliScratchAllocator::new(scratch);
+        let input = input_allocator.alloc_cell(BROTLI_INPUT_BUFFER_SIZE);
+        Self {
+            source,
+            source_offset: 0,
+            input,
+            available_in: 0,
+            input_offset: 0,
+            total_out: 0,
+            state: brotli::BrotliState::new(
+                input_allocator,
+                BrotliScratchAllocator::new(scratch),
+                BrotliScratchAllocator::new(scratch),
+            ),
+            done: false,
+            pending_error: None,
+        }
+    }
+
+    fn refill(&mut self) -> std::io::Result<bool> {
+        if self.source_offset == self.source.len() {
+            return Ok(false);
+        }
+        if self.input.slice().is_empty() {
+            return Err(std::io::Error::other(
+                "Brotli input buffer allocation failed",
+            ));
+        }
+        let remaining = self
+            .source
+            .len()
+            .checked_sub(self.source_offset)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Brotli source position moved past the source",
+                )
+            })?;
+        let read_len = remaining.min(u64::try_from(self.input.slice().len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Brotli input buffer size does not fit u64",
+            )
+        })?);
+        let read_len = usize::try_from(read_len).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Brotli source chunk size does not fit usize",
+            )
+        })?;
+        self.source
+            .read_exact_at(self.source_offset, &mut self.input.slice_mut()[..read_len])
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.source_offset = self
+            .source_offset
+            .checked_add(u64::try_from(read_len).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Brotli source chunk size does not fit u64",
+                )
+            })?)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Brotli source position overflow",
+                )
+            })?;
+        self.available_in = read_len;
+        self.input_offset = 0;
+        Ok(true)
+    }
+
+    fn fail_or_defer(&mut self, produced: usize, message: String) -> std::io::Result<usize> {
+        if produced == 0 {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            ))
+        } else {
+            self.pending_error = Some(message);
+            Ok(produced)
+        }
+    }
+}
+
+impl Read for SegmentedBrotliDecoder<'_, '_, '_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if let Some(message) = self.pending_error.take() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            ));
+        }
+        if self.done {
+            return Ok(0);
+        }
+
+        loop {
+            if self.available_in == 0 {
+                self.refill()?;
+            }
+            let mut available_out = output.len();
+            let mut output_offset = 0_usize;
+            let result = brotli::BrotliDecompressStream(
+                &mut self.available_in,
+                &mut self.input_offset,
+                self.input.slice(),
+                &mut available_out,
+                &mut output_offset,
+                output,
+                &mut self.total_out,
+                &mut self.state,
+            );
+            let produced = output_offset;
+            match result {
+                brotli::BrotliResult::ResultSuccess => {
+                    self.done = true;
+                    let unloaded = self
+                        .source
+                        .len()
+                        .checked_sub(self.source_offset)
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "Brotli source position moved past the source",
+                            )
+                        })?;
+                    let buffered = u64::try_from(self.available_in).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Brotli buffered input size does not fit u64",
+                        )
+                    })?;
+                    let trailing = buffered.checked_add(unloaded).ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Brotli trailing input size overflow",
+                        )
+                    })?;
+                    if trailing != 0 {
+                        return self.fail_or_defer(
+                            produced,
+                            format!("Brotli stream contains {trailing} trailing bytes"),
+                        );
+                    }
+                    return Ok(produced);
+                }
+                brotli::BrotliResult::NeedsMoreInput => {
+                    if produced != 0 {
+                        return Ok(produced);
+                    }
+                    if self.available_in != 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Brotli decoder requested input before consuming its current chunk",
+                        ));
+                    }
+                    if self.source_offset == self.source.len() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "Brotli stream ended before its terminator",
+                        ));
+                    }
+                }
+                brotli::BrotliResult::NeedsMoreOutput => {
+                    if produced == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Brotli decoder requested output without producing bytes",
+                        ));
+                    }
+                    return Ok(produced);
+                }
+                brotli::BrotliResult::ResultFailure => {
+                    return self.fail_or_defer(produced, "Brotli decompression failed".to_string());
+                }
+            }
         }
     }
 }

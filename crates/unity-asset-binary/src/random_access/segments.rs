@@ -4,6 +4,29 @@ use std::sync::Arc;
 use super::{allocation_error, validate_range};
 use crate::error::{BinaryError, Result};
 
+#[derive(Clone, Debug)]
+enum ByteSegmentBacking {
+    Slice(Arc<[u8]>),
+    Vec(Arc<Vec<u8>>),
+}
+
+impl ByteSegmentBacking {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Slice(bytes) => bytes,
+            Self::Vec(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
+impl PartialEq for ByteSegmentBacking {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for ByteSegmentBacking {}
+
 /// One immutable backing slice placed at an explicit logical byte offset.
 ///
 /// This is an internal interoperability value. It is public only so higher-level
@@ -12,7 +35,7 @@ use crate::error::{BinaryError, Result};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ByteSegment {
     logical_range: Range<u64>,
-    bytes: Arc<[u8]>,
+    backing: ByteSegmentBacking,
     backing_range: Range<usize>,
 }
 
@@ -29,7 +52,34 @@ impl ByteSegment {
         bytes: Arc<[u8]>,
         backing_range: Range<usize>,
     ) -> Result<Self> {
-        validate_backing_range(&backing_range, bytes.len())?;
+        Self::from_backing_range(
+            logical_start,
+            ByteSegmentBacking::Slice(bytes),
+            backing_range,
+        )
+    }
+
+    /// Places an entire immutable generated allocation without converting its backing.
+    pub fn from_arc_vec(logical_start: u64, bytes: Arc<Vec<u8>>) -> Result<Self> {
+        let backing_end = bytes.len();
+        Self::from_arc_vec_range(logical_start, bytes, 0..backing_end)
+    }
+
+    /// Places a zero-copy range of an immutable generated allocation.
+    pub fn from_arc_vec_range(
+        logical_start: u64,
+        bytes: Arc<Vec<u8>>,
+        backing_range: Range<usize>,
+    ) -> Result<Self> {
+        Self::from_backing_range(logical_start, ByteSegmentBacking::Vec(bytes), backing_range)
+    }
+
+    fn from_backing_range(
+        logical_start: u64,
+        backing: ByteSegmentBacking,
+        backing_range: Range<usize>,
+    ) -> Result<Self> {
+        validate_backing_range(&backing_range, backing.as_slice().len())?;
         let segment_len = u64::try_from(backing_range.end - backing_range.start)
             .map_err(|_| BinaryError::invalid_data("byte segment length does not fit in u64"))?;
         let logical_end = logical_start.checked_add(segment_len).ok_or_else(|| {
@@ -40,7 +90,7 @@ impl ByteSegment {
 
         Ok(Self {
             logical_range: logical_start..logical_end,
-            bytes,
+            backing,
             backing_range,
         })
     }
@@ -66,7 +116,7 @@ impl ByteSegment {
     /// Returns the original immutable backing slice without copying it.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
-        &self.bytes[self.backing_range.clone()]
+        &self.backing.as_slice()[self.backing_range.clone()]
     }
 
     pub(super) fn logical_start(&self) -> u64 {
@@ -86,18 +136,18 @@ impl ByteSegment {
         let relative_end = usize::try_from(logical_range.end - self.logical_start()).ok()?;
         let backing_start = self.backing_range.start.checked_add(relative_start)?;
         let backing_end = self.backing_range.start.checked_add(relative_end)?;
-        self.bytes.get(backing_start..backing_end)
+        self.backing.as_slice().get(backing_start..backing_end)
     }
 }
 
 /// An immutable, logically contiguous byte image backed by any number of segments.
 ///
-/// Construction and slicing retain the original `Arc<[u8]>` allocations. They do
-/// not concatenate the byte image.
+/// Construction and slicing retain the original shared allocations. They do not
+/// concatenate the byte image.
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SegmentedBytes {
-    segments: Arc<[ByteSegment]>,
+    segments: Vec<ByteSegment>,
     len: u64,
 }
 
@@ -106,14 +156,9 @@ impl SegmentedBytes {
     ///
     /// Empty segments are discarded. Every non-empty segment must begin exactly
     /// where the preceding segment ends, with the first segment beginning at zero.
-    pub fn new(segments: Vec<ByteSegment>) -> Result<Self> {
-        let mut normalized = Vec::new();
-        normalized
-            .try_reserve(segments.len())
-            .map_err(|error| allocation_error(segments.len(), error))?;
-
+    pub fn new(mut segments: Vec<ByteSegment>) -> Result<Self> {
         let mut expected_start = 0_u64;
-        for segment in segments {
+        for segment in &segments {
             if segment.logical_start() != expected_start {
                 return Err(BinaryError::invalid_data(format!(
                     "non-contiguous byte segment: expected logical offset {expected_start}, got {}",
@@ -122,20 +167,24 @@ impl SegmentedBytes {
             }
 
             expected_start = segment.logical_end();
-            if !segment.is_empty() {
-                normalized.push(segment);
-            }
+        }
+
+        segments.retain(|segment| !segment.is_empty());
+        if segments.is_empty() {
+            segments = Vec::new();
         }
 
         Ok(Self {
-            segments: normalized.into(),
+            segments,
             len: expected_start,
         })
     }
 
     /// Constructs a one-segment byte image from an immutable allocation.
     pub fn from_contiguous(bytes: Arc<[u8]>) -> Result<Self> {
-        Self::new(vec![ByteSegment::new(0, bytes)?])
+        let mut segments = Vec::new();
+        try_push_segment(&mut segments, ByteSegment::new(0, bytes)?)?;
+        Self::new(segments)
     }
 
     /// Constructs a byte image from sequential immutable allocations.
@@ -145,7 +194,7 @@ impl SegmentedBytes {
         for bytes in segments {
             let segment = ByteSegment::new(logical_start, bytes)?;
             logical_start = segment.logical_end();
-            positioned.push(segment);
+            try_push_segment(&mut positioned, segment)?;
         }
         Self::new(positioned)
     }
@@ -154,7 +203,7 @@ impl SegmentedBytes {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            segments: Arc::from([]),
+            segments: Vec::new(),
             len: 0,
         }
     }
@@ -174,7 +223,13 @@ impl SegmentedBytes {
     /// Returns the retained segment metadata.
     #[must_use]
     pub fn segments(&self) -> &[ByteSegment] {
-        &self.segments
+        self.segments.as_slice()
+    }
+
+    /// Returns the retained metadata capacity without allocating.
+    #[must_use]
+    pub fn segment_capacity(&self) -> usize {
+        self.segments.capacity()
     }
 
     /// Returns the complete image when it occupies one contiguous backing slice.
@@ -226,9 +281,9 @@ impl SegmentedBytes {
                 .checked_add(relative_end)
                 .ok_or_else(|| BinaryError::invalid_data("segment backing offset overflow"))?;
             let rebased_start = overlap_start - range.start;
-            view.push(ByteSegment::from_arc_range(
+            view.push(ByteSegment::from_backing_range(
                 rebased_start,
-                Arc::clone(&segment.bytes),
+                segment.backing.clone(),
                 backing_start..backing_end,
             )?);
         }
@@ -264,6 +319,14 @@ impl SegmentedBytes {
         let index = self.segment_index(range.start)?;
         self.segments.get(index)?.contiguous_range(range)
     }
+}
+
+fn try_push_segment(segments: &mut Vec<ByteSegment>, segment: ByteSegment) -> Result<()> {
+    segments
+        .try_reserve(1)
+        .map_err(|error| allocation_error(1, error))?;
+    segments.push(segment);
+    Ok(())
 }
 
 fn validate_backing_range(range: &Range<usize>, backing_len: usize) -> Result<()> {

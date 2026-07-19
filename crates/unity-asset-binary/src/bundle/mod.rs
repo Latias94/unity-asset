@@ -38,10 +38,14 @@ pub mod types;
 
 // Re-export main types for easy access
 pub use compression::{BundleCompression, CompressionOptions, CompressionStats};
-pub use header::{BundleFormatInfo, BundleHeader};
+pub use header::{BundleFormatInfo, BundleHeader, BundleLayoutKind};
 pub use loader::{
     BundleLoader, BundleResourceManager, LoaderStatistics, load_bundle, load_bundle_from_memory,
     load_bundle_with_options,
+};
+pub use parser::{
+    BundleBlockInspection, BundleDirectoryInspection, BundleInspection, BundleInspectionStats,
+    BundleLegacyInspection,
 };
 pub use parser::{BundleParser, ParsingComplexity};
 pub use types::{AssetBundle, BundleFileInfo, BundleLoadOptions, BundleStatistics, DirectoryNode};

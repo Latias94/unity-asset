@@ -15,7 +15,7 @@ use super::types::{
 use super::validation;
 use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
-use crate::random_access::{ByteCursor, ByteSource, SegmentedBytes};
+use crate::random_access::{BorrowedBytes, ByteCursor, ByteSource, SegmentedBytes};
 use crate::reader::{BinaryInput, BinaryReader, ByteOrder, not_enough_data_u64};
 use crate::shared_bytes::SharedBytes;
 use std::mem::size_of;
@@ -26,6 +26,42 @@ use unity_asset_core::{AssetLoadBudget, BudgetError};
 ///
 /// This parser supports contiguous and segmented input while charging a caller-owned load budget.
 pub struct SerializedFileParser;
+
+/// Opaque proof produced by independently parsing and validating a SerializedFile image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerializedFileInspection {
+    version: u32,
+    byte_order: ByteOrder,
+    metadata_size: u32,
+    data_offset: u64,
+    declared_file_size: u64,
+}
+
+impl SerializedFileInspection {
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub const fn byte_order(&self) -> ByteOrder {
+        self.byte_order
+    }
+
+    pub const fn metadata_size(&self) -> u32 {
+        self.metadata_size
+    }
+
+    pub const fn data_offset(&self) -> u64 {
+        self.data_offset
+    }
+
+    pub const fn declared_file_size(&self) -> u64 {
+        self.declared_file_size
+    }
+
+    pub const fn retained_heap_bytes(&self) -> Result<u64> {
+        Ok(0)
+    }
+}
 
 #[derive(Debug, Default)]
 struct ParsedMetadata {
@@ -128,13 +164,41 @@ impl SerializedFileParser {
         Ok(file)
     }
 
-    /// Validate a segmented SerializedFile without materializing a contiguous image.
-    #[doc(hidden)]
+    /// Independently inspects a contiguous SerializedFile image.
+    pub fn inspect_slice_with_budget(
+        image: &[u8],
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SerializedFileInspection> {
+        Self::inspect_source(&BorrowedBytes::new(image), budget)
+    }
+
+    /// Independently inspects a segmented SerializedFile without materializing it.
     pub fn validate_segmented_with_budget(
         image: &SegmentedBytes,
         budget: &mut AssetLoadBudget,
-    ) -> Result<()> {
-        Self::parse_source(image, budget).map(|_| ())
+    ) -> Result<SerializedFileInspection> {
+        Self::inspect_source(image, budget)
+    }
+
+    fn inspect_source(
+        source: &dyn ByteSource,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SerializedFileInspection> {
+        let parts = Self::parse_source(source, budget)?;
+        if parts.header.file_size != source.len() {
+            return Err(BinaryError::invalid_data(format!(
+                "SerializedFile declares file size {} but the image contains {} bytes",
+                parts.header.file_size,
+                source.len()
+            )));
+        }
+        Ok(SerializedFileInspection {
+            version: parts.header.version,
+            byte_order: parts.header.byte_order(),
+            metadata_size: parts.header.metadata_size,
+            data_offset: parts.header.data_offset,
+            declared_file_size: parts.header.file_size,
+        })
     }
 
     fn parse_source(source: &dyn ByteSource, budget: &mut AssetLoadBudget) -> Result<ParsedParts> {

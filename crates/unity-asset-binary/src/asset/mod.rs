@@ -45,7 +45,7 @@ pub use format::{
     SerializedFileLayout, SerializedFileRegions, TypeTreeEnablement, TypeTreeEncoding,
 };
 pub use header::SerializedFileHeader;
-pub use parser::{FileStatistics, SerializedFile, SerializedFileParser};
+pub use parser::{FileStatistics, SerializedFile, SerializedFileInspection, SerializedFileParser};
 pub use types::{
     FileIdentifier, ObjectInfo, ObjectMetadata, ObjectTypeReference, SerializedType, TypeRegistry,
     class_ids,

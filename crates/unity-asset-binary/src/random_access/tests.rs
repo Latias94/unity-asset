@@ -297,6 +297,41 @@ struct VirtualSource {
     reads: Cell<usize>,
 }
 
+struct HostileSizeHint {
+    yielded: usize,
+}
+
+impl Iterator for HostileSizeHint {
+    type Item = Arc<[u8]>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let byte = match self.yielded {
+            0 => 0x11,
+            1 => 0x22,
+            _ => return None,
+        };
+        self.yielded += 1;
+        Some(Arc::from([byte]))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (usize::MAX, Some(usize::MAX))
+    }
+}
+
+#[test]
+fn sequential_segment_constructors_preflight_growth_without_trusting_size_hint() {
+    let contiguous = SegmentedBytes::from_contiguous(Arc::from([0x7f])).unwrap();
+    assert_eq!(contiguous.contiguous(), Some(&[0x7f][..]));
+    assert!(contiguous.segment_capacity() >= 1);
+
+    let segmented = SegmentedBytes::from_arcs(HostileSizeHint { yielded: 0 }).unwrap();
+    assert_eq!(segmented.len(), 2);
+    assert_eq!(segmented.segments().len(), 2);
+    assert!(segmented.segment_capacity() >= 2);
+    assert!(segmented.segment_capacity() < 1_024);
+}
+
 impl ByteSource for VirtualSource {
     fn len(&self) -> u64 {
         self.len

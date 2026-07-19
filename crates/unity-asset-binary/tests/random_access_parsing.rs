@@ -25,6 +25,58 @@ fn segmented_values_validate_offsets_and_retain_original_backings() {
 }
 
 #[test]
+fn construction_reuses_nonempty_segment_storage_and_preserves_capacity() {
+    let backing: Arc<[u8]> = Arc::from(&b"abcd"[..]);
+    let mut segments = Vec::with_capacity(16);
+    segments.push(ByteSegment::new(0, Arc::clone(&backing)).unwrap());
+    segments.push(ByteSegment::from_arc_range(4, backing, 4..4).unwrap());
+    let original_pointer = segments.as_ptr();
+    let original_capacity = segments.capacity();
+
+    let image = SegmentedBytes::new(segments).unwrap();
+
+    assert_eq!(image.segments().len(), 1);
+    assert_eq!(image.segments().as_ptr(), original_pointer);
+    assert_eq!(image.segment_capacity(), original_capacity);
+}
+
+#[test]
+fn construction_releases_an_all_empty_segment_buffer() {
+    let backing: Arc<[u8]> = Arc::from(&b"unused"[..]);
+    let mut segments = Vec::with_capacity(16);
+    segments.push(ByteSegment::from_arc_range(0, backing, 0..0).unwrap());
+
+    let image = SegmentedBytes::new(segments).unwrap();
+
+    assert!(image.is_empty());
+    assert!(image.segments().is_empty());
+    assert_eq!(image.segment_capacity(), 0);
+}
+
+#[test]
+fn generated_vec_backing_and_subranges_are_zero_copy() {
+    let generated = Arc::new(b"generated-bytes".to_vec());
+    let image = SegmentedBytes::new(vec![
+        ByteSegment::from_arc_vec_range(0, Arc::clone(&generated), 2..11).unwrap(),
+    ])
+    .unwrap();
+
+    assert_eq!(image.segments()[0].as_slice(), b"nerated-b");
+    assert_eq!(
+        image.segments()[0].as_slice().as_ptr(),
+        generated[2..].as_ptr()
+    );
+
+    let view = image.subrange(1..7).unwrap();
+    assert_eq!(view.segments()[0].as_slice(), b"erated");
+    assert_eq!(
+        view.segments()[0].as_slice().as_ptr(),
+        generated[3..].as_ptr()
+    );
+    assert_eq!(Arc::strong_count(&generated), 3);
+}
+
+#[test]
 fn subrange_is_zero_copy_and_rebased_across_segment_boundaries() {
     let backing: Arc<[u8]> = Arc::from(&b"0123456789"[..]);
     let image = SegmentedBytes::new(vec![
@@ -92,8 +144,53 @@ fn public_segmented_validation_accepts_a_wire_golden_without_materialization() {
     .unwrap();
     let mut budget = AssetLoadBudget::default();
 
-    SerializedFileParser::validate_segmented_with_budget(&image, &mut budget).unwrap();
+    let proof = SerializedFileParser::validate_segmented_with_budget(&image, &mut budget).unwrap();
+    let contiguous =
+        SerializedFileParser::inspect_slice_with_budget(bytes, &mut AssetLoadBudget::default())
+            .unwrap();
+    let parsed = SerializedFileParser::from_bytes(bytes.to_vec()).unwrap();
+
+    assert_eq!(proof, contiguous);
+    assert_eq!(proof.version(), parsed.header.version);
+    assert_eq!(proof.byte_order(), parsed.header.byte_order());
+    assert_eq!(proof.metadata_size(), parsed.header.metadata_size);
+    assert_eq!(proof.data_offset(), parsed.header.data_offset);
+    assert_eq!(proof.declared_file_size(), bytes.len() as u64);
+    assert_eq!(proof.retained_heap_bytes().unwrap(), 0);
     assert!(image.contiguous().is_none());
     assert!(budget.usage().entries > 0);
     assert!(budget.usage().bytes > 0);
+}
+
+#[test]
+fn serialized_file_inspection_rejects_wrong_size_offset_and_untyped_tail() {
+    let golden = include_bytes!(
+        "../../unity-asset-write/tests/fixtures/serialized_file_wire/v16.assets.bin"
+    );
+
+    let mut wrong_size = golden.to_vec();
+    let impossible_size = u32::try_from(golden.len() + 1).unwrap();
+    wrong_size[4..8].copy_from_slice(&impossible_size.to_be_bytes());
+    let error = SerializedFileParser::inspect_slice_with_budget(
+        &wrong_size,
+        &mut AssetLoadBudget::default(),
+    )
+    .expect_err("declared size beyond the image must be rejected");
+    assert!(error.to_string().contains("file size"));
+
+    let mut wrong_offset = golden.to_vec();
+    wrong_offset[12..16].copy_from_slice(&0_u32.to_be_bytes());
+    let error = SerializedFileParser::inspect_slice_with_budget(
+        &wrong_offset,
+        &mut AssetLoadBudget::default(),
+    )
+    .expect_err("data offset before the header must be rejected");
+    assert!(error.to_string().contains("data offset"));
+
+    let mut trailing = golden.to_vec();
+    trailing.push(0);
+    let error =
+        SerializedFileParser::inspect_slice_with_budget(&trailing, &mut AssetLoadBudget::default())
+            .expect_err("bytes after the declared image must be rejected");
+    assert!(error.to_string().contains("image contains"));
 }

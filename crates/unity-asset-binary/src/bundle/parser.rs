@@ -4,17 +4,22 @@
 //! inspired by UnityPy/files/BundleFile.py
 
 use super::compression::BundleCompression;
-use super::header::BundleHeader;
+use super::header::{BundleHeader, BundleLayoutKind, LegacyWebRawHeader};
 use super::types::{AssetBundle, BundleFileInfo, BundleLoadOptions, DirectoryNode};
-use crate::compression::CompressionType;
+use crate::compression::{
+    CompressionType, decompressor_scratch_bytes, inspect_lzma_size_stream_with_budget,
+};
 use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
+use crate::random_access::{
+    BorrowedBytes, ByteCursor, ByteSource, ByteSourceReader, SegmentedBytes,
+};
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::shared_bytes::SharedBytes;
 use crate::unity_version::UnityVersion;
 use std::mem::size_of;
 use std::ops::Range;
-use unity_asset_core::AssetLoadBudget;
+use unity_asset_core::{AssetLoadBudget, string_allocation_bytes, vec_allocation_bytes};
 
 /// Main bundle parser
 ///
@@ -22,7 +27,537 @@ use unity_asset_core::AssetLoadBudget;
 /// supporting both UnityFS and legacy formats.
 pub struct BundleParser;
 
+/// Opaque proof produced by independently parsing and validating a bundle image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleInspection {
+    signature: String,
+    version: u32,
+    unity_version: String,
+    unity_revision: String,
+    layout: BundleLayoutKind,
+    declared_size: u64,
+    flags: u32,
+    file_stream_header_byte: Option<u8>,
+    compression: CompressionType,
+    blocks_info_hash: Option<[u8; 16]>,
+    legacy: Option<BundleLegacyInspection>,
+    blocks: Vec<BundleBlockInspection>,
+    directory: Vec<BundleDirectoryInspection>,
+    stats: BundleInspectionStats,
+}
+
+/// Legacy UnityWeb/UnityRaw header fields retained in wire form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleLegacyInspection {
+    hash: Option<[u8; 16]>,
+    crc: Option<u32>,
+    minimum_streamed_bytes: u32,
+    header_size: u32,
+    number_of_levels_to_download_before_streaming: u32,
+    level_count: i32,
+    compressed_size: u32,
+    uncompressed_size: u32,
+    complete_file_size: Option<u32>,
+    file_info_header_size: Option<u32>,
+}
+
+/// One physical UnityFS data block in encoded order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleBlockInspection {
+    uncompressed_size: u32,
+    compressed_size: u32,
+    flags: u16,
+    compression: CompressionType,
+}
+
+/// One bundle directory record in wire order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleDirectoryInspection {
+    name: String,
+    occurrence: usize,
+    offset: u64,
+    length: u64,
+    flags: u32,
+}
+
+/// Bounded work performed while inspecting a bundle image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundleInspectionStats {
+    encoded_bytes: u64,
+    compressed_bytes: u64,
+    decompressed_bytes: u64,
+    max_temporary_bytes: u64,
+}
+
+impl BundleInspection {
+    pub fn signature(&self) -> &str {
+        &self.signature
+    }
+
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn unity_version(&self) -> &str {
+        &self.unity_version
+    }
+
+    pub fn unity_revision(&self) -> &str {
+        &self.unity_revision
+    }
+
+    pub const fn layout(&self) -> BundleLayoutKind {
+        self.layout
+    }
+
+    pub const fn declared_size(&self) -> u64 {
+        self.declared_size
+    }
+
+    pub const fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    pub const fn file_stream_header_byte(&self) -> Option<u8> {
+        self.file_stream_header_byte
+    }
+
+    pub const fn compression(&self) -> CompressionType {
+        self.compression
+    }
+
+    pub const fn blocks_info_hash(&self) -> Option<[u8; 16]> {
+        self.blocks_info_hash
+    }
+
+    pub const fn legacy(&self) -> Option<&BundleLegacyInspection> {
+        self.legacy.as_ref()
+    }
+
+    pub fn blocks(&self) -> &[BundleBlockInspection] {
+        &self.blocks
+    }
+
+    pub fn directory(&self) -> &[BundleDirectoryInspection] {
+        &self.directory
+    }
+
+    pub const fn stats(&self) -> BundleInspectionStats {
+        self.stats
+    }
+
+    pub fn retained_heap_bytes(&self) -> Result<u64> {
+        let mut bytes = string_allocation_bytes(self.signature.capacity())
+            .map_err(inspection_allocation_size_error)?;
+        add_retained_bytes(
+            &mut bytes,
+            string_allocation_bytes(self.unity_version.capacity())
+                .map_err(inspection_allocation_size_error)?,
+        )?;
+        add_retained_bytes(
+            &mut bytes,
+            string_allocation_bytes(self.unity_revision.capacity())
+                .map_err(inspection_allocation_size_error)?,
+        )?;
+        add_retained_bytes(
+            &mut bytes,
+            vec_allocation_bytes::<BundleBlockInspection>(self.blocks.capacity())
+                .map_err(inspection_allocation_size_error)?,
+        )?;
+        add_retained_bytes(
+            &mut bytes,
+            vec_allocation_bytes::<BundleDirectoryInspection>(self.directory.capacity())
+                .map_err(inspection_allocation_size_error)?,
+        )?;
+        for entry in &self.directory {
+            add_retained_bytes(
+                &mut bytes,
+                string_allocation_bytes(entry.name.capacity())
+                    .map_err(inspection_allocation_size_error)?,
+            )?;
+        }
+        Ok(bytes)
+    }
+}
+
+impl BundleLegacyInspection {
+    pub const fn hash(&self) -> Option<[u8; 16]> {
+        self.hash
+    }
+
+    pub const fn crc(&self) -> Option<u32> {
+        self.crc
+    }
+
+    pub const fn minimum_streamed_bytes(&self) -> u32 {
+        self.minimum_streamed_bytes
+    }
+
+    pub const fn header_size(&self) -> u32 {
+        self.header_size
+    }
+
+    pub const fn levels_before_streaming(&self) -> u32 {
+        self.number_of_levels_to_download_before_streaming
+    }
+
+    pub const fn level_count(&self) -> i32 {
+        self.level_count
+    }
+
+    pub const fn compressed_size(&self) -> u32 {
+        self.compressed_size
+    }
+
+    pub const fn uncompressed_size(&self) -> u32 {
+        self.uncompressed_size
+    }
+
+    pub const fn complete_file_size(&self) -> Option<u32> {
+        self.complete_file_size
+    }
+
+    pub const fn file_info_header_size(&self) -> Option<u32> {
+        self.file_info_header_size
+    }
+}
+
+impl BundleBlockInspection {
+    pub const fn uncompressed_size(&self) -> u32 {
+        self.uncompressed_size
+    }
+
+    pub const fn compressed_size(&self) -> u32 {
+        self.compressed_size
+    }
+
+    pub const fn flags(&self) -> u16 {
+        self.flags
+    }
+
+    pub const fn compression(&self) -> CompressionType {
+        self.compression
+    }
+}
+
+impl BundleDirectoryInspection {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn occurrence(&self) -> usize {
+        self.occurrence
+    }
+
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub const fn length(&self) -> u64 {
+        self.length
+    }
+
+    pub const fn flags(&self) -> u32 {
+        self.flags
+    }
+}
+
+impl BundleInspectionStats {
+    pub const fn encoded_bytes(self) -> u64 {
+        self.encoded_bytes
+    }
+
+    pub const fn compressed_bytes(self) -> u64 {
+        self.compressed_bytes
+    }
+
+    pub const fn decompressed_bytes(self) -> u64 {
+        self.decompressed_bytes
+    }
+
+    pub const fn max_temporary_bytes(self) -> u64 {
+        self.max_temporary_bytes
+    }
+}
+
 impl BundleParser {
+    /// Inspects a contiguous bundle through the same random-access parser as segmented images.
+    pub fn inspect_slice_with_budget(
+        data: &[u8],
+        budget: &mut AssetLoadBudget,
+    ) -> Result<BundleInspection> {
+        Self::inspect_source_with_budget(&BorrowedBytes::new(data), budget)
+    }
+
+    /// Inspects and validates an immutable segmented bundle without concatenating its image.
+    pub fn inspect_segmented_with_budget(
+        data: &SegmentedBytes,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<BundleInspection> {
+        Self::inspect_source_with_budget(data, budget)
+    }
+
+    fn inspect_source_with_budget(
+        source: &dyn ByteSource,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<BundleInspection> {
+        let options = BundleLoadOptions::lazy();
+        let (header, blocks_info, block_data_range) = {
+            let mut reader = ByteCursor::new(source, ByteOrder::Big, budget)?;
+            let header = BundleHeader::from_input(&mut reader)?;
+            header.validate()?;
+            Self::validate_declared_header_limits(&header, &options)?;
+            if header.size != source.len() {
+                return Err(BinaryError::invalid_data(format!(
+                    "Bundle declared size {} does not match available bytes {}",
+                    header.size,
+                    source.len()
+                )));
+            }
+            if header.layout_kind()? == BundleLayoutKind::Legacy {
+                return Self::inspect_legacy_source_with_budget(source, header, &options, budget);
+            }
+            let (blocks_info, block_data_range) =
+                read_file_stream_blocks_info_from_source(&header, &mut reader)?;
+            (header, blocks_info, block_data_range)
+        };
+
+        let blocks_info_compression = header.compression_type()?;
+        let blocks_info_scratch = decompressor_scratch_bytes(
+            &blocks_info,
+            blocks_info_compression,
+            usize::try_from(header.uncompressed_blocks_info_size).map_err(|_| {
+                BinaryError::invalid_data("Blocks-info decoded size does not fit usize")
+            })?,
+        )?;
+        let blocks_info_decoded = BundleCompression::decompress_blocks_info_limited_with_budget(
+            &header,
+            &blocks_info,
+            options.max_blocks_info_size,
+            budget,
+        )?;
+        let blocks_info_hash = blocks_info_decoded
+            .get(..16)
+            .ok_or_else(|| BinaryError::invalid_data("UnityFS blocks info is missing its hash"))?
+            .try_into()
+            .map_err(|_| BinaryError::invalid_data("Invalid UnityFS blocks-info hash width"))?;
+        let tables = parse_file_stream_inspection_tables(&blocks_info_decoded, &options, budget)?;
+        let total_uncompressed = tables.total_uncompressed;
+        let declared_compressed = tables.total_compressed;
+        if declared_compressed != block_data_range.end - block_data_range.start {
+            return Err(BinaryError::invalid_data(format!(
+                "FileStream compressed block total {declared_compressed} does not exactly cover physical payload range {}",
+                block_data_range.end - block_data_range.start
+            )));
+        }
+
+        let mut max_temporary_bytes = u64::from(header.compressed_blocks_info_size)
+            .checked_add(u64::from(header.uncompressed_blocks_info_size))
+            .and_then(|bytes| bytes.checked_add(blocks_info_scratch))
+            .ok_or_else(|| BinaryError::invalid_data("Blocks-info working set overflow"))?;
+        drop(blocks_info_decoded);
+        drop(blocks_info);
+        let mut block_offset = block_data_range.start;
+        for block in &tables.blocks {
+            let block_end = block_offset
+                .checked_add(u64::from(block.compressed_size))
+                .ok_or_else(|| BinaryError::invalid_data("Block source range overflow"))?;
+            let encoded = {
+                let mut reader = ByteCursor::with_range(
+                    source,
+                    block_offset..block_end,
+                    ByteOrder::Big,
+                    budget,
+                )?;
+                reader.read_bytes(u64::from(block.compressed_size))?
+            };
+            let uncompressed_size = usize::try_from(block.uncompressed_size).map_err(|_| {
+                BinaryError::invalid_data("Block uncompressed size does not fit usize")
+            })?;
+            let scratch =
+                decompressor_scratch_bytes(&encoded, block.compression, uncompressed_size)?;
+            let decoded = crate::compression::decompress_with_budget(
+                &encoded,
+                block.compression,
+                uncompressed_size,
+                budget,
+            )?;
+            if decoded.len() != uncompressed_size {
+                return Err(BinaryError::invalid_data(format!(
+                    "UnityFS block decoded to {} bytes, expected {}",
+                    decoded.len(),
+                    block.uncompressed_size
+                )));
+            }
+            let working_set = u64::from(block.compressed_size)
+                .checked_add(u64::from(block.uncompressed_size))
+                .and_then(|bytes| bytes.checked_add(scratch))
+                .ok_or_else(|| BinaryError::invalid_data("Block working set overflow"))?;
+            max_temporary_bytes = max_temporary_bytes.max(working_set);
+            block_offset = block_end;
+        }
+
+        let compressed_bytes = u64::from(header.compressed_blocks_info_size)
+            .checked_add(declared_compressed)
+            .ok_or_else(|| {
+                BinaryError::invalid_data("Inspection compressed byte total overflow")
+            })?;
+        let decompressed_bytes = u64::from(header.uncompressed_blocks_info_size)
+            .checked_add(total_uncompressed)
+            .ok_or_else(|| BinaryError::invalid_data("Inspection decoded byte total overflow"))?;
+        let compression = header.compression_type()?;
+        Ok(BundleInspection {
+            signature: header.signature,
+            version: header.version,
+            unity_version: header.unity_version,
+            unity_revision: header.unity_revision,
+            layout: BundleLayoutKind::FileStream,
+            declared_size: header.size,
+            flags: header.flags,
+            file_stream_header_byte: header.file_stream_header_byte,
+            compression,
+            blocks_info_hash: Some(blocks_info_hash),
+            legacy: None,
+            blocks: tables.blocks,
+            directory: tables.directory,
+            stats: BundleInspectionStats {
+                encoded_bytes: source.len(),
+                compressed_bytes,
+                decompressed_bytes,
+                max_temporary_bytes,
+            },
+        })
+    }
+
+    fn inspect_legacy_source_with_budget(
+        source: &dyn ByteSource,
+        header: BundleHeader,
+        options: &BundleLoadOptions,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<BundleInspection> {
+        let legacy = header.legacy_web_raw.as_ref().ok_or_else(|| {
+            BinaryError::invalid_data("Legacy bundle header fields were not parsed")
+        })?;
+        let compressed_size = u64::from(legacy.compressed_size);
+        let uncompressed_size = u64::from(legacy.uncompressed_size);
+        if legacy.level_count != 1 {
+            return Err(BinaryError::unsupported(format!(
+                "Segmented legacy inspection supports levelCount=1, got {}",
+                legacy.level_count
+            )));
+        }
+        let file_info_header_size = legacy.file_info_header_size.ok_or_else(|| {
+            BinaryError::unsupported(
+                "Segmented legacy inspection requires version 3 or newer directory metadata",
+            )
+        })?;
+        if file_info_header_size > legacy.uncompressed_size {
+            return Err(BinaryError::invalid_data(format!(
+                "Legacy directory header size {file_info_header_size} exceeds decoded blob size {}",
+                legacy.uncompressed_size
+            )));
+        }
+
+        let blob_start = u64::from(legacy.header_size);
+        let blob_end = blob_start
+            .checked_add(u64::from(legacy.compressed_size))
+            .ok_or_else(|| BinaryError::invalid_data("Legacy blob range overflow"))?;
+        if blob_end != header.size {
+            return Err(BinaryError::invalid_data(format!(
+                "Legacy blob ends at {blob_end}, but declared bundle size is {}",
+                header.size
+            )));
+        }
+        let blob_range = blob_start..blob_end;
+        let prefix_size = usize::try_from(file_info_header_size).map_err(|_| {
+            BinaryError::invalid_data("Legacy directory header size does not fit usize")
+        })?;
+        let (directory_prefix, max_temporary_bytes, compression) = match header.signature.as_str() {
+            "UnityRaw" => {
+                if legacy.compressed_size != legacy.uncompressed_size {
+                    return Err(BinaryError::invalid_data(format!(
+                        "UnityRaw encoded size {} does not match decoded size {}",
+                        legacy.compressed_size, legacy.uncompressed_size
+                    )));
+                }
+                budget.check_decompression(
+                    u64::from(legacy.compressed_size),
+                    u64::from(legacy.uncompressed_size),
+                )?;
+                budget.begin_decompression().consume(
+                    u64::from(legacy.compressed_size),
+                    u64::from(legacy.uncompressed_size),
+                )?;
+                let prefix_end = blob_start
+                    .checked_add(u64::from(file_info_header_size))
+                    .ok_or_else(|| BinaryError::invalid_data("Legacy directory range overflow"))?;
+                let prefix =
+                    ByteCursor::with_range(source, blob_start..prefix_end, ByteOrder::Big, budget)?
+                        .read_bytes(u64::from(file_info_header_size))?;
+                (
+                    prefix,
+                    u64::from(file_info_header_size),
+                    CompressionType::None,
+                )
+            }
+            "UnityWeb" => {
+                let input = ByteSourceReader::with_range(source, blob_range)?;
+                let inspected = inspect_lzma_size_stream_with_budget(
+                    input,
+                    u64::from(legacy.compressed_size),
+                    u64::from(legacy.uncompressed_size),
+                    prefix_size,
+                    budget,
+                )?;
+                if inspected.decoded_len != u64::from(legacy.uncompressed_size) {
+                    return Err(BinaryError::invalid_data(
+                        "Legacy LZMA decoder returned an inconsistent length",
+                    ));
+                }
+                (
+                    inspected.prefix,
+                    inspected.max_temporary_bytes,
+                    CompressionType::Lzma,
+                )
+            }
+            signature => {
+                return Err(BinaryError::unsupported(format!(
+                    "Unsupported legacy bundle signature: {signature}"
+                )));
+            }
+        };
+
+        let directory = parse_legacy_inspection_directory(
+            &directory_prefix,
+            u64::from(file_info_header_size),
+            u64::from(legacy.uncompressed_size),
+            options,
+            budget,
+        )?;
+        let legacy = inspect_legacy_header(legacy)?;
+        Ok(BundleInspection {
+            signature: header.signature,
+            version: header.version,
+            unity_version: header.unity_version,
+            unity_revision: header.unity_revision,
+            layout: BundleLayoutKind::Legacy,
+            declared_size: header.size,
+            flags: header.flags,
+            file_stream_header_byte: None,
+            compression,
+            blocks_info_hash: None,
+            legacy: Some(legacy),
+            blocks: Vec::new(),
+            directory,
+            stats: BundleInspectionStats {
+                encoded_bytes: source.len(),
+                compressed_bytes: compressed_size,
+                decompressed_bytes: uncompressed_size,
+                max_temporary_bytes,
+            },
+        })
+    }
+
     /// Parse an AssetBundle from binary data
     pub fn from_bytes(data: Vec<u8>) -> Result<AssetBundle> {
         Self::from_bytes_with_options(data, BundleLoadOptions::default())
@@ -165,23 +700,18 @@ impl BundleParser {
             )));
         }
 
+        let layout = header.layout_kind()?;
         let mut bundle = AssetBundle::new_empty(header);
-        if bundle.header.is_legacy() {
+        if layout == BundleLayoutKind::Legacy {
             bundle.set_legacy_source(view.clone());
         }
 
-        match bundle.header.signature.as_str() {
-            "UnityFS" => {
-                Self::parse_unity_fs(&mut bundle, &view, &mut reader, &options, budget)?;
+        match layout {
+            BundleLayoutKind::FileStream => {
+                Self::parse_file_stream(&mut bundle, &view, &mut reader, &options, budget)?;
             }
-            "UnityWeb" | "UnityRaw" => {
+            BundleLayoutKind::Legacy => {
                 Self::parse_legacy(&mut bundle, &mut reader, &options, budget)?;
-            }
-            _ => {
-                return Err(BinaryError::unsupported(format!(
-                    "Unsupported bundle format: {}",
-                    bundle.header.signature
-                )));
             }
         }
 
@@ -215,7 +745,7 @@ impl BundleParser {
             }
         }
 
-        if header.is_unity_fs() {
+        if header.layout_kind()? == BundleLayoutKind::FileStream {
             if let Some(limit) = options.max_compressed_blocks_info_size
                 && u64::from(header.compressed_blocks_info_size) > limit as u64
             {
@@ -237,8 +767,8 @@ impl BundleParser {
         Ok(())
     }
 
-    /// Parse UnityFS format bundle
-    fn parse_unity_fs(
+    /// Parse a block-based FileStream bundle.
+    fn parse_file_stream(
         bundle: &mut AssetBundle,
         source: &DataView,
         reader: &mut BinaryReader,
@@ -247,7 +777,7 @@ impl BundleParser {
     ) -> Result<()> {
         // Read blocks info
         let block_data_start = Self::read_blocks_info(bundle, reader, options, budget)?;
-        let block_data = Self::unityfs_block_data_view(bundle, source, block_data_start)?;
+        let block_data = Self::file_stream_block_data_view(bundle, source, block_data_start)?;
 
         // Decompress data blocks if requested OR if we need to load assets
         if options.decompress_blocks || options.load_assets {
@@ -272,7 +802,7 @@ impl BundleParser {
         Ok(())
     }
 
-    fn unityfs_block_data_view(
+    fn file_stream_block_data_view(
         bundle: &AssetBundle,
         source: &DataView,
         block_data_start: u64,
@@ -302,9 +832,9 @@ impl BundleParser {
                 .ok_or_else(|| BinaryError::invalid_data("UnityFS compressed block total overflow"))
         })?;
         let available = block_data_end - block_data_start;
-        if declared_compressed > available {
+        if declared_compressed != available {
             return Err(BinaryError::invalid_data(format!(
-                "UnityFS compressed block total {declared_compressed} exceeds physical payload range {available}"
+                "FileStream compressed block total {declared_compressed} does not exactly cover physical payload range {available}"
             )));
         }
 
@@ -743,17 +1273,18 @@ impl BundleParser {
         options: &BundleLoadOptions,
         budget: &mut AssetLoadBudget,
     ) -> Result<()> {
-        let (backing, base_offset, visible_len) = if bundle.header.is_unity_fs() {
-            let backing = crate::shared_bytes::SharedBytes::from_arc(bundle.data_arc()?);
-            let visible_len = backing.len() as u64;
-            (backing, 0usize, visible_len)
-        } else {
-            let view = bundle.legacy_source().ok_or_else(|| {
-                BinaryError::invalid_data("Legacy bundle source is not available")
-            })?;
-            let visible_len = view.len() as u64;
-            (view.backing_shared(), view.base_offset(), visible_len)
-        };
+        let (backing, base_offset, visible_len) =
+            if bundle.header.layout_kind()? == BundleLayoutKind::FileStream {
+                let backing = crate::shared_bytes::SharedBytes::from_arc(bundle.data_arc()?);
+                let visible_len = backing.len() as u64;
+                (backing, 0usize, visible_len)
+            } else {
+                let view = bundle.legacy_source().ok_or_else(|| {
+                    BinaryError::invalid_data("Legacy bundle source is not available")
+                })?;
+                let visible_len = view.len() as u64;
+                (view.backing_shared(), view.base_offset(), visible_len)
+            };
 
         // Clone nodes to avoid borrow conflicts while pushing assets.
         let nodes = bundle.nodes.clone();
@@ -860,36 +1391,495 @@ impl BundleParser {
         let mut reader = BinaryReader::new(data, ByteOrder::Big);
         let header = BundleHeader::from_reader(&mut reader)?;
 
-        let complexity = match header.signature.as_str() {
-            "UnityFS" => {
+        let complexity = match header.layout_kind()? {
+            BundleLayoutKind::FileStream => {
                 let compression_type = header.compression_type()?;
                 let has_compression = compression_type != CompressionType::None;
 
                 ParsingComplexity {
-                    format: "UnityFS".to_string(),
+                    format: header.signature.clone(),
                     estimated_time: if has_compression { "Medium" } else { "Fast" }.to_string(),
                     memory_usage: header.size,
                     has_compression,
                     block_count: 0, // Would need to parse blocks info to get accurate count
                 }
             }
-            "UnityWeb" | "UnityRaw" => ParsingComplexity {
+            BundleLayoutKind::Legacy => ParsingComplexity {
                 format: header.signature.clone(),
                 estimated_time: "Fast".to_string(),
                 memory_usage: header.size,
                 has_compression: header.signature == "UnityWeb",
                 block_count: 1,
             },
-            _ => {
-                return Err(BinaryError::unsupported(format!(
-                    "Unknown bundle format: {}",
-                    header.signature
-                )));
-            }
         };
 
         Ok(complexity)
     }
+}
+
+struct FileStreamInspectionTables {
+    blocks: Vec<BundleBlockInspection>,
+    directory: Vec<BundleDirectoryInspection>,
+    total_compressed: u64,
+    total_uncompressed: u64,
+}
+
+fn parse_file_stream_inspection_tables(
+    data: &[u8],
+    options: &BundleLoadOptions,
+    budget: &mut AssetLoadBudget,
+) -> Result<FileStreamInspectionTables> {
+    if data.len() < 20 {
+        return Err(BinaryError::not_enough_data(20, data.len()));
+    }
+    let block_count = nonnegative_bundle_count(data, 16, "compression block")?;
+    if block_count == 0 {
+        return Err(BinaryError::invalid_data("No compression blocks found"));
+    }
+    if block_count > options.max_blocks {
+        return Err(BinaryError::ResourceLimitExceeded(format!(
+            "Compression block count {block_count} exceeds limit {}",
+            options.max_blocks
+        )));
+    }
+    let block_table_bytes = block_count
+        .checked_mul(10)
+        .ok_or_else(|| BinaryError::invalid_data("Compression block table size overflow"))?;
+    let block_table_end = 20_usize
+        .checked_add(block_table_bytes)
+        .ok_or_else(|| BinaryError::invalid_data("Compression block table range overflow"))?;
+    let node_count = nonnegative_bundle_count(data, block_table_end, "directory node")?;
+    if node_count > options.max_nodes {
+        return Err(BinaryError::ResourceLimitExceeded(format!(
+            "Directory node count {node_count} exceeds limit {}",
+            options.max_nodes
+        )));
+    }
+
+    let mut total_compressed = 0_u64;
+    let mut total_uncompressed = 0_u64;
+    for index in 0..block_count {
+        let offset =
+            20_usize
+                .checked_add(index.checked_mul(10).ok_or_else(|| {
+                    BinaryError::invalid_data("Compression block offset overflow")
+                })?)
+                .ok_or_else(|| BinaryError::invalid_data("Compression block offset overflow"))?;
+        let uncompressed_size = bundle_u32_at(data, offset, "block uncompressed size")?;
+        let compressed_size = bundle_u32_at(data, offset + 4, "block compressed size")?;
+        let flags = bundle_u16_at(data, offset + 8, "block flags")?;
+        if compressed_size == 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Block {index} has zero compressed size"
+            )));
+        }
+        if uncompressed_size == 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Block {index} has zero uncompressed size"
+            )));
+        }
+        if u64::from(compressed_size) > u64::from(uncompressed_size) * 2 && uncompressed_size > 1024
+        {
+            return Err(BinaryError::invalid_data(format!(
+                "Block {index} has suspicious compression ratio: {compressed_size}/{uncompressed_size}"
+            )));
+        }
+        CompressionType::from_flags(u32::from(flags))?;
+        total_compressed = total_compressed
+            .checked_add(u64::from(compressed_size))
+            .ok_or_else(|| BinaryError::invalid_data("Bundle compressed size total overflow"))?;
+        total_uncompressed = total_uncompressed
+            .checked_add(u64::from(uncompressed_size))
+            .ok_or_else(|| BinaryError::invalid_data("Bundle block size total overflow"))?;
+    }
+
+    let mut node_cursor = block_table_end
+        .checked_add(4)
+        .ok_or_else(|| BinaryError::invalid_data("Directory table start overflow"))?;
+    let mut name_bytes = 0_usize;
+    for _ in 0..node_count {
+        let fixed_end = node_cursor
+            .checked_add(20)
+            .ok_or_else(|| BinaryError::invalid_data("Directory node header overflow"))?;
+        if fixed_end > data.len() {
+            return Err(BinaryError::not_enough_data(fixed_end, data.len()));
+        }
+        let offset = bundle_i64_at(data, node_cursor, "directory node offset")?;
+        let length = bundle_i64_at(data, node_cursor + 8, "directory node size")?;
+        let offset = u64::try_from(offset)
+            .map_err(|_| BinaryError::invalid_data("Negative directory node offset"))?;
+        let length = u64::try_from(length)
+            .map_err(|_| BinaryError::invalid_data("Negative directory node size"))?;
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| BinaryError::invalid_data("Directory node offset+size overflow"))?;
+        if end > total_uncompressed {
+            return Err(BinaryError::invalid_data(format!(
+                "Directory node exceeds decompressed data: end {end} > {total_uncompressed}"
+            )));
+        }
+        let (name_length, next) = preflight_bundle_cstring(data, fixed_end)?;
+        name_bytes = name_bytes
+            .checked_add(name_length)
+            .ok_or_else(|| BinaryError::invalid_data("Directory node name size overflow"))?;
+        node_cursor = next;
+    }
+    if node_cursor != data.len() {
+        return Err(BinaryError::invalid_data(format!(
+            "FileStream blocks info contains {} trailing decoded bytes",
+            data.len() - node_cursor
+        )));
+    }
+
+    let entry_count = block_count
+        .checked_add(node_count)
+        .ok_or_else(|| BinaryError::invalid_data("Inspection entry count overflow"))?;
+    let block_bytes = vec_allocation_bytes::<BundleBlockInspection>(block_count)
+        .map_err(inspection_allocation_size_error)?;
+    let directory_bytes = vec_allocation_bytes::<BundleDirectoryInspection>(node_count)
+        .map_err(inspection_allocation_size_error)?;
+    let name_bytes =
+        string_allocation_bytes(name_bytes).map_err(inspection_allocation_size_error)?;
+    let retained_bytes = block_bytes
+        .checked_add(directory_bytes)
+        .and_then(|bytes| bytes.checked_add(name_bytes))
+        .ok_or_else(|| BinaryError::memory_error("FileStream inspection retained size overflow"))?;
+    let entry_count = u64::try_from(entry_count)
+        .map_err(|_| BinaryError::invalid_data("Inspection entry count does not fit u64"))?;
+    let node_count_u64 = u64::try_from(node_count)
+        .map_err(|_| BinaryError::invalid_data("Directory node count does not fit u64"))?;
+    budget.check_entries(entry_count)?;
+    budget.check_members(node_count_u64)?;
+    budget.check_bytes(retained_bytes)?;
+    budget.consume_entries(entry_count)?;
+    budget.consume_members(node_count_u64)?;
+    budget.consume_bytes(retained_bytes)?;
+
+    let mut blocks = Vec::new();
+    blocks.try_reserve_exact(block_count).map_err(|error| {
+        BinaryError::memory_error(format!(
+            "Failed to reserve {block_count} inspected blocks: {error}"
+        ))
+    })?;
+    for index in 0..block_count {
+        let offset = 20 + index * 10;
+        let flags = bundle_u16_at(data, offset + 8, "block flags")?;
+        blocks.push(BundleBlockInspection {
+            uncompressed_size: bundle_u32_at(data, offset, "block uncompressed size")?,
+            compressed_size: bundle_u32_at(data, offset + 4, "block compressed size")?,
+            flags,
+            compression: CompressionType::from_flags(u32::from(flags))?,
+        });
+    }
+
+    let mut directory = Vec::new();
+    directory.try_reserve_exact(node_count).map_err(|error| {
+        BinaryError::memory_error(format!(
+            "Failed to reserve {node_count} inspected directory records: {error}"
+        ))
+    })?;
+    node_cursor = block_table_end + 4;
+    for _ in 0..node_count {
+        let fixed_end = node_cursor + 20;
+        let offset = u64::try_from(bundle_i64_at(data, node_cursor, "directory node offset")?)
+            .map_err(|_| BinaryError::invalid_data("Negative directory node offset"))?;
+        let length = u64::try_from(bundle_i64_at(data, node_cursor + 8, "directory node size")?)
+            .map_err(|_| BinaryError::invalid_data("Negative directory node size"))?;
+        let flags = bundle_u32_at(data, node_cursor + 16, "directory node flags")?;
+        let (name_length, next) = preflight_bundle_cstring(data, fixed_end)?;
+        let name_bytes = &data[fixed_end..fixed_end + name_length];
+        let name_text = std::str::from_utf8(name_bytes)?;
+        let mut name = String::new();
+        name.try_reserve_exact(name_length).map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {name_length} directory name bytes: {error}"
+            ))
+        })?;
+        name.push_str(name_text);
+        directory.push(BundleDirectoryInspection {
+            name,
+            occurrence: 0,
+            offset,
+            length,
+            flags,
+        });
+        node_cursor = next;
+    }
+    assign_directory_occurrences(&mut directory, budget)?;
+
+    Ok(FileStreamInspectionTables {
+        blocks,
+        directory,
+        total_compressed,
+        total_uncompressed,
+    })
+}
+
+fn nonnegative_bundle_count(data: &[u8], offset: usize, field: &'static str) -> Result<usize> {
+    let value = bundle_i32_at(data, offset, field)?;
+    usize::try_from(value).map_err(|_| BinaryError::invalid_data(format!("Negative {field} count")))
+}
+
+fn inspection_allocation_size_error(error: unity_asset_core::AllocationSizeError) -> BinaryError {
+    BinaryError::memory_error(format!(
+        "Inspection retained allocation size overflow: {error}"
+    ))
+}
+
+fn add_retained_bytes(total: &mut u64, amount: u64) -> Result<()> {
+    *total = total
+        .checked_add(amount)
+        .ok_or_else(|| BinaryError::memory_error("Inspection retained heap size overflow"))?;
+    Ok(())
+}
+
+fn inspect_legacy_header(legacy: &LegacyWebRawHeader) -> Result<BundleLegacyInspection> {
+    let hash = legacy
+        .hash
+        .as_deref()
+        .map(|hash| {
+            hash.try_into()
+                .map_err(|_| BinaryError::invalid_data("Invalid legacy bundle hash width"))
+        })
+        .transpose()?;
+    Ok(BundleLegacyInspection {
+        hash,
+        crc: legacy.crc,
+        minimum_streamed_bytes: legacy.minimum_streamed_bytes,
+        header_size: legacy.header_size,
+        number_of_levels_to_download_before_streaming: legacy
+            .number_of_levels_to_download_before_streaming,
+        level_count: legacy.level_count,
+        compressed_size: legacy.compressed_size,
+        uncompressed_size: legacy.uncompressed_size,
+        complete_file_size: legacy.complete_file_size,
+        file_info_header_size: legacy.file_info_header_size,
+    })
+}
+
+fn parse_legacy_inspection_directory(
+    directory_data: &[u8],
+    directory_size: u64,
+    decoded_size: u64,
+    options: &BundleLoadOptions,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<BundleDirectoryInspection>> {
+    let declared_directory_size = usize::try_from(directory_size)
+        .map_err(|_| BinaryError::invalid_data("Legacy directory size does not fit usize"))?;
+    if declared_directory_size != directory_data.len() {
+        return Err(BinaryError::invalid_data(format!(
+            "Legacy directory prefix has {} bytes, expected {declared_directory_size}",
+            directory_data.len()
+        )));
+    }
+    let file_count = nonnegative_bundle_count(directory_data, 0, "legacy bundle file")?;
+    if file_count > options.max_nodes {
+        return Err(BinaryError::ResourceLimitExceeded(format!(
+            "Legacy bundle file count {file_count} exceeds limit {}",
+            options.max_nodes
+        )));
+    }
+    let directory_start = 4;
+    let (name_bytes, directory_end) = preflight_legacy_inspection_directory(
+        directory_data,
+        directory_start,
+        file_count,
+        directory_size,
+        decoded_size,
+    )?;
+    if directory_end != directory_data.len() {
+        return Err(BinaryError::invalid_data(format!(
+            "Legacy directory contains {} trailing bytes",
+            directory_data.len() - directory_end
+        )));
+    }
+    let retained_bytes = size_of::<BundleDirectoryInspection>()
+        .checked_mul(file_count)
+        .and_then(|bytes| bytes.checked_add(name_bytes))
+        .ok_or_else(|| BinaryError::invalid_data("Legacy inspection directory size overflow"))?;
+    consume_directory_budget(
+        file_count,
+        u64::try_from(retained_bytes).map_err(|_| {
+            BinaryError::invalid_data("Legacy inspection directory size does not fit u64")
+        })?,
+        budget,
+    )?;
+
+    let mut directory = Vec::new();
+    directory.try_reserve_exact(file_count).map_err(|error| {
+        BinaryError::memory_error(format!(
+            "Failed to reserve {file_count} legacy inspection records: {error}"
+        ))
+    })?;
+    let mut cursor = directory_start;
+    for _ in 0..file_count {
+        let (name_length, after_name) = preflight_bundle_cstring(directory_data, cursor)?;
+        let name_text = std::str::from_utf8(&directory_data[cursor..cursor + name_length])?;
+        let mut name = String::new();
+        name.try_reserve_exact(name_length).map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {name_length} legacy directory name bytes: {error}"
+            ))
+        })?;
+        name.push_str(name_text);
+        let offset = u64::from(bundle_u32_at(
+            directory_data,
+            after_name,
+            "legacy directory offset",
+        )?);
+        let length = u64::from(bundle_u32_at(
+            directory_data,
+            after_name + 4,
+            "legacy directory length",
+        )?);
+        directory.push(BundleDirectoryInspection {
+            name,
+            occurrence: 0,
+            offset,
+            length,
+            flags: 0x4,
+        });
+        cursor = after_name + 8;
+    }
+    assign_directory_occurrences(&mut directory, budget)?;
+    Ok(directory)
+}
+
+fn preflight_legacy_inspection_directory(
+    data: &[u8],
+    start: usize,
+    file_count: usize,
+    directory_size: u64,
+    decoded_size: u64,
+) -> Result<(usize, usize)> {
+    let mut cursor = start;
+    let mut name_bytes = 0_usize;
+    for _ in 0..file_count {
+        let (name_length, after_name) = preflight_bundle_cstring(data, cursor)?;
+        let fixed_end = after_name
+            .checked_add(8)
+            .ok_or_else(|| BinaryError::invalid_data("Legacy directory entry range overflow"))?;
+        if fixed_end > data.len() {
+            return Err(BinaryError::invalid_data(
+                "Legacy directory entry crosses file_info_header_size",
+            ));
+        }
+        let offset = u64::from(bundle_u32_at(data, after_name, "legacy directory offset")?);
+        let length = u64::from(bundle_u32_at(
+            data,
+            after_name + 4,
+            "legacy directory length",
+        )?);
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| BinaryError::invalid_data("Legacy directory data range overflow"))?;
+        if offset < directory_size || end > decoded_size {
+            return Err(BinaryError::invalid_data(format!(
+                "Legacy directory data range {offset}..{end} is outside payload {directory_size}..{decoded_size}"
+            )));
+        }
+        name_bytes = name_bytes
+            .checked_add(name_length)
+            .ok_or_else(|| BinaryError::invalid_data("Legacy directory name size overflow"))?;
+        cursor = fixed_end;
+    }
+    Ok((name_bytes, cursor))
+}
+
+fn assign_directory_occurrences(
+    directory: &mut [BundleDirectoryInspection],
+    budget: &mut AssetLoadBudget,
+) -> Result<()> {
+    let index_bytes = size_of::<usize>()
+        .checked_mul(directory.len())
+        .ok_or_else(|| BinaryError::invalid_data("Directory occurrence index size overflow"))?;
+    budget.consume_bytes(u64::try_from(index_bytes).map_err(|_| {
+        BinaryError::invalid_data("Directory occurrence index size does not fit u64")
+    })?)?;
+    let mut indices = Vec::new();
+    indices
+        .try_reserve_exact(directory.len())
+        .map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {} directory occurrence indices: {error}",
+                directory.len()
+            ))
+        })?;
+    indices.extend(0..directory.len());
+    indices.sort_unstable_by(|left, right| {
+        directory[*left]
+            .name
+            .cmp(&directory[*right].name)
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut previous_index: Option<usize> = None;
+    let mut occurrence = 0_usize;
+    for index in indices {
+        if previous_index.is_some_and(|previous| directory[previous].name == directory[index].name)
+        {
+            occurrence = occurrence
+                .checked_add(1)
+                .ok_or_else(|| BinaryError::invalid_data("Directory occurrence overflow"))?;
+        } else {
+            occurrence = 0;
+        }
+        directory[index].occurrence = occurrence;
+        previous_index = Some(index);
+    }
+    Ok(())
+}
+
+fn read_file_stream_blocks_info_from_source(
+    header: &BundleHeader,
+    reader: &mut ByteCursor<'_, '_>,
+) -> Result<(Vec<u8>, Range<u64>)> {
+    if header.version >= 7 {
+        reader.align_to(16)?;
+    } else if BundleParser::should_probe_legacy_alignment(header) {
+        let pre_align = reader.position();
+        let padding = (16 - (pre_align % 16)) % 16;
+        if padding != 0 {
+            let bytes = reader.read_bytes(padding)?;
+            if bytes.iter().any(|byte| *byte != 0) {
+                reader.set_position(pre_align)?;
+            }
+        }
+    }
+
+    let data_start_before_info = reader.position();
+    let compressed_size = u64::from(header.compressed_blocks_info_size);
+    let blocks_info = if header.block_info_at_end() {
+        let info_start = header
+            .size
+            .checked_sub(compressed_size)
+            .ok_or_else(|| BinaryError::invalid_data("Blocks-info exceeds declared bundle size"))?;
+        reader.set_position(info_start)?;
+        let bytes = reader.read_bytes(compressed_size)?;
+        reader.set_position(data_start_before_info)?;
+        bytes
+    } else {
+        reader.read_bytes(compressed_size)?
+    };
+
+    if header.flags & crate::compression::ArchiveFlags::BLOCK_INFO_NEEDS_PADDING_AT_START != 0 {
+        reader.align_to(16)?;
+    }
+    let block_data_start = reader.position();
+    let block_data_end = if header.block_info_at_end() {
+        header
+            .size
+            .checked_sub(compressed_size)
+            .ok_or_else(|| BinaryError::invalid_data("Blocks-info exceeds declared bundle size"))?
+    } else {
+        header.size
+    };
+    if block_data_start > block_data_end {
+        return Err(BinaryError::invalid_data(format!(
+            "UnityFS block data starts at {block_data_start} after its physical end {block_data_end}"
+        )));
+    }
+    Ok((blocks_info, block_data_start..block_data_end))
 }
 
 fn consume_directory_budget(
@@ -1067,6 +2057,42 @@ fn bundle_i64_at(data: &[u8], offset: usize, field: &'static str) -> Result<i64>
         .try_into()
         .map_err(|_| BinaryError::invalid_data(format!("Invalid {field} width")))?;
     Ok(i64::from_be_bytes(bytes))
+}
+
+fn bundle_i32_at(data: &[u8], offset: usize, field: &'static str) -> Result<i32> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| BinaryError::invalid_data(format!("{field} range overflow")))?;
+    let bytes = data
+        .get(offset..end)
+        .ok_or_else(|| BinaryError::not_enough_data(end, data.len()))?;
+    Ok(i32::from_be_bytes(bytes.try_into().map_err(|_| {
+        BinaryError::invalid_data(format!("Invalid {field} width"))
+    })?))
+}
+
+fn bundle_u16_at(data: &[u8], offset: usize, field: &'static str) -> Result<u16> {
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| BinaryError::invalid_data(format!("{field} range overflow")))?;
+    let bytes = data
+        .get(offset..end)
+        .ok_or_else(|| BinaryError::not_enough_data(end, data.len()))?;
+    Ok(u16::from_be_bytes(bytes.try_into().map_err(|_| {
+        BinaryError::invalid_data(format!("Invalid {field} width"))
+    })?))
+}
+
+fn bundle_u32_at(data: &[u8], offset: usize, field: &'static str) -> Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| BinaryError::invalid_data(format!("{field} range overflow")))?;
+    let bytes = data
+        .get(offset..end)
+        .ok_or_else(|| BinaryError::not_enough_data(end, data.len()))?;
+    Ok(u32::from_be_bytes(bytes.try_into().map_err(|_| {
+        BinaryError::invalid_data(format!("Invalid {field} width"))
+    })?))
 }
 
 /// Parsing complexity information

@@ -5,10 +5,12 @@ use std::ops::Range;
 use crate::error::{BinaryError, Result};
 
 mod cursor;
+mod reader;
 mod segments;
 mod source;
 
 pub(crate) use cursor::ByteCursor;
+pub(crate) use reader::{ByteSourceReader, FallibleBufReader};
 pub use segments::{ByteSegment, SegmentedBytes};
 pub(crate) use source::{BorrowedBytes, ByteSource};
 

@@ -4,20 +4,32 @@
 //! and may be compressed with gzip or brotli.
 
 use crate::bundle::{AssetBundle, BundleFileInfo};
-use crate::compression::{decompress_brotli_with_budget, decompress_gzip_with_budget};
+use crate::compression::{
+    BrotliScratchReservation, CompressionType, DeferredByteReservation, SegmentedBrotliDecoder,
+    decompress_brotli_with_budget, decompress_gzip_with_budget, decompressor_scratch_bytes,
+};
 use crate::data_view::DataView;
 use crate::error::{BinaryError, Result};
+use crate::random_access::{
+    BorrowedBytes, ByteSource, ByteSourceReader, FallibleBufReader, SegmentedBytes,
+};
 use crate::reader::{BinaryReader, ByteOrder};
 use crate::shared_bytes::SharedBytes;
+use flate2::bufread::GzDecoder;
+use std::io::{self, Read};
 use std::mem::size_of;
 use std::ops::Range;
 use thiserror::Error;
-use unity_asset_core::AssetLoadBudget;
+use unity_asset_core::{
+    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BudgetError, DecompressionBudget,
+    string_allocation_bytes, vec_allocation_bytes,
+};
 
 /// Magic bytes for different compression formats
 const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
 // UnityPy uses the ASCII marker at offset 0x20 as a heuristic.
 const BROTLI_MAGIC: &[u8] = b"brotli";
+const INSPECTION_CODEC_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Compression type used in WebFile
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +37,135 @@ pub enum WebFileCompression {
     None,
     Gzip,
     Brotli,
+}
+
+/// Opaque proof produced by independently parsing and validating a WebFile image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebFileInspection {
+    signature: String,
+    version: String,
+    compression: WebFileCompression,
+    head_length: u64,
+    directory: Vec<WebFileDirectoryInspection>,
+    stats: WebFileInspectionStats,
+}
+
+/// One WebFile directory record in wire order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebFileDirectoryInspection {
+    name: String,
+    occurrence: usize,
+    offset: u64,
+    length: u64,
+}
+
+/// Bounded work performed while inspecting a WebFile image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebFileInspectionStats {
+    encoded_bytes: u64,
+    decoded_bytes: u64,
+    metadata_bytes: u64,
+    max_buffered_bytes: u64,
+}
+
+impl WebFileInspection {
+    pub fn signature(&self) -> &str {
+        &self.signature
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub const fn compression(&self) -> WebFileCompression {
+        self.compression
+    }
+
+    pub const fn head_length(&self) -> u64 {
+        self.head_length
+    }
+
+    pub fn directory(&self) -> &[WebFileDirectoryInspection] {
+        &self.directory
+    }
+
+    pub const fn stats(&self) -> WebFileInspectionStats {
+        self.stats
+    }
+
+    pub fn retained_heap_bytes(&self) -> Result<u64> {
+        let mut bytes = string_allocation_bytes(self.signature.capacity())
+            .map_err(webfile_inspection_allocation_error)?;
+        webfile_add_retained(
+            &mut bytes,
+            string_allocation_bytes(self.version.capacity())
+                .map_err(webfile_inspection_allocation_error)?,
+        )?;
+        webfile_add_retained(
+            &mut bytes,
+            vec_allocation_bytes::<WebFileDirectoryInspection>(self.directory.capacity())
+                .map_err(webfile_inspection_allocation_error)?,
+        )?;
+        for entry in &self.directory {
+            webfile_add_retained(
+                &mut bytes,
+                string_allocation_bytes(entry.name.capacity())
+                    .map_err(webfile_inspection_allocation_error)?,
+            )?;
+        }
+        Ok(bytes)
+    }
+}
+
+impl WebFileDirectoryInspection {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn occurrence(&self) -> usize {
+        self.occurrence
+    }
+
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub const fn length(&self) -> u64 {
+        self.length
+    }
+}
+
+impl WebFileInspectionStats {
+    pub const fn encoded_bytes(self) -> u64 {
+        self.encoded_bytes
+    }
+
+    pub const fn decoded_bytes(self) -> u64 {
+        self.decoded_bytes
+    }
+
+    pub const fn metadata_bytes(self) -> u64 {
+        self.metadata_bytes
+    }
+
+    pub const fn max_buffered_bytes(self) -> u64 {
+        self.max_buffered_bytes
+    }
+}
+
+fn webfile_inspection_allocation_error(
+    error: unity_asset_core::AllocationSizeError,
+) -> BinaryError {
+    BinaryError::memory_error(format!(
+        "WebFile inspection retained allocation size overflow: {error}"
+    ))
+}
+
+fn webfile_add_retained(total: &mut u64, amount: u64) -> Result<()> {
+    *total = total
+        .checked_add(amount)
+        .ok_or_else(|| BinaryError::memory_error("WebFile inspection retained heap overflow"))?;
+    Ok(())
 }
 
 /// Staged WebFile probe failure.
@@ -82,6 +223,41 @@ pub struct WebFile {
 }
 
 impl WebFile {
+    /// Inspects a contiguous WebFile through the segmented streaming parser.
+    pub fn inspect_slice_with_budget(
+        data: &[u8],
+        budget: &mut AssetLoadBudget,
+    ) -> Result<WebFileInspection> {
+        Self::inspect_source_with_budget(&BorrowedBytes::new(data), budget)
+    }
+
+    /// Inspects and validates a segmented WebFile without concatenating its encoded image.
+    pub fn inspect_segmented_with_budget(
+        data: &SegmentedBytes,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<WebFileInspection> {
+        Self::inspect_source_with_budget(data, budget)
+    }
+
+    fn inspect_source_with_budget(
+        source: &dyn ByteSource,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<WebFileInspection> {
+        let compression = detect_source_compression(source)?;
+        let compression =
+            if compression == WebFileCompression::None && !source_has_webfile_prefix(source)? {
+                WebFileCompression::Brotli
+            } else {
+                compression
+            };
+
+        match compression {
+            WebFileCompression::None => inspect_uncompressed_webfile(source, budget),
+            WebFileCompression::Gzip => inspect_gzip_webfile(source, budget),
+            WebFileCompression::Brotli => inspect_brotli_webfile(source, budget),
+        }
+    }
+
     /// Parse a WebFile from binary data
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
         let mut budget = AssetLoadBudget::default();
@@ -474,6 +650,604 @@ impl WebFile {
 
         Ok(bundles)
     }
+}
+
+struct LocalInspectionBudget<'ledger> {
+    limits: AssetLoadLimits,
+    base: AssetLoadUsage,
+    bytes: &'ledger DeferredByteReservation,
+    entries: u64,
+    members: u64,
+}
+
+impl<'ledger> LocalInspectionBudget<'ledger> {
+    fn new(budget: &AssetLoadBudget, bytes: &'ledger DeferredByteReservation) -> Self {
+        Self {
+            limits: budget.limits(),
+            base: budget.usage(),
+            bytes,
+            entries: 0,
+            members: 0,
+        }
+    }
+
+    fn reserve_bytes(&mut self, amount: u64) -> Result<()> {
+        self.bytes.reserve_metadata(amount)
+    }
+
+    fn reserve_directory(&mut self, count: u64) -> Result<()> {
+        self.entries = checked_local_charge(
+            "entries",
+            self.base.entries,
+            self.entries,
+            count,
+            self.limits.max_entries,
+        )?;
+        self.members = checked_local_charge(
+            "members",
+            self.base.members,
+            self.members,
+            count,
+            self.limits.max_members,
+        )?;
+        Ok(())
+    }
+
+    fn commit(self, budget: &mut AssetLoadBudget) -> Result<()> {
+        budget.consume_entries(self.entries)?;
+        budget.consume_members(self.members)?;
+        Ok(())
+    }
+}
+
+fn checked_local_charge(
+    resource: &'static str,
+    base: u64,
+    used: u64,
+    amount: u64,
+    limit: u64,
+) -> Result<u64> {
+    let next =
+        used.checked_add(amount)
+            .ok_or(BinaryError::Budget(BudgetError::ArithmeticOverflow {
+                resource,
+            }))?;
+    let requested =
+        base.checked_add(next)
+            .ok_or(BinaryError::Budget(BudgetError::ArithmeticOverflow {
+                resource,
+            }))?;
+    if requested > limit {
+        return Err(BinaryError::Budget(BudgetError::Exceeded {
+            resource,
+            limit,
+            requested,
+        }));
+    }
+    Ok(next)
+}
+
+struct BudgetedDecoder<'budget, R> {
+    inner: R,
+    budget: DecompressionBudget<'budget>,
+}
+
+impl<R: Read> Read for BudgetedDecoder<'_, R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(output)?;
+        self.budget
+            .consume(
+                0,
+                u64::try_from(read).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "decoded length does not fit u64",
+                    )
+                })?,
+            )
+            .map_err(|error| io::Error::other(BinaryError::Budget(error)))?;
+        Ok(read)
+    }
+}
+
+fn inspect_uncompressed_webfile(
+    source: &dyn ByteSource,
+    budget: &mut AssetLoadBudget,
+) -> Result<WebFileInspection> {
+    let bytes = DeferredByteReservation::new(budget);
+    let mut local = LocalInspectionBudget::new(budget, &bytes);
+    local.reserve_bytes(source.len())?;
+    let result = {
+        let mut reader = ByteSourceReader::new(source);
+        inspect_decoded_webfile(
+            &mut reader,
+            WebFileCompression::None,
+            source.len(),
+            &mut local,
+        )
+    };
+    finish_webfile_inspection(result, local, &bytes, budget)
+}
+
+fn inspect_gzip_webfile(
+    source: &dyn ByteSource,
+    budget: &mut AssetLoadBudget,
+) -> Result<WebFileInspection> {
+    let bytes = DeferredByteReservation::new(budget);
+    let mut local = LocalInspectionBudget::new(budget, &bytes);
+    local.reserve_bytes(source.len())?;
+    bytes.reserve_scratch(
+        u64::try_from(INSPECTION_CODEC_BUFFER_SIZE)
+            .map_err(|_| BinaryError::invalid_data("GZIP input buffer size does not fit u64"))?,
+    )?;
+    let input = FallibleBufReader::try_with_capacity(
+        INSPECTION_CODEC_BUFFER_SIZE,
+        ByteSourceReader::new(source),
+    );
+    let result = input.and_then(|input| {
+        let mut decompression = budget.begin_decompression();
+        decompression.consume(source.len(), 0)?;
+        let decoder = GzDecoder::new(input);
+        let mut reader = BudgetedDecoder {
+            inner: decoder,
+            budget: decompression,
+        };
+        let mut result = inspect_decoded_webfile(
+            &mut reader,
+            WebFileCompression::Gzip,
+            source.len(),
+            &mut local,
+        );
+        if result.is_ok() {
+            let input = reader.inner.get_ref();
+            let physically_read = input.get_ref().bytes_read();
+            let buffered = u64::try_from(input.buffer().len()).map_err(|_| {
+                BinaryError::invalid_data("GZIP buffered input length does not fit u64")
+            })?;
+            let consumed = physically_read.checked_sub(buffered).ok_or_else(|| {
+                BinaryError::invalid_data("GZIP input accounting moved backwards")
+            })?;
+            if consumed != source.len() {
+                result = Err(BinaryError::decompression_failed(format!(
+                    "GZIP stream contains {} trailing bytes after its single member",
+                    source.len() - consumed
+                )));
+            }
+        }
+        result
+    });
+    let mut inspection = finish_webfile_inspection(result, local, &bytes, budget)?;
+    inspection.stats.max_buffered_bytes = inspection
+        .stats
+        .max_buffered_bytes
+        .checked_add(INSPECTION_CODEC_BUFFER_SIZE as u64)
+        .ok_or_else(|| BinaryError::memory_error("GZIP inspection working set overflow"))?;
+    Ok(inspection)
+}
+
+fn inspect_brotli_webfile(
+    source: &dyn ByteSource,
+    budget: &mut AssetLoadBudget,
+) -> Result<WebFileInspection> {
+    let mut prefix = [0_u8; 2];
+    let prefix_len = usize::try_from(source.len().min(2))
+        .map_err(|_| BinaryError::invalid_data("Brotli prefix length does not fit usize"))?;
+    source.read_exact_at(0, &mut prefix[..prefix_len])?;
+    let scratch = decompressor_scratch_bytes(&prefix[..prefix_len], CompressionType::Brotli, 0)?;
+    let bytes = DeferredByteReservation::new(budget);
+    let mut local = LocalInspectionBudget::new(budget, &bytes);
+    local.reserve_bytes(source.len())?;
+    let scratch_reservation = BrotliScratchReservation::with_deferred(&bytes);
+    let result = {
+        let mut decompression = budget.begin_decompression();
+        decompression.consume(source.len(), 0)?;
+        let decoder = SegmentedBrotliDecoder::new(source, &scratch_reservation);
+        let mut reader = BudgetedDecoder {
+            inner: decoder,
+            budget: decompression,
+        };
+        inspect_decoded_webfile(
+            &mut reader,
+            WebFileCompression::Brotli,
+            source.len(),
+            &mut local,
+        )
+    };
+    let result = match (scratch_reservation.finish(), result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), result) => result,
+    };
+    let mut inspection = finish_webfile_inspection(result, local, &bytes, budget)?;
+    inspection.stats.max_buffered_bytes = inspection
+        .stats
+        .max_buffered_bytes
+        .checked_add(scratch)
+        .ok_or_else(|| BinaryError::memory_error("Brotli inspection working set overflow"))?;
+    Ok(inspection)
+}
+
+fn finish_webfile_inspection(
+    result: Result<WebFileInspection>,
+    local: LocalInspectionBudget<'_>,
+    bytes: &DeferredByteReservation,
+    budget: &mut AssetLoadBudget,
+) -> Result<WebFileInspection> {
+    let metadata_bytes = bytes.metadata_bytes();
+    let commit = local.commit(budget).and_then(|()| bytes.commit(budget));
+    match (result, commit) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(mut inspection), Ok(())) => {
+            inspection.stats.metadata_bytes = metadata_bytes;
+            Ok(inspection)
+        }
+    }
+}
+
+fn inspect_decoded_webfile(
+    reader: &mut impl Read,
+    compression: WebFileCompression,
+    encoded_bytes: u64,
+    local: &mut LocalInspectionBudget,
+) -> Result<WebFileInspection> {
+    let signature = read_stream_cstring(reader, local)?;
+    if !signature.starts_with("UnityWebData") && !signature.starts_with("TuanjieWebData") {
+        return Err(BinaryError::invalid_signature(
+            "UnityWebData or TuanjieWebData",
+            &signature,
+        ));
+    }
+    let version = signature
+        .strip_prefix("UnityWebData")
+        .or_else(|| signature.strip_prefix("TuanjieWebData"))
+        .unwrap_or_default();
+    local.reserve_bytes(
+        u64::try_from(version.len())
+            .map_err(|_| BinaryError::invalid_data("WebFile version length does not fit u64"))?,
+    )?;
+    let mut owned_version = String::new();
+    owned_version
+        .try_reserve_exact(version.len())
+        .map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {} WebFile version bytes: {error}",
+                version.len()
+            ))
+        })?;
+    owned_version.push_str(version);
+
+    let signature_wire_len = u64::try_from(signature.len())
+        .map_err(|_| BinaryError::invalid_data("WebFile signature length does not fit u64"))?
+        .checked_add(1)
+        .ok_or_else(|| BinaryError::invalid_data("WebFile signature range overflow"))?;
+    let head_length_i32 = read_stream_i32(reader, "WebFile head_length")?;
+    if head_length_i32 < 0 {
+        return Err(BinaryError::invalid_data(format!(
+            "Negative WebFile head_length: {head_length_i32}"
+        )));
+    }
+    let head_length = u64::try_from(head_length_i32)
+        .map_err(|_| BinaryError::invalid_data("Negative WebFile head_length"))?;
+    let directory_start = signature_wire_len
+        .checked_add(4)
+        .ok_or_else(|| BinaryError::invalid_data("WebFile directory start overflow"))?;
+    if head_length < directory_start {
+        return Err(BinaryError::invalid_data(format!(
+            "WebFile head_length {head_length} precedes current position {directory_start}"
+        )));
+    }
+    let directory_len = head_length - directory_start;
+    local.reserve_bytes(directory_len)?;
+    let directory_len_usize = usize::try_from(directory_len)
+        .map_err(|_| BinaryError::memory_error("WebFile header does not fit usize"))?;
+    let mut header = Vec::new();
+    header
+        .try_reserve_exact(directory_len_usize)
+        .map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {directory_len_usize} WebFile header bytes: {error}"
+            ))
+        })?;
+    header.resize(directory_len_usize, 0);
+    read_stream_exact(reader, &mut header, "WebFile directory")?;
+
+    let mut directory = parse_inspection_directory(&header, local)?;
+    let mut decoded_bytes = head_length;
+    let mut drain = [0_u8; 64 * 1024];
+    loop {
+        let read = read_stream(reader, &mut drain, "WebFile payload")?;
+        if read == 0 {
+            break;
+        }
+        decoded_bytes = decoded_bytes
+            .checked_add(u64::try_from(read).map_err(|_| {
+                BinaryError::invalid_data("WebFile decoded chunk length does not fit u64")
+            })?)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile decoded length overflow"))?;
+    }
+
+    for entry in &directory {
+        let end = entry
+            .offset
+            .checked_add(entry.length)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile entry data range overflow"))?;
+        if entry.offset < head_length || end > decoded_bytes {
+            return Err(BinaryError::invalid_data(format!(
+                "WebFile entry data range {}..{end} is outside payload {head_length}..{decoded_bytes}",
+                entry.offset
+            )));
+        }
+    }
+    assign_webfile_occurrences(&mut directory, local)?;
+
+    Ok(WebFileInspection {
+        signature,
+        version: owned_version,
+        compression,
+        head_length,
+        directory,
+        stats: WebFileInspectionStats {
+            encoded_bytes,
+            decoded_bytes,
+            metadata_bytes: 0,
+            max_buffered_bytes: directory_len,
+        },
+    })
+}
+
+fn read_stream_cstring(
+    reader: &mut impl Read,
+    local: &mut LocalInspectionBudget,
+) -> Result<String> {
+    let max_len = BinaryReader::DEFAULT_MAX_STRING_LEN;
+    let mut bytes = Vec::new();
+    while bytes.len() <= max_len {
+        let mut byte = [0_u8; 1];
+        read_stream_exact(reader, &mut byte, "WebFile signature")?;
+        if byte[0] == 0 {
+            return String::from_utf8(bytes).map_err(Into::into);
+        }
+        if bytes.len() == max_len {
+            return Err(BinaryError::invalid_data(format!(
+                "WebFile signature exceeds maximum length {max_len}"
+            )));
+        }
+        if bytes.len() == bytes.capacity() {
+            let next_capacity = if bytes.capacity() == 0 {
+                64.min(max_len)
+            } else {
+                bytes.capacity().saturating_mul(2).min(max_len)
+            };
+            let additional = next_capacity.saturating_sub(bytes.capacity());
+            local.reserve_bytes(u64::try_from(additional).map_err(|_| {
+                BinaryError::invalid_data("WebFile signature capacity does not fit u64")
+            })?)?;
+            bytes.try_reserve_exact(additional).map_err(|error| {
+                BinaryError::memory_error(format!(
+                    "Failed to grow WebFile signature to {next_capacity} bytes: {error}"
+                ))
+            })?;
+        }
+        bytes.push(byte[0]);
+    }
+    Err(BinaryError::invalid_data(
+        "WebFile signature exceeded its parser limit",
+    ))
+}
+
+fn read_stream_i32(reader: &mut impl Read, context: &'static str) -> Result<i32> {
+    let mut bytes = [0_u8; 4];
+    read_stream_exact(reader, &mut bytes, context)?;
+    Ok(i32::from_le_bytes(bytes))
+}
+
+fn read_stream_exact(
+    reader: &mut impl Read,
+    output: &mut [u8],
+    context: &'static str,
+) -> Result<()> {
+    reader
+        .read_exact(output)
+        .map_err(|error| map_stream_error(error, context))
+}
+
+fn read_stream(reader: &mut impl Read, output: &mut [u8], context: &'static str) -> Result<usize> {
+    reader
+        .read(output)
+        .map_err(|error| map_stream_error(error, context))
+}
+
+fn map_stream_error(error: io::Error, context: &'static str) -> BinaryError {
+    let kind = error.kind();
+    let message = error.to_string();
+    if let Some(source) = error.into_inner()
+        && let Ok(binary) = source.downcast::<BinaryError>()
+    {
+        return *binary;
+    }
+    if kind == io::ErrorKind::UnexpectedEof {
+        BinaryError::invalid_data(format!("Unexpected end of decoded {context}"))
+    } else {
+        BinaryError::decompression_failed(format!("Failed to read decoded {context}: {message}"))
+    }
+}
+
+fn parse_inspection_directory(
+    header: &[u8],
+    local: &mut LocalInspectionBudget,
+) -> Result<Vec<WebFileDirectoryInspection>> {
+    let mut cursor = 0_usize;
+    let mut entry_count = 0_usize;
+    let mut name_bytes = 0_usize;
+    while cursor < header.len() {
+        let fixed_end = cursor
+            .checked_add(12)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile entry header overflow"))?;
+        let fixed = header
+            .get(cursor..fixed_end)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile entry header crosses head_length"))?;
+        let offset = i32::from_le_bytes(
+            fixed[0..4]
+                .try_into()
+                .map_err(|_| BinaryError::invalid_data("Invalid WebFile entry offset width"))?,
+        );
+        let length = i32::from_le_bytes(
+            fixed[4..8]
+                .try_into()
+                .map_err(|_| BinaryError::invalid_data("Invalid WebFile entry length width"))?,
+        );
+        let path_len =
+            i32::from_le_bytes(fixed[8..12].try_into().map_err(|_| {
+                BinaryError::invalid_data("Invalid WebFile entry path length width")
+            })?);
+        if offset < 0 || length < 0 || path_len < 0 {
+            return Err(BinaryError::invalid_data(format!(
+                "Negative WebFile entry values: offset={offset} length={length} path_len={path_len}"
+            )));
+        }
+        let path_len = usize::try_from(path_len)
+            .map_err(|_| BinaryError::invalid_data("Negative WebFile path length"))?;
+        if path_len > 16 * 1024 {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "WebFile entry name too large: {path_len}"
+            )));
+        }
+        let path_end = fixed_end
+            .checked_add(path_len)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile entry name range overflow"))?;
+        let path = header
+            .get(fixed_end..path_end)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile entry name crosses head_length"))?;
+        std::str::from_utf8(path)?;
+        name_bytes = name_bytes
+            .checked_add(path_len)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile entry name total overflow"))?;
+        entry_count = entry_count
+            .checked_add(1)
+            .ok_or_else(|| BinaryError::invalid_data("WebFile entry count overflow"))?;
+        cursor = path_end;
+    }
+
+    let count = u64::try_from(entry_count)
+        .map_err(|_| BinaryError::invalid_data("WebFile entry count does not fit u64"))?;
+    local.reserve_directory(count)?;
+    let table_bytes = size_of::<WebFileDirectoryInspection>()
+        .checked_mul(entry_count)
+        .and_then(|bytes| bytes.checked_add(name_bytes))
+        .ok_or_else(|| BinaryError::invalid_data("WebFile inspection directory size overflow"))?;
+    local.reserve_bytes(u64::try_from(table_bytes).map_err(|_| {
+        BinaryError::invalid_data("WebFile inspection directory size does not fit u64")
+    })?)?;
+
+    let mut directory = Vec::new();
+    directory.try_reserve_exact(entry_count).map_err(|error| {
+        BinaryError::memory_error(format!(
+            "Failed to reserve {entry_count} WebFile inspection records: {error}"
+        ))
+    })?;
+    cursor = 0;
+    while cursor < header.len() {
+        let fixed_end = cursor + 12;
+        let fixed = &header[cursor..fixed_end];
+        let offset =
+            u64::try_from(i32::from_le_bytes(fixed[0..4].try_into().map_err(
+                |_| BinaryError::invalid_data("Invalid WebFile entry offset width"),
+            )?))
+            .map_err(|_| BinaryError::invalid_data("Negative WebFile entry offset"))?;
+        let length =
+            u64::try_from(i32::from_le_bytes(fixed[4..8].try_into().map_err(
+                |_| BinaryError::invalid_data("Invalid WebFile entry length width"),
+            )?))
+            .map_err(|_| BinaryError::invalid_data("Negative WebFile entry length"))?;
+        let path_len =
+            usize::try_from(i32::from_le_bytes(fixed[8..12].try_into().map_err(
+                |_| BinaryError::invalid_data("Invalid WebFile path length width"),
+            )?))
+            .map_err(|_| BinaryError::invalid_data("Negative WebFile path length"))?;
+        let path_end = fixed_end + path_len;
+        let path = std::str::from_utf8(&header[fixed_end..path_end])?;
+        let mut name = String::new();
+        name.try_reserve_exact(path_len).map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {path_len} WebFile entry name bytes: {error}"
+            ))
+        })?;
+        name.push_str(path);
+        directory.push(WebFileDirectoryInspection {
+            name,
+            occurrence: 0,
+            offset,
+            length,
+        });
+        cursor = path_end;
+    }
+    Ok(directory)
+}
+
+fn assign_webfile_occurrences(
+    directory: &mut [WebFileDirectoryInspection],
+    local: &mut LocalInspectionBudget,
+) -> Result<()> {
+    let index_bytes = size_of::<usize>()
+        .checked_mul(directory.len())
+        .ok_or_else(|| BinaryError::invalid_data("WebFile occurrence state size overflow"))?;
+    local.reserve_bytes(u64::try_from(index_bytes).map_err(|_| {
+        BinaryError::invalid_data("WebFile occurrence state size does not fit u64")
+    })?)?;
+    let mut sorted = Vec::new();
+    sorted.try_reserve_exact(directory.len()).map_err(|error| {
+        BinaryError::memory_error(format!(
+            "Failed to reserve {} WebFile occurrence indices: {error}",
+            directory.len()
+        ))
+    })?;
+    sorted.extend(0..directory.len());
+    sorted.sort_unstable_by(|left, right| {
+        directory[*left]
+            .name
+            .cmp(&directory[*right].name)
+            .then_with(|| left.cmp(right))
+    });
+    let mut previous_index: Option<usize> = None;
+    let mut occurrence = 0_usize;
+    for index in sorted {
+        if previous_index.is_some_and(|previous| directory[previous].name == directory[index].name)
+        {
+            occurrence = occurrence
+                .checked_add(1)
+                .ok_or_else(|| BinaryError::invalid_data("WebFile occurrence overflow"))?;
+        } else {
+            occurrence = 0;
+        }
+        directory[index].occurrence = occurrence;
+        previous_index = Some(index);
+    }
+    Ok(())
+}
+
+fn detect_source_compression(source: &dyn ByteSource) -> Result<WebFileCompression> {
+    const PROBE_LEN: usize = 0x20 + BROTLI_MAGIC.len();
+    let read_len = usize::try_from(source.len().min(PROBE_LEN as u64))
+        .map_err(|_| BinaryError::invalid_data("WebFile probe length does not fit usize"))?;
+    let mut probe = [0_u8; PROBE_LEN];
+    source.read_exact_at(0, &mut probe[..read_len])?;
+    if probe[..read_len].starts_with(GZIP_MAGIC) {
+        return Ok(WebFileCompression::Gzip);
+    }
+    if read_len >= PROBE_LEN && &probe[0x20..PROBE_LEN] == BROTLI_MAGIC {
+        return Ok(WebFileCompression::Brotli);
+    }
+    Ok(WebFileCompression::None)
+}
+
+fn source_has_webfile_prefix(source: &dyn ByteSource) -> Result<bool> {
+    const PREFIX_LEN: usize = b"TuanjieWebData".len();
+    let read_len = usize::try_from(source.len().min(PREFIX_LEN as u64))
+        .map_err(|_| BinaryError::invalid_data("WebFile prefix length does not fit usize"))?;
+    let mut prefix = [0_u8; PREFIX_LEN];
+    source.read_exact_at(0, &mut prefix[..read_len])?;
+    Ok(prefix[..read_len].starts_with(b"UnityWebData")
+        || prefix[..read_len].starts_with(b"TuanjieWebData"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
