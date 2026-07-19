@@ -5,6 +5,6 @@ mod chunk;
 mod edits;
 mod writer;
 
-pub use artifact_writer::{BundleArtifactError, BundleArtifactMember};
+pub use artifact_writer::{BundleArtifactEntry, BundleArtifactError, BundleArtifactMember};
 pub use edits::BundleEdits;
 pub use writer::BundleWriter;

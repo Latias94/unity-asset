@@ -1942,6 +1942,42 @@ fn environment_can_parse_external_yaml_prefab_if_provided() {
 }
 
 #[test]
+fn environment_reads_live_default_flag_bundle_resources_before_fallback() {
+    let bundle_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
+    );
+    let cab = "8579bc75d50073df38987733a7cb3193";
+    let stream_path = format!("archive:/CAB-{cab}/CAB-{cab}.resource");
+    let mut env = Environment::new();
+    env.load_file(&bundle_path, &mut AssetLoadBudget::default())
+        .unwrap();
+
+    let bundle = env
+        .bundles()
+        .get(&BinarySource::path(&bundle_path))
+        .expect("bundle is loaded");
+    let resource = bundle
+        .nodes
+        .iter()
+        .find(|node| node.name == format!("CAB-{cab}.resource"))
+        .expect("sample resource node");
+    assert_eq!(resource.flags, 0);
+    assert!(resource.is_file());
+
+    assert_eq!(
+        env.read_stream_data(
+            &bundle_path,
+            BinarySourceKind::AssetBundle,
+            &stream_path,
+            4096,
+            4,
+        )
+        .unwrap(),
+        b"FSB5"
+    );
+}
+
+#[test]
 fn environment_stream_data_falls_back_to_filesystem_for_bundles() {
     let temp = tempfile::tempdir().unwrap();
     let bundle_src = canonicalize_path(
@@ -1950,7 +1986,7 @@ fn environment_stream_data_falls_back_to_filesystem_for_bundles() {
     let bundle_path = temp.path().join("char_118_yuki.ab");
     link_or_copy_file(&bundle_src, &bundle_path).unwrap();
 
-    let cab = "8579bc75d50073df38987733a7cb3193";
+    let cab = "00112233445566778899aabbccddeeff";
     let stream_path = format!("archive:/CAB-{cab}/CAB-{cab}.resource");
     let resource_dir = temp.path().join(format!("CAB-{cab}"));
     fs::create_dir_all(&resource_dir).unwrap();
@@ -2392,7 +2428,7 @@ fn environment_loads_extless_webfile_entries_and_reads_resource_bytes() {
     );
     let bundle_bytes = fs::read(&sample_bundle_path).unwrap();
 
-    let cab = "8579bc75d50073df38987733a7cb3193";
+    let cab = "00112233445566778899aabbccddeeff";
     let resource_name = format!("CAB-{cab}.resource");
     let mut resource_bytes = vec![0u8; 4096 + 4];
     resource_bytes[4096..4096 + 4].copy_from_slice(b"OggS");
@@ -2690,10 +2726,175 @@ fn environment_set_pptr_path_to_key_adds_external_when_cross_source() {
         .assets
         .first()
         .expect("bundle has at least one asset");
-    assert!(
-        sf.externals.iter().any(|e| e.path == "atlas_test"),
-        "expected added external entry for cross-source PPtr"
+    let external = sf
+        .externals
+        .iter()
+        .find(|external| external.path == "atlas_test")
+        .expect("expected added external entry for cross-source PPtr");
+    assert_eq!(external.guid, [0; 16]);
+    assert_eq!(external.type_, 0);
+}
+
+#[test]
+fn environment_external_budget_failure_does_not_publish_edit_state() {
+    fn fixture() -> (Environment, BinaryObjectKey, BinaryObjectKey) {
+        let mut env = Environment::new();
+        let banner_path = canonicalize_path(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
+        );
+        let atlas_path = canonicalize_path(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/atlas_test"),
+        );
+        env.load_file(&banner_path, &mut AssetLoadBudget::default())
+            .unwrap();
+        env.load_file(&atlas_path, &mut AssetLoadBudget::default())
+            .unwrap();
+        let context = env
+            .binary_object_infos()
+            .find(|reference| {
+                reference.source == &BinarySource::path(&banner_path)
+                    && reference.object.class_id() == 213
+            })
+            .unwrap()
+            .key();
+        let target = env
+            .binary_object_infos()
+            .find(|reference| {
+                reference.source == &BinarySource::path(&atlas_path)
+                    && reference.object.class_id() == 687078895
+            })
+            .unwrap()
+            .key();
+        (env, context, target)
+    }
+
+    let (mut probe, context, target) = fixture();
+    let mut measured = AssetLoadBudget::default();
+    probe
+        .edit_session(&mut measured)
+        .file_id_for_target(&context, &target)
+        .unwrap();
+    let required = measured.usage().bytes;
+    assert!(required > 0);
+
+    let (mut env, context, target) = fixture();
+    let mut short = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
+        max_bytes: required - 1,
+        ..unity_asset_core::AssetLoadLimits::default()
+    })
+    .unwrap();
+    let error = env
+        .edit_session(&mut short)
+        .file_id_for_target(&context, &target)
+        .unwrap_err();
+
+    assert!(budget_error_in_chain(&error).is_some(), "{error:?}");
+    assert!(env.write_state.is_empty());
+}
+
+#[test]
+fn environment_reuses_path_only_external_metadata_without_publishing_empty_state() {
+    let mut env = Environment::new();
+    let banner_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
     );
+    let atlas_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/atlas_test"),
+    );
+    env.load_file(&banner_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    env.load_file(&atlas_path, &mut AssetLoadBudget::default())
+        .unwrap();
+
+    let context = env
+        .binary_object_infos()
+        .find(|reference| {
+            reference.source == &BinarySource::path(&banner_path)
+                && reference.object.class_id() == 213
+        })
+        .unwrap()
+        .key();
+    let target = env
+        .binary_object_infos()
+        .find(|reference| {
+            reference.source == &BinarySource::path(&atlas_path)
+                && reference.object.class_id() == 687078895
+        })
+        .unwrap()
+        .key();
+
+    let expected_file_id = {
+        let file = match context.source_kind {
+            BinarySourceKind::SerializedFile => env
+                .binary_assets
+                .get_mut(&context.source)
+                .expect("standalone context file is loaded"),
+            BinarySourceKind::AssetBundle => env
+                .bundles
+                .get_mut(&context.source)
+                .and_then(|bundle| bundle.assets.get_mut(context.asset_index.unwrap()))
+                .expect("bundle context file is loaded"),
+        };
+        file.externals
+            .push(unity_asset_binary::asset::FileIdentifier {
+                temp_empty: String::new(),
+                guid: [0x7a; 16],
+                type_: 1,
+                path: "atlas_test".to_owned(),
+            });
+        i32::try_from(file.externals.len()).unwrap()
+    };
+
+    let file_id = env
+        .edit_session(&mut AssetLoadBudget::default())
+        .file_id_for_target(&context, &target)
+        .unwrap();
+
+    assert_eq!(file_id, expected_file_id);
+    assert!(!env.has_pending_writes());
+}
+
+#[test]
+fn environment_object_edit_failure_does_not_publish_external_state() {
+    let mut env = Environment::new();
+    let banner_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
+    );
+    let atlas_path = canonicalize_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/atlas_test"),
+    );
+    env.load_file(&banner_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    env.load_file(&atlas_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let context = env
+        .binary_object_infos()
+        .find(|reference| {
+            reference.source == &BinarySource::path(&banner_path)
+                && reference.object.class_id() == 213
+        })
+        .unwrap()
+        .key();
+    let target = env
+        .binary_object_infos()
+        .find(|reference| {
+            reference.source == &BinarySource::path(&atlas_path)
+                && reference.object.class_id() == 687078895
+        })
+        .unwrap()
+        .key();
+
+    let error = env
+        .set_pptr_path_to_key(
+            &context,
+            "invalid[path",
+            &target,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("missing ']'"), "{error:?}");
+    assert!(env.write_state.is_empty());
 }
 
 #[test]

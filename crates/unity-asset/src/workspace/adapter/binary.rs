@@ -839,8 +839,26 @@ mod tests {
     fn bundle_duplicate_files_keep_wire_ordinals_across_directory_records() {
         let mut bundle = AssetBundle::new(Default::default(), b"firstsecond".to_vec());
         bundle.nodes = vec![
-            unity_asset_binary::bundle::DirectoryNode::new("duplicate.bin".to_string(), 0, 5, 0x4),
-            unity_asset_binary::bundle::DirectoryNode::new("directory".to_string(), 0, 0, 0),
+            unity_asset_binary::bundle::DirectoryNode::new("duplicate.bin".to_string(), 0, 5, 0),
+            unity_asset_binary::bundle::DirectoryNode::new(
+                "directory".to_string(),
+                0,
+                0,
+                unity_asset_binary::bundle::DirectoryNode::DIRECTORY_FLAG,
+            ),
+            unity_asset_binary::bundle::DirectoryNode::new(
+                "deleted.bin".to_string(),
+                5,
+                0,
+                unity_asset_binary::bundle::DirectoryNode::DELETED_FLAG,
+            ),
+            unity_asset_binary::bundle::DirectoryNode::new(
+                "deleted.assets".to_string(),
+                5,
+                0,
+                unity_asset_binary::bundle::DirectoryNode::DELETED_FLAG
+                    | unity_asset_binary::bundle::DirectoryNode::SERIALIZED_FILE_FLAG,
+            ),
             unity_asset_binary::bundle::DirectoryNode::new("duplicate.bin".to_string(), 5, 6, 0x4),
         ];
         let payload = BinaryPayload::AssetBundle(Box::new(bundle));
@@ -851,7 +869,7 @@ mod tests {
 
         assert_eq!(members.len(), 2);
         assert_eq!(members[0].wire_ordinal, 0);
-        assert_eq!(members[1].wire_ordinal, 2);
+        assert_eq!(members[1].wire_ordinal, 4);
         assert_eq!(members[0].identity.same_name_occurrence(), 0);
         assert_eq!(members[1].identity.same_name_occurrence(), 1);
         assert_eq!(members[0].image.as_ref(), b"first");

@@ -285,11 +285,21 @@ pub struct DirectoryNode {
     pub offset: u64,
     /// Size of the data
     pub size: u64,
-    /// Flags (indicates file type, compression, etc.)
+    /// Unity file-stream node flags.
+    ///
+    /// Bit 0 marks directories, bit 1 marks deleted entries, and bit 2 marks serialized files.
+    /// A regular resource file therefore commonly has no flags set.
     pub flags: u32,
 }
 
 impl DirectoryNode {
+    /// The entry is a directory rather than a file.
+    pub const DIRECTORY_FLAG: u32 = 0x1;
+    /// The entry is a deleted/tombstone node.
+    pub const DELETED_FLAG: u32 = 0x2;
+    /// The file contains a Unity serialized file.
+    pub const SERIALIZED_FILE_FLAG: u32 = 0x4;
+
     /// Create a new DirectoryNode
     pub fn new(name: String, offset: u64, size: u64, flags: u32) -> Self {
         Self {
@@ -300,20 +310,27 @@ impl DirectoryNode {
         }
     }
 
-    /// Check if this node represents a file
+    /// Check if this node represents a live file.
+    ///
+    /// Deleted/tombstone nodes are not exposed as readable files even when they do not carry the
+    /// directory flag.
     pub fn is_file(&self) -> bool {
-        // Unity uses bit 2 (0x4) to indicate files, not bit 0 (0x1)
-        (self.flags & 0x4) != 0
+        !self.is_directory() && !self.is_deleted()
     }
 
     /// Check if this node represents a directory
     pub fn is_directory(&self) -> bool {
-        !self.is_file()
+        (self.flags & Self::DIRECTORY_FLAG) != 0
     }
 
-    /// Check if this node's data is compressed
-    pub fn is_compressed(&self) -> bool {
-        (self.flags & 0x2) != 0
+    /// Check if this node is marked as deleted.
+    pub fn is_deleted(&self) -> bool {
+        (self.flags & Self::DELETED_FLAG) != 0
+    }
+
+    /// Check if this file contains a Unity serialized file.
+    pub fn is_serialized_file(&self) -> bool {
+        self.is_file() && (self.flags & Self::SERIALIZED_FILE_FLAG) != 0
     }
 
     /// Get the end offset of this node
@@ -1024,6 +1041,48 @@ mod tests {
     use crate::compression::CompressionBlock;
     use crate::data_view::DataView;
     use crate::shared_bytes::SharedBytes;
+
+    #[test]
+    fn directory_node_flags_distinguish_resources_directories_and_tombstones() {
+        let resource = DirectoryNode::new("data.resS".to_string(), 0, 0, 0);
+        assert!(resource.is_file());
+        assert!(!resource.is_directory());
+        assert!(!resource.is_serialized_file());
+        assert!(!resource.is_deleted());
+
+        let serialized = DirectoryNode::new(
+            "data.assets".to_string(),
+            0,
+            0,
+            DirectoryNode::SERIALIZED_FILE_FLAG,
+        );
+        assert!(serialized.is_file());
+        assert!(serialized.is_serialized_file());
+
+        let directory = DirectoryNode::new(
+            "folder".to_string(),
+            0,
+            0,
+            DirectoryNode::DIRECTORY_FLAG | 0x10,
+        );
+        assert!(directory.is_directory());
+        assert!(!directory.is_file());
+
+        let deleted = DirectoryNode::new("removed".to_string(), 0, 0, DirectoryNode::DELETED_FLAG);
+        assert!(!deleted.is_file());
+        assert!(!deleted.is_directory());
+        assert!(deleted.is_deleted());
+
+        let deleted_serialized = DirectoryNode::new(
+            "removed.assets".to_string(),
+            0,
+            0,
+            DirectoryNode::DELETED_FLAG | DirectoryNode::SERIALIZED_FILE_FLAG,
+        );
+        assert!(!deleted_serialized.is_file());
+        assert!(!deleted_serialized.is_serialized_file());
+        assert!(deleted_serialized.is_deleted());
+    }
 
     #[test]
     fn unityfs_extract_node_data_is_lazy_and_supports_cross_block_ranges() {

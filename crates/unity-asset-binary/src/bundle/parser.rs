@@ -1270,8 +1270,9 @@ impl BundleParser {
             let file_info = BundleFileInfo::new(name.clone(), offset, size);
             files.push(file_info);
 
-            // Also create a directory node for consistency
-            let node = DirectoryNode::new(name, offset, size, 0x4); // Flag 0x4 = file
+            // Legacy directories do not encode FileStream NodeFlags. Preserve that absence instead
+            // of claiming every entry is a Unity SerializedFile.
+            let node = DirectoryNode::new(name, offset, size, 0);
             nodes.push(node);
         }
         bundle.nodes = nodes;
@@ -1325,15 +1326,6 @@ impl BundleParser {
                 )));
             }
 
-            if let Some(max_memory) = options.max_memory
-                && node.size > max_memory as u64
-            {
-                return Err(BinaryError::ResourceLimitExceeded(format!(
-                    "Bundle node '{}' size {} exceeds max_memory {}",
-                    node.name, node.size, max_memory
-                )));
-            }
-
             let start = usize::try_from(node.offset).map_err(|_| {
                 BinaryError::ResourceLimitExceeded(format!(
                     "Bundle node '{}' offset {} does not fit in usize",
@@ -1359,6 +1351,22 @@ impl BundleParser {
                     node.name
                 ))
             })?;
+
+            let prefix_end = abs_end.min(abs_start.saturating_add(48));
+            if !crate::file::looks_like_serialized_file_prefix(
+                &backing.as_bytes()[abs_start..prefix_end],
+            ) {
+                continue;
+            }
+
+            if let Some(max_memory) = options.max_memory
+                && node.size > max_memory as u64
+            {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Bundle node '{}' size {} exceeds max_memory {}",
+                    node.name, node.size, max_memory
+                )));
+            }
 
             // Parse as a zero-copy view into the backing buffer (UnityFS decompressed buffer or legacy source).
             match crate::asset::SerializedFileParser::from_shared_range_with_budget(
@@ -1751,7 +1759,7 @@ fn parse_legacy_inspection_directory(
             occurrence: 0,
             offset,
             length,
-            flags: 0x4,
+            flags: 0,
         });
         cursor = after_name + 8;
     }
@@ -2124,6 +2132,10 @@ mod tests {
     use super::*;
     use unity_asset_core::{AssetLoadLimits, BudgetError};
 
+    const SERIALIZED_FILE_SAMPLE: &[u8] = include_bytes!(
+        "../../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin"
+    );
+
     fn blocks_info_with_nodes(names: &[&str]) -> Vec<u8> {
         let mut bytes = vec![0_u8; 16];
         bytes.extend_from_slice(&0_i32.to_be_bytes());
@@ -2180,6 +2192,83 @@ mod tests {
             BundleParser::load_assets(&mut bundle, &BundleLoadOptions::default(), &mut budget)
                 .unwrap_err();
         assert!(matches!(err, BinaryError::InvalidData(_)));
+    }
+
+    #[test]
+    fn load_assets_sniffs_live_default_nodes_before_spending_parse_budget() {
+        let header = BundleHeader {
+            signature: "UnityFS".to_string(),
+            ..Default::default()
+        };
+        let mut plain = AssetBundle::new(header.clone(), vec![0xa5; 64]);
+        plain
+            .nodes
+            .push(DirectoryNode::new("plain.bin".to_string(), 0, 64, 0));
+        let mut zero_budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        BundleParser::load_assets(&mut plain, &BundleLoadOptions::default(), &mut zero_budget)
+            .unwrap();
+        assert!(plain.assets.is_empty());
+        assert_eq!(zero_budget.usage(), Default::default());
+
+        let mut memory_limited_plain = AssetBundle::new(header.clone(), vec![0xa5; 64]);
+        memory_limited_plain
+            .nodes
+            .push(DirectoryNode::new("plain.bin".to_string(), 0, 64, 0));
+        BundleParser::load_assets(
+            &mut memory_limited_plain,
+            &BundleLoadOptions {
+                max_memory: Some(1),
+                ..BundleLoadOptions::default()
+            },
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        assert!(memory_limited_plain.assets.is_empty());
+
+        let mut serialized = AssetBundle::new(header, SERIALIZED_FILE_SAMPLE.to_vec());
+        serialized.nodes.push(DirectoryNode::new(
+            "data.assets".to_string(),
+            0,
+            u64::try_from(SERIALIZED_FILE_SAMPLE.len()).unwrap(),
+            0,
+        ));
+        BundleParser::load_assets(
+            &mut serialized,
+            &BundleLoadOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(serialized.assets.len(), 1);
+        assert_eq!(serialized.asset_names, ["data.assets"]);
+
+        let mut limited_serialized = AssetBundle::new(
+            BundleHeader {
+                signature: "UnityFS".to_string(),
+                ..Default::default()
+            },
+            SERIALIZED_FILE_SAMPLE.to_vec(),
+        );
+        limited_serialized.nodes.push(DirectoryNode::new(
+            "data.assets".to_string(),
+            0,
+            u64::try_from(SERIALIZED_FILE_SAMPLE.len()).unwrap(),
+            0,
+        ));
+        let error = BundleParser::load_assets(
+            &mut limited_serialized,
+            &BundleLoadOptions {
+                max_memory: Some(1),
+                ..BundleLoadOptions::default()
+            },
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, BinaryError::ResourceLimitExceeded(_)));
     }
 
     #[test]
@@ -2302,5 +2391,25 @@ mod tests {
         assert!(bundle.files.is_empty());
         assert_eq!(budget.usage().members, 0);
         assert_eq!(budget.usage().entries, 0);
+    }
+
+    #[test]
+    fn legacy_directory_entries_do_not_claim_serialized_file_flags() {
+        let data = legacy_directory_with_files(&["test.txt", "audio.resS"]);
+        let mut bundle = AssetBundle::new_empty(BundleHeader::default());
+
+        BundleParser::parse_legacy_directory(
+            &mut bundle,
+            &data,
+            0,
+            &BundleLoadOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+        assert_eq!(bundle.nodes.len(), 2);
+        assert!(bundle.nodes.iter().all(DirectoryNode::is_file));
+        assert!(bundle.nodes.iter().all(|node| node.flags == 0));
+        assert!(bundle.nodes.iter().all(|node| !node.is_serialized_file()));
     }
 }
