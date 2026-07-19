@@ -1,11 +1,7 @@
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, Diagnostic, FieldPath, FieldPathSegment, ObjectAddress,
-    ObjectKind, UnityClass, UnityValue, WorkspaceRevision, class_names,
-};
-
-use crate::workspace::{
-    FieldGuard, GenericMutation, MutationPlanFragment, PlanPayload, SourceExpectation,
-    WorkspaceLookup, WorkspaceObject, WorkspaceSource, WorkspaceView,
+    ObjectKind, UnityClass, UnityValue, WorkspaceRevision, class_names, field_schema_digest,
+    observe_semantic_value, semantic_value_digest, yaml_field_schema_digest,
 };
 
 use super::contract::{
@@ -13,10 +9,11 @@ use super::contract::{
     RecipeLowering, RecipeRejectionCode, RecipeValueKind, SchemaOrigin, SchemaProvenance,
     SchemaVariantId,
 };
-use super::digest::{
-    field_schema_digest, observe_value, semantic_value_digest, yaml_field_schema_digest,
-};
 use super::output::RecipeOutputBuilder;
+use crate::workspace::{
+    FieldGuard, GenericMutation, MutationPlanFragment, PlanPayload, SourceExpectation,
+    WorkspaceLookup, WorkspaceObject, WorkspaceSource, WorkspaceView,
+};
 
 /// Trusted immutable observation used by every built-in recipe.
 #[derive(Debug)]
@@ -510,7 +507,7 @@ fn material_container_variant(
     budget: &mut AssetLoadBudget,
     depth: u32,
 ) -> Result<Option<SchemaVariantId>, RecipeError> {
-    observe_value(depth, budget)?;
+    observe_semantic_value(depth, budget)?;
     match value {
         UnityValue::Array(entries) => Ok(entries.first().and_then(material_entry_variant)),
         UnityValue::Object(fields) if fields.len() == 1 && fields.contains_key("data") => {
@@ -561,7 +558,7 @@ fn event_applicability(
 ) -> Result<RecipeApplicability, RecipeError> {
     let mut found = false;
     for value in object.class().properties().values() {
-        observe_value(1, budget)?;
+        observe_semantic_value(1, budget)?;
         found = value.as_object().is_some_and(|event| {
             event
                 .get("m_PersistentCalls")

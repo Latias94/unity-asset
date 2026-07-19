@@ -2,11 +2,11 @@ use std::mem::size_of;
 
 use indexmap::IndexMap;
 use unity_asset_core::{
-    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, DigestV1, FieldPath, UnityClass, UnityValue,
+    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, DigestV1, FieldPath, SemanticDigestError,
+    UnityClass, UnityValue, semantic_value_digest, yaml_field_schema_digest,
 };
 
 use super::contract::RecipeError;
-use super::digest::{semantic_value_digest, yaml_field_schema_digest};
 use super::output::RecipeOutputBuilder;
 
 fn object(fields: impl IntoIterator<Item = (&'static str, UnityValue)>) -> UnityValue {
@@ -235,7 +235,7 @@ fn yaml_digest_budget_has_exact_entry_and_byte_boundaries() {
         let mut one_short = AssetLoadBudget::new(limits).unwrap();
         assert!(matches!(
             yaml_field_schema_digest(&class, &path, value, &mut one_short),
-            Err(RecipeError::Budget(_))
+            Err(SemanticDigestError::Budget(_))
         ));
     }
 }

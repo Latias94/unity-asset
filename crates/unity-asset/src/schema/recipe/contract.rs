@@ -3,6 +3,7 @@ use thiserror::Error;
 use unity_asset_binary::unity_version::UnityVersion;
 use unity_asset_core::{
     BudgetError, DigestBuildError, DigestV1, FieldPath, FieldPathError, ObjectAddress, ObjectKind,
+    SemanticDigestError,
 };
 
 use crate::workspace::{MutationPlanError, MutationPlanFragment, WorkspaceError};
@@ -626,6 +627,28 @@ impl From<WorkspaceError> for RecipeError {
             source = next;
         }
         Self::Workspace(error)
+    }
+}
+
+impl From<SemanticDigestError> for RecipeError {
+    fn from(error: SemanticDigestError) -> Self {
+        match error {
+            SemanticDigestError::LengthOverflow => Self::DigestLengthOverflow,
+            SemanticDigestError::ValueDepthExceeded { maximum, actual } => {
+                Self::Plan(MutationPlanError::ValueDepthExceeded { maximum, actual })
+            }
+            SemanticDigestError::AllocationFailed {
+                resource,
+                requested,
+                message,
+            } => Self::AllocationFailed {
+                resource,
+                requested,
+                message,
+            },
+            SemanticDigestError::Budget(error) => Self::Budget(error),
+            SemanticDigestError::Digest(error) => Self::Digest(error),
+        }
     }
 }
 

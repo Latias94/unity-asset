@@ -17,6 +17,7 @@ pub mod error;
 pub mod field_path;
 pub mod identity;
 pub mod revision;
+pub mod semantic_digest;
 pub mod source_image;
 pub mod unity_class;
 pub mod unity_value;
@@ -44,6 +45,10 @@ pub use identity::{
     WorkspaceId, YamlAnchor, YamlDocumentSelector,
 };
 pub use revision::{SourceFingerprint, SourceKind, WorkspaceRevision};
+pub use semantic_digest::{
+    SemanticDigestError, field_schema_digest, observe_semantic_value, semantic_value_digest,
+    yaml_field_schema_digest, yaml_schema_digest,
+};
 pub use source_image::{VerifiedSourceImage, VerifiedSourceImageError, VerifiedSourceRebinding};
 pub use unity_class::{UnityClass, UnityClassRegistry};
 pub use unity_value::UnityValue;
