@@ -3,16 +3,15 @@ use std::mem::size_of;
 
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, Diagnostic, DiagnosticSeverity, FieldPath, FieldPathSegment,
-    ObjectAddress, ObjectId, RevisionedObjectHandle, SourceId, SourceKind, UnityDocument,
-    WorkspaceId, WorkspaceRevision,
+    ObjectId, RevisionedObjectHandle, SourceId, SourceKind, UnityDocument, WorkspaceId,
+    WorkspaceRevision,
 };
-
-use crate::workspace::{WorkspaceError, WorkspaceState};
 
 use super::ReferenceGraphError;
 use super::fact::{
     BinaryExternalReference, RawReferenceTarget, ReferenceGuid, ReferenceResolution,
 };
+use super::input::{ReferenceInput, ReferenceSource};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PathClaim {
@@ -40,7 +39,13 @@ struct SourceGuidClaim {
     guid: [u8; 16],
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceParent {
+    source: SourceId,
+    parent: Option<SourceId>,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct MetaGuidClaim {
     described_path: String,
     parent: Option<SourceId>,
@@ -48,58 +53,48 @@ struct MetaGuidClaim {
     guid: [u8; 16],
 }
 
-pub(crate) struct ResolutionCatalog<'state> {
-    state: &'state WorkspaceState,
-    nodes: &'state [RevisionedObjectHandle],
+pub(crate) struct ResolutionCatalog<'input, I: ReferenceInput + ?Sized> {
+    input: &'input I,
+    nodes: &'input [RevisionedObjectHandle],
     exact_paths: Vec<PathClaim>,
     basenames: Vec<PathClaim>,
     guids: Vec<GuidClaim>,
     source_guids: Vec<SourceGuidClaim>,
+    source_parents: Vec<SourceParent>,
     workspace: WorkspaceId,
     revision: WorkspaceRevision,
 }
 
-impl<'state> ResolutionCatalog<'state> {
+impl<'input, I: ReferenceInput + ?Sized> ResolutionCatalog<'input, I> {
     pub(crate) fn build(
-        state: &'state WorkspaceState,
-        nodes: &'state [RevisionedObjectHandle],
+        input: &'input I,
+        sources: &[ReferenceSource<'_>],
+        nodes: &'input [RevisionedObjectHandle],
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, ReferenceGraphError> {
         let mut exact_paths = Vec::new();
         let mut basenames = Vec::new();
         let mut describable_paths = Vec::new();
         let mut meta_claims = Vec::new();
+        let source_count = sources.len();
+        let mut source_parents =
+            reserve_vec(source_count, "reference source parent claims", budget)?;
 
-        for (source, entry) in state.store().iter() {
-            if !matches!(source.kind(), SourceKind::SerializedFile | SourceKind::Yaml) {
-                continue;
-            }
-            let locator = state
-                .catalog()
-                .source_locator(source)
-                .map_err(WorkspaceError::from)?;
-            let parent = state
-                .catalog()
-                .parent(source)
-                .map_err(WorkspaceError::from)?;
-            let physical_path = if parent.is_none() {
-                state
-                    .catalog()
-                    .physical_origin(source)
-                    .map_err(WorkspaceError::from)?
-                    .path()
-                    .to_str()
-                    .map(|path| {
-                        normalize_external_path(
-                            path,
-                            "reference describable physical paths",
-                            budget,
-                        )
-                    })
-                    .transpose()?
-            } else {
-                None
-            };
+        for source in sources.iter().copied() {
+            let source_id = source.source();
+            let locator = source.locator();
+            let parent = source.parent();
+            source_parents.push(SourceParent {
+                source: source_id,
+                parent,
+            });
+            let physical_path = source
+                .physical_path()
+                .and_then(|path| path.to_str())
+                .map(|path| {
+                    normalize_external_path(path, "reference describable physical paths", budget)
+                })
+                .transpose()?;
 
             let alias = normalize_external_path(
                 locator.root_alias().as_str(),
@@ -112,7 +107,7 @@ impl<'state> ResolutionCatalog<'state> {
             push_path_claim(
                 &mut exact_paths,
                 clone_string(&alias, "reference exact source aliases", budget)?,
-                source,
+                source_id,
                 "reference exact source aliases",
                 budget,
             )?;
@@ -120,7 +115,7 @@ impl<'state> ResolutionCatalog<'state> {
                 push_path_claim(
                     &mut basenames,
                     name,
-                    source,
+                    source_id,
                     "reference alias basenames",
                     budget,
                 )?;
@@ -139,7 +134,7 @@ impl<'state> ResolutionCatalog<'state> {
                 push_path_claim(
                     &mut exact_paths,
                     clone_string(member, "reference exact member paths", budget)?,
-                    source,
+                    source_id,
                     "reference exact member paths",
                     budget,
                 )?;
@@ -147,7 +142,7 @@ impl<'state> ResolutionCatalog<'state> {
                     push_path_claim(
                         &mut basenames,
                         name,
-                        source,
+                        source_id,
                         "reference member basenames",
                         budget,
                     )?;
@@ -164,14 +159,14 @@ impl<'state> ResolutionCatalog<'state> {
                     parent,
                     key: clone_string(logical_path, "reference describable source paths", budget)?,
                     same_name_occurrence,
-                    source,
+                    source: source_id,
                 },
                 "reference describable source paths",
                 budget,
             )?;
 
-            if source.kind() == SourceKind::Yaml
-                && let Some(guid) = entry.cached_yaml().and_then(|document| meta_guid(document))
+            if source_id.kind() == SourceKind::Yaml
+                && let Some(guid) = source.yaml_document().and_then(meta_guid)
                 && let Some(described) = logical_path.strip_suffix(".meta")
             {
                 let described_path =
@@ -195,6 +190,7 @@ impl<'state> ResolutionCatalog<'state> {
         basenames.dedup();
         describable_paths.sort_unstable();
         describable_paths.dedup();
+        meta_claims.sort_unstable();
 
         let mut guids = Vec::new();
         let mut source_guids = Vec::new();
@@ -231,16 +227,26 @@ impl<'state> ResolutionCatalog<'state> {
         guids.dedup();
         source_guids.sort_unstable();
         source_guids.dedup();
+        source_parents.sort_unstable();
+        if source_parents
+            .windows(2)
+            .any(|pair| pair[0].source == pair[1].source)
+        {
+            return Err(ReferenceGraphError::Invariant(
+                "reference input exposed a duplicate object source",
+            ));
+        }
 
         Ok(Self {
-            state,
+            input,
             nodes,
             exact_paths,
             basenames,
             guids,
             source_guids,
-            workspace: state.workspace(),
-            revision: state.revision(),
+            source_parents,
+            workspace: input.workspace_id(),
+            revision: input.revision(),
         })
     }
 
@@ -406,7 +412,7 @@ impl<'state> ResolutionCatalog<'state> {
         if source.kind() != SourceKind::SerializedFile {
             return Ok(ReferenceResolution::Invalid {
                 diagnostic: diagnostic(
-                    self.state,
+                    self.input,
                     None,
                     None,
                     "REFERENCE_SOURCE_KIND_MISMATCH",
@@ -432,7 +438,7 @@ impl<'state> ResolutionCatalog<'state> {
         if source.kind() != SourceKind::Yaml {
             return Ok(ReferenceResolution::Invalid {
                 diagnostic: diagnostic(
-                    self.state,
+                    self.input,
                     None,
                     None,
                     "REFERENCE_SOURCE_KIND_MISMATCH",
@@ -503,7 +509,7 @@ impl<'state> ResolutionCatalog<'state> {
             return Ok(ReferenceResolution::Resolved(handle.clone()));
         }
         Ok(ReferenceResolution::Missing {
-            target: Some(address_for_object(self.state, &object, budget)?),
+            target: Some(self.input.address_for_object(&object, budget)?),
         })
     }
 
@@ -520,11 +526,10 @@ impl<'state> ResolutionCatalog<'state> {
         )?;
         for source in candidates {
             if source.kind() == SourceKind::SerializedFile {
-                addresses.push(address_for_object(
-                    self.state,
-                    &ObjectId::binary(source, path_id)?,
-                    budget,
-                )?);
+                addresses.push(
+                    self.input
+                        .address_for_object(&ObjectId::binary(source, path_id)?, budget)?,
+                );
             }
         }
         addresses.sort_unstable();
@@ -554,7 +559,7 @@ impl<'state> ResolutionCatalog<'state> {
                 | SourceKind::Archive
                 | SourceKind::StreamedResource => continue,
             };
-            addresses.push(address_for_object(self.state, &object, budget)?);
+            addresses.push(self.input.address_for_object(&object, budget)?);
         }
         addresses.sort_unstable();
         addresses.dedup();
@@ -608,11 +613,7 @@ impl<'state> ResolutionCatalog<'state> {
             candidates = collect_path_claims(&self.basenames, name, kind, budget)?;
         }
         if candidates.len() > 1 {
-            let context_parent = self
-                .state
-                .catalog()
-                .parent(context)
-                .map_err(WorkspaceError::from)?;
+            let context_parent = self.source_parent(context)?;
             if context_parent.is_some() {
                 let mut same_parent = reserve_vec(
                     candidates.len(),
@@ -620,13 +621,7 @@ impl<'state> ResolutionCatalog<'state> {
                     budget,
                 )?;
                 for candidate in candidates.iter().copied() {
-                    if self
-                        .state
-                        .catalog()
-                        .parent(candidate)
-                        .map_err(WorkspaceError::from)?
-                        == context_parent
-                    {
+                    if self.source_parent(candidate)? == context_parent {
                         same_parent.push(candidate);
                     }
                 }
@@ -644,6 +639,23 @@ impl<'state> ResolutionCatalog<'state> {
         source_guid_evidence(&self.source_guids, source, expected)
     }
 
+    fn source_parent(&self, source: SourceId) -> Result<Option<SourceId>, ReferenceGraphError> {
+        let position = self
+            .source_parents
+            .binary_search_by_key(&source, |claim| claim.source)
+            .map_err(|_| {
+                ReferenceGraphError::Invariant(
+                    "reference path candidate is absent from the source parent table",
+                )
+            })?;
+        self.source_parents
+            .get(position)
+            .map(|claim| claim.parent)
+            .ok_or(ReferenceGraphError::Invariant(
+                "reference source parent ordinal is out of bounds",
+            ))
+    }
+
     fn invalid(
         &self,
         source: &RevisionedObjectHandle,
@@ -654,7 +666,7 @@ impl<'state> ResolutionCatalog<'state> {
     ) -> Result<ReferenceResolution, ReferenceGraphError> {
         Ok(ReferenceResolution::Invalid {
             diagnostic: diagnostic(
-                self.state,
+                self.input,
                 Some(source.object()),
                 Some(field_path),
                 code,
@@ -693,13 +705,13 @@ enum ExternalCandidates {
     Invalid(Diagnostic),
 }
 
-fn reconcile_external_candidates(
+fn reconcile_external_candidates<I: ReferenceInput + ?Sized>(
     raw_guid: Option<[u8; 16]>,
     mut guid: Vec<SourceId>,
     mut path: Vec<SourceId>,
     source: &RevisionedObjectHandle,
     field_path: &FieldPath,
-    catalog: &ResolutionCatalog<'_>,
+    catalog: &ResolutionCatalog<'_, I>,
     budget: &mut AssetLoadBudget,
 ) -> Result<ExternalCandidates, ReferenceGraphError> {
     if guid.is_empty() {
@@ -745,10 +757,10 @@ fn reconcile_external_candidates(
     Ok(ExternalCandidates::Candidates(intersection))
 }
 
-fn invalid_external_identity(
+fn invalid_external_identity<I: ReferenceInput + ?Sized>(
     source: &RevisionedObjectHandle,
     field_path: &FieldPath,
-    catalog: &ResolutionCatalog<'_>,
+    catalog: &ResolutionCatalog<'_, I>,
     budget: &mut AssetLoadBudget,
 ) -> Result<ExternalCandidates, ReferenceGraphError> {
     let ReferenceResolution::Invalid { diagnostic } = catalog.invalid(
@@ -790,8 +802,8 @@ fn source_guid_evidence(
     }
 }
 
-pub(crate) fn diagnostic(
-    state: &WorkspaceState,
+pub(crate) fn diagnostic<I: ReferenceInput + ?Sized>(
+    input: &I,
     object: Option<&ObjectId>,
     field_path: Option<&FieldPath>,
     code: &'static str,
@@ -799,7 +811,7 @@ pub(crate) fn diagnostic(
     budget: &mut AssetLoadBudget,
 ) -> Result<Diagnostic, ReferenceGraphError> {
     diagnostic_with_severity(
-        state,
+        input,
         object,
         field_path,
         DiagnosticSeverity::Warning,
@@ -809,8 +821,8 @@ pub(crate) fn diagnostic(
     )
 }
 
-pub(crate) fn diagnostic_with_severity(
-    state: &WorkspaceState,
+pub(crate) fn diagnostic_with_severity<I: ReferenceInput + ?Sized>(
+    input: &I,
     object: Option<&ObjectId>,
     field_path: Option<&FieldPath>,
     severity: DiagnosticSeverity,
@@ -820,7 +832,7 @@ pub(crate) fn diagnostic_with_severity(
 ) -> Result<Diagnostic, ReferenceGraphError> {
     let code = clone_string(code, "reference diagnostic code", budget)?;
     let address = object
-        .map(|object| address_for_object(state, object, budget))
+        .map(|object| input.address_for_object(object, budget))
         .transpose()?;
     let field_path = field_path
         .map(|field_path| clone_field_path(field_path, budget))
@@ -850,32 +862,6 @@ fn clone_field_path(
         });
     }
     Ok(FieldPath::from_segments(segments)?)
-}
-
-pub(crate) fn address_for_object(
-    state: &WorkspaceState,
-    object: &ObjectId,
-    budget: &mut AssetLoadBudget,
-) -> Result<ObjectAddress, ReferenceGraphError> {
-    let locator_bytes = state
-        .catalog()
-        .source_locator(object.source())
-        .map_err(WorkspaceError::from)?
-        .retained_clone_bytes()
-        .ok_or(BudgetError::ArithmeticOverflow {
-            resource: "reference target address",
-        })?;
-    let retained = locator_bytes
-        .checked_add(object.retained_clone_bytes())
-        .ok_or(BudgetError::ArithmeticOverflow {
-            resource: "reference target address",
-        })?;
-    budget.consume_bytes(usize_to_u64(retained, "reference target address")?)?;
-    state
-        .catalog()
-        .address_for_object(object)
-        .map_err(WorkspaceError::from)
-        .map_err(ReferenceGraphError::from)
 }
 
 fn collect_path_claims(
@@ -1269,8 +1255,12 @@ mod tests {
             .find(|handle| handle.object().source() == owner)
             .unwrap();
         let parts = reference_view_parts(&snapshot);
+        let sources = parts
+            .object_sources()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         let mut budget = AssetLoadBudget::default();
-        let catalog = ResolutionCatalog::build(parts.state, &nodes, &mut budget).unwrap();
+        let catalog = ResolutionCatalog::build(&parts, &sources, &nodes, &mut budget).unwrap();
         let field_path = FieldPath::root();
 
         let conflicting = catalog

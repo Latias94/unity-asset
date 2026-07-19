@@ -4,6 +4,7 @@ mod builder;
 mod cache;
 mod fact;
 mod index;
+pub(crate) mod input;
 mod occurrence;
 mod projection;
 mod query;
@@ -16,12 +17,12 @@ use std::sync::Arc;
 use thiserror::Error;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, Diagnostic, DiagnosticError, FieldPathError,
-    ObjectAddress, RevisionedObjectHandle, WorkspaceId, WorkspaceRevision,
+    ObjectAddress, RevisionedObjectHandle, SourceId, SourceKind, WorkspaceId, WorkspaceRevision,
 };
 use unity_asset_yaml::YamlReferenceScanError;
 
 use crate::BinaryError;
-use crate::workspace::{WorkspaceError, WorkspaceView};
+use crate::workspace::{WorkspaceError, WorkspaceView, reference_view_parts};
 
 pub use fact::{
     BinaryExternalReference, RawReferenceTarget, ReferenceFact, ReferenceFormat, ReferenceGuid,
@@ -234,7 +235,17 @@ impl ReferenceGraph {
         options: ReferenceGraphBuildOptions,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, ReferenceGraphError> {
-        builder::build_graph(view, options, budget)
+        let input = reference_view_parts(view);
+        Self::build_from_input(view, &input, options, budget)
+    }
+
+    pub(crate) fn build_from_input<I: input::ReferenceInput + ?Sized>(
+        view: &dyn WorkspaceView,
+        input: &I,
+        options: ReferenceGraphBuildOptions,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, ReferenceGraphError> {
+        builder::build_graph_from_input(view, input, options, budget)
             .map(|(inner, build_stats)| Self { inner, build_stats })
     }
 
@@ -375,6 +386,15 @@ pub enum ReferenceGraphError {
     },
     #[error("reference graph cache lock is poisoned")]
     CachePoisoned,
+    #[error(
+        "reference source {source_id:?} has source kind {source_kind:?} and fingerprint kind {fingerprint_kind:?}, but its parse kind is {parse_kind:?}"
+    )]
+    ReferenceSourceKindMismatch {
+        source_id: SourceId,
+        source_kind: SourceKind,
+        fingerprint_kind: SourceKind,
+        parse_kind: SourceKind,
+    },
     #[error("reference graph invariant failed: {0}")]
     Invariant(&'static str),
     #[error("object is not indexed by this reference graph")]

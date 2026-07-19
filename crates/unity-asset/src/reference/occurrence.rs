@@ -2,40 +2,29 @@ use std::fmt::Write as _;
 use std::mem::size_of;
 use std::sync::Arc;
 
+use unity_asset_binary::asset::SerializedFile;
 use unity_asset_binary::typetree::{TypeTreeParseMode, TypeTreeParseOptions};
-use unity_asset_core::{
-    AssetLoadBudget, BudgetError, DiagnosticSeverity, SourceId, SourceKind, UnityDocument,
-};
+use unity_asset_core::{AssetLoadBudget, BudgetError, DiagnosticSeverity, UnityDocument};
 use unity_asset_yaml::{
-    YamlReferenceDiagnostic, YamlReferenceField, YamlReferenceScanError, YamlReferenceShape,
-    YamlValueKind, scan_reference_occurrences,
+    YamlDocument, YamlReferenceDiagnostic, YamlReferenceField, YamlReferenceScanError,
+    YamlReferenceShape, YamlValueKind, scan_reference_occurrences,
 };
-
-use crate::workspace::SourceEntry;
 
 use super::ReferenceGraphError;
 use super::cache::{
     LocalObjectId, LocalReferenceDiagnostic, LocalReferenceOccurrence, SourceReferenceOccurrences,
 };
 use super::fact::{BinaryExternalReference, RawReferenceTarget, ReferenceGuid};
+use super::input::{ReferenceSource, ReferenceSourceParse};
 
 pub(crate) fn scan_source_occurrences(
-    source: SourceId,
-    entry: &SourceEntry,
+    source: &ReferenceSource<'_>,
     typetree: TypeTreeParseOptions,
     budget: &mut AssetLoadBudget,
 ) -> Result<Arc<SourceReferenceOccurrences>, ReferenceGraphError> {
-    let candidate = match source.kind() {
-        SourceKind::SerializedFile => scan_binary_source(entry, typetree, budget)?,
-        SourceKind::Yaml => scan_yaml_source(entry, budget)?,
-        SourceKind::AssetBundle
-        | SourceKind::WebFile
-        | SourceKind::Archive
-        | SourceKind::StreamedResource => {
-            return Err(ReferenceGraphError::Invariant(
-                "non-object source reached the occurrence adapter",
-            ));
-        }
+    let candidate = match source.parse() {
+        ReferenceSourceParse::Serialized(file) => scan_binary_source(file, typetree, budget)?,
+        ReferenceSourceParse::Yaml(document) => scan_yaml_source(document, budget)?,
     };
     let wrapper_bytes = u64::try_from(size_of::<SourceReferenceOccurrences>()).map_err(|_| {
         BudgetError::ArithmeticOverflow {
@@ -47,15 +36,10 @@ pub(crate) fn scan_source_occurrences(
 }
 
 fn scan_binary_source(
-    entry: &SourceEntry,
+    file: &SerializedFile,
     typetree: TypeTreeParseOptions,
     budget: &mut AssetLoadBudget,
 ) -> Result<SourceReferenceOccurrences, ReferenceGraphError> {
-    let file = entry
-        .cached_serialized()
-        .ok_or(ReferenceGraphError::Invariant(
-            "SerializedFile source has no frozen parse",
-        ))?;
     let object_count = usize_to_u64(file.object_count(), "binary reference objects")?;
     let mut occurrences = Vec::new();
     let mut diagnostics = Vec::new();
@@ -178,12 +162,9 @@ fn scan_binary_source(
 }
 
 fn scan_yaml_source(
-    entry: &SourceEntry,
+    document: &YamlDocument,
     budget: &mut AssetLoadBudget,
 ) -> Result<SourceReferenceOccurrences, ReferenceGraphError> {
-    let document = entry.cached_yaml().ok_or(ReferenceGraphError::Invariant(
-        "YAML source has no frozen parse",
-    ))?;
     let scan = scan_reference_occurrences(document, budget).map_err(|error| match error {
         YamlReferenceScanError::Budget(source) => ReferenceGraphError::Budget(source),
         YamlReferenceScanError::AllocationFailed {

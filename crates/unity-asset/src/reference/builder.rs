@@ -3,16 +3,17 @@ use std::sync::Arc;
 
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, Diagnostic, FieldPath, FieldPathSegment, ObjectId,
-    RevisionedObjectHandle, SourceFingerprint, SourceId, SourceKind, YamlDocumentSelector,
+    RevisionedObjectHandle, SourceId, YamlDocumentSelector,
 };
 
-use crate::workspace::{SourceEntry, WorkspaceView, reference_view_parts};
+use crate::workspace::WorkspaceView;
 
 use super::cache::{FactCacheCandidate, LocalObjectId, LocalReferenceDiagnostic};
 use super::fact::{BinaryExternalReference, RawReferenceTarget, ReferenceFact, ReferenceGuid};
 use super::index::{ReferenceIndex, ReferenceIndexInput};
+use super::input::{ReferenceInput, ReferenceSource};
 use super::occurrence::{account_cached_source, scan_source_occurrences};
-use super::resolution::{ResolutionCatalog, address_for_object, diagnostic_with_severity};
+use super::resolution::{ResolutionCatalog, diagnostic_with_severity};
 use super::{
     ReferenceGraphBuildOptions, ReferenceGraphBuildStats, ReferenceGraphCoverage,
     ReferenceGraphError, ReferenceTruncation, ReferenceTruncationKind,
@@ -26,32 +27,27 @@ struct PendingFact {
     invalid: Option<Diagnostic>,
 }
 
-struct SourceScanInput<'entry> {
-    source: SourceId,
-    fingerprint: SourceFingerprint,
-    entry: &'entry Arc<SourceEntry>,
-}
-
-struct SourceScanResult<'entry> {
-    source: SourceId,
-    fingerprint: SourceFingerprint,
-    entry: &'entry Arc<SourceEntry>,
+struct SourceScanResult<'source> {
+    source: ReferenceSource<'source>,
     occurrences: Arc<super::cache::SourceReferenceOccurrences>,
     reused: bool,
 }
 
-pub(crate) fn build_graph(
+pub(crate) fn build_graph_from_input<I: ReferenceInput + ?Sized>(
     view: &dyn WorkspaceView,
+    reference_input: &I,
     options: ReferenceGraphBuildOptions,
     budget: &mut AssetLoadBudget,
 ) -> Result<(Arc<ReferenceIndex>, ReferenceGraphBuildStats), ReferenceGraphError> {
-    let parts = reference_view_parts(view);
-    if parts.state.revision() != view.revision() || parts.state.workspace() != view.workspace_id() {
+    if reference_input.revision() != view.revision()
+        || reference_input.workspace_id() != view.workspace_id()
+    {
         return Err(ReferenceGraphError::Invariant(
             "WorkspaceView reference input does not match its public context",
         ));
     }
-    if let Some(cached) = parts.store.graph(view.revision(), options)? {
+    let store = reference_input.reference_store();
+    if let Some(cached) = store.graph(view.revision(), options)? {
         account_cached_graph(&cached, budget)?;
         return Ok((cached, ReferenceGraphBuildStats::new(true, 0)));
     }
@@ -70,34 +66,25 @@ pub(crate) fn build_graph(
             resource: "reference graph indexed nodes",
         })?;
 
-    let object_source_count = parts
-        .state
-        .store()
-        .iter()
-        .filter(|(source, _)| {
-            matches!(source.kind(), SourceKind::SerializedFile | SourceKind::Yaml)
-        })
-        .count();
+    let object_source_count = reference_input.object_source_count();
     let mut scan_inputs = reserve_vec(object_source_count, "reference source scan inputs", budget)?;
-    for (source, entry) in parts.state.store().iter() {
-        if !matches!(source.kind(), SourceKind::SerializedFile | SourceKind::Yaml) {
-            continue;
+    for source in reference_input.object_sources() {
+        if scan_inputs.len() == object_source_count {
+            return Err(ReferenceGraphError::Invariant(
+                "reference input exposed more object sources than declared",
+            ));
         }
-        let fingerprint = parts
-            .state
-            .catalog()
-            .fingerprint(source)
-            .map_err(crate::workspace::WorkspaceError::from)?;
-        scan_inputs.push(SourceScanInput {
-            source,
-            fingerprint,
-            entry,
-        });
+        scan_inputs.push(source?);
+    }
+    if scan_inputs.len() != object_source_count {
+        return Err(ReferenceGraphError::Invariant(
+            "reference input exposed fewer object sources than declared",
+        ));
     }
     scan_inputs.sort_unstable_by(|left, right| {
-        left.fingerprint
-            .cmp(&right.fingerprint)
-            .then_with(|| left.source.cmp(&right.source))
+        left.fingerprint()
+            .cmp(&right.fingerprint())
+            .then_with(|| left.source().cmp(&right.source()))
     });
 
     let mut scan_results =
@@ -109,39 +96,40 @@ pub(crate) fn build_graph(
     )?;
     let mut position = 0;
     while position < scan_inputs.len() {
-        let fingerprint = scan_inputs[position].fingerprint;
-        let end = scan_inputs.partition_point(|input| input.fingerprint <= fingerprint);
+        let fingerprint = scan_inputs[position].fingerprint();
+        let end = scan_inputs.partition_point(|source| source.fingerprint() <= fingerprint);
         let group = &scan_inputs[position..end];
         let first = group.first().ok_or(ReferenceGraphError::Invariant(
             "reference source scan group is empty",
         ))?;
-        if let Some(cached) = parts.store.facts(fingerprint, first.entry)? {
-            for input in group {
-                account_cached_source(&cached, budget)?;
+        if let Some(hit) = store.fact_hit(fingerprint)? {
+            for source in group {
+                account_cached_source(&hit, budget)?;
                 scan_results.push(SourceScanResult {
-                    source: input.source,
-                    fingerprint,
-                    entry: input.entry,
-                    occurrences: Arc::clone(&cached),
+                    source: *source,
+                    occurrences: Arc::clone(&hit),
                     reused: true,
                 });
             }
-        } else {
-            let candidate =
-                scan_source_occurrences(first.source, first.entry, parts.typetree, budget)?;
             cache_candidates.push(FactCacheCandidate {
                 fingerprint,
-                owner: Arc::clone(first.entry),
+                owner: first.owner(),
+                occurrences: hit,
+            });
+        } else {
+            let candidate =
+                scan_source_occurrences(first, reference_input.typetree_options(), budget)?;
+            cache_candidates.push(FactCacheCandidate {
+                fingerprint,
+                owner: first.owner(),
                 occurrences: Arc::clone(&candidate),
             });
-            for (ordinal, input) in group.iter().enumerate() {
+            for (ordinal, source) in group.iter().enumerate() {
                 if ordinal != 0 {
                     account_cached_source(&candidate, budget)?;
                 }
                 scan_results.push(SourceScanResult {
-                    source: input.source,
-                    fingerprint,
-                    entry: input.entry,
+                    source: *source,
                     occurrences: Arc::clone(&candidate),
                     reused: ordinal != 0,
                 });
@@ -149,33 +137,17 @@ pub(crate) fn build_graph(
         }
         position = end;
     }
-    parts.store.publish_facts_batch(cache_candidates, budget)?;
+    store.publish_facts_batch(cache_candidates, budget)?;
+    scan_results.sort_unstable_by_key(|result| result.source.source());
 
-    position = 0;
-    while position < scan_results.len() {
-        let fingerprint = scan_results[position].fingerprint;
-        let end = scan_results.partition_point(|result| result.fingerprint <= fingerprint);
-        let owner = scan_results
-            .get(end.saturating_sub(1))
-            .ok_or(ReferenceGraphError::Invariant(
-                "reference source scan result group is empty",
-            ))?
-            .entry;
-        let canonical =
-            parts
-                .store
-                .facts(fingerprint, owner)?
-                .ok_or(ReferenceGraphError::Invariant(
-                    "published reference facts are absent from the cache",
-                ))?;
-        for result in &mut scan_results[position..end] {
-            result.reused |= !Arc::ptr_eq(&result.occurrences, &canonical);
-            result.occurrences = Arc::clone(&canonical);
-        }
-        position = end;
-    }
-    scan_results.sort_unstable_by_key(|result| result.source);
-
+    let occurrence_capacity = scan_results.iter().try_fold(0_usize, |total, result| {
+        total
+            .checked_add(result.occurrences.occurrences.len())
+            .ok_or(BudgetError::ArithmeticOverflow {
+                resource: "reference pending fact count",
+            })
+    })?;
+    let mut pending = reserve_vec(occurrence_capacity, "reference pending facts", budget)?;
     let mut source_occurrences = reserve_vec(
         object_source_count,
         "reference source occurrence owners",
@@ -185,6 +157,7 @@ pub(crate) fn build_graph(
     let mut source_complete = true;
     let mut reused_source_occurrences = 0_u64;
     for result in scan_results {
+        let source_id = result.source.source();
         if result.reused {
             reused_source_occurrences = reused_source_occurrences.checked_add(1).ok_or(
                 BudgetError::ArithmeticOverflow {
@@ -195,7 +168,7 @@ pub(crate) fn build_graph(
         source_complete &= result.occurrences.complete;
         for local in result.occurrences.diagnostics.iter() {
             if let Some(diagnostic) =
-                bind_local_diagnostic(parts.state, result.source, local, None, None, budget)?
+                bind_local_diagnostic(reference_input, source_id, local, None, None, budget)?
             {
                 push_value(
                     &mut diagnostics,
@@ -205,35 +178,7 @@ pub(crate) fn build_graph(
                 )?;
             }
         }
-        source_occurrences.push(result.occurrences);
-    }
-
-    let occurrence_capacity = source_occurrences
-        .iter()
-        .try_fold(0_usize, |total, source| {
-            total
-                .checked_add(source.occurrences.len())
-                .ok_or(BudgetError::ArithmeticOverflow {
-                    resource: "reference pending fact count",
-                })
-        })?;
-    let mut pending = reserve_vec(occurrence_capacity, "reference pending facts", budget)?;
-    let mut source_cursor = 0_usize;
-    for (source_id, _) in parts.state.store().iter() {
-        if !matches!(
-            source_id.kind(),
-            SourceKind::SerializedFile | SourceKind::Yaml
-        ) {
-            continue;
-        }
-        let source_facts =
-            source_occurrences
-                .get(source_cursor)
-                .ok_or(ReferenceGraphError::Invariant(
-                    "source occurrence cache entry was lost during graph assembly",
-                ))?;
-        source_cursor += 1;
-        for occurrence in source_facts.occurrences.iter() {
+        for occurrence in result.occurrences.occurrences.iter() {
             let object = local_object_id(source_id, &occurrence.source, budget)?;
             let Ok(node_ordinal) =
                 nodes.binary_search_by(|candidate| candidate.object().cmp(&object))
@@ -263,7 +208,7 @@ pub(crate) fn build_graph(
             )?;
             for local in occurrence.diagnostics.iter() {
                 if let Some(diagnostic) = bind_local_diagnostic(
-                    parts.state,
+                    reference_input,
                     source_id,
                     local,
                     Some(source.object()),
@@ -278,7 +223,7 @@ pub(crate) fn build_graph(
                 .as_ref()
                 .map(|local| {
                     bind_local_diagnostic(
-                        parts.state,
+                        reference_input,
                         source_id,
                         local,
                         Some(source.object()),
@@ -296,6 +241,7 @@ pub(crate) fn build_graph(
                 invalid,
             });
         }
+        source_occurrences.push(result.occurrences);
     }
     pending.sort_unstable_by(|left, right| {
         left.source
@@ -313,7 +259,7 @@ pub(crate) fn build_graph(
     let mut facts = {
         // Resolution must see every loaded object. Otherwise a loaded target excluded by the soft
         // node limit would be misclassified as missing.
-        let resolver = ResolutionCatalog::build(parts.state, &nodes, budget)?;
+        let resolver = ResolutionCatalog::build(reference_input, &scan_inputs, &nodes, budget)?;
         let mut facts = reserve_vec(pending.len(), "resolved reference facts", budget)?;
         for pending in pending {
             let resolution = resolver.resolve(
@@ -390,9 +336,9 @@ pub(crate) fn build_graph(
     );
     let mut addresses = reserve_vec(nodes.len(), "reference graph object addresses", budget)?;
     for node in &nodes {
-        addresses.push(address_for_object(parts.state, node.object(), budget)?);
+        addresses.push(reference_input.address_for_object(node.object(), budget)?);
     }
-    let input = ReferenceIndexInput {
+    let index_input = ReferenceIndexInput {
         workspace: view.workspace_id(),
         revision: view.revision(),
         nodes,
@@ -402,14 +348,12 @@ pub(crate) fn build_graph(
         coverage,
         source_occurrences,
     };
-    let index = ReferenceIndex::build(input, budget)?;
+    let index = ReferenceIndex::build(index_input, budget)?;
     budget.consume_bytes(usize_to_u64(
         size_of::<ReferenceIndex>(),
         "reference graph allocation",
     )?)?;
-    let index = parts
-        .store
-        .publish_graph(view.revision(), options, Arc::new(index), budget)?;
+    let index = store.publish_graph(view.revision(), options, Arc::new(index), budget)?;
     Ok((
         index,
         ReferenceGraphBuildStats::new(false, reused_source_occurrences),
@@ -433,8 +377,8 @@ fn local_object_id(
     }
 }
 
-fn bind_local_diagnostic(
-    state: &crate::workspace::WorkspaceState,
+fn bind_local_diagnostic<I: ReferenceInput + ?Sized>(
+    input: &I,
     source: SourceId,
     local: &LocalReferenceDiagnostic,
     default_object: Option<&ObjectId>,
@@ -450,7 +394,7 @@ fn bind_local_diagnostic(
     let field_path = local.field_path.as_ref().or(default_path);
     let message = clone_string(&local.message, "reference diagnostic message", budget)?;
     let diagnostic = diagnostic_with_severity(
-        state,
+        input,
         object,
         field_path,
         local.severity,
@@ -627,4 +571,183 @@ fn push_value<T>(
 
 fn usize_to_u64(value: usize, resource: &'static str) -> Result<u64, BudgetError> {
     u64::try_from(value).map_err(|_| BudgetError::ArithmeticOverflow { resource })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::fs;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use unity_asset_binary::typetree::TypeTreeParseOptions;
+    use unity_asset_core::{ObjectAddress, WorkspaceId, WorkspaceRevision};
+
+    use super::*;
+    use crate::reference::ReferenceStore;
+    use crate::reference::input::sealed;
+    use crate::workspace::{AssetWorkspace, ReferenceViewParts, reference_view_parts};
+
+    struct ChangingReferenceInput<'state> {
+        inner: ReferenceViewParts<'state>,
+        enumerations: Cell<u32>,
+    }
+
+    impl sealed::Sealed for ChangingReferenceInput<'_> {}
+
+    impl ReferenceInput for ChangingReferenceInput<'_> {
+        fn workspace_id(&self) -> WorkspaceId {
+            ReferenceInput::workspace_id(&self.inner)
+        }
+
+        fn revision(&self) -> WorkspaceRevision {
+            ReferenceInput::revision(&self.inner)
+        }
+
+        fn object_source_count(&self) -> usize {
+            ReferenceInput::object_source_count(&self.inner)
+        }
+
+        fn object_sources(
+            &self,
+        ) -> impl Iterator<Item = Result<ReferenceSource<'_>, ReferenceGraphError>> {
+            let enumeration = self.enumerations.get();
+            self.enumerations.set(enumeration.saturating_add(1));
+            let sources = if enumeration == 0 {
+                ReferenceInput::object_sources(&self.inner).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            sources.into_iter()
+        }
+
+        fn reference_store(&self) -> &ReferenceStore {
+            ReferenceInput::reference_store(&self.inner)
+        }
+
+        fn typetree_options(&self) -> TypeTreeParseOptions {
+            ReferenceInput::typetree_options(&self.inner)
+        }
+
+        fn address_for_object(
+            &self,
+            object: &ObjectId,
+            budget: &mut AssetLoadBudget,
+        ) -> Result<ObjectAddress, ReferenceGraphError> {
+            ReferenceInput::address_for_object(&self.inner, object, budget)
+        }
+    }
+
+    #[test]
+    fn graph_build_freezes_the_reference_source_set_before_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.prefab");
+        fs::write(
+            &path,
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Source\n",
+        )
+        .unwrap();
+        let mut workspace = AssetWorkspace::new().unwrap();
+        workspace
+            .load_path(&path, &mut AssetLoadBudget::default())
+            .unwrap();
+        let snapshot = workspace.snapshot();
+        let input = ChangingReferenceInput {
+            inner: reference_view_parts(&snapshot),
+            enumerations: Cell::new(0),
+        };
+
+        build_graph_from_input(
+            &snapshot,
+            &input,
+            ReferenceGraphBuildOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+        assert_eq!(input.enumerations.get(), 1);
+    }
+
+    #[test]
+    fn graph_build_keeps_its_hit_across_concurrent_rebind_and_sweep() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first.prefab");
+        let second_path = directory.path().join("second.prefab");
+        fs::write(
+            &first_path,
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: First\n",
+        )
+        .unwrap();
+        fs::write(
+            &second_path,
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &2\nGameObject:\n  m_Name: Second\n",
+        )
+        .unwrap();
+
+        let mut workspace = AssetWorkspace::new().unwrap();
+        workspace
+            .load_path(&first_path, &mut AssetLoadBudget::default())
+            .unwrap();
+        let warm_snapshot = workspace.snapshot();
+        let parts = reference_view_parts(&warm_snapshot);
+        let first = ReferenceInput::object_sources(&parts)
+            .next()
+            .unwrap()
+            .unwrap();
+        let fingerprint = first.fingerprint();
+        let store = Arc::clone(parts.store);
+        let warm_graph = warm_snapshot
+            .reference_graph(
+                ReferenceGraphBuildOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(warm_graph.build_stats().source_occurrence_cache_hits(), 0);
+        let retained = store.fact_hit(fingerprint).unwrap().unwrap();
+        drop(warm_graph);
+        drop(warm_snapshot);
+
+        workspace
+            .load_path(&second_path, &mut AssetLoadBudget::default())
+            .unwrap();
+        let snapshot = workspace.snapshot();
+        let (observed_tx, observed_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+        store.install_fact_publish_pause(observed_tx, resume_rx);
+
+        let build_snapshot = snapshot.clone();
+        let build = thread::spawn(move || {
+            build_snapshot.reference_graph(
+                ReferenceGraphBuildOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+        });
+        observed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("build A did not pause before publishing its fact-cache batch");
+
+        let competing_owner = Arc::<[u8]>::from(&b"competing reference owner"[..]);
+        store
+            .publish_facts_batch(
+                vec![FactCacheCandidate {
+                    fingerprint,
+                    owner: (&competing_owner).into(),
+                    occurrences: Arc::clone(&retained),
+                }],
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        drop(competing_owner);
+        resume_tx.send(()).unwrap();
+
+        let graph = build.join().unwrap().unwrap();
+        assert!(graph.is_complete());
+        assert_eq!(graph.coverage().scanned_sources(), 2);
+        assert_eq!(graph.build_stats().source_occurrence_cache_hits(), 1);
+        assert!(Arc::ptr_eq(
+            &store.fact_hit(fingerprint).unwrap().unwrap(),
+            &retained
+        ));
+    }
 }

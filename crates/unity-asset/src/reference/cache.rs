@@ -1,15 +1,17 @@
 use std::mem::size_of;
 use std::sync::{Arc, Mutex, Weak};
 
+#[cfg(test)]
+use std::sync::mpsc::{Receiver, SyncSender};
+
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, DiagnosticSeverity, FieldPath, SourceFingerprint,
     WorkspaceRevision, YamlDocumentSelector,
 };
 
-use crate::workspace::SourceEntry;
-
 use super::fact::RawReferenceTarget;
 use super::index::ReferenceIndex;
+use super::input::{ReferenceSourceOwner, WeakReferenceSourceOwner};
 use super::{ReferenceGraphBuildOptions, ReferenceGraphError};
 
 const REFERENCE_SCANNER_VERSION: u8 = 1;
@@ -76,19 +78,25 @@ struct GraphCacheEntry {
 #[derive(Debug)]
 struct FactCacheEntry {
     key: FactCacheKey,
-    owner: Weak<[u8]>,
+    owners: Vec<WeakReferenceSourceOwner>,
     occurrences: Arc<SourceReferenceOccurrences>,
 }
 
-pub(crate) struct FactCacheCandidate {
+impl FactCacheEntry {
+    fn is_live(&self) -> bool {
+        self.owners.iter().any(WeakReferenceSourceOwner::is_live)
+    }
+}
+
+pub(crate) struct FactCacheCandidate<'owner> {
     pub(crate) fingerprint: SourceFingerprint,
-    pub(crate) owner: Arc<SourceEntry>,
+    pub(crate) owner: ReferenceSourceOwner<'owner>,
     pub(crate) occurrences: Arc<SourceReferenceOccurrences>,
 }
 
 #[derive(Debug, Default)]
 struct ReferenceStoreState {
-    // Content-addressed backings keep facts alive exactly while matching source state is retained.
+    // Source-state owners keep facts alive exactly while matching content remains retained.
     facts: Vec<FactCacheEntry>,
     // A cache lookup must not keep an obsolete revision graph alive.
     graphs: Vec<GraphCacheEntry>,
@@ -118,8 +126,10 @@ impl ReferenceStoreState {
     fn preflight_sweep(&self, budget: &AssetLoadBudget) -> Result<u64, ReferenceGraphError> {
         let scanned = self
             .facts
-            .len()
-            .checked_add(self.graphs.len())
+            .iter()
+            .try_fold(self.graphs.len(), |count, entry| {
+                count.checked_add(entry.owners.len())
+            })
             .and_then(|count| u64::try_from(count).ok())
             .ok_or(BudgetError::ArithmeticOverflow {
                 resource: "reference cache sweep",
@@ -136,7 +146,7 @@ impl ReferenceStoreState {
     ) -> Result<(), ReferenceGraphError> {
         budget.consume_entries(scanned)?;
         budget.consume_members(scanned)?;
-        self.facts.retain(|entry| entry.owner.strong_count() != 0);
+        self.facts.retain(FactCacheEntry::is_live);
         self.graphs.retain(|entry| entry.graph.strong_count() != 0);
         Ok(())
     }
@@ -146,6 +156,15 @@ impl ReferenceStoreState {
 #[derive(Debug, Default)]
 pub(crate) struct ReferenceStore {
     state: Mutex<ReferenceStoreState>,
+    #[cfg(test)]
+    fact_publish_pause: Mutex<Option<FactPublishPause>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct FactPublishPause {
+    observed: SyncSender<()>,
+    resume: Receiver<()>,
 }
 
 impl ReferenceStore {
@@ -153,31 +172,52 @@ impl ReferenceStore {
         Self::default()
     }
 
-    pub(crate) fn facts(
+    pub(crate) fn fact_hit(
         &self,
         fingerprint: SourceFingerprint,
-        owner: &Arc<SourceEntry>,
     ) -> Result<Option<Arc<SourceReferenceOccurrences>>, ReferenceGraphError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ReferenceGraphError::CachePoisoned)?;
-        let key = FactCacheKey::new(fingerprint);
-        let Ok(position) = state.facts.binary_search_by_key(&key, |entry| entry.key) else {
-            return Ok(None);
+        let hit = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| ReferenceGraphError::CachePoisoned)?;
+            let key = FactCacheKey::new(fingerprint);
+            let Ok(position) = state.facts.binary_search_by_key(&key, |entry| entry.key) else {
+                return Ok(None);
+            };
+            Arc::clone(&state.facts[position].occurrences)
         };
-        state.facts[position].owner = Arc::downgrade(owner.image().backing());
-        Ok(Some(Arc::clone(&state.facts[position].occurrences)))
+        Ok(Some(hit))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_fact_publish_pause(
+        &self,
+        observed: SyncSender<()>,
+        resume: Receiver<()>,
+    ) {
+        *self.fact_publish_pause.lock().unwrap() = Some(FactPublishPause { observed, resume });
+    }
+
+    #[cfg(test)]
+    fn pause_before_fact_publish(&self) {
+        let pause = self.fact_publish_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.observed.send(()).unwrap();
+            pause.resume.recv().unwrap();
+        }
     }
 
     pub(crate) fn publish_facts_batch(
         &self,
-        candidates: Vec<FactCacheCandidate>,
+        candidates: Vec<FactCacheCandidate<'_>>,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), ReferenceGraphError> {
         if candidates.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        self.pause_before_fact_publish();
         if candidates.windows(2).any(|pair| {
             FactCacheKey::new(pair[0].fingerprint) >= FactCacheKey::new(pair[1].fingerprint)
         }) {
@@ -190,81 +230,30 @@ impl ReferenceStore {
             .lock()
             .map_err(|_| ReferenceGraphError::CachePoisoned)?;
         let scanned = state.preflight_sweep(budget)?;
-        let final_count = plan_fact_merge(&state.facts, &candidates)?.final_count;
-        let merged_bytes = final_count
+        let plan = plan_fact_merge(&state.facts, &candidates)?;
+        let entry_bytes = plan
+            .final_count
             .checked_mul(size_of::<FactCacheEntry>())
+            .ok_or(BudgetError::ArithmeticOverflow {
+                resource: "reference fact cache batch",
+            })?;
+        let owner_bytes = plan
+            .owner_count
+            .checked_mul(size_of::<WeakReferenceSourceOwner>())
+            .ok_or(BudgetError::ArithmeticOverflow {
+                resource: "reference fact cache owner cohorts",
+            })?;
+        let merged_bytes = entry_bytes
+            .checked_add(owner_bytes)
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(BudgetError::ArithmeticOverflow {
                 resource: "reference fact cache batch",
             })?;
 
         budget.check_bytes(merged_bytes)?;
-        let mut merged = Vec::new();
-        merged.try_reserve_exact(final_count).map_err(|source| {
-            ReferenceGraphError::Allocation {
-                resource: "reference fact cache batch",
-                requested: final_count,
-                unit: super::ReferenceAllocationUnit::Elements,
-                source,
-            }
-        })?;
+        let merged = build_fact_merge(&state.facts, &candidates, &plan)?;
         budget.consume_bytes(merged_bytes)?;
         state.commit_sweep(scanned, budget)?;
-
-        let existing = std::mem::take(&mut state.facts);
-        let mut existing = existing.into_iter();
-        let mut candidates = candidates.into_iter();
-        let mut current = existing.next();
-        let mut candidate = candidates.next();
-        loop {
-            match (current.take(), candidate.take()) {
-                (Some(mut existing_entry), Some(candidate_entry)) => {
-                    let candidate_key = FactCacheKey::new(candidate_entry.fingerprint);
-                    match existing_entry.key.cmp(&candidate_key) {
-                        std::cmp::Ordering::Less => {
-                            if existing_entry.owner.strong_count() != 0 {
-                                merged.push(existing_entry);
-                            }
-                            current = existing.next();
-                            candidate = Some(candidate_entry);
-                        }
-                        std::cmp::Ordering::Greater => {
-                            merged.push(cache_entry(candidate_entry));
-                            current = Some(existing_entry);
-                            candidate = candidates.next();
-                        }
-                        std::cmp::Ordering::Equal => {
-                            if existing_entry.owner.strong_count() == 0 {
-                                merged.push(cache_entry(candidate_entry));
-                            } else {
-                                existing_entry.owner =
-                                    Arc::downgrade(candidate_entry.owner.image().backing());
-                                merged.push(existing_entry);
-                            }
-                            current = existing.next();
-                            candidate = candidates.next();
-                        }
-                    }
-                }
-                (Some(existing_entry), None) => {
-                    if existing_entry.owner.strong_count() != 0 {
-                        merged.push(existing_entry);
-                    }
-                    for existing_entry in existing {
-                        if existing_entry.owner.strong_count() != 0 {
-                            merged.push(existing_entry);
-                        }
-                    }
-                    break;
-                }
-                (None, Some(candidate_entry)) => {
-                    merged.push(cache_entry(candidate_entry));
-                    merged.extend(candidates.map(cache_entry));
-                    break;
-                }
-                (None, None) => break,
-            }
-        }
         state.facts = merged;
         Ok(())
     }
@@ -324,25 +313,19 @@ impl ReferenceStore {
     }
 }
 
-fn cache_entry(candidate: FactCacheCandidate) -> FactCacheEntry {
-    FactCacheEntry {
-        key: FactCacheKey::new(candidate.fingerprint),
-        owner: Arc::downgrade(candidate.owner.image().backing()),
-        occurrences: candidate.occurrences,
-    }
-}
-
 struct FactMergePlan {
     final_count: usize,
+    owner_count: usize,
     #[cfg(test)]
     key_comparisons: usize,
 }
 
 fn plan_fact_merge(
     existing: &[FactCacheEntry],
-    candidates: &[FactCacheCandidate],
+    candidates: &[FactCacheCandidate<'_>],
 ) -> Result<FactMergePlan, ReferenceGraphError> {
     let mut final_count = 0_usize;
+    let mut owner_count = 0_usize;
     let mut existing_index = 0_usize;
     let mut candidate_index = 0_usize;
     #[cfg(test)]
@@ -356,38 +339,192 @@ fn plan_fact_merge(
         let candidate_key = FactCacheKey::new(candidates[candidate_index].fingerprint);
         match existing[existing_index].key.cmp(&candidate_key) {
             std::cmp::Ordering::Less => {
-                if existing[existing_index].owner.strong_count() != 0 {
+                let live_owners = existing[existing_index]
+                    .owners
+                    .iter()
+                    .filter(|owner| owner.is_live())
+                    .count();
+                if live_owners != 0 {
                     final_count = checked_fact_count(final_count)?;
+                    owner_count = checked_owner_count(owner_count, live_owners)?;
                 }
                 existing_index += 1;
             }
             std::cmp::Ordering::Greater => {
                 final_count = checked_fact_count(final_count)?;
+                owner_count = checked_owner_count(owner_count, 1)?;
                 candidate_index += 1;
             }
             std::cmp::Ordering::Equal => {
                 final_count = checked_fact_count(final_count)?;
+                let entry = &existing[existing_index];
+                let candidate_owner = candidates[candidate_index].owner.downgrade();
+                let live_owners = entry.owners.iter().filter(|owner| owner.is_live()).count();
+                let candidate_is_retained = entry
+                    .owners
+                    .iter()
+                    .any(|owner| owner.is_live() && owner.ptr_eq(&candidate_owner));
+                owner_count = checked_owner_count(
+                    owner_count,
+                    live_owners + usize::from(!candidate_is_retained),
+                )?;
                 existing_index += 1;
                 candidate_index += 1;
             }
         }
     }
     for entry in &existing[existing_index..] {
-        if entry.owner.strong_count() != 0 {
+        let live_owners = entry.owners.iter().filter(|owner| owner.is_live()).count();
+        if live_owners != 0 {
             final_count = checked_fact_count(final_count)?;
+            owner_count = checked_owner_count(owner_count, live_owners)?;
         }
     }
-    final_count = final_count
-        .checked_add(candidates.len().saturating_sub(candidate_index))
-        .ok_or(BudgetError::ArithmeticOverflow {
-            resource: "reference fact cache batch",
-        })?;
+    let remaining_candidates = candidates.len().saturating_sub(candidate_index);
+    final_count =
+        final_count
+            .checked_add(remaining_candidates)
+            .ok_or(BudgetError::ArithmeticOverflow {
+                resource: "reference fact cache batch",
+            })?;
+    owner_count = checked_owner_count(owner_count, remaining_candidates)?;
 
     Ok(FactMergePlan {
         final_count,
+        owner_count,
         #[cfg(test)]
         key_comparisons,
     })
+}
+
+fn build_fact_merge(
+    existing: &[FactCacheEntry],
+    candidates: &[FactCacheCandidate<'_>],
+    plan: &FactMergePlan,
+) -> Result<Vec<FactCacheEntry>, ReferenceGraphError> {
+    let mut merged = Vec::new();
+    merged
+        .try_reserve_exact(plan.final_count)
+        .map_err(|source| ReferenceGraphError::Allocation {
+            resource: "reference fact cache batch",
+            requested: plan.final_count,
+            unit: super::ReferenceAllocationUnit::Elements,
+            source,
+        })?;
+
+    let mut existing_index = 0_usize;
+    let mut candidate_index = 0_usize;
+    while existing_index < existing.len() && candidate_index < candidates.len() {
+        let candidate = &candidates[candidate_index];
+        let candidate_key = FactCacheKey::new(candidate.fingerprint);
+        match existing[existing_index].key.cmp(&candidate_key) {
+            std::cmp::Ordering::Less => {
+                if let Some(entry) = merge_fact_entry(Some(&existing[existing_index]), None)? {
+                    merged.push(entry);
+                }
+                existing_index += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                merged.push(
+                    merge_fact_entry(None, Some(candidate))?
+                        .expect("a candidate always has a live owner"),
+                );
+                candidate_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                merged.push(
+                    merge_fact_entry(Some(&existing[existing_index]), Some(candidate))?
+                        .expect("a candidate always has a live owner"),
+                );
+                existing_index += 1;
+                candidate_index += 1;
+            }
+        }
+    }
+    for entry in &existing[existing_index..] {
+        if let Some(entry) = merge_fact_entry(Some(entry), None)? {
+            merged.push(entry);
+        }
+    }
+    for candidate in &candidates[candidate_index..] {
+        merged.push(
+            merge_fact_entry(None, Some(candidate))?.expect("a candidate always has a live owner"),
+        );
+    }
+    debug_assert!(merged.len() <= plan.final_count);
+    Ok(merged)
+}
+
+fn merge_fact_entry(
+    existing: Option<&FactCacheEntry>,
+    candidate: Option<&FactCacheCandidate<'_>>,
+) -> Result<Option<FactCacheEntry>, ReferenceGraphError> {
+    let candidate_owner = candidate.map(|candidate| candidate.owner.downgrade());
+    let live_owner_count = existing.map_or(0, |entry| {
+        entry.owners.iter().filter(|owner| owner.is_live()).count()
+    });
+    let candidate_is_retained = candidate_owner.as_ref().is_some_and(|candidate_owner| {
+        existing.is_some_and(|entry| {
+            entry
+                .owners
+                .iter()
+                .any(|owner| owner.is_live() && owner.ptr_eq(candidate_owner))
+        })
+    });
+    let owner_count =
+        live_owner_count + usize::from(candidate_owner.is_some() && !candidate_is_retained);
+    if owner_count == 0 {
+        return Ok(None);
+    }
+
+    let mut owners = Vec::new();
+    owners
+        .try_reserve_exact(owner_count)
+        .map_err(|source| ReferenceGraphError::Allocation {
+            resource: "reference fact cache owner cohort",
+            requested: owner_count,
+            unit: super::ReferenceAllocationUnit::Elements,
+            source,
+        })?;
+    if let Some(existing) = existing {
+        owners.extend(
+            existing
+                .owners
+                .iter()
+                .filter(|owner| owner.is_live())
+                .cloned(),
+        );
+    }
+    if let Some(candidate_owner) = candidate_owner
+        && !owners.iter().any(|owner| owner.ptr_eq(&candidate_owner))
+    {
+        owners.push(candidate_owner);
+    }
+
+    let existing_is_live = live_owner_count != 0;
+    let key = if let Some(existing) = existing {
+        existing.key
+    } else {
+        FactCacheKey::new(candidate.expect("entry input cannot be empty").fingerprint)
+    };
+    let occurrences = if existing_is_live {
+        Arc::clone(
+            &existing
+                .expect("a live existing entry must exist")
+                .occurrences,
+        )
+    } else {
+        Arc::clone(
+            &candidate
+                .expect("a dead or absent entry requires a candidate")
+                .occurrences,
+        )
+    };
+    Ok(Some(FactCacheEntry {
+        key,
+        owners,
+        occurrences,
+    }))
 }
 
 fn checked_fact_count(count: usize) -> Result<usize, ReferenceGraphError> {
@@ -395,6 +532,15 @@ fn checked_fact_count(count: usize) -> Result<usize, ReferenceGraphError> {
         .checked_add(1)
         .ok_or(BudgetError::ArithmeticOverflow {
             resource: "reference fact cache batch",
+        })
+        .map_err(ReferenceGraphError::from)
+}
+
+fn checked_owner_count(count: usize, additional: usize) -> Result<usize, ReferenceGraphError> {
+    count
+        .checked_add(additional)
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "reference fact cache owner cohorts",
         })
         .map_err(ReferenceGraphError::from)
 }
@@ -428,29 +574,23 @@ mod tests {
 
     use crate::workspace::{AssetWorkspace, reference_view_parts};
     use unity_asset_core::{AssetLoadLimits, SourceKind};
+    use unity_asset_write::artifact::{
+        ArtifactBatchDeclaration, ArtifactBudget, ArtifactLimits, PreparedArtifactSet,
+    };
 
     use super::*;
+    use crate::reference::occurrence::account_cached_source;
 
-    fn source_owner() -> Arc<SourceEntry> {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("owner.prefab");
-        fs::write(
-            &path,
-            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Owner\n",
-        )
-        .unwrap();
-        let mut workspace = AssetWorkspace::new().unwrap();
-        let source = workspace
-            .load_path(&path, &mut AssetLoadBudget::default())
-            .unwrap();
-        let snapshot = workspace.snapshot();
-        Arc::clone(
-            reference_view_parts(&snapshot)
-                .state
-                .store()
-                .get(source)
-                .unwrap(),
-        )
+    fn source_owner() -> Arc<[u8]> {
+        Arc::from(&b"reference cache owner"[..])
+    }
+
+    fn prepared_owner() -> Arc<PreparedArtifactSet> {
+        let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+        let mut inspection_budget = AssetLoadBudget::default();
+        let declaration =
+            ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+        Arc::new(declaration.seal_output_names().unwrap().finish().unwrap())
     }
 
     fn fingerprint(ordinal: u64) -> SourceFingerprint {
@@ -464,6 +604,206 @@ mod tests {
             object_count,
             complete: true,
         })
+    }
+
+    #[test]
+    fn fact_cache_does_not_retain_committed_or_prepared_owners() {
+        let committed = source_owner();
+        let prepared = prepared_owner();
+        let shared = occurrences(1);
+        let store = ReferenceStore::new();
+        let mut candidates = vec![
+            FactCacheCandidate {
+                fingerprint: fingerprint(1),
+                owner: (&committed).into(),
+                occurrences: Arc::clone(&shared),
+            },
+            FactCacheCandidate {
+                fingerprint: fingerprint(2),
+                owner: (&prepared).into(),
+                occurrences: Arc::clone(&shared),
+            },
+        ];
+        candidates.sort_unstable_by_key(|candidate| candidate.fingerprint);
+
+        store
+            .publish_facts_batch(candidates, &mut AssetLoadBudget::default())
+            .unwrap();
+
+        assert_eq!(Arc::strong_count(&committed), 1);
+        assert_eq!(Arc::strong_count(&prepared), 1);
+        drop(committed);
+        drop(prepared);
+        assert!(
+            store
+                .state
+                .lock()
+                .unwrap()
+                .facts
+                .iter()
+                .all(|entry| !entry.is_live())
+        );
+    }
+
+    #[test]
+    fn fact_cache_retains_every_live_owner_for_the_same_fingerprint() {
+        let committed = source_owner();
+        let prepared = prepared_owner();
+        let retained = occurrences(7);
+        let key = fingerprint(10);
+        let store = ReferenceStore::new();
+        store
+            .publish_facts_batch(
+                vec![FactCacheCandidate {
+                    fingerprint: key,
+                    owner: (&committed).into(),
+                    occurrences: Arc::clone(&retained),
+                }],
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        let hit = store.fact_hit(key).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&hit, &retained));
+        store
+            .publish_facts_batch(
+                vec![FactCacheCandidate {
+                    fingerprint: key,
+                    owner: (&prepared).into(),
+                    occurrences: Arc::clone(&hit),
+                }],
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(Arc::strong_count(&prepared), 1);
+        {
+            let state = store.state.lock().unwrap();
+            let entry = &state.facts[state
+                .facts
+                .binary_search_by_key(&FactCacheKey::new(key), |entry| entry.key)
+                .unwrap()];
+            assert_eq!(entry.owners.len(), 2);
+        }
+        drop(prepared);
+
+        let first_sweep_owner = source_owner();
+        store
+            .publish_facts_batch(
+                vec![FactCacheCandidate {
+                    fingerprint: fingerprint(20),
+                    owner: (&first_sweep_owner).into(),
+                    occurrences: occurrences(20),
+                }],
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert!(
+            store
+                .state
+                .lock()
+                .unwrap()
+                .facts
+                .binary_search_by_key(&FactCacheKey::new(key), |entry| entry.key)
+                .is_ok()
+        );
+
+        drop(committed);
+        let second_sweep_owner = source_owner();
+        store
+            .publish_facts_batch(
+                vec![FactCacheCandidate {
+                    fingerprint: fingerprint(30),
+                    owner: (&second_sweep_owner).into(),
+                    occurrences: occurrences(30),
+                }],
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert!(
+            store
+                .state
+                .lock()
+                .unwrap()
+                .facts
+                .binary_search_by_key(&FactCacheKey::new(key), |entry| entry.key)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_cached_accounting_does_not_replace_the_committed_owner() {
+        let committed = source_owner();
+        let prepared = prepared_owner();
+        let retained = occurrences(7);
+        let key = fingerprint(15);
+        let store = ReferenceStore::new();
+        let mut initial = vec![
+            FactCacheCandidate {
+                fingerprint: key,
+                owner: (&committed).into(),
+                occurrences: Arc::clone(&retained),
+            },
+            FactCacheCandidate {
+                fingerprint: fingerprint(16),
+                owner: (&committed).into(),
+                occurrences: occurrences(1),
+            },
+        ];
+        initial.sort_unstable_by_key(|candidate| candidate.fingerprint);
+        store
+            .publish_facts_batch(initial, &mut AssetLoadBudget::default())
+            .unwrap();
+
+        let hit = store.fact_hit(key).unwrap().unwrap();
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_entries: 6,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        let transition = account_cached_source(&hit, &mut one_short).and_then(|()| {
+            store.publish_facts_batch(
+                vec![FactCacheCandidate {
+                    fingerprint: key,
+                    owner: (&prepared).into(),
+                    occurrences: Arc::clone(&hit),
+                }],
+                &mut one_short,
+            )
+        });
+        assert!(matches!(transition, Err(ReferenceGraphError::Budget(_))));
+        assert_eq!(one_short.usage(), Default::default());
+
+        let mut no_sweep = AssetLoadBudget::new(AssetLoadLimits {
+            max_entries: 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            store.publish_facts_batch(
+                vec![FactCacheCandidate {
+                    fingerprint: key,
+                    owner: (&prepared).into(),
+                    occurrences: Arc::clone(&hit),
+                }],
+                &mut no_sweep,
+            ),
+            Err(ReferenceGraphError::Budget(_))
+        ));
+        assert_eq!(no_sweep.usage(), Default::default());
+        drop(prepared);
+
+        let repeated = store.fact_hit(key).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&repeated, &retained));
+        let state = store.state.lock().unwrap();
+        let entry = &state.facts[state
+            .facts
+            .binary_search_by_key(&FactCacheKey::new(key), |entry| entry.key)
+            .unwrap()];
+        assert_eq!(entry.owners.len(), 1);
+        assert!(matches!(
+            &entry.owners[0],
+            WeakReferenceSourceOwner::Committed(owner) if owner.strong_count() == 1
+        ));
     }
 
     #[test]
@@ -522,21 +862,8 @@ mod tests {
 
     #[test]
     fn failed_fact_cache_growth_does_not_publish_the_candidate() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("source.prefab");
-        fs::write(
-            &path,
-            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Source\n",
-        )
-        .unwrap();
-        let mut workspace = AssetWorkspace::new().unwrap();
-        let source = workspace
-            .load_path(&path, &mut AssetLoadBudget::default())
-            .unwrap();
-        let snapshot = workspace.snapshot();
-        let parts = reference_view_parts(&snapshot);
-        let owner = Arc::clone(parts.state.store().get(source).unwrap());
-        let fingerprint = owner.image().fingerprint();
+        let owner = source_owner();
+        let fingerprint = fingerprint(1);
         let store = ReferenceStore::new();
         let candidate = Arc::new(SourceReferenceOccurrences {
             occurrences: Box::new([]),
@@ -554,7 +881,7 @@ mod tests {
             store.publish_facts_batch(
                 vec![FactCacheCandidate {
                     fingerprint,
-                    owner,
+                    owner: (&owner).into(),
                     occurrences: candidate,
                 }],
                 &mut budget,
@@ -568,36 +895,16 @@ mod tests {
     fn cache_hits_are_logarithmic_and_budget_failure_does_not_start_a_sweep() {
         const CACHED_SOURCES: usize = 32;
 
-        let directory = tempfile::tempdir().unwrap();
-        let mut workspace = AssetWorkspace::new().unwrap();
-        let mut sources = Vec::new();
-        for index in 0..CACHED_SOURCES + 2 {
-            let path = directory.path().join(format!("live-{index}.prefab"));
-            fs::write(
-                &path,
-                format!(
-                    "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &{}\nGameObject:\n  m_Name: Live{index}\n",
-                    index + 1
-                ),
-            )
-            .unwrap();
-            sources.push(
-                workspace
-                    .load_path(&path, &mut AssetLoadBudget::default())
-                    .unwrap(),
-            );
-        }
-
-        let doomed = sources[CACHED_SOURCES + 1];
-        let snapshot = workspace.snapshot();
-        let parts = reference_view_parts(&snapshot);
-        let cached = sources[..CACHED_SOURCES]
-            .iter()
-            .map(|source| Arc::clone(parts.state.store().get(*source).unwrap()))
+        let cached = (0..CACHED_SOURCES)
+            .map(|index| {
+                (
+                    fingerprint(u64::try_from(index).unwrap()),
+                    Arc::<[u8]>::from([u8::try_from(index).unwrap()]),
+                )
+            })
             .collect::<Vec<_>>();
-        let next = Arc::clone(parts.state.store().get(sources[CACHED_SOURCES]).unwrap());
-        let doomed_owner = Arc::clone(parts.state.store().get(doomed).unwrap());
-        drop(snapshot);
+        let next = (fingerprint(100), Arc::<[u8]>::from([100]));
+        let doomed = (fingerprint(101), Arc::<[u8]>::from([101]));
 
         let store = ReferenceStore::new();
         let candidate = Arc::new(SourceReferenceOccurrences {
@@ -608,25 +915,22 @@ mod tests {
         });
         let mut candidates = cached
             .iter()
-            .map(|owner| FactCacheCandidate {
-                fingerprint: owner.image().fingerprint(),
-                owner: Arc::clone(owner),
+            .map(|(fingerprint, owner)| FactCacheCandidate {
+                fingerprint: *fingerprint,
+                owner: owner.into(),
                 occurrences: Arc::clone(&candidate),
             })
             .collect::<Vec<_>>();
         candidates.push(FactCacheCandidate {
-            fingerprint: doomed_owner.image().fingerprint(),
-            owner: Arc::clone(&doomed_owner),
+            fingerprint: doomed.0,
+            owner: (&doomed.1).into(),
             occurrences: Arc::clone(&candidate),
         });
         candidates.sort_unstable_by_key(|candidate| candidate.fingerprint);
         store
             .publish_facts_batch(candidates, &mut AssetLoadBudget::default())
             .unwrap();
-        drop(doomed_owner);
-        workspace
-            .unload_source(doomed, &mut AssetLoadBudget::default())
-            .unwrap();
+        drop(doomed);
 
         let mut tiny = AssetLoadBudget::new(AssetLoadLimits {
             max_entries: 1,
@@ -635,17 +939,14 @@ mod tests {
         })
         .unwrap();
         let first = &cached[0];
-        let hit = store
-            .facts(first.image().fingerprint(), first)
-            .unwrap()
-            .unwrap();
+        let hit = store.fact_hit(first.0).unwrap().unwrap();
         assert!(Arc::ptr_eq(&hit, &candidate));
 
         assert!(matches!(
             store.publish_facts_batch(
                 vec![FactCacheCandidate {
-                    fingerprint: next.image().fingerprint(),
-                    owner: Arc::clone(&next),
+                    fingerprint: next.0,
+                    owner: (&next.1).into(),
                     occurrences: Arc::clone(&candidate),
                 }],
                 &mut tiny,
@@ -656,18 +957,11 @@ mod tests {
         assert_eq!(tiny.usage().members, 0);
         let cache = store.state.lock().unwrap();
         assert_eq!(cache.facts.len(), CACHED_SOURCES + 1);
+        assert!(cache.facts.iter().any(|entry| !entry.is_live()));
         assert!(
             cache
                 .facts
-                .iter()
-                .any(|entry| entry.owner.strong_count() == 0)
-        );
-        assert!(
-            cache
-                .facts
-                .binary_search_by_key(&FactCacheKey::new(next.image().fingerprint()), |entry| {
-                    entry.key
-                })
+                .binary_search_by_key(&FactCacheKey::new(next.0), |entry| { entry.key })
                 .is_err()
         );
     }
@@ -682,7 +976,7 @@ mod tests {
         let mut initial = (0..EXISTING)
             .map(|ordinal| FactCacheCandidate {
                 fingerprint: fingerprint(ordinal),
-                owner: Arc::clone(&owner),
+                owner: (&owner).into(),
                 occurrences: Arc::clone(&candidate),
             })
             .collect::<Vec<_>>();
@@ -701,7 +995,7 @@ mod tests {
 
         let make_new = || FactCacheCandidate {
             fingerprint: fingerprint(99),
-            owner: Arc::clone(&owner),
+            owner: (&owner).into(),
             occurrences: Arc::clone(&candidate),
         };
         let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
@@ -754,12 +1048,12 @@ mod tests {
                 vec![
                     FactCacheCandidate {
                         fingerprint: keys[0],
-                        owner: Arc::clone(&owner),
+                        owner: (&owner).into(),
                         occurrences: Arc::clone(&old_live),
                     },
                     FactCacheCandidate {
                         fingerprint: keys[1],
-                        owner: Arc::clone(&owner),
+                        owner: (&owner).into(),
                         occurrences: Arc::clone(&old_dead),
                     },
                 ],
@@ -773,7 +1067,7 @@ mod tests {
                 .binary_search_by_key(&FactCacheKey::new(keys[1]), |entry| entry.key)
                 .unwrap();
             let temporary = Arc::<[u8]>::from([]);
-            state.facts[dead].owner = Arc::downgrade(&temporary);
+            state.facts[dead].owners = vec![ReferenceSourceOwner::from(&temporary).downgrade()];
             drop(temporary);
         }
 
@@ -785,17 +1079,17 @@ mod tests {
                 vec![
                     FactCacheCandidate {
                         fingerprint: keys[0],
-                        owner: Arc::clone(&owner),
+                        owner: (&owner).into(),
                         occurrences: replacement_live,
                     },
                     FactCacheCandidate {
                         fingerprint: keys[1],
-                        owner: Arc::clone(&owner),
+                        owner: (&owner).into(),
                         occurrences: Arc::clone(&replacement_dead),
                     },
                     FactCacheCandidate {
                         fingerprint: keys[2],
-                        owner: Arc::clone(&owner),
+                        owner: (&owner).into(),
                         occurrences: Arc::clone(&inserted),
                     },
                 ],
@@ -804,15 +1098,15 @@ mod tests {
             .unwrap();
 
         assert!(Arc::ptr_eq(
-            &store.facts(keys[0], &owner).unwrap().unwrap(),
+            &store.fact_hit(keys[0]).unwrap().unwrap(),
             &old_live
         ));
         assert!(Arc::ptr_eq(
-            &store.facts(keys[1], &owner).unwrap().unwrap(),
+            &store.fact_hit(keys[1]).unwrap().unwrap(),
             &replacement_dead
         ));
         assert!(Arc::ptr_eq(
-            &store.facts(keys[2], &owner).unwrap().unwrap(),
+            &store.fact_hit(keys[2]).unwrap().unwrap(),
             &inserted
         ));
         let state = store.state.lock().unwrap();
@@ -833,7 +1127,7 @@ mod tests {
             .step_by(2)
             .map(|fingerprint| FactCacheCandidate {
                 fingerprint: *fingerprint,
-                owner: Arc::clone(&owner),
+                owner: (&owner).into(),
                 occurrences: Arc::clone(&shared),
             })
             .collect::<Vec<_>>();
@@ -843,7 +1137,7 @@ mod tests {
             .step_by(2)
             .map(|fingerprint| FactCacheCandidate {
                 fingerprint: *fingerprint,
-                owner: Arc::clone(&owner),
+                owner: (&owner).into(),
                 occurrences: Arc::clone(&shared),
             })
             .collect::<Vec<_>>();

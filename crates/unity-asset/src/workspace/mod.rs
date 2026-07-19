@@ -26,7 +26,6 @@ pub use view::{
 };
 
 pub(crate) use state::WorkspaceState;
-pub(crate) use store::SourceEntry;
 
 #[doc(hidden)]
 pub struct ReferenceViewParts<'a> {
