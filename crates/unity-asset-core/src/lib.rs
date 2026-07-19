@@ -4,6 +4,7 @@
 //! This crate provides the fundamental building blocks that are shared
 //! across different Unity asset formats (YAML, binary, etc.).
 
+pub mod allocation;
 mod bounded;
 pub mod budget;
 pub mod change;
@@ -16,10 +17,15 @@ pub mod error;
 pub mod field_path;
 pub mod identity;
 pub mod revision;
+pub mod source_image;
 pub mod unity_class;
 pub mod unity_value;
 
 // Re-export main types
+pub use allocation::{
+    AllocationSizeError, arc_slice_allocation_bytes, arc_value_allocation_bytes,
+    arc_vec_allocation_bytes, string_allocation_bytes, vec_allocation_bytes,
+};
 pub use budget::{
     AssetLoadBudget, AssetLoadDepthScope, AssetLoadLimits, AssetLoadUsage, BudgetError,
     BudgetedJsonError, DecompressionBudget, DecompressionUsage,
@@ -38,6 +44,7 @@ pub use identity::{
     WorkspaceId, YamlAnchor, YamlDocumentSelector,
 };
 pub use revision::{SourceFingerprint, SourceKind, WorkspaceRevision};
+pub use source_image::{VerifiedSourceImage, VerifiedSourceImageError};
 pub use unity_class::{UnityClass, UnityClassRegistry};
 pub use unity_value::UnityValue;
 
