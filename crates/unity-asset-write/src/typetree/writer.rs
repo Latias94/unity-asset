@@ -7,9 +7,10 @@ use unity_asset_binary::typetree::{
 };
 use unity_asset_core::{AssetLoadBudget, Result, UnityAssetError, UnityValue};
 
-use super::output::TypeTreeOutput;
+use super::output::{TypeTreeOutput, TypeTreeSink, TypeTreeValidation};
 use super::primitives::{
-    checked_i32_length, expect_pair, usize_to_u64, write_primitive, write_primitive_run,
+    checked_i32_length, expect_pair, summarize_value, usize_to_u64, write_primitive,
+    write_primitive_run,
 };
 use crate::binary_writer::Endian;
 
@@ -32,16 +33,31 @@ pub(crate) fn encode_object(
     Ok(output.finish())
 }
 
-/// Writes one canonical schema node into a caller-owned, budgeted output.
-///
-/// Template rewriting uses this adapter for every value that does not need byte preservation.
-/// `endian` must match the byte order used to construct `output`.
-pub(crate) fn write_value(
+/// Validates one canonical value through the same traversal used by the materializing writer.
+pub(crate) fn validate_value(
     schema: &TypeTreeSchema,
     node: SchemaNode<'_>,
     value: &UnityValue,
     endian: Endian,
-    output: &mut TypeTreeOutput<'_>,
+    budget: &mut AssetLoadBudget,
+    context: TypeTreeTraversalContext,
+    depth: u32,
+) -> Result<TypeTreeTraversalStats> {
+    let mut validation = TypeTreeValidation::new(budget);
+    write_value(schema, node, value, endian, &mut validation, context, depth)?;
+    Ok(validation.finish())
+}
+
+/// Writes one canonical schema node into a caller-owned, budgeted output.
+///
+/// Template rewriting uses this adapter for every value that does not need byte preservation.
+/// `endian` must match the byte order used to construct `output`.
+pub(crate) fn write_value<S: TypeTreeSink + ?Sized>(
+    schema: &TypeTreeSchema,
+    node: SchemaNode<'_>,
+    value: &UnityValue,
+    endian: Endian,
+    output: &mut S,
     context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<()> {
@@ -50,12 +66,12 @@ pub(crate) fn write_value(
     align_after_node(node, output)
 }
 
-fn write_value_body(
+fn write_value_body<S: TypeTreeSink + ?Sized>(
     schema: &TypeTreeSchema,
     node: SchemaNode<'_>,
     value: &UnityValue,
     endian: Endian,
-    output: &mut TypeTreeOutput<'_>,
+    output: &mut S,
     context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<()> {
@@ -89,12 +105,12 @@ fn write_value_body(
     }
 }
 
-fn write_object_node(
+fn write_object_node<S: TypeTreeSink + ?Sized>(
     schema: &TypeTreeSchema,
     node: SchemaNode<'_>,
     properties: &IndexMap<String, UnityValue>,
     endian: Endian,
-    output: &mut TypeTreeOutput<'_>,
+    output: &mut S,
     context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<()> {
@@ -113,15 +129,16 @@ fn write_object_node(
     align_after_node(node, output)
 }
 
-fn write_record_body(
+fn write_record_body<S: TypeTreeSink + ?Sized>(
     schema: &TypeTreeSchema,
     node: SchemaNode<'_>,
     object: &IndexMap<String, UnityValue>,
     endian: Endian,
-    output: &mut TypeTreeOutput<'_>,
+    output: &mut S,
     mut context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<()> {
+    validate_object_shape(node, object, context)?;
     output.consume_members(usize_to_u64(
         node.child_count(),
         "TypeTree record child count",
@@ -131,6 +148,9 @@ fn write_record_body(
         let Some(child_context) = context.descend(node, child) else {
             continue;
         };
+        if child.name().is_empty() && output.skips_template_preserved_unnamed_fields() {
+            continue;
+        }
 
         let value = required_property(object, child, node)?;
         write_value(
@@ -146,13 +166,13 @@ fn write_record_body(
     Ok(())
 }
 
-fn write_sequence(
+fn write_sequence<S: TypeTreeSink + ?Sized>(
     schema: &TypeTreeSchema,
     node: SchemaNode<'_>,
     layout: SequenceLayout<'_>,
     value: &UnityValue,
     endian: Endian,
-    output: &mut TypeTreeOutput<'_>,
+    output: &mut S,
     context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<()> {
@@ -186,8 +206,9 @@ fn write_sequence(
         UnityValue::Array(values) => values,
         _ => {
             return Err(UnityAssetError::format(format!(
-                "TypeTree write expected an array for sequence '{}', got {value:?}",
-                node.name()
+                "TypeTree write expected an array for sequence '{}', got {}",
+                node.name(),
+                summarize_value(value)
             )));
         }
     };
@@ -210,13 +231,13 @@ fn write_sequence(
     Ok(())
 }
 
-fn write_pair(
+fn write_pair<S: TypeTreeSink + ?Sized>(
     schema: &TypeTreeSchema,
     node: SchemaNode<'_>,
     layout: PairLayout<'_>,
     value: &UnityValue,
     endian: Endian,
-    output: &mut TypeTreeOutput<'_>,
+    output: &mut S,
     context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<()> {
@@ -243,31 +264,35 @@ fn write_pair(
     )
 }
 
-fn write_pptr(
+fn write_pptr<S: TypeTreeSink + ?Sized>(
     schema: &TypeTreeSchema,
     node: SchemaNode<'_>,
     layout: PPtrLayout<'_>,
     value: &UnityValue,
     endian: Endian,
-    output: &mut TypeTreeOutput<'_>,
+    output: &mut S,
     mut context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<()> {
+    let object = match value {
+        UnityValue::Null => None,
+        UnityValue::Object(object) => {
+            validate_object_shape(node, object, context)?;
+            Some(object)
+        }
+        _ => {
+            return Err(UnityAssetError::format(format!(
+                "TypeTree PPtr '{}' requires an Object or Null, got {}",
+                node.name(),
+                summarize_value(value)
+            )));
+        }
+    };
     output.consume_members(usize_to_u64(
         node.child_count(),
         "TypeTree PPtr child count",
     )?)?;
     let child_depth = child_depth(depth)?;
-    let object = match value {
-        UnityValue::Null => None,
-        UnityValue::Object(object) => Some(object),
-        _ => {
-            return Err(UnityAssetError::format(format!(
-                "TypeTree PPtr '{}' requires an Object or Null, got {value:?}",
-                node.name()
-            )));
-        }
-    };
     let zero = UnityValue::Integer(0);
 
     for child in node.children() {
@@ -313,8 +338,9 @@ fn validate_pptr_file_id(node: SchemaNode<'_>, value: &UnityValue) -> Result<()>
         return Ok(());
     }
     Err(UnityAssetError::format(format!(
-        "PPtr '{}' file ID must fit in i32, got {value:?}",
-        node.name()
+        "PPtr '{}' file ID must fit in i32, got {}",
+        node.name(),
+        summarize_value(value)
     )))
 }
 
@@ -324,31 +350,34 @@ fn validate_pptr_path_id(node: SchemaNode<'_>, value: &UnityValue) -> Result<()>
         return Ok(());
     }
     Err(UnityAssetError::format(format!(
-        "PPtr '{}' path ID must fit in i64, got {value:?}",
-        node.name()
+        "PPtr '{}' path ID must fit in i64, got {}",
+        node.name(),
+        summarize_value(value)
     )))
 }
 
-fn write_referenced_object(
+fn write_referenced_object<S: TypeTreeSink + ?Sized>(
     schema: &TypeTreeSchema,
     node: SchemaNode<'_>,
     layout: ReferencedObjectLayout<'_>,
     value: &UnityValue,
     endian: Endian,
-    output: &mut TypeTreeOutput<'_>,
+    output: &mut S,
     mut context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<()> {
     let object = expect_object(node, value)?;
-    output.consume_members(usize_to_u64(
-        node.child_count(),
-        "ReferencedObject child count",
-    )?)?;
     let type_value = required_property(object, layout.type_node(), node)?;
     let type_object = expect_object(layout.type_node(), type_value)?;
     let class_name = required_string(type_object, layout.class_field(), layout.type_node())?;
     let namespace = required_string(type_object, layout.namespace_field(), layout.type_node())?;
     let assembly_name = required_string(type_object, layout.assembly_field(), layout.type_node())?;
+    let omitted_payload = class_name.is_empty().then(|| layout.payload().node());
+    validate_object_shape_except(node, object, context, omitted_payload)?;
+    output.consume_members(usize_to_u64(
+        node.child_count(),
+        "ReferencedObject child count",
+    )?)?;
     let child_depth = child_depth(depth)?;
 
     for child in node.children() {
@@ -382,7 +411,10 @@ fn write_referenced_object(
                 .or_else(|| layout.payload().fallback())
                 .ok_or_else(|| {
                     UnityAssetError::format(format!(
-                        "Managed type '{class_name}' in namespace '{namespace}' from '{assembly_name}' has no schema or writable fallback"
+                        "Managed type discriminator has no schema or writable fallback (class_bytes={}, namespace_bytes={}, assembly_bytes={})",
+                        class_name.len(),
+                        namespace.len(),
+                        assembly_name.len()
                     ))
                 })?;
             let payload = required_property(object, child, node)?;
@@ -412,12 +444,50 @@ fn write_referenced_object(
     Ok(())
 }
 
-fn write_string(output: &mut TypeTreeOutput<'_>, value: &UnityValue) -> Result<()> {
+pub(super) fn validate_object_shape(
+    node: SchemaNode<'_>,
+    object: &IndexMap<String, UnityValue>,
+    context: TypeTreeTraversalContext,
+) -> Result<()> {
+    validate_object_shape_except(node, object, context, None)
+}
+
+fn validate_object_shape_except(
+    node: SchemaNode<'_>,
+    object: &IndexMap<String, UnityValue>,
+    mut context: TypeTreeTraversalContext,
+    omitted_child: Option<SchemaNode<'_>>,
+) -> Result<()> {
+    let mut expected_fields = 0_usize;
+    let mut missing = false;
+    for child in node.children() {
+        if Some(child) == omitted_child
+            || context.descend(node, child).is_none()
+            || child.name().is_empty()
+        {
+            continue;
+        }
+        expected_fields = expected_fields
+            .checked_add(1)
+            .ok_or_else(|| UnityAssetError::format("TypeTree writable field count overflow"))?;
+        missing |= !object.contains_key(child.name());
+    }
+    if missing || object.len() != expected_fields {
+        return Err(UnityAssetError::TypeTreeShape {
+            expected_fields,
+            actual_fields: object.len(),
+        });
+    }
+    Ok(())
+}
+
+fn write_string<S: TypeTreeSink + ?Sized>(output: &mut S, value: &UnityValue) -> Result<()> {
     let value = match value {
         UnityValue::String(value) => value,
         _ => {
             return Err(UnityAssetError::format(format!(
-                "TypeTree string requires a String value, got {value:?}"
+                "TypeTree string requires a String value, got {}",
+                summarize_value(value)
             )));
         }
     };
@@ -433,8 +503,8 @@ fn write_string(output: &mut TypeTreeOutput<'_>, value: &UnityValue) -> Result<(
     output.write_bytes(value.as_bytes())
 }
 
-fn write_sized_bytes(
-    output: &mut TypeTreeOutput<'_>,
+fn write_sized_bytes<S: TypeTreeSink + ?Sized>(
+    output: &mut S,
     node: SchemaNode<'_>,
     value: &UnityValue,
 ) -> Result<()> {
@@ -444,8 +514,8 @@ fn write_sized_bytes(
     output.write_bytes(bytes)
 }
 
-fn write_fixed_bytes(
-    output: &mut TypeTreeOutput<'_>,
+fn write_fixed_bytes<S: TypeTreeSink + ?Sized>(
+    output: &mut S,
     node: SchemaNode<'_>,
     value: &UnityValue,
     byte_size: u64,
@@ -496,8 +566,9 @@ fn required_string<'value>(
     match value {
         UnityValue::String(value) => Ok(value),
         _ => Err(UnityAssetError::format(format!(
-            "Managed type field '{}' requires a String, got {value:?}",
-            field.name()
+            "Managed type field '{}' requires a String, got {}",
+            field.name(),
+            summarize_value(value)
         ))),
     }
 }
@@ -509,9 +580,10 @@ fn expect_object<'value>(
     match value {
         UnityValue::Object(value) => Ok(value),
         _ => Err(UnityAssetError::format(format!(
-            "TypeTree node '{}' ({:?}) requires an Object, got {value:?}",
+            "TypeTree node '{}' ({:?}) requires an Object, got {}",
             node.name(),
-            node.kind()
+            node.kind(),
+            summarize_value(value)
         ))),
     }
 }
@@ -520,14 +592,15 @@ fn expect_bytes<'value>(node: SchemaNode<'_>, value: &'value UnityValue) -> Resu
     match value {
         UnityValue::Bytes(value) => Ok(value),
         _ => Err(UnityAssetError::format(format!(
-            "TypeTree node '{}' ({:?}) requires Bytes, got {value:?}",
+            "TypeTree node '{}' ({:?}) requires Bytes, got {}",
             node.name(),
-            node.kind()
+            node.kind(),
+            summarize_value(value)
         ))),
     }
 }
 
-fn align_after_node(node: SchemaNode<'_>, output: &mut TypeTreeOutput<'_>) -> Result<()> {
+fn align_after_node<S: TypeTreeSink + ?Sized>(node: SchemaNode<'_>, output: &mut S) -> Result<()> {
     if node.align_after() {
         output.align_to(4)?;
     }
@@ -590,6 +663,119 @@ mod tests {
         assert_eq!(
             encode(&schema, properties, Endian::Big).unwrap(),
             [0x01, 0x02, 0, 0]
+        );
+    }
+
+    #[test]
+    fn fresh_record_encoding_rejects_unrepresentable_extra_fields() {
+        let schema = compile(record("Base", vec![node("int", "m_Value")]), &[]);
+        let properties = IndexMap::from([
+            ("m_Value".to_owned(), UnityValue::Integer(1)),
+            ("m_Extra".to_owned(), UnityValue::Integer(2)),
+        ]);
+
+        assert!(matches!(
+            encode(&schema, properties, Endian::Little),
+            Err(UnityAssetError::TypeTreeShape {
+                expected_fields: 1,
+                actual_fields: 2,
+            })
+        ));
+
+        let wrong_field = IndexMap::from([("m_Other".to_owned(), UnityValue::Integer(1))]);
+        assert!(matches!(
+            encode(&schema, wrong_field, Endian::Little),
+            Err(UnityAssetError::TypeTreeShape {
+                expected_fields: 1,
+                actual_fields: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn validation_reuses_writer_rules_without_allocating_wire_bytes() {
+        let schema = compile(record("Base", vec![node("string", "m_Name")]), &[]);
+        let value = UnityValue::Object(IndexMap::from([(
+            "m_Name".to_owned(),
+            UnityValue::String("validated".to_owned()),
+        )]));
+        let mut budget = AssetLoadBudget::default();
+
+        let stats = validate_value(
+            &schema,
+            schema.root(),
+            &value,
+            Endian::Little,
+            &mut budget,
+            TypeTreeTraversalContext::root(),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(stats.owned_bytes, 0);
+        assert!(stats.wire_bytes > 0);
+        assert_eq!(budget.usage().bytes, 0);
+        assert!(budget.usage().entries > 0);
+        assert!(budget.usage().members > 0);
+    }
+
+    #[test]
+    fn rejected_values_use_bounded_shape_diagnostics() {
+        let schema = compile(record("Base", vec![node("string", "m_Name")]), &[]);
+        let value = UnityValue::Object(IndexMap::from([(
+            "m_Name".to_owned(),
+            UnityValue::Bytes(vec![0; 64 * 1024]),
+        )]));
+        let mut budget = AssetLoadBudget::default();
+
+        let error = validate_value(
+            &schema,
+            schema.root(),
+            &value,
+            Endian::Little,
+            &mut budget,
+            TypeTreeTraversalContext::root(),
+            0,
+        )
+        .expect_err("bytes are not a writable TypeTree string");
+        let diagnostic = error.to_string();
+
+        assert!(diagnostic.contains("Bytes(len=65536)"));
+        assert!(diagnostic.len() < 256, "unbounded diagnostic: {diagnostic}");
+    }
+
+    #[test]
+    fn validation_allows_template_preserved_unnamed_record_fields() {
+        let schema = compile(
+            record("Base", vec![node("int", ""), node("int", "m_Named")]),
+            &[],
+        );
+        let value = UnityValue::Object(IndexMap::from([(
+            "m_Named".to_owned(),
+            UnityValue::Integer(7),
+        )]));
+        let mut budget = AssetLoadBudget::default();
+
+        validate_value(
+            &schema,
+            schema.root(),
+            &value,
+            Endian::Little,
+            &mut budget,
+            TypeTreeTraversalContext::root(),
+            0,
+        )
+        .unwrap();
+        assert!(
+            encode(
+                &schema,
+                match value {
+                    UnityValue::Object(properties) => properties,
+                    _ => unreachable!("test constructs an object"),
+                },
+                Endian::Little,
+            )
+            .is_err()
         );
     }
 
@@ -838,6 +1024,29 @@ mod tests {
             .unwrap(),
             [0_u8; 12]
         );
+
+        let empty_with_payload = UnityValue::Object(IndexMap::from([
+            (
+                "type".to_owned(),
+                UnityValue::Object(IndexMap::from([
+                    ("class".to_owned(), UnityValue::String(String::new())),
+                    ("ns".to_owned(), UnityValue::String(String::new())),
+                    ("asm".to_owned(), UnityValue::String(String::new())),
+                ])),
+            ),
+            ("data".to_owned(), UnityValue::Object(IndexMap::new())),
+        ]));
+        assert!(matches!(
+            encode(
+                &schema,
+                IndexMap::from([("m_Ref".to_owned(), empty_with_payload)]),
+                Endian::Little,
+            ),
+            Err(UnityAssetError::TypeTreeShape {
+                expected_fields: 1,
+                actual_fields: 2,
+            })
+        ));
 
         let unresolved = UnityValue::Object(IndexMap::from([(
             "type".to_owned(),

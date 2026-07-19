@@ -1,5 +1,7 @@
 //! Budgeted append-only output for canonical TypeTree traversal.
 
+use std::mem::size_of;
+
 use unity_asset_binary::typetree::TypeTreeTraversalStats;
 use unity_asset_core::{AssetLoadBudget, BudgetError, Result, UnityAssetError};
 
@@ -18,6 +20,18 @@ enum AppendKind {
     Plain,
     Scalar,
     Bulk,
+}
+
+pub(crate) trait TypeTreeSink {
+    fn skips_template_preserved_unnamed_fields(&self) -> bool;
+    fn write_i32(&mut self, value: i32) -> Result<()>;
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()>;
+    fn write_scalar_bytes(&mut self, bytes: &[u8]) -> Result<()>;
+    fn write_bulk_bytes(&mut self, bytes: &[u8]) -> Result<()>;
+    fn align_to(&mut self, alignment: usize) -> Result<()>;
+    fn enter_node(&mut self, depth: u32) -> Result<()>;
+    fn enter_nodes(&mut self, depth: u32, amount: u64) -> Result<()>;
+    fn consume_members(&mut self, amount: u64) -> Result<()>;
 }
 
 /// An append-only TypeTree output buffer with caller-owned resource accounting.
@@ -221,6 +235,166 @@ impl<'budget> TypeTreeOutput<'budget> {
                 error,
             )
         })?;
+        Ok(())
+    }
+}
+
+impl TypeTreeSink for TypeTreeOutput<'_> {
+    fn skips_template_preserved_unnamed_fields(&self) -> bool {
+        false
+    }
+
+    fn write_i32(&mut self, value: i32) -> Result<()> {
+        Self::write_i32(self, value)
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        Self::write_bytes(self, bytes)
+    }
+
+    fn write_scalar_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        Self::write_scalar_bytes(self, bytes)
+    }
+
+    fn write_bulk_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        Self::write_bulk_bytes(self, bytes)
+    }
+
+    fn align_to(&mut self, alignment: usize) -> Result<()> {
+        Self::align_to(self, alignment)
+    }
+
+    fn enter_node(&mut self, depth: u32) -> Result<()> {
+        Self::enter_node(self, depth)
+    }
+
+    fn enter_nodes(&mut self, depth: u32, amount: u64) -> Result<()> {
+        Self::enter_nodes(self, depth, amount)
+    }
+
+    fn consume_members(&mut self, amount: u64) -> Result<()> {
+        Self::consume_members(self, amount)
+    }
+}
+
+/// Zero-allocation sink that exercises the canonical writer rules without retaining wire bytes.
+pub(crate) struct TypeTreeValidation<'budget> {
+    budget: &'budget mut AssetLoadBudget,
+    stats: TypeTreeTraversalStats,
+}
+
+impl<'budget> TypeTreeValidation<'budget> {
+    pub(crate) fn new(budget: &'budget mut AssetLoadBudget) -> Self {
+        Self {
+            budget,
+            stats: TypeTreeTraversalStats::default(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn finish(self) -> TypeTreeTraversalStats {
+        self.stats
+    }
+
+    fn advance(&mut self, amount: usize, kind: AppendKind) -> Result<()> {
+        let amount = u64::try_from(amount)
+            .map_err(|_| UnityAssetError::format("TypeTree validation extent does not fit u64"))?;
+        self.stats.wire_bytes =
+            checked_add_metric(self.stats.wire_bytes, amount, "validation wire bytes")?;
+        match kind {
+            AppendKind::Plain => {}
+            AppendKind::Scalar => {
+                self.stats.scalar_element_ops = checked_add_metric(
+                    self.stats.scalar_element_ops,
+                    1,
+                    "validation scalar element operations",
+                )?;
+            }
+            AppendKind::Bulk if amount != 0 => {
+                self.stats.bulk_runs =
+                    checked_add_metric(self.stats.bulk_runs, 1, "validation bulk runs")?;
+                self.stats.bulk_bytes =
+                    checked_add_metric(self.stats.bulk_bytes, amount, "validation bulk bytes")?;
+            }
+            AppendKind::Bulk => {}
+        }
+        Ok(())
+    }
+}
+
+impl TypeTreeSink for TypeTreeValidation<'_> {
+    fn skips_template_preserved_unnamed_fields(&self) -> bool {
+        true
+    }
+
+    fn write_i32(&mut self, _value: i32) -> Result<()> {
+        self.advance(size_of::<i32>(), AppendKind::Plain)
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.advance(bytes.len(), AppendKind::Plain)
+    }
+
+    fn write_scalar_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.advance(bytes.len(), AppendKind::Scalar)
+    }
+
+    fn write_bulk_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.advance(bytes.len(), AppendKind::Bulk)
+    }
+
+    fn align_to(&mut self, alignment: usize) -> Result<()> {
+        let alignment = u64::try_from(alignment).map_err(|_| {
+            UnityAssetError::format("TypeTree validation alignment does not fit u64")
+        })?;
+        if alignment == 0 {
+            return Err(UnityAssetError::format(
+                "TypeTree output alignment must be nonzero",
+            ));
+        }
+        let remainder = self.stats.wire_bytes % alignment;
+        if remainder != 0 {
+            self.stats.wire_bytes = checked_add_metric(
+                self.stats.wire_bytes,
+                alignment - remainder,
+                "validation alignment bytes",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn enter_node(&mut self, depth: u32) -> Result<()> {
+        self.enter_nodes(depth, 1)
+    }
+
+    fn enter_nodes(&mut self, depth: u32, amount: u64) -> Result<()> {
+        let node_visits =
+            checked_add_metric(self.stats.node_visits, amount, "validation node visits")?;
+        self.budget
+            .check_depth(depth)
+            .map_err(|error| budget_error("check TypeTree validation depth", error))?;
+        self.budget
+            .check_entries(amount)
+            .map_err(|error| budget_error("check TypeTree validation node visits", error))?;
+        self.budget
+            .consume_entries(amount)
+            .map_err(|error| budget_error("charge TypeTree validation node visits", error))?;
+        self.budget
+            .observe_depth(depth)
+            .map_err(|error| budget_error("record TypeTree validation depth", error))?;
+        self.stats.node_visits = node_visits;
+        Ok(())
+    }
+
+    fn consume_members(&mut self, amount: u64) -> Result<()> {
+        let members = checked_add_metric(self.stats.members, amount, "validation members")?;
+        self.budget
+            .check_members(amount)
+            .map_err(|error| budget_error("check TypeTree validation members", error))?;
+        self.budget
+            .consume_members(amount)
+            .map_err(|error| budget_error("charge TypeTree validation members", error))?;
+        self.stats.members = members;
         Ok(())
     }
 }

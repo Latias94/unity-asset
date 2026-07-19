@@ -1,10 +1,34 @@
+use std::fmt;
+
 use unity_asset_binary::typetree::{PrimitiveKind, SchemaNode};
 use unity_asset_core::{Result, UnityAssetError, UnityValue};
 
-use super::output::TypeTreeOutput;
+use super::output::TypeTreeSink;
 use crate::binary_writer::Endian;
 
 const BULK_STACK_BYTES: usize = 4 * 1024;
+
+pub(crate) struct UnityValueSummary<'value>(&'value UnityValue);
+
+impl fmt::Display for UnityValueSummary<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            UnityValue::Null => formatter.write_str("Null"),
+            UnityValue::Bool(_) => formatter.write_str("Bool"),
+            UnityValue::Integer(_) => formatter.write_str("Integer"),
+            UnityValue::Unsigned(_) => formatter.write_str("Unsigned"),
+            UnityValue::Float(_) => formatter.write_str("Float"),
+            UnityValue::String(value) => write!(formatter, "String(bytes={})", value.len()),
+            UnityValue::Array(value) => write!(formatter, "Array(len={})", value.len()),
+            UnityValue::Bytes(value) => write!(formatter, "Bytes(len={})", value.len()),
+            UnityValue::Object(value) => write!(formatter, "Object(fields={})", value.len()),
+        }
+    }
+}
+
+pub(crate) const fn summarize_value(value: &UnityValue) -> UnityValueSummary<'_> {
+    UnityValueSummary(value)
+}
 
 pub(crate) fn checked_i32_length(length: usize, label: &str) -> Result<i32> {
     i32::try_from(length)
@@ -23,14 +47,15 @@ pub(crate) fn expect_pair<'value>(
     match value {
         UnityValue::Array(values) if values.len() == 2 => Ok(values),
         _ => Err(UnityAssetError::format(format!(
-            "TypeTree pair '{}' requires an Array with exactly two values, got {value:?}",
-            node.name()
+            "TypeTree pair '{}' requires an Array with exactly two values, got {}",
+            node.name(),
+            summarize_value(value)
         ))),
     }
 }
 
-pub(crate) fn write_primitive(
-    output: &mut TypeTreeOutput<'_>,
+pub(crate) fn write_primitive<S: TypeTreeSink + ?Sized>(
+    output: &mut S,
     kind: PrimitiveKind,
     value: &UnityValue,
     endian: Endian,
@@ -39,8 +64,8 @@ pub(crate) fn write_primitive(
     output.write_scalar_bytes(&bytes[..width])
 }
 
-pub(crate) fn write_primitive_run(
-    output: &mut TypeTreeOutput<'_>,
+pub(crate) fn write_primitive_run<S: TypeTreeSink + ?Sized>(
+    output: &mut S,
     kind: PrimitiveKind,
     values: &[UnityValue],
     endian: Endian,
@@ -188,13 +213,15 @@ fn type_mismatch(
     value: &UnityValue,
 ) -> UnityAssetError {
     UnityAssetError::format(format!(
-        "TypeTree write expected {expected} for {kind:?}, got {value:?}"
+        "TypeTree write expected {expected} for {kind:?}, got {}",
+        summarize_value(value)
     ))
 }
 
 fn out_of_range(kind: PrimitiveKind, value: &UnityValue) -> UnityAssetError {
     UnityAssetError::format(format!(
-        "TypeTree write value {value:?} is out of range for {kind:?}"
+        "TypeTree write {} is out of range for {kind:?}",
+        summarize_value(value)
     ))
 }
 

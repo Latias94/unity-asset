@@ -41,6 +41,15 @@ pub enum UnityAssetError {
     #[error("Type conversion error: cannot convert {from} to {to}")]
     TypeConversion { from: String, to: String },
 
+    /// A semantic object contains fields absent from its TypeTree shape or omits writable fields.
+    #[error(
+        "TypeTree object shape mismatch: schema expects {expected_fields} named fields, value contains {actual_fields}"
+    )]
+    TypeTreeShape {
+        expected_fields: usize,
+        actual_fields: usize,
+    },
+
     /// Anchor-related errors
     #[error("Anchor error: {message}")]
     Anchor { message: String },

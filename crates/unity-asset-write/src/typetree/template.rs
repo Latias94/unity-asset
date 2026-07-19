@@ -12,8 +12,8 @@ use unity_asset_binary::typetree::{
 use unity_asset_core::{AssetLoadBudget, Result, UnityAssetError, UnityValue};
 
 use super::output::TypeTreeOutput;
-use super::primitives::{checked_i32_length, expect_pair, usize_to_u64};
-use super::writer::{encode_object, write_value};
+use super::primitives::{checked_i32_length, expect_pair, summarize_value, usize_to_u64};
+use super::writer::{encode_object, validate_object_shape, write_value};
 use crate::binary_writer::Endian;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -339,6 +339,8 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
                 node.name()
             )));
         }
+
+        validate_object_shape(node, object, context)?;
 
         self.observe_input_composite(node, depth, budget)?;
 
@@ -750,8 +752,9 @@ fn expect_object<'value>(
     match value {
         UnityValue::Object(object) => Ok(object),
         _ => Err(UnityAssetError::format(format!(
-            "TypeTree record '{}' requires an Object, got {value:?}",
-            node.name()
+            "TypeTree record '{}' requires an Object, got {}",
+            node.name(),
+            summarize_value(value)
         ))),
     }
 }
@@ -763,8 +766,9 @@ fn expect_sequence<'value>(
     match value {
         UnityValue::Array(values) => Ok(values),
         _ => Err(UnityAssetError::format(format!(
-            "TypeTree sequence '{}' requires an Array, got {value:?}",
-            node.name()
+            "TypeTree sequence '{}' requires an Array, got {}",
+            node.name(),
+            summarize_value(value)
         ))),
     }
 }
@@ -917,6 +921,31 @@ mod tests {
         assert_eq!(stats.input.node_visits, 4);
         assert_eq!(stats.input.wire_bytes, 4);
         assert_eq!(stats.output.node_visits, 4);
+    }
+
+    #[test]
+    fn nested_template_rewrite_rejects_unrepresentable_extra_fields() {
+        let mut nested = node("Nested", "m_Nested");
+        nested.children.push(node("int", "m_Value"));
+        let root = record(vec![nested]);
+        let properties = IndexMap::from([(
+            "m_Nested".to_owned(),
+            UnityValue::Object(IndexMap::from([
+                ("m_Value".to_owned(), UnityValue::Integer(42)),
+                ("m_Extra".to_owned(), UnityValue::Integer(7)),
+            ])),
+        )]);
+        let original = 42_i32.to_le_bytes();
+        let mut budget = AssetLoadBudget::default();
+        let schema = schema(root, &mut budget);
+
+        assert!(matches!(
+            rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget,),
+            Err(UnityAssetError::TypeTreeShape {
+                expected_fields: 1,
+                actual_fields: 2,
+            })
+        ));
     }
 
     #[test]

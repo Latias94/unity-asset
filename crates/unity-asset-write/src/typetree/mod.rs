@@ -8,6 +8,7 @@ mod writer;
 #[cfg(test)]
 mod characterization;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
-pub(crate) use template::rewrite_object;
+pub(crate) use template::{TemplateRewriteStats, rewrite_object};
+pub(crate) use writer::validate_value;
