@@ -417,6 +417,84 @@ fn pptr_field_roles_preserve_distinct_integer_constraints() {
 }
 
 #[test]
+fn pptr_schema_requires_one_unambiguous_file_and_path_role() {
+    let mut missing_path = node("PPtr<Object>", "target");
+    missing_path.children.push(node("int", "m_FileID"));
+    let error = TypeTreeSchema::compile(
+        &tree_with_root(missing_path),
+        &[],
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Invalid data: PPtr TypeTree node 'target' has no pathID/m_PathID field"
+    );
+
+    let mut duplicate_file = node("PPtr<Object>", "target");
+    duplicate_file.children = vec![
+        node("int", "fileID"),
+        node("int", "m_FileID"),
+        node("long long", "m_PathID"),
+    ];
+    let error = TypeTreeSchema::compile(
+        &tree_with_root(duplicate_file),
+        &[],
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Invalid data: PPtr TypeTree node 'target' has duplicate file ID fields"
+    );
+}
+
+#[test]
+fn pptr_schema_keeps_non_role_extension_fields_in_the_canonical_layout() {
+    let mut pointer = node("PPtr<Object>", "target");
+    pointer.children = vec![
+        node("int", "m_FileID"),
+        node("UInt8", "m_Tag"),
+        node("long long", "m_PathID"),
+    ];
+
+    let schema = compile_schema(pointer, &[]);
+    let root = schema.root();
+    let SemanticLayout::PPtr(layout) = root.semantic_layout() else {
+        panic!("expected a typed PPtr layout");
+    };
+
+    assert_eq!(root.child_count(), 3);
+    assert_eq!(root.child(1).unwrap().name(), "m_Tag");
+    assert_eq!(layout.file_child().name(), "m_FileID");
+    assert_eq!(layout.path_child().name(), "m_PathID");
+}
+
+#[test]
+fn file_and_path_fields_do_not_make_an_ordinary_record_a_pptr() {
+    let mut record = node("ReferenceLike", "target");
+    record.children = vec![node("int", "m_FileID"), node("long long", "m_PathID")];
+    let schema = compile_schema(record, &[]);
+
+    assert!(matches!(
+        schema.root().semantic_layout(),
+        SemanticLayout::Record
+    ));
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&2_i32.to_le_bytes());
+    bytes.extend_from_slice(&77_i64.to_le_bytes());
+    let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+    let scan = schema
+        .scan_pptrs(&mut reader, &mut AssetLoadBudget::default())
+        .unwrap();
+    assert!(scan.internal.is_empty());
+    assert!(scan.external.is_empty());
+    assert_eq!(scan.stats.pptrs_emitted, 0);
+    assert_eq!(scan.stats.unity_values_materialized, 0);
+}
+
+#[test]
 fn pair_layout_exposes_exactly_two_prevalidated_children() {
     let mut pair = node("pair", "entry");
     pair.children.push(node("int", "first"));

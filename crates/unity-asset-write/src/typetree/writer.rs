@@ -330,7 +330,7 @@ fn write_pptr<S: TypeTreeSink + ?Sized>(
     Ok(())
 }
 
-fn validate_pptr_file_id(node: SchemaNode<'_>, value: &UnityValue) -> Result<()> {
+pub(super) fn validate_pptr_file_id(node: SchemaNode<'_>, value: &UnityValue) -> Result<()> {
     let valid = value
         .as_i64()
         .is_some_and(|value| i32::try_from(value).is_ok());
@@ -344,7 +344,7 @@ fn validate_pptr_file_id(node: SchemaNode<'_>, value: &UnityValue) -> Result<()>
     )))
 }
 
-fn validate_pptr_path_id(node: SchemaNode<'_>, value: &UnityValue) -> Result<()> {
+pub(super) fn validate_pptr_path_id(node: SchemaNode<'_>, value: &UnityValue) -> Result<()> {
     let valid = value.as_i64().is_some();
     if valid {
         return Ok(());

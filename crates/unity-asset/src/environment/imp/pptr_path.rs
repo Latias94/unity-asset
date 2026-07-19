@@ -155,35 +155,102 @@ pub(crate) fn read_pptr(value: &UnityValue) -> Option<(i32, i64)> {
         return None;
     };
 
-    let file_id = map
-        .get("fileID")
-        .or_else(|| map.get("m_FileID"))
+    let fields = pptr_field_indices(map).ok()?;
+    let file_id = fields
+        .file_id
+        .and_then(|index| map.get_index(index))
+        .map(|(_, value)| value)
         .and_then(|v| v.as_i64())
         .and_then(|v| i32::try_from(v).ok())?;
-    let path_id = map
-        .get("pathID")
-        .or_else(|| map.get("m_PathID"))
+    let path_id = fields
+        .path_id
+        .and_then(|index| map.get_index(index))
+        .map(|(_, value)| value)
         .and_then(|v| v.as_i64())?;
     Some((file_id, path_id))
 }
 
-pub(crate) fn write_pptr(value: &mut UnityValue, file_id: i32, path_id: i64) {
+pub(crate) fn write_pptr(value: &mut UnityValue, file_id: i32, path_id: i64) -> Result<()> {
     if !matches!(value, UnityValue::Object(_)) {
         *value = UnityValue::Object(Default::default());
     }
     let UnityValue::Object(map) = value else {
-        return;
+        return Err(UnityAssetError::format(
+            "PPtr value could not be converted to an object",
+        ));
     };
 
-    let file_id_value = UnityValue::Integer(file_id as i64);
+    let fields = pptr_field_indices(map)?;
+    let file_id_value = UnityValue::Integer(i64::from(file_id));
     let path_id_value = UnityValue::Integer(path_id);
 
-    for key in ["fileID", "m_FileID"] {
-        map.insert(key.to_string(), file_id_value.clone());
+    match (fields.file_id, fields.path_id) {
+        (Some(file_index), Some(path_index)) => {
+            let (_, field) = map.get_index_mut(file_index).ok_or_else(|| {
+                UnityAssetError::format("PPtr file ID field index became invalid")
+            })?;
+            *field = file_id_value;
+
+            let (_, field) = map.get_index_mut(path_index).ok_or_else(|| {
+                UnityAssetError::format("PPtr path ID field index became invalid")
+            })?;
+            *field = path_id_value;
+        }
+        (None, None) => {
+            map.insert("m_FileID".to_owned(), file_id_value);
+            map.insert("m_PathID".to_owned(), path_id_value);
+        }
+        (Some(_), None) => {
+            return Err(UnityAssetError::format(
+                "PPtr object has a file ID field but no path ID field",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(UnityAssetError::format(
+                "PPtr object has a path ID field but no file ID field",
+            ));
+        }
     }
-    for key in ["pathID", "m_PathID"] {
-        map.insert(key.to_string(), path_id_value.clone());
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PPtrFieldIndices {
+    file_id: Option<usize>,
+    path_id: Option<usize>,
+}
+
+fn pptr_field_indices(map: &indexmap::IndexMap<String, UnityValue>) -> Result<PPtrFieldIndices> {
+    let mut fields = PPtrFieldIndices::default();
+    for (index, name) in map.keys().enumerate() {
+        let slot = if is_file_id_name(name) {
+            &mut fields.file_id
+        } else if is_path_id_name(name) {
+            &mut fields.path_id
+        } else {
+            continue;
+        };
+        if slot.replace(index).is_some() {
+            let role = if is_file_id_name(name) {
+                "file ID"
+            } else {
+                "path ID"
+            };
+            return Err(UnityAssetError::format(format!(
+                "PPtr object has duplicate {role} fields"
+            )));
+        }
     }
+    Ok(fields)
+}
+
+fn is_file_id_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("fileID") || name.eq_ignore_ascii_case("m_FileID")
+}
+
+fn is_path_id_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("pathID") || name.eq_ignore_ascii_case("m_PathID")
 }
 
 pub(crate) fn write_pptr_at_path(
@@ -193,8 +260,7 @@ pub(crate) fn write_pptr_at_path(
     path_id: i64,
 ) -> Result<()> {
     let v = get_value_at_path_mut(class, path)?;
-    write_pptr(v, file_id, path_id);
-    Ok(())
+    write_pptr(v, file_id, path_id)
 }
 
 pub(crate) fn set_value_at_path(
@@ -205,4 +271,97 @@ pub(crate) fn set_value_at_path(
     let v = get_value_at_path_mut(class, path)?;
     *v = value;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use indexmap::IndexMap;
+
+    use super::*;
+
+    #[test]
+    fn write_pptr_updates_the_existing_schema_names_without_injecting_aliases() {
+        let mut value = UnityValue::Object(IndexMap::from([
+            ("m_FileID".to_owned(), UnityValue::Integer(0)),
+            ("m_PathID".to_owned(), UnityValue::Integer(1)),
+        ]));
+
+        write_pptr(&mut value, 2, 99).unwrap();
+
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 2);
+        assert_eq!(object.get("m_FileID").and_then(UnityValue::as_i64), Some(2));
+        assert_eq!(
+            object.get("m_PathID").and_then(UnityValue::as_i64),
+            Some(99)
+        );
+        assert!(!object.contains_key("fileID"));
+        assert!(!object.contains_key("pathID"));
+    }
+
+    #[test]
+    fn write_pptr_preserves_extension_fields_and_alias_spelling() {
+        let mut value = UnityValue::Object(IndexMap::from([
+            ("fileID".to_owned(), UnityValue::Integer(0)),
+            ("m_Tag".to_owned(), UnityValue::Integer(7)),
+            ("pathID".to_owned(), UnityValue::Integer(1)),
+        ]));
+
+        write_pptr(&mut value, 3, 101).unwrap();
+
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 3);
+        assert_eq!(object.get("fileID").and_then(UnityValue::as_i64), Some(3));
+        assert_eq!(object.get("pathID").and_then(UnityValue::as_i64), Some(101));
+        assert_eq!(object.get("m_Tag").and_then(UnityValue::as_i64), Some(7));
+        assert!(!object.contains_key("m_FileID"));
+        assert!(!object.contains_key("m_PathID"));
+    }
+
+    #[test]
+    fn pptr_shape_rejects_duplicates_and_partial_roles() {
+        let duplicate = UnityValue::Object(IndexMap::from([
+            ("fileID".to_owned(), UnityValue::Integer(1)),
+            ("m_FileID".to_owned(), UnityValue::Integer(2)),
+            ("pathID".to_owned(), UnityValue::Integer(3)),
+        ]));
+        assert_eq!(read_pptr(&duplicate), None);
+        let mut duplicate_for_write = duplicate.clone();
+        assert!(write_pptr(&mut duplicate_for_write, 4, 5).is_err());
+        assert_eq!(duplicate_for_write, duplicate);
+
+        let partial = UnityValue::Object(IndexMap::from([(
+            "m_FileID".to_owned(),
+            UnityValue::Integer(1),
+        )]));
+        assert_eq!(read_pptr(&partial), None);
+        let mut partial_for_write = partial.clone();
+        assert!(write_pptr(&mut partial_for_write, 4, 5).is_err());
+        assert_eq!(partial_for_write, partial);
+
+        let mut wrong_value_types = UnityValue::Object(IndexMap::from([
+            (
+                "m_FileID".to_owned(),
+                UnityValue::String("not-an-integer".to_owned()),
+            ),
+            ("m_PathID".to_owned(), UnityValue::Bool(false)),
+        ]));
+        assert_eq!(read_pptr(&wrong_value_types), None);
+        write_pptr(&mut wrong_value_types, 6, 7).unwrap();
+        assert_eq!(read_pptr(&wrong_value_types), Some((6, 7)));
+    }
+
+    #[test]
+    fn write_pptr_synthesizes_the_binary_canonical_shape_for_empty_values() {
+        let mut value = UnityValue::Null;
+
+        write_pptr(&mut value, 0, 42).unwrap();
+
+        assert_eq!(read_pptr(&value), Some((0, 42)));
+        let object = value.as_object().unwrap();
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["m_FileID", "m_PathID"]
+        );
+    }
 }

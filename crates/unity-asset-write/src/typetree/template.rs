@@ -6,14 +6,16 @@ use std::ops::Range;
 use indexmap::IndexMap;
 use unity_asset_binary::reader::{BinaryReader, ByteOrder};
 use unity_asset_binary::typetree::{
-    PairLayout, SchemaNode, SemanticKind, SemanticLayout, SequenceLayout, TypeTreeSchema,
-    TypeTreeTraversalContext, TypeTreeTraversalStats,
+    PPtrLayout, PairLayout, SchemaNode, SemanticKind, SemanticLayout, SequenceLayout,
+    TypeTreeSchema, TypeTreeTraversalContext, TypeTreeTraversalStats,
 };
 use unity_asset_core::{AssetLoadBudget, Result, UnityAssetError, UnityValue};
 
 use super::output::TypeTreeOutput;
 use super::primitives::{checked_i32_length, expect_pair, summarize_value, usize_to_u64};
-use super::writer::{encode_object, validate_object_shape, write_value};
+use super::writer::{
+    encode_object, validate_object_shape, validate_pptr_file_id, validate_pptr_path_id, write_value,
+};
 use crate::binary_writer::Endian;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -310,6 +312,10 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
                 let values = expect_pair(node, value)?;
                 self.plan_pair(schema, node, layout, values, reader, budget, context, depth)
             }
+            SemanticLayout::PPtr(layout) if matches!(value, UnityValue::Object(_)) => {
+                let object = expect_object(node, value)?;
+                self.plan_pptr(schema, node, layout, object, reader, budget, context, depth)
+            }
             SemanticLayout::Sequence(layout) | SemanticLayout::Map(layout)
                 if layout.bulk_primitive().is_none() =>
             {
@@ -416,6 +422,74 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
             context,
             child_depth,
         )?;
+        self.plan_alignment(node, reader, budget)
+    }
+
+    fn plan_pptr(
+        &mut self,
+        schema: &'schema TypeTreeSchema,
+        node: SchemaNode<'schema>,
+        layout: PPtrLayout<'schema>,
+        object: &'value IndexMap<String, UnityValue>,
+        reader: &mut BinaryReader<'_>,
+        budget: &mut AssetLoadBudget,
+        mut context: TypeTreeTraversalContext,
+        depth: u32,
+    ) -> Result<()> {
+        validate_object_shape(node, object, context)?;
+        let file_id = object.get(layout.file_child().name()).ok_or_else(|| {
+            UnityAssetError::format(format!(
+                "Missing required field '{}' while template-rewriting '{}'",
+                layout.file_child().name(),
+                node.name()
+            ))
+        })?;
+        let path_id = object.get(layout.path_child().name()).ok_or_else(|| {
+            UnityAssetError::format(format!(
+                "Missing required field '{}' while template-rewriting '{}'",
+                layout.path_child().name(),
+                node.name()
+            ))
+        })?;
+        validate_pptr_file_id(node, file_id)?;
+        validate_pptr_path_id(node, path_id)?;
+
+        self.observe_input_composite(node, depth, budget)?;
+        self.push(
+            RewriteAction::EnterComposite {
+                depth,
+                members: usize_to_u64(node.child_count(), "TypeTree PPtr child count")?,
+            },
+            budget,
+        )?;
+        let child_depth = next_depth(depth)?;
+
+        for child in node.children() {
+            let Some(child_context) = context.descend(node, child) else {
+                continue;
+            };
+            if child.name().is_empty() {
+                self.plan_opaque(schema, child, reader, budget, child_context, child_depth)?;
+                continue;
+            }
+            let value = object.get(child.name()).ok_or_else(|| {
+                UnityAssetError::format(format!(
+                    "Missing required field '{}' while template-rewriting '{}'",
+                    child.name(),
+                    node.name()
+                ))
+            })?;
+            self.plan_node(
+                schema,
+                child,
+                value,
+                reader,
+                budget,
+                child_context,
+                child_depth,
+            )?;
+        }
+
         self.plan_alignment(node, reader, budget)
     }
 
@@ -2050,5 +2124,109 @@ mod tests {
                     .unwrap();
             assert_eq!(rewritten, encoded);
         }
+    }
+
+    #[test]
+    fn pptr_extension_fields_remain_scannable_and_template_preserved() {
+        let mut pointer = node("PPtr<Object>", "m_Target");
+        pointer.children = vec![
+            node("int", "m_FileID"),
+            node("UInt8", "m_Tag"),
+            node("long long", "m_PathID"),
+        ];
+        let properties = IndexMap::from([(
+            "m_Target".to_owned(),
+            UnityValue::Object(IndexMap::from([
+                ("m_FileID".to_owned(), UnityValue::Integer(2)),
+                ("m_Tag".to_owned(), UnityValue::Integer(0xaa)),
+                ("m_PathID".to_owned(), UnityValue::Integer(77)),
+            ])),
+        )]);
+        let mut budget = AssetLoadBudget::default();
+        let schema = schema(record(vec![pointer]), &mut budget);
+        let (encoded, _) =
+            encode_object(&schema, &properties, Endian::Little, &mut budget).unwrap();
+
+        let mut reader = BinaryReader::new(&encoded, ByteOrder::Little);
+        let scan = schema.scan_pptrs(&mut reader, &mut budget).unwrap();
+        assert_eq!(scan.external, vec![(2, 77)]);
+        assert_eq!(scan.stats.unity_values_materialized, 0);
+        assert_eq!(reader.position(), encoded.len() as u64);
+
+        let (rewritten, stats) =
+            rewrite_object(&schema, &properties, &encoded, Endian::Little, &mut budget).unwrap();
+        assert_eq!(rewritten, encoded);
+        assert_eq!(stats.preserved_bytes, encoded.len() as u64);
+        assert_eq!(stats.input.unity_values_materialized, 0);
+    }
+
+    #[test]
+    fn pptr_role_edit_preserves_named_extension_wire_bytes() {
+        let mut pointer = node("PPtr<Object>", "m_Target");
+        pointer.children = vec![
+            node("int", "m_FileID"),
+            node("float", "m_NaN"),
+            aligned(node("UInt8", "m_Tag")),
+            node("long long", "m_PathID"),
+        ];
+        let nan_bits = 0x7fa1_2345_u32;
+        let extension_bytes =
+            [nan_bits.to_le_bytes().as_slice(), &[0xaa, 0xb1, 0xc2, 0xd3]].concat();
+        let mut original = 2_i32.to_le_bytes().to_vec();
+        original.extend_from_slice(&extension_bytes);
+        original.extend_from_slice(&77_i64.to_le_bytes());
+        let properties = IndexMap::from([(
+            "m_Target".to_owned(),
+            UnityValue::Object(IndexMap::from([
+                ("m_FileID".to_owned(), UnityValue::Integer(2)),
+                (
+                    "m_NaN".to_owned(),
+                    UnityValue::Float(f32::from_bits(nan_bits) as f64),
+                ),
+                ("m_Tag".to_owned(), UnityValue::Integer(0xaa)),
+                ("m_PathID".to_owned(), UnityValue::Integer(99)),
+            ])),
+        )]);
+        let mut budget = AssetLoadBudget::default();
+        let schema = schema(record(vec![pointer]), &mut budget);
+
+        let (rewritten, stats) =
+            rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget).unwrap();
+
+        assert_eq!(&rewritten[..4], &2_i32.to_le_bytes());
+        assert_eq!(&rewritten[4..12], extension_bytes);
+        assert_eq!(&rewritten[12..], &99_i64.to_le_bytes());
+        assert_eq!(stats.preserved_bytes, 12);
+    }
+
+    #[test]
+    fn pptr_role_edit_preserves_unnamed_extension_wire_bytes() {
+        let mut pointer = node("PPtr<Object>", "m_Target");
+        pointer.children = vec![
+            node("int", "m_FileID"),
+            aligned(node("UInt8", "")),
+            node("long long", "m_PathID"),
+        ];
+        let opaque = [0x5a, 0xa1, 0xb2, 0xc3];
+        let mut original = 3_i32.to_le_bytes().to_vec();
+        original.extend_from_slice(&opaque);
+        original.extend_from_slice(&41_i64.to_le_bytes());
+        let properties = IndexMap::from([(
+            "m_Target".to_owned(),
+            UnityValue::Object(IndexMap::from([
+                ("m_FileID".to_owned(), UnityValue::Integer(3)),
+                ("m_PathID".to_owned(), UnityValue::Integer(42)),
+            ])),
+        )]);
+        let mut budget = AssetLoadBudget::default();
+        let schema = schema(record(vec![pointer]), &mut budget);
+
+        let (rewritten, stats) =
+            rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget).unwrap();
+
+        assert_eq!(&rewritten[..4], &3_i32.to_le_bytes());
+        assert_eq!(&rewritten[4..8], &opaque);
+        assert_eq!(&rewritten[8..], &42_i64.to_le_bytes());
+        assert_eq!(stats.preserved_bytes, 8);
     }
 }
