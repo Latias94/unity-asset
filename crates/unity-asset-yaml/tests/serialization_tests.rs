@@ -4,8 +4,31 @@
 //! that can be round-tripped successfully.
 
 use std::collections::HashMap;
-use unity_asset_core::{UnityClass, UnityDocument, UnityValue};
+use std::io::{self, Write};
+use unity_asset_core::{LineEnding, UnityAssetError, UnityClass, UnityDocument, UnityValue};
 use unity_asset_yaml::{SerdeUnityLoader, UnityYamlSerializer, YamlDocument};
+
+struct FailingWriter {
+    remaining: usize,
+}
+
+impl Write for FailingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected YAML writer failure",
+            ));
+        }
+        let written = self.remaining.min(bytes.len());
+        self.remaining -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Test basic serialization of a simple GameObject
 #[test]
@@ -190,6 +213,51 @@ fn test_serialize_multiple_documents() {
     assert!(yaml_output.contains("MonoBehaviour:"));
 
     println!("Multi-document YAML:\n{}", yaml_output);
+}
+
+#[test]
+fn io_writer_matches_string_output_for_borrowed_classes() {
+    let mut gameobject = UnityClass::new(1, "GameObject".into(), "123".into());
+    gameobject.set("m_Name".into(), UnityValue::String("Streamed".into()));
+    let mut transform = UnityClass::new(4, "Transform".into(), "456".into());
+    transform.set(
+        "m_LocalPosition".into(),
+        UnityValue::Object(indexmap::indexmap! {
+            "x".into() => UnityValue::Float(1.0),
+            "y".into() => UnityValue::Float(2.0),
+            "z".into() => UnityValue::Float(3.0),
+        }),
+    );
+    let classes = [gameobject, transform];
+
+    let expected = UnityYamlSerializer::new()
+        .with_line_ending(LineEnding::Windows)
+        .serialize_to_string(classes.iter())
+        .unwrap();
+    let mut actual = Vec::new();
+    UnityYamlSerializer::new()
+        .with_line_ending(LineEnding::Windows)
+        .serialize_to_writer(&mut actual, classes.iter())
+        .unwrap();
+
+    assert_eq!(actual, expected.as_bytes());
+    assert_eq!(classes[0].class_name, "GameObject");
+}
+
+#[test]
+fn io_writer_failure_preserves_the_original_io_error() {
+    let class = UnityClass::new(1, "GameObject".into(), "123".into());
+    let mut writer = FailingWriter { remaining: 9 };
+
+    let error = UnityYamlSerializer::new()
+        .serialize_to_writer(&mut writer, std::iter::once(&class))
+        .unwrap_err();
+
+    let UnityAssetError::Io(error) = error else {
+        panic!("expected an I/O error, got {error:?}");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(error.to_string(), "injected YAML writer failure");
 }
 
 /// Test YamlDocument save and load functionality

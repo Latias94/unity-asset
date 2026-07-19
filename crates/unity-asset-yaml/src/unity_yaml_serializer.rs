@@ -8,7 +8,8 @@
 //! - Proper formatting and line endings
 
 use crate::constants::{LineEnding, UNITY_TAG_URI, UNITY_YAML_VERSION};
-use std::fmt::Write;
+use std::fmt::{self, Write as FmtWrite};
+use std::io::{self, Write as IoWrite};
 use unity_asset_core::{Result, UnityAssetError, UnityClass, UnityValue};
 
 /// Unity YAML serializer
@@ -19,8 +20,6 @@ pub struct UnityYamlSerializer {
     indent_size: usize,
     /// Current indentation level
     indent_level: usize,
-    /// Whether this is the first document
-    first_document: bool,
 }
 
 impl UnityYamlSerializer {
@@ -30,7 +29,6 @@ impl UnityYamlSerializer {
             line_ending: LineEnding::default(),
             indent_size: 2,
             indent_level: 0,
-            first_document: true,
         }
     }
 
@@ -40,31 +38,49 @@ impl UnityYamlSerializer {
         self
     }
 
-    /// Serialize Unity classes to YAML string
-    pub fn serialize_to_string(&mut self, classes: &[UnityClass]) -> Result<String> {
+    /// Serialize borrowed Unity classes to a YAML string.
+    pub fn serialize_to_string<'class, I>(&mut self, classes: I) -> Result<String>
+    where
+        I: IntoIterator<Item = &'class UnityClass>,
+    {
         let mut output = String::new();
-        self.serialize_to_writer(&mut output, classes)?;
+        self.serialize_to_fmt_writer(&mut output, classes)?;
         Ok(output)
     }
 
-    /// Serialize Unity classes to a writer
-    pub fn serialize_to_writer<W: Write>(
-        &mut self,
-        writer: &mut W,
-        classes: &[UnityClass],
-    ) -> Result<()> {
-        self.first_document = true;
+    /// Stream borrowed Unity classes directly to an I/O writer.
+    ///
+    /// The serializer does not buffer the complete YAML document and does not flush the writer.
+    /// Any writer failure is returned as [`UnityAssetError::Io`] with the original
+    /// [`io::Error`] intact.
+    pub fn serialize_to_writer<'class, W, I>(&mut self, writer: &mut W, classes: I) -> Result<()>
+    where
+        W: IoWrite + ?Sized,
+        I: IntoIterator<Item = &'class UnityClass>,
+    {
+        let mut adapter = IoWriterAdapter::new(writer);
+        let result = self.serialize_to_fmt_writer(&mut adapter, classes);
+        match adapter.take_error() {
+            Some(error) => Err(error.into()),
+            None => result,
+        }
+    }
+
+    fn serialize_to_fmt_writer<'class, W, I>(&mut self, writer: &mut W, classes: I) -> Result<()>
+    where
+        W: FmtWrite,
+        I: IntoIterator<Item = &'class UnityClass>,
+    {
+        self.indent_level = 0;
+        let mut classes = classes.into_iter().peekable();
 
         // Write YAML header for first document
-        if !classes.is_empty() {
+        if classes.peek().is_some() {
             self.write_yaml_header(writer)?;
         }
 
         // Serialize each Unity class as a separate document
-        for (index, class) in classes.iter().enumerate() {
-            if index > 0 {
-                self.first_document = false;
-            }
+        for class in classes {
             self.serialize_unity_class(writer, class)?;
         }
 
@@ -72,7 +88,7 @@ impl UnityYamlSerializer {
     }
 
     /// Write YAML header (version and tags)
-    fn write_yaml_header<W: Write>(&self, writer: &mut W) -> Result<()> {
+    fn write_yaml_header<W: FmtWrite>(&self, writer: &mut W) -> Result<()> {
         // Write YAML version
         write!(
             writer,
@@ -96,7 +112,7 @@ impl UnityYamlSerializer {
     }
 
     /// Serialize a single Unity class
-    fn serialize_unity_class<W: Write>(
+    fn serialize_unity_class<W: FmtWrite>(
         &mut self,
         writer: &mut W,
         class: &UnityClass,
@@ -130,7 +146,7 @@ impl UnityYamlSerializer {
     }
 
     /// Serialize a property key-value pair
-    fn serialize_property<W: Write>(
+    fn serialize_property<W: FmtWrite>(
         &mut self,
         writer: &mut W,
         key: &str,
@@ -150,7 +166,7 @@ impl UnityYamlSerializer {
     }
 
     /// Serialize a Unity value
-    fn serialize_value<W: Write>(
+    fn serialize_value<W: FmtWrite>(
         &mut self,
         writer: &mut W,
         value: &UnityValue,
@@ -351,7 +367,11 @@ impl UnityYamlSerializer {
     }
 
     /// Serialize a value inline (for arrays and objects)
-    fn serialize_value_inline<W: Write>(&self, writer: &mut W, value: &UnityValue) -> Result<()> {
+    fn serialize_value_inline<W: FmtWrite>(
+        &self,
+        writer: &mut W,
+        value: &UnityValue,
+    ) -> Result<()> {
         match value {
             UnityValue::Null => {
                 write!(writer, "{{fileID: 0}}").map_err(|e| {
@@ -405,7 +425,7 @@ impl UnityYamlSerializer {
     }
 
     /// Write indentation
-    fn write_indent<W: Write>(&self, writer: &mut W) -> Result<()> {
+    fn write_indent<W: FmtWrite>(&self, writer: &mut W) -> Result<()> {
         for _ in 0..(self.indent_level * self.indent_size) {
             write!(writer, " ").map_err(|e| {
                 UnityAssetError::format(format!("Failed to write indentation: {}", e))
@@ -463,6 +483,36 @@ impl UnityYamlSerializer {
                 UnityValue::String(s) => s.len() < 20,
                 _ => false,
             })
+    }
+}
+
+struct IoWriterAdapter<'writer, W: IoWrite + ?Sized> {
+    writer: &'writer mut W,
+    error: Option<io::Error>,
+}
+
+impl<'writer, W: IoWrite + ?Sized> IoWriterAdapter<'writer, W> {
+    fn new(writer: &'writer mut W) -> Self {
+        Self {
+            writer,
+            error: None,
+        }
+    }
+
+    fn take_error(&mut self) -> Option<io::Error> {
+        self.error.take()
+    }
+}
+
+impl<W: IoWrite + ?Sized> FmtWrite for IoWriterAdapter<'_, W> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.error.is_some() {
+            return Err(fmt::Error);
+        }
+        self.writer.write_all(value.as_bytes()).map_err(|error| {
+            self.error = Some(error);
+            fmt::Error
+        })
     }
 }
 

@@ -4,7 +4,7 @@
 //! for YAML format files.
 
 use crate::unity_yaml_serializer::UnityYamlSerializer;
-use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use unity_asset_core::{
     DocumentFormat, LineEnding, Result, UnityAssetError, UnityClass, UnityDocument,
@@ -217,11 +217,10 @@ impl YamlDocument {
         // Create serializer with document settings
         let mut serializer = UnityYamlSerializer::new().with_line_ending(self.newline);
 
-        // Serialize to string
-        let yaml_content = serializer.serialize_to_string(&self.data)?;
-
-        // Write to file
-        fs::write(path, yaml_content).map_err(UnityAssetError::from)?;
+        let file = std::fs::File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        serializer.serialize_to_writer(&mut writer, self.data.iter())?;
+        writer.flush()?;
 
         Ok(())
     }
@@ -385,16 +384,7 @@ impl UnityDocument for YamlDocument {
     }
 
     fn save_to<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = path.as_ref();
-
-        // Serialize the document to YAML format
-        let yaml_content = self.dump_yaml()?;
-
-        // Write to file
-        std::fs::write(path, yaml_content)
-            .map_err(|e| UnityAssetError::format(format!("Failed to write YAML file: {}", e)))?;
-
-        Ok(())
+        YamlDocument::save_to(self, path)
     }
 
     fn format(&self) -> DocumentFormat {
