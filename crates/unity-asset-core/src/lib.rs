@@ -51,7 +51,7 @@ pub use semantic_digest::{
 };
 pub use source_image::{VerifiedSourceImage, VerifiedSourceImageError, VerifiedSourceRebinding};
 pub use unity_class::{UnityClass, UnityClassRegistry};
-pub use unity_value::UnityValue;
+pub use unity_value::{UnityValue, UnityValueKind, ValuePathError};
 
 /// Get Unity class name from class ID
 pub fn get_class_name(class_id: i32) -> Option<String> {

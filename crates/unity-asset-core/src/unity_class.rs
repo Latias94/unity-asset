@@ -4,8 +4,9 @@
 //! runtime creation and manipulation of Unity objects.
 
 use crate::dynamic_access::{DynamicAccess, DynamicValue};
-use crate::error::Result;
-use crate::unity_value::UnityValue;
+use crate::error::Result as UnityResult;
+use crate::field_path::{FieldPath, FieldPathSegment};
+use crate::unity_value::{UnityValue, UnityValueKind, ValuePathError};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::fmt;
@@ -84,6 +85,63 @@ impl UnityClass {
         &mut self.properties
     }
 
+    /// Resolves a property path without cloning its field names or values.
+    ///
+    /// A `UnityClass` stores a property map rather than a root [`UnityValue`], so
+    /// [`FieldPath::root`] returns [`ValuePathError::ClassRoot`]. Use
+    /// [`Self::properties`] when the property root itself is required.
+    pub fn value_at_path(&self, path: &FieldPath) -> Result<&UnityValue, ValuePathError> {
+        let (first, remaining) = path
+            .segments()
+            .split_first()
+            .ok_or(ValuePathError::ClassRoot)?;
+        let mut current = match first {
+            FieldPathSegment::Field(name) => self
+                .properties
+                .get(name)
+                .ok_or(ValuePathError::MissingField { segment: 0 })?,
+            FieldPathSegment::Index(_) => {
+                return Err(ValuePathError::ExpectedArray {
+                    segment: 0,
+                    actual: UnityValueKind::Object,
+                });
+            }
+        };
+        for (offset, segment) in remaining.iter().enumerate() {
+            current = current.value_at_segment(segment, offset + 1)?;
+        }
+        Ok(current)
+    }
+
+    /// Mutably resolves a property path without cloning its field names or values.
+    ///
+    /// The root-path behavior matches [`Self::value_at_path`].
+    pub fn value_at_path_mut(
+        &mut self,
+        path: &FieldPath,
+    ) -> Result<&mut UnityValue, ValuePathError> {
+        let (first, remaining) = path
+            .segments()
+            .split_first()
+            .ok_or(ValuePathError::ClassRoot)?;
+        let mut current = match first {
+            FieldPathSegment::Field(name) => self
+                .properties
+                .get_mut(name)
+                .ok_or(ValuePathError::MissingField { segment: 0 })?,
+            FieldPathSegment::Index(_) => {
+                return Err(ValuePathError::ExpectedArray {
+                    segment: 0,
+                    actual: UnityValueKind::Object,
+                });
+            }
+        };
+        for (offset, segment) in remaining.iter().enumerate() {
+            current = current.value_at_segment_mut(segment, offset + 1)?;
+        }
+        Ok(current)
+    }
+
     /// Update properties from another map
     pub fn update_properties(&mut self, other: IndexMap<String, UnityValue>) {
         for (key, value) in other {
@@ -114,7 +172,7 @@ impl DynamicAccess for UnityClass {
         self.properties.get(key).map(DynamicValue::from_unity_value)
     }
 
-    fn set_dynamic(&mut self, key: &str, value: DynamicValue) -> Result<()> {
+    fn set_dynamic(&mut self, key: &str, value: DynamicValue) -> UnityResult<()> {
         self.properties
             .insert(key.to_string(), value.to_unity_value());
         Ok(())
@@ -207,6 +265,60 @@ mod tests {
         assert_eq!(class.class_id, 1);
         assert_eq!(class.class_name, "GameObject");
         assert_eq!(class.anchor, "123");
+    }
+
+    #[test]
+    fn class_paths_resolve_properties_and_reject_the_value_root() {
+        let mut nested = IndexMap::new();
+        nested.insert(
+            "values".to_owned(),
+            UnityValue::Array(vec![UnityValue::Integer(3)]),
+        );
+        let mut class = UnityClass::new(1, "GameObject".to_owned(), "1".to_owned());
+        class.set("nested".to_owned(), UnityValue::Object(nested));
+
+        assert_eq!(
+            class.value_at_path(&FieldPath::root()),
+            Err(ValuePathError::ClassRoot)
+        );
+        let path = FieldPath::root()
+            .push_field("nested")
+            .and_then(|path| path.push_field("values"))
+            .and_then(|path| path.push_index(0))
+            .expect("valid path");
+        assert_eq!(class.value_at_path(&path), Ok(&UnityValue::Integer(3)));
+
+        *class.value_at_path_mut(&path).expect("path resolves") = UnityValue::Unsigned(u64::MAX);
+        assert_eq!(
+            class.value_at_path(&path),
+            Ok(&UnityValue::Unsigned(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn class_path_errors_report_root_shape_and_missing_fields() {
+        let mut class = UnityClass::new(1, "GameObject".to_owned(), "1".to_owned());
+        assert_eq!(
+            class.value_at_path_mut(&FieldPath::root()),
+            Err(ValuePathError::ClassRoot)
+        );
+        let index = FieldPath::root().push_index(0).expect("valid path");
+        assert_eq!(
+            class.value_at_path(&index),
+            Err(ValuePathError::ExpectedArray {
+                segment: 0,
+                actual: UnityValueKind::Object,
+            })
+        );
+        let missing = FieldPath::root().push_field("missing").expect("valid path");
+        assert_eq!(
+            class.value_at_path(&missing),
+            Err(ValuePathError::MissingField { segment: 0 })
+        );
+        assert_eq!(
+            class.value_at_path_mut(&missing),
+            Err(ValuePathError::MissingField { segment: 0 })
+        );
     }
 
     #[test]

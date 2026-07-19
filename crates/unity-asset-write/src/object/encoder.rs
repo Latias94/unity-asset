@@ -16,8 +16,11 @@ use unity_asset_binary::typetree::{
 };
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, DigestV1, FieldPath, FieldPathSegment, SemanticDigestError,
-    UnityAssetError, UnityValue, field_schema_digest, semantic_value_digest,
+    UnityAssetError, UnityValue, ValuePathError, field_schema_digest, semantic_value_digest,
 };
+
+/// Writer-facing alias for the shared stable [`UnityValue`] shape discriminator.
+pub use unity_asset_core::UnityValueKind as SerializedValueKind;
 
 use crate::Endian;
 use crate::typetree::{TemplateRewriteStats, rewrite_object, validate_value};
@@ -332,36 +335,6 @@ impl EncodedSerializedObject {
     }
 }
 
-/// A stable description of a [`UnityValue`] shape for path diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SerializedValueKind {
-    Null,
-    Bool,
-    Integer,
-    Unsigned,
-    Float,
-    String,
-    Array,
-    Bytes,
-    Object,
-}
-
-impl SerializedValueKind {
-    const fn of(value: &UnityValue) -> Self {
-        match value {
-            UnityValue::Null => Self::Null,
-            UnityValue::Bool(_) => Self::Bool,
-            UnityValue::Integer(_) => Self::Integer,
-            UnityValue::Unsigned(_) => Self::Unsigned,
-            UnityValue::Float(_) => Self::Float,
-            UnityValue::String(_) => Self::String,
-            UnityValue::Array(_) => Self::Array,
-            UnityValue::Bytes(_) => Self::Bytes,
-            UnityValue::Object(_) => Self::Object,
-        }
-    }
-}
-
 /// Failure from atomic single-object encoding.
 #[derive(Debug, Error)]
 pub enum SerializedObjectEncodeError {
@@ -631,7 +604,7 @@ impl<'file> SerializedObjectEncoder<'file> {
                 .checked_add(1)
                 .ok_or(SerializedObjectEncodeError::OperationCountOverflow)?;
         }
-        let actual = SerializedValueKind::of(&root);
+        let actual = root.kind();
         let UnityValue::Object(properties) = root else {
             return Err(SerializedObjectEncodeError::RootTypeInvariant { actual });
         };
@@ -741,9 +714,9 @@ fn apply_operation(
                 Ok(resolution) => resolution,
                 Err(failure) => return Err(map_path_failure(ordinal, path, failure)),
             };
-            let current = match value_at_path_mut(root, &path) {
+            let current = match root.value_at_path_mut(&path) {
                 Ok(current) => current,
-                Err(failure) => return Err(map_path_failure(ordinal, path, failure)),
+                Err(failure) => return Err(map_value_path_failure(ordinal, path, failure)),
             };
             if let Err(failure) =
                 verify_field_guard(&path, guard, object_schema_digest, current, budget)
@@ -756,7 +729,7 @@ fn apply_operation(
                 path_len: path.segments().len(),
             });
             let validation_result =
-                match value_at_path_segments(root, &path.segments()[..validation.path_len]) {
+                match root.value_at_segments(&path.segments()[..validation.path_len]) {
                     Ok(candidate) => Ok(validate_value(
                         schema,
                         validation.schema.node,
@@ -770,7 +743,8 @@ fn apply_operation(
                 };
 
             // Only the terminal value changed, so the resolved path remains valid for rollback.
-            let current = value_at_path_mut(root, &path)
+            let current = root
+                .value_at_path_mut(&path)
                 .expect("a terminal field replacement cannot invalidate its own path");
             let pending = replace(current, original);
             match validation_result {
@@ -781,7 +755,7 @@ fn apply_operation(
                 Ok(Err(error)) => {
                     return Err(map_operation_value_error(path_id, ordinal, path, error));
                 }
-                Err(failure) => return Err(map_path_failure(ordinal, path, failure)),
+                Err(failure) => return Err(map_value_path_failure(ordinal, path, failure)),
             }
         }
         SerializedObjectMutationKind::ReplaceObject { guard, replacement } => {
@@ -814,9 +788,9 @@ fn apply_operation(
                 Ok(resolution) => resolution.target,
                 Err(failure) => return Err(map_path_failure(ordinal, path, failure)),
             };
-            let current = match value_at_path_mut(root, &path) {
+            let current = match root.value_at_path_mut(&path) {
                 Ok(current) => current,
-                Err(failure) => return Err(map_path_failure(ordinal, path, failure)),
+                Err(failure) => return Err(map_value_path_failure(ordinal, path, failure)),
             };
             if let Err(failure) =
                 verify_field_guard(&path, guard, object_schema_digest, current, budget)
@@ -960,7 +934,7 @@ fn apply_sequence_edit(
     edit: SerializedSequenceEdit,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), SerializedObjectEncodeError> {
-    let actual = SerializedValueKind::of(value);
+    let actual = value.kind();
     let UnityValue::Array(values) = value else {
         return Err(SerializedObjectEncodeError::SequenceTypeMismatch {
             ordinal,
@@ -1150,7 +1124,7 @@ fn schema_location_at_path<'schema>(
             .ok_or(PathFailure::SegmentOverflow)?;
         let segment = u32::try_from(segment_index).map_err(|_| PathFailure::SegmentOverflow)?;
         let next_depth = depth.checked_add(1).ok_or(PathFailure::SegmentOverflow)?;
-        let actual = SerializedValueKind::of(current);
+        let actual = current.kind();
         match component {
             FieldPathSegment::Field(name) => {
                 let UnityValue::Object(fields) = current else {
@@ -1282,99 +1256,6 @@ fn resolve_managed_payload<'schema>(
         .or_else(|| layout.payload().fallback())
 }
 
-fn value_at_path_segments<'value>(
-    root: &'value UnityValue,
-    segments: &[FieldPathSegment],
-) -> Result<&'value UnityValue, PathFailure> {
-    let mut current = root;
-    for (segment, component) in segments.iter().enumerate() {
-        let segment = u32::try_from(segment).map_err(|_| PathFailure::SegmentOverflow)?;
-        let actual = SerializedValueKind::of(current);
-        match component {
-            FieldPathSegment::Field(name) => {
-                let UnityValue::Object(fields) = current else {
-                    return Err(PathFailure::TypeMismatch {
-                        segment,
-                        expected: SerializedValueKind::Object,
-                        actual,
-                    });
-                };
-                current = fields.get(name).ok_or(PathFailure::Missing { segment })?;
-            }
-            FieldPathSegment::Index(index) => {
-                let UnityValue::Array(values) = current else {
-                    return Err(PathFailure::TypeMismatch {
-                        segment,
-                        expected: SerializedValueKind::Array,
-                        actual,
-                    });
-                };
-                let converted =
-                    usize::try_from(*index).map_err(|_| PathFailure::IndexOutOfBounds {
-                        segment,
-                        index: *index,
-                        length: values.len(),
-                    })?;
-                current = values.get(converted).ok_or(PathFailure::IndexOutOfBounds {
-                    segment,
-                    index: *index,
-                    length: values.len(),
-                })?;
-            }
-        }
-    }
-    Ok(current)
-}
-
-fn value_at_path_mut<'value>(
-    root: &'value mut UnityValue,
-    path: &FieldPath,
-) -> Result<&'value mut UnityValue, PathFailure> {
-    let mut current = root;
-    for (segment, component) in path.segments().iter().enumerate() {
-        let segment = u32::try_from(segment).map_err(|_| PathFailure::SegmentOverflow)?;
-        let actual = SerializedValueKind::of(current);
-        match component {
-            FieldPathSegment::Field(name) => {
-                let UnityValue::Object(fields) = current else {
-                    return Err(PathFailure::TypeMismatch {
-                        segment,
-                        expected: SerializedValueKind::Object,
-                        actual,
-                    });
-                };
-                current = fields
-                    .get_mut(name)
-                    .ok_or(PathFailure::Missing { segment })?;
-            }
-            FieldPathSegment::Index(index) => {
-                let UnityValue::Array(values) = current else {
-                    return Err(PathFailure::TypeMismatch {
-                        segment,
-                        expected: SerializedValueKind::Array,
-                        actual,
-                    });
-                };
-                let converted =
-                    usize::try_from(*index).map_err(|_| PathFailure::IndexOutOfBounds {
-                        segment,
-                        index: *index,
-                        length: values.len(),
-                    })?;
-                let length = values.len();
-                current = values
-                    .get_mut(converted)
-                    .ok_or(PathFailure::IndexOutOfBounds {
-                        segment,
-                        index: *index,
-                        length,
-                    })?;
-            }
-        }
-    }
-    Ok(current)
-}
-
 fn map_path_failure(
     ordinal: u32,
     path: FieldPath,
@@ -1418,6 +1299,59 @@ fn map_path_failure(
             index,
             length,
         },
+    }
+}
+
+fn map_value_path_failure(
+    ordinal: u32,
+    path: FieldPath,
+    failure: ValuePathError,
+) -> SerializedObjectEncodeError {
+    let Some(segment) = failure.segment() else {
+        return SerializedObjectEncodeError::RootFieldReplacement { ordinal };
+    };
+    let segment = match u32::try_from(segment) {
+        Ok(segment) => segment,
+        Err(_) => {
+            return SerializedObjectEncodeError::ArithmeticOverflow {
+                resource: "field path segment",
+            };
+        }
+    };
+    match failure {
+        ValuePathError::ClassRoot => SerializedObjectEncodeError::RootFieldReplacement { ordinal },
+        ValuePathError::MissingField { .. } => SerializedObjectEncodeError::PathMissing {
+            ordinal,
+            path,
+            segment,
+        },
+        ValuePathError::ExpectedObject { actual, .. } => {
+            SerializedObjectEncodeError::PathTypeMismatch {
+                ordinal,
+                path,
+                segment,
+                expected: SerializedValueKind::Object,
+                actual,
+            }
+        }
+        ValuePathError::ExpectedArray { actual, .. } => {
+            SerializedObjectEncodeError::PathTypeMismatch {
+                ordinal,
+                path,
+                segment,
+                expected: SerializedValueKind::Array,
+                actual,
+            }
+        }
+        ValuePathError::IndexOutOfBounds { index, length, .. } => {
+            SerializedObjectEncodeError::PathIndexOutOfBounds {
+                ordinal,
+                path,
+                segment,
+                index,
+                length,
+            }
+        }
     }
 }
 

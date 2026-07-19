@@ -1,7 +1,7 @@
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, Diagnostic, FieldPath, FieldPathSegment, ObjectAddress,
-    ObjectKind, UnityClass, UnityValue, WorkspaceRevision, class_names, field_schema_digest,
-    observe_semantic_value, semantic_value_digest, yaml_field_schema_digest,
+    AssetLoadBudget, BudgetError, Diagnostic, FieldPath, ObjectAddress, ObjectKind, UnityClass,
+    UnityValue, WorkspaceRevision, class_names, field_schema_digest, observe_semantic_value,
+    semantic_value_digest, yaml_field_schema_digest,
 };
 
 use super::contract::{
@@ -53,7 +53,7 @@ impl RecipeObject {
     }
 
     pub(crate) fn field<'value>(&'value self, path: &FieldPath) -> Option<&'value UnityValue> {
-        value_at_path(self.class(), path)
+        self.class().value_at_path(path).ok()
     }
 
     pub(crate) fn require_field<'value>(
@@ -636,27 +636,6 @@ fn resource_applicability(object: &RecipeObject) -> RecipeApplicability {
             RecipeRejectionCode::UnsupportedSchema,
         )
     }
-}
-
-pub(crate) fn value_at_path<'value>(
-    class: &'value UnityClass,
-    path: &FieldPath,
-) -> Option<&'value UnityValue> {
-    let mut segments = path.segments().iter();
-    let first = segments.next()?;
-    let mut value = match first {
-        FieldPathSegment::Field(name) => class.get(name),
-        FieldPathSegment::Index(_) => None,
-    }?;
-    for segment in segments {
-        value = match segment {
-            FieldPathSegment::Field(name) => value.as_object()?.get(name)?,
-            FieldPathSegment::Index(index) => {
-                value.as_array()?.get(usize::try_from(*index).ok()?)?
-            }
-        };
-    }
-    Some(value)
 }
 
 pub(crate) fn ensure_finite(values: &[f64]) -> Result<(), RecipeError> {
