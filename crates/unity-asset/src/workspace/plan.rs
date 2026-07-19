@@ -15,6 +15,7 @@ use unity_asset_core::{
 
 pub use builder::{MutationPlanBuilder, MutationPlanBuilderError};
 pub use input::MutationPlanReadError;
+pub(crate) use value::MutationValueOwned;
 pub use value::{Float64Bits, MutationField, MutationValue, MutationValueRef, PlanBytes};
 
 pub(crate) const MAX_PLAN_DEPTH: u32 = 59;
@@ -77,6 +78,11 @@ impl PlanPayload {
     #[must_use]
     pub const fn bytes(&self) -> &PlanBytes {
         &self.bytes
+    }
+
+    #[must_use]
+    pub(crate) fn into_bytes(self) -> PlanBytes {
+        self.bytes
     }
 
     fn from_wire(digest: DigestV1, bytes: PlanBytes) -> Result<Self, MutationPlanError> {
@@ -348,6 +354,11 @@ impl MutationOperation {
     pub const fn action(&self) -> &GenericMutation {
         &self.action
     }
+
+    #[must_use]
+    pub(crate) fn into_action(self) -> GenericMutation {
+        self.action
+    }
 }
 
 /// Deterministic sequence of guarded mutations against one workspace revision.
@@ -478,6 +489,23 @@ impl MutationPlan {
     #[must_use]
     pub const fn operations(&self) -> &[MutationOperation] {
         &self.operations
+    }
+
+    #[must_use]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        WorkspaceRevision,
+        Box<[SourceExpectation]>,
+        Box<[PlanPayload]>,
+        Box<[MutationOperation]>,
+    ) {
+        (
+            self.base_revision,
+            self.sources,
+            self.payloads,
+            self.operations,
+        )
     }
 
     /// Returns the compact canonical JSON bytes used for persisted plan identity.
@@ -845,4 +873,174 @@ pub enum MutationPlanError {
     },
     #[error("failed to encode canonical mutation plan JSON: {0}")]
     CanonicalJson(String),
+}
+
+#[cfg(test)]
+mod consumption_tests {
+    use super::*;
+
+    fn digest(label: &[u8]) -> DigestV1 {
+        DigestV1::hash_bytes(label)
+    }
+
+    #[test]
+    fn owned_consumption_preserves_canonical_and_semantic_order() {
+        let locator = SourceLocator::path("Assets/Data/main.assets").unwrap();
+        let target = ObjectAddress::binary_at(locator.clone(), 1).unwrap();
+        let referenced = ObjectAddress::binary_at(locator.clone(), 2).unwrap();
+        let source = SourceExpectation::new(
+            locator,
+            SourceFingerprint::from_bytes(SourceKind::SerializedFile, b"source"),
+        );
+
+        let nested = MutationValue::object(vec![
+            MutationField::new("z_last", MutationValue::unsigned(9)).unwrap(),
+            MutationField::new(
+                "a_first",
+                MutationValue::array(vec![
+                    MutationValue::object(vec![
+                        MutationField::new("z_text", MutationValue::string("kept").unwrap())
+                            .unwrap(),
+                        MutationField::new(
+                            "a_reference",
+                            MutationValue::reference(ReferenceTarget::object(referenced)),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                    MutationValue::bytes(vec![0xde, 0xad]),
+                ])
+                .unwrap(),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        let resource = PlanPayload::new(vec![0x10, 0x20]);
+        let raw = PlanPayload::new(vec![0x30, 0x40, 0x50]);
+        let resource_digest = resource.digest();
+        let raw_digest = raw.digest();
+        let mut expected_payloads = vec![
+            (resource_digest, vec![0x10, 0x20]),
+            (raw_digest, vec![0x30, 0x40, 0x50]),
+        ];
+        expected_payloads.sort_unstable_by_key(|(digest, _)| *digest);
+
+        let payloads = if resource_digest < raw_digest {
+            vec![raw, resource]
+        } else {
+            vec![resource, raw]
+        };
+        let revision = WorkspaceRevision::new(digest(b"revision"));
+        let plan = MutationPlan::new(
+            revision,
+            vec![source],
+            payloads,
+            vec![
+                GenericMutation::SequenceEdit {
+                    target: target.clone(),
+                    path: FieldPath::root().push_field("m_Items").unwrap(),
+                    guard: FieldGuard::new(digest(b"schema"), digest(b"values")),
+                    edit: SequenceMutation::Insert {
+                        index: 3,
+                        value: nested,
+                    },
+                },
+                GenericMutation::ResourceReplace {
+                    target: target.clone(),
+                    path: FieldPath::root().push_field("m_StreamData").unwrap(),
+                    guard: FieldGuard::new(digest(b"resource schema"), digest(b"resource value")),
+                    payload: resource_digest,
+                },
+                GenericMutation::UnsafeRawReplace {
+                    target,
+                    expected_raw_digest: digest(b"raw value"),
+                    payload: raw_digest,
+                    acknowledgement:
+                        UnsafeRawAcknowledgement::WireInvariantsAreCallersResponsibilityV1,
+                },
+            ],
+        )
+        .unwrap();
+
+        let canonical = plan.canonical_json().unwrap();
+        assert_eq!(canonical, serde_json::to_vec(&plan).unwrap());
+
+        let (actual_revision, sources, payloads, operations) = plan.into_parts();
+        assert_eq!(actual_revision, revision);
+        assert_eq!(sources.len(), 1);
+
+        let actual_payloads = payloads
+            .into_vec()
+            .into_iter()
+            .map(|payload| {
+                let digest = payload.digest();
+                (digest, payload.into_bytes().into_vec())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_payloads, expected_payloads);
+
+        let mut operations = operations.into_vec().into_iter();
+        let sequence = operations.next().unwrap();
+        assert_eq!(sequence.ordinal(), 0);
+        let GenericMutation::SequenceEdit { edit, .. } = sequence.into_action() else {
+            panic!("expected sequence edit");
+        };
+        let SequenceMutation::Insert { index, value } = edit else {
+            panic!("expected sequence insertion");
+        };
+        assert_eq!(index, 3);
+
+        let MutationValueOwned::Object(outer_fields) = value.into_owned() else {
+            panic!("expected outer object");
+        };
+        let mut outer_fields = outer_fields.into_iter();
+        let (name, value) = outer_fields.next().unwrap().into_parts();
+        assert_eq!(name, "a_first");
+        let MutationValueOwned::Array(values) = value.into_owned() else {
+            panic!("expected ordered array");
+        };
+        let mut values = values.into_iter();
+        let MutationValueOwned::Object(inner_fields) = values.next().unwrap().into_owned() else {
+            panic!("expected nested object");
+        };
+        let mut inner_fields = inner_fields.into_iter();
+        let (name, value) = inner_fields.next().unwrap().into_parts();
+        assert_eq!(name, "a_reference");
+        let MutationValueOwned::Reference(ReferenceTarget::Object { address }) = value.into_owned()
+        else {
+            panic!("expected owned object reference");
+        };
+        assert_eq!(address.binary_path_id(), Some(2));
+        let (name, value) = inner_fields.next().unwrap().into_parts();
+        assert_eq!(name, "z_text");
+        assert_eq!(
+            value.into_owned(),
+            MutationValueOwned::String("kept".into())
+        );
+        assert!(inner_fields.next().is_none());
+        let MutationValueOwned::Bytes(bytes) = values.next().unwrap().into_owned() else {
+            panic!("expected owned bytes");
+        };
+        assert_eq!(bytes.into_vec(), [0xde, 0xad]);
+        assert!(values.next().is_none());
+        let (name, value) = outer_fields.next().unwrap().into_parts();
+        assert_eq!(name, "z_last");
+        assert_eq!(value.into_owned(), MutationValueOwned::Unsigned(9));
+        assert!(outer_fields.next().is_none());
+
+        let resource = operations.next().unwrap();
+        assert_eq!(resource.ordinal(), 1);
+        assert!(matches!(
+            resource.into_action(),
+            GenericMutation::ResourceReplace { payload, .. } if payload == resource_digest
+        ));
+        let raw = operations.next().unwrap();
+        assert_eq!(raw.ordinal(), 2);
+        assert!(matches!(
+            raw.into_action(),
+            GenericMutation::UnsafeRawReplace { payload, .. } if payload == raw_digest
+        ));
+        assert!(operations.next().is_none());
+    }
 }

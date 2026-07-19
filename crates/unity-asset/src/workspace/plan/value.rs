@@ -206,6 +206,11 @@ impl MutationField {
     pub const fn value(&self) -> &MutationValue {
         &self.value
     }
+
+    #[must_use]
+    pub(crate) fn into_parts(self) -> (String, MutationValue) {
+        (self.name, self.value)
+    }
 }
 
 /// Typed semantic value stored in a Mutation Plan.
@@ -246,6 +251,21 @@ pub enum MutationValueRef<'value> {
     Reference(&'value ReferenceTarget),
     Array(&'value [MutationValue]),
     Object(&'value [MutationField]),
+}
+
+/// Owned view of a validated mutation value for crate-internal interpreters.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MutationValueOwned {
+    Null,
+    Bool(bool),
+    Signed(i64),
+    Unsigned(u64),
+    Float64(Float64Bits),
+    String(String),
+    Bytes(PlanBytes),
+    Reference(ReferenceTarget),
+    Array(Vec<MutationValue>),
+    Object(Vec<MutationField>),
 }
 
 impl Serialize for MutationValue {
@@ -372,6 +392,22 @@ impl MutationValue {
             MutationValueKind::Reference { target } => MutationValueRef::Reference(target),
             MutationValueKind::Array { values } => MutationValueRef::Array(values),
             MutationValueKind::Object { fields } => MutationValueRef::Object(fields),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn into_owned(self) -> MutationValueOwned {
+        match self.kind {
+            MutationValueKind::Null => MutationValueOwned::Null,
+            MutationValueKind::Bool { value } => MutationValueOwned::Bool(value),
+            MutationValueKind::Signed { value } => MutationValueOwned::Signed(value),
+            MutationValueKind::Unsigned { value } => MutationValueOwned::Unsigned(value),
+            MutationValueKind::Float64 { bits } => MutationValueOwned::Float64(bits),
+            MutationValueKind::String { value } => MutationValueOwned::String(value),
+            MutationValueKind::Bytes { value } => MutationValueOwned::Bytes(value),
+            MutationValueKind::Reference { target } => MutationValueOwned::Reference(target),
+            MutationValueKind::Array { values } => MutationValueOwned::Array(values),
+            MutationValueKind::Object { fields } => MutationValueOwned::Object(fields),
         }
     }
 
