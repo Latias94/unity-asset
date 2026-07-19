@@ -44,7 +44,7 @@ pub use identity::{
     WorkspaceId, YamlAnchor, YamlDocumentSelector,
 };
 pub use revision::{SourceFingerprint, SourceKind, WorkspaceRevision};
-pub use source_image::{VerifiedSourceImage, VerifiedSourceImageError};
+pub use source_image::{VerifiedSourceImage, VerifiedSourceImageError, VerifiedSourceRebinding};
 pub use unity_class::{UnityClass, UnityClassRegistry};
 pub use unity_value::UnityValue;
 

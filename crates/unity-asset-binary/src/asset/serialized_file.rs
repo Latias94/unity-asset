@@ -15,7 +15,10 @@ use std::collections::HashMap;
 use std::mem::size_of;
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
-use unity_asset_core::AssetLoadBudget;
+use unity_asset_core::{
+    AssetLoadBudget, SourceKind, VerifiedSourceImage, VerifiedSourceImageError,
+    VerifiedSourceRebinding,
+};
 
 /// Validated fields decoded from a SerializedFile image before backing storage is attached.
 #[derive(Debug)]
@@ -238,6 +241,31 @@ impl SerializedFile {
     /// A stable identity key for caches: `(backing_ptr, base_offset, len)`.
     pub fn data_identity_key(&self) -> (usize, usize, usize) {
         self.data.identity_key()
+    }
+
+    /// Rebinds this parsed image using a proof minted by its verified source image.
+    ///
+    /// This method is an integration seam for content-addressed source stores. It accepts no raw
+    /// backing setter: the proof must identify this complete parsed view as its previous source.
+    #[doc(hidden)]
+    pub fn rebind_verified_source(
+        &mut self,
+        rebinding: VerifiedSourceRebinding,
+    ) -> std::result::Result<VerifiedSourceImage, VerifiedSourceImageError> {
+        let previous = self.data.backing_shared();
+        let previous_arc = match &previous {
+            SharedBytes::Arc(previous) => Some(previous),
+            #[cfg(feature = "mmap")]
+            SharedBytes::Mmap(_) => None,
+        };
+        rebinding.ensure_previous_backing(
+            SourceKind::SerializedFile,
+            previous_arc,
+            self.data.absolute_range(),
+        )?;
+        let canonical = Arc::clone(rebinding.canonical_backing());
+        self.data = DataView::from_shared(SharedBytes::from_arc(canonical));
+        Ok(rebinding.into_image())
     }
 
     /// Get the raw bytes for an object without requiring preloaded per-object buffers.
@@ -471,9 +499,97 @@ pub struct FileStatistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asset::SerializedFileParser;
+    use crate::shared_bytes::SharedBytes;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, mpsc};
     use std::thread;
+    use unity_asset_core::{SourceKind, VerifiedSourceImage, VerifiedSourceImageError};
+
+    const V22_FIXTURE: &[u8] = include_bytes!(
+        "../../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin"
+    );
+
+    #[test]
+    fn verified_rebind_rejects_an_equal_but_unproven_parsed_backing() {
+        let parsed_backing: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let image_backing: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let canonical_backing: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let shared = SharedBytes::from_arc(parsed_backing);
+        let mut parsed = SerializedFileParser::from_shared_range(shared, 0..V22_FIXTURE.len())
+            .expect("fixture parses");
+        let image = VerifiedSourceImage::verify(SourceKind::SerializedFile, image_backing);
+        let rebinding = image
+            .rebind_equivalent_with_proof(canonical_backing)
+            .expect("equal source bytes produce a rebinding proof");
+
+        let error = parsed
+            .rebind_verified_source(rebinding)
+            .expect_err("parsed data must retain the proof's previous backing");
+
+        assert!(matches!(
+            error,
+            VerifiedSourceImageError::PreviousBackingMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn verified_rebind_rejects_a_wrong_source_kind_without_mutating_the_view() {
+        let previous: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let canonical: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let shared = SharedBytes::from_arc(Arc::clone(&previous));
+        let mut parsed = SerializedFileParser::from_shared_range(shared, 0..previous.len())
+            .expect("fixture parses");
+        let identity = parsed.data_identity_key();
+        let image = VerifiedSourceImage::verify(SourceKind::Archive, Arc::clone(&previous));
+        let rebinding = image
+            .rebind_equivalent_with_proof(canonical)
+            .expect("equal source bytes produce a rebinding proof");
+
+        let error = parsed
+            .rebind_verified_source(rebinding)
+            .expect_err("a SerializedFile cannot consume a token for another source kind");
+
+        assert!(matches!(
+            error,
+            VerifiedSourceImageError::SourceKindMismatch {
+                expected: SourceKind::SerializedFile,
+                actual: SourceKind::Archive,
+            }
+        ));
+        assert_eq!(parsed.data_identity_key(), identity);
+    }
+
+    #[test]
+    fn verified_rebind_moves_the_image_and_parsed_view_to_the_canonical_arc() {
+        let previous: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let canonical: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let shared = SharedBytes::from_arc(Arc::clone(&previous));
+        let mut parsed = SerializedFileParser::from_shared_range(shared, 0..previous.len())
+            .expect("fixture parses");
+        let image = VerifiedSourceImage::verify(SourceKind::SerializedFile, Arc::clone(&previous));
+        let rebinding = image
+            .rebind_equivalent_with_proof(Arc::clone(&canonical))
+            .expect("equal source bytes produce a rebinding proof");
+
+        let rebound = parsed
+            .rebind_verified_source(rebinding)
+            .expect("the parsed view shares the proof's previous backing");
+
+        assert!(Arc::ptr_eq(rebound.backing(), &canonical));
+        assert_eq!(
+            parsed.data_identity_key(),
+            (canonical.as_ptr() as usize, 0, canonical.len())
+        );
+        match parsed.data_shared() {
+            SharedBytes::Arc(parsed_backing) => {
+                assert!(Arc::ptr_eq(&parsed_backing, &canonical));
+            }
+            #[cfg(feature = "mmap")]
+            SharedBytes::Mmap(_) => panic!("rebinding must install the canonical Arc"),
+        }
+        assert_eq!(Arc::strong_count(&previous), 1);
+    }
 
     #[test]
     fn schema_cache_initializes_once_across_concurrent_callers() {
