@@ -5,10 +5,13 @@
 //! - data stream (object payloads)
 //! - header + offsets + alignment
 
+mod artifact_writer;
 mod edit;
+mod sink;
 mod types_write;
 mod typetree_dump;
 mod writer;
 
+pub use artifact_writer::SerializedFileSource;
 pub use edit::SerializedFileEdits;
 pub use writer::{SerializedFileSaveOptions, SerializedFileWriter};

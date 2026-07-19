@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use unity_asset_binary::bundle::{BundleLoadOptions, BundleParser};
+use unity_asset_write::PackingPolicy;
 use unity_asset_write::bundle::{BundleEdits, BundleWriter};
-use unity_asset_write::{PackerOptions, UnityPyPacker};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -70,18 +70,16 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).ok().as_deref() == Some("1")
 }
 
-fn parse_packer_env() -> anyhow::Result<UnityPyPacker> {
+fn parse_packing_policy_env() -> anyhow::Result<PackingPolicy> {
     let Ok(raw) = std::env::var("UNITY_ASSET_EXTERNAL_CORPUS_PACKER") else {
-        return Ok(UnityPyPacker::Original);
+        return Ok(PackingPolicy::Preserve);
     };
     let raw = raw.trim();
     if raw.is_empty() {
-        return Ok(UnityPyPacker::Original);
+        return Ok(PackingPolicy::Preserve);
     }
-    UnityPyPacker::from_unitypy_str(raw).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Invalid UNITY_ASSET_EXTERNAL_CORPUS_PACKER={raw:?}. Expected one of: none, lz4, lzma, original."
-        )
+    raw.parse::<PackingPolicy>().map_err(|error| {
+        anyhow::anyhow!("Invalid UNITY_ASSET_EXTERNAL_CORPUS_PACKER={raw:?}: {error}")
     })
 }
 
@@ -170,7 +168,7 @@ fn external_corpus_bundle_roundtrip_and_optional_unitypy_validation() -> anyhow:
 
     let unitypy_enabled = std::env::var("UNITYPY_E2E").ok().as_deref() == Some("1");
     let verbose = env_flag("UNITY_ASSET_EXTERNAL_CORPUS_VERBOSE");
-    let packer = parse_packer_env()?;
+    let packing_policy = parse_packing_policy_env()?;
 
     let mut attempted = 0usize;
     let mut skipped_too_large = 0usize;
@@ -237,14 +235,13 @@ fn external_corpus_bundle_roundtrip_and_optional_unitypy_validation() -> anyhow:
             .map(|n| n.name.clone())
             .collect();
 
-        let saved =
-            match BundleWriter::save(&bundle, &BundleEdits::default(), PackerOptions { packer }) {
-                Ok(b) => b,
-                Err(e) => {
-                    failures.push((path.to_path_buf(), format!("save failed: {e}")));
-                    return Ok(true);
-                }
-            };
+        let saved = match BundleWriter::save(&bundle, &BundleEdits::default(), packing_policy) {
+            Ok(b) => b,
+            Err(e) => {
+                failures.push((path.to_path_buf(), format!("save failed: {e}")));
+                return Ok(true);
+            }
+        };
 
         let reparsed =
             match BundleParser::from_bytes_with_options(saved.clone(), BundleLoadOptions::lazy()) {

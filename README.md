@@ -52,8 +52,8 @@ unity-asset/
 Rust does not make transitive crates importable. Use `unity_asset` for its re-exported high-level
 API, and add a direct dependency on `unity-asset-write`, `unity-asset-binary`, or
 `unity-asset-decode` when using APIs owned by those crates. In particular, high-level
-`Environment` edit methods live in `unity-asset`, while save/repack controls such as
-`PackerOptions` are imported from `unity_asset_write`.
+`Environment` edit methods live in `unity-asset`, while save/repack policy types such as
+`PackingPolicy` are imported from `unity_asset_write`.
 
 Examples are maintained per-crate and are built in CI. For instance:
 `cargo run -p unity-asset --example env_load_and_list -- tests/samples`

@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use unity_asset_binary::bundle::AssetBundle;
 use unity_asset_binary::file::UnityFile;
+use unity_asset_write::PackingPolicy;
 use unity_asset_write::bundle::{BundleEdits, BundleWriter};
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
-use unity_asset_write::{PackerOptions, UnityPyPacker};
 
 fn repo_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is `.../crates/unity-asset-write`.
@@ -48,13 +48,7 @@ fn roundtrip_bundle_noop(bundle: &AssetBundle) -> anyhow::Result<()> {
         .map(|n| n.name.clone())
         .collect();
 
-    let saved = BundleWriter::save(
-        bundle,
-        &BundleEdits::default(),
-        PackerOptions {
-            packer: UnityPyPacker::Original,
-        },
-    )?;
+    let saved = BundleWriter::save(bundle, &BundleEdits::default(), PackingPolicy::Preserve)?;
 
     let reparsed = unity_asset_binary::bundle::BundleParser::from_bytes(saved)?;
 
@@ -156,8 +150,7 @@ fn corpus_roundtrip_noop_save_is_loadable() -> anyhow::Result<()> {
                 let saved = unity_asset_write::webfile::WebFileWriter::save(
                     &web,
                     &unity_asset_write::webfile::WebFileEdits::default(),
-                    unity_asset_write::webfile::WebFilePacker::None,
-                    None,
+                    unity_asset_write::webfile::WebFilePackingPolicy::Uncompressed,
                 )?;
                 let reparsed = unity_asset_binary::webfile::WebFile::from_bytes(saved)?;
                 assert_eq!(reparsed.files().len(), web.files().len());

@@ -18,8 +18,14 @@ unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
 indexmap = { workspace = true }
 lz4_flex = { workspace = true }
 lzma-rs = "0.3"
-brotli = "3.4"
+brotli = { version = "8.0", default-features = false, features = ["std"] }
 flate2 = { workspace = true }
+libc = "0.2"
+thiserror = { workspace = true }
+unicode-normalization = { workspace = true }
+
+[build-dependencies]
+cc = "1"
 
 [dev-dependencies]
 anyhow = { workspace = true }

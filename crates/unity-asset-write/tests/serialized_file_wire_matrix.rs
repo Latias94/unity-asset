@@ -1,10 +1,17 @@
 use std::ops::Range;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use unity_asset_binary::asset::{ObjectMetadata, ObjectTypeReference, SerializedFileParser};
 use unity_asset_binary::error::{BinaryError, BinaryObjectIdentityError};
-use unity_asset_core::UnityAssetError;
-use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
+use unity_asset_core::{
+    AssetLoadBudget, SourceId, SourceKind, UnityAssetError, VerifiedSourceImage, WorkspaceId,
+};
+use unity_asset_write::artifact::{
+    ArtifactBatchDeclaration, ArtifactBudget, ArtifactLimits, ArtifactPayload, LogicalArtifactName,
+};
+use unity_asset_write::serialized_file::{
+    SerializedFileEdits, SerializedFileSource, SerializedFileWriter,
+};
 
 struct WireCase {
     version: u32,
@@ -316,6 +323,38 @@ fn parse_case(case: &WireCase, bytes: Vec<u8>) -> unity_asset_binary::asset::Ser
         .unwrap_or_else(|error| panic!("failed to parse v{} fixture: {error}", case.version))
 }
 
+fn prepare_serialized_file(
+    file: &unity_asset_binary::asset::SerializedFile,
+    edits: &SerializedFileEdits,
+) -> anyhow::Result<Vec<u8>> {
+    let source_id = SourceId::new(
+        WorkspaceId::from_u128(0x5749_5245).unwrap(),
+        SourceKind::SerializedFile,
+        1,
+    )
+    .unwrap();
+    let image =
+        VerifiedSourceImage::verify(SourceKind::SerializedFile, Arc::<[u8]>::from(file.data()));
+    let payload = ArtifactPayload::source_backed(source_id, image)?;
+    let source = SerializedFileSource::whole(&payload)?;
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default())?;
+    let mut load_budget = AssetLoadBudget::default();
+    let mut declaration = ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut load_budget)?;
+    let output = declaration.declare_output(LogicalArtifactName::new("main.assets")?)?;
+    let mut batch = declaration.seal_output_names()?;
+    let artifact = SerializedFileWriter::prepare(&mut batch, file, edits, Some(source))?;
+    batch.bind_output(output, artifact)?;
+    let artifacts = batch.finish()?;
+    let mut bytes = Vec::new();
+    artifacts
+        .outputs()
+        .next()
+        .expect("one declared output")
+        .artifact()
+        .stream_verified_to(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn wire_case(version: u32) -> &'static WireCase {
     CASES
         .iter()
@@ -418,7 +457,7 @@ fn rewrites_wire_goldens_without_reconstructing_object_metadata() {
         let file = parse_case(case, case.bytes.to_vec());
         let original_payload = [case.version as u8, 0xAA, 0xBB, 0xCC];
 
-        let no_op = SerializedFileWriter::save(&file, &SerializedFileEdits::default())
+        let no_op = prepare_serialized_file(&file, &SerializedFileEdits::default())
             .unwrap_or_else(|error| panic!("failed to rewrite v{} fixture: {error}", case.version));
         let reparsed = parse_case(case, no_op);
         assert_wire_case(case, &reparsed, &original_payload);
@@ -426,7 +465,7 @@ fn rewrites_wire_goldens_without_reconstructing_object_metadata() {
         let edited_payload = [0xD0, case.version as u8, 0xAD, 0xBE, 0xEF];
         let mut edits = SerializedFileEdits::default();
         edits.set_object_bytes(case.path_id, edited_payload.to_vec());
-        let edited = SerializedFileWriter::save(&file, &edits).unwrap_or_else(|error| {
+        let edited = prepare_serialized_file(&file, &edits).unwrap_or_else(|error| {
             panic!(
                 "failed to edit and rewrite v{} fixture: {error}",
                 case.version
@@ -460,7 +499,7 @@ fn v16_type_index_collision_follows_the_unitypy_wire_oracle() {
     assert_eq!(object.class_id(), 28);
     assert_eq!(file.object_bytes(object).unwrap(), [0x10, 0xAA, 0xBB, 0xCC]);
 
-    let rewritten = SerializedFileWriter::save(&file, &SerializedFileEdits::default())
+    let rewritten = prepare_serialized_file(&file, &SerializedFileEdits::default())
         .expect("rewrite v16 collision fixture");
     let reparsed =
         SerializedFileParser::from_bytes(rewritten).expect("reparse v16 collision fixture");
@@ -610,7 +649,7 @@ fn editing_one_object_preserves_the_other_object_wire_semantics() {
         let edited_payload = vec![0xE0; 13];
         let mut edits = SerializedFileEdits::default();
         edits.set_object_bytes(first_path_id, edited_payload.clone());
-        let rewritten = SerializedFileWriter::save(&file, &edits)
+        let rewritten = prepare_serialized_file(&file, &edits)
             .unwrap_or_else(|error| panic!("failed to rewrite multi-object v{version}: {error}"));
         let reparsed = SerializedFileParser::from_bytes(rewritten)
             .unwrap_or_else(|error| panic!("failed to reparse multi-object v{version}: {error}"));
@@ -689,7 +728,7 @@ fn legacy_monobehaviour_resolves_raw_type_without_losing_class_bits() {
             stripped: 1,
         }
     );
-    let rewritten = SerializedFileWriter::save(&file, &SerializedFileEdits::default())
+    let rewritten = prepare_serialized_file(&file, &SerializedFileEdits::default())
         .expect("rewrite legacy script fixture");
     let reparsed = SerializedFileParser::from_bytes(rewritten).expect("reparse rewritten fixture");
     let object = &reparsed.objects()[0];

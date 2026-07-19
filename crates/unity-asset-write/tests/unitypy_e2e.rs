@@ -15,10 +15,8 @@ use unity_asset_core::{AssetLoadBudget, UnityValue};
 use unity_asset_write::bundle::{BundleEdits, BundleWriter};
 use unity_asset_write::object::SerializedFileEditSession;
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
-use unity_asset_write::webfile::{WebFileEdits, WebFilePacker, WebFileWriter};
-use unity_asset_write::{
-    BinaryWriter, Endian, PackerOptions, UnityPyPacker, compress_lzma_unity_with_size,
-};
+use unity_asset_write::webfile::{WebFileEdits, WebFilePackingPolicy, WebFileWriter};
+use unity_asset_write::{BinaryWriter, Endian, PackingPolicy, compress_lzma_unity_with_size};
 
 fn repo_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is `.../crates/unity-asset-write`.
@@ -372,13 +370,7 @@ fn unitypy_can_load_saved_unityfs_bundle() -> anyhow::Result<()> {
         .cloned()
         .unwrap_or_else(|| expected_files.first().cloned().unwrap_or_default());
 
-    let saved = BundleWriter::save(
-        &bundle,
-        &BundleEdits::default(),
-        PackerOptions {
-            packer: UnityPyPacker::Original,
-        },
-    )?;
+    let saved = BundleWriter::save(&bundle, &BundleEdits::default(), PackingPolicy::Preserve)?;
 
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), &saved)?;
@@ -425,7 +417,7 @@ fn unitypy_can_load_saved_legacy_unityraw_bundle() -> anyhow::Result<()> {
 
     let mut edits = BundleEdits::default();
     edits.replace_file_bytes("test.txt", b"abcd".to_vec());
-    let saved = BundleWriter::save(&bundle, &edits, PackerOptions::default())?;
+    let saved = BundleWriter::save(&bundle, &edits, PackingPolicy::Uncompressed)?;
 
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), &saved)?;
@@ -473,7 +465,7 @@ fn unitypy_can_load_saved_legacy_unityweb_bundle() -> anyhow::Result<()> {
 
     let mut edits = BundleEdits::default();
     edits.replace_file_bytes("test.txt", b"abcd".to_vec());
-    let saved = BundleWriter::save(&bundle, &edits, PackerOptions::default())?;
+    let saved = BundleWriter::save(&bundle, &edits, PackingPolicy::Uncompressed)?;
 
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), &saved)?;
@@ -823,7 +815,11 @@ fn unitypy_can_load_saved_webfile() -> anyhow::Result<()> {
     let web_bytes = build_uncompressed_webfile(vec![(entry_name.clone(), bundle_bytes)]);
 
     let web = unity_asset_binary::webfile::WebFile::from_bytes(web_bytes)?;
-    let saved = WebFileWriter::save(&web, &WebFileEdits::default(), WebFilePacker::None, None)?;
+    let saved = WebFileWriter::save(
+        &web,
+        &WebFileEdits::default(),
+        WebFilePackingPolicy::Uncompressed,
+    )?;
 
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), &saved)?;
@@ -904,13 +900,7 @@ fn unitypy_observes_rust_typetree_edit_in_repacked_bundle() -> anyhow::Result<()
 
     let mut bundle_edits = BundleEdits::default();
     bundle_edits.replace_file_bytes(node_name.clone(), saved_serialized);
-    let saved_bundle = BundleWriter::save(
-        &bundle,
-        &bundle_edits,
-        PackerOptions {
-            packer: UnityPyPacker::Original,
-        },
-    )?;
+    let saved_bundle = BundleWriter::save(&bundle, &bundle_edits, PackingPolicy::Preserve)?;
 
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), &saved_bundle)?;

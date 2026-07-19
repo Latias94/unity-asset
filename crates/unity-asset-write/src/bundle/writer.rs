@@ -7,7 +7,7 @@ use unity_asset_core::{Result, UnityAssetError};
 use crate::bundle::BundleEdits;
 use crate::bundle::chunk::chunk_based_compress;
 use crate::{
-    BinaryWriter, Endian, PackerOptions, UnityPyPacker, compress_lz4, compress_lzma_unity,
+    BinaryWriter, Endian, PackingPolicy, compress_lz4, compress_lzma_unity,
     compress_lzma_unity_with_size,
 };
 
@@ -20,10 +20,10 @@ impl BundleWriter {
     pub fn save(
         bundle: &AssetBundle,
         edits: &BundleEdits,
-        options: PackerOptions,
+        policy: PackingPolicy,
     ) -> Result<Vec<u8>> {
         match bundle.header.signature.as_str() {
-            "UnityFS" => Self::save_unityfs(bundle, edits, options),
+            "UnityFS" => Self::save_unityfs(bundle, edits, policy),
             "UnityWeb" | "UnityRaw" => Self::save_web_raw(bundle, edits),
             other => Err(UnityAssetError::format(format!(
                 "Bundle saving not implemented for signature: {}",
@@ -36,11 +36,11 @@ impl BundleWriter {
     pub fn save_unityfs(
         bundle: &AssetBundle,
         edits: &BundleEdits,
-        options: PackerOptions,
+        policy: PackingPolicy,
     ) -> Result<Vec<u8>> {
         let header = &bundle.header;
 
-        let (data_flag, block_info_flag) = resolve_unityfs_flags(header, bundle, options)?;
+        let (data_flag, block_info_flag) = resolve_unityfs_flags(header, bundle, policy)?;
 
         if (data_flag & 0x40) == 0 {
             return Err(UnityAssetError::format(
@@ -363,27 +363,20 @@ impl BundleWriter {
 fn resolve_unityfs_flags(
     header: &BundleHeader,
     bundle: &AssetBundle,
-    options: PackerOptions,
+    policy: PackingPolicy,
 ) -> Result<(u32, u32)> {
-    let (data_flag, block_info_flag) = match options.packer {
-        UnityPyPacker::None => (64, 64),
-        UnityPyPacker::Lz4 => (194, 2),
-        UnityPyPacker::Lzma => (65, 1),
-        UnityPyPacker::Original => {
+    reject_unsupported_unityfs_encryption(header, bundle)?;
+    let (data_flag, block_info_flag) = match policy {
+        PackingPolicy::Uncompressed => (64, 64),
+        PackingPolicy::Lz4 => (194, 2),
+        PackingPolicy::Lzma => (65, 1),
+        PackingPolicy::Preserve => {
             let block_info_flag = bundle.blocks.first().map(|b| b.flags as u32).unwrap_or(64);
             (header.flags, block_info_flag)
         }
-        UnityPyPacker::UnityFsFlags {
-            block_info_flag,
-            data_flag,
-        } => (data_flag, block_info_flag),
     };
 
-    Ok(strip_unityfs_encryption_flags(
-        header,
-        data_flag,
-        block_info_flag,
-    ))
+    Ok((data_flag, block_info_flag))
 }
 
 fn compress_unityfs_blob(data: &[u8], switch: u32) -> Result<Vec<u8>> {
@@ -424,27 +417,24 @@ fn unityfs_uses_block_alignment(header: &BundleHeader) -> bool {
     parsed.major > 2019 || (parsed.major == 2019 && parsed.minor >= 4)
 }
 
-fn strip_unityfs_encryption_flags(
+fn reject_unsupported_unityfs_encryption(
     header: &BundleHeader,
-    data_flag: u32,
-    block_info_flag: u32,
-) -> (u32, u32) {
-    // UnityPy clears encryption flags during save because it does not re-encrypt.
-    //
-    // Note: Unity CN introduced encryption before the alignment fix was introduced.
-    // Unity CN also reused the same bit (0x200) later for `BlockInfoNeedPaddingAtStart`.
-    // UnityPy disambiguates this based on the engine version, so we do the same.
+    bundle: &AssetBundle,
+) -> Result<()> {
     let uses_old_flags = unityfs_uses_old_archive_flags(header).unwrap_or(false);
-    let encryption_mask = if uses_old_flags {
-        0x200 // ArchiveFlagsOld.UsesAssetBundleEncryption
-    } else {
-        0x1400 // ArchiveFlags.UsesAssetBundleEncryption (old: 0x400, new: 0x1000)
-    };
-
-    (
-        data_flag & !encryption_mask,
-        block_info_flag & !encryption_mask,
-    )
+    let encryption_mask = if uses_old_flags { 0x200 } else { 0x1400 };
+    let encrypted_header = header.flags & encryption_mask;
+    let encrypted_block = bundle
+        .blocks
+        .iter()
+        .any(|block| u32::from(block.flags) & encryption_mask != 0);
+    if encrypted_header != 0 || encrypted_block {
+        return Err(UnityAssetError::format(format!(
+            "UnityFS encryption flags cannot be preserved while re-encoding: header_flags={:#x}",
+            header.flags
+        )));
+    }
+    Ok(())
 }
 
 fn unityfs_uses_old_archive_flags(header: &BundleHeader) -> Option<bool> {
@@ -479,12 +469,11 @@ fn unityfs_uses_old_archive_flags(header: &BundleHeader) -> Option<bool> {
 mod tests {
     use super::*;
 
-    fn save_sample_with_packer(packer: UnityPyPacker) -> unity_asset_binary::bundle::AssetBundle {
+    fn save_sample_with_packer(policy: PackingPolicy) -> unity_asset_binary::bundle::AssetBundle {
         let bytes = include_bytes!("../../../../tests/samples/char_118_yuki.ab").to_vec();
         let bundle = unity_asset_binary::bundle::BundleParser::from_bytes(bytes).unwrap();
 
-        let saved =
-            BundleWriter::save(&bundle, &BundleEdits::default(), PackerOptions { packer }).unwrap();
+        let saved = BundleWriter::save(&bundle, &BundleEdits::default(), policy).unwrap();
 
         unity_asset_binary::bundle::BundleParser::from_bytes(saved).unwrap()
     }
@@ -505,26 +494,26 @@ mod tests {
 
     #[test]
     fn can_save_unityfs_bundle_and_reload() {
-        let reparsed = save_sample_with_packer(UnityPyPacker::Original);
+        let reparsed = save_sample_with_packer(PackingPolicy::Preserve);
         assert_roundtrip_contains_serialized_file(&reparsed);
     }
 
     #[test]
     fn can_save_unityfs_bundle_with_no_compression_and_reload() {
-        let reparsed = save_sample_with_packer(UnityPyPacker::None);
+        let reparsed = save_sample_with_packer(PackingPolicy::Uncompressed);
         assert_eq!(reparsed.header.flags, 64);
         assert_roundtrip_contains_serialized_file(&reparsed);
     }
 
     #[test]
     fn can_save_unityfs_bundle_with_lz4_and_reload() {
-        let reparsed = save_sample_with_packer(UnityPyPacker::Lz4);
+        let reparsed = save_sample_with_packer(PackingPolicy::Lz4);
         assert_eq!(reparsed.header.flags, 194);
         assert_roundtrip_contains_serialized_file(&reparsed);
     }
 
     #[test]
-    fn unityfs_save_strips_encryption_flag_for_old_versions() {
+    fn unityfs_save_rejects_encryption_flag_for_old_versions() {
         let bytes = include_bytes!("../../../../tests/samples/char_118_yuki.ab").to_vec();
         let mut bundle = unity_asset_binary::bundle::BundleParser::from_bytes(bytes).unwrap();
 
@@ -536,21 +525,13 @@ mod tests {
             first.flags |= 0x200;
         }
 
-        let saved = BundleWriter::save(
-            &bundle,
-            &BundleEdits::default(),
-            PackerOptions {
-                packer: UnityPyPacker::Original,
-            },
-        )
-        .unwrap();
-
-        let reparsed = unity_asset_binary::bundle::BundleParser::from_bytes(saved).unwrap();
-        assert_eq!(reparsed.header.flags & 0x200, 0);
+        let error = BundleWriter::save(&bundle, &BundleEdits::default(), PackingPolicy::Preserve)
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot be preserved"));
     }
 
     #[test]
-    fn unityfs_save_strips_new_encryption_bits_but_keeps_padding_bit() {
+    fn unityfs_save_rejects_new_encryption_bits_without_rewriting_flags() {
         let bytes = include_bytes!("../../../../tests/samples/char_118_yuki.ab").to_vec();
         let mut bundle = unity_asset_binary::bundle::BundleParser::from_bytes(bytes).unwrap();
 
@@ -563,23 +544,14 @@ mod tests {
             first.flags |= 0x1000;
         }
 
-        let saved = BundleWriter::save(
-            &bundle,
-            &BundleEdits::default(),
-            PackerOptions {
-                packer: UnityPyPacker::Original,
-            },
-        )
-        .unwrap();
-
-        let reparsed = unity_asset_binary::bundle::BundleParser::from_bytes(saved).unwrap();
-        assert_ne!(reparsed.header.flags & 0x200, 0);
-        assert_eq!(reparsed.header.flags & 0x1000, 0);
+        let error = BundleWriter::save(&bundle, &BundleEdits::default(), PackingPolicy::Preserve)
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot be preserved"));
     }
 
     #[test]
     fn can_save_unityfs_bundle_with_lzma_and_reload() {
-        let reparsed = save_sample_with_packer(UnityPyPacker::Lzma);
+        let reparsed = save_sample_with_packer(PackingPolicy::Lzma);
         assert_eq!(reparsed.header.flags, 65);
         assert_roundtrip_contains_serialized_file(&reparsed);
     }

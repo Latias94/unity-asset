@@ -39,11 +39,10 @@ mod imp {
     mod pptr_path;
     mod save;
     mod stream;
-    mod streamed_write;
     mod yaml_edit;
     mod yaml_query;
 
-    pub use edit::{EnvironmentEditSession, StreamedResourceWrite};
+    pub use edit::EnvironmentEditSession;
     pub use loader::{ProjectLoadOptions, ProjectLoadStats};
     pub use yaml_query::YamlObjectKey;
 

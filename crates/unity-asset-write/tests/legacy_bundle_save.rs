@@ -1,5 +1,5 @@
 use unity_asset_binary::bundle::BundleParser;
-use unity_asset_write::PackerOptions;
+use unity_asset_write::PackingPolicy;
 use unity_asset_write::bundle::{BundleEdits, BundleWriter};
 
 fn write_cstring(buf: &mut Vec<u8>, s: &str) {
@@ -90,7 +90,7 @@ fn can_save_unityraw_bundle_and_reload_with_edits() {
     let mut edits = BundleEdits::new();
     edits.replace_file_bytes("test.txt", b"abcd".to_vec());
 
-    let saved = BundleWriter::save(&bundle, &edits, PackerOptions::default()).unwrap();
+    let saved = BundleWriter::save(&bundle, &edits, PackingPolicy::Uncompressed).unwrap();
     let reparsed = BundleParser::from_bytes(saved).unwrap();
 
     assert_eq!(reparsed.header.signature, "UnityRaw");
@@ -167,7 +167,7 @@ fn can_save_unityweb_bundle_and_reload_with_edits() {
     let mut edits = BundleEdits::new();
     edits.replace_file_bytes("test.txt", b"abcd".to_vec());
 
-    let saved = BundleWriter::save(&bundle, &edits, PackerOptions::default()).unwrap();
+    let saved = BundleWriter::save(&bundle, &edits, PackingPolicy::Uncompressed).unwrap();
     let reparsed = BundleParser::from_bytes(saved).unwrap();
 
     assert_eq!(reparsed.header.signature, "UnityWeb");

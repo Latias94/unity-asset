@@ -7,9 +7,9 @@ use serde_json::json;
 use unity_asset_binary::bundle::{BundleLoadOptions, BundleParser};
 use unity_asset_binary::webfile::WebFile;
 use unity_asset_core::{AssetLoadBudget, DigestV1};
+use unity_asset_write::PackingPolicy;
 use unity_asset_write::bundle::{BundleEdits, BundleWriter};
-use unity_asset_write::webfile::{WebFileEdits, WebFilePacker, WebFileWriter};
-use unity_asset_write::{PackerOptions, UnityPyPacker};
+use unity_asset_write::webfile::{WebFileEdits, WebFilePackingPolicy, WebFileWriter};
 
 struct SamplingAllocator;
 
@@ -217,8 +217,12 @@ fn legacy_characterization_fixture_contract_is_reproducible() {
         ("c.bin".to_owned(), vec![3; 47]),
     ]);
     let web = WebFile::from_bytes(input.clone()).expect("fixture should parse");
-    let output = WebFileWriter::save(&web, &WebFileEdits::default(), WebFilePacker::None, None)
-        .expect("legacy writer should encode fixture");
+    let output = WebFileWriter::save(
+        &web,
+        &WebFileEdits::default(),
+        WebFilePackingPolicy::Uncompressed,
+    )
+    .expect("legacy writer should encode fixture");
     let reparsed = WebFile::from_bytes(output.clone()).expect("legacy output should reparse");
 
     assert_eq!(reparsed.files().len(), 3);
@@ -251,14 +255,8 @@ fn prepared_artifact_legacy_sample_representative() {
             .sum::<u64>();
         let file_count =
             u64::try_from(bundle.nodes.iter().filter(|node| node.is_file()).count()).unwrap();
-        let output = BundleWriter::save(
-            &bundle,
-            &BundleEdits::default(),
-            PackerOptions {
-                packer: UnityPyPacker::Original,
-            },
-        )
-        .expect("legacy bundle writer should encode representative fixture");
+        let output = BundleWriter::save(&bundle, &BundleEdits::default(), PackingPolicy::Preserve)
+            .expect("legacy bundle writer should encode representative fixture");
         let summary = (
             u64::try_from(output.len()).unwrap(),
             DigestV1::hash_bytes(&output),
@@ -301,8 +299,12 @@ fn prepared_artifact_legacy_sample_generated_large() {
         let web = WebFile::from_bytes_with_budget(input, &mut load_budget)
             .expect("generated large WebFile should parse");
         let source_payload_bytes = web.files().iter().map(|entry| entry.size).sum::<u64>();
-        let output = WebFileWriter::save(&web, &WebFileEdits::default(), WebFilePacker::None, None)
-            .expect("legacy WebFile writer should encode generated fixture");
+        let output = WebFileWriter::save(
+            &web,
+            &WebFileEdits::default(),
+            WebFilePackingPolicy::Uncompressed,
+        )
+        .expect("legacy WebFile writer should encode generated fixture");
         let summary = (
             u64::try_from(output.len()).unwrap(),
             DigestV1::hash_bytes(&output),
@@ -344,8 +346,12 @@ fn prepared_artifact_legacy_sample_adversarial_wide() {
         let web = WebFile::from_bytes_with_budget(input, &mut load_budget)
             .expect("adversarial wide WebFile should parse");
         let source_payload_bytes = web.files().iter().map(|entry| entry.size).sum::<u64>();
-        let output = WebFileWriter::save(&web, &WebFileEdits::default(), WebFilePacker::None, None)
-            .expect("legacy WebFile writer should encode adversarial fixture");
+        let output = WebFileWriter::save(
+            &web,
+            &WebFileEdits::default(),
+            WebFilePackingPolicy::Uncompressed,
+        )
+        .expect("legacy WebFile writer should encode adversarial fixture");
         let summary = (
             u64::try_from(output.len()).unwrap(),
             DigestV1::hash_bytes(&output),

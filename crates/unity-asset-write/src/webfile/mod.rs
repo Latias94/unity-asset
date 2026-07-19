@@ -4,4 +4,4 @@ mod edits;
 mod writer;
 
 pub use edits::WebFileEdits;
-pub use writer::{WebFilePacker, WebFileWriter};
+pub use writer::{WebFileArtifactMember, WebFilePackingPolicy, WebFileWriteError, WebFileWriter};

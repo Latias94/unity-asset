@@ -25,7 +25,7 @@ Parity targets UnityPy’s **edit pipeline**, not only reading:
 4. Rebuild `SerializedFile` (metadata + object table + data stream)
 5. Rebuild containers (`UnityFS` bundles, `WebFile`)
 6. Handle `.resS` / streamed resource payloads
-7. Save out to disk with UnityPy-compatible packer options
+7. Save out to disk with explicit, UnityPy-compatible packing policies
 
 Non-goals (for now):
 - Byte-for-byte identical output vs original inputs (UnityPy itself is not byte-stable either)
@@ -173,7 +173,7 @@ Rust (current):
     - parsed properties + TypeTree → encode to raw bytes (`save_typetree` / `edit_object`), or
     - raw byte patch (escape hatch: `set_raw_data`)
 
-### File.mark_changed / get_writeable_cab (streamed resources)
+### File.mark_changed / streamed resources
 
 UnityPy:
 - `repo-ref/UnityPy/UnityPy/files/File.py`
@@ -184,15 +184,15 @@ UnityPy:
     when the serialized file is inside a Bundle/WebFile container
 
 Rust (current):
-- `crates/unity-asset/src/environment/imp/edit.rs`
-  - `EnvironmentEditSession::write_to_cab(...)` / `write_streamed_resource_to_field(...)`
-- `crates/unity-asset-write/src/resources/mod.rs`
-  - `WritableCab` (UnityPy `EndianBinaryWriter` analogue; stored in container edits)
+- `crates/unity-asset-write/src/resources/`
+  - `StreamedResourcePlan` validates names, extents, offsets, sizes, and flags before encoding
+  - `PreparedStreamedResource` publishes one exact resource artifact into the prepared artifact DAG
+- `Environment` retains streamed-resource reads, but no longer exposes a mutable writable-cab
+  compatibility API; resource writes must be prepared atomically with their owning object/container
 
 Notes:
-- UnityPy returns `None` for `SerializedFile.get_writeable_cab` when not inside a container.
-  Rust supports a best-effort standalone sidecar write under `out/{file}_data/{cab}` to keep the
-  streamed-resource editing workflow possible for `.assets` files.
+- The Rust API deliberately breaks from UnityPy's mutable `EndianBinaryWriter`: caller-owned payloads
+  are allocated deterministically and committed only with the complete prepared artifact graph.
 
 ### MonoBehaviour TypeTree generation
 
@@ -283,9 +283,10 @@ Rust (current):
 - `crates/unity-asset-write/src/bundle/writer.rs`
   - `BundleWriter::save(...)` (UnityPy parity)
   - supports:
-    - UnityFS repack with UnityPy packer semantics (`none`/`lz4`/`lzma`/`original`/custom flags)
+    - UnityFS repack with `PackingPolicy::{Preserve, Uncompressed, Lz4, Lzma}`
     - legacy UnityWeb/UnityRaw repack (UnityPy only supports saving versions `<= 3`)
-  - strips UnityFS encryption flags on save (UnityPy parity; encryption is not re-applied)
+  - defaults to preserving the source signature, flags, and compression policy
+  - rejects UnityFS encryption flags instead of silently publishing unencrypted output
 - `crates/unity-asset-write/src/bundle/edits.rs`
   - `BundleEdits` supports both replacing existing entries and adding new entries
 
@@ -299,11 +300,11 @@ UnityPy:
 Rust (current):
 - `crates/unity-asset-binary/src/webfile.rs` (parse)
 - `crates/unity-asset-write/src/webfile/writer.rs`
-  - `WebFileWriter::save(...)` (UnityPy parity; gzip/brotli/none)
-  - supports signature validation (`UnityWebData*` / `TuanjieWebData*`)
+  - `WebFileWriter::save(...)` accepts `WebFilePackingPolicy::{Preserve, Uncompressed, Gzip, Brotli}`
+  - preserves and validates the source signature (`UnityWebData*` / `TuanjieWebData*`)
   - supports replacements/additions via `WebFileEdits`
 
-### Resource files / `.resS` (writeable cab)
+### Resource files / `.resS` (prepared artifacts)
 
 UnityPy:
 - `repo-ref/UnityPy/UnityPy/files/File.py`
@@ -313,10 +314,10 @@ UnityPy:
 
 Rust (current):
 - loader can read resources (best-effort; streamed read helpers exist)
-- `crates/unity-asset-write/src/resources/mod.rs`
-  - `WritableCab` abstraction
-  - external registration and path conventions aligned with UnityPy:
-    - `archive:/{serialized_name}/{cab_name}` (UnityPy uses the serialized file name as the first component)
+- `crates/unity-asset-write/src/resources/`
+  - deterministic, budgeted multi-extent allocation
+  - exact artifact encoding with typed planning/build failures
+  - no partially appended resource survives a failed prepare
 
 ## TODO Milestones (Trackable Checklist)
 
@@ -326,7 +327,7 @@ Rust (current):
 - [x] Define core traits/structs:
   - [x] `ChangeTracker` (UnityPy `mark_changed`)
   - [x] `SerializedFileEditSession` (per `SerializedFile`)
-  - [x] `PackerOptions` (string/tuple parity with UnityPy)
+  - [x] `PackingPolicy` (explicit preserve/uncompressed/compression semantics)
 - [x] Add `unity-asset` integration stubs:
   - [x] `Environment::save(pack, out_dir)` implemented (standalone SerializedFile + UnityFS bundle repack)
   - [x] `Environment::edit_binary_object_key(...)` / `EnvironmentEditSession` for UnityPy-like change tracking
@@ -388,10 +389,10 @@ TODO (parity):
   - [x] LZ4 (block mode)
   - [x] LZMA (UnityPy-style header layout: 5-byte header, no unpacked-size field)
   - [x] Validate LZMA encoder parameters (props/dict) vs UnityPy defaults (guarded by unit test)
-  - [x] Packer compatibility:
-  - [x] `"none"`, `"lz4"`, `"lzma"`, `"original"`, tuple form
+  - [x] Packing compatibility:
+  - [x] `Preserve`, `Uncompressed`, `Lz4`, and `Lzma`
 - [x] Directory info rebuild and file flags propagation
-- [x] Strip bundle encryption flags on save (UnityPy parity; encryption is not re-applied)
+- [x] Reject bundle encryption flags when exact encrypted output cannot be produced
 - [x] Legacy bundle parse (`UnityWeb` / `UnityRaw`) header + directory offsets (UnityPy `read_web_raw` parity)
 - [x] Legacy bundle save (`UnityWeb` / `UnityRaw`) (UnityPy only supports saving versions `<= 3`)
 
@@ -414,13 +415,10 @@ Acceptance:
 
 ### M6 — `.resS` / streamed resources parity
 
-- [x] Implement `get_writeable_cab` equivalent behavior (P0):
-  - [x] create a writable cab buffer inside container (`AssetBundle` / `WebFile`)
-  - [x] propagate bundle file flags (best-effort)
-  - [x] register as external with GUID and archive path (`archive:/{serialized_name}/{cab_name}`)
-- [x] Write standalone sidecar cab files under `out/{asset_file_name}_data/{cab_name}` (best-effort; UnityPy does not expose this for standalone `SerializedFile`)
-- [x] Provide an ergonomic helper for streamed-resource fields:
-  - [x] `EnvironmentEditSession::write_streamed_resource_to_field(...)` writes bytes into a cab and updates `{path,offset,size}` / `{m_Source,m_Offset,m_Size}` in-place (e.g. `m_StreamData`)
+- [x] Replace mutable writable cabs with `StreamedResourcePlan` and exact prepared artifacts
+- [x] Allocate multiple payload extents deterministically with checked offset/size arithmetic
+- [x] Preserve resource flags and expose structured allocation/build failures
+- [ ] Bind resource artifacts and owning object/container rewrites through `AssetWorkspace::prepare`
 - [x] Provide generic dot-path editing helpers for binary objects:
   - [x] `EnvironmentEditSession::set_binary_value_at_path(...)` for `UnityValue` updates
   - [x] `EnvironmentEditSession::get_binary_value_at_path(...)` reads from pending edits or by parsing the source object
@@ -511,7 +509,7 @@ $env:UNITY_ASSET_EXTERNAL_CORPUS = "C:\\path\\to\\AssetBundles"
 $env:UNITY_ASSET_EXTERNAL_CORPUS_LIMIT = "20"         # default: 20
 $env:UNITY_ASSET_EXTERNAL_CORPUS_MAX_BYTES = "200000000" # default: 200,000,000 (~200MB)
 $env:UNITY_ASSET_EXTERNAL_CORPUS_VERBOSE = "1"        # optional: print every processed path
-$env:UNITY_ASSET_EXTERNAL_CORPUS_PACKER = "none"      # optional: none|lz4|lzma|original (default: original)
+$env:UNITY_ASSET_EXTERNAL_CORPUS_PACKER = "preserve"  # optional: preserve|uncompressed|lz4|lzma (default: preserve)
 ```
 
 3) Run the Rust-side roundtrip:

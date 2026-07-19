@@ -9,6 +9,7 @@
 //! The initial milestones intentionally ship APIs and scaffolding first, before wiring up the full
 //! implementation.
 
+pub mod artifact;
 mod binary_writer;
 pub mod bundle;
 mod compression;
@@ -21,7 +22,7 @@ pub mod webfile;
 
 pub use binary_writer::{BinaryWriter, Endian};
 pub use compression::*;
-pub use packer::{PackerOptions, UnityPyPacker};
+pub use packer::{PackingPolicy, PackingPolicyParseError};
 pub use unity_asset_core::{Result, UnityAssetError};
 
 /// A trait mirroring UnityPy's `mark_changed()` / `is_changed` behavior.

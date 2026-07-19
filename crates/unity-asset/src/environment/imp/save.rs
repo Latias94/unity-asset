@@ -5,10 +5,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 use unity_asset_core::UnityAssetError;
-use unity_asset_write::PackerOptions;
+use unity_asset_write::PackingPolicy;
 use unity_asset_write::bundle::{BundleEdits, BundleWriter};
 use unity_asset_write::serialized_file::SerializedFileWriter;
-use unity_asset_write::webfile::{WebFileEdits, WebFilePacker, WebFileWriter};
+use unity_asset_write::webfile::{WebFileEdits, WebFilePackingPolicy, WebFileWriter};
 
 impl Environment {
     /// Save changed assets to `out_dir` (UnityPy-style).
@@ -20,13 +20,7 @@ impl Environment {
     /// - standalone `SerializedFile` save
     /// - UnityFS `AssetBundle` repack (replacing edited embedded SerializedFiles)
     /// - `WebFile` repack (replacing edited embedded entries)
-    /// - `.resS`/`.resource` write support via `EnvironmentEditSession::write_to_cab`:
-    ///   - embedded into bundles/webfiles
-    ///   - written as sidecar files for standalone serialized files
-    ///
-    /// Not yet implemented:
-    /// - modifying existing `.resS` payloads referenced by objects without updating their offsets
-    pub fn save<P: AsRef<Path>>(&mut self, pack: PackerOptions, out_dir: P) -> Result<()> {
+    pub fn save<P: AsRef<Path>>(&mut self, policy: PackingPolicy, out_dir: P) -> Result<()> {
         let out_dir = out_dir.as_ref();
         fs::create_dir_all(out_dir)?;
 
@@ -35,7 +29,7 @@ impl Environment {
         }
 
         let mut state = self.take_write_state();
-        let result = save_impl(self, &pack, out_dir, &mut state);
+        let result = save_impl(self, policy, out_dir, &mut state);
         match result {
             Ok(()) => {
                 // UnityPy clears the changed flags after saving. We drop the pending write state.
@@ -52,7 +46,7 @@ impl Environment {
 
 fn save_impl(
     env: &Environment,
-    pack: &PackerOptions,
+    policy: PackingPolicy,
     out_dir: &Path,
     state: &mut super::edit::EnvironmentWriteState,
 ) -> Result<()> {
@@ -60,7 +54,7 @@ fn save_impl(
 
     // 1) Save standalone SerializedFiles.
     for (source, file_state) in state.standalone.iter_mut() {
-        if file_state.edits.is_empty() && file_state.cabs.is_empty() {
+        if file_state.edits.is_empty() {
             continue;
         }
 
@@ -76,28 +70,10 @@ fn save_impl(
             super::BinarySource::Path(_) => {
                 let out_name = output_name_for_source(source)?;
                 fs::write(out_dir.join(out_name), bytes)?;
-
-                // For standalone SerializedFiles, write `.resS`/`.resource` sidecars under
-                // `out_dir/{asset_file_name}_data/{cab_name}` to avoid collisions with the file.
-                if !file_state.cabs.is_empty() {
-                    let cab_dir = out_dir.join(format!("{}_data", out_name.to_string_lossy()));
-                    fs::create_dir_all(&cab_dir)?;
-                    for cab in file_state.cabs.values() {
-                        fs::write(cab_dir.join(&cab.name), cab.bytes())?;
-                    }
-                }
             }
             super::BinarySource::ArchiveEntry { .. } => {
                 let out_name = output_name_for_source(source)?;
                 fs::write(out_dir.join(out_name), bytes)?;
-
-                if !file_state.cabs.is_empty() {
-                    let cab_dir = out_dir.join(format!("{}_data", out_name.to_string_lossy()));
-                    fs::create_dir_all(&cab_dir)?;
-                    for cab in file_state.cabs.values() {
-                        fs::write(cab_dir.join(&cab.name), cab.bytes())?;
-                    }
-                }
             }
             super::BinarySource::WebEntry {
                 web_path,
@@ -113,7 +89,7 @@ fn save_impl(
 
     // 2) Repack bundles that contain edited embedded SerializedFiles.
     for (bundle_source, bundle_state) in state.bundles.iter_mut() {
-        if bundle_state.assets.is_empty() && bundle_state.cabs.is_empty() {
+        if bundle_state.assets.is_empty() {
             continue;
         }
 
@@ -149,15 +125,11 @@ fn save_impl(
             edits.replace_file_bytes(node_name.clone(), bytes);
         }
 
-        for cab in bundle_state.cabs.values() {
-            edits.add_file_bytes(cab.name.clone(), cab.bytes().to_vec(), cab.flags);
-        }
-
         if edits.is_empty() {
             continue;
         }
 
-        let bytes = BundleWriter::save(bundle, &edits, *pack)?;
+        let bytes = BundleWriter::save(bundle, &edits, policy)?;
         match bundle_source {
             super::BinarySource::Path(_) => {
                 let out_name = output_name_for_source(bundle_source)?;
@@ -179,16 +151,6 @@ fn save_impl(
         }
     }
 
-    // 3) Repack WebFiles that have pending writable cabs or edited entries.
-    for (web_path, web_state) in state.webfiles.iter_mut() {
-        for cab in web_state.cabs.values() {
-            webfile_edits
-                .entry(web_path.clone())
-                .or_default()
-                .replace_file_bytes(cab.name.clone(), cab.bytes().to_vec());
-        }
-    }
-
     // 3) Repack WebFiles that contain edited entries.
     for (web_path, edits) in webfile_edits.iter() {
         if edits.is_empty() {
@@ -196,7 +158,7 @@ fn save_impl(
         }
 
         let web = resolve_webfile(env, web_path)?;
-        let bytes = WebFileWriter::save(web, edits, WebFilePacker::None, None)?;
+        let bytes = WebFileWriter::save(web, edits, WebFilePackingPolicy::Preserve)?;
 
         let out_name = web_path.file_name().ok_or_else(|| {
             UnityAssetError::format(format!(

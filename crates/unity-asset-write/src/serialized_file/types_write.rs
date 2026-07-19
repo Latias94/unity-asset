@@ -1,6 +1,7 @@
 use crate::Result;
 use crate::binary_writer::BinaryWriter;
-use crate::serialized_file::typetree_dump::dump_typetree;
+use crate::serialized_file::sink::{BinaryWriterSink, EndianSink, SinkBackend};
+use crate::serialized_file::typetree_dump::dump_typetree_to;
 use unity_asset_binary::asset::types::LocalSerializedObjectIdentifier;
 use unity_asset_binary::asset::{
     ExternalEncoding, FileIdentifier, PathIdEncoding, SerializedFileFormat, SerializedType,
@@ -9,8 +10,18 @@ use unity_asset_binary::typetree::TypeTreeParser;
 use unity_asset_core::UnityAssetError;
 
 pub fn write_file_identifier(
-    v: &FileIdentifier,
+    value: &FileIdentifier,
     writer: &mut BinaryWriter,
+    format: SerializedFileFormat,
+) -> Result<()> {
+    let endian = writer.endian();
+    let mut sink = EndianSink::new(BinaryWriterSink::new(writer), endian);
+    write_file_identifier_to(value, &mut sink, format)
+}
+
+pub(crate) fn write_file_identifier_to<B: SinkBackend>(
+    v: &FileIdentifier,
+    writer: &mut EndianSink<B>,
     format: SerializedFileFormat,
 ) -> Result<()> {
     match format.external_encoding() {
@@ -29,25 +40,34 @@ pub fn write_file_identifier(
                     format.version()
                 )));
             }
-            writer.write(v.guid.as_slice());
-            writer.write_i32(v.type_);
+            writer.write(v.guid.as_slice())?;
+            writer.write_i32(v.type_)?;
         }
         ExternalEncoding::AssetPathGuidAndType => {
-            writer.write_string_to_null(&v.temp_empty);
-            writer.write(v.guid.as_slice());
-            writer.write_i32(v.type_);
+            writer.write_string_to_null(&v.temp_empty)?;
+            writer.write(v.guid.as_slice())?;
+            writer.write_i32(v.type_)?;
         }
     }
-    writer.write_string_to_null(&v.path);
-    Ok(())
+    writer.write_string_to_null(&v.path)
 }
 
 pub fn write_local_serialized_object_identifier(
-    v: &LocalSerializedObjectIdentifier,
+    value: &LocalSerializedObjectIdentifier,
     writer: &mut BinaryWriter,
     format: SerializedFileFormat,
 ) -> Result<()> {
-    writer.write_i32(v.local_serialized_file_index);
+    let endian = writer.endian();
+    let mut sink = EndianSink::new(BinaryWriterSink::new(writer), endian);
+    write_local_serialized_object_identifier_to(value, &mut sink, format)
+}
+
+pub(crate) fn write_local_serialized_object_identifier_to<B: SinkBackend>(
+    v: &LocalSerializedObjectIdentifier,
+    writer: &mut EndianSink<B>,
+    format: SerializedFileFormat,
+) -> Result<()> {
+    writer.write_i32(v.local_serialized_file_index)?;
     match format.path_id_encoding() {
         PathIdEncoding::I32 | PathIdEncoding::BigIdFlag => {
             let id = i32::try_from(v.local_identifier_in_file).map_err(|_| {
@@ -56,19 +76,37 @@ pub fn write_local_serialized_object_identifier(
                     v.local_identifier_in_file
                 ))
             })?;
-            writer.write_i32(id);
+            writer.write_i32(id)?;
         }
         PathIdEncoding::AlignedI64 => {
-            writer.align_stream(4);
-            writer.write_i64(v.local_identifier_in_file);
+            writer.align_stream(4)?;
+            writer.write_i64(v.local_identifier_in_file)?;
         }
     }
     Ok(())
 }
 
 pub fn write_serialized_type(
-    st: &SerializedType,
+    serialized_type: &SerializedType,
     writer: &mut BinaryWriter,
+    format: SerializedFileFormat,
+    enable_type_tree: bool,
+    is_ref_type: bool,
+) -> Result<()> {
+    let endian = writer.endian();
+    let mut sink = EndianSink::new(BinaryWriterSink::new(writer), endian);
+    write_serialized_type_to(
+        serialized_type,
+        &mut sink,
+        format,
+        enable_type_tree,
+        is_ref_type,
+    )
+}
+
+pub(crate) fn write_serialized_type_to<B: SinkBackend>(
+    st: &SerializedType,
+    writer: &mut EndianSink<B>,
     format: SerializedFileFormat,
     enable_type_tree: bool,
     is_ref_type: bool,
@@ -135,30 +173,30 @@ pub fn write_serialized_type(
             )
         })?;
     }
-    writer.write_i32(st.class_id);
+    writer.write_i32(st.class_id)?;
 
     if format.serialized_types_have_stripped_flag() {
-        writer.write_bool(st.is_stripped_type);
+        writer.write_bool(st.is_stripped_type)?;
     }
 
     if format.serialized_types_have_script_type_index() {
-        writer.write_i16(st.script_type_index);
+        writer.write_i16(st.script_type_index)?;
     }
 
     if format.serialized_types_have_hashes() {
         if format.serialized_type_has_script_id(st.class_id, st.script_type_index, is_ref_type) {
-            writer.write(st.script_id.as_slice());
+            writer.write(st.script_id.as_slice())?;
         }
-        writer.write(st.old_type_hash.as_slice());
+        writer.write(st.old_type_hash.as_slice())?;
     }
 
     if enable_type_tree {
-        dump_typetree(&st.type_tree, writer, format)?;
+        dump_typetree_to(&st.type_tree, writer, format)?;
 
         if is_ref_type && format.has_ref_type_names() {
-            writer.write_string_to_null(&st.class_name);
-            writer.write_string_to_null(&st.namespace);
-            writer.write_string_to_null(&st.assembly_name);
+            writer.write_string_to_null(&st.class_name)?;
+            writer.write_string_to_null(&st.namespace)?;
+            writer.write_string_to_null(&st.assembly_name)?;
         } else if !is_ref_type && format.has_type_dependencies() {
             let count = i32::try_from(st.type_dependencies.len()).map_err(|_| {
                 UnityAssetError::format(format!(
@@ -166,9 +204,9 @@ pub fn write_serialized_type(
                     st.type_dependencies.len()
                 ))
             })?;
-            writer.write_i32(count);
+            writer.write_i32(count)?;
             for dependency in &st.type_dependencies {
-                writer.write_i32(*dependency);
+                writer.write_i32(*dependency)?;
             }
         }
     }

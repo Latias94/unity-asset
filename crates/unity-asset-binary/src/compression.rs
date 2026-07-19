@@ -563,7 +563,7 @@ const BROTLI_INPUT_BUFFER_SIZE: usize = 64 * 1024;
 const BROTLI_MAX_WINDOW_BITS: u32 = 30;
 
 // These sizes mirror the conservative no-std preallocation strategy in
-// brotli-decompressor 2.5.1. The input buffer is additional reader-owned scratch.
+// brotli-decompressor 5.0.3. The input buffer is additional reader-owned scratch.
 const BROTLI_PREALLOC_U8_FIXED_BYTES: u64 = 64 * 1024 + (256 + 704) * 256;
 const BROTLI_PREALLOC_U32_ELEMENTS: u64 = 12 * 1024 * 6;
 const BROTLI_PREALLOC_HUFFMAN_ELEMENTS: u64 = 128 * (704 + 256) + 6 * 26 * 1_080;
@@ -1726,12 +1726,12 @@ mod tests {
     #[test]
     fn brotli_dynamic_allocations_are_preflighted_against_the_byte_budget() {
         const INPUT_BUFFER_BYTES: u64 = 64 * 1024;
-        // Locks the full allocation sequence for this brotli-decompressor 2.5.1 fixture.
+        // Locks the full allocation sequence for this brotli-decompressor 5.0.3 fixture.
         const ALLOCATION_BOUNDARIES: &[u64] = &[
-            69_856, 82_816, 95_776, 99_938, 99_939, 100_003, 100_007, 100_011, 104_331, 104_335,
-            108_655, 108_659, 112_979,
+            69_856, 82_816, 95_776, 104_034, 104_035, 104_099, 104_103, 104_107, 108_427, 108_431,
+            112_751, 112_755, 117_075,
         ];
-        const EXPECTED_SCRATCH_BYTES: u64 = 112_979;
+        const EXPECTED_SCRATCH_BYTES: u64 = 117_075;
 
         let original = vec![0x5a; 4096];
         let compressed = brotli_compress(&original);

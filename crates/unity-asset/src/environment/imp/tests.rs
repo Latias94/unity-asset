@@ -31,27 +31,6 @@ fn link_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-fn streamed_texture_fixture() -> (Environment, BinarySource, BinaryObjectKey) {
-    let path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/xinzexi_2_n_tex"),
-    );
-    let source = BinarySource::path(&path);
-    let mut env = Environment::new();
-    env.load_file(&path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let key = env
-        .binary_object_infos()
-        .find(|object| {
-            object.source == &source
-                && object.source_kind == BinarySourceKind::AssetBundle
-                && object.object.class_id() == unity_asset_core::class_ids::TEXTURE_2D
-        })
-        .expect("fixture contains a Texture2D object")
-        .key();
-
-    (env, source, key)
-}
-
 fn sample_serialized_file_bytes() -> Vec<u8> {
     let bundle_path = canonicalize_path(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
@@ -67,66 +46,6 @@ fn sample_serialized_file_bytes() -> Vec<u8> {
         })
         .expect("sample bundle contains a SerializedFile node");
     bundle.extract_node_data(node).unwrap()
-}
-
-fn audio_clip_key(env: &Environment, source: &BinarySource) -> BinaryObjectKey {
-    env.binary_object_infos()
-        .find(|object| {
-            object.source == source
-                && object.source_kind == BinarySourceKind::SerializedFile
-                && object.object.class_id() == unity_asset_core::class_ids::AUDIO_CLIP
-        })
-        .expect("fixture contains an AudioClip object")
-        .key()
-}
-
-fn assert_write_state_empty(env: &Environment) {
-    assert!(!env.has_pending_writes());
-    assert!(env.write_state.standalone.is_empty());
-    assert!(env.write_state.bundles.is_empty());
-    assert!(env.write_state.webfiles.is_empty());
-    assert!(env.write_state.yaml_documents.is_empty());
-}
-
-fn assert_single_streamed_bundle_edit(
-    env: &Environment,
-    source: &BinarySource,
-    key: &BinaryObjectKey,
-    cab_name: &str,
-    data: &[u8],
-    write: &StreamedResourceWrite,
-) {
-    assert!(env.write_state.standalone.is_empty());
-    assert!(env.write_state.webfiles.is_empty());
-    assert!(env.write_state.yaml_documents.is_empty());
-    assert_eq!(env.write_state.bundles.len(), 1);
-
-    let bundle_state = &env.write_state.bundles[source];
-    assert_eq!(bundle_state.cabs.len(), 1);
-    assert_eq!(bundle_state.cabs[cab_name].bytes(), data);
-    assert_eq!(bundle_state.assets.len(), 1);
-
-    let asset_index = key.asset_index.expect("bundle key has an asset index");
-    let asset_state = &bundle_state.assets[&asset_index];
-    assert_eq!(asset_state.edits.additional_externals.len(), 1);
-    assert_eq!(asset_state.edits.additional_externals[0].path, write.path);
-    assert_eq!(asset_state.edits.object_bytes.len(), 1);
-    assert!(asset_state.edits.get(key.path_id).is_some());
-    assert_eq!(asset_state.classes.len(), 1);
-    assert!(asset_state.classes.contains_key(&key.path_id));
-}
-
-fn assert_single_streamed_object_edit(
-    state: &super::edit::SerializedFileWriteState,
-    key: &BinaryObjectKey,
-    write: &StreamedResourceWrite,
-) {
-    assert_eq!(state.edits.additional_externals.len(), 1);
-    assert_eq!(state.edits.additional_externals[0].path, write.path);
-    assert_eq!(state.edits.object_bytes.len(), 1);
-    assert!(state.edits.get(key.path_id).is_some());
-    assert_eq!(state.classes.len(), 1);
-    assert!(state.classes.contains_key(&key.path_id));
 }
 
 #[test]
@@ -307,7 +226,7 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
 
 #[test]
 fn environment_can_edit_binary_object_and_save_bundle() {
-    use unity_asset_write::{PackerOptions, UnityPyPacker};
+    use unity_asset_write::PackingPolicy;
 
     let tmp = tempfile::tempdir().unwrap();
     let in_path = tmp.path().join("char_118_yuki.ab");
@@ -365,13 +284,7 @@ fn environment_can_edit_binary_object_and_save_bundle() {
     })
     .unwrap();
 
-    env.save(
-        PackerOptions {
-            packer: UnityPyPacker::Original,
-        },
-        &out_dir,
-    )
-    .unwrap();
+    env.save(PackingPolicy::Preserve, &out_dir).unwrap();
 
     let out_path = out_dir.join("char_118_yuki.ab");
     assert!(out_path.is_file());
@@ -473,134 +386,8 @@ fn failed_bundle_object_edits_leave_pending_state_unchanged() {
 }
 
 #[test]
-fn failed_streamed_resource_field_write_is_atomic_and_retryable() {
-    let (mut env, source, key) = streamed_texture_fixture();
-    let cab_name = "CAB-Atomic-Field.resS";
-    let data = b"atomic streamed field bytes";
-    assert_write_state_empty(&env);
-
-    let mut constrained_budget = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
-        max_bytes: 1,
-        ..unity_asset_core::AssetLoadLimits::default()
-    })
-    .unwrap();
-    let error = env
-        .edit_session(&mut constrained_budget)
-        .write_streamed_resource_to_field(&key, "m_StreamData", Some(cab_name), data)
-        .expect_err("the object phase must exceed the constrained budget");
-    assert!(error.to_string().contains("budget"), "{error:?}");
-    assert_write_state_empty(&env);
-
-    let write = env
-        .edit_session(&mut AssetLoadBudget::default())
-        .write_streamed_resource_to_field(&key, "m_StreamData", Some(cab_name), data)
-        .unwrap();
-    assert_eq!(write.offset, 0);
-    assert_eq!(write.size, data.len() as u32);
-    assert_single_streamed_bundle_edit(&env, &source, &key, cab_name, data, &write);
-}
-
-#[test]
-fn failed_standalone_streamed_write_is_atomic_and_retryable() {
-    let temp = tempfile::tempdir().unwrap();
-    let assets_path = temp.path().join("audio.assets");
-    fs::write(&assets_path, sample_serialized_file_bytes()).unwrap();
-    let assets_path = canonicalize_path(assets_path);
-    let source = BinarySource::path(&assets_path);
-    let mut env = Environment::new();
-    env.load_file(&assets_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let key = audio_clip_key(&env, &source);
-    let cab_name = "CAB-Atomic-Standalone.resS";
-    let data = b"atomic standalone bytes";
-    assert_write_state_empty(&env);
-
-    let mut constrained_budget = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
-        max_bytes: 1,
-        ..unity_asset_core::AssetLoadLimits::default()
-    })
-    .unwrap();
-    let error = env
-        .edit_session(&mut constrained_budget)
-        .write_streamed_resource_to_field(&key, "m_Resource", Some(cab_name), data)
-        .expect_err("the standalone object phase must exceed the constrained budget");
-    assert!(error.to_string().contains("budget"), "{error:?}");
-    assert_write_state_empty(&env);
-
-    let write = env
-        .edit_session(&mut AssetLoadBudget::default())
-        .write_streamed_resource_to_field(&key, "m_Resource", Some(cab_name), data)
-        .unwrap();
-    assert_eq!(write.offset, 0);
-    assert_eq!(write.size, data.len() as u32);
-    assert!(env.write_state.bundles.is_empty());
-    assert!(env.write_state.webfiles.is_empty());
-    assert!(env.write_state.yaml_documents.is_empty());
-    assert_eq!(env.write_state.standalone.len(), 1);
-    let state = &env.write_state.standalone[&source];
-    assert_eq!(state.cabs.len(), 1);
-    assert_eq!(state.cabs[cab_name].bytes(), data);
-    assert_single_streamed_object_edit(state, &key, &write);
-}
-
-#[test]
-fn failed_web_entry_streamed_write_is_atomic_and_retryable() {
-    let temp = tempfile::tempdir().unwrap();
-    let entry_name = "audio.assets".to_string();
-    let web_path = temp.path().join("UnityWebData");
-    fs::write(
-        &web_path,
-        build_uncompressed_webfile(vec![(entry_name.clone(), sample_serialized_file_bytes())]),
-    )
-    .unwrap();
-    let web_path = canonicalize_path(web_path);
-    let source = BinarySource::WebEntry {
-        web_path: Arc::new(web_path.clone()),
-        entry_name: entry_name.clone(),
-    };
-    let mut env = Environment::new();
-    env.load_file(&web_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let key = audio_clip_key(&env, &source);
-    let cab_name = "CAB-Atomic-Web.resS";
-    let data = b"atomic web entry bytes";
-    assert_write_state_empty(&env);
-
-    let mut constrained_budget = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
-        max_bytes: 1,
-        ..unity_asset_core::AssetLoadLimits::default()
-    })
-    .unwrap();
-    let error = env
-        .edit_session(&mut constrained_budget)
-        .write_streamed_resource_to_field(&key, "m_Resource", Some(cab_name), data)
-        .expect_err("the WebEntry object phase must exceed the constrained budget");
-    assert!(error.to_string().contains("budget"), "{error:?}");
-    assert_write_state_empty(&env);
-
-    let write = env
-        .edit_session(&mut AssetLoadBudget::default())
-        .write_streamed_resource_to_field(&key, "m_Resource", Some(cab_name), data)
-        .unwrap();
-    assert_eq!(write.offset, 0);
-    assert_eq!(write.size, data.len() as u32);
-    assert_eq!(write.path, format!("archive:/{entry_name}/{cab_name}"));
-    assert!(env.write_state.bundles.is_empty());
-    assert!(env.write_state.yaml_documents.is_empty());
-    assert_eq!(env.write_state.webfiles.len(), 1);
-    assert_eq!(env.write_state.standalone.len(), 1);
-
-    let web_state = &env.write_state.webfiles[&web_path];
-    assert_eq!(web_state.cabs.len(), 1);
-    assert_eq!(web_state.cabs[cab_name].bytes(), data);
-    let file_state = &env.write_state.standalone[&source];
-    assert!(file_state.cabs.is_empty());
-    assert_single_streamed_object_edit(file_state, &key, &write);
-}
-
-#[test]
 fn environment_edit_session_can_save_binary_object_class_and_save_bundle() {
-    use unity_asset_write::{PackerOptions, UnityPyPacker};
+    use unity_asset_write::PackingPolicy;
 
     let tmp = tempfile::tempdir().unwrap();
     let in_path = tmp.path().join("char_118_yuki.ab");
@@ -661,14 +448,7 @@ fn environment_edit_session_can_save_binary_object_class_and_save_bundle() {
     let mut edit_budget = AssetLoadBudget::default();
     let mut session = env.edit_session(&mut edit_budget);
     session.save_binary_object_class(&key, class).unwrap();
-    session
-        .save(
-            PackerOptions {
-                packer: UnityPyPacker::Original,
-            },
-            &out_dir,
-        )
-        .unwrap();
+    session.save(PackingPolicy::Preserve, &out_dir).unwrap();
 
     let out_path = out_dir.join("char_118_yuki.ab");
     assert!(out_path.is_file());
@@ -692,7 +472,7 @@ fn environment_edit_session_can_save_binary_object_class_and_save_bundle() {
 
 #[test]
 fn environment_edit_session_can_set_binary_value_at_path_and_save_bundle() {
-    use unity_asset_write::{PackerOptions, UnityPyPacker};
+    use unity_asset_write::PackingPolicy;
 
     let tmp = tempfile::tempdir().unwrap();
     let in_path = tmp.path().join("char_118_yuki.ab");
@@ -766,14 +546,7 @@ fn environment_edit_session_can_set_binary_value_at_path_and_save_bundle() {
         Some(new_name.clone())
     );
 
-    session
-        .save(
-            PackerOptions {
-                packer: UnityPyPacker::Original,
-            },
-            &out_dir,
-        )
-        .unwrap();
+    session.save(PackingPolicy::Preserve, &out_dir).unwrap();
 
     let out_path = out_dir.join("char_118_yuki.ab");
     assert!(out_path.is_file());
@@ -1240,7 +1013,7 @@ fn environment_registry_reuses_single_arcs_and_prepares_script_base_composition_
 fn environment_can_edit_and_save_stripped_assets_with_typetree_registry() {
     use serde::Serialize;
     use unity_asset_binary::typetree::JsonTypeTreeRegistry;
-    use unity_asset_write::{PackerOptions, UnityPyPacker};
+    use unity_asset_write::PackingPolicy;
 
     #[derive(Debug, Serialize)]
     struct Dump {
@@ -1329,13 +1102,7 @@ fn environment_can_edit_and_save_stripped_assets_with_typetree_registry() {
     .unwrap();
 
     let out_dir = tmp.path().join("out");
-    env.save(
-        PackerOptions {
-            packer: UnityPyPacker::Original,
-        },
-        &out_dir,
-    )
-    .unwrap();
+    env.save(PackingPolicy::Preserve, &out_dir).unwrap();
 
     let out_path = out_dir.join("banner_1");
     assert!(out_path.is_file());
@@ -1896,7 +1663,7 @@ fn environment_zip_failure_discards_recursive_webfile_stage() {
 #[test]
 fn environment_can_edit_zip_assetbundle_entry_and_save() {
     use std::io::Write;
-    use unity_asset_write::{PackerOptions, UnityPyPacker};
+    use unity_asset_write::PackingPolicy;
     use zip::write::FileOptions;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1958,13 +1725,7 @@ fn environment_can_edit_zip_assetbundle_entry_and_save() {
     })
     .unwrap();
 
-    env.save(
-        PackerOptions {
-            packer: UnityPyPacker::Original,
-        },
-        &out_dir,
-    )
-    .unwrap();
+    env.save(PackingPolicy::Preserve, &out_dir).unwrap();
 
     let out_path = out_dir.join("char_118_yuki.ab");
     assert!(out_path.is_file());
@@ -2287,7 +2048,7 @@ fn build_uncompressed_webfile(entries: Vec<(String, Vec<u8>)>) -> Vec<u8> {
 
 #[test]
 fn environment_explicitly_loads_writer_gzip_and_brotli_webfiles() {
-    use unity_asset_write::webfile::{WebFileEdits, WebFilePacker, WebFileWriter};
+    use unity_asset_write::webfile::{WebFileEdits, WebFilePackingPolicy, WebFileWriter};
 
     let entry_name = "embedded.ab";
     let raw = build_uncompressed_webfile(vec![(
@@ -2298,11 +2059,11 @@ fn environment_explicitly_loads_writer_gzip_and_brotli_webfiles() {
     let temp = tempfile::tempdir().unwrap();
 
     for (file_name, packer) in [
-        ("payload.gzip", WebFilePacker::Gzip),
-        ("payload.brotli", WebFilePacker::Brotli),
+        ("payload.gzip", WebFilePackingPolicy::Gzip),
+        ("payload.brotli", WebFilePackingPolicy::Brotli),
     ] {
         let path = temp.path().join(file_name);
-        let encoded = WebFileWriter::save(&web, &WebFileEdits::default(), packer, None).unwrap();
+        let encoded = WebFileWriter::save(&web, &WebFileEdits::default(), packer).unwrap();
         fs::write(&path, encoded).unwrap();
         let path = canonicalize_path(path);
         let source = BinarySource::web_entry(&path, entry_name);
@@ -2318,7 +2079,7 @@ fn environment_explicitly_loads_writer_gzip_and_brotli_webfiles() {
 
 #[test]
 fn environment_directory_scan_ignores_ordinary_gzip_and_loads_gzip_webfile() {
-    use unity_asset_write::webfile::{WebFileEdits, WebFilePacker, WebFileWriter};
+    use unity_asset_write::webfile::{WebFileEdits, WebFilePackingPolicy, WebFileWriter};
 
     const ORDINARY_GZIP: &[u8] = &[
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xcb, 0x48, 0xcd, 0xc9, 0xc9,
@@ -2335,7 +2096,7 @@ fn environment_directory_scan_ignores_ordinary_gzip_and_loads_gzip_webfile() {
     let web_path = temp.path().join("payload.gz");
     fs::write(
         &web_path,
-        WebFileWriter::save(&web, &WebFileEdits::default(), WebFilePacker::Gzip, None).unwrap(),
+        WebFileWriter::save(&web, &WebFileEdits::default(), WebFilePackingPolicy::Gzip).unwrap(),
     )
     .unwrap();
 
@@ -2413,11 +2174,11 @@ fn environment_budgeted_webfile_load_is_atomic_and_retryable() {
 
 #[test]
 fn environment_webfile_reload_replaces_removed_members_and_changed_kinds() {
-    use unity_asset_write::webfile::{WebFileEdits, WebFilePacker, WebFileWriter};
+    use unity_asset_write::webfile::{WebFileEdits, WebFilePackingPolicy, WebFileWriter};
 
     fn gzip_webfile(entries: Vec<(String, Vec<u8>)>) -> Vec<u8> {
         let web = WebFile::from_bytes(build_uncompressed_webfile(entries)).unwrap();
-        WebFileWriter::save(&web, &WebFileEdits::default(), WebFilePacker::Gzip, None).unwrap()
+        WebFileWriter::save(&web, &WebFileEdits::default(), WebFilePackingPolicy::Gzip).unwrap()
     }
 
     let temp = tempfile::tempdir().unwrap();
@@ -2736,13 +2497,8 @@ fn environment_save_repacks_webfile_after_editing_embedded_bundle() {
     .unwrap();
 
     let out_dir = temp.path().join("out");
-    env.save(
-        unity_asset_write::PackerOptions {
-            packer: unity_asset_write::UnityPyPacker::Original,
-        },
-        &out_dir,
-    )
-    .unwrap();
+    env.save(unity_asset_write::PackingPolicy::Preserve, &out_dir)
+        .unwrap();
 
     // UnityPy-style save should rebuild the container, not emit extracted entry files.
     let out_web_path = out_dir.join("UnityWebData");
@@ -2775,226 +2531,6 @@ fn environment_save_repacks_webfile_after_editing_embedded_bundle() {
         .unwrap()
         .expect("edited object should still have a name");
     assert_eq!(observed, new_name);
-}
-
-#[test]
-fn environment_can_write_streamed_resource_cab_into_bundle_and_reload() {
-    let path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
-    );
-
-    let mut env = Environment::new();
-    env.load_file(&path, &mut AssetLoadBudget::default())
-        .unwrap();
-
-    let bundle_source = BinarySource::path(&path);
-
-    let key = env
-        .binary_object_infos()
-        .find(|r| r.source == &bundle_source && r.source_kind == BinarySourceKind::AssetBundle)
-        .expect("expected at least one binary object in sample bundle")
-        .key();
-
-    let mut edit_budget = AssetLoadBudget::default();
-    let mut session = env.edit_session(&mut edit_budget);
-    let write = session.write_to_cab(&key, None, b"OggS").unwrap();
-
-    let temp = tempfile::tempdir().unwrap();
-    let out_dir = temp.path().join("out");
-    session
-        .save(
-            unity_asset_write::PackerOptions {
-                packer: unity_asset_write::UnityPyPacker::Original,
-            },
-            &out_dir,
-        )
-        .unwrap();
-
-    let out_bundle_path = out_dir.join("char_118_yuki.ab");
-    assert!(out_bundle_path.exists());
-
-    let mut env2 = Environment::new();
-    env2.load_file(&out_bundle_path, &mut AssetLoadBudget::default())
-        .unwrap();
-
-    let bytes = env2
-        .read_stream_data(
-            &out_bundle_path,
-            BinarySourceKind::AssetBundle,
-            &write.path,
-            write.offset,
-            write.size,
-        )
-        .unwrap();
-    assert_eq!(bytes, b"OggS");
-
-    // The cab should be present as a bundle node after saving.
-    let out_source = BinarySource::path(canonicalize_path(out_bundle_path));
-    let out_bundle = env2
-        .bundles()
-        .get(&out_source)
-        .expect("saved bundle should be loaded");
-    assert!(
-        out_bundle
-            .nodes
-            .iter()
-            .any(|n| n.is_file() && n.name == "CAB-UnityPy_Mod.resS")
-    );
-
-    // Externals should include the cab path on the serialized file that owns this object.
-    let asset_index = key
-        .asset_index
-        .expect("chosen object is from an AssetBundle source");
-    let sf = out_bundle
-        .assets
-        .get(asset_index)
-        .expect("asset_index should exist");
-    assert!(sf.externals.iter().any(|e| e.path == write.path));
-}
-
-#[test]
-fn environment_can_write_streamed_resource_cab_for_standalone_serialized_file_and_reload() {
-    // Extract a SerializedFile from a sample bundle so we have a realistic standalone `.assets`.
-    let bundle_path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
-    );
-    let bundle_bytes = fs::read(&bundle_path).unwrap();
-    let bundle = unity_asset_binary::bundle::BundleParser::from_bytes(bundle_bytes).unwrap();
-    let node = bundle
-        .nodes
-        .iter()
-        .find(|n| n.is_file() && !n.name.ends_with(".resS") && !n.name.ends_with(".resource"))
-        .expect("sample bundle should contain a serialized file node");
-    let node_bytes = bundle.extract_node_data(node).unwrap();
-
-    let temp = tempfile::tempdir().unwrap();
-    let assets_path = temp.path().join("standalone.assets");
-    fs::write(&assets_path, node_bytes).unwrap();
-
-    let mut env = Environment::new();
-    env.load_file(&assets_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let assets_path = canonicalize_path(assets_path);
-    let source = BinarySource::path(&assets_path);
-
-    let key = env
-        .binary_object_infos()
-        .find(|r| r.source == &source && r.source_kind == BinarySourceKind::SerializedFile)
-        .expect("standalone serialized file should yield objects")
-        .key();
-
-    let mut edit_budget = AssetLoadBudget::default();
-    let mut session = env.edit_session(&mut edit_budget);
-    let write = session.write_to_cab(&key, None, b"OggS").unwrap();
-
-    let out_dir = temp.path().join("out");
-    session
-        .save(
-            unity_asset_write::PackerOptions {
-                packer: unity_asset_write::UnityPyPacker::Original,
-            },
-            &out_dir,
-        )
-        .unwrap();
-
-    let out_assets_path = out_dir.join("standalone.assets");
-    assert!(out_assets_path.exists());
-
-    // Sidecar cab should be written under `out/{asset_file_name}_data/{cab_name}`.
-    let cab_path = out_dir
-        .join("standalone.assets_data")
-        .join("CAB-UnityPy_Mod.resS");
-    assert!(cab_path.exists());
-
-    // Saved serialized file should include the external reference.
-    let saved_bytes = fs::read(&out_assets_path).unwrap();
-    let sf = unity_asset_binary::asset::SerializedFileParser::from_bytes(saved_bytes).unwrap();
-    assert!(sf.externals.iter().any(|e| e.path == write.path));
-
-    // The environment stream reader should be able to resolve the cab from filesystem candidates.
-    let mut env2 = Environment::new();
-    env2.load_file(&out_assets_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let bytes = env2
-        .read_stream_data(
-            &out_assets_path,
-            BinarySourceKind::SerializedFile,
-            &write.path,
-            write.offset,
-            write.size,
-        )
-        .unwrap();
-    assert_eq!(bytes, b"OggS");
-}
-
-#[test]
-fn streamed_write_helper_updates_m_stream_data_shape() {
-    let mut class = UnityClass::new(0, "Test".to_string(), "0".to_string());
-    let mut stream_data = UnityValue::Object(Default::default());
-    let UnityValue::Object(stream) = &mut stream_data else {
-        unreachable!();
-    };
-    stream.insert(
-        "m_Source".to_string(),
-        UnityValue::String("old".to_string()),
-    );
-    stream.insert("m_Offset".to_string(), UnityValue::Integer(1));
-    stream.insert("m_Size".to_string(), UnityValue::Integer(2));
-    class.set("m_StreamData".to_string(), stream_data);
-
-    let write = super::edit::StreamedResourceWrite {
-        path: "archive:/foo_data/CAB-UnityPy_Mod.resS".to_string(),
-        offset: 123,
-        size: 4,
-    };
-
-    super::streamed_write::apply_streamed_resource_write(&mut class, "m_StreamData", &write)
-        .unwrap();
-
-    let UnityValue::Object(stream) = class.get("m_StreamData").unwrap() else {
-        panic!("m_StreamData should be an object after write");
-    };
-    assert_eq!(
-        stream.get("m_Source").and_then(|v| v.as_str()),
-        Some("archive:/foo_data/CAB-UnityPy_Mod.resS")
-    );
-    assert_eq!(stream.get("m_Offset").and_then(|v| v.as_i64()), Some(123));
-    assert_eq!(stream.get("m_Size").and_then(|v| v.as_i64()), Some(4));
-}
-
-#[test]
-fn streamed_write_helper_updates_video_clip_external_resources_shape() {
-    let mut class = UnityClass::new(0, "Test".to_string(), "0".to_string());
-    let mut res = UnityValue::Object(Default::default());
-    let UnityValue::Object(map) = &mut res else {
-        unreachable!();
-    };
-    map.insert(
-        "m_Source".to_string(),
-        UnityValue::String("old".to_string()),
-    );
-    map.insert("m_Offset".to_string(), UnityValue::Integer(1));
-    map.insert("m_Size".to_string(), UnityValue::Integer(2));
-    class.set("m_ExternalResources".to_string(), res);
-
-    let write = super::edit::StreamedResourceWrite {
-        path: "archive:/foo_data/CAB-UnityPy_Mod.resS".to_string(),
-        offset: 123,
-        size: 4,
-    };
-
-    super::streamed_write::apply_streamed_resource_write(&mut class, "m_ExternalResources", &write)
-        .unwrap();
-
-    let UnityValue::Object(stream) = class.get("m_ExternalResources").unwrap() else {
-        panic!("m_ExternalResources should be an object after write");
-    };
-    assert_eq!(
-        stream.get("m_Source").and_then(|v| v.as_str()),
-        Some("archive:/foo_data/CAB-UnityPy_Mod.resS")
-    );
-    assert_eq!(stream.get("m_Offset").and_then(|v| v.as_i64()), Some(123));
-    assert_eq!(stream.get("m_Size").and_then(|v| v.as_i64()), Some(4));
 }
 
 #[test]
@@ -3032,7 +2568,7 @@ fn environment_resolve_pptr_path_key_resolves_sprite_texture() {
 
 #[test]
 fn environment_can_set_pptr_path_to_key_and_reload() {
-    use unity_asset_write::{PackerOptions, UnityPyPacker};
+    use unity_asset_write::PackingPolicy;
 
     let mut env = Environment::new();
     let path = canonicalize_path(
@@ -3062,14 +2598,7 @@ fn environment_can_set_pptr_path_to_key_and_reload() {
 
     let temp = tempfile::tempdir().unwrap();
     let out_dir = temp.path().join("out");
-    session
-        .save(
-            PackerOptions {
-                packer: UnityPyPacker::Original,
-            },
-            &out_dir,
-        )
-        .unwrap();
+    session.save(PackingPolicy::Preserve, &out_dir).unwrap();
 
     let out_bundle_path = canonicalize_path(out_dir.join("atlas_test"));
     assert!(out_bundle_path.exists());
@@ -3095,7 +2624,7 @@ fn environment_can_set_pptr_path_to_key_and_reload() {
 
 #[test]
 fn environment_set_pptr_path_to_key_adds_external_when_cross_source() {
-    use unity_asset_write::{PackerOptions, UnityPyPacker};
+    use unity_asset_write::PackingPolicy;
 
     let mut env = Environment::new();
     let banner_path = canonicalize_path(
@@ -3130,14 +2659,7 @@ fn environment_set_pptr_path_to_key_adds_external_when_cross_source() {
 
     let temp = tempfile::tempdir().unwrap();
     let out_dir = temp.path().join("out");
-    session
-        .save(
-            PackerOptions {
-                packer: UnityPyPacker::Original,
-            },
-            &out_dir,
-        )
-        .unwrap();
+    session.save(PackingPolicy::Preserve, &out_dir).unwrap();
 
     let out_bundle_path = canonicalize_path(out_dir.join("banner_1"));
     assert!(out_bundle_path.exists());
@@ -3176,7 +2698,7 @@ fn environment_set_pptr_path_to_key_adds_external_when_cross_source() {
 
 #[test]
 fn environment_resolve_pptr_path_key_best_effort_loads_external_bundle_from_subdir() {
-    use unity_asset_write::{PackerOptions, UnityPyPacker};
+    use unity_asset_write::PackingPolicy;
 
     let mut env = Environment::new();
     let banner_path = canonicalize_path(
@@ -3211,14 +2733,7 @@ fn environment_resolve_pptr_path_key_best_effort_loads_external_bundle_from_subd
 
     let temp = tempfile::tempdir().unwrap();
     let out_dir = temp.path().join("out");
-    session
-        .save(
-            PackerOptions {
-                packer: UnityPyPacker::Original,
-            },
-            &out_dir,
-        )
-        .unwrap();
+    session.save(PackingPolicy::Preserve, &out_dir).unwrap();
 
     let out_bundle_path = canonicalize_path(out_dir.join("banner_1"));
     assert!(out_bundle_path.exists());
@@ -3364,12 +2879,7 @@ Transform:
 
     let out_dir = dir.path().join("out");
     session
-        .save(
-            unity_asset_write::PackerOptions {
-                packer: unity_asset_write::UnityPyPacker::Original,
-            },
-            &out_dir,
-        )
+        .save(unity_asset_write::PackingPolicy::Preserve, &out_dir)
         .unwrap();
 
     let out_prefab = out_dir.join("ui.prefab");

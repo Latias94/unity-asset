@@ -38,7 +38,7 @@ flate2 = { workspace = true }
 lz4_flex = { workspace = true }
 # The decoder scratch budget mirrors lzma-rs 0.3.0's allocation model.
 lzma-rs = "=0.3.0"
-brotli = "3.4"
+brotli = { version = "8.0", default-features = false, features = ["std"] }
 memmap2 = { version = "0.9", optional = true }
 
 # Performance and utilities
