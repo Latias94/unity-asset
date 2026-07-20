@@ -310,6 +310,225 @@ impl SourceDescriptor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Fingerprint observed for one existing source in a physical binding domain.
+pub(crate) struct PhysicalDomainSource {
+    source: SourceId,
+    fingerprint: SourceFingerprint,
+}
+
+impl PhysicalDomainSource {
+    #[must_use]
+    pub(crate) const fn new(source: SourceId, fingerprint: SourceFingerprint) -> Self {
+        Self {
+            source,
+            fingerprint,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn source(&self) -> SourceId {
+        self.source
+    }
+
+    #[must_use]
+    pub(crate) const fn fingerprint(&self) -> SourceFingerprint {
+        self.fingerprint
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// New member discovered while rescanning a physical binding domain.
+pub(crate) struct PhysicalDomainAddition {
+    descriptor: SourceDescriptor,
+    fingerprint: SourceFingerprint,
+}
+
+impl PhysicalDomainAddition {
+    #[must_use]
+    pub(crate) const fn new(descriptor: SourceDescriptor, fingerprint: SourceFingerprint) -> Self {
+        Self {
+            descriptor,
+            fingerprint,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn descriptor(&self) -> &SourceDescriptor {
+        &self.descriptor
+    }
+
+    #[must_use]
+    pub(crate) const fn fingerprint(&self) -> SourceFingerprint {
+        self.fingerprint
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+/// Complete observation plus sparse changes for one physical binding domain.
+pub(crate) struct PhysicalDomainRewrite<'a> {
+    owner: SourceId,
+    observed: &'a [PhysicalDomainSource],
+    changed: &'a [PhysicalDomainSource],
+    additions: &'a [PhysicalDomainAddition],
+}
+
+impl<'a> PhysicalDomainRewrite<'a> {
+    #[must_use]
+    pub(crate) const fn new(
+        owner: SourceId,
+        observed: &'a [PhysicalDomainSource],
+        changed: &'a [PhysicalDomainSource],
+        additions: &'a [PhysicalDomainAddition],
+    ) -> Self {
+        Self {
+            owner,
+            observed,
+            changed,
+            additions,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn owner(&self) -> SourceId {
+        self.owner
+    }
+
+    #[must_use]
+    pub(crate) const fn observed(&self) -> &'a [PhysicalDomainSource] {
+        self.observed
+    }
+
+    #[must_use]
+    pub(crate) const fn changed(&self) -> &'a [PhysicalDomainSource] {
+        self.changed
+    }
+
+    #[must_use]
+    pub(crate) const fn additions(&self) -> &'a [PhysicalDomainAddition] {
+        self.additions
+    }
+}
+
+#[derive(Debug)]
+struct PreparedPhysicalDomainAddition {
+    source: SourceId,
+    record: Arc<SourceRecord>,
+    parent: SourceId,
+    step: Arc<ContainmentStep>,
+}
+
+#[derive(Debug)]
+struct PreparedPhysicalDomainChange {
+    source: SourceId,
+    record: Arc<SourceRecord>,
+}
+
+#[derive(Debug)]
+struct PhysicalDomainAdditionPlan {
+    additions: Vec<PreparedPhysicalDomainAddition>,
+    sorted_parents: Vec<SourceId>,
+    scratch_bytes: u64,
+    retained_bytes: u64,
+}
+
+#[derive(Debug)]
+struct PreparedPhysicalDomainRewrite {
+    changes: Vec<PreparedPhysicalDomainChange>,
+    additions: PhysicalDomainAdditionPlan,
+    planned_bytes: u64,
+    addition_count: u64,
+}
+
+#[derive(Debug)]
+struct PreparedPhysicalDomainChildIndex {
+    parent: SourceId,
+    children: HashMap<Arc<ContainmentStep>, SourceId>,
+}
+
+impl PhysicalDomainAdditionPlan {
+    fn new(addition_count: usize, budget: &AssetLoadBudget) -> Result<Self, CatalogError> {
+        let mut scratch_bytes = checked_vec_exact_bytes::<PreparedPhysicalDomainAddition>(
+            addition_count,
+            "physical domain prepared additions",
+        )?;
+        scratch_bytes = checked_byte_add(
+            scratch_bytes,
+            checked_vec_exact_bytes::<SourceId>(
+                addition_count,
+                "physical domain addition parents",
+            )?,
+        )?;
+        scratch_bytes = checked_byte_add(
+            scratch_bytes,
+            checked_empty_hash_map_bytes::<SourceId, usize>(addition_count)?,
+        )?;
+        scratch_bytes = checked_byte_add(
+            scratch_bytes,
+            checked_empty_hash_map_bytes::<Arc<SourceLocator>, SourceId>(addition_count)?,
+        )?;
+        scratch_bytes = checked_byte_add(
+            scratch_bytes,
+            checked_vec_exact_bytes::<PreparedPhysicalDomainChildIndex>(
+                addition_count,
+                "physical domain prepared child indexes",
+            )?,
+        )?;
+        budget.check_bytes(scratch_bytes)?;
+
+        let mut additions = Vec::new();
+        additions
+            .try_reserve_exact(addition_count)
+            .map_err(|error| CatalogError::AllocationFailed {
+                resource: "physical domain prepared additions",
+                requested: addition_count,
+                unit: CatalogAllocationUnit::Elements,
+                message: error.to_string(),
+            })?;
+        let mut sorted_parents = Vec::new();
+        sorted_parents
+            .try_reserve_exact(addition_count)
+            .map_err(|error| CatalogError::AllocationFailed {
+                resource: "physical domain addition parents",
+                requested: addition_count,
+                unit: CatalogAllocationUnit::Elements,
+                message: error.to_string(),
+            })?;
+        Ok(Self {
+            additions,
+            sorted_parents,
+            scratch_bytes,
+            retained_bytes: 0,
+        })
+    }
+
+    fn push(
+        &mut self,
+        addition: PreparedPhysicalDomainAddition,
+        retained_bytes: u64,
+    ) -> Result<(), CatalogError> {
+        self.retained_bytes = checked_byte_add(self.retained_bytes, retained_bytes)?;
+        self.sorted_parents.push(addition.parent);
+        self.additions.push(addition);
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        self.sorted_parents.sort_unstable();
+    }
+
+    fn parent_runs(&self) -> impl Iterator<Item = (SourceId, usize)> + '_ {
+        let mut offset = 0_usize;
+        std::iter::from_fn(move || {
+            let parent = *self.sorted_parents.get(offset)?;
+            let run =
+                self.sorted_parents[offset..].partition_point(|candidate| *candidate == parent);
+            offset += run;
+            Some((parent, run))
+        })
+    }
+}
+
 #[derive(Debug)]
 struct SourceRecord {
     descriptor: SourceDescriptor,
@@ -1265,6 +1484,13 @@ impl SourceCatalog {
     }
 
     pub(crate) fn revision(&self) -> Result<WorkspaceRevision, CatalogError> {
+        self.revision_with_fingerprint_lookup(|_| None)
+    }
+
+    pub(crate) fn revision_with_fingerprint_lookup(
+        &self,
+        mut fingerprint_override: impl FnMut(SourceId) -> Option<SourceFingerprint>,
+    ) -> Result<WorkspaceRevision, CatalogError> {
         const PREFIX: &[u8] = b"unity-asset:source-catalog:v5\0";
 
         let mut logical_length = checked_len(PREFIX.len())?;
@@ -1304,7 +1530,14 @@ impl SourceCatalog {
             digest.update(&source.local().to_le_bytes())?;
             digest.update_framed(source.kind().tag().as_bytes())?;
             digest.update_framed(&record.canonical_key)?;
-            digest.update(record.fingerprint.digest().as_bytes())?;
+            let fingerprint = fingerprint_override(*source).unwrap_or(record.fingerprint);
+            if fingerprint.kind() != record.descriptor.kind {
+                return Err(CatalogError::SourceKindMismatch {
+                    expected: record.descriptor.kind,
+                    actual: fingerprint.kind(),
+                });
+            }
+            digest.update(fingerprint.digest().as_bytes())?;
             let binding_domain = physical_binding_domain(record);
             digest.update(&[binding_domain.tag()])?;
             if binding_domain == PhysicalBindingDomain::Direct {
@@ -2170,6 +2403,569 @@ impl SourceCatalog {
         })
     }
 
+    pub(crate) fn physical_domain_sources(
+        &self,
+        owner: SourceId,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<PhysicalDomainSource>, CatalogError> {
+        let physical_owner = self.physical_domain_owner(owner)?;
+        if physical_owner != owner {
+            return Err(CatalogError::PhysicalDomainOwnerRequired {
+                source_id: owner,
+                physical_owner,
+            });
+        }
+
+        let source_count = self.by_id.keys().try_fold(0_usize, |count, source| {
+            if self.is_in_physical_binding_domain(*source, owner)? {
+                count
+                    .checked_add(1)
+                    .ok_or(CatalogError::AllocationSizeOverflow {
+                        resource: "physical domain sources",
+                    })
+            } else {
+                Ok(count)
+            }
+        })?;
+        let entry_count = checked_usize_to_u64(source_count)?;
+        let retained_bytes = checked_vec_exact_bytes::<PhysicalDomainSource>(
+            source_count,
+            "physical domain sources",
+        )?;
+        budget.check_entries(entry_count)?;
+        budget.check_bytes(retained_bytes)?;
+
+        let mut sources = Vec::new();
+        sources.try_reserve_exact(source_count).map_err(|error| {
+            CatalogError::AllocationFailed {
+                resource: "physical domain sources",
+                requested: source_count,
+                unit: CatalogAllocationUnit::Elements,
+                message: error.to_string(),
+            }
+        })?;
+        budget.consume_entries(entry_count)?;
+        budget.consume_bytes(retained_bytes)?;
+        for (source, record) in &self.by_id {
+            if self.is_in_physical_binding_domain(*source, owner)? {
+                sources.push(PhysicalDomainSource::new(*source, record.fingerprint));
+            }
+        }
+        Ok(sources)
+    }
+
+    fn rewrite_physical_domain(
+        &mut self,
+        rewrite: PhysicalDomainRewrite<'_>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<SourceId>, CatalogError> {
+        let prepared = self.prepare_physical_domain_rewrite(rewrite, budget)?;
+        let additions = rewrite.additions();
+        let addition_plan = prepared.additions;
+
+        let mut added = Vec::new();
+        added.try_reserve_exact(additions.len()).map_err(|error| {
+            CatalogError::AllocationFailed {
+                resource: "physical domain rewrite additions",
+                requested: additions.len(),
+                unit: CatalogAllocationUnit::Elements,
+                message: error.to_string(),
+            }
+        })?;
+
+        let new_child_indexes = self.reserve_physical_domain_additions(&addition_plan)?;
+        budget.consume_entries(prepared.addition_count)?;
+        budget.consume_bytes(prepared.planned_bytes)?;
+
+        for change in prepared.changes {
+            self.by_id.insert(change.source, change.record);
+        }
+
+        for child_index in new_child_indexes {
+            self.children_by_parent
+                .insert(child_index.parent, child_index.children);
+        }
+        for addition in addition_plan.additions {
+            let source = addition.source;
+            let record = addition.record;
+            self.by_key
+                .insert(Arc::clone(&record.canonical_key), source);
+            self.by_locator
+                .insert(Arc::clone(&record.source_locator), source);
+            self.children_by_parent
+                .entry(addition.parent)
+                .or_default()
+                .insert(addition.step, source);
+            self.by_id.insert(source, record);
+            added.push(source);
+        }
+        Ok(added)
+    }
+
+    fn prepare_physical_domain_rewrite(
+        &self,
+        rewrite: PhysicalDomainRewrite<'_>,
+        budget: &AssetLoadBudget,
+    ) -> Result<PreparedPhysicalDomainRewrite, CatalogError> {
+        self.validate_physical_domain_observation_and_changes(rewrite)?;
+        let additions = rewrite.additions();
+        let addition_count = checked_usize_to_u64(additions.len())?;
+        budget.check_entries(addition_count)?;
+        let addition_plan =
+            self.prepare_physical_domain_additions(rewrite.owner(), additions, budget)?;
+
+        let addition_bytes =
+            checked_byte_add(addition_plan.scratch_bytes, addition_plan.retained_bytes)?;
+        let change_scratch_bytes = checked_vec_exact_bytes::<PreparedPhysicalDomainChange>(
+            rewrite.changed().len(),
+            "physical domain prepared changes",
+        )?;
+        budget.check_bytes(checked_byte_add(addition_bytes, change_scratch_bytes)?)?;
+        let mut changes = Vec::new();
+        changes
+            .try_reserve_exact(rewrite.changed().len())
+            .map_err(|error| CatalogError::AllocationFailed {
+                resource: "physical domain prepared changes",
+                requested: rewrite.changed().len(),
+                unit: CatalogAllocationUnit::Elements,
+                message: error.to_string(),
+            })?;
+        let mut changed_record_bytes = 0_u64;
+        for change in rewrite.changed() {
+            let source = change.source();
+            let record = self
+                .by_id
+                .get(&source)
+                .ok_or(CatalogError::UnknownSource(source))?;
+            if record.fingerprint != change.fingerprint() {
+                let record_bytes = checked_record_clone_bytes(&record.descriptor)?;
+                budget.check_bytes(checked_byte_add(
+                    addition_bytes,
+                    checked_byte_add(
+                        change_scratch_bytes,
+                        checked_byte_add(changed_record_bytes, record_bytes)?,
+                    )?,
+                )?)?;
+                changed_record_bytes = checked_byte_add(changed_record_bytes, record_bytes)?;
+                changes.push(PreparedPhysicalDomainChange {
+                    source,
+                    record: Arc::new(SourceRecord {
+                        descriptor: record.descriptor.clone(),
+                        fingerprint: change.fingerprint(),
+                        source_locator: Arc::clone(&record.source_locator),
+                        physical_origin: record.physical_origin.clone(),
+                        canonical_key: Arc::clone(&record.canonical_key),
+                    }),
+                });
+            }
+        }
+        let result_bytes = checked_vec_exact_bytes::<SourceId>(
+            additions.len(),
+            "physical domain rewrite additions",
+        )?;
+        let planned_bytes = checked_byte_add(
+            addition_bytes,
+            checked_byte_add(
+                checked_byte_add(change_scratch_bytes, changed_record_bytes)?,
+                result_bytes,
+            )?,
+        )?;
+        budget.check_bytes(planned_bytes)?;
+        Ok(PreparedPhysicalDomainRewrite {
+            changes,
+            additions: addition_plan,
+            planned_bytes,
+            addition_count,
+        })
+    }
+
+    #[cfg(test)]
+    fn checked_physical_domain_rewrite_bytes(
+        &self,
+        rewrite: PhysicalDomainRewrite<'_>,
+    ) -> Result<u64, CatalogError> {
+        let budget = AssetLoadBudget::default();
+        Ok(self
+            .prepare_physical_domain_rewrite(rewrite, &budget)?
+            .planned_bytes)
+    }
+
+    fn validate_physical_domain_observation_and_changes(
+        &self,
+        rewrite: PhysicalDomainRewrite<'_>,
+    ) -> Result<(), CatalogError> {
+        let owner = rewrite.owner();
+        let observed_sources = rewrite.observed();
+        let changed = rewrite.changed();
+        let physical_owner = self.physical_domain_owner(owner)?;
+        if physical_owner != owner {
+            return Err(CatalogError::PhysicalDomainOwnerRequired {
+                source_id: owner,
+                physical_owner,
+            });
+        }
+        ensure_physical_domain_sources_ordered(observed_sources, "observed")?;
+        ensure_physical_domain_sources_ordered(changed, "changed")?;
+
+        let mut observed = observed_sources.iter();
+        let mut next_observed = observed.next();
+        for (source, record) in &self.by_id {
+            if !self.is_in_physical_binding_domain(*source, owner)? {
+                continue;
+            }
+            let Some(candidate) = next_observed else {
+                return Err(CatalogError::PhysicalDomainObservationMissing {
+                    owner,
+                    source_id: *source,
+                });
+            };
+            if candidate.source() < *source {
+                return Err(CatalogError::PhysicalDomainObservationUnexpected {
+                    owner,
+                    source_id: candidate.source(),
+                });
+            }
+            if candidate.source() > *source {
+                return Err(CatalogError::PhysicalDomainObservationMissing {
+                    owner,
+                    source_id: *source,
+                });
+            }
+            if candidate.fingerprint() != record.fingerprint {
+                return Err(CatalogError::PhysicalDomainFingerprintMismatch {
+                    source_id: *source,
+                    expected: candidate.fingerprint(),
+                    actual: record.fingerprint,
+                });
+            }
+            next_observed = observed.next();
+        }
+        if let Some(candidate) = next_observed {
+            return Err(CatalogError::PhysicalDomainObservationUnexpected {
+                owner,
+                source_id: candidate.source(),
+            });
+        }
+
+        for change in changed {
+            let source = change.source();
+            let fingerprint = change.fingerprint();
+            let physical_owner = self.physical_domain_owner(source)?;
+            if physical_owner != owner {
+                return Err(CatalogError::PhysicalDomainChangeOutsideDomain {
+                    source_id: source,
+                    physical_owner,
+                });
+            }
+            let record = self
+                .by_id
+                .get(&source)
+                .ok_or(CatalogError::UnknownSource(source))?;
+            if fingerprint.kind() != record.descriptor.kind {
+                return Err(CatalogError::SourceKindMismatch {
+                    expected: record.descriptor.kind,
+                    actual: fingerprint.kind(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn prepare_physical_domain_additions(
+        &self,
+        owner: SourceId,
+        additions: &[PhysicalDomainAddition],
+        budget: &AssetLoadBudget,
+    ) -> Result<PhysicalDomainAdditionPlan, CatalogError> {
+        for addition in additions {
+            let descriptor = addition.descriptor();
+            if addition.fingerprint().kind() != descriptor.kind() {
+                return Err(CatalogError::SourceKindMismatch {
+                    expected: descriptor.kind(),
+                    actual: addition.fingerprint().kind(),
+                });
+            }
+            let SourcePlacement::Member { parent, .. } = &descriptor.placement else {
+                return Err(CatalogError::PhysicalDomainAdditionRequiresMember {
+                    location: descriptor.location_kind(),
+                });
+            };
+            self.ensure_workspace(*parent)?;
+        }
+
+        let mut plan = PhysicalDomainAdditionPlan::new(additions.len(), budget)?;
+        let mut planned_by_id: HashMap<SourceId, usize> = HashMap::new();
+        planned_by_id
+            .try_reserve(additions.len())
+            .map_err(|error| CatalogError::AllocationFailed {
+                resource: "physical domain planned source index",
+                requested: additions.len(),
+                unit: CatalogAllocationUnit::Slots,
+                message: error.to_string(),
+            })?;
+        let mut planned_by_locator: HashMap<Arc<SourceLocator>, SourceId> = HashMap::new();
+        planned_by_locator
+            .try_reserve(additions.len())
+            .map_err(|error| CatalogError::AllocationFailed {
+                resource: "physical domain planned locator index",
+                requested: additions.len(),
+                unit: CatalogAllocationUnit::Slots,
+                message: error.to_string(),
+            })?;
+
+        for addition in additions {
+            let descriptor = addition.descriptor();
+            let fingerprint = addition.fingerprint();
+            if fingerprint.kind() != descriptor.kind() {
+                return Err(CatalogError::SourceKindMismatch {
+                    expected: descriptor.kind(),
+                    actual: fingerprint.kind(),
+                });
+            }
+            let SourcePlacement::Member { parent, step, .. } = &descriptor.placement else {
+                return Err(CatalogError::PhysicalDomainAdditionRequiresMember {
+                    location: descriptor.location_kind(),
+                });
+            };
+            self.ensure_workspace(*parent)?;
+            let planned_parent = planned_by_id.get(parent).copied();
+            let parent_record = if let Some(index) = planned_parent {
+                &plan.additions[index].record
+            } else {
+                self.by_id
+                    .get(parent)
+                    .ok_or(CatalogError::PhysicalDomainAdditionParentNotReady { parent: *parent })?
+            };
+            let physical_owner = if planned_parent.is_some() {
+                owner
+            } else {
+                self.physical_domain_owner(*parent)?
+            };
+            if physical_owner != owner {
+                return Err(CatalogError::PhysicalDomainAdditionOutsideDomain {
+                    parent: *parent,
+                    physical_owner,
+                });
+            }
+            if !valid_member_placement(
+                parent_record.descriptor.kind,
+                descriptor.kind,
+                step,
+                descriptor.location_kind(),
+            ) {
+                return Err(CatalogError::PhysicalDomainAdditionInvalidPlacement {
+                    parent: *parent,
+                    parent_kind: parent_record.descriptor.kind,
+                    child_kind: descriptor.kind,
+                    location: descriptor.location_kind(),
+                });
+            }
+            if let Some(existing) = self
+                .children_by_parent
+                .get(parent)
+                .and_then(|children| children.get(step))
+                .copied()
+            {
+                return Err(CatalogError::PhysicalDomainAdditionAlreadyExists {
+                    source_id: existing,
+                });
+            }
+
+            let retained_bytes =
+                checked_physical_domain_addition_intrinsic_bytes(parent_record, descriptor)?;
+            budget.check_bytes(checked_byte_add(
+                plan.scratch_bytes,
+                checked_byte_add(plan.retained_bytes, retained_bytes)?,
+            )?)?;
+
+            let source_locator = parent_record
+                .source_locator
+                .as_ref()
+                .clone()
+                .child(step.container(), step.member().clone())
+                .map_err(CatalogError::InvalidIdentity)?;
+            let key = canonical_source_key(descriptor.kind, &source_locator)?;
+            let source = SourceId::new(
+                self.workspace,
+                descriptor.kind,
+                deterministic_local_id(&key),
+            )
+            .map_err(CatalogError::InvalidIdentity)?;
+            if let Some(existing) = self.by_id.get(&source) {
+                return Err(CatalogError::IdentityCollision {
+                    source_id: source,
+                    existing_kind: existing.descriptor.kind,
+                });
+            }
+            if let Some(existing) = planned_by_id.get(&source) {
+                let existing_record = &plan.additions[*existing].record;
+                if existing_record.source_locator.as_ref() == &source_locator {
+                    return Err(CatalogError::PhysicalDomainAdditionAlreadyExists {
+                        source_id: source,
+                    });
+                }
+                return Err(CatalogError::IdentityCollision {
+                    source_id: source,
+                    existing_kind: existing_record.descriptor.kind,
+                });
+            }
+            if let Some(existing) = self.by_locator.get(&source_locator) {
+                return Err(CatalogError::LocatorCollision {
+                    existing: *existing,
+                    incoming: source,
+                });
+            }
+
+            let source_locator = Arc::new(source_locator);
+            if let Some(existing) = planned_by_locator.get(&source_locator) {
+                return Err(CatalogError::PhysicalDomainAdditionAlreadyExists {
+                    source_id: *existing,
+                });
+            }
+            let key = Arc::new(key);
+            let record = Arc::new(SourceRecord {
+                descriptor: descriptor.clone(),
+                fingerprint,
+                source_locator: Arc::clone(&source_locator),
+                physical_origin: parent_record.physical_origin.clone(),
+                canonical_key: key,
+            });
+            let index = plan.additions.len();
+            plan.push(
+                PreparedPhysicalDomainAddition {
+                    source,
+                    record,
+                    parent: *parent,
+                    step: Arc::new(step.clone()),
+                },
+                retained_bytes,
+            )?;
+            planned_by_id.insert(source, index);
+            planned_by_locator.insert(source_locator, source);
+        }
+        plan.finish();
+
+        plan.retained_bytes = checked_byte_add(
+            plan.retained_bytes,
+            checked_hash_map_growth_bytes(
+                &self.by_key,
+                additions.len(),
+                "source catalog key index",
+            )?,
+        )?;
+        plan.retained_bytes = checked_byte_add(
+            plan.retained_bytes,
+            checked_hash_map_growth_bytes(
+                &self.by_locator,
+                additions.len(),
+                "source catalog locator index",
+            )?,
+        )?;
+        let mut new_child_index_count = 0_usize;
+        let mut child_index_bytes = 0_u64;
+        for (parent, child_count) in plan.parent_runs() {
+            if let Some(children) = self.children_by_parent.get(&parent) {
+                child_index_bytes = checked_byte_add(
+                    child_index_bytes,
+                    checked_hash_map_growth_bytes(
+                        children,
+                        child_count,
+                        "source catalog child-step index",
+                    )?,
+                )?;
+            } else {
+                new_child_index_count = new_child_index_count.checked_add(1).ok_or(
+                    CatalogError::AllocationSizeOverflow {
+                        resource: "source catalog child index",
+                    },
+                )?;
+                child_index_bytes = checked_byte_add(
+                    child_index_bytes,
+                    checked_empty_hash_map_bytes::<Arc<ContainmentStep>, SourceId>(child_count)?,
+                )?;
+            }
+        }
+        plan.retained_bytes = checked_byte_add(plan.retained_bytes, child_index_bytes)?;
+        plan.retained_bytes = checked_byte_add(
+            plan.retained_bytes,
+            checked_hash_map_growth_bytes(
+                &self.children_by_parent,
+                new_child_index_count,
+                "source catalog child index",
+            )?,
+        )?;
+        Ok(plan)
+    }
+
+    fn reserve_physical_domain_additions(
+        &mut self,
+        plan: &PhysicalDomainAdditionPlan,
+    ) -> Result<Vec<PreparedPhysicalDomainChildIndex>, CatalogError> {
+        let mut new_child_indexes = Vec::new();
+        new_child_indexes
+            .try_reserve_exact(plan.additions.len())
+            .map_err(|error| CatalogError::AllocationFailed {
+                resource: "physical domain prepared child indexes",
+                requested: plan.additions.len(),
+                unit: CatalogAllocationUnit::Elements,
+                message: error.to_string(),
+            })?;
+        for (parent, child_count) in plan.parent_runs() {
+            if self.children_by_parent.contains_key(&parent) {
+                continue;
+            }
+            let mut children = HashMap::new();
+            children
+                .try_reserve(child_count)
+                .map_err(|error| CatalogError::AllocationFailed {
+                    resource: "source catalog child-step index",
+                    requested: child_count,
+                    unit: CatalogAllocationUnit::Slots,
+                    message: error.to_string(),
+                })?;
+            new_child_indexes.push(PreparedPhysicalDomainChildIndex { parent, children });
+        }
+
+        self.by_key
+            .try_reserve(plan.additions.len())
+            .map_err(|error| CatalogError::AllocationFailed {
+                resource: "source catalog key index",
+                requested: plan.additions.len(),
+                unit: CatalogAllocationUnit::Slots,
+                message: error.to_string(),
+            })?;
+        self.by_locator
+            .try_reserve(plan.additions.len())
+            .map_err(|error| CatalogError::AllocationFailed {
+                resource: "source catalog locator index",
+                requested: plan.additions.len(),
+                unit: CatalogAllocationUnit::Slots,
+                message: error.to_string(),
+            })?;
+        self.children_by_parent
+            .try_reserve(new_child_indexes.len())
+            .map_err(|error| CatalogError::AllocationFailed {
+                resource: "source catalog child index",
+                requested: new_child_indexes.len(),
+                unit: CatalogAllocationUnit::Slots,
+                message: error.to_string(),
+            })?;
+        for (parent, child_count) in plan.parent_runs() {
+            if let Some(children) = self.children_by_parent.get_mut(&parent) {
+                children.try_reserve(child_count).map_err(|error| {
+                    CatalogError::AllocationFailed {
+                        resource: "source catalog child-step index",
+                        requested: child_count,
+                        unit: CatalogAllocationUnit::Slots,
+                        message: error.to_string(),
+                    }
+                })?;
+            }
+        }
+        Ok(new_child_indexes)
+    }
+
     fn ensure_fingerprint_replacement_allowed(
         &self,
         source: SourceId,
@@ -2196,7 +2992,8 @@ impl SourceCatalog {
         Ok(())
     }
 
-    fn physical_domain_owner(&self, source: SourceId) -> Result<SourceId, CatalogError> {
+    pub(crate) fn physical_domain_owner(&self, source: SourceId) -> Result<SourceId, CatalogError> {
+        self.ensure_workspace(source)?;
         let mut current = source;
         for _ in 0..=self.by_id.len() {
             let record = self
@@ -2302,6 +3099,37 @@ impl SourceCatalogTransaction {
                 });
                 Ok(())
             }
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn rewrite_physical_domain(
+        &mut self,
+        rewrite: PhysicalDomainRewrite<'_>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<SourceId>, CatalogError> {
+        self.ensure_active()?;
+        if let Some((verification, replacement)) =
+            self.pending_verifications.iter().find_map(|verification| {
+                rewrite.changed().iter().find_map(|change| {
+                    (change.source() == verification.source
+                        && change.fingerprint() != verification.fingerprint)
+                        .then_some((verification, change.fingerprint()))
+                })
+            })
+        {
+            self.failed = true;
+            return Err(CatalogError::PendingPhysicalVerificationSuperseded {
+                source_id: verification.source,
+                verified: verification.fingerprint,
+                replacement,
+            });
+        }
+        match self.candidate.rewrite_physical_domain(rewrite, budget) {
+            Ok(added) => Ok(added),
             Err(error) => {
                 self.failed = true;
                 Err(error)
@@ -2573,6 +3401,74 @@ pub(crate) enum CatalogError {
         source_id: SourceId,
         physical_owner: SourceId,
     },
+    #[error(
+        "source {source_id:?} belongs to physical domain {physical_owner:?} and cannot own this rewrite"
+    )]
+    PhysicalDomainOwnerRequired {
+        source_id: SourceId,
+        physical_owner: SourceId,
+    },
+    #[error(
+        "physical domain {collection} sources must be strictly ordered: {previous:?} precedes {current:?}"
+    )]
+    PhysicalDomainSourcesNotStrictlyOrdered {
+        collection: &'static str,
+        previous: SourceId,
+        current: SourceId,
+    },
+    #[error("physical domain {owner:?} observation is missing source {source_id:?}")]
+    PhysicalDomainObservationMissing {
+        owner: SourceId,
+        source_id: SourceId,
+    },
+    #[error("physical domain {owner:?} observation contains unexpected source {source_id:?}")]
+    PhysicalDomainObservationUnexpected {
+        owner: SourceId,
+        source_id: SourceId,
+    },
+    #[error(
+        "physical domain source {source_id:?} fingerprint mismatch: expected {expected:?}, got {actual:?}"
+    )]
+    PhysicalDomainFingerprintMismatch {
+        source_id: SourceId,
+        expected: SourceFingerprint,
+        actual: SourceFingerprint,
+    },
+    #[error("source {source_id:?} belongs to a different physical domain {physical_owner:?}")]
+    PhysicalDomainChangeOutsideDomain {
+        source_id: SourceId,
+        physical_owner: SourceId,
+    },
+    #[error("physical-domain additions must be inherited members, got {location:?}")]
+    PhysicalDomainAdditionRequiresMember { location: SourceLocationKind },
+    #[error("addition parent {parent:?} belongs to a different physical domain {physical_owner:?}")]
+    PhysicalDomainAdditionOutsideDomain {
+        parent: SourceId,
+        physical_owner: SourceId,
+    },
+    #[error("physical-domain addition already exists as source {source_id:?}")]
+    PhysicalDomainAdditionAlreadyExists { source_id: SourceId },
+    #[error(
+        "physical-domain addition parent {parent:?} must exist or precede its children in the batch"
+    )]
+    PhysicalDomainAdditionParentNotReady { parent: SourceId },
+    #[error(
+        "physical-domain addition under {parent:?} ({parent_kind:?}) cannot place {child_kind:?} at {location:?}"
+    )]
+    PhysicalDomainAdditionInvalidPlacement {
+        parent: SourceId,
+        parent_kind: SourceKind,
+        child_kind: SourceKind,
+        location: SourceLocationKind,
+    },
+    #[error(
+        "source {source_id:?} has a pending proof for {verified:?} that cannot be superseded by {replacement:?}"
+    )]
+    PendingPhysicalVerificationSuperseded {
+        source_id: SourceId,
+        verified: SourceFingerprint,
+        replacement: SourceFingerprint,
+    },
     #[error("source {source_id:?} at {location:?} cannot own an independent physical origin")]
     PhysicalOriginBindingUnsupported {
         source_id: SourceId,
@@ -2671,6 +3567,53 @@ impl CatalogError {
     }
 }
 
+fn checked_physical_domain_addition_intrinsic_bytes(
+    parent: &SourceRecord,
+    descriptor: &SourceDescriptor,
+) -> Result<u64, CatalogError> {
+    let SourcePlacement::Member { step, .. } = &descriptor.placement else {
+        return Err(CatalogError::PhysicalDomainAdditionRequiresMember {
+            location: descriptor.location_kind(),
+        });
+    };
+    let locator_clone_bytes = parent.source_locator.retained_clone_bytes().ok_or(
+        CatalogError::AllocationSizeOverflow {
+            resource: "physical domain source locator",
+        },
+    )?;
+    let mut bytes = checked_usize_to_u64(locator_clone_bytes)?;
+    bytes = checked_byte_add(
+        bytes,
+        checked_usize_to_u64(step.member().retained_clone_bytes())?,
+    )?;
+    bytes = checked_byte_add(
+        bytes,
+        checked_vec_growth_bytes::<ContainmentStep>(parent.source_locator.members().len(), 1)?,
+    )?;
+    bytes = checked_byte_add(
+        bytes,
+        checked_usize_to_u64(canonical_source_key_len_parts(
+            descriptor.kind,
+            parent.source_locator.root_alias(),
+            parent.source_locator.members(),
+            Some(step),
+        )?)?,
+    )?;
+    bytes = checked_byte_add(bytes, checked_descriptor_clone_bytes(descriptor)?)?;
+    bytes = checked_byte_add(bytes, checked_arc_allocation_bytes::<SourceLocator>()?)?;
+    bytes = checked_byte_add(bytes, checked_arc_allocation_bytes::<Vec<u8>>()?)?;
+    bytes = checked_byte_add(bytes, checked_arc_allocation_bytes::<SourceRecord>()?)?;
+    bytes = checked_byte_add(
+        bytes,
+        checked_btree_entry_bytes::<SourceId, Arc<SourceRecord>>()?,
+    )?;
+    bytes = checked_byte_add(bytes, checked_arc_allocation_bytes::<ContainmentStep>()?)?;
+    checked_byte_add(
+        bytes,
+        checked_usize_to_u64(step.member().retained_clone_bytes())?,
+    )
+}
+
 fn checked_record_clone_bytes(descriptor: &SourceDescriptor) -> Result<u64, CatalogError> {
     checked_byte_add(
         checked_arc_allocation_bytes::<SourceRecord>()?,
@@ -2748,6 +3691,22 @@ fn checked_vec_exact_bytes<T>(count: usize, resource: &'static str) -> Result<u6
         .checked_mul(size_of::<T>())
         .ok_or(CatalogError::AllocationSizeOverflow { resource })
         .and_then(checked_usize_to_u64)
+}
+
+fn ensure_physical_domain_sources_ordered(
+    sources: &[PhysicalDomainSource],
+    collection: &'static str,
+) -> Result<(), CatalogError> {
+    for pair in sources.windows(2) {
+        if pair[0].source() >= pair[1].source() {
+            return Err(CatalogError::PhysicalDomainSourcesNotStrictlyOrdered {
+                collection,
+                previous: pair[0].source(),
+                current: pair[1].source(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn ensure_regular_member_kind(kind: SourceKind) -> Result<(), CatalogError> {
@@ -3091,6 +4050,694 @@ mod tests {
         AssetLoadBudget::new(limits).unwrap()
     }
 
+    fn physical_domain_fixture() -> (SourceCatalog, SourceId, SourceId, SourceId, SourceId) {
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let mut catalog = SourceCatalog::new(workspace);
+        let root = catalog
+            .register(
+                root_descriptor(SourceKind::Archive, "game.apk", b"archive"),
+                fingerprint(SourceKind::Archive, b"archive"),
+            )
+            .unwrap();
+        let webfile = catalog
+            .register(
+                SourceDescriptor::archive_member(
+                    root,
+                    SourceKind::WebFile,
+                    SourceMemberId::new("data.web").unwrap(),
+                )
+                .unwrap(),
+                fingerprint(SourceKind::WebFile, b"webfile"),
+            )
+            .unwrap();
+        let serialized_file = catalog
+            .register(
+                SourceDescriptor::webfile_member(
+                    webfile,
+                    SourceKind::SerializedFile,
+                    SourceMemberId::new("main.assets").unwrap(),
+                )
+                .unwrap(),
+                fingerprint(SourceKind::SerializedFile, b"asset"),
+            )
+            .unwrap();
+        let companion = catalog
+            .register(
+                SourceDescriptor::companion(
+                    serialized_file,
+                    SourceMemberId::new("main.resS").unwrap(),
+                )
+                .unwrap(),
+                fingerprint(SourceKind::StreamedResource, b"companion"),
+            )
+            .unwrap();
+        (catalog, root, webfile, serialized_file, companion)
+    }
+
+    fn predicted_source(catalog: &SourceCatalog, descriptor: &SourceDescriptor) -> SourceId {
+        let (locator, _) = catalog.resolve_placement(descriptor).unwrap();
+        let key = canonical_source_key(descriptor.kind(), &locator).unwrap();
+        SourceId::new(
+            catalog.workspace(),
+            descriptor.kind(),
+            deterministic_local_id(&key),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn physical_domain_enumeration_is_complete_budgeted_and_excludes_companions() {
+        let (catalog, root, webfile, serialized_file, companion) = physical_domain_fixture();
+        let exact_bytes =
+            checked_vec_exact_bytes::<PhysicalDomainSource>(3, "physical domain sources").unwrap();
+        let mut exact_budget = budget_with(exact_bytes, 3);
+        let sources = catalog
+            .physical_domain_sources(root, &mut exact_budget)
+            .unwrap();
+
+        let mut expected = vec![root, webfile, serialized_file];
+        expected.sort_unstable();
+        assert_eq!(
+            sources
+                .iter()
+                .map(PhysicalDomainSource::source)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for source in &sources {
+            assert_eq!(
+                source.fingerprint(),
+                catalog.fingerprint(source.source()).unwrap()
+            );
+        }
+        assert!(!sources.iter().any(|source| source.source() == companion));
+        assert_eq!(catalog.physical_domain_owner(companion).unwrap(), companion);
+        assert_eq!(exact_budget.usage().entries, 3);
+        assert_eq!(exact_budget.usage().bytes, exact_bytes);
+
+        let mut tiny_budget = budget_with(exact_bytes - 1, 3);
+        assert!(matches!(
+            catalog.physical_domain_sources(root, &mut tiny_budget),
+            Err(CatalogError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+        assert_eq!(tiny_budget.usage().entries, 0);
+        assert_eq!(tiny_budget.usage().bytes, 0);
+
+        let mut owner_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            catalog.physical_domain_sources(webfile, &mut owner_budget),
+            Err(CatalogError::PhysicalDomainOwnerRequired {
+                source_id,
+                physical_owner,
+            }) if source_id == webfile && physical_owner == root
+        ));
+        assert_eq!(owner_budget.usage().entries, 0);
+        assert_eq!(owner_budget.usage().bytes, 0);
+    }
+
+    #[test]
+    fn physical_domain_rewrite_applies_sparse_changes_and_additions_atomically() {
+        let (catalog, root, webfile, serialized_file, companion) = physical_domain_fixture();
+        let companion_fingerprint = catalog.fingerprint(companion).unwrap();
+        let webfile_fingerprint = catalog.fingerprint(webfile).unwrap();
+        let original_revision = catalog.revision().unwrap();
+        let mut observation_budget = AssetLoadBudget::default();
+        let observed = catalog
+            .physical_domain_sources(root, &mut observation_budget)
+            .unwrap();
+        let mut changed = vec![
+            PhysicalDomainSource::new(root, fingerprint(SourceKind::Archive, b"changed archive")),
+            PhysicalDomainSource::new(
+                serialized_file,
+                fingerprint(SourceKind::SerializedFile, b"changed asset"),
+            ),
+        ];
+        changed.sort_unstable_by_key(PhysicalDomainSource::source);
+        let addition = PhysicalDomainAddition::new(
+            SourceDescriptor::sidecar(root, SourceMemberId::new("shared.resS").unwrap()).unwrap(),
+            fingerprint(SourceKind::StreamedResource, b"shared resource"),
+        );
+        let additions = [addition];
+
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let rewrite = PhysicalDomainRewrite::new(root, &observed, &changed, &additions);
+        let exact_bytes = transaction
+            .candidate
+            .checked_physical_domain_rewrite_bytes(rewrite)
+            .unwrap();
+        let mut operation_budget = budget_with(exact_bytes, 1);
+        let added = transaction
+            .rewrite_physical_domain(rewrite, &mut operation_budget)
+            .unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(operation_budget.usage().entries, 1);
+        assert_eq!(operation_budget.usage().bytes, exact_bytes);
+        let candidate = transaction.commit(&mut operation_budget).unwrap();
+        let added_source = added[0];
+
+        assert_eq!(
+            candidate.fingerprint(root).unwrap(),
+            fingerprint(SourceKind::Archive, b"changed archive")
+        );
+        assert_eq!(candidate.fingerprint(webfile).unwrap(), webfile_fingerprint);
+        assert_eq!(
+            candidate.fingerprint(serialized_file).unwrap(),
+            fingerprint(SourceKind::SerializedFile, b"changed asset")
+        );
+        assert_eq!(
+            candidate.fingerprint(added_source).unwrap(),
+            additions[0].fingerprint()
+        );
+        assert_eq!(candidate.physical_domain_owner(added_source).unwrap(), root);
+        assert_eq!(
+            candidate.physical_domain_owner(companion).unwrap(),
+            companion
+        );
+        assert_eq!(
+            candidate.fingerprint(companion).unwrap(),
+            companion_fingerprint
+        );
+        assert!(candidate.contains(companion));
+        assert_ne!(candidate.revision().unwrap(), original_revision);
+        assert_eq!(catalog.revision().unwrap(), original_revision);
+        candidate.validate().unwrap();
+    }
+
+    #[test]
+    fn physical_domain_rewrite_adds_new_containers_before_their_children_atomically() {
+        let (catalog, root, _, _, _) = physical_domain_fixture();
+        let mut observation_budget = AssetLoadBudget::default();
+        let observed = catalog
+            .physical_domain_sources(root, &mut observation_budget)
+            .unwrap();
+        let container_descriptor = SourceDescriptor::archive_member(
+            root,
+            SourceKind::AssetBundle,
+            SourceMemberId::new("nested.bundle").unwrap(),
+        )
+        .unwrap();
+        let container = predicted_source(&catalog, &container_descriptor);
+        let child_descriptor = SourceDescriptor::bundle_member(
+            container,
+            SourceKind::SerializedFile,
+            SourceMemberId::new("nested.assets").unwrap(),
+        )
+        .unwrap();
+        let additions = [
+            PhysicalDomainAddition::new(
+                container_descriptor,
+                fingerprint(SourceKind::AssetBundle, b"nested bundle"),
+            ),
+            PhysicalDomainAddition::new(
+                child_descriptor,
+                fingerprint(SourceKind::SerializedFile, b"nested assets"),
+            ),
+        ];
+        let rewrite = PhysicalDomainRewrite::new(root, &observed, &[], &additions);
+
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut rejected = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let planned = rejected
+            .candidate
+            .checked_physical_domain_rewrite_bytes(rewrite)
+            .unwrap();
+        let rejected_revision = rejected.candidate.revision().unwrap();
+        let mut one_short = budget_with(planned - 1, 2);
+        assert!(matches!(
+            rejected.rewrite_physical_domain(rewrite, &mut one_short),
+            Err(CatalogError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+        assert_eq!(one_short.usage(), Default::default());
+        assert_eq!(rejected.candidate.revision().unwrap(), rejected_revision);
+        assert!(matches!(
+            rejected.commit(&mut one_short),
+            Err(CatalogError::TransactionAborted)
+        ));
+
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let mut exact = budget_with(planned, 2);
+        let added = transaction
+            .rewrite_physical_domain(rewrite, &mut exact)
+            .unwrap();
+        assert_eq!(exact.usage().entries, 2);
+        assert_eq!(exact.usage().bytes, planned);
+        assert_eq!(added[0], container);
+        let child = added[1];
+        let candidate = transaction.commit(&mut exact).unwrap();
+        assert_eq!(candidate.parent(container).unwrap(), Some(root));
+        assert_eq!(candidate.parent(child).unwrap(), Some(container));
+        assert_eq!(candidate.physical_domain_owner(child).unwrap(), root);
+        candidate.validate().unwrap();
+    }
+
+    #[test]
+    fn physical_domain_rewrite_rejects_child_before_parent_and_wrong_kind_without_charging() {
+        let (catalog, root, _, _, _) = physical_domain_fixture();
+        let mut observation_budget = AssetLoadBudget::default();
+        let observed = catalog
+            .physical_domain_sources(root, &mut observation_budget)
+            .unwrap();
+        let container_descriptor = SourceDescriptor::archive_member(
+            root,
+            SourceKind::AssetBundle,
+            SourceMemberId::new("nested.bundle").unwrap(),
+        )
+        .unwrap();
+        let container = predicted_source(&catalog, &container_descriptor);
+        let child_descriptor = SourceDescriptor::bundle_member(
+            container,
+            SourceKind::SerializedFile,
+            SourceMemberId::new("nested.assets").unwrap(),
+        )
+        .unwrap();
+        let reversed = [
+            PhysicalDomainAddition::new(
+                child_descriptor,
+                fingerprint(SourceKind::SerializedFile, b"nested assets"),
+            ),
+            PhysicalDomainAddition::new(
+                container_descriptor,
+                fingerprint(SourceKind::AssetBundle, b"nested bundle"),
+            ),
+        ];
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut reversed_transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let reversed_revision = reversed_transaction.candidate.revision().unwrap();
+        let mut reversed_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            reversed_transaction.rewrite_physical_domain(
+                PhysicalDomainRewrite::new(root, &observed, &[], &reversed),
+                &mut reversed_budget,
+            ),
+            Err(CatalogError::PhysicalDomainAdditionParentNotReady { parent })
+                if parent == container
+        ));
+        assert_eq!(reversed_budget.usage(), Default::default());
+        assert_eq!(
+            reversed_transaction.candidate.revision().unwrap(),
+            reversed_revision
+        );
+
+        let wrong_kind = [PhysicalDomainAddition::new(
+            SourceDescriptor::sidecar(root, SourceMemberId::new("wrong.resS").unwrap()).unwrap(),
+            fingerprint(SourceKind::Yaml, b"wrong kind"),
+        )];
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut wrong_kind_transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let wrong_kind_revision = wrong_kind_transaction.candidate.revision().unwrap();
+        let mut wrong_kind_budget = budget_with(1, 1);
+        assert!(matches!(
+            wrong_kind_transaction.rewrite_physical_domain(
+                PhysicalDomainRewrite::new(root, &observed, &[], &wrong_kind),
+                &mut wrong_kind_budget,
+            ),
+            Err(CatalogError::SourceKindMismatch {
+                expected: SourceKind::StreamedResource,
+                actual: SourceKind::Yaml,
+            })
+        ));
+        assert_eq!(wrong_kind_budget.usage(), Default::default());
+        assert_eq!(
+            wrong_kind_transaction.candidate.revision().unwrap(),
+            wrong_kind_revision
+        );
+    }
+
+    #[test]
+    fn revision_fingerprint_lookup_matches_an_equivalent_domain_rewrite() {
+        let (catalog, root, webfile, serialized_file, _) = physical_domain_fixture();
+        assert_eq!(
+            catalog.revision().unwrap(),
+            catalog.revision_with_fingerprint_lookup(|_| None).unwrap()
+        );
+        assert_eq!(
+            catalog.revision().unwrap(),
+            catalog
+                .revision_with_fingerprint_lookup(|source| {
+                    Some(catalog.fingerprint(source).unwrap())
+                })
+                .unwrap()
+        );
+        assert!(matches!(
+            catalog.revision_with_fingerprint_lookup(|source| {
+                (source == webfile).then(|| fingerprint(SourceKind::Yaml, b"wrong kind"))
+            }),
+            Err(CatalogError::SourceKindMismatch {
+                expected: SourceKind::WebFile,
+                actual: SourceKind::Yaml,
+            })
+        ));
+
+        let mut observation_budget = AssetLoadBudget::default();
+        let observed = catalog
+            .physical_domain_sources(root, &mut observation_budget)
+            .unwrap();
+        let mut changed = vec![
+            PhysicalDomainSource::new(
+                webfile,
+                fingerprint(SourceKind::WebFile, b"changed webfile"),
+            ),
+            PhysicalDomainSource::new(
+                serialized_file,
+                fingerprint(SourceKind::SerializedFile, b"changed assets"),
+            ),
+        ];
+        changed.sort_unstable_by_key(PhysicalDomainSource::source);
+        let predicted = catalog
+            .revision_with_fingerprint_lookup(|source| {
+                changed
+                    .iter()
+                    .find(|change| change.source() == source)
+                    .map(PhysicalDomainSource::fingerprint)
+            })
+            .unwrap();
+        let rewrite = PhysicalDomainRewrite::new(root, &observed, &changed, &[]);
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        transaction
+            .rewrite_physical_domain(rewrite, &mut AssetLoadBudget::default())
+            .unwrap();
+        let candidate = transaction.commit(&mut AssetLoadBudget::default()).unwrap();
+        assert_eq!(candidate.revision().unwrap(), predicted);
+    }
+
+    #[test]
+    fn physical_domain_rewrite_rejects_stale_or_incomplete_observations_without_charging() {
+        let (catalog, root, _, _, companion) = physical_domain_fixture();
+        let mut observation_budget = AssetLoadBudget::default();
+        let observed = catalog
+            .physical_domain_sources(root, &mut observation_budget)
+            .unwrap();
+
+        let mut incomplete = observed.clone();
+        let missing = incomplete.pop().unwrap();
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut missing_transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let mut missing_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            missing_transaction.rewrite_physical_domain(
+                PhysicalDomainRewrite::new(root, &incomplete, &[], &[]),
+                &mut missing_budget,
+            ),
+            Err(CatalogError::PhysicalDomainObservationMissing {
+                owner,
+                source_id,
+            }) if owner == root && source_id == missing.source()
+        ));
+        assert_eq!(missing_budget.usage().entries, 0);
+        assert_eq!(missing_budget.usage().bytes, 0);
+        assert!(matches!(
+            missing_transaction.commit(&mut missing_budget),
+            Err(CatalogError::TransactionAborted)
+        ));
+
+        let mut stale = observed.clone();
+        stale[0] = PhysicalDomainSource::new(
+            stale[0].source(),
+            fingerprint(stale[0].source().kind(), b"stale observation"),
+        );
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut stale_transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let mut stale_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            stale_transaction.rewrite_physical_domain(
+                PhysicalDomainRewrite::new(root, &stale, &[], &[]),
+                &mut stale_budget,
+            ),
+            Err(CatalogError::PhysicalDomainFingerprintMismatch { source_id, .. })
+                if source_id == stale[0].source()
+        ));
+        assert_eq!(stale_budget.usage().entries, 0);
+        assert_eq!(stale_budget.usage().bytes, 0);
+        assert!(matches!(
+            stale_transaction.commit(&mut stale_budget),
+            Err(CatalogError::TransactionAborted)
+        ));
+
+        let mut reversed_changes = observed[..2].to_vec();
+        reversed_changes.reverse();
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut ordering_transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let mut ordering_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            ordering_transaction.rewrite_physical_domain(
+                PhysicalDomainRewrite::new(root, &observed, &reversed_changes, &[]),
+                &mut ordering_budget,
+            ),
+            Err(CatalogError::PhysicalDomainSourcesNotStrictlyOrdered {
+                collection: "changed",
+                ..
+            })
+        ));
+        assert_eq!(ordering_budget.usage().entries, 0);
+        assert_eq!(ordering_budget.usage().bytes, 0);
+
+        let mut unexpected = observed.clone();
+        unexpected.push(PhysicalDomainSource::new(
+            companion,
+            catalog.fingerprint(companion).unwrap(),
+        ));
+        unexpected.sort_unstable_by_key(PhysicalDomainSource::source);
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut unexpected_transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let mut unexpected_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            unexpected_transaction.rewrite_physical_domain(
+                PhysicalDomainRewrite::new(root, &unexpected, &[], &[]),
+                &mut unexpected_budget,
+            ),
+            Err(CatalogError::PhysicalDomainObservationUnexpected {
+                owner,
+                source_id,
+            }) if owner == root && source_id == companion
+        ));
+        assert_eq!(unexpected_budget.usage().entries, 0);
+        assert_eq!(unexpected_budget.usage().bytes, 0);
+    }
+
+    #[test]
+    fn physical_domain_rewrite_rejects_cross_domain_changes_and_invalid_additions() {
+        let (mut catalog, root, _, serialized_file, companion) = physical_domain_fixture();
+        let other_root = catalog
+            .register(
+                root_descriptor(SourceKind::Archive, "other.apk", b"other"),
+                fingerprint(SourceKind::Archive, b"other"),
+            )
+            .unwrap();
+        let existing_descriptor =
+            SourceDescriptor::sidecar(root, SourceMemberId::new("existing.resS").unwrap()).unwrap();
+        let existing_fingerprint = fingerprint(SourceKind::StreamedResource, b"existing");
+        let existing = catalog
+            .register(existing_descriptor.clone(), existing_fingerprint)
+            .unwrap();
+        let mut observation_budget = AssetLoadBudget::default();
+        let observed = catalog
+            .physical_domain_sources(root, &mut observation_budget)
+            .unwrap();
+
+        let outside_change = [PhysicalDomainSource::new(
+            companion,
+            fingerprint(SourceKind::StreamedResource, b"changed companion"),
+        )];
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut change_transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let mut change_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            change_transaction.rewrite_physical_domain(
+                PhysicalDomainRewrite::new(root, &observed, &outside_change, &[]),
+                &mut change_budget,
+            ),
+            Err(CatalogError::PhysicalDomainChangeOutsideDomain {
+                source_id,
+                physical_owner,
+            }) if source_id == companion && physical_owner == companion
+        ));
+        assert!(matches!(
+            change_transaction.commit(&mut change_budget),
+            Err(CatalogError::TransactionAborted)
+        ));
+
+        let companion_addition = [PhysicalDomainAddition::new(
+            SourceDescriptor::companion(
+                serialized_file,
+                SourceMemberId::new("other.resS").unwrap(),
+            )
+            .unwrap(),
+            fingerprint(SourceKind::StreamedResource, b"other companion"),
+        )];
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut companion_transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let mut companion_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            companion_transaction.rewrite_physical_domain(
+                PhysicalDomainRewrite::new(root, &observed, &[], &companion_addition),
+                &mut companion_budget,
+            ),
+            Err(CatalogError::PhysicalDomainAdditionRequiresMember {
+                location: SourceLocationKind::Companion,
+            })
+        ));
+        assert_eq!(companion_budget.usage().entries, 0);
+        assert_eq!(companion_budget.usage().bytes, 0);
+
+        let outside_addition = [PhysicalDomainAddition::new(
+            SourceDescriptor::sidecar(other_root, SourceMemberId::new("outside.resS").unwrap())
+                .unwrap(),
+            fingerprint(SourceKind::StreamedResource, b"outside"),
+        )];
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut outside_transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let mut outside_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            outside_transaction.rewrite_physical_domain(
+                PhysicalDomainRewrite::new(root, &observed, &[], &outside_addition),
+                &mut outside_budget,
+            ),
+            Err(CatalogError::PhysicalDomainAdditionOutsideDomain {
+                parent,
+                physical_owner,
+            }) if parent == other_root && physical_owner == other_root
+        ));
+        assert_eq!(outside_budget.usage().entries, 0);
+        assert_eq!(outside_budget.usage().bytes, 0);
+
+        let existing_addition = [PhysicalDomainAddition::new(
+            existing_descriptor,
+            existing_fingerprint,
+        )];
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut existing_transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let mut existing_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            existing_transaction.rewrite_physical_domain(
+                PhysicalDomainRewrite::new(root, &observed, &[], &existing_addition),
+                &mut existing_budget,
+            ),
+            Err(CatalogError::PhysicalDomainAdditionAlreadyExists { source_id })
+                if source_id == existing
+        ));
+        assert_eq!(existing_budget.usage().entries, 0);
+        assert_eq!(existing_budget.usage().bytes, 0);
+
+        let duplicate_descriptor =
+            SourceDescriptor::sidecar(root, SourceMemberId::new("duplicate.resS").unwrap())
+                .unwrap();
+        let duplicate_fingerprint = fingerprint(SourceKind::StreamedResource, b"duplicate");
+        let duplicate_additions = [
+            PhysicalDomainAddition::new(duplicate_descriptor.clone(), duplicate_fingerprint),
+            PhysicalDomainAddition::new(duplicate_descriptor, duplicate_fingerprint),
+        ];
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut duplicate_transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let candidate_revision = duplicate_transaction.candidate.revision().unwrap();
+        let mut duplicate_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            duplicate_transaction.rewrite_physical_domain(
+                PhysicalDomainRewrite::new(root, &observed, &[], &duplicate_additions),
+                &mut duplicate_budget,
+            ),
+            Err(CatalogError::PhysicalDomainAdditionAlreadyExists { .. })
+        ));
+        assert_eq!(duplicate_budget.usage().entries, 0);
+        assert_eq!(duplicate_budget.usage().bytes, 0);
+        assert_eq!(
+            duplicate_transaction.candidate.revision().unwrap(),
+            candidate_revision
+        );
+        assert!(matches!(
+            duplicate_transaction.commit(&mut duplicate_budget),
+            Err(CatalogError::TransactionAborted)
+        ));
+    }
+
+    #[test]
+    fn physical_domain_rewrite_budget_failure_poisoned_transaction_before_mutation() {
+        let (catalog, root, _, serialized_file, companion) = physical_domain_fixture();
+        let original_revision = catalog.revision().unwrap();
+        let mut observation_budget = AssetLoadBudget::default();
+        let observed = catalog
+            .physical_domain_sources(root, &mut observation_budget)
+            .unwrap();
+        let changes = [PhysicalDomainSource::new(
+            serialized_file,
+            fingerprint(SourceKind::SerializedFile, b"changed asset"),
+        )];
+
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let planned = checked_record_clone_bytes(
+            &transaction
+                .candidate
+                .by_id
+                .get(&serialized_file)
+                .unwrap()
+                .descriptor,
+        )
+        .unwrap();
+        let mut tiny_budget = budget_with(planned - 1, 1);
+        assert!(matches!(
+            transaction.rewrite_physical_domain(
+                PhysicalDomainRewrite::new(root, &observed, &changes, &[]),
+                &mut tiny_budget,
+            ),
+            Err(CatalogError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+        assert_eq!(tiny_budget.usage().entries, 0);
+        assert_eq!(tiny_budget.usage().bytes, 0);
+        assert!(matches!(
+            transaction.commit(&mut tiny_budget),
+            Err(CatalogError::TransactionAborted)
+        ));
+        assert_eq!(catalog.revision().unwrap(), original_revision);
+        assert_eq!(
+            catalog.fingerprint(serialized_file).unwrap(),
+            fingerprint(SourceKind::SerializedFile, b"asset")
+        );
+        assert_eq!(
+            catalog.fingerprint(companion).unwrap(),
+            fingerprint(SourceKind::StreamedResource, b"companion")
+        );
+
+        let addition = PhysicalDomainAddition::new(
+            SourceDescriptor::sidecar(root, SourceMemberId::new("budget.resS").unwrap()).unwrap(),
+            fingerprint(SourceKind::StreamedResource, b"resource"),
+        );
+        let additions = [addition];
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut addition_transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let rewrite = PhysicalDomainRewrite::new(root, &observed, &[], &additions);
+        let planned = addition_transaction
+            .candidate
+            .checked_physical_domain_rewrite_bytes(rewrite)
+            .unwrap();
+        let mut tiny_addition_budget = budget_with(planned - 1, 1);
+        assert!(matches!(
+            addition_transaction.rewrite_physical_domain(rewrite, &mut tiny_addition_budget),
+            Err(CatalogError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+        assert_eq!(tiny_addition_budget.usage().entries, 0);
+        assert_eq!(tiny_addition_budget.usage().bytes, 0);
+        assert!(matches!(
+            addition_transaction.commit(&mut tiny_addition_budget),
+            Err(CatalogError::TransactionAborted)
+        ));
+        assert_eq!(catalog.revision().unwrap(), original_revision);
+    }
+
     #[test]
     fn revision_includes_root_physical_binding_without_changing_logical_identity() {
         let directory = tempfile::tempdir().unwrap();
@@ -3280,6 +4927,72 @@ mod tests {
         assert_eq!(candidate.revision().unwrap(), original_revision);
         assert_eq!(candidate.physical_origin(source).unwrap(), &origin);
         assert_eq!(candidate.find_physical(&origin), Some(source));
+    }
+
+    #[test]
+    fn domain_rewrite_cannot_silently_supersede_a_pending_physical_proof() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.assets");
+        let contents = b"verified base asset";
+        fs::write(&path, contents).unwrap();
+        let source_fingerprint = fingerprint(SourceKind::SerializedFile, contents);
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let mut catalog = SourceCatalog::new(workspace);
+        let source = catalog
+            .register(
+                SourceDescriptor::root(
+                    SourceKind::SerializedFile,
+                    SourceAlias::new("main.assets").unwrap(),
+                    PhysicalOrigin::from_existing_path(&path).unwrap(),
+                ),
+                source_fingerprint,
+            )
+            .unwrap();
+        let mut observation_budget = AssetLoadBudget::default();
+        let observed = catalog
+            .physical_domain_sources(source, &mut observation_budget)
+            .unwrap();
+        let binding = VerifiedPhysicalBinding::verify_existing(
+            SourceKind::SerializedFile,
+            &path,
+            source_fingerprint,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let mut transaction = catalog
+            .begin_transaction(&mut AssetLoadBudget::default())
+            .unwrap();
+        let mut operation_budget = AssetLoadBudget::default();
+        transaction
+            .replace_verified_binding(source, binding, &mut operation_budget)
+            .unwrap();
+        let usage_before_rewrite = operation_budget.usage();
+        let revision_before_rewrite = transaction.candidate.revision().unwrap();
+        let replacement = fingerprint(SourceKind::SerializedFile, b"prepared output");
+        let changed = [PhysicalDomainSource::new(source, replacement)];
+
+        assert!(matches!(
+            transaction.rewrite_physical_domain(
+                PhysicalDomainRewrite::new(source, &observed, &changed, &[]),
+                &mut operation_budget,
+            ),
+            Err(CatalogError::PendingPhysicalVerificationSuperseded {
+                source_id,
+                verified,
+                replacement: actual_replacement,
+            }) if source_id == source
+                && verified == source_fingerprint
+                && actual_replacement == replacement
+        ));
+        assert_eq!(operation_budget.usage(), usage_before_rewrite);
+        assert_eq!(
+            transaction.candidate.revision().unwrap(),
+            revision_before_rewrite
+        );
+        assert!(matches!(
+            transaction.commit(&mut operation_budget),
+            Err(CatalogError::TransactionAborted)
+        ));
     }
 
     #[test]
