@@ -175,7 +175,13 @@ fn ordered_mutations_observe_prior_results_and_rewrite_once() {
     let (encoded_bytes, semantic_value) = encoded.into_bytes_and_semantic_value();
     assert!(semantic_value.is_some());
     let mut edits = SerializedFileEdits::default();
-    edits.set_object_bytes(observed.path_id, encoded_bytes);
+    edits
+        .try_set_object_bytes(
+            observed.path_id,
+            encoded_bytes,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
     let saved = SerializedFileWriter::save(&file, &edits).expect("rebuild SerializedFile");
     let reparsed = SerializedFileParser::from_bytes(saved).expect("reparse rebuilt file");
     let object = reparsed
@@ -385,7 +391,13 @@ fn sequence_edit_uses_the_same_guarded_single_rewrite_pipeline() {
     assert_eq!(encoded.stats().operations_applied, 1);
 
     let mut edits = SerializedFileEdits::default();
-    edits.set_object_bytes(observed.path_id, encoded.into_bytes());
+    edits
+        .try_set_object_bytes(
+            observed.path_id,
+            encoded.into_bytes(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
     let saved = SerializedFileWriter::save(&file, &edits).expect("rebuild sequence file");
     let reparsed = SerializedFileParser::from_bytes(saved).expect("reparse sequence file");
     let object = reparsed

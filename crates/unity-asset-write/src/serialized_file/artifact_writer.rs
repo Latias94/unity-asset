@@ -221,8 +221,8 @@ impl<'source> SerializedFilePlan<'source> {
         validate_representable_file_state(file, format)?;
         validate_source_binding(batch, file, source.as_ref())?;
 
-        for path_id in edits.object_bytes.keys() {
-            if file.find_object(*path_id).is_none() {
+        for path_id in edits.object_path_ids() {
+            if file.find_object(path_id).is_none() {
                 return Err(UnityAssetError::format(format!(
                     "SerializedFile edit references unknown object path ID {path_id}"
                 )));
@@ -309,7 +309,7 @@ fn select_object_data<'source>(
     edits: &'source SerializedFileEdits,
     source: Option<&SerializedFileSource<'source>>,
 ) -> Result<ObjectData<'source>> {
-    if let Some(bytes) = edits.get(info.path_id()) {
+    if let Some(bytes) = edits.object_bytes(info.path_id()) {
         return Ok(ObjectData::Generated(bytes));
     }
     if let Some(bytes) = info.loaded_data() {
@@ -978,7 +978,13 @@ mod tests {
         let path_id = file.objects()[0].path_id();
         let replacement = b"replacement".to_vec();
         let mut edits = SerializedFileEdits::default();
-        edits.set_object_bytes(path_id, replacement.clone());
+        edits
+            .try_set_object_bytes(
+                path_id,
+                replacement.clone(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
         let mut budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
         let mut load = AssetLoadBudget::default();
         let (output, mut batch) = batch(&mut budget, &mut load);

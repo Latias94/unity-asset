@@ -680,10 +680,11 @@ fn unitypy_loads_independent_serialized_file_wire_goldens() -> anyhow::Result<()
             .first()
             .ok_or_else(|| anyhow::anyhow!("wire case v{version} has no object"))?;
         let mut edits = SerializedFileEdits::default();
-        edits.set_object_bytes(
+        edits.try_set_object_bytes(
             object.path_id(),
             vec![0xD0, version as u8, 0xAD, 0xBE, 0xEF],
-        );
+            &mut AssetLoadBudget::default(),
+        )?;
         let edited = SerializedFileWriter::save(&serialized, &edits)?;
         std::fs::write(
             rewritten_dir

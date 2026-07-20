@@ -355,7 +355,7 @@ fn failed_bundle_object_edits_leave_pending_state_unchanged() {
     })
     .unwrap();
     let state = &env.write_state.bundles.get(&source).unwrap().assets[&0];
-    let committed_bytes = state.edits.get(path_id).unwrap().to_vec();
+    let committed_bytes = state.edits.object_bytes(path_id).unwrap().to_vec();
     assert_eq!(
         state.classes[&path_id].get("m_Name"),
         Some(&UnityValue::String("COMMITTED_EDIT".to_owned()))
@@ -378,7 +378,7 @@ fn failed_bundle_object_edits_leave_pending_state_unchanged() {
     );
 
     let state = &env.write_state.bundles.get(&source).unwrap().assets[&0];
-    assert_eq!(state.edits.get(path_id).unwrap(), committed_bytes);
+    assert_eq!(state.edits.object_bytes(path_id).unwrap(), committed_bytes);
     assert_eq!(
         state.classes[&path_id].get("m_Name"),
         Some(&UnityValue::String("COMMITTED_EDIT".to_owned()))

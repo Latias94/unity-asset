@@ -467,7 +467,13 @@ fn rewrites_wire_goldens_without_reconstructing_object_metadata() {
 
         let edited_payload = [0xD0, case.version as u8, 0xAD, 0xBE, 0xEF];
         let mut edits = SerializedFileEdits::default();
-        edits.set_object_bytes(case.path_id, edited_payload.to_vec());
+        edits
+            .try_set_object_bytes(
+                case.path_id,
+                edited_payload.to_vec(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
         let edited = prepare_serialized_file(&file, &edits).unwrap_or_else(|error| {
             panic!(
                 "failed to edit and rewrite v{} fixture: {error}",
@@ -589,7 +595,9 @@ fn writer_rejects_publicly_constructible_unrepresentable_states() {
                 file.ref_types_mut().push(unsupported);
             }
             WriterRejection::UnknownObjectEdit => {
-                edits.set_object_bytes(i64::MAX, vec![0xFF]);
+                edits
+                    .try_set_object_bytes(i64::MAX, vec![0xFF], &mut AssetLoadBudget::default())
+                    .unwrap();
             }
         }
 
@@ -688,7 +696,13 @@ fn editing_one_object_preserves_the_other_object_wire_semantics() {
 
         let edited_payload = vec![0xE0; 13];
         let mut edits = SerializedFileEdits::default();
-        edits.set_object_bytes(first_path_id, edited_payload.clone());
+        edits
+            .try_set_object_bytes(
+                first_path_id,
+                edited_payload.clone(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
         let rewritten = prepare_serialized_file(&file, &edits)
             .unwrap_or_else(|error| panic!("failed to rewrite multi-object v{version}: {error}"));
         let reparsed = SerializedFileParser::from_bytes(rewritten)

@@ -55,8 +55,8 @@ impl SerializedFileWriter {
         let external_table = PlannedExternalTable::build(file, edits).map_err(|error| {
             UnityAssetError::with_source("Invalid SerializedFile external table", error)
         })?;
-        for path_id in edits.object_bytes.keys() {
-            if file.find_object(*path_id).is_none() {
+        for path_id in edits.object_path_ids() {
+            if file.find_object(path_id).is_none() {
                 return Err(UnityAssetError::format(format!(
                     "SerializedFile edit references unknown object path ID {path_id}"
                 )));
@@ -247,7 +247,7 @@ fn write_object_entry(
         }
     }
 
-    let obj_bytes = if let Some(override_bytes) = edits.get(info.path_id()) {
+    let obj_bytes = if let Some(override_bytes) = edits.object_bytes(info.path_id()) {
         override_bytes
     } else if let Some(loaded_data) = info.loaded_data() {
         loaded_data

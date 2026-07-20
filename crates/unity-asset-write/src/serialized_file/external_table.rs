@@ -338,13 +338,12 @@ impl<'file> ExternalTableAllocator<'file> {
     /// Produces edits containing only this external-table plan.
     #[must_use]
     pub fn finish(self) -> SerializedFileEdits {
-        SerializedFileEdits {
-            object_bytes: Default::default(),
-            external_table: Some(ExternalTableMutation {
-                base: self.base,
-                additions: self.additions,
-            }),
-        }
+        let mut edits = SerializedFileEdits::new();
+        edits.external_table = Some(ExternalTableMutation {
+            base: self.base,
+            additions: self.additions,
+        });
+        edits
     }
 
     /// Atomically attaches all planned additions to object edits.
@@ -1026,7 +1025,14 @@ mod tests {
         .unwrap();
         let before = edits.external_additions().to_vec();
 
-        let mut measured_edits = edits.clone();
+        let mut measured_edits = SerializedFileEdits::default();
+        ExternalTableAllocator::intern_into_edits(
+            &file,
+            &mut measured_edits,
+            external("first-new.assets", 1),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
         let mut measured = AssetLoadBudget::default();
         ExternalTableAllocator::intern_into_edits(
             &file,

@@ -267,7 +267,7 @@ impl Environment {
                     f,
                 )?;
                 let state = self.write_state.standalone.entry(source_key).or_default();
-                apply_serialized_file_edit(state, key.path_id, prepared);
+                apply_serialized_file_edit(state, key.path_id, prepared, budget)?;
                 Ok(())
             }
             BinarySourceKind::AssetBundle => {
@@ -300,7 +300,7 @@ impl Environment {
                     .assets
                     .entry(asset_index)
                     .or_default();
-                apply_serialized_file_edit(state, key.path_id, prepared);
+                apply_serialized_file_edit(state, key.path_id, prepared, budget)?;
                 Ok(())
             }
         }
@@ -595,8 +595,7 @@ fn prepare_serialized_file_edit(
     session.save_typetree(path_id, class.properties(), budget)?;
     let bytes = session
         .into_edits()
-        .object_bytes
-        .remove(&path_id)
+        .into_object_bytes(path_id)
         .ok_or_else(|| UnityAssetError::format("TypeTree edit produced no object bytes"))?;
 
     Ok(PreparedSerializedFileEdit { class, bytes })
@@ -606,9 +605,16 @@ fn apply_serialized_file_edit(
     state: &mut SerializedFileWriteState,
     path_id: i64,
     prepared: PreparedSerializedFileEdit,
-) {
+    budget: &mut AssetLoadBudget,
+) -> Result<()> {
+    state
+        .edits
+        .try_set_object_bytes(path_id, prepared.bytes, budget)
+        .map_err(|error| {
+            UnityAssetError::with_source("Failed to retain SerializedFile object edit", error)
+        })?;
     state.classes.insert(path_id, prepared.class);
-    state.edits.set_object_bytes(path_id, prepared.bytes);
+    Ok(())
 }
 
 fn expected_class_id_for_key(env: &Environment, key: &BinaryObjectKey) -> Result<i32> {
@@ -733,7 +739,7 @@ fn commit_external_and_object_edit(
         )
         .map_err(external_table_error)?;
     }
-    apply_serialized_file_edit(state, path_id, prepared);
+    apply_serialized_file_edit(state, path_id, prepared, budget)?;
     Ok(())
 }
 

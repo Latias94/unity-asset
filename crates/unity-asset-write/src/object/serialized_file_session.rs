@@ -72,7 +72,14 @@ impl<'a> SerializedFileEditSession<'a> {
 
         let bytes =
             encode_object_typetree(self.file, handle.info(), obj.class.properties(), budget)?;
-        self.edits.set_object_bytes(path_id, bytes);
+        self.edits
+            .try_set_object_bytes(path_id, bytes, budget)
+            .map_err(|error| {
+                UnityAssetError::with_source(
+                    format!("Failed to retain object edit: path_id={path_id}"),
+                    error,
+                )
+            })?;
         self.mark_changed();
         Ok(())
     }
@@ -91,15 +98,35 @@ impl<'a> SerializedFileEditSession<'a> {
             ))
         })?;
         let bytes = encode_object_typetree(self.file, info, properties, budget)?;
-        self.edits.set_object_bytes(path_id, bytes);
+        self.edits
+            .try_set_object_bytes(path_id, bytes, budget)
+            .map_err(|error| {
+                UnityAssetError::with_source(
+                    format!("Failed to retain object edit: path_id={path_id}"),
+                    error,
+                )
+            })?;
         self.mark_changed();
         Ok(())
     }
 
     /// Store overridden bytes without running TypeTree encoding (escape hatch).
-    pub fn set_raw_data(&mut self, path_id: i64, bytes: Vec<u8>) {
-        self.edits.set_object_bytes(path_id, bytes);
+    pub fn set_raw_data(
+        &mut self,
+        path_id: i64,
+        bytes: Vec<u8>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
+        self.edits
+            .try_set_object_bytes(path_id, bytes, budget)
+            .map_err(|error| {
+                UnityAssetError::with_source(
+                    format!("Failed to retain raw object edit: path_id={path_id}"),
+                    error,
+                )
+            })?;
         self.mark_changed();
+        Ok(())
     }
 }
 
