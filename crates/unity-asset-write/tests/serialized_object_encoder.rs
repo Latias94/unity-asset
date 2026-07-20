@@ -164,9 +164,18 @@ fn ordered_mutations_observe_prior_results_and_rewrite_once() {
     assert_eq!(encoded.stats().validation.owned_bytes, 0);
     assert!(encoded.stats().validation.node_visits > 0);
     assert!(encoded.stats().preserved_bytes > 0);
+    assert_eq!(
+        encoded
+            .semantic_value()
+            .expect("semantic encoding retains its staged value")
+            .value_at_path(&name_path(observed.field)),
+        Ok(&UnityValue::String(final_name.to_owned()))
+    );
 
+    let (encoded_bytes, semantic_value) = encoded.into_bytes_and_semantic_value();
+    assert!(semantic_value.is_some());
     let mut edits = SerializedFileEdits::default();
-    edits.set_object_bytes(observed.path_id, encoded.into_bytes());
+    edits.set_object_bytes(observed.path_id, encoded_bytes);
     let saved = SerializedFileWriter::save(&file, &edits).expect("rebuild SerializedFile");
     let reparsed = SerializedFileParser::from_bytes(saved).expect("reparse rebuilt file");
     let object = reparsed
@@ -527,6 +536,7 @@ fn unsafe_raw_success_is_explicit_and_budgeted() {
     assert_eq!(encoded.original_digest(), expected);
     assert_eq!(encoded.output_digest(), DigestV1::hash_bytes(&bytes));
     assert_eq!(encoded.bytes(), bytes);
+    assert!(encoded.semantic_value().is_none());
     assert_eq!(encoded.stats().parse_passes, 0);
     assert_eq!(encoded.stats().validation_passes, 0);
     assert_eq!(encoded.stats().rewrite_passes, 0);

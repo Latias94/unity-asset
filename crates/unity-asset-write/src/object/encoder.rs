@@ -285,6 +285,7 @@ pub struct EncodedSerializedObject {
     original_digest: DigestV1,
     output_digest: DigestV1,
     bytes: Vec<u8>,
+    semantic_value: Option<UnityValue>,
     stats: SerializedObjectEncodingStats,
 }
 
@@ -324,6 +325,15 @@ impl EncodedSerializedObject {
         &self.bytes
     }
 
+    /// Returns the fully validated staged value for semantic encodings.
+    ///
+    /// Unsafe raw replacements deliberately return `None`: their acknowledgement proves only
+    /// caller ownership of wire invariants and does not invent semantic state for a prepared view.
+    #[must_use]
+    pub const fn semantic_value(&self) -> Option<&UnityValue> {
+        self.semantic_value.as_ref()
+    }
+
     #[must_use]
     pub const fn stats(&self) -> SerializedObjectEncodingStats {
         self.stats
@@ -332,6 +342,12 @@ impl EncodedSerializedObject {
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
+    }
+
+    /// Transfers the exact encoded bytes and their staged semantic value without cloning either.
+    #[must_use]
+    pub fn into_bytes_and_semantic_value(self) -> (Vec<u8>, Option<UnityValue>) {
+        (self.bytes, self.semantic_value)
     }
 }
 
@@ -671,6 +687,7 @@ impl<'file> SerializedObjectEncoder<'file> {
             original_digest: actual,
             output_digest,
             bytes,
+            semantic_value: None,
             stats: SerializedObjectEncodingStats {
                 operations_applied: 1,
                 ..SerializedObjectEncodingStats::default()
@@ -754,6 +771,7 @@ impl SerializedObjectCandidate<'_> {
         let (bytes, rewrite_stats) = rewrite_object(&schema, &properties, original, endian, budget)
             .map_err(|error| map_rewrite_error(path_id, error))?;
         let output_digest = DigestV1::hash_bytes(&bytes);
+        let semantic_value = UnityValue::Object(properties);
 
         Ok(EncodedSerializedObject {
             path_id,
@@ -763,6 +781,7 @@ impl SerializedObjectCandidate<'_> {
             original_digest,
             output_digest,
             bytes,
+            semantic_value: Some(semantic_value),
             stats: semantic_stats(
                 parse_stats,
                 validation_stats,
