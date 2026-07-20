@@ -396,6 +396,7 @@ impl MutationPlanFragment {
         for action in &actions {
             action.validate()?;
         }
+        validate_unsafe_raw_exclusivity(&actions)?;
         let sources = normalize_sources(sources)?;
         let payloads = normalize_payloads(payloads)?;
         validate_source_coverage_without_scratch(&sources, &actions)?;
@@ -444,6 +445,7 @@ impl MutationPlan {
         for action in &actions {
             action.validate()?;
         }
+        validate_unsafe_raw_exclusivity(&actions)?;
         let sources = normalize_sources(sources)?;
         let payloads = normalize_payloads(payloads)?;
         validate_source_coverage(&sources, &actions)?;
@@ -708,6 +710,25 @@ fn validate_source_coverage(
     Ok(())
 }
 
+fn validate_unsafe_raw_exclusivity(actions: &[GenericMutation]) -> Result<(), MutationPlanError> {
+    for (raw_index, action) in actions.iter().enumerate() {
+        if !matches!(action, GenericMutation::UnsafeRawReplace { .. }) {
+            continue;
+        }
+        if let Some((conflicting_index, _)) = actions
+            .iter()
+            .enumerate()
+            .find(|(index, candidate)| *index != raw_index && candidate.target() == action.target())
+        {
+            return Err(MutationPlanError::UnsafeRawNotExclusive {
+                raw_index,
+                conflicting_index,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_source_coverage_without_scratch(
     sources: &[SourceExpectation],
     actions: &[GenericMutation],
@@ -863,6 +884,13 @@ pub enum MutationPlanError {
     ValueDepthOverflow,
     #[error("sequence move at index {index} does not change collection order")]
     NoopSequenceMove { index: u32 },
+    #[error(
+        "unsafe raw operation at index {raw_index} conflicts with operation {conflicting_index} on the same object"
+    )]
+    UnsafeRawNotExclusive {
+        raw_index: usize,
+        conflicting_index: usize,
+    },
     #[error("{operation} requires a non-root field path; use schema_replace for whole objects")]
     RootFieldPath { operation: &'static str },
     #[error("failed to allocate {resource} capacity for {requested} elements: {message}")]
@@ -888,6 +916,7 @@ mod consumption_tests {
         let locator = SourceLocator::path("Assets/Data/main.assets").unwrap();
         let target = ObjectAddress::binary_at(locator.clone(), 1).unwrap();
         let referenced = ObjectAddress::binary_at(locator.clone(), 2).unwrap();
+        let raw_target = ObjectAddress::binary_at(locator.clone(), 3).unwrap();
         let source = SourceExpectation::new(
             locator,
             SourceFingerprint::from_bytes(SourceKind::SerializedFile, b"source"),
@@ -953,7 +982,7 @@ mod consumption_tests {
                     payload: resource_digest,
                 },
                 GenericMutation::UnsafeRawReplace {
-                    target,
+                    target: raw_target,
                     expected_raw_digest: digest(b"raw value"),
                     payload: raw_digest,
                     acknowledgement:
@@ -1042,5 +1071,48 @@ mod consumption_tests {
             GenericMutation::UnsafeRawReplace { payload, .. } if payload == raw_digest
         ));
         assert!(operations.next().is_none());
+    }
+
+    #[test]
+    fn unsafe_raw_replacement_must_be_the_only_operation_for_its_object() {
+        let locator = SourceLocator::path("Assets/Data/main.assets").unwrap();
+        let target = ObjectAddress::binary_at(locator.clone(), 1).unwrap();
+        let payload = PlanPayload::new(vec![0x30, 0x40]);
+        let payload_digest = payload.digest();
+        let source = SourceExpectation::new(
+            locator,
+            SourceFingerprint::from_bytes(SourceKind::SerializedFile, b"source"),
+        );
+        let revision = WorkspaceRevision::new(digest(b"revision"));
+
+        let error = MutationPlan::new(
+            revision,
+            vec![source],
+            vec![payload],
+            vec![
+                GenericMutation::UnsafeRawReplace {
+                    target: target.clone(),
+                    expected_raw_digest: digest(b"raw value"),
+                    payload: payload_digest,
+                    acknowledgement:
+                        UnsafeRawAcknowledgement::WireInvariantsAreCallersResponsibilityV1,
+                },
+                GenericMutation::FieldReplace {
+                    target,
+                    path: FieldPath::root().push_field("m_Name").unwrap(),
+                    guard: FieldGuard::new(digest(b"schema"), digest(b"value")),
+                    replacement: MutationValue::string("replacement").unwrap(),
+                },
+            ],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MutationPlanError::UnsafeRawNotExclusive {
+                raw_index: 0,
+                conflicting_index: 1,
+            }
+        ));
     }
 }
