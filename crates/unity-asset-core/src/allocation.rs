@@ -39,6 +39,41 @@ pub fn string_allocation_bytes(capacity: usize) -> Result<u64, AllocationSizeErr
     usize_to_u64(capacity, "String")
 }
 
+/// Conservatively estimates the entry vector and hash-index backing retained by an
+/// `IndexMap<K, V>` with `capacity` usable entries.
+///
+/// Hashbrown reserves at most seven usable entries per eight buckets and rounds bucket counts to
+/// a power of two. The fixed control allowance covers group-width sentinel bytes and alignment at
+/// the end of the control array.
+pub fn index_map_allocation_bytes<K, V>(capacity: usize) -> Result<u64, AllocationSizeError> {
+    if capacity == 0 {
+        return Ok(0);
+    }
+    let entry_bytes = size_of::<(usize, K, V)>()
+        .checked_mul(capacity)
+        .ok_or_else(|| AllocationSizeError::new("IndexMap"))?;
+    let minimum_buckets = capacity
+        .checked_mul(8)
+        .and_then(|scaled| scaled.checked_add(6))
+        .map(|scaled| scaled / 7)
+        .ok_or_else(|| AllocationSizeError::new("IndexMap"))?;
+    let buckets = minimum_buckets
+        .max(8)
+        .checked_next_power_of_two()
+        .ok_or_else(|| AllocationSizeError::new("IndexMap"))?;
+    let index_bytes = size_of::<usize>()
+        .checked_add(1)
+        .and_then(|slot_bytes| slot_bytes.checked_mul(buckets))
+        .and_then(|bytes| bytes.checked_add(64))
+        .ok_or_else(|| AllocationSizeError::new("IndexMap"))?;
+    usize_to_u64(
+        entry_bytes
+            .checked_add(index_bytes)
+            .ok_or_else(|| AllocationSizeError::new("IndexMap"))?,
+        "IndexMap",
+    )
+}
+
 /// Conservatively estimates the control block and value allocation retained by `Arc<T>`.
 pub fn arc_value_allocation_bytes<T>() -> Result<u64, AllocationSizeError> {
     arc_allocation_bytes(size_of::<T>(), align_of::<T>(), "Arc value")
@@ -95,6 +130,19 @@ mod tests {
         assert_eq!(vec_allocation_bytes::<u32>(7).unwrap(), 28);
         assert_eq!(string_allocation_bytes(11).unwrap(), 11);
         assert_eq!(vec_allocation_bytes::<()>(usize::MAX).unwrap(), 0);
+    }
+
+    #[test]
+    fn index_map_accounting_covers_power_of_two_bucket_growth() {
+        const CAPACITY: usize = 897;
+        const BUCKETS: usize = 2_048;
+        let entries = size_of::<(usize, String, u64)>() * CAPACITY;
+        let index = (size_of::<usize>() + 1) * BUCKETS + 64;
+
+        assert!(
+            index_map_allocation_bytes::<String, u64>(CAPACITY).unwrap()
+                >= u64::try_from(entries + index).unwrap()
+        );
     }
 
     #[test]

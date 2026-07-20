@@ -25,7 +25,8 @@ pub mod unity_value;
 // Re-export main types
 pub use allocation::{
     AllocationSizeError, arc_slice_allocation_bytes, arc_value_allocation_bytes,
-    arc_vec_allocation_bytes, string_allocation_bytes, vec_allocation_bytes,
+    arc_vec_allocation_bytes, index_map_allocation_bytes, string_allocation_bytes,
+    vec_allocation_bytes,
 };
 pub use budget::{
     AssetLoadBudget, AssetLoadDepthScope, AssetLoadLimits, AssetLoadUsage, BudgetError,
@@ -51,7 +52,7 @@ pub use semantic_digest::{
 };
 pub use source_image::{VerifiedSourceImage, VerifiedSourceImageError, VerifiedSourceRebinding};
 pub use unity_class::{UnityClass, UnityClassRegistry};
-pub use unity_value::{UnityValue, UnityValueKind, ValuePathError};
+pub use unity_value::{UnityValue, UnityValueCloneError, UnityValueKind, ValuePathError};
 
 /// Get Unity class name from class ID
 pub fn get_class_name(class_id: i32) -> Option<String> {

@@ -3,10 +3,14 @@
 //! This module implements Unity's dynamic class system, allowing for
 //! runtime creation and manipulation of Unity objects.
 
+use crate::budget::AssetLoadBudget;
 use crate::dynamic_access::{DynamicAccess, DynamicValue};
 use crate::error::Result as UnityResult;
 use crate::field_path::{FieldPath, FieldPathSegment};
-use crate::unity_value::{UnityValue, UnityValueKind, ValuePathError};
+use crate::unity_value::{
+    UnityValue, UnityValueCloneError, UnityValueKind, ValuePathError, clone_string,
+    try_clone_object_with_budget,
+};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::fmt;
@@ -27,6 +31,32 @@ pub struct UnityClass {
 }
 
 impl UnityClass {
+    /// Deeply clones this class while charging all owned string and property
+    /// storage to `budget` before allocation.
+    ///
+    /// The property map is the depth-zero root and shares the caller's member
+    /// and depth ledgers with every nested value.
+    pub fn try_clone_with_budget(
+        &self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, UnityValueCloneError> {
+        let class_name = clone_string(&self.class_name, budget, "Unity class name")?;
+        let anchor = clone_string(&self.anchor, budget, "Unity class anchor")?;
+        let extra_anchor_data = clone_string(
+            &self.extra_anchor_data,
+            budget,
+            "Unity class extra anchor data",
+        )?;
+        let properties = try_clone_object_with_budget(&self.properties, budget)?;
+        Ok(Self {
+            class_id: self.class_id,
+            class_name,
+            anchor,
+            extra_anchor_data,
+            properties,
+        })
+    }
+
     /// Create a new Unity class instance
     pub fn new(class_id: i32, class_name: String, anchor: String) -> Self {
         Self::with_properties(class_id, class_name, anchor, IndexMap::new())
@@ -231,6 +261,7 @@ impl UnityClassRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::AssetLoadLimits;
 
     #[test]
     fn test_unity_class_creation() {
@@ -339,5 +370,34 @@ mod tests {
         // Test keys_dynamic
         let keys = class.keys_dynamic();
         assert!(keys.contains(&"m_Name".to_string()));
+    }
+
+    #[test]
+    fn budgeted_clone_preserves_class_metadata_and_property_order() {
+        let mut properties = IndexMap::new();
+        properties.insert("first".to_owned(), UnityValue::String("one".to_owned()));
+        properties.insert(
+            "second".to_owned(),
+            UnityValue::Array(vec![UnityValue::Unsigned(u64::MAX)]),
+        );
+        let mut source = UnityClass::with_properties(
+            114,
+            "MonoBehaviour".to_owned(),
+            "9001".to_owned(),
+            properties,
+        );
+        source.extra_anchor_data = " stripped".to_owned();
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits::default()).unwrap();
+
+        let cloned = source.try_clone_with_budget(&mut budget).unwrap();
+
+        assert_eq!(cloned.class_id, source.class_id);
+        assert_eq!(cloned.class_name, source.class_name);
+        assert_eq!(cloned.anchor, source.anchor);
+        assert_eq!(cloned.extra_anchor_data, source.extra_anchor_data);
+        assert_eq!(cloned.properties(), source.properties());
+        assert!(cloned.properties().keys().eq(source.properties().keys()));
+        assert_eq!(budget.usage().members, 3);
+        assert_eq!(budget.usage().max_observed_depth, 2);
     }
 }
