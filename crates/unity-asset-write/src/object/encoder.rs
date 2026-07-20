@@ -3,6 +3,7 @@
 use std::collections::TryReserveError;
 use std::error::Error as StdError;
 use std::mem::{replace, size_of};
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use thiserror::Error;
@@ -11,16 +12,319 @@ use unity_asset_binary::error::BinaryError;
 use unity_asset_binary::object::ObjectHandle;
 use unity_asset_binary::reader::{BinaryReader, ByteOrder};
 use unity_asset_binary::typetree::{
-    SchemaNode, SemanticLayout, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeSchema,
-    TypeTreeSemanticDigestError, TypeTreeTraversalContext, TypeTreeTraversalStats,
+    PrimitiveKind, SchemaNode, SemanticKind, SemanticLayout, TypeTreeParseMode,
+    TypeTreeParseOptions, TypeTreeSchema, TypeTreeSemanticDigestError, TypeTreeTraversalContext,
+    TypeTreeTraversalStats,
 };
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, DigestV1, FieldPath, FieldPathSegment, SemanticDigestError,
-    UnityAssetError, UnityValue, ValuePathError, field_schema_digest, semantic_value_digest,
+    UnityAssetError, UnityValue, ValuePathError, arc_value_allocation_bytes, field_schema_digest,
+    semantic_value_digest,
 };
 
 /// Writer-facing alias for the shared stable [`UnityValue`] shape discriminator.
 pub use unity_asset_core::UnityValueKind as SerializedValueKind;
+
+/// Stable, read-only field projection for one compiled binary `PPtr`.
+///
+/// The projection exposes only the information needed to synthesize the two wire integers. It
+/// deliberately does not expose the candidate's backing [`TypeTreeSchema`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerializedPPtrLayout<'schema> {
+    file_field: &'schema str,
+    file_index: usize,
+    file_primitive: PrimitiveKind,
+    path_field: &'schema str,
+    path_index: usize,
+    path_primitive: PrimitiveKind,
+    field_count: usize,
+}
+
+impl<'schema> SerializedPPtrLayout<'schema> {
+    #[must_use]
+    pub const fn file_field(self) -> &'schema str {
+        self.file_field
+    }
+
+    #[must_use]
+    pub const fn file_index(self) -> usize {
+        self.file_index
+    }
+
+    #[must_use]
+    pub const fn file_primitive(self) -> PrimitiveKind {
+        self.file_primitive
+    }
+
+    #[must_use]
+    pub const fn path_field(self) -> &'schema str {
+        self.path_field
+    }
+
+    #[must_use]
+    pub const fn path_index(self) -> usize {
+        self.path_index
+    }
+
+    #[must_use]
+    pub const fn path_primitive(self) -> PrimitiveKind {
+        self.path_primitive
+    }
+
+    #[must_use]
+    pub const fn field_count(self) -> usize {
+        self.field_count
+    }
+}
+
+/// Stable field names for one compiled binary managed-reference object.
+///
+/// The projection lets semantic mutation lowering identify the replacement value's runtime type
+/// without exposing TypeTree nodes or the managed-reference catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerializedManagedReferenceLayout<'schema> {
+    type_field: &'schema str,
+    class_field: &'schema str,
+    namespace_field: &'schema str,
+    assembly_field: &'schema str,
+    payload_field: &'schema str,
+}
+
+impl<'schema> SerializedManagedReferenceLayout<'schema> {
+    #[must_use]
+    pub const fn type_field(self) -> &'schema str {
+        self.type_field
+    }
+
+    #[must_use]
+    pub const fn class_field(self) -> &'schema str {
+        self.class_field
+    }
+
+    #[must_use]
+    pub const fn namespace_field(self) -> &'schema str {
+        self.namespace_field
+    }
+
+    #[must_use]
+    pub const fn assembly_field(self) -> &'schema str {
+        self.assembly_field
+    }
+
+    #[must_use]
+    pub const fn payload_field(self) -> &'schema str {
+        self.payload_field
+    }
+}
+
+/// Borrowed runtime type discriminator for a binary managed-reference replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerializedManagedReferenceType<'value> {
+    class_name: &'value str,
+    namespace: &'value str,
+    assembly_name: &'value str,
+}
+
+impl<'value> SerializedManagedReferenceType<'value> {
+    #[must_use]
+    pub const fn new(
+        class_name: &'value str,
+        namespace: &'value str,
+        assembly_name: &'value str,
+    ) -> Self {
+        Self {
+            class_name,
+            namespace,
+            assembly_name,
+        }
+    }
+
+    #[must_use]
+    pub const fn class_name(self) -> &'value str {
+        self.class_name
+    }
+
+    #[must_use]
+    pub const fn namespace(self) -> &'value str {
+        self.namespace
+    }
+
+    #[must_use]
+    pub const fn assembly_name(self) -> &'value str {
+        self.assembly_name
+    }
+}
+
+/// Opaque schema location used while lowering a semantic replacement.
+///
+/// Callers can descend named fields and collection elements, and can inspect a terminal PPtr, but
+/// cannot retain or execute the underlying TypeTree program.
+#[derive(Clone, Copy)]
+pub struct SerializedValueSchema<'schema> {
+    schema: &'schema TypeTreeSchema,
+    node: SchemaNode<'schema>,
+    context: TypeTreeTraversalContext,
+}
+
+impl std::fmt::Debug for SerializedValueSchema<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SerializedValueSchema")
+            .field("name", &self.node.name())
+            .field("kind", &self.node.kind())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'schema> SerializedValueSchema<'schema> {
+    #[must_use]
+    pub fn kind(self) -> SemanticKind {
+        self.node.kind()
+    }
+
+    /// Resolves one direct named schema field without consulting replacement values.
+    #[must_use]
+    pub fn field(self, name: &str) -> Option<Self> {
+        let mut context = self.context;
+        for child in self.node.children() {
+            let Some(child_context) = context.descend(self.node, child) else {
+                continue;
+            };
+            if child.name() == name {
+                return Some(Self {
+                    schema: self.schema,
+                    node: child,
+                    context: child_context,
+                });
+            }
+        }
+        None
+    }
+
+    /// Resolves one named field against a current staged value.
+    ///
+    /// Unlike [`Self::field`], this follows a managed-reference payload's runtime type identity.
+    #[must_use]
+    pub fn field_for_value(self, name: &str, current: &UnityValue) -> Option<Self> {
+        let UnityValue::Object(fields) = current else {
+            return None;
+        };
+        let (node, context) =
+            resolve_named_schema_child(self.schema, self.node, self.context, fields, name)?;
+        Some(Self {
+            schema: self.schema,
+            node,
+            context,
+        })
+    }
+
+    /// Returns the stable discriminator and payload field names for a managed-reference object.
+    #[must_use]
+    pub fn managed_reference_layout(self) -> Option<SerializedManagedReferenceLayout<'schema>> {
+        let SemanticLayout::ReferencedObject(layout) = self.node.semantic_layout() else {
+            return None;
+        };
+        Some(SerializedManagedReferenceLayout {
+            type_field: layout.type_node().name(),
+            class_field: layout.class_field().name(),
+            namespace_field: layout.namespace_field().name(),
+            assembly_field: layout.assembly_field().name(),
+            payload_field: layout.payload().node().name(),
+        })
+    }
+
+    /// Resolves a direct field using the replacement value's managed runtime type.
+    ///
+    /// This must be used for managed payloads being inserted or whose discriminator changes;
+    /// consulting the current staged value would select the previous runtime schema.
+    #[must_use]
+    pub fn field_for_managed_type(
+        self,
+        name: &str,
+        runtime_type: SerializedManagedReferenceType<'_>,
+    ) -> Option<Self> {
+        let (node, context) = resolve_named_schema_child_for_managed_type(
+            self.schema,
+            self.node,
+            self.context,
+            name,
+            runtime_type,
+        )?;
+        Some(Self {
+            schema: self.schema,
+            node,
+            context,
+        })
+    }
+
+    /// Resolves one array element schema. Sequence indices share one schema; pair indices select
+    /// their corresponding child.
+    #[must_use]
+    pub fn element(self, index: usize) -> Option<Self> {
+        let node = match self.node.semantic_layout() {
+            SemanticLayout::Sequence(layout) | SemanticLayout::Map(layout) => layout.element(),
+            SemanticLayout::Pair(layout) => match index {
+                0 => layout.first(),
+                1 => layout.second(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(Self {
+            schema: self.schema,
+            node,
+            context: self.context,
+        })
+    }
+
+    /// Returns stable PPtr field locations when this schema node is a compiled PPtr.
+    #[must_use]
+    pub fn pptr_layout(self) -> Option<SerializedPPtrLayout<'schema>> {
+        let layout = self.node.pptr_layout()?;
+        let mut file_index = None;
+        let mut path_index = None;
+        for (index, child) in self.node.children().enumerate() {
+            if child == layout.file_child() {
+                file_index = Some(index);
+            }
+            if child == layout.path_child() {
+                path_index = Some(index);
+            }
+        }
+        Some(SerializedPPtrLayout {
+            file_field: layout.file_child().name(),
+            file_index: file_index?,
+            file_primitive: layout.file_primitive(),
+            path_field: layout.path_child().name(),
+            path_index: path_index?,
+            path_primitive: layout.path_primitive(),
+            field_count: self.node.child_count(),
+        })
+    }
+}
+
+/// Allocation-free failure from resolving the schema corresponding to a staged value path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SerializedValueSchemaError {
+    #[error("field path segment count overflowed")]
+    SegmentOverflow,
+    #[error("staged value is missing field path segment {segment}")]
+    Missing { segment: u32 },
+    #[error("compiled schema cannot resolve field path segment {segment}")]
+    SchemaMismatch { segment: u32 },
+    #[error("field path segment {segment} expected {expected:?}, found {actual:?}")]
+    TypeMismatch {
+        segment: u32,
+        expected: SerializedValueKind,
+        actual: SerializedValueKind,
+    },
+    #[error("field path segment {segment} index {index} is outside sequence length {length}")]
+    IndexOutOfBounds {
+        segment: u32,
+        index: u32,
+        length: usize,
+    },
+}
 
 use crate::Endian;
 use crate::typetree::{TemplateRewriteStats, rewrite_object, validate_value};
@@ -388,6 +692,8 @@ pub enum SerializedObjectEncodeError {
     NoOperations,
     #[error("operation ordinals must increase: {current} follows {previous}")]
     OperationOrder { previous: u32, current: u32 },
+    #[error("operation {ordinal} uses a stale field guard for object {path_id}")]
+    StaleFieldGuard { path_id: i64, ordinal: u32 },
     #[error("semantic operation count overflow")]
     OperationCountOverflow,
     #[error("operation {ordinal} must use object replacement for the root path")]
@@ -538,6 +844,14 @@ pub struct SerializedObjectEncoder<'file> {
     handle: ObjectHandle<'file>,
 }
 
+/// A raw object whose original byte digest has already passed its caller guard.
+#[derive(Debug)]
+#[must_use = "finish the prepared raw object to produce encoded bytes"]
+pub struct PreparedUnsafeRawObject<'file> {
+    handle: ObjectHandle<'file>,
+    original_digest: DigestV1,
+}
+
 /// One parsed SerializedFile object receiving guarded mutations in plan order.
 ///
 /// The candidate retains semantic state between calls to [`Self::apply`]. This lets a workspace
@@ -547,6 +861,7 @@ pub struct SerializedObjectEncoder<'file> {
 #[must_use = "finish the candidate to produce encoded object bytes"]
 pub struct SerializedObjectCandidate<'file> {
     handle: ObjectHandle<'file>,
+    lineage: Arc<CandidateLineage>,
     schema: TypeTreeSchema,
     schema_digest: DigestV1,
     original: &'file [u8],
@@ -557,6 +872,54 @@ pub struct SerializedObjectCandidate<'file> {
     previous_ordinal: Option<u32>,
     operation_count: u64,
     validation_stats: OperationValidationStats,
+}
+
+#[derive(Debug)]
+struct CandidateLineage;
+
+/// A field guard bound to one unchanged serialized-object candidate generation.
+#[derive(Debug)]
+#[must_use = "prepare or discard the validated field guard"]
+pub struct ValidatedSerializedFieldGuard<'file> {
+    handle: ObjectHandle<'file>,
+    lineage: Arc<CandidateLineage>,
+    schema_digest: DigestV1,
+    previous_ordinal: Option<u32>,
+    operation_count: u64,
+    next_operation_count: u64,
+    ordinal: u32,
+    path: FieldPath,
+}
+
+impl ValidatedSerializedFieldGuard<'_> {
+    #[must_use]
+    pub const fn path(&self) -> &FieldPath {
+        &self.path
+    }
+}
+
+/// A fully validated serialized field replacement awaiting an infallible candidate commit.
+#[derive(Debug)]
+#[must_use = "commit the prepared field replacement after dependent allocations succeed"]
+pub struct PreparedSerializedFieldReplace<'candidate> {
+    target: &'candidate mut UnityValue,
+    previous_ordinal: &'candidate mut Option<u32>,
+    validation_stats: &'candidate mut OperationValidationStats,
+    operation_count: &'candidate mut u64,
+    replacement: UnityValue,
+    ordinal: u32,
+    next_validation_stats: OperationValidationStats,
+    next_operation_count: u64,
+}
+
+impl PreparedSerializedFieldReplace<'_> {
+    /// Installs the already validated replacement without allocation or further TypeTree work.
+    pub fn commit(self) {
+        *self.target = self.replacement;
+        *self.previous_ordinal = Some(self.ordinal);
+        *self.validation_stats = self.next_validation_stats;
+        *self.operation_count = self.next_operation_count;
+    }
 }
 
 impl<'file> SerializedObjectEncoder<'file> {
@@ -614,8 +977,15 @@ impl<'file> SerializedObjectEncoder<'file> {
             return Err(SerializedObjectEncodeError::IncompleteParse { path_id });
         }
 
+        let lineage_bytes = arc_value_allocation_bytes::<CandidateLineage>().map_err(|_| {
+            SerializedObjectEncodeError::ArithmeticOverflow {
+                resource: "serialized candidate lineage",
+            }
+        })?;
+        budget.consume_bytes(lineage_bytes)?;
         Ok(SerializedObjectCandidate {
             handle: self.handle,
+            lineage: Arc::new(CandidateLineage),
             schema,
             schema_digest,
             original,
@@ -652,26 +1022,56 @@ impl<'file> SerializedObjectEncoder<'file> {
         replacement: UnsafeRawObjectReplacement,
         budget: &mut AssetLoadBudget,
     ) -> Result<EncodedSerializedObject, SerializedObjectEncodeError> {
+        let UnsafeRawObjectReplacement {
+            expected_raw_digest,
+            bytes,
+            acknowledgement,
+        } = replacement;
+        self.prepare_unsafe_raw(expected_raw_digest)?
+            .finish(bytes, acknowledgement, budget)
+    }
+
+    /// Verifies the original raw bytes now and returns an opaque completion token.
+    ///
+    /// This separates operation-ordered guard validation from later artifact encoding without
+    /// hashing the immutable source object twice.
+    pub fn prepare_unsafe_raw(
+        self,
+        expected_raw_digest: DigestV1,
+    ) -> Result<PreparedUnsafeRawObject<'file>, SerializedObjectEncodeError> {
         let path_id = self.path_id();
-        let class_id = self.class_id();
         let original = self
             .handle
             .raw_data()
             .map_err(|source| SerializedObjectEncodeError::ReadRaw { path_id, source })?;
         let actual = DigestV1::hash_bytes(original);
-        if replacement.expected_raw_digest != actual {
+        if expected_raw_digest != actual {
             return Err(SerializedObjectEncodeError::RawDigestMismatch {
                 path_id,
-                expected: replacement.expected_raw_digest,
+                expected: expected_raw_digest,
                 actual,
             });
         }
-        let UnsafeRawObjectReplacement {
-            bytes,
-            acknowledgement:
-                UnsafeRawObjectAcknowledgement::WireInvariantsAreCallersResponsibilityV1,
-            ..
-        } = replacement;
+
+        Ok(PreparedUnsafeRawObject {
+            handle: self.handle,
+            original_digest: actual,
+        })
+    }
+}
+
+impl PreparedUnsafeRawObject<'_> {
+    /// Completes a previously guarded raw replacement without rereading the source object.
+    pub fn finish(
+        self,
+        bytes: Vec<u8>,
+        acknowledgement: UnsafeRawObjectAcknowledgement,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<EncodedSerializedObject, SerializedObjectEncodeError> {
+        let UnsafeRawObjectAcknowledgement::WireInvariantsAreCallersResponsibilityV1 =
+            acknowledgement;
+        let path_id = self.handle.path_id();
+        let class_id = self.handle.class_id();
         let byte_count = usize_to_u64(bytes.len(), "raw replacement bytes")?;
         budget.check_bytes(byte_count)?;
         budget.check_entries(1)?;
@@ -684,7 +1084,7 @@ impl<'file> SerializedObjectEncoder<'file> {
             class_id,
             mode: SerializedObjectEncodingMode::UnsafeRaw,
             schema_digest: None,
-            original_digest: actual,
+            original_digest: self.original_digest,
             output_digest,
             bytes,
             semantic_value: None,
@@ -696,7 +1096,7 @@ impl<'file> SerializedObjectEncoder<'file> {
     }
 }
 
-impl SerializedObjectCandidate<'_> {
+impl<'file> SerializedObjectCandidate<'file> {
     #[must_use]
     pub fn path_id(&self) -> i64 {
         self.handle.path_id()
@@ -712,9 +1112,136 @@ impl SerializedObjectCandidate<'_> {
         self.schema_digest
     }
 
+    /// Returns an opaque projection of the root schema for recursive replacement lowering.
+    #[must_use]
+    pub fn root_value_schema(&self) -> SerializedValueSchema<'_> {
+        SerializedValueSchema {
+            schema: &self.schema,
+            node: self.schema.root(),
+            context: TypeTreeTraversalContext::root(),
+        }
+    }
+
+    /// Resolves the schema corresponding to the candidate's current staged value at `path`.
+    ///
+    /// Resolution observes earlier successful operations on this candidate. The returned value is
+    /// a read-only location projection and cannot mutate or execute the backing TypeTree.
+    pub fn value_schema_at_path(
+        &self,
+        path: &FieldPath,
+    ) -> Result<SerializedValueSchema<'_>, SerializedValueSchemaError> {
+        let location = schema_location_at_path(&self.schema, &self.root, path)
+            .map_err(SerializedValueSchemaError::from)?
+            .target;
+        Ok(SerializedValueSchema {
+            schema: &self.schema,
+            node: location.node,
+            context: location.context,
+        })
+    }
+
     /// Returns the current staged semantic value at a field path without allocating.
     pub fn value_at_path(&self, path: &FieldPath) -> Result<&UnityValue, ValuePathError> {
         self.root.value_at_path(path)
+    }
+
+    /// Completes every fallible step of a field replacement without changing the candidate.
+    ///
+    /// Dropping the returned token leaves the semantic root and operation cursors unchanged.
+    pub fn prepare_replace_field(
+        &mut self,
+        ordinal: u32,
+        path: FieldPath,
+        guard: SerializedFieldGuard,
+        replacement: UnityValue,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<PreparedSerializedFieldReplace<'_>, SerializedObjectEncodeError> {
+        let validated = self.validate_replace_field_guard(ordinal, path, guard, budget)?;
+        self.prepare_validated_replace_field(validated, replacement, budget)
+    }
+
+    /// Verifies an ordered field guard without borrowing or changing the candidate.
+    ///
+    /// The token retains the immutable object handle and the candidate's operation generation, so
+    /// it cannot be replayed against another object or after an intervening mutation.
+    pub fn validate_replace_field_guard(
+        &self,
+        ordinal: u32,
+        path: FieldPath,
+        guard: SerializedFieldGuard,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<ValidatedSerializedFieldGuard<'file>, SerializedObjectEncodeError> {
+        let next_operation_count = self
+            .operation_count
+            .checked_add(1)
+            .ok_or(SerializedObjectEncodeError::OperationCountOverflow)?;
+        let path = validate_field_replacement_guard(
+            &self.schema,
+            self.schema_digest,
+            &self.root,
+            self.previous_ordinal,
+            ordinal,
+            path,
+            guard,
+            budget,
+        )?;
+        Ok(ValidatedSerializedFieldGuard {
+            handle: self.handle,
+            lineage: Arc::clone(&self.lineage),
+            schema_digest: self.schema_digest,
+            previous_ordinal: self.previous_ordinal,
+            operation_count: self.operation_count,
+            next_operation_count,
+            ordinal,
+            path,
+        })
+    }
+
+    /// Validates a replacement against a previously guarded candidate generation.
+    pub fn prepare_validated_replace_field(
+        &mut self,
+        validated: ValidatedSerializedFieldGuard<'file>,
+        replacement: UnityValue,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<PreparedSerializedFieldReplace<'_>, SerializedObjectEncodeError> {
+        let same_object = Arc::ptr_eq(&validated.lineage, &self.lineage)
+            && std::ptr::eq(validated.handle.file(), self.handle.file())
+            && std::ptr::eq(validated.handle.info(), self.handle.info());
+        if !same_object
+            || validated.schema_digest != self.schema_digest
+            || validated.previous_ordinal != self.previous_ordinal
+            || validated.operation_count != self.operation_count
+        {
+            return Err(SerializedObjectEncodeError::StaleFieldGuard {
+                path_id: self.path_id(),
+                ordinal: validated.ordinal,
+            });
+        }
+        let prepared = prepare_validated_field_replacement(
+            FieldReplacementValidation {
+                path_id: self.path_id(),
+                schema: &self.schema,
+                object_schema_digest: self.schema_digest,
+                endian: self.endian,
+                root: &mut self.root,
+                previous_ordinal: self.previous_ordinal,
+                validation_stats: self.validation_stats,
+            },
+            validated.ordinal,
+            validated.path,
+            replacement,
+            budget,
+        )?;
+        Ok(PreparedSerializedFieldReplace {
+            target: prepared.target,
+            previous_ordinal: &mut self.previous_ordinal,
+            validation_stats: &mut self.validation_stats,
+            operation_count: &mut self.operation_count,
+            replacement: prepared.replacement,
+            ordinal: validated.ordinal,
+            next_validation_stats: prepared.next_validation_stats,
+            next_operation_count: validated.next_operation_count,
+        })
     }
 
     /// Applies one operation immediately, preserving this candidate for later plan operations.
@@ -792,6 +1319,156 @@ impl SerializedObjectCandidate<'_> {
     }
 }
 
+struct FieldReplacementValidation<'schema, 'candidate> {
+    path_id: i64,
+    schema: &'schema TypeTreeSchema,
+    object_schema_digest: DigestV1,
+    endian: Endian,
+    root: &'candidate mut UnityValue,
+    previous_ordinal: Option<u32>,
+    validation_stats: OperationValidationStats,
+}
+
+struct ValidatedFieldReplacement<'candidate> {
+    target: &'candidate mut UnityValue,
+    replacement: UnityValue,
+    next_validation_stats: OperationValidationStats,
+}
+
+impl ValidatedFieldReplacement<'_> {
+    fn commit(self) -> OperationValidationStats {
+        *self.target = self.replacement;
+        self.next_validation_stats
+    }
+}
+
+fn prepare_field_replacement<'candidate>(
+    state: FieldReplacementValidation<'_, 'candidate>,
+    ordinal: u32,
+    path: FieldPath,
+    guard: SerializedFieldGuard,
+    replacement: UnityValue,
+    budget: &mut AssetLoadBudget,
+) -> Result<ValidatedFieldReplacement<'candidate>, SerializedObjectEncodeError> {
+    let path = validate_field_replacement_guard(
+        state.schema,
+        state.object_schema_digest,
+        state.root,
+        state.previous_ordinal,
+        ordinal,
+        path,
+        guard,
+        budget,
+    )?;
+    prepare_validated_field_replacement(state, ordinal, path, replacement, budget)
+}
+
+fn validate_field_replacement_guard(
+    schema: &TypeTreeSchema,
+    object_schema_digest: DigestV1,
+    root: &UnityValue,
+    previous_ordinal: Option<u32>,
+    ordinal: u32,
+    path: FieldPath,
+    guard: SerializedFieldGuard,
+    budget: &mut AssetLoadBudget,
+) -> Result<FieldPath, SerializedObjectEncodeError> {
+    if let Some(previous) = previous_ordinal
+        && ordinal <= previous
+    {
+        return Err(SerializedObjectEncodeError::OperationOrder {
+            previous,
+            current: ordinal,
+        });
+    }
+    if path.segments().is_empty() {
+        return Err(SerializedObjectEncodeError::RootFieldReplacement { ordinal });
+    }
+    budget.consume_entries(1)?;
+    charge_path(&path, budget)?;
+    match schema_location_at_path(schema, root, &path) {
+        Ok(_) => {}
+        Err(failure) => return Err(map_path_failure(ordinal, path, failure)),
+    }
+    let current = match root.value_at_path(&path) {
+        Ok(current) => current,
+        Err(failure) => return Err(map_value_path_failure(ordinal, path, failure)),
+    };
+    if let Err(failure) = verify_field_guard(&path, guard, object_schema_digest, current, budget) {
+        return Err(failure.into_error(ordinal, path));
+    }
+
+    Ok(path)
+}
+
+fn prepare_validated_field_replacement<'candidate>(
+    state: FieldReplacementValidation<'_, 'candidate>,
+    ordinal: u32,
+    path: FieldPath,
+    replacement: UnityValue,
+    budget: &mut AssetLoadBudget,
+) -> Result<ValidatedFieldReplacement<'candidate>, SerializedObjectEncodeError> {
+    let resolution = match schema_location_at_path(state.schema, state.root, &path) {
+        Ok(resolution) => resolution,
+        Err(failure) => return Err(map_path_failure(ordinal, path, failure)),
+    };
+    let current = match state.root.value_at_path_mut(&path) {
+        Ok(current) => current,
+        Err(failure) => return Err(map_value_path_failure(ordinal, path, failure)),
+    };
+
+    let original = replace(current, replacement);
+    let validation = resolution.semantic_owner.unwrap_or(SemanticOwnerLocation {
+        schema: resolution.target,
+        path_len: path.segments().len(),
+    });
+    let validation_result = match state
+        .root
+        .value_at_segments(&path.segments()[..validation.path_len])
+    {
+        Ok(candidate) => Ok(validate_value(
+            state.schema,
+            validation.schema.node,
+            candidate,
+            state.endian,
+            budget,
+            validation.schema.context,
+            validation.schema.depth,
+        )),
+        Err(failure) => Err(failure),
+    };
+
+    let current = state
+        .root
+        .value_at_path_mut(&path)
+        .expect("a terminal field replacement cannot invalidate its own path");
+    let pending = replace(current, original);
+    let traversal = match validation_result {
+        Ok(Ok(stats)) => stats,
+        Ok(Err(error)) => {
+            return Err(map_operation_value_error(
+                state.path_id,
+                ordinal,
+                path,
+                error,
+            ));
+        }
+        Err(failure) => return Err(map_value_path_failure(ordinal, path, failure)),
+    };
+    let mut next_validation_stats = state.validation_stats;
+    next_validation_stats.record(traversal)?;
+    let target = state
+        .root
+        .value_at_path_mut(&path)
+        .expect("the validated field path remains stable until token commit");
+
+    Ok(ValidatedFieldReplacement {
+        target,
+        replacement: pending,
+        next_validation_stats,
+    })
+}
+
 fn apply_operation(
     operation: SerializedObjectMutation,
     path_id: i64,
@@ -804,15 +1481,21 @@ fn apply_operation(
     budget: &mut AssetLoadBudget,
 ) -> Result<(), SerializedObjectEncodeError> {
     let ordinal = operation.ordinal;
-    if let Some(previous) = *previous_ordinal
-        && ordinal <= previous
-    {
-        return Err(SerializedObjectEncodeError::OperationOrder {
-            previous,
-            current: ordinal,
-        });
+    let field_replace = matches!(
+        &operation.kind,
+        SerializedObjectMutationKind::ReplaceField { .. }
+    );
+    if !field_replace {
+        if let Some(previous) = *previous_ordinal
+            && ordinal <= previous
+        {
+            return Err(SerializedObjectEncodeError::OperationOrder {
+                previous,
+                current: ordinal,
+            });
+        }
+        budget.consume_entries(1)?;
     }
-    budget.consume_entries(1)?;
 
     match operation.kind {
         SerializedObjectMutationKind::ReplaceField {
@@ -820,57 +1503,23 @@ fn apply_operation(
             guard,
             replacement,
         } => {
-            if path.segments().is_empty() {
-                return Err(SerializedObjectEncodeError::RootFieldReplacement { ordinal });
-            }
-            charge_path(&path, budget)?;
-            let resolution = match schema_location_at_path(schema, root, &path) {
-                Ok(resolution) => resolution,
-                Err(failure) => return Err(map_path_failure(ordinal, path, failure)),
-            };
-            let current = match root.value_at_path_mut(&path) {
-                Ok(current) => current,
-                Err(failure) => return Err(map_value_path_failure(ordinal, path, failure)),
-            };
-            if let Err(failure) =
-                verify_field_guard(&path, guard, object_schema_digest, current, budget)
-            {
-                return Err(failure.into_error(ordinal, path));
-            }
-            let original = replace(current, replacement);
-            let validation = resolution.semantic_owner.unwrap_or(SemanticOwnerLocation {
-                schema: resolution.target,
-                path_len: path.segments().len(),
-            });
-            let validation_result =
-                match root.value_at_segments(&path.segments()[..validation.path_len]) {
-                    Ok(candidate) => Ok(validate_value(
-                        schema,
-                        validation.schema.node,
-                        candidate,
-                        endian,
-                        budget,
-                        validation.schema.context,
-                        validation.schema.depth,
-                    )),
-                    Err(failure) => Err(failure),
-                };
-
-            // Only the terminal value changed, so the resolved path remains valid for rollback.
-            let current = root
-                .value_at_path_mut(&path)
-                .expect("a terminal field replacement cannot invalidate its own path");
-            let pending = replace(current, original);
-            match validation_result {
-                Ok(Ok(stats)) => {
-                    validation_stats.record(stats)?;
-                    *current = pending;
-                }
-                Ok(Err(error)) => {
-                    return Err(map_operation_value_error(path_id, ordinal, path, error));
-                }
-                Err(failure) => return Err(map_value_path_failure(ordinal, path, failure)),
-            }
+            let validated = prepare_field_replacement(
+                FieldReplacementValidation {
+                    path_id,
+                    schema,
+                    object_schema_digest,
+                    endian,
+                    root,
+                    previous_ordinal: *previous_ordinal,
+                    validation_stats: *validation_stats,
+                },
+                ordinal,
+                path,
+                guard,
+                replacement,
+                budget,
+            )?;
+            *validation_stats = validated.commit();
         }
         SerializedObjectMutationKind::ReplaceObject { guard, replacement } => {
             verify_object_guard(ordinal, guard, object_schema_digest, root, budget)?;
@@ -1202,6 +1851,34 @@ enum PathFailure {
     },
 }
 
+impl From<PathFailure> for SerializedValueSchemaError {
+    fn from(failure: PathFailure) -> Self {
+        match failure {
+            PathFailure::SegmentOverflow => Self::SegmentOverflow,
+            PathFailure::Missing { segment } => Self::Missing { segment },
+            PathFailure::SchemaMismatch { segment } => Self::SchemaMismatch { segment },
+            PathFailure::TypeMismatch {
+                segment,
+                expected,
+                actual,
+            } => Self::TypeMismatch {
+                segment,
+                expected,
+                actual,
+            },
+            PathFailure::IndexOutOfBounds {
+                segment,
+                index,
+                length,
+            } => Self::IndexOutOfBounds {
+                segment,
+                index,
+                length,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SchemaLocation<'schema> {
     node: SchemaNode<'schema>,
@@ -1330,6 +2007,12 @@ fn resolve_named_schema_child<'schema>(
     object: &IndexMap<String, UnityValue>,
     name: &str,
 ) -> Option<(SchemaNode<'schema>, TypeTreeTraversalContext)> {
+    let runtime_type = match node.semantic_layout() {
+        SemanticLayout::ReferencedObject(layout) => {
+            managed_reference_type_from_value(layout, object)
+        }
+        _ => None,
+    };
     for child in node.children() {
         let Some(child_context) = context.descend(node, child) else {
             continue;
@@ -1339,7 +2022,7 @@ fn resolve_named_schema_child<'schema>(
         }
         let resolved = match node.semantic_layout() {
             SemanticLayout::ReferencedObject(layout) if layout.is_payload(child) => {
-                resolve_managed_payload(schema, layout, object)?
+                resolve_managed_payload_for_type(schema, layout, runtime_type?)?
             }
             _ => child,
         };
@@ -1348,11 +2031,35 @@ fn resolve_named_schema_child<'schema>(
     None
 }
 
-fn resolve_managed_payload<'schema>(
+fn resolve_named_schema_child_for_managed_type<'schema>(
     schema: &'schema TypeTreeSchema,
-    layout: unity_asset_binary::typetree::ReferencedObjectLayout<'schema>,
-    object: &IndexMap<String, UnityValue>,
-) -> Option<SchemaNode<'schema>> {
+    node: SchemaNode<'schema>,
+    mut context: TypeTreeTraversalContext,
+    name: &str,
+    runtime_type: SerializedManagedReferenceType<'_>,
+) -> Option<(SchemaNode<'schema>, TypeTreeTraversalContext)> {
+    for child in node.children() {
+        let Some(child_context) = context.descend(node, child) else {
+            continue;
+        };
+        if child.name() != name {
+            continue;
+        }
+        let resolved = match node.semantic_layout() {
+            SemanticLayout::ReferencedObject(layout) if layout.is_payload(child) => {
+                resolve_managed_payload_for_type(schema, layout, runtime_type)?
+            }
+            _ => child,
+        };
+        return Some((resolved, child_context));
+    }
+    None
+}
+
+fn managed_reference_type_from_value<'value>(
+    layout: unity_asset_binary::typetree::ReferencedObjectLayout<'_>,
+    object: &'value IndexMap<String, UnityValue>,
+) -> Option<SerializedManagedReferenceType<'value>> {
     let UnityValue::Object(type_fields) = object.get(layout.type_node().name())? else {
         return None;
     };
@@ -1365,8 +2072,24 @@ fn resolve_managed_payload<'schema>(
     let UnityValue::String(assembly_name) = type_fields.get(layout.assembly_field().name())? else {
         return None;
     };
+    Some(SerializedManagedReferenceType::new(
+        class_name,
+        namespace,
+        assembly_name,
+    ))
+}
+
+fn resolve_managed_payload_for_type<'schema>(
+    schema: &'schema TypeTreeSchema,
+    layout: unity_asset_binary::typetree::ReferencedObjectLayout<'schema>,
+    runtime_type: SerializedManagedReferenceType<'_>,
+) -> Option<SchemaNode<'schema>> {
     schema
-        .resolve_managed_root(class_name, namespace, assembly_name)
+        .resolve_managed_root(
+            runtime_type.class_name(),
+            runtime_type.namespace(),
+            runtime_type.assembly_name(),
+        )
         .or_else(|| layout.payload().fallback())
 }
 
@@ -1620,6 +2343,35 @@ mod tests {
     }
 
     #[test]
+    fn opaque_schema_projection_exposes_stable_pptr_field_locations() {
+        let mut pointer = node("PPtr<Texture2D>", "m_Texture");
+        pointer.children = vec![
+            node("UInt16", "m_Tag"),
+            node("UInt32", "m_FileID"),
+            node("UInt64", "m_PathID"),
+        ];
+        let schema = compile(record(vec![pointer]), &[]);
+        let root = SerializedValueSchema {
+            schema: &schema,
+            node: schema.root(),
+            context: TypeTreeTraversalContext::root(),
+        };
+
+        let layout = root
+            .field("m_Texture")
+            .and_then(SerializedValueSchema::pptr_layout)
+            .expect("compiled PPtr layout");
+
+        assert_eq!(layout.file_field(), "m_FileID");
+        assert_eq!(layout.file_index(), 1);
+        assert_eq!(layout.file_primitive(), PrimitiveKind::U32);
+        assert_eq!(layout.path_field(), "m_PathID");
+        assert_eq!(layout.path_index(), 2);
+        assert_eq!(layout.path_primitive(), PrimitiveKind::U64);
+        assert_eq!(layout.field_count(), 3);
+    }
+
+    #[test]
     fn field_validation_includes_nearest_pptr_owner() {
         let mut pointer = node("PPtr<Texture2D>", "m_Texture");
         pointer.children = vec![node("UInt32", "m_FileID"), node("UInt64", "m_PathID")];
@@ -1686,6 +2438,92 @@ mod tests {
         assert_eq!(previous, None);
         assert_eq!(validation.passes, 0);
         assert_eq!(root, original_root);
+    }
+
+    #[test]
+    fn prepared_field_replacement_is_inert_until_commit() {
+        let schema = compile(record(vec![node("UInt32", "m_Value")]), &[]);
+        let digest = schema_digest(&schema);
+        let path = FieldPath::root().push_field("m_Value").unwrap();
+        let original = UnityValue::Unsigned(7);
+        let guard = SerializedFieldGuard::from_observed(
+            digest,
+            &path,
+            &original,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let mut root = UnityValue::Object(IndexMap::from([("m_Value".to_owned(), original)]));
+        let mut previous = None;
+        let mut validation = OperationValidationStats::default();
+        let mut operation_count = 0_u64;
+
+        let validated = prepare_field_replacement(
+            FieldReplacementValidation {
+                path_id: 93,
+                schema: &schema,
+                object_schema_digest: digest,
+                endian: Endian::Little,
+                root: &mut root,
+                previous_ordinal: previous,
+                validation_stats: validation,
+            },
+            7,
+            path.clone(),
+            guard,
+            UnityValue::Unsigned(9),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let pending = PreparedSerializedFieldReplace {
+            target: validated.target,
+            previous_ordinal: &mut previous,
+            validation_stats: &mut validation,
+            operation_count: &mut operation_count,
+            replacement: validated.replacement,
+            ordinal: 7,
+            next_validation_stats: validated.next_validation_stats,
+            next_operation_count: 1,
+        };
+        drop(pending);
+        assert_eq!(root.value_at_path(&path).unwrap(), &UnityValue::Unsigned(7));
+        assert_eq!(previous, None);
+        assert_eq!(validation.passes, 0);
+        assert_eq!(operation_count, 0);
+
+        let validated = prepare_field_replacement(
+            FieldReplacementValidation {
+                path_id: 93,
+                schema: &schema,
+                object_schema_digest: digest,
+                endian: Endian::Little,
+                root: &mut root,
+                previous_ordinal: previous,
+                validation_stats: validation,
+            },
+            7,
+            path.clone(),
+            guard,
+            UnityValue::Unsigned(9),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        PreparedSerializedFieldReplace {
+            target: validated.target,
+            previous_ordinal: &mut previous,
+            validation_stats: &mut validation,
+            operation_count: &mut operation_count,
+            replacement: validated.replacement,
+            ordinal: 7,
+            next_validation_stats: validated.next_validation_stats,
+            next_operation_count: 1,
+        }
+        .commit();
+
+        assert_eq!(root.value_at_path(&path).unwrap(), &UnityValue::Unsigned(9));
+        assert_eq!(previous, Some(7));
+        assert_eq!(validation.passes, 1);
+        assert_eq!(operation_count, 1);
     }
 
     #[test]

@@ -6,22 +6,27 @@ use unity_asset_core::{
 use crate::reference::input::{ReferenceInput, ReferenceSource, ReferenceSourceOwner, sealed};
 use crate::reference::{ReferenceGraphError, ReferenceStore};
 
-use super::super::{ReferenceViewParts, WorkspaceError};
+use super::super::{
+    ReferenceViewParts, ReferenceViewState, WorkspaceError, WorkspaceState,
+    source_catalog::SourceCatalog,
+};
 
 impl sealed::Sealed for ReferenceViewParts<'_> {}
 
 impl ReferenceInput for ReferenceViewParts<'_> {
     fn workspace_id(&self) -> WorkspaceId {
-        self.state.workspace()
+        self.catalog().workspace()
     }
 
     fn revision(&self) -> WorkspaceRevision {
-        self.state.revision()
+        match self.state {
+            ReferenceViewState::Committed(state) => state.revision(),
+            ReferenceViewState::Prepared(state) => state.revision(),
+        }
     }
 
     fn object_source_count(&self) -> usize {
-        self.state
-            .store()
+        self.catalog()
             .iter()
             .filter(|(source, _)| is_object_source(source.kind()))
             .count()
@@ -30,23 +35,77 @@ impl ReferenceInput for ReferenceViewParts<'_> {
     fn object_sources(
         &self,
     ) -> impl Iterator<Item = Result<ReferenceSource<'_>, ReferenceGraphError>> {
-        self.state
-            .store()
+        let catalog = self.catalog();
+        let base = self.base_state();
+        let prepared = self.prepared_state();
+        catalog
             .iter()
             .filter(|(source, _)| is_object_source(source.kind()))
-            .map(|(source, entry)| {
-                let catalog = self.state.catalog();
+            .map(move |(source, _)| {
+                let entry = base
+                    .store()
+                    .get(source)
+                    .ok_or(ReferenceGraphError::Invariant(
+                        "prepared object source has no immutable baseline parse",
+                    ))?;
                 let locator = catalog
                     .source_locator(source)
                     .map_err(WorkspaceError::from)?;
                 let parent = catalog.parent(source).map_err(WorkspaceError::from)?;
-                let physical_path = parent
-                    .is_none()
-                    .then(|| catalog.physical_origin(source))
-                    .transpose()
-                    .map_err(WorkspaceError::from)?
-                    .map(|origin| origin.path());
+                let physical_path = if parent.is_none() {
+                    catalog
+                        .physical_origin_option(source)
+                        .map_err(WorkspaceError::from)?
+                        .map(|origin| origin.path())
+                } else {
+                    None
+                };
                 let fingerprint = catalog.fingerprint(source).map_err(WorkspaceError::from)?;
+
+                if let Some(prepared) = prepared
+                    && prepared.source_binding(source).is_some()
+                {
+                    let owner = ReferenceSourceOwner::from(prepared.artifacts());
+                    return match source.kind() {
+                        SourceKind::SerializedFile => ReferenceSource::prepared_serialized(
+                            source,
+                            fingerprint,
+                            owner,
+                            locator,
+                            parent,
+                            physical_path,
+                            entry
+                                .cached_serialized()
+                                .ok_or(ReferenceGraphError::Invariant(
+                                    "SerializedFile source has no frozen parse",
+                                ))?
+                                .as_ref(),
+                            prepared,
+                        ),
+                        SourceKind::Yaml => ReferenceSource::prepared_yaml(
+                            source,
+                            fingerprint,
+                            owner,
+                            locator,
+                            parent,
+                            physical_path,
+                            entry
+                                .cached_yaml()
+                                .ok_or(ReferenceGraphError::Invariant(
+                                    "YAML source has no frozen parse",
+                                ))?
+                                .as_ref(),
+                            prepared,
+                        ),
+                        SourceKind::AssetBundle
+                        | SourceKind::WebFile
+                        | SourceKind::Archive
+                        | SourceKind::StreamedResource => Err(ReferenceGraphError::Invariant(
+                            "non-object source reached the reference input adapter",
+                        )),
+                    };
+                }
+
                 let owner = ReferenceSourceOwner::from(entry.image().backing());
                 match source.kind() {
                     SourceKind::SerializedFile => ReferenceSource::serialized(
@@ -101,7 +160,6 @@ impl ReferenceInput for ReferenceViewParts<'_> {
         budget: &mut AssetLoadBudget,
     ) -> Result<ObjectAddress, ReferenceGraphError> {
         let locator_bytes = self
-            .state
             .catalog()
             .source_locator(object.source())
             .map_err(WorkspaceError::from)?
@@ -115,11 +173,33 @@ impl ReferenceInput for ReferenceViewParts<'_> {
                 resource: "reference target address",
             })?;
         budget.consume_bytes(usize_to_u64(retained, "reference target address")?)?;
-        self.state
-            .catalog()
+        self.catalog()
             .address_for_object(object)
             .map_err(WorkspaceError::from)
             .map_err(ReferenceGraphError::from)
+    }
+}
+
+impl ReferenceViewParts<'_> {
+    fn catalog(&self) -> &SourceCatalog {
+        match self.state {
+            ReferenceViewState::Committed(state) => state.catalog(),
+            ReferenceViewState::Prepared(state) => state.catalog(),
+        }
+    }
+
+    fn base_state(&self) -> &WorkspaceState {
+        match self.state {
+            ReferenceViewState::Committed(state) => state.as_ref(),
+            ReferenceViewState::Prepared(state) => state.base().state().as_ref(),
+        }
+    }
+
+    fn prepared_state(&self) -> Option<&super::super::overlay::PreparedStateCore> {
+        match self.state {
+            ReferenceViewState::Committed(_) => None,
+            ReferenceViewState::Prepared(state) => Some(state),
+        }
     }
 }
 

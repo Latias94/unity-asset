@@ -116,31 +116,9 @@ fn committed_yaml_object_borrows_its_document_class_without_cloning_it() {
 }
 
 #[test]
-fn prepared_yaml_object_and_its_clone_retain_the_class_after_owners_are_dropped() {
-    let class = Arc::new(UnityClass::new(
-        114,
-        "MonoBehaviour".to_owned(),
-        "4201".to_owned(),
-    ));
-    let expected_class = Arc::as_ptr(&class);
-    let object = WorkspaceYamlObject::from_prepared(Arc::clone(&class), 7);
-    let retained = object.clone();
-
-    drop(class);
-    assert_eq!(object.document_index(), 7);
-    assert_eq!(std::ptr::from_ref(object.class()), expected_class);
-    drop(object);
-
-    assert_eq!(retained.document_index(), 7);
-    assert_eq!(retained.class().class_name, "MonoBehaviour");
-    assert_eq!(std::ptr::from_ref(retained.class()), expected_class);
-}
-
-#[test]
-fn yaml_object_debug_is_bounded_and_consistent_across_backings() {
+fn yaml_object_debug_is_bounded_and_omits_sibling_values() {
     let mut class = UnityClass::new(114, "MonoBehaviour".to_owned(), "4201".to_owned());
     class.set("m_Secret".to_owned(), "selected-object-sensitive-property");
-    let prepared_class = Arc::new(class.clone());
     let mut sibling = UnityClass::new(1, "SiblingObject".to_owned(), "9001".to_owned());
     sibling.set("m_Secret".to_owned(), "sibling-sensitive-property");
     let mut document = YamlDocument::new();
@@ -148,17 +126,11 @@ fn yaml_object_debug_is_bounded_and_consistent_across_backings() {
     document.add_entry(sibling);
 
     let committed = WorkspaceYamlObject::new(Arc::new(document), 0);
-    let prepared = WorkspaceYamlObject::from_prepared(prepared_class, 0);
     let committed_debug = format!("{committed:?}");
-    let prepared_debug = format!("{prepared:?}");
 
     assert_eq!(
         committed_debug,
-        "WorkspaceYamlObject { backing: \"committed\", document_index: 0, class_id: 114, class_name: \"MonoBehaviour\", anchor: \"4201\" }"
-    );
-    assert_eq!(
-        prepared_debug,
-        "WorkspaceYamlObject { backing: \"prepared\", document_index: 0, class_id: 114, class_name: \"MonoBehaviour\", anchor: \"4201\" }"
+        "WorkspaceYamlObject { document_index: 0, class_id: 114, class_name: \"MonoBehaviour\", anchor: \"4201\" }"
     );
     for sensitive in [
         "m_Secret",
@@ -167,7 +139,6 @@ fn yaml_object_debug_is_bounded_and_consistent_across_backings() {
         "sibling-sensitive-property",
     ] {
         assert!(!committed_debug.contains(sensitive));
-        assert!(!prepared_debug.contains(sensitive));
     }
 }
 

@@ -10,8 +10,9 @@ use unity_asset::schema::{
     Vector3, recipe_capabilities,
 };
 use unity_asset::workspace::{
-    AssetWorkspace, GenericMutation, MutationPlanBuilder, MutationPlanBuilderError,
-    MutationValueRef, PlanPayload, ReferenceTarget, SequenceMutation,
+    AssetWorkspace, GenericMutation, MutationPlan, MutationPlanBuilder, MutationPlanBuilderError,
+    MutationPlanFragment, MutationValueRef, PlanPayload, PrepareOptions, ReferenceTarget,
+    SequenceMutation,
 };
 use unity_asset::{
     AssetLoadBudget, AssetLoadLimits, FieldPath, ObjectAddress, SourceLocator, UnityValue,
@@ -1590,4 +1591,266 @@ fn material_scan_to_the_last_property_is_budgeted() {
         let mut one_short = AssetLoadBudget::new(limits).unwrap();
         assert_eq!(run(&mut one_short), Err(true));
     }
+}
+
+fn equivalent_plan_pair(fragment: MutationPlanFragment) -> (MutationPlan, MutationPlan) {
+    let direct = MutationPlan::new(
+        fragment.base_revision(),
+        fragment.sources().to_vec(),
+        fragment.payloads().to_vec(),
+        fragment.actions().to_vec(),
+    )
+    .unwrap();
+    let mut builder = MutationPlanBuilder::new(fragment.base_revision());
+    builder.append(fragment).unwrap();
+    let recipe = builder.build().unwrap();
+    assert_eq!(
+        recipe.canonical_json().unwrap(),
+        direct.canonical_json().unwrap()
+    );
+    (recipe, direct)
+}
+
+fn assert_prepare_equivalent(fixture: &Fixture, fragment: MutationPlanFragment) {
+    let (recipe, direct) = equivalent_plan_pair(fragment);
+    let recipe = fixture
+        .workspace
+        .prepare(
+            recipe,
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let direct = fixture
+        .workspace
+        .prepare(
+            direct,
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+    assert_eq!(recipe.report(), direct.report());
+    assert_eq!(recipe.artifact_usage(), direct.artifact_usage());
+    assert_eq!(
+        recipe.view().reference_graph().facts(),
+        direct.view().reference_graph().facts()
+    );
+}
+
+#[test]
+fn every_retained_recipe_matches_its_direct_primitive_prepare_result() {
+    let mut covered = Vec::new();
+
+    {
+        let fixture = Fixture::open("reference-equivalence.prefab", MATERIAL_YAML);
+        let snapshot = fixture.workspace.snapshot();
+        let planner = SchemaRecipePlanner::new(&snapshot);
+        let object = planner
+            .inspect(&fixture.address("2100000"), &mut AssetLoadBudget::default())
+            .unwrap();
+        let path = FieldPath::root()
+            .push_field("m_SavedProperties")
+            .unwrap()
+            .push_field("m_TexEnvs")
+            .unwrap()
+            .push_index(0)
+            .unwrap()
+            .push_field("second")
+            .unwrap()
+            .push_field("m_Texture")
+            .unwrap();
+        let fragment = changed(
+            planner
+                .lower_reference(
+                    &object,
+                    path,
+                    ReferenceTarget::null(),
+                    ReferenceTarget::object(fixture.address("2100001")),
+                    &mut AssetLoadBudget::default(),
+                )
+                .unwrap(),
+        );
+        assert_prepare_equivalent(&fixture, fragment);
+        covered.push(RecipeId::ReferenceRetargetV1);
+    }
+
+    {
+        let fixture = Fixture::open("transform-equivalence.prefab", HIERARCHY_YAML);
+        let snapshot = fixture.workspace.snapshot();
+        let planner = SchemaRecipePlanner::new(&snapshot);
+        let object = planner
+            .inspect(&fixture.address("1"), &mut AssetLoadBudget::default())
+            .unwrap();
+        let fragment = changed(
+            TransformRecipe::lower_transform(
+                &planner,
+                &object,
+                TransformChange::LocalPosition(Vector3::new(3.0, 2.0, 1.0)),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap(),
+        );
+        assert_prepare_equivalent(&fixture, fragment);
+        covered.push(RecipeId::TransformV1);
+    }
+
+    {
+        let fixture = Fixture::open("material-equivalence.prefab", MATERIAL_YAML);
+        let snapshot = fixture.workspace.snapshot();
+        let planner = SchemaRecipePlanner::new(&snapshot);
+        let object = planner
+            .inspect(&fixture.address("2100000"), &mut AssetLoadBudget::default())
+            .unwrap();
+        let fragment = changed(
+            MaterialRecipe::lower(
+                &planner,
+                &object,
+                "_MainTex",
+                MaterialTextureChange::SetScaleOffset {
+                    scale: Vector2::new(2.0, 3.0),
+                    offset: Vector2::new(0.25, 0.5),
+                },
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap(),
+        );
+        assert_prepare_equivalent(&fixture, fragment);
+        covered.push(RecipeId::MaterialTextureEnvironmentV1);
+    }
+
+    {
+        let fixture = Fixture::open("event-equivalence.prefab", EVENT_YAML);
+        let snapshot = fixture.workspace.snapshot();
+        let planner = SchemaRecipePlanner::new(&snapshot);
+        let object = planner
+            .inspect(
+                &fixture.address("11400001"),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let call = PersistentCall::new(
+            ReferenceTarget::object(fixture.address("100000")),
+            "Example.Target, Example",
+            "Prepared",
+            PersistentArgument::Void,
+            PersistentCallState::RuntimeOnly,
+        )
+        .unwrap();
+        let fragment = changed(
+            UnityEventRecipe::lower(
+                &planner,
+                &object,
+                FieldPath::root().push_field("m_OnClick").unwrap(),
+                UnityEventEdit::Add {
+                    call,
+                    shape: PersistentCallShape::WithTargetAssemblyTypeName,
+                },
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap(),
+        );
+        assert_prepare_equivalent(&fixture, fragment);
+        covered.push(RecipeId::UnityEventPersistentCallsV1);
+    }
+
+    {
+        let fixture = Fixture::open("hierarchy-equivalence.prefab", HIERARCHY_YAML);
+        let snapshot = fixture.workspace.snapshot();
+        let planner = SchemaRecipePlanner::new(&snapshot);
+        let state = hierarchy_state(&fixture, &planner);
+        let fragment = changed(
+            HierarchyRecipe::reparent(
+                &planner,
+                &state,
+                &fixture.address("2"),
+                Some(&fixture.address("3")),
+                ChildPlacement::Append,
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap(),
+        );
+        assert_prepare_equivalent(&fixture, fragment);
+        covered.push(RecipeId::HierarchyReparentV1);
+    }
+
+    {
+        let fixture = Fixture::open("resource-equivalence.prefab", RESOURCE_YAML);
+        let snapshot = fixture.workspace.snapshot();
+        let planner = SchemaRecipePlanner::new(&snapshot);
+        let object = planner
+            .inspect(&fixture.address("8300001"), &mut AssetLoadBudget::default())
+            .unwrap();
+        let fragment = changed(
+            AudioClipResourceRecipe::lower(
+                &planner,
+                &object,
+                PlanPayload::new(b"OggS-equivalence".to_vec()),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap(),
+        );
+        assert_prepare_equivalent(&fixture, fragment);
+        covered.push(RecipeId::AudioClipStreamedResourceV1);
+    }
+
+    assert_eq!(
+        covered,
+        recipe_capabilities()
+            .recipes()
+            .iter()
+            .map(|recipe| recipe.id())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn recipe_and_direct_plan_report_the_same_external_source_conflict() {
+    let fixture = Fixture::open("recipe-conflict.prefab", HIERARCHY_YAML);
+    let snapshot = fixture.workspace.snapshot();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+    let object = planner
+        .inspect(&fixture.address("1"), &mut AssetLoadBudget::default())
+        .unwrap();
+    let fragment = changed(
+        TransformRecipe::lower_transform(
+            &planner,
+            &object,
+            TransformChange::LocalScale(Vector3::new(2.0, 2.0, 2.0)),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap(),
+    );
+    let (recipe, direct) = equivalent_plan_pair(fragment);
+    let changed_source = HIERARCHY_YAML.replacen(
+        "m_LocalScale: {x: 1, y: 1, z: 1}",
+        "m_LocalScale: {x: 9, y: 9, z: 9}",
+        1,
+    );
+    fs::write(
+        fixture._directory.path().join(&fixture.alias),
+        changed_source,
+    )
+    .unwrap();
+
+    let recipe = fixture
+        .workspace
+        .prepare(
+            recipe,
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    let direct = fixture
+        .workspace
+        .prepare(
+            direct,
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    assert_eq!(recipe.report(), direct.report());
+    let diagnostic = &recipe.report().diagnostics()[0];
+    assert!(diagnostic.expected_fingerprint().is_some());
+    assert!(diagnostic.actual_fingerprint().is_some());
 }

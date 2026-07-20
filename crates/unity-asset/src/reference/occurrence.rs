@@ -7,7 +7,8 @@ use unity_asset_binary::typetree::{TypeTreeParseMode, TypeTreeParseOptions};
 use unity_asset_core::{AssetLoadBudget, BudgetError, DiagnosticSeverity, UnityDocument};
 use unity_asset_yaml::{
     YamlDocument, YamlReferenceDiagnostic, YamlReferenceField, YamlReferenceScanError,
-    YamlReferenceShape, YamlValueKind, scan_reference_occurrences,
+    YamlReferenceShape, YamlValueKind, scan_reference_class_occurrences,
+    scan_reference_occurrences,
 };
 
 use super::ReferenceGraphError;
@@ -15,7 +16,7 @@ use super::cache::{
     LocalObjectId, LocalReferenceDiagnostic, LocalReferenceOccurrence, SourceReferenceOccurrences,
 };
 use super::fact::{BinaryExternalReference, RawReferenceTarget, ReferenceGuid};
-use super::input::{ReferenceSource, ReferenceSourceParse};
+use super::input::{PreparedReferenceOverlay, ReferenceSource, ReferenceSourceParse};
 
 pub(crate) fn scan_source_occurrences(
     source: &ReferenceSource<'_>,
@@ -23,8 +24,18 @@ pub(crate) fn scan_source_occurrences(
     budget: &mut AssetLoadBudget,
 ) -> Result<Arc<SourceReferenceOccurrences>, ReferenceGraphError> {
     let candidate = match source.parse() {
-        ReferenceSourceParse::Serialized(file) => scan_binary_source(file, typetree, budget)?,
-        ReferenceSourceParse::Yaml(document) => scan_yaml_source(document, budget)?,
+        ReferenceSourceParse::Serialized(file) => scan_binary_source(file, None, typetree, budget)?,
+        ReferenceSourceParse::Yaml(document) => scan_yaml_source(document, None, budget)?,
+        ReferenceSourceParse::PreparedSerialized {
+            source,
+            file,
+            overlay,
+        } => scan_binary_source(file, Some((source, overlay)), typetree, budget)?,
+        ReferenceSourceParse::PreparedYaml {
+            source,
+            document,
+            overlay,
+        } => scan_yaml_source(document, Some((source, overlay)), budget)?,
     };
     let wrapper_bytes = u64::try_from(size_of::<SourceReferenceOccurrences>()).map_err(|_| {
         BudgetError::ArithmeticOverflow {
@@ -37,6 +48,7 @@ pub(crate) fn scan_source_occurrences(
 
 fn scan_binary_source(
     file: &SerializedFile,
+    overlay: Option<(unity_asset_core::SourceId, &dyn PreparedReferenceOverlay)>,
     typetree: TypeTreeParseOptions,
     budget: &mut AssetLoadBudget,
 ) -> Result<SourceReferenceOccurrences, ReferenceGraphError> {
@@ -48,7 +60,17 @@ fn scan_binary_source(
     for object in file.object_handles() {
         budget.consume_entries(1)?;
         let owner = LocalObjectId::Binary(object.path_id());
-        let scan = match object.scan_reference_occurrences_with_options(budget, typetree) {
+        let replacement = overlay
+            .and_then(|(source, overlay)| overlay.binary_replacement(source, object.path_id()));
+        let scan_result = match replacement {
+            Some(replacement) => object.scan_replacement_reference_occurrences_with_options(
+                replacement,
+                budget,
+                typetree,
+            ),
+            None => object.scan_reference_occurrences_with_options(budget, typetree),
+        };
+        let scan = match scan_result {
             Ok(Some(scan)) => scan,
             Ok(None) => {
                 complete = false;
@@ -105,7 +127,13 @@ fn scan_binary_source(
             let external = if occurrence.file_id > 0 {
                 usize::try_from(occurrence.file_id - 1)
                     .ok()
-                    .and_then(|index| file.externals.get(index).map(|external| (index, external)))
+                    .and_then(|index| {
+                        let external = match overlay {
+                            Some((source, overlay)) => overlay.binary_external(source, file, index),
+                            None => file.externals.get(index),
+                        }?;
+                        Some((index, external))
+                    })
                     .map(|(index, external)| {
                         let index =
                             u32::try_from(index).map_err(|_| BudgetError::ArithmeticOverflow {
@@ -163,9 +191,23 @@ fn scan_binary_source(
 
 fn scan_yaml_source(
     document: &YamlDocument,
+    overlay: Option<(unity_asset_core::SourceId, &dyn PreparedReferenceOverlay)>,
     budget: &mut AssetLoadBudget,
 ) -> Result<SourceReferenceOccurrences, ReferenceGraphError> {
-    let scan = scan_reference_occurrences(document, budget).map_err(|error| match error {
+    let scan = match overlay {
+        Some((source, overlay)) => scan_reference_class_occurrences(
+            document.entries().len(),
+            |index| {
+                document
+                    .entries()
+                    .get(index)
+                    .map(|base| overlay.yaml_class(source, index, base))
+            },
+            budget,
+        ),
+        None => scan_reference_occurrences(document, budget),
+    }
+    .map_err(|error| match error {
         YamlReferenceScanError::Budget(source) => ReferenceGraphError::Budget(source),
         YamlReferenceScanError::AllocationFailed {
             resource,

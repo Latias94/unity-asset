@@ -43,6 +43,49 @@ fn preview_and_push<'payload>(
 }
 
 #[test]
+fn declared_generated_digest_is_verified_only_by_independent_reparse() {
+    let bytes = b"actual payload";
+    let declared_digest = DigestV1::hash_bytes(b"different payload");
+    let extent = StreamedResourceExtent::generated_declared(bytes, declared_digest, 1).unwrap();
+    assert_eq!(extent.payload_digest(), declared_digest);
+
+    let extents = [extent];
+    let plan = StreamedResourcePlan::new(StreamedResourceFlags::default(), &extents).unwrap();
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let mut declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    let declared = plan
+        .declare_output(&mut declaration, logical_name("CAB-declared.resS"))
+        .unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+
+    let error = declared.prepare(&mut batch).unwrap_err();
+    let StreamedResourceError::Artifact(error) = error else {
+        panic!("declared digest mismatch must fail artifact inspection");
+    };
+    let ArtifactBuildError::IndependentReparse { source } = *error else {
+        panic!("declared digest mismatch must be independently reparsed");
+    };
+    assert!(matches!(
+        *source,
+        ArtifactBuildError::StreamedResourcePayloadDigestMismatch {
+            ordinal: 0,
+            expected,
+            ..
+        } if expected == declared_digest
+    ));
+    assert!(matches!(
+        batch.finish(),
+        Err(ArtifactBuildError::PoisonedBatch)
+    ));
+    assert_eq!(
+        artifact_budget.committed_usage(),
+        ArtifactBudgetUsage::default()
+    );
+}
+
+#[test]
 fn allocation_is_deterministic_for_multiple_aligned_extents() {
     let extents = [
         StreamedResourceExtent::generated(b"abc", 1).unwrap(),

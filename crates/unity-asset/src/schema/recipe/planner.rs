@@ -40,7 +40,7 @@ impl RecipeObject {
     }
 
     #[must_use]
-    pub const fn provenance(&self) -> &SchemaProvenance {
+    pub fn provenance(&self) -> &SchemaProvenance {
         self.object.schema_provenance()
     }
 
@@ -649,6 +649,7 @@ pub(crate) fn ensure_finite(values: &[f64]) -> Result<(), RecipeError> {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use unity_asset_binary::object::UnityObject;
     use unity_asset_core::{AssetLoadBudget, FieldPath, SourceLocator, UnityValue};
@@ -688,7 +689,7 @@ mod tests {
             let WorkspaceObjectValue::Binary(binary) = object.into_value() else {
                 panic!("expected the binary fixture to yield a binary object");
             };
-            let mut binary = *binary;
+            let mut binary = (*binary).clone();
             let Some(UnityValue::Object(fields)) = binary.class.get_mut("m_Father") else {
                 panic!("expected the Transform fixture to contain m_Father");
             };
@@ -707,7 +708,7 @@ mod tests {
                 source,
                 object: WorkspaceObject::new(
                     handle,
-                    WorkspaceObjectValue::Binary(Box::new(UnityObject::from_info_and_class(
+                    WorkspaceObjectValue::Binary(Arc::new(UnityObject::from_info_and_class(
                         binary.info,
                         binary.class,
                     ))),

@@ -2,6 +2,7 @@
 
 mod builder;
 mod cache;
+pub(crate) mod encoding;
 mod fact;
 mod index;
 pub(crate) mod input;

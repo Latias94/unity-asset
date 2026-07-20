@@ -2,7 +2,7 @@ use unity_asset_binary::webfile::{WebFile, WebFileCompression};
 use unity_asset_core::AssetLoadBudget;
 use unity_asset_write::artifact::{
     ArtifactBatchDeclaration, ArtifactBudget, ArtifactBudgetError, ArtifactBuildError,
-    ArtifactLimits, LogicalArtifactName, PreparedArtifactKind,
+    ArtifactBuildFailurePhase, ArtifactLimits, LogicalArtifactName, PreparedArtifactKind,
 };
 use unity_asset_write::webfile::{
     WebFileArtifactMember, WebFileEdits, WebFilePackingPolicy, WebFileWriteError, WebFileWriter,
@@ -218,6 +218,7 @@ fn prepared_brotli_webfile_reports_codec_scratch_budget_failure() -> anyhow::Res
         WebFilePackingPolicy::Brotli,
     )
     .expect_err("Brotli codec allocations must respect the artifact scratch limit");
+    assert_eq!(error.failure_phase(), ArtifactBuildFailurePhase::Encoding);
     assert!(matches!(
         error,
         WebFileWriteError::Artifact(error)

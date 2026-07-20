@@ -108,6 +108,17 @@ fn assert_footprint_matches_committed_usage(
     assert_eq!(footprint.segments(), usage.segments());
 }
 
+fn independent_reparse_source(error: ArtifactBuildError) -> ArtifactBuildError {
+    assert_eq!(
+        error.failure_phase(),
+        ArtifactBuildFailurePhase::IndependentReparse
+    );
+    match error {
+        ArtifactBuildError::IndependentReparse { source } => *source,
+        error => panic!("expected an independent-reparse failure, got {error}"),
+    }
+}
+
 #[test]
 fn default_limits_expose_independent_output_proof_and_retention_ceilings() {
     let limits = ArtifactLimits::default();
@@ -123,6 +134,130 @@ fn default_limits_expose_independent_output_proof_and_retention_ceilings() {
     assert_eq!(limits.max_pinned_source_bytes(), 16 * GIB);
     assert_eq!(limits.max_retained_bytes(), 20 * GIB);
     assert_eq!(limits.max_scratch_bytes(), 2 * GIB);
+}
+
+#[test]
+fn source_inspection_borrows_the_batch_budget_only_for_the_call() {
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+
+    let observed = batch
+        .inspect_with_budget(|budget| {
+            budget.consume_bytes(7)?;
+            Ok(budget.usage().bytes)
+        })
+        .unwrap();
+    assert_eq!(observed, 7);
+
+    let second = batch
+        .inspect_with_budget(|budget| {
+            budget.consume_entries(1)?;
+            Ok(budget.usage())
+        })
+        .unwrap();
+    assert_eq!(second.bytes, 7);
+    assert_eq!(second.entries, 1);
+}
+
+#[test]
+fn source_inspection_error_poisons_the_batch() {
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+
+    let error = batch
+        .inspect_with_budget::<()>(|_| {
+            Err(ArtifactBuildError::InternalInvariant {
+                message: "inspection rejected",
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ArtifactBuildError::InternalInvariant {
+            message: "inspection rejected"
+        }
+    ));
+    assert!(matches!(
+        batch.inspect_with_budget(|_| Ok(())),
+        Err(ArtifactBuildError::PoisonedBatch)
+    ));
+}
+
+#[test]
+fn source_inspection_budget_error_poisons_the_batch() {
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
+        max_bytes: 3,
+        ..unity_asset_core::AssetLoadLimits::default()
+    })
+    .unwrap();
+    let declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+
+    assert!(matches!(
+        batch.inspect_with_budget::<()>(|budget| {
+            budget.consume_bytes(4)?;
+            Ok(())
+        }),
+        Err(ArtifactBuildError::LoadBudget(_))
+    ));
+    assert!(matches!(
+        batch.inspect_with_budget(|_| Ok(())),
+        Err(ArtifactBuildError::PoisonedBatch)
+    ));
+}
+
+#[test]
+fn fail_stop_success_keeps_the_batch_active() {
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+
+    let value = batch
+        .run_fail_stop(|_| Result::<_, ArtifactBuildError>::Ok(17_u8))
+        .unwrap();
+
+    assert_eq!(value, 17);
+    assert!(batch.inspect_with_budget(|_| Ok(())).is_ok());
+}
+
+#[test]
+fn fail_stop_domain_error_poisons_the_batch() {
+    #[derive(Debug)]
+    enum DomainError {
+        Artifact,
+        Rejected,
+    }
+
+    impl From<ArtifactBuildError> for DomainError {
+        fn from(_error: ArtifactBuildError) -> Self {
+            Self::Artifact
+        }
+    }
+
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+
+    assert!(matches!(
+        batch.run_fail_stop::<(), DomainError>(|_| Err(DomainError::Rejected)),
+        Err(DomainError::Rejected)
+    ));
+    assert!(matches!(
+        batch.inspect_with_budget(|_| Ok(())),
+        Err(ArtifactBuildError::PoisonedBatch)
+    ));
 }
 
 #[test]
@@ -477,9 +612,10 @@ fn yaml_leaf_rejects_invalid_syntax_without_committing_artifact_usage() {
             ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
         declaration.declare_output(name("invalid.yaml")).unwrap();
         let mut batch = declaration.seal_output_names().unwrap();
+        let error = batch.prepare_yaml(&payload).unwrap_err();
         assert!(matches!(
-            batch.prepare_yaml(&payload),
-            Err(ArtifactBuildError::InvalidYaml(_))
+            independent_reparse_source(error),
+            ArtifactBuildError::InvalidYaml(_)
         ));
         assert!(matches!(
             batch.finish(),
@@ -506,12 +642,15 @@ fn yaml_leaf_rejects_invalid_segmented_utf8_with_a_typed_offset() {
         .unwrap();
     let mut batch = declaration.seal_output_names().unwrap();
 
-    assert!(matches!(
-        batch.prepare_yaml_encoded(declared_len, |encoder| {
+    let error = batch
+        .prepare_yaml_encoded(declared_len, |encoder| {
             encoder.push_payload_full(&first)?;
             encoder.push_payload_full(&second)
-        }),
-        Err(ArtifactBuildError::InvalidYamlUtf8 { offset: 6 })
+        })
+        .unwrap_err();
+    assert!(matches!(
+        independent_reparse_source(error),
+        ArtifactBuildError::InvalidYamlUtf8 { offset: 6 }
     ));
 }
 
@@ -529,14 +668,13 @@ fn yaml_reparse_charges_parser_work_before_parsing() {
     declaration.declare_output(name("budgeted.yaml")).unwrap();
     let mut batch = declaration.seal_output_names().unwrap();
 
+    let error = batch.prepare_yaml(&payload).unwrap_err();
     assert!(matches!(
-        batch.prepare_yaml(&payload),
-        Err(ArtifactBuildError::LoadBudget(
-            unity_asset_core::BudgetError::Exceeded {
-                resource: "bytes",
-                ..
-            }
-        ))
+        independent_reparse_source(error),
+        ArtifactBuildError::LoadBudget(unity_asset_core::BudgetError::Exceeded {
+            resource: "bytes",
+            ..
+        })
     ));
 }
 
@@ -678,11 +816,14 @@ fn nonzero_resource_padding_poisoned_batch_does_not_commit() {
             ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
         let mut batch = declaration.seal_output_names().unwrap();
 
-        assert!(matches!(
-            batch.prepare_streamed_resource_extents(extents, |encoder| {
+        let error = batch
+            .prepare_streamed_resource_extents(extents, |encoder| {
                 encoder.push_payload_full(&payload)
-            }),
-            Err(ArtifactBuildError::NonZeroStreamedResourcePadding { ordinal: 1 })
+            })
+            .unwrap_err();
+        assert!(matches!(
+            independent_reparse_source(error),
+            ArtifactBuildError::NonZeroStreamedResourcePadding { ordinal: 1 }
         ));
         assert!(matches!(
             batch.finish(),
@@ -711,11 +852,14 @@ fn resource_payload_digest_mismatch_poisoned_batch_does_not_commit() {
             ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
         let mut batch = declaration.seal_output_names().unwrap();
 
-        assert!(matches!(
-            batch.prepare_streamed_resource_extents([extent], |encoder| {
+        let error = batch
+            .prepare_streamed_resource_extents([extent], |encoder| {
                 encoder.push_payload_full(&payload)
-            }),
-            Err(ArtifactBuildError::StreamedResourcePayloadDigestMismatch { ordinal: 0, .. })
+            })
+            .unwrap_err();
+        assert!(matches!(
+            independent_reparse_source(error),
+            ArtifactBuildError::StreamedResourcePayloadDigestMismatch { ordinal: 0, .. }
         ));
         assert!(matches!(
             batch.finish(),
@@ -868,6 +1012,8 @@ fn output_iteration_preserves_declaration_order_not_prepare_order() {
         .map(|output| output.name().as_str())
         .collect::<Vec<_>>();
     assert_eq!(names, ["a.resS", "b.resS"]);
+    assert_eq!(set.output(first_slot).unwrap().name().as_str(), "a.resS");
+    assert_eq!(set.output(second_slot).unwrap().name().as_str(), "b.resS");
 }
 
 #[test]
@@ -967,11 +1113,17 @@ fn invalid_serialized_image_consumes_inspection_budget_but_not_artifact_budget()
         declaration.declare_output(name("bad.assets")).unwrap();
         let mut batch = declaration.seal_output_names().unwrap();
 
+        let error = batch
+            .prepare_serialized_file(invalid.len(), |encoder| encoder.push_payload_full(&invalid))
+            .unwrap_err();
+        assert_eq!(
+            error.failure_phase(),
+            ArtifactBuildFailurePhase::IndependentReparse
+        );
         assert!(matches!(
-            batch.prepare_serialized_file(invalid.len(), |encoder| {
-                encoder.push_payload_full(&invalid)
-            }),
-            Err(ArtifactBuildError::Binary(_))
+            error,
+            ArtifactBuildError::IndependentReparse { source }
+                if matches!(*source, ArtifactBuildError::Binary(_))
         ));
         assert!(matches!(
             batch.finish(),
@@ -984,6 +1136,32 @@ fn invalid_serialized_image_consumes_inspection_budget_but_not_artifact_budget()
         artifact_budget.committed_usage(),
         ArtifactBudgetUsage::default()
     );
+}
+
+#[test]
+fn encoding_failure_is_not_retagged_as_an_independent_reparse() {
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let mut declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    declaration.declare_output(name("bad.assets")).unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+
+    let error = batch
+        .prepare_serialized_file(0, |_| {
+            Err(ArtifactBuildError::InternalInvariant {
+                message: "injected encoding failure",
+            })
+        })
+        .unwrap_err();
+
+    assert_eq!(error.failure_phase(), ArtifactBuildFailurePhase::Encoding);
+    assert!(matches!(
+        error,
+        ArtifactBuildError::InternalInvariant {
+            message: "injected encoding failure"
+        }
+    ));
 }
 
 #[test]

@@ -16,6 +16,7 @@ mod writer;
 pub use artifact_writer::SerializedFileSource;
 pub use edit::{SerializedFileEditError, SerializedFileEdits};
 pub use external_table::{
-    ExternalIdentifierField, ExternalMetadataField, ExternalTableAllocator, ExternalTableError,
+    BudgetedExternalPath, ExternalIdentifierField, ExternalMetadataField, ExternalTableAllocator,
+    ExternalTableError, PreparedExternalPath,
 };
 pub use writer::{SerializedFileSaveOptions, SerializedFileWriter};

@@ -1,8 +1,8 @@
 use thiserror::Error;
 
 use crate::artifact::{
-    ArtifactBatch, ArtifactBatchDeclaration, ArtifactBuildError, ArtifactHandle,
-    LogicalArtifactName, OutputSlot, StreamedResourceExtentInspection,
+    ArtifactBatch, ArtifactBatchDeclaration, ArtifactBuildError, ArtifactBuildFailurePhase,
+    ArtifactHandle, LogicalArtifactName, OutputSlot, StreamedResourceExtentInspection,
 };
 
 use super::allocation::{
@@ -106,6 +106,17 @@ pub enum StreamedResourceError {
     Plan(#[from] StreamedResourcePlanError),
     #[error(transparent)]
     Artifact(Box<ArtifactBuildError>),
+}
+
+impl StreamedResourceError {
+    /// Reports the artifact-build stage in which resource preparation failed.
+    #[must_use]
+    pub const fn failure_phase(&self) -> ArtifactBuildFailurePhase {
+        match self {
+            Self::Artifact(error) => error.failure_phase(),
+            Self::Plan(_) => ArtifactBuildFailurePhase::Encoding,
+        }
+    }
 }
 
 impl From<ArtifactBuildError> for StreamedResourceError {

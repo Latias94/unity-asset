@@ -12,10 +12,12 @@ mod encoder;
 mod serialized_file_session;
 
 pub use encoder::{
-    EncodedSerializedObject, SerializedFieldGuard, SerializedObjectCandidate,
-    SerializedObjectEncodeError, SerializedObjectEncoder, SerializedObjectEncodingMode,
-    SerializedObjectEncodingStats, SerializedObjectGuard, SerializedObjectMutation,
-    SerializedSequenceEdit, SerializedValueKind, UnsafeRawObjectAcknowledgement,
-    UnsafeRawObjectReplacement,
+    EncodedSerializedObject, PreparedSerializedFieldReplace, PreparedUnsafeRawObject,
+    SerializedFieldGuard, SerializedManagedReferenceLayout, SerializedManagedReferenceType,
+    SerializedObjectCandidate, SerializedObjectEncodeError, SerializedObjectEncoder,
+    SerializedObjectEncodingMode, SerializedObjectEncodingStats, SerializedObjectGuard,
+    SerializedObjectMutation, SerializedPPtrLayout, SerializedSequenceEdit, SerializedValueKind,
+    SerializedValueSchema, SerializedValueSchemaError, UnsafeRawObjectAcknowledgement,
+    UnsafeRawObjectReplacement, ValidatedSerializedFieldGuard,
 };
 pub use serialized_file_session::SerializedFileEditSession;

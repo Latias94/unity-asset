@@ -1035,6 +1035,10 @@ mod tests {
             Some(SerializedFileSource::whole(&source).unwrap()),
         )
         .unwrap_err();
+        assert_eq!(
+            error.failure_phase(),
+            crate::artifact::ArtifactBuildFailurePhase::Encoding
+        );
         assert!(matches!(
             error,
             ArtifactBuildError::Budget(ArtifactBudgetError::Exceeded {

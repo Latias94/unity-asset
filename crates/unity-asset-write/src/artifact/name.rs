@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
-use unity_asset_core::DigestV1;
+use unity_asset_core::{AssetLoadBudget, BudgetError, DigestV1};
 
 const MAX_LOGICAL_NAME_BYTES: usize = 4_096;
 const MAX_COMPONENT_BYTES: usize = 255;
@@ -31,6 +31,19 @@ impl LogicalArtifactName {
         sidecar_logical_name(directory, base_name, digest)
     }
 
+    /// Derive a sidecar name while bounding every simultaneously live construction allocation.
+    ///
+    /// Temporary strings are checked as a peak working set. Only the returned name's exact
+    /// retained capacities are consumed from the monotonic caller budget.
+    pub fn sidecar_with_budget(
+        directory: Option<&Self>,
+        base_name: &str,
+        digest: DigestV1,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, ArtifactNameError> {
+        sidecar_logical_name_with_budget(directory, base_name, digest, budget)
+    }
+
     fn from_string(value: String) -> Result<Self, ArtifactNameError> {
         validate_logical_name(&value)?;
         let portability_key = portability_key(&value)?;
@@ -43,6 +56,15 @@ impl LogicalArtifactName {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.value
+    }
+
+    /// Returns the exact heap capacity retained by this validated logical name.
+    ///
+    /// Callers that keep a name outside an [`ArtifactBatch`](super::ArtifactBatch) use this to
+    /// charge their own allocation budget. Artifact declarations account for the same storage
+    /// through the private batch hook below.
+    pub fn retained_bytes(&self) -> Result<u64, ArtifactNameError> {
+        self.heap_bytes()
     }
 
     fn portability_key(&self) -> &str {
@@ -164,6 +186,8 @@ pub enum ArtifactNameError {
         "logical artifact outputs {existing} and {incoming} use the same portable filesystem name"
     )]
     PortabilityCollision { existing: usize, incoming: usize },
+    #[error(transparent)]
+    Budget(#[from] BudgetError),
 }
 
 pub(crate) fn validate_unique_names<'name>(
@@ -207,14 +231,42 @@ pub(crate) fn sidecar_logical_name(
     base_name: &str,
     digest: DigestV1,
 ) -> Result<LogicalArtifactName, ArtifactNameError> {
+    let value = sidecar_logical_name_value(directory, base_name, digest, None)?;
+    LogicalArtifactName::try_from(value)
+}
+
+fn sidecar_logical_name_with_budget(
+    directory: Option<&LogicalArtifactName>,
+    base_name: &str,
+    digest: DigestV1,
+    budget: &mut AssetLoadBudget,
+) -> Result<LogicalArtifactName, ArtifactNameError> {
+    let value = sidecar_logical_name_value(directory, base_name, digest, Some(budget))?;
+    validate_logical_name(&value)?;
+    let portability_key = portability_key_with_budget(&value, budget)?;
+    let name = LogicalArtifactName {
+        value,
+        portability_key,
+    };
+    budget.consume_bytes(name.heap_bytes()?)?;
+    Ok(name)
+}
+
+fn sidecar_logical_name_value(
+    directory: Option<&LogicalArtifactName>,
+    base_name: &str,
+    digest: DigestV1,
+    budget: Option<&AssetLoadBudget>,
+) -> Result<String, ArtifactNameError> {
     if base_name.contains('/') {
+        check_peak_bytes(budget, base_name.len(), "sidecar base name error")?;
         return Err(ArtifactNameError::SidecarBaseMustBeComponent {
             base: try_copy_string(base_name, "sidecar base name")?,
         });
     }
-    validate_logical_name(base_name)?;
+    validate_sidecar_base_name(base_name)?;
 
-    let component = sidecar_component(base_name, digest)?;
+    let component = sidecar_component(base_name, digest, budget)?;
     let value = match directory {
         Some(directory) => {
             let requested = directory
@@ -225,6 +277,12 @@ pub(crate) fn sidecar_logical_name(
                 .ok_or(ArtifactNameError::ArithmeticOverflow {
                     resource: "sidecar logical name",
                 })?;
+            let peak = component.capacity().checked_add(requested).ok_or(
+                ArtifactNameError::ArithmeticOverflow {
+                    resource: "sidecar logical name peak allocation",
+                },
+            )?;
+            check_peak_bytes(budget, peak, "sidecar logical name")?;
             let mut value = String::new();
             value
                 .try_reserve_exact(requested)
@@ -240,10 +298,21 @@ pub(crate) fn sidecar_logical_name(
         }
         None => component,
     };
-    LogicalArtifactName::try_from(value)
+    Ok(value)
 }
 
 fn validate_logical_name(value: &str) -> Result<(), ArtifactNameError> {
+    validate_logical_name_with_component_limit(value, true)
+}
+
+fn validate_sidecar_base_name(value: &str) -> Result<(), ArtifactNameError> {
+    validate_logical_name_with_component_limit(value, false)
+}
+
+fn validate_logical_name_with_component_limit(
+    value: &str,
+    enforce_component_limit: bool,
+) -> Result<(), ArtifactNameError> {
     if value.is_empty() {
         return Err(ArtifactNameError::Empty);
     }
@@ -285,12 +354,16 @@ fn validate_logical_name(value: &str) -> Result<(), ArtifactNameError> {
     }
 
     for (index, component) in value.split('/').enumerate() {
-        validate_component(index, component)?;
+        validate_component(index, component, enforce_component_limit)?;
     }
     Ok(())
 }
 
-fn validate_component(index: usize, component: &str) -> Result<(), ArtifactNameError> {
+fn validate_component(
+    index: usize,
+    component: &str,
+    enforce_length_limit: bool,
+) -> Result<(), ArtifactNameError> {
     if component.is_empty() {
         return Err(ArtifactNameError::EmptyComponent { index });
     }
@@ -300,7 +373,7 @@ fn validate_component(index: usize, component: &str) -> Result<(), ArtifactNameE
     if component == ".." {
         return Err(ArtifactNameError::ParentDirectoryComponent { index });
     }
-    if component.len() > MAX_COMPONENT_BYTES {
+    if enforce_length_limit && component.len() > MAX_COMPONENT_BYTES {
         return Err(ArtifactNameError::ComponentTooLong {
             index,
             actual: component.len(),
@@ -357,29 +430,61 @@ fn reserved_numbered_device(stem: &str, prefix: &str) -> bool {
 }
 
 fn portability_key(value: &str) -> Result<String, ArtifactNameError> {
+    portability_key_inner(value, None)
+}
+
+fn portability_key_with_budget(
+    value: &String,
+    budget: &AssetLoadBudget,
+) -> Result<String, ArtifactNameError> {
+    portability_key_inner(value, Some((budget, value.capacity())))
+}
+
+fn portability_key_inner(
+    value: &str,
+    budget: Option<(&AssetLoadBudget, usize)>,
+) -> Result<String, ArtifactNameError> {
     // NFKC plus lowercase catches common filesystem aliases without claiming full Unicode
     // case-folding semantics, which would require a separately audited dependency and policy.
+    let requested =
+        value
+            .nfkc()
+            .flat_map(char::to_lowercase)
+            .try_fold(0_usize, |length, character| {
+                length.checked_add(character.len_utf8()).ok_or(
+                    ArtifactNameError::ArithmeticOverflow {
+                        resource: "logical name portability key",
+                    },
+                )
+            })?;
+    if let Some((budget, value_capacity)) = budget {
+        let peak =
+            value_capacity
+                .checked_add(requested)
+                .ok_or(ArtifactNameError::ArithmeticOverflow {
+                    resource: "logical name normalization peak allocation",
+                })?;
+        check_peak_bytes(Some(budget), peak, "logical name portability key")?;
+    }
     let mut key = String::new();
-    key.try_reserve(value.len())
+    key.try_reserve_exact(requested)
         .map_err(|source| ArtifactNameError::Allocation {
             resource: "logical name portability key",
-            requested: value.len(),
+            requested,
             source,
         })?;
     for character in value.nfkc().flat_map(char::to_lowercase) {
-        key.try_reserve(character.len_utf8())
-            .map_err(|source| ArtifactNameError::Allocation {
-                resource: "logical name portability key",
-                requested: character.len_utf8(),
-                source,
-            })?;
         key.push(character);
     }
     Ok(key)
 }
 
-fn sidecar_component(base_name: &str, digest: DigestV1) -> Result<String, ArtifactNameError> {
-    let suffix = digest_hex(digest)?;
+fn sidecar_component(
+    base_name: &str,
+    digest: DigestV1,
+    budget: Option<&AssetLoadBudget>,
+) -> Result<String, ArtifactNameError> {
+    let suffix = digest_hex(digest, budget)?;
     let candidate_extension = base_name
         .rsplit_once('.')
         .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty());
@@ -416,6 +521,14 @@ fn sidecar_component(base_name: &str, digest: DigestV1) -> Result<String, Artifa
         .ok_or(ArtifactNameError::ArithmeticOverflow {
             resource: "sidecar component",
         })?;
+    let peak =
+        suffix
+            .capacity()
+            .checked_add(requested)
+            .ok_or(ArtifactNameError::ArithmeticOverflow {
+                resource: "sidecar component peak allocation",
+            })?;
+    check_peak_bytes(budget, peak, "sidecar component")?;
     let mut component = String::new();
     component
         .try_reserve_exact(requested)
@@ -447,10 +560,14 @@ fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
     &value[..end]
 }
 
-fn digest_hex(digest: DigestV1) -> Result<String, ArtifactNameError> {
+fn digest_hex(
+    digest: DigestV1,
+    budget: Option<&AssetLoadBudget>,
+) -> Result<String, ArtifactNameError> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
     let requested = DigestV1::BYTE_LEN * 2;
+    check_peak_bytes(budget, requested, "sidecar digest suffix")?;
     let mut encoded = String::new();
     encoded
         .try_reserve_exact(requested)
@@ -464,6 +581,19 @@ fn digest_hex(digest: DigestV1) -> Result<String, ArtifactNameError> {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     Ok(encoded)
+}
+
+fn check_peak_bytes(
+    budget: Option<&AssetLoadBudget>,
+    bytes: usize,
+    resource: &'static str,
+) -> Result<(), ArtifactNameError> {
+    let bytes =
+        u64::try_from(bytes).map_err(|_| ArtifactNameError::ArithmeticOverflow { resource })?;
+    if let Some(budget) = budget {
+        budget.check_bytes(bytes)?;
+    }
+    Ok(())
 }
 
 fn try_copy_string(value: &str, resource: &'static str) -> Result<String, ArtifactNameError> {
@@ -481,6 +611,7 @@ fn try_copy_string(value: &str, resource: &'static str) -> Result<String, Artifa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unity_asset_core::AssetLoadLimits;
 
     fn name(value: &str) -> LogicalArtifactName {
         LogicalArtifactName::new(value).expect("test logical artifact name should be valid")
@@ -704,6 +835,91 @@ mod tests {
                 .count(),
             61
         );
+    }
+
+    #[test]
+    fn sidecar_accepts_an_overlong_utf8_base_and_validates_the_generated_component() {
+        let digest = DigestV1::from_bytes([0x5a; DigestV1::BYTE_LEN]);
+        let base_name = format!("{}.resS", "资源".repeat(200));
+
+        let sidecar = LogicalArtifactName::sidecar(None, &base_name, digest).unwrap();
+
+        assert!(sidecar.as_str().len() <= MAX_COMPONENT_BYTES);
+        assert!(sidecar.as_str().is_char_boundary(sidecar.as_str().len()));
+        assert!(sidecar.as_str().ends_with(".resS"));
+        assert!(sidecar.as_str().contains(&format!("-{}", "5a".repeat(32))));
+        validate_logical_name(sidecar.as_str()).unwrap();
+    }
+
+    #[test]
+    fn sidecar_rejects_invalid_raw_base_content_before_truncation() {
+        let digest = DigestV1::from_bytes([0x5b; DigestV1::BYTE_LEN]);
+        let long_prefix = "x".repeat(MAX_COMPONENT_BYTES + 32);
+
+        assert!(matches!(
+            LogicalArtifactName::sidecar(None, &format!("{long_prefix}?tail"), digest),
+            Err(ArtifactNameError::ForbiddenWindowsCharacter { character: '?', .. })
+        ));
+        assert!(matches!(
+            LogicalArtifactName::sidecar(None, &format!("{long_prefix}\\tail"), digest),
+            Err(ArtifactNameError::Backslash { .. })
+        ));
+        for base in [".", "..", "CON", "payload.", "payload "] {
+            assert!(LogicalArtifactName::sidecar(None, base, digest).is_err());
+        }
+    }
+
+    #[test]
+    fn budgeted_sidecar_checks_transient_peak_and_consumes_only_retained_name() {
+        let digest = DigestV1::from_bytes([0x5c; DigestV1::BYTE_LEN]);
+        let directory = name("d");
+        let base_name = format!("{}.resS", "Ａ".repeat(80));
+        let component = sidecar_component(&base_name, digest, None).unwrap();
+        let unbudgeted =
+            LogicalArtifactName::sidecar(Some(&directory), &base_name, digest).unwrap();
+        let transient_peak = u64::try_from(
+            component
+                .capacity()
+                .checked_add(unbudgeted.value.capacity())
+                .unwrap(),
+        )
+        .unwrap();
+        let retained = unbudgeted.retained_bytes().unwrap();
+        assert!(transient_peak > retained);
+
+        let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: transient_peak,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        let budgeted = LogicalArtifactName::sidecar_with_budget(
+            Some(&directory),
+            &base_name,
+            digest,
+            &mut exact,
+        )
+        .unwrap();
+        assert_eq!(budgeted, unbudgeted);
+        assert_eq!(exact.usage().bytes, retained);
+
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: transient_peak - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            LogicalArtifactName::sidecar_with_budget(
+                Some(&directory),
+                &base_name,
+                digest,
+                &mut one_short,
+            ),
+            Err(ArtifactNameError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+        assert_eq!(one_short.usage(), Default::default());
     }
 
     #[test]

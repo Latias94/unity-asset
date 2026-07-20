@@ -17,6 +17,9 @@ pub enum BinaryObjectIdentityError {
 /// Invalid use of replacement bytes with an existing SerializedFile object identity.
 #[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryObjectReplacementError {
+    /// Raw replacement bytes cannot be represented by the SerializedFile object-size field.
+    #[error("raw replacement payload length {length} exceeds the u32 wire-size limit")]
+    RawPayloadTooLarge { length: usize },
     /// Replacement bytes cannot be interpreted without the object's canonical TypeTree.
     #[error("object {path_id} (class {class_id}) has no TypeTree schema for replacement parsing")]
     MissingSchema { path_id: i64, class_id: i32 },

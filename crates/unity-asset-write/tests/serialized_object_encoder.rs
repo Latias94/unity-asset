@@ -240,6 +240,132 @@ fn incremental_candidate_exposes_read_after_write_and_matches_batch_encoding() {
 }
 
 #[test]
+fn detached_field_guard_is_inert_and_rejects_an_intervening_mutation() {
+    let file = sample_serialized_file();
+    let observed = observe_name(&file);
+    let path = name_path(observed.field);
+    let (_, guard) = field_guard(&observed, &observed.value);
+    let mut budget = AssetLoadBudget::default();
+    let mut candidate = SerializedObjectEncoder::new(&file, observed.path_id)
+        .expect("bind candidate encoder")
+        .begin_semantic(&mut budget)
+        .expect("open semantic candidate");
+
+    let detached = candidate
+        .validate_replace_field_guard(3, path.clone(), guard, &mut budget)
+        .expect("validate detached guard");
+    assert_eq!(detached.path(), &path);
+    drop(detached);
+    assert_eq!(candidate.value_at_path(&path), Ok(&observed.value));
+
+    let stale = candidate
+        .validate_replace_field_guard(3, path.clone(), guard, &mut budget)
+        .expect("validate guard before intervening write");
+    candidate
+        .apply(
+            SerializedObjectMutation::replace_field(
+                3,
+                path.clone(),
+                guard,
+                UnityValue::String("INTERVENING_RESULT".to_owned()),
+            ),
+            &mut budget,
+        )
+        .expect("apply intervening write");
+    let error = match candidate.prepare_validated_replace_field(
+        stale,
+        UnityValue::String("MUST_NOT_APPLY".to_owned()),
+        &mut budget,
+    ) {
+        Ok(_) => panic!("stale detached guard must not prepare a replacement"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SerializedObjectEncodeError::StaleFieldGuard {
+            path_id,
+            ordinal: 3
+        } if path_id == observed.path_id
+    ));
+    assert_eq!(
+        candidate.value_at_path(&path),
+        Ok(&UnityValue::String("INTERVENING_RESULT".to_owned()))
+    );
+}
+
+#[test]
+fn detached_field_guard_cannot_cross_candidate_lineages() {
+    let file = sample_serialized_file();
+    let observed = observe_name(&file);
+    let path = name_path(observed.field);
+    let (_, initial_guard) = field_guard(&observed, &observed.value);
+    let mut first = SerializedObjectEncoder::new(&file, observed.path_id)
+        .unwrap()
+        .begin_semantic(&mut AssetLoadBudget::default())
+        .unwrap();
+    let mut second = SerializedObjectEncoder::new(&file, observed.path_id)
+        .unwrap()
+        .begin_semantic(&mut AssetLoadBudget::default())
+        .unwrap();
+    let first_value = UnityValue::String("FIRST_LINEAGE".to_owned());
+    let second_value = UnityValue::String("SECOND_LINEAGE".to_owned());
+    first
+        .apply(
+            SerializedObjectMutation::replace_field(
+                0,
+                path.clone(),
+                initial_guard,
+                first_value.clone(),
+            ),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    second
+        .apply(
+            SerializedObjectMutation::replace_field(
+                0,
+                path.clone(),
+                initial_guard,
+                second_value.clone(),
+            ),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let first_guard = SerializedFieldGuard::from_observed(
+        observed.schema_digest,
+        &path,
+        &first_value,
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap();
+    let detached = first
+        .validate_replace_field_guard(
+            1,
+            path.clone(),
+            first_guard,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+    let error = match second.prepare_validated_replace_field(
+        detached,
+        UnityValue::String("MUST_NOT_CROSS".to_owned()),
+        &mut AssetLoadBudget::default(),
+    ) {
+        Ok(_) => panic!("detached guard must remain bound to its candidate lineage"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SerializedObjectEncodeError::StaleFieldGuard {
+            path_id,
+            ordinal: 1
+        } if path_id == observed.path_id
+    ));
+    assert_eq!(second.value_at_path(&path), Ok(&second_value));
+}
+
+#[test]
 fn empty_incremental_candidate_cannot_produce_an_artifact() {
     let file = sample_serialized_file();
     let observed = observe_name(&file);

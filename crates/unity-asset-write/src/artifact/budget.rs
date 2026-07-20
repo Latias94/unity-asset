@@ -731,7 +731,7 @@ impl ArtifactBudgetTransaction<'_> {
             Some(existing) => {
                 if existing.fingerprint != fingerprint {
                     return Err(ArtifactBudgetError::ConflictingSourceFingerprint {
-                        source_id: source,
+                        source_id: Box::new(source),
                         first: existing.fingerprint.digest(),
                         second: fingerprint.digest(),
                     });
@@ -844,7 +844,7 @@ impl ArtifactBudgetTransaction<'_> {
         if let Some(existing) = self.source_proofs.get(&source).copied() {
             if existing.fingerprint != fingerprint {
                 return Err(ArtifactBudgetError::ConflictingSourceFingerprint {
-                    source_id: source,
+                    source_id: Box::new(source),
                     first: existing.fingerprint.digest(),
                     second: fingerprint.digest(),
                 });
@@ -1428,7 +1428,7 @@ pub enum ArtifactBudgetError {
     },
     #[error("source {source_id:?} has conflicting digests {first} and {second}")]
     ConflictingSourceFingerprint {
-        source_id: SourceId,
+        source_id: Box<SourceId>,
         first: unity_asset_core::DigestV1,
         second: unity_asset_core::DigestV1,
     },

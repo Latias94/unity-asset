@@ -17,8 +17,9 @@ mod name;
 mod payload;
 
 pub use batch::{
-    ArtifactBatch, ArtifactBatchDeclaration, ArtifactBuildError, ArtifactHandle, OutputSlot,
-    PreparedArtifact, PreparedArtifactSet, PreparedOutput, PreparedOutputIter, YamlArtifactWriter,
+    ArtifactBatch, ArtifactBatchDeclaration, ArtifactBuildError, ArtifactBuildFailurePhase,
+    ArtifactHandle, OutputSlot, PreparedArtifact, PreparedArtifactSet, PreparedOutput,
+    PreparedOutputIter, YamlArtifactWriter,
 };
 pub use budget::{ArtifactBudget, ArtifactBudgetError, ArtifactBudgetUsage, ArtifactLimits};
 pub(crate) use budget::{CodecScratchBudget, CodecScratchLease};

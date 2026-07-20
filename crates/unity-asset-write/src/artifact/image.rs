@@ -336,7 +336,7 @@ impl<'transaction, 'budget> ImageBuilder<'transaction, 'budget> {
                 let dependency = &mut self.dependencies[index];
                 if dependency.fingerprint != fingerprint {
                     return Err(ArtifactBuildError::ConflictingSourceFingerprint {
-                        source_id,
+                        source_id: Box::new(source_id),
                         first: dependency.fingerprint.digest(),
                         second: fingerprint.digest(),
                     });

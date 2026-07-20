@@ -279,6 +279,42 @@ impl<'artifact, 'inspection> ArtifactBatch<'artifact, 'inspection> {
         Ok(self.artifacts[ordinal].artifact.len())
     }
 
+    /// Runs one fallible operation as a fail-stop validation boundary for this batch.
+    ///
+    /// Any returned error poisons the batch, including domain errors produced outside the
+    /// artifact crate. This prevents callers from continuing after partially validating or
+    /// extending the prepared artifact graph.
+    pub fn run_fail_stop<T, E>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<ArtifactBuildError>,
+    {
+        self.ensure_active().map_err(E::from)?;
+        let result = operation(self);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Runs one bounded source-inspection step against this batch's caller-owned load budget.
+    ///
+    /// The budget borrow exists only for the duration of `inspect`. Any inspection failure poisons
+    /// the batch so callers cannot continue from a partially validated artifact graph.
+    pub fn inspect_with_budget<T>(
+        &mut self,
+        inspect: impl for<'budget> FnOnce(&'budget mut AssetLoadBudget) -> Result<T, ArtifactBuildError>,
+    ) -> Result<T, ArtifactBuildError> {
+        self.ensure_active()?;
+        let result = inspect(self.inspection_budget);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
     pub(crate) fn consume_inspection_bytes(
         &mut self,
         amount: u64,
@@ -572,7 +608,8 @@ impl<'artifact, 'inspection> ArtifactBatch<'artifact, 'inspection> {
             sealed.digest(),
             sealed.dependencies(),
             self.inspection_budget,
-        )?;
+        )
+        .map_err(ArtifactBuildError::independent_reparse)?;
         let inspection_bytes = format.retained_heap_bytes()?;
         let newly_accounted_inspection_bytes = inspection_bytes
             .checked_sub(preaccounted_inspection_bytes)
@@ -697,7 +734,7 @@ impl<'artifact, 'inspection> ArtifactBatch<'artifact, 'inspection> {
                 let previous = &mut source_dependencies[write - 1];
                 if previous.fingerprint != current.fingerprint {
                     return Err(ArtifactBuildError::ConflictingSourceFingerprint {
-                        source_id: current.source,
+                        source_id: Box::new(current.source),
                         first: previous.fingerprint.digest(),
                         second: current.fingerprint.digest(),
                     });
@@ -1250,6 +1287,38 @@ pub struct PreparedArtifactSet {
 }
 
 impl PreparedArtifactSet {
+    /// Returns the public output bound to this exact declaration slot.
+    ///
+    /// Slots are batch capabilities. A slot produced by another graph is rejected even when its
+    /// numeric ordinal happens to exist in this set.
+    pub fn output(&self, slot: OutputSlot) -> Result<PreparedOutput<'_>, ArtifactBuildError> {
+        if slot.token != self.token {
+            return Err(ArtifactBuildError::ForeignOutputSlot {
+                output: slot.ordinal,
+            });
+        }
+        let output =
+            self.outputs
+                .get(slot.ordinal)
+                .ok_or(ArtifactBuildError::UnknownOutputSlot {
+                    output: slot.ordinal,
+                })?;
+        let artifact = self.artifacts.get(output.artifact_ordinal).ok_or(
+            ArtifactBuildError::InternalInvariant {
+                message: "prepared output references an unknown artifact",
+            },
+        )?;
+        Ok(PreparedOutput {
+            slot,
+            handle: ArtifactHandle {
+                token: self.token,
+                ordinal: output.artifact_ordinal,
+            },
+            name: &output.name,
+            artifact: &artifact.artifact,
+        })
+    }
+
     /// Returns an artifact from this exact prepared graph.
     ///
     /// Handles are batch capabilities. A handle produced by another graph is rejected even when
@@ -1441,8 +1510,23 @@ impl<'artifact> Iterator for PreparedOutputIter<'artifact> {
 impl ExactSizeIterator for PreparedOutputIter<'_> {}
 impl FusedIterator for PreparedOutputIter<'_> {}
 
+/// The externally meaningful stage that rejected an artifact build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ArtifactBuildFailurePhase {
+    /// Declaration, encoding, artifact budgeting, or final retained-proof construction failed.
+    Encoding,
+    /// The fixed-format inspector rejected the exact bytes produced by the encoder.
+    IndependentReparse,
+}
+
 #[derive(Debug, Error)]
 pub enum ArtifactBuildError {
+    #[error("independent artifact reparse rejected the encoded image: {source}")]
+    IndependentReparse {
+        #[source]
+        source: Box<ArtifactBuildError>,
+    },
     #[error(transparent)]
     Name(#[from] ArtifactNameError),
     #[error(transparent)]
@@ -1490,7 +1574,7 @@ pub enum ArtifactBuildError {
     InternalInvariant { message: &'static str },
     #[error("source {source_id:?} has conflicting digests {first} and {second}")]
     ConflictingSourceFingerprint {
-        source_id: SourceId,
+        source_id: Box<SourceId>,
         first: DigestV1,
         second: DigestV1,
     },
@@ -1581,6 +1665,23 @@ pub enum ArtifactBuildError {
     ForeignStreamedResourceLayout,
     #[error("streamed-resource layout cannot continue after a failed operation")]
     PoisonedStreamedResourceLayout,
+}
+
+impl ArtifactBuildError {
+    /// Reports whether this failure arose while encoding or independently reparsing its result.
+    #[must_use]
+    pub const fn failure_phase(&self) -> ArtifactBuildFailurePhase {
+        match self {
+            Self::IndependentReparse { .. } => ArtifactBuildFailurePhase::IndependentReparse,
+            _ => ArtifactBuildFailurePhase::Encoding,
+        }
+    }
+
+    fn independent_reparse(source: Self) -> Self {
+        Self::IndependentReparse {
+            source: Box::new(source),
+        }
+    }
 }
 
 impl From<std::io::Error> for ArtifactBuildError {

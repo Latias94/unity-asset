@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use thiserror::Error;
+use unity_asset_binary::asset::ObjectInfo;
 use unity_asset_binary::object::UnityObject;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, Diagnostic, DigestV1, ObjectAddress,
@@ -41,7 +42,7 @@ pub struct WorkspaceSource {
     fingerprint: SourceFingerprint,
     parent: Option<SourceId>,
     location: SourceLocationKind,
-    physical_origin: PathBuf,
+    physical_origin: Option<PathBuf>,
 }
 
 impl WorkspaceSource {
@@ -51,7 +52,7 @@ impl WorkspaceSource {
         fingerprint: SourceFingerprint,
         parent: Option<SourceId>,
         location: SourceLocationKind,
-        physical_origin: PathBuf,
+        physical_origin: Option<PathBuf>,
     ) -> Self {
         Self {
             id,
@@ -95,8 +96,8 @@ impl WorkspaceSource {
     }
 
     #[must_use]
-    pub fn physical_origin(&self) -> &std::path::Path {
-        &self.physical_origin
+    pub fn physical_origin(&self) -> Option<&std::path::Path> {
+        self.physical_origin.as_deref()
     }
 }
 
@@ -477,7 +478,7 @@ fn bounded_seek_target(current: u64, len: u64, position: SeekFrom) -> io::Result
     })
 }
 
-fn validate_prepared_artifact(
+pub(super) fn validate_prepared_artifact(
     source: SourceId,
     fingerprint: SourceFingerprint,
     artifact: &PreparedArtifact,
@@ -556,78 +557,52 @@ fn inspected_artifact_len(format: &PreparedArtifactFormat) -> Option<u64> {
 /// Format-specific value behind one revision-bound object handle.
 #[derive(Debug, Clone)]
 pub enum WorkspaceObjectValue {
-    Binary(Box<UnityObject>),
+    Binary(Arc<UnityObject>),
     Yaml(WorkspaceYamlObject),
 }
 
-/// Copy-free YAML object view retaining either its committed document or one prepared class.
-#[derive(Clone)]
-pub struct WorkspaceYamlObject {
-    backing: WorkspaceYamlObjectBacking,
+impl WorkspaceObjectValue {
+    #[must_use]
+    pub fn class(&self) -> &UnityClass {
+        match self {
+            Self::Binary(object) => object.as_unity_class(),
+            Self::Yaml(object) => object.class(),
+        }
+    }
 }
 
+/// Copy-free YAML object view retaining the complete document that produced its class.
 #[derive(Clone)]
-enum WorkspaceYamlObjectBacking {
-    Committed {
-        document: Arc<YamlDocument>,
-        document_index: usize,
-    },
-    Prepared {
-        class: Arc<UnityClass>,
-        document_index: usize,
-    },
+pub struct WorkspaceYamlObject {
+    document: Arc<YamlDocument>,
+    document_index: usize,
 }
 
 impl WorkspaceYamlObject {
     pub(crate) fn new(document: Arc<YamlDocument>, document_index: usize) -> Self {
         debug_assert!(document_index < document.entries().len());
         Self {
-            backing: WorkspaceYamlObjectBacking::Committed {
-                document,
-                document_index,
-            },
-        }
-    }
-
-    pub(crate) fn from_prepared(class: Arc<UnityClass>, document_index: usize) -> Self {
-        Self {
-            backing: WorkspaceYamlObjectBacking::Prepared {
-                class,
-                document_index,
-            },
+            document,
+            document_index,
         }
     }
 
     #[must_use]
-    pub fn document_index(&self) -> usize {
-        match &self.backing {
-            WorkspaceYamlObjectBacking::Committed { document_index, .. }
-            | WorkspaceYamlObjectBacking::Prepared { document_index, .. } => *document_index,
-        }
+    pub const fn document_index(&self) -> usize {
+        self.document_index
     }
 
     #[must_use]
     pub fn class(&self) -> &UnityClass {
-        match &self.backing {
-            WorkspaceYamlObjectBacking::Committed {
-                document,
-                document_index,
-            } => &document.entries()[*document_index],
-            WorkspaceYamlObjectBacking::Prepared { class, .. } => class,
-        }
+        &self.document.entries()[self.document_index]
     }
 }
 
 impl fmt::Debug for WorkspaceYamlObject {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let backing = match &self.backing {
-            WorkspaceYamlObjectBacking::Committed { .. } => "committed",
-            WorkspaceYamlObjectBacking::Prepared { .. } => "prepared",
-        };
         let class = self.class();
         formatter
             .debug_struct("WorkspaceYamlObject")
-            .field("backing", &backing)
             .field("document_index", &self.document_index())
             .field("class_id", &class.class_id)
             .field("class_name", &class.class_name)
@@ -641,7 +616,7 @@ impl fmt::Debug for WorkspaceYamlObject {
 pub struct WorkspaceObject {
     handle: RevisionedObjectHandle,
     value: WorkspaceObjectValue,
-    schema: SchemaProvenance,
+    schema: Arc<SchemaProvenance>,
 }
 
 impl WorkspaceObject {
@@ -649,6 +624,18 @@ impl WorkspaceObject {
         handle: RevisionedObjectHandle,
         value: WorkspaceObjectValue,
         schema: SchemaProvenance,
+    ) -> Self {
+        Self {
+            handle,
+            value,
+            schema: Arc::new(schema),
+        }
+    }
+
+    pub(super) fn from_shared(
+        handle: RevisionedObjectHandle,
+        value: WorkspaceObjectValue,
+        schema: Arc<SchemaProvenance>,
     ) -> Self {
         Self {
             handle,
@@ -669,21 +656,59 @@ impl WorkspaceObject {
 
     #[must_use]
     pub fn class(&self) -> &UnityClass {
-        match &self.value {
-            WorkspaceObjectValue::Binary(object) => object.as_unity_class(),
-            WorkspaceObjectValue::Yaml(object) => object.class(),
-        }
+        self.value.class()
     }
 
     /// Returns the trusted schema identity used to materialize this object.
     #[must_use]
-    pub const fn schema_provenance(&self) -> &SchemaProvenance {
+    pub fn schema_provenance(&self) -> &SchemaProvenance {
         &self.schema
     }
 
     #[must_use]
     pub fn into_value(self) -> WorkspaceObjectValue {
         self.value
+    }
+
+    pub(super) fn into_shared_parts(
+        self,
+    ) -> (
+        RevisionedObjectHandle,
+        WorkspaceObjectValue,
+        Arc<SchemaProvenance>,
+    ) {
+        (self.handle, self.value, self.schema)
+    }
+
+    pub(super) fn with_revision(mut self, revision: WorkspaceRevision) -> Self {
+        self.handle = self.handle.with_revision(revision);
+        self
+    }
+
+    pub(super) fn with_exact_binary_info(
+        mut self,
+        info: ObjectInfo,
+    ) -> Result<Self, WorkspaceError> {
+        let WorkspaceObjectValue::Binary(object) = &mut self.value else {
+            return Err(WorkspaceError::operation(
+                "prepared binary object projection",
+                io::Error::other("binary metadata was applied to a YAML object"),
+            ));
+        };
+        let object = Arc::get_mut(object).ok_or_else(|| {
+            WorkspaceError::operation(
+                "prepared binary object projection",
+                io::Error::other("fresh binary object unexpectedly shared its owned projection"),
+            )
+        })?;
+        if object.path_id() != info.path_id() || object.class_id() != info.class_id() {
+            return Err(WorkspaceError::operation(
+                "prepared binary object projection",
+                io::Error::other("exact binary metadata changed object identity or class"),
+            ));
+        }
+        object.info = info;
+        Ok(self)
     }
 }
 

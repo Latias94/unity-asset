@@ -11,6 +11,7 @@ use crate::typetree::{
 };
 use crate::unity_objects::{GameObject, Transform};
 use std::fmt::Write as _;
+use std::io::Read;
 use std::sync::Arc;
 use unity_asset_core::{AssetLoadBudget, UnityClass, UnityValue};
 
@@ -211,6 +212,77 @@ impl<'a> ObjectHandle<'a> {
         Ok(MaterializedObject {
             object,
             selected_schema: Some(selected),
+        })
+    }
+
+    /// Reads and parses one exact replacement extent without retaining an intermediate copy.
+    ///
+    /// The caller supplies the parser-proven payload length. The retained raw payload is the same
+    /// allocation filled from `reader`; it is not copied again after TypeTree traversal.
+    pub fn materialize_replacement_from_reader(
+        &self,
+        reader: &mut impl Read,
+        replacement_len: usize,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<MaterializedObject> {
+        self.materialize_replacement_from_reader_with_options(
+            reader,
+            replacement_len,
+            budget,
+            TypeTreeParseOptions {
+                mode: TypeTreeParseMode::Strict,
+            },
+        )
+    }
+
+    /// Reads and parses one exact replacement extent under an explicit recovery policy.
+    pub fn materialize_replacement_from_reader_with_options(
+        &self,
+        reader: &mut impl Read,
+        replacement_len: usize,
+        budget: &mut AssetLoadBudget,
+        options: TypeTreeParseOptions,
+    ) -> Result<MaterializedObject> {
+        // Resolve the schema before advancing the reader. A caller may then deliberately fall
+        // back to `materialize_raw_replacement_from_reader` on MissingSchema.
+        let selected =
+            self.selected_schema(budget)?
+                .ok_or(BinaryObjectReplacementError::MissingSchema {
+                    path_id: self.path_id(),
+                    class_id: self.class_id(),
+                })?;
+        let replacement = read_owned_replacement(reader, replacement_len, budget)?;
+        let object = UnityObject::from_owned_replacement_with_compiled_schema(
+            self.file,
+            self.info,
+            replacement,
+            &selected.schema,
+            budget,
+            options,
+        )?;
+        Ok(MaterializedObject {
+            object,
+            selected_schema: Some(selected),
+        })
+    }
+
+    /// Reads one exact replacement extent when no canonical TypeTree is available.
+    ///
+    /// Identity, class, byte order, and raw bytes remain authoritative. The semantic class is
+    /// intentionally property-free and the payload provenance records that no schema was used.
+    pub fn materialize_raw_replacement_from_reader(
+        &self,
+        reader: &mut impl Read,
+        replacement_len: usize,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<MaterializedObject> {
+        validate_raw_replacement_len(replacement_len)?;
+        let replacement = read_owned_replacement(reader, replacement_len, budget)?;
+        let object =
+            UnityObject::from_owned_raw_replacement(self.file, self.info, replacement, budget)?;
+        Ok(MaterializedObject {
+            object,
+            selected_schema: None,
         })
     }
 
@@ -442,6 +514,41 @@ impl ObjectBytes {
     }
 }
 
+fn read_owned_replacement(
+    reader: &mut impl Read,
+    replacement_len: usize,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<u8>> {
+    let amount = u64::try_from(replacement_len)
+        .map_err(|_| BinaryError::memory_error("Replacement payload length does not fit in u64"))?;
+    budget.check_bytes(amount)?;
+    let mut replacement = Vec::new();
+    replacement
+        .try_reserve_exact(replacement_len)
+        .map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {replacement_len} bytes for a replacement payload: {error}"
+            ))
+        })?;
+    let retained = u64::try_from(replacement.capacity()).map_err(|_| {
+        BinaryError::memory_error("Replacement payload capacity does not fit in u64")
+    })?;
+    budget.check_bytes(retained)?;
+    budget.consume_bytes(retained)?;
+    replacement.resize(replacement_len, 0);
+    reader.read_exact(&mut replacement)?;
+    Ok(replacement)
+}
+
+fn validate_raw_replacement_len(replacement_len: usize) -> Result<()> {
+    u32::try_from(replacement_len)
+        .map(|_| ())
+        .map_err(|_| BinaryObjectReplacementError::RawPayloadTooLarge {
+            length: replacement_len,
+        })
+        .map_err(Into::into)
+}
+
 /// Origin of the payload currently owned or referenced by a [`UnityObject`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectPayloadProvenance {
@@ -449,8 +556,10 @@ pub enum ObjectPayloadProvenance {
     Committed,
     /// Bytes came from the authoritative `ObjectInfo::loaded_data` payload.
     Loaded,
-    /// Bytes were supplied to an [`ObjectHandle`] replacement API.
-    Replacement,
+    /// Bytes were supplied to an [`ObjectHandle`] replacement API and parsed with a TypeTree.
+    TypedReplacement,
+    /// Bytes were supplied to an [`ObjectHandle`] replacement API without an available TypeTree.
+    RawReplacement,
     /// The object was constructed independently of a SerializedFile payload.
     Synthetic,
 }
@@ -600,9 +709,65 @@ impl UnityObject {
             class: UnityClass::with_properties(info.class_id(), class_name, anchor, out.properties),
             byte_order,
             raw,
-            payload_provenance: ObjectPayloadProvenance::Replacement,
+            payload_provenance: ObjectPayloadProvenance::TypedReplacement,
             typetree_warnings: out.warnings,
             typetree_stats: out.stats,
+        })
+    }
+
+    fn from_owned_replacement_with_compiled_schema(
+        file: &SerializedFile,
+        info: &ObjectInfo,
+        replacement: Vec<u8>,
+        schema: &TypeTreeSchema,
+        budget: &mut AssetLoadBudget,
+        options: TypeTreeParseOptions,
+    ) -> Result<Self> {
+        let byte_order = file.header.byte_order();
+        let out = parse_replacement_extent(
+            replacement.as_slice(),
+            byte_order,
+            info.path_id(),
+            |reader| schema.read_object(reader, budget, options),
+        )?;
+        if !out.complete {
+            return Err(BinaryObjectReplacementError::Incomplete {
+                path_id: info.path_id(),
+                consumed: replacement.len(),
+            }
+            .into());
+        }
+        let class_name = class_name_from_id_with_budget(info.class_id(), budget)?;
+        let anchor = anchor_from_path_id(info.path_id(), budget)?;
+
+        Ok(Self {
+            info: info.clone_without_loaded_data(),
+            class: UnityClass::with_properties(info.class_id(), class_name, anchor, out.properties),
+            byte_order,
+            raw: ObjectBytes::Inline(replacement),
+            payload_provenance: ObjectPayloadProvenance::TypedReplacement,
+            typetree_warnings: out.warnings,
+            typetree_stats: out.stats,
+        })
+    }
+
+    fn from_owned_raw_replacement(
+        file: &SerializedFile,
+        info: &ObjectInfo,
+        replacement: Vec<u8>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self> {
+        validate_raw_replacement_len(replacement.len())?;
+        let class_name = class_name_from_id_with_budget(info.class_id(), budget)?;
+        let anchor = anchor_from_path_id(info.path_id(), budget)?;
+        Ok(Self {
+            info: info.clone_without_loaded_data(),
+            class: UnityClass::new(info.class_id(), class_name, anchor),
+            byte_order: file.header.byte_order(),
+            raw: ObjectBytes::Inline(replacement),
+            payload_provenance: ObjectPayloadProvenance::RawReplacement,
+            typetree_warnings: Vec::new(),
+            typetree_stats: TypeTreeTraversalStats::default(),
         })
     }
 
@@ -1038,7 +1203,7 @@ mod tests {
         assert_eq!(object.payload_len(), replacement.len());
         assert_eq!(
             object.payload_provenance(),
-            ObjectPayloadProvenance::Replacement
+            ObjectPayloadProvenance::TypedReplacement
         );
         assert_ne!(
             usize::try_from(object.byte_size()).unwrap(),
@@ -1062,6 +1227,115 @@ mod tests {
         assert_eq!(object.info.byte_start(), original_identity.2);
         assert_eq!(object.info.byte_size(), original_identity.3);
         assert!(object.info.loaded_data().is_none());
+    }
+
+    #[test]
+    fn replacement_reader_retains_one_typed_payload_allocation() {
+        let file = replacement_fixture();
+        let handle = file.object_handles().next().unwrap();
+        let replacement = valid_replacement(&file);
+        let mut reader = std::io::Cursor::new(replacement.as_slice());
+        let materialized = handle
+            .materialize_replacement_from_reader(
+                &mut reader,
+                replacement.len(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        assert_eq!(reader.position(), replacement.len() as u64);
+        assert_eq!(materialized.object().raw_data(), replacement);
+        assert_eq!(
+            materialized.object().payload_provenance(),
+            ObjectPayloadProvenance::TypedReplacement
+        );
+        assert!(materialized.schema().is_some());
+    }
+
+    #[test]
+    fn raw_replacement_reader_preserves_identity_byte_order_and_exact_budget_growth() {
+        fn materialize(payload: &[u8]) -> (UnityObject, u64, usize) {
+            let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+            let handle = file.object_handles().next().unwrap();
+            let mut reader = std::io::Cursor::new(payload);
+            let mut budget = AssetLoadBudget::default();
+            let object = handle
+                .materialize_raw_replacement_from_reader(&mut reader, payload.len(), &mut budget)
+                .unwrap()
+                .into_object();
+            assert_eq!(reader.position(), payload.len() as u64);
+            assert_eq!(object.path_id(), handle.path_id());
+            assert_eq!(object.class_id(), handle.class_id());
+            assert_eq!(object.byte_order(), file.header.byte_order());
+            let retained_capacity = match &object.raw {
+                ObjectBytes::Inline(bytes) => bytes.capacity(),
+                other => panic!("raw replacement must retain inline bytes, got {other:?}"),
+            };
+            (object, budget.usage().bytes, retained_capacity)
+        }
+
+        let (_, empty_usage, empty_capacity) = materialize(b"");
+        let (short, short_usage, short_capacity) = materialize(b"raw!");
+        let (long, long_usage, long_capacity) = materialize(b"raw payload!");
+        assert_eq!(short.raw_data(), b"raw!");
+        assert_eq!(long.raw_data(), b"raw payload!");
+        assert!(short.as_unity_class().properties().is_empty());
+        assert_eq!(
+            short.payload_provenance(),
+            ObjectPayloadProvenance::RawReplacement
+        );
+        assert_eq!(empty_capacity, 0);
+        assert_eq!(short_usage - empty_usage, short_capacity as u64);
+        assert_eq!(long_usage - empty_usage, long_capacity as u64);
+
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let handle = file.object_handles().next().unwrap();
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: short_usage - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        let error = handle
+            .materialize_raw_replacement_from_reader(
+                &mut std::io::Cursor::new(b"raw!"),
+                4,
+                &mut one_short,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BinaryError::Budget(BudgetError::Exceeded { .. })
+        ));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn oversized_raw_replacement_is_rejected_before_allocation_or_read() {
+        struct RejectReads;
+
+        impl Read for RejectReads {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                panic!("oversized raw replacement must be rejected before reading")
+            }
+        }
+
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let handle = file.object_handles().next().unwrap();
+        let oversized = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        let mut reader = RejectReads;
+        let mut budget = AssetLoadBudget::default();
+
+        let error = handle
+            .materialize_raw_replacement_from_reader(&mut reader, oversized, &mut budget)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BinaryError::ObjectReplacement(
+                BinaryObjectReplacementError::RawPayloadTooLarge { length }
+            ) if length == oversized
+        ));
+        assert_eq!(budget.usage(), Default::default());
     }
 
     #[test]
@@ -1782,7 +2056,7 @@ mod tests {
         assert_eq!(materialized.object().raw_data(), replacement);
         assert_eq!(
             materialized.object().payload_provenance(),
-            ObjectPayloadProvenance::Replacement
+            ObjectPayloadProvenance::TypedReplacement
         );
         assert_eq!(registry.calls.load(Ordering::SeqCst), 1);
     }

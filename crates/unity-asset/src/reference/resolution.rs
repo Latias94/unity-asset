@@ -56,22 +56,30 @@ struct MetaGuidClaim {
 pub(crate) struct ResolutionCatalog<'input, I: ReferenceInput + ?Sized> {
     input: &'input I,
     nodes: &'input [RevisionedObjectHandle],
+    identity: ResolutionIdentityIndex,
+    workspace: WorkspaceId,
+    revision: WorkspaceRevision,
+}
+
+/// Bidirectional, allocation-accounted source identity index shared by reference decoding and
+/// mutation-time destination encoding.
+pub(super) struct ResolutionIdentityIndex {
     exact_paths: Vec<PathClaim>,
     basenames: Vec<PathClaim>,
     guids: Vec<GuidClaim>,
     source_guids: Vec<SourceGuidClaim>,
     source_parents: Vec<SourceParent>,
-    workspace: WorkspaceId,
-    revision: WorkspaceRevision,
 }
 
-impl<'input, I: ReferenceInput + ?Sized> ResolutionCatalog<'input, I> {
-    pub(crate) fn build(
-        input: &'input I,
+impl ResolutionIdentityIndex {
+    pub(super) fn build(
         sources: &[ReferenceSource<'_>],
-        nodes: &'input [RevisionedObjectHandle],
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, ReferenceGraphError> {
+        budget.consume_entries(usize_to_u64(
+            sources.len(),
+            "reference source identity scan",
+        )?)?;
         let mut exact_paths = Vec::new();
         let mut basenames = Vec::new();
         let mut describable_paths = Vec::new();
@@ -166,22 +174,25 @@ impl<'input, I: ReferenceInput + ?Sized> ResolutionCatalog<'input, I> {
             )?;
 
             if source_id.kind() == SourceKind::Yaml
-                && let Some(guid) = source.yaml_document().and_then(meta_guid)
                 && let Some(described) = logical_path.strip_suffix(".meta")
             {
-                let described_path =
-                    clone_string(described, "reference meta described paths", budget)?;
-                push_value(
-                    &mut meta_claims,
-                    MetaGuidClaim {
-                        described_path,
-                        parent,
-                        same_name_occurrence,
-                        guid,
-                    },
-                    "reference meta GUID claims",
-                    budget,
-                )?;
+                for guid in meta_guids(&source, budget)? {
+                    push_value(
+                        &mut meta_claims,
+                        MetaGuidClaim {
+                            described_path: clone_string(
+                                described,
+                                "reference meta described paths",
+                                budget,
+                            )?,
+                            parent,
+                            same_name_occurrence,
+                            guid,
+                        },
+                        "reference meta GUID claims",
+                        budget,
+                    )?;
+                }
             }
         }
         exact_paths.sort_unstable();
@@ -238,13 +249,169 @@ impl<'input, I: ReferenceInput + ?Sized> ResolutionCatalog<'input, I> {
         }
 
         Ok(Self {
-            input,
-            nodes,
             exact_paths,
             basenames,
             guids,
             source_guids,
             source_parents,
+        })
+    }
+
+    pub(super) fn source_guids(&self, source: SourceId) -> impl Iterator<Item = [u8; 16]> + '_ {
+        let start = self
+            .source_guids
+            .partition_point(|claim| claim.source < source);
+        let end = self
+            .source_guids
+            .partition_point(|claim| claim.source <= source);
+        self.source_guids[start..end].iter().map(|claim| claim.guid)
+    }
+
+    pub(super) fn guid_sources(&self, guid: [u8; 16]) -> impl Iterator<Item = SourceId> + '_ {
+        let start = self.guids.partition_point(|claim| claim.guid < guid);
+        let end = self.guids.partition_point(|claim| claim.guid <= guid);
+        self.guids[start..end].iter().map(|claim| claim.source)
+    }
+
+    #[cfg(test)]
+    pub(super) fn unique_path_source(
+        &self,
+        context: SourceId,
+        raw_path: &str,
+        kind: SourceKind,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Option<SourceId>, ReferenceGraphError> {
+        let normalized =
+            normalize_external_path(raw_path, "unique external reference lookup path", budget)?;
+        let candidates = self.path_candidates(context, &normalized, kind, budget)?;
+        Ok(match candidates.as_slice() {
+            [source] => Some(*source),
+            _ => None,
+        })
+    }
+
+    /// Tests whether one binary external identity resolves uniquely to `expected`.
+    ///
+    /// This follows the same GUID/path reconciliation rules as graph construction without
+    /// allocating a diagnostic or a temporary GUID candidate vector.
+    pub(super) fn binary_external_resolves_to(
+        &self,
+        context: SourceId,
+        raw_guid: Option<[u8; 16]>,
+        raw_path: &str,
+        expected: SourceId,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<bool, ReferenceGraphError> {
+        let normalized =
+            normalize_external_path(raw_path, "external reference lookup path", budget)?;
+        if raw_guid.is_none() && normalized.is_empty() {
+            return Ok(false);
+        }
+        let path =
+            self.path_candidates(context, &normalized, SourceKind::SerializedFile, budget)?;
+        let Some(raw_guid) = raw_guid else {
+            return Ok(path.as_slice() == [expected]);
+        };
+
+        let guid_start = self.guids.partition_point(|claim| claim.guid < raw_guid);
+        let guid_end = self.guids.partition_point(|claim| claim.guid <= raw_guid);
+        let guid = self.guids[guid_start..guid_end]
+            .iter()
+            .map(|claim| claim.source)
+            .filter(|source| source.kind() == SourceKind::SerializedFile);
+        let mut guid_count = 0_usize;
+        let mut guid_is_expected = false;
+        for source in guid {
+            guid_count = guid_count.saturating_add(1);
+            guid_is_expected |= source == expected;
+        }
+
+        if guid_count == 0 {
+            let mut candidates = path.iter().copied().filter(|source| {
+                !matches!(
+                    source_guid_evidence(&self.source_guids, *source, raw_guid),
+                    SourceGuidEvidence::Conflicting
+                )
+            });
+            return Ok(candidates.next() == Some(expected) && candidates.next().is_none());
+        }
+        if path.is_empty() {
+            return Ok(guid_count == 1 && guid_is_expected);
+        }
+
+        let mut intersection = self.guids[guid_start..guid_end]
+            .iter()
+            .map(|claim| claim.source)
+            .filter(|source| source.kind() == SourceKind::SerializedFile)
+            .filter(|source| path.binary_search(source).is_ok());
+        Ok(intersection.next() == Some(expected) && intersection.next().is_none())
+    }
+
+    fn path_candidates(
+        &self,
+        context: SourceId,
+        normalized: &str,
+        kind: SourceKind,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<SourceId>, ReferenceGraphError> {
+        let mut candidates = collect_path_claims(&self.exact_paths, normalized, kind, budget)?;
+        if candidates.is_empty()
+            && let Some(name) = external_basename(normalized)
+        {
+            candidates = collect_path_claims(&self.basenames, name, kind, budget)?;
+        }
+        if candidates.len() > 1 {
+            let context_parent = self.source_parent(context)?;
+            if context_parent.is_some() {
+                let mut same_parent = reserve_vec(
+                    candidates.len(),
+                    "same-parent external path candidates",
+                    budget,
+                )?;
+                for candidate in candidates.iter().copied() {
+                    if self.source_parent(candidate)? == context_parent {
+                        same_parent.push(candidate);
+                    }
+                }
+                if !same_parent.is_empty() {
+                    candidates = same_parent;
+                }
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        Ok(candidates)
+    }
+
+    fn source_parent(&self, source: SourceId) -> Result<Option<SourceId>, ReferenceGraphError> {
+        let position = self
+            .source_parents
+            .binary_search_by_key(&source, |claim| claim.source)
+            .map_err(|_| {
+                ReferenceGraphError::Invariant(
+                    "reference path candidate is absent from the source parent table",
+                )
+            })?;
+        self.source_parents
+            .get(position)
+            .map(|claim| claim.parent)
+            .ok_or(ReferenceGraphError::Invariant(
+                "reference source parent ordinal is out of bounds",
+            ))
+    }
+}
+
+impl<'input, I: ReferenceInput + ?Sized> ResolutionCatalog<'input, I> {
+    pub(crate) fn build(
+        input: &'input I,
+        sources: &[ReferenceSource<'_>],
+        nodes: &'input [RevisionedObjectHandle],
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, ReferenceGraphError> {
+        Ok(Self {
+            input,
+            nodes,
+            identity: ResolutionIdentityIndex::build(sources, budget)?,
             workspace: input.workspace_id(),
             revision: input.revision(),
         })
@@ -584,14 +751,20 @@ impl<'input, I: ReferenceInput + ?Sized> ResolutionCatalog<'input, I> {
         guid: [u8; 16],
         budget: &mut AssetLoadBudget,
     ) -> Result<Vec<SourceId>, ReferenceGraphError> {
-        let start = self.guids.partition_point(|claim| claim.guid < guid);
-        let end = self.guids.partition_point(|claim| claim.guid <= guid);
+        let start = self
+            .identity
+            .guids
+            .partition_point(|claim| claim.guid < guid);
+        let end = self
+            .identity
+            .guids
+            .partition_point(|claim| claim.guid <= guid);
         let mut candidates = reserve_vec(
             end.saturating_sub(start),
             "GUID reference candidates",
             budget,
         )?;
-        for claim in &self.guids[start..end] {
+        for claim in &self.identity.guids[start..end] {
             candidates.push(claim.source);
         }
         candidates.sort_unstable();
@@ -606,54 +779,12 @@ impl<'input, I: ReferenceInput + ?Sized> ResolutionCatalog<'input, I> {
         kind: SourceKind,
         budget: &mut AssetLoadBudget,
     ) -> Result<Vec<SourceId>, ReferenceGraphError> {
-        let mut candidates = collect_path_claims(&self.exact_paths, normalized, kind, budget)?;
-        if candidates.is_empty()
-            && let Some(name) = external_basename(normalized)
-        {
-            candidates = collect_path_claims(&self.basenames, name, kind, budget)?;
-        }
-        if candidates.len() > 1 {
-            let context_parent = self.source_parent(context)?;
-            if context_parent.is_some() {
-                let mut same_parent = reserve_vec(
-                    candidates.len(),
-                    "same-parent external path candidates",
-                    budget,
-                )?;
-                for candidate in candidates.iter().copied() {
-                    if self.source_parent(candidate)? == context_parent {
-                        same_parent.push(candidate);
-                    }
-                }
-                if !same_parent.is_empty() {
-                    candidates = same_parent;
-                }
-            }
-        }
-        candidates.sort_unstable();
-        candidates.dedup();
-        Ok(candidates)
+        self.identity
+            .path_candidates(context, normalized, kind, budget)
     }
 
     fn source_guid_evidence(&self, source: SourceId, expected: [u8; 16]) -> SourceGuidEvidence {
-        source_guid_evidence(&self.source_guids, source, expected)
-    }
-
-    fn source_parent(&self, source: SourceId) -> Result<Option<SourceId>, ReferenceGraphError> {
-        let position = self
-            .source_parents
-            .binary_search_by_key(&source, |claim| claim.source)
-            .map_err(|_| {
-                ReferenceGraphError::Invariant(
-                    "reference path candidate is absent from the source parent table",
-                )
-            })?;
-        self.source_parents
-            .get(position)
-            .map(|claim| claim.parent)
-            .ok_or(ReferenceGraphError::Invariant(
-                "reference source parent ordinal is out of bounds",
-            ))
+        source_guid_evidence(&self.identity.source_guids, source, expected)
     }
 
     fn invalid(
@@ -905,31 +1036,45 @@ fn push_value<T>(
     budget: &mut AssetLoadBudget,
 ) -> Result<(), ReferenceGraphError> {
     if values.len() == values.capacity() {
-        let bytes = usize_to_u64(size_of::<T>(), resource)?;
-        budget.check_bytes(bytes)?;
+        let previous_capacity = values.capacity();
+        let required = values
+            .len()
+            .checked_add(1)
+            .ok_or(BudgetError::ArithmeticOverflow { resource })?;
+        let target = geometric_vec_capacity(previous_capacity, required, resource)?;
+        let additional = target
+            .checked_sub(values.len())
+            .ok_or(BudgetError::ArithmeticOverflow { resource })?;
+        budget.check_bytes(vec_capacity_bytes::<T>(
+            target
+                .checked_sub(previous_capacity)
+                .ok_or(BudgetError::ArithmeticOverflow { resource })?,
+            resource,
+        )?)?;
         values
-            .try_reserve_exact(1)
+            .try_reserve_exact(additional)
             .map_err(|error| ReferenceGraphError::Allocation {
                 resource,
-                requested: 1,
+                requested: additional,
                 unit: super::ReferenceAllocationUnit::Elements,
                 source: error,
             })?;
-        budget.consume_bytes(bytes)?;
+        let retained = values
+            .capacity()
+            .checked_sub(previous_capacity)
+            .ok_or(BudgetError::ArithmeticOverflow { resource })?;
+        budget.consume_bytes(vec_capacity_bytes::<T>(retained, resource)?)?;
     }
     values.push(value);
     Ok(())
 }
 
-fn reserve_vec<T>(
+pub(super) fn reserve_vec<T>(
     capacity: usize,
     resource: &'static str,
     budget: &mut AssetLoadBudget,
 ) -> Result<Vec<T>, ReferenceGraphError> {
-    let bytes = capacity
-        .checked_mul(size_of::<T>())
-        .ok_or(BudgetError::ArithmeticOverflow { resource })?;
-    budget.check_bytes(usize_to_u64(bytes, resource)?)?;
+    budget.check_bytes(vec_capacity_bytes::<T>(capacity, resource)?)?;
     let mut values = Vec::new();
     values
         .try_reserve_exact(capacity)
@@ -939,8 +1084,29 @@ fn reserve_vec<T>(
             unit: super::ReferenceAllocationUnit::Elements,
             source: error,
         })?;
-    budget.consume_bytes(usize_to_u64(bytes, resource)?)?;
+    budget.consume_bytes(vec_capacity_bytes::<T>(values.capacity(), resource)?)?;
     Ok(values)
+}
+
+fn geometric_vec_capacity(
+    current: usize,
+    required: usize,
+    resource: &'static str,
+) -> Result<usize, BudgetError> {
+    if required <= current {
+        return Ok(current);
+    }
+    let doubled = current
+        .checked_mul(2)
+        .ok_or(BudgetError::ArithmeticOverflow { resource })?;
+    Ok(required.max(doubled).max(4))
+}
+
+fn vec_capacity_bytes<T>(capacity: usize, resource: &'static str) -> Result<u64, BudgetError> {
+    let bytes = capacity
+        .checked_mul(size_of::<T>())
+        .ok_or(BudgetError::ArithmeticOverflow { resource })?;
+    usize_to_u64(bytes, resource)
 }
 
 fn normalize_external_path(
@@ -982,6 +1148,8 @@ fn normalize_external_path(
             unit: super::ReferenceAllocationUnit::Bytes,
             source,
         })?;
+    let retained = usize_to_u64(normalized.capacity(), resource)?;
+    budget.check_bytes(retained)?;
     for character in input.chars() {
         normalized.push(if character == '\\' {
             '/'
@@ -1001,12 +1169,36 @@ fn external_basename(path: &str) -> Option<&str> {
     path.rsplit('/').find(|component| !component.is_empty())
 }
 
-fn meta_guid(document: &unity_asset_yaml::YamlDocument) -> Option<[u8; 16]> {
-    document
-        .entries()
-        .iter()
-        .find_map(|class| class.get("guid").and_then(|value| value.as_str()))
-        .and_then(parse_guid)
+fn meta_guids(
+    source: &ReferenceSource<'_>,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<[u8; 16]>, ReferenceGraphError> {
+    let Some(document) = source.yaml_document() else {
+        return Ok(Vec::new());
+    };
+    let document_count = document.entries().len();
+    budget.consume_entries(usize_to_u64(
+        document_count,
+        "reference meta document scan",
+    )?)?;
+    let mut guids = Vec::new();
+    for index in 0..document_count {
+        let guid = source
+            .yaml_class(index)
+            .and_then(|class| class.get("guid"))
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .and_then(parse_guid)
+                    .or_else(|| (value.as_u64() == Some(0)).then_some([0; 16]))
+            });
+        if let Some(guid) = guid {
+            push_value(&mut guids, guid, "reference meta source GUIDs", budget)?;
+        }
+    }
+    guids.sort_unstable();
+    guids.dedup();
+    Ok(guids)
 }
 
 fn parse_guid(value: &str) -> Option<[u8; 16]> {
@@ -1029,13 +1221,12 @@ fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
-fn clone_string(
+pub(super) fn clone_string(
     value: &str,
     resource: &'static str,
     budget: &mut AssetLoadBudget,
 ) -> Result<String, ReferenceGraphError> {
-    let retained = usize_to_u64(value.len(), resource)?;
-    budget.check_bytes(retained)?;
+    budget.check_bytes(usize_to_u64(value.len(), resource)?)?;
     let mut cloned = String::new();
     cloned
         .try_reserve_exact(value.len())
@@ -1045,6 +1236,8 @@ fn clone_string(
             unit: super::ReferenceAllocationUnit::Bytes,
             source,
         })?;
+    let retained = usize_to_u64(cloned.capacity(), resource)?;
+    budget.check_bytes(retained)?;
     cloned.push_str(value);
     budget.consume_bytes(retained)?;
     Ok(cloned)
@@ -1061,8 +1254,7 @@ fn decimal_i64(value: i64, budget: &mut AssetLoadBudget) -> Result<String, Refer
         }
     }
     let resource = "YAML reference file ID";
-    let retained = usize_to_u64(length, resource)?;
-    budget.check_bytes(retained)?;
+    budget.check_bytes(usize_to_u64(length, resource)?)?;
     let mut rendered = String::new();
     rendered
         .try_reserve_exact(length)
@@ -1072,6 +1264,8 @@ fn decimal_i64(value: i64, budget: &mut AssetLoadBudget) -> Result<String, Refer
             unit: super::ReferenceAllocationUnit::Bytes,
             source,
         })?;
+    let retained = usize_to_u64(rendered.capacity(), resource)?;
+    budget.check_bytes(retained)?;
     write!(rendered, "{value}")
         .map_err(|_| ReferenceGraphError::Invariant("failed to format YAML reference file ID"))?;
     budget.consume_bytes(retained)?;
@@ -1085,8 +1279,13 @@ fn usize_to_u64(value: usize, resource: &'static str) -> Result<u64, BudgetError
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
 
-    use unity_asset_core::{AssetLoadLimits, SourceKind, WorkspaceId};
+    use unity_asset_core::{
+        AssetLoadLimits, AssetLoadUsage, SourceFingerprint, SourceKind, SourceLocator, UnityClass,
+        UnityValue, WorkspaceId,
+    };
+    use unity_asset_yaml::YamlDocument;
 
     use super::*;
     use crate::workspace::{AssetWorkspace, WorkspaceView, reference_view_parts};
@@ -1111,6 +1310,45 @@ mod tests {
             normalize_external_path("./Folder/Ä.asset", "test path", &mut budget).unwrap(),
             "folder/Ä.asset"
         );
+    }
+
+    #[test]
+    fn reference_strings_charge_retained_capacity() {
+        let mut clone_budget = AssetLoadBudget::default();
+        let cloned = clone_string("reference.assets", "test string", &mut clone_budget).unwrap();
+        assert_eq!(
+            clone_budget.usage().bytes,
+            u64::try_from(cloned.capacity()).unwrap()
+        );
+
+        let mut path_budget = AssetLoadBudget::default();
+        let normalized =
+            normalize_external_path("./Reference.Assets/", "test path", &mut path_budget).unwrap();
+        assert_eq!(
+            path_budget.usage().bytes,
+            u64::try_from(normalized.capacity()).unwrap()
+        );
+
+        let mut decimal_budget = AssetLoadBudget::default();
+        let rendered = decimal_i64(i64::MIN, &mut decimal_budget).unwrap();
+        assert_eq!(
+            decimal_budget.usage().bytes,
+            u64::try_from(rendered.capacity()).unwrap()
+        );
+
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: clone_budget.usage().bytes - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            clone_string("reference.assets", "test string", &mut one_short),
+            Err(ReferenceGraphError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+        assert_eq!(one_short.usage(), AssetLoadUsage::default());
     }
 
     #[test]
@@ -1146,6 +1384,144 @@ mod tests {
             ),
             SourceGuidEvidence::Conflicting,
         );
+    }
+
+    #[test]
+    fn identity_vector_growth_charges_the_retained_capacity_delta() {
+        let mut values = Vec::new();
+        let mut budget = AssetLoadBudget::default();
+        for value in 0_u64..9 {
+            push_value(&mut values, value, "test identity vector", &mut budget).unwrap();
+        }
+
+        assert!(values.capacity() >= 16);
+        assert_eq!(
+            budget.usage().bytes,
+            u64::try_from(values.capacity() * size_of::<u64>()).unwrap()
+        );
+    }
+
+    #[test]
+    fn identity_index_collects_all_root_meta_guids_with_exact_budgeting() {
+        const FIRST_GUID: &str = "11111111111111111111111111111111";
+        const SECOND_GUID: &str = "22222222222222222222222222222222";
+
+        fn guid_class(guid: &str) -> UnityClass {
+            let mut class = UnityClass::new(0, "YamlDocument".to_owned(), "0".to_owned());
+            class.set("guid".to_owned(), UnityValue::String(guid.to_owned()));
+            class
+        }
+
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let target_id = SourceId::new(workspace, SourceKind::Yaml, 1).unwrap();
+        let meta_id = SourceId::new(workspace, SourceKind::Yaml, 2).unwrap();
+        let duplicate_basename_id = SourceId::new(workspace, SourceKind::Yaml, 3).unwrap();
+        let target_owner = Arc::<[u8]>::from(&b"target"[..]);
+        let meta_owner = Arc::<[u8]>::from(&b"meta"[..]);
+        let duplicate_owner = Arc::<[u8]>::from(&b"duplicate"[..]);
+        let target_locator = SourceLocator::path("folder/target.prefab").unwrap();
+        let meta_locator = SourceLocator::path("folder/target.prefab.meta").unwrap();
+        let duplicate_locator = SourceLocator::path("other/target.prefab").unwrap();
+        let target_document = YamlDocument::new();
+        let duplicate_document = YamlDocument::new();
+        let mut meta_document = YamlDocument::new();
+        meta_document.add_entry(guid_class(SECOND_GUID));
+        meta_document.add_entry(guid_class("not-a-guid"));
+        meta_document.add_entry(guid_class(FIRST_GUID));
+        meta_document.add_entry(guid_class(SECOND_GUID));
+
+        let sources = [
+            ReferenceSource::yaml(
+                target_id,
+                SourceFingerprint::from_bytes(SourceKind::Yaml, target_owner.as_ref()),
+                (&target_owner).into(),
+                &target_locator,
+                None,
+                None,
+                &target_document,
+            )
+            .unwrap(),
+            ReferenceSource::yaml(
+                meta_id,
+                SourceFingerprint::from_bytes(SourceKind::Yaml, meta_owner.as_ref()),
+                (&meta_owner).into(),
+                &meta_locator,
+                None,
+                None,
+                &meta_document,
+            )
+            .unwrap(),
+            ReferenceSource::yaml(
+                duplicate_basename_id,
+                SourceFingerprint::from_bytes(SourceKind::Yaml, duplicate_owner.as_ref()),
+                (&duplicate_owner).into(),
+                &duplicate_locator,
+                None,
+                None,
+                &duplicate_document,
+            )
+            .unwrap(),
+        ];
+
+        let mut measured = AssetLoadBudget::default();
+        let identity = ResolutionIdentityIndex::build(&sources, &mut measured).unwrap();
+        let first = parse_guid(FIRST_GUID).unwrap();
+        let second = parse_guid(SECOND_GUID).unwrap();
+        assert_eq!(
+            identity.source_guids(target_id).collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert_eq!(
+            identity.guid_sources(first).collect::<Vec<_>>(),
+            [target_id]
+        );
+        assert_eq!(
+            identity.guid_sources(second).collect::<Vec<_>>(),
+            [target_id]
+        );
+        assert_eq!(
+            identity
+                .unique_path_source(
+                    meta_id,
+                    r"./FOLDER\TARGET.PREFAB",
+                    SourceKind::Yaml,
+                    &mut measured,
+                )
+                .unwrap(),
+            Some(target_id)
+        );
+        assert_eq!(
+            identity
+                .unique_path_source(meta_id, "target.prefab", SourceKind::Yaml, &mut measured,)
+                .unwrap(),
+            None
+        );
+
+        let index_bytes = {
+            let mut budget = AssetLoadBudget::default();
+            ResolutionIdentityIndex::build(&sources, &mut budget).unwrap();
+            budget.usage().bytes
+        };
+        let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: index_bytes,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        ResolutionIdentityIndex::build(&sources, &mut exact).unwrap();
+        assert_eq!(exact.usage().bytes, index_bytes);
+
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: index_bytes - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            ResolutionIdentityIndex::build(&sources, &mut one_short),
+            Err(ReferenceGraphError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
     }
 
     #[test]

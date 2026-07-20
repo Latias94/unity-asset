@@ -1,9 +1,8 @@
 //! Budgeted Unity YAML parsing for workspace-owned source images.
 
-use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::mem::size_of;
-use std::str::Utf8Error;
+use std::str::{CharIndices, Utf8Error};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -102,10 +101,10 @@ pub(crate) fn parse_yaml_source(
     })?;
 
     let headers = scan_headers(input, budget)?;
-    let parser_input = normalize_stripped_headers(input, &headers, budget)?;
+    let parser_input = StrippedHeaderChars::new(input, &headers)?;
     // Unity declares `!u!` once at the beginning of a multi-document file and reuses it for every
     // following document, despite standard YAML limiting tag directives to one document.
-    let mut parser = Parser::new_from_str(parser_input.as_ref()).keep_tags(true);
+    let mut parser = Parser::new(parser_input).keep_tags(true);
     let mut document = YamlDocument::new();
     let mut document_capacity = 0;
     let mut header_cursor = 0;
@@ -417,44 +416,65 @@ impl<'a> HeaderTokens<'a> {
     }
 }
 
-fn normalize_stripped_headers<'a>(
-    input: &'a str,
-    headers: &[DocumentHeader<'_>],
-    budget: &mut AssetLoadBudget,
-) -> Result<Cow<'a, str>, YamlAdapterError> {
-    if headers.iter().all(|header| header.stripped_range.is_none()) {
-        return Ok(Cow::Borrowed(input));
-    }
+/// A zero-allocation parser view that hides Unity's non-YAML `stripped` header marker.
+struct StrippedHeaderChars<'input, 'headers> {
+    chars: CharIndices<'input>,
+    headers: &'headers [DocumentHeader<'input>],
+    header_cursor: usize,
+}
 
-    let mut bytes = Vec::new();
-    let mut accounted_capacity = 0;
-    reserve_budgeted_vec(
-        &mut bytes,
-        &mut accounted_capacity,
-        input.len(),
-        budget,
-        "normalized Unity YAML input",
-    )?;
-    bytes.extend_from_slice(input.as_bytes());
-    for header in headers {
-        if let Some((start, end)) = header.stripped_range {
-            let Some(range) = bytes.get_mut(start..end) else {
+impl<'input, 'headers> StrippedHeaderChars<'input, 'headers> {
+    fn new(
+        input: &'input str,
+        headers: &'headers [DocumentHeader<'input>],
+    ) -> Result<Self, YamlAdapterError> {
+        let mut previous_end = 0;
+        for header in headers {
+            let Some((start, end)) = header.stripped_range else {
+                continue;
+            };
+            if start < previous_end || input.get(start..end) != Some("stripped") {
                 return Err(YamlAdapterError::InvalidHeader {
                     line: header.line,
                     column: 1,
                     reason: "stripped marker range is outside the input",
                 });
+            }
+            previous_end = end;
+        }
+
+        Ok(Self {
+            chars: input.char_indices(),
+            headers,
+            header_cursor: 0,
+        })
+    }
+}
+
+impl Iterator for StrippedHeaderChars<'_, '_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (offset, character) = self.chars.next()?;
+        loop {
+            let Some(header) = self.headers.get(self.header_cursor) else {
+                return Some(character);
             };
-            range.fill(b' ');
+            let Some((start, end)) = header.stripped_range else {
+                self.header_cursor += 1;
+                continue;
+            };
+            if offset >= end {
+                self.header_cursor += 1;
+                continue;
+            }
+            return Some(if offset >= start { ' ' } else { character });
         }
     }
-    String::from_utf8(bytes)
-        .map(Cow::Owned)
-        .map_err(|_| YamlAdapterError::InvalidHeader {
-            line: 1,
-            column: 1,
-            reason: "normalizing a valid UTF-8 header changed its encoding",
-        })
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.chars.size_hint()
+    }
 }
 
 fn take_header_for_line<'a>(
@@ -1093,6 +1113,16 @@ mod tests {
         parse_yaml_source(Arc::from(input.as_ref()), &mut budget)
     }
 
+    fn first_parser_error<T: Iterator<Item = char>>(mut parser: Parser<T>) -> ScanError {
+        loop {
+            match parser.next_token() {
+                Ok((Event::StreamEnd, _)) => panic!("expected malformed YAML to fail"),
+                Ok(_) => {}
+                Err(error) => return error,
+            }
+        }
+    }
+
     #[test]
     fn parses_unity_headers_scalars_multiline_values_and_stripped_metadata() {
         let input = r#"%YAML 1.1
@@ -1152,6 +1182,71 @@ MonoBehaviour:
         );
         assert_eq!(entries[1].extra_anchor_data, "stripped");
         assert_eq!(entries[1].anchor, "9001");
+    }
+
+    #[test]
+    fn virtual_stripped_header_view_preserves_utf8_parser_locations() {
+        let input = "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n# Unicode before the header: \u{8d44}\u{6e90}\n--- !u!114 &9001 stripped\nMonoBehaviour:\n  broken: [1,\n";
+        let materialized = input.replacen("stripped", "        ", 1);
+        assert_eq!(input.len(), materialized.len());
+
+        let mut budget = AssetLoadBudget::default();
+        let headers = scan_headers(input, &mut budget).unwrap();
+        let virtual_view: String = StrippedHeaderChars::new(input, &headers).unwrap().collect();
+        assert_eq!(virtual_view, materialized);
+
+        let virtual_error = first_parser_error(
+            Parser::new(StrippedHeaderChars::new(input, &headers).unwrap()).keep_tags(true),
+        );
+        let materialized_error =
+            first_parser_error(Parser::new_from_str(&materialized).keep_tags(true));
+        assert_eq!(virtual_error.marker(), materialized_error.marker());
+        assert_eq!(virtual_error.info(), materialized_error.info());
+    }
+
+    #[test]
+    fn large_stripped_yaml_uses_one_backing_and_an_exact_budget() {
+        let payload = "x".repeat(128 * 1024);
+        let stripped = format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!114 &9001 stripped\nMonoBehaviour:\n  payload: {payload}\n"
+        );
+        let plain = stripped.replacen("stripped", "        ", 1);
+        assert_eq!(stripped.len(), plain.len());
+
+        let encoded: Arc<[u8]> = Arc::from(stripped.as_bytes());
+        let mut stripped_budget = AssetLoadBudget::default();
+        let parsed = parse_yaml_source(Arc::clone(&encoded), &mut stripped_budget).unwrap();
+        assert!(Arc::ptr_eq(parsed.encoded(), &encoded));
+
+        let mut plain_budget = AssetLoadBudget::default();
+        parse_yaml_source(Arc::from(plain.as_bytes()), &mut plain_budget).unwrap();
+        assert_eq!(
+            stripped_budget.usage().bytes,
+            plain_budget.usage().bytes + u64::try_from("stripped".len()).unwrap(),
+            "the stripped parser view must not charge a second input-sized backing"
+        );
+
+        let required = stripped_budget.usage().bytes;
+        let exact_limits = AssetLoadLimits {
+            max_bytes: required,
+            ..AssetLoadLimits::default()
+        };
+        let mut exact_budget = AssetLoadBudget::new(exact_limits).unwrap();
+        parse_yaml_source(Arc::clone(&encoded), &mut exact_budget).unwrap();
+        assert_eq!(exact_budget.usage().bytes, required);
+
+        let one_short_limits = AssetLoadLimits {
+            max_bytes: required - 1,
+            ..AssetLoadLimits::default()
+        };
+        let mut one_short_budget = AssetLoadBudget::new(one_short_limits).unwrap();
+        assert!(matches!(
+            parse_yaml_source(encoded, &mut one_short_budget),
+            Err(YamlAdapterError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
     }
 
     #[test]

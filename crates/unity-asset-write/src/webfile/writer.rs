@@ -6,7 +6,9 @@ use thiserror::Error;
 use unity_asset_binary::webfile::{WebFile, WebFileCompression};
 use unity_asset_core::{Result, UnityAssetError};
 
-use crate::artifact::{ArtifactBatch, ArtifactBuildError, ArtifactHandle, encode_brotli};
+use crate::artifact::{
+    ArtifactBatch, ArtifactBuildError, ArtifactBuildFailurePhase, ArtifactHandle, encode_brotli,
+};
 
 use super::WebFileEdits;
 
@@ -87,6 +89,17 @@ pub enum WebFileWriteError {
     WireFieldTooLarge { field: &'static str, value: u64 },
     #[error("WebFile arithmetic overflow while computing {resource}")]
     ArithmeticOverflow { resource: &'static str },
+}
+
+impl WebFileWriteError {
+    /// Reports the artifact-build stage in which this WebFile preparation failed.
+    #[must_use]
+    pub const fn failure_phase(&self) -> ArtifactBuildFailurePhase {
+        match self {
+            Self::Artifact(error) => error.failure_phase(),
+            _ => ArtifactBuildFailurePhase::Encoding,
+        }
+    }
 }
 
 impl From<ArtifactBuildError> for WebFileWriteError {

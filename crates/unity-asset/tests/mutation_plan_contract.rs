@@ -45,6 +45,10 @@ fn binary_address() -> ObjectAddress {
     ObjectAddress::binary_at(binary_locator(), -7).unwrap()
 }
 
+fn raw_binary_address() -> ObjectAddress {
+    ObjectAddress::binary_at(binary_locator(), -8).unwrap()
+}
+
 fn yaml_address() -> ObjectAddress {
     ObjectAddress::yaml(yaml_locator(), "100100000").unwrap()
 }
@@ -163,7 +167,7 @@ fn sample_plan() -> MutationPlan {
                 edit: SequenceMutation::Clear,
             },
             GenericMutation::UnsafeRawReplace {
-                target: binary_address(),
+                target: raw_binary_address(),
                 expected_raw_digest: digest(b"old raw object"),
                 payload: raw_digest,
                 acknowledgement: UnsafeRawAcknowledgement::WireInvariantsAreCallersResponsibilityV1,
@@ -183,7 +187,7 @@ fn all_mutation_primitives_have_stable_canonical_json_and_digest() {
     assert_eq!(bytes, golden.as_bytes());
     assert_eq!(
         plan.digest().unwrap().to_string(),
-        "blake3-v1:24f2a46f6a9d190184cbab071f56f923cd0e865ad21003a38e89c01dfb72097b"
+        "blake3-v1:6f6b5b372d5ebd6f33c32830b40f9b8a1f38c03d2a0df901577154c6573222e9"
     );
     assert_eq!(serde_json::to_vec(&plan).unwrap(), bytes);
     assert_eq!(read_json_plan(&bytes).unwrap(), plan);

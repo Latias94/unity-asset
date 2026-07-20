@@ -877,7 +877,7 @@ fn account_frozen_type_tree(
     Ok(())
 }
 
-fn validate_yaml_identities(
+pub(super) fn validate_yaml_identities(
     document: &YamlDocument,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), WorkspaceError> {
@@ -1012,7 +1012,10 @@ fn reserve_prepared_children(
     Ok(children)
 }
 
-fn map_yaml_adapter_error(operation: &'static str, error: YamlAdapterError) -> WorkspaceError {
+pub(super) fn map_yaml_adapter_error(
+    operation: &'static str,
+    error: YamlAdapterError,
+) -> WorkspaceError {
     match error {
         YamlAdapterError::Budget(error) => WorkspaceError::Budget(error),
         YamlAdapterError::AllocationFailed { context, requested } => WorkspaceError::Allocation {

@@ -15,6 +15,68 @@ use super::SerializedFileEdits;
 const EXTERNAL_TABLE_IDENTITY_DOMAIN: &[u8] = b"unity-asset:serialized-file:externals:v1";
 const EXTERNAL_ALLOCATION_RESOURCE: &str = "serialized_file_external_table";
 
+/// An owned external path whose String backing is already charged to a caller budget.
+#[derive(Debug)]
+#[must_use = "intern the budgeted path or its retained allocation remains unused"]
+pub struct BudgetedExternalPath {
+    path: String,
+    accounted_bytes: u64,
+}
+
+impl BudgetedExternalPath {
+    pub fn new(path: String, budget: &mut AssetLoadBudget) -> Result<Self, ExternalTableError> {
+        let accounted_bytes = string_allocation_bytes(path.capacity())?;
+        budget.check_bytes(accounted_bytes)?;
+        budget.consume_bytes(accounted_bytes)?;
+        Ok(Self {
+            path,
+            accounted_bytes,
+        })
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.path
+    }
+}
+
+/// A preflighted external-path insertion whose commit cannot allocate or fail.
+#[derive(Debug)]
+#[must_use = "commit the prepared external path after dependent work succeeds"]
+pub struct PreparedExternalPath<'allocator, 'file> {
+    allocator: &'allocator mut ExternalTableAllocator<'file>,
+    file_id: i32,
+    addition: Option<PreparedExternalAddition>,
+}
+
+impl PreparedExternalPath<'_, '_> {
+    /// Publishes the already budgeted table entry without further validation or allocation.
+    pub fn commit(self) -> i32 {
+        if let Some(addition) = self.addition {
+            addition.commit(&mut self.allocator.additions);
+        }
+        self.file_id
+    }
+}
+
+#[derive(Debug)]
+struct PreparedExternalAddition {
+    identifier: FileIdentifier,
+    replacement: Option<Vec<FileIdentifier>>,
+}
+
+impl PreparedExternalAddition {
+    fn commit(self, additions: &mut Vec<FileIdentifier>) {
+        if let Some(mut replacement) = self.replacement {
+            replacement.append(additions);
+            replacement.push(self.identifier);
+            *additions = replacement;
+        } else {
+            additions.push(self.identifier);
+        }
+    }
+}
+
 /// A field that cannot be represented by the current SerializedFile external encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalIdentifierField {
@@ -197,6 +259,97 @@ impl<'file> ExternalTableAllocator<'file> {
             append_budgeted(&mut self.additions, identifier, budget)?;
         }
         Ok(disposition.file_id)
+    }
+
+    /// Returns the existing or newly allocated positive PPtr file ID for `path`.
+    ///
+    /// Canonically equivalent retained paths reuse the lowest table index without replacing its
+    /// metadata. A missing path is appended in first-seen order with empty asset-path, zero GUID,
+    /// and zero type compatibility metadata.
+    pub fn intern_path(
+        &mut self,
+        path: String,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<i32, ExternalTableError> {
+        let disposition = plan_path(
+            self.base.format,
+            &self.file.externals,
+            &self.additions,
+            &path,
+        )?;
+        if disposition.append {
+            append_budgeted(
+                &mut self.additions,
+                FileIdentifier {
+                    temp_empty: String::new(),
+                    guid: [0; 16],
+                    type_: 0,
+                    path,
+                },
+                budget,
+            )?;
+        }
+        Ok(disposition.file_id)
+    }
+
+    /// Interns a path whose owned String backing was already charged exactly once.
+    pub fn intern_budgeted_path(
+        &mut self,
+        path: BudgetedExternalPath,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<i32, ExternalTableError> {
+        Ok(self.prepare_budgeted_path(path, budget)?.commit())
+    }
+
+    /// Completes every fallible step of interning a preaccounted path without appending it.
+    pub fn prepare_budgeted_path<'allocator>(
+        &'allocator mut self,
+        path: BudgetedExternalPath,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<PreparedExternalPath<'allocator, 'file>, ExternalTableError> {
+        let disposition = plan_path(
+            self.base.format,
+            &self.file.externals,
+            &self.additions,
+            path.as_str(),
+        )?;
+        let addition = disposition
+            .append
+            .then(|| {
+                prepare_append_budgeted_inner(
+                    &self.additions,
+                    FileIdentifier {
+                        temp_empty: String::new(),
+                        guid: [0; 16],
+                        type_: 0,
+                        path: path.path,
+                    },
+                    path.accounted_bytes,
+                    budget,
+                )
+            })
+            .transpose()?;
+        Ok(PreparedExternalPath {
+            allocator: self,
+            file_id: disposition.file_id,
+            addition,
+        })
+    }
+
+    /// Returns the identifier currently addressed by a positive staged PPtr file ID.
+    ///
+    /// The lookup includes additions interned by earlier operations and never allocates or mutates
+    /// the staged table. Zero, negative, and out-of-range file IDs return `None`.
+    #[must_use]
+    pub fn identifier(&self, file_id: i32) -> Option<&FileIdentifier> {
+        let index = file_id
+            .checked_sub(1)
+            .and_then(|value| usize::try_from(value).ok())?;
+        if let Some(identifier) = self.file.externals.get(index) {
+            return Some(identifier);
+        }
+        self.additions
+            .get(index.checked_sub(self.file.externals.len())?)
     }
 
     /// Plans the file ID against existing edits without retaining or allocating the identifier.
@@ -724,9 +877,35 @@ fn append_budgeted(
     identifier: FileIdentifier,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), ExternalTableError> {
+    append_budgeted_inner(additions, identifier, 0, budget)
+}
+
+fn append_budgeted_inner(
+    additions: &mut Vec<FileIdentifier>,
+    identifier: FileIdentifier,
+    preaccounted_path_bytes: u64,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), ExternalTableError> {
+    prepare_append_budgeted_inner(additions, identifier, preaccounted_path_bytes, budget)?
+        .commit(additions);
+    Ok(())
+}
+
+fn prepare_append_budgeted_inner(
+    additions: &Vec<FileIdentifier>,
+    identifier: FileIdentifier,
+    preaccounted_path_bytes: u64,
+    budget: &mut AssetLoadBudget,
+) -> Result<PreparedExternalAddition, ExternalTableError> {
     budget.check_entries(1)?;
+    let path_bytes = string_allocation_bytes(identifier.path.capacity())?;
+    let unaccounted_path_bytes = path_bytes.checked_sub(preaccounted_path_bytes).ok_or(
+        ExternalTableError::ArithmeticOverflow {
+            resource: EXTERNAL_ALLOCATION_RESOURCE,
+        },
+    )?;
     let retained_strings = string_allocation_bytes(identifier.temp_empty.capacity())?
-        .checked_add(string_allocation_bytes(identifier.path.capacity())?)
+        .checked_add(unaccounted_path_bytes)
         .ok_or(ExternalTableError::ArithmeticOverflow {
             resource: EXTERNAL_ALLOCATION_RESOURCE,
         })?;
@@ -742,8 +921,10 @@ fn append_budgeted(
         budget.check_bytes(retained_strings)?;
         budget.consume_entries(1)?;
         budget.consume_bytes(retained_strings)?;
-        additions.push(identifier);
-        return Ok(());
+        return Ok(PreparedExternalAddition {
+            identifier,
+            replacement: None,
+        });
     }
 
     let planned_table = vec_allocation_bytes::<FileIdentifier>(required)?;
@@ -754,8 +935,8 @@ fn append_budgeted(
     )?;
     budget.check_bytes(planned)?;
 
-    // Allocate a staging table so a reserve or supplemental-budget failure leaves the allocator
-    // unchanged. Existing identifiers move only after every fallible check succeeds.
+    // Retain an empty replacement table in the token. Existing identifiers move into it only at
+    // commit, so dropping the token leaves the allocator's logical table unchanged.
     let mut staged = Vec::new();
     staged
         .try_reserve_exact(required)
@@ -772,11 +953,10 @@ fn append_budgeted(
     budget.check_bytes(actual)?;
     budget.consume_entries(1)?;
     budget.consume_bytes(actual)?;
-
-    staged.append(additions);
-    staged.push(identifier);
-    *additions = staged;
-    Ok(())
+    Ok(PreparedExternalAddition {
+        identifier,
+        replacement: Some(staged),
+    })
 }
 
 fn external_index_to_file_id(index: usize) -> Result<i32, ExternalTableError> {
@@ -876,6 +1056,185 @@ mod tests {
             1
         );
         assert!(allocator.additions().is_empty());
+    }
+
+    #[test]
+    fn staged_identifier_queries_are_read_only_and_include_prior_additions() {
+        let file = parse_file(V22_FIXTURE);
+        let mut allocator = ExternalTableAllocator::new(&file).unwrap();
+        let added = external("staged.assets", 9);
+        let added_file_id = allocator
+            .intern(added.clone(), &mut AssetLoadBudget::default())
+            .unwrap();
+        let before = allocator.additions().to_vec();
+
+        assert_eq!(allocator.identifier(0), None);
+        assert_eq!(allocator.identifier(-1), None);
+        assert_eq!(allocator.identifier(added_file_id), Some(&added));
+        assert_eq!(allocator.additions(), before);
+    }
+
+    #[test]
+    fn path_intern_reuses_canonical_paths_and_appends_compatibility_metadata_once() {
+        let file = parse_file(V22_FIXTURE);
+        let retained = file.externals[0].clone();
+        let mut allocator = ExternalTableAllocator::new(&file).unwrap();
+        let mut budget = AssetLoadBudget::default();
+
+        assert_eq!(
+            allocator
+                .intern_path(
+                    ".\\ARCHIVE:\\FIXTURE-DEPENDENCY.ASSETS/".to_owned(),
+                    &mut budget,
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(allocator.identifier(1), Some(&retained));
+        assert_eq!(budget.usage(), AssetLoadUsage::default());
+
+        let first = allocator
+            .intern_path("archive:/CAB-asset/shared.resS".to_owned(), &mut budget)
+            .unwrap();
+        let usage_after_first = budget.usage();
+        let duplicate = allocator
+            .intern_path("ARCHIVE:\\CAB-asset\\shared.resS".to_owned(), &mut budget)
+            .unwrap();
+
+        assert_eq!((first, duplicate), (2, 2));
+        assert_eq!(budget.usage(), usage_after_first);
+        assert_eq!(allocator.additions().len(), 1);
+        assert_eq!(
+            allocator.additions()[0],
+            FileIdentifier {
+                temp_empty: String::new(),
+                guid: [0; 16],
+                type_: 0,
+                path: "archive:/CAB-asset/shared.resS".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn path_intern_has_an_exact_atomic_budget_boundary() {
+        let file = parse_file(V22_FIXTURE);
+        let path = "archive:/CAB-asset/budget.resS";
+        let mut measured = AssetLoadBudget::default();
+        let mut measured_allocator = ExternalTableAllocator::new(&file).unwrap();
+        measured_allocator
+            .intern_path(path.to_owned(), &mut measured)
+            .unwrap();
+        let exact = measured.usage().bytes;
+        assert!(exact > 0);
+
+        let mut exact_budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_entries: 1,
+            max_bytes: exact,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        let mut exact_allocator = ExternalTableAllocator::new(&file).unwrap();
+        exact_allocator
+            .intern_path(path.to_owned(), &mut exact_budget)
+            .unwrap();
+        assert_eq!(exact_budget.usage(), measured.usage());
+
+        let mut short_budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_entries: 1,
+            max_bytes: exact - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        let mut short_allocator = ExternalTableAllocator::new(&file).unwrap();
+        let error = short_allocator
+            .intern_path(path.to_owned(), &mut short_budget)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ExternalTableError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            })
+        ));
+        assert_eq!(short_budget.usage(), AssetLoadUsage::default());
+        assert!(short_allocator.additions().is_empty());
+    }
+
+    #[test]
+    fn budgeted_path_handoff_charges_the_owned_string_once() {
+        let file = parse_file(V22_FIXTURE);
+        let path = "archive:/CAB-asset/preaccounted.resS";
+
+        let mut ordinary_budget = AssetLoadBudget::default();
+        let mut ordinary_allocator = ExternalTableAllocator::new(&file).unwrap();
+        ordinary_allocator
+            .intern_path(path.to_owned(), &mut ordinary_budget)
+            .unwrap();
+        let expected = ordinary_budget.usage();
+
+        let mut measured_budget = AssetLoadBudget::default();
+        let owned = BudgetedExternalPath::new(path.to_owned(), &mut measured_budget).unwrap();
+        let path_bytes = measured_budget.usage().bytes;
+        assert_eq!(
+            path_bytes,
+            string_allocation_bytes(owned.path.capacity()).unwrap()
+        );
+        let mut measured_allocator = ExternalTableAllocator::new(&file).unwrap();
+        measured_allocator
+            .intern_budgeted_path(owned, &mut measured_budget)
+            .unwrap();
+        assert_eq!(measured_budget.usage(), expected);
+
+        let mut exact_budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_entries: expected.entries,
+            max_bytes: expected.bytes,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        let owned = BudgetedExternalPath::new(path.to_owned(), &mut exact_budget).unwrap();
+        let mut exact_allocator = ExternalTableAllocator::new(&file).unwrap();
+        exact_allocator
+            .intern_budgeted_path(owned, &mut exact_budget)
+            .unwrap();
+        assert_eq!(exact_budget.usage(), expected);
+
+        let mut short_budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_entries: expected.entries,
+            max_bytes: expected.bytes - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        let owned = BudgetedExternalPath::new(path.to_owned(), &mut short_budget).unwrap();
+        let mut short_allocator = ExternalTableAllocator::new(&file).unwrap();
+        assert!(matches!(
+            short_allocator.intern_budgeted_path(owned, &mut short_budget),
+            Err(ExternalTableError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+        assert_eq!(short_budget.usage().bytes, path_bytes);
+        assert!(short_allocator.additions().is_empty());
+    }
+
+    #[test]
+    fn prepared_budgeted_path_is_logically_inert_until_commit() {
+        let file = parse_file(V22_FIXTURE);
+        let path = "archive:/CAB-asset/prepared.resS";
+        let mut allocator = ExternalTableAllocator::new(&file).unwrap();
+        let mut budget = AssetLoadBudget::default();
+
+        let owned = BudgetedExternalPath::new(path.to_owned(), &mut budget).unwrap();
+        let prepared = allocator.prepare_budgeted_path(owned, &mut budget).unwrap();
+        drop(prepared);
+        assert!(allocator.additions().is_empty());
+
+        let owned = BudgetedExternalPath::new(path.to_owned(), &mut budget).unwrap();
+        let prepared = allocator.prepare_budgeted_path(owned, &mut budget).unwrap();
+        assert_eq!(prepared.commit(), 2);
+        assert_eq!(allocator.additions().len(), 1);
+        assert_eq!(allocator.additions()[0].path, path);
     }
 
     #[test]

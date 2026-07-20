@@ -855,9 +855,26 @@ impl RevisionedObjectHandle {
         Ok(())
     }
 
+    /// Rebinds this owned handle to another immutable revision of the same workspace.
+    ///
+    /// This is intended for derived read views whose object identity is unchanged while the
+    /// revision context advances. Consuming the handle preserves any owned YAML selector without
+    /// cloning its anchor string.
+    #[must_use]
+    pub fn with_revision(mut self, revision: WorkspaceRevision) -> Self {
+        self.revision = revision;
+        self
+    }
+
     #[must_use]
     pub const fn object(&self) -> &ObjectId {
         &self.object
+    }
+
+    /// Consumes the revision binding and returns the stable workspace-local object identity.
+    #[must_use]
+    pub fn into_object(self) -> ObjectId {
+        self.object
     }
 
     #[must_use]

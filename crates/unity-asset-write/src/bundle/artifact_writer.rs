@@ -16,7 +16,9 @@ use unity_asset_binary::unity_version::UnityVersion;
 use unity_asset_core::UnityAssetError;
 
 use crate::PackingPolicy;
-use crate::artifact::{ArtifactBatch, ArtifactBuildError, ArtifactHandle};
+use crate::artifact::{
+    ArtifactBatch, ArtifactBuildError, ArtifactBuildFailurePhase, ArtifactHandle,
+};
 
 use super::writer::BundleWriter;
 
@@ -248,6 +250,17 @@ pub enum BundleArtifactError {
         #[source]
         source: TryReserveError,
     },
+}
+
+impl BundleArtifactError {
+    /// Reports the artifact-build stage in which this bundle preparation failed.
+    #[must_use]
+    pub const fn failure_phase(&self) -> ArtifactBuildFailurePhase {
+        match self {
+            Self::Artifact(error) => error.failure_phase(),
+            _ => ArtifactBuildFailurePhase::Encoding,
+        }
+    }
 }
 
 impl From<ArtifactBuildError> for BundleArtifactError {
@@ -1882,6 +1895,7 @@ mod tests {
         let error =
             build_uncompressed_directory_bundle(&directory_name, exact_block_info_bytes - 1)
                 .expect_err("one byte below the block-info budget must fail");
+        assert_eq!(error.failure_phase(), ArtifactBuildFailurePhase::Encoding);
         assert!(matches!(
             error,
             BundleArtifactError::Artifact(error)

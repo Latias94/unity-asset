@@ -1,23 +1,27 @@
 //! Immutable workspace query implementation.
 
 use std::fmt;
+use std::io::Read;
 use std::mem::size_of;
 use std::sync::Arc;
 
-use unity_asset_binary::asset::SerializedFile;
+use unity_asset_binary::asset::{ObjectInfo, SerializedFile};
+use unity_asset_binary::error::BinaryObjectReplacementError;
 use unity_asset_binary::object::ObjectSchemaOrigin;
 use unity_asset_binary::unity_version::UnityVersion;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, Diagnostic, DiagnosticSeverity, ObjectAddress,
     ObjectId, ObjectKind, RevisionedObjectHandle, SourceId, SourceKind, SourceLocator, UnityClass,
-    UnityDocument, WorkspaceId, WorkspaceRevision, YamlDocumentSelector, yaml_schema_digest,
+    UnityDocument, WorkspaceId, WorkspaceRevision, YamlDocumentSelector,
+    arc_value_allocation_bytes, vec_allocation_bytes, yaml_schema_digest,
 };
 use unity_asset_yaml::YamlDocument;
 
+use crate::BinaryError;
 use crate::schema::{BinarySchemaVersion, DeclaredUnityVersion, SchemaOrigin, SchemaProvenance};
 
 use super::interface::WorkspaceConfig;
-use super::source_catalog::LocatorResolution;
+use super::source_catalog::{LocatorResolution, SourceCatalog};
 use super::state::WorkspaceState;
 use super::store::SourceEntry;
 use super::view::{
@@ -56,6 +60,21 @@ impl WorkspaceSnapshot {
         self.state.revision()
     }
 
+    #[must_use]
+    pub(super) const fn state(&self) -> &Arc<WorkspaceState> {
+        &self.state
+    }
+
+    #[must_use]
+    pub(super) const fn config(&self) -> &Arc<WorkspaceConfig> {
+        &self.config
+    }
+
+    #[must_use]
+    pub(super) const fn reference_store(&self) -> &Arc<crate::reference::ReferenceStore> {
+        &self.reference_store
+    }
+
     pub fn reference_graph(
         &self,
         options: crate::reference::ReferenceGraphBuildOptions,
@@ -70,29 +89,7 @@ impl WorkspaceSnapshot {
         include_result_entry: bool,
         budget: &mut AssetLoadBudget,
     ) -> Result<WorkspaceSource, WorkspaceError> {
-        let catalog = self.state.catalog();
-        let descriptor = catalog.resolve(source)?;
-        let locator = catalog.source_locator(source)?;
-        let origin = catalog.physical_origin(source)?;
-        let retained_bytes = locator
-            .retained_clone_bytes()
-            .and_then(|total| total.checked_add(origin.path().as_os_str().as_encoded_bytes().len()))
-            .ok_or(BudgetError::ArithmeticOverflow {
-                resource: "workspace_source_projection",
-            })?;
-        if include_result_entry {
-            consume_single_result(retained_bytes, "workspace_source_projection", budget)?;
-        } else {
-            consume_retained_bytes(retained_bytes, "workspace_source_projection", budget)?;
-        }
-        Ok(WorkspaceSource::new(
-            source,
-            locator.clone(),
-            catalog.fingerprint(source)?,
-            descriptor.parent(),
-            descriptor.location_kind(),
-            origin.path().to_path_buf(),
-        ))
+        project_catalog_source(self.state.catalog(), source, include_result_entry, budget)
     }
 
     fn cached_serialized<'entry>(
@@ -130,6 +127,101 @@ impl WorkspaceSnapshot {
             self.revision(),
             object,
         )?)
+    }
+
+    pub(super) fn materialize_prepared_binary_object(
+        &self,
+        object: &ObjectId,
+        exact_info: &ObjectInfo,
+        reader: &mut impl Read,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<WorkspaceObject, WorkspaceError> {
+        let path_id = object.binary_path_id().ok_or_else(|| {
+            WorkspaceError::operation(
+                "prepared binary object identity",
+                std::io::Error::other("binary object has no path ID"),
+            )
+        })?;
+        if exact_info.path_id() != path_id {
+            return Err(WorkspaceError::operation(
+                "prepared binary object proof",
+                std::io::Error::other(
+                    "artifact object metadata does not match the requested baseline identity",
+                ),
+            ));
+        }
+        let entry = self
+            .state
+            .store()
+            .get(object.source())
+            .ok_or(WorkspaceError::MissingSource(object.source()))?;
+        let file = self.cached_serialized(entry, budget)?;
+        consume_object_table_scan(file.object_count(), budget)?;
+        let candidate = file.find_object_handle(path_id).ok_or_else(|| {
+            WorkspaceError::operation(
+                "prepared binary object proof",
+                std::io::Error::other("artifact object is absent from the immutable baseline"),
+            )
+        })?;
+        if candidate.class_id() != exact_info.class_id() {
+            return Err(WorkspaceError::operation(
+                "prepared binary object proof",
+                std::io::Error::other("artifact changed the baseline object class identity"),
+            ));
+        }
+        let replacement_len = usize::try_from(exact_info.byte_size()).map_err(|_| {
+            BudgetError::ArithmeticOverflow {
+                resource: "prepared_binary_object_bytes",
+            }
+        })?;
+        let materialized =
+            match candidate.materialize_replacement_from_reader(reader, replacement_len, budget) {
+                Ok(materialized) => materialized,
+                Err(BinaryError::ObjectReplacement(
+                    BinaryObjectReplacementError::MissingSchema { .. },
+                )) => candidate.materialize_raw_replacement_from_reader(
+                    reader,
+                    replacement_len,
+                    budget,
+                )?,
+                Err(error) => return Err(error.into()),
+            };
+        let schema_digest = materialized
+            .schema()
+            .map(|schema| schema.semantic_digest_with_budget(budget))
+            .transpose()
+            .map_err(|error| WorkspaceError::operation("TypeTree semantic digest", error))?;
+        let origin = match materialized.schema_origin() {
+            Some(ObjectSchemaOrigin::EmbeddedTypeTree) => SchemaOrigin::EmbeddedTypeTree,
+            Some(ObjectSchemaOrigin::ExternalRegistry) => SchemaOrigin::FrozenRegistry,
+            None => SchemaOrigin::Unavailable,
+        };
+        let version = declared_unity_version(&file.unity_version, budget)?;
+        let script_id = object_script_id(file, candidate.info());
+        let schema = SchemaProvenance::binary(
+            exact_info.class_id(),
+            origin,
+            schema_digest,
+            BinarySchemaVersion::new(version, file.format().version()),
+            script_id,
+        );
+        let mut exact = materialized.into_object();
+        exact.info = exact_info.clone();
+        budget.consume_bytes(
+            arc_value_allocation_bytes::<unity_asset_binary::object::UnityObject>().map_err(
+                |error| WorkspaceError::operation("prepared binary object allocation", error),
+            )?,
+        )?;
+        budget.consume_bytes(arc_value_allocation_bytes::<SchemaProvenance>().map_err(
+            |error| WorkspaceError::operation("prepared schema provenance allocation", error),
+        )?)?;
+        let handle =
+            RevisionedObjectHandle::new(self.workspace_id(), self.revision(), object.clone())?;
+        Ok(WorkspaceObject::from_shared(
+            handle,
+            WorkspaceObjectValue::Binary(Arc::new(exact)),
+            Arc::new(schema),
+        ))
     }
 
     fn missing_object_error(
@@ -170,11 +262,11 @@ impl fmt::Debug for WorkspaceSnapshot {
 
 impl view::sealed::Sealed for WorkspaceSnapshot {
     fn reference_view_parts(&self) -> super::ReferenceViewParts<'_> {
-        super::ReferenceViewParts {
-            state: &self.state,
-            store: &self.reference_store,
-            typetree: self.config.typetree,
-        }
+        super::ReferenceViewParts::committed(
+            &self.state,
+            &self.reference_store,
+            self.config.typetree,
+        )
     }
 }
 
@@ -192,16 +284,7 @@ impl WorkspaceView for WorkspaceSnapshot {
         budget: &mut AssetLoadBudget,
     ) -> Result<Vec<WorkspaceSource>, WorkspaceError> {
         let count = self.state.catalog().len();
-        reserve_result_items::<WorkspaceSource>(count, budget)?;
-        let mut sources = Vec::new();
-        sources
-            .try_reserve_exact(count)
-            .map_err(|error| WorkspaceError::Allocation {
-                resource: "workspace source results",
-                requested: count,
-                unit: WorkspaceAllocationUnit::Elements,
-                message: error.to_string(),
-            })?;
+        let mut sources = budgeted_result_vec::<WorkspaceSource>(count, budget)?;
         for (source, _) in self.state.catalog().iter() {
             sources.push(self.project_source(source, false, budget)?);
         }
@@ -285,21 +368,12 @@ impl WorkspaceView for WorkspaceSnapshot {
                 | SourceKind::StreamedResource => {}
             }
         }
-        reserve_result_items::<RevisionedObjectHandle>(count, budget)?;
+        let mut objects = budgeted_result_vec::<RevisionedObjectHandle>(count, budget)?;
         budget.check_bytes(u64::try_from(yaml_anchor_bytes).map_err(|_| {
             BudgetError::ArithmeticOverflow {
                 resource: "workspace_object_results",
             }
         })?)?;
-        let mut objects = Vec::new();
-        objects
-            .try_reserve_exact(count)
-            .map_err(|error| WorkspaceError::Allocation {
-                resource: "workspace object results",
-                requested: count,
-                unit: WorkspaceAllocationUnit::Elements,
-                message: error.to_string(),
-            })?;
         budget.consume_bytes(u64::try_from(yaml_anchor_bytes).map_err(|_| {
             BudgetError::ArithmeticOverflow {
                 resource: "workspace_object_results",
@@ -521,13 +595,12 @@ impl WorkspaceView for WorkspaceSnapshot {
                 );
                 let object = materialized.into_object();
                 budget.consume_bytes(
-                    u64::try_from(size_of::<unity_asset_binary::object::UnityObject>()).map_err(
-                        |_| BudgetError::ArithmeticOverflow {
-                            resource: "workspace_binary_object_box",
-                        },
-                    )?,
+                    arc_value_allocation_bytes::<unity_asset_binary::object::UnityObject>()
+                        .map_err(|error| {
+                            WorkspaceError::operation("workspace binary object allocation", error)
+                        })?,
                 )?;
-                (WorkspaceObjectValue::Binary(Box::new(object)), provenance)
+                (WorkspaceObjectValue::Binary(Arc::new(object)), provenance)
             }
             ObjectKind::Yaml => {
                 let document = self.cached_yaml(entry, budget)?;
@@ -573,6 +646,9 @@ impl WorkspaceView for WorkspaceSnapshot {
                 )
             }
         };
+        budget.consume_bytes(arc_value_allocation_bytes::<SchemaProvenance>().map_err(
+            |error| WorkspaceError::operation("workspace schema provenance allocation", error),
+        )?)?;
         Ok(WorkspaceObject::new(handle.clone(), value, schema))
     }
 
@@ -676,7 +752,41 @@ fn declared_unity_version(
     }
 }
 
-fn consume_single_result(
+pub(super) fn project_catalog_source(
+    catalog: &SourceCatalog,
+    source: SourceId,
+    include_result_entry: bool,
+    budget: &mut AssetLoadBudget,
+) -> Result<WorkspaceSource, WorkspaceError> {
+    let descriptor = catalog.resolve(source)?;
+    let locator = catalog.source_locator(source)?;
+    let origin = catalog.physical_origin_option(source)?;
+    let retained_bytes = locator
+        .retained_clone_bytes()
+        .and_then(|total| {
+            origin.map_or(Some(total), |origin| {
+                total.checked_add(origin.path().as_os_str().as_encoded_bytes().len())
+            })
+        })
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "workspace_source_projection",
+        })?;
+    if include_result_entry {
+        consume_single_result(retained_bytes, "workspace_source_projection", budget)?;
+    } else {
+        consume_retained_bytes(retained_bytes, "workspace_source_projection", budget)?;
+    }
+    Ok(WorkspaceSource::new(
+        source,
+        locator.clone(),
+        catalog.fingerprint(source)?,
+        descriptor.parent(),
+        descriptor.location_kind(),
+        origin.map(|origin| origin.path().to_path_buf()),
+    ))
+}
+
+pub(super) fn consume_single_result(
     retained_bytes: usize,
     resource: &'static str,
     budget: &mut AssetLoadBudget,
@@ -690,7 +800,7 @@ fn consume_single_result(
     Ok(())
 }
 
-fn consume_retained_bytes(
+pub(super) fn consume_retained_bytes(
     retained_bytes: usize,
     resource: &'static str,
     budget: &mut AssetLoadBudget,
@@ -715,7 +825,7 @@ fn consume_object_table_scan(
     Ok(())
 }
 
-fn invalid_lookup<T>(
+pub(super) fn invalid_lookup<T>(
     code: &'static str,
     message: &'static str,
     budget: &mut AssetLoadBudget,
@@ -732,27 +842,35 @@ fn invalid_lookup<T>(
     Ok(WorkspaceLookup::Invalid { diagnostic })
 }
 
-fn reserve_result_items<T>(
+pub(super) fn budgeted_result_vec<T>(
     count: usize,
     budget: &mut AssetLoadBudget,
-) -> Result<(), WorkspaceError> {
+) -> Result<Vec<T>, WorkspaceError> {
     let entries = u64::try_from(count).map_err(|_| BudgetError::ArithmeticOverflow {
         resource: "workspace_query_results",
     })?;
-    let bytes = count
-        .checked_mul(size_of::<T>())
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or(BudgetError::ArithmeticOverflow {
-            resource: "workspace_query_results",
-        })?;
+    let minimum_bytes = vec_allocation_bytes::<T>(count)
+        .map_err(|error| WorkspaceError::operation("workspace query results", error))?;
     budget.check_entries(entries)?;
-    budget.check_bytes(bytes)?;
+    budget.check_bytes(minimum_bytes)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|error| WorkspaceError::Allocation {
+            resource: "workspace query results",
+            requested: count,
+            unit: WorkspaceAllocationUnit::Elements,
+            message: error.to_string(),
+        })?;
+    let retained_bytes = vec_allocation_bytes::<T>(values.capacity())
+        .map_err(|error| WorkspaceError::operation("workspace query results", error))?;
+    budget.check_bytes(retained_bytes)?;
     budget.consume_entries(entries)?;
-    budget.consume_bytes(bytes)?;
-    Ok(())
+    budget.consume_bytes(retained_bytes)?;
+    Ok(values)
 }
 
-fn yaml_object_id(
+pub(super) fn yaml_object_id(
     source: SourceId,
     index: usize,
     class: &UnityClass,
@@ -767,7 +885,7 @@ fn yaml_object_id(
     }
 }
 
-fn is_plain_yaml_document(index: usize, class: &UnityClass) -> bool {
+pub(super) fn is_plain_yaml_document(index: usize, class: &UnityClass) -> bool {
     class.class_id == 0
         && class.class_name == "YamlDocument"
         && class

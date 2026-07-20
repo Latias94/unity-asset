@@ -1,11 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use unity_asset_binary::asset::SerializedFile;
+use unity_asset_binary::asset::{FileIdentifier, SerializedFile};
 use unity_asset_binary::typetree::TypeTreeParseOptions;
 use unity_asset_core::{
     AssetLoadBudget, ObjectAddress, ObjectId, SourceFingerprint, SourceId, SourceKind,
-    SourceLocator, WorkspaceId, WorkspaceRevision,
+    SourceLocator, UnityClass, UnityDocument, WorkspaceId, WorkspaceRevision,
 };
 use unity_asset_write::artifact::PreparedArtifactSet;
 use unity_asset_yaml::YamlDocument;
@@ -37,6 +37,25 @@ pub(crate) trait ReferenceInput: sealed::Sealed {
         object: &ObjectId,
         budget: &mut AssetLoadBudget,
     ) -> Result<ObjectAddress, ReferenceGraphError>;
+}
+
+/// Sparse semantic and wire overlay used while scanning a prepared source.
+pub(crate) trait PreparedReferenceOverlay: std::fmt::Debug + Send + Sync {
+    fn binary_replacement(&self, source: SourceId, path_id: i64) -> Option<&[u8]>;
+
+    fn binary_external<'overlay>(
+        &'overlay self,
+        source: SourceId,
+        file: &'overlay SerializedFile,
+        index: usize,
+    ) -> Option<&'overlay FileIdentifier>;
+
+    fn yaml_class<'overlay>(
+        &'overlay self,
+        source: SourceId,
+        document_index: usize,
+        base: &'overlay UnityClass,
+    ) -> &'overlay UnityClass;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,6 +107,56 @@ impl<'source> ReferenceSource<'source> {
             parent,
             physical_path,
             ReferenceSourceParse::Yaml(document),
+        )
+    }
+
+    pub(crate) fn prepared_serialized(
+        source: SourceId,
+        fingerprint: SourceFingerprint,
+        owner: ReferenceSourceOwner<'source>,
+        locator: &'source SourceLocator,
+        parent: Option<SourceId>,
+        physical_path: Option<&'source Path>,
+        file: &'source SerializedFile,
+        overlay: &'source dyn PreparedReferenceOverlay,
+    ) -> Result<Self, ReferenceGraphError> {
+        Self::checked(
+            source,
+            fingerprint,
+            owner,
+            locator,
+            parent,
+            physical_path,
+            ReferenceSourceParse::PreparedSerialized {
+                source,
+                file,
+                overlay,
+            },
+        )
+    }
+
+    pub(crate) fn prepared_yaml(
+        source: SourceId,
+        fingerprint: SourceFingerprint,
+        owner: ReferenceSourceOwner<'source>,
+        locator: &'source SourceLocator,
+        parent: Option<SourceId>,
+        physical_path: Option<&'source Path>,
+        document: &'source YamlDocument,
+        overlay: &'source dyn PreparedReferenceOverlay,
+    ) -> Result<Self, ReferenceGraphError> {
+        Self::checked(
+            source,
+            fingerprint,
+            owner,
+            locator,
+            parent,
+            physical_path,
+            ReferenceSourceParse::PreparedYaml {
+                source,
+                document,
+                overlay,
+            },
         )
     }
 
@@ -152,8 +221,34 @@ impl<'source> ReferenceSource<'source> {
 
     pub(crate) const fn yaml_document(self) -> Option<&'source YamlDocument> {
         match self.parse {
-            ReferenceSourceParse::Serialized(_) => None,
-            ReferenceSourceParse::Yaml(document) => Some(document),
+            ReferenceSourceParse::Serialized(_)
+            | ReferenceSourceParse::PreparedSerialized { .. } => None,
+            ReferenceSourceParse::Yaml(document)
+            | ReferenceSourceParse::PreparedYaml { document, .. } => Some(document),
+        }
+    }
+
+    pub(crate) const fn serialized_file(self) -> Option<&'source SerializedFile> {
+        match self.parse {
+            ReferenceSourceParse::Serialized(file)
+            | ReferenceSourceParse::PreparedSerialized { file, .. } => Some(file),
+            ReferenceSourceParse::Yaml(_) | ReferenceSourceParse::PreparedYaml { .. } => None,
+        }
+    }
+
+    pub(crate) fn yaml_class(self, document_index: usize) -> Option<&'source UnityClass> {
+        match self.parse {
+            ReferenceSourceParse::Serialized(_)
+            | ReferenceSourceParse::PreparedSerialized { .. } => None,
+            ReferenceSourceParse::Yaml(document) => document.entries().get(document_index),
+            ReferenceSourceParse::PreparedYaml {
+                source,
+                document,
+                overlay,
+            } => document
+                .entries()
+                .get(document_index)
+                .map(|base| overlay.yaml_class(source, document_index, base)),
         }
     }
 }
@@ -219,13 +314,23 @@ impl WeakReferenceSourceOwner {
 pub(crate) enum ReferenceSourceParse<'source> {
     Serialized(&'source SerializedFile),
     Yaml(&'source YamlDocument),
+    PreparedSerialized {
+        source: SourceId,
+        file: &'source SerializedFile,
+        overlay: &'source dyn PreparedReferenceOverlay,
+    },
+    PreparedYaml {
+        source: SourceId,
+        document: &'source YamlDocument,
+        overlay: &'source dyn PreparedReferenceOverlay,
+    },
 }
 
 impl ReferenceSourceParse<'_> {
     const fn kind(self) -> SourceKind {
         match self {
-            Self::Serialized(_) => SourceKind::SerializedFile,
-            Self::Yaml(_) => SourceKind::Yaml,
+            Self::Serialized(_) | Self::PreparedSerialized { .. } => SourceKind::SerializedFile,
+            Self::Yaml(_) | Self::PreparedYaml { .. } => SourceKind::Yaml,
         }
     }
 }

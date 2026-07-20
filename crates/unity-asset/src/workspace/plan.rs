@@ -81,6 +81,7 @@ impl PlanPayload {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn into_bytes(self) -> PlanBytes {
         self.bytes
     }
@@ -370,6 +371,13 @@ pub struct MutationPlan {
     operations: Box<[MutationOperation]>,
 }
 
+type MutationPlanParts = (
+    WorkspaceRevision,
+    Box<[SourceExpectation]>,
+    Box<[PlanPayload]>,
+    Box<[MutationOperation]>,
+);
+
 /// A revision-bound group of generic mutations produced atomically by one schema recipe.
 ///
 /// Fragments are not part of the persisted plan wire contract. They retain recipe ordering until
@@ -494,14 +502,7 @@ impl MutationPlan {
     }
 
     #[must_use]
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        WorkspaceRevision,
-        Box<[SourceExpectation]>,
-        Box<[PlanPayload]>,
-        Box<[MutationOperation]>,
-    ) {
+    pub(crate) fn into_parts(self) -> MutationPlanParts {
         (
             self.base_revision,
             self.sources,
