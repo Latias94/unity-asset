@@ -441,9 +441,10 @@ struct PreparedPhysicalDomainRewrite {
 }
 
 #[derive(Debug)]
-struct PreparedPhysicalDomainChildIndex {
-    parent: SourceId,
-    children: HashMap<Arc<ContainmentStep>, SourceId>,
+struct PreparedPhysicalDomainIndexes {
+    by_key: HashMap<Arc<Vec<u8>>, SourceId>,
+    by_locator: HashMap<Arc<SourceLocator>, SourceId>,
+    children_by_parent: HashMap<SourceId, HashMap<Arc<ContainmentStep>, SourceId>>,
 }
 
 impl PhysicalDomainAdditionPlan {
@@ -466,13 +467,6 @@ impl PhysicalDomainAdditionPlan {
         scratch_bytes = checked_byte_add(
             scratch_bytes,
             checked_empty_hash_map_bytes::<Arc<SourceLocator>, SourceId>(addition_count)?,
-        )?;
-        scratch_bytes = checked_byte_add(
-            scratch_bytes,
-            checked_vec_exact_bytes::<PreparedPhysicalDomainChildIndex>(
-                addition_count,
-                "physical domain prepared child indexes",
-            )?,
         )?;
         budget.check_bytes(scratch_bytes)?;
 
@@ -526,6 +520,16 @@ impl PhysicalDomainAdditionPlan {
             offset += run;
             Some((parent, run))
         })
+    }
+
+    fn additions_for_parent(&self, parent: SourceId) -> usize {
+        let first = self
+            .sorted_parents
+            .partition_point(|candidate| *candidate < parent);
+        let last = self
+            .sorted_parents
+            .partition_point(|candidate| *candidate <= parent);
+        last.saturating_sub(first)
     }
 }
 
@@ -2150,21 +2154,13 @@ impl SourceCatalog {
         fingerprint: SourceFingerprint,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), CatalogError> {
-        self.ensure_workspace(source)?;
+        if !self.validate_fingerprint_replacement(source, fingerprint)? {
+            return Ok(());
+        }
         let record = self
             .by_id
             .get(&source)
             .ok_or(CatalogError::UnknownSource(source))?;
-        if fingerprint.kind() != record.descriptor.kind {
-            return Err(CatalogError::SourceKindMismatch {
-                expected: record.descriptor.kind,
-                actual: fingerprint.kind(),
-            });
-        }
-        if fingerprint == record.fingerprint {
-            return Ok(());
-        }
-        self.ensure_fingerprint_replacement_allowed(source, fingerprint)?;
 
         let retained_bytes = checked_record_clone_bytes(&record.descriptor)?;
         budget.check_bytes(retained_bytes)?;
@@ -2178,6 +2174,29 @@ impl SourceCatalog {
         });
         self.by_id.insert(source, replacement);
         Ok(())
+    }
+
+    fn validate_fingerprint_replacement(
+        &self,
+        source: SourceId,
+        fingerprint: SourceFingerprint,
+    ) -> Result<bool, CatalogError> {
+        self.ensure_workspace(source)?;
+        let record = self
+            .by_id
+            .get(&source)
+            .ok_or(CatalogError::UnknownSource(source))?;
+        if fingerprint.kind() != record.descriptor.kind {
+            return Err(CatalogError::SourceKindMismatch {
+                expected: record.descriptor.kind,
+                actual: fingerprint.kind(),
+            });
+        }
+        if fingerprint == record.fingerprint {
+            return Ok(false);
+        }
+        self.ensure_fingerprint_replacement_allowed(source, fingerprint)?;
+        Ok(true)
     }
 
     fn replace_verified_binding(
@@ -2473,7 +2492,9 @@ impl SourceCatalog {
             }
         })?;
 
-        let new_child_indexes = self.reserve_physical_domain_additions(&addition_plan)?;
+        let indexes = (!addition_plan.additions.is_empty())
+            .then(|| self.prepare_physical_domain_indexes(&addition_plan))
+            .transpose()?;
         budget.consume_entries(prepared.addition_count)?;
         budget.consume_bytes(prepared.planned_bytes)?;
 
@@ -2481,23 +2502,15 @@ impl SourceCatalog {
             self.by_id.insert(change.source, change.record);
         }
 
-        for child_index in new_child_indexes {
-            self.children_by_parent
-                .insert(child_index.parent, child_index.children);
-        }
         for addition in addition_plan.additions {
             let source = addition.source;
-            let record = addition.record;
-            self.by_key
-                .insert(Arc::clone(&record.canonical_key), source);
-            self.by_locator
-                .insert(Arc::clone(&record.source_locator), source);
-            self.children_by_parent
-                .entry(addition.parent)
-                .or_default()
-                .insert(addition.step, source);
-            self.by_id.insert(source, record);
+            self.by_id.insert(source, addition.record);
             added.push(source);
+        }
+        if let Some(indexes) = indexes {
+            self.by_key = indexes.by_key;
+            self.by_locator = indexes.by_locator;
+            self.children_by_parent = indexes.children_by_parent;
         }
         Ok(added)
     }
@@ -2846,124 +2859,191 @@ impl SourceCatalog {
         }
         plan.finish();
 
-        plan.retained_bytes = checked_byte_add(
-            plan.retained_bytes,
-            checked_hash_map_growth_bytes(
-                &self.by_key,
-                additions.len(),
-                "source catalog key index",
-            )?,
-        )?;
-        plan.retained_bytes = checked_byte_add(
-            plan.retained_bytes,
-            checked_hash_map_growth_bytes(
-                &self.by_locator,
-                additions.len(),
-                "source catalog locator index",
-            )?,
-        )?;
-        let mut new_child_index_count = 0_usize;
-        let mut child_index_bytes = 0_u64;
-        for (parent, child_count) in plan.parent_runs() {
-            if let Some(children) = self.children_by_parent.get(&parent) {
+        if !additions.is_empty() {
+            let final_source_count = self.by_id.len().checked_add(additions.len()).ok_or(
+                CatalogError::AllocationSizeOverflow {
+                    resource: "source catalog source indexes",
+                },
+            )?;
+            plan.retained_bytes = checked_byte_add(
+                plan.retained_bytes,
+                checked_hash_table_bytes::<Arc<Vec<u8>>, SourceId>(
+                    final_source_count,
+                    "source catalog prepared key index",
+                )?,
+            )?;
+            plan.retained_bytes = checked_byte_add(
+                plan.retained_bytes,
+                checked_hash_table_bytes::<Arc<SourceLocator>, SourceId>(
+                    final_source_count,
+                    "source catalog prepared locator index",
+                )?,
+            )?;
+            let mut new_child_index_count = 0_usize;
+            let mut child_index_bytes = 0_u64;
+            for (parent, children) in &self.children_by_parent {
+                let child_count = children
+                    .len()
+                    .checked_add(plan.additions_for_parent(*parent))
+                    .ok_or(CatalogError::AllocationSizeOverflow {
+                        resource: "source catalog prepared child-step index",
+                    })?;
                 child_index_bytes = checked_byte_add(
                     child_index_bytes,
-                    checked_hash_map_growth_bytes(
-                        children,
+                    checked_hash_table_bytes::<Arc<ContainmentStep>, SourceId>(
                         child_count,
-                        "source catalog child-step index",
+                        "source catalog prepared child-step index",
                     )?,
                 )?;
-            } else {
-                new_child_index_count = new_child_index_count.checked_add(1).ok_or(
-                    CatalogError::AllocationSizeOverflow {
-                        resource: "source catalog child index",
-                    },
-                )?;
-                child_index_bytes = checked_byte_add(
-                    child_index_bytes,
-                    checked_empty_hash_map_bytes::<Arc<ContainmentStep>, SourceId>(child_count)?,
-                )?;
             }
+            for (parent, child_count) in plan.parent_runs() {
+                if !self.children_by_parent.contains_key(&parent) {
+                    new_child_index_count = new_child_index_count.checked_add(1).ok_or(
+                        CatalogError::AllocationSizeOverflow {
+                            resource: "source catalog child index",
+                        },
+                    )?;
+                    child_index_bytes = checked_byte_add(
+                        child_index_bytes,
+                        checked_hash_table_bytes::<Arc<ContainmentStep>, SourceId>(
+                            child_count,
+                            "source catalog prepared child-step index",
+                        )?,
+                    )?;
+                }
+            }
+            plan.retained_bytes = checked_byte_add(plan.retained_bytes, child_index_bytes)?;
+            let final_parent_count = self
+                .children_by_parent
+                .len()
+                .checked_add(new_child_index_count)
+                .ok_or(CatalogError::AllocationSizeOverflow {
+                    resource: "source catalog prepared child index",
+                })?;
+            plan.retained_bytes = checked_byte_add(
+                plan.retained_bytes,
+                checked_hash_table_bytes::<SourceId, HashMap<Arc<ContainmentStep>, SourceId>>(
+                    final_parent_count,
+                    "source catalog prepared child index",
+                )?,
+            )?;
         }
-        plan.retained_bytes = checked_byte_add(plan.retained_bytes, child_index_bytes)?;
-        plan.retained_bytes = checked_byte_add(
-            plan.retained_bytes,
-            checked_hash_map_growth_bytes(
-                &self.children_by_parent,
-                new_child_index_count,
-                "source catalog child index",
-            )?,
-        )?;
         Ok(plan)
     }
 
-    fn reserve_physical_domain_additions(
-        &mut self,
+    fn prepare_physical_domain_indexes(
+        &self,
         plan: &PhysicalDomainAdditionPlan,
-    ) -> Result<Vec<PreparedPhysicalDomainChildIndex>, CatalogError> {
-        let mut new_child_indexes = Vec::new();
-        new_child_indexes
-            .try_reserve_exact(plan.additions.len())
+    ) -> Result<PreparedPhysicalDomainIndexes, CatalogError> {
+        let final_source_count = self.by_id.len().checked_add(plan.additions.len()).ok_or(
+            CatalogError::AllocationSizeOverflow {
+                resource: "source catalog prepared source indexes",
+            },
+        )?;
+        let mut by_key = HashMap::new();
+        by_key
+            .try_reserve(final_source_count)
             .map_err(|error| CatalogError::AllocationFailed {
-                resource: "physical domain prepared child indexes",
-                requested: plan.additions.len(),
-                unit: CatalogAllocationUnit::Elements,
+                resource: "source catalog prepared key index",
+                requested: final_source_count,
+                unit: CatalogAllocationUnit::Slots,
                 message: error.to_string(),
             })?;
+        by_key.extend(
+            self.by_key
+                .iter()
+                .map(|(key, source)| (Arc::clone(key), *source)),
+        );
+
+        let mut by_locator = HashMap::new();
+        by_locator
+            .try_reserve(final_source_count)
+            .map_err(|error| CatalogError::AllocationFailed {
+                resource: "source catalog prepared locator index",
+                requested: final_source_count,
+                unit: CatalogAllocationUnit::Slots,
+                message: error.to_string(),
+            })?;
+        by_locator.extend(
+            self.by_locator
+                .iter()
+                .map(|(locator, source)| (Arc::clone(locator), *source)),
+        );
+
+        let new_parent_count = plan
+            .parent_runs()
+            .filter(|(parent, _)| !self.children_by_parent.contains_key(parent))
+            .count();
+        let final_parent_count = self
+            .children_by_parent
+            .len()
+            .checked_add(new_parent_count)
+            .ok_or(CatalogError::AllocationSizeOverflow {
+                resource: "source catalog prepared child index",
+            })?;
+        let mut children_by_parent = HashMap::new();
+        children_by_parent
+            .try_reserve(final_parent_count)
+            .map_err(|error| CatalogError::AllocationFailed {
+                resource: "source catalog prepared child index",
+                requested: final_parent_count,
+                unit: CatalogAllocationUnit::Slots,
+                message: error.to_string(),
+            })?;
+        for (parent, current_children) in &self.children_by_parent {
+            let final_child_count = current_children
+                .len()
+                .checked_add(plan.additions_for_parent(*parent))
+                .ok_or(CatalogError::AllocationSizeOverflow {
+                    resource: "source catalog prepared child-step index",
+                })?;
+            let mut children = HashMap::new();
+            children.try_reserve(final_child_count).map_err(|error| {
+                CatalogError::AllocationFailed {
+                    resource: "source catalog prepared child-step index",
+                    requested: final_child_count,
+                    unit: CatalogAllocationUnit::Slots,
+                    message: error.to_string(),
+                }
+            })?;
+            children.extend(
+                current_children
+                    .iter()
+                    .map(|(step, source)| (Arc::clone(step), *source)),
+            );
+            children_by_parent.insert(*parent, children);
+        }
         for (parent, child_count) in plan.parent_runs() {
-            if self.children_by_parent.contains_key(&parent) {
+            if children_by_parent.contains_key(&parent) {
                 continue;
             }
             let mut children = HashMap::new();
             children
                 .try_reserve(child_count)
                 .map_err(|error| CatalogError::AllocationFailed {
-                    resource: "source catalog child-step index",
+                    resource: "source catalog prepared child-step index",
                     requested: child_count,
                     unit: CatalogAllocationUnit::Slots,
                     message: error.to_string(),
                 })?;
-            new_child_indexes.push(PreparedPhysicalDomainChildIndex { parent, children });
+            children_by_parent.insert(parent, children);
         }
 
-        self.by_key
-            .try_reserve(plan.additions.len())
-            .map_err(|error| CatalogError::AllocationFailed {
-                resource: "source catalog key index",
-                requested: plan.additions.len(),
-                unit: CatalogAllocationUnit::Slots,
-                message: error.to_string(),
-            })?;
-        self.by_locator
-            .try_reserve(plan.additions.len())
-            .map_err(|error| CatalogError::AllocationFailed {
-                resource: "source catalog locator index",
-                requested: plan.additions.len(),
-                unit: CatalogAllocationUnit::Slots,
-                message: error.to_string(),
-            })?;
-        self.children_by_parent
-            .try_reserve(new_child_indexes.len())
-            .map_err(|error| CatalogError::AllocationFailed {
-                resource: "source catalog child index",
-                requested: new_child_indexes.len(),
-                unit: CatalogAllocationUnit::Slots,
-                message: error.to_string(),
-            })?;
-        for (parent, child_count) in plan.parent_runs() {
-            if let Some(children) = self.children_by_parent.get_mut(&parent) {
-                children.try_reserve(child_count).map_err(|error| {
-                    CatalogError::AllocationFailed {
-                        resource: "source catalog child-step index",
-                        requested: child_count,
-                        unit: CatalogAllocationUnit::Slots,
-                        message: error.to_string(),
-                    }
-                })?;
-            }
+        for addition in &plan.additions {
+            by_key.insert(Arc::clone(&addition.record.canonical_key), addition.source);
+            by_locator.insert(Arc::clone(&addition.record.source_locator), addition.source);
+            let children = children_by_parent.get_mut(&addition.parent).ok_or(
+                CatalogError::InvariantMissingChildIndex {
+                    parent: addition.parent,
+                },
+            )?;
+            children.insert(Arc::clone(&addition.step), addition.source);
         }
-        Ok(new_child_indexes)
+        Ok(PreparedPhysicalDomainIndexes {
+            by_key,
+            by_locator,
+            children_by_parent,
+        })
     }
 
     fn ensure_fingerprint_replacement_allowed(
@@ -3089,16 +3169,28 @@ impl SourceCatalogTransaction {
         budget: &mut AssetLoadBudget,
     ) -> Result<(), CatalogError> {
         self.ensure_active()?;
+        if let Err(error) = self
+            .candidate
+            .validate_fingerprint_replacement(source, fingerprint)
+        {
+            self.failed = true;
+            return Err(error);
+        }
+        if let Some(verification) = self.pending_verifications.iter().find(|verification| {
+            verification.source == source && verification.fingerprint != fingerprint
+        }) {
+            self.failed = true;
+            return Err(CatalogError::PendingPhysicalVerificationSuperseded {
+                source_id: source,
+                verified: verification.fingerprint,
+                replacement: fingerprint,
+            });
+        }
         match self
             .candidate
             .replace_fingerprint(source, fingerprint, budget)
         {
-            Ok(()) => {
-                self.pending_verifications.retain(|verification| {
-                    verification.source != source || verification.fingerprint == fingerprint
-                });
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(error) => {
                 self.failed = true;
                 Err(error)
@@ -4050,6 +4142,23 @@ mod tests {
         AssetLoadBudget::new(limits).unwrap()
     }
 
+    fn catalog_index_capacities(
+        catalog: &SourceCatalog,
+    ) -> (usize, usize, usize, Vec<(SourceId, usize)>) {
+        let mut child_capacities = catalog
+            .children_by_parent
+            .iter()
+            .map(|(parent, children)| (*parent, children.capacity()))
+            .collect::<Vec<_>>();
+        child_capacities.sort_unstable_by_key(|(parent, _)| *parent);
+        (
+            catalog.by_key.capacity(),
+            catalog.by_locator.capacity(),
+            catalog.children_by_parent.capacity(),
+            child_capacities,
+        )
+    }
+
     fn physical_domain_fixture() -> (SourceCatalog, SourceId, SourceId, SourceId, SourceId) {
         let workspace = WorkspaceId::from_u128(1).unwrap();
         let mut catalog = SourceCatalog::new(workspace);
@@ -4721,6 +4830,7 @@ mod tests {
             .candidate
             .checked_physical_domain_rewrite_bytes(rewrite)
             .unwrap();
+        let capacities_before = catalog_index_capacities(&addition_transaction.candidate);
         let mut tiny_addition_budget = budget_with(planned - 1, 1);
         assert!(matches!(
             addition_transaction.rewrite_physical_domain(rewrite, &mut tiny_addition_budget),
@@ -4731,6 +4841,10 @@ mod tests {
         ));
         assert_eq!(tiny_addition_budget.usage().entries, 0);
         assert_eq!(tiny_addition_budget.usage().bytes, 0);
+        assert_eq!(
+            catalog_index_capacities(&addition_transaction.candidate),
+            capacities_before
+        );
         assert!(matches!(
             addition_transaction.commit(&mut tiny_addition_budget),
             Err(CatalogError::TransactionAborted)
@@ -4976,6 +5090,64 @@ mod tests {
                 PhysicalDomainRewrite::new(source, &observed, &changed, &[]),
                 &mut operation_budget,
             ),
+            Err(CatalogError::PendingPhysicalVerificationSuperseded {
+                source_id,
+                verified,
+                replacement: actual_replacement,
+            }) if source_id == source
+                && verified == source_fingerprint
+                && actual_replacement == replacement
+        ));
+        assert_eq!(operation_budget.usage(), usage_before_rewrite);
+        assert_eq!(
+            transaction.candidate.revision().unwrap(),
+            revision_before_rewrite
+        );
+        assert!(matches!(
+            transaction.commit(&mut operation_budget),
+            Err(CatalogError::TransactionAborted)
+        ));
+    }
+
+    #[test]
+    fn fingerprint_rewrite_cannot_silently_discard_a_pending_physical_proof() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.assets");
+        let contents = b"verified base asset";
+        fs::write(&path, contents).unwrap();
+        let source_fingerprint = fingerprint(SourceKind::SerializedFile, contents);
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let mut catalog = SourceCatalog::new(workspace);
+        let source = catalog
+            .register(
+                SourceDescriptor::root(
+                    SourceKind::SerializedFile,
+                    SourceAlias::new("main.assets").unwrap(),
+                    PhysicalOrigin::from_existing_path(&path).unwrap(),
+                ),
+                source_fingerprint,
+            )
+            .unwrap();
+        let binding = VerifiedPhysicalBinding::verify_existing(
+            SourceKind::SerializedFile,
+            &path,
+            source_fingerprint,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let mut transaction = catalog
+            .begin_transaction(&mut AssetLoadBudget::default())
+            .unwrap();
+        let mut operation_budget = AssetLoadBudget::default();
+        transaction
+            .replace_verified_binding(source, binding, &mut operation_budget)
+            .unwrap();
+        let usage_before_rewrite = operation_budget.usage();
+        let revision_before_rewrite = transaction.candidate.revision().unwrap();
+        let replacement = fingerprint(SourceKind::SerializedFile, b"prepared output");
+
+        assert!(matches!(
+            transaction.replace_fingerprint(source, replacement, &mut operation_budget),
             Err(CatalogError::PendingPhysicalVerificationSuperseded {
                 source_id,
                 verified,
