@@ -184,6 +184,8 @@ pub enum YamlReferenceScanError {
     },
     #[error("YAML document index {document_index} exceeds the u32 selector range")]
     DocumentIndexOverflow { document_index: usize },
+    #[error("YAML class source omitted declared document index {document_index}")]
+    MissingDocument { document_index: usize },
     #[error(
         "YAML documents {first_document_index} and {second_document_index} use the same anchor"
     )]
@@ -211,12 +213,30 @@ pub fn scan_reference_occurrences(
     document: &YamlDocument,
     budget: &mut AssetLoadBudget,
 ) -> Result<YamlReferenceScan, YamlReferenceScanError> {
-    let selectors = prepare_selectors(document, budget)?;
+    scan_reference_class_occurrences(
+        document.entries().len(),
+        |index| document.entries().get(index),
+        budget,
+    )
+}
+
+/// Scans a stable indexed projection of Unity YAML classes.
+///
+/// The callback may overlay selected classes on an immutable parsed document without cloning all
+/// unchanged classes. It must return the same class for an index throughout this call.
+pub fn scan_reference_class_occurrences<'class>(
+    document_count: usize,
+    mut class_at: impl FnMut(usize) -> Option<&'class UnityClass>,
+    budget: &mut AssetLoadBudget,
+) -> Result<YamlReferenceScan, YamlReferenceScanError> {
+    let selectors = prepare_selectors(document_count, &mut class_at, budget)?;
     let mut state = ScanState::new(budget);
     let mut path = Vec::new();
     let mut traversal = Vec::new();
 
-    for (class, selector) in document.entries().iter().zip(selectors) {
+    for (document_index, selector) in selectors.into_iter().enumerate() {
+        let class = class_at(document_index)
+            .ok_or(YamlReferenceScanError::MissingDocument { document_index })?;
         state.visit_document(class, selector, &mut path, &mut traversal)?;
     }
 
@@ -523,10 +543,11 @@ impl<'budget> ScanState<'budget> {
     }
 }
 
-fn prepare_selectors<'document>(
-    document: &'document YamlDocument,
+fn prepare_selectors<'class>(
+    document_count: usize,
+    class_at: &mut impl FnMut(usize) -> Option<&'class UnityClass>,
     budget: &mut AssetLoadBudget,
-) -> Result<Vec<SelectorRef<'document>>, YamlReferenceScanError> {
+) -> Result<Vec<SelectorRef<'class>>, YamlReferenceScanError> {
     let mut selectors = Vec::new();
     let mut selector_capacity = 0;
     let mut anchors = Vec::new();
@@ -534,19 +555,21 @@ fn prepare_selectors<'document>(
     reserve_budgeted_vec(
         &mut selectors,
         &mut selector_capacity,
-        document.entries().len(),
+        document_count,
         budget,
         "YAML document selector table",
     )?;
     reserve_budgeted_vec(
         &mut anchors,
         &mut anchor_capacity,
-        document.entries().len(),
+        document_count,
         budget,
         "YAML document anchor validation",
     )?;
 
-    for (document_index, class) in document.entries().iter().enumerate() {
+    for document_index in 0..document_count {
+        let class = class_at(document_index)
+            .ok_or(YamlReferenceScanError::MissingDocument { document_index })?;
         let selector = selector_ref(class, document_index)?;
         if let SelectorRef::Anchored { anchor, .. } = selector {
             anchors.push((anchor, document_index));

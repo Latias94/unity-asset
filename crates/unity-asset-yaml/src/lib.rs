@@ -40,7 +40,8 @@ pub mod yaml_document;
 pub use reference::{
     YamlReferenceDiagnostic, YamlReferenceField, YamlReferenceOccurrence, YamlReferenceRawTarget,
     YamlReferenceRawTargetRef, YamlReferenceScan, YamlReferenceScanError, YamlReferenceScanStats,
-    YamlReferenceShape, YamlReferenceTarget, YamlValueKind, scan_reference_occurrences,
+    YamlReferenceShape, YamlReferenceTarget, YamlValueKind, scan_reference_class_occurrences,
+    scan_reference_occurrences,
 };
 pub use serde_unity_loader::SerdeUnityLoader;
 pub use unity_yaml_serializer::UnityYamlSerializer;

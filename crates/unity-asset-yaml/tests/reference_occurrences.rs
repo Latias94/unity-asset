@@ -6,7 +6,7 @@ use unity_asset_core::{
 use unity_asset_yaml::{
     SerdeUnityLoader, YamlDocument, YamlReferenceDiagnostic, YamlReferenceField,
     YamlReferenceOccurrence, YamlReferenceScanError, YamlReferenceShape, YamlValueKind,
-    scan_reference_occurrences,
+    scan_reference_class_occurrences, scan_reference_occurrences,
 };
 
 fn parse_document(input: &str) -> YamlDocument {
@@ -343,6 +343,60 @@ fn emits_an_occurrence_at_the_maximum_representable_field_path_depth() {
     assert!(matches!(
         scan.occurrences[0].shape,
         YamlReferenceShape::Valid(ref target) if target.file_id == 77
+    ));
+}
+
+#[test]
+fn indexed_class_projection_scans_sparse_replacements_without_cloning_the_document() {
+    let mut first = UnityClass::new(1, "GameObject".to_string(), "100".to_string());
+    first.set("target".to_string(), UnityValue::Object(pointer(1)));
+    let mut second = UnityClass::new(4, "Transform".to_string(), "200".to_string());
+    second.set("target".to_string(), UnityValue::Object(pointer(2)));
+    let mut document = YamlDocument::new();
+    document.add_entry(first);
+    document.add_entry(second);
+
+    let mut replacement = UnityClass::new(1, "GameObject".to_string(), "100".to_string());
+    replacement.set("target".to_string(), UnityValue::Object(pointer(91)));
+    let scan = scan_reference_class_occurrences(
+        document.entries().len(),
+        |index| match index {
+            0 => Some(&replacement),
+            _ => document.entries().get(index),
+        },
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap();
+
+    assert_eq!(scan.occurrences.len(), 2);
+    assert!(matches!(
+        scan.occurrences[0].shape,
+        YamlReferenceShape::Valid(ref target) if target.file_id == 91
+    ));
+    assert!(matches!(
+        scan.occurrences[1].shape,
+        YamlReferenceShape::Valid(ref target) if target.file_id == 2
+    ));
+    assert_eq!(
+        scan.occurrences[0].object,
+        YamlDocumentSelector::anchor("100").unwrap()
+    );
+    assert_eq!(
+        scan.occurrences[1].object,
+        YamlDocumentSelector::anchor("200").unwrap()
+    );
+}
+
+#[test]
+fn indexed_class_projection_rejects_a_missing_declared_document() {
+    let class = UnityClass::new(1, "GameObject".to_string(), "100".to_string());
+    assert!(matches!(
+        scan_reference_class_occurrences(
+            2,
+            |index| (index == 0).then_some(&class),
+            &mut AssetLoadBudget::default(),
+        ),
+        Err(YamlReferenceScanError::MissingDocument { document_index: 1 })
     ));
 }
 
