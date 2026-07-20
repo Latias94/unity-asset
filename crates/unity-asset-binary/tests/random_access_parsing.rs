@@ -200,7 +200,16 @@ fn public_segmented_validation_accepts_a_wire_golden_without_materialization() {
     assert_eq!(proof.metadata_size(), parsed.header.metadata_size);
     assert_eq!(proof.data_offset(), parsed.header.data_offset);
     assert_eq!(proof.declared_file_size(), bytes.len() as u64);
-    assert_eq!(proof.retained_heap_bytes().unwrap(), 0);
+    assert_eq!(proof.objects(), parsed.objects());
+    assert_eq!(proof.externals(), parsed.externals.as_slice());
+    let object = &proof.objects()[0];
+    assert_eq!(
+        object.byte_start()..object.byte_end().unwrap(),
+        224_u64..228_u64
+    );
+    assert_eq!(object.path_id(), 42);
+    assert_eq!(object.class_id(), 28);
+    assert!(proof.retained_heap_bytes().unwrap() > 0);
     assert!(image.contiguous().is_none());
     assert!(budget.usage().entries > 0);
     assert!(budget.usage().bytes > 0);

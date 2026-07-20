@@ -20,7 +20,9 @@ use crate::reader::{BinaryInput, BinaryReader, ByteOrder, not_enough_data_u64};
 use crate::shared_bytes::SharedBytes;
 use std::mem::size_of;
 use std::ops::Range;
-use unity_asset_core::{AssetLoadBudget, BudgetError};
+use unity_asset_core::{
+    AssetLoadBudget, BudgetError, string_allocation_bytes, vec_allocation_bytes,
+};
 
 /// SerializedFile parser.
 ///
@@ -35,6 +37,8 @@ pub struct SerializedFileInspection {
     metadata_size: u32,
     data_offset: u64,
     declared_file_size: u64,
+    objects: Vec<ObjectInfo>,
+    externals: Vec<FileIdentifier>,
 }
 
 impl SerializedFileInspection {
@@ -58,8 +62,40 @@ impl SerializedFileInspection {
         self.declared_file_size
     }
 
-    pub const fn retained_heap_bytes(&self) -> Result<u64> {
-        Ok(0)
+    /// Returns the validated object table in its original wire order.
+    ///
+    /// Object byte offsets are absolute within the inspected SerializedFile image.
+    pub fn objects(&self) -> &[ObjectInfo] {
+        &self.objects
+    }
+
+    /// Returns the complete validated external-reference table in wire order.
+    pub fn externals(&self) -> &[FileIdentifier] {
+        &self.externals
+    }
+
+    /// Returns the heap retained exclusively by this inspection proof.
+    pub fn retained_heap_bytes(&self) -> Result<u64> {
+        let mut bytes = vec_allocation_bytes::<ObjectInfo>(self.objects.capacity())
+            .map_err(serialized_file_inspection_allocation_error)?;
+        add_serialized_file_inspection_bytes(
+            &mut bytes,
+            vec_allocation_bytes::<FileIdentifier>(self.externals.capacity())
+                .map_err(serialized_file_inspection_allocation_error)?,
+        )?;
+        for external in &self.externals {
+            add_serialized_file_inspection_bytes(
+                &mut bytes,
+                string_allocation_bytes(external.temp_empty.capacity())
+                    .map_err(serialized_file_inspection_allocation_error)?,
+            )?;
+            add_serialized_file_inspection_bytes(
+                &mut bytes,
+                string_allocation_bytes(external.path.capacity())
+                    .map_err(serialized_file_inspection_allocation_error)?,
+            )?;
+        }
+        Ok(bytes)
     }
 }
 
@@ -192,12 +228,20 @@ impl SerializedFileParser {
                 source.len()
             )));
         }
+        let ParsedParts {
+            header,
+            objects,
+            externals,
+            ..
+        } = parts;
         Ok(SerializedFileInspection {
-            version: parts.header.version,
-            byte_order: parts.header.byte_order(),
-            metadata_size: parts.header.metadata_size,
-            data_offset: parts.header.data_offset,
-            declared_file_size: parts.header.file_size,
+            version: header.version,
+            byte_order: header.byte_order(),
+            metadata_size: header.metadata_size,
+            data_offset: header.data_offset,
+            declared_file_size: header.file_size,
+            objects,
+            externals,
         })
     }
 
@@ -524,6 +568,21 @@ fn i64_to_u64_checked(value: i64, name: &'static str) -> Result<u64> {
         )));
     }
     Ok(value as u64)
+}
+
+fn serialized_file_inspection_allocation_error(
+    error: unity_asset_core::AllocationSizeError,
+) -> BinaryError {
+    BinaryError::memory_error(format!(
+        "SerializedFile inspection retained allocation size overflow: {error}"
+    ))
+}
+
+fn add_serialized_file_inspection_bytes(total: &mut u64, amount: u64) -> Result<()> {
+    *total = total.checked_add(amount).ok_or_else(|| {
+        BinaryError::memory_error("SerializedFile inspection retained heap size overflow")
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

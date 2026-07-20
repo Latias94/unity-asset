@@ -383,7 +383,7 @@ impl ObjectMetadata {
 }
 
 /// Object information within a SerializedFile.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ObjectInfo {
     path_id: i64,
     byte_start: u64,

@@ -231,6 +231,43 @@ fn complete_parser_budget_usage_has_fixed_oracles() {
 }
 
 #[test]
+fn inspection_retained_heap_counts_actual_table_and_external_string_capacities() {
+    let bytes = SEGMENTED_CASES
+        .iter()
+        .find(|(version, _)| *version == 22)
+        .unwrap()
+        .1;
+    let inspection =
+        SerializedFileParser::inspect_slice_with_budget(bytes, &mut AssetLoadBudget::default())
+            .unwrap();
+    let mut expected =
+        unity_asset_core::vec_allocation_bytes::<ObjectInfo>(inspection.objects.capacity())
+            .unwrap();
+    expected +=
+        unity_asset_core::vec_allocation_bytes::<FileIdentifier>(inspection.externals.capacity())
+            .unwrap();
+    for external in &inspection.externals {
+        expected +=
+            unity_asset_core::string_allocation_bytes(external.temp_empty.capacity()).unwrap();
+        expected += unity_asset_core::string_allocation_bytes(external.path.capacity()).unwrap();
+    }
+
+    assert_eq!(inspection.retained_heap_bytes().unwrap(), expected);
+    assert_eq!(inspection.objects().len(), 1);
+    assert_eq!(inspection.externals().len(), 1);
+    assert_eq!(
+        inspection.externals()[0].path,
+        "archive:/fixture-dependency.assets"
+    );
+    assert_eq!(inspection.externals()[0].temp_empty, "fixture-empty");
+    assert_eq!(
+        inspection.externals()[0].guid,
+        std::array::from_fn(|index| index as u8 + 1)
+    );
+    assert_eq!(inspection.externals()[0].type_, 3);
+}
+
+#[test]
 fn segmented_errors_and_usage_are_independent_of_boundaries() {
     let mut bytes = SEGMENTED_CASES
         .iter()
@@ -412,6 +449,26 @@ fn duplicate_path_id_uses_budgeted_sort_scratch_and_preserves_wire_order() {
     assert_eq!(&MULTI_V22[second.clone()], 84_i64.to_be_bytes());
     let mut duplicate = MULTI_V22.to_vec();
     duplicate[second].copy_from_slice(&42_i64.to_be_bytes());
+
+    let contiguous_inspection_error = SerializedFileParser::inspect_slice_with_budget(
+        &duplicate,
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        contiguous_inspection_error,
+        BinaryError::ObjectIdentity(BinaryObjectIdentityError::DuplicatePathId { path_id: 42 })
+    ));
+    let duplicate_backing: Arc<[u8]> = Arc::from(duplicate.clone());
+    let segmented_inspection_error = SerializedFileParser::validate_segmented_with_budget(
+        &one_byte_source(&duplicate_backing),
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        segmented_inspection_error,
+        BinaryError::ObjectIdentity(BinaryObjectIdentityError::DuplicatePathId { path_id: 42 })
+    ));
 
     let mut probe = AssetLoadBudget::default();
     let error =

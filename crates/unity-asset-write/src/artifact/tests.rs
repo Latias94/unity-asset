@@ -72,6 +72,20 @@ fn prepare_resource(
     })
 }
 
+fn prepare_serialized_set(
+    payload: &ArtifactPayload,
+    budget: &mut ArtifactBudget,
+) -> Result<PreparedArtifactSet, ArtifactBuildError> {
+    let mut inspection_budget = AssetLoadBudget::default();
+    let mut declaration = ArtifactBatchDeclaration::begin(budget, &mut inspection_budget)?;
+    let output = declaration.declare_output(name("main.assets"))?;
+    let mut batch = declaration.seal_output_names()?;
+    let artifact = batch
+        .prepare_serialized_file(payload.len(), |encoder| encoder.push_payload_full(payload))?;
+    batch.bind_output(output, artifact)?;
+    batch.finish()
+}
+
 fn resource_extent(payload: &ArtifactPayload, alignment: u32) -> StreamedResourceExtentInspection {
     let digest = payload
         .digest()
@@ -131,6 +145,58 @@ fn serialized_format_is_produced_only_by_the_fixed_binary_inspector() {
         PreparedArtifactFormat::SerializedFile(proof)
             if proof.version() == 8 && proof.byte_order() == ByteOrder::Little
     ));
+}
+
+#[test]
+fn serialized_inspection_tables_are_charged_exactly_to_artifact_metadata() {
+    let empty_tables = serialized_payload(20);
+    let populated_tables = source_payload(
+        include_bytes!("../../tests/fixtures/serialized_file_wire/v22.assets.bin").to_vec(),
+        SourceKind::SerializedFile,
+        21,
+    );
+
+    let mut empty_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let empty_set = prepare_serialized_set(&empty_tables, &mut empty_budget).unwrap();
+    let empty_metadata = empty_budget.committed_usage().metadata_bytes();
+    drop(empty_set);
+
+    let mut probe_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let probe_set = prepare_serialized_set(&populated_tables, &mut probe_budget).unwrap();
+    let populated_metadata = probe_budget.committed_usage().metadata_bytes();
+    let proof_heap = match probe_set.outputs().next().unwrap().artifact().format() {
+        PreparedArtifactFormat::SerializedFile(proof) => proof.retained_heap_bytes().unwrap(),
+        format => panic!("expected SerializedFile proof, found {format:?}"),
+    };
+    assert!(proof_heap > 0);
+    assert_eq!(populated_metadata - empty_metadata, proof_heap);
+    drop(probe_set);
+
+    let exact_limits = ArtifactLimits::default().with_max_metadata_bytes(populated_metadata);
+    let mut exact_budget = ArtifactBudget::new(exact_limits).unwrap();
+    let exact_set = prepare_serialized_set(&populated_tables, &mut exact_budget).unwrap();
+    assert_eq!(
+        exact_budget.committed_usage().metadata_bytes(),
+        populated_metadata
+    );
+    drop(exact_set);
+
+    let short_limit = populated_metadata - 1;
+    let short_limits = ArtifactLimits::default().with_max_metadata_bytes(short_limit);
+    let mut short_budget = ArtifactBudget::new(short_limits).unwrap();
+    assert!(matches!(
+        prepare_serialized_set(&populated_tables, &mut short_budget),
+        Err(ArtifactBuildError::Budget(ArtifactBudgetError::Exceeded {
+            resource: "metadata_bytes",
+            requested,
+            limit,
+        })) if requested == populated_metadata && limit == short_limit
+    ));
+    assert_eq!(
+        short_budget.committed_usage(),
+        ArtifactBudgetUsage::default()
+    );
+    assert_eq!(short_budget.live_scratch_bytes(), 0);
 }
 
 #[test]
