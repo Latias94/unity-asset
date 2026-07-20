@@ -1,8 +1,11 @@
+use std::collections::TryReserveError;
 use std::iter::FusedIterator;
 use std::ops::Range;
 
 use thiserror::Error;
-use unity_asset_core::DigestV1;
+use unity_asset_core::{
+    AllocationSizeError, AssetLoadBudget, BudgetError, DigestV1, vec_allocation_bytes,
+};
 
 use crate::artifact::{ArtifactPayload, ArtifactPayloadProvenance};
 
@@ -176,25 +179,14 @@ impl<'extent, 'payload> StreamedResourcePlan<'extent, 'payload> {
         flags: StreamedResourceFlags,
         extents: &'extent [StreamedResourceExtent<'payload>],
     ) -> Result<Self, StreamedResourcePlanError> {
-        let mut cursor = 0_u64;
-        for (ordinal, extent) in extents.iter().enumerate() {
-            // Constructors validate this already.  Recheck it here so a plan remains robust if
-            // more constructors are added in the future.
-            validate_alignment(extent.alignment)?;
-            let offset = if ordinal == 0 {
-                0
-            } else {
-                align_up(cursor, extent.alignment)
-                    .ok_or(StreamedResourcePlanError::LengthOverflow { ordinal })?
-            };
-            cursor = offset
-                .checked_add(u64::from(extent.length))
-                .ok_or(StreamedResourcePlanError::LengthOverflow { ordinal })?;
+        let mut layout = StreamedResourceLayout::default();
+        for extent in extents {
+            layout.push(extent)?;
         }
         Ok(Self {
             flags,
             extents,
-            length: cursor,
+            length: layout.length(),
         })
     }
 
@@ -227,8 +219,78 @@ impl<'extent, 'payload> StreamedResourcePlan<'extent, 'payload> {
     pub fn allocations(self) -> StreamedResourceAllocationIter<'extent, 'payload> {
         StreamedResourceAllocationIter {
             extents: self.extents.iter(),
-            cursor: 0,
-            ordinal: 0,
+            layout: StreamedResourceLayout::default(),
+        }
+    }
+}
+
+/// Incrementally plans one deterministic streamed-resource sidecar.
+///
+/// Each successful [`Self::push`] charges the caller-owned load budget for one retained extent and
+/// any new metadata backing before publishing the extent. The returned allocation is therefore
+/// available to the mutation operation that introduced the bytes, while a failed push leaves the
+/// planner unchanged. [`Self::finish`] borrows the retained extents without another allocation.
+#[derive(Debug)]
+#[must_use = "the planner must be finished or its allocations are discarded"]
+pub struct StreamedResourcePlanner<'payload> {
+    flags: StreamedResourceFlags,
+    extents: Vec<StreamedResourceExtent<'payload>>,
+    layout: StreamedResourceLayout,
+}
+
+impl<'payload> StreamedResourcePlanner<'payload> {
+    pub const fn new(flags: StreamedResourceFlags) -> Self {
+        Self {
+            flags,
+            extents: Vec::new(),
+            layout: StreamedResourceLayout::new(),
+        }
+    }
+
+    /// Appends one extent and returns its final placement immediately.
+    ///
+    /// Layout validation, count accounting, byte accounting, and allocation are completed before
+    /// the planner advances. The caller can consequently attach any failure to the operation that
+    /// supplied `extent` without rolling back earlier extents.
+    pub fn push(
+        &mut self,
+        extent: StreamedResourceExtent<'payload>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<StreamedResourceAllocation, StreamedResourcePlannerError> {
+        let (next_layout, allocation) = self.layout.next(&extent)?;
+        reserve_extent_slot(&mut self.extents, budget)?;
+        self.extents.push(extent);
+        self.layout = next_layout;
+        Ok(allocation)
+    }
+
+    #[must_use]
+    pub const fn flags(&self) -> StreamedResourceFlags {
+        self.flags
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.layout.length()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.layout.length() == 0
+    }
+
+    #[must_use]
+    pub const fn extent_count(&self) -> usize {
+        self.extents.len()
+    }
+
+    /// Returns the completed borrowed plan without copying extent metadata.
+    #[must_use]
+    pub fn finish(&self) -> StreamedResourcePlan<'_, 'payload> {
+        StreamedResourcePlan {
+            flags: self.flags,
+            extents: &self.extents,
+            length: self.layout.length(),
         }
     }
 }
@@ -278,8 +340,7 @@ impl StreamedResourceAllocation {
 /// Iterator over a validated plan's placements.
 pub struct StreamedResourceAllocationIter<'extent, 'payload> {
     extents: std::slice::Iter<'extent, StreamedResourceExtent<'payload>>,
-    cursor: u64,
-    ordinal: usize,
+    layout: StreamedResourceLayout,
 }
 
 impl Iterator for StreamedResourceAllocationIter<'_, '_> {
@@ -287,22 +348,10 @@ impl Iterator for StreamedResourceAllocationIter<'_, '_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let extent = self.extents.next()?;
-        let offset = if self.ordinal == 0 {
-            0
-        } else {
-            // The plan constructor proves this addition cannot overflow.  Saturating arithmetic
-            // keeps this iterator total even if a future internal constructor violates that proof.
-            align_up_saturating(self.cursor, extent.alignment)
-        };
-        let allocation = StreamedResourceAllocation {
-            ordinal: self.ordinal,
-            offset,
-            size: extent.length,
-            alignment: extent.alignment,
-            padding_before: offset.saturating_sub(self.cursor),
-        };
-        self.cursor = offset.saturating_add(u64::from(extent.length));
-        self.ordinal = self.ordinal.saturating_add(1);
+        // Every public plan constructor validates this exact transition. Returning `None` keeps
+        // the iterator total if an internal constructor ever violates that invariant.
+        let (next_layout, allocation) = self.layout.next(extent).ok()?;
+        self.layout = next_layout;
         Some(allocation)
     }
 
@@ -339,6 +388,132 @@ pub enum StreamedResourcePlanError {
     },
     #[error("streamed-resource layout length overflow at extent {ordinal}")]
     LengthOverflow { ordinal: usize },
+    #[error("streamed-resource extent count cannot be represented after extent {ordinal}")]
+    ExtentCountOverflow { ordinal: usize },
+}
+
+/// Typed failure from an incremental streamed-resource planner operation.
+#[derive(Debug, Error)]
+pub enum StreamedResourcePlannerError {
+    #[error(transparent)]
+    Plan(#[from] StreamedResourcePlanError),
+    #[error("failed to reserve {requested} streamed-resource extent slots: {source}")]
+    Allocation {
+        requested: usize,
+        #[source]
+        source: TryReserveError,
+    },
+    #[error(transparent)]
+    AllocationSize(#[from] AllocationSizeError),
+    #[error(transparent)]
+    Budget(#[from] BudgetError),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StreamedResourceLayout {
+    cursor: u64,
+    extent_count: usize,
+}
+
+impl StreamedResourceLayout {
+    const fn new() -> Self {
+        Self {
+            cursor: 0,
+            extent_count: 0,
+        }
+    }
+
+    const fn length(self) -> u64 {
+        self.cursor
+    }
+
+    fn push(
+        &mut self,
+        extent: &StreamedResourceExtent<'_>,
+    ) -> Result<StreamedResourceAllocation, StreamedResourcePlanError> {
+        let (next, allocation) = self.next(extent)?;
+        *self = next;
+        Ok(allocation)
+    }
+
+    fn next(
+        self,
+        extent: &StreamedResourceExtent<'_>,
+    ) -> Result<(Self, StreamedResourceAllocation), StreamedResourcePlanError> {
+        // Constructors validate this already. Recheck it here so the layout remains robust if
+        // more constructors are added in the future.
+        validate_alignment(extent.alignment)?;
+        let ordinal = self.extent_count;
+        let offset = if ordinal == 0 {
+            0
+        } else {
+            align_up(self.cursor, extent.alignment)
+                .ok_or(StreamedResourcePlanError::LengthOverflow { ordinal })?
+        };
+        let cursor = offset
+            .checked_add(u64::from(extent.length))
+            .ok_or(StreamedResourcePlanError::LengthOverflow { ordinal })?;
+        let extent_count = ordinal
+            .checked_add(1)
+            .ok_or(StreamedResourcePlanError::ExtentCountOverflow { ordinal })?;
+        let padding_before = offset
+            .checked_sub(self.cursor)
+            .ok_or(StreamedResourcePlanError::LengthOverflow { ordinal })?;
+        let allocation = StreamedResourceAllocation {
+            ordinal,
+            offset,
+            size: extent.length,
+            alignment: extent.alignment,
+            padding_before,
+        };
+        Ok((
+            Self {
+                cursor,
+                extent_count,
+            },
+            allocation,
+        ))
+    }
+}
+
+fn reserve_extent_slot(
+    extents: &mut Vec<StreamedResourceExtent<'_>>,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), StreamedResourcePlannerError> {
+    budget.check_entries(1)?;
+    if extents.len() < extents.capacity() {
+        budget.consume_entries(1)?;
+        return Ok(());
+    }
+
+    let ordinal = extents.len();
+    let required = ordinal
+        .checked_add(1)
+        .ok_or(StreamedResourcePlanError::ExtentCountOverflow { ordinal })?;
+    let target_capacity = match extents.capacity().checked_mul(2) {
+        Some(doubled) => doubled.max(required).max(4),
+        None => required,
+    };
+    let planned_bytes = vec_allocation_bytes::<StreamedResourceExtent<'_>>(target_capacity)?;
+    budget.check_bytes(planned_bytes)?;
+
+    // Stage the replacement backing so allocation or supplemental-budget failure leaves the
+    // planner and its previously returned allocations unchanged.
+    let mut staged = Vec::new();
+    staged
+        .try_reserve_exact(target_capacity)
+        .map_err(|source| StreamedResourcePlannerError::Allocation {
+            requested: target_capacity,
+            source,
+        })?;
+    let actual_bytes = vec_allocation_bytes::<StreamedResourceExtent<'_>>(staged.capacity())?;
+    budget.check_bytes(actual_bytes)?;
+    budget.consume_entries(1)?;
+    budget.consume_bytes(actual_bytes)?;
+
+    staged.append(extents);
+    *extents = staged;
+    Ok(())
 }
 
 fn checked_size_usize(length: usize) -> Result<u32, StreamedResourcePlanError> {
@@ -361,9 +536,4 @@ fn validate_alignment(alignment: u32) -> Result<(), StreamedResourcePlanError> {
 fn align_up(value: u64, alignment: u32) -> Option<u64> {
     let mask = u64::from(alignment) - 1;
     value.checked_add(mask).map(|value| value & !mask)
-}
-
-fn align_up_saturating(value: u64, alignment: u32) -> u64 {
-    let mask = u64::from(alignment) - 1;
-    value.saturating_add(mask) & !mask
 }

@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use unity_asset_core::{AssetLoadBudget, SourceId, SourceKind, VerifiedSourceImage, WorkspaceId};
+use unity_asset_core::{
+    AssetLoadBudget, AssetLoadLimits, BudgetError, SourceId, SourceKind, VerifiedSourceImage,
+    WorkspaceId,
+};
 
 use super::*;
 use crate::artifact::{
@@ -37,10 +40,31 @@ fn allocation_is_deterministic_for_multiple_aligned_extents() {
     ];
     let flags = StreamedResourceFlags::new(0x4);
     let plan = StreamedResourcePlan::new(flags, &extents).unwrap();
+    let mut incremental_budget = AssetLoadBudget::default();
+    let mut planner = StreamedResourcePlanner::new(flags);
+    let incremental_allocations = extents
+        .iter()
+        .cloned()
+        .map(|extent| planner.push(extent, &mut incremental_budget).unwrap())
+        .collect::<Vec<_>>();
+    let incremental_plan = planner.finish();
 
     assert_eq!(plan.flags(), flags);
     assert_eq!(plan.len(), 9);
     assert_eq!(plan.extent_count(), 4);
+    assert_eq!(incremental_plan.flags(), plan.flags());
+    assert_eq!(incremental_plan.len(), plan.len());
+    assert_eq!(incremental_plan.extent_count(), plan.extent_count());
+    assert_eq!(
+        incremental_allocations,
+        plan.allocations().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        incremental_plan.allocations().collect::<Vec<_>>(),
+        plan.allocations().collect::<Vec<_>>()
+    );
+    assert_eq!(incremental_budget.usage().entries, 4);
+    assert!(incremental_budget.usage().bytes > 0);
     assert_eq!(
         plan.allocations()
             .map(|allocation| {
@@ -65,7 +89,7 @@ fn allocation_is_deterministic_for_multiple_aligned_extents() {
     let mut inspection_budget = AssetLoadBudget::default();
     let mut declaration =
         ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
-    let declared = plan
+    let declared = incremental_plan
         .declare_output(&mut declaration, logical_name("data/CAB-main.resS"))
         .unwrap();
     let slot = declared.output_slot();
@@ -106,6 +130,143 @@ fn allocation_is_deterministic_for_multiple_aligned_extents() {
     assert_eq!(bytes, b"abc\0de\0\0f");
     assert_eq!(receipt.bytes_written(), 9);
     assert_eq!(receipt.digest(), output.artifact().digest());
+}
+
+#[test]
+fn incremental_budget_failure_keeps_the_completed_prefix_unchanged() {
+    let limits = AssetLoadLimits {
+        max_entries: 2,
+        ..AssetLoadLimits::default()
+    };
+    let mut budget = AssetLoadBudget::new(limits).unwrap();
+    let mut planner = StreamedResourcePlanner::new(StreamedResourceFlags::new(7));
+
+    assert_eq!(
+        planner
+            .push(
+                StreamedResourceExtent::generated(b"abc", 1).unwrap(),
+                &mut budget,
+            )
+            .unwrap()
+            .offset(),
+        0
+    );
+    assert_eq!(
+        planner
+            .push(
+                StreamedResourceExtent::generated(b"de", 4).unwrap(),
+                &mut budget,
+            )
+            .unwrap()
+            .offset(),
+        4
+    );
+    let before = budget.usage();
+    let error = planner
+        .push(
+            StreamedResourceExtent::generated(b"f", 8).unwrap(),
+            &mut budget,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        StreamedResourcePlannerError::Budget(BudgetError::Exceeded {
+            resource: "entries",
+            requested: 3,
+            limit: 2,
+        })
+    ));
+    assert_eq!(budget.usage(), before);
+    assert_eq!(planner.extent_count(), 2);
+    assert_eq!(planner.len(), 6);
+    assert_eq!(
+        planner
+            .finish()
+            .allocations()
+            .map(|allocation| (
+                allocation.ordinal(),
+                allocation.offset(),
+                allocation.size(),
+                allocation.alignment(),
+                allocation.padding_before(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![(0, 0, 3, 1, 0), (1, 4, 2, 4, 1)]
+    );
+}
+
+#[test]
+fn incremental_metadata_allocation_is_preflighted_against_byte_budget() {
+    let limits = AssetLoadLimits {
+        max_bytes: 1,
+        ..AssetLoadLimits::default()
+    };
+    let mut budget = AssetLoadBudget::new(limits).unwrap();
+    let mut planner = StreamedResourcePlanner::new(StreamedResourceFlags::default());
+    let error = planner
+        .push(
+            StreamedResourceExtent::generated(b"x", 1).unwrap(),
+            &mut budget,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        StreamedResourcePlannerError::Budget(BudgetError::Exceeded {
+            resource: "bytes",
+            limit: 1,
+            ..
+        })
+    ));
+    assert_eq!(budget.usage(), Default::default());
+    assert!(planner.is_empty());
+    assert_eq!(planner.len(), 0);
+}
+
+#[test]
+fn incremental_growth_budget_failure_preserves_the_retained_prefix() {
+    let mut budget = AssetLoadBudget::default();
+    let mut planner = StreamedResourcePlanner::new(StreamedResourceFlags::default());
+    planner
+        .push(
+            StreamedResourceExtent::generated(b"x", 1).unwrap(),
+            &mut budget,
+        )
+        .unwrap();
+
+    // Leave one byte for unrelated caller work. Existing capacity remains usable, but the next
+    // metadata growth must fail before it moves any retained extent.
+    let supplemental = budget.remaining_bytes().checked_sub(1).unwrap();
+    budget.consume_bytes(supplemental).unwrap();
+    let mut completed = 1;
+    loop {
+        let before = budget.usage();
+        match planner.push(
+            StreamedResourceExtent::generated(b"x", 1).unwrap(),
+            &mut budget,
+        ) {
+            Ok(allocation) => {
+                assert_eq!(allocation.ordinal(), completed);
+                assert_eq!(allocation.offset(), u64::try_from(completed).unwrap());
+                assert_eq!(budget.usage().bytes, before.bytes);
+                completed += 1;
+            }
+            Err(StreamedResourcePlannerError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            })) => {
+                assert_eq!(budget.usage(), before);
+                break;
+            }
+            Err(error) => panic!("unexpected planner failure: {error}"),
+        }
+    }
+
+    assert!(completed >= 4);
+    assert_eq!(planner.extent_count(), completed);
+    assert_eq!(planner.len(), u64::try_from(completed).unwrap());
+    assert_eq!(planner.finish().allocations().count(), completed);
 }
 
 #[test]
@@ -202,6 +363,19 @@ fn an_empty_sidecar_is_a_valid_exact_artifact() {
     let plan = StreamedResourcePlan::new(StreamedResourceFlags::new(12), &extents).unwrap();
     assert_eq!(plan.len(), 0);
     assert!(plan.allocations().next().is_none());
+
+    let mut planner = StreamedResourcePlanner::new(StreamedResourceFlags::new(12));
+    let mut planner_budget = AssetLoadBudget::default();
+    let empty_allocation = planner
+        .push(
+            StreamedResourceExtent::generated(b"", 8).unwrap(),
+            &mut planner_budget,
+        )
+        .unwrap();
+    assert_eq!(empty_allocation.offset(), 0);
+    assert!(planner.is_empty());
+    assert_eq!(planner.extent_count(), 1);
+    assert!(planner.finish().is_empty());
 
     let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
     let mut inspection_budget = AssetLoadBudget::default();
