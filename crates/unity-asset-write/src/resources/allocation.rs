@@ -4,7 +4,8 @@ use std::ops::Range;
 
 use thiserror::Error;
 use unity_asset_core::{
-    AllocationSizeError, AssetLoadBudget, BudgetError, DigestV1, vec_allocation_bytes,
+    AllocationSizeError, AssetLoadBudget, BudgetError, DigestBuildError, DigestV1, DigestV1Builder,
+    vec_allocation_bytes,
 };
 
 use crate::artifact::{ArtifactPayload, ArtifactPayloadProvenance};
@@ -54,6 +55,7 @@ pub(super) enum ExtentPayload<'payload> {
 #[derive(Debug, Clone)]
 pub struct StreamedResourceExtent<'payload> {
     payload: ExtentPayload<'payload>,
+    payload_digest: DigestV1,
     alignment: u32,
     length: u32,
 }
@@ -68,6 +70,7 @@ impl<'payload> StreamedResourceExtent<'payload> {
         let length = checked_size_usize(bytes.len())?;
         Ok(Self {
             payload: ExtentPayload::Generated(bytes),
+            payload_digest: DigestV1::hash_bytes(bytes),
             alignment,
             length,
         })
@@ -82,6 +85,9 @@ impl<'payload> StreamedResourceExtent<'payload> {
         let length = checked_size_u64(payload.len())?;
         Ok(Self {
             payload: ExtentPayload::Artifact(payload),
+            payload_digest: payload
+                .digest()
+                .unwrap_or_else(|| DigestV1::hash_bytes(payload.bytes())),
             alignment,
             length,
         })
@@ -117,8 +123,16 @@ impl<'payload> StreamedResourceExtent<'payload> {
             });
         }
         let length = checked_size_usize(range.len())?;
+        let payload_digest = if range.start == 0 && range.end == payload.bytes().len() {
+            payload
+                .digest()
+                .unwrap_or_else(|| DigestV1::hash_bytes(payload.bytes()))
+        } else {
+            DigestV1::hash_bytes(&payload.bytes()[range.clone()])
+        };
         Ok(Self {
             payload: ExtentPayload::ArtifactRange { payload, range },
+            payload_digest,
             alignment,
             length,
         })
@@ -139,38 +153,54 @@ impl<'payload> StreamedResourceExtent<'payload> {
         self.length == 0
     }
 
-    pub(crate) fn payload_digest(&self) -> DigestV1 {
-        match &self.payload {
-            ExtentPayload::Generated(bytes) => DigestV1::hash_bytes(bytes),
-            ExtentPayload::Artifact(payload) => payload
-                .digest()
-                .unwrap_or_else(|| DigestV1::hash_bytes(payload.bytes())),
-            ExtentPayload::ArtifactRange { payload, range } => {
-                if range.start == 0 && range.end == payload.bytes().len() {
-                    payload
-                        .digest()
-                        .unwrap_or_else(|| DigestV1::hash_bytes(payload.bytes()))
-                } else {
-                    DigestV1::hash_bytes(&payload.bytes()[range.clone()])
-                }
-            }
-        }
+    pub(crate) const fn payload_digest(&self) -> DigestV1 {
+        self.payload_digest
     }
 
     pub(super) fn payload(&self) -> &ExtentPayload<'payload> {
         &self.payload
     }
+
+    fn payload_bytes(&self) -> &[u8] {
+        match &self.payload {
+            ExtentPayload::Generated(bytes) => bytes,
+            ExtentPayload::Artifact(payload) => payload.bytes(),
+            ExtentPayload::ArtifactRange { payload, range } => &payload.bytes()[range.clone()],
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StreamedResourceExtents<'extent, 'payload> {
+    Borrowed(&'extent [StreamedResourceExtent<'payload>]),
+    Owned(Vec<StreamedResourceExtent<'payload>>),
+}
+
+impl<'payload> StreamedResourceExtents<'_, 'payload> {
+    const fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(extents) => extents.len(),
+            Self::Owned(extents) => extents.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[StreamedResourceExtent<'payload>] {
+        match self {
+            Self::Borrowed(extents) => extents,
+            Self::Owned(extents) => extents,
+        }
+    }
 }
 
 /// A validated, deterministic allocation plan for one sidecar artifact.
 ///
-/// The plan stores only a borrowed extent slice.  It therefore does not introduce an
-/// unaccounted metadata allocation; the retained extent proof is charged by `ArtifactBatch` when
-/// the plan is prepared.
-#[derive(Debug, Clone, Copy)]
+/// A plan built from a complete slice borrows that slice without allocating. A plan finished from
+/// [`StreamedResourcePlanner`] takes ownership of the planner's already-budgeted metadata. The
+/// retained artifact proof is charged separately by `ArtifactBatch` when the plan is prepared.
+#[derive(Debug)]
 pub struct StreamedResourcePlan<'extent, 'payload> {
     flags: StreamedResourceFlags,
-    extents: &'extent [StreamedResourceExtent<'payload>],
+    extents: StreamedResourceExtents<'extent, 'payload>,
     length: u64,
 }
 
@@ -185,51 +215,89 @@ impl<'extent, 'payload> StreamedResourcePlan<'extent, 'payload> {
         }
         Ok(Self {
             flags,
-            extents,
+            extents: StreamedResourceExtents::Borrowed(extents),
             length: layout.length(),
         })
     }
 
     #[must_use]
-    pub const fn flags(self) -> StreamedResourceFlags {
+    pub const fn flags(&self) -> StreamedResourceFlags {
         self.flags
     }
 
     #[must_use]
-    pub const fn len(self) -> u64 {
+    pub const fn len(&self) -> u64 {
         self.length
     }
 
     #[must_use]
-    pub const fn is_empty(self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.length == 0
     }
 
     #[must_use]
-    pub const fn extent_count(self) -> usize {
+    pub const fn extent_count(&self) -> usize {
         self.extents.len()
     }
 
     #[must_use]
-    pub fn extents(self) -> &'extent [StreamedResourceExtent<'payload>] {
-        self.extents
+    pub fn extents(&self) -> &[StreamedResourceExtent<'payload>] {
+        self.extents.as_slice()
     }
 
     #[must_use]
-    pub fn allocations(self) -> StreamedResourceAllocationIter<'extent, 'payload> {
+    pub fn allocations(&self) -> StreamedResourceAllocationIter<'_, 'payload> {
         StreamedResourceAllocationIter {
-            extents: self.extents.iter(),
+            extents: self.extents.as_slice().iter(),
             layout: StreamedResourceLayout::default(),
         }
+    }
+
+    /// Computes the digest of the exact sidecar bytes, including deterministic zero padding.
+    ///
+    /// This operation streams borrowed payloads directly into the digest and neither allocates nor
+    /// consumes an [`AssetLoadBudget`]. Flags are container metadata and therefore do not affect
+    /// the content identity.
+    pub fn content_digest(&self) -> Result<DigestV1, StreamedResourcePlanError> {
+        let mut digest = DigestV1Builder::new(self.length);
+        for (extent, allocation) in self.extents().iter().zip(self.allocations()) {
+            update_zero_padding(&mut digest, allocation.padding_before())?;
+            digest.update(extent.payload_bytes())?;
+        }
+        Ok(digest.finalize()?)
+    }
+}
+
+/// An allocation preview bound to one planner state and one exact payload.
+///
+/// The token is intentionally opaque. It can only be produced by [`StreamedResourcePlanner`] and
+/// must be consumed by [`StreamedResourcePlanner::push_previewed`] before any other extent advances
+/// that planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamedResourcePreview {
+    state: StreamedResourcePlannerState,
+    allocation: StreamedResourceAllocation,
+    payload_digest: DigestV1,
+}
+
+impl StreamedResourcePreview {
+    #[must_use]
+    pub const fn allocation(self) -> StreamedResourceAllocation {
+        self.allocation
+    }
+
+    #[must_use]
+    pub const fn payload_digest(self) -> DigestV1 {
+        self.payload_digest
     }
 }
 
 /// Incrementally plans one deterministic streamed-resource sidecar.
 ///
-/// Each successful [`Self::push`] charges the caller-owned load budget for one retained extent and
-/// any new metadata backing before publishing the extent. The returned allocation is therefore
-/// available to the mutation operation that introduced the bytes, while a failed push leaves the
-/// planner unchanged. [`Self::finish`] borrows the retained extents without another allocation.
+/// Each successful [`Self::push_previewed`] charges the caller-owned load budget for one retained
+/// extent and any new metadata backing before publishing the extent. The previewed allocation is
+/// therefore available to the mutation operation that introduced the bytes, while a failed push
+/// leaves the planner unchanged. [`Self::finish`] consumes the planner without another allocation.
 #[derive(Debug)]
 #[must_use = "the planner must be finished or its allocations are discarded"]
 pub struct StreamedResourcePlanner<'payload> {
@@ -247,17 +315,61 @@ impl<'payload> StreamedResourcePlanner<'payload> {
         }
     }
 
-    /// Appends one extent and returns its final placement immediately.
+    /// Computes the next exact placement without changing state or consuming budget.
     ///
-    /// Layout validation, count accounting, byte accounting, and allocation are completed before
-    /// the planner advances. The caller can consequently attach any failure to the operation that
-    /// supplied `extent` without rolling back earlier extents.
-    pub fn push(
+    /// The returned token remains valid only while this planner has not accepted another extent.
+    /// Its payload digest prevents a same-shaped but different payload from being appended after a
+    /// caller has used the previewed offset and size in a read-after-write mutation.
+    pub fn preview_next(
+        &self,
+        extent: &StreamedResourceExtent<'_>,
+    ) -> Result<StreamedResourcePreview, StreamedResourcePlannerError> {
+        let (_, allocation) = self.layout.next(extent)?;
+        Ok(StreamedResourcePreview {
+            state: self.state(),
+            allocation,
+            payload_digest: extent.payload_digest(),
+        })
+    }
+
+    /// Appends the exact extent previously accepted by [`Self::preview_next`].
+    ///
+    /// Preview validation, layout validation, count accounting, byte accounting, and allocation
+    /// are completed before the planner advances. Any failure leaves both planner and budget
+    /// unchanged.
+    pub fn push_previewed(
         &mut self,
+        preview: StreamedResourcePreview,
         extent: StreamedResourceExtent<'payload>,
         budget: &mut AssetLoadBudget,
     ) -> Result<StreamedResourceAllocation, StreamedResourcePlannerError> {
+        let actual_state = self.state();
+        if preview.state != actual_state {
+            return Err(StreamedResourcePlannerError::StalePreview {
+                expected_ordinal: preview.state.extent_count,
+                expected_length: preview.state.length,
+                actual_ordinal: actual_state.extent_count,
+                actual_length: actual_state.length,
+            });
+        }
+        if preview.allocation.size != extent.length
+            || preview.allocation.alignment != extent.alignment
+        {
+            return Err(StreamedResourcePlannerError::PreviewShapeMismatch {
+                expected_size: preview.allocation.size,
+                expected_alignment: preview.allocation.alignment,
+                actual_size: extent.length,
+                actual_alignment: extent.alignment,
+            });
+        }
+        if preview.payload_digest != extent.payload_digest() {
+            return Err(StreamedResourcePlannerError::PreviewPayloadMismatch {
+                expected: preview.payload_digest,
+                actual: extent.payload_digest(),
+            });
+        }
         let (next_layout, allocation) = self.layout.next(&extent)?;
+        debug_assert_eq!(allocation, preview.allocation);
         reserve_extent_slot(&mut self.extents, budget)?;
         self.extents.push(extent);
         self.layout = next_layout;
@@ -284,12 +396,22 @@ impl<'payload> StreamedResourcePlanner<'payload> {
         self.extents.len()
     }
 
-    /// Returns the completed borrowed plan without copying extent metadata.
+    /// Consumes the planner and seals its already-budgeted metadata into a completed plan.
+    ///
+    /// Consuming `self` makes post-seal preview or append attempts unrepresentable. No extent
+    /// metadata is copied or allocated by this transition.
     #[must_use]
-    pub fn finish(&self) -> StreamedResourcePlan<'_, 'payload> {
+    pub fn finish(self) -> StreamedResourcePlan<'payload, 'payload> {
         StreamedResourcePlan {
             flags: self.flags,
-            extents: &self.extents,
+            extents: StreamedResourceExtents::Owned(self.extents),
+            length: self.layout.length(),
+        }
+    }
+
+    const fn state(&self) -> StreamedResourcePlannerState {
+        StreamedResourcePlannerState {
+            extent_count: self.layout.extent_count,
             length: self.layout.length(),
         }
     }
@@ -390,6 +512,8 @@ pub enum StreamedResourcePlanError {
     LengthOverflow { ordinal: usize },
     #[error("streamed-resource extent count cannot be represented after extent {ordinal}")]
     ExtentCountOverflow { ordinal: usize },
+    #[error("failed to digest exact streamed-resource content: {0}")]
+    Digest(#[from] DigestBuildError),
 }
 
 /// Typed failure from an incremental streamed-resource planner operation.
@@ -407,6 +531,37 @@ pub enum StreamedResourcePlannerError {
     AllocationSize(#[from] AllocationSizeError),
     #[error(transparent)]
     Budget(#[from] BudgetError),
+    #[error(
+        "streamed-resource preview for extent {expected_ordinal} at length {expected_length} is stale; planner is at extent {actual_ordinal} and length {actual_length}"
+    )]
+    StalePreview {
+        expected_ordinal: usize,
+        expected_length: u64,
+        actual_ordinal: usize,
+        actual_length: u64,
+    },
+    #[error(
+        "streamed-resource preview expected size {expected_size} and alignment {expected_alignment}, but push supplied size {actual_size} and alignment {actual_alignment}"
+    )]
+    PreviewShapeMismatch {
+        expected_size: u32,
+        expected_alignment: u32,
+        actual_size: u32,
+        actual_alignment: u32,
+    },
+    #[error(
+        "streamed-resource preview expected payload digest {expected}, but push supplied {actual}"
+    )]
+    PreviewPayloadMismatch {
+        expected: DigestV1,
+        actual: DigestV1,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamedResourcePlannerState {
+    extent_count: usize,
+    length: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -536,4 +691,70 @@ fn validate_alignment(alignment: u32) -> Result<(), StreamedResourcePlanError> {
 fn align_up(value: u64, alignment: u32) -> Option<u64> {
     let mask = u64::from(alignment) - 1;
     value.checked_add(mask).map(|value| value & !mask)
+}
+
+fn update_zero_padding(
+    digest: &mut DigestV1Builder,
+    mut remaining: u64,
+) -> Result<(), DigestBuildError> {
+    const ZEROES: [u8; 4 * 1024] = [0; 4 * 1024];
+
+    while remaining != 0 {
+        let chunk_length = remaining.min(ZEROES.len() as u64) as usize;
+        digest.update(&ZEROES[..chunk_length])?;
+        remaining -= chunk_length as u64;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod internal_tests {
+    use super::*;
+
+    #[test]
+    fn layout_rejects_alignment_overflow() {
+        let layout = StreamedResourceLayout {
+            cursor: u64::MAX - 1,
+            extent_count: 7,
+        };
+        let extent = StreamedResourceExtent::generated(b"x", 4).unwrap();
+
+        assert!(matches!(
+            layout.next(&extent),
+            Err(StreamedResourcePlanError::LengthOverflow { ordinal: 7 })
+        ));
+        assert_eq!(layout.length(), u64::MAX - 1);
+    }
+
+    #[test]
+    fn layout_rejects_extent_end_overflow() {
+        let layout = StreamedResourceLayout {
+            cursor: u64::MAX - 1,
+            extent_count: 3,
+        };
+        let extent = StreamedResourceExtent::generated(b"xx", 1).unwrap();
+
+        assert!(matches!(
+            layout.next(&extent),
+            Err(StreamedResourcePlanError::LengthOverflow { ordinal: 3 })
+        ));
+        assert_eq!(layout.length(), u64::MAX - 1);
+    }
+
+    #[test]
+    fn layout_rejects_extent_count_overflow() {
+        let layout = StreamedResourceLayout {
+            cursor: 0,
+            extent_count: usize::MAX,
+        };
+        let extent = StreamedResourceExtent::generated(b"", 1).unwrap();
+
+        assert!(matches!(
+            layout.next(&extent),
+            Err(StreamedResourcePlanError::ExtentCountOverflow {
+                ordinal: usize::MAX
+            })
+        ));
+        assert_eq!(layout.length(), 0);
+    }
 }

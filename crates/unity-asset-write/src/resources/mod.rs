@@ -13,7 +13,7 @@ mod encoder;
 pub use allocation::{
     StreamedResourceAllocation, StreamedResourceAllocationIter, StreamedResourceExtent,
     StreamedResourceFlags, StreamedResourcePlan, StreamedResourcePlanError,
-    StreamedResourcePlanner, StreamedResourcePlannerError,
+    StreamedResourcePlanner, StreamedResourcePlannerError, StreamedResourcePreview,
 };
 pub use encoder::{DeclaredStreamedResource, PreparedStreamedResource, StreamedResourceError};
 
