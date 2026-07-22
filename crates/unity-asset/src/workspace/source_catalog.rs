@@ -4,7 +4,6 @@ use std::io;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use thiserror::Error;
 use unity_asset_core::{
@@ -374,54 +373,36 @@ struct SourceRecord {
     canonical_key: Arc<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PhysicalBindingDomain {
-    Unbound,
-    Direct,
-    Inherited,
-}
-
-impl PhysicalBindingDomain {
-    const fn tag(self) -> u8 {
-        match self {
-            Self::Unbound => 0,
-            Self::Direct => 1,
-            Self::Inherited => 2,
-        }
-    }
-}
-
-fn physical_binding_domain(record: &SourceRecord) -> PhysicalBindingDomain {
-    match (&record.descriptor.placement, &record.physical_origin) {
-        (_, None) => PhysicalBindingDomain::Unbound,
-        (SourcePlacement::Root { .. } | SourcePlacement::Companion { .. }, Some(_)) => {
-            PhysicalBindingDomain::Direct
-        }
-        (SourcePlacement::Member { .. }, Some(_)) => PhysicalBindingDomain::Inherited,
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PhysicalFileIdentity {
+pub(crate) struct PhysicalFileIdentity {
     length: u64,
-    modified: SystemTime,
-    created: Option<SystemTime>,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
-    #[cfg(unix)]
-    change_time_seconds: i64,
-    #[cfg(unix)]
-    change_time_nanoseconds: i64,
-    #[cfg(windows)]
-    creation_time: u64,
-    #[cfg(windows)]
-    file_attributes: u32,
     #[cfg(windows)]
     volume_serial_number: u64,
     #[cfg(windows)]
     file_id: [u8; 16],
+}
+
+impl PhysicalFileIdentity {
+    #[must_use]
+    pub(crate) const fn length(&self) -> u64 {
+        self.length
+    }
+
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) const fn unix_parts(&self) -> (u64, u64) {
+        (self.device, self.inode)
+    }
+
+    #[cfg(windows)]
+    #[must_use]
+    pub(crate) const fn windows_parts(&self) -> (u64, [u8; 16]) {
+        (self.volume_serial_number, self.file_id)
+    }
 }
 
 /// Canonical path observation whose budget charge is committed only after its proof succeeds.
@@ -566,6 +547,11 @@ impl VerifiedPhysicalBinding {
         self.fingerprint
     }
 
+    #[must_use]
+    pub(crate) const fn file_identity(&self) -> &PhysicalFileIdentity {
+        &self.file_identity
+    }
+
     const fn revalidation_bytes(&self) -> u64 {
         self.file_identity.length
     }
@@ -633,6 +619,11 @@ impl VerifiedPhysicalDirectoryBinding {
         &self.path
     }
 
+    #[must_use]
+    pub(crate) const fn identity(&self) -> &PhysicalFileIdentity {
+        &self.identity
+    }
+
     pub(crate) fn revalidate_current_entry(
         &self,
         budget: &mut AssetLoadBudget,
@@ -658,52 +649,6 @@ impl VerifiedPhysicalDirectoryBinding {
         budget.consume_entries(1)?;
         budget.consume_bytes(planned_bytes)?;
         Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct PendingPhysicalVerification {
-    source: SourceId,
-    kind: SourceKind,
-    fingerprint: SourceFingerprint,
-    file_identity: PhysicalFileIdentity,
-}
-
-impl PendingPhysicalVerification {
-    const fn revalidation_bytes(&self) -> u64 {
-        self.file_identity.length
-    }
-
-    fn revalidate(&self, catalog: &SourceCatalog) -> Result<(), CatalogError> {
-        let record = catalog
-            .by_id
-            .get(&self.source)
-            .ok_or(CatalogError::UnknownSource(self.source))?;
-        if record.descriptor.kind != self.kind {
-            return Err(CatalogError::SourceKindMismatch {
-                expected: self.kind,
-                actual: record.descriptor.kind,
-            });
-        }
-        if record.fingerprint != self.fingerprint {
-            return Err(CatalogError::VerifiedFingerprintMismatch {
-                expected: self.fingerprint,
-                actual: record.fingerprint,
-            });
-        }
-        let physical_origin =
-            record
-                .physical_origin
-                .as_deref()
-                .ok_or(CatalogError::UnboundPhysicalOrigin {
-                    source_id: self.source,
-                })?;
-        revalidate_physical_contents(
-            self.kind,
-            physical_origin,
-            self.fingerprint,
-            &self.file_identity,
-        )
     }
 }
 
@@ -789,31 +734,23 @@ fn physical_node_identity(
             path: path.to_path_buf(),
         });
     }
-    let modified = metadata
-        .modified()
-        .map_err(|error| CatalogError::verified_binding_io(path, error))?;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt as _;
     #[cfg(windows)]
-    use std::os::windows::fs::MetadataExt as _;
-    #[cfg(windows)]
     let (volume_serial_number, file_id) = windows_file_identity(file, path)?;
     Ok(PhysicalFileIdentity {
-        length: metadata.len(),
-        modified,
-        created: metadata.created().ok(),
+        // Directory entry timestamps and directory size legitimately change
+        // when the journal creates staging/recovery children. Only a regular
+        // file's length participates in content identity; directory identity
+        // is the stable node id below.
+        length: match expected_kind {
+            PhysicalNodeKind::File => metadata.len(),
+            PhysicalNodeKind::Directory => 0,
+        },
         #[cfg(unix)]
         device: metadata.dev(),
         #[cfg(unix)]
         inode: metadata.ino(),
-        #[cfg(unix)]
-        change_time_seconds: metadata.ctime(),
-        #[cfg(unix)]
-        change_time_nanoseconds: metadata.ctime_nsec(),
-        #[cfg(windows)]
-        creation_time: metadata.creation_time(),
-        #[cfg(windows)]
-        file_attributes: metadata.file_attributes(),
         #[cfg(windows)]
         volume_serial_number,
         #[cfg(windows)]
@@ -1392,7 +1329,6 @@ impl SourceCatalog {
 
         Ok(SourceCatalogTransaction {
             candidate,
-            pending_verifications: Vec::new(),
             failed: false,
             #[cfg(test)]
             last_physical_domain_owner_resolutions: 0,
@@ -1562,7 +1498,7 @@ impl SourceCatalog {
         &self,
         mut fingerprint_override: impl FnMut(SourceId) -> Option<SourceFingerprint>,
     ) -> Result<WorkspaceRevision, CatalogError> {
-        const PREFIX: &[u8] = b"unity-asset:source-catalog:v5\0";
+        const PREFIX: &[u8] = b"unity-asset:source-catalog:v6\0";
 
         let mut logical_length = checked_len(PREFIX.len())?;
         logical_length = checked_add(logical_length, 16)?;
@@ -1577,21 +1513,6 @@ impl SourceCatalog {
                 DigestV1Builder::framed_len(&record.canonical_key)?,
             )?;
             logical_length = checked_add(logical_length, DigestV1::BYTE_LEN as u64)?;
-            logical_length = checked_add(logical_length, 1)?;
-            if physical_binding_domain(record) == PhysicalBindingDomain::Direct {
-                let physical_origin = record.physical_origin.as_deref().ok_or(
-                    CatalogError::InvariantRecordMismatch {
-                        source_id: *source,
-                        field: "direct physical binding",
-                    },
-                )?;
-                logical_length = checked_add(
-                    logical_length,
-                    DigestV1Builder::framed_len(
-                        physical_origin.path().as_os_str().as_encoded_bytes(),
-                    )?,
-                )?;
-            }
         }
 
         let mut digest = DigestV1Builder::new(logical_length);
@@ -1609,17 +1530,6 @@ impl SourceCatalog {
                 });
             }
             digest.update(fingerprint.digest().as_bytes())?;
-            let binding_domain = physical_binding_domain(record);
-            digest.update(&[binding_domain.tag()])?;
-            if binding_domain == PhysicalBindingDomain::Direct {
-                let physical_origin = record.physical_origin.as_deref().ok_or(
-                    CatalogError::InvariantRecordMismatch {
-                        source_id: *source,
-                        field: "direct physical binding",
-                    },
-                )?;
-                digest.update_framed(physical_origin.path().as_os_str().as_encoded_bytes())?;
-            }
         }
         Ok(WorkspaceRevision::new(digest.finalize()?))
     }
@@ -2217,285 +2127,6 @@ impl SourceCatalog {
         }
     }
 
-    fn replace_fingerprint(
-        &mut self,
-        source: SourceId,
-        fingerprint: SourceFingerprint,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<(), CatalogError> {
-        if !self.validate_fingerprint_replacement(source, fingerprint)? {
-            return Ok(());
-        }
-        let record = self
-            .by_id
-            .get(&source)
-            .ok_or(CatalogError::UnknownSource(source))?;
-
-        let retained_bytes = checked_record_clone_bytes(&record.descriptor)?;
-        budget.check_bytes(retained_bytes)?;
-        budget.consume_bytes(retained_bytes)?;
-        let replacement = Arc::new(SourceRecord {
-            descriptor: record.descriptor.clone(),
-            fingerprint,
-            source_locator: Arc::clone(&record.source_locator),
-            physical_origin: record.physical_origin.clone(),
-            canonical_key: Arc::clone(&record.canonical_key),
-        });
-        self.by_id.insert(source, replacement);
-        Ok(())
-    }
-
-    fn validate_fingerprint_replacement(
-        &self,
-        source: SourceId,
-        fingerprint: SourceFingerprint,
-    ) -> Result<bool, CatalogError> {
-        self.ensure_workspace(source)?;
-        let record = self
-            .by_id
-            .get(&source)
-            .ok_or(CatalogError::UnknownSource(source))?;
-        if fingerprint.kind() != record.descriptor.kind {
-            return Err(CatalogError::SourceKindMismatch {
-                expected: record.descriptor.kind,
-                actual: fingerprint.kind(),
-            });
-        }
-        if fingerprint == record.fingerprint {
-            return Ok(false);
-        }
-        self.ensure_fingerprint_replacement_allowed(source, fingerprint)?;
-        Ok(true)
-    }
-
-    fn replace_verified_binding(
-        &mut self,
-        source: SourceId,
-        binding: VerifiedPhysicalBinding,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<PendingPhysicalVerification, CatalogError> {
-        self.ensure_workspace(source)?;
-        let record = self
-            .by_id
-            .get(&source)
-            .ok_or(CatalogError::UnknownSource(source))?;
-        if !record.descriptor.has_independent_physical_origin() {
-            return Err(CatalogError::PhysicalOriginBindingUnsupported {
-                source_id: source,
-                location: record.descriptor.location_kind(),
-            });
-        }
-        if binding.kind != record.descriptor.kind {
-            return Err(CatalogError::SourceKindMismatch {
-                expected: record.descriptor.kind,
-                actual: binding.kind,
-            });
-        }
-        if binding.fingerprint.kind() != binding.kind {
-            return Err(CatalogError::SourceKindMismatch {
-                expected: binding.kind,
-                actual: binding.fingerprint.kind(),
-            });
-        }
-        self.ensure_fingerprint_replacement_allowed(source, binding.fingerprint)?;
-        self.ensure_physical_available(source, &binding.physical_origin)?;
-        let is_noop = record.physical_origin.as_deref() == Some(&binding.physical_origin)
-            && record.fingerprint == binding.fingerprint;
-        let planned_bytes = self.checked_verified_binding_operation_bytes(source, &binding)?;
-        let replacement_bytes = planned_bytes
-            .checked_sub(binding.revalidation_bytes())
-            .ok_or(CatalogError::AllocationSizeOverflow {
-                resource: "source catalog verified binding replacement",
-            })?;
-        budget.check_bytes(planned_bytes)?;
-        binding.revalidate_current_contents(budget)?;
-        let verification = PendingPhysicalVerification {
-            source,
-            kind: binding.kind,
-            fingerprint: binding.fingerprint,
-            file_identity: binding.file_identity.clone(),
-        };
-        if is_noop {
-            budget.consume_bytes(replacement_bytes)?;
-            return Ok(verification);
-        }
-
-        let old_physical_origin = record.physical_origin.clone();
-        let affected_count = self.by_id.keys().try_fold(0_usize, |count, candidate| {
-            self.is_in_physical_binding_domain(*candidate, source)
-                .and_then(|affected| {
-                    count.checked_add(usize::from(affected)).ok_or(
-                        CatalogError::AllocationSizeOverflow {
-                            resource: "source catalog verified binding replacements",
-                        },
-                    )
-                })
-        })?;
-        if old_physical_origin.is_none() {
-            self.physical_bindings.try_reserve(1).map_err(|error| {
-                CatalogError::AllocationFailed {
-                    resource: "source catalog physical-binding index",
-                    requested: 1,
-                    unit: CatalogAllocationUnit::Slots,
-                    message: error.to_string(),
-                }
-            })?;
-        }
-        let mut replacements = Vec::new();
-        replacements
-            .try_reserve_exact(affected_count)
-            .map_err(|error| CatalogError::AllocationFailed {
-                resource: "source catalog verified binding replacements",
-                requested: affected_count,
-                unit: CatalogAllocationUnit::Elements,
-                message: error.to_string(),
-            })?;
-
-        let rebound_origin = Arc::new(binding.physical_origin);
-        for (record_source, affected) in &self.by_id {
-            if !self.is_in_physical_binding_domain(*record_source, source)? {
-                continue;
-            }
-            let descriptor = if *record_source == source {
-                rebound_descriptor(source, &affected.descriptor, rebound_origin.as_ref())?
-            } else {
-                affected.descriptor.clone()
-            };
-            replacements.push((
-                *record_source,
-                Arc::new(SourceRecord {
-                    descriptor,
-                    fingerprint: if *record_source == source {
-                        binding.fingerprint
-                    } else {
-                        affected.fingerprint
-                    },
-                    source_locator: Arc::clone(&affected.source_locator),
-                    physical_origin: Some(Arc::clone(&rebound_origin)),
-                    canonical_key: Arc::clone(&affected.canonical_key),
-                }),
-            ));
-        }
-
-        budget.consume_bytes(replacement_bytes)?;
-        if let Some(old_physical_origin) = old_physical_origin {
-            self.physical_bindings.remove(&old_physical_origin);
-        }
-        self.physical_bindings
-            .insert(Arc::clone(&rebound_origin), source);
-        for (record_source, replacement) in replacements {
-            self.by_id.insert(record_source, replacement);
-        }
-        Ok(verification)
-    }
-
-    fn checked_verified_binding_operation_bytes(
-        &self,
-        source: SourceId,
-        binding: &VerifiedPhysicalBinding,
-    ) -> Result<u64, CatalogError> {
-        let record = self
-            .by_id
-            .get(&source)
-            .ok_or(CatalogError::UnknownSource(source))?;
-        let replacement_bytes = if record.physical_origin.as_deref()
-            == Some(&binding.physical_origin)
-            && record.fingerprint == binding.fingerprint
-        {
-            0
-        } else {
-            self.checked_verified_binding_replacement_bytes(source, binding)?
-        };
-        checked_byte_add(binding.revalidation_bytes(), replacement_bytes)
-    }
-
-    fn checked_verified_binding_replacement_bytes(
-        &self,
-        source: SourceId,
-        binding: &VerifiedPhysicalBinding,
-    ) -> Result<u64, CatalogError> {
-        let record = self
-            .by_id
-            .get(&source)
-            .ok_or(CatalogError::UnknownSource(source))?;
-        let affected_count = self.by_id.keys().try_fold(0_usize, |count, candidate| {
-            self.is_in_physical_binding_domain(*candidate, source)
-                .and_then(|affected| {
-                    count.checked_add(usize::from(affected)).ok_or(
-                        CatalogError::AllocationSizeOverflow {
-                            resource: "source catalog verified binding replacements",
-                        },
-                    )
-                })
-        })?;
-        let mut retained_bytes = checked_vec_exact_bytes::<(SourceId, Arc<SourceRecord>)>(
-            affected_count,
-            "source catalog verified binding replacements",
-        )?;
-        retained_bytes = checked_byte_add(
-            retained_bytes,
-            checked_arc_allocation_bytes::<PhysicalOrigin>()?,
-        )?;
-        if record.physical_origin.is_none() {
-            retained_bytes = checked_byte_add(
-                retained_bytes,
-                checked_hash_map_growth_bytes(
-                    &self.physical_bindings,
-                    1,
-                    "source catalog physical-binding index",
-                )?,
-            )?;
-        }
-        for (record_source, affected) in &self.by_id {
-            if !self.is_in_physical_binding_domain(*record_source, source)? {
-                continue;
-            }
-            retained_bytes = checked_byte_add(
-                retained_bytes,
-                checked_arc_allocation_bytes::<SourceRecord>()?,
-            )?;
-            retained_bytes = checked_byte_add(
-                retained_bytes,
-                if *record_source == source {
-                    checked_rebound_descriptor_bytes(
-                        source,
-                        &affected.descriptor,
-                        &binding.physical_origin,
-                    )?
-                } else {
-                    checked_descriptor_clone_bytes(&affected.descriptor)?
-                },
-            )?;
-        }
-        Ok(retained_bytes)
-    }
-
-    fn is_in_physical_binding_domain(
-        &self,
-        candidate: SourceId,
-        owner: SourceId,
-    ) -> Result<bool, CatalogError> {
-        let mut current = candidate;
-        for _ in 0..=self.by_id.len() {
-            if current == owner {
-                return Ok(true);
-            }
-            let record = self
-                .by_id
-                .get(&current)
-                .ok_or(CatalogError::UnknownSource(current))?;
-            match &record.descriptor.placement {
-                SourcePlacement::Member { parent, .. } => current = *parent,
-                SourcePlacement::Root { .. } | SourcePlacement::Companion { .. } => {
-                    return Ok(false);
-                }
-            }
-        }
-        Err(CatalogError::InvariantOwnershipCycle {
-            source_id: candidate,
-        })
-    }
-
     /// Freezes every physical domain affected by an ordered replacement set in two catalog scans.
     pub(crate) fn prepare_physical_domain_rewrite_batch<'change>(
         &self,
@@ -2796,32 +2427,6 @@ impl SourceCatalog {
         Ok(owner_resolutions)
     }
 
-    fn ensure_fingerprint_replacement_allowed(
-        &self,
-        source: SourceId,
-        fingerprint: SourceFingerprint,
-    ) -> Result<(), CatalogError> {
-        let record = self
-            .by_id
-            .get(&source)
-            .ok_or(CatalogError::UnknownSource(source))?;
-        if fingerprint == record.fingerprint {
-            return Ok(());
-        }
-        if matches!(&record.descriptor.placement, SourcePlacement::Member { .. }) {
-            return Err(CatalogError::InheritedSourceReplacementRequired {
-                source_id: source,
-                physical_owner: self.physical_domain_owner(source)?,
-            });
-        }
-        for candidate in self.by_id.keys().copied() {
-            if candidate != source && self.is_in_physical_binding_domain(candidate, source)? {
-                return Err(CatalogError::SubtreeReplacementRequired { source_id: source });
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn physical_domain_owner(&self, source: SourceId) -> Result<SourceId, CatalogError> {
         self.ensure_workspace(source)?;
         let mut current = source;
@@ -2870,7 +2475,6 @@ impl SourceCatalog {
 /// Fallible candidate catalog. Once an operation fails, the candidate cannot be committed.
 pub(crate) struct SourceCatalogTransaction {
     candidate: SourceCatalog,
-    pending_verifications: Vec<PendingPhysicalVerification>,
     failed: bool,
     #[cfg(test)]
     last_physical_domain_owner_resolutions: usize,
@@ -2915,42 +2519,6 @@ impl SourceCatalogTransaction {
         self.register(descriptor, fingerprint, budget)
     }
 
-    pub(crate) fn replace_fingerprint(
-        &mut self,
-        source: SourceId,
-        fingerprint: SourceFingerprint,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<(), CatalogError> {
-        self.ensure_active()?;
-        if let Err(error) = self
-            .candidate
-            .validate_fingerprint_replacement(source, fingerprint)
-        {
-            self.failed = true;
-            return Err(error);
-        }
-        if let Some(verification) = self.pending_verifications.iter().find(|verification| {
-            verification.source == source && verification.fingerprint != fingerprint
-        }) {
-            self.failed = true;
-            return Err(CatalogError::PendingPhysicalVerificationSuperseded {
-                source_id: source,
-                verified: verification.fingerprint,
-                replacement: fingerprint,
-            });
-        }
-        match self
-            .candidate
-            .replace_fingerprint(source, fingerprint, budget)
-        {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.failed = true;
-                Err(error)
-            }
-        }
-    }
-
     /// Applies a complete multi-domain CAS batch without rescanning once per owner.
     pub(crate) fn rewrite_physical_domains(
         &mut self,
@@ -2958,24 +2526,6 @@ impl SourceCatalogTransaction {
         budget: &mut AssetLoadBudget,
     ) -> Result<(), CatalogError> {
         self.ensure_active()?;
-        if let Some((verification, replacement)) =
-            self.pending_verifications.iter().find_map(|verification| {
-                batch
-                    .changes
-                    .binary_search_by_key(&verification.source, PhysicalDomainChange::source)
-                    .ok()
-                    .map(|index| (verification, batch.changes[index].replacement()))
-                    .filter(|(verification, replacement)| verification.fingerprint != *replacement)
-            })
-        {
-            self.failed = true;
-            return Err(CatalogError::PendingPhysicalVerificationSuperseded {
-                source_id: verification.source,
-                verified: verification.fingerprint,
-                replacement,
-            });
-        }
-
         match self
             .candidate
             .apply_physical_domain_rewrite_batch(batch, budget)
@@ -2995,61 +2545,19 @@ impl SourceCatalogTransaction {
         }
     }
 
-    pub(crate) fn replace_verified_binding(
+    /// Builds and applies a complete physical-domain rewrite against the
+    /// transaction candidate, including sources registered earlier in the
+    /// same recovery delta.
+    pub(crate) fn rewrite_physical_domains_from_changes(
         &mut self,
-        source: SourceId,
-        binding: VerifiedPhysicalBinding,
+        changes: &[PhysicalDomainChange],
         budget: &mut AssetLoadBudget,
     ) -> Result<(), CatalogError> {
         self.ensure_active()?;
-        let result = (|| {
-            let existing = self
-                .pending_verifications
-                .iter()
-                .position(|verification| verification.source == source);
-            let storage_bytes = if existing.is_none()
-                && self.pending_verifications.len() == self.pending_verifications.capacity()
-            {
-                checked_vec_growth_bytes::<PendingPhysicalVerification>(
-                    self.pending_verifications.len(),
-                    1,
-                )?
-            } else {
-                0
-            };
-            let apply_bytes = self
-                .candidate
-                .checked_verified_binding_operation_bytes(source, &binding)?;
-            let planned_bytes = checked_byte_add(apply_bytes, storage_bytes)?;
-            budget.check_bytes(planned_bytes)?;
-
-            let verification = self
-                .candidate
-                .replace_verified_binding(source, binding, budget)?;
-            if storage_bytes != 0 {
-                self.pending_verifications
-                    .try_reserve_exact(1)
-                    .map_err(|error| CatalogError::AllocationFailed {
-                        resource: "source catalog pending physical verification",
-                        requested: 1,
-                        unit: CatalogAllocationUnit::Elements,
-                        message: error.to_string(),
-                    })?;
-                budget.consume_bytes(storage_bytes)?;
-            }
-            match existing {
-                Some(index) => self.pending_verifications[index] = verification,
-                None => self.pending_verifications.push(verification),
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.failed = true;
-                Err(error)
-            }
-        }
+        let batch = self
+            .candidate
+            .prepare_physical_domain_rewrite_batch(changes, budget)?;
+        self.rewrite_physical_domains(batch, budget)
     }
 
     pub(crate) fn remove_subtree(
@@ -3059,11 +2567,7 @@ impl SourceCatalogTransaction {
     ) -> Result<Vec<SourceId>, CatalogError> {
         self.ensure_active()?;
         match self.candidate.remove_subtree(root, budget) {
-            Ok(removed) => {
-                self.pending_verifications
-                    .retain(|verification| self.candidate.contains(verification.source));
-                Ok(removed)
-            }
+            Ok(removed) => Ok(removed),
             Err(error) => {
                 self.failed = true;
                 Err(error)
@@ -3083,9 +2587,6 @@ impl SourceCatalogTransaction {
             self.failed = true;
             return Err(error);
         }
-        self.pending_verifications
-            .retain(|verification| self.candidate.contains(verification.source));
-
         let mut inserted = Vec::new();
         for (descriptor, fingerprint) in replacements {
             match self
@@ -3104,53 +2605,13 @@ impl SourceCatalogTransaction {
 
     pub(crate) fn commit(
         self,
-        budget: &mut AssetLoadBudget,
+        _budget: &mut AssetLoadBudget,
     ) -> Result<SourceCatalog, CatalogError> {
         if self.failed {
             return Err(CatalogError::TransactionAborted);
         }
         self.candidate.validate()?;
-        let revalidation_bytes = self.checked_commit_revalidation_bytes()?;
-        budget.check_bytes(revalidation_bytes)?;
-        for verification in &self.pending_verifications {
-            verification.revalidate(&self.candidate)?;
-        }
-        budget.consume_bytes(revalidation_bytes)?;
         Ok(self.candidate)
-    }
-
-    fn checked_commit_revalidation_bytes(&self) -> Result<u64, CatalogError> {
-        self.pending_verifications
-            .iter()
-            .try_fold(0_u64, |total, verification| {
-                checked_byte_add(total, verification.revalidation_bytes())
-            })
-    }
-
-    #[cfg(test)]
-    fn checked_verified_binding_apply_bytes(
-        &self,
-        source: SourceId,
-        binding: &VerifiedPhysicalBinding,
-    ) -> Result<u64, CatalogError> {
-        let storage_bytes = if self
-            .pending_verifications
-            .iter()
-            .any(|verification| verification.source == source)
-            || self.pending_verifications.len() < self.pending_verifications.capacity()
-        {
-            0
-        } else {
-            checked_vec_growth_bytes::<PendingPhysicalVerification>(
-                self.pending_verifications.len(),
-                1,
-            )?
-        };
-        checked_byte_add(
-            self.candidate
-                .checked_verified_binding_operation_bytes(source, binding)?,
-            storage_bytes,
-        )
     }
 
     fn ensure_active(&self) -> Result<(), CatalogError> {
@@ -3305,15 +2766,6 @@ pub(crate) enum CatalogError {
     },
     #[error("source {source_id:?} is already bound to a different physical origin")]
     PhysicalOriginChanged { source_id: SourceId },
-    #[error("source {source_id:?} has member descendants and requires atomic subtree replacement")]
-    SubtreeReplacementRequired { source_id: SourceId },
-    #[error(
-        "source {source_id:?} inherits physical contents from {physical_owner:?} and must be replaced through that owner's subtree"
-    )]
-    InheritedSourceReplacementRequired {
-        source_id: SourceId,
-        physical_owner: SourceId,
-    },
     #[error(
         "physical domain {collection} sources must be strictly ordered: {previous:?} precedes {current:?}"
     )]
@@ -3346,19 +2798,6 @@ pub(crate) enum CatalogError {
     PhysicalDomainChangeOutsideDomain {
         source_id: SourceId,
         physical_owner: SourceId,
-    },
-    #[error(
-        "source {source_id:?} has a pending proof for {verified:?} that cannot be superseded by {replacement:?}"
-    )]
-    PendingPhysicalVerificationSuperseded {
-        source_id: SourceId,
-        verified: SourceFingerprint,
-        replacement: SourceFingerprint,
-    },
-    #[error("source {source_id:?} at {location:?} cannot own an independent physical origin")]
-    PhysicalOriginBindingUnsupported {
-        source_id: SourceId,
-        location: SourceLocationKind,
     },
     #[error("source {source_id:?} does not yet have a physical origin")]
     UnboundPhysicalOrigin { source_id: SourceId },
@@ -3476,53 +2915,6 @@ fn checked_descriptor_clone_bytes(descriptor: &SourceDescriptor) -> Result<u64, 
             checked_usize_to_u64(step.member().retained_clone_bytes())
         }
     }
-}
-
-fn checked_rebound_descriptor_bytes(
-    source: SourceId,
-    descriptor: &SourceDescriptor,
-    physical_origin: &PhysicalOrigin,
-) -> Result<u64, CatalogError> {
-    match &descriptor.placement {
-        SourcePlacement::Root { alias, .. } => checked_byte_add(
-            checked_usize_to_u64(alias.retained_clone_bytes())?,
-            checked_usize_to_u64(physical_origin.path().as_os_str().len())?,
-        ),
-        SourcePlacement::Companion { step, .. } => {
-            checked_usize_to_u64(step.member().retained_clone_bytes())
-        }
-        SourcePlacement::Member { .. } => Err(CatalogError::PhysicalOriginBindingUnsupported {
-            source_id: source,
-            location: descriptor.location_kind(),
-        }),
-    }
-}
-
-fn rebound_descriptor(
-    source: SourceId,
-    descriptor: &SourceDescriptor,
-    physical_origin: &PhysicalOrigin,
-) -> Result<SourceDescriptor, CatalogError> {
-    let placement = match &descriptor.placement {
-        SourcePlacement::Root { alias, .. } => SourcePlacement::Root {
-            alias: alias.clone(),
-            physical_origin: physical_origin.clone(),
-        },
-        SourcePlacement::Companion { parent, step } => SourcePlacement::Companion {
-            parent: *parent,
-            step: step.clone(),
-        },
-        SourcePlacement::Member { .. } => {
-            return Err(CatalogError::PhysicalOriginBindingUnsupported {
-                source_id: source,
-                location: descriptor.location_kind(),
-            });
-        }
-    };
-    Ok(SourceDescriptor {
-        kind: descriptor.kind,
-        placement,
-    })
 }
 
 fn checked_vec_exact_bytes<T>(count: usize, resource: &'static str) -> Result<u64, CatalogError> {
@@ -4417,7 +3809,7 @@ mod tests {
     }
 
     #[test]
-    fn revision_includes_root_physical_binding_without_changing_logical_identity() {
+    fn revision_excludes_root_physical_binding_from_logical_identity() {
         let directory = tempfile::tempdir().unwrap();
         let first_path = directory.path().join("first.assets");
         let second_path = directory.path().join("second.assets");
@@ -4454,7 +3846,7 @@ mod tests {
             first.source_locator(first_source).unwrap(),
             second.source_locator(second_source).unwrap()
         );
-        assert_ne!(first.revision().unwrap(), second.revision().unwrap());
+        assert_eq!(first.revision().unwrap(), second.revision().unwrap());
     }
 
     #[test]
@@ -4629,26 +4021,30 @@ mod tests {
     }
 
     #[test]
+    fn verified_directory_binding_ignores_child_entry_metadata_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let binding = VerifiedPhysicalDirectoryBinding::verify_existing(
+            directory.path(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+        let recovery = directory.path().join(".unity-asset-recovery");
+        fs::create_dir(&recovery).unwrap();
+        fs::write(recovery.join("journal"), b"durable evidence").unwrap();
+
+        binding
+            .revalidate_current_entry(&mut AssetLoadBudget::default())
+            .unwrap();
+    }
+
+    #[test]
     fn verified_binding_revalidation_is_exact_budgeted_even_for_noop() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("main.assets");
         let contents = b"stable asset bytes";
         fs::write(&path, contents).unwrap();
-        let origin = PhysicalOrigin::from_existing_path(&path).unwrap();
         let source_fingerprint = fingerprint(SourceKind::SerializedFile, contents);
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let source = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::SerializedFile,
-                    SourceAlias::new("main.assets").unwrap(),
-                    origin.clone(),
-                ),
-                source_fingerprint,
-            )
-            .unwrap();
-        let original_revision = catalog.revision().unwrap();
 
         let mut verification_budget = AssetLoadBudget::default();
         let binding = VerifiedPhysicalBinding::verify_existing(
@@ -4658,490 +4054,23 @@ mod tests {
             &mut verification_budget,
         )
         .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut rejected = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let apply_bytes = rejected
-            .checked_verified_binding_apply_bytes(source, &binding)
-            .unwrap();
-        let planned = checked_byte_add(apply_bytes, binding.revalidation_bytes()).unwrap();
-        assert!(planned >= contents.len() as u64 * 2);
+        let planned = binding.revalidation_bytes();
+        assert_eq!(planned, contents.len() as u64);
         let mut one_short = budget_with(planned - 1, 1);
-        rejected
-            .replace_verified_binding(source, binding, &mut one_short)
-            .unwrap();
-        assert_eq!(one_short.usage().bytes, apply_bytes);
         assert!(matches!(
-            rejected.commit(&mut one_short),
-            Err(CatalogError::Budget(BudgetError::Exceeded {
-                resource: "bytes",
-                ..
-            }))
-        ));
-        assert_eq!(one_short.usage().bytes, apply_bytes);
-        assert_eq!(catalog.revision().unwrap(), original_revision);
-
-        let mut verification_budget = AssetLoadBudget::default();
-        let binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::SerializedFile,
-            &path,
-            source_fingerprint,
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut exact = budget_with(planned, 1);
-        transaction
-            .replace_verified_binding(source, binding, &mut exact)
-            .unwrap();
-        let candidate = transaction.commit(&mut exact).unwrap();
-
-        assert_eq!(exact.usage().bytes, planned);
-        assert_eq!(candidate.revision().unwrap(), original_revision);
-        assert_eq!(candidate.physical_origin(source).unwrap(), &origin);
-        assert_eq!(candidate.find_physical(&origin), Some(source));
-    }
-
-    #[test]
-    fn domain_rewrite_cannot_silently_supersede_a_pending_physical_proof() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("main.assets");
-        let contents = b"verified base asset";
-        fs::write(&path, contents).unwrap();
-        let source_fingerprint = fingerprint(SourceKind::SerializedFile, contents);
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let source = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::SerializedFile,
-                    SourceAlias::new("main.assets").unwrap(),
-                    PhysicalOrigin::from_existing_path(&path).unwrap(),
-                ),
-                source_fingerprint,
-            )
-            .unwrap();
-        let replacement = fingerprint(SourceKind::SerializedFile, b"prepared output");
-        let changed = [PhysicalDomainChange::new(source, replacement)];
-        let rewrite = catalog
-            .prepare_physical_domain_rewrite_batch(&changed, &mut AssetLoadBudget::default())
-            .unwrap();
-        let binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::SerializedFile,
-            &path,
-            source_fingerprint,
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
-        let mut transaction = catalog
-            .begin_transaction(&mut AssetLoadBudget::default())
-            .unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        transaction
-            .replace_verified_binding(source, binding, &mut operation_budget)
-            .unwrap();
-        let usage_before_rewrite = operation_budget.usage();
-        let revision_before_rewrite = transaction.candidate.revision().unwrap();
-        assert!(matches!(
-            transaction.rewrite_physical_domains(rewrite, &mut operation_budget),
-            Err(CatalogError::PendingPhysicalVerificationSuperseded {
-                source_id,
-                verified,
-                replacement: actual_replacement,
-            }) if source_id == source
-                && verified == source_fingerprint
-                && actual_replacement == replacement
-        ));
-        assert_eq!(operation_budget.usage(), usage_before_rewrite);
-        assert_eq!(
-            transaction.candidate.revision().unwrap(),
-            revision_before_rewrite
-        );
-        assert!(matches!(
-            transaction.commit(&mut operation_budget),
-            Err(CatalogError::TransactionAborted)
-        ));
-    }
-
-    #[test]
-    fn fingerprint_rewrite_cannot_silently_discard_a_pending_physical_proof() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("main.assets");
-        let contents = b"verified base asset";
-        fs::write(&path, contents).unwrap();
-        let source_fingerprint = fingerprint(SourceKind::SerializedFile, contents);
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let source = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::SerializedFile,
-                    SourceAlias::new("main.assets").unwrap(),
-                    PhysicalOrigin::from_existing_path(&path).unwrap(),
-                ),
-                source_fingerprint,
-            )
-            .unwrap();
-        let binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::SerializedFile,
-            &path,
-            source_fingerprint,
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
-        let mut transaction = catalog
-            .begin_transaction(&mut AssetLoadBudget::default())
-            .unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        transaction
-            .replace_verified_binding(source, binding, &mut operation_budget)
-            .unwrap();
-        let usage_before_rewrite = operation_budget.usage();
-        let revision_before_rewrite = transaction.candidate.revision().unwrap();
-        let replacement = fingerprint(SourceKind::SerializedFile, b"prepared output");
-
-        assert!(matches!(
-            transaction.replace_fingerprint(source, replacement, &mut operation_budget),
-            Err(CatalogError::PendingPhysicalVerificationSuperseded {
-                source_id,
-                verified,
-                replacement: actual_replacement,
-            }) if source_id == source
-                && verified == source_fingerprint
-                && actual_replacement == replacement
-        ));
-        assert_eq!(operation_budget.usage(), usage_before_rewrite);
-        assert_eq!(
-            transaction.candidate.revision().unwrap(),
-            revision_before_rewrite
-        );
-        assert!(matches!(
-            transaction.commit(&mut operation_budget),
-            Err(CatalogError::TransactionAborted)
-        ));
-    }
-
-    #[test]
-    fn verified_binding_commit_charges_only_the_final_superseding_proof() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("main.assets");
-        let contents = b"stable asset bytes";
-        fs::write(&path, contents).unwrap();
-        let origin = PhysicalOrigin::from_existing_path(&path).unwrap();
-        let source_fingerprint = fingerprint(SourceKind::SerializedFile, contents);
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let source = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::SerializedFile,
-                    SourceAlias::new("main.assets").unwrap(),
-                    origin,
-                ),
-                source_fingerprint,
-            )
-            .unwrap();
-        let mut first_verification_budget = AssetLoadBudget::default();
-        let first = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::SerializedFile,
-            &path,
-            source_fingerprint,
-            &mut first_verification_budget,
-        )
-        .unwrap();
-        let mut second_verification_budget = AssetLoadBudget::default();
-        let second = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::SerializedFile,
-            &path,
-            source_fingerprint,
-            &mut second_verification_budget,
-        )
-        .unwrap();
-
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        transaction
-            .replace_verified_binding(source, first, &mut operation_budget)
-            .unwrap();
-        let after_first_apply = operation_budget.usage().bytes;
-        transaction
-            .replace_verified_binding(source, second, &mut operation_budget)
-            .unwrap();
-        let after_second_apply = operation_budget.usage().bytes;
-        assert_eq!(
-            after_second_apply - after_first_apply,
-            contents.len() as u64
-        );
-
-        let candidate = transaction.commit(&mut operation_budget).unwrap();
-        assert_eq!(
-            operation_budget.usage().bytes - after_second_apply,
-            contents.len() as u64
-        );
-        assert_eq!(candidate.fingerprint(source).unwrap(), source_fingerprint);
-    }
-
-    #[test]
-    fn removed_or_aborted_proofs_do_not_charge_future_commit_work() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("main.assets");
-        let contents = b"stable asset bytes";
-        fs::write(&path, contents).unwrap();
-        let origin = PhysicalOrigin::from_existing_path(&path).unwrap();
-        let source_fingerprint = fingerprint(SourceKind::SerializedFile, contents);
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let source = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::SerializedFile,
-                    SourceAlias::new("main.assets").unwrap(),
-                    origin,
-                ),
-                source_fingerprint,
-            )
-            .unwrap();
-
-        let mut verification_budget = AssetLoadBudget::default();
-        let binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::SerializedFile,
-            &path,
-            source_fingerprint,
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut removed = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        removed
-            .replace_verified_binding(source, binding, &mut operation_budget)
-            .unwrap();
-        removed
-            .remove_subtree(source, &mut operation_budget)
-            .unwrap();
-        let before_removed_commit = operation_budget.usage().bytes;
-        let candidate = removed.commit(&mut operation_budget).unwrap();
-        assert_eq!(operation_budget.usage().bytes, before_removed_commit);
-        assert!(candidate.is_empty());
-
-        let mut verification_budget = AssetLoadBudget::default();
-        let binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::SerializedFile,
-            &path,
-            source_fingerprint,
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut aborted = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        aborted
-            .replace_verified_binding(source, binding, &mut operation_budget)
-            .unwrap();
-        assert!(matches!(
-            aborted.replace_fingerprint(
-                source,
-                fingerprint(SourceKind::Yaml, b"wrong kind"),
-                &mut operation_budget,
-            ),
-            Err(CatalogError::SourceKindMismatch { .. })
-        ));
-        let before_aborted_commit = operation_budget.usage().bytes;
-        assert!(matches!(
-            aborted.commit(&mut operation_budget),
-            Err(CatalogError::TransactionAborted)
-        ));
-        assert_eq!(operation_budget.usage().bytes, before_aborted_commit);
-    }
-
-    #[test]
-    fn verified_binding_commit_rejects_contents_changed_after_apply() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("main.assets");
-        fs::write(&path, b"before").unwrap();
-        let origin = PhysicalOrigin::from_existing_path(&path).unwrap();
-        let source_fingerprint = fingerprint(SourceKind::SerializedFile, b"before");
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let source = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::SerializedFile,
-                    SourceAlias::new("main.assets").unwrap(),
-                    origin,
-                ),
-                source_fingerprint,
-            )
-            .unwrap();
-        let binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::SerializedFile,
-            &path,
-            source_fingerprint,
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
-        let mut transaction = catalog
-            .begin_transaction(&mut AssetLoadBudget::default())
-            .unwrap();
-        transaction
-            .replace_verified_binding(source, binding, &mut AssetLoadBudget::default())
-            .unwrap();
-
-        fs::write(&path, b"change").unwrap();
-        let mut commit_budget = AssetLoadBudget::default();
-        assert!(matches!(
-            transaction.commit(&mut commit_budget),
-            Err(CatalogError::VerifiedPhysicalBindingChanged { .. }
-                | CatalogError::VerifiedFingerprintMismatch { .. })
-        ));
-        assert_eq!(commit_budget.usage().bytes, 0);
-    }
-
-    #[test]
-    fn verified_binding_commit_rejects_byte_identical_path_replacement() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("main.assets");
-        let replacement = directory.path().join("replacement.assets");
-        fs::write(&path, b"same bytes").unwrap();
-        fs::write(&replacement, b"same bytes").unwrap();
-        let origin = PhysicalOrigin::from_existing_path(&path).unwrap();
-        let source_fingerprint = fingerprint(SourceKind::SerializedFile, b"same bytes");
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let source = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::SerializedFile,
-                    SourceAlias::new("main.assets").unwrap(),
-                    origin,
-                ),
-                source_fingerprint,
-            )
-            .unwrap();
-        let binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::SerializedFile,
-            &path,
-            source_fingerprint,
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
-        let mut transaction = catalog
-            .begin_transaction(&mut AssetLoadBudget::default())
-            .unwrap();
-        transaction
-            .replace_verified_binding(source, binding, &mut AssetLoadBudget::default())
-            .unwrap();
-
-        fs::remove_file(&path).unwrap();
-        fs::rename(&replacement, &path).unwrap();
-        let mut commit_budget = AssetLoadBudget::default();
-        assert!(matches!(
-            transaction.commit(&mut commit_budget),
-            Err(CatalogError::VerifiedPhysicalBindingChanged { .. })
-        ));
-        assert_eq!(commit_budget.usage().bytes, 0);
-    }
-
-    #[test]
-    fn commit_preflights_all_proofs_and_never_charges_partial_revalidation() {
-        let directory = tempfile::tempdir().unwrap();
-        let first_path = directory.path().join("first.assets");
-        let second_path = directory.path().join("second.assets");
-        let first_contents = b"first";
-        let second_contents = b"second";
-        fs::write(&first_path, first_contents).unwrap();
-        fs::write(&second_path, second_contents).unwrap();
-        let first_fingerprint = fingerprint(SourceKind::SerializedFile, first_contents);
-        let second_fingerprint = fingerprint(SourceKind::SerializedFile, second_contents);
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let first_source = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::SerializedFile,
-                    SourceAlias::new("first.assets").unwrap(),
-                    PhysicalOrigin::from_existing_path(&first_path).unwrap(),
-                ),
-                first_fingerprint,
-            )
-            .unwrap();
-        let second_source = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::SerializedFile,
-                    SourceAlias::new("second.assets").unwrap(),
-                    PhysicalOrigin::from_existing_path(&second_path).unwrap(),
-                ),
-                second_fingerprint,
-            )
-            .unwrap();
-
-        let verify = |source_path: &Path, source_fingerprint| {
-            VerifiedPhysicalBinding::verify_existing(
-                SourceKind::SerializedFile,
-                source_path,
-                source_fingerprint,
-                &mut AssetLoadBudget::default(),
-            )
-            .unwrap()
-        };
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut preflight = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        preflight
-            .replace_verified_binding(
-                first_source,
-                verify(&first_path, first_fingerprint),
-                &mut operation_budget,
-            )
-            .unwrap();
-        preflight
-            .replace_verified_binding(
-                second_source,
-                verify(&second_path, second_fingerprint),
-                &mut operation_budget,
-            )
-            .unwrap();
-        fs::remove_file(&first_path).unwrap();
-        let revalidation_bytes =
-            checked_usize_to_u64(first_contents.len() + second_contents.len()).unwrap();
-        let mut one_short = budget_with(revalidation_bytes - 1, 1);
-        assert!(matches!(
-            preflight.commit(&mut one_short),
+            binding.revalidate_current_contents(&mut one_short),
             Err(CatalogError::Budget(BudgetError::Exceeded {
                 resource: "bytes",
                 ..
             }))
         ));
         assert_eq!(one_short.usage().bytes, 0);
+        assert_eq!(one_short.usage().entries, 0);
 
-        fs::write(&first_path, first_contents).unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut partial_failure = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        partial_failure
-            .replace_verified_binding(
-                first_source,
-                verify(&first_path, first_fingerprint),
-                &mut operation_budget,
-            )
-            .unwrap();
-        partial_failure
-            .replace_verified_binding(
-                second_source,
-                verify(&second_path, second_fingerprint),
-                &mut operation_budget,
-            )
-            .unwrap();
-        fs::write(&second_path, b"changed second").unwrap();
-        let mut commit_budget = AssetLoadBudget::default();
-        assert!(matches!(
-            partial_failure.commit(&mut commit_budget),
-            Err(CatalogError::VerifiedPhysicalBindingChanged { .. }
-                | CatalogError::VerifiedFingerprintMismatch { .. })
-        ));
-        assert_eq!(commit_budget.usage().bytes, 0);
+        let mut exact = budget_with(planned, 1);
+        binding.revalidate_current_contents(&mut exact).unwrap();
+        assert_eq!(exact.usage().bytes, planned);
+        assert_eq!(exact.usage().entries, 0);
     }
 
     #[test]
@@ -5152,22 +4081,8 @@ mod tests {
         let changed_contents = b"BBBB";
         fs::write(&path, original_contents).unwrap();
         let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
-        let origin = PhysicalOrigin::from_existing_path(&path).unwrap();
         let original_fingerprint = fingerprint(SourceKind::SerializedFile, original_contents);
         let changed_fingerprint = fingerprint(SourceKind::SerializedFile, changed_contents);
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let source = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::SerializedFile,
-                    SourceAlias::new("main.assets").unwrap(),
-                    origin.clone(),
-                ),
-                original_fingerprint,
-            )
-            .unwrap();
-        let original_revision = catalog.revision().unwrap();
 
         let mut verification_budget = AssetLoadBudget::default();
         let binding = VerifiedPhysicalBinding::verify_existing(
@@ -5185,33 +4100,18 @@ mod tests {
             .set_modified(original_modified)
             .unwrap();
 
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
+        let mut revalidation_budget = AssetLoadBudget::default();
         assert!(matches!(
-            transaction.replace_verified_binding(source, binding, &mut operation_budget),
+            binding.revalidate_current_contents(&mut revalidation_budget),
             Err(CatalogError::VerifiedFingerprintMismatch { expected, actual })
                 if expected == original_fingerprint && actual == changed_fingerprint
         ));
-        assert_eq!(operation_budget.usage().bytes, 0);
-        assert!(matches!(
-            transaction.commit(&mut operation_budget),
-            Err(CatalogError::TransactionAborted)
-        ));
-
-        assert_eq!(catalog.revision().unwrap(), original_revision);
-        assert_eq!(catalog.physical_origin(source).unwrap(), &origin);
-        assert_eq!(catalog.find_physical(&origin), Some(source));
-        assert_eq!(catalog.fingerprint(source).unwrap(), original_fingerprint);
+        assert_eq!(revalidation_budget.usage().bytes, 0);
+        assert_eq!(revalidation_budget.usage().entries, 0);
     }
 
     #[test]
-    fn companion_identity_is_stable_across_unbound_and_verified_bindings() {
-        let directory = tempfile::tempdir().unwrap();
-        let first_companion_path = directory.path().join("main.resS");
-        let second_companion_path = directory.path().join("main.resource");
-        fs::write(&first_companion_path, b"resource").unwrap();
-        fs::write(&second_companion_path, b"resource").unwrap();
+    fn unbound_companion_identity_revision_and_locator_are_deterministic() {
         let workspace = WorkspaceId::from_u128(1).unwrap();
         let root_origin = physical_origin("main.assets", b"asset");
         let member = SourceMemberId::new("main.resS").unwrap();
@@ -5282,63 +4182,11 @@ mod tests {
             Err(CatalogError::UnboundPhysicalOrigin { source_id })
                 if source_id == first_companion
         ));
-
-        let mut verification_budget = AssetLoadBudget::default();
-        let first_binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::StreamedResource,
-            &first_companion_path,
-            source_fingerprint,
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        let mut transaction = first
-            .begin_transaction(&mut AssetLoadBudget::default())
-            .unwrap();
-        transaction
-            .replace_verified_binding(first_companion, first_binding, &mut operation_budget)
-            .unwrap();
-        first = transaction.commit(&mut operation_budget).unwrap();
-
-        let mut verification_budget = AssetLoadBudget::default();
-        let second_binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::StreamedResource,
-            &second_companion_path,
-            source_fingerprint,
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        let mut transaction = second
-            .begin_transaction(&mut AssetLoadBudget::default())
-            .unwrap();
-        transaction
-            .replace_verified_binding(second_companion, second_binding, &mut operation_budget)
-            .unwrap();
-        second = transaction.commit(&mut operation_budget).unwrap();
-
-        let first_companion_origin =
-            PhysicalOrigin::from_existing_path(&first_companion_path).unwrap();
-        let second_companion_origin =
-            PhysicalOrigin::from_existing_path(&second_companion_path).unwrap();
+        assert_eq!(first.physical_origin_option(first_companion).unwrap(), None);
         assert_eq!(
-            first.physical_origin(first_companion).unwrap(),
-            &first_companion_origin
+            second.physical_origin_option(second_companion).unwrap(),
+            None
         );
-        assert_eq!(
-            second.physical_origin(second_companion).unwrap(),
-            &second_companion_origin
-        );
-        assert_eq!(
-            first.find_physical(&first_companion_origin),
-            Some(first_companion)
-        );
-        assert_eq!(
-            first.physical_origin_option(first_companion).unwrap(),
-            Some(&first_companion_origin)
-        );
-        assert_ne!(first.revision().unwrap(), unbound_revision);
-        assert_ne!(first.revision().unwrap(), second.revision().unwrap());
         first.validate().unwrap();
         second.validate().unwrap();
     }
@@ -5495,736 +4343,6 @@ mod tests {
                     if actual == kind
             ));
         }
-    }
-
-    #[test]
-    fn fingerprint_replacement_preserves_source_identity_and_is_budget_atomic() {
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let source = catalog
-            .register(
-                root_descriptor(SourceKind::SerializedFile, "main.assets", b"old"),
-                fingerprint(SourceKind::SerializedFile, b"old"),
-            )
-            .unwrap();
-        let original_revision = catalog.revision().unwrap();
-        let original_locator = catalog.source_locator(source).unwrap().clone();
-        let original_origin = catalog.physical_origin(source).unwrap().clone();
-
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut rejected = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut tiny_budget = budget_with(1, 1);
-        assert!(matches!(
-            rejected.replace_fingerprint(
-                source,
-                fingerprint(SourceKind::SerializedFile, b"new"),
-                &mut tiny_budget,
-            ),
-            Err(CatalogError::Budget(BudgetError::Exceeded {
-                resource: "bytes",
-                ..
-            }))
-        ));
-        assert_eq!(tiny_budget.usage().bytes, 0);
-        assert!(matches!(
-            rejected.commit(&mut tiny_budget),
-            Err(CatalogError::TransactionAborted)
-        ));
-        assert_eq!(catalog.revision().unwrap(), original_revision);
-
-        let mut budget = AssetLoadBudget::default();
-        let mut wrong_kind = catalog.begin_transaction(&mut budget).unwrap();
-        assert!(matches!(
-            wrong_kind.replace_fingerprint(
-                source,
-                fingerprint(SourceKind::Yaml, b"new"),
-                &mut budget,
-            ),
-            Err(CatalogError::SourceKindMismatch {
-                expected: SourceKind::SerializedFile,
-                actual: SourceKind::Yaml,
-            })
-        ));
-        assert!(matches!(
-            wrong_kind.commit(&mut budget),
-            Err(CatalogError::TransactionAborted)
-        ));
-        assert_eq!(catalog.revision().unwrap(), original_revision);
-
-        let mut budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut budget).unwrap();
-        transaction
-            .replace_fingerprint(
-                source,
-                fingerprint(SourceKind::SerializedFile, b"new"),
-                &mut budget,
-            )
-            .unwrap();
-        let candidate = transaction.commit(&mut budget).unwrap();
-
-        assert!(candidate.contains(source));
-        assert_eq!(candidate.source_locator(source).unwrap(), &original_locator);
-        assert_eq!(candidate.physical_origin(source).unwrap(), &original_origin);
-        assert_eq!(
-            candidate.fingerprint(source).unwrap(),
-            fingerprint(SourceKind::SerializedFile, b"new")
-        );
-        assert_ne!(candidate.revision().unwrap(), original_revision);
-        candidate.validate().unwrap();
-    }
-
-    #[test]
-    fn verified_root_binding_is_atomic_and_updates_only_inherited_members() {
-        let directory = tempfile::tempdir().unwrap();
-        let old_root_path = directory.path().join("old.apk");
-        let new_root_path = directory.path().join("new.apk");
-        let companion_path = directory.path().join("main.resS");
-        fs::write(&old_root_path, b"archive").unwrap();
-        fs::write(&new_root_path, b"archive").unwrap();
-        fs::write(&companion_path, b"resource").unwrap();
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let old_root_origin = PhysicalOrigin::from_existing_path(&old_root_path).unwrap();
-        let new_root_origin = PhysicalOrigin::from_existing_path(&new_root_path).unwrap();
-        let companion_origin = PhysicalOrigin::from_existing_path(&companion_path).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let root = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::Archive,
-                    SourceAlias::new("game.apk").unwrap(),
-                    old_root_origin.clone(),
-                ),
-                fingerprint(SourceKind::Archive, b"archive"),
-            )
-            .unwrap();
-        let member = catalog
-            .register(
-                SourceDescriptor::archive_member(
-                    root,
-                    SourceKind::SerializedFile,
-                    SourceMemberId::new("main.assets").unwrap(),
-                )
-                .unwrap(),
-                fingerprint(SourceKind::SerializedFile, b"asset"),
-            )
-            .unwrap();
-        let mut budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut budget).unwrap();
-        let companion = transaction
-            .register_companion(
-                member,
-                SourceMemberId::new("main.resS").unwrap(),
-                fingerprint(SourceKind::StreamedResource, b"resource"),
-                &mut budget,
-            )
-            .unwrap();
-        catalog = transaction.commit(&mut budget).unwrap();
-
-        let mut verification_budget = AssetLoadBudget::default();
-        let companion_binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::StreamedResource,
-            &companion_path,
-            fingerprint(SourceKind::StreamedResource, b"resource"),
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        transaction
-            .replace_verified_binding(companion, companion_binding, &mut operation_budget)
-            .unwrap();
-        catalog = transaction.commit(&mut operation_budget).unwrap();
-
-        let original_revision = catalog.revision().unwrap();
-        let root_locator = catalog.source_locator(root).unwrap().clone();
-        let member_locator = catalog.source_locator(member).unwrap().clone();
-        let companion_locator = catalog.source_locator(companion).unwrap().clone();
-
-        let mut verification_budget = AssetLoadBudget::default();
-        let conflicting_binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::Archive,
-            &companion_path,
-            fingerprint(SourceKind::Archive, b"resource"),
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut conflict = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        assert!(matches!(
-            conflict.replace_verified_binding(root, conflicting_binding, &mut operation_budget),
-            Err(CatalogError::SubtreeReplacementRequired { source_id }) if source_id == root
-        ));
-        assert_eq!(operation_budget.usage().bytes, 0);
-        assert!(matches!(
-            conflict.commit(&mut operation_budget),
-            Err(CatalogError::TransactionAborted)
-        ));
-        assert_eq!(catalog.revision().unwrap(), original_revision);
-
-        let new_fingerprint = fingerprint(SourceKind::Archive, b"archive");
-        let mut verification_budget = AssetLoadBudget::default();
-        let rejected_binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::Archive,
-            &new_root_path,
-            new_fingerprint,
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut rejected = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let apply_bytes = rejected
-            .checked_verified_binding_apply_bytes(root, &rejected_binding)
-            .unwrap();
-        let planned = checked_byte_add(apply_bytes, rejected_binding.revalidation_bytes()).unwrap();
-        let mut tiny_budget = budget_with(apply_bytes - 1, 1);
-        assert!(matches!(
-            rejected.replace_verified_binding(root, rejected_binding, &mut tiny_budget),
-            Err(CatalogError::Budget(BudgetError::Exceeded {
-                resource: "bytes",
-                ..
-            }))
-        ));
-        assert_eq!(tiny_budget.usage().bytes, 0);
-        assert!(matches!(
-            rejected.commit(&mut tiny_budget),
-            Err(CatalogError::TransactionAborted)
-        ));
-        assert_eq!(catalog.revision().unwrap(), original_revision);
-
-        let mut verification_budget = AssetLoadBudget::default();
-        let binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::Archive,
-            &new_root_path,
-            new_fingerprint,
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut exact = budget_with(planned, 1);
-        transaction
-            .replace_verified_binding(root, binding, &mut exact)
-            .unwrap();
-        let candidate = transaction.commit(&mut exact).unwrap();
-        assert_eq!(exact.usage().bytes, planned);
-
-        assert_eq!(candidate.source_locator(root).unwrap(), &root_locator);
-        assert_eq!(candidate.source_locator(member).unwrap(), &member_locator);
-        assert_eq!(
-            candidate.source_locator(companion).unwrap(),
-            &companion_locator
-        );
-        assert_eq!(candidate.physical_origin(root).unwrap(), &new_root_origin);
-        assert_eq!(candidate.physical_origin(member).unwrap(), &new_root_origin);
-        assert_eq!(
-            candidate.physical_origin(companion).unwrap(),
-            &companion_origin
-        );
-        assert_eq!(candidate.find_physical(&old_root_origin), None);
-        assert_eq!(candidate.find_physical(&new_root_origin), Some(root));
-        assert_eq!(candidate.find_physical(&companion_origin), Some(companion));
-        assert_eq!(candidate.fingerprint(root).unwrap(), new_fingerprint);
-        assert_eq!(
-            candidate.fingerprint(member).unwrap(),
-            fingerprint(SourceKind::SerializedFile, b"asset")
-        );
-        assert_ne!(candidate.revision().unwrap(), original_revision);
-        candidate.validate().unwrap();
-    }
-
-    #[test]
-    fn root_fingerprint_change_with_members_requires_atomic_subtree_replacement() {
-        let directory = tempfile::tempdir().unwrap();
-        let old_root_path = directory.path().join("old.apk");
-        let new_root_path = directory.path().join("new.apk");
-        fs::write(&old_root_path, b"old archive").unwrap();
-        fs::write(&new_root_path, b"new archive").unwrap();
-        let old_root_origin = PhysicalOrigin::from_existing_path(&old_root_path).unwrap();
-        let new_root_origin = PhysicalOrigin::from_existing_path(&new_root_path).unwrap();
-        let old_fingerprint = fingerprint(SourceKind::Archive, b"old archive");
-        let new_fingerprint = fingerprint(SourceKind::Archive, b"new archive");
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let root = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::Archive,
-                    SourceAlias::new("game.apk").unwrap(),
-                    old_root_origin.clone(),
-                ),
-                old_fingerprint,
-            )
-            .unwrap();
-        let webfile = catalog
-            .register(
-                SourceDescriptor::archive_member(
-                    root,
-                    SourceKind::WebFile,
-                    SourceMemberId::new("data.web").unwrap(),
-                )
-                .unwrap(),
-                fingerprint(SourceKind::WebFile, b"webfile"),
-            )
-            .unwrap();
-        let serialized_file = catalog
-            .register(
-                SourceDescriptor::webfile_member(
-                    webfile,
-                    SourceKind::SerializedFile,
-                    SourceMemberId::new("main.assets").unwrap(),
-                )
-                .unwrap(),
-                fingerprint(SourceKind::SerializedFile, b"asset"),
-            )
-            .unwrap();
-        let original_revision = catalog.revision().unwrap();
-        let original_root_locator = catalog.source_locator(root).unwrap().clone();
-
-        let mut verification_budget = AssetLoadBudget::default();
-        let binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::Archive,
-            &new_root_path,
-            new_fingerprint,
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        assert!(matches!(
-            transaction.replace_verified_binding(root, binding, &mut operation_budget),
-            Err(CatalogError::SubtreeReplacementRequired { source_id }) if source_id == root
-        ));
-        assert_eq!(operation_budget.usage().bytes, 0);
-        assert_eq!(operation_budget.usage().entries, 0);
-        assert!(matches!(
-            transaction.commit(&mut operation_budget),
-            Err(CatalogError::TransactionAborted)
-        ));
-
-        assert_eq!(catalog.revision().unwrap(), original_revision);
-        assert_eq!(
-            catalog.source_locator(root).unwrap(),
-            &original_root_locator
-        );
-        assert_eq!(catalog.fingerprint(root).unwrap(), old_fingerprint);
-        assert_eq!(catalog.physical_origin(root).unwrap(), &old_root_origin);
-        assert_eq!(catalog.physical_origin(webfile).unwrap(), &old_root_origin);
-        assert_eq!(
-            catalog.physical_origin(serialized_file).unwrap(),
-            &old_root_origin
-        );
-        assert_eq!(catalog.find_physical(&old_root_origin), Some(root));
-        assert_eq!(catalog.find_physical(&new_root_origin), None);
-
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        assert!(matches!(
-            transaction.replace_fingerprint(root, new_fingerprint, &mut operation_budget),
-            Err(CatalogError::SubtreeReplacementRequired { source_id }) if source_id == root
-        ));
-        assert_eq!(operation_budget.usage().bytes, 0);
-        assert_eq!(operation_budget.usage().entries, 0);
-        assert!(matches!(
-            transaction.commit(&mut operation_budget),
-            Err(CatalogError::TransactionAborted)
-        ));
-        assert_eq!(catalog.revision().unwrap(), original_revision);
-        assert_eq!(catalog.find_physical(&old_root_origin), Some(root));
-        assert_eq!(catalog.find_physical(&new_root_origin), None);
-    }
-
-    #[test]
-    fn nested_member_fingerprint_change_requires_physical_owner_subtree_replacement() {
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let root = catalog
-            .register(
-                root_descriptor(SourceKind::Archive, "game.apk", b"archive"),
-                fingerprint(SourceKind::Archive, b"archive"),
-            )
-            .unwrap();
-        let webfile = catalog
-            .register(
-                SourceDescriptor::archive_member(
-                    root,
-                    SourceKind::WebFile,
-                    SourceMemberId::new("data.web").unwrap(),
-                )
-                .unwrap(),
-                fingerprint(SourceKind::WebFile, b"old webfile"),
-            )
-            .unwrap();
-        let serialized_file = catalog
-            .register(
-                SourceDescriptor::webfile_member(
-                    webfile,
-                    SourceKind::SerializedFile,
-                    SourceMemberId::new("main.assets").unwrap(),
-                )
-                .unwrap(),
-                fingerprint(SourceKind::SerializedFile, b"asset"),
-            )
-            .unwrap();
-        let original_revision = catalog.revision().unwrap();
-
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        assert!(matches!(
-            transaction.replace_fingerprint(
-                webfile,
-                fingerprint(SourceKind::WebFile, b"new webfile"),
-                &mut operation_budget,
-            ),
-            Err(CatalogError::InheritedSourceReplacementRequired {
-                source_id,
-                physical_owner,
-            }) if source_id == webfile && physical_owner == root
-        ));
-        assert_eq!(operation_budget.usage().bytes, 0);
-        assert_eq!(operation_budget.usage().entries, 0);
-        assert!(matches!(
-            transaction.commit(&mut operation_budget),
-            Err(CatalogError::TransactionAborted)
-        ));
-
-        assert_eq!(catalog.revision().unwrap(), original_revision);
-        assert_eq!(
-            catalog.fingerprint(webfile).unwrap(),
-            fingerprint(SourceKind::WebFile, b"old webfile")
-        );
-        assert_eq!(
-            catalog.fingerprint(serialized_file).unwrap(),
-            fingerprint(SourceKind::SerializedFile, b"asset")
-        );
-        catalog.validate().unwrap();
-    }
-
-    #[test]
-    fn inherited_leaf_change_aborts_transaction_with_pending_root_proof() {
-        let directory = tempfile::tempdir().unwrap();
-        let root_path = directory.path().join("game.apk");
-        fs::write(&root_path, b"archive").unwrap();
-        let root_origin = PhysicalOrigin::from_existing_path(&root_path).unwrap();
-        let root_fingerprint = fingerprint(SourceKind::Archive, b"archive");
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let root = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::Archive,
-                    SourceAlias::new("game.apk").unwrap(),
-                    root_origin,
-                ),
-                root_fingerprint,
-            )
-            .unwrap();
-        let webfile = catalog
-            .register(
-                SourceDescriptor::archive_member(
-                    root,
-                    SourceKind::WebFile,
-                    SourceMemberId::new("data.web").unwrap(),
-                )
-                .unwrap(),
-                fingerprint(SourceKind::WebFile, b"webfile"),
-            )
-            .unwrap();
-        let leaf = catalog
-            .register(
-                SourceDescriptor::webfile_member(
-                    webfile,
-                    SourceKind::SerializedFile,
-                    SourceMemberId::new("main.assets").unwrap(),
-                )
-                .unwrap(),
-                fingerprint(SourceKind::SerializedFile, b"asset"),
-            )
-            .unwrap();
-        let original_revision = catalog.revision().unwrap();
-
-        let mut verification_budget = AssetLoadBudget::default();
-        let binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::Archive,
-            &root_path,
-            root_fingerprint,
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut binding_budget = AssetLoadBudget::default();
-        transaction
-            .replace_verified_binding(root, binding, &mut binding_budget)
-            .unwrap();
-
-        let mut replacement_budget = AssetLoadBudget::default();
-        assert!(matches!(
-            transaction.replace_fingerprint(
-                leaf,
-                fingerprint(SourceKind::SerializedFile, b"changed"),
-                &mut replacement_budget,
-            ),
-            Err(CatalogError::InheritedSourceReplacementRequired {
-                source_id,
-                physical_owner,
-            }) if source_id == leaf && physical_owner == root
-        ));
-        assert_eq!(replacement_budget.usage().bytes, 0);
-        assert_eq!(replacement_budget.usage().entries, 0);
-        assert!(matches!(
-            transaction.commit(&mut replacement_budget),
-            Err(CatalogError::TransactionAborted)
-        ));
-        assert_eq!(catalog.revision().unwrap(), original_revision);
-        assert_eq!(
-            catalog.fingerprint(leaf).unwrap(),
-            fingerprint(SourceKind::SerializedFile, b"asset")
-        );
-        catalog.validate().unwrap();
-    }
-
-    #[test]
-    fn root_fingerprint_change_with_only_companion_is_allowed_and_not_propagated() {
-        let directory = tempfile::tempdir().unwrap();
-        let old_root_path = directory.path().join("old.assets");
-        let new_root_path = directory.path().join("new.assets");
-        fs::write(&old_root_path, b"old asset").unwrap();
-        fs::write(&new_root_path, b"new asset").unwrap();
-        let old_root_origin = PhysicalOrigin::from_existing_path(&old_root_path).unwrap();
-        let new_root_origin = PhysicalOrigin::from_existing_path(&new_root_path).unwrap();
-        let old_fingerprint = fingerprint(SourceKind::SerializedFile, b"old asset");
-        let new_fingerprint = fingerprint(SourceKind::SerializedFile, b"new asset");
-        let companion_fingerprint = fingerprint(SourceKind::StreamedResource, b"resource");
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let root = catalog
-            .register(
-                SourceDescriptor::root(
-                    SourceKind::SerializedFile,
-                    SourceAlias::new("main.assets").unwrap(),
-                    old_root_origin.clone(),
-                ),
-                old_fingerprint,
-            )
-            .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        let companion = transaction
-            .register_companion(
-                root,
-                SourceMemberId::new("main.resS").unwrap(),
-                companion_fingerprint,
-                &mut operation_budget,
-            )
-            .unwrap();
-        catalog = transaction.commit(&mut operation_budget).unwrap();
-
-        let mut verification_budget = AssetLoadBudget::default();
-        let binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::SerializedFile,
-            &new_root_path,
-            new_fingerprint,
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        transaction
-            .replace_verified_binding(root, binding, &mut operation_budget)
-            .unwrap();
-        let candidate = transaction.commit(&mut operation_budget).unwrap();
-
-        assert_eq!(candidate.fingerprint(root).unwrap(), new_fingerprint);
-        assert_eq!(
-            candidate.fingerprint(companion).unwrap(),
-            companion_fingerprint
-        );
-        assert_eq!(candidate.physical_origin(root).unwrap(), &new_root_origin);
-        assert_eq!(candidate.physical_origin_option(companion).unwrap(), None);
-        assert_eq!(candidate.find_physical(&old_root_origin), None);
-        assert_eq!(candidate.find_physical(&new_root_origin), Some(root));
-        candidate.validate().unwrap();
-    }
-
-    #[test]
-    fn companion_operations_reject_typed_conflicts_without_publishing() {
-        let directory = tempfile::tempdir().unwrap();
-        let companion_path = directory.path().join("main.resS");
-        let embedded_path = directory.path().join("embedded.assets");
-        fs::write(&companion_path, b"resource").unwrap();
-        fs::write(&embedded_path, b"embedded").unwrap();
-        let workspace = WorkspaceId::from_u128(1).unwrap();
-        let mut catalog = SourceCatalog::new(workspace);
-        let parent = catalog
-            .register(
-                root_descriptor(SourceKind::SerializedFile, "main.assets", b"asset"),
-                fingerprint(SourceKind::SerializedFile, b"asset"),
-            )
-            .unwrap();
-        let archive = catalog
-            .register(
-                root_descriptor(SourceKind::Archive, "game.apk", b"archive"),
-                fingerprint(SourceKind::Archive, b"archive"),
-            )
-            .unwrap();
-        let embedded = catalog
-            .register(
-                SourceDescriptor::archive_member(
-                    archive,
-                    SourceKind::SerializedFile,
-                    SourceMemberId::new("embedded.assets").unwrap(),
-                )
-                .unwrap(),
-                fingerprint(SourceKind::SerializedFile, b"embedded"),
-            )
-            .unwrap();
-        let member = SourceMemberId::new("main.resS").unwrap();
-        let companion_fingerprint = fingerprint(SourceKind::StreamedResource, b"resource");
-        let mut budget = AssetLoadBudget::default();
-        let mut transaction = catalog.begin_transaction(&mut budget).unwrap();
-        let companion = transaction
-            .register_companion(parent, member.clone(), companion_fingerprint, &mut budget)
-            .unwrap();
-        catalog = transaction.commit(&mut budget).unwrap();
-        let revision = catalog.revision().unwrap();
-
-        let mut budget = AssetLoadBudget::default();
-        let mut duplicate = catalog.begin_transaction(&mut budget).unwrap();
-        assert_eq!(
-            duplicate
-                .register_companion(parent, member.clone(), companion_fingerprint, &mut budget,)
-                .unwrap(),
-            companion
-        );
-        let duplicate = duplicate.commit(&mut budget).unwrap();
-        assert_eq!(duplicate.revision().unwrap(), revision);
-
-        let mut budget = AssetLoadBudget::default();
-        let mut changed_fingerprint = catalog.begin_transaction(&mut budget).unwrap();
-        assert!(matches!(
-            changed_fingerprint.register_companion(
-                parent,
-                member.clone(),
-                fingerprint(SourceKind::StreamedResource, b"changed"),
-                &mut budget,
-            ),
-            Err(CatalogError::FingerprintConflict { source_id, .. }) if source_id == companion
-        ));
-
-        let mut budget = AssetLoadBudget::default();
-        let mut wrong_parent = catalog.begin_transaction(&mut budget).unwrap();
-        assert!(matches!(
-            wrong_parent.register_companion(
-                archive,
-                SourceMemberId::new("archive.resS").unwrap(),
-                companion_fingerprint,
-                &mut budget,
-            ),
-            Err(CatalogError::InvalidCompanionParentKind { parent, actual })
-                if parent == archive && actual == SourceKind::Archive
-        ));
-
-        let mut budget = AssetLoadBudget::default();
-        let mut wrong_type = catalog.begin_transaction(&mut budget).unwrap();
-        assert!(matches!(
-            wrong_type.register_companion(
-                parent,
-                SourceMemberId::new("wrong.resS").unwrap(),
-                fingerprint(SourceKind::Yaml, b"resource"),
-                &mut budget,
-            ),
-            Err(CatalogError::SourceKindMismatch {
-                expected: SourceKind::StreamedResource,
-                actual: SourceKind::Yaml,
-            })
-        ));
-
-        let mut verification_budget = AssetLoadBudget::default();
-        let embedded_binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::SerializedFile,
-            &embedded_path,
-            fingerprint(SourceKind::SerializedFile, b"embedded"),
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut unsupported_binding = catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        assert!(matches!(
-            unsupported_binding.replace_verified_binding(
-                embedded,
-                embedded_binding,
-                &mut operation_budget,
-            ),
-            Err(CatalogError::PhysicalOriginBindingUnsupported {
-                source_id,
-                location: SourceLocationKind::ArchiveMember,
-            }) if source_id == embedded
-        ));
-        assert!(matches!(
-            unsupported_binding.commit(&mut operation_budget),
-            Err(CatalogError::TransactionAborted)
-        ));
-
-        let mut verification_budget = AssetLoadBudget::default();
-        let companion_binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::StreamedResource,
-            &companion_path,
-            companion_fingerprint,
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut companion_binding_transaction =
-            catalog.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        companion_binding_transaction
-            .replace_verified_binding(companion, companion_binding, &mut operation_budget)
-            .unwrap();
-        let bound = companion_binding_transaction
-            .commit(&mut operation_budget)
-            .unwrap();
-        let companion_origin = PhysicalOrigin::from_existing_path(&companion_path).unwrap();
-        assert_eq!(bound.physical_origin(companion).unwrap(), &companion_origin);
-        assert!(bound.contains(companion));
-        assert_ne!(bound.revision().unwrap(), revision);
-        assert_eq!(catalog.revision().unwrap(), revision);
-
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut second_registration = bound.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        let second = second_registration
-            .register_companion(
-                parent,
-                SourceMemberId::new("other.resS").unwrap(),
-                companion_fingerprint,
-                &mut operation_budget,
-            )
-            .unwrap();
-        let bound = second_registration.commit(&mut operation_budget).unwrap();
-        let mut verification_budget = AssetLoadBudget::default();
-        let conflicting_binding = VerifiedPhysicalBinding::verify_existing(
-            SourceKind::StreamedResource,
-            &companion_path,
-            companion_fingerprint,
-            &mut verification_budget,
-        )
-        .unwrap();
-        let mut begin_budget = AssetLoadBudget::default();
-        let mut conflict = bound.begin_transaction(&mut begin_budget).unwrap();
-        let mut operation_budget = AssetLoadBudget::default();
-        assert!(matches!(
-            conflict.replace_verified_binding(second, conflicting_binding, &mut operation_budget),
-            Err(CatalogError::PhysicalOriginConflict { existing, incoming })
-                if existing == companion && incoming == second
-        ));
     }
 
     #[test]

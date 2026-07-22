@@ -68,6 +68,7 @@ hex = "0.4"
 ignore = "0.4"
 notify = "8"
 zip = "0.6"
+rustix = "1.1.3"
 
 # The profile that 'dist' will build with
 [profile.dist]

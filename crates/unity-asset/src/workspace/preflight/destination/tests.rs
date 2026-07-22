@@ -73,6 +73,7 @@ fn tree_entries(root: &Path) -> Vec<PathBuf> {
 #[test]
 fn observes_existing_and_nested_absent_outputs_in_canonical_order() {
     let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("nested")).unwrap();
     let existing_path = directory.path().join("z-existing.yaml");
     let existing_bytes = b"old destination";
     fs::write(&existing_path, existing_bytes).unwrap();
@@ -220,6 +221,45 @@ fn rejects_duplicate_targets_and_non_bijective_output_mappings() {
 }
 
 #[test]
+fn rejects_targets_that_alias_under_portable_filesystem_rules() {
+    let directory = tempfile::tempdir().unwrap();
+    let artifacts = artifacts(&["a.yaml", "b.yaml"]);
+    let outputs = artifacts.outputs().collect::<Vec<_>>();
+
+    for (first_name, second_name) in [
+        ("Foo.asset", "foo.asset"),
+        ("\u{e9}.asset", "e\u{301}.asset"),
+    ] {
+        let first = directory.path().join(first_name);
+        let second = directory.path().join(second_name);
+        let declarations = [
+            PublicationDestination::exact(
+                outputs[0].name(),
+                &first,
+                DestinationExpectation::Absent,
+            ),
+            PublicationDestination::exact(
+                outputs[1].name(),
+                &second,
+                DestinationExpectation::Absent,
+            ),
+        ];
+
+        assert!(matches!(
+            DestinationProofSet::observe(
+                &artifacts,
+                &declarations,
+                &mut AssetLoadBudget::default(),
+            ),
+            Err(DestinationProofError::PortableTargetCollision {
+                first_output: 0,
+                second_output: 1,
+            })
+        ));
+    }
+}
+
+#[test]
 fn distinguishes_destination_declaration_indices_from_canonical_output_ordinals() {
     let directory = tempfile::tempdir().unwrap();
     let artifacts = artifacts(&["z.yaml", "a.yaml", "m.yaml"]);
@@ -318,6 +358,7 @@ fn revalidation_uses_canonical_output_ordinals_after_scrambled_declarations() {
 #[test]
 fn prepare_observation_performs_no_filesystem_writes() {
     let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("missing/tree")).unwrap();
     fs::write(directory.path().join("existing.yaml"), b"existing").unwrap();
     let artifacts = artifacts(&["existing.yaml", "missing/tree/new.yaml"]);
     let declarations = declarations_under_root(&artifacts, directory.path());

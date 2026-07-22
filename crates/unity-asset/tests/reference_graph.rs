@@ -55,6 +55,7 @@ const INCREMENTAL_BINARY_ALIAS: &str = "binary-owner.assets";
 const INCREMENTAL_META_ALIAS: &str = "target.assets.meta";
 const INCREMENTAL_TARGET_ALIAS: &str = "target.assets";
 const REMAPPED_TARGET_ALIAS: &str = "renamed/target.assets";
+const REMAPPED_META_ALIAS: &str = "renamed/target.assets.meta";
 
 const CACHE_SOURCE: &str = r#"%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
@@ -107,6 +108,7 @@ struct IncrementalParityPaths {
 #[derive(Debug, Clone, Copy)]
 struct IncrementalParityLayout {
     target_alias: &'static str,
+    meta_alias: &'static str,
     target_loaded: bool,
 }
 
@@ -256,7 +258,7 @@ fn load_incremental_parity_sources(
 ) {
     load_with_alias(workspace, &paths.owner, INCREMENTAL_OWNER_ALIAS);
     load_with_alias(workspace, &paths.binary_owner, INCREMENTAL_BINARY_ALIAS);
-    load_with_alias(workspace, &paths.target_meta, INCREMENTAL_META_ALIAS);
+    load_with_alias(workspace, &paths.target_meta, layout.meta_alias);
     if layout.target_loaded {
         load_with_alias(workspace, &paths.target, layout.target_alias);
     }
@@ -1006,7 +1008,7 @@ fn duplicate_archive_members_pair_meta_guids_and_project_exact_occurrences() {
 }
 
 #[test]
-fn physical_sidecar_relocation_advances_revision_and_rejects_stale_handles() {
+fn physical_sidecar_relocation_preserves_logical_revision_and_handles() {
     let directory = tempfile::tempdir().unwrap();
     let first = directory.path().join("first");
     let second = directory.path().join("second");
@@ -1052,7 +1054,7 @@ fn physical_sidecar_relocation_advances_revision_and_rejects_stale_handles() {
             && matches!(fact.resolution(), ReferenceResolution::Resolved(_))
     }));
     let revision = old_snapshot.revision();
-    let stale_handle = old_graph.nodes()[0].clone();
+    let retained_handle = old_graph.nodes()[0].clone();
 
     workspace
         .unload_source(target, &mut AssetLoadBudget::default())
@@ -1063,7 +1065,7 @@ fn physical_sidecar_relocation_advances_revision_and_rejects_stale_handles() {
     load_with_alias(&mut workspace, &second_target, "logical/target.prefab");
     load_with_alias(&mut workspace, &detached_meta, "logical/target.prefab.meta");
     let new_snapshot = workspace.snapshot();
-    assert_ne!(new_snapshot.revision(), revision);
+    assert_eq!(new_snapshot.revision(), revision);
     let new_graph = new_snapshot
         .reference_graph(
             ReferenceGraphBuildOptions::unbounded(),
@@ -1072,15 +1074,12 @@ fn physical_sidecar_relocation_advances_revision_and_rejects_stale_handles() {
         .unwrap();
     assert!(new_graph.facts().iter().any(|fact| {
         fact.field_path().to_string() == "$.m_Target"
-            && matches!(fact.resolution(), ReferenceResolution::Unloaded { .. })
+            && matches!(fact.resolution(), ReferenceResolution::Resolved(_))
     }));
 
-    assert!(matches!(
-        new_graph.outgoing(&stale_handle),
-        Err(ReferenceGraphError::Contract(_))
-    ));
-    assert_ne!(old_graph.revision(), new_graph.revision());
-    assert_ne!(old_snapshot.revision(), new_snapshot.revision());
+    new_graph.outgoing(&retained_handle).unwrap();
+    assert_eq!(old_graph.revision(), new_graph.revision());
+    assert_eq!(old_snapshot.revision(), new_snapshot.revision());
 }
 
 #[test]
@@ -1338,6 +1337,7 @@ fn incremental_reference_resolution_matches_a_fresh_full_rebuild_after_identity_
 
     let initial_layout = IncrementalParityLayout {
         target_alias: INCREMENTAL_TARGET_ALIAS,
+        meta_alias: INCREMENTAL_META_ALIAS,
         target_loaded: true,
     };
     let mut workspace = AssetWorkspace::new().unwrap();
@@ -1422,11 +1422,13 @@ fn incremental_reference_resolution_matches_a_fresh_full_rebuild_after_identity_
         CanonicalResolution::Resolved(_)
     ));
 
+    load_with_alias(&mut workspace, &paths.target_meta, REMAPPED_META_ALIAS);
     let remapped_target = load_with_alias(&mut workspace, &paths.target, REMAPPED_TARGET_ALIAS);
     assert_ne!(workspace.revision(), external_changed_revision);
     let remapped_revision = workspace.revision();
     let remapped_layout = IncrementalParityLayout {
         target_alias: REMAPPED_TARGET_ALIAS,
+        meta_alias: REMAPPED_META_ALIAS,
         target_loaded: true,
     };
     let remapped = assert_incremental_matches_fresh(&workspace, &paths, remapped_layout, 4);
@@ -1448,6 +1450,7 @@ fn incremental_reference_resolution_matches_a_fresh_full_rebuild_after_identity_
     let unloaded_revision = workspace.revision();
     let unloaded_layout = IncrementalParityLayout {
         target_alias: REMAPPED_TARGET_ALIAS,
+        meta_alias: REMAPPED_META_ALIAS,
         target_loaded: false,
     };
     let unloaded = assert_incremental_matches_fresh(&workspace, &paths, unloaded_layout, 3);

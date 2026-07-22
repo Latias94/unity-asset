@@ -32,6 +32,14 @@ pub struct OutputSlot {
     ordinal: usize,
 }
 
+impl OutputSlot {
+    /// Stable ordinal within the artifact set that minted this capability.
+    #[must_use]
+    pub const fn ordinal(self) -> usize {
+        self.ordinal
+    }
+}
+
 impl fmt::Debug for OutputSlot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -45,6 +53,14 @@ impl fmt::Debug for OutputSlot {
 pub struct ArtifactHandle {
     token: u64,
     ordinal: usize,
+}
+
+impl ArtifactHandle {
+    /// Stable ordinal within the artifact set that minted this capability.
+    #[must_use]
+    pub const fn ordinal(self) -> usize {
+        self.ordinal
+    }
 }
 
 impl fmt::Debug for ArtifactHandle {

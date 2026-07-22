@@ -52,14 +52,6 @@ impl ReferenceInput for ReferenceViewParts<'_> {
                     .source_locator(source)
                     .map_err(WorkspaceError::from)?;
                 let parent = catalog.parent(source).map_err(WorkspaceError::from)?;
-                let physical_path = if parent.is_none() {
-                    catalog
-                        .physical_origin_option(source)
-                        .map_err(WorkspaceError::from)?
-                        .map(|origin| origin.path())
-                } else {
-                    None
-                };
                 let fingerprint = catalog.fingerprint(source).map_err(WorkspaceError::from)?;
 
                 if let Some(prepared) = prepared
@@ -73,7 +65,6 @@ impl ReferenceInput for ReferenceViewParts<'_> {
                             owner,
                             locator,
                             parent,
-                            physical_path,
                             entry
                                 .cached_serialized()
                                 .ok_or(ReferenceGraphError::Invariant(
@@ -88,7 +79,6 @@ impl ReferenceInput for ReferenceViewParts<'_> {
                             owner,
                             locator,
                             parent,
-                            physical_path,
                             entry
                                 .cached_yaml()
                                 .ok_or(ReferenceGraphError::Invariant(
@@ -114,7 +104,6 @@ impl ReferenceInput for ReferenceViewParts<'_> {
                         owner,
                         locator,
                         parent,
-                        physical_path,
                         entry
                             .cached_serialized()
                             .ok_or(ReferenceGraphError::Invariant(
@@ -128,7 +117,6 @@ impl ReferenceInput for ReferenceViewParts<'_> {
                         owner,
                         locator,
                         parent,
-                        physical_path,
                         entry
                             .cached_yaml()
                             .ok_or(ReferenceGraphError::Invariant(

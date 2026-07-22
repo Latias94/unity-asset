@@ -7,7 +7,7 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use unity_asset_binary::asset::SerializedFile;
 use unity_asset_core::{
-    AssetLoadBudget, Diagnostic, DiagnosticSeverity, DigestV1, FieldPath, ObjectAddress,
+    AssetLoadBudget, Diagnostic, DiagnosticSeverity, DigestV1, FieldPath, ObjectAddress, ObjectId,
     ObjectKind, RevisionedObjectHandle, SourceFingerprint, SourceId, SourceKind, SourceLocator,
     UnityDocument, UnityValue, arc_value_allocation_bytes, index_map_allocation_bytes,
     string_allocation_bytes, vec_allocation_bytes,
@@ -143,6 +143,13 @@ fn prepare_with_observer(
     let mut resource_manifest_index = None;
     let mut codec = None;
     let mut groups = SourceCandidateSets::new();
+    let mut changed_objects = budgeted_vec(
+        operations.len(),
+        "prepare changed objects",
+        PrepareStage::AddressResolution,
+        budget,
+    )
+    .map_err(|failure| reject(&snapshot, Some(plan_digest), failure))?;
     let mut operations = operations.into_vec().into_iter();
     while let Some(operation) = operations.next() {
         let ordinal = operation.ordinal();
@@ -167,6 +174,7 @@ fn prepare_with_observer(
             &snapshot,
             codec.as_ref(),
             &mut groups,
+            &mut changed_objects,
             &mut resource_manifest_index,
             operations.as_slice(),
             &payloads,
@@ -177,6 +185,8 @@ fn prepare_with_observer(
         .map_err(|failure| reject(&snapshot, Some(plan_digest), failure))?;
     }
     drop(codec.take());
+    changed_objects.sort_unstable();
+    changed_objects.dedup();
 
     let resource_domain_count = resource_manifest_index
         .as_ref()
@@ -677,6 +687,7 @@ fn prepare_with_observer(
         state,
         report,
         artifact_usage,
+        changed_objects,
         source_proofs,
         destination_proofs,
     })
@@ -1240,6 +1251,7 @@ fn stage_operation<'snapshot, 'payload>(
     snapshot: &'snapshot WorkspaceSnapshot,
     codec: Option<&StagedReferenceMutationCodec<'_>>,
     groups: &mut SourceCandidateSets<'snapshot>,
+    changed_objects: &mut Vec<ObjectId>,
     resource_manifest_index: &mut Option<ResourceManifestIndex<'payload>>,
     remaining_operations: &[MutationOperation],
     payloads: &'payload [PlanPayload],
@@ -1254,6 +1266,38 @@ fn stage_operation<'snapshot, 'payload>(
         budget,
     )?;
     let handle = resolve_object(snapshot, ordinal, &target, budget)?;
+    let retained = u64::try_from(handle.object().retained_clone_bytes()).map_err(|_| {
+        RunnerFailure::operation_at(
+            ordinal,
+            PrepareStage::AddressResolution,
+            "PREPARE_OBJECT_IDENTITY_OVERFLOW",
+            "resolved object identity allocation does not fit the load-budget ledger",
+            target.clone(),
+            None,
+        )
+    })?;
+    budget.check_bytes(retained).map_err(|error| {
+        RunnerFailure::operation_at(
+            ordinal,
+            PrepareStage::AddressResolution,
+            "PREPARE_OBJECT_IDENTITY_REJECTED",
+            error.to_string(),
+            target.clone(),
+            None,
+        )
+    })?;
+    let changed_object = handle.object().clone();
+    budget.consume_bytes(retained).map_err(|error| {
+        RunnerFailure::operation_at(
+            ordinal,
+            PrepareStage::AddressResolution,
+            "PREPARE_OBJECT_IDENTITY_REJECTED",
+            error.to_string(),
+            target.clone(),
+            None,
+        )
+    })?;
+    changed_objects.push(changed_object);
     let source = handle.object().source();
     let group_index = match handle.object().kind() {
         ObjectKind::Yaml => {
@@ -4012,6 +4056,7 @@ fn destination_error_output(error: &DestinationProofError) -> Option<usize> {
     match error {
         DestinationProofError::OutputNameMismatch { output, .. }
         | DestinationProofError::NonAbsoluteTarget { output }
+        | DestinationProofError::UnsupportedTargetEncoding { output }
         | DestinationProofError::TargetEscapesRoot { output }
         | DestinationProofError::InvalidTargetState { output, .. }
         | DestinationProofError::InvalidParentState { output, .. }
@@ -4022,7 +4067,10 @@ fn destination_error_output(error: &DestinationProofError) -> Option<usize> {
         | DestinationProofError::PathComponentChanged { output, .. }
         | DestinationProofError::Io { output, .. }
         | DestinationProofError::Catalog { output, .. } => Some(*output),
-        DestinationProofError::DuplicateTarget { first_output, .. } => Some(*first_output),
+        DestinationProofError::DuplicateTarget { first_output, .. }
+        | DestinationProofError::PortableTargetCollision { first_output, .. } => {
+            Some(*first_output)
+        }
         DestinationProofError::Budget(_)
         | DestinationProofError::ArithmeticOverflow { .. }
         | DestinationProofError::Allocation { .. }

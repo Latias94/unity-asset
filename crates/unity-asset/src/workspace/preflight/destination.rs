@@ -10,8 +10,9 @@ use unity_asset_write::artifact::{
     LogicalArtifactName, PreparedArtifact, PreparedArtifactFormat, PreparedArtifactSet,
 };
 
+use super::super::portable_path::{PortablePathError, native_key};
 use super::super::source_catalog::{
-    CatalogError, VerifiedPhysicalBinding, VerifiedPhysicalDirectoryBinding,
+    CatalogError, PhysicalFileIdentity, VerifiedPhysicalBinding, VerifiedPhysicalDirectoryBinding,
 };
 
 /// What prepare expects to find at one publication destination.
@@ -26,7 +27,7 @@ pub(super) enum DestinationExpectation {
 
 /// Structured filesystem state used in destination conflict diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DestinationState {
+pub(crate) enum DestinationState {
     Existing(SourceFingerprint),
     Absent,
     Directory,
@@ -159,15 +160,36 @@ impl DestinationProofSet {
             }
         }
 
+        let mut portability_order = budgeted_vec::<PortableTargetKey>(count, budget)?;
+        for (output, binding) in bindings.iter().enumerate() {
+            portability_order.push(PortableTargetKey {
+                output,
+                key: portable_target_key(output, binding.target(), budget)?,
+            });
+        }
+        portability_order.sort_unstable_by(|left, right| {
+            left.key
+                .cmp(&right.key)
+                .then_with(|| left.output.cmp(&right.output))
+        });
+        for pair in portability_order.windows(2) {
+            if pair[0].key == pair[1].key {
+                return Err(DestinationProofError::PortableTargetCollision {
+                    first_output: pair[0].output,
+                    second_output: pair[1].output,
+                });
+            }
+        }
+
         Ok(Self { bindings })
     }
 
     #[must_use]
-    pub(super) fn bindings(&self) -> &[DestinationProof] {
+    pub(crate) fn bindings(&self) -> &[DestinationProof] {
         &self.bindings
     }
 
-    pub(super) fn revalidate(
+    pub(crate) fn revalidate(
         &self,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), DestinationProofError> {
@@ -179,19 +201,20 @@ impl DestinationProofSet {
 }
 
 #[derive(Debug)]
-pub(super) struct DestinationProof {
+pub(crate) struct DestinationProof {
     output_name: String,
+    parent: VerifiedPhysicalDirectoryBinding,
     evidence: DestinationEvidence,
 }
 
 impl DestinationProof {
     #[must_use]
-    pub(super) fn output_name(&self) -> &str {
+    pub(crate) fn output_name(&self) -> &str {
         &self.output_name
     }
 
     #[must_use]
-    pub(super) fn target(&self) -> &Path {
+    pub(crate) fn target(&self) -> &Path {
         match &self.evidence {
             DestinationEvidence::Existing(binding) => binding.path(),
             DestinationEvidence::Absent(binding) => &binding.target,
@@ -199,13 +222,31 @@ impl DestinationProof {
     }
 
     #[must_use]
-    pub(super) const fn expected(&self) -> DestinationState {
+    pub(crate) const fn expected(&self) -> DestinationState {
         match &self.evidence {
             DestinationEvidence::Existing(binding) => {
                 DestinationState::Existing(binding.fingerprint())
             }
             DestinationEvidence::Absent(_) => DestinationState::Absent,
         }
+    }
+
+    #[must_use]
+    pub(crate) const fn existing_file_identity(&self) -> Option<&PhysicalFileIdentity> {
+        match &self.evidence {
+            DestinationEvidence::Existing(binding) => Some(binding.file_identity()),
+            DestinationEvidence::Absent(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn destination_parent_identity(&self) -> &PhysicalFileIdentity {
+        self.parent.identity()
+    }
+
+    #[must_use]
+    pub(crate) fn filesystem_anchor(&self) -> &Path {
+        self.parent.path()
     }
 
     fn revalidate(
@@ -215,6 +256,9 @@ impl DestinationProof {
     ) -> Result<(), DestinationProofError> {
         match &self.evidence {
             DestinationEvidence::Existing(binding) => {
+                self.parent
+                    .revalidate_current_entry(budget)
+                    .map_err(|error| map_parent_error(output, error))?;
                 let expected = binding.fingerprint();
                 match entry_state(binding.path(), output)? {
                     EntryState::File => {}
@@ -226,7 +270,7 @@ impl DestinationProof {
                         });
                     }
                 }
-                match binding.revalidate_current_contents(budget) {
+                let result = match binding.revalidate_current_contents(budget) {
                     Ok(()) => Ok(()),
                     Err(CatalogError::VerifiedFingerprintMismatch { actual, .. }) => {
                         Err(DestinationProofError::ObservationMismatch {
@@ -242,9 +286,15 @@ impl DestinationProof {
                         })
                     }
                     Err(error) => Err(map_catalog_error(output, error)),
-                }
+                };
+                result?;
+                self.parent
+                    .revalidate_current_entry(budget)
+                    .map_err(|error| map_parent_error(output, error))
             }
-            DestinationEvidence::Absent(binding) => binding.revalidate(output, budget),
+            DestinationEvidence::Absent(binding) => {
+                binding.revalidate(&self.parent, output, budget)
+            }
         }
     }
 }
@@ -257,7 +307,6 @@ enum DestinationEvidence {
 
 #[derive(Debug)]
 struct AbsentDestinationProof {
-    parent: VerifiedPhysicalDirectoryBinding,
     first_missing: PathBuf,
     target: PathBuf,
     source_kind: SourceKind,
@@ -266,11 +315,12 @@ struct AbsentDestinationProof {
 impl AbsentDestinationProof {
     fn revalidate(
         &self,
+        parent: &VerifiedPhysicalDirectoryBinding,
         output: usize,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), DestinationProofError> {
         self.ensure_missing(output, budget)?;
-        self.parent
+        parent
             .revalidate_current_entry(budget)
             .map_err(|error| map_parent_error(output, error))?;
         self.ensure_missing(output, budget)?;
@@ -309,6 +359,29 @@ impl AbsentDestinationProof {
 struct OutputView<'artifact> {
     name: &'artifact LogicalArtifactName,
     artifact: &'artifact PreparedArtifact,
+}
+
+struct PortableTargetKey {
+    output: usize,
+    key: String,
+}
+
+fn portable_target_key(
+    output: usize,
+    target: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<String, DestinationProofError> {
+    native_key(target, budget).map_err(|error| match error {
+        PortablePathError::Budget(error) => DestinationProofError::Budget(error),
+        PortablePathError::UnsupportedEncoding => {
+            DestinationProofError::UnsupportedTargetEncoding { output }
+        }
+        PortablePathError::Allocation { requested, message } => DestinationProofError::Allocation {
+            resource: "portable destination path",
+            requested,
+            message,
+        },
+    })
 }
 
 fn observe_destination(
@@ -365,7 +438,7 @@ fn observe_path(
     source_kind: SourceKind,
     budget: &mut AssetLoadBudget,
 ) -> Result<DestinationProof, DestinationProofError> {
-    let evidence = match entry_state(requested, output)? {
+    let (evidence, parent) = match entry_state(requested, output)? {
         EntryState::Missing => match expectation {
             DestinationExpectation::Existing(expected) => {
                 return Err(DestinationProofError::ObservationMismatch {
@@ -375,20 +448,16 @@ fn observe_path(
                 });
             }
             #[cfg(test)]
-            DestinationExpectation::Observe => DestinationEvidence::Absent(observe_absent(
-                output,
-                requested,
-                containment_root,
-                source_kind,
-                budget,
-            )?),
-            DestinationExpectation::Absent => DestinationEvidence::Absent(observe_absent(
-                output,
-                requested,
-                containment_root,
-                source_kind,
-                budget,
-            )?),
+            DestinationExpectation::Observe => {
+                let (parent, proof) =
+                    observe_absent(output, requested, containment_root, source_kind, budget)?;
+                (DestinationEvidence::Absent(proof), parent)
+            }
+            DestinationExpectation::Absent => {
+                let (parent, proof) =
+                    observe_absent(output, requested, containment_root, source_kind, budget)?;
+                (DestinationEvidence::Absent(proof), parent)
+            }
         },
         EntryState::File => {
             let binding = match expectation {
@@ -427,7 +496,17 @@ fn observe_path(
                 error => map_catalog_error(output, error),
             })?;
             ensure_contained(output, binding.path(), containment_root)?;
-            DestinationEvidence::Existing(binding)
+            let parent_path =
+                binding
+                    .path()
+                    .parent()
+                    .ok_or(DestinationProofError::InvalidParentState {
+                        output,
+                        actual: DestinationState::Other,
+                    })?;
+            let parent = VerifiedPhysicalDirectoryBinding::verify_existing(parent_path, budget)
+                .map_err(|error| map_parent_error(output, error))?;
+            (DestinationEvidence::Existing(binding), parent)
         }
         actual => {
             let actual = actual.destination_state();
@@ -451,6 +530,7 @@ fn observe_path(
     };
     Ok(DestinationProof {
         output_name: budgeted_string(output_name.as_str(), budget)?,
+        parent,
         evidence,
     })
 }
@@ -461,57 +541,44 @@ fn observe_absent(
     containment_root: Option<&Path>,
     source_kind: SourceKind,
     budget: &mut AssetLoadBudget,
-) -> Result<AbsentDestinationProof, DestinationProofError> {
-    let mut ancestor = budgeted_path_copy(requested, budget)?;
-    if !ancestor.pop() {
-        return Err(DestinationProofError::InvalidAbsentTarget { output });
-    }
-    loop {
-        match entry_state(&ancestor, output)? {
-            EntryState::Directory => break,
-            EntryState::Missing => {
-                if !ancestor.pop() {
-                    return Err(DestinationProofError::InvalidAbsentTarget { output });
-                }
-            }
-            actual => {
-                return Err(DestinationProofError::InvalidParentState {
-                    output,
-                    actual: actual.destination_state(),
-                });
-            }
+) -> Result<(VerifiedPhysicalDirectoryBinding, AbsentDestinationProof), DestinationProofError> {
+    let parent_path = requested
+        .parent()
+        .ok_or(DestinationProofError::InvalidAbsentTarget { output })?;
+    match entry_state(parent_path, output)? {
+        EntryState::Directory => {}
+        actual => {
+            return Err(DestinationProofError::InvalidParentState {
+                output,
+                actual: actual.destination_state(),
+            });
         }
     }
-
-    let relative = requested
-        .strip_prefix(&ancestor)
-        .map_err(|_| DestinationProofError::InvalidAbsentTarget { output })?;
-    let mut components = relative.components();
-    let Some(Component::Normal(first_component)) = components.next() else {
-        return Err(DestinationProofError::InvalidAbsentTarget { output });
-    };
-    if components.any(|component| !matches!(component, Component::Normal(_))) {
+    let file_name = requested
+        .file_name()
+        .ok_or(DestinationProofError::InvalidAbsentTarget { output })?;
+    if !matches!(
+        requested.components().next_back(),
+        Some(Component::Normal(_))
+    ) {
         return Err(DestinationProofError::InvalidAbsentTarget { output });
     }
-
-    let parent = VerifiedPhysicalDirectoryBinding::verify_existing(&ancestor, budget)
+    let parent = VerifiedPhysicalDirectoryBinding::verify_existing(parent_path, budget)
         .map_err(|error| map_catalog_error(output, error))?;
-    let target = budgeted_path_join(parent.path(), relative, budget)?;
-    let first_missing = budgeted_path_join(parent.path(), Path::new(first_component), budget)?;
+    let target = budgeted_path_join(parent.path(), Path::new(file_name), budget)?;
+    let first_missing = budgeted_path_copy(&target, budget)?;
     ensure_contained(output, &target, containment_root)?;
     let proof = AbsentDestinationProof {
-        parent,
         first_missing,
         target,
         source_kind,
     };
     proof.ensure_missing(output, budget)?;
-    proof
-        .parent
+    parent
         .revalidate_current_entry(budget)
         .map_err(|error| map_parent_error(output, error))?;
     proof.ensure_missing(output, budget)?;
-    Ok(proof)
+    Ok((parent, proof))
 }
 
 fn ensure_contained(
@@ -729,7 +796,7 @@ fn map_parent_error(output: usize, error: CatalogError) -> DestinationProofError
 /// Every singular `output`, `first_output`, and `second_output` field indexes prepared outputs
 /// after sorting by [`LogicalArtifactName`]. [`Self::DuplicateOutput`] is deliberately different:
 /// its fields index the caller's destination declarations because no output bijection exists.
-pub(super) enum DestinationProofError {
+pub(crate) enum DestinationProofError {
     #[error(transparent)]
     Budget(#[from] BudgetError),
     #[error("destination proof allocation overflow for {resource}")]
@@ -758,6 +825,15 @@ pub(super) enum DestinationProofError {
         first_output: usize,
         second_output: usize,
     },
+    #[error(
+        "prepared outputs {first_output} and {second_output} collide under portable filesystem rules"
+    )]
+    PortableTargetCollision {
+        first_output: usize,
+        second_output: usize,
+    },
+    #[error("publication destination for output {output} is not valid UTF-8")]
+    UnsupportedTargetEncoding { output: usize },
     #[error("publication destination for output {output} must be absolute")]
     NonAbsoluteTarget { output: usize },
     #[error("publication destination for output {output} escapes its declared root")]

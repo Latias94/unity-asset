@@ -96,14 +96,6 @@ impl ResolutionIdentityIndex {
                 source: source_id,
                 parent,
             });
-            let physical_path = source
-                .physical_path()
-                .and_then(|path| path.to_str())
-                .map(|path| {
-                    normalize_external_path(path, "reference describable physical paths", budget)
-                })
-                .transpose()?;
-
             let alias = normalize_external_path(
                 locator.root_alias().as_str(),
                 "reference exact source aliases",
@@ -157,10 +149,7 @@ impl ResolutionIdentityIndex {
                 }
             }
 
-            let logical_path = member
-                .as_deref()
-                .or(physical_path.as_deref())
-                .unwrap_or(&alias);
+            let logical_path = member.as_deref().unwrap_or(&alias);
             push_value(
                 &mut describable_paths,
                 DescribablePathClaim {
@@ -1437,7 +1426,6 @@ mod tests {
                 (&target_owner).into(),
                 &target_locator,
                 None,
-                None,
                 &target_document,
             )
             .unwrap(),
@@ -1447,7 +1435,6 @@ mod tests {
                 (&meta_owner).into(),
                 &meta_locator,
                 None,
-                None,
                 &meta_document,
             )
             .unwrap(),
@@ -1456,7 +1443,6 @@ mod tests {
                 SourceFingerprint::from_bytes(SourceKind::Yaml, duplicate_owner.as_ref()),
                 (&duplicate_owner).into(),
                 &duplicate_locator,
-                None,
                 None,
                 &duplicate_document,
             )

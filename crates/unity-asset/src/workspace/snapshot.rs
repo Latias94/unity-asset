@@ -61,7 +61,7 @@ impl WorkspaceSnapshot {
     }
 
     #[must_use]
-    pub(super) const fn state(&self) -> &Arc<WorkspaceState> {
+    pub(crate) const fn state(&self) -> &Arc<WorkspaceState> {
         &self.state
     }
 

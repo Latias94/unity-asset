@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 
 use unity_asset_binary::asset::{FileIdentifier, SerializedFile};
@@ -65,7 +64,6 @@ pub(crate) struct ReferenceSource<'source> {
     owner: ReferenceSourceOwner<'source>,
     locator: &'source SourceLocator,
     parent: Option<SourceId>,
-    physical_path: Option<&'source Path>,
     parse: ReferenceSourceParse<'source>,
 }
 
@@ -76,7 +74,6 @@ impl<'source> ReferenceSource<'source> {
         owner: ReferenceSourceOwner<'source>,
         locator: &'source SourceLocator,
         parent: Option<SourceId>,
-        physical_path: Option<&'source Path>,
         file: &'source SerializedFile,
     ) -> Result<Self, ReferenceGraphError> {
         Self::checked(
@@ -85,7 +82,6 @@ impl<'source> ReferenceSource<'source> {
             owner,
             locator,
             parent,
-            physical_path,
             ReferenceSourceParse::Serialized(file),
         )
     }
@@ -96,7 +92,6 @@ impl<'source> ReferenceSource<'source> {
         owner: ReferenceSourceOwner<'source>,
         locator: &'source SourceLocator,
         parent: Option<SourceId>,
-        physical_path: Option<&'source Path>,
         document: &'source YamlDocument,
     ) -> Result<Self, ReferenceGraphError> {
         Self::checked(
@@ -105,7 +100,6 @@ impl<'source> ReferenceSource<'source> {
             owner,
             locator,
             parent,
-            physical_path,
             ReferenceSourceParse::Yaml(document),
         )
     }
@@ -116,7 +110,6 @@ impl<'source> ReferenceSource<'source> {
         owner: ReferenceSourceOwner<'source>,
         locator: &'source SourceLocator,
         parent: Option<SourceId>,
-        physical_path: Option<&'source Path>,
         file: &'source SerializedFile,
         overlay: &'source dyn PreparedReferenceOverlay,
     ) -> Result<Self, ReferenceGraphError> {
@@ -126,7 +119,6 @@ impl<'source> ReferenceSource<'source> {
             owner,
             locator,
             parent,
-            physical_path,
             ReferenceSourceParse::PreparedSerialized {
                 source,
                 file,
@@ -141,7 +133,6 @@ impl<'source> ReferenceSource<'source> {
         owner: ReferenceSourceOwner<'source>,
         locator: &'source SourceLocator,
         parent: Option<SourceId>,
-        physical_path: Option<&'source Path>,
         document: &'source YamlDocument,
         overlay: &'source dyn PreparedReferenceOverlay,
     ) -> Result<Self, ReferenceGraphError> {
@@ -151,7 +142,6 @@ impl<'source> ReferenceSource<'source> {
             owner,
             locator,
             parent,
-            physical_path,
             ReferenceSourceParse::PreparedYaml {
                 source,
                 document,
@@ -166,7 +156,6 @@ impl<'source> ReferenceSource<'source> {
         owner: ReferenceSourceOwner<'source>,
         locator: &'source SourceLocator,
         parent: Option<SourceId>,
-        physical_path: Option<&'source Path>,
         parse: ReferenceSourceParse<'source>,
     ) -> Result<Self, ReferenceGraphError> {
         let parse_kind = parse.kind();
@@ -186,7 +175,6 @@ impl<'source> ReferenceSource<'source> {
             owner,
             locator,
             parent,
-            physical_path,
             parse,
         })
     }
@@ -209,10 +197,6 @@ impl<'source> ReferenceSource<'source> {
 
     pub(crate) const fn parent(self) -> Option<SourceId> {
         self.parent
-    }
-
-    pub(crate) const fn physical_path(self) -> Option<&'source Path> {
-        self.physical_path
     }
 
     pub(crate) const fn parse(self) -> ReferenceSourceParse<'source> {
@@ -357,7 +341,6 @@ mod tests {
             (&owner).into(),
             &locator,
             None,
-            None,
             &document,
         )
         .unwrap_err();
@@ -384,7 +367,6 @@ mod tests {
             SourceFingerprint::from_bytes(SourceKind::SerializedFile, owner.as_ref()),
             (&owner).into(),
             &locator,
-            None,
             None,
             &document,
         )

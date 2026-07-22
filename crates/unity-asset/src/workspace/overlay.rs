@@ -83,16 +83,29 @@ enum PreparedSourceProof {
 
 /// Private proof binding minted only after reparsing the exact artifact.
 #[derive(Debug)]
-pub(super) struct ProvenPreparedSourceBinding {
+pub(crate) struct ProvenPreparedSourceBinding {
     source: SourceId,
     fingerprint: SourceFingerprint,
     artifact: ArtifactHandle,
+    publication_root: bool,
     proof: PreparedSourceProof,
 }
 
 impl ProvenPreparedSourceBinding {
-    const fn source(&self) -> SourceId {
+    pub(crate) const fn source(&self) -> SourceId {
         self.source
+    }
+
+    pub(crate) const fn fingerprint(&self) -> SourceFingerprint {
+        self.fingerprint
+    }
+
+    pub(crate) const fn artifact(&self) -> ArtifactHandle {
+        self.artifact
+    }
+
+    pub(crate) const fn is_publication_root(&self) -> bool {
+        self.publication_root
     }
 
     fn yaml_document(&self) -> Option<&Arc<YamlDocument>> {
@@ -399,6 +412,7 @@ impl PreparedStateCore {
                 source: binding.source,
                 fingerprint: binding.fingerprint,
                 artifact: binding.artifact,
+                publication_root: binding.publication_root,
                 proof,
             });
         }
@@ -457,20 +471,24 @@ impl PreparedStateCore {
         }))
     }
 
-    pub(super) const fn base(&self) -> &WorkspaceSnapshot {
+    pub(crate) const fn base(&self) -> &WorkspaceSnapshot {
         &self.base
     }
 
-    pub(super) const fn catalog(&self) -> &SourceCatalog {
+    pub(crate) const fn catalog(&self) -> &SourceCatalog {
         &self.catalog
     }
 
-    pub(super) const fn revision(&self) -> WorkspaceRevision {
+    pub(crate) const fn revision(&self) -> WorkspaceRevision {
         self.revision
     }
 
-    pub(super) const fn artifacts(&self) -> &Arc<PreparedArtifactSet> {
+    pub(crate) const fn artifacts(&self) -> &Arc<PreparedArtifactSet> {
         &self.artifacts
+    }
+
+    pub(crate) fn source_bindings(&self) -> &[ProvenPreparedSourceBinding] {
+        &self.source_bindings
     }
 
     pub(super) fn source_binding(&self, source: SourceId) -> Option<&ProvenPreparedSourceBinding> {
@@ -606,6 +624,10 @@ impl PreparedState {
 
     pub(crate) fn artifacts(&self) -> &Arc<PreparedArtifactSet> {
         &self.core.artifacts
+    }
+
+    pub(crate) const fn core(&self) -> &Arc<PreparedStateCore> {
+        &self.core
     }
 
     #[cfg(test)]

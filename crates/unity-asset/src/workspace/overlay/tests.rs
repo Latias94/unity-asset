@@ -23,6 +23,7 @@ use unity_asset_write::serialized_file::{
 use crate::reference::{RawReferenceTarget, ReferenceGraphBuildOptions, ReferenceResolution};
 
 use super::*;
+use crate::workspace::source_catalog::PhysicalDomainChange;
 use crate::workspace::{AssetWorkspace, SourceOpenRequest};
 
 struct TestAllocator;
@@ -221,7 +222,10 @@ fn prepared_view() -> (tempfile::TempDir, WorkspaceSnapshot, PreparedView, Sourc
         .begin_transaction(&mut budget)
         .unwrap();
     catalog
-        .replace_fingerprint(source, fingerprint, &mut budget)
+        .rewrite_physical_domains_from_changes(
+            &[PhysicalDomainChange::new(source, fingerprint)],
+            &mut budget,
+        )
         .unwrap();
     let catalog = catalog.commit(&mut budget).unwrap();
     let state = PreparedState::new(
@@ -380,7 +384,10 @@ fn prepared_state_rejects_yaml_identity_mismatch_from_the_exact_artifact() {
         .begin_transaction(&mut catalog_budget)
         .unwrap();
     transaction
-        .replace_fingerprint(source, fingerprint, &mut catalog_budget)
+        .rewrite_physical_domains_from_changes(
+            &[PhysicalDomainChange::new(source, fingerprint)],
+            &mut catalog_budget,
+        )
         .unwrap();
     let catalog = transaction.commit(&mut catalog_budget).unwrap();
 
@@ -444,7 +451,10 @@ fn prepared_state_rejects_source_deletion_and_orphan_output_roots() {
         .begin_transaction(&mut catalog_budget)
         .unwrap();
     transaction
-        .replace_fingerprint(source, fingerprint, &mut catalog_budget)
+        .rewrite_physical_domains_from_changes(
+            &[PhysicalDomainChange::new(source, fingerprint)],
+            &mut catalog_budget,
+        )
         .unwrap();
     let catalog = transaction.commit(&mut catalog_budget).unwrap();
     let orphan = PreparedState::new(
@@ -486,7 +496,10 @@ fn build_yaml_state_with_limits(limits: AssetLoadLimits) -> Result<u64, Prepared
         .begin_transaction(&mut catalog_budget)
         .unwrap();
     transaction
-        .replace_fingerprint(source, fingerprint, &mut catalog_budget)
+        .rewrite_physical_domains_from_changes(
+            &[PhysicalDomainChange::new(source, fingerprint)],
+            &mut catalog_budget,
+        )
         .unwrap();
     let catalog = transaction.commit(&mut catalog_budget).unwrap();
     let mut budget = AssetLoadBudget::new(limits).unwrap();
@@ -636,7 +649,10 @@ fn prepared_binary_objects_are_derived_from_the_exact_serialized_artifact() {
         .begin_transaction(&mut catalog_budget)
         .unwrap();
     transaction
-        .replace_fingerprint(source, fingerprint, &mut catalog_budget)
+        .rewrite_physical_domains_from_changes(
+            &[PhysicalDomainChange::new(source, fingerprint)],
+            &mut catalog_budget,
+        )
         .unwrap();
     let catalog = transaction.commit(&mut catalog_budget).unwrap();
     let state = PreparedState::new(

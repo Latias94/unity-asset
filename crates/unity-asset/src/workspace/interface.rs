@@ -228,6 +228,31 @@ impl AssetWorkspace {
         )
     }
 
+    #[must_use]
+    pub(crate) const fn state(&self) -> &Arc<WorkspaceState> {
+        &self.state
+    }
+
+    #[must_use]
+    pub(crate) const fn binary_adapter(&self) -> &BinaryWorkspaceAdapter {
+        &self.binary
+    }
+
+    pub(crate) fn install_state_if_current(
+        &mut self,
+        expected: &Arc<WorkspaceState>,
+        next: Arc<WorkspaceState>,
+    ) -> bool {
+        if !Arc::ptr_eq(&self.state, expected)
+            || expected.workspace() != next.workspace()
+            || expected.revision() == next.revision()
+        {
+            return false;
+        }
+        self.state = next;
+        true
+    }
+
     pub fn load_path(
         &mut self,
         path: impl Into<PathBuf>,
@@ -1085,7 +1110,7 @@ fn map_archive_error(operation: &'static str, error: ArchiveLoadError) -> Worksp
     }
 }
 
-fn map_binary_adapter_error(error: BinaryAdapterError) -> WorkspaceError {
+pub(crate) fn map_binary_adapter_error(error: BinaryAdapterError) -> WorkspaceError {
     match error {
         BinaryAdapterError::Parse { source } => WorkspaceError::from(source),
         BinaryAdapterError::MemberBinary {
@@ -1197,7 +1222,7 @@ fn consume_arc_allocation<T>(
     Ok(())
 }
 
-fn promote_box_to_arc<T>(
+pub(crate) fn promote_box_to_arc<T>(
     value: Box<T>,
     budget: &mut AssetLoadBudget,
     resource: &'static str,

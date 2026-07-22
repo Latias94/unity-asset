@@ -1,9 +1,11 @@
 //! Revisioned ownership and source-resolution foundation.
 
 mod adapter;
+mod commit;
 mod interface;
 mod overlay;
 mod plan;
+mod portable_path;
 mod preflight;
 mod snapshot;
 mod source_catalog;
@@ -11,6 +13,11 @@ mod state;
 mod store;
 mod view;
 
+pub use commit::{
+    COMMIT_REPORT_VERSION, CommitArtifactReport, CommitAtomicity, CommitContractError,
+    CommitDestinationState, CommitError, CommitReport, PublicationTarget, PublicationTargetError,
+    RecoveryBlockedReason, RecoveryDisposition, RecoveryError, RecoveryLocator, RecoveryOutcome,
+};
 pub use interface::{AssetWorkspace, SourceOpenRequest, WorkspaceOptions};
 pub use overlay::PreparedView;
 pub use plan::{

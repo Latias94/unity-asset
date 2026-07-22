@@ -15,18 +15,6 @@ pub(crate) struct PhysicalDependencyProof {
     binding: VerifiedPhysicalBinding,
 }
 
-impl PhysicalDependencyProof {
-    #[must_use]
-    pub(crate) const fn source(&self) -> SourceId {
-        self.source
-    }
-
-    #[must_use]
-    pub(crate) const fn binding(&self) -> &VerifiedPhysicalBinding {
-        &self.binding
-    }
-}
-
 /// Complete, source-sorted CAS baseline for the physical inputs behind one prepared view.
 #[derive(Debug)]
 pub(crate) struct PhysicalDependencyProofSet {

@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use unity_asset_core::{
-    AssetLoadBudget, Diagnostic, DigestV1, SourceFingerprint, SourceId, SourceLocator, WorkspaceId,
-    WorkspaceRevision,
+    AssetLoadBudget, Diagnostic, DigestV1, ObjectId, SourceFingerprint, SourceId, SourceLocator,
+    WorkspaceId, WorkspaceRevision,
 };
 use unity_asset_write::artifact::{ArtifactBudgetUsage, ArtifactLimits, PreparedArtifactSet};
 
@@ -14,7 +14,7 @@ use super::overlay::{PreparedState, PreparedView};
 use super::{AssetWorkspace, MutationPlan};
 
 mod artifact_graph;
-mod destination;
+pub(crate) mod destination;
 mod reference;
 mod resource;
 mod runner;
@@ -364,6 +364,7 @@ pub struct PreparedChange {
     state: Arc<PreparedState>,
     report: PrepareReport,
     artifact_usage: ArtifactBudgetUsage,
+    changed_objects: Vec<ObjectId>,
     source_proofs: source_proof::PhysicalDependencyProofSet,
     destination_proofs: destination::DestinationProofSet,
 }
@@ -388,6 +389,14 @@ impl PreparedChange {
         self.state.artifacts()
     }
 
+    pub(crate) const fn state(&self) -> &Arc<PreparedState> {
+        &self.state
+    }
+
+    pub(crate) fn changed_objects(&self) -> &[ObjectId] {
+        &self.changed_objects
+    }
+
     pub(crate) const fn source_proofs(&self) -> &source_proof::PhysicalDependencyProofSet {
         &self.source_proofs
     }
@@ -407,6 +416,7 @@ impl fmt::Debug for PreparedChange {
             .field("plan_digest", &self.report.plan_digest)
             .field("operation_count", &self.report.operation_count)
             .field("source_count", &self.report.sources.len())
+            .field("changed_object_count", &self.changed_objects.len())
             .field("artifact_usage", &self.artifact_usage)
             .field("source_proof_count", &self.source_proofs.bindings().len())
             .field(
