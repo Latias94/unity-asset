@@ -77,6 +77,34 @@ jobs:
     - name: Run tests (decode/export)
       run: cargo nextest run -p unity-asset-decode --features full
 
+  workspace-publication-platforms:
+    name: Workspace publication / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
+
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: workspace-publication-${{ matrix.os }}
+
+    - name: Run platform publication and recovery tests
+      run: cargo nextest run -p unity-asset -E 'test(/^workspace::commit::/)'
+
+    - name: Run publication contract tests
+      run: cargo nextest run -p unity-asset --test workspace_commit
+
   binary-loader-features:
     name: Binary loader / ${{ matrix.mode }}
     runs-on: ubuntu-latest
