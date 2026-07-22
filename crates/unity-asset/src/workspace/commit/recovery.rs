@@ -4,7 +4,14 @@
 //! machine below decides one sticky direction from journal facts, filesystem
 //! evidence, and the currently installed workspace baseline. Only after that
 //! decision is durably appended may the executor move an artifact.
+//!
+//! The caller must authorize the locator's destination root; workspace and
+//! transaction IDs provide consistency, not authentication. Owner-only state
+//! and the commit guard isolate other principals and cooperating processes.
+//! An actively malicious process running as the same principal remains outside
+//! the filesystem race guarantee.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::mem::size_of;
@@ -19,13 +26,17 @@ use unity_asset_core::{
 use super::super::portable_path::{PortablePathError, slash_key};
 
 use super::journal::{
-    Journal, JournalArtifact, JournalError, JournalEvent, JournalEventKey, JournalEventKind,
-    JournalEventPlan, JournalLayout, JournalPath, RecoveryDirection, matches_ordinal_journal_path,
+    BACKUP_DIRECTORY, BASELINE_DIRECTORY, EVENTS_DIRECTORY, Journal, JournalArtifact,
+    JournalBaselineImage, JournalError, JournalEvent, JournalEventKey, JournalEventKind,
+    JournalEventPlan, JournalLayout, JournalPath, JournalPreparation, MANIFEST_TEMPORARY_FILE,
+    OpenedJournalPreparation, RECOVERY_DIRECTORY, RECOVERY_VERSION_DIRECTORY, RecoveryDirection,
+    STAGE_DIRECTORY, matches_ordinal_journal_path,
 };
 use super::platform::{
     CommitGuard, DirectoryIdentity, FileIdentity, capture_existing_in_parent,
     capture_matching_digest_in_parent, copy_security_metadata, observe_directory_identity,
-    open_readonly_regular_in_parent, opened_file_identity,
+    open_readonly_regular_in_parent, opened_file_identity, remove_owned_empty_directory_in_parent,
+    remove_owned_file_in_parent,
 };
 #[cfg(test)]
 use super::platform::{capture_existing, observe_file_identity};
@@ -33,7 +44,7 @@ use super::{AssetWorkspace, CommitReport, RecoveryLocator};
 
 /// Direction selected by deterministic journal recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecoveryDisposition {
+pub(crate) enum RecoveryDisposition {
     /// Finish publishing the exact prepared artifact set.
     Forward,
     /// Restore the complete pre-publication artifact set.
@@ -42,29 +53,123 @@ pub enum RecoveryDisposition {
     Blocked,
 }
 
+/// Stable receipt for a transaction whose pre-publication state was restored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackReceipt {
+    workspace_id: WorkspaceId,
+    base_revision: WorkspaceRevision,
+    recovery: RecoveryLocator,
+}
+
+impl RollbackReceipt {
+    const fn new(
+        workspace_id: WorkspaceId,
+        base_revision: WorkspaceRevision,
+        recovery: RecoveryLocator,
+    ) -> Self {
+        Self {
+            workspace_id,
+            base_revision,
+            recovery,
+        }
+    }
+
+    #[must_use]
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    #[must_use]
+    pub const fn base_revision(&self) -> WorkspaceRevision {
+        self.base_revision
+    }
+
+    #[must_use]
+    pub const fn recovery(&self) -> &RecoveryLocator {
+        &self.recovery
+    }
+}
+
 /// Terminal result of recovering one transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryOutcome {
-    /// The canonical commit result was finalized and may be redelivered.
-    Committed(Box<CommitReport>),
+    /// Publication bytes are durable, but a trusted workspace must still attach them.
+    FilesystemRecovered(Box<CommitReport>),
+    /// Publication bytes and the attached workspace baseline are both finalized.
+    Finalized(Box<CommitReport>),
     /// The pre-publication artifact set was restored.
-    RolledBack(RecoveryLocator),
+    RolledBack(RollbackReceipt),
+    /// No durable evidence exists for the supplied transaction locator.
+    NoTransaction(RecoveryLocator),
 }
 
 impl RecoveryOutcome {
     #[must_use]
     pub const fn committed(&self) -> Option<&CommitReport> {
         match self {
-            Self::Committed(report) => Some(report),
-            Self::RolledBack(_) => None,
+            Self::FilesystemRecovered(report) | Self::Finalized(report) => Some(report),
+            Self::RolledBack(_) | Self::NoTransaction(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn filesystem_recovered(&self) -> Option<&CommitReport> {
+        match self {
+            Self::FilesystemRecovered(report) => Some(report),
+            Self::Finalized(_) | Self::RolledBack(_) | Self::NoTransaction(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn finalized(&self) -> Option<&CommitReport> {
+        match self {
+            Self::Finalized(report) => Some(report),
+            Self::FilesystemRecovered(_) | Self::RolledBack(_) | Self::NoTransaction(_) => None,
+        }
+    }
+
+    /// Reports whether trusted sources must be reopened before finalization.
+    #[must_use]
+    pub const fn requires_workspace_finalization(&self) -> bool {
+        matches!(self, Self::FilesystemRecovered(_))
+    }
+
+    #[must_use]
+    pub const fn rolled_back(&self) -> Option<&RollbackReceipt> {
+        match self {
+            Self::RolledBack(receipt) => Some(receipt),
+            Self::FilesystemRecovered(_) | Self::Finalized(_) | Self::NoTransaction(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn workspace_id(&self) -> Option<WorkspaceId> {
+        match self {
+            Self::FilesystemRecovered(report) | Self::Finalized(report) => {
+                Some(report.workspace_id())
+            }
+            Self::RolledBack(receipt) => Some(receipt.workspace_id()),
+            Self::NoTransaction(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> Option<WorkspaceRevision> {
+        match self {
+            Self::FilesystemRecovered(report) | Self::Finalized(report) => {
+                Some(report.committed_revision())
+            }
+            Self::RolledBack(receipt) => Some(receipt.base_revision()),
+            Self::NoTransaction(_) => None,
         }
     }
 
     #[must_use]
     pub const fn recovery(&self) -> &RecoveryLocator {
         match self {
-            Self::Committed(report) => report.recovery(),
-            Self::RolledBack(locator) => locator,
+            Self::FilesystemRecovered(report) | Self::Finalized(report) => report.recovery(),
+            Self::RolledBack(receipt) => receipt.recovery(),
+            Self::NoTransaction(locator) => locator,
         }
     }
 }
@@ -92,11 +197,13 @@ pub enum RecoveryBlockedReason {
         expected: WorkspaceId,
         actual: WorkspaceId,
     },
+    #[error("publication bytes must be recovered before a workspace baseline can be attached")]
+    FilesystemRecoveryRequired,
     #[error(
-        "published revision {committed} cannot be installed from this journal over current revision {actual}"
+        "recovery baseline {expected} cannot be installed from this journal over current revision {actual}"
     )]
     BaselineUnavailable {
-        committed: WorkspaceRevision,
+        expected: WorkspaceRevision,
         actual: WorkspaceRevision,
     },
     #[error("the published workspace baseline could not be rebuilt: {message}")]
@@ -251,13 +358,14 @@ impl ArtifactObservation {
     }
 
     fn is_rolled_back(self) -> bool {
-        if self.had_original {
-            self.target == EntryEvidence::Old && self.backup == EntryEvidence::Missing
+        let target_matches = if self.had_original {
+            self.target == EntryEvidence::Old
         } else {
             self.target == EntryEvidence::Missing
-                && self.backup == EntryEvidence::Missing
-                && self.staging != EntryEvidence::Unexpected
-        }
+        };
+        target_matches
+            && self.staging != EntryEvidence::Unexpected
+            && self.backup == EntryEvidence::Missing
     }
 
     fn contains_unexpected(self) -> bool {
@@ -319,6 +427,7 @@ enum BaselineObservation {
     Base,
     Committed,
     Other,
+    Detached,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -429,8 +538,10 @@ fn decide_recovery(observation: &RecoveryObservation) -> RecoveryPlan {
             .artifacts
             .iter()
             .all(|artifact| artifact.is_rolled_back())
-            && observation.baseline == BaselineObservation::Base
-        {
+            && matches!(
+                observation.baseline,
+                BaselineObservation::Base | BaselineObservation::Detached
+            ) {
             RecoveryPlan::rollback()
         } else {
             RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
@@ -462,16 +573,7 @@ fn decide_recovery(observation: &RecoveryObservation) -> RecoveryPlan {
                 message: "a published transaction does not retain every new artifact".to_owned(),
             });
         }
-        return match observation.baseline {
-            BaselineObservation::Base | BaselineObservation::Committed => RecoveryPlan::forward(),
-            BaselineObservation::Other => {
-                RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
-                    message:
-                        "published bytes do not match the base or committed workspace revision"
-                            .to_owned(),
-                })
-            }
-        };
+        return RecoveryPlan::forward();
     }
 
     match observation.events.direction {
@@ -581,7 +683,10 @@ fn decide_abandon(observation: &RecoveryObservation) -> RecoveryPlan {
             message: "a transaction with a sticky forward decision cannot be abandoned".to_owned(),
         });
     }
-    if observation.baseline != BaselineObservation::Base {
+    if !matches!(
+        observation.baseline,
+        BaselineObservation::Base | BaselineObservation::Detached
+    ) {
         return RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
             message: "explicit abandon requires the workspace base revision".to_owned(),
         });
@@ -603,6 +708,7 @@ fn decide_abandon(observation: &RecoveryObservation) -> RecoveryPlan {
 fn recovery_event_keys(
     observation: &RecoveryObservation,
     disposition: RecoveryDisposition,
+    finalize_workspace: bool,
     budget: &mut AssetLoadBudget,
 ) -> Result<Vec<JournalEventKey>, ObservationError> {
     let capacity = observation
@@ -730,11 +836,13 @@ fn recovery_event_keys(
     if !observation.events.published {
         keys.push(JournalEventKey::Published);
     }
-    if !observation.events.baseline_installed {
-        keys.push(JournalEventKey::BaselineInstalled);
-    }
-    if !observation.events.finalized {
-        keys.push(JournalEventKey::Finalized);
+    if finalize_workspace {
+        if !observation.events.baseline_installed {
+            keys.push(JournalEventKey::BaselineInstalled);
+        }
+        if !observation.events.finalized {
+            keys.push(JournalEventKey::Finalized);
+        }
     }
     Ok(keys)
 }
@@ -789,67 +897,822 @@ fn prebuild_recovery_baseline(
 }
 
 impl AssetWorkspace {
-    /// Recovers exactly one durable transaction named by a previous commit result.
+    /// Recovers publication bytes before any workspace sources are opened.
     ///
-    /// The locator is validated against its deterministic destination-parent
-    /// namespace before any journal path is opened. A published transaction can
-    /// only be redelivered when this workspace already owns its committed
-    /// baseline; the current journal format intentionally does not pretend it can
-    /// reconstruct missing parse/catalog state after a process restart.
+    /// This entry point trusts only the caller-provided recovery locator. It
+    /// never treats journal data as authority to open source paths outside the
+    /// locator's containment root. Callers may reopen their trusted source
+    /// requests with the workspace identity returned in the canonical report,
+    /// then call [`Self::finalize_recovery_at`] to finalize the in-memory
+    /// baseline. A committed result is returned as
+    /// [`RecoveryOutcome::FilesystemRecovered`] until that second stage succeeds.
     pub fn recover_at(
-        &mut self,
         locator: &RecoveryLocator,
         budget: &mut AssetLoadBudget,
     ) -> Result<RecoveryOutcome, RecoveryError> {
-        self.recover_with_intent(locator, budget, RecoveryIntent::Resume)
+        recover_with_intent(None, locator, budget, RecoveryIntent::Resume)
     }
 
-    /// Explicitly rolls back one unfinished transaction when its durable
-    /// evidence still proves a safe rollback.
-    ///
-    /// Published, finalized, or sticky-forward transactions are rejected. An
-    /// explicit abandon never deletes journal evidence directly.
+    /// Rolls back an unfinished publication before opening workspace sources.
     pub fn abandon_at(
-        &mut self,
         locator: &RecoveryLocator,
         budget: &mut AssetLoadBudget,
     ) -> Result<RecoveryOutcome, RecoveryError> {
-        self.recover_with_intent(locator, budget, RecoveryIntent::Abandon)
+        recover_with_intent(None, locator, budget, RecoveryIntent::Abandon)
     }
 
-    fn recover_with_intent(
+    /// Attaches a filesystem recovery to an already reopened trusted workspace.
+    ///
+    /// Call [`Self::recover_at`] or [`Self::abandon_at`] first, create a workspace
+    /// with the returned identity, and reopen source requests from caller-owned
+    /// trusted configuration. This method never finishes pending filesystem
+    /// renames; it rejects them with
+    /// [`RecoveryBlockedReason::FilesystemRecoveryRequired`]. A successful
+    /// committed result is returned as [`RecoveryOutcome::Finalized`]. Rolled
+    /// back and absent transactions require no workspace finalization.
+    pub fn finalize_recovery_at(
         &mut self,
         locator: &RecoveryLocator,
         budget: &mut AssetLoadBudget,
-        intent: RecoveryIntent,
     ) -> Result<RecoveryOutcome, RecoveryError> {
-        let layout = layout_from_locator(locator).map_err(|reason| RecoveryError::Blocked {
-            locator: locator.clone(),
-            reason: Box::new(reason),
-        })?;
-        let _guard =
-            CommitGuard::acquire(layout.parent()).map_err(|error| RecoveryError::Busy {
-                locator: locator.clone(),
+        recover_with_intent(Some(self), locator, budget, RecoveryIntent::Resume)
+    }
+}
+
+fn recover_with_intent(
+    mut workspace: Option<&mut AssetWorkspace>,
+    locator: &RecoveryLocator,
+    budget: &mut AssetLoadBudget,
+    intent: RecoveryIntent,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    let layout = layout_from_locator(locator).map_err(|reason| RecoveryError::Blocked {
+        locator: locator.clone(),
+        reason: Box::new(reason),
+    })?;
+    let _guard = CommitGuard::acquire(layout.parent())
+        .map_err(|error| map_commit_guard_error(locator, error))?;
+    match fs::symlink_metadata(layout.manifest_path()) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(blocked(
+            locator,
+            invalid_journal("canonical manifest is not a regular file".to_owned()),
+        )),
+        Ok(_) => {
+            let mut journal = Journal::open(layout, budget)
+                .map_err(|error| map_journal_open_error(locator, error))?;
+            recover_open_journal(
+                workspace.as_deref_mut(),
+                &mut journal,
+                locator,
+                intent,
+                budget,
+            )
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            recover_prepared_transaction(workspace.as_deref(), &layout, locator, budget)
+        }
+        Err(error) => Err(blocked(
+            locator,
+            RecoveryBlockedReason::Io {
                 message: error.to_string(),
+            },
+        )),
+    }
+}
+
+fn recover_prepared_transaction(
+    workspace: Option<&AssetWorkspace>,
+    layout: &JournalLayout,
+    locator: &RecoveryLocator,
+    budget: &mut AssetLoadBudget,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    match fs::symlink_metadata(layout.rollback_path()) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(blocked(
+                locator,
+                unexpected_premanifest("rollback-receipt-path"),
+            ));
+        }
+        Ok(_) => return recover_premanifest_rollback(workspace, layout, locator, budget),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(blocked(locator, io_reason(error))),
+    }
+    let preparation = match JournalPreparation::open(layout, budget) {
+        Ok(preparation) => preparation,
+        Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return recover_absent_prepared_transaction(layout, locator, budget);
+        }
+        Err(error) => return Err(map_journal_open_error(locator, error)),
+    };
+    if let Some(workspace) = workspace
+        && preparation.document().workspace_id() != workspace.workspace_id()
+    {
+        return Err(blocked(
+            locator,
+            RecoveryBlockedReason::WorkspaceMismatch {
+                expected: preparation.document().workspace_id(),
+                actual: workspace.workspace_id(),
+            },
+        ));
+    }
+    let receipt = RollbackReceipt::new(
+        preparation.document().workspace_id(),
+        preparation.document().base_revision(),
+        locator.clone(),
+    );
+    let plan = observe_premanifest_cleanup(layout, preparation, budget)
+        .map_err(|error| map_observation_error(locator, error))?;
+    execute_premanifest_cleanup(layout, &plan, PreparationCleanup::RetainRollbackReceipt).map_err(
+        |error| {
+            blocked(
+                locator,
+                RecoveryBlockedReason::Io {
+                    message: error.to_string(),
+                },
+            )
+        },
+    )?;
+    Ok(RecoveryOutcome::RolledBack(receipt))
+}
+
+fn recover_premanifest_rollback(
+    workspace: Option<&AssetWorkspace>,
+    layout: &JournalLayout,
+    locator: &RecoveryLocator,
+    budget: &mut AssetLoadBudget,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    let rollback = JournalPreparation::open_rollback(layout, budget)
+        .map_err(|error| map_journal_open_error(locator, error))?;
+    for (path, artifact) in [
+        (layout.preparation_path(), "active-preparation-record"),
+        (
+            layout.preparation_temporary_path(),
+            "preparation-temporary-record",
+        ),
+        (layout.directory().to_owned(), "transaction-directory"),
+    ] {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(blocked(locator, unexpected_premanifest(artifact))),
+            Err(error) => return Err(blocked(locator, io_reason(error))),
+        }
+    }
+    if let Some(workspace) = workspace {
+        if rollback.document().workspace_id() != workspace.workspace_id() {
+            return Err(blocked(
+                locator,
+                RecoveryBlockedReason::WorkspaceMismatch {
+                    expected: rollback.document().workspace_id(),
+                    actual: workspace.workspace_id(),
+                },
+            ));
+        }
+        if rollback.document().base_revision() != workspace.revision() {
+            return Err(blocked(
+                locator,
+                RecoveryBlockedReason::BaselineUnavailable {
+                    expected: rollback.document().base_revision(),
+                    actual: workspace.revision(),
+                },
+            ));
+        }
+    }
+    Ok(RecoveryOutcome::RolledBack(RollbackReceipt::new(
+        rollback.document().workspace_id(),
+        rollback.document().base_revision(),
+        locator.clone(),
+    )))
+}
+
+fn recover_absent_prepared_transaction(
+    layout: &JournalLayout,
+    locator: &RecoveryLocator,
+    budget: &mut AssetLoadBudget,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    match fs::symlink_metadata(layout.directory()) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(blocked(
+                locator,
+                RecoveryBlockedReason::InvalidJournal {
+                    message: "transaction state exists without its durable preparation record"
+                        .to_owned(),
+                },
+            ));
+        }
+        Err(error) => {
+            return Err(blocked(
+                locator,
+                RecoveryBlockedReason::Io {
+                    message: error.to_string(),
+                },
+            ));
+        }
+    }
+    let version_directory = layout.directory().parent().ok_or_else(|| {
+        blocked(
+            locator,
+            RecoveryBlockedReason::InvalidLocator {
+                message: "recovery transaction has no version directory".to_owned(),
+            },
+        )
+    })?;
+    match fs::symlink_metadata(version_directory) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RecoveryOutcome::NoTransaction(locator.clone()));
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(blocked(
+                locator,
+                unexpected_premanifest("recovery-version-directory"),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return Err(blocked(
+                locator,
+                RecoveryBlockedReason::Io {
+                    message: error.to_string(),
+                },
+            ));
+        }
+    }
+    let version_identity = observe_directory_identity(version_directory).map_err(|error| {
+        blocked(
+            locator,
+            RecoveryBlockedReason::Io {
+                message: error.to_string(),
+            },
+        )
+    })?;
+    cleanup_orphaned_preparation_attempts(layout, &version_identity, budget)
+        .map_err(|error| map_premanifest_cleanup_error(locator, error))?;
+    for path in [
+        layout.preparation_path(),
+        layout.rollback_path(),
+        layout.directory().to_owned(),
+    ] {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(blocked(
+                    locator,
+                    RecoveryBlockedReason::InvalidJournal {
+                        message:
+                            "transaction evidence changed while orphaned attempts were cleaned"
+                                .to_owned(),
+                    },
+                ));
+            }
+            Err(error) => {
+                return Err(blocked(
+                    locator,
+                    RecoveryBlockedReason::Io {
+                        message: error.to_string(),
+                    },
+                ));
+            }
+        }
+    }
+    Ok(RecoveryOutcome::NoTransaction(locator.clone()))
+}
+
+fn map_premanifest_cleanup_error(
+    locator: &RecoveryLocator,
+    error: PremanifestCleanupError,
+) -> RecoveryError {
+    match error {
+        PremanifestCleanupError::Budget(source) => RecoveryError::Budget {
+            locator: locator.clone(),
+            source,
+        },
+        PremanifestCleanupError::Blocked(reason) => blocked(locator, reason),
+        PremanifestCleanupError::Preparation(error) => map_journal_open_error(locator, error),
+        PremanifestCleanupError::Io(error) => blocked(
+            locator,
+            RecoveryBlockedReason::Io {
+                message: error.to_string(),
+            },
+        ),
+    }
+}
+
+#[derive(Debug, Error)]
+pub(super) enum PremanifestCleanupError {
+    #[error("the durable preparation record could not be opened: {0}")]
+    Preparation(#[source] JournalError),
+    #[error("premanifest cleanup exceeded its caller-owned budget: {0}")]
+    Budget(#[source] BudgetError),
+    #[error("premanifest cleanup was blocked by filesystem evidence: {0}")]
+    Blocked(#[source] RecoveryBlockedReason),
+    #[error("premanifest cleanup I/O failed: {0}")]
+    Io(#[source] io::Error),
+}
+
+pub(super) fn cleanup_prepared_transaction(
+    layout: &JournalLayout,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), PremanifestCleanupError> {
+    let preparation =
+        JournalPreparation::open(layout, budget).map_err(PremanifestCleanupError::Preparation)?;
+    let plan =
+        observe_premanifest_cleanup(layout, preparation, budget).map_err(|error| match error {
+            ObservationError::Budget(error) => PremanifestCleanupError::Budget(error),
+            ObservationError::Blocked(error) => PremanifestCleanupError::Blocked(error),
+        })?;
+    execute_premanifest_cleanup(layout, &plan, PreparationCleanup::Remove)
+        .map_err(PremanifestCleanupError::Io)
+}
+
+#[derive(Debug)]
+struct OrphanedPreparationAttempt {
+    path: PathBuf,
+    identity: FileIdentity,
+}
+
+pub(super) fn cleanup_orphaned_preparation_attempts(
+    layout: &JournalLayout,
+    version_identity: &DirectoryIdentity,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), PremanifestCleanupError> {
+    let attempt = observe_orphaned_preparation_attempt(layout, version_identity, budget).map_err(
+        |error| match error {
+            ObservationError::Budget(error) => PremanifestCleanupError::Budget(error),
+            ObservationError::Blocked(error) => PremanifestCleanupError::Blocked(error),
+        },
+    )?;
+    let Some(attempt) = attempt else {
+        return Ok(());
+    };
+    remove_owned_file_in_parent(&attempt.path, &attempt.identity, version_identity)
+        .map_err(PremanifestCleanupError::Io)?;
+    let version_directory = layout
+        .directory()
+        .parent()
+        .expect("validated journal layout has a version directory");
+    super::platform::sync_directory(version_directory).map_err(PremanifestCleanupError::Io)
+}
+
+fn observe_orphaned_preparation_attempt(
+    layout: &JournalLayout,
+    version_identity: &DirectoryIdentity,
+    budget: &mut AssetLoadBudget,
+) -> Result<Option<OrphanedPreparationAttempt>, ObservationError> {
+    let version_directory =
+        layout
+            .directory()
+            .parent()
+            .ok_or_else(|| RecoveryBlockedReason::InvalidLocator {
+                message: "recovery transaction has no version directory".to_owned(),
             })?;
-        let mut journal = Journal::open(layout, budget)
-            .map_err(|error| map_journal_open_error(locator, error))?;
-        recover_open_journal(self, &mut journal, locator, intent, budget)
+    let path = layout.preparation_temporary_path();
+    let retained_bytes =
+        u64::try_from(path.capacity()).map_err(|_| BudgetError::ArithmeticOverflow {
+            resource: "orphaned preparation attempt path",
+        })?;
+    budget.consume_bytes(retained_bytes)?;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(unexpected_premanifest("preparation-attempt-path").into());
+        }
+        Ok(_) => budget.consume_entries(1)?,
+        Err(error) => return Err(io_reason(error).into()),
+    }
+    let file = open_readonly_regular_in_parent(&path, version_identity).map_err(io_reason)?;
+    let identity = opened_file_identity(&file).map_err(io_reason)?;
+    let observed_version_identity =
+        observe_directory_identity(version_directory).map_err(io_reason)?;
+    if &observed_version_identity != version_identity {
+        return Err(unexpected_premanifest("changed-recovery-version-directory").into());
+    }
+    Ok(Some(OrphanedPreparationAttempt { path, identity }))
+}
+
+#[derive(Debug)]
+struct PremanifestCleanupFile {
+    path: PathBuf,
+    identity: FileIdentity,
+    parent: DirectoryIdentity,
+}
+
+#[derive(Debug)]
+struct PremanifestCleanupDirectory {
+    path: PathBuf,
+    identity: DirectoryIdentity,
+    parent: DirectoryIdentity,
+}
+
+#[derive(Debug)]
+struct PremanifestCleanupPlan {
+    preparation: OpenedJournalPreparation,
+    files: Vec<PremanifestCleanupFile>,
+    directories: Vec<PremanifestCleanupDirectory>,
+    transaction: Option<(PathBuf, DirectoryIdentity, DirectoryIdentity)>,
+}
+
+fn observe_premanifest_cleanup(
+    layout: &JournalLayout,
+    preparation: OpenedJournalPreparation,
+    budget: &mut AssetLoadBudget,
+) -> Result<PremanifestCleanupPlan, ObservationError> {
+    ensure_final_manifest_absent(layout)?;
+    let file_capacity = preparation
+        .document()
+        .outputs()
+        .len()
+        .checked_add(preparation.document().baseline().sources().len())
+        .and_then(|count| count.checked_add(1))
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "premanifest cleanup files",
+        })?;
+    let mut files = recovery_vec(file_capacity, "premanifest cleanup files", budget)?;
+    let mut directories = recovery_vec(4, "premanifest cleanup directories", budget)?;
+    let transaction_path = layout.directory();
+    let transaction_metadata = match fs::symlink_metadata(transaction_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            preparation
+                .revalidate(layout, budget)
+                .map_err(preparation_observation_error)?;
+            ensure_final_manifest_absent(layout)?;
+            return Ok(PremanifestCleanupPlan {
+                preparation,
+                files,
+                directories,
+                transaction: None,
+            });
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(RecoveryBlockedReason::UnexpectedEvidence {
+                artifact: "premanifest-transaction-directory".to_owned(),
+            }
+            .into());
+        }
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(RecoveryBlockedReason::Io {
+                message: error.to_string(),
+            }
+            .into());
+        }
+    };
+    let _ = transaction_metadata;
+    let transaction_identity = observe_directory_identity(transaction_path).map_err(io_reason)?;
+    let transaction_parent = preparation.parent().clone();
+    let mut present = [false; 4];
+    let mut root_entries = 0_usize;
+    for entry in fs::read_dir(transaction_path).map_err(io_reason)? {
+        root_entries = root_entries
+            .checked_add(1)
+            .ok_or(BudgetError::ArithmeticOverflow {
+                resource: "premanifest transaction entries",
+            })?;
+        if root_entries > 5 {
+            return Err(unexpected_premanifest("transaction-entry-count").into());
+        }
+        budget.consume_entries(1)?;
+        let entry = entry.map_err(io_reason)?;
+        let name = entry.file_name();
+        let name_text = name
+            .to_str()
+            .ok_or_else(|| unexpected_premanifest("non-utf8-transaction-entry"))?;
+        let file_type = entry.file_type().map_err(io_reason)?;
+        let directory_index = match name_text {
+            EVENTS_DIRECTORY => Some(0),
+            STAGE_DIRECTORY => Some(1),
+            BACKUP_DIRECTORY => Some(2),
+            BASELINE_DIRECTORY => Some(3),
+            _ => None,
+        };
+        if let Some(index) = directory_index {
+            if !file_type.is_dir() || file_type.is_symlink() || present[index] {
+                return Err(unexpected_premanifest(name_text).into());
+            }
+            present[index] = true;
+            continue;
+        }
+        if name_text == MANIFEST_TEMPORARY_FILE && file_type.is_file() && !file_type.is_symlink() {
+            let path = recovery_join_component(
+                transaction_path,
+                &name,
+                "premanifest manifest temporary path",
+                budget,
+            )?;
+            observe_premanifest_file(path, &transaction_identity, &mut files)?;
+            continue;
+        }
+        return Err(unexpected_premanifest(name_text).into());
+    }
+
+    let child_paths = [
+        recovery_join_component(
+            transaction_path,
+            OsStr::new(EVENTS_DIRECTORY),
+            "premanifest events path",
+            budget,
+        )?,
+        recovery_join_component(
+            transaction_path,
+            OsStr::new(STAGE_DIRECTORY),
+            "premanifest stage path",
+            budget,
+        )?,
+        recovery_join_component(
+            transaction_path,
+            OsStr::new(BACKUP_DIRECTORY),
+            "premanifest backup path",
+            budget,
+        )?,
+        recovery_join_component(
+            transaction_path,
+            OsStr::new(BASELINE_DIRECTORY),
+            "premanifest baseline path",
+            budget,
+        )?,
+    ];
+    for (index, path) in child_paths.into_iter().enumerate() {
+        if !present[index] {
+            continue;
+        }
+        let identity = observe_directory_identity(&path).map_err(io_reason)?;
+        match index {
+            0 | 2 => observe_empty_premanifest_directory(&path, budget)?,
+            1 => observe_stage_directory(
+                &path,
+                &identity,
+                preparation.document(),
+                &mut files,
+                budget,
+            )?,
+            3 => observe_baseline_directory(
+                &path,
+                &identity,
+                preparation.document(),
+                &mut files,
+                budget,
+            )?,
+            _ => unreachable!("fixed premanifest directory index"),
+        }
+        directories.push(PremanifestCleanupDirectory {
+            path,
+            identity,
+            parent: transaction_identity.clone(),
+        });
+    }
+    for directory in &directories {
+        if observe_directory_identity(&directory.path).map_err(io_reason)? != directory.identity {
+            return Err(unexpected_premanifest("changed-private-directory").into());
+        }
+    }
+    if observe_directory_identity(transaction_path).map_err(io_reason)? != transaction_identity {
+        return Err(unexpected_premanifest("changed-transaction-directory").into());
+    }
+    preparation
+        .revalidate(layout, budget)
+        .map_err(preparation_observation_error)?;
+    ensure_final_manifest_absent(layout)?;
+    Ok(PremanifestCleanupPlan {
+        preparation,
+        files,
+        directories,
+        transaction: Some((
+            recovery_clone_path(transaction_path, "premanifest transaction path", budget)?,
+            transaction_identity,
+            transaction_parent,
+        )),
+    })
+}
+
+fn observe_empty_premanifest_directory(
+    path: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), ObservationError> {
+    let mut entries = fs::read_dir(path).map_err(io_reason)?;
+    match entries.next() {
+        None => Ok(()),
+        Some(Ok(_)) => {
+            budget.consume_entries(1)?;
+            Err(unexpected_premanifest("non-empty-private-directory").into())
+        }
+        Some(Err(error)) => Err(io_reason(error).into()),
+    }
+}
+
+fn observe_stage_directory(
+    path: &Path,
+    parent: &DirectoryIdentity,
+    preparation: &JournalPreparation,
+    files: &mut Vec<PremanifestCleanupFile>,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), ObservationError> {
+    let mut count = 0_usize;
+    for entry in fs::read_dir(path).map_err(io_reason)? {
+        count = count
+            .checked_add(1)
+            .ok_or(BudgetError::ArithmeticOverflow {
+                resource: "premanifest stage entries",
+            })?;
+        if count > preparation.outputs().len() {
+            return Err(unexpected_premanifest("stage-entry-count").into());
+        }
+        budget.consume_entries(1)?;
+        let entry = entry.map_err(io_reason)?;
+        let file_type = entry.file_type().map_err(io_reason)?;
+        let name = entry.file_name();
+        let name_text = name
+            .to_str()
+            .ok_or_else(|| unexpected_premanifest("non-utf8-stage-entry"))?;
+        let ordinal = parse_premanifest_ordinal(name_text, ".stage")
+            .filter(|ordinal| *ordinal < preparation.outputs().len())
+            .ok_or_else(|| unexpected_premanifest(name_text))?;
+        if !file_type.is_file()
+            || file_type.is_symlink()
+            || preparation.outputs()[ordinal].ordinal()
+                != u32::try_from(ordinal)
+                    .map_err(|_| unexpected_premanifest("stage-ordinal-overflow"))?
+        {
+            return Err(unexpected_premanifest(name_text).into());
+        }
+        let entry_path =
+            recovery_join_component(path, &name, "premanifest staged file path", budget)?;
+        observe_premanifest_file(entry_path, parent, files)?;
+    }
+    Ok(())
+}
+
+fn observe_baseline_directory(
+    path: &Path,
+    parent: &DirectoryIdentity,
+    preparation: &JournalPreparation,
+    files: &mut Vec<PremanifestCleanupFile>,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), ObservationError> {
+    let sources = preparation.baseline().sources();
+    let mut count = 0_usize;
+    for entry in fs::read_dir(path).map_err(io_reason)? {
+        count = count
+            .checked_add(1)
+            .ok_or(BudgetError::ArithmeticOverflow {
+                resource: "premanifest baseline entries",
+            })?;
+        if count > sources.len() {
+            return Err(unexpected_premanifest("baseline-entry-count").into());
+        }
+        budget.consume_entries(1)?;
+        let entry = entry.map_err(io_reason)?;
+        let file_type = entry.file_type().map_err(io_reason)?;
+        let name = entry.file_name();
+        let name_text = name
+            .to_str()
+            .ok_or_else(|| unexpected_premanifest("non-utf8-baseline-entry"))?;
+        let ordinal = parse_premanifest_ordinal(name_text, ".image")
+            .filter(|ordinal| *ordinal < sources.len())
+            .ok_or_else(|| unexpected_premanifest(name_text))?;
+        let declared = matches!(
+            sources[ordinal].image(),
+            JournalBaselineImage::Blob { path, .. }
+                if matches_ordinal_journal_path(path, "baseline/", ordinal, ".image")
+        );
+        if !file_type.is_file() || file_type.is_symlink() || !declared {
+            return Err(unexpected_premanifest(name_text).into());
+        }
+        let entry_path =
+            recovery_join_component(path, &name, "premanifest baseline file path", budget)?;
+        observe_premanifest_file(entry_path, parent, files)?;
+    }
+    Ok(())
+}
+
+fn observe_premanifest_file(
+    path: PathBuf,
+    parent: &DirectoryIdentity,
+    files: &mut Vec<PremanifestCleanupFile>,
+) -> Result<(), ObservationError> {
+    let file = open_readonly_regular_in_parent(&path, parent).map_err(io_reason)?;
+    let identity = opened_file_identity(&file).map_err(io_reason)?;
+    files.push(PremanifestCleanupFile {
+        path,
+        identity,
+        parent: parent.clone(),
+    });
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparationCleanup {
+    Remove,
+    RetainRollbackReceipt,
+}
+
+fn execute_premanifest_cleanup(
+    layout: &JournalLayout,
+    plan: &PremanifestCleanupPlan,
+    cleanup: PreparationCleanup,
+) -> io::Result<()> {
+    ensure_final_manifest_absent_io(layout)?;
+    for file in &plan.files {
+        ensure_final_manifest_absent_io(layout)?;
+        remove_owned_file_in_parent(&file.path, &file.identity, &file.parent)?;
+    }
+    for directory in plan.directories.iter().rev() {
+        ensure_final_manifest_absent_io(layout)?;
+        remove_owned_empty_directory_in_parent(
+            &directory.path,
+            &directory.identity,
+            &directory.parent,
+        )?;
+    }
+    if let Some((path, identity, parent)) = &plan.transaction {
+        ensure_final_manifest_absent_io(layout)?;
+        remove_owned_empty_directory_in_parent(path, identity, parent)?;
+    }
+    ensure_final_manifest_absent_io(layout)?;
+    match cleanup {
+        PreparationCleanup::Remove => remove_owned_file_in_parent(
+            &layout.preparation_path(),
+            plan.preparation.identity(),
+            plan.preparation.parent(),
+        ),
+        PreparationCleanup::RetainRollbackReceipt => {
+            capture_existing_in_parent(
+                &layout.preparation_path(),
+                &layout.rollback_path(),
+                plan.preparation.identity(),
+                plan.preparation.parent(),
+                plan.preparation.parent(),
+            )?;
+            super::platform::sync_directory(
+                layout
+                    .directory()
+                    .parent()
+                    .expect("validated journal layout has a version directory"),
+            )?;
+            #[cfg(test)]
+            super::test_crash_failpoint("premanifest_rollback_recorded");
+            Ok(())
+        }
+    }
+}
+
+fn parse_premanifest_ordinal(name: &str, suffix: &str) -> Option<usize> {
+    let ordinal = name.strip_suffix(suffix)?;
+    if ordinal.len() != 8 || !ordinal.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    ordinal.parse().ok()
+}
+
+fn ensure_final_manifest_absent(layout: &JournalLayout) -> Result<(), ObservationError> {
+    ensure_final_manifest_absent_io(layout).map_err(io_reason)?;
+    Ok(())
+}
+
+fn ensure_final_manifest_absent_io(layout: &JournalLayout) -> io::Result<()> {
+    match fs::symlink_metadata(layout.manifest_path()) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "final manifest appeared during premanifest recovery",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn unexpected_premanifest(artifact: impl Into<String>) -> RecoveryBlockedReason {
+    RecoveryBlockedReason::UnexpectedEvidence {
+        artifact: artifact.into(),
+    }
+}
+
+fn io_reason(error: io::Error) -> RecoveryBlockedReason {
+    RecoveryBlockedReason::Io {
+        message: error.to_string(),
+    }
+}
+
+fn preparation_observation_error(error: JournalError) -> ObservationError {
+    match error {
+        JournalError::Budget(error) => ObservationError::Budget(error),
+        error => ObservationError::Blocked(RecoveryBlockedReason::InvalidJournal {
+            message: error.to_string(),
+        }),
     }
 }
 
 fn recover_open_journal(
-    workspace: &mut AssetWorkspace,
+    mut workspace: Option<&mut AssetWorkspace>,
     journal: &mut Journal,
     locator: &RecoveryLocator,
     intent: RecoveryIntent,
     budget: &mut AssetLoadBudget,
 ) -> Result<RecoveryOutcome, RecoveryError> {
+    let workspace_attached = workspace.is_some();
     let report = journal
         .manifest()
         .report(locator.root(), budget)
         .map_err(|error| map_journal_mutation_error(locator, error))?;
-    if report.workspace_id() != workspace.workspace_id() {
+    if let Some(workspace) = workspace.as_deref()
+        && report.workspace_id() != workspace.workspace_id()
+    {
         return Err(blocked(
             locator,
             RecoveryBlockedReason::WorkspaceMismatch {
@@ -861,22 +1724,16 @@ fn recover_open_journal(
 
     let events = EventFacts::from_journal(journal, budget)
         .map_err(|error| map_observation_error(locator, error))?;
-    let baseline = if workspace.revision() == report.committed_revision() {
-        BaselineObservation::Committed
-    } else if workspace.revision() == report.base_revision() {
-        BaselineObservation::Base
-    } else {
-        BaselineObservation::Other
+    let baseline = match workspace.as_deref() {
+        Some(workspace) if workspace.revision() == report.committed_revision() => {
+            BaselineObservation::Committed
+        }
+        Some(workspace) if workspace.revision() == report.base_revision() => {
+            BaselineObservation::Base
+        }
+        Some(_) => BaselineObservation::Other,
+        None => BaselineObservation::Detached,
     };
-    if baseline == BaselineObservation::Other {
-        return Err(blocked(
-            locator,
-            RecoveryBlockedReason::BaselineUnavailable {
-                committed: report.committed_revision(),
-                actual: workspace.revision(),
-            },
-        ));
-    }
     let (execution, artifacts) = observe_execution(journal, budget)
         .map_err(|error| map_observation_error(locator, error))?;
     let mut observation = RecoveryObservation {
@@ -884,6 +1741,107 @@ fn recover_open_journal(
         artifacts,
         baseline,
     };
+    if observation.events.finalized {
+        if observation.events.abandoned {
+            if !observation
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.is_rolled_back())
+            {
+                return Err(blocked(
+                    locator,
+                    RecoveryBlockedReason::UnexpectedEvidence {
+                        artifact: "finalized-rollback".to_owned(),
+                    },
+                ));
+            }
+            return if matches!(
+                observation.baseline,
+                BaselineObservation::Base | BaselineObservation::Detached
+            ) {
+                Ok(rollback_outcome(&report))
+            } else {
+                let actual = workspace
+                    .as_deref()
+                    .expect("attached rollback has a workspace")
+                    .revision();
+                Err(blocked(
+                    locator,
+                    RecoveryBlockedReason::BaselineUnavailable {
+                        expected: report.base_revision(),
+                        actual,
+                    },
+                ))
+            };
+        }
+        if !observation.events.published {
+            return Err(blocked(
+                locator,
+                RecoveryBlockedReason::InvalidEventSequence {
+                    message: "Finalized transaction does not contain a complete publication"
+                        .to_owned(),
+                },
+            ));
+        }
+        if !observation
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.is_published())
+        {
+            return Err(blocked(
+                locator,
+                RecoveryBlockedReason::UnexpectedEvidence {
+                    artifact: "finalized-publication".to_owned(),
+                },
+            ));
+        }
+        if intent == RecoveryIntent::Abandon {
+            return Err(blocked(
+                locator,
+                RecoveryBlockedReason::InvalidEventSequence {
+                    message: "a finalized publication cannot be abandoned".to_owned(),
+                },
+            ));
+        }
+        if matches!(
+            observation.baseline,
+            BaselineObservation::Base | BaselineObservation::Other
+        ) {
+            let workspace = workspace
+                .as_deref_mut()
+                .expect("an attached baseline observation has a workspace");
+            let baseline = prebuild_recovery_baseline(
+                workspace,
+                journal,
+                &observation.artifacts,
+                locator,
+                budget,
+            )?;
+            if !workspace.install_state_if_current(&baseline.expected, baseline.next) {
+                return Err(blocked(
+                    locator,
+                    RecoveryBlockedReason::BaselineUnavailable {
+                        expected: report.committed_revision(),
+                        actual: workspace.revision(),
+                    },
+                ));
+            }
+            observation.baseline = BaselineObservation::Committed;
+        }
+        return Ok(commit_outcome(report, workspace_attached));
+    }
+    if workspace.is_some()
+        && (!observation.events.published
+            || !observation
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.is_published()))
+    {
+        return Err(blocked(
+            locator,
+            RecoveryBlockedReason::FilesystemRecoveryRequired,
+        ));
+    }
     let plan = match intent {
         RecoveryIntent::Resume => decide_recovery(&observation),
         RecoveryIntent::Abandon => decide_abandon(&observation),
@@ -900,13 +1858,19 @@ fn recover_open_journal(
                 && (observation.events.published
                     || observation.events.baseline_installed
                     || observation.events.finalized)
-                && workspace.revision() != report.committed_revision()
+                && workspace
+                    .as_deref()
+                    .is_some_and(|workspace| workspace.revision() != report.committed_revision())
             {
+                let actual = workspace
+                    .as_deref()
+                    .expect("baseline mismatch has an attached workspace")
+                    .revision();
                 return Err(blocked(
                     locator,
                     RecoveryBlockedReason::BaselineUnavailable {
-                        committed: report.committed_revision(),
-                        actual: workspace.revision(),
+                        expected: report.committed_revision(),
+                        actual,
                     },
                 ));
             }
@@ -940,15 +1904,21 @@ fn recover_open_journal(
             if observation.events.finalized
                 && observation.baseline == BaselineObservation::Committed
             {
-                return Ok(RecoveryOutcome::Committed(Box::new(report)));
+                return Ok(commit_outcome(report, workspace_attached));
             }
             let already_published = observation
                 .artifacts
                 .iter()
                 .all(|artifact| artifact.is_published());
-            let prebuilt_baseline = if observation.baseline == BaselineObservation::Base {
+            let finalize_workspace = workspace.is_some();
+            let prebuilt_baseline = if matches!(
+                observation.baseline,
+                BaselineObservation::Base | BaselineObservation::Other
+            ) {
                 Some(prebuild_recovery_baseline(
-                    workspace,
+                    workspace
+                        .as_deref()
+                        .expect("an attached baseline observation has a workspace"),
                     journal,
                     &observation.artifacts,
                     locator,
@@ -957,8 +1927,9 @@ fn recover_open_journal(
             } else {
                 None
             };
-            let event_keys = recovery_event_keys(&observation, plan.disposition, budget)
-                .map_err(|error| map_observation_error(locator, error))?;
+            let event_keys =
+                recovery_event_keys(&observation, plan.disposition, finalize_workspace, budget)
+                    .map_err(|error| map_observation_error(locator, error))?;
             let mut event_plan = journal
                 .plan_events(&event_keys, budget)
                 .map_err(|error| map_journal_mutation_error(locator, error))?;
@@ -992,52 +1963,63 @@ fn recover_open_journal(
                 .map_err(|error| map_execution_error(locator, error))?;
             }
 
-            if workspace.revision() == report.base_revision() {
-                let baseline = prebuilt_baseline.expect("base recovery prebuilds its baseline");
-                if !workspace.install_state_if_current(&baseline.expected, baseline.next) {
-                    return Err(blocked(
-                        locator,
-                        RecoveryBlockedReason::BaselineUnavailable {
-                            committed: report.committed_revision(),
-                            actual: workspace.revision(),
-                        },
-                    ));
+            if let Some(workspace) = workspace.as_deref_mut() {
+                if workspace.revision() != report.committed_revision() {
+                    let baseline = prebuilt_baseline
+                        .expect("non-committed recovery prebuilds its workspace baseline");
+                    if !workspace.install_state_if_current(&baseline.expected, baseline.next) {
+                        return Err(blocked(
+                            locator,
+                            RecoveryBlockedReason::BaselineUnavailable {
+                                expected: report.committed_revision(),
+                                actual: workspace.revision(),
+                            },
+                        ));
+                    }
+                    observation.baseline = BaselineObservation::Committed;
                 }
-                observation.baseline = BaselineObservation::Committed;
-            } else if workspace.revision() != report.committed_revision() {
-                return Err(blocked(
-                    locator,
-                    RecoveryBlockedReason::BaselineUnavailable {
-                        committed: report.committed_revision(),
-                        actual: workspace.revision(),
-                    },
-                ));
-            }
-            append_once(
-                journal,
-                &mut observation.events.baseline_installed,
-                JournalEventKey::BaselineInstalled,
-                &mut event_plan,
-            )
-            .and_then(|_| {
                 append_once(
                     journal,
-                    &mut observation.events.finalized,
-                    JournalEventKey::Finalized,
+                    &mut observation.events.baseline_installed,
+                    JournalEventKey::BaselineInstalled,
                     &mut event_plan,
                 )
-            })
-            .map_err(|error| map_journal_mutation_error(locator, error))?;
+                .and_then(|_| {
+                    append_once(
+                        journal,
+                        &mut observation.events.finalized,
+                        JournalEventKey::Finalized,
+                        &mut event_plan,
+                    )
+                })
+                .map_err(|error| map_journal_mutation_error(locator, error))?;
+            }
             event_plan
                 .finish()
                 .map_err(|error| map_journal_mutation_error(locator, error))?;
-            Ok(RecoveryOutcome::Committed(Box::new(report)))
+            Ok(commit_outcome(report, workspace_attached))
         }
         RecoveryDisposition::Rollback => {
             if observation.events.finalized && observation.events.abandoned {
-                return Ok(RecoveryOutcome::RolledBack(locator.clone()));
+                return Ok(rollback_outcome(&report));
             }
-            let event_keys = recovery_event_keys(&observation, plan.disposition, budget)
+            if !matches!(
+                observation.baseline,
+                BaselineObservation::Base | BaselineObservation::Detached
+            ) {
+                let actual = workspace
+                    .as_deref()
+                    .expect("attached rollback has a workspace")
+                    .revision();
+                return Err(blocked(
+                    locator,
+                    RecoveryBlockedReason::BaselineUnavailable {
+                        expected: report.base_revision(),
+                        actual,
+                    },
+                ));
+            }
+            let event_keys = recovery_event_keys(&observation, plan.disposition, true, budget)
                 .map_err(|error| map_observation_error(locator, error))?;
             let mut event_plan = journal
                 .plan_events(&event_keys, budget)
@@ -1076,8 +2058,24 @@ fn recover_open_journal(
             event_plan
                 .finish()
                 .map_err(|error| map_journal_mutation_error(locator, error))?;
-            Ok(RecoveryOutcome::RolledBack(locator.clone()))
+            Ok(rollback_outcome(&report))
         }
+    }
+}
+
+fn rollback_outcome(report: &CommitReport) -> RecoveryOutcome {
+    RecoveryOutcome::RolledBack(RollbackReceipt::new(
+        report.workspace_id(),
+        report.base_revision(),
+        report.recovery().clone(),
+    ))
+}
+
+fn commit_outcome(report: CommitReport, workspace_attached: bool) -> RecoveryOutcome {
+    if workspace_attached {
+        RecoveryOutcome::Finalized(Box::new(report))
+    } else {
+        RecoveryOutcome::FilesystemRecovered(Box::new(report))
     }
 }
 
@@ -1316,10 +2314,12 @@ fn layout_from_locator(locator: &RecoveryLocator) -> Result<JournalLayout, Recov
     let parent = recovery
         .parent()
         .ok_or_else(|| invalid_locator("the destination parent is missing"))?;
-    if version.file_name().and_then(|name| name.to_str()) != Some("v1")
-        || recovery.file_name().and_then(|name| name.to_str()) != Some(".unity-asset-recovery")
+    if version.file_name().and_then(|name| name.to_str()) != Some(RECOVERY_VERSION_DIRECTORY)
+        || recovery.file_name().and_then(|name| name.to_str()) != Some(RECOVERY_DIRECTORY)
     {
-        return Err(invalid_locator("the recovery namespace is not version 1"));
+        return Err(invalid_locator(
+            "the recovery namespace version is unsupported",
+        ));
     }
     let layout = JournalLayout::new(parent, locator.transaction());
     if layout.directory() != directory {
@@ -1328,9 +2328,23 @@ fn layout_from_locator(locator: &RecoveryLocator) -> Result<JournalLayout, Recov
         ));
     }
     validate_directory(parent, "destination parent")?;
-    validate_directory(recovery, "recovery directory")?;
-    validate_directory(version, "recovery version directory")?;
-    validate_directory(directory, "transaction directory")?;
+    if validate_optional_directory(recovery, "recovery directory")? {
+        validate_optional_directory(version, "recovery version directory")?;
+    }
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(invalid_locator(
+                "transaction directory is not a non-symlink directory",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(RecoveryBlockedReason::Io {
+                message: format!("failed to inspect transaction directory: {error}"),
+            });
+        }
+    }
     Ok(layout)
 }
 
@@ -1350,6 +2364,22 @@ fn validate_directory(path: &Path, label: &'static str) -> Result<(), RecoveryBl
         )));
     }
     Ok(())
+}
+
+fn validate_optional_directory(
+    path: &Path,
+    label: &'static str,
+) -> Result<bool, RecoveryBlockedReason> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(
+            invalid_locator(format!("{label} is not a non-symlink directory")),
+        ),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(RecoveryBlockedReason::Io {
+            message: format!("failed to inspect {label}: {error}"),
+        }),
+    }
 }
 
 #[derive(Debug, Error)]
@@ -1995,10 +3025,19 @@ fn recovery_join(
     resource: &'static str,
     budget: &mut AssetLoadBudget,
 ) -> Result<PathBuf, ObservationError> {
+    recovery_join_component(root, OsStr::new(relative.as_str()), resource, budget)
+}
+
+fn recovery_join_component(
+    root: &Path,
+    component: &OsStr,
+    resource: &'static str,
+    budget: &mut AssetLoadBudget,
+) -> Result<PathBuf, ObservationError> {
     let requested = root
         .as_os_str()
         .len()
-        .checked_add(relative.as_str().len())
+        .checked_add(component.len())
         .and_then(|bytes| bytes.checked_add(1))
         .ok_or(BudgetError::ArithmeticOverflow { resource })?;
     budget.check_bytes(
@@ -2010,7 +3049,29 @@ fn recovery_join(
             message: format!("failed to reserve {resource}: {error}"),
         })?;
     path.push(root);
-    path.push(relative.as_str());
+    path.push(component);
+    let actual =
+        u64::try_from(path.capacity()).map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
+    budget.check_bytes(actual)?;
+    budget.consume_bytes(actual)?;
+    Ok(path)
+}
+
+fn recovery_clone_path(
+    source: &Path,
+    resource: &'static str,
+    budget: &mut AssetLoadBudget,
+) -> Result<PathBuf, ObservationError> {
+    let requested = source.as_os_str().len();
+    budget.check_bytes(
+        u64::try_from(requested).map_err(|_| BudgetError::ArithmeticOverflow { resource })?,
+    )?;
+    let mut path = PathBuf::new();
+    path.try_reserve_exact(requested)
+        .map_err(|error| RecoveryBlockedReason::Io {
+            message: format!("failed to reserve {resource}: {error}"),
+        })?;
+    path.push(source);
     let actual =
         u64::try_from(path.capacity()).map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
     budget.check_bytes(actual)?;
@@ -2670,6 +3731,17 @@ fn blocked(locator: &RecoveryLocator, reason: RecoveryBlockedReason) -> Recovery
     }
 }
 
+fn map_commit_guard_error(locator: &RecoveryLocator, error: io::Error) -> RecoveryError {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        RecoveryError::Busy {
+            locator: locator.clone(),
+            message: error.to_string(),
+        }
+    } else {
+        blocked(locator, io_reason(error))
+    }
+}
+
 fn invalid_journal(message: String) -> RecoveryBlockedReason {
     RecoveryBlockedReason::InvalidJournal { message }
 }
@@ -2680,6 +3752,7 @@ fn map_journal_open_error(locator: &RecoveryLocator, error: JournalError) -> Rec
             locator: locator.clone(),
             source,
         },
+        JournalError::Io(error) => blocked(locator, io_reason(error)),
         error => blocked(locator, invalid_journal(error.to_string())),
     }
 }
@@ -2690,6 +3763,7 @@ fn map_journal_mutation_error(locator: &RecoveryLocator, error: JournalError) ->
             locator: locator.clone(),
             source,
         },
+        JournalError::Io(error) => blocked(locator, io_reason(error)),
         error => blocked(locator, invalid_journal(error.to_string())),
     }
 }
@@ -2703,6 +3777,10 @@ fn map_baseline_error(
             locator: locator.clone(),
             source,
         },
+        Err(super::baseline::BaselineBuildError::Revision { expected, actual }) => blocked(
+            locator,
+            RecoveryBlockedReason::BaselineUnavailable { expected, actual },
+        ),
         Err(error) => blocked(
             locator,
             RecoveryBlockedReason::BaselineRebuild {
@@ -2738,7 +3816,8 @@ fn map_execution_error(locator: &RecoveryLocator, error: ExecutionError) -> Reco
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     use tempfile::TempDir;
     use unity_asset_core::{semantic_value_digest, yaml_field_schema_digest};
@@ -2758,6 +3837,12 @@ mod tests {
     const SOURCE_ALIAS: &str = "recovery.prefab";
     const RESOURCE_ALIAS: &str = "recovery-audio.asset";
     const RESOURCE_PAYLOAD: &[u8] = b"recoverable streamed payload";
+    const CRASH_ROOT_ENV: &str = "UNITY_ASSET_TEST_CRASH_ROOT";
+    const CRASH_SCENARIO_ENV: &str = "UNITY_ASSET_TEST_CRASH_SCENARIO";
+    const RESOURCE_CRASH_SCENARIO: &str = "resource";
+    const RECOVERY_CRASH_SCENARIO: &str = "recovery";
+    const CRASH_CHILD_TEST: &str = "workspace::commit::recovery::tests::publication_crash_child";
+    const CRASH_WORKSPACE_ID: u128 = 0x7a11_5afe_c0de_0001;
     const YAML: &[u8] =
         b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Before\n";
     const RESOURCE_YAML: &[u8] = b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!83 &1\nAudioClip:\n  m_StreamData: {path: old.resS, offset: 7, size: 4}\n";
@@ -2883,8 +3968,518 @@ mod tests {
         (directory, path, workspace, report)
     }
 
+    fn crash_workspace_id() -> WorkspaceId {
+        WorkspaceId::from_u128(CRASH_WORKSPACE_ID).expect("workspace id")
+    }
+
+    fn open_crash_workspace(path: &Path, workspace_id: WorkspaceId) -> AssetWorkspace {
+        let mut workspace =
+            AssetWorkspace::with_workspace_id(workspace_id, WorkspaceOptions::default())
+                .expect("crash workspace");
+        workspace
+            .load_source(
+                SourceOpenRequest::new(path, SourceAlias::new(SOURCE_ALIAS).expect("alias"))
+                    .with_kind_hint(SourceKind::Yaml),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("load crash fixture");
+        workspace
+    }
+
+    fn open_crash_resource_workspace(path: &Path, workspace_id: WorkspaceId) -> AssetWorkspace {
+        let mut workspace =
+            AssetWorkspace::with_workspace_id(workspace_id, WorkspaceOptions::default())
+                .expect("crash resource workspace");
+        workspace
+            .load_source(
+                SourceOpenRequest::new(
+                    path,
+                    SourceAlias::new(RESOURCE_ALIAS).expect("resource alias"),
+                )
+                .with_kind_hint(SourceKind::Yaml),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("load crash resource fixture");
+        workspace
+    }
+
+    fn crash_locator(directory: &Path, path: &Path) -> RecoveryLocator {
+        let workspace = open_crash_workspace(path, crash_workspace_id());
+        let prepared = workspace
+            .prepare(
+                mutation_plan(&workspace, "Before", "After"),
+                PrepareOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("prepare crash transaction");
+        let target = PublicationTarget::in_place(directory).expect("publication target");
+        let preflight =
+            super::super::preflight_commit(&prepared, &target, &mut AssetLoadBudget::default())
+                .expect("preflight crash transaction");
+        target.recovery_locator(preflight.transaction)
+    }
+
+    fn crash_resource_locator(directory: &Path, path: &Path) -> RecoveryLocator {
+        let workspace = open_crash_resource_workspace(path, crash_workspace_id());
+        let prepared = workspace
+            .prepare(
+                resource_plan(&workspace),
+                PrepareOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("prepare crash resource transaction");
+        let target = PublicationTarget::in_place(directory).expect("publication target");
+        let preflight =
+            super::super::preflight_commit(&prepared, &target, &mut AssetLoadBudget::default())
+                .expect("preflight crash resource transaction");
+        target.recovery_locator(preflight.transaction)
+    }
+
+    fn run_crash_child(directory: &Path, point: &str, scenario: Option<&str>) {
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .arg("--exact")
+            .arg(CRASH_CHILD_TEST)
+            .arg("--nocapture")
+            .env(CRASH_ROOT_ENV, directory)
+            .env(super::super::TEST_CRASH_POINT_ENV, point);
+        if let Some(scenario) = scenario {
+            command.env(CRASH_SCENARIO_ENV, scenario);
+        }
+        let output = command.output().expect("spawn crashing commit");
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "failpoint {point} did not terminate at the requested barrier\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    fn run_crashing_commit(point: &str) -> (TempDir, PathBuf, RecoveryLocator) {
+        let directory = tempfile::tempdir().expect("crash directory");
+        let path = directory.path().join(SOURCE_ALIAS);
+        fs::write(&path, YAML).expect("crash fixture bytes");
+        let locator = crash_locator(directory.path(), &path);
+        run_crash_child(directory.path(), point, None);
+        (directory, path, locator)
+    }
+
+    fn run_crashing_resource_commit(point: &str) -> (TempDir, PathBuf, RecoveryLocator) {
+        let directory = tempfile::tempdir().expect("resource crash directory");
+        let path = directory.path().join(RESOURCE_ALIAS);
+        fs::write(&path, RESOURCE_YAML).expect("resource crash fixture bytes");
+        let locator = crash_resource_locator(directory.path(), &path);
+        run_crash_child(directory.path(), point, Some(RESOURCE_CRASH_SCENARIO));
+        (directory, path, locator)
+    }
+
+    #[test]
+    fn publication_crash_child() {
+        let Some(root) = std::env::var_os(CRASH_ROOT_ENV) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        if std::env::var(CRASH_SCENARIO_ENV)
+            .is_ok_and(|scenario| scenario == RECOVERY_CRASH_SCENARIO)
+        {
+            let path = root.join(SOURCE_ALIAS);
+            let locator = crash_locator(&root, &path);
+            let result = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default());
+            panic!("configured recovery crash point was not reached: {result:?}");
+        }
+        let (mut workspace, prepared) = if std::env::var(CRASH_SCENARIO_ENV)
+            .is_ok_and(|scenario| scenario == RESOURCE_CRASH_SCENARIO)
+        {
+            let path = root.join(RESOURCE_ALIAS);
+            let workspace = open_crash_resource_workspace(&path, crash_workspace_id());
+            let prepared = workspace
+                .prepare(
+                    resource_plan(&workspace),
+                    PrepareOptions::default(),
+                    &mut AssetLoadBudget::default(),
+                )
+                .expect("prepare child resource transaction");
+            (workspace, prepared)
+        } else {
+            let path = root.join(SOURCE_ALIAS);
+            let workspace = open_crash_workspace(&path, crash_workspace_id());
+            let prepared = workspace
+                .prepare(
+                    mutation_plan(&workspace, "Before", "After"),
+                    PrepareOptions::default(),
+                    &mut AssetLoadBudget::default(),
+                )
+                .expect("prepare child transaction");
+            (workspace, prepared)
+        };
+        let result = workspace.commit(
+            prepared,
+            PublicationTarget::in_place(&root).expect("child publication target"),
+            &mut AssetLoadBudget::default(),
+        );
+        panic!("configured crash point was not reached: {result:?}");
+    }
+
+    #[test]
+    fn crash_before_preparation_installation_leaves_no_recovery_blocker() {
+        let (directory, path, locator) = run_crashing_commit("preparation_temporary_synced");
+        let layout = layout_from_locator(&locator).expect("preparation-attempt layout");
+        assert_target_unchanged(&path, YAML);
+        assert!(!layout.preparation_path().exists());
+        assert!(!layout.directory().exists());
+        assert!(layout.preparation_temporary_path().is_file());
+        let mut workspace = open_crash_workspace(&path, crash_workspace_id());
+        let prepared = workspace
+            .prepare(
+                mutation_plan(&workspace, "Before", "After"),
+                PrepareOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("prepare after orphaned attempt");
+
+        workspace
+            .commit(
+                prepared,
+                PublicationTarget::in_place(directory.path()).expect("retry target"),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("orphaned preparation attempt must not block a new canonical attempt");
+
+        assert!(!layout.preparation_temporary_path().exists());
+        assert_eq!(read_name(&workspace), "After");
+    }
+
+    #[test]
+    fn preopen_recovery_removes_an_orphaned_preparation_attempt() {
+        let (_directory, path, locator) = run_crashing_commit("preparation_temporary_synced");
+        let layout = layout_from_locator(&locator).expect("preparation-attempt layout");
+        assert!(layout.preparation_temporary_path().is_file());
+
+        let outcome = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect("clean orphaned preparation attempt");
+
+        assert_eq!(outcome, RecoveryOutcome::NoTransaction(locator));
+        assert!(!layout.preparation_temporary_path().exists());
+        assert_target_unchanged(&path, YAML);
+    }
+
+    #[test]
+    fn replaced_orphaned_preparation_attempt_is_preserved() {
+        let (_directory, path, locator) = run_crashing_commit("preparation_temporary_synced");
+        let layout = layout_from_locator(&locator).expect("preparation-attempt layout");
+        let attempt = layout.preparation_temporary_path();
+        fs::remove_file(&attempt).expect("replace owned preparation attempt");
+        fs::create_dir(&attempt).expect("external replacement directory");
+
+        let error = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect_err("external replacement must block cleanup");
+
+        assert!(matches!(
+            error.blocked_reason(),
+            Some(RecoveryBlockedReason::UnexpectedEvidence { artifact })
+                if artifact == "preparation-attempt-path"
+        ));
+        assert!(attempt.is_dir());
+        assert_target_unchanged(&path, YAML);
+    }
+
+    #[test]
+    fn clean_publication_root_reports_no_transaction() {
+        let directory = tempfile::tempdir().expect("clean publication root");
+        let transaction = unity_asset_core::TransactionId::new(DigestV1::hash_bytes(b"absent"));
+        let locator = PublicationTarget::in_place(directory.path())
+            .expect("publication target")
+            .recovery_locator(transaction);
+
+        let recovered = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect("clean recovery probe");
+        let abandoned = AssetWorkspace::abandon_at(&locator, &mut AssetLoadBudget::default())
+            .expect("clean abandon probe");
+
+        assert_eq!(recovered, RecoveryOutcome::NoTransaction(locator.clone()));
+        assert_eq!(abandoned, RecoveryOutcome::NoTransaction(locator));
+    }
+
+    #[test]
+    fn lost_premanifest_rollback_response_redelivers_the_same_receipt() {
+        let (directory, path, locator) = run_crashing_commit("recovery_baseline_synced");
+        run_crash_child(
+            directory.path(),
+            "premanifest_rollback_recorded",
+            Some(RECOVERY_CRASH_SCENARIO),
+        );
+        let layout = layout_from_locator(&locator).expect("recovery layout");
+        assert!(!layout.preparation_path().exists());
+        assert!(!layout.directory().exists());
+        assert!(layout.rollback_path().is_file());
+        assert_target_unchanged(&path, YAML);
+
+        let first = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect("redeliver lost rollback response");
+        let second = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect("redeliver rollback receipt again");
+
+        assert_eq!(first, second);
+        assert_eq!(first.workspace_id(), Some(crash_workspace_id()));
+        assert!(first.rolled_back().is_some());
+    }
+
+    #[test]
+    fn child_crashes_before_final_manifest_roll_back_without_target_writes() {
+        for point in [
+            "preparation_installed",
+            "transaction_directory_installed",
+            "private_directories_synced",
+            "staged_artifact_synced:0",
+            "recovery_baseline_synced",
+            "manifest_temporary_synced",
+        ] {
+            let (directory, path, locator) = run_crashing_commit(point);
+            assert_target_unchanged(&path, YAML);
+            if point == "preparation_installed" {
+                assert!(!locator.root().exists());
+                assert!(
+                    layout_from_locator(&locator)
+                        .expect("preparation-only layout")
+                        .preparation_path()
+                        .is_file()
+                );
+            }
+            let outcome = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+                .unwrap_or_else(|error| panic!("recover {point}: {error}"));
+
+            let receipt = outcome
+                .rolled_back()
+                .expect("premanifest recovery must return a rollback receipt")
+                .clone();
+            assert_eq!(receipt.workspace_id(), crash_workspace_id());
+            assert_eq!(receipt.recovery(), &locator);
+            assert!(!locator.root().exists(), "{point} transaction directory");
+            assert!(
+                !JournalLayout::new(directory.path(), locator.transaction())
+                    .preparation_path()
+                    .exists(),
+                "{point} preparation record"
+            );
+            assert!(
+                JournalLayout::new(directory.path(), locator.transaction())
+                    .rollback_path()
+                    .is_file(),
+                "{point} rollback receipt"
+            );
+            assert_eq!(
+                AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default(),)
+                    .unwrap_or_else(|error| panic!("repeat recover {point}: {error}")),
+                outcome,
+                "{point} rollback receipt must redeliver idempotently"
+            );
+            let mut workspace = open_crash_workspace(&path, receipt.workspace_id());
+            assert_eq!(workspace.revision(), receipt.base_revision());
+            let prepared = workspace
+                .prepare(
+                    mutation_plan(&workspace, "Before", "After"),
+                    PrepareOptions::default(),
+                    &mut AssetLoadBudget::default(),
+                )
+                .expect("prepare after premanifest recovery");
+            workspace
+                .commit(
+                    prepared,
+                    PublicationTarget::in_place(directory.path()).expect("retry target"),
+                    &mut AssetLoadBudget::default(),
+                )
+                .expect("commit after premanifest recovery");
+            assert_eq!(read_name(&workspace), "After");
+        }
+    }
+
+    #[test]
+    fn premanifest_recovery_preserves_every_entry_when_unknown_evidence_exists() {
+        let (_directory, path, locator) = run_crashing_commit("recovery_baseline_synced");
+        let staged = locator.root().join(STAGE_DIRECTORY).join("00000000.stage");
+        let staged_before = fs::read(&staged).expect("valid staged image");
+        let baseline_directory = locator.root().join(BASELINE_DIRECTORY);
+        let baseline_before: Vec<_> = fs::read_dir(&baseline_directory)
+            .expect("baseline directory")
+            .map(|entry| {
+                let path = entry.expect("baseline entry").path();
+                let bytes = fs::read(&path).expect("baseline image");
+                (path, bytes)
+            })
+            .collect();
+        let unknown = locator.root().join(STAGE_DIRECTORY).join("unknown.bin");
+        fs::write(&unknown, b"external evidence").expect("unknown evidence");
+        let preparation = layout_from_locator(&locator)
+            .expect("premanifest layout")
+            .preparation_path();
+        let error = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect_err("unknown premanifest evidence must block recovery");
+
+        assert!(matches!(
+            error.blocked_reason(),
+            Some(RecoveryBlockedReason::UnexpectedEvidence { .. })
+        ));
+        assert_target_unchanged(&path, YAML);
+        assert_eq!(
+            fs::read(&unknown).expect("retained evidence"),
+            b"external evidence"
+        );
+        assert_eq!(
+            fs::read(&staged).expect("retained staged image"),
+            staged_before
+        );
+        for (path, bytes) in baseline_before {
+            assert_eq!(fs::read(path).expect("retained baseline image"), bytes);
+        }
+        assert!(locator.root().exists());
+        assert!(preparation.exists());
+        for child in [
+            EVENTS_DIRECTORY,
+            STAGE_DIRECTORY,
+            BACKUP_DIRECTORY,
+            BASELINE_DIRECTORY,
+        ] {
+            assert!(locator.root().join(child).exists(), "retained {child}");
+        }
+    }
+
+    #[test]
+    fn premanifest_recovery_rejects_a_declared_hard_link_without_deleting_it() {
+        let (directory, path, locator) = run_crashing_commit("private_directories_synced");
+        let external = directory.path().join("external-evidence.bin");
+        fs::write(&external, b"shared evidence").expect("external evidence");
+        let staged = locator.root().join(STAGE_DIRECTORY).join("00000000.stage");
+        fs::hard_link(&external, &staged).expect("hard-linked staged evidence");
+        let error = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect_err("hard-linked premanifest evidence must block recovery");
+
+        assert!(matches!(
+            error.blocked_reason(),
+            Some(RecoveryBlockedReason::Io { .. })
+        ));
+        assert_target_unchanged(&path, YAML);
+        assert_eq!(
+            fs::read(&external).expect("external hard link"),
+            b"shared evidence"
+        );
+        assert_eq!(
+            fs::read(&staged).expect("staged hard link"),
+            b"shared evidence"
+        );
+    }
+
+    #[test]
+    fn child_crashes_after_final_manifest_redeliver_the_canonical_commit() {
+        for point in [
+            "manifest_installed",
+            "backup_intent:0",
+            "backup_renamed:0",
+            "promotion_intent:0",
+            "promotion_renamed:0",
+            "published",
+            "baseline_cas_before_event",
+            "finalized_before_response",
+        ] {
+            let (_directory, path, locator) = run_crashing_commit(point);
+            let first = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+                .unwrap_or_else(|error| panic!("recover {point}: {error}"));
+            let expected = first
+                .committed()
+                .expect("postmanifest recovery must return the canonical commit report")
+                .clone();
+            assert_eq!(expected.recovery(), &locator);
+            let mut workspace = open_crash_workspace(&path, expected.workspace_id());
+            assert_eq!(workspace.revision(), expected.committed_revision());
+            assert_eq!(read_name(&workspace), "After");
+            let finalized = workspace
+                .finalize_recovery_at(&locator, &mut AssetLoadBudget::default())
+                .unwrap_or_else(|error| panic!("finalize {point}: {error}"));
+            assert_eq!(
+                finalized,
+                RecoveryOutcome::Finalized(Box::new(expected.clone()))
+            );
+            let redelivered = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+                .unwrap_or_else(|error| panic!("redeliver {point}: {error}"));
+            assert_eq!(
+                redelivered,
+                RecoveryOutcome::FilesystemRecovered(Box::new(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn child_crashes_converge_a_two_artifact_publication_before_trusted_reopen() {
+        for point in [
+            "backup_intent:1",
+            "backup_renamed:1",
+            "promotion_intent:0",
+            "promotion_renamed:0",
+            "promotion_intent:1",
+            "promotion_renamed:1",
+        ] {
+            let (_directory, path, locator) = run_crashing_resource_commit(point);
+            if point == "backup_renamed:1" {
+                assert!(
+                    matches!(
+                        fs::symlink_metadata(&path),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound
+                    ),
+                    "the trusted root must genuinely be missing before recovery"
+                );
+            }
+
+            let recovered = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+                .unwrap_or_else(|error| panic!("recover two-artifact crash {point}: {error}"));
+            let report = recovered
+                .committed()
+                .expect("two-artifact recovery must return a commit report")
+                .clone();
+            assert_eq!(report.artifacts().len(), 2);
+
+            let mut reopened =
+                open_crash_resource_workspace(&path, recovered.workspace_id().expect("workspace"));
+            let finalized = reopened
+                .finalize_recovery_at(&locator, &mut AssetLoadBudget::default())
+                .unwrap_or_else(|error| panic!("attach two-artifact crash {point}: {error}"));
+
+            assert_eq!(
+                finalized,
+                RecoveryOutcome::Finalized(Box::new(report.clone()))
+            );
+            assert_eq!(reopened.revision(), report.committed_revision());
+            assert_resource_payload(&reopened, &report);
+            assert_eq!(
+                AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+                    .expect("redeliver two-artifact report"),
+                recovered
+            );
+        }
+    }
+
     fn assert_target_unchanged(path: &Path, expected: &[u8]) {
         assert_eq!(fs::read(path).expect("target bytes"), expected);
+    }
+
+    fn assert_resource_payload(workspace: &AssetWorkspace, report: &CommitReport) {
+        let companion = report
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.source().kind() == SourceKind::StreamedResource)
+            .expect("companion artifact")
+            .source();
+        let range = workspace
+            .snapshot()
+            .read_source_range(
+                companion,
+                0,
+                u64::try_from(RESOURCE_PAYLOAD.len()).expect("payload length"),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("read recovered companion");
+        let mut payload = Vec::new();
+        range.copy_to(&mut payload).expect("copy companion bytes");
+        assert_eq!(payload, RESOURCE_PAYLOAD);
     }
 
     fn remove_terminal_events(report: &CommitReport) {
@@ -3275,12 +4870,12 @@ mod tests {
     fn finalized_recovery_redelivers_the_same_report_idempotently() {
         let (_directory, _path, mut workspace, report) = committed_fixture();
         let first = workspace
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect("finalized recovery");
-        assert_eq!(first, RecoveryOutcome::Committed(Box::new(report.clone())));
+        assert_eq!(first, RecoveryOutcome::Finalized(Box::new(report.clone())));
 
         let second = workspace
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect("idempotent finalized recovery");
         assert_eq!(second, first);
     }
@@ -3293,7 +4888,7 @@ mod tests {
         let mut wrong_workspace = AssetWorkspace::new().expect("wrong workspace");
 
         let error = wrong_workspace
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect_err("workspace mismatch must block recovery");
         assert!(matches!(
             error.blocked_reason(),
@@ -3302,9 +4897,9 @@ mod tests {
         assert_eq!(fs::read_dir(&events).expect("events").count(), event_count);
 
         let outcome = workspace
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect("canonical recovery must remain available");
-        assert_eq!(outcome, RecoveryOutcome::Committed(Box::new(report)));
+        assert_eq!(outcome, RecoveryOutcome::Finalized(Box::new(report)));
     }
 
     #[test]
@@ -3312,12 +4907,12 @@ mod tests {
         let (_directory, _path, mut reopened, report, _published) = published_restart_fixture();
 
         let outcome = reopened
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect("recover published transaction");
 
         assert_eq!(
             outcome,
-            RecoveryOutcome::Committed(Box::new(report.clone()))
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
         );
         assert_eq!(reopened.revision(), report.committed_revision());
         assert_eq!(read_name(&reopened), "After");
@@ -3329,7 +4924,7 @@ mod tests {
             published_restart_fixture();
         let mut measured = AssetLoadBudget::default();
         measured_workspace
-            .recover_at(measured_report.recovery(), &mut measured)
+            .finalize_recovery_at(measured_report.recovery(), &mut measured)
             .expect("measure published recovery");
         let usage = measured.usage();
         let exact_limits = unity_asset_core::AssetLoadLimits {
@@ -3344,7 +4939,7 @@ mod tests {
             published_restart_fixture();
         let mut exact = AssetLoadBudget::new(exact_limits).expect("exact budget");
         exact_workspace
-            .recover_at(exact_report.recovery(), &mut exact)
+            .finalize_recovery_at(exact_report.recovery(), &mut exact)
             .expect("exact recovery budget");
         assert_eq!(exact.usage(), usage);
 
@@ -3359,7 +4954,7 @@ mod tests {
         .expect("one-short budget");
 
         let error = short_workspace
-            .recover_at(short_report.recovery(), &mut one_short)
+            .finalize_recovery_at(short_report.recovery(), &mut one_short)
             .expect_err("one-short recovery must fail");
         assert!(matches!(error, RecoveryError::Budget { .. }));
         assert_eq!(short_workspace.revision(), short_report.base_revision());
@@ -3368,12 +4963,11 @@ mod tests {
     }
 
     #[test]
-    fn journaled_recovery_precharges_exact_budget_before_any_durable_write() {
-        let (_measured_directory, _measured_path, mut measured_workspace, measured_report, _) =
+    fn preopen_recovery_precharges_exact_budget_before_any_durable_write() {
+        let (_measured_directory, _measured_path, _measured_workspace, measured_report, _) =
             journaled_restart_fixture();
         let mut measured = AssetLoadBudget::default();
-        measured_workspace
-            .recover_at(measured_report.recovery(), &mut measured)
+        AssetWorkspace::recover_at(measured_report.recovery(), &mut measured)
             .expect("measure journaled recovery");
         let usage = measured.usage();
         let exact_limits = unity_asset_core::AssetLoadLimits {
@@ -3406,8 +5000,7 @@ mod tests {
         })
         .expect("one-short budget");
 
-        let error = workspace
-            .recover_at(report.recovery(), &mut one_short)
+        let error = AssetWorkspace::recover_at(report.recovery(), &mut one_short)
             .expect_err("one-short journaled recovery must fail before mutation");
 
         assert!(matches!(error, RecoveryError::Budget { .. }));
@@ -3421,15 +5014,22 @@ mod tests {
         assert_eq!(fs::read_dir(&events).expect("events").count(), event_count);
 
         let mut exact = AssetLoadBudget::new(exact_limits).expect("exact budget");
-        let outcome = workspace
-            .recover_at(report.recovery(), &mut exact)
+        let recovered = AssetWorkspace::recover_at(report.recovery(), &mut exact)
             .expect("exact recovery after one-short probe");
         assert_eq!(
-            outcome,
-            RecoveryOutcome::Committed(Box::new(report.clone()))
+            recovered,
+            RecoveryOutcome::FilesystemRecovered(Box::new(report.clone()))
         );
         assert_eq!(exact.usage(), usage);
         assert_eq!(fs::read(path).expect("published target"), published);
+        let finalized = workspace
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("attach exact preopen recovery");
+        assert_eq!(
+            finalized,
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
+        );
+        assert_eq!(workspace.revision(), report.committed_revision());
     }
 
     #[test]
@@ -3440,14 +5040,18 @@ mod tests {
             .recovery_locator(report.transaction());
         assert_eq!(&locator, report.recovery());
 
+        let recovered = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect("recover journaled filesystem transaction");
         let outcome = reopened
-            .recover_at(&locator, &mut AssetLoadBudget::default())
-            .expect("recover journaled transaction");
+            .finalize_recovery_at(&locator, &mut AssetLoadBudget::default())
+            .expect("attach journaled transaction");
 
+        assert!(recovered.requires_workspace_finalization());
         assert_eq!(
             outcome,
-            RecoveryOutcome::Committed(Box::new(report.clone()))
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
         );
+        assert_eq!(recovered.committed(), outcome.committed());
         assert_eq!(fs::read(&path).expect("recovered target"), published);
         assert_eq!(reopened.revision(), report.committed_revision());
         assert_eq!(read_name(&reopened), "After");
@@ -3455,16 +5059,13 @@ mod tests {
 
     #[test]
     fn explicit_abandon_rolls_back_an_unpublished_journaled_transaction() {
-        let (_directory, path, mut reopened, report, _published) = journaled_restart_fixture();
+        let (_directory, path, reopened, report, _published) = journaled_restart_fixture();
 
-        let outcome = reopened
-            .abandon_at(report.recovery(), &mut AssetLoadBudget::default())
-            .expect("explicit abandon must roll back journaled evidence");
+        let outcome =
+            AssetWorkspace::abandon_at(report.recovery(), &mut AssetLoadBudget::default())
+                .expect("explicit abandon must roll back journaled evidence");
 
-        assert_eq!(
-            outcome,
-            RecoveryOutcome::RolledBack(report.recovery().clone())
-        );
+        assert_eq!(outcome, rollback_outcome(&report));
         assert_eq!(fs::read(&path).expect("restored target"), YAML);
         assert_eq!(reopened.revision(), report.base_revision());
 
@@ -3494,6 +5095,29 @@ mod tests {
     }
 
     #[test]
+    fn finalized_rollback_rejects_later_target_tampering() {
+        let (_directory, path, _workspace, report, _published) = journaled_restart_fixture();
+        let receipt =
+            AssetWorkspace::abandon_at(report.recovery(), &mut AssetLoadBudget::default())
+                .expect("finalize rollback");
+        assert!(receipt.rolled_back().is_some());
+
+        fs::write(&path, b"external replacement").expect("tamper rolled-back target");
+        let error = AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect_err("tampered rollback cannot redeliver a success receipt");
+
+        assert!(matches!(
+            error.blocked_reason(),
+            Some(RecoveryBlockedReason::UnexpectedEvidence { artifact })
+                if artifact == "finalized-rollback"
+        ));
+        assert_eq!(
+            fs::read(path).expect("tampered target remains"),
+            b"external replacement"
+        );
+    }
+
+    #[test]
     fn explicit_abandon_refuses_a_sticky_forward_transaction() {
         let (_directory, path, mut reopened, report, published) = journaled_restart_fixture();
         let layout = layout_from_locator(report.recovery()).expect("journal layout");
@@ -3502,8 +5126,7 @@ mod tests {
         let events = layout.events_directory();
         let event_count = fs::read_dir(&events).expect("events").count();
 
-        let error = reopened
-            .abandon_at(report.recovery(), &mut AssetLoadBudget::default())
+        let error = AssetWorkspace::abandon_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect_err("sticky forward transaction cannot be abandoned");
 
         assert!(matches!(
@@ -3514,13 +5137,18 @@ mod tests {
         assert_eq!(reopened.revision(), report.base_revision());
         assert_eq!(fs::read_dir(events).expect("events").count(), event_count);
 
+        let recovered =
+            AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
+                .expect("ordinary preopen recovery remains available");
         let outcome = reopened
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
-            .expect("ordinary forward recovery remains available");
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("attach ordinary forward recovery");
+        assert!(recovered.requires_workspace_finalization());
         assert_eq!(
             outcome,
-            RecoveryOutcome::Committed(Box::new(report.clone()))
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
         );
+        assert_eq!(recovered.committed(), outcome.committed());
         assert_eq!(fs::read(&path).expect("published target"), published);
     }
 
@@ -3551,7 +5179,7 @@ mod tests {
 
         let mut wrong_workspace = AssetWorkspace::new().expect("wrong workspace");
         let error = wrong_workspace
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect_err("wrong workspace must block recovery");
         assert!(matches!(
             error.blocked_reason(),
@@ -3574,22 +5202,38 @@ mod tests {
         assert_ne!(wrong_revision.revision(), report.base_revision());
         assert_ne!(wrong_revision.revision(), report.committed_revision());
         let error = wrong_revision
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
-            .expect_err("wrong revision must block recovery");
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect_err("attachment must require preopen recovery");
         assert!(matches!(
             error.blocked_reason(),
-            Some(RecoveryBlockedReason::BaselineUnavailable { .. })
+            Some(RecoveryBlockedReason::FilesystemRecoveryRequired)
         ));
         assert_eq!(fs::read_dir(&events).expect("events").count(), event_count);
         assert_eq!(fs::read(&path).expect("base target"), YAML);
 
+        AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("preopen recovery with no workspace context");
+        let recovered_event_count = fs::read_dir(&events).expect("events").count();
+        let error = wrong_revision
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect_err("unrelated loaded sources must block baseline attachment");
+        assert!(matches!(
+            error.blocked_reason(),
+            Some(RecoveryBlockedReason::BaselineUnavailable { .. })
+        ));
+        assert_eq!(
+            fs::read_dir(&events).expect("events").count(),
+            recovered_event_count
+        );
+        assert_eq!(fs::read(&path).expect("published target"), published);
+
         let mut reopened = reopen_base_workspace(workspace_id, &path);
         let outcome = reopened
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect("correct recovery remains available");
         assert_eq!(
             outcome,
-            RecoveryOutcome::Committed(Box::new(report.clone()))
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
         );
         assert_eq!(fs::read(&path).expect("recovered target"), published);
     }
@@ -3622,9 +5266,8 @@ mod tests {
         let tampered_identity = observe_file_identity(&staging).expect("tampered stage identity");
         assert_eq!(&tampered_identity, artifact.new_identity());
 
-        let mut reopened = reopen_base_workspace(workspace_id, &path);
-        let error = reopened
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+        let reopened = reopen_base_workspace(workspace_id, &path);
+        let error = AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect_err("tampered staging must block recovery");
         assert!(matches!(
             error.blocked_reason(),
@@ -3636,7 +5279,7 @@ mod tests {
 
     #[test]
     fn same_identity_target_tamper_before_published_is_rolled_back_privately() {
-        let (_directory, path, mut workspace, report, published) = published_restart_fixture();
+        let (_directory, path, workspace, report, published) = published_restart_fixture();
         let (layout, artifact) = truncate_events_after(&report, |kind| {
             matches!(kind, JournalEventKind::PromotionIntent { .. })
         });
@@ -3650,14 +5293,11 @@ mod tests {
             artifact.new_identity()
         );
 
-        let outcome = workspace
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
-            .expect("owned corrupt target can be rolled back");
+        let outcome =
+            AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
+                .expect("owned corrupt target can be rolled back");
 
-        assert_eq!(
-            outcome,
-            RecoveryOutcome::RolledBack(report.recovery().clone())
-        );
+        assert_eq!(outcome, rollback_outcome(&report));
         assert_eq!(fs::read(&path).expect("restored target"), YAML);
         assert_eq!(
             fs::read(staging).expect("preserved corrupt image"),
@@ -3668,7 +5308,7 @@ mod tests {
 
     #[test]
     fn sticky_forward_rehomes_corrupt_new_inode_and_restores_old_target() {
-        let (_directory, path, mut workspace, report, published) = published_restart_fixture();
+        let (_directory, path, workspace, report, published) = published_restart_fixture();
         let (layout, artifact) = truncate_events_after(&report, |kind| {
             matches!(kind, JournalEventKind::PromotionIntent { .. })
         });
@@ -3679,8 +5319,7 @@ mod tests {
         tampered[0] ^= 1;
         fs::write(&path, &tampered).expect("same-inode target tamper");
 
-        let error = workspace
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+        let error = AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect_err("sticky forward cannot publish corrupt owned bytes");
 
         assert!(matches!(
@@ -3697,7 +5336,7 @@ mod tests {
 
     #[test]
     fn same_identity_backup_tamper_is_restored_to_target_before_blocking() {
-        let (_directory, path, mut workspace, report, published) = published_restart_fixture();
+        let (_directory, path, workspace, report, published) = published_restart_fixture();
         let (layout, artifact) = truncate_events_after(&report, |kind| {
             matches!(kind, JournalEventKind::BackupIntent { .. })
         });
@@ -3717,8 +5356,7 @@ mod tests {
             artifact.old_identity().expect("old target identity")
         );
 
-        let error = workspace
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+        let error = AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect_err("external writes to the captured old inode must remain visible");
 
         assert!(matches!(
@@ -3736,7 +5374,7 @@ mod tests {
 
     #[test]
     fn sticky_forward_restores_corrupt_old_inode_to_its_external_path() {
-        let (_directory, path, mut workspace, report, published) = published_restart_fixture();
+        let (_directory, path, workspace, report, published) = published_restart_fixture();
         let (layout, artifact) = truncate_events_after(&report, |kind| {
             matches!(kind, JournalEventKind::BackupIntent { .. })
         });
@@ -3753,8 +5391,7 @@ mod tests {
         tampered[0] ^= 1;
         fs::write(&backup, &tampered).expect("same-inode backup tamper");
 
-        let error = workspace
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+        let error = AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect_err("sticky forward cannot strand external old bytes in the journal");
 
         assert!(matches!(
@@ -3773,7 +5410,6 @@ mod tests {
     #[test]
     fn byte_identical_target_replacement_after_journal_is_never_captured() {
         let (_directory, path, workspace, report) = committed_fixture();
-        let workspace_id = workspace.workspace_id();
         let (layout, artifact) =
             truncate_events_after(&report, |kind| matches!(kind, JournalEventKind::Journaled));
         drop(workspace);
@@ -3791,8 +5427,6 @@ mod tests {
             artifact.old_identity().expect("existing target identity"),
         )
         .expect("restore base target identity");
-        let mut reopened = reopen_base_workspace(workspace_id, &path);
-
         fs::remove_file(&path).expect("remove original target");
         fs::write(&path, YAML).expect("byte-identical replacement");
         let replacement_identity = observe_file_identity(&path).expect("replacement identity");
@@ -3801,8 +5435,7 @@ mod tests {
             artifact.old_identity().expect("existing target identity")
         );
 
-        let error = reopened
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+        let error = AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect_err("replacement identity must block recovery");
 
         assert!(matches!(
@@ -3841,7 +5474,6 @@ mod tests {
             artifact.old_identity().expect("existing target identity"),
         )
         .expect("restore base target identity");
-        let mut reopened = reopen_base_workspace(workspace_id, &path);
         capture_existing(
             &path,
             &backup,
@@ -3849,14 +5481,20 @@ mod tests {
         )
         .expect("simulate completed backup rename");
 
+        let recovered =
+            AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
+                .expect("recover captured backup");
+        let mut reopened = reopen_base_workspace(workspace_id, &path);
         let outcome = reopened
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
-            .expect("recover captured backup");
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("attach recovered backup transaction");
 
+        assert!(recovered.requires_workspace_finalization());
         assert_eq!(
             outcome,
-            RecoveryOutcome::Committed(Box::new(report.clone()))
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
         );
+        assert_eq!(recovered.committed(), outcome.committed());
         assert_eq!(fs::read(&path).expect("recovered target"), published);
         assert_eq!(reopened.revision(), report.committed_revision());
     }
@@ -3871,18 +5509,23 @@ mod tests {
         });
         drop(workspace);
 
-        fs::write(&path, YAML).expect("restore old target for reopen");
-        let mut reopened = reopen_base_workspace(workspace_id, &path);
+        fs::write(&path, YAML).expect("restore old target before promotion");
         fs::write(&path, &published).expect("simulate completed promotion rename");
 
+        let recovered =
+            AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
+                .expect("recover promoted target");
+        let mut reopened = reopen_base_workspace(workspace_id, &path);
         let outcome = reopened
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
-            .expect("recover promoted target");
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("attach promoted transaction");
 
+        assert!(recovered.requires_workspace_finalization());
         assert_eq!(
             outcome,
-            RecoveryOutcome::Committed(Box::new(report.clone()))
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
         );
+        assert_eq!(recovered.committed(), outcome.committed());
         assert_eq!(fs::read(&path).expect("recovered target"), published);
         assert_eq!(reopened.revision(), report.committed_revision());
     }
@@ -3940,7 +5583,7 @@ mod tests {
         fs::write(&path, published).expect("restore published YAML");
 
         reopened
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect("recover resource transaction");
 
         assert_eq!(reopened.revision(), report.committed_revision());
@@ -3968,7 +5611,7 @@ mod tests {
         fs::write(&path, tampered).expect("tamper target");
 
         let error = workspace
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect_err("tampered target must block recovery");
         assert!(matches!(
             error.blocked_reason(),
@@ -3979,9 +5622,9 @@ mod tests {
 
         fs::write(&path, published).expect("restore published target");
         let outcome = workspace
-            .recover_at(report.recovery(), &mut AssetLoadBudget::default())
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect("canonical recovery must remain available");
-        assert_eq!(outcome, RecoveryOutcome::Committed(Box::new(report)));
+        assert_eq!(outcome, RecoveryOutcome::Finalized(Box::new(report)));
     }
 
     #[test]
@@ -3994,7 +5637,7 @@ mod tests {
         );
 
         let error = workspace
-            .recover_at(&malicious, &mut AssetLoadBudget::default())
+            .finalize_recovery_at(&malicious, &mut AssetLoadBudget::default())
             .expect_err("noncanonical locator must block");
         assert!(matches!(
             error.blocked_reason(),

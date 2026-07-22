@@ -192,7 +192,13 @@ impl AssetWorkspace {
         }
     }
 
-    pub(crate) fn with_workspace_id(
+    /// Opens an empty workspace under a caller-persisted namespace identity.
+    ///
+    /// Workspace IDs are stable namespace keys, not authentication secrets.
+    /// Recovery callers obtain the expected identity from
+    /// [`crate::workspace::RecoveryOutcome::workspace_id`], then load source
+    /// requests from their own trusted project configuration.
+    pub fn with_workspace_id(
         workspace: WorkspaceId,
         options: WorkspaceOptions,
     ) -> Result<Self, WorkspaceError> {

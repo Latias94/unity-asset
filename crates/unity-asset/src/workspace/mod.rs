@@ -16,7 +16,7 @@ mod view;
 pub use commit::{
     COMMIT_REPORT_VERSION, CommitArtifactReport, CommitAtomicity, CommitContractError,
     CommitDestinationState, CommitError, CommitReport, PublicationTarget, PublicationTargetError,
-    RecoveryBlockedReason, RecoveryDisposition, RecoveryError, RecoveryLocator, RecoveryOutcome,
+    RecoveryBlockedReason, RecoveryError, RecoveryLocator, RecoveryOutcome, RollbackReceipt,
 };
 pub use interface::{AssetWorkspace, SourceOpenRequest, WorkspaceOptions};
 pub use overlay::PreparedView;

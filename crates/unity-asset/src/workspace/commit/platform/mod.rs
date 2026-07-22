@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use unity_asset_core::DigestV1;
 
 use super::super::source_catalog::PhysicalFileIdentity;
+use super::journal::RECOVERY_DIRECTORY;
+
+const COMMIT_LOCK_FILE: &str = ".commit.lock";
+const LEGACY_COMMIT_LOCK_DIRECTORY: &str = "v1";
 
 #[derive(Debug)]
 pub(crate) enum AtomicMoveError {
@@ -167,11 +171,6 @@ impl FileIdentity {
         self.0.length()
     }
 
-    #[must_use]
-    pub(crate) fn same_file(&self, other: &Self) -> bool {
-        self.0.same_file(&other.0)
-    }
-
     pub(crate) fn invalid_sentinel() -> Self {
         #[cfg(unix)]
         {
@@ -240,23 +239,28 @@ impl DirectoryIdentity {
 }
 
 pub(crate) struct CommitGuard {
-    _file: File,
+    _legacy_file: File,
+    _stable_file: File,
     lock_path: PathBuf,
 }
 
 impl CommitGuard {
     pub(crate) fn acquire(root: &Path) -> io::Result<Self> {
-        let lock_path = root
-            .join(".unity-asset-recovery")
-            .join("v1")
-            .join(".commit.lock");
-        let parent = lock_path
-            .parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "lock has no parent"))?;
-        platform::create_private_directory(parent)?;
-        let file = platform::acquire_lock(&lock_path)?;
+        let recovery_directory = root.join(RECOVERY_DIRECTORY);
+        let legacy_directory = recovery_directory.join(LEGACY_COMMIT_LOCK_DIRECTORY);
+        platform::create_private_directory(&recovery_directory)?;
+        platform::create_private_directory(&legacy_directory)?;
+
+        // Journal v1 placed its only writer lock under v1/. Newer protocols
+        // retain that lock and also take a version-independent lock so old and
+        // future binaries cannot publish concurrently into the same root.
+        let legacy_lock_path = legacy_directory.join(COMMIT_LOCK_FILE);
+        let legacy_file = platform::acquire_lock(&legacy_lock_path)?;
+        let lock_path = recovery_directory.join(COMMIT_LOCK_FILE);
+        let stable_file = platform::acquire_lock(&lock_path)?;
         Ok(Self {
-            _file: file,
+            _legacy_file: legacy_file,
+            _stable_file: stable_file,
             lock_path,
         })
     }
@@ -264,6 +268,51 @@ impl CommitGuard {
     #[must_use]
     pub(crate) fn path(&self) -> &Path {
         &self.lock_path
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn commit_guard_holds_stable_and_v1_compatibility_locks() {
+        let root = tempdir().expect("temporary publication root");
+        let guard = CommitGuard::acquire(root.path()).expect("commit guard");
+        let recovery = root.path().join(RECOVERY_DIRECTORY);
+        let legacy = recovery
+            .join(LEGACY_COMMIT_LOCK_DIRECTORY)
+            .join(COMMIT_LOCK_FILE);
+
+        assert_eq!(guard.path(), recovery.join(COMMIT_LOCK_FILE));
+        assert!(platform::acquire_lock(&legacy).is_err());
+        assert!(platform::acquire_lock(guard.path()).is_err());
+
+        drop(guard);
+        CommitGuard::acquire(root.path()).expect("locks released with guard");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_guard_tightens_an_existing_recovery_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempdir().expect("temporary publication root");
+        let recovery = root.path().join(RECOVERY_DIRECTORY);
+        std::fs::create_dir(&recovery).expect("broad recovery root");
+        std::fs::set_permissions(&recovery, std::fs::Permissions::from_mode(0o777))
+            .expect("broad recovery permissions");
+
+        let _guard = CommitGuard::acquire(root.path()).expect("commit guard");
+        let mode = std::fs::metadata(recovery)
+            .expect("recovery metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o700);
     }
 }
 
@@ -318,6 +367,7 @@ pub(crate) fn open_readonly_regular_in_parent(
     platform::open_readonly_regular_in_parent(path, &expected_parent.0)
 }
 
+#[cfg(test)]
 pub(crate) fn observe_file_identity(path: &Path) -> io::Result<FileIdentity> {
     platform::observe_file_identity(path).map(FileIdentity)
 }
@@ -458,10 +508,6 @@ mod platform {
         pub(super) const fn length(&self) -> u64 {
             u64::MAX
         }
-
-        pub(super) fn same_file(&self, _: &Self) -> bool {
-            false
-        }
     }
 
     pub(super) fn sync_directory(_: &Path) -> io::Result<()> {
@@ -550,6 +596,7 @@ mod platform {
         ))
     }
 
+    #[cfg(test)]
     pub(super) fn observe_file_identity(_: &Path) -> io::Result<FileIdentity> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,

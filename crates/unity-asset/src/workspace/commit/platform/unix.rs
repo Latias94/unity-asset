@@ -50,11 +50,6 @@ impl FileIdentity {
     pub(super) const fn length(&self) -> u64 {
         self.length
     }
-
-    #[must_use]
-    pub(super) fn same_file(&self, other: &Self) -> bool {
-        self.device == other.device && self.inode == other.inode
-    }
 }
 
 /// Stable Unix identity captured from an opened publication directory.
@@ -326,6 +321,7 @@ pub(super) fn ensure_single_hardlink(path: &Path) -> io::Result<()> {
 }
 
 /// Captures a stable device/inode token for a no-follow regular source.
+#[cfg(test)]
 pub(super) fn observe_file_identity(path: &Path) -> io::Result<FileIdentity> {
     let (parent_path, name) = split_leaf(path)?;
     let parent = open_directory(parent_path)?;

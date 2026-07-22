@@ -112,11 +112,6 @@ impl FileIdentity {
     pub(super) const fn length(&self) -> u64 {
         self.length
     }
-
-    #[must_use]
-    pub(super) fn same_file(&self, other: &Self) -> bool {
-        self.volume_serial_number == other.volume_serial_number && self.file_id == other.file_id
-    }
 }
 
 /// Stable identity of one opened directory.
@@ -365,6 +360,7 @@ pub(super) fn acquire_lock(path: &Path) -> io::Result<File> {
     Ok(opened.handle.into_file())
 }
 
+#[cfg(test)]
 pub(super) fn observe_file_identity(path: &Path) -> io::Result<FileIdentity> {
     let opened = open_regular(
         path,

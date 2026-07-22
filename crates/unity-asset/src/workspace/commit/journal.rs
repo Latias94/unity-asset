@@ -28,9 +28,15 @@ use super::platform::{
 };
 use super::{CommitArtifactReport, CommitAtomicity, CommitReport, RecoveryLocator};
 
-pub(crate) const JOURNAL_VERSION: u8 = 1;
+mod preparation;
 
-#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) use preparation::{
+    JournalPreparation, JournalPreparationOutput, OpenedJournalPreparation,
+};
+
+pub(crate) const JOURNAL_VERSION: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum JournalExpectedDestination {
     Existing,
@@ -129,13 +135,17 @@ impl Write for DigestWriter<'_> {
     }
 }
 
-const RECOVERY_DIRECTORY: &str = ".unity-asset-recovery";
-const RECOVERY_VERSION_DIRECTORY: &str = "v1";
-const MANIFEST_FILE: &str = "manifest.v1.json";
-const EVENTS_DIRECTORY: &str = "events";
-const STAGE_DIRECTORY: &str = "stage";
-const BACKUP_DIRECTORY: &str = "backup";
-const BASELINE_DIRECTORY: &str = "baseline";
+pub(crate) const RECOVERY_DIRECTORY: &str = ".unity-asset-recovery";
+pub(crate) const RECOVERY_VERSION_DIRECTORY: &str = "v2";
+const MANIFEST_FILE: &str = "manifest.v2.json";
+const PREPARATION_SUFFIX: &str = "prepare.v2.json";
+const PREPARATION_TEMPORARY_SUFFIX: &str = "prepare.v2.tmp";
+const ROLLBACK_SUFFIX: &str = "rollback.v2.json";
+pub(crate) const MANIFEST_TEMPORARY_FILE: &str = ".manifest.v2.json.tmp";
+pub(crate) const EVENTS_DIRECTORY: &str = "events";
+pub(crate) const STAGE_DIRECTORY: &str = "stage";
+pub(crate) const BACKUP_DIRECTORY: &str = "backup";
+pub(crate) const BASELINE_DIRECTORY: &str = "baseline";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EVENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EVENT_COUNT: usize = 65_536;
@@ -1034,7 +1044,7 @@ impl JournalManifest {
                 ));
             }
         }
-        if self.result.version != self.version
+        if self.result.version != super::COMMIT_REPORT_VERSION
             || self.result.transaction != self.transaction
             || self.result.workspace_id != self.workspace_id
             || self.result.base_revision != self.base_revision
@@ -1168,11 +1178,6 @@ impl JournalManifest {
     #[must_use]
     pub(crate) const fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
-    }
-
-    #[must_use]
-    pub(crate) const fn base_revision(&self) -> WorkspaceRevision {
-        self.base_revision
     }
 
     #[must_use]
@@ -1760,6 +1765,33 @@ impl JournalLayout {
     }
 
     #[must_use]
+    pub(crate) fn preparation_path(&self) -> PathBuf {
+        let mut path = self.directory.clone();
+        path.set_extension(PREPARATION_SUFFIX);
+        path
+    }
+
+    #[must_use]
+    pub(crate) fn preparation_temporary_path(&self) -> PathBuf {
+        let slug = self
+            .directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("transaction digest slug is canonical UTF-8");
+        self.directory
+            .parent()
+            .expect("journal layout has a version directory")
+            .join(format!(".{slug}.{PREPARATION_TEMPORARY_SUFFIX}"))
+    }
+
+    #[must_use]
+    pub(crate) fn rollback_path(&self) -> PathBuf {
+        let mut path = self.directory.clone();
+        path.set_extension(ROLLBACK_SUFFIX);
+        path
+    }
+
+    #[must_use]
     pub(crate) fn events_directory(&self) -> PathBuf {
         self.directory.join(EVENTS_DIRECTORY)
     }
@@ -1870,6 +1902,9 @@ impl Journal {
         let result = (|| {
             manifest.validate()?;
             manifest.validate_transaction_identity(layout.parent(), budget)?;
+            JournalPreparation::open(&layout, budget)?
+                .document()
+                .validate_manifest(&manifest)?;
             manifest.directories.validate(&layout)?;
             let chain = EventChain {
                 events: journal_budgeted_vec(
@@ -1886,7 +1921,7 @@ impl Journal {
             )?;
             let manifest_temporary = budgeted_journal_join(
                 layout.directory(),
-                ".manifest.v1.json.tmp",
+                MANIFEST_TEMPORARY_FILE,
                 "journal manifest temporary path",
                 budget,
             )?;
@@ -1923,6 +1958,9 @@ impl Journal {
             read_json_bounded(&layout.manifest_path(), MAX_MANIFEST_BYTES, budget)?;
         manifest.validate()?;
         manifest.validate_transaction_identity(layout.parent(), budget)?;
+        JournalPreparation::open(&layout, budget)?
+            .document()
+            .validate_manifest(&manifest)?;
         if manifest.transaction() != layout.transaction {
             return Err(JournalError::TransactionMismatch {
                 expected: layout.transaction,
@@ -2355,6 +2393,14 @@ fn write_encoded_atomic_with_temporary_path_tracked(
     let mut file = create_private_file_in_parent(temporary, expected_parent)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    #[cfg(test)]
+    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        if name == MANIFEST_FILE {
+            super::test_crash_failpoint("manifest_temporary_synced");
+        } else if name.ends_with(".prepare.v2.json") {
+            super::test_crash_failpoint("preparation_temporary_synced");
+        }
+    }
     drop(file);
     match atomic_replace_tracked(
         temporary,
@@ -2870,7 +2916,59 @@ mod tests {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
+        install_fixture_preparation(&layout, &report, &manifest);
         (report, manifest, layout)
+    }
+
+    fn install_fixture_preparation(
+        layout: &JournalLayout,
+        report: &CommitReport,
+        manifest: &JournalManifest,
+    ) {
+        let mut budget = AssetLoadBudget::default();
+        let outputs = manifest
+            .artifacts()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, artifact)| {
+                JournalPreparationOutput::new(
+                    u32::try_from(ordinal).expect("fixture ordinal"),
+                    artifact.logical_name(),
+                    artifact.source(),
+                    artifact.target().clone(),
+                    if artifact.old_digest().is_some() {
+                        JournalExpectedDestination::Existing
+                    } else {
+                        JournalExpectedDestination::Absent
+                    },
+                    artifact.old_digest(),
+                    artifact.old_identity().cloned(),
+                    artifact.destination_parent_identity().clone(),
+                    artifact.new_digest(),
+                    artifact.bytes(),
+                    &mut budget,
+                )
+                .expect("fixture preparation output")
+            })
+            .collect::<Vec<_>>();
+        let preparation_parent = layout
+            .preparation_path()
+            .parent()
+            .map(observe_directory_identity)
+            .expect("preparation parent")
+            .expect("preparation parent identity");
+        let mut temporary = layout.preparation_path();
+        temporary.set_extension("prepare.v2.fixture.tmp");
+        JournalPreparation::install(
+            layout,
+            report,
+            &outputs,
+            manifest.baseline(),
+            &temporary,
+            &preparation_parent,
+            &mut budget,
+        )
+        .expect("fixture preparation");
     }
 
     fn baseline(
@@ -2893,6 +2991,158 @@ mod tests {
             workspace,
         )
         .expect("baseline")
+    }
+
+    fn preparation_fixture() -> (tempfile::TempDir, JournalLayout, Vec<u8>) {
+        let directory = tempdir().expect("temporary directory");
+        let (_report, _manifest, layout) = journal_fixture(directory.path(), true);
+        let encoded = fs::read(layout.preparation_path()).expect("preparation bytes");
+        (directory, layout, encoded)
+    }
+
+    fn write_preparation_value(
+        layout: &JournalLayout,
+        original: &[u8],
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(original).expect("preparation JSON");
+        mutate(&mut value);
+        fs::write(
+            layout.preparation_path(),
+            serde_json::to_vec(&value).expect("mutated preparation JSON"),
+        )
+        .expect("write mutated preparation");
+    }
+
+    #[test]
+    fn preparation_rejects_unknown_and_duplicate_fields_without_deleting_evidence() {
+        let (_directory, layout, original) = preparation_fixture();
+        write_preparation_value(&layout, &original, |value| {
+            value
+                .as_object_mut()
+                .expect("preparation object")
+                .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+        });
+        assert!(matches!(
+            JournalPreparation::open(&layout, &mut AssetLoadBudget::default()),
+            Err(JournalError::Json(_))
+        ));
+        assert!(layout.preparation_path().is_file());
+
+        let text = std::str::from_utf8(&original).expect("UTF-8 preparation");
+        let duplicate = format!("{{\"version\":{JOURNAL_VERSION},{}", &text[1..]);
+        fs::write(layout.preparation_path(), duplicate).expect("duplicate preparation field");
+        assert!(matches!(
+            JournalPreparation::open(&layout, &mut AssetLoadBudget::default()),
+            Err(JournalError::Json(_))
+        ));
+        assert!(layout.preparation_path().is_file());
+    }
+
+    #[test]
+    fn preparation_rejects_depth_overflow_before_schema_deserialization() {
+        let (_directory, layout, _original) = preparation_fixture();
+        let nesting = usize::try_from(MAX_JOURNAL_DEPTH).expect("depth") + 1;
+        let encoded = format!(
+            "{{\"unknown\":{}null{}}}",
+            "[".repeat(nesting),
+            "]".repeat(nesting)
+        );
+        fs::write(layout.preparation_path(), encoded).expect("deep preparation");
+
+        assert!(matches!(
+            JournalPreparation::open(&layout, &mut AssetLoadBudget::default()),
+            Err(JournalError::NestingDepthExceeded { .. })
+        ));
+        assert!(layout.preparation_path().is_file());
+    }
+
+    #[test]
+    fn preparation_rejects_oversized_input_before_reading_it() {
+        let (_directory, layout, _original) = preparation_fixture();
+        let path = layout.preparation_path();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open preparation for resize");
+        file.set_len(MAX_MANIFEST_BYTES + 1)
+            .expect("extend preparation beyond limit");
+        drop(file);
+
+        assert!(matches!(
+            JournalPreparation::open(&layout, &mut AssetLoadBudget::default()),
+            Err(JournalError::DocumentTooLarge { .. })
+        ));
+        assert_eq!(
+            fs::metadata(path).expect("preparation metadata").len(),
+            MAX_MANIFEST_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn preparation_open_obeys_exact_and_one_short_budgets_without_writing() {
+        let (_directory, layout, original) = preparation_fixture();
+        let mut measured = AssetLoadBudget::default();
+        JournalPreparation::open(&layout, &mut measured).expect("measure preparation open");
+        let usage = measured.usage();
+        let exact_limits = AssetLoadLimits {
+            max_entries: usage.entries,
+            max_bytes: usage.bytes,
+            max_depth: usage.max_observed_depth,
+            max_members: usage.members,
+            ..AssetLoadLimits::default()
+        };
+
+        let mut exact = AssetLoadBudget::new(exact_limits).expect("exact preparation budget");
+        JournalPreparation::open(&layout, &mut exact).expect("exact preparation open");
+        assert_eq!(exact.usage(), usage);
+
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: usage.bytes - 1,
+            ..exact_limits
+        })
+        .expect("one-short preparation budget");
+        assert!(matches!(
+            JournalPreparation::open(&layout, &mut one_short),
+            Err(JournalError::Budget(_))
+        ));
+        assert_eq!(
+            fs::read(layout.preparation_path()).expect("retained preparation"),
+            original
+        );
+    }
+
+    #[test]
+    fn preparation_rejects_noncanonical_ordinals_and_transaction_seed_changes() {
+        let (_directory, layout, original) = preparation_fixture();
+        write_preparation_value(&layout, &original, |value| {
+            value["outputs"][0]["ordinal"] = serde_json::Value::from(1_u64);
+        });
+        assert!(matches!(
+            JournalPreparation::open(&layout, &mut AssetLoadBudget::default()),
+            Err(JournalError::InvalidManifest(_))
+        ));
+
+        write_preparation_value(&layout, &original, |value| {
+            value["workspace_id"] =
+                serde_json::to_value(WorkspaceId::from_u128(99).expect("different workspace id"))
+                    .expect("workspace JSON");
+        });
+        assert!(matches!(
+            JournalPreparation::open(&layout, &mut AssetLoadBudget::default()),
+            Err(JournalError::InvalidManifest(_))
+        ));
+
+        write_preparation_value(&layout, &original, |value| {
+            value["plan_digest"] =
+                serde_json::to_value(DigestV1::hash_bytes(b"other plan")).expect("digest JSON");
+        });
+        assert!(matches!(
+            JournalPreparation::open(&layout, &mut AssetLoadBudget::default()),
+            Err(JournalError::TransactionMismatch { .. })
+        ));
+        assert!(layout.preparation_path().is_file());
     }
 
     #[test]

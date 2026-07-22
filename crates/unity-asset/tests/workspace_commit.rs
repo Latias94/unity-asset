@@ -90,11 +90,11 @@ fn target(root: &Path) -> PublicationTarget {
 }
 
 fn manifest_count(root: &Path) -> usize {
-    let version = root.join(".unity-asset-recovery").join("v1");
+    let version = root.join(".unity-asset-recovery").join("v2");
     fs::read_dir(version)
         .unwrap()
         .filter_map(Result::ok)
-        .filter(|entry| entry.path().join("manifest.v1.json").is_file())
+        .filter(|entry| entry.path().join("manifest.v2.json").is_file())
         .count()
 }
 
@@ -143,7 +143,7 @@ fn commit_publishes_exact_bytes_and_installs_the_new_baseline() {
             .unwrap()
             .contains("m_Name: After")
     );
-    assert!(report.recovery().root().join("manifest.v1.json").is_file());
+    assert!(report.recovery().root().join("manifest.v2.json").is_file());
 }
 
 #[test]
@@ -409,7 +409,7 @@ fn hardlinked_target_is_terminally_rejected_before_journal_publication() {
     assert_eq!(workspace.revision(), base_revision);
     assert_eq!(fs::read(&path).unwrap(), YAML.as_bytes());
     assert_eq!(fs::read(alias).unwrap(), YAML.as_bytes());
-    let version = directory.path().join(".unity-asset-recovery").join("v1");
+    let version = directory.path().join(".unity-asset-recovery").join("v2");
     let entries: Vec<_> = fs::read_dir(version)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())

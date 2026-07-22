@@ -280,9 +280,9 @@ pub(crate) fn build_from_journal_with_images(
 ) -> Result<PreparedBaseline, BaselineBuildError> {
     let base = expected.as_ref();
     let manifest = journal.manifest();
-    if base.workspace() != manifest.workspace_id() || base.revision() != manifest.base_revision() {
+    if base.workspace() != manifest.workspace_id() {
         return Err(BaselineBuildError::RecoveryBinding {
-            message: "recovery baseline does not match the loaded base workspace".to_owned(),
+            message: "recovery baseline does not match the loaded workspace identity".to_owned(),
         });
     }
 
@@ -299,10 +299,10 @@ pub(crate) fn build_from_journal_with_images(
                     .catalog()
                     .fingerprint(source.source())
                     .map_err(BaselineBuildError::catalog)?;
-                if actual != *base_fingerprint {
+                if actual != *base_fingerprint && actual != source.fingerprint() {
                     return Err(BaselineBuildError::RecoveryBinding {
                         message: format!(
-                            "base fingerprint for {:?} changed before recovery",
+                            "source {:?} matches neither its base nor committed fingerprint",
                             source.source()
                         ),
                     });
