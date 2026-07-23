@@ -680,13 +680,6 @@ impl Environment {
         self.bundles.retain(|source, _| !belongs_to_root(source));
         self.webfiles.retain(|path, _| !web_belongs_to_root(path));
         self.yaml_documents.remove(source_root);
-        self.write_state
-            .standalone
-            .retain(|source, _| !belongs_to_root(source));
-        self.write_state
-            .bundles
-            .retain(|source, _| !belongs_to_root(source));
-        self.write_state.yaml_documents.remove(source_root);
 
         match self.bundle_container_cache.write() {
             Ok(mut cache) => cache.clear(),

@@ -13,6 +13,32 @@ fn value_matches_string(value: &UnityValue, expected: &str) -> bool {
 }
 
 impl Environment {
+    pub(crate) fn ensure_yaml_loaded(&mut self, path: &Path) -> Result<PathBuf> {
+        let path = canonicalize_if_exists(path);
+        if self.yaml_documents.contains_key(&path) {
+            return Ok(path);
+        }
+
+        match YamlDocument::load_yaml_with_warnings(&path, false) {
+            Ok((document, warnings)) => {
+                for warning in warnings {
+                    self.push_warning(EnvironmentWarning::YamlDocumentSkipped {
+                        path: path.clone(),
+                        doc_index: warning.doc_index,
+                        error: warning.error,
+                    });
+                }
+                self.yaml_documents.insert(path.clone(), document);
+                Ok(path)
+            }
+            Err(error) => Err(UnityAssetError::format(format!(
+                "Failed to load YAML document {}: {}",
+                path.display(),
+                error
+            ))),
+        }
+    }
+
     /// Iterate YAML Unity objects with stable keys (path + anchor).
     pub fn yaml_objects_with_keys(
         &self,
@@ -92,9 +118,7 @@ impl Environment {
 
         Ok(out)
     }
-}
 
-impl<'a> EnvironmentEditSession<'a> {
     /// Ensure a YAML file is loaded, then return the unique matching object key.
     pub fn find_yaml_object_key_in_file_by_field_string_unique(
         &mut self,
@@ -103,11 +127,9 @@ impl<'a> EnvironmentEditSession<'a> {
         field_path: &str,
         expected: &str,
     ) -> Result<YamlObjectKey> {
-        let matches = self
-            .env_mut()
-            .find_yaml_object_keys_in_file_by_field_string(
-                yaml_path, class_name, field_path, expected,
-            )?;
+        let matches = self.find_yaml_object_keys_in_file_by_field_string(
+            yaml_path, class_name, field_path, expected,
+        )?;
 
         match matches.as_slice() {
             [only] => Ok(only.clone()),

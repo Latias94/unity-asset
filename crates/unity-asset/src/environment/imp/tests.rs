@@ -1,7 +1,18 @@
 use super::*;
 use std::fs;
 use std::path::Path;
-use unity_asset_core::BudgetError;
+use unity_asset_binary::asset::{FileIdentifier, SerializedFileParser};
+use unity_asset_core::{AssetLoadLimits, BudgetError, FieldPath};
+use unity_asset_write::object::{
+    SerializedFieldGuard, SerializedObjectEncoder, SerializedObjectMutation,
+};
+use unity_asset_write::serialized_file::{
+    ExternalTableAllocator, SerializedFileEdits, SerializedFileWriter,
+};
+
+const TRANSFORM_HIERARCHY_FIXTURE: &[u8] = include_bytes!(
+    "../../../../unity-asset-write/tests/fixtures/serialized_file_wire/transform_hierarchy_v22.assets.bin"
+);
 
 fn canonicalize_path(path: PathBuf) -> PathBuf {
     std::fs::canonicalize(&path).unwrap_or(path)
@@ -46,6 +57,61 @@ fn sample_serialized_file_bytes() -> Vec<u8> {
         })
         .expect("sample bundle contains a SerializedFile node");
     bundle.extract_node_data(node).unwrap()
+}
+
+fn external_transform_fixture(external_path: &str) -> Vec<u8> {
+    let file = SerializedFileParser::from_bytes(TRANSFORM_HIERARCHY_FIXTURE.to_vec()).unwrap();
+    let mut budget = AssetLoadBudget::default();
+    let mut candidate = SerializedObjectEncoder::new(&file, 2)
+        .unwrap()
+        .begin_semantic(&mut budget)
+        .unwrap();
+    let father_path = FieldPath::root().push_field("m_Father").unwrap();
+    let mut father = candidate.value_at_path(&father_path).unwrap().clone();
+    let guard = SerializedFieldGuard::from_observed(
+        candidate.schema_digest(),
+        &father_path,
+        &father,
+        &mut budget,
+    )
+    .unwrap();
+    let father_fields = father
+        .as_object_mut()
+        .expect("Transform fixture must expose m_Father as a PPtr object");
+    father_fields.insert("m_FileID".to_owned(), UnityValue::Integer(1));
+    father_fields.insert("m_PathID".to_owned(), UnityValue::Integer(1));
+    candidate
+        .apply(
+            SerializedObjectMutation::replace_field(0, father_path, guard, father),
+            &mut budget,
+        )
+        .unwrap();
+    let encoded = candidate.finish(&mut budget).unwrap();
+    let mut edits = SerializedFileEdits::default();
+    edits
+        .try_insert_encoded_object(encoded, &mut budget)
+        .unwrap();
+
+    let mut allocator = ExternalTableAllocator::new(&file).unwrap();
+    allocator
+        .intern(
+            FileIdentifier {
+                temp_empty: String::new(),
+                guid: [0x11; 16],
+                type_: 3,
+                path: external_path.to_owned(),
+            },
+            &mut budget,
+        )
+        .unwrap();
+    let edits = allocator.into_edits(edits).unwrap();
+    SerializedFileWriter::save(&file, &edits).unwrap()
+}
+
+fn external_transform_context(env: &Environment, owner_path: &Path) -> BinaryObjectKey {
+    env.find_binary_object_in_source(owner_path, 2)
+        .expect("owner Transform object must be loaded")
+        .key()
 }
 
 #[test]
@@ -222,350 +288,6 @@ fn environment_can_find_binary_object_by_path_id_and_container_and_stream_info()
         .peek_binary_object_name(&key, &mut AssetLoadBudget::default())
         .unwrap();
     assert_eq!(peek, obj.name());
-}
-
-#[test]
-fn environment_can_edit_binary_object_and_save_bundle() {
-    use unity_asset_write::PackingPolicy;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let in_path = tmp.path().join("char_118_yuki.ab");
-    let out_dir = tmp.path().join("out");
-
-    std::fs::write(
-        &in_path,
-        include_bytes!("../../../../../tests/samples/char_118_yuki.ab"),
-    )
-    .unwrap();
-
-    let in_path = canonicalize_path(in_path);
-
-    let mut env = Environment::new();
-    env.load_file(&in_path, &mut AssetLoadBudget::default())
-        .unwrap();
-
-    let bundle = env
-        .bundles()
-        .get(&BinarySource::path(&in_path))
-        .expect("sample bundle loaded");
-    let sf = bundle.assets.first().expect("bundle has asset 0");
-
-    let mut name_budget = AssetLoadBudget::default();
-    let (path_id, old_name) = sf
-        .object_handles()
-        .filter_map(|h| {
-            h.peek_name(&mut name_budget)
-                .ok()
-                .flatten()
-                .map(|n| (h.path_id(), n))
-        })
-        .find(|(_id, name)| !name.is_empty())
-        .expect("expected at least one object with peekable name in sample");
-
-    let key = BinaryObjectKey {
-        source: BinarySource::path(&in_path),
-        source_kind: BinarySourceKind::AssetBundle,
-        asset_index: Some(0),
-        path_id,
-    };
-
-    let new_name = format!("RUST_ENV_SAVE_{}", old_name);
-
-    env.edit_binary_object_key(&key, &mut AssetLoadBudget::default(), |class| {
-        if let Some(v) = class.get_mut("m_Name") {
-            *v = UnityValue::String(new_name.clone());
-            return Ok(());
-        }
-        if let Some(v) = class.get_mut("name") {
-            *v = UnityValue::String(new_name.clone());
-            return Ok(());
-        }
-        Err(UnityAssetError::format("No m_Name/name field found"))
-    })
-    .unwrap();
-
-    env.save(PackingPolicy::Preserve, &out_dir).unwrap();
-
-    let out_path = out_dir.join("char_118_yuki.ab");
-    assert!(out_path.is_file());
-
-    let saved_bundle =
-        unity_asset_binary::bundle::BundleParser::from_bytes(std::fs::read(out_path).unwrap())
-            .unwrap();
-    let saved_sf = saved_bundle
-        .assets
-        .first()
-        .expect("saved bundle has asset 0");
-    let saved_obj = saved_sf
-        .find_object_handle(path_id)
-        .expect("edited object exists after save");
-    let saved_name = saved_obj
-        .peek_name(&mut AssetLoadBudget::default())
-        .unwrap()
-        .unwrap();
-    assert_eq!(saved_name, new_name);
-}
-
-#[test]
-fn failed_bundle_object_edits_leave_pending_state_unchanged() {
-    let tmp = tempfile::tempdir().unwrap();
-    let input = tmp.path().join("char_118_yuki.ab");
-    std::fs::write(
-        &input,
-        include_bytes!("../../../../../tests/samples/char_118_yuki.ab"),
-    )
-    .unwrap();
-    let input = canonicalize_path(input);
-    let source = BinarySource::path(&input);
-    let mut env = Environment::new();
-    env.load_file(&input, &mut AssetLoadBudget::default())
-        .unwrap();
-    let file = &env.bundles().get(&source).unwrap().assets[0];
-    let mut name_budget = AssetLoadBudget::default();
-    let path_id = file
-        .object_handles()
-        .find(|handle| handle.peek_name(&mut name_budget).ok().flatten().is_some())
-        .unwrap()
-        .path_id();
-    let key = BinaryObjectKey {
-        source: source.clone(),
-        source_kind: BinarySourceKind::AssetBundle,
-        asset_index: Some(0),
-        path_id,
-    };
-
-    let error = env
-        .edit_binary_object_key(&key, &mut AssetLoadBudget::default(), |class| {
-            class.set(
-                "m_Name".to_owned(),
-                UnityValue::String("FAILED_CALLBACK".to_owned()),
-            );
-            Err(UnityAssetError::format("callback rejected edit"))
-        })
-        .unwrap_err();
-    assert!(error.to_string().contains("callback rejected edit"));
-    assert!(!env.has_pending_writes());
-
-    env.edit_binary_object_key(&key, &mut AssetLoadBudget::default(), |class| {
-        class.set(
-            "m_Name".to_owned(),
-            UnityValue::String("COMMITTED_EDIT".to_owned()),
-        );
-        Ok(())
-    })
-    .unwrap();
-    let state = &env.write_state.bundles.get(&source).unwrap().assets[&0];
-    let committed_bytes = state.edits.object_bytes(path_id).unwrap().to_vec();
-    assert_eq!(
-        state.classes[&path_id].get("m_Name"),
-        Some(&UnityValue::String("COMMITTED_EDIT".to_owned()))
-    );
-
-    let mut exhausted = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
-        max_bytes: 1,
-        ..unity_asset_core::AssetLoadLimits::default()
-    })
-    .unwrap();
-    assert!(
-        env.edit_binary_object_key(&key, &mut exhausted, |class| {
-            class.set(
-                "m_Name".to_owned(),
-                UnityValue::String("FAILED_ENCODE".to_owned()),
-            );
-            Ok(())
-        })
-        .is_err()
-    );
-
-    let state = &env.write_state.bundles.get(&source).unwrap().assets[&0];
-    assert_eq!(state.edits.object_bytes(path_id).unwrap(), committed_bytes);
-    assert_eq!(
-        state.classes[&path_id].get("m_Name"),
-        Some(&UnityValue::String("COMMITTED_EDIT".to_owned()))
-    );
-}
-
-#[test]
-fn environment_edit_session_can_save_binary_object_class_and_save_bundle() {
-    use unity_asset_write::PackingPolicy;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let in_path = tmp.path().join("char_118_yuki.ab");
-    let out_dir = tmp.path().join("out");
-
-    std::fs::write(
-        &in_path,
-        include_bytes!("../../../../../tests/samples/char_118_yuki.ab"),
-    )
-    .unwrap();
-
-    let in_path = canonicalize_path(in_path);
-
-    let mut env = Environment::new();
-    env.load_file(&in_path, &mut AssetLoadBudget::default())
-        .unwrap();
-
-    let bundle = env
-        .bundles()
-        .get(&BinarySource::path(&in_path))
-        .expect("sample bundle loaded");
-    let sf = bundle.assets.first().expect("bundle has asset 0");
-
-    let mut name_budget = AssetLoadBudget::default();
-    let (path_id, old_name) = sf
-        .object_handles()
-        .filter_map(|h| {
-            h.peek_name(&mut name_budget)
-                .ok()
-                .flatten()
-                .map(|n| (h.path_id(), n))
-        })
-        .find(|(_id, name)| !name.is_empty())
-        .expect("expected at least one object with peekable name in sample");
-
-    let key = BinaryObjectKey {
-        source: BinarySource::path(&in_path),
-        source_kind: BinarySourceKind::AssetBundle,
-        asset_index: Some(0),
-        path_id,
-    };
-
-    let obj = env
-        .read_binary_object_key(&key, &mut AssetLoadBudget::default())
-        .unwrap();
-    let mut class = obj.as_unity_class().clone();
-    let field_name = if class.get("m_Name").is_some() {
-        "m_Name"
-    } else if class.get("name").is_some() {
-        "name"
-    } else {
-        return;
-    };
-
-    let new_name = format!("RUST_ENV_OBJ_SAVE_{}", old_name);
-    *class.get_mut(field_name).unwrap() = UnityValue::String(new_name.clone());
-
-    let mut edit_budget = AssetLoadBudget::default();
-    let mut session = env.edit_session(&mut edit_budget);
-    session.save_binary_object_class(&key, class).unwrap();
-    session.save(PackingPolicy::Preserve, &out_dir).unwrap();
-
-    let out_path = out_dir.join("char_118_yuki.ab");
-    assert!(out_path.is_file());
-
-    let saved_bundle =
-        unity_asset_binary::bundle::BundleParser::from_bytes(std::fs::read(out_path).unwrap())
-            .unwrap();
-    let saved_sf = saved_bundle
-        .assets
-        .first()
-        .expect("saved bundle has asset 0");
-    let saved_obj = saved_sf
-        .find_object_handle(path_id)
-        .expect("edited object exists after save");
-    let saved_name = saved_obj
-        .peek_name(&mut AssetLoadBudget::default())
-        .unwrap()
-        .unwrap();
-    assert_eq!(saved_name, new_name);
-}
-
-#[test]
-fn environment_edit_session_can_set_binary_value_at_path_and_save_bundle() {
-    use unity_asset_write::PackingPolicy;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let in_path = tmp.path().join("char_118_yuki.ab");
-    let out_dir = tmp.path().join("out");
-
-    std::fs::write(
-        &in_path,
-        include_bytes!("../../../../../tests/samples/char_118_yuki.ab"),
-    )
-    .unwrap();
-
-    let in_path = canonicalize_path(in_path);
-
-    let mut env = Environment::new();
-    env.load_file(&in_path, &mut AssetLoadBudget::default())
-        .unwrap();
-
-    let bundle = env
-        .bundles()
-        .get(&BinarySource::path(&in_path))
-        .expect("sample bundle loaded");
-    let sf = bundle.assets.first().expect("bundle has asset 0");
-
-    let mut name_budget = AssetLoadBudget::default();
-    let (path_id, old_name) = sf
-        .object_handles()
-        .filter_map(|h| {
-            h.peek_name(&mut name_budget)
-                .ok()
-                .flatten()
-                .map(|n| (h.path_id(), n))
-        })
-        .find(|(_id, name)| !name.is_empty())
-        .expect("expected at least one object with peekable name in sample");
-
-    let key = BinaryObjectKey {
-        source: BinarySource::path(&in_path),
-        source_kind: BinarySourceKind::AssetBundle,
-        asset_index: Some(0),
-        path_id,
-    };
-
-    let obj = env
-        .read_binary_object_key(&key, &mut AssetLoadBudget::default())
-        .unwrap();
-    let class = obj.as_unity_class();
-    let field_name = if class.get("m_Name").is_some() {
-        "m_Name"
-    } else if class.get("name").is_some() {
-        "name"
-    } else {
-        return;
-    };
-
-    let new_name = format!("RUST_ENV_SET_PATH_{}", old_name);
-    let mut edit_budget = AssetLoadBudget::default();
-    let mut session = env.edit_session(&mut edit_budget);
-    let before = session.get_binary_value_at_path(&key, field_name).unwrap();
-    assert_eq!(
-        before.and_then(|v| v.as_str().map(|s| s.to_string())),
-        Some(old_name)
-    );
-
-    session
-        .set_binary_value_at_path(&key, field_name, UnityValue::String(new_name.clone()))
-        .unwrap();
-
-    let after = session.get_binary_value_at_path(&key, field_name).unwrap();
-    assert_eq!(
-        after.and_then(|v| v.as_str().map(|s| s.to_string())),
-        Some(new_name.clone())
-    );
-
-    session.save(PackingPolicy::Preserve, &out_dir).unwrap();
-
-    let out_path = out_dir.join("char_118_yuki.ab");
-    assert!(out_path.is_file());
-
-    let saved_bundle =
-        unity_asset_binary::bundle::BundleParser::from_bytes(std::fs::read(out_path).unwrap())
-            .unwrap();
-    let saved_sf = saved_bundle
-        .assets
-        .first()
-        .expect("saved bundle has asset 0");
-    let saved_obj = saved_sf
-        .find_object_handle(path_id)
-        .expect("edited object exists after save");
-    let saved_name = saved_obj
-        .peek_name(&mut AssetLoadBudget::default())
-        .unwrap()
-        .unwrap();
-    assert_eq!(saved_name, new_name);
 }
 
 #[test]
@@ -1007,122 +729,6 @@ fn environment_registry_reuses_single_arcs_and_prepares_script_base_composition_
             .expect("failed preparation preserves the effective registry"),
         &old_effective
     ));
-}
-
-#[test]
-fn environment_can_edit_and_save_stripped_assets_with_typetree_registry() {
-    use serde::Serialize;
-    use unity_asset_binary::typetree::JsonTypeTreeRegistry;
-    use unity_asset_write::PackingPolicy;
-
-    #[derive(Debug, Serialize)]
-    struct Dump {
-        schema: u32,
-        entries: Vec<Entry>,
-    }
-
-    #[derive(Debug, Serialize)]
-    struct Entry {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        unity_version: Option<String>,
-        class_id: i32,
-        type_tree: unity_asset_binary::typetree::TypeTree,
-    }
-
-    let mut env = Environment::new();
-    let path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
-    );
-    env.load_file(&path, &mut AssetLoadBudget::default())
-        .unwrap();
-
-    let source = BinarySource::path(&path);
-    let texture_path_id = -3875358842991402074i64;
-    let key = BinaryObjectKey {
-        source: source.clone(),
-        source_kind: BinarySourceKind::AssetBundle,
-        asset_index: Some(0),
-        path_id: texture_path_id,
-    };
-
-    let type_tree = {
-        let bundle = env.bundles.get(&source).expect("sample bundle loaded");
-        let file = bundle.assets.first().expect("bundle has asset 0");
-        file.types()
-            .iter()
-            .find(|t| t.class_id == 28)
-            .expect("bundle asset has Texture2D type tree")
-            .type_tree
-            .clone()
-    };
-
-    {
-        let bundle = env
-            .bundles
-            .get_mut(&source)
-            .expect("sample bundle loaded (mutable)");
-        let file = bundle.assets.first_mut().expect("bundle has asset 0");
-        file.set_type_tree_enabled(false);
-        for t in file.types_mut().iter_mut() {
-            t.type_tree.clear();
-        }
-        file.set_type_tree_registry(None);
-    }
-
-    let obj = env
-        .read_binary_object_key(&key, &mut AssetLoadBudget::default())
-        .unwrap();
-    assert_eq!(obj.name(), None, "expected no typetree without registry");
-
-    let tmp = tempfile::tempdir().unwrap();
-    let reg_path = tmp.path().join("typetree_registry.json");
-    let dump = Dump {
-        schema: 1,
-        entries: vec![Entry {
-            unity_version: None,
-            class_id: 28,
-            type_tree,
-        }],
-    };
-    fs::write(&reg_path, serde_json::to_string_pretty(&dump).unwrap()).unwrap();
-
-    env.set_type_tree_registry_from_paths(
-        std::slice::from_ref(&reg_path),
-        &mut AssetLoadBudget::default(),
-    )
-    .unwrap();
-
-    env.edit_binary_object_key(&key, &mut AssetLoadBudget::default(), |class| {
-        class.set(
-            "m_Name".to_string(),
-            UnityValue::String("banner_1_edited".to_string()),
-        );
-        Ok(())
-    })
-    .unwrap();
-
-    let out_dir = tmp.path().join("out");
-    env.save(PackingPolicy::Preserve, &out_dir).unwrap();
-
-    let out_path = out_dir.join("banner_1");
-    assert!(out_path.is_file());
-
-    let mut saved_bundle =
-        unity_asset_binary::bundle::BundleParser::from_bytes(std::fs::read(&out_path).unwrap())
-            .unwrap();
-    let reg = std::sync::Arc::new(
-        JsonTypeTreeRegistry::from_path(&reg_path, &mut AssetLoadBudget::default()).unwrap(),
-    );
-
-    let file = saved_bundle.assets.first_mut().expect("bundle has asset 0");
-    file.set_type_tree_registry(Some(reg));
-
-    let saved = file
-        .find_object_handle(texture_path_id)
-        .expect("edited object exists after save")
-        .read(&mut AssetLoadBudget::default())
-        .unwrap();
-    assert_eq!(saved.name().as_deref(), Some("banner_1_edited"));
 }
 
 #[test]
@@ -1658,93 +1264,6 @@ fn environment_zip_failure_discards_recursive_webfile_stage() {
         env.bundles()
             .contains_key(&BinarySource::archive_entry(&zip_path, "payload/direct.ab"))
     );
-}
-
-#[test]
-fn environment_can_edit_zip_assetbundle_entry_and_save() {
-    use std::io::Write;
-    use unity_asset_write::PackingPolicy;
-    use zip::write::FileOptions;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let zip_path = tmp.path().join("samples.zip");
-    let out_dir = tmp.path().join("out");
-
-    let f = std::fs::File::create(&zip_path).unwrap();
-    let mut zip = zip::ZipWriter::new(f);
-    zip.start_file("inner/char_118_yuki.ab", FileOptions::default())
-        .unwrap();
-    zip.write_all(include_bytes!(
-        "../../../../../tests/samples/char_118_yuki.ab"
-    ))
-    .unwrap();
-    zip.finish().unwrap();
-
-    let zip_path = canonicalize_path(zip_path);
-
-    let mut env = Environment::new();
-    env.load_file(&zip_path, &mut AssetLoadBudget::default())
-        .unwrap();
-
-    let source = BinarySource::archive_entry(&zip_path, "inner/char_118_yuki.ab");
-
-    let bundle = env.bundles().get(&source).expect("zip bundle loaded");
-    let sf = bundle.assets.first().expect("bundle has asset 0");
-
-    let mut name_budget = AssetLoadBudget::default();
-    let (path_id, old_name) = sf
-        .object_handles()
-        .filter_map(|h| {
-            h.peek_name(&mut name_budget)
-                .ok()
-                .flatten()
-                .map(|n| (h.path_id(), n))
-        })
-        .find(|(_id, name)| !name.is_empty())
-        .expect("expected at least one object with peekable name in sample");
-
-    let key = BinaryObjectKey {
-        source: source.clone(),
-        source_kind: BinarySourceKind::AssetBundle,
-        asset_index: Some(0),
-        path_id,
-    };
-
-    let new_name = format!("RUST_ZIP_ENV_SAVE_{}", old_name);
-
-    env.edit_binary_object_key(&key, &mut AssetLoadBudget::default(), |class| {
-        if let Some(v) = class.get_mut("m_Name") {
-            *v = UnityValue::String(new_name.clone());
-            return Ok(());
-        }
-        if let Some(v) = class.get_mut("name") {
-            *v = UnityValue::String(new_name.clone());
-            return Ok(());
-        }
-        Err(UnityAssetError::format("No m_Name/name field found"))
-    })
-    .unwrap();
-
-    env.save(PackingPolicy::Preserve, &out_dir).unwrap();
-
-    let out_path = out_dir.join("char_118_yuki.ab");
-    assert!(out_path.is_file());
-
-    let saved_bundle =
-        unity_asset_binary::bundle::BundleParser::from_bytes(std::fs::read(out_path).unwrap())
-            .unwrap();
-    let saved_sf = saved_bundle
-        .assets
-        .first()
-        .expect("saved bundle has asset 0");
-    let saved_obj = saved_sf
-        .find_object_handle(path_id)
-        .expect("edited object exists after save");
-    let saved_name = saved_obj
-        .peek_name(&mut AssetLoadBudget::default())
-        .unwrap()
-        .unwrap();
-    assert_eq!(saved_name, new_name);
 }
 
 #[test]
@@ -2477,99 +1996,6 @@ fn environment_loads_extless_webfile_entries_and_reads_resource_bytes() {
 }
 
 #[test]
-fn environment_save_repacks_webfile_after_editing_embedded_bundle() {
-    let sample_bundle_path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/char_118_yuki.ab"),
-    );
-    let bundle_bytes = fs::read(&sample_bundle_path).unwrap();
-
-    let entry_name = "char_118_yuki.ab".to_string();
-    let web_bytes = build_uncompressed_webfile(vec![(entry_name.clone(), bundle_bytes)]);
-
-    let temp = tempfile::tempdir().unwrap();
-    let web_path = temp.path().join("UnityWebData");
-    fs::write(&web_path, web_bytes).unwrap();
-
-    let mut env = Environment::new();
-    env.load_file(&web_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let web_path = canonicalize_path(web_path);
-
-    let bundle_source = BinarySource::WebEntry {
-        web_path: Arc::new(web_path.clone()),
-        entry_name: entry_name.clone(),
-    };
-
-    // Pick a stable object inside the embedded bundle and patch its name.
-    let mut chosen: Option<(BinaryObjectKey, String)> = None;
-    let mut name_budget = AssetLoadBudget::default();
-    for r in env.binary_object_infos() {
-        if r.source != &bundle_source || r.source_kind != BinarySourceKind::AssetBundle {
-            continue;
-        }
-        if let Ok(Some(name)) = r.object.peek_name(&mut name_budget)
-            && !name.is_empty()
-        {
-            chosen = Some((r.key(), name));
-            break;
-        }
-    }
-
-    let (key, old_name) = chosen.expect("expected at least one object with a peekable name");
-    let new_name = format!("RUST_WEBFILE_SAVE_{}", old_name);
-
-    env.edit_binary_object_key(&key, &mut AssetLoadBudget::default(), |class| {
-        if let Some(v) = class.get_mut("m_Name") {
-            *v = UnityValue::String(new_name.clone());
-        } else if let Some(v) = class.get_mut("name") {
-            *v = UnityValue::String(new_name.clone());
-        } else {
-            return Err(UnityAssetError::format(
-                "Chosen object has peekable name but no m_Name/name field",
-            ));
-        }
-        Ok(())
-    })
-    .unwrap();
-
-    let out_dir = temp.path().join("out");
-    env.save(unity_asset_write::PackingPolicy::Preserve, &out_dir)
-        .unwrap();
-
-    // UnityPy-style save should rebuild the container, not emit extracted entry files.
-    let out_web_path = out_dir.join("UnityWebData");
-    assert!(out_web_path.exists());
-    assert!(!out_dir.join(&entry_name).exists());
-
-    let mut env2 = Environment::new();
-    env2.load_file(&out_web_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let out_web_path = canonicalize_path(out_web_path);
-
-    let out_bundle_source = BinarySource::WebEntry {
-        web_path: Arc::new(out_web_path),
-        entry_name,
-    };
-
-    let r2 = env2
-        .binary_object_infos()
-        .find(|r| {
-            r.source == &out_bundle_source
-                && r.source_kind == BinarySourceKind::AssetBundle
-                && r.asset_index == key.asset_index
-                && r.object.path_id() == key.path_id
-        })
-        .expect("expected edited object handle in repacked webfile bundle");
-
-    let observed = r2
-        .object
-        .peek_name(&mut AssetLoadBudget::default())
-        .unwrap()
-        .expect("edited object should still have a name");
-    assert_eq!(observed, new_name);
-}
-
-#[test]
 fn environment_resolve_pptr_path_key_resolves_sprite_texture() {
     let mut env = Environment::new();
     let path = canonicalize_path(
@@ -2603,490 +2029,169 @@ fn environment_resolve_pptr_path_key_resolves_sprite_texture() {
 }
 
 #[test]
-fn environment_can_set_pptr_path_to_key_and_reload() {
-    use unity_asset_write::PackingPolicy;
+fn environment_best_effort_pptr_budget_failure_is_atomic_and_typed() {
+    let temp = tempfile::tempdir().unwrap();
+    let owner_path = temp.path().join("owner.assets");
+    let dependency_path = temp.path().join("dependency.assets");
+    fs::write(&owner_path, external_transform_fixture("dependency.assets")).unwrap();
+    fs::write(&dependency_path, TRANSFORM_HIERARCHY_FIXTURE).unwrap();
+    let owner_path = canonicalize_path(owner_path);
+    let dependency_path = canonicalize_path(dependency_path);
 
     let mut env = Environment::new();
-    let path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/atlas_test"),
+    env.load_file(&owner_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let context_key = external_transform_context(&env, &owner_path);
+    let base_path = env.base_path.clone();
+    env.read_binary_object_key(&context_key, &mut AssetLoadBudget::default())
+        .unwrap();
+
+    let mut baseline = AssetLoadBudget::default();
+    assert_eq!(
+        env.resolve_pptr_path_key(&context_key, "m_Father", &mut baseline)
+            .unwrap(),
+        None,
+        "the owner must remain unresolved before the dependency is loaded"
     );
-    env.load_file(&path, &mut AssetLoadBudget::default())
-        .unwrap();
+    let baseline_entries = baseline.usage().entries;
 
-    let sprite_key = env
-        .binary_object_infos()
-        .find(|r| r.source_kind == BinarySourceKind::AssetBundle && r.object.class_id() == 213)
-        .expect("sample bundle contains at least one Sprite")
-        .key();
-    let atlas_key = env
-        .binary_object_infos()
-        .find(|r| {
-            r.source_kind == BinarySourceKind::AssetBundle && r.object.class_id() == 687078895
-        })
-        .expect("sample bundle contains a SpriteAtlas")
-        .key();
-
-    let mut edit_budget = AssetLoadBudget::default();
-    let mut session = env.edit_session(&mut edit_budget);
-    session
-        .set_pptr_path_to_key(&sprite_key, "m_SpriteAtlas", &atlas_key)
-        .unwrap();
-
-    let temp = tempfile::tempdir().unwrap();
-    let out_dir = temp.path().join("out");
-    session.save(PackingPolicy::Preserve, &out_dir).unwrap();
-
-    let out_bundle_path = canonicalize_path(out_dir.join("atlas_test"));
-    assert!(out_bundle_path.exists());
-
-    let mut env2 = Environment::new();
-    env2.load_file(&out_bundle_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let sprite_ref = env2
-        .find_binary_object_in_bundle_asset(&out_bundle_path, 0, sprite_key.path_id)
-        .expect("saved bundle contains sprite path id");
-    let sprite_obj = env2
-        .read_binary_object_key(&sprite_ref.key(), &mut AssetLoadBudget::default())
-        .unwrap();
-
-    let atlas_ref =
-        super::pptr_path::get_value_at_path(sprite_obj.as_unity_class(), "m_SpriteAtlas")
-            .expect("m_SpriteAtlas present");
-    let (file_id, path_id) =
-        super::pptr_path::read_pptr(atlas_ref).expect("m_SpriteAtlas is a PPtr");
-    assert_eq!(file_id, 0);
-    assert_eq!(path_id, atlas_key.path_id);
-}
-
-#[test]
-fn environment_set_pptr_path_to_key_adds_external_when_cross_source() {
-    use unity_asset_write::PackingPolicy;
-
-    let mut env = Environment::new();
-    let banner_path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
-    );
-    let atlas_path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/atlas_test"),
-    );
-
-    env.load_file(&banner_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    env.load_file(&atlas_path, &mut AssetLoadBudget::default())
-        .unwrap();
-
-    let sprite_key = env
-        .binary_object_infos()
-        .find(|r| r.source == &BinarySource::path(&banner_path) && r.object.class_id() == 213)
-        .expect("banner_1 bundle contains a Sprite")
-        .key();
-    let atlas_key = env
-        .binary_object_infos()
-        .find(|r| r.source == &BinarySource::path(&atlas_path) && r.object.class_id() == 687078895)
-        .expect("atlas_test bundle contains a SpriteAtlas")
-        .key();
-
-    let mut edit_budget = AssetLoadBudget::default();
-    let mut session = env.edit_session(&mut edit_budget);
-    let (file_id, _) = session
-        .set_pptr_path_to_key(&sprite_key, "m_SpriteAtlas", &atlas_key)
-        .unwrap();
-    assert!(file_id > 0);
-
-    let temp = tempfile::tempdir().unwrap();
-    let out_dir = temp.path().join("out");
-    session.save(PackingPolicy::Preserve, &out_dir).unwrap();
-
-    let out_bundle_path = canonicalize_path(out_dir.join("banner_1"));
-    assert!(out_bundle_path.exists());
-
-    let mut env2 = Environment::new();
-    env2.load_file(&out_bundle_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let sprite_ref = env2
-        .find_binary_object_in_bundle_asset(&out_bundle_path, 0, sprite_key.path_id)
-        .expect("saved bundle contains sprite path id");
-    let sprite_obj = env2
-        .read_binary_object_key(&sprite_ref.key(), &mut AssetLoadBudget::default())
-        .unwrap();
-
-    let atlas_ref =
-        super::pptr_path::get_value_at_path(sprite_obj.as_unity_class(), "m_SpriteAtlas")
-            .expect("m_SpriteAtlas present");
-    let (saved_file_id, saved_path_id) =
-        super::pptr_path::read_pptr(atlas_ref).expect("m_SpriteAtlas is a PPtr");
-    assert_eq!(saved_file_id, file_id);
-    assert_eq!(saved_path_id, atlas_key.path_id);
-
-    let bundle = env2
-        .bundles()
-        .get(&BinarySource::path(&out_bundle_path))
-        .expect("saved bundle loaded");
-    let sf = bundle
-        .assets
-        .first()
-        .expect("bundle has at least one asset");
-    let external = sf
-        .externals
-        .iter()
-        .find(|external| external.path == "atlas_test")
-        .expect("expected added external entry for cross-source PPtr");
-    assert_eq!(external.guid, [0; 16]);
-    assert_eq!(external.type_, 0);
-}
-
-#[test]
-fn environment_external_budget_failure_does_not_publish_edit_state() {
-    fn fixture() -> (Environment, BinaryObjectKey, BinaryObjectKey) {
-        let mut env = Environment::new();
-        let banner_path = canonicalize_path(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
-        );
-        let atlas_path = canonicalize_path(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/atlas_test"),
-        );
-        env.load_file(&banner_path, &mut AssetLoadBudget::default())
-            .unwrap();
-        env.load_file(&atlas_path, &mut AssetLoadBudget::default())
-            .unwrap();
-        let context = env
-            .binary_object_infos()
-            .find(|reference| {
-                reference.source == &BinarySource::path(&banner_path)
-                    && reference.object.class_id() == 213
-            })
-            .unwrap()
-            .key();
-        let target = env
-            .binary_object_infos()
-            .find(|reference| {
-                reference.source == &BinarySource::path(&atlas_path)
-                    && reference.object.class_id() == 687078895
-            })
-            .unwrap()
-            .key();
-        (env, context, target)
-    }
-
-    let (mut probe, context, target) = fixture();
-    let mut measured = AssetLoadBudget::default();
-    probe
-        .edit_session(&mut measured)
-        .file_id_for_target(&context, &target)
-        .unwrap();
-    let required = measured.usage().bytes;
-    assert!(required > 0);
-
-    let (mut env, context, target) = fixture();
-    let mut short = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
-        max_bytes: required - 1,
-        ..unity_asset_core::AssetLoadLimits::default()
+    let mut constrained = AssetLoadBudget::new(AssetLoadLimits {
+        max_entries: baseline_entries,
+        ..AssetLoadLimits::default()
     })
     .unwrap();
     let error = env
-        .edit_session(&mut short)
-        .file_id_for_target(&context, &target)
-        .unwrap_err();
+        .resolve_pptr_path_key_best_effort(&context_key, "m_Father", &mut constrained)
+        .expect_err("candidate parsing must share and exhaust the caller budget");
 
-    assert!(budget_error_in_chain(&error).is_some(), "{error:?}");
-    assert!(env.write_state.is_empty());
+    assert!(
+        matches!(
+            budget_error_in_chain(&error),
+            Some(BudgetError::Exceeded {
+                resource: "entries",
+                limit,
+                requested,
+            }) if *limit == baseline_entries && *requested > baseline_entries
+        ),
+        "error={error:?}, usage={:?}",
+        constrained.usage()
+    );
+    assert!(
+        !env.binary_assets()
+            .contains_key(&BinarySource::path(&dependency_path)),
+        "a budget-rejected candidate must not become a loaded dependency"
+    );
+    assert_eq!(
+        env.base_path, base_path,
+        "implicit dependency loading must restore the caller's base path"
+    );
+    assert!(
+        env.warnings().is_empty(),
+        "resource exhaustion is surfaced as the typed error, not downgraded to a warning"
+    );
 }
 
 #[test]
-fn environment_reuses_path_only_external_metadata_without_publishing_empty_state() {
+fn environment_best_effort_pptr_skips_corrupt_candidate_and_can_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let owner_path = temp.path().join("owner.assets");
+    let dependency_path = temp.path().join("dependency.assets");
+    fs::write(&owner_path, external_transform_fixture("dependency.assets")).unwrap();
+    fs::write(&dependency_path, b"not a Unity binary source").unwrap();
+    let owner_path = canonicalize_path(owner_path);
+    let dependency_path = canonicalize_path(dependency_path);
+
     let mut env = Environment::new();
-    let banner_path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
-    );
-    let atlas_path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/atlas_test"),
-    );
-    env.load_file(&banner_path, &mut AssetLoadBudget::default())
+    env.load_file(&owner_path, &mut AssetLoadBudget::default())
         .unwrap();
-    env.load_file(&atlas_path, &mut AssetLoadBudget::default())
-        .unwrap();
+    let context_key = external_transform_context(&env, &owner_path);
+    let mut budget = AssetLoadBudget::default();
 
-    let context = env
-        .binary_object_infos()
-        .find(|reference| {
-            reference.source == &BinarySource::path(&banner_path)
-                && reference.object.class_id() == 213
-        })
-        .unwrap()
-        .key();
-    let target = env
-        .binary_object_infos()
-        .find(|reference| {
-            reference.source == &BinarySource::path(&atlas_path)
-                && reference.object.class_id() == 687078895
-        })
-        .unwrap()
-        .key();
+    assert_eq!(
+        env.resolve_pptr_path_key_best_effort(&context_key, "m_Father", &mut budget)
+            .unwrap(),
+        None,
+        "a corrupt dependency candidate must be skipped"
+    );
+    assert!(
+        !env.binary_assets()
+            .contains_key(&BinarySource::path(&dependency_path)),
+        "a corrupt candidate must not pollute the loaded-source cache"
+    );
+    assert!(
+        env.read_binary_object_key(&context_key, &mut budget)
+            .is_ok(),
+        "the valid owner must remain readable after a candidate failure"
+    );
+    assert!(
+        env.warnings().iter().any(|warning| {
+            matches!(
+                warning,
+                EnvironmentWarning::LoadFailed { path, error }
+                    if path == &dependency_path && !error.is_empty()
+            )
+        }),
+        "a skipped dependency candidate must produce an observable structured warning"
+    );
 
-    let expected_file_id = {
-        let file = match context.source_kind {
-            BinarySourceKind::SerializedFile => env
-                .binary_assets
-                .get_mut(&context.source)
-                .expect("standalone context file is loaded"),
-            BinarySourceKind::AssetBundle => env
-                .bundles
-                .get_mut(&context.source)
-                .and_then(|bundle| bundle.assets.get_mut(context.asset_index.unwrap()))
-                .expect("bundle context file is loaded"),
-        };
-        file.externals
-            .push(unity_asset_binary::asset::FileIdentifier {
-                temp_empty: String::new(),
-                guid: [0x7a; 16],
-                type_: 1,
-                path: "atlas_test".to_owned(),
-            });
-        i32::try_from(file.externals.len()).unwrap()
+    fs::write(&dependency_path, TRANSFORM_HIERARCHY_FIXTURE).unwrap();
+    let resolved = env
+        .resolve_pptr_path_key_best_effort(&context_key, "m_Father", &mut budget)
+        .unwrap()
+        .expect("a later valid candidate must be loadable after the corrupt attempt");
+    assert_eq!(resolved.source, BinarySource::path(&dependency_path));
+    assert_eq!(resolved.source_kind, BinarySourceKind::SerializedFile);
+    assert_eq!(resolved.path_id, 1);
+    assert!(
+        env.read_binary_object_key(&resolved, &mut budget).is_ok(),
+        "the retry must resolve a readable target rather than only update a cache entry"
+    );
+}
+
+#[test]
+fn environment_pptr_paths_read_nested_sequence_elements() {
+    use indexmap::IndexMap;
+
+    let pptr = |file_id, path_id| {
+        UnityValue::Object(IndexMap::from([
+            ("m_FileID".to_owned(), UnityValue::Integer(file_id)),
+            ("m_PathID".to_owned(), UnityValue::Integer(path_id)),
+        ]))
     };
-
-    let file_id = env
-        .edit_session(&mut AssetLoadBudget::default())
-        .file_id_for_target(&context, &target)
-        .unwrap();
-
-    assert_eq!(file_id, expected_file_id);
-    assert!(!env.has_pending_writes());
-}
-
-#[test]
-fn environment_object_edit_failure_does_not_publish_external_state() {
-    let mut env = Environment::new();
-    let banner_path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
-    );
-    let atlas_path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/atlas_test"),
-    );
-    env.load_file(&banner_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    env.load_file(&atlas_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let context = env
-        .binary_object_infos()
-        .find(|reference| {
-            reference.source == &BinarySource::path(&banner_path)
-                && reference.object.class_id() == 213
-        })
-        .unwrap()
-        .key();
-    let target = env
-        .binary_object_infos()
-        .find(|reference| {
-            reference.source == &BinarySource::path(&atlas_path)
-                && reference.object.class_id() == 687078895
-        })
-        .unwrap()
-        .key();
-
-    let error = env
-        .set_pptr_path_to_key(
-            &context,
-            "invalid[path",
-            &target,
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap_err();
-
-    assert!(error.to_string().contains("missing ']'"), "{error:?}");
-    assert!(env.write_state.is_empty());
-}
-
-#[test]
-fn environment_resolve_pptr_path_key_best_effort_loads_external_bundle_from_subdir() {
-    use unity_asset_write::PackingPolicy;
-
-    let mut env = Environment::new();
-    let banner_path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/banner_1"),
-    );
-    let atlas_path = canonicalize_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/atlas_test"),
+    let class = UnityClass::with_properties(
+        1,
+        "GameObject".to_owned(),
+        "1".to_owned(),
+        IndexMap::from([
+            (
+                "m_Component".to_owned(),
+                UnityValue::Array(vec![
+                    UnityValue::Object(IndexMap::from([("component".to_owned(), pptr(0, 11))])),
+                    UnityValue::Object(IndexMap::from([("component".to_owned(), pptr(2, 22))])),
+                ]),
+            ),
+            (
+                "m_Nested".to_owned(),
+                UnityValue::Object(IndexMap::from([(
+                    "m_References".to_owned(),
+                    UnityValue::Array(vec![UnityValue::Object(IndexMap::from([(
+                        "target".to_owned(),
+                        pptr(3, 33),
+                    )]))]),
+                )])),
+            ),
+        ]),
     );
 
-    env.load_file(&banner_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    env.load_file(&atlas_path, &mut AssetLoadBudget::default())
-        .unwrap();
+    let component = super::pptr_path::get_value_at_path(&class, "m_Component[1].component")
+        .expect("root sequence index must select the second component PPtr");
+    assert_eq!(super::pptr_path::read_pptr(component), Some((2, 22)));
 
-    let sprite_key = env
-        .binary_object_infos()
-        .find(|r| r.source == &BinarySource::path(&banner_path) && r.object.class_id() == 213)
-        .expect("banner_1 bundle contains a Sprite")
-        .key();
-    let atlas_key = env
-        .binary_object_infos()
-        .find(|r| r.source == &BinarySource::path(&atlas_path) && r.object.class_id() == 687078895)
-        .expect("atlas_test bundle contains a SpriteAtlas")
-        .key();
-
-    let mut edit_budget = AssetLoadBudget::default();
-    let mut session = env.edit_session(&mut edit_budget);
-    let (file_id, _) = session
-        .set_pptr_path_to_key(&sprite_key, "m_SpriteAtlas", &atlas_key)
-        .unwrap();
-    assert!(file_id > 0);
-
-    let temp = tempfile::tempdir().unwrap();
-    let out_dir = temp.path().join("out");
-    session.save(PackingPolicy::Preserve, &out_dir).unwrap();
-
-    let out_bundle_path = canonicalize_path(out_dir.join("banner_1"));
-    assert!(out_bundle_path.exists());
-
-    // Place the external dependency in a nested folder to force the `find_file`-style directory scan.
-    let deps_dir = out_dir.join("deps");
-    std::fs::create_dir_all(&deps_dir).unwrap();
-    let atlas_copy_path = deps_dir.join("atlas_test");
-
-    let mut missing_env = Environment::new();
-    missing_env
-        .load_file(&out_bundle_path, &mut AssetLoadBudget::default())
-        .unwrap();
-
-    let sprite_ref = missing_env
-        .find_binary_object_in_bundle_asset(&out_bundle_path, 0, sprite_key.path_id)
-        .expect("saved bundle contains sprite path id");
-    let sprite_key2 = sprite_ref.key();
-
-    let mut missing_budget = AssetLoadBudget::default();
-    let mut missing_session = missing_env.edit_session(&mut missing_budget);
+    let nested = super::pptr_path::get_value_at_path(&class, "m_Nested.m_References[0].target")
+        .expect("nested sequence index must select the target PPtr");
+    assert_eq!(super::pptr_path::read_pptr(nested), Some((3, 33)));
     assert!(
-        missing_session
-            .resolve_pptr_path_key(&sprite_key2, "m_SpriteAtlas")
-            .unwrap()
-            .is_none()
+        super::pptr_path::get_value_at_path(&class, "m_Component[2].component").is_none(),
+        "an out-of-range sequence index must not resolve a neighboring PPtr"
     );
-
-    std::fs::copy(&atlas_path, &atlas_copy_path).unwrap();
-    let atlas_copy_path = canonicalize_path(atlas_copy_path);
-    let mut env2 = Environment::new();
-    env2.load_file(&out_bundle_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let mut constrained_budget = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
-        max_bytes: std::fs::metadata(&atlas_copy_path).unwrap().len(),
-        ..unity_asset_core::AssetLoadLimits::default()
-    })
-    .unwrap();
-    let mut constrained_session = env2.edit_session(&mut constrained_budget);
-    let error = constrained_session
-        .resolve_pptr_path_key(&sprite_key2, "m_SpriteAtlas")
-        .expect_err("dependency loading must use the caller-owned budget");
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
-    let mut is_resource_error = false;
-    while let Some(current) = source {
-        if current
-            .downcast_ref::<unity_asset_binary::error::BinaryError>()
-            .is_some_and(unity_asset_binary::error::BinaryError::is_resource_error)
-        {
-            is_resource_error = true;
-            break;
-        }
-        source = current.source();
-    }
-    assert!(is_resource_error, "unexpected error chain: {error:?}");
-    assert!(
-        !env2
-            .bundles()
-            .contains_key(&BinarySource::path(&atlas_copy_path))
-    );
-
-    std::fs::write(&atlas_copy_path, b"not a Unity binary").unwrap();
-    let warning_count = env2.warnings().len();
-    let mut invalid_format_budget = AssetLoadBudget::default();
-    let mut invalid_format_session = env2.edit_session(&mut invalid_format_budget);
-    assert!(
-        invalid_format_session
-            .resolve_pptr_path_key(&sprite_key2, "m_SpriteAtlas")
-            .unwrap()
-            .is_none()
-    );
-    let warnings = env2.warnings();
-    assert_eq!(warnings.len(), warning_count + 1);
-    assert!(matches!(
-        warnings.last(),
-        Some(EnvironmentWarning::LoadFailed { path, .. }) if path == &atlas_copy_path
-    ));
-
-    std::fs::copy(&atlas_path, &atlas_copy_path).unwrap();
-    let mut edit_budget2 = AssetLoadBudget::default();
-    let mut session2 = env2.edit_session(&mut edit_budget2);
-    let resolved = session2
-        .resolve_pptr_path_key(&sprite_key2, "m_SpriteAtlas")
-        .unwrap()
-        .expect("sprite should reference a SpriteAtlas via external PPtr");
-
-    assert_eq!(resolved.path_id, atlas_key.path_id);
-    assert_eq!(resolved.source_kind, BinarySourceKind::AssetBundle);
-    assert_eq!(resolved.source, BinarySource::path(&atlas_copy_path));
-    assert!(
-        env2.bundles()
-            .contains_key(&BinarySource::path(&atlas_copy_path))
-    );
-}
-
-#[test]
-fn pptr_path_supports_array_indices() {
-    let mut class = UnityClass::new(0, "Test".to_string(), "0".to_string());
-    class.set("m_Materials".to_string(), UnityValue::Array(Vec::new()));
-
-    super::pptr_path::write_pptr_at_path(&mut class, "m_Materials[1]", 0, 42).unwrap();
-
-    let v = super::pptr_path::get_value_at_path(&class, "m_Materials[1]")
-        .expect("m_Materials[1] exists");
-    let (file_id, path_id) = super::pptr_path::read_pptr(v).expect("element is a PPtr");
-    assert_eq!(file_id, 0);
-    assert_eq!(path_id, 42);
-}
-
-#[test]
-fn environment_can_edit_yaml_prefab_by_anchor_and_save() {
-    let dir = tempfile::tempdir().unwrap();
-    let prefab_path = dir.path().join("ui.prefab");
-    let prefab = r#"%YAML 1.1
-%TAG !u! tag:unity3d.com,2011:
---- !u!1 &100000
-GameObject:
-  m_Name: Old
-  m_Component:
-  - component: {fileID: 100001}
---- !u!4 &100001
-Transform:
-  m_GameObject: {fileID: 100000}
-  m_Father: {fileID: 0}
-  m_Children: []
-"#;
-    fs::write(&prefab_path, prefab).unwrap();
-
-    let mut env = Environment::new();
-    env.load_file(&prefab_path, &mut AssetLoadBudget::default())
-        .unwrap();
-
-    let mut edit_budget = AssetLoadBudget::default();
-    let mut session = env.edit_session(&mut edit_budget);
-    session
-        .set_yaml_value_at_path(
-            &prefab_path,
-            "100000",
-            "m_Name",
-            UnityValue::String("New".to_string()),
-        )
-        .unwrap();
-
-    let out_dir = dir.path().join("out");
-    session
-        .save(unity_asset_write::PackingPolicy::Preserve, &out_dir)
-        .unwrap();
-
-    let out_prefab = out_dir.join("ui.prefab");
-    assert!(out_prefab.exists());
-
-    let doc = YamlDocument::load_yaml(&out_prefab, false).unwrap();
-    let go = doc.get(Some("GameObject"), Some(&["m_Name"])).unwrap();
-    assert_eq!(go.get("m_Name").and_then(|v| v.as_str()), Some("New"));
 }

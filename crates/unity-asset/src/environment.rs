@@ -29,7 +29,6 @@ mod imp {
 
     mod container;
     mod dependency_files;
-    mod edit;
     mod key;
     mod loader;
     mod meta_guid;
@@ -37,12 +36,9 @@ mod imp {
     mod path;
     mod pptr;
     mod pptr_path;
-    mod save;
     mod stream;
-    mod yaml_edit;
     mod yaml_query;
 
-    pub use edit::EnvironmentEditSession;
     pub use loader::{ProjectLoadOptions, ProjectLoadStats};
     pub use yaml_query::YamlObjectKey;
 
@@ -298,7 +294,6 @@ mod imp {
         base_type_tree_registry: Option<Arc<dyn TypeTreeRegistry>>,
         script_type_tree_registry: Option<Arc<dyn TypeTreeRegistry>>,
         type_tree_registry: Option<Arc<dyn TypeTreeRegistry>>,
-        write_state: edit::EnvironmentWriteState,
         /// Base path for relative file resolution
         #[allow(dead_code)]
         base_path: PathBuf,
@@ -325,7 +320,6 @@ mod imp {
                 base_type_tree_registry: None,
                 script_type_tree_registry: None,
                 type_tree_registry: None,
-                write_state: edit::EnvironmentWriteState::default(),
                 base_path: std::env::current_dir().unwrap_or_default(),
             }
         }
