@@ -1,7 +1,7 @@
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, Diagnostic, FieldPath, ObjectAddress, ObjectKind, UnityClass,
-    UnityValue, WorkspaceRevision, class_names, field_schema_digest, observe_semantic_value,
-    semantic_value_digest, yaml_field_schema_digest,
+    AssetLoadBudget, BudgetError, Diagnostic, FieldPath, FieldPathSegment, ObjectAddress,
+    ObjectKind, UnityClass, UnityValue, ValuePathError, WorkspaceRevision, class_ids, class_names,
+    field_schema_digest, observe_semantic_value, semantic_value_digest, yaml_field_schema_digest,
 };
 
 use super::contract::{
@@ -11,8 +11,9 @@ use super::contract::{
 };
 use super::output::RecipeOutputBuilder;
 use crate::workspace::{
-    FieldGuard, GenericMutation, MutationPlanFragment, PlanPayload, SourceExpectation,
-    WorkspaceLookup, WorkspaceObject, WorkspaceSource, WorkspaceView,
+    FieldGuard, GenericMutation, MutationPlanError, MutationPlanFragment, MutationValue,
+    PlanPayload, SourceExpectation, WorkspaceLookup, WorkspaceObject, WorkspaceSource,
+    WorkspaceView,
 };
 
 /// Trusted immutable observation used by every built-in recipe.
@@ -61,12 +62,7 @@ impl RecipeObject {
         path: &FieldPath,
         output: &mut RecipeOutputBuilder<'_>,
     ) -> Result<&'value UnityValue, RecipeError> {
-        match self.field(path) {
-            Some(value) => Ok(value),
-            None => Err(RecipeError::MissingField {
-                path: output.path(path)?,
-            }),
-        }
+        self.resolve_field(path, output)
     }
 
     pub(crate) fn field_guard(
@@ -78,15 +74,8 @@ impl RecipeObject {
             .provenance()
             .schema_digest()
             .ok_or(RecipeError::MissingSchemaProvenance)?;
-        let value = match self.field(path) {
-            Some(value) => value,
-            None => {
-                let mut output = RecipeOutputBuilder::new(budget);
-                return Err(RecipeError::MissingField {
-                    path: output.path(path)?,
-                });
-            }
-        };
+        let mut output = RecipeOutputBuilder::new(budget);
+        let value = self.resolve_field(path, &mut output)?;
         let schema = match self.address.kind() {
             ObjectKind::Binary => field_schema_digest(object_schema, path)?,
             ObjectKind::Yaml => yaml_field_schema_digest(self.class(), path, value, budget)?,
@@ -95,6 +84,23 @@ impl RecipeObject {
             schema,
             semantic_value_digest(value, budget)?,
         ))
+    }
+
+    fn resolve_field<'value>(
+        &'value self,
+        path: &FieldPath,
+        output: &mut RecipeOutputBuilder<'_>,
+    ) -> Result<&'value UnityValue, RecipeError> {
+        match self.class().value_at_path(path) {
+            Ok(value) => Ok(value),
+            Err(source) => {
+                let path = output.path(path)?;
+                Err(match source {
+                    ValuePathError::MissingField { .. } => RecipeError::MissingField { path },
+                    source => RecipeError::InvalidFieldPath { path, source },
+                })
+            }
+        }
     }
 
     pub(crate) fn fragment(
@@ -216,14 +222,14 @@ impl<'view> SchemaRecipePlanner<'view> {
     ) -> Result<RecipeLowering, RecipeError> {
         self.validate_object(object)?;
         validate_recipe_provenance(object)?;
+        let mut output = RecipeOutputBuilder::new(budget);
+        validate_reference_shape(object, &path, &mut output)?;
         if expected == replacement {
             return Ok(RecipeLowering::unchanged(
                 RecipeId::ReferenceRetargetV1,
                 SchemaVariantId::GenericReference,
             ));
         }
-        let mut output = RecipeOutputBuilder::new(budget);
-        validate_reference_shape(object, &path, &mut output)?;
         let guard = object.field_guard(&path, output.budget())?;
         let action = GenericMutation::ReferenceReplace {
             target: output.address(&object.address)?,
@@ -239,6 +245,50 @@ impl<'view> SchemaRecipePlanner<'view> {
             SchemaVariantId::GenericReference,
             object.fragment(self, Vec::new(), actions, &mut output)?,
         )
+    }
+
+    /// Lowers one observed field replacement into a revision-bound guarded plan fragment.
+    ///
+    /// The guard is derived from this planner's immutable view, so callers do not need to assemble
+    /// schema and semantic digests manually. Use [`Self::lower_reference`] for a top-level Unity
+    /// pointer field so logical target resolution and external-table allocation stay in preflight.
+    pub fn lower_field_replace(
+        &self,
+        object: &RecipeObject,
+        path: FieldPath,
+        replacement: MutationValue,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<MutationPlanFragment, RecipeError> {
+        self.validate_object(object)?;
+        validate_recipe_provenance(object)?;
+        if path.segments().is_empty() {
+            return Err(MutationPlanError::RootFieldPath {
+                operation: "field_replace",
+            }
+            .into());
+        }
+        let mut output = RecipeOutputBuilder::new(budget);
+        let guard = object.field_guard(&path, output.budget())?;
+        if let Some(owner) = protected_plain_field_owner(
+            object.class().class_id,
+            object.address.kind(),
+            object.class().properties(),
+            &path,
+        ) {
+            return Err(RecipeError::ProtectedSemanticField {
+                path: output.path(&path)?,
+                owner,
+            });
+        }
+        let action = GenericMutation::FieldReplace {
+            target: output.address(&object.address)?,
+            path,
+            guard,
+            replacement,
+        };
+        let mut actions = output.vec::<GenericMutation>(1, "field replacement actions")?;
+        actions.push(action);
+        object.fragment(self, Vec::new(), actions, &mut output)
     }
 
     pub(crate) fn validate_object(&self, object: &RecipeObject) -> Result<(), RecipeError> {
@@ -298,6 +348,59 @@ pub(crate) fn value_kind(value: &UnityValue) -> RecipeValueKind {
     }
 }
 
+/// Returns the semantic subsystem that owns a field which must not be mutated as plain data.
+pub(crate) fn protected_plain_field_owner(
+    class_id: i32,
+    kind: ObjectKind,
+    root: &indexmap::IndexMap<String, UnityValue>,
+    path: &FieldPath,
+) -> Option<&'static str> {
+    let first = match path.segments().first()? {
+        FieldPathSegment::Field(name) => name.as_str(),
+        FieldPathSegment::Index(_) => return None,
+    };
+    if class_id == class_ids::AUDIO_CLIP && matches!(first, "m_Resource" | "m_StreamData") {
+        return Some("streamed-resource");
+    }
+    if matches!(class_id, class_ids::TRANSFORM | class_ids::RECT_TRANSFORM)
+        && first == "m_Children"
+        && path.segments().len() == 1
+    {
+        return Some("transform-hierarchy");
+    }
+
+    let mut current = root.get(first)?;
+    if is_reference_value(current, kind) {
+        return Some("unity-reference");
+    }
+    for segment in &path.segments()[1..] {
+        current = match (segment, current) {
+            (FieldPathSegment::Field(name), UnityValue::Object(fields)) => fields.get(name)?,
+            (FieldPathSegment::Index(index), UnityValue::Array(values)) => {
+                values.get(usize::try_from(*index).ok()?)?
+            }
+            _ => return None,
+        };
+        if is_reference_value(current, kind) {
+            return Some("unity-reference");
+        }
+    }
+    None
+}
+
+fn is_reference_value(value: &UnityValue, kind: ObjectKind) -> bool {
+    let Some(fields) = value.as_object() else {
+        return false;
+    };
+    match kind {
+        ObjectKind::Yaml => fields.get("fileID").and_then(UnityValue::as_i64).is_some(),
+        ObjectKind::Binary => {
+            aliased_reference_integer(fields, "m_FileID", "fileID").is_some()
+                && aliased_reference_integer(fields, "m_PathID", "pathID").is_some()
+        }
+    }
+}
+
 pub(crate) fn validate_recipe_provenance(object: &RecipeObject) -> Result<(), RecipeError> {
     let provenance = object.provenance();
     if provenance.schema_digest().is_none() {
@@ -334,11 +437,7 @@ pub(crate) fn validate_reference_shape<'value>(
     path: &FieldPath,
     output: &mut RecipeOutputBuilder<'_>,
 ) -> Result<&'value indexmap::IndexMap<String, UnityValue>, RecipeError> {
-    let Some(value) = object.field(path) else {
-        return Err(RecipeError::MissingField {
-            path: output.path(path)?,
-        });
-    };
+    let value = object.resolve_field(path, output)?;
     let Some(fields) = value.as_object() else {
         return Err(RecipeError::WrongFieldShape {
             path: output.path(path)?,

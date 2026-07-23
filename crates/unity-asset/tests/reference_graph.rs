@@ -17,7 +17,9 @@ use unity_asset::{
     SourceAlias, SourceId, SourceLocator, UnityValue,
 };
 use unity_asset_binary::asset::{FileIdentifier, SerializedFileParser};
-use unity_asset_write::object::SerializedFileEditSession;
+use unity_asset_write::object::{
+    SerializedFieldGuard, SerializedObjectEncoder, SerializedObjectMutation,
+};
 use unity_asset_write::serialized_file::{
     ExternalTableAllocator, SerializedFileEdits, SerializedFileWriter,
 };
@@ -315,17 +317,35 @@ fn assert_incremental_matches_fresh(
 
 fn external_transform_fixture(guid: [u8; 16]) -> Vec<u8> {
     let file = SerializedFileParser::from_bytes(TRANSFORM_BINARY.to_vec()).unwrap();
-    let mut session = SerializedFileEditSession::new(&file);
-    session
-        .edit_object(2, &mut AssetLoadBudget::default(), |class| {
-            let father = class
-                .get_mut("m_Father")
-                .and_then(UnityValue::as_object_mut)
-                .expect("Transform fixture must expose m_Father as a PPtr object");
-            father.insert("m_FileID".to_owned(), UnityValue::Integer(1));
-            father.insert("m_PathID".to_owned(), UnityValue::Integer(1));
-            Ok(())
-        })
+    let mut budget = AssetLoadBudget::default();
+    let mut candidate = SerializedObjectEncoder::new(&file, 2)
+        .unwrap()
+        .begin_semantic(&mut budget)
+        .unwrap();
+    let father_path = FieldPath::root().push_field("m_Father").unwrap();
+    let mut father = candidate.value_at_path(&father_path).unwrap().clone();
+    let guard = SerializedFieldGuard::from_observed(
+        candidate.schema_digest(),
+        &father_path,
+        &father,
+        &mut budget,
+    )
+    .unwrap();
+    let father_fields = father
+        .as_object_mut()
+        .expect("Transform fixture must expose m_Father as a PPtr object");
+    father_fields.insert("m_FileID".to_owned(), UnityValue::Integer(1));
+    father_fields.insert("m_PathID".to_owned(), UnityValue::Integer(1));
+    candidate
+        .apply(
+            SerializedObjectMutation::replace_field(0, father_path, guard, father),
+            &mut budget,
+        )
+        .unwrap();
+    let encoded = candidate.finish(&mut budget).unwrap();
+    let mut edits = SerializedFileEdits::default();
+    edits
+        .try_insert_encoded_object(encoded, &mut budget)
         .unwrap();
     let mut allocator = ExternalTableAllocator::new(&file).unwrap();
     allocator
@@ -336,10 +356,10 @@ fn external_transform_fixture(guid: [u8; 16]) -> Vec<u8> {
                 type_: 3,
                 path: INCREMENTAL_TARGET_ALIAS.to_owned(),
             },
-            &mut AssetLoadBudget::default(),
+            &mut budget,
         )
         .unwrap();
-    let edits = allocator.into_edits(session.into_edits()).unwrap();
+    let edits = allocator.into_edits(edits).unwrap();
     SerializedFileWriter::save(&file, &edits).unwrap()
 }
 

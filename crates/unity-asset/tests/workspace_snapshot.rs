@@ -10,9 +10,9 @@ use unity_asset::schema::{
     SchemaOrigin, SchemaRecipePlanner,
 };
 use unity_asset::workspace::{
-    AssetWorkspace, ReferenceTarget, SourceOpenRequest, WorkspaceError, WorkspaceLookup,
-    WorkspaceObjectValue, WorkspaceOptions, WorkspaceSourceContainer,
-    WorkspaceSourceMemberIdentityError, WorkspaceView,
+    AssetWorkspace, MutationPlanBuilder, MutationPlanError, MutationValue, PrepareOptions,
+    ReferenceTarget, SourceOpenRequest, WorkspaceError, WorkspaceLookup, WorkspaceObjectValue,
+    WorkspaceOptions, WorkspaceSourceContainer, WorkspaceSourceMemberIdentityError, WorkspaceView,
 };
 use unity_asset::{
     AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BinaryError, BudgetError, ContainmentKind,
@@ -1422,7 +1422,7 @@ fn rewritten_unknown_unity_versions_remain_readable_but_reject_all_recipes() {
 }
 
 #[test]
-fn registry_paths_are_loaded_once_and_snapshot_reads_use_frozen_type_trees() {
+fn registry_paths_are_loaded_once_and_frozen_type_trees_drive_prepare() {
     let directory = tempfile::tempdir().unwrap();
     let registry_path = directory.path().join("registry.json");
     fs::write(&registry_path, EXTERNAL_TYPE_TREE_REGISTRY).unwrap();
@@ -1445,7 +1445,6 @@ fn registry_paths_are_loaded_once_and_snapshot_reads_use_frozen_type_trees() {
         .objects(&mut AssetLoadBudget::default())
         .unwrap()
         .remove(0);
-    fs::remove_file(&asset_path).unwrap();
 
     let first = snapshot
         .read_object(&handle, &mut AssetLoadBudget::default())
@@ -1461,4 +1460,72 @@ fn registry_paths_are_loaded_once_and_snapshot_reads_use_frozen_type_trees() {
     );
     assert!(first.schema_provenance().schema_digest().is_some());
     assert_eq!(second.schema_provenance(), first.schema_provenance());
+
+    let address = ObjectAddress::binary_direct(
+        SourceLocator::path("stripped.assets").unwrap(),
+        handle.object().binary_path_id().unwrap(),
+    )
+    .unwrap();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+    let observed = planner
+        .inspect(&address, &mut AssetLoadBudget::default())
+        .unwrap();
+    let root_error = planner
+        .lower_field_replace(
+            &observed,
+            FieldPath::root(),
+            MutationValue::signed(123),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        root_error,
+        RecipeError::Plan(MutationPlanError::RootFieldPath {
+            operation: "field_replace"
+        })
+    ));
+    let fragment = planner
+        .lower_field_replace(
+            &observed,
+            FieldPath::root().push_field("m_Value").unwrap(),
+            MutationValue::signed(123),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let mut builder = MutationPlanBuilder::new(snapshot.revision());
+    builder.append(fragment).unwrap();
+    let prepared = workspace
+        .prepare(
+            builder.build().unwrap(),
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    fs::remove_file(&asset_path).unwrap();
+    let retained = snapshot
+        .read_object(&handle, &mut AssetLoadBudget::default())
+        .unwrap();
+    assert_eq!(retained.class().properties(), first.class().properties());
+    let prepared_view = prepared.view();
+    let prepared_handle = match prepared_view
+        .resolve_object(&address, &mut AssetLoadBudget::default())
+        .unwrap()
+    {
+        WorkspaceLookup::Resolved(handle) => handle,
+        other => panic!("prepared object must resolve, got {other:?}"),
+    };
+    let rewritten = prepared_view
+        .read_object(&prepared_handle, &mut AssetLoadBudget::default())
+        .unwrap();
+    assert_eq!(
+        rewritten
+            .class()
+            .get("m_Value")
+            .and_then(|value| value.as_i64()),
+        Some(123)
+    );
+    assert_eq!(
+        rewritten.schema_provenance().origin(),
+        SchemaOrigin::FrozenRegistry
+    );
 }

@@ -3,7 +3,7 @@ use thiserror::Error;
 use unity_asset_binary::{typetree::TypeTreeSemanticDigestError, unity_version::UnityVersion};
 use unity_asset_core::{
     BudgetError, DigestBuildError, DigestV1, FieldPath, FieldPathError, ObjectAddress, ObjectKind,
-    SemanticDigestError,
+    SemanticDigestError, ValuePathError,
 };
 
 use crate::workspace::{MutationPlanError, MutationPlanFragment, WorkspaceError};
@@ -493,6 +493,8 @@ pub enum RecipeRejectionCode {
     UnsupportedVersion,
     UnsupportedSchema,
     MissingField,
+    InvalidFieldPath,
+    ProtectedSemanticField,
     WrongFieldShape,
     AmbiguousFieldVariant,
     PropertyNotFound,
@@ -544,6 +546,17 @@ pub enum RecipeError {
     UnsupportedSchema { variant: &'static str },
     #[error("required field is missing: {path}")]
     MissingField { path: FieldPath },
+    #[error("field path {path} cannot be resolved: {source}")]
+    InvalidFieldPath {
+        path: FieldPath,
+        #[source]
+        source: ValuePathError,
+    },
+    #[error("field {path} is owned by the {owner} semantic recipe")]
+    ProtectedSemanticField {
+        path: FieldPath,
+        owner: &'static str,
+    },
     #[error("field {path} has {actual:?}; expected {expected}")]
     WrongFieldShape {
         path: FieldPath,
@@ -680,6 +693,10 @@ impl RecipeError {
             Self::UnsupportedVersion => Some(RecipeRejectionCode::UnsupportedVersion),
             Self::UnsupportedSchema { .. } => Some(RecipeRejectionCode::UnsupportedSchema),
             Self::MissingField { .. } => Some(RecipeRejectionCode::MissingField),
+            Self::InvalidFieldPath { .. } => Some(RecipeRejectionCode::InvalidFieldPath),
+            Self::ProtectedSemanticField { .. } => {
+                Some(RecipeRejectionCode::ProtectedSemanticField)
+            }
             Self::WrongFieldShape { .. } => Some(RecipeRejectionCode::WrongFieldShape),
             Self::AmbiguousFieldVariant { .. } => Some(RecipeRejectionCode::AmbiguousFieldVariant),
             Self::PropertyNotFound { .. } => Some(RecipeRejectionCode::PropertyNotFound),

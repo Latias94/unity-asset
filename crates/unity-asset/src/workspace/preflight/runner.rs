@@ -47,6 +47,7 @@ use super::{
     PrepareFailureReport, PrepareOptions, PrepareReport, PrepareStage, PreparedChange,
     PreparedSourceReport,
 };
+use crate::schema::protected_plain_field_owner;
 use crate::workspace::overlay::{PreparedSourceBinding, PreparedState};
 use crate::workspace::plan::{
     GenericMutation, MutationOperation, MutationPlan, MutationValueOwned, PlanPayload,
@@ -1476,6 +1477,20 @@ fn stage_yaml_operation(
             replacement,
             ..
         } => {
+            if let Some(owner) = protected_plain_field_owner(
+                entry.candidate.class().class_id,
+                ObjectKind::Yaml,
+                entry.candidate.class().properties(),
+                &path,
+            ) {
+                return Err(RunnerFailure::operation(
+                    ordinal,
+                    "PREPARE_PROTECTED_SEMANTIC_FIELD",
+                    format!("field is owned by the {owner} semantic recipe"),
+                    target,
+                    Some(path),
+                ));
+            }
             let replacement = {
                 let current = entry
                     .candidate
@@ -1862,6 +1877,21 @@ fn stage_binary_operation(
             replacement,
             ..
         } => {
+            let root = candidate
+                .semantic_value()
+                .as_object()
+                .expect("a semantic SerializedFile candidate always has an object root");
+            if let Some(owner) =
+                protected_plain_field_owner(candidate.class_id(), ObjectKind::Binary, root, &path)
+            {
+                return Err(RunnerFailure::operation(
+                    ordinal,
+                    "PREPARE_PROTECTED_SEMANTIC_FIELD",
+                    format!("field is owned by the {owner} semantic recipe"),
+                    target,
+                    Some(path),
+                ));
+            }
             let replacement = {
                 let schema = candidate.value_schema_at_path(&path).map_err(|error| {
                     RunnerFailure::operation(
@@ -2835,7 +2865,7 @@ fn finish_binary_group(
             }
         };
         edits
-            .try_set_object_bytes(encoded.path_id(), encoded.into_bytes(), budget)
+            .try_insert_encoded_object(encoded, budget)
             .map_err(|error| {
                 RunnerFailure::new(
                     Some(ordinal),

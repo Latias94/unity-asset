@@ -23,3 +23,5 @@ pub use recipe::{
     SchemaVariantId, recipe_capabilities,
 };
 pub use resource::AudioClipResourceRecipe;
+
+pub(crate) use recipe::protected_plain_field_owner;

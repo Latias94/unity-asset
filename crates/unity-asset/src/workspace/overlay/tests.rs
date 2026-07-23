@@ -16,6 +16,9 @@ use unity_asset_core::{
 use unity_asset_write::artifact::{
     ArtifactBatchDeclaration, ArtifactBudget, ArtifactLimits, ArtifactPayload, LogicalArtifactName,
 };
+use unity_asset_write::object::{
+    SerializedObjectEncoder, UnsafeRawObjectAcknowledgement, UnsafeRawObjectReplacement,
+};
 use unity_asset_write::serialized_file::{
     SerializedFileEdits, SerializedFileSource, SerializedFileWriter,
 };
@@ -603,23 +606,27 @@ fn prepared_binary_objects_are_derived_from_the_exact_serialized_artifact() {
     )
     .unwrap();
     let path_id = file.objects()[0].path_id();
-    let mut replacement = file
-        .object_handles()
-        .next()
-        .unwrap()
-        .raw_data()
-        .unwrap()
-        .to_vec();
+    let original = file.object_handles().next().unwrap().raw_data().unwrap();
+    let original_digest = DigestV1::hash_bytes(original);
+    let mut replacement = original.to_vec();
     replacement[20] = 3;
     let image = VerifiedSourceImage::verify(SourceKind::SerializedFile, backing);
     let payload = ArtifactPayload::source_backed(source, image).unwrap();
+    let mut edit_budget = AssetLoadBudget::default();
+    let encoded = SerializedObjectEncoder::new(&file, path_id)
+        .unwrap()
+        .encode_unsafe_raw(
+            UnsafeRawObjectReplacement::new(
+                original_digest,
+                replacement.clone(),
+                UnsafeRawObjectAcknowledgement::WireInvariantsAreCallersResponsibilityV1,
+            ),
+            &mut edit_budget,
+        )
+        .unwrap();
     let mut edits = SerializedFileEdits::default();
     edits
-        .try_set_object_bytes(
-            path_id,
-            replacement.clone(),
-            &mut AssetLoadBudget::default(),
-        )
+        .try_insert_encoded_object(encoded, &mut edit_budget)
         .unwrap();
     let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
     let mut inspection_budget = AssetLoadBudget::default();

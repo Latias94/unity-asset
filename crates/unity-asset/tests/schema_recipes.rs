@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use unity_asset::environment::{BinarySource, BinarySourceKind, Environment};
 use unity_asset::schema::{
     AudioClipResourceRecipe, ChildPlacement, DeclaredUnityVersion, HierarchyNode, HierarchyRecipe,
     HierarchyState, MaterialRecipe, MaterialTextureChange, PersistentArgument, PersistentCall,
@@ -10,14 +11,15 @@ use unity_asset::schema::{
     Vector3, recipe_capabilities,
 };
 use unity_asset::workspace::{
-    AssetWorkspace, GenericMutation, MutationPlan, MutationPlanBuilder, MutationPlanBuilderError,
-    MutationPlanFragment, MutationValueRef, PlanPayload, PrepareOptions, ReferenceTarget,
-    SequenceMutation,
+    AssetWorkspace, FieldGuard, GenericMutation, MutationPlan, MutationPlanBuilder,
+    MutationPlanBuilderError, MutationPlanFragment, MutationValue, MutationValueRef, PlanPayload,
+    PrepareOptions, PublicationTarget, ReferenceTarget, SequenceMutation,
 };
 use unity_asset::{
     AssetLoadBudget, AssetLoadLimits, FieldPath, ObjectAddress, SourceLocator, UnityValue,
     WorkspaceRevision,
 };
+use unity_asset_core::{semantic_value_digest, yaml_field_schema_digest};
 
 const MATERIAL_YAML: &str = r#"%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
@@ -329,6 +331,142 @@ fn capability_catalog_and_target_applicability_are_structured() {
         .unwrap();
     assert_eq!(material.status(), RecipeApplicabilityStatus::Applicable);
     assert!(material.rejection().is_none());
+}
+
+#[test]
+fn generic_field_replace_rejects_semantic_owners_and_preserves_path_errors() {
+    let hierarchy = Fixture::open("protected-hierarchy.prefab", HIERARCHY_YAML);
+    let snapshot = hierarchy.workspace.snapshot();
+    let hierarchy_revision = snapshot.revision();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+    let child_address = hierarchy.address("2");
+    let child = planner
+        .inspect(&child_address, &mut AssetLoadBudget::default())
+        .unwrap();
+
+    let father_path = FieldPath::root().push_field("m_Father").unwrap();
+    let father_leaf = father_path.clone().push_field("fileID").unwrap();
+    let error = planner
+        .lower_field_replace(
+            &child,
+            father_leaf.clone(),
+            MutationValue::signed(99),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        RecipeError::ProtectedSemanticField {
+            owner: "unity-reference",
+            ..
+        }
+    ));
+    assert_eq!(
+        error.code(),
+        Some(RecipeRejectionCode::ProtectedSemanticField)
+    );
+
+    let children = FieldPath::root().push_field("m_Children").unwrap();
+    let error = planner
+        .lower_field_replace(
+            &child,
+            children,
+            MutationValue::array(Vec::new()).unwrap(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RecipeError::ProtectedSemanticField {
+            owner: "transform-hierarchy",
+            ..
+        }
+    ));
+
+    let invalid = father_path.clone().push_index(0).unwrap();
+    let error = planner
+        .lower_field_replace(
+            &child,
+            invalid,
+            MutationValue::signed(1),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(&error, RecipeError::InvalidFieldPath { .. }));
+    assert_eq!(error.code(), Some(RecipeRejectionCode::InvalidFieldPath));
+
+    let not_a_reference = FieldPath::root().push_field("m_LocalPosition").unwrap();
+    let error = planner
+        .lower_reference(
+            &child,
+            not_a_reference,
+            ReferenceTarget::null(),
+            ReferenceTarget::null(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), Some(RecipeRejectionCode::InvalidReference));
+
+    let resource = Fixture::open("protected-resource.asset", RESOURCE_YAML);
+    let snapshot = resource.workspace.snapshot();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+    let audio = planner
+        .inspect(
+            &resource.address("8300000"),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let resource_size = FieldPath::root()
+        .push_field("m_Resource")
+        .unwrap()
+        .push_field("m_Size")
+        .unwrap();
+    let error = planner
+        .lower_field_replace(
+            &audio,
+            resource_size,
+            MutationValue::signed(8),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RecipeError::ProtectedSemanticField {
+            owner: "streamed-resource",
+            ..
+        }
+    ));
+
+    let value = child.class().value_at_path(&father_leaf).unwrap();
+    let mut guard_budget = AssetLoadBudget::default();
+    let guard = FieldGuard::new(
+        yaml_field_schema_digest(child.class(), &father_leaf, value, &mut guard_budget).unwrap(),
+        semantic_value_digest(value, &mut guard_budget).unwrap(),
+    );
+    let plan = MutationPlan::new(
+        hierarchy_revision,
+        vec![child.source_expectation().clone()],
+        Vec::new(),
+        vec![GenericMutation::FieldReplace {
+            target: child_address,
+            path: father_leaf,
+            guard,
+            replacement: MutationValue::signed(99),
+        }],
+    )
+    .unwrap();
+    let error = hierarchy
+        .workspace
+        .prepare(
+            plan,
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.report().diagnostics()[0].diagnostic().code(),
+        "PREPARE_PROTECTED_SEMANTIC_FIELD"
+    );
 }
 
 #[test]
@@ -1058,6 +1196,97 @@ fn binary_hierarchy_recipe_uses_the_same_guarded_sequence_contract() {
             ..
         }
     ));
+}
+
+#[test]
+fn cross_source_reference_commit_is_discoverable_by_read_only_environment() {
+    let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../unity-asset-write/tests/fixtures/serialized_file_wire/transform_hierarchy_v22.assets.bin",
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let owner_path = directory.path().join("owner.assets");
+    let dependency_directory = directory.path().join("deps");
+    let target_path = dependency_directory.join("target.assets");
+    fs::create_dir_all(&dependency_directory).unwrap();
+    fs::copy(&sample, &owner_path).unwrap();
+    fs::copy(&sample, &target_path).unwrap();
+
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(&owner_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    workspace
+        .load_path(&target_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let owner_locator = SourceLocator::path("owner.assets").unwrap();
+    let target_locator = SourceLocator::path("target.assets").unwrap();
+    let owner_parent = ObjectAddress::binary_direct(owner_locator.clone(), 1).unwrap();
+    let owner_child = ObjectAddress::binary_direct(owner_locator, 2).unwrap();
+    let target_parent = ObjectAddress::binary_direct(target_locator, 1).unwrap();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+    let child = planner
+        .inspect(&owner_child, &mut AssetLoadBudget::default())
+        .unwrap();
+    let lowering = planner
+        .lower_reference(
+            &child,
+            FieldPath::root().push_field("m_Father").unwrap(),
+            ReferenceTarget::object(owner_parent),
+            ReferenceTarget::object(target_parent),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let fragment = changed(lowering);
+    let mut builder = MutationPlanBuilder::new(snapshot.revision());
+    builder.append(fragment).unwrap();
+    let prepared = workspace
+        .prepare(
+            builder.build().unwrap(),
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    workspace
+        .commit(
+            prepared,
+            PublicationTarget::in_place(directory.path()).unwrap(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+    let owner_path = fs::canonicalize(owner_path).unwrap();
+    let target_path = fs::canonicalize(target_path).unwrap();
+    let mut environment = Environment::new();
+    environment
+        .load_file(&owner_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let owner_source = BinarySource::path(&owner_path);
+    let child_key = environment
+        .binary_object_infos()
+        .find(|object| object.source == &owner_source && object.object.path_id() == 2)
+        .expect("owner fixture must retain its child Transform")
+        .key();
+    assert_eq!(
+        environment
+            .resolve_pptr_path_key(&child_key, "m_Father", &mut AssetLoadBudget::default())
+            .unwrap(),
+        None
+    );
+
+    let resolved = environment
+        .resolve_pptr_path_key_best_effort(&child_key, "m_Father", &mut AssetLoadBudget::default())
+        .unwrap()
+        .expect("best-effort lookup must load the nested dependency");
+    assert_eq!(resolved.source, BinarySource::path(&target_path));
+    assert_eq!(resolved.source_kind, BinarySourceKind::SerializedFile);
+    assert_eq!(resolved.asset_index, None);
+    assert_eq!(resolved.path_id, 1);
+    assert!(
+        environment
+            .binary_assets()
+            .contains_key(&BinarySource::path(target_path))
+    );
 }
 
 #[test]
