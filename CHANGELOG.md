@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `SchemaRecipePlanner::lower_field_replace` builds a revision-bound, digest-guarded generic field mutation without exposing manual guard construction.
+- Cross-source binary reference mutation now has an end-to-end Workspace commit and read-only Environment discovery regression test.
+
+### Removed
+- **Breaking:** Removed `EnvironmentEditSession`, `Environment` direct edit/save methods, and mutable pending write state. High-level writes now use `AssetWorkspace`, `MutationPlan`, `prepare`, and recoverable `commit` exclusively.
+- **Breaking:** Removed `SerializedFileEditSession` and `ChangeTracker`. Low-level callers use `SerializedObjectEncoder`; application workflows use Workspace mutations.
+- **Breaking:** Removed the raw object mutation escape hatches `SerializedFileEdits::try_set_object_bytes`, `SerializedFile::find_object_mut`, `ObjectInfo::set_data`, and `ObjectInfo::clear_data`. Serialized-file edits now accept only guarded `EncodedSerializedObject` values.
+- Removed private path/PPtr mutation helpers that only supported the deleted Environment write lifecycle.
+
 ## [0.3.0] - 2026-01-27
 
 ### Highlights

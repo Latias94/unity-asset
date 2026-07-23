@@ -11,16 +11,20 @@
 //! An actively malicious process running as the same principal remains outside
 //! the filesystem race guarantee.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::mem::size_of;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+#[cfg(all(test, unix))]
+use std::sync::{Mutex, OnceLock};
 
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, DigestV1, WorkspaceId, WorkspaceRevision, vec_allocation_bytes,
+    AssetLoadBudget, BudgetError, DigestV1, TransactionId, WorkspaceId, WorkspaceRevision,
+    vec_allocation_bytes,
 };
 
 use super::super::portable_path::{PortablePathError, slash_key};
@@ -30,17 +34,27 @@ use super::journal::{
     JournalBaselineImage, JournalError, JournalEvent, JournalEventKey, JournalEventKind,
     JournalEventPlan, JournalLayout, JournalPath, JournalPreparation, MANIFEST_TEMPORARY_FILE,
     OpenedJournalPreparation, RECOVERY_DIRECTORY, RECOVERY_VERSION_DIRECTORY, RecoveryDirection,
-    STAGE_DIRECTORY, matches_ordinal_journal_path,
+    RecoveryEvidenceName, STAGE_DIRECTORY, matches_ordinal_journal_path,
+    parse_recovery_evidence_name,
 };
 use super::platform::{
-    CommitGuard, DirectoryIdentity, FileIdentity, capture_existing_in_parent,
-    capture_matching_digest_in_parent, copy_security_metadata, observe_directory_identity,
-    open_readonly_regular_in_parent, opened_file_identity, remove_owned_empty_directory_in_parent,
-    remove_owned_file_in_parent,
+    COMMIT_LOCK_FILE, CommitGuard, CommitLockPathError, CommitLockPaths,
+    DIRECTORY_VISIT_ENTRY_BYTES, DIRECTORY_VISIT_SETUP_BYTES, DirectoryEntryName,
+    DirectoryIdentity, DirectoryVisitError, FileIdentity, JournalAccess, JournalDirectory,
+    LEGACY_COMMIT_LOCK_DIRECTORY, SecurityMetadataError,
+    capture_external_regular_in_journal_directory, capture_journal_regular,
+    copy_security_metadata_between_journal_directories, journal_access, journal_directory_identity,
+    observe_directory_identity, open_commit_root, open_existing_journal_namespace,
+    open_journal_directory, open_journal_directory_in_directory, open_journal_regular,
+    open_journal_regular_in_directory, open_readonly_regular_in_parent, opened_file_identity,
+    promote_journal_regular_to_external, remove_journal_directory,
+    remove_journal_directory_in_directory, remove_journal_regular,
+    remove_journal_regular_in_directory, sync_journal_access, visit_existing_directory_entries,
+    visit_journal_directory_entries,
 };
 #[cfg(test)]
 use super::platform::{capture_existing, observe_file_identity};
-use super::{AssetWorkspace, CommitReport, RecoveryLocator};
+use super::{AssetWorkspace, CommitReport, PublicationTarget, RecoveryLocator};
 
 /// Direction selected by deterministic journal recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,8 +111,14 @@ pub enum RecoveryOutcome {
     FilesystemRecovered(Box<CommitReport>),
     /// Publication bytes and the attached workspace baseline are both finalized.
     Finalized(Box<CommitReport>),
-    /// The pre-publication artifact set was restored.
+    /// A finalized journal records a historical commit, but it does not prove
+    /// that its targets or an attached workspace are still current.
+    HistoricalCommitReceipt(Box<CommitReport>),
+    /// The pre-publication artifact set is currently verified as restored.
     RolledBack(RollbackReceipt),
+    /// A finalized journal records a historical rollback, but it does not
+    /// prove that its former targets are still restored.
+    HistoricalRollbackReceipt(RollbackReceipt),
     /// No durable evidence exists for the supplied transaction locator.
     NoTransaction(RecoveryLocator),
 }
@@ -107,8 +127,12 @@ impl RecoveryOutcome {
     #[must_use]
     pub const fn committed(&self) -> Option<&CommitReport> {
         match self {
-            Self::FilesystemRecovered(report) | Self::Finalized(report) => Some(report),
-            Self::RolledBack(_) | Self::NoTransaction(_) => None,
+            Self::FilesystemRecovered(report)
+            | Self::Finalized(report)
+            | Self::HistoricalCommitReceipt(report) => Some(report),
+            Self::RolledBack(_) | Self::HistoricalRollbackReceipt(_) | Self::NoTransaction(_) => {
+                None
+            }
         }
     }
 
@@ -116,7 +140,11 @@ impl RecoveryOutcome {
     pub const fn filesystem_recovered(&self) -> Option<&CommitReport> {
         match self {
             Self::FilesystemRecovered(report) => Some(report),
-            Self::Finalized(_) | Self::RolledBack(_) | Self::NoTransaction(_) => None,
+            Self::Finalized(_)
+            | Self::HistoricalCommitReceipt(_)
+            | Self::RolledBack(_)
+            | Self::HistoricalRollbackReceipt(_)
+            | Self::NoTransaction(_) => None,
         }
     }
 
@@ -124,7 +152,25 @@ impl RecoveryOutcome {
     pub const fn finalized(&self) -> Option<&CommitReport> {
         match self {
             Self::Finalized(report) => Some(report),
-            Self::FilesystemRecovered(_) | Self::RolledBack(_) | Self::NoTransaction(_) => None,
+            Self::FilesystemRecovered(_)
+            | Self::HistoricalCommitReceipt(_)
+            | Self::RolledBack(_)
+            | Self::HistoricalRollbackReceipt(_)
+            | Self::NoTransaction(_) => None,
+        }
+    }
+
+    /// Returns the immutable report for a receipt that is no longer asserted
+    /// to describe the current filesystem or workspace state.
+    #[must_use]
+    pub const fn historical_commit_receipt(&self) -> Option<&CommitReport> {
+        match self {
+            Self::HistoricalCommitReceipt(report) => Some(report),
+            Self::FilesystemRecovered(_)
+            | Self::Finalized(_)
+            | Self::RolledBack(_)
+            | Self::HistoricalRollbackReceipt(_)
+            | Self::NoTransaction(_) => None,
         }
     }
 
@@ -138,17 +184,37 @@ impl RecoveryOutcome {
     pub const fn rolled_back(&self) -> Option<&RollbackReceipt> {
         match self {
             Self::RolledBack(receipt) => Some(receipt),
-            Self::FilesystemRecovered(_) | Self::Finalized(_) | Self::NoTransaction(_) => None,
+            Self::FilesystemRecovered(_)
+            | Self::Finalized(_)
+            | Self::HistoricalCommitReceipt(_)
+            | Self::HistoricalRollbackReceipt(_)
+            | Self::NoTransaction(_) => None,
+        }
+    }
+
+    /// Returns the immutable receipt for a rollback that is no longer
+    /// asserted to describe the current filesystem state.
+    #[must_use]
+    pub const fn historical_rollback_receipt(&self) -> Option<&RollbackReceipt> {
+        match self {
+            Self::HistoricalRollbackReceipt(receipt) => Some(receipt),
+            Self::FilesystemRecovered(_)
+            | Self::Finalized(_)
+            | Self::HistoricalCommitReceipt(_)
+            | Self::RolledBack(_)
+            | Self::NoTransaction(_) => None,
         }
     }
 
     #[must_use]
     pub const fn workspace_id(&self) -> Option<WorkspaceId> {
         match self {
-            Self::FilesystemRecovered(report) | Self::Finalized(report) => {
-                Some(report.workspace_id())
+            Self::FilesystemRecovered(report)
+            | Self::Finalized(report)
+            | Self::HistoricalCommitReceipt(report) => Some(report.workspace_id()),
+            Self::RolledBack(receipt) | Self::HistoricalRollbackReceipt(receipt) => {
+                Some(receipt.workspace_id())
             }
-            Self::RolledBack(receipt) => Some(receipt.workspace_id()),
             Self::NoTransaction(_) => None,
         }
     }
@@ -156,10 +222,12 @@ impl RecoveryOutcome {
     #[must_use]
     pub const fn revision(&self) -> Option<WorkspaceRevision> {
         match self {
-            Self::FilesystemRecovered(report) | Self::Finalized(report) => {
-                Some(report.committed_revision())
+            Self::FilesystemRecovered(report)
+            | Self::Finalized(report)
+            | Self::HistoricalCommitReceipt(report) => Some(report.committed_revision()),
+            Self::RolledBack(receipt) | Self::HistoricalRollbackReceipt(receipt) => {
+                Some(receipt.base_revision())
             }
-            Self::RolledBack(receipt) => Some(receipt.base_revision()),
             Self::NoTransaction(_) => None,
         }
     }
@@ -167,11 +235,124 @@ impl RecoveryOutcome {
     #[must_use]
     pub const fn recovery(&self) -> &RecoveryLocator {
         match self {
-            Self::FilesystemRecovered(report) | Self::Finalized(report) => report.recovery(),
-            Self::RolledBack(receipt) => receipt.recovery(),
+            Self::FilesystemRecovered(report)
+            | Self::Finalized(report)
+            | Self::HistoricalCommitReceipt(report) => report.recovery(),
+            Self::RolledBack(receipt) | Self::HistoricalRollbackReceipt(receipt) => {
+                receipt.recovery()
+            }
             Self::NoTransaction(locator) => locator,
         }
     }
+}
+
+/// Version of the deterministic recovery-discovery response contract.
+pub const RECOVERY_DISCOVERY_VERSION: u8 = 1;
+
+/// Deterministic read-only inventory of canonical recovery candidates.
+///
+/// Discovery never opens a candidate journal or changes filesystem state.
+/// Call [`AssetWorkspace::recover_at`] for each returned locator; that entry
+/// point remains responsible for validating every journal and target before it
+/// acts on the candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryDiscovery {
+    version: u8,
+    recoveries: Vec<RecoveryLocator>,
+}
+
+impl RecoveryDiscovery {
+    fn new(recoveries: Vec<RecoveryLocator>) -> Self {
+        Self {
+            version: RECOVERY_DISCOVERY_VERSION,
+            recoveries,
+        }
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> u8 {
+        self.version
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.recoveries.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.recoveries.len()
+    }
+
+    /// Returns unique locators sorted by their transaction identity.
+    #[must_use]
+    pub fn recoveries(&self) -> &[RecoveryLocator] {
+        &self.recoveries
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryDiscoveryWire {
+    version: u8,
+    recoveries: Vec<RecoveryLocator>,
+}
+
+impl<'de> Deserialize<'de> for RecoveryDiscovery {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RecoveryDiscoveryWire::deserialize(deserializer)?;
+        if wire.version != RECOVERY_DISCOVERY_VERSION {
+            return Err(serde::de::Error::custom(
+                "unsupported recovery discovery response version",
+            ));
+        }
+        if wire
+            .recoveries
+            .windows(2)
+            .any(|pair| pair[0].transaction() >= pair[1].transaction())
+        {
+            return Err(serde::de::Error::custom(
+                "recovery discovery locators must be strictly sorted by transaction",
+            ));
+        }
+        Ok(Self {
+            version: wire.version,
+            recoveries: wire.recoveries,
+        })
+    }
+}
+
+/// Stable reason why recovery discovery returned no partial candidate list.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RecoveryDiscoveryBlockedReason {
+    #[error("the recovery namespace contains unsupported or noncanonical evidence")]
+    UnsupportedEvidence,
+    #[error("the recovery namespace contains legacy transaction evidence")]
+    LegacyTransactionEvidence,
+    #[error("the recovery namespace contains an unsupported future protocol version")]
+    FutureProtocolVersion,
+    #[error("the recovery namespace could not be inspected safely")]
+    UnsafeFilesystemState,
+}
+
+/// Failure to acquire or inventory the recovery namespace.
+#[derive(Debug, Error)]
+pub enum RecoveryDiscoveryError {
+    #[error("recovery discovery is busy")]
+    Busy,
+    #[error("recovery discovery exceeded its caller-owned budget: {source}")]
+    Budget {
+        #[source]
+        source: BudgetError,
+    },
+    #[error("recovery discovery is blocked: {reason}")]
+    Blocked {
+        reason: RecoveryDiscoveryBlockedReason,
+    },
 }
 
 /// Stable reason why recovery preserved evidence instead of mutating it.
@@ -217,17 +398,17 @@ pub enum RecoveryBlockedReason {
 pub enum RecoveryError {
     #[error("the recovery transaction is busy: {message}")]
     Busy {
-        locator: RecoveryLocator,
+        locator: Box<RecoveryLocator>,
         message: String,
     },
     #[error("recovery is blocked: {reason}")]
     Blocked {
-        locator: RecoveryLocator,
+        locator: Box<RecoveryLocator>,
         reason: Box<RecoveryBlockedReason>,
     },
     #[error("recovery exceeded its caller-owned budget: {source}")]
     Budget {
-        locator: RecoveryLocator,
+        locator: Box<RecoveryLocator>,
         #[source]
         source: BudgetError,
     },
@@ -235,21 +416,539 @@ pub enum RecoveryError {
 
 impl RecoveryError {
     #[must_use]
-    pub const fn locator(&self) -> &RecoveryLocator {
+    pub fn locator(&self) -> &RecoveryLocator {
         match self {
             Self::Busy { locator, .. }
             | Self::Blocked { locator, .. }
-            | Self::Budget { locator, .. } => locator,
+            | Self::Budget { locator, .. } => locator.as_ref(),
         }
     }
 
     #[must_use]
-    pub const fn blocked_reason(&self) -> Option<&RecoveryBlockedReason> {
+    pub fn blocked_reason(&self) -> Option<&RecoveryBlockedReason> {
         match self {
-            Self::Blocked { reason, .. } => Some(reason),
+            Self::Blocked { reason, .. } => Some(reason.as_ref()),
             Self::Busy { .. } | Self::Budget { .. } => None,
         }
     }
+}
+
+const MAX_PROTOCOL_DIRECTORY_ENTRY_NAME_BYTES: usize = 128;
+
+/// Paths retained while recovery discovery holds its read-only publication
+/// guard. Every owned path is allocated through the caller-owned budget.
+#[derive(Debug)]
+struct DiscoveryPaths {
+    recovery_root: PathBuf,
+    legacy_root: PathBuf,
+    version_root: PathBuf,
+}
+
+impl DiscoveryPaths {
+    fn new(root: &Path, budget: &mut AssetLoadBudget) -> Result<Self, RecoveryDiscoveryError> {
+        let recovery_root = budgeted_discovery_child_path(
+            root,
+            RECOVERY_DIRECTORY,
+            "recovery discovery root path",
+            budget,
+        )?;
+        let legacy_root = budgeted_discovery_child_path(
+            &recovery_root,
+            LEGACY_COMMIT_LOCK_DIRECTORY,
+            "recovery discovery legacy root path",
+            budget,
+        )?;
+        let version_root = budgeted_discovery_child_path(
+            &recovery_root,
+            RECOVERY_VERSION_DIRECTORY,
+            "recovery discovery version root path",
+            budget,
+        )?;
+        Ok(Self {
+            recovery_root,
+            legacy_root,
+            version_root,
+        })
+    }
+
+    fn lock_paths(
+        root: &Path,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<CommitLockPaths, RecoveryDiscoveryError> {
+        CommitLockPaths::new_budgeted(root, budget).map_err(|error| match error {
+            CommitLockPathError::Budget(source) => RecoveryDiscoveryError::Budget { source },
+            CommitLockPathError::Allocation { .. } => {
+                discovery_blocked(RecoveryDiscoveryBlockedReason::UnsafeFilesystemState)
+            }
+        })
+    }
+}
+
+#[derive(Debug)]
+enum DiscoveryScanError {
+    Budget(BudgetError),
+    Blocked(RecoveryDiscoveryBlockedReason),
+}
+
+impl From<BudgetError> for DiscoveryScanError {
+    fn from(source: BudgetError) -> Self {
+        Self::Budget(source)
+    }
+}
+
+fn discovery_scan_error(error: RecoveryDiscoveryError) -> DiscoveryScanError {
+    match error {
+        RecoveryDiscoveryError::Budget { source } => DiscoveryScanError::Budget(source),
+        RecoveryDiscoveryError::Blocked { reason } => DiscoveryScanError::Blocked(reason),
+        RecoveryDiscoveryError::Busy => {
+            DiscoveryScanError::Blocked(RecoveryDiscoveryBlockedReason::UnsafeFilesystemState)
+        }
+    }
+}
+
+pub(super) fn discover_recoveries(
+    target: &PublicationTarget,
+    budget: &mut AssetLoadBudget,
+) -> Result<RecoveryDiscovery, RecoveryDiscoveryError> {
+    let paths = DiscoveryPaths::new(target.root(), budget)?;
+    let lock_paths = DiscoveryPaths::lock_paths(target.root(), budget)?;
+    let Some(_guard) = acquire_discovery_guard(target.root(), target.identity(), lock_paths)?
+    else {
+        return Ok(RecoveryDiscovery::new(Vec::new()));
+    };
+
+    let recovery_identity = discovery_directory_identity(&paths.recovery_root)?;
+    let has_current_version = scan_recovery_root(&paths.recovery_root, &recovery_identity, budget)?;
+
+    // The v1 directory is retained solely as a compatibility lock namespace.
+    // Any other durable entry is legacy transaction evidence, which discovery
+    // refuses to mix with a v2 candidate list.
+    let legacy_identity = discovery_directory_identity(&paths.legacy_root)?;
+    scan_legacy_recovery_root(&paths.legacy_root, &legacy_identity, budget)?;
+
+    if !has_current_version {
+        return Ok(RecoveryDiscovery::new(Vec::new()));
+    }
+
+    let version_identity = discovery_directory_identity(&paths.version_root)?;
+    let candidate_count =
+        count_v2_recovery_evidence(&paths.version_root, &version_identity, budget)?;
+    let mut transactions = discovery_vec::<TransactionId>(
+        candidate_count,
+        "recovery discovery transaction candidates",
+        budget,
+    )?;
+    collect_v2_recovery_evidence(
+        &paths.version_root,
+        &version_identity,
+        candidate_count,
+        &mut transactions,
+        budget,
+    )?;
+    transactions.sort_unstable();
+    transactions.dedup();
+
+    let mut recoveries = discovery_vec::<RecoveryLocator>(
+        transactions.len(),
+        "recovery discovery locator list",
+        budget,
+    )?;
+    for transaction in transactions {
+        recoveries.push(discovery_recovery_locator(
+            &paths.version_root,
+            transaction,
+            target.identity(),
+            budget,
+        )?);
+    }
+    Ok(RecoveryDiscovery::new(recoveries))
+}
+
+fn acquire_discovery_guard(
+    root: &Path,
+    root_identity: &DirectoryIdentity,
+    paths: CommitLockPaths,
+) -> Result<Option<CommitGuard>, RecoveryDiscoveryError> {
+    match CommitGuard::acquire_existing(root, root_identity, paths) {
+        Ok(guard) => Ok(guard),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(RecoveryDiscoveryError::Busy)
+        }
+        Err(_) => Err(discovery_blocked(
+            RecoveryDiscoveryBlockedReason::UnsafeFilesystemState,
+        )),
+    }
+}
+
+fn discovery_directory_identity(path: &Path) -> Result<DirectoryIdentity, RecoveryDiscoveryError> {
+    observe_directory_identity(path)
+        .map_err(|_| discovery_blocked(RecoveryDiscoveryBlockedReason::UnsafeFilesystemState))
+}
+
+fn scan_recovery_root(
+    root: &Path,
+    identity: &DirectoryIdentity,
+    budget: &mut AssetLoadBudget,
+) -> Result<bool, RecoveryDiscoveryError> {
+    let mut has_current_version = false;
+    let mut scratch = [0_u8; MAX_PROTOCOL_DIRECTORY_ENTRY_NAME_BYTES];
+    charge_discovery_directory_visit(budget)?;
+    map_discovery_visit(visit_existing_directory_entries(
+        root,
+        identity,
+        budget,
+        charge_discovery_directory_entry,
+        |budget, entry| {
+            let name = discovery_entry_name(entry, &mut scratch)?;
+            if matches!(name, "." | "..") {
+                return Ok(());
+            }
+            charge_discovery_entry(budget)?;
+            if matches!(name, COMMIT_LOCK_FILE | LEGACY_COMMIT_LOCK_DIRECTORY) {
+                return Ok(());
+            }
+            if name == RECOVERY_VERSION_DIRECTORY {
+                has_current_version = true;
+                return Ok(());
+            }
+            if is_future_recovery_version(name) {
+                return Err(DiscoveryScanError::Blocked(
+                    RecoveryDiscoveryBlockedReason::FutureProtocolVersion,
+                ));
+            }
+            Err(DiscoveryScanError::Blocked(
+                RecoveryDiscoveryBlockedReason::UnsupportedEvidence,
+            ))
+        },
+    ))?;
+    Ok(has_current_version)
+}
+
+fn scan_legacy_recovery_root(
+    root: &Path,
+    identity: &DirectoryIdentity,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), RecoveryDiscoveryError> {
+    let mut scratch = [0_u8; MAX_PROTOCOL_DIRECTORY_ENTRY_NAME_BYTES];
+    charge_discovery_directory_visit(budget)?;
+    map_discovery_visit(visit_existing_directory_entries(
+        root,
+        identity,
+        budget,
+        charge_discovery_directory_entry,
+        |budget, entry| {
+            let name = discovery_entry_name(entry, &mut scratch)?;
+            if matches!(name, "." | "..") {
+                return Ok(());
+            }
+            charge_discovery_entry(budget)?;
+            if name == COMMIT_LOCK_FILE {
+                Ok(())
+            } else {
+                Err(DiscoveryScanError::Blocked(
+                    RecoveryDiscoveryBlockedReason::LegacyTransactionEvidence,
+                ))
+            }
+        },
+    ))
+}
+
+fn count_v2_recovery_evidence(
+    root: &Path,
+    identity: &DirectoryIdentity,
+    budget: &mut AssetLoadBudget,
+) -> Result<usize, RecoveryDiscoveryError> {
+    let mut count = 0_usize;
+    let mut scratch = [0_u8; MAX_PROTOCOL_DIRECTORY_ENTRY_NAME_BYTES];
+    charge_discovery_directory_visit(budget)?;
+    map_discovery_visit(visit_existing_directory_entries(
+        root,
+        identity,
+        budget,
+        charge_discovery_directory_entry,
+        |budget, entry| {
+            let name = discovery_entry_name(entry, &mut scratch)?;
+            if matches!(name, "." | "..") {
+                return Ok(());
+            }
+            charge_discovery_entry(budget)?;
+            let evidence = parse_recovery_evidence_name(name).ok_or(
+                DiscoveryScanError::Blocked(RecoveryDiscoveryBlockedReason::UnsupportedEvidence),
+            )?;
+            verify_v2_evidence(root, identity, name, evidence, budget)?;
+            count = count.checked_add(1).ok_or(DiscoveryScanError::Budget(
+                BudgetError::ArithmeticOverflow {
+                    resource: "recovery discovery candidate count",
+                },
+            ))?;
+            Ok(())
+        },
+    ))?;
+    Ok(count)
+}
+
+fn collect_v2_recovery_evidence(
+    root: &Path,
+    identity: &DirectoryIdentity,
+    expected_count: usize,
+    transactions: &mut Vec<TransactionId>,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), RecoveryDiscoveryError> {
+    let mut scratch = [0_u8; MAX_PROTOCOL_DIRECTORY_ENTRY_NAME_BYTES];
+    charge_discovery_directory_visit(budget)?;
+    map_discovery_visit(visit_existing_directory_entries(
+        root,
+        identity,
+        budget,
+        charge_discovery_directory_entry,
+        |budget, entry| {
+            let name = discovery_entry_name(entry, &mut scratch)?;
+            if matches!(name, "." | "..") {
+                return Ok(());
+            }
+            charge_discovery_entry(budget)?;
+            let evidence = parse_recovery_evidence_name(name).ok_or(
+                DiscoveryScanError::Blocked(RecoveryDiscoveryBlockedReason::UnsupportedEvidence),
+            )?;
+            verify_v2_evidence(root, identity, name, evidence, budget)?;
+            if transactions.len() == expected_count {
+                return Err(DiscoveryScanError::Blocked(
+                    RecoveryDiscoveryBlockedReason::UnsafeFilesystemState,
+                ));
+            }
+            transactions.push(evidence.transaction());
+            Ok(())
+        },
+    ))?;
+    if transactions.len() != expected_count {
+        return Err(discovery_blocked(
+            RecoveryDiscoveryBlockedReason::UnsafeFilesystemState,
+        ));
+    }
+    Ok(())
+}
+
+fn charge_discovery_entry(budget: &mut AssetLoadBudget) -> Result<(), DiscoveryScanError> {
+    budget.consume_entries(1)?;
+    Ok(())
+}
+
+fn charge_discovery_directory_visit(
+    budget: &mut AssetLoadBudget,
+) -> Result<(), RecoveryDiscoveryError> {
+    budget
+        .consume_bytes(DIRECTORY_VISIT_SETUP_BYTES)
+        .map_err(|source| RecoveryDiscoveryError::Budget { source })
+}
+
+fn charge_discovery_directory_entry(
+    budget: &mut AssetLoadBudget,
+) -> Result<(), DiscoveryScanError> {
+    budget.consume_bytes(DIRECTORY_VISIT_ENTRY_BYTES)?;
+    Ok(())
+}
+
+fn discovery_entry_name<'a>(
+    entry: DirectoryEntryName<'_>,
+    scratch: &'a mut [u8; MAX_PROTOCOL_DIRECTORY_ENTRY_NAME_BYTES],
+) -> Result<&'a str, DiscoveryScanError> {
+    ascii_directory_entry_name(entry, scratch).ok_or(DiscoveryScanError::Blocked(
+        RecoveryDiscoveryBlockedReason::UnsupportedEvidence,
+    ))
+}
+
+fn ascii_directory_entry_name<'a>(
+    entry: DirectoryEntryName<'_>,
+    scratch: &'a mut [u8],
+) -> Option<&'a str> {
+    let length = entry.copy_ascii_into(scratch)?;
+    std::str::from_utf8(&scratch[..length]).ok()
+}
+
+fn verify_v2_evidence(
+    root: &Path,
+    parent_identity: &DirectoryIdentity,
+    name: &str,
+    evidence: RecoveryEvidenceName,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), DiscoveryScanError> {
+    let path =
+        budgeted_discovery_child_path(root, name, "recovery discovery evidence path", budget)
+            .map_err(discovery_scan_error)?;
+    match evidence {
+        RecoveryEvidenceName::Transaction(_) => {
+            if observe_directory_identity(root).map_err(|_| {
+                DiscoveryScanError::Blocked(RecoveryDiscoveryBlockedReason::UnsafeFilesystemState)
+            })? != *parent_identity
+            {
+                return Err(DiscoveryScanError::Blocked(
+                    RecoveryDiscoveryBlockedReason::UnsafeFilesystemState,
+                ));
+            }
+            discovery_directory_identity(&path).map_err(|_| {
+                DiscoveryScanError::Blocked(RecoveryDiscoveryBlockedReason::UnsafeFilesystemState)
+            })?;
+            if observe_directory_identity(root).map_err(|_| {
+                DiscoveryScanError::Blocked(RecoveryDiscoveryBlockedReason::UnsafeFilesystemState)
+            })? != *parent_identity
+            {
+                return Err(DiscoveryScanError::Blocked(
+                    RecoveryDiscoveryBlockedReason::UnsafeFilesystemState,
+                ));
+            }
+            Ok(())
+        }
+        RecoveryEvidenceName::Preparation(_)
+        | RecoveryEvidenceName::Rollback(_)
+        | RecoveryEvidenceName::PreparationTemporary(_) => {
+            open_readonly_regular_in_parent(&path, parent_identity).map_err(|_| {
+                DiscoveryScanError::Blocked(RecoveryDiscoveryBlockedReason::UnsafeFilesystemState)
+            })?;
+            Ok(())
+        }
+    }
+}
+
+fn is_future_recovery_version(name: &str) -> bool {
+    name.strip_prefix('v').is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn map_discovery_visit(
+    result: Result<(), DirectoryVisitError<DiscoveryScanError>>,
+) -> Result<(), RecoveryDiscoveryError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(DirectoryVisitError::Visitor(DiscoveryScanError::Budget(source))) => {
+            Err(RecoveryDiscoveryError::Budget { source })
+        }
+        Err(DirectoryVisitError::Visitor(DiscoveryScanError::Blocked(reason))) => {
+            Err(discovery_blocked(reason))
+        }
+        Err(DirectoryVisitError::Io(error)) => {
+            let _ = error.kind();
+            Err(discovery_blocked(
+                RecoveryDiscoveryBlockedReason::UnsafeFilesystemState,
+            ))
+        }
+    }
+}
+
+fn discovery_vec<T>(
+    count: usize,
+    resource: &'static str,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<T>, RecoveryDiscoveryError> {
+    let planned = vec_allocation_bytes::<T>(count).map_err(|_| RecoveryDiscoveryError::Budget {
+        source: BudgetError::ArithmeticOverflow { resource },
+    })?;
+    budget
+        .check_bytes(planned)
+        .map_err(|source| RecoveryDiscoveryError::Budget { source })?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| discovery_blocked(RecoveryDiscoveryBlockedReason::UnsafeFilesystemState))?;
+    let actual = size_of::<T>()
+        .checked_mul(values.capacity())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(RecoveryDiscoveryError::Budget {
+            source: BudgetError::ArithmeticOverflow { resource },
+        })?;
+    budget
+        .check_bytes(actual)
+        .map_err(|source| RecoveryDiscoveryError::Budget { source })?;
+    budget
+        .consume_bytes(actual)
+        .map_err(|source| RecoveryDiscoveryError::Budget { source })?;
+    Ok(values)
+}
+
+fn discovery_recovery_locator(
+    version_root: &Path,
+    transaction: TransactionId,
+    root_identity: &DirectoryIdentity,
+    budget: &mut AssetLoadBudget,
+) -> Result<RecoveryLocator, RecoveryDiscoveryError> {
+    budget
+        .check_members(1)
+        .map_err(|source| RecoveryDiscoveryError::Budget { source })?;
+    let slug = transaction_slug(transaction);
+    let slug = std::str::from_utf8(&slug).expect("hexadecimal transaction slugs are UTF-8");
+    let root = budgeted_discovery_child_path(
+        version_root,
+        slug,
+        "recovery discovery locator path",
+        budget,
+    )?;
+    budget
+        .consume_members(1)
+        .map_err(|source| RecoveryDiscoveryError::Budget { source })?;
+    Ok(RecoveryLocator::new(
+        root,
+        transaction,
+        root_identity.clone(),
+    ))
+}
+
+fn transaction_slug(transaction: TransactionId) -> [u8; DigestV1::BYTE_LEN * 2] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut slug = [0_u8; DigestV1::BYTE_LEN * 2];
+    for (index, byte) in transaction.digest().as_bytes().iter().copied().enumerate() {
+        slug[index * 2] = HEX[usize::from(byte >> 4)];
+        slug[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
+    }
+    slug
+}
+
+fn budgeted_discovery_child_path(
+    parent: &Path,
+    child: &str,
+    resource: &'static str,
+    budget: &mut AssetLoadBudget,
+) -> Result<PathBuf, RecoveryDiscoveryError> {
+    let requested = parent
+        .as_os_str()
+        .len()
+        .checked_add(child.len())
+        .and_then(|capacity| capacity.checked_add(1))
+        .ok_or(RecoveryDiscoveryError::Budget {
+            source: BudgetError::ArithmeticOverflow { resource },
+        })?;
+    let requested = u64::try_from(requested).map_err(|_| RecoveryDiscoveryError::Budget {
+        source: BudgetError::ArithmeticOverflow { resource },
+    })?;
+    budget
+        .check_bytes(requested)
+        .map_err(|source| RecoveryDiscoveryError::Budget { source })?;
+
+    let mut value = OsString::new();
+    value
+        .try_reserve_exact(usize::try_from(requested).map_err(|_| {
+            RecoveryDiscoveryError::Budget {
+                source: BudgetError::ArithmeticOverflow { resource },
+            }
+        })?)
+        .map_err(|_| discovery_blocked(RecoveryDiscoveryBlockedReason::UnsafeFilesystemState))?;
+    value.push(parent.as_os_str());
+    let mut path = PathBuf::from(value);
+    path.push(child);
+    let capacity = u64::try_from(path.capacity()).map_err(|_| RecoveryDiscoveryError::Budget {
+        source: BudgetError::ArithmeticOverflow { resource },
+    })?;
+    budget
+        .check_bytes(capacity)
+        .map_err(|source| RecoveryDiscoveryError::Budget { source })?;
+    budget
+        .consume_bytes(capacity)
+        .map_err(|source| RecoveryDiscoveryError::Budget { source })?;
+    Ok(path)
+}
+
+fn discovery_blocked(reason: RecoveryDiscoveryBlockedReason) -> RecoveryDiscoveryError {
+    RecoveryDiscoveryError::Blocked { reason }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,8 +1162,6 @@ struct RecoveryObservation {
 /// operation, so forward and rollback execution do not allocate path state.
 #[derive(Debug)]
 struct RecoveryExecutionPlan {
-    stage_parent_identity: DirectoryIdentity,
-    backup_parent_identity: DirectoryIdentity,
     artifacts: Vec<RecoveryArtifactExecution>,
 }
 
@@ -904,8 +1601,12 @@ impl AssetWorkspace {
     /// locator's containment root. Callers may reopen their trusted source
     /// requests with the workspace identity returned in the canonical report,
     /// then call [`Self::finalize_recovery_at`] to finalize the in-memory
-    /// baseline. A committed result is returned as
-    /// [`RecoveryOutcome::FilesystemRecovered`] until that second stage succeeds.
+    /// baseline. An unfinished committed result is returned as
+    /// [`RecoveryOutcome::FilesystemRecovered`] until that second stage
+    /// succeeds. A journal that was already finalized is immutable historical
+    /// evidence, so this detached entry point returns
+    /// [`RecoveryOutcome::HistoricalCommitReceipt`] instead of asserting that
+    /// its former targets are still current.
     pub fn recover_at(
         locator: &RecoveryLocator,
         budget: &mut AssetLoadBudget,
@@ -928,8 +1629,12 @@ impl AssetWorkspace {
     /// trusted configuration. This method never finishes pending filesystem
     /// renames; it rejects them with
     /// [`RecoveryBlockedReason::FilesystemRecoveryRequired`]. A successful
-    /// committed result is returned as [`RecoveryOutcome::Finalized`]. Rolled
-    /// back and absent transactions require no workspace finalization.
+    /// current committed result is returned as [`RecoveryOutcome::Finalized`].
+    /// If the attached workspace has advanced, or a finalized receipt's
+    /// targets no longer match its artifact set, the immutable receipt is
+    /// returned as [`RecoveryOutcome::HistoricalCommitReceipt`] without
+    /// replacing current state. Rolled back and absent transactions require no
+    /// workspace finalization.
     pub fn finalize_recovery_at(
         &mut self,
         locator: &RecoveryLocator,
@@ -945,37 +1650,109 @@ fn recover_with_intent(
     budget: &mut AssetLoadBudget,
     intent: RecoveryIntent,
 ) -> Result<RecoveryOutcome, RecoveryError> {
-    let layout = layout_from_locator(locator).map_err(|reason| RecoveryError::Blocked {
-        locator: locator.clone(),
-        reason: Box::new(reason),
-    })?;
-    let _guard = CommitGuard::acquire(layout.parent())
+    let layout = layout_from_locator(locator, budget)?;
+    let root = open_commit_root(layout.parent(), layout.root_identity())
         .map_err(|error| map_commit_guard_error(locator, error))?;
-    match fs::symlink_metadata(layout.manifest_path()) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(blocked(
+    let _guard = CommitGuard::acquire_with_root(&root)
+        .map_err(|error| map_commit_guard_error(locator, error))?;
+    #[cfg(all(test, unix))]
+    test_run_recovery_post_guard_hook(locator);
+    layout.verify_root_path_binding().map_err(|error| {
+        blocked(
             locator,
-            invalid_journal("canonical manifest is not a regular file".to_owned()),
-        )),
-        Ok(_) => {
-            let mut journal = Journal::open(layout, budget)
-                .map_err(|error| map_journal_open_error(locator, error))?;
-            recover_open_journal(
-                workspace.as_deref_mut(),
-                &mut journal,
-                locator,
-                intent,
-                budget,
-            )
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            recover_prepared_transaction(workspace.as_deref(), &layout, locator, budget)
-        }
-        Err(error) => Err(blocked(
-            locator,
-            RecoveryBlockedReason::Io {
+            RecoveryBlockedReason::InvalidLocator {
                 message: error.to_string(),
             },
-        )),
+        )
+    })?;
+    let namespace = match open_existing_journal_namespace(&root) {
+        Ok(namespace) => namespace,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RecoveryOutcome::NoTransaction(locator.clone()));
+        }
+        Err(error) => return Err(blocked(locator, io_reason(error))),
+    };
+    let access = journal_access(&root, &namespace);
+    match open_journal_directory(&access, layout.directory()) {
+        Ok(directory) => {
+            match open_journal_regular_in_directory(&directory, layout.manifest_path()) {
+                Ok(_) => {
+                    let mut journal = Journal::open_in_access(layout, &access, budget)
+                        .map_err(|error| map_journal_open_error(locator, error))?;
+                    recover_open_journal(
+                        workspace.as_deref_mut(),
+                        &mut journal,
+                        locator,
+                        intent,
+                        budget,
+                    )
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    recover_prepared_transaction(
+                        workspace.as_deref(),
+                        &layout,
+                        locator,
+                        &access,
+                        budget,
+                    )
+                }
+                Err(_) => Err(blocked(
+                    locator,
+                    invalid_journal("canonical manifest is not a regular file".to_owned()),
+                )),
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            recover_prepared_transaction(workspace.as_deref(), &layout, locator, &access, budget)
+        }
+        Err(error) => Err(blocked(locator, io_reason(error))),
+    }
+}
+
+#[cfg(all(test, unix))]
+struct RecoveryPostGuardHook {
+    root: PathBuf,
+    action: Box<dyn FnOnce() + Send>,
+}
+
+#[cfg(all(test, unix))]
+fn recovery_post_guard_hook() -> &'static Mutex<Option<RecoveryPostGuardHook>> {
+    static HOOK: OnceLock<Mutex<Option<RecoveryPostGuardHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(all(test, unix))]
+fn test_install_recovery_post_guard_hook(root: PathBuf, action: impl FnOnce() + Send + 'static) {
+    let mut hook = recovery_post_guard_hook()
+        .lock()
+        .expect("recovery post-guard hook lock");
+    assert!(
+        hook.is_none(),
+        "a recovery post-guard hook is already installed"
+    );
+    *hook = Some(RecoveryPostGuardHook {
+        root,
+        action: Box::new(action),
+    });
+}
+
+#[cfg(all(test, unix))]
+fn test_run_recovery_post_guard_hook(locator: &RecoveryLocator) {
+    let action = {
+        let mut hook = recovery_post_guard_hook()
+            .lock()
+            .expect("recovery post-guard hook lock");
+        if hook
+            .as_ref()
+            .is_some_and(|installed| installed.root == locator.root())
+        {
+            hook.take().map(|installed| installed.action)
+        } else {
+            None
+        }
+    };
+    if let Some(action) = action {
+        action();
     }
 }
 
@@ -983,23 +1760,18 @@ fn recover_prepared_transaction(
     workspace: Option<&AssetWorkspace>,
     layout: &JournalLayout,
     locator: &RecoveryLocator,
+    access: &JournalAccess<'_>,
     budget: &mut AssetLoadBudget,
 ) -> Result<RecoveryOutcome, RecoveryError> {
-    match fs::symlink_metadata(layout.rollback_path()) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(blocked(
-                locator,
-                unexpected_premanifest("rollback-receipt-path"),
-            ));
-        }
-        Ok(_) => return recover_premanifest_rollback(workspace, layout, locator, budget),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(blocked(locator, io_reason(error))),
+    match JournalPreparation::open_rollback_in_access(layout, access, budget) {
+        Ok(_) => return recover_premanifest_rollback(workspace, layout, locator, access, budget),
+        Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(map_journal_open_error(locator, error)),
     }
-    let preparation = match JournalPreparation::open(layout, budget) {
+    let preparation = match JournalPreparation::open_in_access(layout, access, budget) {
         Ok(preparation) => preparation,
         Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-            return recover_absent_prepared_transaction(layout, locator, budget);
+            return recover_absent_prepared_transaction(layout, locator, access, budget);
         }
         Err(error) => return Err(map_journal_open_error(locator, error)),
     };
@@ -1019,18 +1791,22 @@ fn recover_prepared_transaction(
         preparation.document().base_revision(),
         locator.clone(),
     );
-    let plan = observe_premanifest_cleanup(layout, preparation, budget)
+    let plan = observe_premanifest_cleanup(layout, access, preparation, budget)
         .map_err(|error| map_observation_error(locator, error))?;
-    execute_premanifest_cleanup(layout, &plan, PreparationCleanup::RetainRollbackReceipt).map_err(
-        |error| {
-            blocked(
-                locator,
-                RecoveryBlockedReason::Io {
-                    message: error.to_string(),
-                },
-            )
-        },
-    )?;
+    execute_premanifest_cleanup(
+        layout,
+        access,
+        &plan,
+        PreparationCleanup::RetainRollbackReceipt,
+    )
+    .map_err(|error| {
+        blocked(
+            locator,
+            RecoveryBlockedReason::Io {
+                message: error.to_string(),
+            },
+        )
+    })?;
     Ok(RecoveryOutcome::RolledBack(receipt))
 }
 
@@ -1038,24 +1814,26 @@ fn recover_premanifest_rollback(
     workspace: Option<&AssetWorkspace>,
     layout: &JournalLayout,
     locator: &RecoveryLocator,
+    access: &JournalAccess<'_>,
     budget: &mut AssetLoadBudget,
 ) -> Result<RecoveryOutcome, RecoveryError> {
-    let rollback = JournalPreparation::open_rollback(layout, budget)
+    let rollback = JournalPreparation::open_rollback_in_access(layout, access, budget)
         .map_err(|error| map_journal_open_error(locator, error))?;
-    for (path, artifact) in [
-        (layout.preparation_path(), "active-preparation-record"),
-        (
-            layout.preparation_temporary_path(),
-            "preparation-temporary-record",
-        ),
-        (layout.directory().to_owned(), "transaction-directory"),
-    ] {
-        match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Ok(_) => return Err(blocked(locator, unexpected_premanifest(artifact))),
-            Err(error) => return Err(blocked(locator, io_reason(error))),
+    let duplicate_preparation = match JournalPreparation::open_in_access(layout, access, budget) {
+        Ok(preparation) => {
+            if preparation.document() != rollback.document() {
+                return Err(blocked(
+                    locator,
+                    unexpected_premanifest("mismatched-active-preparation-record"),
+                ));
+            }
+            Some(preparation)
         }
-    }
+        Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(map_journal_open_error(locator, error)),
+    };
+    ensure_premanifest_rollback_absence(access, layout, duplicate_preparation.is_none())
+        .map_err(|reason| blocked(locator, reason))?;
     if let Some(workspace) = workspace {
         if rollback.document().workspace_id() != workspace.workspace_id() {
             return Err(blocked(
@@ -1076,6 +1854,44 @@ fn recover_premanifest_rollback(
             ));
         }
     }
+    if let Some(preparation) = duplicate_preparation {
+        let current = JournalPreparation::open_in_access(layout, access, budget)
+            .map_err(|error| map_journal_open_error(locator, error))?;
+        if current.identity() != preparation.identity()
+            || current.document() != preparation.document()
+        {
+            return Err(blocked(
+                locator,
+                unexpected_premanifest("changed-active-preparation-record"),
+            ));
+        }
+        let current_rollback = JournalPreparation::open_rollback_in_access(layout, access, budget)
+            .map_err(|error| map_journal_open_error(locator, error))?;
+        if current_rollback.identity() != rollback.identity()
+            || current_rollback.document() != rollback.document()
+        {
+            return Err(blocked(
+                locator,
+                unexpected_premanifest("changed-rollback-record"),
+            ));
+        }
+        remove_journal_regular(access, layout.preparation_path(), preparation.identity())
+            .map_err(|error| map_journal_open_error(locator, JournalError::Io(error)))?;
+        sync_journal_access(access)
+            .map_err(|error| map_journal_open_error(locator, JournalError::Io(error)))?;
+        ensure_premanifest_rollback_absence(access, layout, true)
+            .map_err(|reason| blocked(locator, reason))?;
+        let current_rollback = JournalPreparation::open_rollback_in_access(layout, access, budget)
+            .map_err(|error| map_journal_open_error(locator, error))?;
+        if current_rollback.identity() != rollback.identity()
+            || current_rollback.document() != rollback.document()
+        {
+            return Err(blocked(
+                locator,
+                unexpected_premanifest("changed-rollback-record"),
+            ));
+        }
+    }
     Ok(RecoveryOutcome::RolledBack(RollbackReceipt::new(
         rollback.document().workspace_id(),
         rollback.document().base_revision(),
@@ -1083,12 +1899,38 @@ fn recover_premanifest_rollback(
     )))
 }
 
+fn ensure_premanifest_rollback_absence(
+    access: &JournalAccess<'_>,
+    layout: &JournalLayout,
+    require_active_preparation_absent: bool,
+) -> Result<(), RecoveryBlockedReason> {
+    if require_active_preparation_absent {
+        match open_journal_regular(access, layout.preparation_path()) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => {
+                return Err(unexpected_premanifest("active-preparation-record"));
+            }
+        }
+    }
+    match open_journal_regular(access, layout.preparation_temporary_path()) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) | Err(_) => {
+            return Err(unexpected_premanifest("preparation-temporary-record"));
+        }
+    }
+    match open_journal_directory(access, layout.directory()) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) | Err(_) => Err(unexpected_premanifest("transaction-directory")),
+    }
+}
+
 fn recover_absent_prepared_transaction(
     layout: &JournalLayout,
     locator: &RecoveryLocator,
+    access: &JournalAccess<'_>,
     budget: &mut AssetLoadBudget,
 ) -> Result<RecoveryOutcome, RecoveryError> {
-    match fs::symlink_metadata(layout.directory()) {
+    match open_journal_directory(access, layout.directory()) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Ok(_) => {
             return Err(blocked(
@@ -1099,61 +1941,14 @@ fn recover_absent_prepared_transaction(
                 },
             ));
         }
-        Err(error) => {
-            return Err(blocked(
-                locator,
-                RecoveryBlockedReason::Io {
-                    message: error.to_string(),
-                },
-            ));
-        }
+        Err(error) => return Err(blocked(locator, io_reason(error))),
     }
-    let version_directory = layout.directory().parent().ok_or_else(|| {
-        blocked(
-            locator,
-            RecoveryBlockedReason::InvalidLocator {
-                message: "recovery transaction has no version directory".to_owned(),
-            },
-        )
-    })?;
-    match fs::symlink_metadata(version_directory) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(RecoveryOutcome::NoTransaction(locator.clone()));
-        }
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(blocked(
-                locator,
-                unexpected_premanifest("recovery-version-directory"),
-            ));
-        }
-        Ok(_) => {}
-        Err(error) => {
-            return Err(blocked(
-                locator,
-                RecoveryBlockedReason::Io {
-                    message: error.to_string(),
-                },
-            ));
-        }
-    }
-    let version_identity = observe_directory_identity(version_directory).map_err(|error| {
-        blocked(
-            locator,
-            RecoveryBlockedReason::Io {
-                message: error.to_string(),
-            },
-        )
-    })?;
-    cleanup_orphaned_preparation_attempts(layout, &version_identity, budget)
+    cleanup_orphaned_preparation_attempts(layout, access, budget)
         .map_err(|error| map_premanifest_cleanup_error(locator, error))?;
-    for path in [
-        layout.preparation_path(),
-        layout.rollback_path(),
-        layout.directory().to_owned(),
-    ] {
-        match fs::symlink_metadata(path) {
+    for path in [layout.preparation_path(), layout.rollback_path()] {
+        match open_journal_regular(access, path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Ok(_) => {
+            Ok(_) | Err(_) => {
                 return Err(blocked(
                     locator,
                     RecoveryBlockedReason::InvalidJournal {
@@ -1163,14 +1958,18 @@ fn recover_absent_prepared_transaction(
                     },
                 ));
             }
-            Err(error) => {
-                return Err(blocked(
-                    locator,
-                    RecoveryBlockedReason::Io {
-                        message: error.to_string(),
-                    },
-                ));
-            }
+        }
+    }
+    match open_journal_directory(access, layout.directory()) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) | Err(_) => {
+            return Err(blocked(
+                locator,
+                RecoveryBlockedReason::InvalidJournal {
+                    message: "transaction evidence changed while orphaned attempts were cleaned"
+                        .to_owned(),
+                },
+            ));
         }
     }
     Ok(RecoveryOutcome::NoTransaction(locator.clone()))
@@ -1182,7 +1981,7 @@ fn map_premanifest_cleanup_error(
 ) -> RecoveryError {
     match error {
         PremanifestCleanupError::Budget(source) => RecoveryError::Budget {
-            locator: locator.clone(),
+            locator: Box::new(locator.clone()),
             source,
         },
         PremanifestCleanupError::Blocked(reason) => blocked(locator, reason),
@@ -1210,31 +2009,47 @@ pub(super) enum PremanifestCleanupError {
 
 pub(super) fn cleanup_prepared_transaction(
     layout: &JournalLayout,
+    access: &JournalAccess<'_>,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), PremanifestCleanupError> {
-    let preparation =
-        JournalPreparation::open(layout, budget).map_err(PremanifestCleanupError::Preparation)?;
+    let preparation = JournalPreparation::open_in_access(layout, access, budget)
+        .map_err(PremanifestCleanupError::Preparation)?;
     let plan =
-        observe_premanifest_cleanup(layout, preparation, budget).map_err(|error| match error {
-            ObservationError::Budget(error) => PremanifestCleanupError::Budget(error),
-            ObservationError::Blocked(error) => PremanifestCleanupError::Blocked(error),
+        observe_premanifest_cleanup(layout, access, preparation, budget).map_err(|error| {
+            match error {
+                ObservationError::Budget(error) => PremanifestCleanupError::Budget(error),
+                ObservationError::Blocked(error) => PremanifestCleanupError::Blocked(error),
+            }
         })?;
-    execute_premanifest_cleanup(layout, &plan, PreparationCleanup::Remove)
+    execute_premanifest_cleanup(layout, access, &plan, PreparationCleanup::Remove)
         .map_err(PremanifestCleanupError::Io)
+}
+
+/// Removes freshly written premanifest evidence after the main caller budget
+/// has already been exhausted.
+///
+/// This ledger remains finite. It is intentionally independent from the
+/// failed operation so cleanup cannot mask its typed budget error and force a
+/// caller to recover a transaction that never published a canonical manifest.
+pub(super) fn cleanup_prepared_transaction_after_budget_exhaustion(
+    layout: &JournalLayout,
+    access: &JournalAccess<'_>,
+) -> Result<(), PremanifestCleanupError> {
+    let mut cleanup_budget = AssetLoadBudget::default();
+    cleanup_prepared_transaction(layout, access, &mut cleanup_budget)
 }
 
 #[derive(Debug)]
 struct OrphanedPreparationAttempt {
-    path: PathBuf,
     identity: FileIdentity,
 }
 
 pub(super) fn cleanup_orphaned_preparation_attempts(
     layout: &JournalLayout,
-    version_identity: &DirectoryIdentity,
+    access: &JournalAccess<'_>,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), PremanifestCleanupError> {
-    let attempt = observe_orphaned_preparation_attempt(layout, version_identity, budget).map_err(
+    let attempt = observe_orphaned_preparation_attempt(layout, access, budget).map_err(
         |error| match error {
             ObservationError::Budget(error) => PremanifestCleanupError::Budget(error),
             ObservationError::Blocked(error) => PremanifestCleanupError::Blocked(error),
@@ -1243,63 +2058,43 @@ pub(super) fn cleanup_orphaned_preparation_attempts(
     let Some(attempt) = attempt else {
         return Ok(());
     };
-    remove_owned_file_in_parent(&attempt.path, &attempt.identity, version_identity)
-        .map_err(PremanifestCleanupError::Io)?;
-    let version_directory = layout
-        .directory()
-        .parent()
-        .expect("validated journal layout has a version directory");
-    super::platform::sync_directory(version_directory).map_err(PremanifestCleanupError::Io)
+    remove_journal_regular(
+        access,
+        layout.preparation_temporary_path(),
+        &attempt.identity,
+    )
+    .map_err(PremanifestCleanupError::Io)?;
+    sync_journal_access(access).map_err(PremanifestCleanupError::Io)
 }
 
 fn observe_orphaned_preparation_attempt(
     layout: &JournalLayout,
-    version_identity: &DirectoryIdentity,
+    access: &JournalAccess<'_>,
     budget: &mut AssetLoadBudget,
 ) -> Result<Option<OrphanedPreparationAttempt>, ObservationError> {
-    let version_directory =
-        layout
-            .directory()
-            .parent()
-            .ok_or_else(|| RecoveryBlockedReason::InvalidLocator {
-                message: "recovery transaction has no version directory".to_owned(),
-            })?;
     let path = layout.preparation_temporary_path();
-    let retained_bytes =
-        u64::try_from(path.capacity()).map_err(|_| BudgetError::ArithmeticOverflow {
-            resource: "orphaned preparation attempt path",
-        })?;
-    budget.consume_bytes(retained_bytes)?;
-    match fs::symlink_metadata(&path) {
+    let file = match open_journal_regular(access, path) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(unexpected_premanifest("preparation-attempt-path").into());
-        }
-        Ok(_) => budget.consume_entries(1)?,
-        Err(error) => return Err(io_reason(error).into()),
-    }
-    let file = open_readonly_regular_in_parent(&path, version_identity).map_err(io_reason)?;
+        Err(_) => return Err(unexpected_premanifest("preparation-attempt-path").into()),
+    };
+    budget.consume_entries(1)?;
     let identity = opened_file_identity(&file).map_err(io_reason)?;
-    let observed_version_identity =
-        observe_directory_identity(version_directory).map_err(io_reason)?;
-    if &observed_version_identity != version_identity {
-        return Err(unexpected_premanifest("changed-recovery-version-directory").into());
-    }
-    Ok(Some(OrphanedPreparationAttempt { path, identity }))
+    Ok(Some(OrphanedPreparationAttempt { identity }))
 }
 
 #[derive(Debug)]
 struct PremanifestCleanupFile {
     path: PathBuf,
     identity: FileIdentity,
-    parent: DirectoryIdentity,
+    parent: PremanifestParentDirectory,
+    parent_identity: DirectoryIdentity,
 }
 
 #[derive(Debug)]
 struct PremanifestCleanupDirectory {
-    path: PathBuf,
+    kind: PremanifestPrivateDirectory,
     identity: DirectoryIdentity,
-    parent: DirectoryIdentity,
 }
 
 #[derive(Debug)]
@@ -1307,15 +2102,63 @@ struct PremanifestCleanupPlan {
     preparation: OpenedJournalPreparation,
     files: Vec<PremanifestCleanupFile>,
     directories: Vec<PremanifestCleanupDirectory>,
-    transaction: Option<(PathBuf, DirectoryIdentity, DirectoryIdentity)>,
+    transaction: Option<DirectoryIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PremanifestPrivateDirectory {
+    Events,
+    Stage,
+    Backup,
+    Baseline,
+}
+
+impl PremanifestPrivateDirectory {
+    const ALL: [Self; 4] = [Self::Events, Self::Stage, Self::Backup, Self::Baseline];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Events => 0,
+            Self::Stage => 1,
+            Self::Backup => 2,
+            Self::Baseline => 3,
+        }
+    }
+
+    fn from_entry_name(name: &str) -> Option<Self> {
+        match name {
+            EVENTS_DIRECTORY => Some(Self::Events),
+            STAGE_DIRECTORY => Some(Self::Stage),
+            BACKUP_DIRECTORY => Some(Self::Backup),
+            BASELINE_DIRECTORY => Some(Self::Baseline),
+            _ => None,
+        }
+    }
+
+    fn path(self, layout: &JournalLayout) -> &Path {
+        match self {
+            Self::Events => layout.events_directory(),
+            Self::Stage => layout.stage_directory(),
+            Self::Backup => layout.backup_directory(),
+            Self::Baseline => layout.baseline_directory(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PremanifestParentDirectory {
+    Transaction,
+    Stage,
+    Baseline,
 }
 
 fn observe_premanifest_cleanup(
     layout: &JournalLayout,
+    access: &JournalAccess<'_>,
     preparation: OpenedJournalPreparation,
     budget: &mut AssetLoadBudget,
 ) -> Result<PremanifestCleanupPlan, ObservationError> {
-    ensure_final_manifest_absent(layout)?;
+    ensure_final_manifest_absent(access, layout, None)?;
     let file_capacity = preparation
         .document()
         .outputs()
@@ -1327,13 +2170,12 @@ fn observe_premanifest_cleanup(
         })?;
     let mut files = recovery_vec(file_capacity, "premanifest cleanup files", budget)?;
     let mut directories = recovery_vec(4, "premanifest cleanup directories", budget)?;
-    let transaction_path = layout.directory();
-    let transaction_metadata = match fs::symlink_metadata(transaction_path) {
+    let transaction = match open_journal_directory(access, layout.directory()) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             preparation
-                .revalidate(layout, budget)
+                .revalidate_in_access(layout, access, budget)
                 .map_err(preparation_observation_error)?;
-            ensure_final_manifest_absent(layout)?;
+            ensure_final_manifest_absent(access, layout, None)?;
             return Ok(PremanifestCleanupPlan {
                 preparation,
                 files,
@@ -1341,26 +2183,17 @@ fn observe_premanifest_cleanup(
                 transaction: None,
             });
         }
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(RecoveryBlockedReason::UnexpectedEvidence {
-                artifact: "premanifest-transaction-directory".to_owned(),
-            }
-            .into());
-        }
-        Ok(metadata) => metadata,
-        Err(error) => {
-            return Err(RecoveryBlockedReason::Io {
-                message: error.to_string(),
-            }
-            .into());
-        }
+        Ok(transaction) => transaction,
+        Err(_) => return Err(unexpected_premanifest("transaction-directory").into()),
     };
-    let _ = transaction_metadata;
-    let transaction_identity = observe_directory_identity(transaction_path).map_err(io_reason)?;
-    let transaction_parent = preparation.parent().clone();
+    let transaction_identity = journal_directory_identity(&transaction).map_err(io_reason)?;
     let mut present = [false; 4];
     let mut root_entries = 0_usize;
-    for entry in fs::read_dir(transaction_path).map_err(io_reason)? {
+    let mut scratch = [0_u8; MAX_PROTOCOL_DIRECTORY_ENTRY_NAME_BYTES];
+    visit_premanifest_directory(&transaction, budget, |budget, entry| {
+        let Some(name_text) = premanifest_entry_name(entry, &mut scratch)? else {
+            return Ok(());
+        };
         root_entries = root_entries
             .checked_add(1)
             .ok_or(BudgetError::ArithmeticOverflow {
@@ -1370,142 +2203,104 @@ fn observe_premanifest_cleanup(
             return Err(unexpected_premanifest("transaction-entry-count").into());
         }
         budget.consume_entries(1)?;
-        let entry = entry.map_err(io_reason)?;
-        let name = entry.file_name();
-        let name_text = name
-            .to_str()
-            .ok_or_else(|| unexpected_premanifest("non-utf8-transaction-entry"))?;
-        let file_type = entry.file_type().map_err(io_reason)?;
-        let directory_index = match name_text {
-            EVENTS_DIRECTORY => Some(0),
-            STAGE_DIRECTORY => Some(1),
-            BACKUP_DIRECTORY => Some(2),
-            BASELINE_DIRECTORY => Some(3),
-            _ => None,
-        };
-        if let Some(index) = directory_index {
-            if !file_type.is_dir() || file_type.is_symlink() || present[index] {
+        if let Some(kind) = PremanifestPrivateDirectory::from_entry_name(name_text) {
+            let index = kind.index();
+            if present[index] {
                 return Err(unexpected_premanifest(name_text).into());
             }
             present[index] = true;
-            continue;
+            return Ok(());
         }
-        if name_text == MANIFEST_TEMPORARY_FILE && file_type.is_file() && !file_type.is_symlink() {
+        if name_text == MANIFEST_TEMPORARY_FILE {
             let path = recovery_join_component(
-                transaction_path,
-                &name,
+                layout.directory(),
+                OsStr::new(name_text),
                 "premanifest manifest temporary path",
                 budget,
             )?;
-            observe_premanifest_file(path, &transaction_identity, &mut files)?;
-            continue;
+            observe_premanifest_file(
+                path,
+                &transaction,
+                &transaction_identity,
+                PremanifestParentDirectory::Transaction,
+                &mut files,
+            )?;
+            return Ok(());
         }
-        return Err(unexpected_premanifest(name_text).into());
-    }
+        Err(unexpected_premanifest(name_text).into())
+    })?;
 
-    let child_paths = [
-        recovery_join_component(
-            transaction_path,
-            OsStr::new(EVENTS_DIRECTORY),
-            "premanifest events path",
-            budget,
-        )?,
-        recovery_join_component(
-            transaction_path,
-            OsStr::new(STAGE_DIRECTORY),
-            "premanifest stage path",
-            budget,
-        )?,
-        recovery_join_component(
-            transaction_path,
-            OsStr::new(BACKUP_DIRECTORY),
-            "premanifest backup path",
-            budget,
-        )?,
-        recovery_join_component(
-            transaction_path,
-            OsStr::new(BASELINE_DIRECTORY),
-            "premanifest baseline path",
-            budget,
-        )?,
-    ];
-    for (index, path) in child_paths.into_iter().enumerate() {
-        if !present[index] {
+    for kind in PremanifestPrivateDirectory::ALL {
+        if !present[kind.index()] {
             continue;
         }
-        let identity = observe_directory_identity(&path).map_err(io_reason)?;
-        match index {
-            0 | 2 => observe_empty_premanifest_directory(&path, budget)?,
-            1 => observe_stage_directory(
-                &path,
+        let directory = open_journal_directory_in_directory(&transaction, kind.path(layout))
+            .map_err(|_| unexpected_premanifest("private-directory"))?;
+        let identity = journal_directory_identity(&directory)
+            .map_err(|_| unexpected_premanifest("private-directory"))?;
+        match kind {
+            PremanifestPrivateDirectory::Events | PremanifestPrivateDirectory::Backup => {
+                observe_empty_premanifest_directory(&directory, budget)?;
+            }
+            PremanifestPrivateDirectory::Stage => observe_stage_directory(
+                layout,
+                &directory,
                 &identity,
                 preparation.document(),
                 &mut files,
                 budget,
             )?,
-            3 => observe_baseline_directory(
-                &path,
+            PremanifestPrivateDirectory::Baseline => observe_baseline_directory(
+                layout,
+                &directory,
                 &identity,
                 preparation.document(),
                 &mut files,
                 budget,
             )?,
-            _ => unreachable!("fixed premanifest directory index"),
         }
-        directories.push(PremanifestCleanupDirectory {
-            path,
-            identity,
-            parent: transaction_identity.clone(),
-        });
-    }
-    for directory in &directories {
-        if observe_directory_identity(&directory.path).map_err(io_reason)? != directory.identity {
-            return Err(unexpected_premanifest("changed-private-directory").into());
-        }
-    }
-    if observe_directory_identity(transaction_path).map_err(io_reason)? != transaction_identity {
-        return Err(unexpected_premanifest("changed-transaction-directory").into());
+        directories.push(PremanifestCleanupDirectory { kind, identity });
     }
     preparation
-        .revalidate(layout, budget)
+        .revalidate_in_access(layout, access, budget)
         .map_err(preparation_observation_error)?;
-    ensure_final_manifest_absent(layout)?;
+    ensure_final_manifest_absent(access, layout, Some(&transaction_identity))?;
     Ok(PremanifestCleanupPlan {
         preparation,
         files,
         directories,
-        transaction: Some((
-            recovery_clone_path(transaction_path, "premanifest transaction path", budget)?,
-            transaction_identity,
-            transaction_parent,
-        )),
+        transaction: Some(transaction_identity),
     })
 }
 
 fn observe_empty_premanifest_directory(
-    path: &Path,
+    directory: &JournalDirectory,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), ObservationError> {
-    let mut entries = fs::read_dir(path).map_err(io_reason)?;
-    match entries.next() {
-        None => Ok(()),
-        Some(Ok(_)) => {
-            budget.consume_entries(1)?;
-            Err(unexpected_premanifest("non-empty-private-directory").into())
-        }
-        Some(Err(error)) => Err(io_reason(error).into()),
-    }
+    let mut scratch = [0_u8; MAX_PROTOCOL_DIRECTORY_ENTRY_NAME_BYTES];
+    visit_premanifest_directory(directory, budget, |budget, entry| {
+        let Some(_) = premanifest_entry_name(entry, &mut scratch)? else {
+            return Ok(());
+        };
+        budget.consume_entries(1)?;
+        Err(unexpected_premanifest("non-empty-private-directory").into())
+    })
 }
 
 fn observe_stage_directory(
-    path: &Path,
+    layout: &JournalLayout,
+    directory: &JournalDirectory,
     parent: &DirectoryIdentity,
     preparation: &JournalPreparation,
     files: &mut Vec<PremanifestCleanupFile>,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), ObservationError> {
     let mut count = 0_usize;
-    for entry in fs::read_dir(path).map_err(io_reason)? {
+    let mut scratch = [0_u8; MAX_PROTOCOL_DIRECTORY_ENTRY_NAME_BYTES];
+    visit_premanifest_directory(directory, budget, |budget, entry| {
+        let Some(name_text) = premanifest_entry_name(entry, &mut scratch)? else {
+            return Ok(());
+        };
         count = count
             .checked_add(1)
             .ok_or(BudgetError::ArithmeticOverflow {
@@ -1515,32 +2310,35 @@ fn observe_stage_directory(
             return Err(unexpected_premanifest("stage-entry-count").into());
         }
         budget.consume_entries(1)?;
-        let entry = entry.map_err(io_reason)?;
-        let file_type = entry.file_type().map_err(io_reason)?;
-        let name = entry.file_name();
-        let name_text = name
-            .to_str()
-            .ok_or_else(|| unexpected_premanifest("non-utf8-stage-entry"))?;
         let ordinal = parse_premanifest_ordinal(name_text, ".stage")
             .filter(|ordinal| *ordinal < preparation.outputs().len())
             .ok_or_else(|| unexpected_premanifest(name_text))?;
-        if !file_type.is_file()
-            || file_type.is_symlink()
-            || preparation.outputs()[ordinal].ordinal()
-                != u32::try_from(ordinal)
-                    .map_err(|_| unexpected_premanifest("stage-ordinal-overflow"))?
+        if preparation.outputs()[ordinal].ordinal()
+            != u32::try_from(ordinal)
+                .map_err(|_| unexpected_premanifest("stage-ordinal-overflow"))?
         {
             return Err(unexpected_premanifest(name_text).into());
         }
-        let entry_path =
-            recovery_join_component(path, &name, "premanifest staged file path", budget)?;
-        observe_premanifest_file(entry_path, parent, files)?;
-    }
-    Ok(())
+        let entry_path = recovery_join_component(
+            layout.stage_directory(),
+            OsStr::new(name_text),
+            "premanifest staged file path",
+            budget,
+        )?;
+        observe_premanifest_file(
+            entry_path,
+            directory,
+            parent,
+            PremanifestParentDirectory::Stage,
+            files,
+        )?;
+        Ok(())
+    })
 }
 
 fn observe_baseline_directory(
-    path: &Path,
+    layout: &JournalLayout,
+    directory: &JournalDirectory,
     parent: &DirectoryIdentity,
     preparation: &JournalPreparation,
     files: &mut Vec<PremanifestCleanupFile>,
@@ -1548,7 +2346,11 @@ fn observe_baseline_directory(
 ) -> Result<(), ObservationError> {
     let sources = preparation.baseline().sources();
     let mut count = 0_usize;
-    for entry in fs::read_dir(path).map_err(io_reason)? {
+    let mut scratch = [0_u8; MAX_PROTOCOL_DIRECTORY_ENTRY_NAME_BYTES];
+    visit_premanifest_directory(directory, budget, |budget, entry| {
+        let Some(name_text) = premanifest_entry_name(entry, &mut scratch)? else {
+            return Ok(());
+        };
         count = count
             .checked_add(1)
             .ok_or(BudgetError::ArithmeticOverflow {
@@ -1558,12 +2360,6 @@ fn observe_baseline_directory(
             return Err(unexpected_premanifest("baseline-entry-count").into());
         }
         budget.consume_entries(1)?;
-        let entry = entry.map_err(io_reason)?;
-        let file_type = entry.file_type().map_err(io_reason)?;
-        let name = entry.file_name();
-        let name_text = name
-            .to_str()
-            .ok_or_else(|| unexpected_premanifest("non-utf8-baseline-entry"))?;
         let ordinal = parse_premanifest_ordinal(name_text, ".image")
             .filter(|ordinal| *ordinal < sources.len())
             .ok_or_else(|| unexpected_premanifest(name_text))?;
@@ -1572,27 +2368,74 @@ fn observe_baseline_directory(
             JournalBaselineImage::Blob { path, .. }
                 if matches_ordinal_journal_path(path, "baseline/", ordinal, ".image")
         );
-        if !file_type.is_file() || file_type.is_symlink() || !declared {
+        if !declared {
             return Err(unexpected_premanifest(name_text).into());
         }
-        let entry_path =
-            recovery_join_component(path, &name, "premanifest baseline file path", budget)?;
-        observe_premanifest_file(entry_path, parent, files)?;
+        let entry_path = recovery_join_component(
+            layout.baseline_directory(),
+            OsStr::new(name_text),
+            "premanifest baseline file path",
+            budget,
+        )?;
+        observe_premanifest_file(
+            entry_path,
+            directory,
+            parent,
+            PremanifestParentDirectory::Baseline,
+            files,
+        )?;
+        Ok(())
+    })
+}
+
+fn visit_premanifest_directory(
+    directory: &JournalDirectory,
+    budget: &mut AssetLoadBudget,
+    visitor: impl FnMut(&mut AssetLoadBudget, DirectoryEntryName<'_>) -> Result<(), ObservationError>,
+) -> Result<(), ObservationError> {
+    budget.consume_bytes(DIRECTORY_VISIT_SETUP_BYTES)?;
+    match visit_journal_directory_entries(
+        directory,
+        budget,
+        |budget| {
+            budget.consume_bytes(DIRECTORY_VISIT_ENTRY_BYTES)?;
+            Ok(())
+        },
+        visitor,
+    ) {
+        Ok(()) => Ok(()),
+        Err(DirectoryVisitError::Visitor(error)) => Err(error),
+        Err(DirectoryVisitError::Io(error)) => Err(io_reason(error).into()),
     }
-    Ok(())
+}
+
+fn premanifest_entry_name<'a>(
+    entry: DirectoryEntryName<'_>,
+    scratch: &'a mut [u8; MAX_PROTOCOL_DIRECTORY_ENTRY_NAME_BYTES],
+) -> Result<Option<&'a str>, ObservationError> {
+    let name = ascii_directory_entry_name(entry, scratch)
+        .ok_or_else(|| unexpected_premanifest("non-utf8-private-directory-entry"))?;
+    if matches!(name, "." | "..") {
+        Ok(None)
+    } else {
+        Ok(Some(name))
+    }
 }
 
 fn observe_premanifest_file(
     path: PathBuf,
-    parent: &DirectoryIdentity,
+    parent: &JournalDirectory,
+    parent_identity: &DirectoryIdentity,
+    parent_kind: PremanifestParentDirectory,
     files: &mut Vec<PremanifestCleanupFile>,
 ) -> Result<(), ObservationError> {
-    let file = open_readonly_regular_in_parent(&path, parent).map_err(io_reason)?;
+    let file = open_journal_regular_in_directory(parent, &path).map_err(io_reason)?;
     let identity = opened_file_identity(&file).map_err(io_reason)?;
     files.push(PremanifestCleanupFile {
         path,
         identity,
-        parent: parent.clone(),
+        parent: parent_kind,
+        parent_identity: parent_identity.clone(),
     });
     Ok(())
 }
@@ -1605,52 +2448,120 @@ enum PreparationCleanup {
 
 fn execute_premanifest_cleanup(
     layout: &JournalLayout,
+    access: &JournalAccess<'_>,
     plan: &PremanifestCleanupPlan,
     cleanup: PreparationCleanup,
 ) -> io::Result<()> {
-    ensure_final_manifest_absent_io(layout)?;
-    for file in &plan.files {
-        ensure_final_manifest_absent_io(layout)?;
-        remove_owned_file_in_parent(&file.path, &file.identity, &file.parent)?;
+    if let Some(transaction_identity) = &plan.transaction {
+        ensure_final_manifest_absent_io(access, layout, Some(transaction_identity))?;
+        for file in &plan.files {
+            ensure_final_manifest_absent_io(access, layout, Some(transaction_identity))?;
+            let parent = open_premanifest_cleanup_parent(
+                access,
+                layout,
+                transaction_identity,
+                file.parent,
+                &file.parent_identity,
+            )?;
+            remove_journal_regular_in_directory(&parent, &file.path, &file.identity)?;
+        }
+        for directory in plan.directories.iter().rev() {
+            ensure_final_manifest_absent_io(access, layout, Some(transaction_identity))?;
+            let transaction = open_premanifest_transaction(access, layout, transaction_identity)?;
+            remove_journal_directory_in_directory(
+                &transaction,
+                directory.kind.path(layout),
+                &directory.identity,
+            )?;
+        }
+        ensure_final_manifest_absent_io(access, layout, Some(transaction_identity))?;
+        remove_journal_directory(access, layout.directory(), transaction_identity)?;
+    } else {
+        ensure_final_manifest_absent_io(access, layout, None)?;
     }
-    for directory in plan.directories.iter().rev() {
-        ensure_final_manifest_absent_io(layout)?;
-        remove_owned_empty_directory_in_parent(
-            &directory.path,
-            &directory.identity,
-            &directory.parent,
-        )?;
-    }
-    if let Some((path, identity, parent)) = &plan.transaction {
-        ensure_final_manifest_absent_io(layout)?;
-        remove_owned_empty_directory_in_parent(path, identity, parent)?;
-    }
-    ensure_final_manifest_absent_io(layout)?;
     match cleanup {
-        PreparationCleanup::Remove => remove_owned_file_in_parent(
-            &layout.preparation_path(),
-            plan.preparation.identity(),
-            plan.preparation.parent(),
-        ),
-        PreparationCleanup::RetainRollbackReceipt => {
-            capture_existing_in_parent(
-                &layout.preparation_path(),
-                &layout.rollback_path(),
+        PreparationCleanup::Remove => {
+            remove_journal_regular(
+                access,
+                layout.preparation_path(),
                 plan.preparation.identity(),
-                plan.preparation.parent(),
-                plan.preparation.parent(),
             )?;
-            super::platform::sync_directory(
-                layout
-                    .directory()
-                    .parent()
-                    .expect("validated journal layout has a version directory"),
+            sync_journal_access(access)
+        }
+        PreparationCleanup::RetainRollbackReceipt => {
+            capture_journal_regular(
+                access,
+                layout.preparation_path(),
+                layout.rollback_path(),
+                plan.preparation.identity(),
             )?;
+            #[cfg(test)]
+            super::test_crash_failpoint("premanifest_rollback_captured");
+            remove_journal_regular(
+                access,
+                layout.preparation_path(),
+                plan.preparation.identity(),
+            )?;
+            sync_journal_access(access)?;
             #[cfg(test)]
             super::test_crash_failpoint("premanifest_rollback_recorded");
             Ok(())
         }
     }
+}
+
+fn open_premanifest_transaction(
+    access: &JournalAccess<'_>,
+    layout: &JournalLayout,
+    expected: &DirectoryIdentity,
+) -> io::Result<JournalDirectory> {
+    let transaction = open_journal_directory(access, layout.directory())?;
+    ensure_premanifest_directory_identity(&transaction, expected)?;
+    Ok(transaction)
+}
+
+fn open_premanifest_cleanup_parent(
+    access: &JournalAccess<'_>,
+    layout: &JournalLayout,
+    transaction_identity: &DirectoryIdentity,
+    parent: PremanifestParentDirectory,
+    expected_parent: &DirectoryIdentity,
+) -> io::Result<JournalDirectory> {
+    let transaction = open_premanifest_transaction(access, layout, transaction_identity)?;
+    match parent {
+        PremanifestParentDirectory::Transaction => {
+            if expected_parent != transaction_identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "premanifest cleanup plan has an invalid transaction parent identity",
+                ));
+            }
+            Ok(transaction)
+        }
+        PremanifestParentDirectory::Stage | PremanifestParentDirectory::Baseline => {
+            let path = match parent {
+                PremanifestParentDirectory::Stage => layout.stage_directory(),
+                PremanifestParentDirectory::Baseline => layout.baseline_directory(),
+                PremanifestParentDirectory::Transaction => unreachable!("handled above"),
+            };
+            let directory = open_journal_directory_in_directory(&transaction, path)?;
+            ensure_premanifest_directory_identity(&directory, expected_parent)?;
+            Ok(directory)
+        }
+    }
+}
+
+fn ensure_premanifest_directory_identity(
+    directory: &JournalDirectory,
+    expected: &DirectoryIdentity,
+) -> io::Result<()> {
+    if journal_directory_identity(directory)? != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "premanifest journal directory no longer matches its captured identity",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_premanifest_ordinal(name: &str, suffix: &str) -> Option<usize> {
@@ -1661,13 +2572,38 @@ fn parse_premanifest_ordinal(name: &str, suffix: &str) -> Option<usize> {
     ordinal.parse().ok()
 }
 
-fn ensure_final_manifest_absent(layout: &JournalLayout) -> Result<(), ObservationError> {
-    ensure_final_manifest_absent_io(layout).map_err(io_reason)?;
+fn ensure_final_manifest_absent(
+    access: &JournalAccess<'_>,
+    layout: &JournalLayout,
+    expected_transaction: Option<&DirectoryIdentity>,
+) -> Result<(), ObservationError> {
+    ensure_final_manifest_absent_io(access, layout, expected_transaction).map_err(io_reason)?;
     Ok(())
 }
 
-fn ensure_final_manifest_absent_io(layout: &JournalLayout) -> io::Result<()> {
-    match fs::symlink_metadata(layout.manifest_path()) {
+fn ensure_final_manifest_absent_io(
+    access: &JournalAccess<'_>,
+    layout: &JournalLayout,
+    expected_transaction: Option<&DirectoryIdentity>,
+) -> io::Result<()> {
+    let transaction = match open_journal_directory(access, layout.directory()) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return if expected_transaction.is_some() {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "premanifest transaction disappeared during recovery",
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        Ok(transaction) => transaction,
+        Err(error) => return Err(error),
+    };
+    if let Some(expected) = expected_transaction {
+        ensure_premanifest_directory_identity(&transaction, expected)?;
+    }
+    match open_journal_regular_in_directory(&transaction, layout.manifest_path()) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -1698,6 +2634,117 @@ fn preparation_observation_error(error: JournalError) -> ObservationError {
     }
 }
 
+fn recover_finalized_journal(
+    workspace: Option<&mut AssetWorkspace>,
+    journal: &Journal,
+    locator: &RecoveryLocator,
+    intent: RecoveryIntent,
+    report: CommitReport,
+    events: &EventFacts,
+    baseline: BaselineObservation,
+    budget: &mut AssetLoadBudget,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    if events.blocked_reason.is_some() {
+        return Err(blocked(
+            locator,
+            RecoveryBlockedReason::InvalidEventSequence {
+                message: "a finalized receipt retains a prior recovery-blocked event".to_owned(),
+            },
+        ));
+    }
+    if events.abandoned {
+        if events.published
+            || events.baseline_installed
+            || events.direction != Some(RecoveryDirection::Rollback)
+        {
+            return Err(blocked(
+                locator,
+                RecoveryBlockedReason::InvalidEventSequence {
+                    message: "finalized rollback receipt has incompatible events".to_owned(),
+                },
+            ));
+        }
+        // A rollback receipt is historical evidence. Its former target bytes
+        // may have been superseded by a later publication, so terminal
+        // redelivery must never inspect or restore them.
+        return Ok(historical_rollback_receipt(&report));
+    }
+    if !events.published
+        || !events.baseline_installed
+        || events.artifacts.iter().any(|artifact| !artifact.promoted)
+    {
+        return Err(blocked(
+            locator,
+            RecoveryBlockedReason::InvalidEventSequence {
+                message:
+                    "finalized publication does not contain a complete canonical event sequence"
+                        .to_owned(),
+            },
+        ));
+    }
+    if intent == RecoveryIntent::Abandon {
+        return Err(blocked(
+            locator,
+            RecoveryBlockedReason::InvalidEventSequence {
+                message: "a finalized publication cannot be abandoned".to_owned(),
+            },
+        ));
+    }
+
+    let Some(workspace) = workspace else {
+        // Detached recovery only validates immutable journal evidence. It
+        // intentionally does not compare current targets with a historical
+        // digest because a later legitimate transaction may have superseded
+        // every target since this receipt was finalized.
+        return Ok(historical_commit_receipt(report));
+    };
+    match baseline {
+        BaselineObservation::Committed => match observe_execution(journal, budget) {
+            Ok((_, artifacts)) if artifacts.iter().all(|artifact| artifact.is_published()) => {
+                Ok(commit_outcome(report, true))
+            }
+            Ok(_) | Err(ObservationError::Blocked(_)) => Ok(historical_commit_receipt(report)),
+            Err(ObservationError::Budget(source)) => Err(RecoveryError::Budget {
+                locator: Box::new(locator.clone()),
+                source,
+            }),
+        },
+        BaselineObservation::Base => {
+            // Installing a baseline changes in-memory state, so it remains a
+            // stronger operation than receipt redelivery. Verify the current
+            // publication image only in this branch before rebuilding it.
+            let (_, artifacts) = observe_execution(journal, budget)
+                .map_err(|error| map_observation_error(locator, error))?;
+            if artifacts.iter().any(|artifact| !artifact.is_published()) {
+                return Err(blocked(
+                    locator,
+                    RecoveryBlockedReason::UnexpectedEvidence {
+                        artifact: "finalized-publication".to_owned(),
+                    },
+                ));
+            }
+            let rebuilt =
+                prebuild_recovery_baseline(workspace, journal, &artifacts, locator, budget)?;
+            if !workspace.install_state_if_current(&rebuilt.expected, rebuilt.next) {
+                return Err(blocked(
+                    locator,
+                    RecoveryBlockedReason::BaselineUnavailable {
+                        expected: report.committed_revision(),
+                        actual: workspace.revision(),
+                    },
+                ));
+            }
+            Ok(commit_outcome(report, true))
+        }
+        BaselineObservation::Other | BaselineObservation::Detached => {
+            // The same workspace can legitimately have advanced through a
+            // successor transaction. Redeliver the immutable receipt without
+            // replacing its newer state.
+            Ok(historical_commit_receipt(report))
+        }
+    }
+}
+
 fn recover_open_journal(
     mut workspace: Option<&mut AssetWorkspace>,
     journal: &mut Journal,
@@ -1708,7 +2755,7 @@ fn recover_open_journal(
     let workspace_attached = workspace.is_some();
     let report = journal
         .manifest()
-        .report(locator.root(), budget)
+        .report(locator.root(), locator.root_identity(), budget)
         .map_err(|error| map_journal_mutation_error(locator, error))?;
     if let Some(workspace) = workspace.as_deref()
         && report.workspace_id() != workspace.workspace_id()
@@ -1734,6 +2781,20 @@ fn recover_open_journal(
         Some(_) => BaselineObservation::Other,
         None => BaselineObservation::Detached,
     };
+    if events.finalized {
+        validate_manifest_paths(journal, budget)
+            .map_err(|error| map_observation_error(locator, error))?;
+        return recover_finalized_journal(
+            workspace.as_deref_mut(),
+            journal,
+            locator,
+            intent,
+            report,
+            &events,
+            baseline,
+            budget,
+        );
+    }
     let (execution, artifacts) = observe_execution(journal, budget)
         .map_err(|error| map_observation_error(locator, error))?;
     let mut observation = RecoveryObservation {
@@ -1741,95 +2802,6 @@ fn recover_open_journal(
         artifacts,
         baseline,
     };
-    if observation.events.finalized {
-        if observation.events.abandoned {
-            if !observation
-                .artifacts
-                .iter()
-                .all(|artifact| artifact.is_rolled_back())
-            {
-                return Err(blocked(
-                    locator,
-                    RecoveryBlockedReason::UnexpectedEvidence {
-                        artifact: "finalized-rollback".to_owned(),
-                    },
-                ));
-            }
-            return if matches!(
-                observation.baseline,
-                BaselineObservation::Base | BaselineObservation::Detached
-            ) {
-                Ok(rollback_outcome(&report))
-            } else {
-                let actual = workspace
-                    .as_deref()
-                    .expect("attached rollback has a workspace")
-                    .revision();
-                Err(blocked(
-                    locator,
-                    RecoveryBlockedReason::BaselineUnavailable {
-                        expected: report.base_revision(),
-                        actual,
-                    },
-                ))
-            };
-        }
-        if !observation.events.published {
-            return Err(blocked(
-                locator,
-                RecoveryBlockedReason::InvalidEventSequence {
-                    message: "Finalized transaction does not contain a complete publication"
-                        .to_owned(),
-                },
-            ));
-        }
-        if !observation
-            .artifacts
-            .iter()
-            .all(|artifact| artifact.is_published())
-        {
-            return Err(blocked(
-                locator,
-                RecoveryBlockedReason::UnexpectedEvidence {
-                    artifact: "finalized-publication".to_owned(),
-                },
-            ));
-        }
-        if intent == RecoveryIntent::Abandon {
-            return Err(blocked(
-                locator,
-                RecoveryBlockedReason::InvalidEventSequence {
-                    message: "a finalized publication cannot be abandoned".to_owned(),
-                },
-            ));
-        }
-        if matches!(
-            observation.baseline,
-            BaselineObservation::Base | BaselineObservation::Other
-        ) {
-            let workspace = workspace
-                .as_deref_mut()
-                .expect("an attached baseline observation has a workspace");
-            let baseline = prebuild_recovery_baseline(
-                workspace,
-                journal,
-                &observation.artifacts,
-                locator,
-                budget,
-            )?;
-            if !workspace.install_state_if_current(&baseline.expected, baseline.next) {
-                return Err(blocked(
-                    locator,
-                    RecoveryBlockedReason::BaselineUnavailable {
-                        expected: report.committed_revision(),
-                        actual: workspace.revision(),
-                    },
-                ));
-            }
-            observation.baseline = BaselineObservation::Committed;
-        }
-        return Ok(commit_outcome(report, workspace_attached));
-    }
     if workspace.is_some()
         && (!observation.events.published
             || !observation
@@ -1886,7 +2858,7 @@ fn recover_open_journal(
                 let repairs =
                     plan_owned_corruption_repairs(&execution, &observation.artifacts, budget)
                         .map_err(|error| map_observation_error(locator, error))?;
-                execute_owned_corruption_repairs(&execution, &repairs)
+                execute_owned_corruption_repairs(journal, &execution, &repairs)
                     .map_err(|error| map_execution_error(locator, error))?;
                 return Err(blocked(
                     locator,
@@ -1959,6 +2931,7 @@ fn recover_open_journal(
                     &mut observation.artifacts,
                     &execution,
                     &mut event_plan,
+                    budget,
                 )
                 .map_err(|error| map_execution_error(locator, error))?;
             }
@@ -2038,7 +3011,7 @@ fn recover_open_journal(
                 &mut event_plan,
             )
             .map_err(|error| map_journal_mutation_error(locator, error))?;
-            roll_back(&mut observation.artifacts, &execution)
+            roll_back(journal, &mut observation.artifacts, &execution)
                 .map_err(|error| map_execution_error(locator, error))?;
             append_once(
                 journal,
@@ -2077,6 +3050,18 @@ fn commit_outcome(report: CommitReport, workspace_attached: bool) -> RecoveryOut
     } else {
         RecoveryOutcome::FilesystemRecovered(Box::new(report))
     }
+}
+
+fn historical_commit_receipt(report: CommitReport) -> RecoveryOutcome {
+    RecoveryOutcome::HistoricalCommitReceipt(Box::new(report))
+}
+
+fn historical_rollback_receipt(report: &CommitReport) -> RecoveryOutcome {
+    RecoveryOutcome::HistoricalRollbackReceipt(RollbackReceipt::new(
+        report.workspace_id(),
+        report.base_revision(),
+        report.recovery().clone(),
+    ))
 }
 
 impl EventFacts {
@@ -2294,58 +3279,104 @@ fn invalid_event(message: impl Into<String>) -> RecoveryBlockedReason {
     }
 }
 
-fn layout_from_locator(locator: &RecoveryLocator) -> Result<JournalLayout, RecoveryBlockedReason> {
+fn layout_from_locator(
+    locator: &RecoveryLocator,
+    budget: &mut AssetLoadBudget,
+) -> Result<JournalLayout, RecoveryError> {
     let directory = locator.root();
     if !directory.is_absolute()
         || directory
             .components()
             .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
     {
-        return Err(invalid_locator(
-            "the transaction path is not absolute and normalized",
+        return Err(blocked(
+            locator,
+            invalid_locator("the transaction path is not absolute and normalized"),
         ));
     }
     let version = directory
         .parent()
-        .ok_or_else(|| invalid_locator("the version directory is missing"))?;
-    let recovery = version
-        .parent()
-        .ok_or_else(|| invalid_locator("the recovery directory is missing"))?;
-    let parent = recovery
-        .parent()
-        .ok_or_else(|| invalid_locator("the destination parent is missing"))?;
+        .ok_or_else(|| blocked(locator, invalid_locator("the version directory is missing")))?;
+    let recovery = version.parent().ok_or_else(|| {
+        blocked(
+            locator,
+            invalid_locator("the recovery directory is missing"),
+        )
+    })?;
+    let parent = recovery.parent().ok_or_else(|| {
+        blocked(
+            locator,
+            invalid_locator("the destination parent is missing"),
+        )
+    })?;
     if version.file_name().and_then(|name| name.to_str()) != Some(RECOVERY_VERSION_DIRECTORY)
         || recovery.file_name().and_then(|name| name.to_str()) != Some(RECOVERY_DIRECTORY)
     {
-        return Err(invalid_locator(
-            "the recovery namespace version is unsupported",
+        return Err(blocked(
+            locator,
+            invalid_locator("the recovery namespace version is unsupported"),
         ));
     }
-    let layout = JournalLayout::new(parent, locator.transaction());
+    let current_root_identity = observe_directory_identity(parent)
+        .map_err(|error| map_commit_guard_error(locator, error))?;
+    if current_root_identity != *locator.root_identity() {
+        return Err(blocked(
+            locator,
+            invalid_locator("publication root identity no longer matches the recovery locator"),
+        ));
+    }
+    let layout = JournalLayout::new_budgeted(
+        parent,
+        locator.transaction(),
+        locator.root_identity().clone(),
+        budget,
+    )
+    .map_err(|error| map_layout_error(locator, error))?;
     if layout.directory() != directory {
-        return Err(invalid_locator(
-            "the transaction directory does not match its transaction digest",
+        return Err(blocked(
+            locator,
+            invalid_locator("the transaction directory does not match its transaction digest"),
         ));
     }
-    validate_directory(parent, "destination parent")?;
-    if validate_optional_directory(recovery, "recovery directory")? {
-        validate_optional_directory(version, "recovery version directory")?;
+    validate_directory(parent, "destination parent").map_err(|reason| blocked(locator, reason))?;
+    if validate_optional_directory(recovery, "recovery directory")
+        .map_err(|reason| blocked(locator, reason))?
+    {
+        validate_optional_directory(version, "recovery version directory")
+            .map_err(|reason| blocked(locator, reason))?;
     }
     match fs::symlink_metadata(directory) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(invalid_locator(
-                "transaction directory is not a non-symlink directory",
+            return Err(blocked(
+                locator,
+                invalid_locator("transaction directory is not a non-symlink directory"),
             ));
         }
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(RecoveryBlockedReason::Io {
-                message: format!("failed to inspect transaction directory: {error}"),
-            });
+            return Err(blocked(
+                locator,
+                RecoveryBlockedReason::Io {
+                    message: format!("failed to inspect transaction directory: {error}"),
+                },
+            ));
         }
     }
     Ok(layout)
+}
+
+fn map_layout_error(locator: &RecoveryLocator, error: JournalError) -> RecoveryError {
+    match error {
+        JournalError::Budget(source) => RecoveryError::Budget {
+            locator: Box::new(locator.clone()),
+            source,
+        },
+        JournalError::Allocation { message, .. } => {
+            blocked(locator, RecoveryBlockedReason::Io { message })
+        }
+        error => blocked(locator, invalid_locator(error.to_string())),
+    }
 }
 
 fn invalid_locator(message: impl Into<String>) -> RecoveryBlockedReason {
@@ -2566,11 +3597,7 @@ impl RecoveryExecutionPlan {
                 new_identity: artifact.new_identity().clone(),
             });
         }
-        Ok(Self {
-            stage_parent_identity: manifest.directories().stage().clone(),
-            backup_parent_identity: manifest.directories().backup().clone(),
-            artifacts,
-        })
+        Ok(Self { artifacts })
     }
 }
 
@@ -2673,21 +3700,26 @@ fn validate_ancestors(
             artifact: artifact.to_owned(),
             role,
         })?;
-    let mut current = root.to_path_buf();
-    let mut components = relative.components().peekable();
-    while let Some(component) = components.next() {
-        let Component::Normal(component) = component else {
-            return Err(RecoveryBlockedReason::UnsafePath {
-                artifact: artifact.to_owned(),
-                role,
-            });
-        };
-        current.push(component);
-        if components.peek().is_none() {
-            break;
-        }
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(RecoveryBlockedReason::UnsafePath {
+            artifact: artifact.to_owned(),
+            role,
+        });
+    }
+
+    let mut current = path
+        .parent()
+        .ok_or_else(|| RecoveryBlockedReason::UnsafePath {
+            artifact: artifact.to_owned(),
+            role,
+        })?;
+    while current != root {
         let metadata =
-            fs::symlink_metadata(&current).map_err(|error| RecoveryBlockedReason::Io {
+            fs::symlink_metadata(current).map_err(|error| RecoveryBlockedReason::Io {
                 message: format!("failed to inspect an {role} ancestor: {error}"),
             })?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -2696,6 +3728,12 @@ fn validate_ancestors(
                 role,
             });
         }
+        current = current
+            .parent()
+            .ok_or_else(|| RecoveryBlockedReason::UnsafePath {
+                artifact: artifact.to_owned(),
+                role,
+            })?;
     }
     Ok(())
 }
@@ -3057,29 +4095,8 @@ fn recovery_join_component(
     Ok(path)
 }
 
-fn recovery_clone_path(
-    source: &Path,
-    resource: &'static str,
-    budget: &mut AssetLoadBudget,
-) -> Result<PathBuf, ObservationError> {
-    let requested = source.as_os_str().len();
-    budget.check_bytes(
-        u64::try_from(requested).map_err(|_| BudgetError::ArithmeticOverflow { resource })?,
-    )?;
-    let mut path = PathBuf::new();
-    path.try_reserve_exact(requested)
-        .map_err(|error| RecoveryBlockedReason::Io {
-            message: format!("failed to reserve {resource}: {error}"),
-        })?;
-    path.push(source);
-    let actual =
-        u64::try_from(path.capacity()).map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
-    budget.check_bytes(actual)?;
-    budget.consume_bytes(actual)?;
-    Ok(path)
-}
-
 fn execute_owned_corruption_repairs(
+    journal: &Journal,
     execution: &RecoveryExecutionPlan,
     repairs: &[OwnedCorruptionRepair],
 ) -> Result<(), ExecutionError> {
@@ -3105,19 +4122,21 @@ fn execute_owned_corruption_repairs(
                     ))
                 })?;
                 if *displace_new {
-                    capture_existing_in_parent(
+                    capture_external_regular_in_journal_directory(
                         &paths.target,
+                        journal.stage_directory(),
                         &paths.staging,
                         &paths.new_identity,
+                        None,
                         &paths.target_parent_identity,
-                        &execution.stage_parent_identity,
                     )?;
                 }
-                capture_existing_in_parent(
+                promote_journal_regular_to_external(
+                    journal.backup_directory(),
                     backup,
                     &paths.target,
                     old_identity,
-                    &execution.backup_parent_identity,
+                    paths.old_digest,
                     &paths.target_parent_identity,
                 )?;
             }
@@ -3127,12 +4146,13 @@ fn execute_owned_corruption_repairs(
                         "owned-corruption repair ordinal is outside its execution plan",
                     ))
                 })?;
-                capture_existing_in_parent(
+                capture_external_regular_in_journal_directory(
                     &paths.target,
+                    journal.stage_directory(),
                     &paths.staging,
                     &paths.new_identity,
+                    None,
                     &paths.target_parent_identity,
-                    &execution.stage_parent_identity,
                 )?;
             }
         }
@@ -3146,6 +4166,7 @@ fn roll_forward(
     observations: &mut [ArtifactObservation],
     execution: &RecoveryExecutionPlan,
     event_plan: &mut JournalEventPlan,
+    budget: &mut AssetLoadBudget,
 ) -> Result<(), ExecutionError> {
     if facts.artifacts.len() != execution.artifacts.len()
         || observations.len() != execution.artifacts.len()
@@ -3168,7 +4189,15 @@ fn roll_forward(
     )?;
 
     for index in 0..execution.artifacts.len() {
-        forward_artifact(journal, facts, observations, execution, index, event_plan)?;
+        forward_artifact(
+            journal,
+            facts,
+            observations,
+            execution,
+            index,
+            event_plan,
+            budget,
+        )?;
     }
     if observations.iter().any(|artifact| !artifact.is_published()) {
         return Err(ExecutionError::Blocked(
@@ -3241,6 +4270,7 @@ fn forward_artifact(
     execution: &RecoveryExecutionPlan,
     index: usize,
     event_plan: &mut JournalEventPlan,
+    budget: &mut AssetLoadBudget,
 ) -> Result<(), ExecutionError> {
     let paths = execution.artifacts.get(index).ok_or_else(|| {
         ExecutionError::Blocked(invalid_event(
@@ -3280,30 +4310,32 @@ fn forward_artifact(
                     ArtifactEvent::BackupIntent,
                     event_plan,
                 )?;
-                capture_matching_digest_in_parent(
+                capture_external_regular_in_journal_directory(
                     &paths.target,
+                    journal.backup_directory(),
                     backup,
                     old_identity,
-                    old,
+                    Some(old),
                     &paths.target_parent_identity,
-                    &execution.backup_parent_identity,
                 )?;
-                verify_digest_precharged(
+                verify_journal_digest_precharged(
+                    journal.backup_directory(),
                     backup,
                     old,
                     old_identity,
-                    &execution.backup_parent_identity,
                 )?;
                 observations[index].target = EntryEvidence::Missing;
                 observations[index].backup = EntryEvidence::Old;
-                copy_security_metadata(
+                copy_security_metadata_between_journal_directories(
+                    journal.backup_directory(),
                     backup,
+                    journal.stage_directory(),
                     &paths.staging,
                     old_identity,
-                    &execution.backup_parent_identity,
                     &paths.new_identity,
-                    &execution.stage_parent_identity,
-                )?;
+                    budget,
+                )
+                .map_err(map_security_metadata_execution_error)?;
                 append_artifact_once(
                     journal,
                     &mut facts.backup_captured,
@@ -3318,20 +4350,22 @@ fn forward_artifact(
                         "captured backup has no durable intent",
                     )));
                 }
-                verify_digest_precharged(
+                verify_journal_digest_precharged(
+                    journal.backup_directory(),
                     backup,
                     old,
                     old_identity,
-                    &execution.backup_parent_identity,
                 )?;
-                copy_security_metadata(
+                copy_security_metadata_between_journal_directories(
+                    journal.backup_directory(),
                     backup,
+                    journal.stage_directory(),
                     &paths.staging,
                     old_identity,
-                    &execution.backup_parent_identity,
                     &paths.new_identity,
-                    &execution.stage_parent_identity,
-                )?;
+                    budget,
+                )
+                .map_err(map_security_metadata_execution_error)?;
                 append_artifact_once(
                     journal,
                     &mut facts.backup_captured,
@@ -3393,11 +4427,11 @@ fn forward_artifact(
 
     // Revalidate from a fresh no-follow handle immediately before persisting promotion intent.
     // Existing corruption is rejected before the target is renamed.
-    verify_digest_precharged(
+    verify_journal_digest_precharged(
+        journal.stage_directory(),
         &paths.staging,
         paths.new_digest,
         &paths.new_identity,
-        &execution.stage_parent_identity,
     )?;
     append_artifact_once(
         journal,
@@ -3406,12 +4440,12 @@ fn forward_artifact(
         ArtifactEvent::PromotionIntent,
         event_plan,
     )?;
-    capture_matching_digest_in_parent(
+    promote_journal_regular_to_external(
+        journal.stage_directory(),
         &paths.staging,
         &paths.target,
         &paths.new_identity,
-        paths.new_digest,
-        &execution.stage_parent_identity,
+        Some(paths.new_digest),
         &paths.target_parent_identity,
     )?;
     verify_digest_precharged(
@@ -3432,7 +4466,42 @@ fn forward_artifact(
     Ok(())
 }
 
+fn capture_recovery_target_into_stage(
+    journal: &Journal,
+    paths: &RecoveryArtifactExecution,
+    expected_digest: Option<DigestV1>,
+) -> Result<(), ExecutionError> {
+    capture_external_regular_in_journal_directory(
+        &paths.target,
+        journal.stage_directory(),
+        &paths.staging,
+        &paths.new_identity,
+        expected_digest,
+        &paths.target_parent_identity,
+    )?;
+    Ok(())
+}
+
+fn restore_recovery_backup_to_target(
+    journal: &Journal,
+    paths: &RecoveryArtifactExecution,
+    backup: &Path,
+    expected_identity: &FileIdentity,
+    expected_digest: Option<DigestV1>,
+) -> Result<(), ExecutionError> {
+    promote_journal_regular_to_external(
+        journal.backup_directory(),
+        backup,
+        &paths.target,
+        expected_identity,
+        expected_digest,
+        &paths.target_parent_identity,
+    )?;
+    Ok(())
+}
+
 fn roll_back(
+    journal: &Journal,
     observations: &mut [ArtifactObservation],
     execution: &RecoveryExecutionPlan,
 ) -> Result<(), ExecutionError> {
@@ -3458,13 +4527,12 @@ fn roll_back(
             match (observation.target, observation.staging, observation.backup) {
                 (EntryEvidence::Old, _, EntryEvidence::Missing) => {}
                 (EntryEvidence::Missing, _, EntryEvidence::Old) => {
-                    capture_matching_digest_in_parent(
+                    restore_recovery_backup_to_target(
+                        journal,
+                        paths,
                         backup,
-                        &paths.target,
                         old_identity,
-                        old,
-                        &execution.backup_parent_identity,
-                        &paths.target_parent_identity,
+                        Some(old),
                     )?;
                     verify_digest_precharged(
                         &paths.target,
@@ -3480,31 +4548,17 @@ fn roll_back(
                     EntryEvidence::Missing,
                     EntryEvidence::Old,
                 ) => {
-                    if observation.target == EntryEvidence::New {
-                        capture_matching_digest_in_parent(
-                            &paths.target,
-                            &paths.staging,
-                            &paths.new_identity,
-                            paths.new_digest,
-                            &paths.target_parent_identity,
-                            &execution.stage_parent_identity,
-                        )?;
-                    } else {
-                        capture_existing_in_parent(
-                            &paths.target,
-                            &paths.staging,
-                            &paths.new_identity,
-                            &paths.target_parent_identity,
-                            &execution.stage_parent_identity,
-                        )?;
-                    }
-                    capture_matching_digest_in_parent(
+                    capture_recovery_target_into_stage(
+                        journal,
+                        paths,
+                        (observation.target == EntryEvidence::New).then_some(paths.new_digest),
+                    )?;
+                    restore_recovery_backup_to_target(
+                        journal,
+                        paths,
                         backup,
-                        &paths.target,
                         old_identity,
-                        old,
-                        &execution.backup_parent_identity,
-                        &paths.target_parent_identity,
+                        Some(old),
                     )?;
                     verify_digest_precharged(
                         &paths.target,
@@ -3517,13 +4571,7 @@ fn roll_back(
                     observations[index].backup = EntryEvidence::Missing;
                 }
                 (EntryEvidence::Missing, _, EntryEvidence::CorruptOld) => {
-                    capture_existing_in_parent(
-                        backup,
-                        &paths.target,
-                        old_identity,
-                        &execution.backup_parent_identity,
-                        &paths.target_parent_identity,
-                    )?;
+                    restore_recovery_backup_to_target(journal, paths, backup, old_identity, None)?;
                     observations[index].target = EntryEvidence::CorruptOld;
                     observations[index].backup = EntryEvidence::Missing;
                     return Err(unexpected_execution_artifact(paths.ordinal));
@@ -3533,31 +4581,12 @@ fn roll_back(
                     EntryEvidence::Missing,
                     EntryEvidence::CorruptOld,
                 ) => {
-                    if observation.target == EntryEvidence::New {
-                        capture_matching_digest_in_parent(
-                            &paths.target,
-                            &paths.staging,
-                            &paths.new_identity,
-                            paths.new_digest,
-                            &paths.target_parent_identity,
-                            &execution.stage_parent_identity,
-                        )?;
-                    } else {
-                        capture_existing_in_parent(
-                            &paths.target,
-                            &paths.staging,
-                            &paths.new_identity,
-                            &paths.target_parent_identity,
-                            &execution.stage_parent_identity,
-                        )?;
-                    }
-                    capture_existing_in_parent(
-                        backup,
-                        &paths.target,
-                        old_identity,
-                        &execution.backup_parent_identity,
-                        &paths.target_parent_identity,
+                    capture_recovery_target_into_stage(
+                        journal,
+                        paths,
+                        (observation.target == EntryEvidence::New).then_some(paths.new_digest),
                     )?;
+                    restore_recovery_backup_to_target(journal, paths, backup, old_identity, None)?;
                     observations[index].target = EntryEvidence::CorruptOld;
                     observations[index].staging = observation.target;
                     observations[index].backup = EntryEvidence::Missing;
@@ -3573,24 +4602,11 @@ fn roll_back(
                     EntryEvidence::Missing,
                     EntryEvidence::Missing,
                 ) => {
-                    if observation.target == EntryEvidence::New {
-                        capture_matching_digest_in_parent(
-                            &paths.target,
-                            &paths.staging,
-                            &paths.new_identity,
-                            paths.new_digest,
-                            &paths.target_parent_identity,
-                            &execution.stage_parent_identity,
-                        )?;
-                    } else {
-                        capture_existing_in_parent(
-                            &paths.target,
-                            &paths.staging,
-                            &paths.new_identity,
-                            &paths.target_parent_identity,
-                            &execution.stage_parent_identity,
-                        )?;
-                    }
+                    capture_recovery_target_into_stage(
+                        journal,
+                        paths,
+                        (observation.target == EntryEvidence::New).then_some(paths.new_digest),
+                    )?;
                     observations[index].target = EntryEvidence::Missing;
                     observations[index].staging = observation.target;
                 }
@@ -3684,6 +4700,36 @@ fn verify_digest_precharged(
     }
 }
 
+fn verify_journal_digest_precharged(
+    directory: &JournalDirectory,
+    path: &Path,
+    expected: DigestV1,
+    expected_identity: &FileIdentity,
+) -> Result<(), ExecutionError> {
+    let mut file = match open_journal_regular_in_directory(directory, path) {
+        Ok(file) => file,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return Err(unexpected_verification());
+        }
+        Err(error) => return Err(ExecutionError::Io(error)),
+    };
+    let identity = opened_file_identity(&file)?;
+    if &identity != expected_identity {
+        return Err(unexpected_verification());
+    }
+    let actual = DigestV1::hash_reader(&mut file, expected_identity.length())?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(unexpected_verification())
+    }
+}
+
 fn unexpected_verification() -> ExecutionError {
     ExecutionError::Blocked(RecoveryBlockedReason::UnexpectedEvidence {
         artifact: "post-move-verification".to_owned(),
@@ -3692,6 +4738,8 @@ fn unexpected_verification() -> ExecutionError {
 
 #[derive(Debug, Error)]
 enum ExecutionError {
+    #[error(transparent)]
+    Budget(#[from] BudgetError),
     #[error(transparent)]
     Journal(#[from] super::journal::JournalError),
     #[error(transparent)]
@@ -3726,7 +4774,7 @@ fn block_and_record<T>(
 
 fn blocked(locator: &RecoveryLocator, reason: RecoveryBlockedReason) -> RecoveryError {
     RecoveryError::Blocked {
-        locator: locator.clone(),
+        locator: Box::new(locator.clone()),
         reason: Box::new(reason),
     }
 }
@@ -3734,7 +4782,7 @@ fn blocked(locator: &RecoveryLocator, reason: RecoveryBlockedReason) -> Recovery
 fn map_commit_guard_error(locator: &RecoveryLocator, error: io::Error) -> RecoveryError {
     if error.kind() == io::ErrorKind::WouldBlock {
         RecoveryError::Busy {
-            locator: locator.clone(),
+            locator: Box::new(locator.clone()),
             message: error.to_string(),
         }
     } else {
@@ -3749,7 +4797,7 @@ fn invalid_journal(message: String) -> RecoveryBlockedReason {
 fn map_journal_open_error(locator: &RecoveryLocator, error: JournalError) -> RecoveryError {
     match error {
         JournalError::Budget(source) => RecoveryError::Budget {
-            locator: locator.clone(),
+            locator: Box::new(locator.clone()),
             source,
         },
         JournalError::Io(error) => blocked(locator, io_reason(error)),
@@ -3760,7 +4808,7 @@ fn map_journal_open_error(locator: &RecoveryLocator, error: JournalError) -> Rec
 fn map_journal_mutation_error(locator: &RecoveryLocator, error: JournalError) -> RecoveryError {
     match error {
         JournalError::Budget(source) => RecoveryError::Budget {
-            locator: locator.clone(),
+            locator: Box::new(locator.clone()),
             source,
         },
         JournalError::Io(error) => blocked(locator, io_reason(error)),
@@ -3774,7 +4822,7 @@ fn map_baseline_error(
 ) -> RecoveryError {
     match error.into_budget() {
         Ok(source) => RecoveryError::Budget {
-            locator: locator.clone(),
+            locator: Box::new(locator.clone()),
             source,
         },
         Err(super::baseline::BaselineBuildError::Revision { expected, actual }) => blocked(
@@ -3793,7 +4841,7 @@ fn map_baseline_error(
 fn map_observation_error(locator: &RecoveryLocator, error: ObservationError) -> RecoveryError {
     match error {
         ObservationError::Budget(source) => RecoveryError::Budget {
-            locator: locator.clone(),
+            locator: Box::new(locator.clone()),
             source,
         },
         ObservationError::Blocked(reason) => blocked(locator, reason),
@@ -3802,6 +4850,10 @@ fn map_observation_error(locator: &RecoveryLocator, error: ObservationError) -> 
 
 fn map_execution_error(locator: &RecoveryLocator, error: ExecutionError) -> RecoveryError {
     match error {
+        ExecutionError::Budget(source) => RecoveryError::Budget {
+            locator: Box::new(locator.clone()),
+            source,
+        },
         ExecutionError::Blocked(reason) => blocked(locator, reason),
         ExecutionError::Journal(error) => map_journal_mutation_error(locator, error),
         ExecutionError::Io(error) => blocked(
@@ -3810,6 +4862,13 @@ fn map_execution_error(locator: &RecoveryLocator, error: ExecutionError) -> Reco
                 message: error.to_string(),
             },
         ),
+    }
+}
+
+fn map_security_metadata_execution_error(error: SecurityMetadataError) -> ExecutionError {
+    match error {
+        SecurityMetadataError::Budget(source) => ExecutionError::Budget(source),
+        SecurityMetadataError::Io(error) => ExecutionError::Io(error),
     }
 }
 
@@ -3846,6 +4905,10 @@ mod tests {
     const YAML: &[u8] =
         b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Before\n";
     const RESOURCE_YAML: &[u8] = b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!83 &1\nAudioClip:\n  m_StreamData: {path: old.resS, offset: 7, size: 4}\n";
+
+    fn test_layout_from_locator(locator: &RecoveryLocator) -> Result<JournalLayout, RecoveryError> {
+        layout_from_locator(locator, &mut AssetLoadBudget::default())
+    }
 
     fn name_path() -> FieldPath {
         FieldPath::root().push_field("m_Name").expect("field path")
@@ -4124,7 +5187,7 @@ mod tests {
     #[test]
     fn crash_before_preparation_installation_leaves_no_recovery_blocker() {
         let (directory, path, locator) = run_crashing_commit("preparation_temporary_synced");
-        let layout = layout_from_locator(&locator).expect("preparation-attempt layout");
+        let layout = test_layout_from_locator(&locator).expect("preparation-attempt layout");
         assert_target_unchanged(&path, YAML);
         assert!(!layout.preparation_path().exists());
         assert!(!layout.directory().exists());
@@ -4153,7 +5216,7 @@ mod tests {
     #[test]
     fn preopen_recovery_removes_an_orphaned_preparation_attempt() {
         let (_directory, path, locator) = run_crashing_commit("preparation_temporary_synced");
-        let layout = layout_from_locator(&locator).expect("preparation-attempt layout");
+        let layout = test_layout_from_locator(&locator).expect("preparation-attempt layout");
         assert!(layout.preparation_temporary_path().is_file());
 
         let outcome = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
@@ -4167,10 +5230,10 @@ mod tests {
     #[test]
     fn replaced_orphaned_preparation_attempt_is_preserved() {
         let (_directory, path, locator) = run_crashing_commit("preparation_temporary_synced");
-        let layout = layout_from_locator(&locator).expect("preparation-attempt layout");
+        let layout = test_layout_from_locator(&locator).expect("preparation-attempt layout");
         let attempt = layout.preparation_temporary_path();
-        fs::remove_file(&attempt).expect("replace owned preparation attempt");
-        fs::create_dir(&attempt).expect("external replacement directory");
+        fs::remove_file(attempt).expect("replace owned preparation attempt");
+        fs::create_dir(attempt).expect("external replacement directory");
 
         let error = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
             .expect_err("external replacement must block cleanup");
@@ -4209,7 +5272,7 @@ mod tests {
             "premanifest_rollback_recorded",
             Some(RECOVERY_CRASH_SCENARIO),
         );
-        let layout = layout_from_locator(&locator).expect("recovery layout");
+        let layout = test_layout_from_locator(&locator).expect("recovery layout");
         assert!(!layout.preparation_path().exists());
         assert!(!layout.directory().exists());
         assert!(layout.rollback_path().is_file());
@@ -4223,6 +5286,52 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.workspace_id(), Some(crash_workspace_id()));
         assert!(first.rolled_back().is_some());
+    }
+
+    #[test]
+    fn interrupted_premanifest_rollback_capture_reconciles_duplicate_preparation() {
+        let (directory, path, locator) = run_crashing_commit("recovery_baseline_synced");
+        run_crash_child(
+            directory.path(),
+            "premanifest_rollback_captured",
+            Some(RECOVERY_CRASH_SCENARIO),
+        );
+        let layout = test_layout_from_locator(&locator).expect("recovery layout");
+        assert!(layout.preparation_path().is_file());
+        assert!(layout.rollback_path().is_file());
+        assert!(!layout.directory().exists());
+
+        let first = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect("reconcile duplicate preparation record");
+        let second = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect("redeliver reconciled rollback receipt");
+
+        assert_eq!(first, second);
+        assert!(first.rolled_back().is_some());
+        assert!(!layout.preparation_path().exists());
+        assert!(layout.rollback_path().is_file());
+        assert_target_unchanged(&path, YAML);
+    }
+
+    #[test]
+    fn duplicate_premanifest_record_with_transaction_preserves_all_evidence() {
+        let (_directory, path, locator) = run_crashing_commit("recovery_baseline_synced");
+        let layout = test_layout_from_locator(&locator).expect("recovery layout");
+        fs::copy(layout.preparation_path(), layout.rollback_path())
+            .expect("copy preparation into rollback receipt");
+
+        let error = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect_err("transaction evidence must block duplicate-record cleanup");
+
+        assert!(matches!(
+            error.blocked_reason(),
+            Some(RecoveryBlockedReason::UnexpectedEvidence { artifact })
+                if artifact == "transaction-directory"
+        ));
+        assert!(layout.preparation_path().is_file());
+        assert!(layout.rollback_path().is_file());
+        assert!(layout.directory().is_dir());
+        assert_target_unchanged(&path, YAML);
     }
 
     #[test]
@@ -4240,7 +5349,7 @@ mod tests {
             if point == "preparation_installed" {
                 assert!(!locator.root().exists());
                 assert!(
-                    layout_from_locator(&locator)
+                    test_layout_from_locator(&locator)
                         .expect("preparation-only layout")
                         .preparation_path()
                         .is_file()
@@ -4257,15 +5366,23 @@ mod tests {
             assert_eq!(receipt.recovery(), &locator);
             assert!(!locator.root().exists(), "{point} transaction directory");
             assert!(
-                !JournalLayout::new(directory.path(), locator.transaction())
-                    .preparation_path()
-                    .exists(),
+                !JournalLayout::new(
+                    directory.path(),
+                    locator.transaction(),
+                    locator.root_identity().clone(),
+                )
+                .preparation_path()
+                .exists(),
                 "{point} preparation record"
             );
             assert!(
-                JournalLayout::new(directory.path(), locator.transaction())
-                    .rollback_path()
-                    .is_file(),
+                JournalLayout::new(
+                    directory.path(),
+                    locator.transaction(),
+                    locator.root_identity().clone(),
+                )
+                .rollback_path()
+                .is_file(),
                 "{point} rollback receipt"
             );
             assert_eq!(
@@ -4310,9 +5427,8 @@ mod tests {
             .collect();
         let unknown = locator.root().join(STAGE_DIRECTORY).join("unknown.bin");
         fs::write(&unknown, b"external evidence").expect("unknown evidence");
-        let preparation = layout_from_locator(&locator)
-            .expect("premanifest layout")
-            .preparation_path();
+        let preparation_layout = test_layout_from_locator(&locator).expect("premanifest layout");
+        let preparation = preparation_layout.preparation_path();
         let error = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
             .expect_err("unknown premanifest evidence must block recovery");
 
@@ -4370,7 +5486,7 @@ mod tests {
     }
 
     #[test]
-    fn child_crashes_after_final_manifest_redeliver_the_canonical_commit() {
+    fn child_crashes_after_final_manifest_redeliver_historical_commit_receipts() {
         for point in [
             "manifest_installed",
             "backup_intent:0",
@@ -4403,13 +5519,15 @@ mod tests {
                 .unwrap_or_else(|error| panic!("redeliver {point}: {error}"));
             assert_eq!(
                 redelivered,
-                RecoveryOutcome::FilesystemRecovered(Box::new(expected))
+                RecoveryOutcome::HistoricalCommitReceipt(Box::new(expected))
             );
+            assert!(redelivered.filesystem_recovered().is_none());
+            assert!(redelivered.historical_commit_receipt().is_some());
         }
     }
 
     #[test]
-    fn child_crashes_converge_a_two_artifact_publication_before_trusted_reopen() {
+    fn child_crashes_redeliver_historical_two_artifact_commit_receipts() {
         for point in [
             "backup_intent:1",
             "backup_renamed:1",
@@ -4452,7 +5570,7 @@ mod tests {
             assert_eq!(
                 AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
                     .expect("redeliver two-artifact report"),
-                recovered
+                RecoveryOutcome::HistoricalCommitReceipt(Box::new(report))
             );
         }
     }
@@ -4499,7 +5617,7 @@ mod tests {
         report: &CommitReport,
         retained: fn(&JournalEventKind) -> bool,
     ) -> (JournalLayout, JournalArtifact) {
-        let layout = layout_from_locator(report.recovery()).expect("journal layout");
+        let layout = test_layout_from_locator(report.recovery()).expect("journal layout");
         let journal = Journal::open(layout.clone(), &mut AssetLoadBudget::default())
             .expect("open journal for crash simulation");
         let cutoff = journal
@@ -4979,7 +6097,7 @@ mod tests {
         };
 
         let (_directory, path, mut workspace, report, published) = journaled_restart_fixture();
-        let layout = layout_from_locator(report.recovery()).expect("journal layout");
+        let layout = test_layout_from_locator(report.recovery()).expect("journal layout");
         let journal = Journal::open(layout.clone(), &mut AssetLoadBudget::default())
             .expect("journal before one-short recovery");
         let artifact = journal.manifest().artifacts()[0].clone();
@@ -4992,7 +6110,7 @@ mod tests {
         let target_before = fs::read(&path).expect("target before recovery");
         let staging_before = fs::read(&staging).expect("staging before recovery");
         let events = layout.events_directory();
-        let event_count = fs::read_dir(&events).expect("events").count();
+        let event_count = fs::read_dir(events).expect("events").count();
         assert!(!backup.exists());
         let mut one_short = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
             max_bytes: usage.bytes - 1,
@@ -5011,7 +6129,7 @@ mod tests {
             staging_before
         );
         assert!(!backup.exists());
-        assert_eq!(fs::read_dir(&events).expect("events").count(), event_count);
+        assert_eq!(fs::read_dir(events).expect("events").count(), event_count);
 
         let mut exact = AssetLoadBudget::new(exact_limits).expect("exact budget");
         let recovered = AssetWorkspace::recover_at(report.recovery(), &mut exact)
@@ -5069,7 +6187,7 @@ mod tests {
         assert_eq!(fs::read(&path).expect("restored target"), YAML);
         assert_eq!(reopened.revision(), report.base_revision());
 
-        let layout = layout_from_locator(report.recovery()).expect("journal layout");
+        let layout = test_layout_from_locator(report.recovery()).expect("journal layout");
         let journal =
             Journal::open(layout, &mut AssetLoadBudget::default()).expect("open abandoned journal");
         assert!(journal.events().iter().any(|event| {
@@ -5095,7 +6213,7 @@ mod tests {
     }
 
     #[test]
-    fn finalized_rollback_rejects_later_target_tampering() {
+    fn finalized_rollback_redelivers_historical_receipt_after_later_target_tampering() {
         let (_directory, path, _workspace, report, _published) = journaled_restart_fixture();
         let receipt =
             AssetWorkspace::abandon_at(report.recovery(), &mut AssetLoadBudget::default())
@@ -5103,14 +6221,21 @@ mod tests {
         assert!(receipt.rolled_back().is_some());
 
         fs::write(&path, b"external replacement").expect("tamper rolled-back target");
-        let error = AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
-            .expect_err("tampered rollback cannot redeliver a success receipt");
+        let redelivered =
+            AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
+                .expect("finalized rollback receipt remains historical evidence");
 
-        assert!(matches!(
-            error.blocked_reason(),
-            Some(RecoveryBlockedReason::UnexpectedEvidence { artifact })
-                if artifact == "finalized-rollback"
-        ));
+        assert_eq!(
+            redelivered,
+            RecoveryOutcome::HistoricalRollbackReceipt(
+                receipt
+                    .rolled_back()
+                    .expect("initial rollback is current")
+                    .clone(),
+            )
+        );
+        assert!(redelivered.rolled_back().is_none());
+        assert!(redelivered.historical_rollback_receipt().is_some());
         assert_eq!(
             fs::read(path).expect("tampered target remains"),
             b"external replacement"
@@ -5120,11 +6245,11 @@ mod tests {
     #[test]
     fn explicit_abandon_refuses_a_sticky_forward_transaction() {
         let (_directory, path, mut reopened, report, published) = journaled_restart_fixture();
-        let layout = layout_from_locator(report.recovery()).expect("journal layout");
+        let layout = test_layout_from_locator(report.recovery()).expect("journal layout");
         append_recovery_direction(&layout, RecoveryDirection::Forward);
         let original = fs::read(&path).expect("base target");
         let events = layout.events_directory();
-        let event_count = fs::read_dir(&events).expect("events").count();
+        let event_count = fs::read_dir(events).expect("events").count();
 
         let error = AssetWorkspace::abandon_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect_err("sticky forward transaction cannot be abandoned");
@@ -5175,7 +6300,7 @@ mod tests {
         )
         .expect("restore old target identity");
         let events = layout.events_directory();
-        let event_count = fs::read_dir(&events).expect("events").count();
+        let event_count = fs::read_dir(events).expect("events").count();
 
         let mut wrong_workspace = AssetWorkspace::new().expect("wrong workspace");
         let error = wrong_workspace
@@ -5185,7 +6310,7 @@ mod tests {
             error.blocked_reason(),
             Some(RecoveryBlockedReason::WorkspaceMismatch { .. })
         ));
-        assert_eq!(fs::read_dir(&events).expect("events").count(), event_count);
+        assert_eq!(fs::read_dir(events).expect("events").count(), event_count);
 
         let mut wrong_revision = reopen_base_workspace(workspace_id, &path);
         for alias in ["unrelated-a.prefab", "unrelated-b.prefab"] {
@@ -5208,12 +6333,12 @@ mod tests {
             error.blocked_reason(),
             Some(RecoveryBlockedReason::FilesystemRecoveryRequired)
         ));
-        assert_eq!(fs::read_dir(&events).expect("events").count(), event_count);
+        assert_eq!(fs::read_dir(events).expect("events").count(), event_count);
         assert_eq!(fs::read(&path).expect("base target"), YAML);
 
         AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect("preopen recovery with no workspace context");
-        let recovered_event_count = fs::read_dir(&events).expect("events").count();
+        let recovered_event_count = fs::read_dir(events).expect("events").count();
         let error = wrong_revision
             .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect_err("unrelated loaded sources must block baseline attachment");
@@ -5222,7 +6347,7 @@ mod tests {
             Some(RecoveryBlockedReason::BaselineUnavailable { .. })
         ));
         assert_eq!(
-            fs::read_dir(&events).expect("events").count(),
+            fs::read_dir(events).expect("events").count(),
             recovered_event_count
         );
         assert_eq!(fs::read(&path).expect("published target"), published);
@@ -5602,29 +6727,108 @@ mod tests {
     }
 
     #[test]
-    fn tampered_target_is_blocked_without_replacing_the_target() {
+    fn finalized_receipt_redelivers_historical_commit_without_replacing_an_external_target() {
         let (_directory, path, mut workspace, report) = committed_fixture();
-        let published = fs::read(&path).expect("published target");
         let events = report.recovery().root().join("events");
         let event_count = fs::read_dir(&events).expect("events").count();
         let tampered = b"externally replaced bytes";
         fs::write(&path, tampered).expect("tamper target");
 
-        let error = workspace
-            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
-            .expect_err("tampered target must block recovery");
-        assert!(matches!(
-            error.blocked_reason(),
-            Some(RecoveryBlockedReason::UnexpectedEvidence { .. })
-        ));
-        assert_target_unchanged(&path, tampered);
-        assert_eq!(fs::read_dir(&events).expect("events").count(), event_count);
-
-        fs::write(&path, published).expect("restore published target");
         let outcome = workspace
             .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
-            .expect("canonical recovery must remain available");
-        assert_eq!(outcome, RecoveryOutcome::Finalized(Box::new(report)));
+            .expect("finalized receipt remains available after successor bytes");
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::HistoricalCommitReceipt(Box::new(report))
+        );
+        assert!(outcome.finalized().is_none());
+        assert!(outcome.historical_commit_receipt().is_some());
+        assert_target_unchanged(&path, tampered);
+        assert_eq!(fs::read_dir(&events).expect("events").count(), event_count);
+    }
+
+    #[test]
+    fn finalized_receipt_redelivers_without_replacing_a_successor_commit() {
+        let (directory, path, mut workspace, first) = committed_fixture();
+        let second_prepared = workspace
+            .prepare(
+                mutation_plan(&workspace, "After", "Later"),
+                PrepareOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("prepare successor mutation");
+        let second = workspace
+            .commit(
+                second_prepared,
+                PublicationTarget::in_place(directory.path()).expect("publication target"),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("commit successor mutation");
+        let successor_bytes = fs::read(&path).expect("successor target");
+
+        let detached =
+            AssetWorkspace::recover_at(first.recovery(), &mut AssetLoadBudget::default())
+                .expect("redeliver first filesystem receipt");
+        assert_eq!(
+            detached,
+            RecoveryOutcome::HistoricalCommitReceipt(Box::new(first.clone()))
+        );
+        assert!(detached.filesystem_recovered().is_none());
+        assert!(detached.historical_commit_receipt().is_some());
+        assert_target_unchanged(&path, &successor_bytes);
+
+        let attached = workspace
+            .finalize_recovery_at(first.recovery(), &mut AssetLoadBudget::default())
+            .expect("redeliver first finalized receipt");
+        assert_eq!(
+            attached,
+            RecoveryOutcome::HistoricalCommitReceipt(Box::new(first))
+        );
+        assert!(attached.finalized().is_none());
+        assert!(attached.historical_commit_receipt().is_some());
+        assert_eq!(workspace.revision(), second.committed_revision());
+        assert_target_unchanged(&path, &successor_bytes);
+    }
+
+    #[test]
+    fn recovery_discovery_wire_requires_the_current_version_and_shape() {
+        let discovery = RecoveryDiscovery::new(Vec::new());
+        let encoded = serde_json::to_value(&discovery).expect("serialize discovery response");
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "version": RECOVERY_DISCOVERY_VERSION,
+                "recoveries": [],
+            })
+        );
+        let decoded = serde_json::from_value::<RecoveryDiscovery>(encoded.clone())
+            .expect("deserialize current discovery response");
+        assert_eq!(decoded, discovery);
+
+        let unsupported = serde_json::json!({
+            "version": RECOVERY_DISCOVERY_VERSION + 1,
+            "recoveries": [],
+        });
+        assert!(serde_json::from_value::<RecoveryDiscovery>(unsupported).is_err());
+
+        let unknown_field = serde_json::json!({
+            "version": RECOVERY_DISCOVERY_VERSION,
+            "recoveries": [],
+            "unexpected": true,
+        });
+        assert!(serde_json::from_value::<RecoveryDiscovery>(unknown_field).is_err());
+    }
+
+    #[test]
+    fn recovery_discovery_reports_a_busy_publication_guard() {
+        let (directory, _path, _workspace, _report) = committed_fixture();
+        let target = PublicationTarget::in_place(directory.path()).expect("publication target");
+        let _guard = CommitGuard::acquire(directory.path()).expect("publication guard");
+
+        let error = target
+            .discover_recoveries(&mut AssetLoadBudget::default())
+            .expect_err("discovery must not race a publication");
+        assert!(matches!(error, RecoveryDiscoveryError::Busy));
     }
 
     #[test]
@@ -5634,6 +6838,7 @@ mod tests {
         let malicious = RecoveryLocator::new(
             report.recovery().root().join("..").join("escape"),
             report.transaction(),
+            report.recovery().root_identity().clone(),
         );
 
         let error = workspace
@@ -5644,5 +6849,72 @@ mod tests {
             Some(RecoveryBlockedReason::InvalidLocator { .. })
         ));
         assert_target_unchanged(&path, &original);
+    }
+
+    #[test]
+    fn replaced_publication_root_is_blocked_before_recovery_namespace_creation() {
+        let parent = tempfile::tempdir().expect("temporary publication parent");
+        let root = parent.path().join("publication-root");
+        let original = parent.path().join("original-publication-root");
+        std::fs::create_dir(&root).expect("publication root");
+        let target = PublicationTarget::in_place(&root).expect("publication target");
+        let transaction = TransactionId::new(DigestV1::hash_bytes(b"replaced recovery root"));
+        let locator = target.recovery_locator(transaction);
+
+        std::fs::rename(&root, &original).expect("move original publication root");
+        std::fs::create_dir(&root).expect("replacement publication root");
+
+        let error = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect_err("replacement publication root must be blocked");
+        assert!(matches!(
+            error.blocked_reason(),
+            Some(RecoveryBlockedReason::InvalidLocator { .. })
+        ));
+        assert!(!root.join(RECOVERY_DIRECTORY).exists());
+        assert!(!original.join(RECOVERY_DIRECTORY).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_replacement_after_recovery_guard_preserves_old_evidence_and_skips_replacement() {
+        let parent = tempfile::tempdir().expect("temporary publication parent");
+        let root = parent.path().join("publication-root");
+        let original = parent.path().join("original-publication-root");
+        fs::create_dir(&root).expect("publication root");
+        let path = root.join(SOURCE_ALIAS);
+        fs::write(&path, YAML).expect("fixture bytes");
+        let locator = crash_locator(&root, &path);
+        run_crash_child(&root, "recovery_baseline_synced", None);
+        let layout = test_layout_from_locator(&locator).expect("recovery layout");
+        let preparation_name = layout
+            .preparation_path()
+            .file_name()
+            .expect("preparation filename")
+            .to_os_string();
+        let transaction_name = layout
+            .directory()
+            .file_name()
+            .expect("transaction filename")
+            .to_os_string();
+        let replacement = root.clone();
+        let moved = original.clone();
+        test_install_recovery_post_guard_hook(locator.root().to_path_buf(), move || {
+            fs::rename(&replacement, &moved).expect("move original publication root");
+            fs::create_dir(&replacement).expect("replacement publication root");
+        });
+
+        let error = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect_err("root replacement after guard must block recovery");
+
+        assert!(matches!(
+            error.blocked_reason(),
+            Some(RecoveryBlockedReason::InvalidLocator { .. })
+        ));
+        assert!(!root.join(RECOVERY_DIRECTORY).exists());
+        let original_v2 = original
+            .join(RECOVERY_DIRECTORY)
+            .join(RECOVERY_VERSION_DIRECTORY);
+        assert!(original_v2.join(preparation_name).is_file());
+        assert!(original_v2.join(transaction_name).is_dir());
     }
 }

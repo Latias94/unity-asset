@@ -9,16 +9,20 @@ use unity_asset_core::{
 };
 
 use super::super::platform::{
-    DirectoryIdentity, FileIdentity, observe_directory_identity, open_readonly_regular_in_parent,
-    opened_file_identity, remove_owned_file_in_parent, sync_directory,
+    DirectoryIdentity, FileIdentity, JournalAccess, open_journal_regular, opened_file_identity,
+    remove_journal_regular, sync_journal_access,
 };
+#[cfg(test)]
+use super::super::platform::{observe_directory_identity, open_readonly_regular_in_parent};
+#[cfg(test)]
+use super::write_encoded_atomic_with_temporary_path_tracked;
 use super::{
     BoundedSequence, JOURNAL_VERSION, JournalArtifact, JournalBaseline, JournalError,
     JournalExpectedDestination, JournalLayout, JournalManifest, JournalTransactionOutputSeed,
     JournalTransactionSeed, MAX_ARTIFACT_COUNT, MAX_MANIFEST_BYTES, budgeted_journal_string,
     encode_json_bounded, journal_budgeted_vec, read_json_bounded_from_file,
     transaction_id_from_seed, validate_event_capacity,
-    write_encoded_atomic_with_temporary_path_tracked,
+    write_encoded_atomic_in_journal_access_tracked,
 };
 use crate::workspace::commit::{CommitAtomicity, CommitReport};
 
@@ -114,6 +118,7 @@ pub(crate) struct JournalPreparation {
     committed_revision: WorkspaceRevision,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
+    containment_root_identity: DirectoryIdentity,
     outputs: Vec<JournalPreparationOutput>,
     baseline: JournalBaseline,
     changes: ChangeSet,
@@ -129,6 +134,7 @@ struct JournalPreparationWire {
     committed_revision: WorkspaceRevision,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
+    containment_root_identity: DirectoryIdentity,
     outputs: BoundedSequence<JournalPreparationOutput, MAX_ARTIFACT_COUNT>,
     baseline: JournalBaseline,
     changes: ChangeSet,
@@ -148,6 +154,7 @@ impl<'de> Deserialize<'de> for JournalPreparation {
             committed_revision: wire.committed_revision,
             plan_digest: wire.plan_digest,
             atomicity: wire.atomicity,
+            containment_root_identity: wire.containment_root_identity,
             outputs: wire.outputs.0,
             baseline: wire.baseline,
             changes: wire.changes,
@@ -165,12 +172,69 @@ struct JournalPreparationRef<'a> {
     committed_revision: WorkspaceRevision,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
+    containment_root_identity: &'a DirectoryIdentity,
     outputs: &'a [JournalPreparationOutput],
     baseline: &'a JournalBaseline,
     changes: &'a ChangeSet,
 }
 
 impl JournalPreparation {
+    pub(crate) fn install_in_access(
+        layout: &JournalLayout,
+        report: &CommitReport,
+        outputs: &[JournalPreparationOutput],
+        baseline: &JournalBaseline,
+        temporary: &Path,
+        access: &JournalAccess<'_>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<OpenedJournalPreparation, JournalPreparationInstallError> {
+        let mut preparation_installed = false;
+        let result = (|| {
+            if report.recovery().root_identity() != layout.root_identity() {
+                return Err(JournalError::InvalidManifest(
+                    "commit report recovery locator does not match the preparation containment root"
+                        .to_owned(),
+                ));
+            }
+            let preparation = JournalPreparationRef {
+                version: JOURNAL_VERSION,
+                transaction: report.transaction(),
+                workspace_id: report.workspace_id(),
+                base_revision: report.base_revision(),
+                committed_revision: report.committed_revision(),
+                plan_digest: report.plan_digest(),
+                atomicity: report.atomicity(),
+                containment_root_identity: layout.root_identity(),
+                outputs,
+                baseline,
+                changes: report.changes(),
+            };
+            validate_parts(preparation, layout.parent(), layout.root_identity(), budget)?;
+            if preparation.transaction != layout.transaction() {
+                return Err(JournalError::TransactionMismatch {
+                    expected: layout.transaction(),
+                    actual: preparation.transaction,
+                });
+            }
+            let path = layout.preparation_path();
+            let bytes = encode_json_bounded(path, &preparation, MAX_MANIFEST_BYTES, budget)?;
+            write_encoded_atomic_in_journal_access_tracked(
+                access,
+                path,
+                &bytes,
+                false,
+                temporary,
+                &mut preparation_installed,
+            )?;
+            Self::open_in_access(layout, access, budget)
+        })();
+        result.map_err(|source| JournalPreparationInstallError {
+            source,
+            preparation_installed,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn install(
         layout: &JournalLayout,
         report: &CommitReport,
@@ -182,6 +246,13 @@ impl JournalPreparation {
     ) -> Result<OpenedJournalPreparation, JournalPreparationInstallError> {
         let mut preparation_installed = false;
         let result = (|| {
+            layout.verify_root_path_binding()?;
+            if report.recovery().root_identity() != layout.root_identity() {
+                return Err(JournalError::InvalidManifest(
+                    "commit report recovery locator does not match the preparation containment root"
+                        .to_owned(),
+                ));
+            }
             let preparation = JournalPreparationRef {
                 version: JOURNAL_VERSION,
                 transaction: report.transaction(),
@@ -190,11 +261,12 @@ impl JournalPreparation {
                 committed_revision: report.committed_revision(),
                 plan_digest: report.plan_digest(),
                 atomicity: report.atomicity(),
+                containment_root_identity: layout.root_identity(),
                 outputs,
                 baseline,
                 changes: report.changes(),
             };
-            validate_parts(preparation, layout.parent(), budget)?;
+            validate_parts(preparation, layout.parent(), layout.root_identity(), budget)?;
             if preparation.transaction != layout.transaction() {
                 return Err(JournalError::TransactionMismatch {
                     expected: layout.transaction(),
@@ -202,16 +274,16 @@ impl JournalPreparation {
                 });
             }
             let path = layout.preparation_path();
-            let bytes = encode_json_bounded(&path, &preparation, MAX_MANIFEST_BYTES, budget)?;
+            let bytes = encode_json_bounded(path, &preparation, MAX_MANIFEST_BYTES, budget)?;
             write_encoded_atomic_with_temporary_path_tracked(
-                &path,
+                path,
                 &bytes,
                 false,
                 temporary,
                 expected_parent,
                 &mut preparation_installed,
             )?;
-            Self::open_path_with_parent(layout, &path, expected_parent, budget)
+            Self::open_path_with_parent(layout, path, expected_parent, budget)
         })();
         result.map_err(|source| JournalPreparationInstallError {
             source,
@@ -219,6 +291,7 @@ impl JournalPreparation {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn open(
         layout: &JournalLayout,
         budget: &mut AssetLoadBudget,
@@ -226,29 +299,38 @@ impl JournalPreparation {
         Self::open_path(layout, layout.preparation_path(), budget)
     }
 
-    pub(crate) fn open_rollback(
+    pub(crate) fn open_in_access(
         layout: &JournalLayout,
+        access: &JournalAccess<'_>,
         budget: &mut AssetLoadBudget,
     ) -> Result<OpenedJournalPreparation, JournalError> {
-        Self::open_path(layout, layout.rollback_path(), budget)
+        Self::open_in_access_path(layout, access, layout.preparation_path(), budget)
     }
 
+    pub(crate) fn open_rollback_in_access(
+        layout: &JournalLayout,
+        access: &JournalAccess<'_>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<OpenedJournalPreparation, JournalError> {
+        Self::open_in_access_path(layout, access, layout.rollback_path(), budget)
+    }
+
+    #[cfg(test)]
     fn open_path(
         layout: &JournalLayout,
-        path: std::path::PathBuf,
+        path: &Path,
         budget: &mut AssetLoadBudget,
     ) -> Result<OpenedJournalPreparation, JournalError> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| JournalError::InvalidPath {
-                path: path.display().to_string(),
-                reason: "preparation state has no version directory",
-            })?
-            .to_owned();
-        let parent_identity = observe_directory_identity(&parent)?;
-        Self::open_path_with_parent(layout, &path, &parent_identity, budget)
+        layout.verify_root_path_binding()?;
+        let parent = path.parent().ok_or_else(|| JournalError::InvalidPath {
+            path: path.display().to_string(),
+            reason: "preparation state has no version directory",
+        })?;
+        let parent_identity = observe_directory_identity(parent)?;
+        Self::open_path_with_parent(layout, path, &parent_identity, budget)
     }
 
+    #[cfg(test)]
     fn open_path_with_parent(
         layout: &JournalLayout,
         path: &Path,
@@ -258,23 +340,39 @@ impl JournalPreparation {
         let file = open_readonly_regular_in_parent(path, parent_identity)?;
         let identity = opened_file_identity(&file)?;
         let document = read_json_bounded_from_file::<Self>(path, file, MAX_MANIFEST_BYTES, budget)?;
-        document.validate(layout.parent(), budget)?;
+        document.validate(layout.parent(), layout.root_identity(), budget)?;
         if document.transaction != layout.transaction() {
             return Err(JournalError::TransactionMismatch {
                 expected: layout.transaction(),
                 actual: document.transaction,
             });
         }
-        Ok(OpenedJournalPreparation {
-            document,
-            identity,
-            parent: parent_identity.clone(),
-        })
+        Ok(OpenedJournalPreparation { document, identity })
+    }
+
+    fn open_in_access_path(
+        layout: &JournalLayout,
+        access: &JournalAccess<'_>,
+        path: &Path,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<OpenedJournalPreparation, JournalError> {
+        let file = open_journal_regular(access, path)?;
+        let identity = opened_file_identity(&file)?;
+        let document = read_json_bounded_from_file::<Self>(path, file, MAX_MANIFEST_BYTES, budget)?;
+        document.validate(layout.parent(), layout.root_identity(), budget)?;
+        if document.transaction != layout.transaction() {
+            return Err(JournalError::TransactionMismatch {
+                expected: layout.transaction(),
+                actual: document.transaction,
+            });
+        }
+        Ok(OpenedJournalPreparation { document, identity })
     }
 
     pub(crate) fn validate(
         &self,
         containment_root: &Path,
+        containment_root_identity: &DirectoryIdentity,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), JournalError> {
         validate_parts(
@@ -286,11 +384,13 @@ impl JournalPreparation {
                 committed_revision: self.committed_revision,
                 plan_digest: self.plan_digest,
                 atomicity: self.atomicity,
+                containment_root_identity: &self.containment_root_identity,
                 outputs: &self.outputs,
                 baseline: &self.baseline,
                 changes: &self.changes,
             },
             containment_root,
+            containment_root_identity,
             budget,
         )
     }
@@ -302,6 +402,7 @@ impl JournalPreparation {
             || self.committed_revision != manifest.committed_revision
             || self.plan_digest != manifest.plan_digest
             || self.atomicity != manifest.atomicity
+            || self.containment_root_identity != manifest.containment_root_identity
             || self.baseline != manifest.baseline
             || self.changes != manifest.result.changes
             || self.outputs.len() != manifest.artifacts.len()
@@ -321,12 +422,13 @@ impl JournalPreparation {
         Ok(())
     }
 
-    pub(crate) fn acknowledge_matching_rollback(
+    pub(crate) fn acknowledge_matching_rollback_in_access(
         layout: &JournalLayout,
         report: &CommitReport,
+        access: &JournalAccess<'_>,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), JournalError> {
-        let rollback = Self::open_rollback(layout, budget)?;
+        let rollback = Self::open_rollback_in_access(layout, access, budget)?;
         let document = rollback.document();
         let report_matches = document.transaction == report.transaction()
             && document.workspace_id == report.workspace_id()
@@ -334,6 +436,7 @@ impl JournalPreparation {
             && document.committed_revision == report.committed_revision()
             && document.plan_digest == report.plan_digest()
             && document.atomicity == report.atomicity()
+            && document.containment_root_identity == *report.recovery().root_identity()
             && document.changes == *report.changes()
             && document.outputs.len() == report.artifacts().len()
             && document
@@ -351,18 +454,8 @@ impl JournalPreparation {
                 "terminal rollback does not match the retried commit report".to_owned(),
             ));
         }
-        remove_owned_file_in_parent(
-            &layout.rollback_path(),
-            rollback.identity(),
-            rollback.parent(),
-        )?;
-        sync_directory(
-            layout
-                .directory()
-                .parent()
-                .expect("validated journal layout has a version directory"),
-        )
-        .map_err(JournalError::Io)
+        remove_journal_regular(access, layout.rollback_path(), rollback.identity())?;
+        sync_journal_access(access).map_err(JournalError::Io)
     }
 
     #[must_use]
@@ -413,6 +506,7 @@ impl JournalPreparationOutput {
 fn validate_parts(
     preparation: JournalPreparationRef<'_>,
     containment_root: &Path,
+    containment_root_identity: &DirectoryIdentity,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), JournalError> {
     let JournalPreparationRef {
@@ -423,12 +517,18 @@ fn validate_parts(
         committed_revision,
         plan_digest,
         atomicity,
+        containment_root_identity: preparation_root_identity,
         outputs,
         baseline,
         changes,
     } = preparation;
     if version != JOURNAL_VERSION {
         return Err(JournalError::UnsupportedVersion(version));
+    }
+    if preparation_root_identity != containment_root_identity {
+        return Err(JournalError::InvalidManifest(
+            "preparation containment root identity does not match its trusted locator".to_owned(),
+        ));
     }
     if outputs.is_empty() || outputs.len() > MAX_ARTIFACT_COUNT {
         return Err(JournalError::InvalidManifest(
@@ -492,6 +592,7 @@ fn validate_parts(
             plan_digest,
             atomicity,
             containment_root,
+            containment_root_identity: preparation_root_identity,
             outputs: &seeds,
             changed_sources: changes.changed_sources(),
             changed_objects: changes.changed_objects(),
@@ -513,7 +614,6 @@ fn validate_parts(
 pub(crate) struct OpenedJournalPreparation {
     document: JournalPreparation,
     identity: FileIdentity,
-    parent: DirectoryIdentity,
 }
 
 impl OpenedJournalPreparation {
@@ -527,19 +627,13 @@ impl OpenedJournalPreparation {
         &self.identity
     }
 
-    #[must_use]
-    pub(crate) const fn parent(&self) -> &DirectoryIdentity {
-        &self.parent
-    }
-
-    pub(crate) fn revalidate(
+    pub(crate) fn revalidate_in_access(
         &self,
         layout: &JournalLayout,
+        access: &JournalAccess<'_>,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), JournalError> {
-        let path = layout.preparation_path();
-        let current =
-            JournalPreparation::open_path_with_parent(layout, &path, &self.parent, budget)?;
+        let current = JournalPreparation::open_in_access(layout, access, budget)?;
         if current.identity != self.identity || current.document != self.document {
             return Err(JournalError::InvalidManifest(
                 "durable preparation record changed during recovery".to_owned(),

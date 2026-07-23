@@ -6,7 +6,9 @@
 //! containment and stable file identity before acting on a stored path.
 
 use std::fmt::{self, Write as _};
-use std::fs::{self, File};
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::path::{Component, Path, PathBuf};
@@ -23,8 +25,15 @@ use unity_asset_core::{
 };
 
 use super::platform::{
-    DirectoryIdentity, FileIdentity, atomic_replace_tracked, create_private_file_in_parent,
-    observe_directory_identity, open_readonly_regular, open_readonly_regular_in_parent,
+    DIRECTORY_VISIT_ENTRY_BYTES, DIRECTORY_VISIT_SETUP_BYTES, DirectoryEntryName,
+    DirectoryIdentity, DirectoryVisitError, FileIdentity, JournalAccess, JournalDirectory,
+    atomic_replace_journal_regular, atomic_replace_journal_regular_in_directory,
+    create_journal_regular, create_journal_regular_in_directory, observe_directory_identity,
+    sync_journal_access, sync_journal_directory,
+};
+#[cfg(test)]
+use super::platform::{
+    atomic_replace_tracked, create_private_file_in_parent, open_readonly_regular_in_parent,
 };
 use super::{CommitArtifactReport, CommitAtomicity, CommitReport, RecoveryLocator};
 
@@ -34,7 +43,7 @@ pub(crate) use preparation::{
     JournalPreparation, JournalPreparationOutput, OpenedJournalPreparation,
 };
 
-pub(crate) const JOURNAL_VERSION: u8 = 2;
+pub(crate) const JOURNAL_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +75,7 @@ pub(crate) struct JournalTransactionSeed<'a> {
     pub(crate) plan_digest: DigestV1,
     pub(crate) atomicity: CommitAtomicity,
     pub(crate) containment_root: &'a str,
+    pub(crate) containment_root_identity: &'a DirectoryIdentity,
     pub(crate) outputs: &'a [JournalTransactionOutputSeed<'a>],
     pub(crate) changed_sources: &'a [SourceId],
     pub(crate) changed_objects: &'a [ObjectId],
@@ -137,6 +147,8 @@ impl Write for DigestWriter<'_> {
 
 pub(crate) const RECOVERY_DIRECTORY: &str = ".unity-asset-recovery";
 pub(crate) const RECOVERY_VERSION_DIRECTORY: &str = "v2";
+const RECOVERY_DIGEST_PREFIX: &[u8] = b"blake3-v1:";
+pub(crate) const RECOVERY_TRANSACTION_SLUG_BYTES: usize = DigestV1::BYTE_LEN * 2;
 const MANIFEST_FILE: &str = "manifest.v2.json";
 const PREPARATION_SUFFIX: &str = "prepare.v2.json";
 const PREPARATION_TEMPORARY_SUFFIX: &str = "prepare.v2.tmp";
@@ -159,6 +171,63 @@ const PARSER_FIXED_WORK_BYTES: u64 = 4 * 1024;
 const EXISTING_TARGET_EVENT_COUNT: usize = 4;
 const ABSENT_TARGET_EVENT_COUNT: usize = 2;
 const TRANSACTION_EVENT_RESERVE: usize = 6;
+
+/// Canonical v2 transaction evidence named directly in the recovery version
+/// directory. The parser is intentionally shared by discovery and layout
+/// validation so accepted slugs cannot drift between those boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryEvidenceName {
+    Transaction(TransactionId),
+    Preparation(TransactionId),
+    Rollback(TransactionId),
+    PreparationTemporary(TransactionId),
+}
+
+impl RecoveryEvidenceName {
+    #[must_use]
+    pub(crate) const fn transaction(self) -> TransactionId {
+        match self {
+            Self::Transaction(transaction)
+            | Self::Preparation(transaction)
+            | Self::Rollback(transaction)
+            | Self::PreparationTemporary(transaction) => transaction,
+        }
+    }
+}
+
+/// Parses only the four v2 names which can identify a recoverable
+/// transaction. Unknown and noncanonical names deliberately return `None`.
+#[must_use]
+pub(crate) fn parse_recovery_evidence_name(name: &str) -> Option<RecoveryEvidenceName> {
+    if let Some(transaction) = transaction_from_recovery_slug(name) {
+        return Some(RecoveryEvidenceName::Transaction(transaction));
+    }
+    if let Some(slug) = name.strip_suffix(".prepare.v2.json") {
+        return transaction_from_recovery_slug(slug).map(RecoveryEvidenceName::Preparation);
+    }
+    if let Some(slug) = name.strip_suffix(".rollback.v2.json") {
+        return transaction_from_recovery_slug(slug).map(RecoveryEvidenceName::Rollback);
+    }
+    name.strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".prepare.v2.tmp"))
+        .and_then(transaction_from_recovery_slug)
+        .map(RecoveryEvidenceName::PreparationTemporary)
+}
+
+fn transaction_from_recovery_slug(slug: &str) -> Option<TransactionId> {
+    if slug.len() != RECOVERY_TRANSACTION_SLUG_BYTES
+        || !slug
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut wire = [0_u8; RECOVERY_DIGEST_PREFIX.len() + RECOVERY_TRANSACTION_SLUG_BYTES];
+    wire[..RECOVERY_DIGEST_PREFIX.len()].copy_from_slice(RECOVERY_DIGEST_PREFIX);
+    wire[RECOVERY_DIGEST_PREFIX.len()..].copy_from_slice(slug.as_bytes());
+    let digest = std::str::from_utf8(&wire).ok()?.parse::<DigestV1>().ok()?;
+    Some(TransactionId::new(digest))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct BoundedSequence<T, const MAX: usize>(Vec<T>);
@@ -264,14 +333,19 @@ impl JournalPath {
         &self.0
     }
 
-    #[must_use]
-    pub(crate) fn as_path(&self) -> PathBuf {
-        PathBuf::from(&self.0)
+    pub(crate) fn join_root_budgeted(
+        &self,
+        root: &Path,
+        resource: &'static str,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<PathBuf, JournalError> {
+        budgeted_journal_join(root, self.as_str(), resource, budget)
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn join_root(&self, root: &Path) -> PathBuf {
-        root.join(self.as_path())
+        root.join(Path::new(self.as_str()))
     }
 }
 
@@ -478,19 +552,11 @@ impl JournalDirectoryIdentities {
     pub(crate) fn observe(layout: &JournalLayout) -> Result<Self, JournalError> {
         Ok(Self::new(
             observe_directory_identity(layout.directory())?,
-            observe_directory_identity(&layout.events_directory())?,
-            observe_directory_identity(&layout.stage_directory())?,
-            observe_directory_identity(&layout.backup_directory())?,
-            observe_directory_identity(&layout.baseline_directory())?,
+            observe_directory_identity(layout.events_directory())?,
+            observe_directory_identity(layout.stage_directory())?,
+            observe_directory_identity(layout.backup_directory())?,
+            observe_directory_identity(layout.baseline_directory())?,
         ))
-    }
-
-    fn validate(&self, layout: &JournalLayout) -> Result<(), JournalError> {
-        validate_directory_identity(layout.directory(), &self.transaction, "transaction")?;
-        validate_directory_identity(&layout.events_directory(), &self.events, "events")?;
-        validate_directory_identity(&layout.stage_directory(), &self.stage, "stage")?;
-        validate_directory_identity(&layout.backup_directory(), &self.backup, "backup")?;
-        validate_directory_identity(&layout.baseline_directory(), &self.baseline, "baseline")
     }
 
     #[must_use]
@@ -896,7 +962,11 @@ impl JournalResult {
         })
     }
 
-    pub(crate) fn into_report(self, root: PathBuf) -> Result<CommitReport, JournalError> {
+    pub(crate) fn into_report(
+        self,
+        root: PathBuf,
+        root_identity: DirectoryIdentity,
+    ) -> Result<CommitReport, JournalError> {
         let report = CommitReport::new(
             self.transaction,
             self.workspace_id,
@@ -906,7 +976,7 @@ impl JournalResult {
             self.atomicity,
             self.artifacts,
             self.changes,
-            RecoveryLocator::new(root, self.transaction),
+            RecoveryLocator::new(root, self.transaction, root_identity),
         );
         report
             .validate()
@@ -949,6 +1019,7 @@ pub(crate) struct JournalManifest {
     committed_revision: WorkspaceRevision,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
+    containment_root_identity: DirectoryIdentity,
     directories: JournalDirectoryIdentities,
     artifacts: Vec<JournalArtifact>,
     baseline: JournalBaseline,
@@ -965,6 +1036,7 @@ struct JournalManifestWire {
     committed_revision: WorkspaceRevision,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
+    containment_root_identity: DirectoryIdentity,
     directories: JournalDirectoryIdentities,
     artifacts: BoundedSequence<JournalArtifact, MAX_ARTIFACT_COUNT>,
     baseline: JournalBaseline,
@@ -985,6 +1057,7 @@ impl<'de> Deserialize<'de> for JournalManifest {
             committed_revision: wire.committed_revision,
             plan_digest: wire.plan_digest,
             atomicity: wire.atomicity,
+            containment_root_identity: wire.containment_root_identity,
             directories: wire.directories,
             artifacts: wire.artifacts.0,
             baseline: wire.baseline,
@@ -996,11 +1069,18 @@ impl<'de> Deserialize<'de> for JournalManifest {
 impl JournalManifest {
     pub(crate) fn new(
         report: &CommitReport,
+        containment_root_identity: DirectoryIdentity,
         directories: JournalDirectoryIdentities,
         artifacts: Vec<JournalArtifact>,
         baseline: JournalBaseline,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, JournalError> {
+        if report.recovery().root_identity() != &containment_root_identity {
+            return Err(JournalError::InvalidManifest(
+                "commit report recovery locator does not match the journal containment root"
+                    .to_owned(),
+            ));
+        }
         let manifest = Self {
             version: JOURNAL_VERSION,
             transaction: report.transaction(),
@@ -1009,6 +1089,7 @@ impl JournalManifest {
             committed_revision: report.committed_revision(),
             plan_digest: report.plan_digest(),
             atomicity: report.atomicity(),
+            containment_root_identity,
             directories,
             artifacts,
             baseline,
@@ -1109,8 +1190,14 @@ impl JournalManifest {
     pub(crate) fn validate_transaction_identity(
         &self,
         containment_root: &Path,
+        containment_root_identity: &DirectoryIdentity,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), JournalError> {
+        if &self.containment_root_identity != containment_root_identity {
+            return Err(JournalError::InvalidManifest(
+                "journal containment root identity does not match its trusted locator".to_owned(),
+            ));
+        }
         let containment_root = containment_root.to_str().ok_or_else(|| {
             JournalError::InvalidManifest(
                 "transaction containment root is not valid UTF-8".to_owned(),
@@ -1153,6 +1240,7 @@ impl JournalManifest {
                 plan_digest: self.plan_digest,
                 atomicity: self.atomicity,
                 containment_root,
+                containment_root_identity,
                 outputs: &outputs,
                 changed_sources: self.result.changes.changed_sources(),
                 changed_objects: self.result.changes.changed_objects(),
@@ -1212,8 +1300,14 @@ impl JournalManifest {
     pub(crate) fn report(
         &self,
         root: &Path,
+        root_identity: &DirectoryIdentity,
         budget: &mut AssetLoadBudget,
     ) -> Result<CommitReport, JournalError> {
+        if &self.containment_root_identity != root_identity {
+            return Err(JournalError::InvalidManifest(
+                "journal report root identity does not match its manifest".to_owned(),
+            ));
+        }
         let result = JournalResult {
             version: self.result.version,
             transaction: self.result.transaction,
@@ -1225,11 +1319,10 @@ impl JournalManifest {
             artifacts: clone_artifact_reports(&self.result.artifacts, budget)?,
             changes: clone_change_set(&self.result.changes, budget)?,
         };
-        result.into_report(budgeted_journal_path(
-            root,
-            "journal report recovery path",
-            budget,
-        )?)
+        result.into_report(
+            budgeted_journal_path(root, "journal report recovery path", budget)?,
+            root_identity.clone(),
+        )
     }
 }
 
@@ -1378,6 +1471,44 @@ fn budgeted_journal_join(
     budget.check_bytes(actual)?;
     budget.consume_bytes(actual)?;
     Ok(path)
+}
+
+fn visit_opened_journal_directory(
+    directory: &JournalDirectory,
+    budget: &mut AssetLoadBudget,
+    visitor: impl FnMut(&mut AssetLoadBudget, DirectoryEntryName<'_>) -> Result<(), JournalError>,
+) -> Result<(), JournalError> {
+    budget.consume_bytes(DIRECTORY_VISIT_SETUP_BYTES)?;
+    match super::platform::visit_journal_directory_entries(
+        directory,
+        budget,
+        |budget| {
+            budget.consume_bytes(DIRECTORY_VISIT_ENTRY_BYTES)?;
+            Ok(())
+        },
+        visitor,
+    ) {
+        Ok(()) => Ok(()),
+        Err(DirectoryVisitError::Visitor(error)) => Err(error),
+        Err(DirectoryVisitError::Io(error)) => Err(JournalError::Io(error)),
+    }
+}
+
+fn journal_entry_name<'a>(
+    entry: DirectoryEntryName<'_>,
+    scratch: &'a mut [u8; EVENT_TEMPORARY_FILENAME_BYTES],
+) -> Result<Option<&'a str>, JournalError> {
+    let length = entry.copy_ascii_into(scratch).ok_or_else(|| {
+        JournalError::InvalidEvent("event directory entry name is not canonical ASCII".to_owned())
+    })?;
+    let name = std::str::from_utf8(&scratch[..length]).map_err(|_| {
+        JournalError::InvalidEvent("event directory entry name is not canonical ASCII".to_owned())
+    })?;
+    if matches!(name, "." | "..") {
+        Ok(None)
+    } else {
+        Ok(Some(name))
+    }
 }
 
 fn clone_artifact_reports(
@@ -1721,27 +1852,162 @@ impl EventChain {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct JournalLayout {
     parent: PathBuf,
+    root_identity: DirectoryIdentity,
     transaction: TransactionId,
     directory: PathBuf,
+    manifest: PathBuf,
+    preparation: PathBuf,
+    preparation_temporary: PathBuf,
+    rollback: PathBuf,
+    events: PathBuf,
+    stage: PathBuf,
+    backup: PathBuf,
+    baseline: PathBuf,
 }
 
 impl JournalLayout {
-    pub(crate) fn new(parent: impl Into<PathBuf>, transaction: TransactionId) -> Self {
+    pub(crate) fn new(
+        parent: impl Into<PathBuf>,
+        transaction: TransactionId,
+        root_identity: DirectoryIdentity,
+    ) -> Self {
         let parent = parent.into();
-        let digest = transaction.digest().to_string();
-        let slug = digest.strip_prefix("blake3-v1:").unwrap_or(&digest);
-        let directory = parent
-            .join(RECOVERY_DIRECTORY)
-            .join(RECOVERY_VERSION_DIRECTORY)
-            .join(slug);
+        let slug = transaction_slug(transaction);
+        let slug = std::str::from_utf8(&slug).expect("transaction digest hex is valid UTF-8");
+        let recovery = parent.join(RECOVERY_DIRECTORY);
+        let version = recovery.join(RECOVERY_VERSION_DIRECTORY);
+        let directory = version.join(slug);
+        let manifest = directory.join(MANIFEST_FILE);
+        let preparation = version.join(journal_suffixed_filename(slug, PREPARATION_SUFFIX));
+        let preparation_temporary = version.join(journal_prefixed_suffixed_filename(
+            ".",
+            slug,
+            PREPARATION_TEMPORARY_SUFFIX,
+        ));
+        let rollback = version.join(journal_suffixed_filename(slug, ROLLBACK_SUFFIX));
+        let events = directory.join(EVENTS_DIRECTORY);
+        let stage = directory.join(STAGE_DIRECTORY);
+        let backup = directory.join(BACKUP_DIRECTORY);
+        let baseline = directory.join(BASELINE_DIRECTORY);
         Self {
             parent,
+            root_identity,
             transaction,
             directory,
+            manifest,
+            preparation,
+            preparation_temporary,
+            rollback,
+            events,
+            stage,
+            backup,
+            baseline,
         }
+    }
+
+    pub(crate) fn new_budgeted(
+        parent: &Path,
+        transaction: TransactionId,
+        root_identity: DirectoryIdentity,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, JournalError> {
+        let parent = budgeted_journal_path(parent, "journal layout parent path", budget)?;
+        let slug = transaction_slug(transaction);
+        let slug = std::str::from_utf8(&slug).expect("transaction digest hex is valid UTF-8");
+        let recovery = budgeted_journal_join(
+            &parent,
+            RECOVERY_DIRECTORY,
+            "journal recovery namespace path",
+            budget,
+        )?;
+        let version = budgeted_journal_join(
+            &recovery,
+            RECOVERY_VERSION_DIRECTORY,
+            "journal recovery version path",
+            budget,
+        )?;
+        let directory =
+            budgeted_journal_join(&version, slug, "journal transaction directory path", budget)?;
+        let manifest =
+            budgeted_journal_join(&directory, MANIFEST_FILE, "journal manifest path", budget)?;
+        let preparation_name = budgeted_journal_suffixed_filename(
+            "",
+            slug,
+            PREPARATION_SUFFIX,
+            "journal preparation filename",
+            budget,
+        )?;
+        let preparation = budgeted_journal_join(
+            &version,
+            &preparation_name,
+            "journal preparation path",
+            budget,
+        )?;
+        let preparation_temporary_name = budgeted_journal_suffixed_filename(
+            ".",
+            slug,
+            PREPARATION_TEMPORARY_SUFFIX,
+            "journal preparation temporary filename",
+            budget,
+        )?;
+        let preparation_temporary = budgeted_journal_join(
+            &version,
+            &preparation_temporary_name,
+            "journal preparation temporary path",
+            budget,
+        )?;
+        let rollback_name = budgeted_journal_suffixed_filename(
+            "",
+            slug,
+            ROLLBACK_SUFFIX,
+            "journal rollback filename",
+            budget,
+        )?;
+        let rollback =
+            budgeted_journal_join(&version, &rollback_name, "journal rollback path", budget)?;
+        let events = budgeted_journal_join(
+            &directory,
+            EVENTS_DIRECTORY,
+            "journal event directory path",
+            budget,
+        )?;
+        let stage = budgeted_journal_join(
+            &directory,
+            STAGE_DIRECTORY,
+            "journal stage directory path",
+            budget,
+        )?;
+        let backup = budgeted_journal_join(
+            &directory,
+            BACKUP_DIRECTORY,
+            "journal backup directory path",
+            budget,
+        )?;
+        let baseline = budgeted_journal_join(
+            &directory,
+            BASELINE_DIRECTORY,
+            "journal baseline directory path",
+            budget,
+        )?;
+
+        Ok(Self {
+            parent,
+            root_identity,
+            transaction,
+            directory,
+            manifest,
+            preparation,
+            preparation_temporary,
+            rollback,
+            events,
+            stage,
+            backup,
+            baseline,
+        })
     }
 
     #[must_use]
@@ -1749,9 +2015,34 @@ impl JournalLayout {
         &self.parent
     }
 
+    /// Rejects a pathname that was rebound after this transaction acquired its
+    /// publication root. Callers use this only as an early stop; every write
+    /// still carries the identity of its immediate opened parent.
+    pub(crate) fn verify_root_path_binding(&self) -> io::Result<()> {
+        if observe_directory_identity(&self.parent)? != self.root_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "publication root identity changed during journal operation",
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) const fn root_identity(&self) -> &DirectoryIdentity {
+        &self.root_identity
+    }
+
     #[must_use]
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    pub(crate) fn directory_path_budgeted(
+        &self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<PathBuf, JournalError> {
+        budgeted_journal_path(&self.directory, "journal recovery locator path", budget)
     }
 
     #[must_use]
@@ -1760,56 +2051,84 @@ impl JournalLayout {
     }
 
     #[must_use]
-    pub(crate) fn manifest_path(&self) -> PathBuf {
-        self.directory.join(MANIFEST_FILE)
+    pub(crate) fn manifest_path(&self) -> &Path {
+        &self.manifest
     }
 
     #[must_use]
-    pub(crate) fn preparation_path(&self) -> PathBuf {
-        let mut path = self.directory.clone();
-        path.set_extension(PREPARATION_SUFFIX);
-        path
+    pub(crate) fn preparation_path(&self) -> &Path {
+        &self.preparation
     }
 
     #[must_use]
-    pub(crate) fn preparation_temporary_path(&self) -> PathBuf {
-        let slug = self
-            .directory
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("transaction digest slug is canonical UTF-8");
-        self.directory
-            .parent()
-            .expect("journal layout has a version directory")
-            .join(format!(".{slug}.{PREPARATION_TEMPORARY_SUFFIX}"))
+    pub(crate) fn preparation_temporary_path(&self) -> &Path {
+        &self.preparation_temporary
     }
 
     #[must_use]
-    pub(crate) fn rollback_path(&self) -> PathBuf {
-        let mut path = self.directory.clone();
-        path.set_extension(ROLLBACK_SUFFIX);
-        path
+    pub(crate) fn rollback_path(&self) -> &Path {
+        &self.rollback
     }
 
     #[must_use]
-    pub(crate) fn events_directory(&self) -> PathBuf {
-        self.directory.join(EVENTS_DIRECTORY)
+    pub(crate) fn events_directory(&self) -> &Path {
+        &self.events
     }
 
     #[must_use]
-    pub(crate) fn stage_directory(&self) -> PathBuf {
-        self.directory.join(STAGE_DIRECTORY)
+    pub(crate) fn stage_directory(&self) -> &Path {
+        &self.stage
     }
 
     #[must_use]
-    pub(crate) fn backup_directory(&self) -> PathBuf {
-        self.directory.join(BACKUP_DIRECTORY)
+    pub(crate) fn backup_directory(&self) -> &Path {
+        &self.backup
     }
 
     #[must_use]
-    pub(crate) fn baseline_directory(&self) -> PathBuf {
-        self.directory.join(BASELINE_DIRECTORY)
+    pub(crate) fn baseline_directory(&self) -> &Path {
+        &self.baseline
     }
+}
+
+fn transaction_slug(transaction: TransactionId) -> [u8; DigestV1::BYTE_LEN * 2] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut slug = [0_u8; DigestV1::BYTE_LEN * 2];
+    for (index, byte) in transaction.digest().as_bytes().iter().copied().enumerate() {
+        slug[index * 2] = HEX[usize::from(byte >> 4)];
+        slug[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
+    }
+    slug
+}
+
+fn journal_suffixed_filename(slug: &str, suffix: &str) -> String {
+    journal_prefixed_suffixed_filename("", slug, suffix)
+}
+
+fn journal_prefixed_suffixed_filename(prefix: &str, slug: &str, suffix: &str) -> String {
+    format!("{prefix}{slug}.{suffix}")
+}
+
+fn budgeted_journal_suffixed_filename(
+    prefix: &str,
+    slug: &str,
+    suffix: &str,
+    resource: &'static str,
+    budget: &mut AssetLoadBudget,
+) -> Result<String, JournalError> {
+    let requested = prefix
+        .len()
+        .checked_add(slug.len())
+        .and_then(|length| length.checked_add(1))
+        .and_then(|length| length.checked_add(suffix.len()))
+        .ok_or(BudgetError::ArithmeticOverflow { resource })?;
+    let mut name = budgeted_empty_journal_string(requested, resource, budget)?;
+    name.push_str(prefix);
+    name.push_str(slug);
+    name.push('.');
+    name.push_str(suffix);
+    Ok(name)
 }
 
 #[derive(Debug)]
@@ -1817,7 +2136,20 @@ pub(crate) struct Journal {
     layout: JournalLayout,
     manifest: JournalManifest,
     chain: EventChain,
+    _transaction_directory: JournalDirectory,
+    events_directory: JournalDirectory,
+    stage_directory: JournalDirectory,
+    backup_directory: JournalDirectory,
+    _baseline_directory: JournalDirectory,
     next_temporary_attempt: u32,
+}
+
+struct OpenedJournalDirectories {
+    transaction: JournalDirectory,
+    events: JournalDirectory,
+    stage: JournalDirectory,
+    backup: JournalDirectory,
+    baseline: JournalDirectory,
 }
 
 struct PreparedJournalEvent {
@@ -1859,8 +2191,9 @@ impl JournalEventPlan {
 #[derive(Debug, Error)]
 #[error("{source}")]
 pub(crate) struct JournalCreateError {
+    layout: Box<JournalLayout>,
     #[source]
-    source: JournalError,
+    source: Box<JournalError>,
     manifest_installed: bool,
 }
 
@@ -1870,14 +2203,67 @@ impl JournalCreateError {
         self.manifest_installed
     }
 
-    pub(crate) fn into_source(self) -> JournalError {
-        self.source
+    pub(crate) fn into_parts(self) -> (JournalLayout, JournalError) {
+        (*self.layout, *self.source)
     }
 
     #[cfg(test)]
-    pub(crate) const fn journal_error(&self) -> &JournalError {
-        &self.source
+    pub(crate) fn journal_error(&self) -> &JournalError {
+        self.source.as_ref()
     }
+}
+
+fn open_journal_directories(
+    access: &JournalAccess<'_>,
+    layout: &JournalLayout,
+    manifest: &JournalManifest,
+) -> Result<OpenedJournalDirectories, JournalError> {
+    let transaction = super::platform::open_journal_directory(access, layout.directory())?;
+    validate_opened_journal_directory(
+        &transaction,
+        manifest.directories.transaction(),
+        "transaction",
+    )?;
+    let events = super::platform::open_journal_directory_in_directory(
+        &transaction,
+        layout.events_directory(),
+    )?;
+    validate_opened_journal_directory(&events, manifest.directories.events(), "events")?;
+    let stage = super::platform::open_journal_directory_in_directory(
+        &transaction,
+        layout.stage_directory(),
+    )?;
+    validate_opened_journal_directory(&stage, manifest.directories.stage(), "stage")?;
+    let backup = super::platform::open_journal_directory_in_directory(
+        &transaction,
+        layout.backup_directory(),
+    )?;
+    validate_opened_journal_directory(&backup, manifest.directories.backup(), "backup")?;
+    let baseline = super::platform::open_journal_directory_in_directory(
+        &transaction,
+        layout.baseline_directory(),
+    )?;
+    validate_opened_journal_directory(&baseline, manifest.directories.baseline(), "baseline")?;
+    Ok(OpenedJournalDirectories {
+        transaction,
+        events,
+        stage,
+        backup,
+        baseline,
+    })
+}
+
+fn validate_opened_journal_directory(
+    directory: &JournalDirectory,
+    expected: &DirectoryIdentity,
+    role: &'static str,
+) -> Result<(), JournalError> {
+    if super::platform::journal_directory_identity(directory)? != *expected {
+        return Err(JournalError::InvalidManifest(format!(
+            "opened {role} directory does not match the journal manifest"
+        )));
+    }
+    Ok(())
 }
 
 impl Journal {
@@ -1892,20 +2278,49 @@ impl Journal {
         Ok(journal)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_planned(
         layout: JournalLayout,
         manifest: JournalManifest,
         event_keys: &[JournalEventKey],
         budget: &mut AssetLoadBudget,
     ) -> Result<(Self, JournalEventPlan), JournalCreateError> {
+        let root = super::platform::open_commit_root(layout.parent(), layout.root_identity())
+            .map_err(|source| JournalCreateError {
+                layout: Box::new(layout.clone()),
+                source: Box::new(JournalError::Io(source)),
+                manifest_installed: false,
+            })?;
+        let namespace = super::platform::open_journal_namespace(&root).map_err(|source| {
+            JournalCreateError {
+                layout: Box::new(layout.clone()),
+                source: Box::new(JournalError::Io(source)),
+                manifest_installed: false,
+            }
+        })?;
+        let access = super::platform::journal_access(&root, &namespace);
+        Self::create_planned_in_access(layout, manifest, event_keys, &access, budget)
+    }
+
+    pub(crate) fn create_planned_in_access(
+        layout: JournalLayout,
+        manifest: JournalManifest,
+        event_keys: &[JournalEventKey],
+        access: &JournalAccess<'_>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<(Self, JournalEventPlan), JournalCreateError> {
         let mut manifest_installed = false;
         let result = (|| {
             manifest.validate()?;
-            manifest.validate_transaction_identity(layout.parent(), budget)?;
-            JournalPreparation::open(&layout, budget)?
+            manifest.validate_transaction_identity(
+                layout.parent(),
+                layout.root_identity(),
+                budget,
+            )?;
+            JournalPreparation::open_in_access(&layout, access, budget)?
                 .document()
                 .validate_manifest(&manifest)?;
-            manifest.directories.validate(&layout)?;
+            let directories = open_journal_directories(access, &layout, &manifest)?;
             let chain = EventChain {
                 events: journal_budgeted_vec(
                     manifest.event_capacity()?,
@@ -1913,123 +2328,152 @@ impl Journal {
                     budget,
                 )?,
             };
-            let manifest_path = budgeted_journal_join(
-                layout.directory(),
-                MANIFEST_FILE,
-                "journal manifest path",
-                budget,
-            )?;
             let manifest_temporary = budgeted_journal_join(
                 layout.directory(),
                 MANIFEST_TEMPORARY_FILE,
                 "journal manifest temporary path",
                 budget,
             )?;
-            let manifest_bytes =
-                encode_json_bounded(&manifest_path, &manifest, MAX_MANIFEST_BYTES, budget)?;
-            let journal = Self {
-                layout,
-                manifest,
-                chain,
-                next_temporary_attempt: 0,
-            };
-            let event_plan = journal.plan_events(event_keys, budget)?;
-            write_encoded_atomic_with_temporary_path_tracked(
-                &manifest_path,
+            let manifest_bytes = encode_json_bounded(
+                layout.manifest_path(),
+                &manifest,
+                MAX_MANIFEST_BYTES,
+                budget,
+            )?;
+            let event_plan =
+                Self::plan_events_for(&layout, &manifest, &chain, 0, event_keys, budget)?;
+            write_encoded_atomic_in_journal_directory_tracked(
+                &directories.transaction,
+                layout.manifest_path(),
                 &manifest_bytes,
                 false,
                 &manifest_temporary,
-                journal.manifest.directories.transaction(),
                 &mut manifest_installed,
             )?;
-            Ok::<(Self, JournalEventPlan), JournalError>((journal, event_plan))
+            Ok::<(EventChain, JournalEventPlan, OpenedJournalDirectories), JournalError>((
+                chain,
+                event_plan,
+                directories,
+            ))
         })();
-        result.map_err(|source| JournalCreateError {
-            source,
-            manifest_installed,
-        })
+        match result {
+            Ok((chain, event_plan, directories)) => Ok((
+                Self {
+                    layout,
+                    manifest,
+                    chain,
+                    _transaction_directory: directories.transaction,
+                    events_directory: directories.events,
+                    stage_directory: directories.stage,
+                    backup_directory: directories.backup,
+                    _baseline_directory: directories.baseline,
+                    next_temporary_attempt: 0,
+                },
+                event_plan,
+            )),
+            Err(source) => Err(JournalCreateError {
+                layout: Box::new(layout),
+                source: Box::new(source),
+                manifest_installed,
+            }),
+        }
     }
 
+    #[cfg(test)]
     pub(crate) fn open(
         layout: JournalLayout,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, JournalError> {
-        let manifest: JournalManifest =
-            read_json_bounded(&layout.manifest_path(), MAX_MANIFEST_BYTES, budget)?;
+        let root = super::platform::open_commit_root(layout.parent(), layout.root_identity())?;
+        let namespace = super::platform::open_journal_namespace(&root)?;
+        let access = super::platform::journal_access(&root, &namespace);
+        Self::open_in_access(layout, &access, budget)
+    }
+
+    pub(crate) fn open_in_access(
+        layout: JournalLayout,
+        access: &JournalAccess<'_>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, JournalError> {
+        let transaction = super::platform::open_journal_directory(access, layout.directory())?;
+        let manifest = read_json_bounded_from_file(
+            layout.manifest_path(),
+            super::platform::open_journal_regular_in_directory(
+                &transaction,
+                layout.manifest_path(),
+            )?,
+            MAX_MANIFEST_BYTES,
+            budget,
+        )?;
+        let preparation = JournalPreparation::open_in_access(&layout, access, budget)?;
+        Self::open_loaded_in_access(layout, manifest, preparation, access, budget)
+    }
+
+    fn open_loaded_in_access(
+        layout: JournalLayout,
+        manifest: JournalManifest,
+        preparation: OpenedJournalPreparation,
+        access: &JournalAccess<'_>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, JournalError> {
         manifest.validate()?;
-        manifest.validate_transaction_identity(layout.parent(), budget)?;
-        JournalPreparation::open(&layout, budget)?
-            .document()
-            .validate_manifest(&manifest)?;
+        manifest.validate_transaction_identity(layout.parent(), layout.root_identity(), budget)?;
+        preparation.document().validate_manifest(&manifest)?;
         if manifest.transaction() != layout.transaction {
             return Err(JournalError::TransactionMismatch {
                 expected: layout.transaction,
                 actual: manifest.transaction(),
             });
         }
-        manifest.directories.validate(&layout)?;
+        let directories = open_journal_directories(access, &layout, &manifest)?;
         let mut events =
             journal_budgeted_vec(manifest.event_capacity()?, "journal event chain", budget)?;
         let mut maximum_temporary = None;
         let mut directory_entries = 0_usize;
-        let events_directory = layout.events_directory();
-        match fs::symlink_metadata(&events_directory) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+        let mut scratch = [0_u8; EVENT_TEMPORARY_FILENAME_BYTES];
+        visit_opened_journal_directory(&directories.events, budget, |budget, entry| {
+            let Some(name) = journal_entry_name(entry, &mut scratch)? else {
+                return Ok(());
+            };
+            directory_entries = directory_entries.checked_add(1).ok_or_else(|| {
+                JournalError::InvalidEvent("event directory entry count overflow".to_owned())
+            })?;
+            if directory_entries > MAX_EVENT_COUNT {
+                return Err(JournalError::TooManyEvents(directory_entries));
+            }
+            budget.consume_entries(1)?;
+            let path = budgeted_journal_join(
+                layout.events_directory(),
+                name,
+                "journal event entry path",
+                budget,
+            )?;
+            if name.starts_with('.') && name.ends_with(".tmp") {
+                super::platform::open_journal_regular_in_directory(&directories.events, &path)?;
+                let temporary = parse_event_temporary_filename(name)?;
+                if maximum_temporary.is_none_or(|current| temporary > current) {
+                    maximum_temporary = Some(temporary);
+                }
+                return Ok(());
+            }
+            let (sequence, digest) = parse_event_filename(name)?;
+            let event: JournalEvent = read_json_bounded_from_file(
+                &path,
+                super::platform::open_journal_regular_in_directory(&directories.events, &path)?,
+                MAX_EVENT_BYTES,
+                budget,
+            )?;
+            if event.sequence() != sequence || event.digest() != digest {
                 return Err(JournalError::InvalidEvent(
-                    "event directory is not a non-symlink directory".to_owned(),
+                    "event filename does not match its record".to_owned(),
                 ));
             }
-            Ok(_) => {
-                for entry in fs::read_dir(&events_directory)? {
-                    directory_entries = directory_entries.checked_add(1).ok_or_else(|| {
-                        JournalError::InvalidEvent(
-                            "event directory entry count overflow".to_owned(),
-                        )
-                    })?;
-                    if directory_entries > MAX_EVENT_COUNT {
-                        return Err(JournalError::TooManyEvents(directory_entries));
-                    }
-                    budget.consume_entries(1)?;
-                    let entry = entry?;
-                    if !entry.file_type()?.is_file() {
-                        return Err(JournalError::InvalidEvent(
-                            "event directory contains a non-file entry".to_owned(),
-                        ));
-                    }
-                    let name = entry.file_name();
-                    let name = name.to_str().ok_or_else(|| {
-                        JournalError::InvalidEvent(
-                            "event directory entry name is not valid UTF-8".to_owned(),
-                        )
-                    })?;
-                    if name.starts_with('.') && name.ends_with(".tmp") {
-                        let temporary = parse_event_temporary_filename(name)?;
-                        if maximum_temporary.is_none_or(|current| temporary > current) {
-                            maximum_temporary = Some(temporary);
-                        }
-                        continue;
-                    }
-                    let (sequence, digest) = parse_event_filename(name)?;
-                    let event: JournalEvent = read_json_bounded_in_parent(
-                        &entry.path(),
-                        manifest.directories().events(),
-                        MAX_EVENT_BYTES,
-                        budget,
-                    )?;
-                    if event.sequence() != sequence || event.digest() != digest {
-                        return Err(JournalError::InvalidEvent(
-                            "event filename does not match its record".to_owned(),
-                        ));
-                    }
-                    if events.len() == events.capacity() {
-                        journal_reserve_one(&mut events, "journal event chain growth", budget)?;
-                    }
-                    events.push(event);
-                }
+            if events.len() == events.capacity() {
+                journal_reserve_one(&mut events, "journal event chain growth", budget)?;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(JournalError::Io(error)),
-        }
+            events.push(event);
+            Ok(())
+        })?;
         events.sort_by_key(JournalEvent::sequence);
         let chain = EventChain::from_events(events, budget)?;
         let expected = u64::try_from(chain.events().len())
@@ -2055,6 +2499,11 @@ impl Journal {
             layout,
             manifest,
             chain,
+            _transaction_directory: directories.transaction,
+            events_directory: directories.events,
+            stage_directory: directories.stage,
+            backup_directory: directories.backup,
+            _baseline_directory: directories.baseline,
             next_temporary_attempt,
         })
     }
@@ -2070,6 +2519,16 @@ impl Journal {
     }
 
     #[must_use]
+    pub(crate) const fn stage_directory(&self) -> &JournalDirectory {
+        &self.stage_directory
+    }
+
+    #[must_use]
+    pub(crate) const fn backup_directory(&self) -> &JournalDirectory {
+        &self.backup_directory
+    }
+
+    #[must_use]
     pub(crate) fn events(&self) -> &[JournalEvent] {
         self.chain.events()
     }
@@ -2079,8 +2538,25 @@ impl Journal {
         keys: &[JournalEventKey],
         budget: &mut AssetLoadBudget,
     ) -> Result<JournalEventPlan, JournalError> {
-        let total = self
-            .chain
+        Self::plan_events_for(
+            &self.layout,
+            &self.manifest,
+            &self.chain,
+            self.next_temporary_attempt,
+            keys,
+            budget,
+        )
+    }
+
+    fn plan_events_for(
+        layout: &JournalLayout,
+        manifest: &JournalManifest,
+        chain: &EventChain,
+        next_temporary_attempt: u32,
+        keys: &[JournalEventKey],
+        budget: &mut AssetLoadBudget,
+    ) -> Result<JournalEventPlan, JournalError> {
+        let total = chain
             .events()
             .len()
             .checked_add(keys.len())
@@ -2088,7 +2564,7 @@ impl Journal {
         if total > MAX_EVENT_COUNT {
             return Err(JournalError::TooManyEvents(total));
         }
-        if total > self.chain.events.capacity() {
+        if total > chain.events.capacity() {
             return Err(JournalError::InvalidEvent(
                 "journal event chain was not preallocated for its execution plan".to_owned(),
             ));
@@ -2100,16 +2576,16 @@ impl Journal {
         })?)?;
         let mut events = journal_budgeted_vec(keys.len(), "journal event plan", budget)?;
         let events_directory = budgeted_journal_join(
-            self.layout.directory(),
+            layout.directory(),
             EVENTS_DIRECTORY,
             "journal event directory path",
             budget,
         )?;
-        let mut sequence = u64::try_from(self.chain.events().len())
+        let mut sequence = u64::try_from(chain.events().len())
             .map_err(|_| JournalError::InvalidEvent("event sequence overflow".to_owned()))?;
-        let mut previous = self.chain.events().last().map(JournalEvent::digest);
+        let mut previous = chain.events().last().map(JournalEvent::digest);
         for (offset, key) in keys.iter().copied().enumerate() {
-            let kind = key.into_kind(&self.manifest, budget)?;
+            let kind = key.into_kind(manifest, budget)?;
             let event = JournalEvent::new(sequence, previous, kind, budget)?;
             let filename = budgeted_event_filename(&event, budget)?;
             let destination = budgeted_journal_join(
@@ -2119,7 +2595,7 @@ impl Journal {
                 budget,
             )?;
             let attempt = if offset == 0 {
-                self.next_temporary_attempt
+                next_temporary_attempt
             } else {
                 0
             };
@@ -2153,6 +2629,7 @@ impl Journal {
         plan: &mut JournalEventPlan,
         expected: JournalEventKey,
     ) -> Result<(), JournalError> {
+        self.layout.verify_root_path_binding()?;
         if self.chain.events.len() >= self.chain.events.capacity() {
             return Err(JournalError::InvalidEvent(
                 "journal event chain capacity was exhausted before durable append".to_owned(),
@@ -2169,12 +2646,12 @@ impl Journal {
             ));
         }
         let mut installed = false;
-        write_encoded_atomic_with_temporary_path_tracked(
+        write_encoded_atomic_in_journal_directory_tracked(
+            &self.events_directory,
             &prepared.destination,
             &prepared.encoded,
             false,
             &prepared.temporary,
-            self.manifest.directories.events(),
             &mut installed,
         )?;
         self.chain.events.push(prepared.event);
@@ -2225,12 +2702,12 @@ impl Journal {
             budget,
         )?;
         let mut installed = false;
-        write_encoded_atomic_with_temporary_path_tracked(
+        write_encoded_atomic_in_journal_directory_tracked(
+            &self.events_directory,
             &destination,
             &encoded,
             false,
             &temporary,
-            self.manifest.directories.events(),
             &mut installed,
         )?;
         self.chain.events.push(event);
@@ -2372,6 +2849,7 @@ fn decode_lower_hex(byte: u8) -> Result<u8, JournalError> {
     }
 }
 
+#[cfg(test)]
 fn write_encoded_atomic_with_temporary_path_tracked(
     path: &Path,
     bytes: &[u8],
@@ -2393,14 +2871,7 @@ fn write_encoded_atomic_with_temporary_path_tracked(
     let mut file = create_private_file_in_parent(temporary, expected_parent)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    #[cfg(test)]
-    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-        if name == MANIFEST_FILE {
-            super::test_crash_failpoint("manifest_temporary_synced");
-        } else if name.ends_with(".prepare.v2.json") {
-            super::test_crash_failpoint("preparation_temporary_synced");
-        }
-    }
+    test_journal_temporary_sync_failpoint(path);
     drop(file);
     match atomic_replace_tracked(
         temporary,
@@ -2420,6 +2891,76 @@ fn write_encoded_atomic_with_temporary_path_tracked(
         }
     }
     Ok(())
+}
+
+pub(super) fn write_encoded_atomic_in_journal_access_tracked(
+    access: &JournalAccess<'_>,
+    path: &Path,
+    bytes: &[u8],
+    replace_existing: bool,
+    temporary: &Path,
+    installed: &mut bool,
+) -> Result<(), JournalError> {
+    let mut file = create_journal_regular(access, temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    test_journal_temporary_sync_failpoint(path);
+    drop(file);
+    match atomic_replace_journal_regular(access, temporary, path, replace_existing) {
+        Ok(()) => *installed = true,
+        Err(error) => {
+            if error.moved_or_unknown_state()
+                || error.error().kind() == io::ErrorKind::AlreadyExists
+            {
+                *installed = true;
+            }
+            return Err(JournalError::Io(error.into_error()));
+        }
+    }
+    sync_journal_access(access)?;
+    Ok(())
+}
+
+pub(super) fn write_encoded_atomic_in_journal_directory_tracked(
+    directory: &JournalDirectory,
+    path: &Path,
+    bytes: &[u8],
+    replace_existing: bool,
+    temporary: &Path,
+    installed: &mut bool,
+) -> Result<(), JournalError> {
+    let mut file = create_journal_regular_in_directory(directory, temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    test_journal_temporary_sync_failpoint(path);
+    drop(file);
+    match atomic_replace_journal_regular_in_directory(directory, temporary, path, replace_existing)
+    {
+        Ok(()) => *installed = true,
+        Err(error) => {
+            if error.moved_or_unknown_state()
+                || error.error().kind() == io::ErrorKind::AlreadyExists
+            {
+                *installed = true;
+            }
+            return Err(JournalError::Io(error.into_error()));
+        }
+    }
+    sync_journal_directory(directory)?;
+    Ok(())
+}
+
+fn test_journal_temporary_sync_failpoint(path: &Path) {
+    #[cfg(test)]
+    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        if name == MANIFEST_FILE {
+            super::test_crash_failpoint("manifest_temporary_synced");
+        } else if name.ends_with(".prepare.v2.json") {
+            super::test_crash_failpoint("preparation_temporary_synced");
+        }
+    }
+    #[cfg(not(test))]
+    let _ = path;
 }
 
 fn encode_json_bounded<T: Serialize>(
@@ -2467,14 +3008,7 @@ fn encode_json_bounded<T: Serialize>(
     Ok(encoded)
 }
 
-fn read_json_bounded<T: DeserializeOwned>(
-    path: &Path,
-    maximum: u64,
-    budget: &mut AssetLoadBudget,
-) -> Result<T, JournalError> {
-    read_json_bounded_from_file(path, open_readonly_regular(path)?, maximum, budget)
-}
-
+#[cfg(test)]
 fn read_json_bounded_in_parent<T: DeserializeOwned>(
     path: &Path,
     expected_parent: &DirectoryIdentity,
@@ -2733,20 +3267,6 @@ impl JsonProbeVisitor<'_, '_> {
     }
 }
 
-fn validate_directory_identity(
-    path: &Path,
-    expected: &DirectoryIdentity,
-    role: &'static str,
-) -> Result<(), JournalError> {
-    let actual = observe_directory_identity(path)?;
-    if &actual != expected {
-        return Err(JournalError::InvalidEvent(format!(
-            "journal {role} directory identity changed"
-        )));
-    }
-    Ok(())
-}
-
 #[derive(Debug, Error)]
 pub(crate) enum JournalError {
     #[error("journal I/O failed: {0}")]
@@ -2809,7 +3329,6 @@ impl fmt::Display for JournalPath {
 
 #[cfg(test)]
 mod tests {
-    use super::super::platform::create_private_directory;
     use super::*;
     use tempfile::tempdir;
     use unity_asset_core::{AssetLoadLimits, BudgetError, SourceKind, WorkspaceId};
@@ -2829,6 +3348,7 @@ mod tests {
         let old_identity = existing.then(|| FileIdentity::test_identity(1, 3));
         let destination_parent_identity =
             observe_directory_identity(parent).expect("destination parent identity");
+        let root_identity = destination_parent_identity.clone();
         let outputs = [JournalTransactionOutputSeed {
             ordinal: 0,
             logical_name: report_artifact.logical_name(),
@@ -2858,6 +3378,7 @@ mod tests {
                 plan_digest,
                 atomicity: CommitAtomicity::PerArtifactRecoverable,
                 containment_root: parent.to_str().expect("UTF-8 fixture path"),
+                containment_root_identity: &root_identity,
                 outputs: &outputs,
                 changed_sources: &changed_sources,
                 changed_objects: &changed_objects,
@@ -2877,12 +3398,11 @@ mod tests {
             Vec::new(),
         )
         .expect("change set");
-        let layout = JournalLayout::new(parent, transaction);
-        create_private_directory(layout.directory()).expect("transaction directory");
-        create_private_directory(&layout.events_directory()).expect("events directory");
-        create_private_directory(&layout.stage_directory()).expect("stage directory");
-        create_private_directory(&layout.backup_directory()).expect("backup directory");
-        create_private_directory(&layout.baseline_directory()).expect("baseline directory");
+        let layout = JournalLayout::new(parent, transaction, root_identity);
+        std::fs::create_dir_all(layout.events_directory()).expect("events directory");
+        std::fs::create_dir(layout.stage_directory()).expect("stage directory");
+        std::fs::create_dir(layout.backup_directory()).expect("backup directory");
+        std::fs::create_dir(layout.baseline_directory()).expect("baseline directory");
         let directories =
             JournalDirectoryIdentities::observe(&layout).expect("journal directory identities");
         let report = CommitReport::new(
@@ -2894,7 +3414,11 @@ mod tests {
             CommitAtomicity::PerArtifactRecoverable,
             vec![report_artifact],
             changes,
-            RecoveryLocator::new(layout.directory().to_path_buf(), transaction),
+            RecoveryLocator::new(
+                layout.directory().to_path_buf(),
+                transaction,
+                layout.root_identity().clone(),
+            ),
         );
         let artifact = JournalArtifact::new(
             &report.artifacts()[0],
@@ -2910,6 +3434,7 @@ mod tests {
         .unwrap();
         let manifest = JournalManifest::new(
             &report,
+            layout.root_identity().clone(),
             directories,
             vec![artifact],
             baseline,
@@ -2957,7 +3482,7 @@ mod tests {
             .map(observe_directory_identity)
             .expect("preparation parent")
             .expect("preparation parent identity");
-        let mut temporary = layout.preparation_path();
+        let mut temporary = layout.preparation_path().to_path_buf();
         temporary.set_extension("prepare.v2.fixture.tmp");
         JournalPreparation::install(
             layout,
@@ -3064,7 +3589,7 @@ mod tests {
         let path = layout.preparation_path();
         let file = fs::OpenOptions::new()
             .write(true)
-            .open(&path)
+            .open(path)
             .expect("open preparation for resize");
         file.set_len(MAX_MANIFEST_BYTES + 1)
             .expect("extend preparation beyond limit");
@@ -3154,6 +3679,42 @@ mod tests {
             JournalPath::new("nested/file").unwrap().as_str(),
             "nested/file"
         );
+    }
+
+    #[test]
+    fn budgeted_journal_path_join_rejects_one_short_byte_budget() {
+        let directory = tempdir().expect("temporary journal root");
+        let path = JournalPath::new("nested/recovery.image").expect("journal path");
+
+        let mut measured = AssetLoadBudget::default();
+        let joined = path
+            .join_root_budgeted(directory.path(), "test journal path", &mut measured)
+            .expect("measure joined path");
+        let usage = measured.usage();
+        assert_eq!(joined, directory.path().join("nested/recovery.image"));
+        assert!(usage.bytes > 0);
+
+        let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: usage.bytes,
+            ..AssetLoadLimits::default()
+        })
+        .expect("exact path budget");
+        path.join_root_budgeted(directory.path(), "test journal path", &mut exact)
+            .expect("exact budgeted path");
+        assert_eq!(exact.usage(), usage);
+
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: usage.bytes - 1,
+            ..AssetLoadLimits::default()
+        })
+        .expect("one-short path budget");
+        assert!(matches!(
+            path.join_root_budgeted(directory.path(), "test journal path", &mut one_short),
+            Err(JournalError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
     }
 
     #[test]
@@ -3286,7 +3847,11 @@ mod tests {
         assert_eq!(
             reopened
                 .manifest()
-                .report(directory.path(), &mut AssetLoadBudget::default())
+                .report(
+                    directory.path(),
+                    reopened.layout().root_identity(),
+                    &mut AssetLoadBudget::default(),
+                )
                 .unwrap()
                 .transaction(),
             transaction

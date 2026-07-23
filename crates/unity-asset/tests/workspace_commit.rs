@@ -1,11 +1,13 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
+use unity_asset::reference::{ReferenceGraphBuildOptions, ReferenceResolution};
+use unity_asset::schema::SchemaRecipePlanner;
 use unity_asset::workspace::{
-    AssetWorkspace, CommitError, FieldGuard, GenericMutation, MutationPlan, MutationValue,
-    PrepareOptions, PublicationTarget, SourceExpectation, SourceOpenRequest, WorkspaceLookup,
-    WorkspaceView,
+    AssetWorkspace, CommitError, FieldGuard, GenericMutation, MutationPlan, MutationPlanBuilder,
+    MutationValue, PrepareOptions, PublicationTarget, ReferenceTarget, SourceExpectation,
+    SourceOpenRequest, WorkspaceLookup, WorkspaceView,
 };
 use unity_asset::{
     AssetLoadBudget, AssetLoadLimits, BudgetError, FieldPath, ObjectAddress, SourceAlias,
@@ -83,6 +85,18 @@ fn read_name(view: &impl WorkspaceView) -> String {
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+fn resolved_object(
+    view: &impl WorkspaceView,
+    address: &ObjectAddress,
+) -> unity_asset::RevisionedObjectHandle {
+    let mut budget = AssetLoadBudget::default();
+    let WorkspaceLookup::Resolved(handle) = view.resolve_object(address, &mut budget).unwrap()
+    else {
+        panic!("fixture object must resolve: {address:?}");
+    };
+    handle
 }
 
 fn target(root: &Path) -> PublicationTarget {
@@ -343,7 +357,7 @@ fn commit_obeys_exact_and_one_short_byte_budgets_before_manifest_installation() 
         .commit(one_short_prepared, target(directory.path()), &mut one_short)
         .unwrap_err();
     let CommitError::Budget { prepared, .. } = error else {
-        panic!("one-short commit must return a typed budget error");
+        panic!("one-short commit must return a typed budget error, got {error:?}");
     };
 
     assert_eq!(prepared.report().prepared_revision(), prepared_revision);
@@ -409,12 +423,14 @@ fn hardlinked_target_is_terminally_rejected_before_journal_publication() {
     assert_eq!(workspace.revision(), base_revision);
     assert_eq!(fs::read(&path).unwrap(), YAML.as_bytes());
     assert_eq!(fs::read(alias).unwrap(), YAML.as_bytes());
-    let version = directory.path().join(".unity-asset-recovery").join("v2");
-    let entries: Vec<_> = fs::read_dir(version)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect();
-    assert_eq!(entries, [std::ffi::OsString::from(".commit.lock")]);
+    assert!(
+        !directory
+            .path()
+            .join(".unity-asset-recovery")
+            .join("v2")
+            .exists(),
+        "terminal preflight rejection must not create versioned recovery state"
+    );
 }
 
 #[test]
@@ -468,7 +484,9 @@ fn recovery_baseline_entry_budget_failure_remains_typed_and_prejournal() {
         prepared,
     } = error
     else {
-        panic!("recovery baseline exhaustion must remain a typed entry-budget error");
+        panic!(
+            "recovery baseline exhaustion must remain a typed entry-budget error, got {error:?}"
+        );
     };
 
     assert_eq!(limit, required_entries - 1);
@@ -478,4 +496,151 @@ fn recovery_baseline_entry_budget_failure_remains_typed_and_prejournal() {
     assert_eq!(workspace.revision(), base_revision);
     assert_eq!(fs::read(path).unwrap(), original);
     assert_eq!(manifest_count(directory.path()), 0);
+}
+
+#[test]
+fn cross_source_reference_commit_rebases_the_workspace_and_preserves_old_snapshot() {
+    let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../unity-asset-write/tests/fixtures/serialized_file_wire/transform_hierarchy_v22.assets.bin",
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let owner_path = directory.path().join("owner.assets");
+    let dependency_directory = directory.path().join("deps");
+    let target_path = dependency_directory.join("target.assets");
+    fs::create_dir_all(&dependency_directory).unwrap();
+    fs::copy(&sample, &owner_path).unwrap();
+    fs::copy(&sample, &target_path).unwrap();
+    let original_owner_bytes = fs::read(&owner_path).unwrap();
+
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(&owner_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    workspace
+        .load_path(&target_path, &mut AssetLoadBudget::default())
+        .unwrap();
+
+    let base = workspace.snapshot();
+    let owner_locator = SourceLocator::path("owner.assets").unwrap();
+    let target_locator = SourceLocator::path("target.assets").unwrap();
+    let owner_parent = ObjectAddress::binary_direct(owner_locator.clone(), 1).unwrap();
+    let owner_child = ObjectAddress::binary_direct(owner_locator, 2).unwrap();
+    let target_parent = ObjectAddress::binary_direct(target_locator, 1).unwrap();
+    let father_path = FieldPath::root().push_field("m_Father").unwrap();
+    let base_owner_child = resolved_object(&base, &owner_child);
+    let base_owner_parent = resolved_object(&base, &owner_parent);
+    let base_graph = base
+        .reference_graph(
+            ReferenceGraphBuildOptions::unbounded(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let base_father = base_graph
+        .outgoing(&base_owner_child)
+        .unwrap()
+        .find(|fact| fact.field_path() == &father_path)
+        .expect("base child Transform must retain its local parent reference");
+    assert!(matches!(
+        base_father.resolution(),
+        ReferenceResolution::Resolved(target) if target == &base_owner_parent
+    ));
+    base.read_object(&base_owner_child, &mut AssetLoadBudget::default())
+        .unwrap()
+        .class()
+        .value_at_path(&father_path)
+        .unwrap();
+
+    let planner = SchemaRecipePlanner::new(&base);
+    let child = planner
+        .inspect(&owner_child, &mut AssetLoadBudget::default())
+        .unwrap();
+    let lowering = planner
+        .lower_reference(
+            &child,
+            father_path.clone(),
+            ReferenceTarget::object(owner_parent),
+            ReferenceTarget::object(target_parent.clone()),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let fragment = lowering
+        .into_fragment()
+        .expect("changing the parent reference must produce a mutation fragment");
+    let mut builder = MutationPlanBuilder::new(base.revision());
+    builder.append(fragment).unwrap();
+    let prepared = workspace
+        .prepare(
+            builder.build().unwrap(),
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let prepared_revision = prepared.report().prepared_revision();
+
+    let report = workspace
+        .commit(
+            prepared,
+            target(directory.path()),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let committed = workspace.snapshot();
+    assert_eq!(report.base_revision(), base.revision());
+    assert_eq!(report.committed_revision(), prepared_revision);
+    assert_eq!(committed.revision(), report.committed_revision());
+    assert_ne!(committed.revision(), base.revision());
+    assert_ne!(fs::read(&owner_path).unwrap(), original_owner_bytes);
+
+    let committed_owner_child = resolved_object(&committed, &owner_child);
+    let committed_target_parent = resolved_object(&committed, &target_parent);
+    committed
+        .read_object(&committed_owner_child, &mut AssetLoadBudget::default())
+        .unwrap()
+        .class()
+        .value_at_path(&father_path)
+        .unwrap();
+    let committed_graph = committed
+        .reference_graph(
+            ReferenceGraphBuildOptions::unbounded(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    assert_eq!(committed_graph.revision(), committed.revision());
+    let committed_father = committed_graph
+        .outgoing(&committed_owner_child)
+        .unwrap()
+        .find(|fact| fact.field_path() == &father_path)
+        .expect("committed child Transform must retain its parent reference");
+    assert!(matches!(
+        committed_father.resolution(),
+        ReferenceResolution::Resolved(target) if target == &committed_target_parent
+    ));
+    assert_eq!(
+        committed_graph
+            .incoming(&committed_target_parent)
+            .unwrap()
+            .filter(|fact| {
+                fact.field_path() == &father_path && fact.source() == &committed_owner_child
+            })
+            .count(),
+        1,
+        "the committed graph must index the new cross-source parent edge"
+    );
+
+    assert_eq!(base.revision(), report.base_revision());
+    assert_eq!(base_graph.revision(), base.revision());
+    assert!(matches!(
+        base_graph
+            .outgoing(&base_owner_child)
+            .unwrap()
+            .find(|fact| fact.field_path() == &father_path)
+            .expect("old graph must remain queryable after commit")
+            .resolution(),
+        ReferenceResolution::Resolved(target) if target == &base_owner_parent
+    ));
+    base.read_object(&base_owner_child, &mut AssetLoadBudget::default())
+        .unwrap()
+        .class()
+        .value_at_path(&father_path)
+        .unwrap();
 }

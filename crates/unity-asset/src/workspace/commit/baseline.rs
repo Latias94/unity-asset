@@ -1,6 +1,5 @@
 //! Construction of the next immutable workspace baseline.
 
-use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -23,7 +22,9 @@ use super::super::source_catalog::{CatalogError, PhysicalDomainChange, SourceDes
 use super::super::state::{WorkspaceState, WorkspaceStateError};
 use super::super::store::{FrozenSourceParse, SourceStoreError};
 use super::super::view::WorkspaceError;
-use super::journal::{Journal, JournalBaselineImage, JournalBaselineSource, JournalCatalogAction};
+use super::journal::{
+    Journal, JournalBaselineImage, JournalBaselineSource, JournalCatalogAction, JournalError,
+};
 use super::platform::{
     DirectoryIdentity, observe_directory_identity, open_readonly_regular_in_parent,
 };
@@ -47,11 +48,25 @@ pub(crate) fn read_artifact_image(
     })?;
     let (path, parent_identity) = match location {
         RecoveryArtifactLocation::Target => (
-            artifact.target().join_root(journal.layout().parent()),
+            artifact
+                .target()
+                .join_root_budgeted(
+                    journal.layout().parent(),
+                    "recovery target image path",
+                    budget,
+                )
+                .map_err(map_journal_path_error)?,
             artifact.destination_parent_identity(),
         ),
         RecoveryArtifactLocation::Staging => (
-            artifact.staging().join_root(journal.layout().directory()),
+            artifact
+                .staging()
+                .join_root_budgeted(
+                    journal.layout().directory(),
+                    "recovery staging image path",
+                    budget,
+                )
+                .map_err(map_journal_path_error)?,
             journal.manifest().directories().stage(),
         ),
     };
@@ -368,7 +383,7 @@ pub(crate) fn build_from_journal_with_images(
         .clone_for_update(budget)
         .map_err(BaselineBuildError::Store)?;
     for source in sources {
-        validate_in_place_binding(base, journal, source)?;
+        validate_in_place_binding(base, journal, source, budget)?;
         let image = recovery_image(journal, source, published_images, budget)?;
         let verified = VerifiedSourceImage::verify(source.source().kind(), image);
         if verified.fingerprint() != source.fingerprint() {
@@ -412,6 +427,7 @@ fn validate_in_place_binding(
     base: &WorkspaceState,
     journal: &Journal,
     source: &JournalBaselineSource,
+    budget: &mut AssetLoadBudget,
 ) -> Result<(), BaselineBuildError> {
     if !matches!(source.catalog(), JournalCatalogAction::Existing { .. }) {
         return Ok(());
@@ -427,33 +443,28 @@ fn validate_in_place_binding(
             message: "published baseline artifact index is out of range".to_owned(),
         }
     })?;
-    let target = artifact.target().join_root(journal.layout().parent());
+    let target = artifact
+        .target()
+        .join_root_budgeted(
+            journal.layout().parent(),
+            "recovery published baseline target path",
+            budget,
+        )
+        .map_err(map_journal_path_error)?;
     verify_recovery_parent(
         &target,
         artifact.destination_parent_identity(),
         source.source(),
     )?;
-    let target_parent = target
-        .parent()
-        .ok_or_else(|| BaselineBuildError::RecoveryBinding {
-            message: "published source target has no parent directory".to_owned(),
-        })?;
-    let target_name = target
-        .file_name()
-        .ok_or_else(|| BaselineBuildError::RecoveryBinding {
-            message: "published source target has no file name".to_owned(),
-        })?;
-    let canonical_parent =
-        fs::canonicalize(target_parent).map_err(|error| BaselineBuildError::RecoveryImage {
-            source_id: source.source(),
-            message: error.to_string(),
-        })?;
-    let canonical = canonical_parent.join(target_name);
     let origin = base
         .catalog()
         .physical_origin(source.source())
         .map_err(BaselineBuildError::catalog)?;
-    if origin.path() != canonical {
+    // Publication roots are canonical and journal paths are validated relative
+    // descendants. The parent identity check above rejects symlink traversal,
+    // so this lexical comparison is the canonical physical binding without a
+    // second, allocator-owned `canonicalize` call.
+    if origin.path() != target {
         return Err(BaselineBuildError::RecoveryBinding {
             message: format!(
                 "published source {:?} is relocated; the journal has no catalog checkpoint for that path",
@@ -488,13 +499,25 @@ fn recovery_image(
                 return Ok(Arc::clone(image));
             }
             (
-                artifact.target().join_root(journal.layout().parent()),
+                artifact
+                    .target()
+                    .join_root_budgeted(
+                        journal.layout().parent(),
+                        "recovery published image path",
+                        budget,
+                    )
+                    .map_err(map_journal_path_error)?,
                 artifact.bytes(),
                 artifact.destination_parent_identity(),
             )
         }
         JournalBaselineImage::Blob { path, bytes, .. } => (
-            path.join_root(journal.layout().directory()),
+            path.join_root_budgeted(
+                journal.layout().directory(),
+                "recovery baseline blob path",
+                budget,
+            )
+            .map_err(map_journal_path_error)?,
             *bytes,
             journal.manifest().directories().baseline(),
         ),
@@ -507,6 +530,24 @@ fn recovery_image(
         expected_bytes,
         budget,
     )
+}
+
+fn map_journal_path_error(error: JournalError) -> BaselineBuildError {
+    match error {
+        JournalError::Budget(error) => BaselineBuildError::Budget(error),
+        JournalError::Allocation {
+            resource,
+            requested,
+            message,
+        } => BaselineBuildError::Allocation {
+            resource,
+            requested,
+            message,
+        },
+        error => BaselineBuildError::RecoveryBinding {
+            message: error.to_string(),
+        },
+    }
 }
 
 fn read_recovery_image(

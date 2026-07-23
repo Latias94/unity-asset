@@ -30,10 +30,18 @@ use self::journal::{
     JournalTransactionSeed, OpenedJournalPreparation, transaction_id_from_seed,
 };
 use self::platform::{
-    CommitGuard, DirectoryIdentity, FileIdentity, capture_matching_digest_in_parent,
-    copy_security_metadata, create_private_directory, create_private_directory_exclusive_in_parent,
-    create_private_file_in_parent, ensure_same_filesystem, ensure_single_hardlink,
-    observe_directory_identity, open_readonly_regular_in_parent, opened_file_identity,
+    CommitGuard, CommitRoot, DirectoryIdentity, FileIdentity, JournalAccess, JournalDirectory,
+    JournalNamespace, SecurityMetadataCopyReservation, SecurityMetadataError,
+    capture_external_regular_in_journal_directory,
+    copy_security_metadata_between_journal_directories,
+    copy_security_metadata_external_to_journal_directory, create_journal_directory,
+    create_journal_directory_in_directory, create_journal_regular_in_directory,
+    ensure_journal_directory_same_filesystem, ensure_single_hardlink, journal_access,
+    journal_directory_identity, observe_directory_identity, open_commit_root,
+    open_journal_directory, open_journal_namespace, open_journal_regular,
+    open_journal_regular_in_directory, open_readonly_regular_in_parent, opened_file_identity,
+    promote_journal_regular_to_external, reserve_security_metadata_copy, sync_journal_access,
+    sync_journal_directory, sync_journal_namespace,
 };
 
 mod baseline;
@@ -60,7 +68,11 @@ fn test_crash_artifact_failpoint(point: &str, ordinal: u32) {
     }
 }
 
-pub use recovery::{RecoveryBlockedReason, RecoveryError, RecoveryOutcome, RollbackReceipt};
+pub use recovery::{
+    RECOVERY_DISCOVERY_VERSION, RecoveryBlockedReason, RecoveryDiscovery,
+    RecoveryDiscoveryBlockedReason, RecoveryDiscoveryError, RecoveryError, RecoveryOutcome,
+    RollbackReceipt,
+};
 
 /// Current canonical commit-report wire version.
 pub const COMMIT_REPORT_VERSION: u8 = 1;
@@ -102,18 +114,37 @@ impl From<DestinationState> for CommitDestinationState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicationTarget {
     root: PathBuf,
+    identity: DirectoryIdentity,
 }
 
 impl PublicationTarget {
     pub fn in_place(root: impl AsRef<Path>) -> Result<Self, PublicationTargetError> {
-        Ok(Self {
-            root: validate_publication_root(root.as_ref())?,
-        })
+        let root = validate_publication_root(root.as_ref())?;
+        let identity =
+            observe_directory_identity(&root).map_err(|error| PublicationTargetError::Io {
+                path: root.clone(),
+                message: error.to_string(),
+            })?;
+        Ok(Self { root, identity })
     }
 
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn identity(&self) -> &DirectoryIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn verify_current(&self) -> io::Result<()> {
+        if observe_directory_identity(&self.root)? != self.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "publication target root identity changed",
+            ));
+        }
+        Ok(())
     }
 
     /// Rebuilds the deterministic journal locator for one transaction.
@@ -122,8 +153,21 @@ impl PublicationTarget {
     /// can recover after a process restart without retaining a [`CommitReport`].
     #[must_use]
     pub fn recovery_locator(&self, transaction: TransactionId) -> RecoveryLocator {
-        let layout = JournalLayout::new(&self.root, transaction);
-        RecoveryLocator::new(layout.directory().to_path_buf(), transaction)
+        let layout = JournalLayout::new(&self.root, transaction, self.identity.clone());
+        RecoveryLocator::new(
+            layout.directory().to_path_buf(),
+            transaction,
+            layout.root_identity().clone(),
+        )
+    }
+
+    /// Lists canonical v2 recovery candidates without opening a journal or
+    /// modifying the publication namespace.
+    pub fn discover_recoveries(
+        &self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<RecoveryDiscovery, RecoveryDiscoveryError> {
+        recovery::discover_recoveries(self, budget)
     }
 }
 
@@ -165,11 +209,20 @@ fn validate_publication_root(root: &Path) -> Result<PathBuf, PublicationTargetEr
 pub struct RecoveryLocator {
     root: PathBuf,
     transaction: TransactionId,
+    root_identity: DirectoryIdentity,
 }
 
 impl RecoveryLocator {
-    pub(crate) fn new(root: PathBuf, transaction: TransactionId) -> Self {
-        Self { root, transaction }
+    pub(crate) fn new(
+        root: PathBuf,
+        transaction: TransactionId,
+        root_identity: DirectoryIdentity,
+    ) -> Self {
+        Self {
+            root,
+            transaction,
+            root_identity,
+        }
     }
 
     #[must_use]
@@ -180,6 +233,11 @@ impl RecoveryLocator {
     #[must_use]
     pub const fn transaction(&self) -> TransactionId {
         self.transaction
+    }
+
+    #[must_use]
+    pub(crate) const fn root_identity(&self) -> &DirectoryIdentity {
+        &self.root_identity
     }
 }
 
@@ -378,6 +436,7 @@ struct PublicationExecution {
     ordinal: u32,
     stage: PathBuf,
     backup: Option<PathBuf>,
+    security_metadata: Option<SecurityMetadataCopyReservation>,
 }
 
 struct CommitPreflight {
@@ -579,6 +638,7 @@ fn preflight_commit(
         plan_digest: report.plan_digest(),
         atomicity: CommitAtomicity::PerArtifactRecoverable,
         containment_root: root,
+        containment_root_identity: target.identity(),
         outputs: &output_seeds,
         changed_sources: &changed_sources,
         changed_objects: &changed_objects,
@@ -799,6 +859,8 @@ enum CommitPreflightError {
 }
 
 struct ReadyPublication {
+    _root: CommitRoot,
+    _journal_namespace: JournalNamespace,
     _guard: CommitGuard,
     publications: Vec<PreparedPublication>,
     execution: Vec<PublicationExecution>,
@@ -806,6 +868,14 @@ struct ReadyPublication {
     journal: Journal,
     event_plan: JournalEventPlan,
     report: CommitReport,
+}
+
+#[derive(Debug)]
+struct PreparedJournalDirectories {
+    identities: JournalDirectoryIdentities,
+    stage: JournalDirectory,
+    backup: JournalDirectory,
+    baseline: JournalDirectory,
 }
 
 impl AssetWorkspace {
@@ -889,9 +959,13 @@ impl AssetWorkspace {
         target: &PublicationTarget,
         budget: &mut AssetLoadBudget,
     ) -> Result<ReadyPublication, PreparePublicationError> {
-        let guard = CommitGuard::acquire(target.root())
+        let root = open_commit_root(target.root(), target.identity())
+            .map_err(|error| map_prejournal_io("open publication target root", error))?;
+        let guard = CommitGuard::acquire_with_root(&root)
             .map_err(|error| map_prejournal_io("acquire publication guard", error))?;
-        let _ = guard.path();
+        target
+            .verify_current()
+            .map_err(|error| map_prejournal_io("reverify publication target root", error))?;
         if prepared.report().base_revision() != self.revision()
             || !Arc::ptr_eq(prepared.state().core().base().state(), self.state())
         {
@@ -918,23 +992,21 @@ impl AssetWorkspace {
             recovery_baseline,
         } = preflight;
         validate_publication_hardlinks(&publications)?;
-        let layout = JournalLayout::new(target.root(), transaction);
-        let locator = RecoveryLocator::new(layout.directory().to_path_buf(), transaction);
-        if fs::symlink_metadata(layout.manifest_path()).is_ok()
-            || fs::symlink_metadata(layout.preparation_path()).is_ok()
-        {
-            return Err(PreparePublicationError::RecoveryRequired {
-                locator,
-                message: "this transaction already has durable recovery evidence".to_owned(),
-            });
-        }
-        if fs::symlink_metadata(layout.directory()).is_ok() {
-            return Err(PreparePublicationError::PublishBlocked(
-                "an unowned transaction directory exists without a durable preparation record"
-                    .to_owned(),
-            ));
-        }
-        let execution = publication_execution_plan(&layout, &publications, budget)
+        let layout = JournalLayout::new_budgeted(
+            target.root(),
+            transaction,
+            target.identity().clone(),
+            budget,
+        )
+        .map_err(map_journal_layout_prepare_error)?;
+        let locator = RecoveryLocator::new(
+            layout
+                .directory_path_budgeted(budget)
+                .map_err(map_journal_layout_prepare_error)?,
+            transaction,
+            layout.root_identity().clone(),
+        );
+        let mut execution = publication_execution_plan(&layout, &publications, budget)
             .map_err(map_preflight_error)?;
         let prepare_report = prepared.report();
         let report = CommitReport::new(
@@ -951,49 +1023,86 @@ impl AssetWorkspace {
         report
             .validate()
             .map_err(|error| PreparePublicationError::PublishBlocked(error.to_string()))?;
-        match fs::symlink_metadata(layout.rollback_path()) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+        let journal_namespace = prepare_recovery_namespace(&root)?;
+        let access = journal_access(&root, &journal_namespace);
+        match open_journal_regular(&access, layout.preparation_path()) {
+            Ok(_) => {
                 return Err(PreparePublicationError::RecoveryRequired {
                     locator,
-                    message: "terminal rollback path is not a regular file".to_owned(),
+                    message: "this transaction already has durable recovery evidence".to_owned(),
                 });
             }
-            Ok(_) => {
-                match JournalPreparation::acknowledge_matching_rollback(&layout, &report, budget) {
-                    Ok(()) => {}
-                    Err(JournalError::Budget(source)) => {
-                        return Err(PreparePublicationError::Budget(source));
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(PreparePublicationError::RecoveryRequired {
+                    locator,
+                    message: format!("inspect durable preparation evidence: {error}"),
+                });
+            }
+        }
+        match open_journal_directory(&access, layout.directory()) {
+            Ok(directory) => {
+                match open_journal_regular_in_directory(&directory, layout.manifest_path()) {
+                    Ok(_) => {
+                        return Err(PreparePublicationError::RecoveryRequired {
+                            locator,
+                            message: "this transaction already has durable recovery evidence"
+                                .to_owned(),
+                        });
                     }
-                    Err(JournalError::Io(error)) => {
-                        return Err(map_prejournal_io("acknowledge terminal rollback", error));
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        return Err(PreparePublicationError::PublishBlocked(
+                        "an unowned transaction directory exists without a durable preparation record"
+                            .to_owned(),
+                    ));
                     }
                     Err(error) => {
                         return Err(PreparePublicationError::RecoveryRequired {
                             locator,
-                            message: error.to_string(),
+                            message: format!("inspect canonical manifest evidence: {error}"),
                         });
                     }
                 }
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(map_prejournal_io("inspect terminal rollback", error));
+                return Err(map_prejournal_io(
+                    "inspect recovery transaction directory",
+                    error,
+                ));
+            }
+        }
+        match JournalPreparation::acknowledge_matching_rollback_in_access(
+            &layout, &report, &access, budget,
+        ) {
+            Ok(()) => {}
+            Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(JournalError::Budget(source)) => {
+                return Err(PreparePublicationError::Budget(source));
+            }
+            Err(JournalError::Io(error)) => {
+                return Err(map_prejournal_io("acknowledge terminal rollback", error));
+            }
+            Err(error) => {
+                return Err(PreparePublicationError::RecoveryRequired {
+                    locator,
+                    message: error.to_string(),
+                });
             }
         }
         let preparation_outputs =
             journal_preparation_outputs(&publications, budget).map_err(map_preflight_error)?;
-        let preparation_parent = prepare_recovery_namespace(&layout)?;
-        recovery::cleanup_orphaned_preparation_attempts(&layout, &preparation_parent, budget)
+        recovery::cleanup_orphaned_preparation_attempts(&layout, &access, budget)
             .map_err(map_orphaned_preparation_cleanup_error)?;
         let preparation_temporary =
             preparation_temporary_path(&layout, budget).map_err(map_preflight_error)?;
-        let preparation = match JournalPreparation::install(
+        let preparation = match JournalPreparation::install_in_access(
             &layout,
             &report,
             &preparation_outputs,
             &recovery_baseline,
             &preparation_temporary,
-            &preparation_parent,
+            &access,
             budget,
         ) {
             Ok(preparation) => preparation,
@@ -1009,42 +1118,46 @@ impl AssetWorkspace {
         };
         #[cfg(test)]
         test_crash_failpoint("preparation_installed");
-        let directories = match prepare_empty_transaction_directory(&layout, preparation) {
-            Ok(directories) => directories,
-            Err(error) => {
-                return Err(cleanup_prejournal_error(
-                    &layout,
-                    error,
-                    "private recovery namespace creation failed",
-                    budget,
-                ));
-            }
-        };
+        let directories =
+            match prepare_empty_transaction_directory(&layout, &preparation, &access, budget) {
+                Ok(directories) => directories,
+                Err(error) => {
+                    return Err(cleanup_prejournal_error(
+                        &layout,
+                        &access,
+                        error,
+                        "private recovery namespace creation failed",
+                        budget,
+                    ));
+                }
+            };
         #[cfg(test)]
         test_crash_failpoint("private_directories_synced");
 
         let result = (|| {
             for publication in &publications {
-                ensure_same_filesystem(&layout.stage_directory(), &publication.filesystem_anchor)
-                .and_then(|()| {
-                        ensure_same_filesystem(
-                            &layout.backup_directory(),
+                ensure_journal_directory_same_filesystem(
+                    &directories.stage,
+                    &publication.filesystem_anchor,
+                )
+                    .and_then(|()| {
+                        ensure_journal_directory_same_filesystem(
+                            &directories.backup,
                             &publication.filesystem_anchor,
                         )
-                })
-                .map_err(|error| {
-                    PreparePublicationError::PublishBlocked(format!(
-                        "publication staging and destination are not on one supported filesystem: {error}"
-                    ))
-                })?;
+                    })
+                    .map_err(|error| {
+                        PreparePublicationError::PublishBlocked(format!(
+                            "publication staging and destination are not on one supported filesystem: {error}"
+                        ))
+                    })?;
             }
             let mut images = MaterializedImages::new(prepared.artifacts(), budget)
                 .map_err(map_baseline_prepare_error)?;
             for (publication, execution) in publications.iter_mut().zip(&execution) {
                 debug_assert_eq!(publication.ordinal, execution.ordinal);
                 let path = &execution.stage;
-                let stage_parent = directories.stage().clone();
-                let mut file = create_private_file_in_parent(path, &stage_parent)
+                let mut file = create_journal_regular_in_directory(&directories.stage, path)
                     .map_err(|error| map_prejournal_io("create staged artifact", error))?;
                 images
                     .stream_and_materialize(
@@ -1063,22 +1176,19 @@ impl AssetWorkspace {
                 })?;
                 drop(file);
                 if let Some(expected_identity) = publication.expected_identity.as_ref() {
-                    copy_security_metadata(
+                    copy_security_metadata_external_to_journal_directory(
                         &publication.target,
+                        &directories.stage,
                         path,
                         expected_identity,
                         &publication.destination_parent_identity,
                         &staged_identity,
-                        &stage_parent,
+                        budget,
                     )
-                    .map_err(|error| {
-                        PreparePublicationError::PublishBlocked(format!(
-                            "destination security metadata cannot be preserved exactly: {error}"
-                        ))
-                    })?;
+                    .map_err(map_security_metadata_prepare_error)?;
                 }
                 publication.staged_identity = Some(staged_identity);
-                platform::sync_directory(&layout.stage_directory())
+                sync_journal_directory(&directories.stage)
                     .map_err(|error| map_prejournal_io("sync staging directory", error))?;
                 #[cfg(test)]
                 test_crash_artifact_failpoint("staged_artifact_synced", publication.ordinal);
@@ -1090,7 +1200,7 @@ impl AssetWorkspace {
                 &recovery_baseline,
                 &images,
                 &layout,
-                &directories,
+                &directories.baseline,
                 budget,
             )
             .map_err(map_recovery_baseline_prepare_error)?;
@@ -1101,14 +1211,18 @@ impl AssetWorkspace {
         let baseline = match result {
             Ok(result) => result,
             Err(error) => {
+                drop(directories);
                 return Err(cleanup_prejournal_error(
                     &layout,
+                    &access,
                     error,
                     "publication staging failed",
                     budget,
                 ));
             }
         };
+        let directory_identities = directories.identities.clone();
+        drop(directories);
         let final_validation = prepared
             .source_proofs()
             .revalidate(budget)
@@ -1122,6 +1236,7 @@ impl AssetWorkspace {
         if let Err(error) = final_validation {
             return Err(cleanup_prejournal_error(
                 &layout,
+                &access,
                 error,
                 "final publication validation failed",
                 budget,
@@ -1130,8 +1245,20 @@ impl AssetWorkspace {
         if let Err(error) = validate_publication_hardlinks(&publications) {
             return Err(cleanup_prejournal_error(
                 &layout,
+                &access,
                 error,
                 "final hard-link validation failed",
+                budget,
+            ));
+        }
+        if let Err(error) =
+            reserve_publication_security_metadata(&publications, &mut execution, budget)
+        {
+            return Err(cleanup_prejournal_error(
+                &layout,
+                &access,
+                PreparePublicationError::Budget(error),
+                "security metadata reservation failed",
                 budget,
             ));
         }
@@ -1140,6 +1267,7 @@ impl AssetWorkspace {
             Err(error) => {
                 return Err(cleanup_prejournal_error(
                     &layout,
+                    &access,
                     map_preflight_error(error),
                     "journal artifact construction failed",
                     budget,
@@ -1148,7 +1276,8 @@ impl AssetWorkspace {
         };
         let manifest = match JournalManifest::new(
             &report,
-            directories.clone(),
+            layout.root_identity().clone(),
+            directory_identities,
             artifacts,
             recovery_baseline,
             budget,
@@ -1157,6 +1286,7 @@ impl AssetWorkspace {
             Err(error) => {
                 return Err(cleanup_prejournal_error(
                     &layout,
+                    &access,
                     map_unpublished_journal_prepare_error(error),
                     "journal manifest construction failed",
                     budget,
@@ -1168,6 +1298,7 @@ impl AssetWorkspace {
             Err(error) => {
                 return Err(cleanup_prejournal_error(
                     &layout,
+                    &access,
                     map_preflight_error(error),
                     "commit event planning failed",
                     budget,
@@ -1175,7 +1306,8 @@ impl AssetWorkspace {
             }
         };
         let (journal, event_plan) =
-            match Journal::create_planned(layout.clone(), manifest, &event_keys, budget) {
+            match Journal::create_planned_in_access(layout, manifest, &event_keys, &access, budget)
+            {
                 Ok(ready) => ready,
                 Err(error) if error.manifest_installed() => {
                     return Err(PreparePublicationError::RecoveryRequired {
@@ -1184,9 +1316,10 @@ impl AssetWorkspace {
                     });
                 }
                 Err(error) => {
-                    let source = error.into_source();
+                    let (layout, source) = error.into_parts();
                     return Err(cleanup_prejournal_error(
                         &layout,
+                        &access,
                         map_unpublished_journal_prepare_error(source),
                         "canonical manifest was not published",
                         budget,
@@ -1196,6 +1329,8 @@ impl AssetWorkspace {
         #[cfg(test)]
         test_crash_failpoint("manifest_installed");
         Ok(ReadyPublication {
+            _root: root,
+            _journal_namespace: journal_namespace,
             _guard: guard,
             publications,
             execution,
@@ -1208,9 +1343,11 @@ impl AssetWorkspace {
 
     fn publish_ready(&mut self, ready: ReadyPublication) -> Result<CommitReport, CommitError> {
         let ReadyPublication {
+            _root,
+            _journal_namespace,
             _guard,
             publications,
-            execution,
+            mut execution,
             baseline,
             mut journal,
             mut event_plan,
@@ -1226,14 +1363,17 @@ impl AssetWorkspace {
                 message: error.to_string(),
             })?;
 
-        for (publication, execution) in publications.iter().zip(&execution) {
+        for (publication, execution) in publications.iter().zip(&mut execution) {
             debug_assert_eq!(publication.ordinal, execution.ordinal);
-            publish_one(&mut journal, &mut event_plan, publication, execution).map_err(
-                |error| CommitError::RecoveryRequired {
-                    locator: locator.clone(),
-                    message: error,
-                },
-            )?;
+            match publish_one(&mut journal, &mut event_plan, publication, execution) {
+                Ok(()) => {}
+                Err(PublishError::Message(message)) => {
+                    return Err(CommitError::RecoveryRequired {
+                        locator: locator.clone(),
+                        message,
+                    });
+                }
+            }
         }
         journal
             .append_planned(&mut event_plan, JournalEventKey::Published)
@@ -1276,29 +1416,13 @@ impl AssetWorkspace {
 }
 
 fn prepare_recovery_namespace(
-    layout: &JournalLayout,
-) -> Result<DirectoryIdentity, PreparePublicationError> {
-    let version_directory = layout.directory().parent().ok_or_else(|| {
-        PreparePublicationError::PublishBlocked(
-            "recovery transaction has no version directory".to_owned(),
-        )
-    })?;
-    let recovery_directory = version_directory.parent().ok_or_else(|| {
-        PreparePublicationError::PublishBlocked(
-            "recovery transaction has no recovery directory".to_owned(),
-        )
-    })?;
-    create_private_directory(recovery_directory)
-        .map_err(|error| map_prejournal_io("create recovery namespace", error))?;
-    create_private_directory(version_directory)
-        .map_err(|error| map_prejournal_io("create recovery version namespace", error))?;
-    let identity = observe_directory_identity(version_directory)
-        .map_err(|error| map_prejournal_io("capture recovery version identity", error))?;
-    platform::sync_directory(version_directory)
-        .and_then(|()| platform::sync_directory(recovery_directory))
-        .and_then(|()| platform::sync_directory(layout.parent()))
+    root: &CommitRoot,
+) -> Result<JournalNamespace, PreparePublicationError> {
+    let namespace = open_journal_namespace(root)
+        .map_err(|error| map_prejournal_io("open recovery namespace", error))?;
+    sync_journal_namespace(root, &namespace)
         .map_err(|error| map_prejournal_io("persist recovery namespace", error))?;
-    Ok(identity)
+    Ok(namespace)
 }
 
 fn preparation_temporary_path(
@@ -1377,113 +1501,136 @@ fn preparation_temporary_path(
 
 fn prepare_empty_transaction_directory(
     layout: &JournalLayout,
-    preparation: OpenedJournalPreparation,
-) -> Result<JournalDirectoryIdentities, PreparePublicationError> {
-    let version_directory = layout.directory().parent().ok_or_else(|| {
-        PreparePublicationError::PublishBlocked(
-            "recovery transaction has no version directory".to_owned(),
-        )
-    })?;
-    let recovery_directory = version_directory.parent().ok_or_else(|| {
-        PreparePublicationError::PublishBlocked(
-            "recovery transaction has no recovery directory".to_owned(),
-        )
-    })?;
-    let transaction_parent = preparation.parent().clone();
-    let actual_parent = observe_directory_identity(version_directory)
-        .map_err(|error| map_prejournal_io("capture recovery version identity", error))?;
-    if actual_parent != transaction_parent {
-        return Err(PreparePublicationError::RecoveryRequired {
-            locator: RecoveryLocator::new(layout.directory().to_path_buf(), layout.transaction()),
-            message: "recovery version directory changed after preparation was installed"
-                .to_owned(),
-        });
-    }
-
-    let transaction =
-        match create_private_directory_exclusive_in_parent(layout.directory(), &transaction_parent)
-        {
-            Ok(identity) => identity,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(PreparePublicationError::RecoveryRequired {
-                    locator: RecoveryLocator::new(
-                        layout.directory().to_path_buf(),
-                        layout.transaction(),
-                    ),
-                    message: "this prepared transaction already has private recovery state"
-                        .to_owned(),
-                });
-            }
-            Err(error) => {
-                return Err(map_prejournal_io(
-                    "create exclusive recovery transaction",
-                    error,
-                ));
-            }
-        };
+    preparation: &OpenedJournalPreparation,
+    access: &JournalAccess<'_>,
+    budget: &mut AssetLoadBudget,
+) -> Result<PreparedJournalDirectories, PreparePublicationError> {
+    preparation
+        .revalidate_in_access(layout, access, budget)
+        .map_err(map_unpublished_journal_prepare_error)?;
+    let transaction = match create_journal_directory(access, layout.directory()) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(PreparePublicationError::RecoveryRequired {
+                locator: RecoveryLocator::new(
+                    layout.directory().to_path_buf(),
+                    layout.transaction(),
+                    layout.root_identity().clone(),
+                ),
+                message: "this prepared transaction already has private recovery state".to_owned(),
+            });
+        }
+        Err(error) => {
+            return Err(map_prejournal_io(
+                "create exclusive recovery transaction",
+                error,
+            ));
+        }
+    };
+    let transaction_identity = journal_directory_identity(&transaction)
+        .map_err(|error| map_prejournal_io("capture recovery transaction identity", error))?;
     #[cfg(test)]
     test_crash_failpoint("transaction_directory_installed");
-    let events = create_private_directory_exclusive_in_parent(&layout.events_directory(), &transaction)
+    let events = create_journal_directory_in_directory(&transaction, layout.events_directory())
         .map_err(|error| {
             PreparePublicationError::PublishBlocked(format!(
                 "exclusive recovery transaction was retained after events directory creation failed: {error}"
             ))
         })?;
-    let stage = create_private_directory_exclusive_in_parent(&layout.stage_directory(), &transaction)
+    let events_identity = journal_directory_identity(&events)
+        .map_err(|error| map_prejournal_io("capture recovery events identity", error))?;
+    let stage = create_journal_directory_in_directory(&transaction, layout.stage_directory())
         .map_err(|error| {
             PreparePublicationError::PublishBlocked(format!(
                 "exclusive recovery transaction was retained after stage directory creation failed: {error}"
             ))
         })?;
-    let backup = create_private_directory_exclusive_in_parent(&layout.backup_directory(), &transaction)
+    let stage_identity = journal_directory_identity(&stage)
+        .map_err(|error| map_prejournal_io("capture recovery stage identity", error))?;
+    let backup = create_journal_directory_in_directory(&transaction, layout.backup_directory())
         .map_err(|error| {
             PreparePublicationError::PublishBlocked(format!(
                 "exclusive recovery transaction was retained after backup directory creation failed: {error}"
             ))
         })?;
-    let baseline = create_private_directory_exclusive_in_parent(
-        &layout.baseline_directory(),
-        &transaction,
-    )
-    .map_err(|error| {
+    let backup_identity = journal_directory_identity(&backup)
+        .map_err(|error| map_prejournal_io("capture recovery backup identity", error))?;
+    let baseline = create_journal_directory_in_directory(&transaction, layout.baseline_directory())
+        .map_err(|error| {
             PreparePublicationError::PublishBlocked(format!(
                 "exclusive recovery transaction was retained after baseline directory creation failed: {error}"
             ))
         })?;
-    let directories = JournalDirectoryIdentities::new(transaction, events, stage, backup, baseline);
-    let durability = platform::sync_directory(&layout.events_directory())
-        .and_then(|()| platform::sync_directory(&layout.stage_directory()))
-        .and_then(|()| platform::sync_directory(&layout.backup_directory()))
-        .and_then(|()| platform::sync_directory(&layout.baseline_directory()))
-        .and_then(|()| platform::sync_directory(layout.directory()))
-        .and_then(|()| platform::sync_directory(version_directory))
-        .and_then(|()| platform::sync_directory(recovery_directory))
-        .and_then(|()| platform::sync_directory(layout.parent()));
+    let baseline_identity = journal_directory_identity(&baseline)
+        .map_err(|error| map_prejournal_io("capture recovery baseline identity", error))?;
+    let identities = JournalDirectoryIdentities::new(
+        transaction_identity,
+        events_identity,
+        stage_identity,
+        backup_identity,
+        baseline_identity,
+    );
+    let durability = sync_journal_directory(&events)
+        .and_then(|()| sync_journal_directory(&stage))
+        .and_then(|()| sync_journal_directory(&backup))
+        .and_then(|()| sync_journal_directory(&baseline))
+        .and_then(|()| sync_journal_directory(&transaction))
+        .and_then(|()| sync_journal_access(access));
     if let Err(error) = durability {
         return Err(map_prejournal_io(
             "persist private recovery namespace",
             error,
         ));
     }
-    Ok(directories)
+    Ok(PreparedJournalDirectories {
+        identities,
+        stage,
+        backup,
+        baseline,
+    })
 }
 
 fn cleanup_prejournal_error(
     layout: &JournalLayout,
+    access: &JournalAccess<'_>,
     error: PreparePublicationError,
     context: &'static str,
-    budget: &mut AssetLoadBudget,
+    operation_budget: &mut AssetLoadBudget,
 ) -> PreparePublicationError {
-    let Err(cleanup) = recovery::cleanup_prepared_transaction(layout, budget) else {
+    let cleanup = if matches!(&error, PreparePublicationError::Budget(_)) {
+        recovery::cleanup_prepared_transaction_after_budget_exhaustion(layout, access)
+    } else {
+        recovery::cleanup_prepared_transaction(layout, access, operation_budget)
+    };
+    let Err(cleanup) = cleanup else {
         return error;
     };
     let original = error.to_string();
     PreparePublicationError::RecoveryRequired {
-        locator: RecoveryLocator::new(layout.directory().to_path_buf(), layout.transaction()),
+        locator: RecoveryLocator::new(
+            layout.directory().to_path_buf(),
+            layout.transaction(),
+            layout.root_identity().clone(),
+        ),
         message: format!(
             "{context} ({original}); prepared transaction cleanup also failed: {cleanup}"
         ),
     }
+}
+
+fn reserve_publication_security_metadata(
+    publications: &[PreparedPublication],
+    execution: &mut [PublicationExecution],
+    budget: &mut AssetLoadBudget,
+) -> Result<(), BudgetError> {
+    debug_assert_eq!(publications.len(), execution.len());
+    for (publication, execution) in publications.iter().zip(execution) {
+        debug_assert_eq!(publication.ordinal, execution.ordinal);
+        if matches!(publication.expected, DestinationState::Existing(_)) {
+            execution.security_metadata = Some(reserve_security_metadata_copy(budget)?);
+        }
+    }
+    Ok(())
 }
 
 fn map_orphaned_preparation_cleanup_error(
@@ -1510,7 +1657,7 @@ fn publication_execution_plan(
     )?;
     for publication in publications {
         let stage = budgeted_ordinal_child_path(
-            &layout.stage_directory(),
+            layout.stage_directory(),
             publication.ordinal,
             ".stage",
             "commit staging execution path",
@@ -1518,7 +1665,7 @@ fn publication_execution_plan(
         )?;
         let backup = if matches!(publication.expected, DestinationState::Existing(_)) {
             Some(budgeted_ordinal_child_path(
-                &layout.backup_directory(),
+                layout.backup_directory(),
                 publication.ordinal,
                 ".backup",
                 "commit backup execution path",
@@ -1531,6 +1678,7 @@ fn publication_execution_plan(
             ordinal: publication.ordinal,
             stage,
             backup,
+            security_metadata: None,
         });
     }
     Ok(execution)
@@ -1613,7 +1761,7 @@ fn recovery_baseline_image_paths(
     )
     .map_err(map_recovery_baseline_path_error)?;
     let path = budgeted_ordinal_child_path(
-        &layout.baseline_directory(),
+        layout.baseline_directory(),
         ordinal,
         ".image",
         "recovery baseline image path",
@@ -1731,7 +1879,7 @@ fn write_recovery_baseline(
     planned: &JournalBaseline,
     images: &MaterializedImages,
     layout: &JournalLayout,
-    directories: &JournalDirectoryIdentities,
+    baseline_directory: &JournalDirectory,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), RecoveryBaselineWriteError> {
     let core = prepared.state().core();
@@ -1785,12 +1933,11 @@ fn write_recovery_baseline(
                 "nested recovery image path changed after planning".to_owned(),
             ));
         }
-        let baseline_parent = directories.baseline().clone();
-        let mut file = create_private_file_in_parent(&path, &baseline_parent)?;
+        let mut file = create_journal_regular_in_directory(baseline_directory, &path)?;
         file.write_all(image)?;
         file.sync_all()?;
     }
-    platform::sync_directory(&layout.baseline_directory())?;
+    sync_journal_directory(baseline_directory)?;
     Ok(())
 }
 
@@ -2001,24 +2148,35 @@ fn commit_event_keys(
     Ok(keys)
 }
 
+#[derive(Debug)]
+enum PublishError {
+    Message(String),
+}
+
+impl From<String> for PublishError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
 fn publish_one(
     journal: &mut Journal,
     event_plan: &mut JournalEventPlan,
     publication: &PreparedPublication,
-    execution: &PublicationExecution,
-) -> Result<(), String> {
+    execution: &mut PublicationExecution,
+) -> Result<(), PublishError> {
     debug_assert_eq!(publication.ordinal, execution.ordinal);
     let stage = &execution.stage;
     let staged_identity = publication
         .staged_identity
         .as_ref()
         .ok_or_else(|| "staged artifact has no captured identity".to_owned())?;
-    verify_file(
+    verify_journal_file(
+        journal.stage_directory(),
         stage,
         publication.digest,
         Some(publication.bytes),
         Some(staged_identity),
-        journal.manifest().directories().stage(),
     )
     .map_err(|error| error.to_string())?;
     if matches!(publication.expected, DestinationState::Existing(_)) {
@@ -2041,32 +2199,39 @@ fn publish_one(
         let DestinationState::Existing(expected) = publication.expected else {
             unreachable!();
         };
-        capture_matching_digest_in_parent(
+        capture_external_regular_in_journal_directory(
             &publication.target,
+            journal.backup_directory(),
             backup,
             expected_identity,
-            expected.digest(),
+            Some(expected.digest()),
             &publication.destination_parent_identity,
-            journal.manifest().directories().backup(),
         )
         .map_err(|error| error.to_string())?;
         #[cfg(test)]
         test_crash_artifact_failpoint("backup_renamed", publication.ordinal);
-        verify_file(
+        verify_journal_file(
+            journal.backup_directory(),
             backup,
             expected.digest(),
             None,
             publication.expected_identity.as_ref(),
-            journal.manifest().directories().backup(),
         )
         .map_err(|error| error.to_string())?;
-        copy_security_metadata(
+        copy_security_metadata_between_journal_directories(
+            journal.backup_directory(),
             backup,
+            journal.stage_directory(),
             stage,
             expected_identity,
-            journal.manifest().directories().backup(),
             staged_identity,
-            journal.manifest().directories().stage(),
+            execution
+                .security_metadata
+                .as_mut()
+                .ok_or_else(|| {
+                    "existing publication has no reserved security metadata budget".to_owned()
+                })?
+                .budget_mut(),
         )
         .map_err(|error| error.to_string())?;
         journal
@@ -2078,12 +2243,12 @@ fn publish_one(
     }
     // This is the publication linearization check. It immediately precedes the durable intent so
     // already-visible stage corruption cannot mutate the target first.
-    verify_file(
+    verify_journal_file(
+        journal.stage_directory(),
         stage,
         publication.digest,
         Some(publication.bytes),
         Some(staged_identity),
-        journal.manifest().directories().stage(),
     )
     .map_err(|error| error.to_string())?;
     journal
@@ -2094,12 +2259,12 @@ fn publish_one(
         .map_err(|error| error.to_string())?;
     #[cfg(test)]
     test_crash_artifact_failpoint("promotion_intent", publication.ordinal);
-    capture_matching_digest_in_parent(
+    promote_journal_regular_to_external(
+        journal.stage_directory(),
         stage,
         &publication.target,
         staged_identity,
-        publication.digest,
-        journal.manifest().directories().stage(),
+        Some(publication.digest),
         &publication.destination_parent_identity,
     )
     .map_err(|error| error.to_string())?;
@@ -2127,6 +2292,38 @@ fn verify_file(
     expected_parent: &DirectoryIdentity,
 ) -> io::Result<()> {
     let mut file = open_readonly_regular_in_parent(path, expected_parent)?;
+    let identity = opened_file_identity(&file)?;
+    let length = file.metadata()?.len();
+    if expected_len.is_some_and(|expected_len| expected_len != length) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "published artifact length changed",
+        ));
+    }
+    if expected_identity.is_some_and(|expected_identity| expected_identity != &identity) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "published artifact identity changed",
+        ));
+    }
+    let actual = DigestV1::hash_reader(&mut file, length)?;
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "published artifact digest changed",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_journal_file(
+    directory: &JournalDirectory,
+    path: &Path,
+    expected: DigestV1,
+    expected_len: Option<u64>,
+    expected_identity: Option<&FileIdentity>,
+) -> io::Result<()> {
+    let mut file = open_journal_regular_in_directory(directory, path)?;
     let identity = opened_file_identity(&file)?;
     let length = file.metadata()?.len();
     if expected_len.is_some_and(|expected_len| expected_len != length) {
@@ -2340,6 +2537,23 @@ fn map_recovery_baseline_prepare_error(
     }
 }
 
+fn map_security_metadata_prepare_error(error: SecurityMetadataError) -> PreparePublicationError {
+    match error {
+        SecurityMetadataError::Budget(error) => PreparePublicationError::Budget(error),
+        SecurityMetadataError::Io(error) => map_prejournal_io("copy security metadata", error),
+    }
+}
+
+fn map_journal_layout_prepare_error(error: JournalError) -> PreparePublicationError {
+    match error {
+        JournalError::Budget(error) => PreparePublicationError::Budget(error),
+        error @ JournalError::Allocation { .. } => {
+            PreparePublicationError::Retryable(error.to_string())
+        }
+        error => PreparePublicationError::PublishBlocked(error.to_string()),
+    }
+}
+
 fn map_prejournal_io(operation: &'static str, error: io::Error) -> PreparePublicationError {
     let message = format!("{operation}: {error}");
     match error.kind() {
@@ -2491,7 +2705,7 @@ impl fmt::Display for PublicationTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unity_asset_core::{SourceKind, WorkspaceId};
+    use unity_asset_core::{AssetLoadLimits, SourceKind, WorkspaceId};
 
     #[test]
     fn publication_target_is_explicitly_in_place() {
@@ -2512,7 +2726,7 @@ mod tests {
         assert_eq!(locator.transaction(), transaction);
         assert_eq!(
             locator.root(),
-            JournalLayout::new(target.root(), transaction).directory()
+            JournalLayout::new(target.root(), transaction, target.identity().clone()).directory()
         );
     }
 
@@ -2520,7 +2734,8 @@ mod tests {
     fn recovery_layout_publishes_preparation_before_the_transaction_directory() {
         let directory = tempfile::tempdir().unwrap();
         let transaction = TransactionId::new(DigestV1::hash_bytes(b"preparation locator"));
-        let layout = JournalLayout::new(directory.path(), transaction);
+        let root_identity = observe_directory_identity(directory.path()).unwrap();
+        let layout = JournalLayout::new(directory.path(), transaction, root_identity);
 
         assert_eq!(
             layout.preparation_path().parent(),
@@ -2594,5 +2809,42 @@ mod tests {
             )),
             PreparePublicationError::PublishBlocked(_)
         ));
+    }
+
+    #[test]
+    fn cleanup_prejournal_error_uses_the_callers_remaining_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let transaction = TransactionId::new(DigestV1::hash_bytes(b"cleanup budget"));
+        let root_identity = observe_directory_identity(directory.path()).unwrap();
+        let layout = JournalLayout::new(directory.path(), transaction, root_identity);
+        let preparation = layout.preparation_path();
+        std::fs::create_dir_all(preparation.parent().expect("preparation parent")).unwrap();
+        std::fs::write(preparation, b"{}").unwrap();
+        let root = open_commit_root(layout.parent(), layout.root_identity()).unwrap();
+        let namespace = open_journal_namespace(&root).unwrap();
+        let access = journal_access(&root, &namespace);
+
+        let limits = AssetLoadLimits {
+            max_bytes: 1,
+            ..AssetLoadLimits::default()
+        };
+        let mut budget = AssetLoadBudget::new(limits).unwrap();
+        let error = cleanup_prejournal_error(
+            &layout,
+            &access,
+            PreparePublicationError::PublishBlocked("synthetic prejournal failure".to_owned()),
+            "synthetic prejournal cleanup",
+            &mut budget,
+        );
+
+        let PreparePublicationError::RecoveryRequired { locator, message } = error else {
+            panic!("budget-exhausted cleanup must preserve a recoverable transaction");
+        };
+        assert_eq!(locator.root(), layout.directory());
+        assert!(message.contains("asset load budget exceeded for bytes"));
+        assert!(
+            preparation.is_file(),
+            "cleanup must retain preparation evidence"
+        );
     }
 }

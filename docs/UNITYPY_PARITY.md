@@ -127,20 +127,26 @@ TODO (parity):
   - optional directory scan under `Environment.base_path` (cached index)
   - implementation: `crates/unity-asset/src/environment/imp/dependency_files.rs` + `Environment::resolve_pptr_path_key_best_effort(...)`
 
-### Environment / Save entrypoint
+### Publication entrypoint
 
 UnityPy:
 - `repo-ref/UnityPy/UnityPy/environment.py`
   - `Environment.save(pack="none", out_path="output")`
 
 Rust (current):
-- `crates/unity-asset/src/environment.rs`
-  - `Environment::save(pack, out_dir)` writes only changed sources
-  - `.zip/.apk` entries are treated as standalone sources (UnityPy-style): edited entries are written to `out_dir` and the archive is not re-packed
-  - delegates to `unity-asset-write` rebuilders:
-    - `SerializedFileWriter`
-    - `BundleWriter`
-    - `WebFileWriter`
+- `crates/unity-asset/src/workspace/`
+  - `AssetWorkspace` owns one immutable revision and explicit source identities
+  - `MutationPlan` records ordered, guarded, serializable intent
+  - `AssetWorkspace::prepare(...)` builds a read-your-writes `PreparedChange` without durable writes
+  - `AssetWorkspace::commit(...)` publishes exact prepared artifacts through a durable recovery journal
+  - `PublicationTarget::discover_recoveries(...)` inventories deterministic, versioned recovery
+    locators without opening a journal; `recover_at(...)` / `finalize_recovery_at(...)` complete
+    interrupted publication
+- `crates/unity-asset-write/`
+  - `SerializedFileWriter`, `BundleWriter`, and `WebFileWriter` are low-level format adapters used by workspace preflight
+
+`Environment` no longer owns mutable pending state or a save entrypoint. This intentionally differs
+from UnityPy: change tracking must not bypass workspace revision checks, guards, prepare, or recovery.
 
 ### Object editing hook
 
@@ -161,17 +167,17 @@ Rust (current):
 - `crates/unity-asset/src/schema/`
   - `SchemaRecipePlanner::inspect(...)` validates object identity and records binary/YAML schema provenance
   - `SchemaRecipePlanner::capabilities_for(...)` reports supported recipes and structured rejection reasons without attempting mutation
+  - `SchemaRecipePlanner::lower_field_replace(...)` derives field guards from the immutable view for generic agent/user edits
+  - `SchemaRecipePlanner::lower_reference(...)` keeps logical PPtr targets and external allocation inside preflight
   - schema recipes lower supported domain operations to guarded `MutationPlanFragment` values; callers assemble these into a canonical `MutationPlan`
-- `crates/unity-asset/src/environment/imp/edit.rs`
-  - `EnvironmentEditSession` provides low-level edit + save hooks on top of `ObjectHandle`:
-    - `edit_binary_object_key(...)` (mutate in a closure)
-    - `save_binary_object_class(...)` (UnityPy `Object.save()`-style: mutate outside, then persist)
-- `crates/unity-asset-write/src/object/serialized_file_session.rs`
-  - `SerializedFileEditSession` (UnityPy-like: edit -> save_typetree/set_raw_data -> mark_changed)
-  - `ChangeTracker` trait mirrors UnityPy `mark_changed()` / `is_changed`
-  - stores either:
-    - parsed properties + TypeTree → encode to raw bytes (`save_typetree` / `edit_object`), or
-    - raw byte patch (escape hatch: `set_raw_data`)
+- `crates/unity-asset-write/src/object/encoder.rs`
+  - `SerializedObjectEncoder` is the low-level canonical TypeTree encoder
+  - semantic replacements require observed schema/value guards and caller-owned budget
+  - raw replacement requires an explicit `UnsafeRawObjectAcknowledgement`
+
+The old mutable `EnvironmentEditSession`, `SerializedFileEditSession`, `ChangeTracker`, and
+unacknowledged raw patch lifecycle were removed. They could not represent revision identity,
+read-your-writes ordering, atomic multi-source publication, or restart recovery.
 
 ### File.mark_changed / streamed resources
 
@@ -232,8 +238,8 @@ Rust (current):
 - `crates/unity-asset-write/src/typetree/`
   - encode and byte-preserving rewrite use the same compiled `TypeTreeSchema`; there is no separate
     serializer facade with independent semantics
-  - `SerializedFileEditSession::edit_object` / `save_typetree` carry the caller's budget through
-    schema compilation, read, write, and rewrite
+  - `SerializedObjectEncoder` carries the caller's budget through schema compilation, guarded
+    mutation, write, and rewrite
   - untouched fields, padding, and rare unnamed children retain their original byte slices
 
 ### SerializedFile save/rebuild
@@ -325,12 +331,11 @@ Rust (current):
 
 - [x] Create `crates/unity-asset-write` with minimal public surface
 - [x] Define core traits/structs:
-  - [x] `ChangeTracker` (UnityPy `mark_changed`)
-  - [x] `SerializedFileEditSession` (per `SerializedFile`)
+  - [x] `SerializedObjectEncoder` (guarded low-level object encoding)
   - [x] `PackingPolicy` (explicit preserve/uncompressed/compression semantics)
 - [x] Add `unity-asset` integration stubs:
-  - [x] `Environment::save(pack, out_dir)` implemented (standalone SerializedFile + UnityFS bundle repack)
-  - [x] `Environment::edit_binary_object_key(...)` / `EnvironmentEditSession` for UnityPy-like change tracking
+  - [x] `AssetWorkspace` revision ownership and immutable snapshots
+  - [x] `MutationPlan -> prepare -> commit/recover` transactional lifecycle
 
 Acceptance:
 - Compiles with `cargo build --workspace`
@@ -370,7 +375,8 @@ Acceptance:
   - [x] offsets (32/64-bit depending on version)
   - [x] size, type id/index, stripped/script fields
   - [x] alignment (object stream + metadata alignment)
-- [x] Support “edited object bytes” overriding original slices (`SerializedFileEdits`)
+- [x] Support encoded object replacements overriding original slices (`SerializedFileEdits` accepts
+  only the `EncodedSerializedObject` capability; it does not accept bare object bytes)
 - [x] Support `version < 9` save (legacy metadata-at-end layout, with endian boolean prefix)
 - [x] Legacy TypeTree dump `SerializedType::write_type_tree` for `version == 2` (writes `m_VariableCount` best-effort)
 
@@ -380,7 +386,7 @@ Acceptance:
   - [x] UnityPy (baseline snapshot) (opt-in: `UNITYPY_E2E=1`; see `crates/unity-asset-write/tests/unitypy_e2e.rs`)
 
 TODO (parity):
-- [x] Support stripped TypeTree edits in `SerializedFileEditSession` via `TypeTreeRegistry`
+- [x] Support stripped TypeTree edits in `SerializedObjectEncoder` via `TypeTreeRegistry`
 
 ### M4 — BundleFile.save (UnityFS) parity
 
@@ -419,12 +425,11 @@ Acceptance:
 - [x] Allocate multiple payload extents deterministically with checked offset/size arithmetic
 - [x] Preserve resource flags and expose structured allocation/build failures
 - [ ] Bind resource artifacts and owning object/container rewrites through `AssetWorkspace::prepare`
-- [x] Provide generic dot-path editing helpers for binary objects:
-  - [x] `EnvironmentEditSession::set_binary_value_at_path(...)` for `UnityValue` updates
-  - [x] `EnvironmentEditSession::get_binary_value_at_path(...)` reads from pending edits or by parsing the source object
+- [x] Provide guarded generic mutations for binary objects through `MutationPlan`
+- [x] Provide read-your-writes inspection through `PreparedView`
 - [x] Provide a generic `PPtr` path helper (Unity-style references):
-  - [x] resolve via `Environment::resolve_pptr_path_key(...)`
-  - [x] set via `EnvironmentEditSession::set_pptr_path_to_key(...)` (best-effort externals)
+  - [x] resolve via `Environment::resolve_pptr_path_key_best_effort(...)` for compatibility reads
+  - [x] replace through guarded `GenericMutation::ReferenceReplace`
 - [x] Provide one revision-bound binary + YAML Reference Graph for "find references":
   - [x] format-local scanners preserve typed `FieldPath` plus raw file ID, path ID, GUID, and type
   - [x] `ReferenceGraph::incoming` and `outgoing` expose Null, Resolved, Unloaded, Missing, Ambiguous, and Invalid states without hidden loading

@@ -39,7 +39,7 @@ unity-asset/
 
 ### Crates
 
-- `unity-asset` (library): high-level loading, querying, and editing API. Start here for `Environment` (YAML + binary) and `YamlDocument`.
+- `unity-asset` (library): revisioned loading, querying, mutation planning, and transactional publication. Start with `AssetWorkspace`; `Environment` is a read-only query facade for YAML and binary assets.
 - `unity-asset-binary` (parser): low-level binary parsers (AssetBundle/SerializedFile/WebFile), TypeTree schemas, and fast object helpers (`ObjectHandle`).
 - `unity-asset-write` (edit/repack): TypeTree object edits, SerializedFile rebuilds, Bundle/WebFile repacking, and streamed-resource writes.
 - `unity-asset-decode` (decode/export): optional decode/export helpers behind feature flags (Texture/Audio/Sprite/Mesh).
@@ -51,9 +51,13 @@ unity-asset/
 
 Rust does not make transitive crates importable. Use `unity_asset` for its re-exported high-level
 API, and add a direct dependency on `unity-asset-write`, `unity-asset-binary`, or
-`unity-asset-decode` when using APIs owned by those crates. In particular, high-level
-`Environment` edit methods live in `unity-asset`, while save/repack policy types such as
-`PackingPolicy` are imported from `unity_asset_write`.
+`unity-asset-decode` when using APIs owned by those crates. `Environment` is read/query only.
+`AssetWorkspace` owns the inspect, plan, prepare, commit, and recover lifecycle. Use
+`PublicationTarget::discover_recoveries` to inventory versioned, read-only recovery candidates
+after a restart, then pass each `RecoveryLocator` to the recovery API. Low-level save and repack
+policy types such as `PackingPolicy` are imported from `unity_asset_write`; using those writers
+directly does not provide Workspace revision checks, atomic multi-source publication, or recovery
+guarantees.
 
 Examples are maintained per-crate and are built in CI. For instance:
 `cargo run -p unity-asset --example env_load_and_list -- tests/samples`
@@ -79,7 +83,8 @@ See `docs/README.md` for documentation entry points, and `docs/EXAMPLES.md` for 
 - Performance monitoring and basic statistics
 
 #### Editing and Repacking (Advanced, WIP)
-- TypeTree-backed object mutation through `Environment` or `SerializedFileEditSession`
+- Revision-bound, guarded mutation through `AssetWorkspace`, `MutationPlan`, and `PreparedChange`
+- Read-your-writes inspection through `PreparedView`, followed by recoverable `commit`
 - SerializedFile rebuilds and AssetBundle/WebFile repacking via `unity-asset-write`
 - Streamed `.resS`/`.resource` writes for supported object fields and container layouts
 - YAML serialization through `YamlDocument`
@@ -128,13 +133,13 @@ This project is published on crates.io. Install it with:
 # Add to your Cargo.toml
 [dependencies]
 unity-asset = "0.3.0"
-# Add when calling edit/save/repack APIs that use writer-owned types.
+# Add only when using low-level object encoding or format repacking directly.
 unity-asset-write = "0.3.0"
 ```
 
-`unity-asset` is sufficient for the high-level read/query API. Keep `unity-asset-write` as a direct
-dependency when calling `Environment::save` or importing edit/repack types; those types are not
-re-exported from `unity-asset`.
+`unity-asset` contains the high-level revisioned workspace lifecycle. Keep `unity-asset-write` as a
+direct dependency only for low-level `SerializedObjectEncoder` or SerializedFile/Bundle/WebFile
+format adapters; those types are not re-exported from `unity-asset`.
 
 ```bash
 # Install CLI tools
@@ -262,10 +267,12 @@ All binary TypeTree operations use one compiled
 `unity_asset_binary::typetree::TypeTreeSchema` contract, obtained through
 `unity_asset_binary::object::ObjectHandle::schema(&mut AssetLoadBudget)`. The schema owns the
 semantics for materialized reads (`read_object` and `read_value`), allocation-free skips
-(`skip_value`), and zero-materialization PPtr scans (`scan_pptrs`). Object writes do not use a
-separate serializer facade: `unity_asset_write::object::SerializedFileEditSession::edit_object`
-and `save_typetree` accept the same caller-owned budget, reuse the canonical schema, and rewrite
-changed fields while preserving untouched original bytes. Keep one budget for the whole logical
+(`skip_value`), and zero-materialization PPtr scans (`scan_pptrs`). Low-level object writes use
+`unity_asset_write::object::SerializedObjectEncoder`, which applies ordered digest-guarded
+mutations through that same schema and preserves untouched original bytes. High-level callers
+should inspect through `SchemaRecipePlanner`, use `lower_field_replace` or a domain recipe to build
+guarded fragments, and call `AssetWorkspace::prepare` so source expectations, read-your-writes
+validation, publication, and recovery remain one lifecycle. Keep one budget for the whole logical
 operation so schema compilation, traversal, and rewrite are accounted cumulatively.
 
 ### CLI Usage

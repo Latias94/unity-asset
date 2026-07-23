@@ -52,6 +52,7 @@ windows-sys = { version = "0.61", features = [
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs"] }
+libc = "0.2"
 
 [features]
 default = ["mmap"]

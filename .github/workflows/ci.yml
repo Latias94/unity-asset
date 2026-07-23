@@ -103,7 +103,7 @@ jobs:
       run: cargo nextest run -p unity-asset -E 'test(/^workspace::commit::/)'
 
     - name: Run publication contract tests
-      run: cargo nextest run -p unity-asset --test workspace_commit
+      run: cargo nextest run -p unity-asset --test workspace_commit --test workspace_recovery
 
   binary-loader-features:
     name: Binary loader / ${{ matrix.mode }}

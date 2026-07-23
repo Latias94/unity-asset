@@ -1,27 +1,39 @@
 //! Windows publication primitives.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Seek as _, SeekFrom};
-use std::mem::{MaybeUninit, align_of, size_of};
+use std::mem::{MaybeUninit, align_of, size_of, size_of_val};
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-use std::path::{Component, Path, Prefix};
+use std::path::{Component, Components, Path, Prefix};
 
 use serde::{Deserialize, Serialize};
-use unity_asset_core::DigestV1;
+use unity_asset_core::{AssetLoadBudget, DigestV1};
+
+use super::super::journal::{RECOVERY_DIRECTORY, RECOVERY_VERSION_DIRECTORY};
+use super::{
+    COMMIT_LOCK_FILE, DirectoryEntryName, DirectoryVisitError, LEGACY_COMMIT_LOCK_DIRECTORY,
+    SecurityMetadataError,
+};
+
+pub(super) const DIRECTORY_VISIT_SETUP_BYTES: u64 = 0;
+pub(super) const DIRECTORY_VISIT_ENTRY_BYTES: u64 = 0;
+pub(super) const SECURITY_METADATA_COPY_RESERVATION_BYTES: u64 = 256 * 1024;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION, FILE_NON_DIRECTORY_FILE,
-    FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
-    FILE_RENAME_INFORMATION_0, FILE_SYNCHRONOUS_IO_NONALERT, FileDispositionInformation,
-    FileRenameInformation, NtCreateFile, NtSetInformationFile,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DIRECTORY_INFORMATION, FILE_DISPOSITION_INFORMATION,
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+    FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileDirectoryInformation, FileDispositionInformation, FileRenameInformation, NtCreateFile,
+    NtQueryDirectoryFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_TOKEN, ERROR_NOT_SAME_DEVICE,
-    GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE,
-    OBJ_DONT_REPARSE, RtlNtStatusToDosError, STATUS_REPARSE_POINT_ENCOUNTERED,
-    STATUS_STOPPED_ON_SYMLINK,
+    CloseHandle, DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_LOCK_VIOLATION, ERROR_NO_TOKEN,
+    ERROR_NOT_SAME_DEVICE, ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError,
+    STATUS_NO_MORE_FILES, STATUS_REPARSE_POINT_ENCOUNTERED, STATUS_STOPPED_ON_SYMLINK,
+    STATUS_SUCCESS,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE,
@@ -50,7 +62,6 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::WindowsProgramming::{FILE_CREATED, FILE_OPENED};
 
-const RECOVERY_DIRECTORY: &str = ".unity-asset-recovery";
 const PINNED_DIRECTORY_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 const PINNED_FILE_SHARE: u32 = FILE_SHARE_READ;
 const DIRECTORY_TRAVERSE_ACCESS: u32 =
@@ -73,6 +84,10 @@ const SECURITY_METADATA_INFORMATION: u32 =
     OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
 const PRIVATE_SECURITY_INFORMATION: u32 =
     OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+const MAX_WINDOWS_ROOT_UTF16_UNITS: usize = 1_024;
+const MAX_WINDOWS_COMPONENT_UTF16_UNITS: usize = 255;
+const WINDOWS_ROOT_BUFFER_UTF16_UNITS: usize = MAX_WINDOWS_ROOT_UTF16_UNITS + 2;
+const MAX_WINDOWS_SECURITY_DESCRIPTOR_BYTES: usize = 128 * 1024;
 
 /// Stable identity of one opened regular file.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -134,35 +149,560 @@ impl DirectoryIdentity {
     }
 }
 
+pub(super) struct CommitRoot {
+    directory: OpenedDirectory,
+}
+
+pub(super) struct JournalNamespace {
+    recovery: OpenedDirectory,
+    version: OpenedDirectory,
+}
+
+pub(super) struct JournalDirectory {
+    directory: OpenedDirectory,
+}
+
+pub(super) fn open_commit_root(
+    path: &Path,
+    expected: &DirectoryIdentity,
+) -> io::Result<CommitRoot> {
+    let directory = open_directory(path, DIRECTORY_DESTINATION_SYNC_ACCESS)?;
+    verify_directory_identity(
+        directory.raw(),
+        expected,
+        "publication root changed before writer lock acquisition",
+    )?;
+    Ok(CommitRoot { directory })
+}
+
+pub(super) fn acquire_commit_locks(root: &CommitRoot) -> io::Result<(File, File)> {
+    let directory_security = PrivateSecurityDescriptor::new(true)?;
+    let recovery = open_or_create_private_directory_at(
+        root.directory.raw(),
+        OsStr::new(RECOVERY_DIRECTORY),
+        &directory_security,
+    )?;
+    let legacy = open_or_create_private_directory_at(
+        recovery.raw(),
+        OsStr::new(LEGACY_COMMIT_LOCK_DIRECTORY),
+        &directory_security,
+    )?;
+
+    // Journal v1 placed its only writer lock under v1/. Newer protocols
+    // retain that lock and also take a version-independent lock so old and
+    // future binaries cannot publish concurrently into the same root.
+    let legacy_file = acquire_lock_at(legacy.raw(), OsStr::new(COMMIT_LOCK_FILE))?;
+    let stable_file = acquire_lock_at(recovery.raw(), OsStr::new(COMMIT_LOCK_FILE))?;
+    Ok((legacy_file, stable_file))
+}
+
+pub(super) fn open_journal_namespace(root: &CommitRoot) -> io::Result<JournalNamespace> {
+    let directory_security = PrivateSecurityDescriptor::new(true)?;
+    let recovery = open_or_create_private_directory_at(
+        root.directory.raw(),
+        OsStr::new(RECOVERY_DIRECTORY),
+        &directory_security,
+    )?;
+    let version = open_or_create_private_directory_at(
+        recovery.raw(),
+        OsStr::new(RECOVERY_VERSION_DIRECTORY),
+        &directory_security,
+    )?;
+    Ok(JournalNamespace {
+        recovery: OpenedDirectory { handle: recovery },
+        version: OpenedDirectory { handle: version },
+    })
+}
+
+pub(super) fn open_existing_journal_namespace(root: &CommitRoot) -> io::Result<JournalNamespace> {
+    let (recovery, _) = open_directory_at(
+        root.directory.raw(),
+        OsStr::new(RECOVERY_DIRECTORY),
+        DIRECTORY_DESTINATION_SYNC_ACCESS,
+        FILE_OPEN,
+        None,
+    )?;
+    let (version, _) = open_directory_at(
+        recovery.raw(),
+        OsStr::new(RECOVERY_VERSION_DIRECTORY),
+        DIRECTORY_DESTINATION_SYNC_ACCESS,
+        FILE_OPEN,
+        None,
+    )?;
+    Ok(JournalNamespace {
+        recovery: OpenedDirectory { handle: recovery },
+        version: OpenedDirectory { handle: version },
+    })
+}
+
+pub(super) fn open_journal_directory(
+    namespace: &JournalNamespace,
+    name: &OsStr,
+) -> io::Result<JournalDirectory> {
+    open_journal_directory_at(namespace.version.raw(), name)
+}
+
+pub(super) fn open_journal_directory_in_directory(
+    parent: &JournalDirectory,
+    name: &OsStr,
+) -> io::Result<JournalDirectory> {
+    open_journal_directory_at(parent.directory.raw(), name)
+}
+
+pub(super) fn create_journal_directory(
+    namespace: &JournalNamespace,
+    name: &OsStr,
+) -> io::Result<JournalDirectory> {
+    create_journal_directory_at(namespace.version.raw(), name)
+}
+
+pub(super) fn create_journal_directory_in_directory(
+    parent: &JournalDirectory,
+    name: &OsStr,
+) -> io::Result<JournalDirectory> {
+    create_journal_directory_at(parent.directory.raw(), name)
+}
+
+pub(super) fn journal_directory_identity(
+    directory: &JournalDirectory,
+) -> io::Result<DirectoryIdentity> {
+    directory_identity(directory.directory.raw())
+}
+
+pub(super) fn open_journal_regular(namespace: &JournalNamespace, name: &OsStr) -> io::Result<File> {
+    open_journal_regular_at(namespace.version.raw(), name)
+}
+
+pub(super) fn open_journal_regular_in_directory(
+    parent: &JournalDirectory,
+    name: &OsStr,
+) -> io::Result<File> {
+    open_journal_regular_at(parent.directory.raw(), name)
+}
+
+pub(super) fn create_journal_regular(
+    namespace: &JournalNamespace,
+    name: &OsStr,
+) -> io::Result<File> {
+    create_journal_regular_at(namespace.version.raw(), name)
+}
+
+pub(super) fn create_journal_regular_in_directory(
+    parent: &JournalDirectory,
+    name: &OsStr,
+) -> io::Result<File> {
+    create_journal_regular_at(parent.directory.raw(), name)
+}
+
+pub(super) fn remove_journal_regular(
+    namespace: &JournalNamespace,
+    name: &OsStr,
+    expected: &FileIdentity,
+) -> io::Result<()> {
+    remove_journal_regular_at(namespace.version.raw(), name, expected)
+}
+
+pub(super) fn remove_journal_regular_in_directory(
+    parent: &JournalDirectory,
+    name: &OsStr,
+    expected: &FileIdentity,
+) -> io::Result<()> {
+    remove_journal_regular_at(parent.directory.raw(), name, expected)
+}
+
+pub(super) fn remove_journal_directory(
+    namespace: &JournalNamespace,
+    name: &OsStr,
+    expected: &DirectoryIdentity,
+) -> io::Result<()> {
+    remove_journal_directory_at(namespace.version.raw(), name, expected)
+}
+
+pub(super) fn remove_journal_directory_in_directory(
+    parent: &JournalDirectory,
+    name: &OsStr,
+    expected: &DirectoryIdentity,
+) -> io::Result<()> {
+    remove_journal_directory_at(parent.directory.raw(), name, expected)
+}
+
+pub(super) fn atomic_replace_journal_regular(
+    namespace: &JournalNamespace,
+    source: &OsStr,
+    destination: &OsStr,
+    replace_existing: bool,
+) -> Result<(), super::AtomicMoveError> {
+    atomic_replace_journal_regular_at(
+        namespace.version.raw(),
+        source,
+        destination,
+        replace_existing,
+    )
+}
+
+pub(super) fn atomic_replace_journal_regular_in_directory(
+    parent: &JournalDirectory,
+    source: &OsStr,
+    destination: &OsStr,
+    replace_existing: bool,
+) -> Result<(), super::AtomicMoveError> {
+    atomic_replace_journal_regular_at(
+        parent.directory.raw(),
+        source,
+        destination,
+        replace_existing,
+    )
+}
+
+pub(super) fn sync_journal_directory(directory: &JournalDirectory) -> io::Result<()> {
+    flush_handle(directory.directory.raw())
+}
+
+pub(super) fn visit_journal_directory_entries<S, E>(
+    directory: &JournalDirectory,
+    state: &mut S,
+    mut before_entry: impl FnMut(&mut S) -> Result<(), E>,
+    mut visitor: impl FnMut(&mut S, DirectoryEntryName<'_>) -> Result<(), E>,
+) -> Result<(), DirectoryVisitError<E>> {
+    const DIRECTORY_BUFFER_BYTES: usize = 64 * 1024;
+    const DIRECTORY_BUFFER_WORDS: usize = DIRECTORY_BUFFER_BYTES / size_of::<u64>();
+    const NEXT_ENTRY_OFFSET: usize =
+        std::mem::offset_of!(FILE_DIRECTORY_INFORMATION, NextEntryOffset);
+    const FILE_NAME_LENGTH_OFFSET: usize =
+        std::mem::offset_of!(FILE_DIRECTORY_INFORMATION, FileNameLength);
+    const FILE_NAME_OFFSET: usize = std::mem::offset_of!(FILE_DIRECTORY_INFORMATION, FileName);
+
+    let mut buffer = [0_u64; DIRECTORY_BUFFER_WORDS];
+    let buffer_bytes = size_of::<[u64; DIRECTORY_BUFFER_WORDS]>();
+    let buffer_length = u32::try_from(buffer_bytes).expect("directory enumeration buffer fits u32");
+    let mut restart_scan = true;
+    loop {
+        let mut io_status = IO_STATUS_BLOCK::default();
+        // SAFETY: `directory` is an opened directory handle, the stack buffer
+        // is aligned and writable for the announced length, and synchronous I/O
+        // leaves no outstanding references after this call returns.
+        let status = unsafe {
+            NtQueryDirectoryFile(
+                directory.directory.raw(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null(),
+                &raw mut io_status,
+                buffer.as_mut_ptr().cast(),
+                buffer_length,
+                FileDirectoryInformation,
+                false,
+                std::ptr::null(),
+                restart_scan,
+            )
+        };
+        restart_scan = false;
+        if status == STATUS_NO_MORE_FILES {
+            break;
+        }
+        if status != STATUS_SUCCESS {
+            return Err(DirectoryVisitError::Io(io::Error::from_raw_os_error(
+                i32::try_from(unsafe { RtlNtStatusToDosError(status) }).unwrap_or(i32::MAX),
+            )));
+        }
+        let returned = io_status.Information;
+        if returned == 0 || returned > buffer_bytes {
+            return Err(DirectoryVisitError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows directory enumeration returned an invalid byte count",
+            )));
+        }
+
+        let base = buffer.as_ptr().cast::<u8>();
+        let mut offset = 0_usize;
+        loop {
+            let remaining = returned.checked_sub(offset).ok_or_else(|| {
+                DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory enumeration offset overflowed",
+                ))
+            })?;
+            if remaining < FILE_NAME_OFFSET {
+                return Err(DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory enumeration record is truncated",
+                )));
+            }
+            // SAFETY: `remaining` covers the fixed header, including both
+            // u32 fields. Reading the generated C struct itself would also
+            // read its one-element flexible-array placeholder and any Rust
+            // tail padding beyond a short final record.
+            let (next_entry_offset, file_name_length) = unsafe {
+                (
+                    std::ptr::read_unaligned(base.add(offset + NEXT_ENTRY_OFFSET).cast::<u32>()),
+                    std::ptr::read_unaligned(
+                        base.add(offset + FILE_NAME_LENGTH_OFFSET).cast::<u32>(),
+                    ),
+                )
+            };
+            let name_bytes = usize::try_from(file_name_length).map_err(|_| {
+                DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry name length is unsupported",
+                ))
+            })?;
+            if name_bytes % size_of::<u16>() != 0 {
+                return Err(DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry name is not UTF-16 aligned",
+                )));
+            }
+            let record_bytes = FILE_NAME_OFFSET.checked_add(name_bytes).ok_or_else(|| {
+                DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry length overflowed",
+                ))
+            })?;
+            if record_bytes > remaining {
+                return Err(DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry extends beyond the query buffer",
+                )));
+            }
+            // SAFETY: `record_bytes` bounds the UTF-16 payload and the query
+            // buffer alignment is sufficient for `u16` reads.
+            let name = unsafe {
+                std::slice::from_raw_parts(
+                    base.add(offset + FILE_NAME_OFFSET).cast::<u16>(),
+                    name_bytes / size_of::<u16>(),
+                )
+            };
+            before_entry(state).map_err(DirectoryVisitError::Visitor)?;
+            visitor(state, DirectoryEntryName::Windows(name))
+                .map_err(DirectoryVisitError::Visitor)?;
+
+            let next = usize::try_from(next_entry_offset).map_err(|_| {
+                DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry offset is unsupported",
+                ))
+            })?;
+            if next == 0 {
+                break;
+            }
+            if next < record_bytes || next > remaining || next % align_of::<u64>() != 0 {
+                return Err(DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry offset is invalid",
+                )));
+            }
+            offset = offset.checked_add(next).ok_or_else(|| {
+                DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry offset overflowed",
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn journal_namespace_version_identity(
+    namespace: &JournalNamespace,
+) -> io::Result<DirectoryIdentity> {
+    directory_identity(namespace.version.raw())
+}
+
+pub(super) fn sync_journal_namespace(
+    root: &CommitRoot,
+    namespace: &JournalNamespace,
+) -> io::Result<()> {
+    flush_handle(namespace.version.raw())?;
+    flush_handle(namespace.recovery.raw())?;
+    flush_handle(root.directory.raw())
+}
+
+fn open_journal_directory_at(parent: HANDLE, name: &OsStr) -> io::Result<JournalDirectory> {
+    let (handle, _) = open_directory_at(
+        parent,
+        name,
+        DIRECTORY_DESTINATION_SYNC_ACCESS,
+        FILE_OPEN,
+        None,
+    )?;
+    Ok(JournalDirectory {
+        directory: OpenedDirectory { handle },
+    })
+}
+
+fn create_journal_directory_at(parent: HANDLE, name: &OsStr) -> io::Result<JournalDirectory> {
+    let private_security = PrivateSecurityDescriptor::new(true)?;
+    let (directory, information) = open_directory_at(
+        parent,
+        name,
+        PRIVATE_DIRECTORY_ACCESS | DIRECTORY_DESTINATION_SYNC_ACCESS,
+        FILE_CREATE,
+        Some(private_security.as_ptr()),
+    )?;
+    if information != FILE_CREATED as usize {
+        return Err(io::Error::other(
+            "Windows exclusive private journal directory returned an unexpected create disposition",
+        ));
+    }
+    private_security.apply_and_verify(directory.raw())?;
+    Ok(JournalDirectory {
+        directory: OpenedDirectory { handle: directory },
+    })
+}
+
+fn open_journal_regular_at(parent: HANDLE, name: &OsStr) -> io::Result<File> {
+    let opened = open_regular_at(
+        parent,
+        name,
+        GENERIC_READ | FILE_READ_ATTRIBUTES,
+        PINNED_FILE_SHARE,
+        "journal entry",
+    )?;
+    reject_mutable_hardlink(opened.raw(), "opened journal entry")?;
+    Ok(opened.into_file())
+}
+
+fn create_journal_regular_at(parent: HANDLE, name: &OsStr) -> io::Result<File> {
+    let private_security = PrivateSecurityDescriptor::new(false)?;
+    let (handle, information) = nt_create_at(
+        parent,
+        name,
+        PRIVATE_FILE_ACCESS,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        FILE_ATTRIBUTE_NORMAL,
+        Some(private_security.as_ptr()),
+    )?;
+    validate_regular_handle(handle.raw(), "Windows private journal file")?;
+    if information != FILE_CREATED as usize {
+        return Err(io::Error::other(
+            "Windows exclusive private journal file returned an unexpected create disposition",
+        ));
+    }
+    private_security.apply_and_verify(handle.raw())?;
+    reject_mutable_hardlink(handle.raw(), "created journal entry")?;
+    Ok(handle.into_file())
+}
+
+fn remove_journal_regular_at(
+    parent: HANDLE,
+    name: &OsStr,
+    expected: &FileIdentity,
+) -> io::Result<()> {
+    let (file, _) = nt_create_at(
+        parent,
+        name,
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        PINNED_FILE_SHARE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )?;
+    validate_regular_handle(
+        file.raw(),
+        "owned journal cleanup file is not a regular file",
+    )?;
+    verify_file_identity(
+        file.raw(),
+        expected,
+        "owned journal cleanup file no longer matches its captured identity",
+    )?;
+    reject_mutable_hardlink(file.raw(), "owned journal cleanup file")?;
+    mark_for_delete_on_close(file.raw())?;
+    file.close()?;
+    flush_handle(parent)
+}
+
+fn remove_journal_directory_at(
+    parent: HANDLE,
+    name: &OsStr,
+    expected: &DirectoryIdentity,
+) -> io::Result<()> {
+    let (directory, _) =
+        open_directory_at(parent, name, DELETE | FILE_READ_ATTRIBUTES, FILE_OPEN, None)?;
+    verify_directory_identity(
+        directory.raw(),
+        expected,
+        "owned journal directory no longer matches its captured identity",
+    )?;
+    mark_for_delete_on_close(directory.raw())?;
+    directory.close()?;
+    flush_handle(parent)
+}
+
+fn atomic_replace_journal_regular_at(
+    parent: HANDLE,
+    source_name: &OsStr,
+    destination_name: &OsStr,
+    replace_existing: bool,
+) -> Result<(), super::AtomicMoveError> {
+    let mut moved = false;
+    let result = (|| {
+        let source = open_regular_at(
+            parent,
+            source_name,
+            DELETE | FILE_READ_ATTRIBUTES,
+            PINNED_FILE_SHARE,
+            "journal temporary entry",
+        )?;
+        let expected = file_identity(source.raw())?;
+        reject_mutable_hardlink(source.raw(), "journal temporary entry")?;
+        let rename = RenameInformation::new(destination_name, parent, replace_existing)?;
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let status = unsafe {
+            NtSetInformationFile(
+                source.raw(),
+                &raw mut io_status,
+                rename.as_ptr(),
+                rename.byte_len(),
+                FileRenameInformation,
+            )
+        };
+        ntstatus_result(status, "rename journal temporary entry")?;
+        moved = true;
+        verify_file_identity(
+            source.raw(),
+            &expected,
+            "journal destination does not match the promoted temporary entry",
+        )?;
+        reject_mutable_hardlink(source.raw(), "promoted journal entry")?;
+        flush_handle(parent)
+    })();
+    result.map_err(|source| {
+        if moved {
+            super::AtomicMoveError::moved_or_unknown(source)
+        } else {
+            super::AtomicMoveError::not_moved(source)
+        }
+    })
+}
+
+#[cfg(test)]
 pub(super) fn create_private_directory(path: &Path) -> io::Result<()> {
-    let parsed = ParsedAbsolutePath::new(path)?;
-    if parsed.components.is_empty() {
+    let mut path = AbsolutePathParts::new(path)?;
+    if !path.has_components() {
         return Err(invalid_path(
             "private directory path must name a child directory",
         ));
     }
 
     let private_security = PrivateSecurityDescriptor::new(true)?;
-    let mut handles = Vec::new();
-    handles
-        .try_reserve_exact(parsed.components.len() + 1)
-        .map_err(|error| allocation_error("Windows directory handle chain", error))?;
-    handles.push(open_root(&parsed.root, DIRECTORY_TRAVERSE_ACCESS)?);
+    let mut directory = open_root(path.root(), DIRECTORY_TRAVERSE_ACCESS)?;
 
     let mut private_scope = false;
-    for (index, name) in parsed.components.iter().enumerate() {
-        let is_last = index + 1 == parsed.components.len();
+    while let Some(name) = path.next_component()? {
+        let is_last = !path.has_components();
         let should_be_private = private_scope || name == OsStr::new(RECOVERY_DIRECTORY) || is_last;
-        let parent = handles
-            .last()
-            .ok_or_else(|| io::Error::other("Windows directory chain lost its root"))?;
 
         let child = if should_be_private {
             private_scope = true;
-            open_or_create_private_directory_at(parent.raw(), name, &private_security)?
+            open_or_create_private_directory_at(directory.raw(), name, &private_security)?
         } else {
             match open_directory_at(
-                parent.raw(),
+                directory.raw(),
                 name,
                 DIRECTORY_TRAVERSE_ACCESS,
                 FILE_OPEN,
@@ -171,12 +711,14 @@ pub(super) fn create_private_directory(path: &Path) -> io::Result<()> {
                 Ok((handle, _)) => handle,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     private_scope = true;
-                    open_or_create_private_directory_at(parent.raw(), name, &private_security)?
+                    open_or_create_private_directory_at(directory.raw(), name, &private_security)?
                 }
                 Err(error) => return Err(error),
             }
         };
-        handles.push(child);
+        // A child opened relative to `directory` remains bound to that exact
+        // object after its parent handle is released.
+        directory = child;
     }
     Ok(())
 }
@@ -188,6 +730,7 @@ pub(super) fn create_private_directory_exclusive(path: &Path) -> io::Result<Dire
     create_private_directory_exclusive_in_parent(path, &expected_parent)
 }
 
+#[cfg(test)]
 pub(super) fn create_private_directory_exclusive_in_parent(
     path: &Path,
     expected_parent: &DirectoryIdentity,
@@ -226,6 +769,7 @@ pub(super) fn create_private_file(path: &Path) -> io::Result<File> {
     Ok(opened.handle.into_file())
 }
 
+#[cfg(test)]
 pub(super) fn create_private_file_in_parent(
     path: &Path,
     expected_parent: &DirectoryIdentity,
@@ -261,6 +805,7 @@ pub(super) fn create_private_file_in_parent(
     Ok(handle.into_file())
 }
 
+#[cfg(test)]
 pub(super) fn remove_owned_file_in_parent(
     path: &Path,
     expected_file: &FileIdentity,
@@ -295,6 +840,7 @@ pub(super) fn remove_owned_file_in_parent(
     flush_handle(parent.raw())
 }
 
+#[cfg(test)]
 pub(super) fn remove_owned_empty_directory_in_parent(
     path: &Path,
     expected_directory: &DirectoryIdentity,
@@ -346,18 +892,215 @@ pub(super) fn open_readonly_regular_in_parent(
     Ok(opened.into_file())
 }
 
-pub(super) fn open_readonly_regular(path: &Path) -> io::Result<File> {
-    let (parent, _) = split_leaf(path)?;
-    let expected_parent = observe_directory_identity(parent)?;
-    open_readonly_regular_in_parent(path, &expected_parent)
+#[cfg(test)]
+pub(super) fn acquire_lock(path: &Path) -> io::Result<File> {
+    let (parent_path, name) = split_leaf(path)?;
+    let parent = open_directory(parent_path, DIRECTORY_DESTINATION_ACCESS)?;
+    acquire_lock_at(parent.raw(), name)
 }
 
-pub(super) fn acquire_lock(path: &Path) -> io::Result<File> {
+fn acquire_lock_at(parent: HANDLE, name: &OsStr) -> io::Result<File> {
     let private_security = PrivateSecurityDescriptor::new(false)?;
-    let opened = create_or_open_private_file(path, FILE_OPEN_IF, &private_security)?;
-    private_security.apply_and_verify(opened.handle.raw())?;
+    let handle = create_or_open_private_file_at(parent, name, FILE_OPEN_IF, &private_security)
+        .map_err(normalize_lock_contention)?;
+    private_security.apply_and_verify(handle.raw())?;
+    reject_mutable_hardlink(handle.raw(), "publication lock")?;
+    Ok(handle.into_file())
+}
+
+/// Takes an existing lock with the same no-reparse and sharing guarantees as
+/// publication, without creating or changing the lock file's security state.
+pub(super) fn acquire_existing_lock(path: &Path) -> io::Result<File> {
+    let opened = open_regular(
+        path,
+        GENERIC_READ | GENERIC_WRITE,
+        PINNED_FILE_SHARE,
+        "publication lock",
+    )
+    .map_err(normalize_lock_contention)?;
     reject_mutable_hardlink(opened.handle.raw(), "publication lock")?;
     Ok(opened.handle.into_file())
+}
+
+fn normalize_lock_contention(error: io::Error) -> io::Error {
+    let is_contention = matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == ERROR_SHARING_VIOLATION as i32 || code == ERROR_LOCK_VIOLATION as i32
+    );
+    if is_contention {
+        io::Error::new(io::ErrorKind::WouldBlock, error)
+    } else {
+        error
+    }
+}
+
+pub(super) fn visit_existing_directory_entries<S, E>(
+    path: &Path,
+    expected: &DirectoryIdentity,
+    state: &mut S,
+    mut before_entry: impl FnMut(&mut S) -> Result<(), E>,
+    mut visitor: impl FnMut(&mut S, DirectoryEntryName<'_>) -> Result<(), E>,
+) -> Result<(), DirectoryVisitError<E>> {
+    const DIRECTORY_BUFFER_BYTES: usize = 64 * 1024;
+    const DIRECTORY_BUFFER_WORDS: usize = DIRECTORY_BUFFER_BYTES / size_of::<u64>();
+    const NEXT_ENTRY_OFFSET: usize =
+        std::mem::offset_of!(FILE_DIRECTORY_INFORMATION, NextEntryOffset);
+    const FILE_NAME_LENGTH_OFFSET: usize =
+        std::mem::offset_of!(FILE_DIRECTORY_INFORMATION, FileNameLength);
+    const FILE_NAME_OFFSET: usize = std::mem::offset_of!(FILE_DIRECTORY_INFORMATION, FileName);
+
+    let directory =
+        open_directory(path, DIRECTORY_TRAVERSE_ACCESS).map_err(DirectoryVisitError::Io)?;
+    verify_directory_identity(
+        directory.raw(),
+        expected,
+        "directory changed before recovery discovery enumeration",
+    )
+    .map_err(DirectoryVisitError::Io)?;
+
+    let mut buffer = [0_u64; DIRECTORY_BUFFER_WORDS];
+    let buffer_bytes = size_of::<[u64; DIRECTORY_BUFFER_WORDS]>();
+    let buffer_length = u32::try_from(buffer_bytes).expect("directory enumeration buffer fits u32");
+    let mut restart_scan = true;
+    loop {
+        let mut io_status = IO_STATUS_BLOCK::default();
+        // SAFETY: `directory` is an opened directory handle, the stack buffer
+        // is aligned and writable for the announced length, and synchronous I/O
+        // leaves no outstanding references after this call returns.
+        let status = unsafe {
+            NtQueryDirectoryFile(
+                directory.raw(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null(),
+                &raw mut io_status,
+                buffer.as_mut_ptr().cast(),
+                buffer_length,
+                FileDirectoryInformation,
+                false,
+                std::ptr::null(),
+                restart_scan,
+            )
+        };
+        restart_scan = false;
+        if status == STATUS_NO_MORE_FILES {
+            break;
+        }
+        if status != STATUS_SUCCESS {
+            return Err(DirectoryVisitError::Io(io::Error::from_raw_os_error(
+                i32::try_from(unsafe { RtlNtStatusToDosError(status) }).unwrap_or(i32::MAX),
+            )));
+        }
+        let returned = io_status.Information;
+        if returned == 0 || returned > buffer_bytes {
+            return Err(DirectoryVisitError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows directory enumeration returned an invalid byte count",
+            )));
+        }
+
+        let base = buffer.as_ptr().cast::<u8>();
+        let mut offset = 0_usize;
+        loop {
+            let remaining = returned.checked_sub(offset).ok_or_else(|| {
+                DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory enumeration offset overflowed",
+                ))
+            })?;
+            if remaining < FILE_NAME_OFFSET {
+                return Err(DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory enumeration record is truncated",
+                )));
+            }
+            // SAFETY: `remaining` covers the fixed header, including both
+            // u32 fields. Reading the generated C struct itself would also
+            // read its one-element flexible-array placeholder and any Rust
+            // tail padding beyond a short final record.
+            let (next_entry_offset, file_name_length) = unsafe {
+                (
+                    std::ptr::read_unaligned(base.add(offset + NEXT_ENTRY_OFFSET).cast::<u32>()),
+                    std::ptr::read_unaligned(
+                        base.add(offset + FILE_NAME_LENGTH_OFFSET).cast::<u32>(),
+                    ),
+                )
+            };
+            let name_bytes = usize::try_from(file_name_length).map_err(|_| {
+                DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry name length is unsupported",
+                ))
+            })?;
+            if name_bytes % size_of::<u16>() != 0 {
+                return Err(DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry name is not UTF-16 aligned",
+                )));
+            }
+            let record_bytes = FILE_NAME_OFFSET.checked_add(name_bytes).ok_or_else(|| {
+                DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry length overflowed",
+                ))
+            })?;
+            if record_bytes > remaining {
+                return Err(DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry extends beyond the query buffer",
+                )));
+            }
+            // SAFETY: `record_bytes` bounds the UTF-16 payload and the query
+            // buffer alignment is sufficient for `u16` reads.
+            let name = unsafe {
+                std::slice::from_raw_parts(
+                    base.add(offset + FILE_NAME_OFFSET).cast::<u16>(),
+                    name_bytes / size_of::<u16>(),
+                )
+            };
+            before_entry(state).map_err(DirectoryVisitError::Visitor)?;
+            visitor(state, DirectoryEntryName::Windows(name))
+                .map_err(DirectoryVisitError::Visitor)?;
+
+            let next = usize::try_from(next_entry_offset).map_err(|_| {
+                DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry offset is unsupported",
+                ))
+            })?;
+            if next == 0 {
+                break;
+            }
+            if next < record_bytes || next > remaining || next % align_of::<u64>() != 0 {
+                return Err(DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry offset is invalid",
+                )));
+            }
+            offset = offset.checked_add(next).ok_or_else(|| {
+                DirectoryVisitError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows directory entry offset overflowed",
+                ))
+            })?;
+        }
+    }
+
+    verify_directory_identity(
+        directory.raw(),
+        expected,
+        "directory changed during recovery discovery enumeration",
+    )
+    .map_err(DirectoryVisitError::Io)?;
+    let reopened =
+        open_directory(path, DIRECTORY_TRAVERSE_ACCESS).map_err(DirectoryVisitError::Io)?;
+    verify_directory_identity(
+        reopened.raw(),
+        expected,
+        "directory path changed during recovery discovery enumeration",
+    )
+    .map_err(DirectoryVisitError::Io)
 }
 
 #[cfg(test)]
@@ -380,12 +1123,23 @@ pub(super) fn opened_file_identity(file: &File) -> io::Result<FileIdentity> {
     file_identity(file.as_raw_handle())
 }
 
+#[cfg(test)]
 pub(super) fn ensure_same_filesystem(first: &Path, second: &Path) -> io::Result<()> {
     let first = open_existing_node(first)?;
     let second = open_existing_node(second)?;
     let first_volume = file_id_information(first.handle.raw())?.VolumeSerialNumber;
     let second_volume = file_id_information(second.handle.raw())?.VolumeSerialNumber;
     ensure_same_volume(first_volume, second_volume)
+}
+
+pub(super) fn ensure_journal_directory_same_filesystem(
+    directory: &JournalDirectory,
+    anchor: &Path,
+) -> io::Result<()> {
+    let anchor = open_existing_node(anchor)?;
+    let directory_volume = file_id_information(directory.directory.raw())?.VolumeSerialNumber;
+    let anchor_volume = file_id_information(anchor.handle.raw())?.VolumeSerialNumber;
+    ensure_same_volume(directory_volume, anchor_volume)
 }
 
 pub(super) fn ensure_single_hardlink(path: &Path) -> io::Result<()> {
@@ -398,6 +1152,7 @@ pub(super) fn ensure_single_hardlink(path: &Path) -> io::Result<()> {
     reject_mutable_hardlink(opened.handle.raw(), "publication source")
 }
 
+#[cfg(test)]
 pub(super) fn copy_security_metadata(
     source: &Path,
     destination: &Path,
@@ -405,7 +1160,8 @@ pub(super) fn copy_security_metadata(
     expected_source_parent: &DirectoryIdentity,
     expected_destination: &FileIdentity,
     expected_destination_parent: &DirectoryIdentity,
-) -> io::Result<()> {
+    budget: &mut AssetLoadBudget,
+) -> Result<(), SecurityMetadataError> {
     let (source_parent_path, source_name) = split_leaf(source)?;
     let (destination_parent_path, destination_name) = split_leaf(destination)?;
     let source_parent = open_directory(source_parent_path, DIRECTORY_TRAVERSE_ACCESS)?;
@@ -447,16 +1203,125 @@ pub(super) fn copy_security_metadata(
     reject_mutable_hardlink(source.raw(), "security metadata source")?;
     reject_mutable_hardlink(destination.raw(), "security metadata destination")?;
 
-    let metadata = SecuritySnapshot::capture(source.raw())
-        .map_err(|error| unsupported_security("read owner, group, and DACL from source", error))?;
+    let metadata = SecuritySnapshot::capture_budgeted(source.raw(), budget).map_err(|error| {
+        map_security_metadata_error("read owner, group, and DACL from source", error)
+    })?;
     metadata
-        .apply_and_verify(destination.raw())
+        .apply_and_verify_budgeted(destination.raw(), budget)
         .map_err(|error| {
-            unsupported_security("apply owner, group, and DACL to destination", error)
+            map_security_metadata_error("apply owner, group, and DACL to destination", error)
         })?;
-    flush_handle(destination.raw())
+    Ok(flush_handle(destination.raw())?)
 }
 
+pub(super) fn copy_security_metadata_between_journal_directories(
+    source_directory: &JournalDirectory,
+    source_name: &OsStr,
+    destination_directory: &JournalDirectory,
+    destination_name: &OsStr,
+    expected_source: &FileIdentity,
+    expected_destination: &FileIdentity,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), SecurityMetadataError> {
+    let source = open_regular_at(
+        source_directory.directory.raw(),
+        source_name,
+        READ_CONTROL | FILE_READ_ATTRIBUTES,
+        PINNED_FILE_SHARE,
+        "journal security metadata source",
+    )?;
+    let destination = open_regular_at(
+        destination_directory.directory.raw(),
+        destination_name,
+        GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+        PINNED_FILE_SHARE,
+        "journal security metadata destination",
+    )?;
+    verify_file_identity(
+        source.raw(),
+        expected_source,
+        "journal security metadata source no longer matches its captured identity",
+    )?;
+    verify_file_identity(
+        destination.raw(),
+        expected_destination,
+        "journal security metadata destination no longer matches its captured identity",
+    )?;
+    reject_mutable_hardlink(source.raw(), "journal security metadata source")?;
+    reject_mutable_hardlink(destination.raw(), "journal security metadata destination")?;
+
+    let metadata = SecuritySnapshot::capture_budgeted(source.raw(), budget).map_err(|error| {
+        map_security_metadata_error("read owner, group, and DACL from journal source", error)
+    })?;
+    metadata
+        .apply_and_verify_budgeted(destination.raw(), budget)
+        .map_err(|error| {
+            map_security_metadata_error(
+                "apply owner, group, and DACL to journal destination",
+                error,
+            )
+        })?;
+    Ok(flush_handle(destination.raw())?)
+}
+
+pub(super) fn copy_security_metadata_external_to_journal_directory(
+    source: &Path,
+    destination_directory: &JournalDirectory,
+    destination_name: &OsStr,
+    expected_source: &FileIdentity,
+    expected_source_parent: &DirectoryIdentity,
+    expected_destination: &FileIdentity,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), SecurityMetadataError> {
+    let (source_parent_path, source_name) = split_leaf(source)?;
+    let source_parent = open_directory(source_parent_path, DIRECTORY_SYNC_ACCESS)?;
+    verify_directory_identity(
+        source_parent.raw(),
+        expected_source_parent,
+        "security metadata source parent no longer matches its captured identity",
+    )?;
+    let source = open_regular_at(
+        source_parent.raw(),
+        source_name,
+        READ_CONTROL | FILE_READ_ATTRIBUTES,
+        PINNED_FILE_SHARE,
+        "security metadata source",
+    )?;
+    let destination = open_regular_at(
+        destination_directory.directory.raw(),
+        destination_name,
+        GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+        PINNED_FILE_SHARE,
+        "journal security metadata destination",
+    )?;
+    verify_file_identity(
+        source.raw(),
+        expected_source,
+        "security metadata source no longer matches its captured identity",
+    )?;
+    verify_file_identity(
+        destination.raw(),
+        expected_destination,
+        "journal security metadata destination no longer matches its captured identity",
+    )?;
+    reject_mutable_hardlink(source.raw(), "security metadata source")?;
+    reject_mutable_hardlink(destination.raw(), "journal security metadata destination")?;
+
+    let metadata = SecuritySnapshot::capture_budgeted(source.raw(), budget).map_err(|error| {
+        map_security_metadata_error("read owner, group, and DACL from source", error)
+    })?;
+    metadata
+        .apply_and_verify_budgeted(destination.raw(), budget)
+        .map_err(|error| {
+            map_security_metadata_error(
+                "apply owner, group, and DACL to journal destination",
+                error,
+            )
+        })?;
+    Ok(flush_handle(destination.raw())?)
+}
+
+#[cfg(test)]
 pub(super) fn capture_existing(
     source: &Path,
     destination: &Path,
@@ -486,14 +1351,60 @@ pub(super) fn capture_existing(
     }
 }
 
-pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
-    let directory = open_directory(
-        path,
-        GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-    )?;
-    flush_handle(directory.raw())
+pub(super) fn capture_external_regular_in_journal_directory(
+    source: &Path,
+    destination: &JournalDirectory,
+    destination_name: &OsStr,
+    expected_source: &FileIdentity,
+    expected_digest: Option<DigestV1>,
+    expected_source_parent: &DirectoryIdentity,
+) -> io::Result<()> {
+    let (source_parent_path, source_name) = split_leaf(source)?;
+    let source_parent = open_directory(source_parent_path, DIRECTORY_SYNC_ACCESS)?;
+    rename_verified_opened(
+        &source_parent,
+        source_name,
+        &destination.directory,
+        destination_name,
+        false,
+        RenameVerification {
+            expected_source: Some(expected_source),
+            expected_digest,
+            expected_source_parent: Some(expected_source_parent),
+            expected_destination_parent: None,
+        },
+    )
+    .map_err(super::AtomicMoveError::into_error)
 }
 
+pub(super) fn promote_journal_regular_to_external(
+    source: &JournalDirectory,
+    source_name: &OsStr,
+    destination: &Path,
+    expected_source: &FileIdentity,
+    expected_digest: Option<DigestV1>,
+    expected_destination_parent: &DirectoryIdentity,
+) -> io::Result<()> {
+    let (destination_parent_path, destination_name) = split_leaf(destination)?;
+    let destination_parent =
+        open_directory(destination_parent_path, DIRECTORY_DESTINATION_SYNC_ACCESS)?;
+    rename_verified_opened(
+        &source.directory,
+        source_name,
+        &destination_parent,
+        destination_name,
+        false,
+        RenameVerification {
+            expected_source: Some(expected_source),
+            expected_digest,
+            expected_source_parent: None,
+            expected_destination_parent: Some(expected_destination_parent),
+        },
+    )
+    .map_err(super::AtomicMoveError::into_error)
+}
+
+#[cfg(test)]
 pub(super) fn atomic_replace_tracked(
     source: &Path,
     destination: &Path,
@@ -532,6 +1443,7 @@ pub(super) fn atomic_replace(
     .map_err(super::AtomicMoveError::into_error)
 }
 
+#[cfg(test)]
 fn rename_verified(
     source: &Path,
     destination: &Path,
@@ -552,6 +1464,7 @@ fn rename_verified(
     .map_err(super::AtomicMoveError::into_error)
 }
 
+#[cfg(test)]
 fn rename_verified_digest(
     source: &Path,
     destination: &Path,
@@ -573,6 +1486,7 @@ fn rename_verified_digest(
     .map_err(super::AtomicMoveError::into_error)
 }
 
+#[cfg(test)]
 fn rename_verified_tracked(
     source: &Path,
     destination: &Path,
@@ -582,18 +1496,65 @@ fn rename_verified_tracked(
     expected_source_parent: &DirectoryIdentity,
     expected_destination_parent: &DirectoryIdentity,
 ) -> Result<(), super::AtomicMoveError> {
+    let (source_parent_path, source_name) = match split_leaf(source) {
+        Ok(parts) => parts,
+        Err(error) => return Err(super::AtomicMoveError::not_moved(error)),
+    };
+    let source_parent = match open_directory(source_parent_path, DIRECTORY_SYNC_ACCESS) {
+        Ok(directory) => directory,
+        Err(error) => return Err(super::AtomicMoveError::not_moved(error)),
+    };
+    let (destination_parent_path, destination_name) = match split_leaf(destination) {
+        Ok(parts) => parts,
+        Err(error) => return Err(super::AtomicMoveError::not_moved(error)),
+    };
+    let destination_parent =
+        match open_directory(destination_parent_path, DIRECTORY_DESTINATION_SYNC_ACCESS) {
+            Ok(directory) => directory,
+            Err(error) => return Err(super::AtomicMoveError::not_moved(error)),
+        };
+    rename_verified_opened(
+        &source_parent,
+        source_name,
+        &destination_parent,
+        destination_name,
+        replace_existing,
+        RenameVerification {
+            expected_source: expected,
+            expected_digest,
+            expected_source_parent: Some(expected_source_parent),
+            expected_destination_parent: Some(expected_destination_parent),
+        },
+    )
+}
+
+struct RenameVerification<'a> {
+    expected_source: Option<&'a FileIdentity>,
+    expected_digest: Option<DigestV1>,
+    expected_source_parent: Option<&'a DirectoryIdentity>,
+    expected_destination_parent: Option<&'a DirectoryIdentity>,
+}
+
+fn rename_verified_opened(
+    source_parent: &OpenedDirectory,
+    source_name: &OsStr,
+    destination_parent: &OpenedDirectory,
+    destination_name: &OsStr,
+    replace_existing: bool,
+    verification: RenameVerification<'_>,
+) -> Result<(), super::AtomicMoveError> {
     let mut moved = false;
     let result = (|| {
-        let (source_parent_path, source_name) = split_leaf(source)?;
-        let source_parent = open_directory(source_parent_path, DIRECTORY_SYNC_ACCESS)?;
-        verify_directory_identity(
-            source_parent.raw(),
-            expected_source_parent,
-            "atomic publication source parent no longer matches its captured identity",
-        )?;
+        if let Some(expected_source_parent) = verification.expected_source_parent {
+            verify_directory_identity(
+                source_parent.raw(),
+                expected_source_parent,
+                "atomic publication source parent no longer matches its captured identity",
+            )?;
+        }
         let source_access = DELETE
             | FILE_READ_ATTRIBUTES
-            | if expected_digest.is_some() {
+            | if verification.expected_digest.is_some() {
                 GENERIC_READ
             } else {
                 0
@@ -607,13 +1568,13 @@ fn rename_verified_tracked(
         )?;
         let actual = file_identity(source.raw())?;
         reject_mutable_hardlink(source.raw(), "atomic publication source")?;
-        let expected = expected.unwrap_or(&actual);
+        let expected = verification.expected_source.unwrap_or(&actual);
         verify_file_identity(
             source.raw(),
             expected,
             "atomic publication source no longer matches its captured identity",
         )?;
-        let mut source_reader = match expected_digest {
+        let mut source_reader = match verification.expected_digest {
             Some(expected_digest) => {
                 let mut reader = duplicate_handle_for_identity(source.raw())?.into_file();
                 validate_opened_digest(
@@ -632,11 +1593,10 @@ fn rename_verified_tracked(
             None => None,
         };
 
-        let (destination_parent_path, destination_name) = split_leaf(destination)?;
-        let destination_parent =
-            open_directory(destination_parent_path, DIRECTORY_DESTINATION_SYNC_ACCESS)?;
         let actual_destination_parent = directory_identity(destination_parent.raw())?;
-        if &actual_destination_parent != expected_destination_parent {
+        if let Some(expected_destination_parent) = verification.expected_destination_parent
+            && &actual_destination_parent != expected_destination_parent
+        {
             return Err(identity_changed(
                 "atomic publication destination parent no longer matches its captured identity",
             ));
@@ -667,12 +1627,28 @@ fn rename_verified_tracked(
             "atomic publication source identity changed during rename",
         )?;
         reject_mutable_hardlink(source.raw(), "promoted publication source")?;
-        if let (Some(expected_digest), Some(reader)) = (expected_digest, &mut source_reader) {
+        if let (Some(expected_digest), Some(reader)) =
+            (verification.expected_digest, &mut source_reader)
+        {
             validate_opened_digest(
                 reader,
                 expected_digest,
                 expected.length,
                 "atomic publication source content changed during rename",
+            )?;
+        }
+        if let Some(expected_source_parent) = verification.expected_source_parent {
+            verify_directory_identity(
+                source_parent.raw(),
+                expected_source_parent,
+                "atomic publication source parent changed during publication",
+            )?;
+        }
+        if let Some(expected_destination_parent) = verification.expected_destination_parent {
+            verify_directory_identity(
+                destination_parent.raw(),
+                expected_destination_parent,
+                "atomic publication destination parent changed during publication",
             )?;
         }
         flush_handle(source_parent.raw())?;
@@ -687,13 +1663,13 @@ fn rename_verified_tracked(
     })
 }
 
-struct ParsedAbsolutePath {
-    root: Vec<u16>,
-    components: Vec<OsString>,
+struct AbsolutePathParts<'path> {
+    root: &'path OsStr,
+    components: Components<'path>,
 }
 
-impl ParsedAbsolutePath {
-    fn new(path: &Path) -> io::Result<Self> {
+impl<'path> AbsolutePathParts<'path> {
+    fn new(path: &'path Path) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(invalid_path("Windows publication path must be absolute"));
         }
@@ -721,21 +1697,12 @@ impl ParsedAbsolutePath {
             ));
         }
 
-        let mut root: Vec<u16> = prefix.as_os_str().encode_wide().collect();
-        if root.contains(&0) {
-            return Err(invalid_path("Windows publication root contains a NUL"));
-        }
-        if root.last().copied() != Some(u16::from(b'\\')) {
-            root.push(u16::from(b'\\'));
-        }
-        root.push(0);
-
-        let mut normal = Vec::new();
-        for component in components {
+        let root = prefix.as_os_str();
+        validate_root(root)?;
+        for component in components.clone() {
             match component {
                 Component::Normal(name) => {
-                    wide_leaf(name)?;
-                    normal.push(name.to_os_string());
+                    validate_leaf(name)?;
                 }
                 Component::CurDir | Component::ParentDir => {
                     return Err(invalid_path(
@@ -749,33 +1716,48 @@ impl ParsedAbsolutePath {
                 }
             }
         }
-        Ok(Self {
-            root,
-            components: normal,
-        })
+        Ok(Self { root, components })
+    }
+
+    fn root(&self) -> &'path OsStr {
+        self.root
+    }
+
+    fn has_components(&self) -> bool {
+        self.components.clone().next().is_some()
+    }
+
+    fn next_component(&mut self) -> io::Result<Option<&'path OsStr>> {
+        match self.components.next() {
+            Some(Component::Normal(name)) => Ok(Some(name)),
+            Some(Component::CurDir | Component::ParentDir) => Err(invalid_path(
+                "Windows publication path contains a relative component",
+            )),
+            Some(Component::Prefix(_) | Component::RootDir) => Err(invalid_path(
+                "Windows publication path contains a second root",
+            )),
+            None => Ok(None),
+        }
     }
 }
 
-struct DirectoryChain {
-    handles: Vec<OwnedHandle>,
+struct OpenedDirectory {
+    handle: OwnedHandle,
 }
 
-impl DirectoryChain {
+impl OpenedDirectory {
     fn raw(&self) -> HANDLE {
-        self.handles
-            .last()
-            .expect("directory chain always contains its root")
-            .raw()
+        self.handle.raw()
     }
 }
 
 struct OpenedNode {
-    _parent: Option<DirectoryChain>,
+    _parent: Option<OpenedDirectory>,
     handle: OwnedHandle,
 }
 
 struct OpenedRegular {
-    _parent: DirectoryChain,
+    _parent: OpenedDirectory,
     handle: OwnedHandle,
 }
 
@@ -813,35 +1795,33 @@ impl Drop for OwnedHandle {
     }
 }
 
-fn open_directory(path: &Path, final_access: u32) -> io::Result<DirectoryChain> {
-    let parsed = ParsedAbsolutePath::new(path)?;
-    let root_access = if parsed.components.is_empty() {
-        final_access
-    } else {
+fn open_directory(path: &Path, final_access: u32) -> io::Result<OpenedDirectory> {
+    let mut path = AbsolutePathParts::new(path)?;
+    let root_access = if path.has_components() {
         DIRECTORY_TRAVERSE_ACCESS
+    } else {
+        final_access
     };
-    let mut handles = Vec::new();
-    handles
-        .try_reserve_exact(parsed.components.len() + 1)
-        .map_err(|error| allocation_error("Windows directory handle chain", error))?;
-    handles.push(open_root(&parsed.root, root_access)?);
+    let mut directory = open_root(path.root(), root_access)?;
 
-    for (index, name) in parsed.components.iter().enumerate() {
-        let access = if index + 1 == parsed.components.len() {
-            final_access
-        } else {
+    while let Some(name) = path.next_component()? {
+        let access = if path.has_components() {
             DIRECTORY_TRAVERSE_ACCESS
+        } else {
+            final_access
         };
-        let parent = handles
-            .last()
-            .ok_or_else(|| io::Error::other("Windows directory chain lost its root"))?;
-        let (child, _) = open_directory_at(parent.raw(), name, access, FILE_OPEN, None)?;
-        handles.push(child);
+        let (child, _) = open_directory_at(directory.raw(), name, access, FILE_OPEN, None)?;
+        // `child` was opened relative to the currently pinned parent, then
+        // became its own stable handle. Retaining every ancestor only creates
+        // an unbounded handle-chain allocation without adding protection.
+        directory = child;
     }
-    Ok(DirectoryChain { handles })
+    Ok(OpenedDirectory { handle: directory })
 }
 
-fn open_root(path: &[u16], access: u32) -> io::Result<OwnedHandle> {
+fn open_root(root: &OsStr, access: u32) -> io::Result<OwnedHandle> {
+    let mut path = [0_u16; WINDOWS_ROOT_BUFFER_UTF16_UNITS];
+    encode_root(root, &mut path)?;
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
@@ -890,7 +1870,7 @@ fn open_or_create_private_directory_at(
     let (handle, information) = open_directory_at(
         parent,
         name,
-        PRIVATE_DIRECTORY_ACCESS,
+        PRIVATE_DIRECTORY_ACCESS | DIRECTORY_DESTINATION_SYNC_ACCESS,
         FILE_OPEN_IF,
         Some(security.as_ptr()),
     )?;
@@ -903,6 +1883,7 @@ fn open_or_create_private_directory_at(
     Ok(handle)
 }
 
+#[cfg(test)]
 fn create_or_open_private_file(
     path: &Path,
     disposition: u32,
@@ -910,8 +1891,21 @@ fn create_or_open_private_file(
 ) -> io::Result<OpenedRegular> {
     let (parent_path, name) = split_leaf(path)?;
     let parent = open_directory(parent_path, DIRECTORY_DESTINATION_ACCESS)?;
+    let handle = create_or_open_private_file_at(parent.raw(), name, disposition, security)?;
+    Ok(OpenedRegular {
+        _parent: parent,
+        handle,
+    })
+}
+
+fn create_or_open_private_file_at(
+    parent: HANDLE,
+    name: &OsStr,
+    disposition: u32,
+    security: &PrivateSecurityDescriptor,
+) -> io::Result<OwnedHandle> {
     let (handle, information) = nt_create_at(
-        parent.raw(),
+        parent,
         name,
         PRIVATE_FILE_ACCESS,
         0,
@@ -929,10 +1923,7 @@ fn create_or_open_private_file(
             "Windows private file returned an unexpected create disposition",
         ));
     }
-    Ok(OpenedRegular {
-        _parent: parent,
-        handle,
-    })
+    Ok(handle)
 }
 
 fn open_regular(
@@ -984,11 +1975,7 @@ fn open_regular_at(
 fn open_existing_node(path: &Path) -> io::Result<OpenedNode> {
     if path.file_name().is_none() {
         let directory = open_directory(path, DIRECTORY_TRAVERSE_ACCESS)?;
-        let handle = directory
-            .handles
-            .last()
-            .ok_or_else(|| io::Error::other("Windows directory chain lost its root"))?;
-        let duplicate = duplicate_handle_for_identity(handle.raw())?;
+        let duplicate = duplicate_handle_for_identity(directory.raw())?;
         return Ok(OpenedNode {
             _parent: Some(directory),
             handle: duplicate,
@@ -1054,17 +2041,17 @@ fn nt_create_at(
     attributes: u32,
     security: Option<*const SECURITY_DESCRIPTOR>,
 ) -> io::Result<(OwnedHandle, usize)> {
-    let mut name = wide_leaf(name)?;
-    let name_bytes = name
-        .len()
+    let mut encoded_name = [0_u16; MAX_WINDOWS_COMPONENT_UTF16_UNITS];
+    let name_length = encode_leaf(name, &mut encoded_name)?;
+    let name_bytes = name_length
         .checked_mul(size_of::<u16>())
         .ok_or_else(|| invalid_path("Windows path component is too long"))?;
-    let name_length = u16::try_from(name_bytes)
+    let name_bytes = u16::try_from(name_bytes)
         .map_err(|_| invalid_path("Windows path component is too long"))?;
     let unicode = windows_sys::Win32::Foundation::UNICODE_STRING {
-        Length: name_length,
-        MaximumLength: name_length,
-        Buffer: name.as_mut_ptr(),
+        Length: name_bytes,
+        MaximumLength: name_bytes,
+        Buffer: encoded_name.as_mut_ptr(),
     };
     let object_attributes = OBJECT_ATTRIBUTES {
         Length: u32::try_from(size_of::<OBJECT_ATTRIBUTES>())
@@ -1112,33 +2099,87 @@ fn split_leaf(path: &Path) -> io::Result<(&Path, &OsStr)> {
     let name = path
         .file_name()
         .ok_or_else(|| invalid_path("atomic publication path has no regular leaf name"))?;
-    wide_leaf(name)?;
+    validate_leaf(name)?;
     let parent = path
         .parent()
         .ok_or_else(|| invalid_path("atomic publication path has no parent"))?;
     Ok((parent, name))
 }
 
-fn wide_leaf(name: &OsStr) -> io::Result<Vec<u16>> {
+fn validate_root(root: &OsStr) -> io::Result<()> {
+    let mut length = 0_usize;
+    for unit in root.encode_wide() {
+        if unit == 0 {
+            return Err(invalid_path("Windows publication root contains a NUL"));
+        }
+        length = length
+            .checked_add(1)
+            .ok_or_else(|| invalid_path("Windows publication root is too long"))?;
+        if length > MAX_WINDOWS_ROOT_UTF16_UNITS {
+            return Err(invalid_path("Windows publication root is too long"));
+        }
+    }
+    if length == 0 {
+        return Err(invalid_path("Windows publication root is empty"));
+    }
+    Ok(())
+}
+
+fn encode_root(
+    root: &OsStr,
+    buffer: &mut [u16; WINDOWS_ROOT_BUFFER_UTF16_UNITS],
+) -> io::Result<()> {
+    validate_root(root)?;
+    let mut length = 0_usize;
+    for unit in root.encode_wide() {
+        buffer[length] = unit;
+        length += 1;
+    }
+    if buffer[length - 1] != u16::from(b'\\') {
+        buffer[length] = u16::from(b'\\');
+        length += 1;
+    }
+    buffer[length] = 0;
+    Ok(())
+}
+
+fn validate_leaf(name: &OsStr) -> io::Result<usize> {
     if name.is_empty() || name == OsStr::new(".") || name == OsStr::new("..") {
         return Err(invalid_path(
             "atomic publication path has an invalid leaf name",
         ));
     }
-    let wide: Vec<u16> = name.encode_wide().collect();
-    if wide.is_empty()
-        || wide.iter().any(|unit| {
-            *unit == 0
-                || *unit == u16::from(b':')
-                || *unit == u16::from(b'/')
-                || *unit == u16::from(b'\\')
-        })
-    {
-        return Err(invalid_path(
-            "atomic publication path has an invalid leaf name",
-        ));
+
+    let mut length = 0_usize;
+    for unit in name.encode_wide() {
+        if unit == 0
+            || unit == u16::from(b':')
+            || unit == u16::from(b'/')
+            || unit == u16::from(b'\\')
+        {
+            return Err(invalid_path(
+                "atomic publication path has an invalid leaf name",
+            ));
+        }
+        length = length
+            .checked_add(1)
+            .ok_or_else(|| invalid_path("Windows path component is too long"))?;
+        if length > MAX_WINDOWS_COMPONENT_UTF16_UNITS {
+            return Err(invalid_path("Windows path component is too long"));
+        }
     }
-    Ok(wide)
+    Ok(length)
+}
+
+fn encode_leaf(
+    name: &OsStr,
+    buffer: &mut [u16; MAX_WINDOWS_COMPONENT_UTF16_UNITS],
+) -> io::Result<usize> {
+    let length = validate_leaf(name)?;
+    for (index, unit) in name.encode_wide().enumerate() {
+        buffer[index] = unit;
+    }
+    Ok(length)
 }
 
 fn validate_non_reparse(handle: HANDLE, message: &'static str) -> io::Result<()> {
@@ -1303,7 +2344,7 @@ struct PrivateSecurityDescriptor {
 impl PrivateSecurityDescriptor {
     fn new(directory: bool) -> io::Result<Self> {
         let token = open_effective_token()?;
-        let mut required = 0;
+        let mut required = 0_u32;
         let first = unsafe {
             GetTokenInformation(
                 token.raw(),
@@ -1471,12 +2512,13 @@ struct SecuritySnapshot {
 }
 
 impl SecuritySnapshot {
+    #[cfg(test)]
     fn capture(handle: HANDLE) -> io::Result<Self> {
         Self::capture_with(handle, SECURITY_METADATA_INFORMATION)
     }
 
     fn capture_with(handle: HANDLE, information: u32) -> io::Result<Self> {
-        let mut required = 0;
+        let mut required = 0_u32;
         let first = unsafe {
             GetKernelObjectSecurity(
                 handle,
@@ -1515,6 +2557,64 @@ impl SecuritySnapshot {
             return Err(io::Error::other(
                 "Windows returned an invalid security descriptor",
             ));
+        }
+        Ok(snapshot)
+    }
+
+    fn capture_budgeted(
+        handle: HANDLE,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, SecurityMetadataError> {
+        Self::capture_with_budgeted(handle, SECURITY_METADATA_INFORMATION, budget)
+    }
+
+    fn capture_with_budgeted(
+        handle: HANDLE,
+        information: u32,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, SecurityMetadataError> {
+        let mut required = 0_u32;
+        let first = unsafe {
+            GetKernelObjectSecurity(
+                handle,
+                information,
+                std::ptr::null_mut(),
+                0,
+                &raw mut required,
+            )
+        };
+        if first != 0
+            || io::Error::last_os_error().raw_os_error()
+                != Some(i32::try_from(ERROR_INSUFFICIENT_BUFFER).expect("Win32 error fits i32"))
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        let required_bytes = usize::try_from(required)
+            .map_err(|_| io::Error::other("security descriptor size does not fit usize"))?;
+        if required_bytes > MAX_WINDOWS_SECURITY_DESCRIPTOR_BYTES {
+            return Err(unsupported_descriptor(
+                "Windows security descriptor exceeds the supported bounded size",
+            )
+            .into());
+        }
+        let mut storage =
+            aligned_storage_budgeted(required_bytes, "Windows security descriptor", budget)?;
+        let capacity = storage_bytes_u32(&storage)?;
+        let succeeded = unsafe {
+            GetKernelObjectSecurity(
+                handle,
+                information,
+                storage.as_mut_ptr().cast(),
+                capacity,
+                &raw mut required,
+            )
+        };
+        if succeeded == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let snapshot = Self { storage };
+        if unsafe { IsValidSecurityDescriptor(snapshot.as_ptr()) } == 0 {
+            return Err(io::Error::other("Windows returned an invalid security descriptor").into());
         }
         Ok(snapshot)
     }
@@ -1596,7 +2696,11 @@ impl SecuritySnapshot {
         })
     }
 
-    fn apply_and_verify(&self, handle: HANDLE) -> io::Result<()> {
+    fn apply_and_verify_budgeted(
+        &self,
+        handle: HANDLE,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<(), SecurityMetadataError> {
         let source = self.full_view()?;
         let protection = if source.dacl_protected {
             PROTECTED_DACL_SECURITY_INFORMATION
@@ -1611,13 +2715,14 @@ impl SecuritySnapshot {
             )
         };
         if succeeded == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(io::Error::last_os_error().into());
         }
-        let applied = Self::capture(handle)?;
+        let applied = Self::capture_budgeted(handle, budget)?;
         if !self.equivalent_to(&applied)? {
             return Err(unsupported_descriptor(
                 "Windows owner, group, or DACL could not be preserved exactly",
-            ));
+            )
+            .into());
         }
         Ok(())
     }
@@ -1685,6 +2790,38 @@ fn aligned_storage(
     Ok(storage)
 }
 
+fn aligned_storage_budgeted(
+    byte_len: usize,
+    description: &'static str,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<MaybeUninit<usize>>, SecurityMetadataError> {
+    if byte_len == 0 {
+        return Err(io::Error::other(format!("{description} requested zero bytes")).into());
+    }
+    let units = byte_len.div_ceil(size_of::<usize>());
+    let requested = units
+        .checked_mul(size_of::<MaybeUninit<usize>>())
+        .ok_or_else(|| io::Error::other("Windows aligned storage size overflow"))?;
+    let requested = u64::try_from(requested)
+        .map_err(|_| io::Error::other("Windows aligned storage is too large"))?;
+    budget.check_bytes(requested)?;
+
+    let mut storage = Vec::new();
+    storage
+        .try_reserve_exact(units)
+        .map_err(|error| allocation_error(description, error))?;
+    let actual = storage
+        .capacity()
+        .checked_mul(size_of::<MaybeUninit<usize>>())
+        .ok_or_else(|| io::Error::other("Windows aligned storage size overflow"))?;
+    let actual = u64::try_from(actual)
+        .map_err(|_| io::Error::other("Windows aligned storage is too large"))?;
+    budget.check_bytes(actual)?;
+    budget.consume_bytes(actual)?;
+    storage.resize_with(units, MaybeUninit::zeroed);
+    Ok(storage)
+}
+
 fn storage_bytes_u32(storage: &[MaybeUninit<usize>]) -> io::Result<u32> {
     let bytes = storage
         .len()
@@ -1693,16 +2830,20 @@ fn storage_bytes_u32(storage: &[MaybeUninit<usize>]) -> io::Result<u32> {
     u32::try_from(bytes).map_err(|_| io::Error::other("Windows aligned storage is too large"))
 }
 
+const RENAME_INFORMATION_STORAGE_UNITS: usize = (size_of::<FILE_RENAME_INFORMATION>()
+    + MAX_WINDOWS_COMPONENT_UTF16_UNITS * size_of::<u16>())
+.div_ceil(size_of::<FILE_RENAME_INFORMATION>());
+
 struct RenameInformation {
-    storage: Vec<MaybeUninit<FILE_RENAME_INFORMATION>>,
+    storage: [MaybeUninit<FILE_RENAME_INFORMATION>; RENAME_INFORMATION_STORAGE_UNITS],
     byte_len: u32,
 }
 
 impl RenameInformation {
-    fn new(name: &OsStr, root: HANDLE, replace_existing: bool) -> io::Result<Self> {
-        let name = wide_leaf(name)?;
-        let name_bytes = name
-            .len()
+    fn new(destination_name: &OsStr, root: HANDLE, replace_existing: bool) -> io::Result<Self> {
+        let mut encoded_name = [0_u16; MAX_WINDOWS_COMPONENT_UTF16_UNITS];
+        let name_length = encode_leaf(destination_name, &mut encoded_name)?;
+        let name_bytes = name_length
             .checked_mul(size_of::<u16>())
             .ok_or_else(|| invalid_path("destination leaf name is too long"))?;
         let required_bytes = size_of::<FILE_RENAME_INFORMATION>()
@@ -1710,12 +2851,9 @@ impl RenameInformation {
             .ok_or_else(|| invalid_path("destination leaf name is too long"))?;
         let byte_len = u32::try_from(required_bytes)
             .map_err(|_| invalid_path("destination leaf name is too long"))?;
-        let units = required_bytes.div_ceil(size_of::<FILE_RENAME_INFORMATION>());
-        let mut storage = Vec::new();
-        storage
-            .try_reserve_exact(units)
-            .map_err(|error| allocation_error("Windows rename information", error))?;
-        storage.resize_with(units, MaybeUninit::zeroed);
+        let mut storage: [MaybeUninit<FILE_RENAME_INFORMATION>; RENAME_INFORMATION_STORAGE_UNITS] =
+            std::array::from_fn(|_| MaybeUninit::zeroed());
+        debug_assert!(required_bytes <= size_of_val(&storage));
 
         let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         unsafe {
@@ -1726,9 +2864,9 @@ impl RenameInformation {
             (*information).FileNameLength = u32::try_from(name_bytes)
                 .map_err(|_| invalid_path("destination leaf name is too long"))?;
             std::ptr::copy_nonoverlapping(
-                name.as_ptr(),
+                encoded_name.as_ptr(),
                 (*information).FileName.as_mut_ptr(),
-                name.len(),
+                name_length,
             );
         }
         debug_assert_eq!(
@@ -1795,6 +2933,18 @@ fn unsupported_security(operation: &'static str, error: io::Error) -> io::Error 
     )
 }
 
+fn map_security_metadata_error(
+    operation: &'static str,
+    error: SecurityMetadataError,
+) -> SecurityMetadataError {
+    match error {
+        SecurityMetadataError::Budget(error) => SecurityMetadataError::Budget(error),
+        SecurityMetadataError::Io(error) => {
+            SecurityMetadataError::Io(unsupported_security(operation, error))
+        }
+    }
+}
+
 fn allocation_error(description: &'static str, error: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("failed to allocate {description}: {error}"))
 }
@@ -1820,19 +2970,68 @@ fn ntstatus_result(status: NTSTATUS, operation: &'static str) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::{
-        DIRECTORY_TRAVERSE_ACCESS, ERROR_NOT_SAME_DEVICE, FileIdentity, PINNED_FILE_SHARE,
-        PrivateSecurityDescriptor, READ_CONTROL, SecuritySnapshot, WRITE_DAC, WRITE_OWNER,
-        atomic_replace, capture_existing, copy_security_metadata, create_private_directory,
-        create_private_directory_exclusive, create_private_directory_exclusive_in_parent,
-        create_private_file, create_private_file_in_parent, ensure_same_filesystem,
-        ensure_same_volume, ensure_single_hardlink, observe_directory_identity,
-        observe_file_identity, open_directory, open_readonly_regular_in_parent, open_regular,
+        AbsolutePathParts, DIRECTORY_TRAVERSE_ACCESS, ERROR_NOT_SAME_DEVICE, FileIdentity,
+        MAX_WINDOWS_COMPONENT_UTF16_UNITS, MAX_WINDOWS_ROOT_UTF16_UNITS, PINNED_FILE_SHARE,
+        PrivateSecurityDescriptor, READ_CONTROL, RenameInformation, SecurityMetadataError,
+        SecuritySnapshot, WRITE_DAC, WRITE_OWNER, atomic_replace, capture_existing,
+        capture_external_regular_in_journal_directory, copy_security_metadata,
+        create_journal_directory, create_private_directory, create_private_directory_exclusive,
+        create_private_directory_exclusive_in_parent, create_private_file,
+        create_private_file_in_parent, ensure_same_filesystem, ensure_same_volume,
+        ensure_single_hardlink, observe_directory_identity, observe_file_identity,
+        open_commit_root, open_directory, open_existing_journal_namespace, open_journal_namespace,
+        open_readonly_regular_in_parent, open_regular, promote_journal_regular_to_external,
         remove_owned_empty_directory_in_parent, remove_owned_file_in_parent,
+        sync_journal_namespace,
     };
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io;
     use std::os::windows::fs::symlink_dir;
-    use unity_asset_core::DigestV1;
+    use std::path::Path;
+    use unity_asset_core::{AssetLoadBudget, DigestV1};
+
+    #[test]
+    fn absolute_path_parts_borrow_and_bound_components() {
+        let mut path =
+            AbsolutePathParts::new(Path::new(r"C:\alpha\beta")).expect("absolute path components");
+        assert_eq!(path.root(), std::ffi::OsStr::new("C:"));
+        assert_eq!(
+            path.next_component().unwrap(),
+            Some(std::ffi::OsStr::new("alpha"))
+        );
+        assert!(path.has_components());
+        assert_eq!(
+            path.next_component().unwrap(),
+            Some(std::ffi::OsStr::new("beta"))
+        );
+        assert!(!path.has_components());
+
+        let accepted = Path::new(r"C:\").join("a".repeat(MAX_WINDOWS_COMPONENT_UTF16_UNITS));
+        assert!(AbsolutePathParts::new(&accepted).is_ok());
+        let rejected = Path::new(r"C:\").join("a".repeat(MAX_WINDOWS_COMPONENT_UTF16_UNITS + 1));
+        assert!(AbsolutePathParts::new(&rejected).is_err());
+    }
+
+    #[test]
+    fn absolute_path_parts_bound_windows_roots() {
+        let accepted_share = "a".repeat(MAX_WINDOWS_ROOT_UTF16_UNITS - 4);
+        let accepted = format!(r"\\s\{accepted_share}\leaf");
+        assert!(AbsolutePathParts::new(Path::new(&accepted)).is_ok());
+
+        let rejected_share = "a".repeat(MAX_WINDOWS_ROOT_UTF16_UNITS - 3);
+        let rejected = format!(r"\\s\{rejected_share}\leaf");
+        assert!(AbsolutePathParts::new(Path::new(&rejected)).is_err());
+    }
+
+    #[test]
+    fn rename_information_bounds_destination_leaf_storage() {
+        let accepted = OsString::from("a".repeat(MAX_WINDOWS_COMPONENT_UTF16_UNITS));
+        assert!(RenameInformation::new(&accepted, std::ptr::null_mut(), false).is_ok());
+
+        let rejected = OsString::from("a".repeat(MAX_WINDOWS_COMPONENT_UTF16_UNITS + 1));
+        assert!(RenameInformation::new(&rejected, std::ptr::null_mut(), false).is_err());
+    }
 
     #[test]
     fn moves_a_file_without_replacing_the_destination() {
@@ -1859,6 +3058,61 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&source).expect("source remains"), b"new");
         assert_eq!(fs::read(&destination).expect("destination remains"), b"old");
+    }
+
+    #[test]
+    fn handle_rooted_journal_moves_preserve_identity_and_content() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        fs::write(&source, b"journal move").expect("source fixture");
+
+        let root_identity = observe_directory_identity(directory.path()).expect("root identity");
+        let source_identity = observe_file_identity(&source).expect("source identity");
+        let digest = DigestV1::hash_bytes(b"journal move");
+        let root = open_commit_root(directory.path(), &root_identity).expect("commit root");
+        let namespace = open_journal_namespace(&root).expect("journal namespace");
+        let stage =
+            create_journal_directory(&namespace, OsStr::new("stage")).expect("stage directory");
+
+        capture_external_regular_in_journal_directory(
+            &source,
+            &stage,
+            OsStr::new("artifact"),
+            &source_identity,
+            Some(digest),
+            &root_identity,
+        )
+        .expect("capture source into journal");
+        assert!(!source.exists());
+
+        promote_journal_regular_to_external(
+            &stage,
+            OsStr::new("artifact"),
+            &destination,
+            &source_identity,
+            Some(digest),
+            &root_identity,
+        )
+        .expect("promote source from journal");
+        assert_eq!(
+            fs::read(&destination).expect("promoted content"),
+            b"journal move"
+        );
+    }
+
+    #[test]
+    fn journal_namespace_handles_support_directory_sync() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root_identity = observe_directory_identity(directory.path()).expect("root identity");
+        let root = open_commit_root(directory.path(), &root_identity).expect("commit root");
+
+        let namespace = open_journal_namespace(&root).expect("new journal namespace");
+        sync_journal_namespace(&root, &namespace).expect("sync new journal namespace");
+        drop(namespace);
+
+        let reopened = open_existing_journal_namespace(&root).expect("existing journal namespace");
+        sync_journal_namespace(&root, &reopened).expect("sync existing journal namespace");
     }
 
     #[test]
@@ -2317,6 +3571,7 @@ mod tests {
             observe_directory_identity(&recovery).expect("source parent identity");
         let expected_destination_parent =
             observe_directory_identity(&recovery).expect("destination parent identity");
+        let mut budget = AssetLoadBudget::default();
 
         copy_security_metadata(
             &source,
@@ -2325,6 +3580,7 @@ mod tests {
             &expected_source_parent,
             &expected_destination,
             &expected_destination_parent,
+            &mut budget,
         )
         .expect("copy metadata");
 
@@ -2368,6 +3624,7 @@ mod tests {
             observe_directory_identity(&recovery).expect("destination parent identity");
         fs::rename(&destination, &displaced).expect("displace destination");
         drop(create_private_file(&destination).expect("replacement destination"));
+        let mut budget = AssetLoadBudget::default();
 
         let error = copy_security_metadata(
             &source,
@@ -2376,9 +3633,13 @@ mod tests {
             &expected_source_parent,
             &expected_destination,
             &expected_destination_parent,
+            &mut budget,
         )
         .expect_err("replacement identity rejected");
 
+        let SecurityMetadataError::Io(error) = error else {
+            panic!("replaced destination must fail with an I/O identity error");
+        };
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(
             observe_file_identity(&displaced).expect("displaced identity"),
@@ -2412,6 +3673,7 @@ mod tests {
         fs::rename(&source_parent, &displaced_parent).expect("displace source parent");
         fs::create_dir(&source_parent).expect("replacement source parent");
         fs::write(&source, b"replacement source").expect("replacement source");
+        let mut budget = AssetLoadBudget::default();
 
         let error = copy_security_metadata(
             &source,
@@ -2420,9 +3682,13 @@ mod tests {
             &expected_source_parent,
             &expected_destination,
             &expected_destination_parent,
+            &mut budget,
         )
         .expect_err("replacement source parent rejected");
 
+        let SecurityMetadataError::Io(error) = error else {
+            panic!("replaced source parent must fail with an I/O identity error");
+        };
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(
             fs::read(&destination).expect("destination remains"),

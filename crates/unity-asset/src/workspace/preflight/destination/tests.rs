@@ -370,7 +370,7 @@ fn prepare_observation_performs_no_filesystem_writes() {
 
     assert_eq!(tree_entries(directory.path()), before);
     assert_eq!(proof.bindings().len(), 2);
-    assert!(!directory.path().join("missing").exists());
+    assert!(!directory.path().join("missing/tree/new.yaml").exists());
 }
 
 #[test]

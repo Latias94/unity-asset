@@ -1,12 +1,35 @@
 //! Unix publication primitives.
 
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+))]
+use std::ffi::CStr;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Seek as _, SeekFrom};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::mem::MaybeUninit;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+))]
+use std::os::fd::AsRawFd as _;
 use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path};
 
 use rustix::fs::CWD;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use rustix::fs::RawDir;
 use rustix::fs::{
     AtFlags, FileType, FlockOperation, Gid, Mode, OFlags, Stat, Uid, fchmod, fchown, flock, fstat,
     fsync, mkdirat, openat, renameat, statat, unlinkat,
@@ -15,7 +38,64 @@ use rustix::fs::{
 use rustix::fs::{RenameFlags, renameat_with};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
-use unity_asset_core::DigestV1;
+use unity_asset_core::{AssetLoadBudget, DigestV1};
+
+use super::super::journal::{RECOVERY_DIRECTORY, RECOVERY_VERSION_DIRECTORY};
+use super::{
+    COMMIT_LOCK_FILE, DirectoryEntryName, DirectoryVisitError, LEGACY_COMMIT_LOCK_DIRECTORY,
+    SecurityMetadataError,
+};
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) const DIRECTORY_VISIT_SETUP_BYTES: u64 = 0;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) const DIRECTORY_VISIT_ENTRY_BYTES: u64 = 0;
+pub(super) const SECURITY_METADATA_COPY_RESERVATION_BYTES: u64 = 0;
+
+// `fdopendir` owns one opaque C iterator buffer on Darwin/BSD. The entry
+// names themselves remain borrowed from `readdir`, so one bounded setup
+// reservation covers the only opaque allocation.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+))]
+pub(super) const DIRECTORY_VISIT_SETUP_BYTES: u64 = 64 * 1024;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+))]
+pub(super) const DIRECTORY_VISIT_ENTRY_BYTES: u64 = 0;
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+)))]
+pub(super) const DIRECTORY_VISIT_SETUP_BYTES: u64 = 0;
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+)))]
+pub(super) const DIRECTORY_VISIT_ENTRY_BYTES: u64 = 0;
 
 const DIRECTORY_FLAGS: OFlags =
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -69,6 +149,263 @@ impl DirectoryIdentity {
     }
 }
 
+pub(super) struct CommitRoot {
+    directory: OwnedFd,
+}
+
+pub(super) struct JournalNamespace {
+    recovery: OwnedFd,
+    version: OwnedFd,
+}
+
+pub(super) struct JournalDirectory {
+    directory: OwnedFd,
+}
+
+pub(super) fn open_commit_root(
+    path: &Path,
+    expected: &DirectoryIdentity,
+) -> io::Result<CommitRoot> {
+    let directory = open_directory(path)?;
+    validate_expected_directory_identity(
+        &directory,
+        expected,
+        "publication root changed before writer lock acquisition",
+    )?;
+    Ok(CommitRoot { directory })
+}
+
+pub(super) fn acquire_commit_locks(root: &CommitRoot) -> io::Result<(File, File)> {
+    let recovery =
+        open_or_create_private_directory_at(&root.directory, OsStr::new(RECOVERY_DIRECTORY))?;
+    let legacy =
+        open_or_create_private_directory_at(&recovery, OsStr::new(LEGACY_COMMIT_LOCK_DIRECTORY))?;
+
+    // Journal v1 placed its only writer lock under v1/. Newer protocols
+    // retain that lock and also take a version-independent lock so old and
+    // future binaries cannot publish concurrently into the same root.
+    let legacy_file = acquire_lock_at(&legacy, OsStr::new(COMMIT_LOCK_FILE))?;
+    let stable_file = acquire_lock_at(&recovery, OsStr::new(COMMIT_LOCK_FILE))?;
+    Ok((legacy_file, stable_file))
+}
+
+pub(super) fn open_journal_namespace(root: &CommitRoot) -> io::Result<JournalNamespace> {
+    let recovery =
+        open_or_create_private_directory_at(&root.directory, OsStr::new(RECOVERY_DIRECTORY))?;
+    let version =
+        open_or_create_private_directory_at(&recovery, OsStr::new(RECOVERY_VERSION_DIRECTORY))?;
+    Ok(JournalNamespace { recovery, version })
+}
+
+pub(super) fn open_existing_journal_namespace(root: &CommitRoot) -> io::Result<JournalNamespace> {
+    let recovery =
+        open_existing_private_directory_at(&root.directory, OsStr::new(RECOVERY_DIRECTORY))?;
+    let version =
+        open_existing_private_directory_at(&recovery, OsStr::new(RECOVERY_VERSION_DIRECTORY))?;
+    Ok(JournalNamespace { recovery, version })
+}
+
+pub(super) fn open_journal_directory(
+    namespace: &JournalNamespace,
+    name: &OsStr,
+) -> io::Result<JournalDirectory> {
+    open_journal_directory_at(&namespace.version, name)
+}
+
+pub(super) fn open_journal_directory_in_directory(
+    parent: &JournalDirectory,
+    name: &OsStr,
+) -> io::Result<JournalDirectory> {
+    open_journal_directory_at(&parent.directory, name)
+}
+
+pub(super) fn create_journal_directory(
+    namespace: &JournalNamespace,
+    name: &OsStr,
+) -> io::Result<JournalDirectory> {
+    create_journal_directory_at(&namespace.version, name)
+}
+
+pub(super) fn create_journal_directory_in_directory(
+    parent: &JournalDirectory,
+    name: &OsStr,
+) -> io::Result<JournalDirectory> {
+    create_journal_directory_at(&parent.directory, name)
+}
+
+pub(super) fn journal_directory_identity(
+    directory: &JournalDirectory,
+) -> io::Result<DirectoryIdentity> {
+    opened_directory_identity(&directory.directory)
+}
+
+pub(super) fn open_journal_regular(namespace: &JournalNamespace, name: &OsStr) -> io::Result<File> {
+    open_journal_regular_at(&namespace.version, name)
+}
+
+pub(super) fn open_journal_regular_in_directory(
+    parent: &JournalDirectory,
+    name: &OsStr,
+) -> io::Result<File> {
+    open_journal_regular_at(&parent.directory, name)
+}
+
+pub(super) fn create_journal_regular(
+    namespace: &JournalNamespace,
+    name: &OsStr,
+) -> io::Result<File> {
+    create_journal_regular_at(&namespace.version, name)
+}
+
+pub(super) fn create_journal_regular_in_directory(
+    parent: &JournalDirectory,
+    name: &OsStr,
+) -> io::Result<File> {
+    create_journal_regular_at(&parent.directory, name)
+}
+
+pub(super) fn remove_journal_regular(
+    namespace: &JournalNamespace,
+    name: &OsStr,
+    expected: &FileIdentity,
+) -> io::Result<()> {
+    remove_journal_regular_at(&namespace.version, name, expected)
+}
+
+pub(super) fn remove_journal_regular_in_directory(
+    parent: &JournalDirectory,
+    name: &OsStr,
+    expected: &FileIdentity,
+) -> io::Result<()> {
+    remove_journal_regular_at(&parent.directory, name, expected)
+}
+
+pub(super) fn remove_journal_directory(
+    namespace: &JournalNamespace,
+    name: &OsStr,
+    expected: &DirectoryIdentity,
+) -> io::Result<()> {
+    remove_journal_directory_at(&namespace.version, name, expected)
+}
+
+pub(super) fn remove_journal_directory_in_directory(
+    parent: &JournalDirectory,
+    name: &OsStr,
+    expected: &DirectoryIdentity,
+) -> io::Result<()> {
+    remove_journal_directory_at(&parent.directory, name, expected)
+}
+
+pub(super) fn atomic_replace_journal_regular(
+    namespace: &JournalNamespace,
+    source: &OsStr,
+    destination: &OsStr,
+    replace_existing: bool,
+) -> Result<(), super::AtomicMoveError> {
+    atomic_replace_journal_regular_at(&namespace.version, source, destination, replace_existing)
+}
+
+pub(super) fn atomic_replace_journal_regular_in_directory(
+    parent: &JournalDirectory,
+    source: &OsStr,
+    destination: &OsStr,
+    replace_existing: bool,
+) -> Result<(), super::AtomicMoveError> {
+    atomic_replace_journal_regular_at(&parent.directory, source, destination, replace_existing)
+}
+
+pub(super) fn sync_journal_directory(directory: &JournalDirectory) -> io::Result<()> {
+    fsync(&directory.directory).map_err(io::Error::from)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) fn visit_journal_directory_entries<S, E>(
+    directory: &JournalDirectory,
+    state: &mut S,
+    mut before_entry: impl FnMut(&mut S) -> Result<(), E>,
+    mut visitor: impl FnMut(&mut S, DirectoryEntryName<'_>) -> Result<(), E>,
+) -> Result<(), DirectoryVisitError<E>> {
+    const DIRECTORY_BUFFER_BYTES: usize = 64 * 1024;
+
+    let mut buffer = [MaybeUninit::<u8>::uninit(); DIRECTORY_BUFFER_BYTES];
+    let mut entries = RawDir::new(&directory.directory, &mut buffer);
+    while let Some(entry) = entries.next() {
+        before_entry(state).map_err(DirectoryVisitError::Visitor)?;
+        let entry = entry
+            .map_err(io::Error::from)
+            .map_err(DirectoryVisitError::Io)?;
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        visitor(state, DirectoryEntryName::Unix(name)).map_err(DirectoryVisitError::Visitor)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+))]
+pub(super) fn visit_journal_directory_entries<S, E>(
+    directory: &JournalDirectory,
+    state: &mut S,
+    mut before_entry: impl FnMut(&mut S) -> Result<(), E>,
+    mut visitor: impl FnMut(&mut S, DirectoryEntryName<'_>) -> Result<(), E>,
+) -> Result<(), DirectoryVisitError<E>> {
+    let mut entries =
+        DirectoryStream::from_directory(&directory.directory).map_err(DirectoryVisitError::Io)?;
+    loop {
+        let entry = entries.next().map_err(DirectoryVisitError::Io)?;
+        let Some(entry) = entry else {
+            break;
+        };
+        before_entry(state).map_err(DirectoryVisitError::Visitor)?;
+        visitor(state, DirectoryEntryName::Unix(entry)).map_err(DirectoryVisitError::Visitor)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+)))]
+pub(super) fn visit_journal_directory_entries<S, E>(
+    _: &JournalDirectory,
+    _: &mut S,
+    _: impl FnMut(&mut S) -> Result<(), E>,
+    _: impl FnMut(&mut S, DirectoryEntryName<'_>) -> Result<(), E>,
+) -> Result<(), DirectoryVisitError<E>> {
+    Err(DirectoryVisitError::Io(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "opened journal directory enumeration is unsupported on this target",
+    )))
+}
+
+#[cfg(test)]
+pub(super) fn journal_namespace_version_identity(
+    namespace: &JournalNamespace,
+) -> io::Result<DirectoryIdentity> {
+    opened_directory_identity(&namespace.version)
+}
+
+pub(super) fn sync_journal_namespace(
+    root: &CommitRoot,
+    namespace: &JournalNamespace,
+) -> io::Result<()> {
+    fsync(&namespace.version).map_err(io::Error::from)?;
+    fsync(&namespace.recovery).map_err(io::Error::from)?;
+    fsync(&root.directory).map_err(io::Error::from)
+}
+
+#[cfg(test)]
 pub(super) fn create_private_directory(path: &Path) -> io::Result<()> {
     validate_directory_path(path)?;
 
@@ -95,11 +432,186 @@ pub(super) fn create_private_directory(path: &Path) -> io::Result<()> {
     fchmod(&directory, Mode::RWXU).map_err(io::Error::from)
 }
 
+fn open_or_create_private_directory_at(parent: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
+    match mkdirat(parent, name, Mode::RWXU) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let directory =
+        openat(parent, name, DIRECTORY_FLAGS, Mode::empty()).map_err(io::Error::from)?;
+    // `mkdirat` is affected by umask and an existing recovery directory may
+    // be broader. Tighten the opened descriptor, never the re-resolved path.
+    fchmod(&directory, Mode::RWXU).map_err(io::Error::from)?;
+    Ok(directory)
+}
+
+fn open_existing_private_directory_at(parent: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
+    let directory =
+        openat(parent, name, DIRECTORY_FLAGS, Mode::empty()).map_err(io::Error::from)?;
+    validate_directory_entry(
+        parent,
+        name,
+        &directory,
+        "opened journal directory changed during validation",
+    )?;
+    Ok(directory)
+}
+
+fn open_journal_directory_at(parent: &OwnedFd, name: &OsStr) -> io::Result<JournalDirectory> {
+    Ok(JournalDirectory {
+        directory: open_existing_private_directory_at(parent, name)?,
+    })
+}
+
+fn create_journal_directory_at(parent: &OwnedFd, name: &OsStr) -> io::Result<JournalDirectory> {
+    mkdirat(parent, name, Mode::RWXU).map_err(io::Error::from)?;
+    let directory =
+        openat(parent, name, DIRECTORY_FLAGS, Mode::empty()).map_err(io::Error::from)?;
+    validate_directory_entry(
+        parent,
+        name,
+        &directory,
+        "created journal directory changed during validation",
+    )?;
+    fchmod(&directory, Mode::RWXU).map_err(io::Error::from)?;
+    Ok(JournalDirectory { directory })
+}
+
+fn open_journal_regular_at(parent: &OwnedFd, name: &OsStr) -> io::Result<File> {
+    let descriptor = open_regular_at(parent, name, REGULAR_FILE_FLAGS)?;
+    let metadata = validate_regular_entry(
+        parent,
+        name,
+        &descriptor,
+        "opened journal entry changed during validation",
+    )?;
+    reject_mutable_hardlink(&metadata, "opened journal entry")?;
+    Ok(descriptor.into())
+}
+
+fn create_journal_regular_at(parent: &OwnedFd, name: &OsStr) -> io::Result<File> {
+    let descriptor = openat(
+        parent,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(io::Error::from)?;
+    validate_regular_entry(
+        parent,
+        name,
+        &descriptor,
+        "created journal entry changed during validation",
+    )?;
+    Ok(descriptor.into())
+}
+
+fn remove_journal_regular_at(
+    parent: &OwnedFd,
+    name: &OsStr,
+    expected: &FileIdentity,
+) -> io::Result<()> {
+    let descriptor = open_regular_at(parent, name, REGULAR_FILE_FLAGS)?;
+    let metadata = validate_regular_entry(
+        parent,
+        name,
+        &descriptor,
+        "owned journal entry changed during deletion validation",
+    )?;
+    validate_expected_file_identity(
+        &metadata,
+        expected,
+        "owned journal entry no longer matches its captured identity",
+    )?;
+    reject_mutable_hardlink(&metadata, "owned journal entry")?;
+    unlinkat(parent, name, AtFlags::empty()).map_err(io::Error::from)?;
+    fsync(parent).map_err(io::Error::from)
+}
+
+fn remove_journal_directory_at(
+    parent: &OwnedFd,
+    name: &OsStr,
+    expected: &DirectoryIdentity,
+) -> io::Result<()> {
+    let directory =
+        openat(parent, name, DIRECTORY_FLAGS, Mode::empty()).map_err(io::Error::from)?;
+    validate_directory_entry(
+        parent,
+        name,
+        &directory,
+        "owned journal directory changed during deletion validation",
+    )?;
+    validate_expected_directory_identity(
+        &directory,
+        expected,
+        "owned journal directory no longer matches its captured identity",
+    )?;
+    unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(io::Error::from)?;
+    fsync(parent).map_err(io::Error::from)
+}
+
+fn atomic_replace_journal_regular_at(
+    parent: &OwnedFd,
+    source: &OsStr,
+    destination: &OsStr,
+    replace_existing: bool,
+) -> Result<(), super::AtomicMoveError> {
+    let mut moved = false;
+    let result = (|| {
+        let source_file = open_regular_at(parent, source, REGULAR_FILE_FLAGS)?;
+        let opened = validate_regular_entry(
+            parent,
+            source,
+            &source_file,
+            "journal temporary entry changed during replacement",
+        )?;
+        reject_mutable_hardlink(&opened, "journal temporary entry")?;
+        let expected_source = identity(&opened);
+
+        if !replace_existing {
+            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            {
+                renameat_with(parent, source, parent, destination, RenameFlags::NOREPLACE)
+                    .map_err(io::Error::from)?;
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "atomic no-replace journal replacement is unsupported on this Unix target",
+                ));
+            }
+        } else {
+            renameat(parent, source, parent, destination).map_err(io::Error::from)?;
+        }
+        moved = true;
+
+        validate_promoted_source(&source_file, &expected_source)?;
+        let promoted =
+            statat(parent, destination, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+        if identity(&promoted) != expected_source {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "journal destination does not match the promoted temporary entry",
+            ));
+        }
+        fsync(parent).map_err(io::Error::from)
+    })();
+    result.map_err(|source| {
+        if moved {
+            super::AtomicMoveError::moved_or_unknown(source)
+        } else {
+            super::AtomicMoveError::not_moved(source)
+        }
+    })
+}
+
 #[cfg(test)]
 pub(super) fn create_private_directory_exclusive(path: &Path) -> io::Result<DirectoryIdentity> {
     create_private_directory_exclusive_with_parent(path, None)
 }
 
+#[cfg(test)]
 pub(super) fn create_private_directory_exclusive_in_parent(
     path: &Path,
     expected_parent: &DirectoryIdentity,
@@ -107,6 +619,7 @@ pub(super) fn create_private_directory_exclusive_in_parent(
     create_private_directory_exclusive_with_parent(path, Some(expected_parent))
 }
 
+#[cfg(test)]
 fn create_private_directory_exclusive_with_parent(
     path: &Path,
     expected_parent: Option<&DirectoryIdentity>,
@@ -138,6 +651,7 @@ pub(super) fn create_private_file(path: &Path) -> io::Result<File> {
     create_private_file_with_parent(path, None)
 }
 
+#[cfg(test)]
 pub(super) fn create_private_file_in_parent(
     path: &Path,
     expected_parent: &DirectoryIdentity,
@@ -145,6 +659,7 @@ pub(super) fn create_private_file_in_parent(
     create_private_file_with_parent(path, Some(expected_parent))
 }
 
+#[cfg(test)]
 fn create_private_file_with_parent(
     path: &Path,
     expected_parent: Option<&DirectoryIdentity>,
@@ -174,6 +689,7 @@ fn create_private_file_with_parent(
     Ok(descriptor.into())
 }
 
+#[cfg(test)]
 pub(super) fn remove_owned_file_in_parent(
     path: &Path,
     expected_file: &FileIdentity,
@@ -203,6 +719,7 @@ pub(super) fn remove_owned_file_in_parent(
     fsync(&parent).map_err(io::Error::from)
 }
 
+#[cfg(test)]
 pub(super) fn remove_owned_empty_directory_in_parent(
     path: &Path,
     expected_directory: &DirectoryIdentity,
@@ -254,11 +771,16 @@ pub(super) fn open_readonly_regular_in_parent(
     Ok(descriptor.into())
 }
 
+#[cfg(test)]
 pub(super) fn acquire_lock(path: &Path) -> io::Result<File> {
     let (parent_path, name) = split_leaf(path)?;
     let parent = open_directory(parent_path)?;
+    acquire_lock_at(&parent, name)
+}
+
+fn acquire_lock_at(parent: &OwnedFd, name: &OsStr) -> io::Result<File> {
     let descriptor = openat(
-        &parent,
+        parent,
         name,
         OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
@@ -285,9 +807,261 @@ pub(super) fn acquire_lock(path: &Path) -> io::Result<File> {
     Ok(descriptor.into())
 }
 
-pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
-    let directory = open_directory(path)?;
-    fsync(&directory).map_err(io::Error::from)
+/// Takes an already-existing lock without creating or tightening it.
+pub(super) fn acquire_existing_lock(path: &Path) -> io::Result<File> {
+    let (parent_path, name) = split_leaf(path)?;
+    let parent = open_directory(parent_path)?;
+    let descriptor = openat(
+        &parent,
+        name,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let metadata = validate_regular_entry(
+        &parent,
+        name,
+        &descriptor,
+        "publication lock changed during validation",
+    )?;
+    reject_mutable_hardlink(&metadata, "publication lock")?;
+    flock(&descriptor, FlockOperation::NonBlockingLockExclusive).map_err(io::Error::from)?;
+    validate_regular_entry(
+        &parent,
+        name,
+        &descriptor,
+        "publication lock path changed after locking",
+    )?;
+    Ok(descriptor.into())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) fn visit_existing_directory_entries<S, E>(
+    path: &Path,
+    expected: &DirectoryIdentity,
+    state: &mut S,
+    mut before_entry: impl FnMut(&mut S) -> Result<(), E>,
+    mut visitor: impl FnMut(&mut S, DirectoryEntryName<'_>) -> Result<(), E>,
+) -> Result<(), DirectoryVisitError<E>> {
+    const DIRECTORY_BUFFER_BYTES: usize = 64 * 1024;
+
+    let directory = open_directory(path).map_err(DirectoryVisitError::Io)?;
+    validate_expected_directory_identity(
+        &directory,
+        expected,
+        "directory changed before recovery discovery enumeration",
+    )
+    .map_err(DirectoryVisitError::Io)?;
+
+    let mut buffer = [MaybeUninit::<u8>::uninit(); DIRECTORY_BUFFER_BYTES];
+    let mut entries = RawDir::new(&directory, &mut buffer);
+    while let Some(entry) = entries.next() {
+        before_entry(state).map_err(DirectoryVisitError::Visitor)?;
+        let entry = entry
+            .map_err(io::Error::from)
+            .map_err(DirectoryVisitError::Io)?;
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        visitor(state, DirectoryEntryName::Unix(name)).map_err(DirectoryVisitError::Visitor)?;
+    }
+
+    validate_expected_directory_identity(
+        &directory,
+        expected,
+        "directory changed during recovery discovery enumeration",
+    )
+    .map_err(DirectoryVisitError::Io)?;
+    let reopened = open_directory(path).map_err(DirectoryVisitError::Io)?;
+    validate_expected_directory_identity(
+        &reopened,
+        expected,
+        "directory path changed during recovery discovery enumeration",
+    )
+    .map_err(DirectoryVisitError::Io)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+))]
+pub(super) fn visit_existing_directory_entries<S, E>(
+    path: &Path,
+    expected: &DirectoryIdentity,
+    state: &mut S,
+    mut before_entry: impl FnMut(&mut S) -> Result<(), E>,
+    mut visitor: impl FnMut(&mut S, DirectoryEntryName<'_>) -> Result<(), E>,
+) -> Result<(), DirectoryVisitError<E>> {
+    // `readdir` returns a borrowed `dirent` name. It avoids the opaque
+    // `OsString` allocation in `std::fs::DirEntry::file_name`, while the
+    // opened descriptor remains available for identity checks during the scan.
+    let directory = open_directory(path).map_err(DirectoryVisitError::Io)?;
+    validate_expected_directory_identity(
+        &directory,
+        expected,
+        "directory changed before recovery discovery enumeration",
+    )
+    .map_err(DirectoryVisitError::Io)?;
+
+    let mut entries =
+        DirectoryStream::from_directory(&directory).map_err(DirectoryVisitError::Io)?;
+    loop {
+        let entry = entries.next().map_err(DirectoryVisitError::Io)?;
+        let Some(entry) = entry else {
+            break;
+        };
+        before_entry(state).map_err(DirectoryVisitError::Visitor)?;
+        visitor(state, DirectoryEntryName::Unix(entry)).map_err(DirectoryVisitError::Visitor)?;
+        validate_expected_directory_identity(
+            &directory,
+            expected,
+            "directory changed during recovery discovery enumeration",
+        )
+        .map_err(DirectoryVisitError::Io)?;
+    }
+    let reopened = open_directory(path).map_err(DirectoryVisitError::Io)?;
+    validate_expected_directory_identity(
+        &reopened,
+        expected,
+        "directory path changed during recovery discovery enumeration",
+    )
+    .map_err(DirectoryVisitError::Io)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+))]
+struct DirectoryStream(*mut libc::DIR);
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+))]
+impl DirectoryStream {
+    fn from_directory(directory: &OwnedFd) -> io::Result<Self> {
+        let descriptor = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let stream = unsafe { libc::fdopendir(descriptor) };
+        if stream.is_null() {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(descriptor);
+            }
+            return Err(error);
+        }
+        Ok(Self(stream))
+    }
+
+    fn next(&mut self) -> io::Result<Option<&OsStr>> {
+        clear_directory_errno();
+        let entry = unsafe { libc::readdir(self.0) };
+        if entry.is_null() {
+            let error = directory_errno();
+            return if error == 0 {
+                Ok(None)
+            } else {
+                Err(io::Error::from_raw_os_error(error))
+            };
+        }
+        // SAFETY: `readdir` returned a valid pointer owned by `self`, and its
+        // `d_name` member is NUL-terminated for the lifetime of this borrow.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name = OsStr::from_bytes(name.to_bytes());
+        Ok(Some(name))
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+))]
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        unsafe {
+            libc::closedir(self.0);
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+fn directory_errno_pointer() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+fn directory_errno_pointer() -> *mut libc::c_int {
+    unsafe { libc::__errno() }
+}
+
+#[cfg(target_os = "dragonfly")]
+fn directory_errno_pointer() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+))]
+fn clear_directory_errno() {
+    unsafe {
+        *directory_errno_pointer() = 0;
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+))]
+fn directory_errno() -> i32 {
+    unsafe { *directory_errno_pointer() }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+)))]
+pub(super) fn visit_existing_directory_entries<S, E>(
+    _path: &Path,
+    _expected: &DirectoryIdentity,
+    _state: &mut S,
+    _before_entry: impl FnMut(&mut S) -> Result<(), E>,
+    _visitor: impl FnMut(&mut S, DirectoryEntryName<'_>) -> Result<(), E>,
+) -> Result<(), DirectoryVisitError<E>> {
+    Err(DirectoryVisitError::Io(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "identity-bound directory enumeration is unavailable on this Unix target",
+    )))
 }
 
 /// Returns whether two existing regular files or directories share a device.
@@ -295,12 +1069,27 @@ pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
 /// Every path component and the final object are opened without following
 /// symbolic links. This makes the comparison operate on stable handles rather
 /// than on path metadata that can be exchanged between two lookups.
+#[cfg(test)]
 pub(super) fn ensure_same_filesystem(first: &Path, second: &Path) -> io::Result<()> {
     let first = open_existing_file_or_directory(first)?;
     let second = open_existing_file_or_directory(second)?;
     let first = fstat(&first).map_err(io::Error::from)?;
     let second = fstat(&second).map_err(io::Error::from)?;
     if first.st_dev == second.st_dev {
+        Ok(())
+    } else {
+        Err(Errno::XDEV.into())
+    }
+}
+
+pub(super) fn ensure_journal_directory_same_filesystem(
+    directory: &JournalDirectory,
+    anchor: &Path,
+) -> io::Result<()> {
+    let anchor = open_existing_file_or_directory(anchor)?;
+    let directory = fstat(&directory.directory).map_err(io::Error::from)?;
+    let anchor = fstat(&anchor).map_err(io::Error::from)?;
+    if directory.st_dev == anchor.st_dev {
         Ok(())
     } else {
         Err(Errno::XDEV.into())
@@ -358,6 +1147,7 @@ pub(super) fn opened_file_identity(file: &File) -> io::Result<FileIdentity> {
 /// The final mode is exactly the source mode, so this operation never grants a
 /// permission that the source did not have. If ownership cannot be preserved,
 /// the operation fails rather than silently weakening the publication proof.
+#[cfg(test)]
 pub(super) fn copy_security_metadata(
     source: &Path,
     target: &Path,
@@ -365,7 +1155,8 @@ pub(super) fn copy_security_metadata(
     expected_source_parent: &DirectoryIdentity,
     expected_target: &FileIdentity,
     expected_target_parent: &DirectoryIdentity,
-) -> io::Result<()> {
+    _: &mut AssetLoadBudget,
+) -> Result<(), SecurityMetadataError> {
     let (source_parent_path, source_name) = split_leaf(source)?;
     let (target_parent_path, target_name) = split_leaf(target)?;
     let source_parent = open_directory(source_parent_path)?;
@@ -434,6 +1225,142 @@ pub(super) fn copy_security_metadata(
     Ok(())
 }
 
+pub(super) fn copy_security_metadata_between_journal_directories(
+    source_directory: &JournalDirectory,
+    source_name: &OsStr,
+    target_directory: &JournalDirectory,
+    target_name: &OsStr,
+    expected_source: &FileIdentity,
+    expected_target: &FileIdentity,
+    _: &mut AssetLoadBudget,
+) -> Result<(), SecurityMetadataError> {
+    let source = open_regular_at(&source_directory.directory, source_name, REGULAR_FILE_FLAGS)?;
+    let target = open_regular_at(&target_directory.directory, target_name, REGULAR_FILE_FLAGS)?;
+    let source_metadata = validate_regular_entry(
+        &source_directory.directory,
+        source_name,
+        &source,
+        "journal security metadata source changed during validation",
+    )?;
+    let target_metadata = validate_regular_entry(
+        &target_directory.directory,
+        target_name,
+        &target,
+        "journal security metadata target changed during validation",
+    )?;
+    validate_expected_file_identity(
+        &source_metadata,
+        expected_source,
+        "journal security metadata source no longer matches its captured identity",
+    )?;
+    validate_expected_file_identity(
+        &target_metadata,
+        expected_target,
+        "journal security metadata target no longer matches its captured identity",
+    )?;
+    reject_mutable_hardlink(&target_metadata, "journal security metadata target")?;
+
+    if source_metadata.st_uid != target_metadata.st_uid
+        || source_metadata.st_gid != target_metadata.st_gid
+    {
+        fchown(
+            &target,
+            Some(Uid::from_raw(source_metadata.st_uid)),
+            Some(Gid::from_raw(source_metadata.st_gid)),
+        )
+        .map_err(io::Error::from)?;
+    }
+
+    let source_mode = Mode::from_raw_mode(source_metadata.st_mode);
+    fchmod(&target, source_mode).map_err(io::Error::from)?;
+
+    let applied = fstat(&target).map_err(io::Error::from)?;
+    if applied.st_uid != source_metadata.st_uid
+        || applied.st_gid != source_metadata.st_gid
+        || Mode::from_raw_mode(applied.st_mode) != source_mode
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Unix security metadata could not be preserved exactly",
+        )
+        .into());
+    }
+    fsync(&target).map_err(io::Error::from)?;
+    Ok(())
+}
+
+pub(super) fn copy_security_metadata_external_to_journal_directory(
+    source: &Path,
+    target_directory: &JournalDirectory,
+    target_name: &OsStr,
+    expected_source: &FileIdentity,
+    expected_source_parent: &DirectoryIdentity,
+    expected_target: &FileIdentity,
+    _: &mut AssetLoadBudget,
+) -> Result<(), SecurityMetadataError> {
+    let (source_parent_path, source_name) = split_leaf(source)?;
+    let source_parent = open_directory(source_parent_path)?;
+    validate_expected_directory_identity(
+        &source_parent,
+        expected_source_parent,
+        "security metadata source parent no longer matches its captured identity",
+    )?;
+    let source = open_regular_at(&source_parent, source_name, REGULAR_FILE_FLAGS)?;
+    let target = open_regular_at(&target_directory.directory, target_name, REGULAR_FILE_FLAGS)?;
+    let source_metadata = validate_regular_entry(
+        &source_parent,
+        source_name,
+        &source,
+        "security metadata source changed during validation",
+    )?;
+    let target_metadata = validate_regular_entry(
+        &target_directory.directory,
+        target_name,
+        &target,
+        "journal security metadata target changed during validation",
+    )?;
+    validate_expected_file_identity(
+        &source_metadata,
+        expected_source,
+        "security metadata source no longer matches its captured identity",
+    )?;
+    validate_expected_file_identity(
+        &target_metadata,
+        expected_target,
+        "journal security metadata target no longer matches its captured identity",
+    )?;
+    reject_mutable_hardlink(&target_metadata, "journal security metadata target")?;
+
+    if source_metadata.st_uid != target_metadata.st_uid
+        || source_metadata.st_gid != target_metadata.st_gid
+    {
+        fchown(
+            &target,
+            Some(Uid::from_raw(source_metadata.st_uid)),
+            Some(Gid::from_raw(source_metadata.st_gid)),
+        )
+        .map_err(io::Error::from)?;
+    }
+
+    let source_mode = Mode::from_raw_mode(source_metadata.st_mode);
+    fchmod(&target, source_mode).map_err(io::Error::from)?;
+
+    let applied = fstat(&target).map_err(io::Error::from)?;
+    if applied.st_uid != source_metadata.st_uid
+        || applied.st_gid != source_metadata.st_gid
+        || Mode::from_raw_mode(applied.st_mode) != source_mode
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Unix security metadata could not be preserved exactly",
+        )
+        .into());
+    }
+    fsync(&target).map_err(io::Error::from)?;
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) fn atomic_replace_tracked(
     source: &Path,
     destination: &Path,
@@ -472,6 +1399,7 @@ pub(super) fn atomic_replace(
     .map_err(super::AtomicMoveError::into_error)
 }
 
+#[cfg(test)]
 pub(super) fn capture_existing(
     source: &Path,
     destination: &Path,
@@ -501,11 +1429,64 @@ pub(super) fn capture_existing(
     }
 }
 
+pub(super) fn capture_external_regular_in_journal_directory(
+    source: &Path,
+    destination: &JournalDirectory,
+    destination_name: &OsStr,
+    expected_source: &FileIdentity,
+    expected_digest: Option<DigestV1>,
+    expected_source_parent: &DirectoryIdentity,
+) -> io::Result<()> {
+    let (source_parent_path, source_name) = split_leaf(source)?;
+    let source_parent = open_directory(source_parent_path)?;
+    atomic_replace_verified_opened(
+        &source_parent,
+        source_name,
+        &destination.directory,
+        destination_name,
+        false,
+        AtomicReplaceVerification {
+            expected_source: Some(expected_source),
+            expected_digest,
+            expected_source_parent: Some(expected_source_parent),
+            expected_destination_parent: None,
+        },
+    )
+    .map_err(super::AtomicMoveError::into_error)
+}
+
+pub(super) fn promote_journal_regular_to_external(
+    source: &JournalDirectory,
+    source_name: &OsStr,
+    destination: &Path,
+    expected_source: &FileIdentity,
+    expected_digest: Option<DigestV1>,
+    expected_destination_parent: &DirectoryIdentity,
+) -> io::Result<()> {
+    let (destination_parent_path, destination_name) = split_leaf(destination)?;
+    let destination_parent = open_directory(destination_parent_path)?;
+    atomic_replace_verified_opened(
+        &source.directory,
+        source_name,
+        &destination_parent,
+        destination_name,
+        false,
+        AtomicReplaceVerification {
+            expected_source: Some(expected_source),
+            expected_digest,
+            expected_source_parent: None,
+            expected_destination_parent: Some(expected_destination_parent),
+        },
+    )
+    .map_err(super::AtomicMoveError::into_error)
+}
+
 /// Atomically moves a source whose identity was captured before publication.
 ///
 /// The source file and both parent directories remain open across validation
 /// and rename. The source device must equal the destination-parent device, so
 /// cross-filesystem publication is rejected as `EXDEV` before mutation.
+#[cfg(test)]
 pub(super) fn atomic_replace_verified(
     source: &Path,
     destination: &Path,
@@ -526,6 +1507,7 @@ pub(super) fn atomic_replace_verified(
     .map_err(super::AtomicMoveError::into_error)
 }
 
+#[cfg(test)]
 fn atomic_replace_verified_digest(
     source: &Path,
     destination: &Path,
@@ -547,6 +1529,7 @@ fn atomic_replace_verified_digest(
     .map_err(super::AtomicMoveError::into_error)
 }
 
+#[cfg(test)]
 fn atomic_replace_verified_tracked(
     source: &Path,
     destination: &Path,
@@ -556,39 +1539,85 @@ fn atomic_replace_verified_tracked(
     expected_source_parent: &DirectoryIdentity,
     expected_destination_parent: &DirectoryIdentity,
 ) -> Result<(), super::AtomicMoveError> {
+    let (source_parent_path, source_name) = match split_leaf(source) {
+        Ok(parts) => parts,
+        Err(error) => return Err(super::AtomicMoveError::not_moved(error)),
+    };
+    let (destination_parent_path, destination_name) = match split_leaf(destination) {
+        Ok(parts) => parts,
+        Err(error) => return Err(super::AtomicMoveError::not_moved(error)),
+    };
+    let source_parent = match open_directory(source_parent_path) {
+        Ok(directory) => directory,
+        Err(error) => return Err(super::AtomicMoveError::not_moved(error)),
+    };
+    let destination_parent = match open_directory(destination_parent_path) {
+        Ok(directory) => directory,
+        Err(error) => return Err(super::AtomicMoveError::not_moved(error)),
+    };
+    atomic_replace_verified_opened(
+        &source_parent,
+        source_name,
+        &destination_parent,
+        destination_name,
+        replace_existing,
+        AtomicReplaceVerification {
+            expected_source,
+            expected_digest,
+            expected_source_parent: Some(expected_source_parent),
+            expected_destination_parent: Some(expected_destination_parent),
+        },
+    )
+}
+
+struct AtomicReplaceVerification<'a> {
+    expected_source: Option<&'a FileIdentity>,
+    expected_digest: Option<DigestV1>,
+    expected_source_parent: Option<&'a DirectoryIdentity>,
+    expected_destination_parent: Option<&'a DirectoryIdentity>,
+}
+
+fn atomic_replace_verified_opened(
+    source_parent: &OwnedFd,
+    source_name: &OsStr,
+    destination_parent: &OwnedFd,
+    destination_name: &OsStr,
+    replace_existing: bool,
+    verification: AtomicReplaceVerification<'_>,
+) -> Result<(), super::AtomicMoveError> {
     let mut moved = false;
     let result = (|| {
-        let (source_parent_path, source_name) = split_leaf(source)?;
-        let (destination_parent_path, destination_name) = split_leaf(destination)?;
-        let source_parent = open_directory(source_parent_path)?;
-        let destination_parent = open_directory(destination_parent_path)?;
-        validate_expected_directory_identity(
-            &source_parent,
-            expected_source_parent,
-            "atomic publication source parent no longer matches its captured identity",
-        )?;
-        validate_expected_directory_identity(
-            &destination_parent,
-            expected_destination_parent,
-            "atomic publication destination parent no longer matches its captured identity",
-        )?;
-        let source_file = open_regular_at(&source_parent, source_name, REGULAR_FILE_FLAGS)?;
+        if let Some(expected_source_parent) = verification.expected_source_parent {
+            validate_expected_directory_identity(
+                source_parent,
+                expected_source_parent,
+                "atomic publication source parent no longer matches its captured identity",
+            )?;
+        }
+        if let Some(expected_destination_parent) = verification.expected_destination_parent {
+            validate_expected_directory_identity(
+                destination_parent,
+                expected_destination_parent,
+                "atomic publication destination parent no longer matches its captured identity",
+            )?;
+        }
+        let source_file = open_regular_at(source_parent, source_name, REGULAR_FILE_FLAGS)?;
         let opened = validate_regular_entry(
-            &source_parent,
+            source_parent,
             source_name,
             &source_file,
             "atomic publication source changed during validation",
         )?;
         reject_mutable_hardlink(&opened, "atomic publication source")?;
         let observed_source = identity(&opened);
-        let expected_source = expected_source.unwrap_or(&observed_source);
+        let expected_source = verification.expected_source.unwrap_or(&observed_source);
         validate_expected_file_identity(
             &opened,
             expected_source,
             "atomic publication source no longer matches its captured identity",
         )?;
         let mut source_file = File::from(source_file);
-        if let Some(expected_digest) = expected_digest {
+        if let Some(expected_digest) = verification.expected_digest {
             validate_opened_digest(
                 &mut source_file,
                 expected_digest,
@@ -598,7 +1627,7 @@ fn atomic_replace_verified_tracked(
             validate_promoted_source(&source_file, expected_source)?;
         }
 
-        let destination_parent_metadata = fstat(&destination_parent).map_err(io::Error::from)?;
+        let destination_parent_metadata = fstat(destination_parent).map_err(io::Error::from)?;
         if opened.st_dev != destination_parent_metadata.st_dev {
             return Err(Errno::XDEV.into());
         }
@@ -607,9 +1636,9 @@ fn atomic_replace_verified_tracked(
             #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
             {
                 renameat_with(
-                    &source_parent,
+                    source_parent,
                     source_name,
-                    &destination_parent,
+                    destination_parent,
                     destination_name,
                     RenameFlags::NOREPLACE,
                 )
@@ -624,9 +1653,9 @@ fn atomic_replace_verified_tracked(
             }
         } else {
             renameat(
-                &source_parent,
+                source_parent,
                 source_name,
-                &destination_parent,
+                destination_parent,
                 destination_name,
             )
             .map_err(io::Error::from)?;
@@ -634,7 +1663,7 @@ fn atomic_replace_verified_tracked(
         moved = true;
 
         validate_promoted_source(&source_file, expected_source)?;
-        if let Some(expected_digest) = expected_digest {
+        if let Some(expected_digest) = verification.expected_digest {
             validate_opened_digest(
                 &mut source_file,
                 expected_digest,
@@ -647,7 +1676,7 @@ fn atomic_replace_verified_tracked(
         // entry now names the opened inode; higher layers retain digest evidence
         // and recover if a hostile same-user process races the final name lookup.
         let promoted = statat(
-            &destination_parent,
+            destination_parent,
             destination_name,
             AtFlags::SYMLINK_NOFOLLOW,
         )
@@ -659,18 +1688,22 @@ fn atomic_replace_verified_tracked(
             ));
         }
 
-        validate_expected_directory_identity(
-            &destination_parent,
-            expected_destination_parent,
-            "atomic publication destination parent handle changed during publication",
-        )?;
-        validate_expected_directory_identity(
-            &source_parent,
-            expected_source_parent,
-            "atomic publication source parent handle changed during publication",
-        )?;
-        fsync(&source_parent).map_err(io::Error::from)?;
-        fsync(&destination_parent).map_err(io::Error::from)?;
+        if let Some(expected_destination_parent) = verification.expected_destination_parent {
+            validate_expected_directory_identity(
+                destination_parent,
+                expected_destination_parent,
+                "atomic publication destination parent handle changed during publication",
+            )?;
+        }
+        if let Some(expected_source_parent) = verification.expected_source_parent {
+            validate_expected_directory_identity(
+                source_parent,
+                expected_source_parent,
+                "atomic publication source parent handle changed during publication",
+            )?;
+        }
+        fsync(source_parent).map_err(io::Error::from)?;
+        fsync(destination_parent).map_err(io::Error::from)?;
         Ok(())
     })();
     result.map_err(|source| {
@@ -698,6 +1731,7 @@ fn split_leaf(path: &Path) -> io::Result<(&Path, &OsStr)> {
     Ok((path.parent().unwrap_or_else(|| Path::new(".")), name))
 }
 
+#[cfg(test)]
 fn validate_directory_path(path: &Path) -> io::Result<()> {
     let mut has_normal_component = false;
     for component in path.components() {
@@ -923,19 +1957,23 @@ fn reject_mutable_hardlink(metadata: &Stat, description: &'static str) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::{
-        REGULAR_FILE_FLAGS, atomic_replace, atomic_replace_verified, capture_existing,
-        copy_security_metadata, create_private_directory, create_private_directory_exclusive,
+        REGULAR_FILE_FLAGS, SecurityMetadataError, atomic_replace, atomic_replace_verified,
+        capture_existing, capture_external_regular_in_journal_directory, copy_security_metadata,
+        create_journal_directory, create_private_directory, create_private_directory_exclusive,
         create_private_directory_exclusive_in_parent, create_private_file,
         create_private_file_in_parent, ensure_same_filesystem, ensure_single_hardlink,
-        observe_directory_identity, observe_file_identity, open_directory,
-        open_readonly_regular_in_parent, open_regular_at, remove_owned_empty_directory_in_parent,
+        observe_directory_identity, observe_file_identity, open_commit_root, open_directory,
+        open_journal_namespace, open_readonly_regular_in_parent, open_regular_at,
+        promote_journal_regular_to_external, remove_owned_empty_directory_in_parent,
         remove_owned_file_in_parent, validate_promoted_source,
     };
     use rustix::io::Errno;
+    use std::ffi::OsStr;
     use std::fs;
     use std::io;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::path::Path;
+    use unity_asset_core::{AssetLoadBudget, DigestV1};
 
     #[test]
     fn no_replace_does_not_overwrite_an_existing_destination() {
@@ -949,6 +1987,47 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&source).expect("source remains"), b"new");
         assert_eq!(fs::read(&destination).expect("destination remains"), b"old");
+    }
+
+    #[test]
+    fn handle_rooted_journal_moves_preserve_identity_and_content() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        fs::write(&source, b"journal move").expect("source fixture");
+
+        let root_identity = observe_directory_identity(directory.path()).expect("root identity");
+        let source_identity = observe_file_identity(&source).expect("source identity");
+        let digest = DigestV1::hash_bytes(b"journal move");
+        let root = open_commit_root(directory.path(), &root_identity).expect("commit root");
+        let namespace = open_journal_namespace(&root).expect("journal namespace");
+        let stage =
+            create_journal_directory(&namespace, OsStr::new("stage")).expect("stage directory");
+
+        capture_external_regular_in_journal_directory(
+            &source,
+            &stage,
+            OsStr::new("artifact"),
+            &source_identity,
+            Some(digest),
+            &root_identity,
+        )
+        .expect("capture source into journal");
+        assert!(!source.exists());
+
+        promote_journal_regular_to_external(
+            &stage,
+            OsStr::new("artifact"),
+            &destination,
+            &source_identity,
+            Some(digest),
+            &root_identity,
+        )
+        .expect("promote source from journal");
+        assert_eq!(
+            fs::read(&destination).expect("promoted content"),
+            b"journal move"
+        );
     }
 
     #[test]
@@ -1338,6 +2417,7 @@ mod tests {
         let expected_target = observe_file_identity(&target).expect("target identity");
         let expected_parent =
             observe_directory_identity(directory.path()).expect("metadata parent identity");
+        let mut budget = AssetLoadBudget::default();
 
         copy_security_metadata(
             &source,
@@ -1346,6 +2426,7 @@ mod tests {
             &expected_parent,
             &expected_target,
             &expected_parent,
+            &mut budget,
         )
         .expect("preserve metadata");
 
@@ -1375,6 +2456,7 @@ mod tests {
         let expected_parent =
             observe_directory_identity(directory.path()).expect("metadata parent identity");
         fs::rename(&replacement, &target).expect("replace target");
+        let mut budget = AssetLoadBudget::default();
 
         let error = copy_security_metadata(
             &source,
@@ -1383,9 +2465,13 @@ mod tests {
             &expected_parent,
             &expected_target,
             &expected_parent,
+            &mut budget,
         )
         .expect_err("replacement target rejected");
 
+        let SecurityMetadataError::Io(error) = error else {
+            panic!("replaced target must fail with an I/O identity error");
+        };
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         let mode = fs::metadata(&target)
             .expect("replacement metadata")
@@ -1420,6 +2506,7 @@ mod tests {
         fs::write(&source, b"replacement").expect("replacement source");
         fs::set_permissions(&source, fs::Permissions::from_mode(0o604))
             .expect("replacement source mode");
+        let mut budget = AssetLoadBudget::default();
 
         let error = copy_security_metadata(
             &source,
@@ -1428,9 +2515,13 @@ mod tests {
             &expected_source_parent,
             &expected_target,
             &expected_target_parent,
+            &mut budget,
         )
         .expect_err("replacement source parent rejected");
 
+        let SecurityMetadataError::Io(error) = error else {
+            panic!("replaced source parent must fail with an I/O identity error");
+        };
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         let target_mode = fs::metadata(&target)
             .expect("target metadata")
