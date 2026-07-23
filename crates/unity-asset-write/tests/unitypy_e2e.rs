@@ -11,9 +11,12 @@ use unity_asset_binary::typetree::{
     JsonTypeTreeRegistry, TypeTree, TypeTreeNode, TypeTreeParseMode, TypeTreeParseOptions,
     TypeTreeRegistry,
 };
-use unity_asset_core::{AssetLoadBudget, UnityValue};
+use unity_asset_core::{AssetLoadBudget, DigestV1, FieldPath, UnityValue};
 use unity_asset_write::bundle::{BundleEdits, BundleWriter};
-use unity_asset_write::object::SerializedFileEditSession;
+use unity_asset_write::object::{
+    SerializedFieldGuard, SerializedObjectCandidate, SerializedObjectEncoder,
+    SerializedObjectMutation, UnsafeRawObjectAcknowledgement, UnsafeRawObjectReplacement,
+};
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
 use unity_asset_write::webfile::{WebFileEdits, WebFilePackingPolicy, WebFileWriter};
 use unity_asset_write::{BinaryWriter, Endian, PackingPolicy, compress_lzma_unity_with_size};
@@ -218,6 +221,26 @@ fn find_first_serialized_node(
         .nodes
         .iter()
         .find(|n| n.is_file() && !n.name.ends_with(".resS") && !n.name.ends_with(".resource"))
+}
+
+fn apply_guarded_field_replacement(
+    candidate: &mut SerializedObjectCandidate<'_>,
+    ordinal: u32,
+    path: FieldPath,
+    replacement: UnityValue,
+    budget: &mut AssetLoadBudget,
+) -> anyhow::Result<()> {
+    let guard = SerializedFieldGuard::from_observed(
+        candidate.schema_digest(),
+        &path,
+        candidate.value_at_path(&path)?,
+        budget,
+    )?;
+    candidate.apply(
+        SerializedObjectMutation::replace_field(ordinal, path, guard, replacement),
+        budget,
+    )?;
+    Ok(())
 }
 
 fn build_uncompressed_webfile(entries: Vec<(String, Vec<u8>)>) -> Vec<u8> {
@@ -679,12 +702,24 @@ fn unitypy_loads_independent_serialized_file_wire_goldens() -> anyhow::Result<()
             .objects()
             .first()
             .ok_or_else(|| anyhow::anyhow!("wire case v{version} has no object"))?;
-        let mut edits = SerializedFileEdits::default();
-        edits.try_set_object_bytes(
-            object.path_id(),
-            vec![0xD0, version as u8, 0xAD, 0xBE, 0xEF],
-            &mut AssetLoadBudget::default(),
+        let path_id = object.path_id();
+        let original_digest = DigestV1::hash_bytes(
+            serialized
+                .find_object_handle(path_id)
+                .ok_or_else(|| anyhow::anyhow!("wire case v{version} object disappeared"))?
+                .raw_data()?,
+        );
+        let mut edit_budget = AssetLoadBudget::default();
+        let encoded = SerializedObjectEncoder::new(&serialized, path_id)?.encode_unsafe_raw(
+            UnsafeRawObjectReplacement::new(
+                original_digest,
+                vec![0xD0, version as u8, 0xAD, 0xBE, 0xEF],
+                UnsafeRawObjectAcknowledgement::WireInvariantsAreCallersResponsibilityV1,
+            ),
+            &mut edit_budget,
         )?;
+        let mut edits = SerializedFileEdits::default();
+        edits.try_insert_encoded_object(encoded, &mut edit_budget)?;
         let edited = SerializedFileWriter::save(&serialized, &edits)?;
         std::fs::write(
             rewritten_dir
@@ -883,21 +918,34 @@ fn unitypy_observes_rust_typetree_edit_in_repacked_bundle() -> anyhow::Result<()
     let (path_id, old_name) = chosen.expect("expected at least one object with a peekable name");
     let new_name = format!("RUST_E2E_{}", old_name);
 
-    let mut session = SerializedFileEditSession::new(&serialized);
-    session.edit_object(path_id, &mut budget, |class| {
-        if let Some(value) = class.get_mut("m_Name") {
-            *value = UnityValue::String(new_name.clone());
-            return Ok(());
-        }
-        if let Some(value) = class.get_mut("name") {
-            *value = UnityValue::String(new_name.clone());
-            return Ok(());
-        }
-        Err(unity_asset_write::UnityAssetError::format(format!(
-            "Chosen object has peekable name but no writable m_Name/name field: path_id={path_id}"
-        )))
-    })?;
-    let saved_serialized = SerializedFileWriter::save(&serialized, session.edits())?;
+    let mut candidate =
+        SerializedObjectEncoder::new(&serialized, path_id)?.begin_semantic(&mut budget)?;
+    let name_path = ["m_Name", "name"]
+        .into_iter()
+        .find_map(|field| {
+            let path = FieldPath::root().push_field(field).ok()?;
+            matches!(
+                candidate.value_at_path(&path),
+                Ok(UnityValue::String(name)) if name == &old_name
+            )
+            .then_some(path)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "chosen object has peekable name but no matching m_Name/name field: path_id={path_id}"
+            )
+        })?;
+    apply_guarded_field_replacement(
+        &mut candidate,
+        0,
+        name_path,
+        UnityValue::String(new_name.clone()),
+        &mut budget,
+    )?;
+    let encoded = candidate.finish(&mut budget)?;
+    let mut edits = SerializedFileEdits::default();
+    edits.try_insert_encoded_object(encoded, &mut budget)?;
+    let saved_serialized = SerializedFileWriter::save(&serialized, &edits)?;
 
     let mut bundle_edits = BundleEdits::default();
     bundle_edits.replace_file_bytes(node_name.clone(), saved_serialized);
@@ -1361,36 +1409,8 @@ fn assert_ae6_properties(
     );
 }
 
-fn ae6_nested_field_mut<'a>(
-    properties: &'a mut IndexMap<String, UnityValue>,
-    path: &[&str],
-) -> Result<&'a mut UnityValue, unity_asset_write::UnityAssetError> {
-    let Some((field, rest)) = path.split_first() else {
-        return Err(unity_asset_write::UnityAssetError::format(
-            "AE6 field path must not be empty",
-        ));
-    };
-    let value = properties.get_mut(*field).ok_or_else(|| {
-        unity_asset_write::UnityAssetError::format(format!(
-            "AE6 field path is missing `{}`",
-            path.join(".")
-        ))
-    })?;
-    if rest.is_empty() {
-        return Ok(value);
-    }
-    let object = value.as_object_mut().ok_or_else(|| {
-        unity_asset_write::UnityAssetError::format(format!("AE6 field `{field}` is not an object"))
-    })?;
-    ae6_nested_field_mut(object, rest)
-}
-
 #[test]
 fn unitypy_differential_covers_ae6_typetree_semantics() -> anyhow::Result<()> {
-    if !unitypy_e2e_enabled("unitypy_differential_covers_ae6_typetree_semantics")? {
-        return Ok(());
-    }
-
     let fixture = build_ae6_serialized_file()?;
     let serialized = unity_asset_binary::asset::SerializedFileParser::from_bytes(fixture.clone())?;
     anyhow::ensure!(
@@ -1434,53 +1454,65 @@ fn unitypy_differential_covers_ae6_typetree_semantics() -> anyhow::Result<()> {
     schema.skip_value(&mut skip_reader, &mut budget, schema.root())?;
     assert_eq!(skip_reader.position(), u64::try_from(raw.len())?);
 
-    let original = tempfile::NamedTempFile::new()?;
-    std::fs::write(original.path(), &fixture)?;
-
-    let mut session = SerializedFileEditSession::new(&serialized);
-    session.edit_object(AE6_PATH_ID, &mut budget, |class| {
-        *ae6_nested_field_mut(class.properties_mut(), &["m_SizeAligned"])? =
-            UnityValue::Bytes(vec![0x80]);
-
-        let map = ae6_nested_field_mut(class.properties_mut(), &["m_Map"])?;
-        let UnityValue::Array(entries) = map else {
-            return Err(unity_asset_write::UnityAssetError::format(
-                "AE6 m_Map is not an array",
-            ));
-        };
-        let Some(UnityValue::Array(second_pair)) = entries.get_mut(1) else {
-            return Err(unity_asset_write::UnityAssetError::format(
-                "AE6 m_Map second entry is not a pair",
-            ));
-        };
-        let Some(second_value) = second_pair.get_mut(1) else {
-            return Err(unity_asset_write::UnityAssetError::format(
-                "AE6 m_Map second pair has no value",
-            ));
-        };
-        *second_value = UnityValue::Integer(0x0708);
-
-        *ae6_nested_field_mut(
-            class.properties_mut(),
-            &["m_Reference", "data", "m_ManagedValue"],
-        )? = UnityValue::Integer(0x6677_8899);
-        *ae6_nested_field_mut(
-            class.properties_mut(),
-            &[
-                "m_Reference",
-                "data",
-                "m_NestedReference",
-                "data",
-                "m_LeafWide",
-            ],
-        )? = UnityValue::Unsigned(AE6_REWRITTEN_LEAF_WIDE);
-        *ae6_nested_field_mut(class.properties_mut(), &["m_Wide"])? =
-            UnityValue::Unsigned(AE6_REWRITTEN_ROOT_WIDE);
-        *ae6_nested_field_mut(class.properties_mut(), &["m_RewriteMarker"])? =
-            UnityValue::Integer(12);
-        Ok(())
-    })?;
-    let rewritten_bytes = SerializedFileWriter::save(&serialized, session.edits())?;
+    let mut candidate =
+        SerializedObjectEncoder::new(&serialized, AE6_PATH_ID)?.begin_semantic(&mut budget)?;
+    apply_guarded_field_replacement(
+        &mut candidate,
+        0,
+        FieldPath::root().push_field("m_SizeAligned")?,
+        UnityValue::Bytes(vec![0x80]),
+        &mut budget,
+    )?;
+    apply_guarded_field_replacement(
+        &mut candidate,
+        1,
+        FieldPath::root()
+            .push_field("m_Map")?
+            .push_index(1)?
+            .push_index(1)?,
+        UnityValue::Integer(0x0708),
+        &mut budget,
+    )?;
+    apply_guarded_field_replacement(
+        &mut candidate,
+        2,
+        FieldPath::root()
+            .push_field("m_Reference")?
+            .push_field("data")?
+            .push_field("m_ManagedValue")?,
+        UnityValue::Integer(0x6677_8899),
+        &mut budget,
+    )?;
+    apply_guarded_field_replacement(
+        &mut candidate,
+        3,
+        FieldPath::root()
+            .push_field("m_Reference")?
+            .push_field("data")?
+            .push_field("m_NestedReference")?
+            .push_field("data")?
+            .push_field("m_LeafWide")?,
+        UnityValue::Unsigned(AE6_REWRITTEN_LEAF_WIDE),
+        &mut budget,
+    )?;
+    apply_guarded_field_replacement(
+        &mut candidate,
+        4,
+        FieldPath::root().push_field("m_Wide")?,
+        UnityValue::Unsigned(AE6_REWRITTEN_ROOT_WIDE),
+        &mut budget,
+    )?;
+    apply_guarded_field_replacement(
+        &mut candidate,
+        5,
+        FieldPath::root().push_field("m_RewriteMarker")?,
+        UnityValue::Integer(12),
+        &mut budget,
+    )?;
+    let encoded = candidate.finish(&mut budget)?;
+    let mut edits = SerializedFileEdits::default();
+    edits.try_insert_encoded_object(encoded, &mut budget)?;
+    let rewritten_bytes = SerializedFileWriter::save(&serialized, &edits)?;
     let rewritten =
         unity_asset_binary::asset::SerializedFileParser::from_bytes(rewritten_bytes.clone())?;
     let rewritten_handle = rewritten
@@ -1515,6 +1547,12 @@ fn unitypy_differential_covers_ae6_typetree_semantics() -> anyhow::Result<()> {
         12,
     );
 
+    if !unitypy_e2e_enabled("unitypy_differential_covers_ae6_typetree_semantics")? {
+        return Ok(());
+    }
+
+    let original = tempfile::NamedTempFile::new()?;
+    std::fs::write(original.path(), &fixture)?;
     let rewritten_file = tempfile::NamedTempFile::new()?;
     std::fs::write(rewritten_file.path(), &rewritten_bytes)?;
     let py = r#"

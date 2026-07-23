@@ -1570,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn loaded_payload_state_drives_handles_and_owned_objects() {
+    fn parser_preload_state_drives_handles_and_owned_objects() {
         let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
         // This wire fixture intentionally uses a scalar root to exercise SerializedFile state,
         // not object materialization. Keep this test on the raw-object path.
@@ -1584,37 +1584,23 @@ mod tests {
             .to_vec();
         assert!(!original.is_empty());
 
-        file.find_object_mut(path_id).unwrap().set_data(Vec::new());
-        let handle = file.find_object_handle(path_id).unwrap();
-        assert!(handle.raw_data().unwrap().is_empty());
-        let loaded_empty = read(handle);
-        assert!(loaded_empty.raw_data().is_empty());
-        assert_eq!(loaded_empty.payload_len(), 0);
-        assert_eq!(
-            loaded_empty.payload_provenance(),
-            ObjectPayloadProvenance::Loaded
-        );
-
-        file.find_object_mut(path_id)
-            .unwrap()
-            .set_data(vec![0xD0, 0xAD]);
-        let handle = file.find_object_handle(path_id).unwrap();
-        assert_eq!(handle.raw_data().unwrap(), [0xD0, 0xAD]);
-        let loaded = read(handle);
-        assert_eq!(loaded.raw_data(), [0xD0, 0xAD]);
-        assert_eq!(loaded.payload_len(), 2);
-        assert_eq!(loaded.payload_provenance(), ObjectPayloadProvenance::Loaded);
-
-        file.find_object_mut(path_id).unwrap().clear_data();
-        let handle = file.find_object_handle(path_id).unwrap();
-        assert_eq!(handle.raw_data().unwrap(), original);
-        let committed = read(handle);
+        let committed = read(file.find_object_handle(path_id).unwrap());
         assert_eq!(committed.raw_data(), original);
         assert_eq!(committed.payload_len(), original.len());
         assert_eq!(
             committed.payload_provenance(),
             ObjectPayloadProvenance::Committed
         );
+
+        let mut preloaded =
+            SerializedFileParser::from_bytes_with_options(V22_FIXTURE.to_vec(), true).unwrap();
+        preloaded.set_type_tree_enabled(false);
+        let handle = preloaded.find_object_handle(path_id).unwrap();
+        assert_eq!(handle.raw_data().unwrap(), original);
+        let loaded = read(handle);
+        assert_eq!(loaded.raw_data(), original);
+        assert_eq!(loaded.payload_len(), original.len());
+        assert_eq!(loaded.payload_provenance(), ObjectPayloadProvenance::Loaded);
     }
 
     #[test]

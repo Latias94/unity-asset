@@ -16,7 +16,7 @@ use unity_asset_core::UnityAssetError;
 pub struct SerializedFileSaveOptions {
     /// Best-effort: allow saving even if not all object bytes were preloaded.
     ///
-    /// When false, saving requires `ObjectInfo.data` to be present for all objects.
+    /// When false, saving requires independently loaded payload bytes for every object.
     pub allow_lazy_object_reads: bool,
 }
 
@@ -52,16 +52,12 @@ impl SerializedFileWriter {
             UnityAssetError::with_source("Invalid SerializedFile wire state", error)
         })?;
         validate_representable_file_state(file, format)?;
+        edits.validate_for(file).map_err(|error| {
+            UnityAssetError::with_source("Invalid SerializedFile object edits", error)
+        })?;
         let external_table = PlannedExternalTable::build(file, edits).map_err(|error| {
             UnityAssetError::with_source("Invalid SerializedFile external table", error)
         })?;
-        for path_id in edits.object_path_ids() {
-            if file.find_object(path_id).is_none() {
-                return Err(UnityAssetError::format(format!(
-                    "SerializedFile edit references unknown object path ID {path_id}"
-                )));
-            }
-        }
 
         let endian = match file.header.byte_order() {
             unity_asset_binary::reader::ByteOrder::Little => Endian::Little,
@@ -408,6 +404,10 @@ fn i64_field(value: u64, label: &str) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::{
+        SerializedObjectEncoder, UnsafeRawObjectAcknowledgement, UnsafeRawObjectReplacement,
+    };
+    use unity_asset_core::{AssetLoadBudget, DigestV1};
 
     const V22_FIXTURE: &[u8] =
         include_bytes!("../../tests/fixtures/serialized_file_wire/v22.assets.bin");
@@ -436,18 +436,43 @@ mod tests {
 
     #[test]
     fn loaded_empty_payload_is_distinct_from_unloaded_for_strict_saves() {
-        let mut file =
+        let file =
             unity_asset_binary::asset::SerializedFileParser::from_bytes(V22_FIXTURE.to_vec())
                 .unwrap();
         let path_id = file.objects()[0].path_id();
-        file.find_object_mut(path_id).unwrap().set_data(Vec::new());
+        let original = file
+            .find_object_handle(path_id)
+            .unwrap()
+            .raw_data()
+            .unwrap();
+        let encoded = SerializedObjectEncoder::new(&file, path_id)
+            .unwrap()
+            .encode_unsafe_raw(
+                UnsafeRawObjectReplacement::new(
+                    DigestV1::hash_bytes(original),
+                    Vec::new(),
+                    UnsafeRawObjectAcknowledgement::WireInvariantsAreCallersResponsibilityV1,
+                ),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let mut edits = SerializedFileEdits::new();
+        edits
+            .try_insert_encoded_object(encoded, &mut AssetLoadBudget::default())
+            .unwrap();
+        let zero_sized = SerializedFileWriter::save(&file, &edits).unwrap();
 
         let options = SerializedFileSaveOptions {
             allow_lazy_object_reads: false,
         };
+        let loaded = unity_asset_binary::asset::SerializedFileParser::from_bytes_with_options(
+            zero_sized.clone(),
+            true,
+        )
+        .unwrap();
         let encoded =
-            SerializedFileWriter::save_with_options(&file, &SerializedFileEdits::new(), options)
-                .expect("an explicitly loaded empty payload is savable");
+            SerializedFileWriter::save_with_options(&loaded, &SerializedFileEdits::new(), options)
+                .expect("a preloaded empty payload is savable");
         let reparsed =
             unity_asset_binary::asset::SerializedFileParser::from_bytes(encoded).unwrap();
         assert_eq!(reparsed.objects()[0].byte_size(), 0);
@@ -460,10 +485,14 @@ mod tests {
                 .is_empty()
         );
 
-        file.find_object_mut(path_id).unwrap().clear_data();
-        let error =
-            SerializedFileWriter::save_with_options(&file, &SerializedFileEdits::new(), options)
-                .expect_err("an unloaded payload cannot be saved when lazy reads are disabled");
+        let unloaded = unity_asset_binary::asset::SerializedFileParser::from_bytes(zero_sized)
+            .expect("parse without preloading");
+        let error = SerializedFileWriter::save_with_options(
+            &unloaded,
+            &SerializedFileEdits::new(),
+            options,
+        )
+        .expect_err("an unloaded payload cannot be saved when lazy reads are disabled");
         assert!(error.to_string().contains("bytes not loaded"));
     }
 }

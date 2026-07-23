@@ -220,14 +220,9 @@ impl<'source> SerializedFilePlan<'source> {
         })?;
         validate_representable_file_state(file, format)?;
         validate_source_binding(batch, file, source.as_ref())?;
-
-        for path_id in edits.object_path_ids() {
-            if file.find_object(path_id).is_none() {
-                return Err(UnityAssetError::format(format!(
-                    "SerializedFile edit references unknown object path ID {path_id}"
-                )));
-            }
-        }
+        edits.validate_for(file).map_err(|error| {
+            UnityAssetError::with_source("Invalid SerializedFile object edits", error)
+        })?;
 
         let external_table = PlannedExternalTable::build(file, edits).map_err(|error| {
             UnityAssetError::with_source("Invalid SerializedFile external table", error)
@@ -766,13 +761,17 @@ mod tests {
     use unity_asset_binary::asset::SerializedFileParser;
     use unity_asset_binary::shared_bytes::SharedBytes;
     use unity_asset_core::{
-        AssetLoadBudget, AssetLoadLimits, SourceId, SourceKind, VerifiedSourceImage, WorkspaceId,
+        AssetLoadBudget, AssetLoadLimits, DigestV1, SourceId, SourceKind, VerifiedSourceImage,
+        WorkspaceId,
     };
 
     use super::*;
     use crate::artifact::{
         ArtifactBatchDeclaration, ArtifactBudget, ArtifactBudgetError, ArtifactLimits,
         LogicalArtifactName, PreparedArtifactFormat,
+    };
+    use crate::object::{
+        SerializedObjectEncoder, UnsafeRawObjectAcknowledgement, UnsafeRawObjectReplacement,
     };
 
     const V22_FIXTURE: &[u8] =
@@ -977,13 +976,25 @@ mod tests {
         let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
         let path_id = file.objects()[0].path_id();
         let replacement = b"replacement".to_vec();
-        let mut edits = SerializedFileEdits::default();
-        edits
-            .try_set_object_bytes(
-                path_id,
-                replacement.clone(),
+        let original = file
+            .find_object_handle(path_id)
+            .unwrap()
+            .raw_data()
+            .unwrap();
+        let encoded = SerializedObjectEncoder::new(&file, path_id)
+            .unwrap()
+            .encode_unsafe_raw(
+                UnsafeRawObjectReplacement::new(
+                    DigestV1::hash_bytes(original),
+                    replacement.clone(),
+                    UnsafeRawObjectAcknowledgement::WireInvariantsAreCallersResponsibilityV1,
+                ),
                 &mut AssetLoadBudget::default(),
             )
+            .unwrap();
+        let mut edits = SerializedFileEdits::default();
+        edits
+            .try_insert_encoded_object(encoded, &mut AssetLoadBudget::default())
             .unwrap();
         let mut budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
         let mut load = AssetLoadBudget::default();

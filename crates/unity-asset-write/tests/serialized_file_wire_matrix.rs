@@ -2,14 +2,18 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use unity_asset_binary::asset::{
-    FileIdentifier, ObjectMetadata, ObjectTypeReference, SerializedFileParser,
+    FileIdentifier, ObjectMetadata, ObjectTypeReference, SerializedFile, SerializedFileParser,
 };
 use unity_asset_binary::error::{BinaryError, BinaryObjectIdentityError};
 use unity_asset_core::{
-    AssetLoadBudget, SourceId, SourceKind, UnityAssetError, VerifiedSourceImage, WorkspaceId,
+    AssetLoadBudget, DigestV1, SourceId, SourceKind, UnityAssetError, VerifiedSourceImage,
+    WorkspaceId,
 };
 use unity_asset_write::artifact::{
     ArtifactBatchDeclaration, ArtifactBudget, ArtifactLimits, ArtifactPayload, LogicalArtifactName,
+};
+use unity_asset_write::object::{
+    SerializedObjectEncoder, UnsafeRawObjectAcknowledgement, UnsafeRawObjectReplacement,
 };
 use unity_asset_write::serialized_file::{
     ExternalMetadataField, ExternalTableAllocator, ExternalTableError, SerializedFileEdits,
@@ -445,6 +449,34 @@ fn decode_hex_fixture(contents: &str) -> Vec<u8> {
         .collect()
 }
 
+fn insert_unsafe_raw_object(
+    file: &SerializedFile,
+    edits: &mut SerializedFileEdits,
+    path_id: i64,
+    bytes: Vec<u8>,
+    budget: &mut AssetLoadBudget,
+) {
+    let original = file
+        .find_object_handle(path_id)
+        .unwrap_or_else(|| panic!("fixture object {path_id} must exist"))
+        .raw_data()
+        .unwrap_or_else(|error| panic!("fixture object {path_id} must be readable: {error}"));
+    let encoded = SerializedObjectEncoder::new(file, path_id)
+        .unwrap_or_else(|error| panic!("fixture object {path_id} must be encodable: {error}"))
+        .encode_unsafe_raw(
+            UnsafeRawObjectReplacement::new(
+                DigestV1::hash_bytes(original),
+                bytes,
+                UnsafeRawObjectAcknowledgement::WireInvariantsAreCallersResponsibilityV1,
+            ),
+            budget,
+        )
+        .unwrap_or_else(|error| panic!("fixture object {path_id} raw edit must encode: {error}"));
+    edits
+        .try_insert_encoded_object(encoded, budget)
+        .unwrap_or_else(|error| panic!("fixture object {path_id} edit must be retained: {error}"));
+}
+
 #[test]
 fn parses_independent_wire_goldens_across_format_transitions() {
     for case in CASES {
@@ -467,13 +499,13 @@ fn rewrites_wire_goldens_without_reconstructing_object_metadata() {
 
         let edited_payload = [0xD0, case.version as u8, 0xAD, 0xBE, 0xEF];
         let mut edits = SerializedFileEdits::default();
-        edits
-            .try_set_object_bytes(
-                case.path_id,
-                edited_payload.to_vec(),
-                &mut AssetLoadBudget::default(),
-            )
-            .unwrap();
+        insert_unsafe_raw_object(
+            &file,
+            &mut edits,
+            case.path_id,
+            edited_payload.to_vec(),
+            &mut AssetLoadBudget::default(),
+        );
         let edited = prepare_serialized_file(&file, &edits).unwrap_or_else(|error| {
             panic!(
                 "failed to edit and rewrite v{} fixture: {error}",
@@ -528,7 +560,6 @@ enum WriterRejection {
     DisableImplicitTypeTree,
     UnsupportedUnityVersion,
     UnsupportedReferenceTypes,
-    UnknownObjectEdit,
 }
 
 struct WriterRejectionCase {
@@ -571,18 +602,12 @@ fn writer_rejects_publicly_constructible_unrepresentable_states() {
             rejection: WriterRejection::UnsupportedReferenceTypes,
             expected_fragment: "cannot encode reference types",
         },
-        WriterRejectionCase {
-            name: "unknown object edit",
-            version: 22,
-            rejection: WriterRejection::UnknownObjectEdit,
-            expected_fragment: "unknown object path ID",
-        },
     ];
 
     for case in cases {
         let wire_case = wire_case(case.version);
         let mut file = parse_case(wire_case, wire_case.bytes.to_vec());
-        let mut edits = SerializedFileEdits::default();
+        let edits = SerializedFileEdits::default();
         match case.rejection {
             WriterRejection::HeaderVersionMismatch => file.header.version = 21,
             WriterRejection::InvalidEndian => file.header.endian = 2,
@@ -593,11 +618,6 @@ fn writer_rejects_publicly_constructible_unrepresentable_states() {
             WriterRejection::UnsupportedReferenceTypes => {
                 let unsupported = file.types()[0].clone();
                 file.ref_types_mut().push(unsupported);
-            }
-            WriterRejection::UnknownObjectEdit => {
-                edits
-                    .try_set_object_bytes(i64::MAX, vec![0xFF], &mut AssetLoadBudget::default())
-                    .unwrap();
             }
         }
 
@@ -696,13 +716,13 @@ fn editing_one_object_preserves_the_other_object_wire_semantics() {
 
         let edited_payload = vec![0xE0; 13];
         let mut edits = SerializedFileEdits::default();
-        edits
-            .try_set_object_bytes(
-                first_path_id,
-                edited_payload.clone(),
-                &mut AssetLoadBudget::default(),
-            )
-            .unwrap();
+        insert_unsafe_raw_object(
+            &file,
+            &mut edits,
+            first_path_id,
+            edited_payload.clone(),
+            &mut AssetLoadBudget::default(),
+        );
         let rewritten = prepare_serialized_file(&file, &edits)
             .unwrap_or_else(|error| panic!("failed to rewrite multi-object v{version}: {error}"));
         let reparsed = SerializedFileParser::from_bytes(rewritten)

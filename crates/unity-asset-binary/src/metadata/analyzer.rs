@@ -394,7 +394,7 @@ mod tests {
         asset.set_type_tree_registry(Some(Arc::new(registry)));
 
         let mut game_object = ObjectInfo::for_standalone_class(303, 0, 4, 1).unwrap();
-        game_object.set_data(match asset.header.byte_order() {
+        game_object.install_loaded_data(match asset.header.byte_order() {
             crate::reader::ByteOrder::Little => 1_i32.to_le_bytes().to_vec(),
             crate::reader::ByteOrder::Big => 1_i32.to_be_bytes().to_vec(),
         });

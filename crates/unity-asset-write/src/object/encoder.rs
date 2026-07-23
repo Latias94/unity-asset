@@ -643,15 +643,13 @@ impl EncodedSerializedObject {
         self.stats
     }
 
-    #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-
-    /// Transfers the exact encoded bytes and their staged semantic value without cloning either.
-    #[must_use]
-    pub fn into_bytes_and_semantic_value(self) -> (Vec<u8>, Option<UnityValue>) {
-        (self.bytes, self.semantic_value)
+    pub(crate) fn into_file_edit_parts(self) -> (i64, i32, DigestV1, Vec<u8>) {
+        (
+            self.path_id,
+            self.class_id,
+            self.original_digest,
+            self.bytes,
+        )
     }
 }
 
@@ -1110,6 +1108,12 @@ impl<'file> SerializedObjectCandidate<'file> {
     #[must_use]
     pub const fn schema_digest(&self) -> DigestV1 {
         self.schema_digest
+    }
+
+    /// Returns the current staged root value without granting mutable access.
+    #[must_use]
+    pub const fn semantic_value(&self) -> &UnityValue {
+        &self.root
     }
 
     /// Returns an opaque projection of the root schema for recursive replacement lowering.

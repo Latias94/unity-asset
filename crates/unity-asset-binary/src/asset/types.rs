@@ -476,12 +476,12 @@ impl ObjectInfo {
         self.loaded_data.as_deref()
     }
 
-    pub fn set_data(&mut self, data: Vec<u8>) {
+    /// Installs payload bytes copied by the parser's explicit preload path.
+    ///
+    /// This is crate-private so callers cannot mutate a parsed SerializedFile outside the
+    /// validated writer pipeline. Internal tests may also use it to construct parser fixtures.
+    pub(crate) fn install_loaded_data(&mut self, data: Vec<u8>) {
         self.loaded_data = Some(data);
-    }
-
-    pub fn clear_data(&mut self) {
-        self.loaded_data = None;
     }
 
     pub(crate) fn clone_without_loaded_data(&self) -> Self {
@@ -701,15 +701,12 @@ mod tests {
     }
 
     #[test]
-    fn zero_byte_object_data_retains_loaded_state() {
+    fn installed_zero_byte_object_data_is_distinct_from_missing_data() {
         let mut object = ObjectInfo::for_standalone_class(1, 0, 0, 1).unwrap();
         assert_eq!(object.loaded_data(), None);
 
-        object.set_data(Vec::new());
+        object.install_loaded_data(Vec::new());
         assert_eq!(object.loaded_data(), Some([].as_slice()));
-
-        object.clear_data();
-        assert_eq!(object.loaded_data(), None);
     }
 
     #[test]

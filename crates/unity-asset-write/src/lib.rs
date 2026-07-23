@@ -24,12 +24,3 @@ pub use binary_writer::{BinaryWriter, Endian};
 pub use compression::*;
 pub use packer::{PackingPolicy, PackingPolicyParseError};
 pub use unity_asset_core::{Result, UnityAssetError};
-
-/// A trait mirroring UnityPy's `mark_changed()` / `is_changed` behavior.
-///
-/// The write pipeline saves only changed assets by default.
-pub trait ChangeTracker {
-    fn mark_changed(&mut self);
-    fn is_changed(&self) -> bool;
-    fn clear_changed(&mut self);
-}

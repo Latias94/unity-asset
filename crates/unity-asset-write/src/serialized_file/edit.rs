@@ -1,10 +1,14 @@
 use std::collections::TryReserveError;
 
 use thiserror::Error;
-use unity_asset_binary::asset::FileIdentifier;
-use unity_asset_core::{AllocationSizeError, AssetLoadBudget, BudgetError, vec_allocation_bytes};
+use unity_asset_binary::BinaryError;
+use unity_asset_binary::asset::{FileIdentifier, SerializedFile};
+use unity_asset_core::{
+    AllocationSizeError, AssetLoadBudget, BudgetError, DigestV1, vec_allocation_bytes,
+};
 
 use super::external_table::ExternalTableMutation;
+use crate::object::EncodedSerializedObject;
 
 const OBJECT_EDIT_ALLOCATION_RESOURCE: &str = "serialized_file_object_edits";
 
@@ -23,11 +27,37 @@ pub enum SerializedFileEditError {
     Budget(#[from] BudgetError),
     #[error("SerializedFile object edit arithmetic overflow for {resource}")]
     ArithmeticOverflow { resource: &'static str },
+    #[error("SerializedFile already contains an encoded edit for object {path_id}")]
+    DuplicateObjectEdit { path_id: i64 },
+    #[error("SerializedFile has no object with path ID {path_id}")]
+    ObjectNotFound { path_id: i64 },
+    #[error(
+        "SerializedFile object {path_id} class changed from encoded class {expected} to {actual}"
+    )]
+    ObjectClassMismatch {
+        path_id: i64,
+        expected: i32,
+        actual: i32,
+    },
+    #[error("failed to read original bytes for SerializedFile object {path_id}: {source}")]
+    ReadOriginal {
+        path_id: i64,
+        #[source]
+        source: BinaryError,
+    },
+    #[error("SerializedFile object {path_id} original digest changed from {expected} to {actual}")]
+    OriginalDigestMismatch {
+        path_id: i64,
+        expected: DigestV1,
+        actual: DigestV1,
+    },
 }
 
 #[derive(Debug)]
 struct ObjectBytesEdit {
     path_id: i64,
+    class_id: i32,
+    original_digest: DigestV1,
     bytes: Vec<u8>,
 }
 
@@ -50,57 +80,43 @@ impl SerializedFileEdits {
         }
     }
 
-    /// Inserts or replaces raw object bytes while atomically charging retained storage.
+    /// Retains one fully encoded object while atomically charging retained storage.
     ///
-    /// The incoming byte allocation is charged by capacity because the edit set assumes ownership
-    /// of the complete allocation. A failed budget check or table allocation leaves both the edit
-    /// set and budget usage unchanged.
-    pub fn try_set_object_bytes(
+    /// The encoded capability binds bytes to their source object, class, and original digest.
+    /// Duplicate objects are rejected because one encoder must aggregate all ordered operations.
+    pub fn try_insert_encoded_object(
         &mut self,
-        path_id: i64,
-        bytes: Vec<u8>,
+        encoded: EncodedSerializedObject,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), SerializedFileEditError> {
+        let (path_id, class_id, original_digest, bytes) = encoded.into_file_edit_parts();
         let byte_allocation = vec_allocation_bytes::<u8>(bytes.capacity())?;
         match self
             .object_bytes
             .binary_search_by_key(&path_id, |edit| edit.path_id)
         {
-            Ok(index) => {
-                budget.check_bytes(byte_allocation)?;
-                budget.consume_bytes(byte_allocation)?;
-                self.object_bytes[index].bytes = bytes;
-                Ok(())
-            }
-            Err(index) => self.insert_object_bytes(index, path_id, bytes, byte_allocation, budget),
+            Ok(_) => Err(SerializedFileEditError::DuplicateObjectEdit { path_id }),
+            Err(index) => self.insert_object_bytes(
+                index,
+                ObjectBytesEdit {
+                    path_id,
+                    class_id,
+                    original_digest,
+                    bytes,
+                },
+                byte_allocation,
+                budget,
+            ),
         }
     }
 
     /// Returns a retained replacement for `path_id`.
     #[must_use]
-    pub fn object_bytes(&self, path_id: i64) -> Option<&[u8]> {
+    pub(crate) fn object_bytes(&self, path_id: i64) -> Option<&[u8]> {
         self.object_bytes
             .binary_search_by_key(&path_id, |edit| edit.path_id)
             .ok()
             .map(|index| self.object_bytes[index].bytes.as_slice())
-    }
-
-    /// Consumes the complete edit set and moves out the replacement for `path_id`.
-    ///
-    /// This is the zero-copy handoff for a caller that used an edit set as a temporary encoding
-    /// transaction. Every other replacement and external-table addition is discarded with `self`.
-    #[must_use]
-    pub fn into_object_bytes(mut self, path_id: i64) -> Option<Vec<u8>> {
-        let index = self
-            .object_bytes
-            .binary_search_by_key(&path_id, |edit| edit.path_id)
-            .ok()?;
-        Some(self.object_bytes.swap_remove(index).bytes)
-    }
-
-    /// Iterates edited path IDs in their deterministic ascending order.
-    pub fn object_path_ids(&self) -> impl ExactSizeIterator<Item = i64> + DoubleEndedIterator + '_ {
-        self.object_bytes.iter().map(|edit| edit.path_id)
     }
 
     /// Returns validated external identifiers appended by an external-table allocator.
@@ -116,11 +132,47 @@ impl SerializedFileEdits {
         self.object_bytes.is_empty() && self.external_additions().is_empty()
     }
 
+    pub(crate) fn validate_for(
+        &self,
+        file: &SerializedFile,
+    ) -> Result<(), SerializedFileEditError> {
+        for edit in &self.object_bytes {
+            let handle = file.find_object_handle(edit.path_id).ok_or(
+                SerializedFileEditError::ObjectNotFound {
+                    path_id: edit.path_id,
+                },
+            )?;
+            let actual_class = handle.class_id();
+            if actual_class != edit.class_id {
+                return Err(SerializedFileEditError::ObjectClassMismatch {
+                    path_id: edit.path_id,
+                    expected: edit.class_id,
+                    actual: actual_class,
+                });
+            }
+            let original =
+                handle
+                    .raw_data()
+                    .map_err(|source| SerializedFileEditError::ReadOriginal {
+                        path_id: edit.path_id,
+                        source,
+                    })?;
+            let actual = DigestV1::hash_bytes(original);
+            if actual != edit.original_digest {
+                return Err(SerializedFileEditError::OriginalDigestMismatch {
+                    path_id: edit.path_id,
+                    expected: edit.original_digest,
+                    actual,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn insert_object_bytes(
         &mut self,
         index: usize,
-        path_id: i64,
-        bytes: Vec<u8>,
+        edit: ObjectBytesEdit,
         byte_allocation: u64,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), SerializedFileEditError> {
@@ -129,8 +181,7 @@ impl SerializedFileEdits {
             budget.check_bytes(byte_allocation)?;
             budget.consume_entries(1)?;
             budget.consume_bytes(byte_allocation)?;
-            self.object_bytes
-                .insert(index, ObjectBytesEdit { path_id, bytes });
+            self.object_bytes.insert(index, edit);
             return Ok(());
         }
 
@@ -165,7 +216,7 @@ impl SerializedFileEdits {
         budget.consume_bytes(actual)?;
 
         staged.append(&mut self.object_bytes);
-        staged.insert(index, ObjectBytesEdit { path_id, bytes });
+        staged.insert(index, edit);
         self.object_bytes = staged;
         Ok(())
     }
@@ -173,55 +224,71 @@ impl SerializedFileEdits {
 
 #[cfg(test)]
 mod tests {
+    use unity_asset_binary::asset::SerializedFileParser;
     use unity_asset_core::{AssetLoadLimits, AssetLoadUsage};
 
     use super::*;
+    use crate::object::{
+        SerializedObjectEncoder, UnsafeRawObjectAcknowledgement, UnsafeRawObjectReplacement,
+    };
 
-    #[test]
-    fn object_replacements_are_unique_and_sorted_by_signed_path_id() {
-        let mut edits = SerializedFileEdits::new();
-        let mut budget = AssetLoadBudget::default();
+    const V8_FIXTURE: &[u8] =
+        include_bytes!("../../tests/fixtures/serialized_file_wire/v8.assets.bin");
+    const V21_FIXTURE: &[u8] =
+        include_bytes!("../../tests/fixtures/serialized_file_wire/v21.assets.bin");
+    const V22_FIXTURE: &[u8] =
+        include_bytes!("../../tests/fixtures/serialized_file_wire/v22.assets.bin");
 
-        edits.try_set_object_bytes(9, vec![9], &mut budget).unwrap();
-        edits
-            .try_set_object_bytes(-4, vec![4], &mut budget)
-            .unwrap();
-        edits.try_set_object_bytes(2, vec![2], &mut budget).unwrap();
-        edits
-            .try_set_object_bytes(2, vec![20], &mut budget)
-            .unwrap();
-
-        assert_eq!(edits.object_path_ids().collect::<Vec<_>>(), [-4, 2, 9]);
-        assert_eq!(edits.object_bytes(2), Some([20].as_slice()));
+    fn unsafe_encoded(
+        file: &SerializedFile,
+        path_id: i64,
+        bytes: Vec<u8>,
+    ) -> EncodedSerializedObject {
+        let original = file
+            .find_object_handle(path_id)
+            .expect("fixture object")
+            .raw_data()
+            .expect("fixture object bytes");
+        SerializedObjectEncoder::new(file, path_id)
+            .expect("bind fixture object encoder")
+            .encode_unsafe_raw(
+                UnsafeRawObjectReplacement::new(
+                    DigestV1::hash_bytes(original),
+                    bytes,
+                    UnsafeRawObjectAcknowledgement::WireInvariantsAreCallersResponsibilityV1,
+                ),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("encode fixture replacement")
     }
 
     #[test]
-    fn consuming_lookup_moves_the_original_byte_allocation() {
+    fn encoded_replacement_retains_the_original_byte_allocation() {
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let path_id = file.objects()[0].path_id();
         let mut replacement = Vec::with_capacity(32);
         replacement.extend_from_slice(&[1, 2, 3]);
         let allocation = replacement.as_ptr();
-        let capacity = replacement.capacity();
+        let encoded = unsafe_encoded(&file, path_id, replacement);
         let mut edits = SerializedFileEdits::new();
         edits
-            .try_set_object_bytes(7, replacement, &mut AssetLoadBudget::default())
-            .unwrap();
-        edits
-            .try_set_object_bytes(-2, vec![9], &mut AssetLoadBudget::default())
+            .try_insert_encoded_object(encoded, &mut AssetLoadBudget::default())
             .unwrap();
 
-        let replacement = edits.into_object_bytes(7).unwrap();
-
-        assert_eq!(replacement.as_ptr(), allocation);
-        assert_eq!(replacement.capacity(), capacity);
-        assert_eq!(replacement, [1, 2, 3]);
+        let retained = edits.object_bytes(path_id).unwrap();
+        assert_eq!(retained.as_ptr(), allocation);
+        assert_eq!(retained.len(), 3);
+        assert_eq!(retained, [1, 2, 3]);
     }
 
     #[test]
     fn failed_insert_leaves_edits_and_budget_unchanged() {
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let path_id = file.objects()[0].path_id();
         let mut measured = AssetLoadBudget::default();
         let mut measured_edits = SerializedFileEdits::new();
         measured_edits
-            .try_set_object_bytes(7, vec![1, 2, 3], &mut measured)
+            .try_insert_encoded_object(unsafe_encoded(&file, path_id, vec![1, 2, 3]), &mut measured)
             .unwrap();
         let required = measured.usage().bytes;
         assert!(required > 0);
@@ -233,7 +300,7 @@ mod tests {
         .unwrap();
         let mut edits = SerializedFileEdits::new();
         let error = edits
-            .try_set_object_bytes(7, vec![1, 2, 3], &mut budget)
+            .try_insert_encoded_object(unsafe_encoded(&file, path_id, vec![1, 2, 3]), &mut budget)
             .unwrap_err();
 
         assert!(matches!(
@@ -248,90 +315,90 @@ mod tests {
     }
 
     #[test]
-    fn failed_growth_preserves_the_existing_sorted_prefix() {
-        let mut measured_edits = SerializedFileEdits::new();
-        measured_edits
-            .try_set_object_bytes(7, vec![7], &mut AssetLoadBudget::default())
-            .unwrap();
-        let mut measured = AssetLoadBudget::default();
-        measured_edits
-            .try_set_object_bytes(-2, vec![2], &mut measured)
-            .unwrap();
-        let required = measured.usage().bytes;
-        assert!(required > 0);
-
+    fn duplicate_edit_is_rejected_without_charging_budget_or_replacing_bytes() {
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let path_id = file.objects()[0].path_id();
         let mut edits = SerializedFileEdits::new();
         edits
-            .try_set_object_bytes(7, vec![7], &mut AssetLoadBudget::default())
+            .try_insert_encoded_object(
+                unsafe_encoded(&file, path_id, vec![1]),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap();
-        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
-            max_bytes: required - 1,
-            ..AssetLoadLimits::default()
-        })
-        .unwrap();
-        let error = edits
-            .try_set_object_bytes(-2, vec![2], &mut budget)
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            SerializedFileEditError::Budget(BudgetError::Exceeded {
-                resource: "bytes",
-                ..
-            })
-        ));
-        assert_eq!(edits.object_path_ids().collect::<Vec<_>>(), [7]);
-        assert_eq!(edits.object_bytes(7), Some([7].as_slice()));
-        assert_eq!(budget.usage(), AssetLoadUsage::default());
-    }
-
-    #[test]
-    fn failed_replacement_preserves_prior_bytes_and_budget() {
-        let mut edits = SerializedFileEdits::new();
-        edits
-            .try_set_object_bytes(7, vec![1, 2, 3], &mut AssetLoadBudget::default())
-            .unwrap();
-
-        let mut replacement = Vec::with_capacity(32);
-        replacement.extend_from_slice(&[4, 5, 6]);
-        let replacement_capacity = replacement.capacity() as u64;
-        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
-            max_bytes: replacement_capacity - 1,
-            ..AssetLoadLimits::default()
-        })
-        .unwrap();
-        let error = edits
-            .try_set_object_bytes(7, replacement, &mut budget)
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            SerializedFileEditError::Budget(BudgetError::Exceeded {
-                resource: "bytes",
-                ..
-            })
-        ));
-        assert_eq!(edits.object_bytes(7), Some([1, 2, 3].as_slice()));
-        assert_eq!(budget.usage(), AssetLoadUsage::default());
-    }
-
-    #[test]
-    fn successful_replacement_charges_owned_capacity_without_new_entry() {
-        let mut edits = SerializedFileEdits::new();
-        edits
-            .try_set_object_bytes(7, vec![1], &mut AssetLoadBudget::default())
-            .unwrap();
-
-        let mut replacement = Vec::with_capacity(32);
-        replacement.push(9);
-        let replacement_capacity = replacement.capacity() as u64;
         let mut budget = AssetLoadBudget::default();
-        edits
-            .try_set_object_bytes(7, replacement, &mut budget)
-            .unwrap();
+        let error = edits
+            .try_insert_encoded_object(unsafe_encoded(&file, path_id, vec![2]), &mut budget)
+            .unwrap_err();
 
-        assert_eq!(budget.usage().bytes, replacement_capacity);
-        assert_eq!(budget.usage().entries, 0);
-        assert_eq!(edits.object_bytes(7), Some([9].as_slice()));
+        assert!(matches!(
+            error,
+            SerializedFileEditError::DuplicateObjectEdit { path_id: actual }
+                if actual == path_id
+        ));
+        assert_eq!(edits.object_bytes.len(), 1);
+        assert_eq!(edits.object_bytes(path_id), Some([1].as_slice()));
+        assert_eq!(budget.usage(), AssetLoadUsage::default());
+    }
+
+    #[test]
+    fn encoded_edit_is_bound_to_its_source_object_identity() {
+        let v8 = SerializedFileParser::from_bytes(V8_FIXTURE.to_vec()).unwrap();
+        let v21 = SerializedFileParser::from_bytes(V21_FIXTURE.to_vec()).unwrap();
+        let v22 = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+
+        let mut unknown = SerializedFileEdits::new();
+        let v8_path = v8.objects()[0].path_id();
+        unknown
+            .try_insert_encoded_object(
+                unsafe_encoded(&v8, v8_path, vec![8]),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            unknown.validate_for(&v22),
+            Err(SerializedFileEditError::ObjectNotFound { path_id }) if path_id == v8_path
+        ));
+
+        let mut stale = SerializedFileEdits::new();
+        let shared_path = v21.objects()[0].path_id();
+        assert_eq!(shared_path, v22.objects()[0].path_id());
+        stale
+            .try_insert_encoded_object(
+                unsafe_encoded(&v21, shared_path, vec![21]),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            stale.validate_for(&v22),
+            Err(SerializedFileEditError::OriginalDigestMismatch { path_id, .. })
+                if path_id == shared_path
+        ));
+    }
+
+    #[test]
+    fn class_mismatch_is_rejected_before_original_bytes_are_read() {
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let object = &file.objects()[0];
+        let original = file.object_bytes(object).unwrap();
+        let edits = SerializedFileEdits {
+            object_bytes: vec![ObjectBytesEdit {
+                path_id: object.path_id(),
+                class_id: object.class_id() + 1,
+                original_digest: DigestV1::hash_bytes(original),
+                bytes: vec![1],
+            }],
+            external_table: None,
+        };
+
+        assert!(matches!(
+            edits.validate_for(&file),
+            Err(SerializedFileEditError::ObjectClassMismatch {
+                path_id,
+                expected,
+                actual,
+            }) if path_id == object.path_id()
+                && expected == object.class_id() + 1
+                && actual == object.class_id()
+        ));
     }
 }

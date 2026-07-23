@@ -149,8 +149,8 @@ impl SerializedFile {
 
     /// Returns object metadata in immutable SerializedFile table order.
     ///
-    /// Object topology is intentionally not mutable after parsing because path-ID lookup is part
-    /// of this snapshot's identity contract. Payload overrides use [`Self::find_object_mut`].
+    /// Object topology and payload state are intentionally not mutable after parsing because
+    /// path-ID lookup and source bytes are part of this snapshot's identity contract.
     pub fn objects(&self) -> &[ObjectInfo] {
         &self.objects
     }
@@ -311,12 +311,6 @@ impl SerializedFile {
             .and_then(|index| self.objects.get(*index))
     }
 
-    /// Returns an object whose payload may be overridden without changing table identity.
-    pub fn find_object_mut(&mut self, path_id: i64) -> Option<&mut ObjectInfo> {
-        let index = self.object_index().get(&path_id).copied()?;
-        self.objects.get_mut(index)
-    }
-
     /// Find type by class ID.
     pub fn find_type(&self, class_id: i32) -> Option<&SerializedType> {
         self.types
@@ -460,7 +454,7 @@ impl SerializedFile {
                 ))
             })?;
             payload.extend_from_slice(&bytes[range]);
-            object.set_data(payload);
+            object.install_loaded_data(payload);
         }
         Ok(())
     }
