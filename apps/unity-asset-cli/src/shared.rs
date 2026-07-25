@@ -684,24 +684,6 @@ pub(crate) fn resolve_loaded_source(
     )
 }
 
-pub(crate) fn lookup_object_type_info(env: &Environment, key: &BinaryObjectKey) -> (i32, u32) {
-    match key.source_kind {
-        unity_asset::environment::BinarySourceKind::AssetBundle => env
-            .bundles()
-            .get(&key.source)
-            .and_then(|b| key.asset_index.and_then(|i| b.assets.get(i)))
-            .and_then(|f| f.find_object(key.path_id))
-            .map(|info| (info.class_id(), info.byte_size()))
-            .unwrap_or((0, 0)),
-        unity_asset::environment::BinarySourceKind::SerializedFile => env
-            .binary_assets()
-            .get(&key.source)
-            .and_then(|f| f.find_object(key.path_id))
-            .map(|info| (info.class_id(), info.byte_size()))
-            .unwrap_or((0, 0)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

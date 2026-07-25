@@ -6,7 +6,7 @@ use std::io::{self, Seek as _, SeekFrom};
 use std::mem::{MaybeUninit, align_of, size_of, size_of_val};
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-use std::path::{Component, Components, Path, Prefix};
+use std::path::{Component, Components, Path, PathBuf, Prefix};
 
 use serde::{Deserialize, Serialize};
 use unity_asset_core::{AssetLoadBudget, DigestV1};
@@ -126,6 +126,11 @@ impl FileIdentity {
     #[must_use]
     pub(super) const fn length(&self) -> u64 {
         self.length
+    }
+
+    #[must_use]
+    pub(super) fn same_object(&self, other: &Self) -> bool {
+        self.volume_serial_number == other.volume_serial_number && self.file_id == other.file_id
     }
 }
 
@@ -769,7 +774,6 @@ pub(super) fn create_private_file(path: &Path) -> io::Result<File> {
     Ok(opened.handle.into_file())
 }
 
-#[cfg(test)]
 pub(super) fn create_private_file_in_parent(
     path: &Path,
     expected_parent: &DirectoryIdentity,
@@ -805,7 +809,6 @@ pub(super) fn create_private_file_in_parent(
     Ok(handle.into_file())
 }
 
-#[cfg(test)]
 pub(super) fn remove_owned_file_in_parent(
     path: &Path,
     expected_file: &FileIdentity,
@@ -896,6 +899,20 @@ pub(super) fn open_readonly_regular_in_parent(
 pub(super) fn acquire_lock(path: &Path) -> io::Result<File> {
     let (parent_path, name) = split_leaf(path)?;
     let parent = open_directory(parent_path, DIRECTORY_DESTINATION_ACCESS)?;
+    acquire_lock_at(parent.raw(), name)
+}
+
+pub(super) fn acquire_lock_in_parent(
+    path: &Path,
+    expected_parent: &DirectoryIdentity,
+) -> io::Result<File> {
+    let (parent_path, name) = split_leaf(path)?;
+    let parent = open_directory(parent_path, DIRECTORY_DESTINATION_ACCESS)?;
+    verify_directory_identity(
+        parent.raw(),
+        expected_parent,
+        "publication lock parent no longer matches its captured identity",
+    )?;
     acquire_lock_at(parent.raw(), name)
 }
 
@@ -1103,7 +1120,6 @@ pub(super) fn visit_existing_directory_entries<S, E>(
     .map_err(DirectoryVisitError::Io)
 }
 
-#[cfg(test)]
 pub(super) fn observe_file_identity(path: &Path) -> io::Result<FileIdentity> {
     let opened = open_regular(
         path,
@@ -1117,6 +1133,48 @@ pub(super) fn observe_file_identity(path: &Path) -> io::Result<FileIdentity> {
 pub(super) fn observe_directory_identity(path: &Path) -> io::Result<DirectoryIdentity> {
     let opened = open_directory(path, DIRECTORY_TRAVERSE_ACCESS)?;
     directory_identity(opened.raw())
+}
+
+pub(super) fn ensure_directory_no_follow(path: &Path) -> io::Result<DirectoryIdentity> {
+    let mut path = AbsolutePathParts::new(path)?;
+    let mut root_path = path.root().to_os_string();
+    root_path.push("\\");
+    let mut current_path = PathBuf::from(root_path);
+    let mut directory = open_root(path.root(), DIRECTORY_TRAVERSE_ACCESS)?;
+
+    while let Some(name) = path.next_component()? {
+        directory = match open_directory_at(
+            directory.raw(),
+            name,
+            DIRECTORY_TRAVERSE_ACCESS,
+            FILE_OPEN,
+            None,
+        ) {
+            Ok((child, _)) => child,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // Traversal through a protected ancestor such as `C:\\Users` must not demand
+                // create permissions. Reopen only the verified direct parent when a missing
+                // child actually needs to be created.
+                let parent = open_directory(&current_path, DIRECTORY_DESTINATION_ACCESS)?;
+                let (child, information) = open_directory_at(
+                    parent.raw(),
+                    name,
+                    DIRECTORY_DESTINATION_ACCESS,
+                    FILE_OPEN_IF,
+                    None,
+                )?;
+                if information != FILE_CREATED as usize && information != FILE_OPENED as usize {
+                    return Err(io::Error::other(
+                        "Windows output directory returned an unexpected create disposition",
+                    ));
+                }
+                child
+            }
+            Err(error) => return Err(error),
+        };
+        current_path.push(name);
+    }
+    directory_identity(directory.raw())
 }
 
 pub(super) fn opened_file_identity(file: &File) -> io::Result<FileIdentity> {
@@ -1486,7 +1544,6 @@ fn rename_verified_digest(
     .map_err(super::AtomicMoveError::into_error)
 }
 
-#[cfg(test)]
 fn rename_verified_tracked(
     source: &Path,
     destination: &Path,
@@ -1525,6 +1582,26 @@ fn rename_verified_tracked(
             expected_source_parent: Some(expected_source_parent),
             expected_destination_parent: Some(expected_destination_parent),
         },
+    )
+}
+
+pub(super) fn atomic_replace_captured_tracked(
+    source: &Path,
+    destination: &Path,
+    replace_existing: bool,
+    expected_source: &FileIdentity,
+    expected_digest: DigestV1,
+    expected_source_parent: &DirectoryIdentity,
+    expected_destination_parent: &DirectoryIdentity,
+) -> Result<(), super::AtomicMoveError> {
+    rename_verified_tracked(
+        source,
+        destination,
+        replace_existing,
+        Some(expected_source),
+        Some(expected_digest),
+        expected_source_parent,
+        expected_destination_parent,
     )
 }
 

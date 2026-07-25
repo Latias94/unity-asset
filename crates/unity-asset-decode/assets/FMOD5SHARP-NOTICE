@@ -1,0 +1,41 @@
+This crate includes `fmod5sharp-vorbis-headers.json` and the
+`tests/fixtures/short_vorbis.fsb` regression fixture, copied from:
+
+https://github.com/FModel/Fmod5Sharp/blob/d176ea8774f69543ae1f50984f58985160ca94ee/Fmod5Sharp/Util/vorbis_headers_converted.json
+https://github.com/FModel/Fmod5Sharp/blob/d176ea8774f69543ae1f50984f58985160ca94ee/Fmod5Sharp.Tests/TestResources/short_vorbis.fsb
+
+Source commit: d176ea8774f69543ae1f50984f58985160ca94ee
+Downloaded: 2026-07-23
+SHA-256: 89D72238F9F1746AEE6A82DE6DB48B5C7F6ED8174CB1D63570BAE9FFE245D095
+Fixture SHA-256: D9E00F224A14E6745E050989577B36122C85A51F9E551E107DE5C8143A67A35A
+
+The file is used to reconstruct standard Ogg/Vorbis setup packets for FSB5
+audio. It and the accompanying parsing approach are available under the MIT
+license reproduced in `FMOD5SHARP-LICENSE`.
+
+Fmod5Sharp also carries the following upstream notice for material developed
+by vgmstream. It is reproduced here with the imported header database:
+
+Copyright (c) 2008-2025 Adam Gashlin, Fastelbja, Ronny Elfert, bnnm,
+                        Christopher Snowhill, NicknineTheEagle, bxaimc,
+                        Thealexbarney, CyberBotX, et al
+
+Portions Copyright (c) 2004-2008, Marko Kreen
+Portions Copyright 2001-2007 jagarl / Kazunori Ueno <jagarl@creator.club.ne.jp>
+Portions Copyright (c) 1998, Justin Frankel/Nullsoft Inc.
+Portions Copyright (C) 2006 Nullsoft, Inc.
+Portions Copyright (c) 2005-2007 Paul Hsieh
+Portions Copyright (C) 2000-2004 Leshade Entis, Entis-soft.
+Portions Public Domain originating with Sun Microsystems
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.

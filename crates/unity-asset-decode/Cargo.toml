@@ -10,6 +10,7 @@ homepage.workspace = true
 documentation = "https://docs.rs/unity-asset-decode"
 keywords = ["unity", "assets", "decode", "export", "parser"]
 categories = ["parsing", "game-development"]
+include = ["src/**", "assets/**", "examples/**", "tests/**", "Cargo.toml"]
 
 [dependencies]
 unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
@@ -21,13 +22,23 @@ hound = { version = "3.5", optional = true }
 texture2ddecoder = { version = "0.1", optional = true }
 obj = { version = "0.10", optional = true }
 indexmap = { workspace = true }
+base64 = { version = "0.22", optional = true }
+ogg = { version = "0.9", optional = true }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true }
 
 [features]
 default = []
 
 texture = ["dep:image"]
 texture-advanced = ["texture", "dep:texture2ddecoder"]
-audio = ["dep:symphonia", "dep:hound"]
+audio = [
+    "dep:base64",
+    "dep:hound",
+    "dep:ogg",
+    "dep:serde_json",
+    "dep:symphonia",
+]
 mesh = []
 mesh-export = ["mesh", "dep:obj"]
 sprite = ["texture"]

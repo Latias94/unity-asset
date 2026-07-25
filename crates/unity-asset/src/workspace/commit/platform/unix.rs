@@ -130,6 +130,11 @@ impl FileIdentity {
     pub(super) const fn length(&self) -> u64 {
         self.length
     }
+
+    #[must_use]
+    pub(super) fn same_object(&self, other: &Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
 }
 
 /// Stable Unix identity captured from an opened publication directory.
@@ -651,7 +656,6 @@ pub(super) fn create_private_file(path: &Path) -> io::Result<File> {
     create_private_file_with_parent(path, None)
 }
 
-#[cfg(test)]
 pub(super) fn create_private_file_in_parent(
     path: &Path,
     expected_parent: &DirectoryIdentity,
@@ -659,7 +663,6 @@ pub(super) fn create_private_file_in_parent(
     create_private_file_with_parent(path, Some(expected_parent))
 }
 
-#[cfg(test)]
 fn create_private_file_with_parent(
     path: &Path,
     expected_parent: Option<&DirectoryIdentity>,
@@ -689,7 +692,6 @@ fn create_private_file_with_parent(
     Ok(descriptor.into())
 }
 
-#[cfg(test)]
 pub(super) fn remove_owned_file_in_parent(
     path: &Path,
     expected_file: &FileIdentity,
@@ -775,6 +777,20 @@ pub(super) fn open_readonly_regular_in_parent(
 pub(super) fn acquire_lock(path: &Path) -> io::Result<File> {
     let (parent_path, name) = split_leaf(path)?;
     let parent = open_directory(parent_path)?;
+    acquire_lock_at(&parent, name)
+}
+
+pub(super) fn acquire_lock_in_parent(
+    path: &Path,
+    expected_parent: &DirectoryIdentity,
+) -> io::Result<File> {
+    let (parent_path, name) = split_leaf(path)?;
+    let parent = open_directory(parent_path)?;
+    validate_expected_directory_identity(
+        &parent,
+        expected_parent,
+        "publication lock parent no longer matches its captured identity",
+    )?;
     acquire_lock_at(&parent, name)
 }
 
@@ -1110,7 +1126,6 @@ pub(super) fn ensure_single_hardlink(path: &Path) -> io::Result<()> {
 }
 
 /// Captures a stable device/inode token for a no-follow regular source.
-#[cfg(test)]
 pub(super) fn observe_file_identity(path: &Path) -> io::Result<FileIdentity> {
     let (parent_path, name) = split_leaf(path)?;
     let parent = open_directory(parent_path)?;
@@ -1127,6 +1142,33 @@ pub(super) fn observe_file_identity(path: &Path) -> io::Result<FileIdentity> {
 /// Captures a stable device/inode token for a no-follow directory.
 pub(super) fn observe_directory_identity(path: &Path) -> io::Result<DirectoryIdentity> {
     let directory = open_directory(path)?;
+    opened_directory_identity(&directory)
+}
+
+pub(super) fn ensure_directory_no_follow(path: &Path) -> io::Result<DirectoryIdentity> {
+    validate_directory_path(path)?;
+
+    let mut directory = open_start_directory(path)?;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                match mkdirat(
+                    &directory,
+                    name,
+                    Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                ) {
+                    Ok(()) | Err(Errno::EXIST) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                directory = openat(&directory, name, DIRECTORY_FLAGS, Mode::empty())
+                    .map_err(io::Error::from)?;
+            }
+            Component::ParentDir | Component::Prefix(_) => unreachable!(
+                "validate_directory_path rejects escaping components before filesystem writes"
+            ),
+        }
+    }
     opened_directory_identity(&directory)
 }
 
@@ -1529,8 +1571,7 @@ fn atomic_replace_verified_digest(
     .map_err(super::AtomicMoveError::into_error)
 }
 
-#[cfg(test)]
-fn atomic_replace_verified_tracked(
+pub(super) fn atomic_replace_verified_tracked(
     source: &Path,
     destination: &Path,
     replace_existing: bool,
@@ -1567,6 +1608,26 @@ fn atomic_replace_verified_tracked(
             expected_source_parent: Some(expected_source_parent),
             expected_destination_parent: Some(expected_destination_parent),
         },
+    )
+}
+
+pub(super) fn atomic_replace_captured_tracked(
+    source: &Path,
+    destination: &Path,
+    replace_existing: bool,
+    expected_source: &FileIdentity,
+    expected_digest: DigestV1,
+    expected_source_parent: &DirectoryIdentity,
+    expected_destination_parent: &DirectoryIdentity,
+) -> Result<(), super::AtomicMoveError> {
+    atomic_replace_verified_tracked(
+        source,
+        destination,
+        replace_existing,
+        Some(expected_source),
+        Some(expected_digest),
+        expected_source_parent,
+        expected_destination_parent,
     )
 }
 
@@ -1731,7 +1792,6 @@ fn split_leaf(path: &Path) -> io::Result<(&Path, &OsStr)> {
     Ok((path.parent().unwrap_or_else(|| Path::new(".")), name))
 }
 
-#[cfg(test)]
 fn validate_directory_path(path: &Path) -> io::Result<()> {
     let mut has_normal_component = false;
     for component in path.components() {

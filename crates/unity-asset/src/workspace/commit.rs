@@ -46,7 +46,7 @@ use self::platform::{
 
 mod baseline;
 mod journal;
-mod platform;
+pub(crate) mod platform;
 mod recovery;
 
 #[cfg(test)]

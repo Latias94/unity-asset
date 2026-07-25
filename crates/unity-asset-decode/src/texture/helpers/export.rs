@@ -3,7 +3,8 @@
 //! This module provides functionality for exporting textures to various image formats.
 
 use crate::error::{BinaryError, Result};
-use image::{ImageFormat, RgbaImage};
+use image::{ExtendedColorType, ImageEncoder, ImageFormat, RgbaImage};
+use std::io::Write;
 use std::path::Path;
 
 /// Texture exporter utility
@@ -11,15 +12,45 @@ use std::path::Path;
 /// This struct provides methods for exporting texture data to various image formats.
 pub struct TextureExporter;
 
+pub(crate) fn write_rgba_png<W: Write + ?Sized>(
+    image: &RgbaImage,
+    writer: &mut W,
+    error_context: &'static str,
+) -> Result<()> {
+    image::codecs::png::PngEncoder::new(writer)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| BinaryError::generic(format!("{error_context}: {error}")))
+}
+
 impl TextureExporter {
     /// Export texture as PNG
     ///
     /// This is the most common export format, providing lossless compression
     /// with full alpha channel support.
     pub fn export_png<P: AsRef<Path>>(image: &RgbaImage, path: P) -> Result<()> {
-        image
-            .save_with_format(path, ImageFormat::Png)
+        use std::fs::File;
+        use std::io::BufWriter;
+
+        let file = File::create(path)
+            .map_err(|e| BinaryError::generic(format!("Failed to save PNG: {}", e)))?;
+        let mut writer = BufWriter::new(file);
+        Self::write_png(image, &mut writer)?;
+        writer
+            .flush()
             .map_err(|e| BinaryError::generic(format!("Failed to save PNG: {}", e)))
+    }
+
+    /// Write PNG bytes to a caller-owned sink.
+    ///
+    /// The sink is not flushed. Callers that buffer output retain control over
+    /// the flush and durability policy.
+    pub fn write_png<W: Write + ?Sized>(image: &RgbaImage, writer: &mut W) -> Result<()> {
+        write_rgba_png(image, writer, "Failed to save PNG")
     }
 
     /// Export texture as JPEG

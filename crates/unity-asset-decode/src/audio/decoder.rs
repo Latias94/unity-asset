@@ -4,6 +4,7 @@
 //! for various audio formats supported by Unity.
 
 use super::formats::AudioCompressionFormat;
+use super::ogg::final_ogg_granule;
 use super::types::{AudioClip, DecodedAudio};
 use crate::error::{BinaryError, Result};
 
@@ -22,7 +23,7 @@ impl AudioDecoder {
     /// Decode audio using Symphonia (supports many formats)
     pub fn decode(&self, clip: &AudioClip) -> Result<DecodedAudio> {
         use std::io::Cursor;
-        use symphonia::core::audio::{AudioBufferRef, Signal};
+        use symphonia::core::audio::SampleBuffer;
         use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
         use symphonia::core::errors::Error as SymphoniaError;
         use symphonia::core::formats::FormatOptions;
@@ -115,136 +116,16 @@ impl AudioDecoder {
                 continue;
             }
 
-            // Decode the packet into an audio buffer
+            // Decode each packet into an interleaved f32 buffer. Symphonia's
+            // conversion preserves channel order for every supported sample type.
             match decoder.decode(&packet) {
                 Ok(decoded) => {
-                    // Get audio buffer information
                     let spec = *decoded.spec();
                     sample_rate = spec.rate;
                     channels = spec.channels.count() as u32;
-
-                    // Convert the audio buffer to f32 samples
-                    match decoded {
-                        AudioBufferRef::F32(buf) => {
-                            samples.extend_from_slice(buf.chan(0));
-                            if channels > 1 {
-                                for ch in 1..channels as usize {
-                                    if ch < buf.spec().channels.count() {
-                                        let channel_samples = buf.chan(ch);
-                                        // Interleave channels
-                                        for (i, &sample) in channel_samples.iter().enumerate() {
-                                            if i * channels as usize + ch < samples.len() {
-                                                samples.insert(i * channels as usize + ch, sample);
-                                            } else {
-                                                samples.push(sample);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        AudioBufferRef::U8(buf) => {
-                            for ch in 0..channels as usize {
-                                if ch < buf.spec().channels.count() {
-                                    let channel_samples = buf.chan(ch);
-                                    for &sample in channel_samples {
-                                        let normalized = (sample as f32 - 128.0) / 128.0;
-                                        samples.push(normalized);
-                                    }
-                                }
-                            }
-                        }
-                        AudioBufferRef::U16(buf) => {
-                            for ch in 0..channels as usize {
-                                if ch < buf.spec().channels.count() {
-                                    let channel_samples = buf.chan(ch);
-                                    for &sample in channel_samples {
-                                        let normalized = (sample as f32 - 32768.0) / 32768.0;
-                                        samples.push(normalized);
-                                    }
-                                }
-                            }
-                        }
-                        AudioBufferRef::U32(buf) => {
-                            for ch in 0..channels as usize {
-                                if ch < buf.spec().channels.count() {
-                                    let channel_samples = buf.chan(ch);
-                                    for &sample in channel_samples {
-                                        let normalized =
-                                            (sample as f32 - 2147483648.0) / 2147483648.0;
-                                        samples.push(normalized);
-                                    }
-                                }
-                            }
-                        }
-                        AudioBufferRef::S8(buf) => {
-                            for ch in 0..channels as usize {
-                                if ch < buf.spec().channels.count() {
-                                    let channel_samples = buf.chan(ch);
-                                    for &sample in channel_samples {
-                                        let normalized = sample as f32 / 128.0;
-                                        samples.push(normalized);
-                                    }
-                                }
-                            }
-                        }
-                        AudioBufferRef::S16(buf) => {
-                            for ch in 0..channels as usize {
-                                if ch < buf.spec().channels.count() {
-                                    let channel_samples = buf.chan(ch);
-                                    for &sample in channel_samples {
-                                        let normalized = sample as f32 / 32768.0;
-                                        samples.push(normalized);
-                                    }
-                                }
-                            }
-                        }
-                        AudioBufferRef::S32(buf) => {
-                            for ch in 0..channels as usize {
-                                if ch < buf.spec().channels.count() {
-                                    let channel_samples = buf.chan(ch);
-                                    for &sample in channel_samples {
-                                        let normalized = sample as f32 / 2147483648.0;
-                                        samples.push(normalized);
-                                    }
-                                }
-                            }
-                        }
-                        AudioBufferRef::F64(buf) => {
-                            for ch in 0..channels as usize {
-                                if ch < buf.spec().channels.count() {
-                                    let channel_samples = buf.chan(ch);
-                                    for &sample in channel_samples {
-                                        samples.push(sample as f32);
-                                    }
-                                }
-                            }
-                        }
-                        AudioBufferRef::U24(buf) => {
-                            for ch in 0..channels as usize {
-                                if ch < buf.spec().channels.count() {
-                                    let channel_samples = buf.chan(ch);
-                                    for &sample in channel_samples {
-                                        let value = sample.inner() as i32;
-                                        let normalized = (value as f32 - 8388608.0) / 8388608.0;
-                                        samples.push(normalized);
-                                    }
-                                }
-                            }
-                        }
-                        AudioBufferRef::S24(buf) => {
-                            for ch in 0..channels as usize {
-                                if ch < buf.spec().channels.count() {
-                                    let channel_samples = buf.chan(ch);
-                                    for &sample in channel_samples {
-                                        let value = sample.inner();
-                                        let normalized = value as f32 / 8388608.0;
-                                        samples.push(normalized);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+                    buffer.copy_interleaved_ref(decoded);
+                    samples.extend_from_slice(buffer.samples());
                 }
                 Err(SymphoniaError::IoError(_)) => {
                     // The packet reader has reached the end of the stream
@@ -264,6 +145,7 @@ impl AudioDecoder {
         if samples.is_empty() {
             return Err(BinaryError::generic("No audio samples decoded"));
         }
+        trim_to_ogg_granule(clip, &mut samples, channels);
 
         Ok(DecodedAudio::new(samples, sample_rate, channels))
     }
@@ -289,6 +171,24 @@ impl AudioDecoder {
             AudioCompressionFormat::AAC,
             AudioCompressionFormat::ADPCM,
         ]
+    }
+}
+
+fn trim_to_ogg_granule(clip: &AudioClip, samples: &mut Vec<f32>, channels: u32) {
+    if clip.compression_format() != AudioCompressionFormat::Vorbis || channels == 0 {
+        return;
+    }
+    let Some(granule) = final_ogg_granule(&clip.data) else {
+        return;
+    };
+    let Ok(frames) = usize::try_from(granule) else {
+        return;
+    };
+    let Some(sample_count) = frames.checked_mul(channels as usize) else {
+        return;
+    };
+    if sample_count <= samples.len() {
+        samples.truncate(sample_count);
     }
 }
 

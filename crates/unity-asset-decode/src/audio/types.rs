@@ -107,6 +107,17 @@ impl AudioClip {
         }
     }
 
+    /// Return the selected subsound in an FMOD bank, when Unity provided one.
+    ///
+    /// Legacy Unity layouts do not carry this field and therefore select the
+    /// first subsound.
+    pub fn subsound_index(&self) -> i32 {
+        match &self.meta {
+            AudioClipMeta::Legacy { .. } => 0,
+            AudioClipMeta::Modern { subsound_index, .. } => *subsound_index,
+        }
+    }
+
     /// Get audio properties
     pub fn properties(&self) -> AudioProperties {
         match &self.meta {

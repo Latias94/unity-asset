@@ -27,6 +27,7 @@ unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
 unity-asset-yaml = { path = "../unity-asset-yaml", version = "0.3.0" }
 unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
 unity-asset-write = { path = "../unity-asset-write", version = "0.3.0" }
+unity-asset-decode = { path = "../unity-asset-decode", version = "0.3.0", features = ["audio", "texture-advanced", "sprite"], optional = true }
 ignore = { workspace = true }
 zip = { workspace = true }
 thiserror = { workspace = true }
@@ -58,9 +59,11 @@ libc = "0.2"
 default = ["mmap"]
 async = ["unity-asset-core/async", "unity-asset-yaml/async"]
 mmap = ["unity-asset-binary/mmap"]
+decode = ["dep:unity-asset-decode"]
 
 [dev-dependencies]
 flate2 = { workspace = true }
+image = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 unity-asset-decode = { path = "../unity-asset-decode", version = "0.3.0", features = ["audio"] }

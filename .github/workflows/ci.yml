@@ -57,7 +57,7 @@ jobs:
         cargo build --workspace
         ./target/debug/unity-asset --help
         cargo build -p unity-asset-cli --features async
-        ./target/debug/unity-asset-async --help
+        ./target/debug/unity-asset --help
         cargo build -p unity-asset-cli --features decode
 
     - name: Build examples
@@ -75,7 +75,21 @@ jobs:
         cargo nextest run -p unity-asset-cli --features async --no-tests=pass
 
     - name: Run tests (decode/export)
-      run: cargo nextest run -p unity-asset-decode --features full
+      run: |
+        cargo nextest run -p unity-asset-decode --features full
+        cargo nextest run -p unity-asset --features decode --test extraction_decode
+        cargo nextest run -p unity-asset-cli --features decode --test export_command
+
+    - name: Verify decode package assets
+      run: |
+        package_files="$(cargo package -p unity-asset-decode --list)"
+        for required in \
+          assets/FMOD5SHARP-LICENSE \
+          assets/FMOD5SHARP-NOTICE \
+          assets/fmod5sharp-vorbis-headers.json \
+          tests/fixtures/short_vorbis.fsb; do
+          printf '%s\n' "$package_files" | grep -Fqx "$required"
+        done
 
   workspace-publication-platforms:
     name: Workspace publication / ${{ matrix.os }}
@@ -104,6 +118,9 @@ jobs:
 
     - name: Run publication contract tests
       run: cargo nextest run -p unity-asset --test workspace_commit --test workspace_recovery
+
+    - name: Run extraction output publication tests
+      run: cargo nextest run -p unity-asset -E 'test(/^extraction::artifact::tests::/)'
 
   binary-loader-features:
     name: Binary loader / ${{ matrix.mode }}

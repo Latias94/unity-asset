@@ -280,6 +280,22 @@ impl TextureFormat {
                 has_alpha: true,
                 supported: true,
             },
+            TextureFormat::ASTC_RGBA_6x6 => TextureFormatInfo {
+                name: "ASTC_RGBA_6x6".to_string(),
+                bits_per_pixel: 4,
+                block_size: (6, 6),
+                compressed: true,
+                has_alpha: true,
+                supported: true,
+            },
+            TextureFormat::ASTC_RGBA_8x8 => TextureFormatInfo {
+                name: "ASTC_RGBA_8x8".to_string(),
+                bits_per_pixel: 2,
+                block_size: (8, 8),
+                compressed: true,
+                has_alpha: true,
+                supported: true,
+            },
             _ => TextureFormatInfo::default(),
         }
     }
@@ -302,7 +318,9 @@ impl TextureFormat {
                 TextureFormat::BC7 => 16,
                 TextureFormat::ETC2_RGB => 8,
                 TextureFormat::ETC2_RGBA8 => 16,
-                TextureFormat::ASTC_RGBA_4x4 => 16,
+                TextureFormat::ASTC_RGBA_4x4
+                | TextureFormat::ASTC_RGBA_6x6
+                | TextureFormat::ASTC_RGBA_8x8 => 16,
                 _ => info.bits_per_pixel / 8,
             };
             blocks_x * blocks_y * bytes_per_block

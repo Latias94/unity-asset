@@ -8,8 +8,10 @@ use super::types::*;
 use crate::error::{BinaryError, Result};
 use crate::object::UnityObject;
 use crate::texture::Texture2D;
+use crate::texture::helpers::export::write_rgba_png;
 use crate::unity_version::UnityVersion;
 use image::{RgbaImage, imageops};
+use std::io::Write;
 
 /// Sprite processor
 ///
@@ -18,6 +20,12 @@ use image::{RgbaImage, imageops};
 pub struct SpriteProcessor {
     parser: SpriteParser,
     config: SpriteConfig,
+}
+
+/// Opaque decoded texture shared while rendering sprites from one atlas.
+#[derive(Debug)]
+pub struct DecodedSpriteTexture {
+    image: RgbaImage,
 }
 
 impl SpriteProcessor {
@@ -66,9 +74,49 @@ impl SpriteProcessor {
 
     /// Extract sprite image from texture
     pub fn extract_sprite_image(&self, sprite: &Sprite, texture: &Texture2D) -> Result<Vec<u8>> {
-        // Get texture image data using converter
+        let mut png_data = Vec::new();
+        self.write_sprite_png(sprite, texture, &mut png_data)?;
+        Ok(png_data)
+    }
+
+    /// Extract and encode a sprite as PNG into a caller-owned sink.
+    ///
+    /// The sink is not flushed. Callers that buffer output retain control over
+    /// the flush and durability policy.
+    pub fn write_sprite_png<W: Write + ?Sized>(
+        &self,
+        sprite: &Sprite,
+        texture: &Texture2D,
+        writer: &mut W,
+    ) -> Result<()> {
+        let image = self.render_sprite(sprite, texture)?;
+        write_rgba_png(&image, writer, "Failed to encode PNG")
+    }
+
+    /// Render a sprite into a standalone RGBA image.
+    ///
+    /// Keeping rendering separate from PNG publication lets callers preserve
+    /// the distinction between malformed Unity data and a failing output sink.
+    pub fn render_sprite(&self, sprite: &Sprite, texture: &Texture2D) -> Result<RgbaImage> {
+        let texture = self.decode_sprite_texture(texture)?;
+        self.render_sprite_from_texture(sprite, &texture)
+    }
+
+    /// Decode one Texture2D for reuse by every Sprite that references it.
+    pub fn decode_sprite_texture(&self, texture: &Texture2D) -> Result<DecodedSpriteTexture> {
         let converter = crate::texture::Texture2DConverter::new(self.parser.version().clone());
-        let texture_image = converter.decode_to_image(texture)?;
+        converter
+            .decode_to_image(texture)
+            .map(|image| DecodedSpriteTexture { image })
+    }
+
+    /// Render a Sprite from an already decoded atlas texture.
+    pub fn render_sprite_from_texture(
+        &self,
+        sprite: &Sprite,
+        texture: &DecodedSpriteTexture,
+    ) -> Result<RgbaImage> {
+        let texture_image = &texture.image;
 
         // Calculate sprite bounds
         let sprite_rect = sprite.get_rect();
@@ -106,7 +154,7 @@ impl SpriteProcessor {
         let flipped_y = texture_height - y - height;
 
         let sprite_image =
-            imageops::crop_imm(&texture_image, x, flipped_y, width, height).to_image();
+            imageops::crop_imm(texture_image, x, flipped_y, width, height).to_image();
 
         // Apply transformations if enabled
         let final_image = if self.config.apply_transformations {
@@ -115,24 +163,7 @@ impl SpriteProcessor {
             sprite_image
         };
 
-        // Convert to PNG bytes
-        let mut png_data = Vec::new();
-        {
-            use image::ImageEncoder;
-            use image::codecs::png::PngEncoder;
-
-            let encoder = PngEncoder::new(&mut png_data);
-            encoder
-                .write_image(
-                    final_image.as_raw(),
-                    final_image.width(),
-                    final_image.height(),
-                    image::ExtendedColorType::Rgba8,
-                )
-                .map_err(|e| BinaryError::generic(format!("Failed to encode PNG: {}", e)))?;
-        }
-
-        Ok(png_data)
+        Ok(final_image)
     }
 
     /// Apply sprite transformations (pivot, offset, etc.)

@@ -26,16 +26,10 @@ path = "src/main.rs"
 # The binary's rustdoc output collides with the `unity-asset` library crate.
 doc = false
 
-[[bin]]
-name = "unity-asset-async"
-path = "src/main_async.rs"
-required-features = ["async"]
-
 [dependencies]
 # Core library
 unity-asset = { path = "../../crates/unity-asset", version = "0.3.0" }
 unity-asset-binary = { path = "../../crates/unity-asset-binary", version = "0.3.0" }
-unity-asset-decode = { path = "../../crates/unity-asset-decode", version = "0.3.0", features = ["audio", "sprite", "texture-advanced"], optional = true }
 
 # CLI dependencies
 clap = { workspace = true }
@@ -47,15 +41,10 @@ tracing = { version = "0.1.41" }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tempfile = { workspace = true }
 
-# Async CLI dependencies (optional)
-tokio = { version = "1.0", features = ["fs", "io-util", "rt-multi-thread", "macros"], optional = true }
-futures = { version = "0.3", optional = true }
-indicatif = { version = "0.18", optional = true }
-
 [features]
 default = ["mmap"]
-async = ["unity-asset/async", "tokio", "futures", "indicatif"]
-decode = ["dep:unity-asset-decode"]
+async = ["unity-asset/async"]
+decode = ["unity-asset/decode"]
 mmap = ["unity-asset/mmap", "unity-asset-binary/mmap", "dep:memmap2"]
 full = ["decode", "mmap"]
 

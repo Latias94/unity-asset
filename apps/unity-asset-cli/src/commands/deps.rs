@@ -11,7 +11,9 @@ use unity_asset::reference::{
     ReferenceTruncationKind,
 };
 use unity_asset::workspace::{AssetWorkspace, SourceOpenRequest, WorkspaceOptions};
-use unity_asset::{AssetLoadBudget, BudgetError, ObjectAddress, SourceAlias, SourceKind};
+use unity_asset::{
+    AssetLoadBudget, BudgetError, ObjectAddress, SourceAlias, SourceKind, WorkspaceId,
+};
 use unity_asset_binary::file::UnityFileKind;
 
 const PROBE_PREFIX_LEN: usize = 64;
@@ -70,6 +72,16 @@ impl WorkspaceScanReport {
 
 pub(crate) struct LoadedReferenceGraph {
     pub(crate) graph: ReferenceGraph,
+    pub(crate) scan: WorkspaceScanReport,
+}
+
+/// A fully loaded workspace plus deterministic source-discovery accounting.
+///
+/// Commands that only need object inspection or extraction can reuse this loader without
+/// paying for a reference-graph scan. Commands that need graph facts build that graph from the
+/// returned workspace at their own explicit boundary.
+pub(crate) struct LoadedWorkspace {
+    pub(crate) workspace: AssetWorkspace,
     pub(crate) scan: WorkspaceScanReport,
 }
 
@@ -230,6 +242,37 @@ pub(crate) fn load_reference_graph(
     ctx: &AppContext,
     budget: &mut AssetLoadBudget,
 ) -> Result<LoadedReferenceGraph> {
+    let mut loaded = load_workspace(
+        input,
+        include_yaml,
+        max_files,
+        excluded_path,
+        discovery_policy,
+        None,
+        ctx,
+        budget,
+    )?;
+    let snapshot = loaded.workspace.snapshot();
+    let graph = snapshot
+        .reference_graph(ReferenceGraphBuildOptions::unbounded(), budget)
+        .context("Failed to build the revision-bound reference graph")?;
+    loaded.scan.workspace_sources = graph.coverage().total_sources();
+    Ok(LoadedReferenceGraph {
+        graph,
+        scan: loaded.scan,
+    })
+}
+
+pub(crate) fn load_workspace(
+    input: &Path,
+    include_yaml: bool,
+    max_files: Option<usize>,
+    excluded_path: Option<&Path>,
+    discovery_policy: DiscoveryPolicy,
+    workspace_id: Option<WorkspaceId>,
+    ctx: &AppContext,
+    budget: &mut AssetLoadBudget,
+) -> Result<LoadedWorkspace> {
     let input = std::path::absolute(input).context("Failed to normalize the input path")?;
     let input = input.as_path();
     if !input.exists() {
@@ -244,8 +287,11 @@ pub(crate) fn load_reference_graph(
     let workspace_options = workspace_options
         .with_type_tree_registry_paths(ctx.typetree_registries(), budget)
         .context("Failed to load --typetree-registry paths")?;
-    let mut workspace = AssetWorkspace::with_options(workspace_options)
-        .context("Failed to initialize asset workspace")?;
+    let mut workspace = match workspace_id {
+        Some(workspace_id) => AssetWorkspace::with_workspace_id(workspace_id, workspace_options),
+        None => AssetWorkspace::with_options(workspace_options),
+    }
+    .context("Failed to initialize asset workspace")?;
 
     let discovery =
         discover_candidates(input, include_yaml, excluded_path, discovery_policy, budget)?;
@@ -296,12 +342,46 @@ pub(crate) fn load_reference_graph(
         );
     }
 
-    let snapshot = workspace.snapshot();
-    let graph = snapshot
-        .reference_graph(ReferenceGraphBuildOptions::unbounded(), budget)
-        .context("Failed to build the revision-bound reference graph")?;
-    scan.workspace_sources = graph.coverage().total_sources();
-    Ok(LoadedReferenceGraph { graph, scan })
+    Ok(LoadedWorkspace { workspace, scan })
+}
+
+pub(crate) fn load_full_workspace(
+    input: &Path,
+    ctx: &AppContext,
+    budget: &mut AssetLoadBudget,
+) -> Result<LoadedWorkspace> {
+    load_full_workspace_with_id(input, None, ctx, budget)
+}
+
+/// Loads all supported sources into a caller-selected logical workspace namespace.
+///
+/// CLI resume manifests carry their original workspace ID so a later process can recreate the
+/// same object-address namespace before plan validation.
+pub(crate) fn load_full_workspace_with_workspace_id(
+    input: &Path,
+    workspace_id: WorkspaceId,
+    ctx: &AppContext,
+    budget: &mut AssetLoadBudget,
+) -> Result<LoadedWorkspace> {
+    load_full_workspace_with_id(input, Some(workspace_id), ctx, budget)
+}
+
+fn load_full_workspace_with_id(
+    input: &Path,
+    workspace_id: Option<WorkspaceId>,
+    ctx: &AppContext,
+    budget: &mut AssetLoadBudget,
+) -> Result<LoadedWorkspace> {
+    load_workspace(
+        input,
+        true,
+        None,
+        None,
+        DiscoveryPolicy::Generic,
+        workspace_id,
+        ctx,
+        budget,
+    )
 }
 
 fn discover_candidates(

@@ -36,13 +36,18 @@ pub mod converter;
 pub mod decoder;
 pub mod export;
 pub mod formats;
+mod fsb5;
+mod ogg;
 pub mod types;
 
 // Re-export main types for easy access
 pub use converter::{AudioClipConverter, AudioClipProcessor}; // Processor is legacy alias
 pub use decoder::AudioDecoder;
-pub use export::{AudioExporter, AudioFormat, ExportOptions};
+pub use export::{
+    AudioExporter, AudioFormat, AudioSourceError, ExportOptions, PreparedAudioSource,
+};
 pub use formats::{AudioCompressionFormat, AudioFormatInfo, FMODSoundType};
+pub use fsb5::MAX_VORBIS_SETUP_PACKET_BYTES;
 pub use types::{
     AudioAnalysis, AudioClip, AudioClipMeta, AudioInfo, AudioProperties, DecodedAudio,
     StreamingInfo,

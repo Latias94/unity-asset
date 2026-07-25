@@ -67,7 +67,9 @@ impl LogicalArtifactName {
         self.heap_bytes()
     }
 
-    fn portability_key(&self) -> &str {
+    /// Returns the portable comparison key derived when this name was validated.
+    #[must_use]
+    pub fn portability_key(&self) -> &str {
         &self.portability_key
     }
 

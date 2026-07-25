@@ -304,6 +304,17 @@ impl FileIdentity {
         self.0.length()
     }
 
+    /// Returns whether two observations name the same filesystem object.
+    ///
+    /// File length deliberately does not participate here: a newly created
+    /// staging file grows while its writer is still owned by this process.
+    /// Callers that cross an irreversible boundary retain the final complete
+    /// identity, including its length, for exact verification.
+    #[must_use]
+    pub(crate) fn same_object(&self, other: &Self) -> bool {
+        self.0.same_object(&other.0)
+    }
+
     pub(crate) fn invalid_sentinel() -> Self {
         #[cfg(unix)]
         {
@@ -818,6 +829,17 @@ mod tests {
     use super::super::journal::RECOVERY_VERSION_DIRECTORY;
     use super::*;
 
+    #[test]
+    fn file_identity_separates_object_identity_from_length() {
+        let empty = FileIdentity::test_identity(7, 0);
+        let written = FileIdentity::test_identity(7, 9);
+        let replacement = FileIdentity::test_identity(8, 9);
+
+        assert_ne!(empty, written);
+        assert!(empty.same_object(&written));
+        assert!(!empty.same_object(&replacement));
+    }
+
     fn existing_lock_paths(root: &Path) -> CommitLockPaths {
         let recovery = root.join(RECOVERY_DIRECTORY);
         let legacy = recovery.join(LEGACY_COMMIT_LOCK_DIRECTORY);
@@ -964,7 +986,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn create_private_file_in_parent(
     path: &Path,
     expected_parent: &DirectoryIdentity,
@@ -979,7 +1000,14 @@ pub(crate) fn open_readonly_regular_in_parent(
     platform::open_readonly_regular_in_parent(path, &expected_parent.0)
 }
 
-#[cfg(test)]
+/// Acquires a private, non-following exclusive lock in an identity-bound directory.
+pub(crate) fn acquire_private_lock_in_parent(
+    path: &Path,
+    expected_parent: &DirectoryIdentity,
+) -> io::Result<File> {
+    platform::acquire_lock_in_parent(path, &expected_parent.0)
+}
+
 pub(crate) fn observe_file_identity(path: &Path) -> io::Result<FileIdentity> {
     platform::observe_file_identity(path).map(FileIdentity)
 }
@@ -990,6 +1018,11 @@ pub(crate) fn opened_file_identity(file: &File) -> io::Result<FileIdentity> {
 
 pub(crate) fn observe_directory_identity(path: &Path) -> io::Result<DirectoryIdentity> {
     platform::observe_directory_identity(path).map(DirectoryIdentity)
+}
+
+/// Creates missing directory components without following links or changing existing metadata.
+pub(crate) fn ensure_directory_no_follow(path: &Path) -> io::Result<DirectoryIdentity> {
+    platform::ensure_directory_no_follow(path).map(DirectoryIdentity)
 }
 
 /// Visits names in an existing, identity-bound directory without following a
@@ -1145,6 +1178,36 @@ pub(crate) fn atomic_replace_tracked(
     )
 }
 
+/// Atomically publishes a captured temporary file after revalidating its identity and digest.
+pub(crate) fn atomic_replace_verified_tracked(
+    source: &Path,
+    destination: &Path,
+    replace_existing: bool,
+    expected_source: &FileIdentity,
+    expected_digest: DigestV1,
+    expected_source_parent: &DirectoryIdentity,
+    expected_destination_parent: &DirectoryIdentity,
+) -> Result<(), AtomicMoveError> {
+    platform::atomic_replace_captured_tracked(
+        source,
+        destination,
+        replace_existing,
+        &expected_source.0,
+        expected_digest,
+        &expected_source_parent.0,
+        &expected_destination_parent.0,
+    )
+}
+
+/// Removes an unpublished temporary file only while its captured identities still match.
+pub(crate) fn remove_owned_file_in_parent(
+    path: &Path,
+    expected_file: &FileIdentity,
+    expected_parent: &DirectoryIdentity,
+) -> io::Result<()> {
+    platform::remove_owned_file_in_parent(path, &expected_file.0, &expected_parent.0)
+}
+
 #[cfg(unix)]
 use unix as platform;
 #[cfg(windows)]
@@ -1158,7 +1221,6 @@ mod platform {
 
     use serde::{Deserialize, Serialize};
 
-    #[cfg(test)]
     use super::DigestV1;
     use super::{DirectoryEntryName, DirectoryVisitError};
 
@@ -1182,8 +1244,13 @@ mod platform {
         pub(super) const fn length(&self) -> u64 {
             u64::MAX
         }
+
+        pub(super) fn same_object(&self, _: &Self) -> bool {
+            true
+        }
     }
 
+    #[cfg(test)]
     pub(super) fn atomic_replace_tracked(
         _: &Path,
         _: &Path,
@@ -1194,6 +1261,21 @@ mod platform {
         Err(super::AtomicMoveError::not_moved(io::Error::new(
             io::ErrorKind::Unsupported,
             "atomic replacement is unsupported on this platform",
+        )))
+    }
+
+    pub(super) fn atomic_replace_captured_tracked(
+        _: &Path,
+        _: &Path,
+        _: bool,
+        _: &FileIdentity,
+        _: DigestV1,
+        _: &DirectoryIdentity,
+        _: &DirectoryIdentity,
+    ) -> Result<(), super::AtomicMoveError> {
+        Err(super::AtomicMoveError::not_moved(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "verified atomic replacement is unsupported on this platform",
         )))
     }
 
@@ -1420,7 +1502,6 @@ mod platform {
         ))
     }
 
-    #[cfg(test)]
     pub(super) fn create_private_file_in_parent(
         _: &Path,
         _: &DirectoryIdentity,
@@ -1441,7 +1522,6 @@ mod platform {
         ))
     }
 
-    #[cfg(test)]
     pub(super) fn observe_file_identity(_: &Path) -> io::Result<FileIdentity> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -1475,6 +1555,24 @@ mod platform {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "directory identity is unsupported",
+        ))
+    }
+
+    pub(super) fn ensure_directory_no_follow(_: &Path) -> io::Result<DirectoryIdentity> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no-follow directory creation is unsupported on this platform",
+        ))
+    }
+
+    pub(super) fn remove_owned_file_in_parent(
+        _: &Path,
+        _: &FileIdentity,
+        _: &DirectoryIdentity,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "identity-bound temporary cleanup is unsupported on this platform",
         ))
     }
 
@@ -1567,6 +1665,16 @@ mod platform {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "publication locking is unsupported on this platform",
+        ))
+    }
+
+    pub(super) fn acquire_lock_in_parent(
+        _: &Path,
+        _: &DirectoryIdentity,
+    ) -> io::Result<std::fs::File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "identity-bound publication locking is unsupported on this platform",
         ))
     }
 

@@ -1,12 +1,12 @@
 use crate::cli::Commands;
 use crate::shared::AppContext;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::io::Write;
+use unity_asset::extraction::ExistingOutputPolicy;
 
 mod deps;
 mod dump_typetree_registry;
-mod export_bundle;
-mod export_serialized;
-mod extract;
+mod export;
 mod find_object;
 mod inspect_object;
 mod list_bundle;
@@ -14,8 +14,28 @@ mod list_objects;
 mod parse_yaml;
 mod project_graph;
 mod scan_pptr;
+mod split_yaml;
 mod stats;
 mod stats_pathid;
+
+pub(crate) fn parse_existing_output(value: &str) -> Result<ExistingOutputPolicy> {
+    match value {
+        "error" => Ok(ExistingOutputPolicy::Error),
+        "skip" => Ok(ExistingOutputPolicy::Skip),
+        "replace" => Ok(ExistingOutputPolicy::Replace),
+        _ => anyhow::bail!("Invalid --existing-output {value:?}; expected error|skip|replace"),
+    }
+}
+
+pub(crate) fn write_stdout(
+    write: impl FnOnce(&mut dyn Write) -> Result<()>,
+    flush_context: &'static str,
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    write(&mut output)?;
+    output.flush().context(flush_context)
+}
 
 pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
     match command {
@@ -24,81 +44,12 @@ pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
             format,
             preserve_types,
         } => parse_yaml::run(input, format, preserve_types, ctx),
-        Commands::Extract {
+        Commands::Export(command) => export::run(*command, ctx),
+        Commands::SplitYaml {
             input,
             output,
-            types,
-        } => extract::run(input, output, types, ctx),
-        Commands::ExportBundle {
-            input,
-            output,
-            pattern,
-            limit,
-            class_id,
-            class_name,
-            dry_run,
-            decode,
-            overwrite,
-            skip_existing,
-            manifest,
-            resume,
-            retry_failed_from,
-            continue_on_error,
-            jobs,
-        } => export_bundle::run(
-            input,
-            output,
-            pattern,
-            limit,
-            class_id,
-            class_name,
-            dry_run,
-            decode,
-            overwrite,
-            skip_existing,
-            manifest,
-            resume,
-            retry_failed_from,
-            continue_on_error,
-            jobs,
-            ctx,
-        ),
-        Commands::ExportSerialized {
-            input,
-            output,
-            source,
-            class_id,
-            class_name,
-            name,
-            limit,
-            dry_run,
-            decode,
-            overwrite,
-            skip_existing,
-            manifest,
-            resume,
-            retry_failed_from,
-            continue_on_error,
-            jobs,
-        } => export_serialized::run(
-            input,
-            output,
-            source,
-            class_id,
-            class_name,
-            name,
-            limit,
-            dry_run,
-            decode,
-            overwrite,
-            skip_existing,
-            manifest,
-            resume,
-            retry_failed_from,
-            continue_on_error,
-            jobs,
-            ctx,
-        ),
+            existing_output,
+        } => split_yaml::run(input, output, existing_output, ctx),
         Commands::ListBundle {
             input,
             filter,

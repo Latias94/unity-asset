@@ -38,7 +38,7 @@ pub mod types;
 
 // Re-export main types for easy access
 pub use parser::SpriteParser;
-pub use processor::{SpriteProcessor, SpriteStats};
+pub use processor::{DecodedSpriteTexture, SpriteProcessor, SpriteStats};
 pub use types::{
     // Core sprite types
     Sprite,

@@ -1,7 +1,7 @@
 //! Revisioned ownership and source-resolution foundation.
 
 mod adapter;
-mod commit;
+pub(crate) mod commit;
 mod interface;
 mod overlay;
 mod plan;
