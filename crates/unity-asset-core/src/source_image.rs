@@ -1,10 +1,115 @@
 use std::fmt;
+use std::ops::Deref;
 use std::ops::Range;
 use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::{SourceFingerprint, SourceKind};
+use crate::{
+    AssetLoadBudget, BudgetError, SourceFingerprint, SourceKind, arc_slice_allocation_bytes,
+    budget::AssetLoadBudgetDomain,
+};
+
+/// Immutable source bytes whose shared allocation has already been charged to one load budget.
+///
+/// Cloning this value only shares the existing allocation. Consumers that retain the backing can
+/// therefore transfer this proof within the same budget domain instead of charging the same
+/// `Arc<[u8]>` allocation again. A different budget cannot consume the proof.
+#[derive(Clone)]
+pub struct BudgetedSourceBytes {
+    bytes: Arc<[u8]>,
+    domain: Arc<AssetLoadBudgetDomain>,
+}
+
+impl BudgetedSourceBytes {
+    /// Promotes caller-owned bytes into a shared backing after charging the Arc allocation.
+    pub fn from_vec(bytes: Vec<u8>, budget: &mut AssetLoadBudget) -> Result<Self, BudgetError> {
+        let allocation = source_arc_allocation(bytes.len())?;
+        budget.consume_bytes(allocation)?;
+        Ok(Self {
+            bytes: Arc::from(bytes.into_boxed_slice()),
+            domain: budget.domain(),
+        })
+    }
+
+    /// Accounts an existing shared backing before it enters a budgeted ownership domain.
+    pub fn from_arc(bytes: Arc<[u8]>, budget: &mut AssetLoadBudget) -> Result<Self, BudgetError> {
+        budget.consume_bytes(source_arc_allocation(bytes.len())?)?;
+        Ok(Self {
+            bytes,
+            domain: budget.domain(),
+        })
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Borrows the shared backing after validating the owning budget domain.
+    pub fn backing(&self, budget: &AssetLoadBudget) -> Result<&Arc<[u8]>, BudgetError> {
+        self.validate_budget(budget)?;
+        Ok(&self.bytes)
+    }
+
+    /// Clones the shared backing after validating the owning budget domain.
+    pub fn clone_backing(&self, budget: &AssetLoadBudget) -> Result<Arc<[u8]>, BudgetError> {
+        self.backing(budget).map(Arc::clone)
+    }
+
+    /// Consumes the proof after validating the owning budget domain.
+    pub fn into_backing(self, budget: &AssetLoadBudget) -> Result<Arc<[u8]>, BudgetError> {
+        self.validate_budget(budget)?;
+        Ok(self.bytes)
+    }
+
+    /// Verifies that this proof was minted by `budget`.
+    pub fn validate_budget(&self, budget: &AssetLoadBudget) -> Result<(), BudgetError> {
+        if !budget.belongs_to_domain(&self.domain) {
+            return Err(BudgetError::DomainMismatch {
+                resource: "source bytes",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl PartialEq for BudgetedSourceBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for BudgetedSourceBytes {}
+
+impl AsRef<[u8]> for BudgetedSourceBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl Deref for BudgetedSourceBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_bytes()
+    }
+}
+
+impl fmt::Debug for BudgetedSourceBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BudgetedSourceBytes")
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+fn source_arc_allocation(length: usize) -> Result<u64, BudgetError> {
+    arc_slice_allocation_bytes::<u8>(length).map_err(|_| BudgetError::ArithmeticOverflow {
+        resource: "budgeted_source_bytes",
+    })
+}
 
 /// Immutable source bytes whose fingerprint was derived from the retained backing.
 ///
@@ -166,6 +271,74 @@ pub enum VerifiedSourceImageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AssetLoadLimits;
+
+    #[test]
+    fn budgeted_source_bytes_charge_once_and_clone_the_backing() {
+        let expected = source_arc_allocation(6).unwrap();
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: expected,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let bytes = BudgetedSourceBytes::from_vec(b"shared".to_vec(), &mut budget).unwrap();
+        let cloned = bytes.clone();
+
+        assert_eq!(budget.usage().bytes, expected);
+        assert!(Arc::ptr_eq(
+            bytes.backing(&budget).unwrap(),
+            cloned.backing(&budget).unwrap()
+        ));
+        assert_eq!(bytes, cloned);
+    }
+
+    #[test]
+    fn budgeted_source_bytes_reject_a_different_budget_domain() {
+        let mut first = AssetLoadBudget::default();
+        let bytes = BudgetedSourceBytes::from_vec(b"shared".to_vec(), &mut first).unwrap();
+        let cloned = bytes.clone();
+        let second = AssetLoadBudget::default();
+
+        assert!(matches!(
+            cloned.into_backing(&second),
+            Err(BudgetError::DomainMismatch {
+                resource: "source bytes"
+            })
+        ));
+        assert!(bytes.into_backing(&first).is_ok());
+    }
+
+    #[test]
+    fn budgeted_source_bytes_equality_ignores_budget_domain() {
+        let mut first = AssetLoadBudget::default();
+        let mut second = AssetLoadBudget::default();
+        let left = BudgetedSourceBytes::from_vec(b"same".to_vec(), &mut first).unwrap();
+        let right = BudgetedSourceBytes::from_vec(b"same".to_vec(), &mut second).unwrap();
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn budgeted_source_bytes_reject_before_arc_promotion() {
+        let required = source_arc_allocation(6).unwrap();
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: required - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let error = BudgetedSourceBytes::from_vec(b"shared".to_vec(), &mut budget).unwrap_err();
+
+        assert!(matches!(
+            error,
+            BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            } if limit == required - 1 && requested == required
+        ));
+    }
 
     #[test]
     fn verification_binds_kind_digest_and_backing() {

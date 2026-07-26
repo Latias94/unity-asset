@@ -760,6 +760,9 @@ pub trait WorkspaceView: sealed::Sealed + Send + Sync {
         budget: &mut AssetLoadBudget,
     ) -> Result<WorkspaceObject, WorkspaceError>;
 
+    /// Returns the exact byte length retained for one source in this view.
+    fn source_length(&self, source: SourceId) -> Result<u64, WorkspaceError>;
+
     fn read_source_range(
         &self,
         source: SourceId,

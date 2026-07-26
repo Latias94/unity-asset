@@ -652,6 +652,27 @@ impl WorkspaceView for WorkspaceSnapshot {
         Ok(WorkspaceObject::new(handle.clone(), value, schema))
     }
 
+    fn source_length(&self, source: SourceId) -> Result<u64, WorkspaceError> {
+        if source.workspace() != self.workspace_id() {
+            return Err(ContractError::WorkspaceMismatch {
+                expected: self.workspace_id(),
+                actual: source.workspace(),
+            }
+            .into());
+        }
+        let entry = self
+            .state
+            .store()
+            .get(source)
+            .ok_or(WorkspaceError::MissingSource(source))?;
+        u64::try_from(entry.image().as_bytes().len()).map_err(|_| {
+            BudgetError::ArithmeticOverflow {
+                resource: "workspace_source_length",
+            }
+            .into()
+        })
+    }
+
     fn read_source_range(
         &self,
         source: SourceId,

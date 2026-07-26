@@ -23,6 +23,13 @@ const VALID_YAML: &str = r#"%YAML 1.1
 AudioClip:
   m_StreamData: {path: archive:/CAB-old/CAB-old.resS, offset: 7, size: 4}
 "#;
+const ORDERED_FAILURE_YAML: &str = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!83 &8300001
+AudioClip:
+  m_Name: Clip
+  m_StreamData: {path: archive:/CAB-old/CAB-old.resS, offset: 7, size: 4}
+"#;
 const INVALID_YAML: &str = r#"%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
 --- !u!83 &8300001
@@ -287,22 +294,23 @@ fn invalid_or_missing_resource_fields_leave_no_sidecar_or_candidate() {
 
 #[test]
 fn earlier_field_guard_failure_precedes_later_missing_resource_target() {
-    let fixture = Fixture::open(VALID_YAML);
+    let fixture = Fixture::open(ORDERED_FAILURE_YAML);
     let snapshot = fixture.workspace.snapshot();
-    let path = FieldPath::root().push_field("m_StreamData").unwrap();
+    let field_path = FieldPath::root().push_field("m_Name").unwrap();
+    let resource_path = FieldPath::root().push_field("m_StreamData").unwrap();
     let payload = PlanPayload::new(PAYLOAD.to_vec());
     let missing = ObjectAddress::yaml(SourceLocator::path(ALIAS).unwrap(), "8300002").unwrap();
     let plan = MutationPlan::new(
         snapshot.revision(),
         vec![SourceExpectation::new(
             SourceLocator::path(ALIAS).unwrap(),
-            SourceFingerprint::from_bytes(SourceKind::Yaml, VALID_YAML.as_bytes()),
+            SourceFingerprint::from_bytes(SourceKind::Yaml, ORDERED_FAILURE_YAML.as_bytes()),
         )],
         vec![payload.clone()],
         vec![
             GenericMutation::FieldReplace {
                 target: fixture.address(),
-                path: path.clone(),
+                path: field_path,
                 guard: FieldGuard::new(
                     DigestV1::hash_bytes(b"stale-field-schema"),
                     DigestV1::hash_bytes(b"stale-field-value"),
@@ -311,7 +319,7 @@ fn earlier_field_guard_failure_precedes_later_missing_resource_target() {
             },
             GenericMutation::ResourceReplace {
                 target: missing,
-                path,
+                path: resource_path,
                 guard: FieldGuard::new(
                     DigestV1::hash_bytes(b"unreachable-resource-schema"),
                     DigestV1::hash_bytes(b"unreachable-resource-value"),

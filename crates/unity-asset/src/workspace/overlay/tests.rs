@@ -348,6 +348,14 @@ fn prepared_view_projects_one_candidate_revision_across_all_queries() {
 #[test]
 fn prepared_source_range_reads_exact_artifact_bytes_without_changing_the_baseline() {
     let (_directory, snapshot, view, source) = prepared_view();
+    assert_eq!(
+        WorkspaceView::source_length(&view, source).unwrap(),
+        u64::try_from(PREPARED_YAML.len()).unwrap()
+    );
+    assert_eq!(
+        WorkspaceView::source_length(&snapshot, source).unwrap(),
+        u64::try_from(BASE_YAML.len()).unwrap()
+    );
     let prepared_range = WorkspaceView::read_source_range(
         &view,
         source,

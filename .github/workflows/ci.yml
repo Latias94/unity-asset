@@ -92,7 +92,7 @@ jobs:
         done
 
   workspace-publication-platforms:
-    name: Workspace publication / ${{ matrix.os }}
+    name: Filesystem publication and security / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -121,6 +121,12 @@ jobs:
 
     - name: Run extraction output publication tests
       run: cargo nextest run -p unity-asset -E 'test(/^extraction::artifact::tests::/)'
+
+    - name: Run search generation filesystem contract tests
+      run: cargo nextest run -p unity-asset-search-index --test reference_generation
+
+    - name: Run daemon credential security contract tests
+      run: cargo nextest run -p unity-asset-search-daemon --test security_contract
 
   binary-loader-features:
     name: Binary loader / ${{ matrix.mode }}

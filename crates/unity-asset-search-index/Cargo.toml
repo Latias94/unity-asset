@@ -19,10 +19,26 @@ regex.workspace = true
 hex.workspace = true
 tantivy.workspace = true
 ignore.workspace = true
-once_cell.workspace = true
+fs2.workspace = true
+same-file.workspace = true
 unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
+unity-asset = { path = "../unity-asset", version = "0.3.0", default-features = false }
+unity-asset-yaml = { path = "../unity-asset-yaml", version = "0.3.0" }
 unity-asset-search-core = { path = "../unity-asset-search-core", version = "0.3.0" }
 unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

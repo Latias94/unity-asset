@@ -4,7 +4,10 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use thiserror::Error;
-use unity_asset_core::{AssetLoadBudget, BudgetError, ContractError, SourceMemberId};
+use unity_asset_core::{
+    AssetLoadBudget, BudgetError, BudgetedSourceBytes, ContractError, SourceMemberId,
+    arc_slice_allocation_bytes,
+};
 use zip::ZipArchive;
 use zip::result::ZipError;
 
@@ -33,7 +36,6 @@ const ZIP_PARSER_BYTES_PER_MEMBER: u64 = 512;
 // four times the encoded length: one raw buffer plus four decoded-capacity buffers at peak.
 const ZIP_PARSER_DIRECTORY_MULTIPLIER: u64 = 5;
 const ZIP_PARSER_FIXED_BYTES: u64 = 4 * 1024;
-const ARC_ALLOCATION_OVERHEAD: u64 = 64;
 // zip 0.6 creates opaque streaming decoders. These dependency-bound conservative charges cover
 // the accepted window/state sizes before the decoder can allocate them.
 const ZIP_DEFLATE_DECODER_SCRATCH_BYTES: u64 = 1024 * 1024;
@@ -46,7 +48,7 @@ const MAX_OCCURRENCE_MEMBER_COUNT: u64 = u32::MAX as u64 + 1;
 pub(crate) struct ArchiveMemberRecord {
     pub(crate) wire_ordinal: u64,
     pub(crate) member_id: SourceMemberId,
-    pub(crate) bytes: Arc<[u8]>,
+    pub(crate) bytes: BudgetedSourceBytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -141,6 +143,7 @@ struct ArchiveTotals {
     compressed_bytes: u64,
     decompressed_bytes: u64,
     payload_bytes: u64,
+    retained_arc_bytes: u64,
     name_bytes: u64,
     codec_scratch_bytes: u64,
 }
@@ -255,7 +258,11 @@ pub(crate) fn load_preflighted_zip_archive(
         .consume(totals.compressed_bytes, totals.decompressed_bytes)
         .map_err(|source| budget_error("aggregate decompression", source))?;
     budget
-        .consume_bytes(planned_bytes)
+        .consume_bytes(planned_bytes.checked_sub(totals.retained_arc_bytes).ok_or(
+            ArchiveLoadError::ArithmeticOverflow {
+                resource: "archive upfront allocation total",
+            },
+        )?)
         .map_err(|source| budget_error("archive adapter allocations", source))?;
 
     let mut zip = ZipArchive::new(Cursor::new(Arc::clone(&archive_bytes)))
@@ -316,6 +323,8 @@ pub(crate) fn load_preflighted_zip_archive(
 
         let payload_len = usize_from_u64(member.decompressed_size, "member payload length")?;
         let payload = read_exact_payload(&mut entry, payload_len, member.wire_ordinal)?;
+        let bytes = BudgetedSourceBytes::from_vec(payload, budget)
+            .map_err(|source| budget_error("archive member source allocation", source))?;
         let member_id = SourceMemberId::with_occurrence(member.name, member.same_name_occurrence)
             .map_err(|source| ArchiveLoadError::MemberIdentity {
             wire_ordinal: member.wire_ordinal,
@@ -324,7 +333,7 @@ pub(crate) fn load_preflighted_zip_archive(
         output.push(ArchiveMemberRecord {
             wire_ordinal: member.wire_ordinal,
             member_id,
-            bytes: Arc::from(payload),
+            bytes,
         });
     }
     Ok(output)
@@ -363,12 +372,21 @@ fn preflight_members(
             "ZIP decoder scratch total",
         )?;
         if !entry.is_directory {
-            usize_from_u64(entry.decompressed_size, "member payload length")?;
+            let payload_len = usize_from_u64(entry.decompressed_size, "member payload length")?;
             totals.file_count = checked_add(totals.file_count, 1, "regular member count")?;
             totals.payload_bytes = checked_add(
                 totals.payload_bytes,
                 entry.decompressed_size,
                 "regular member payload total",
+            )?;
+            totals.retained_arc_bytes = checked_add(
+                totals.retained_arc_bytes,
+                arc_slice_allocation_bytes::<u8>(payload_len).map_err(|_| {
+                    ArchiveLoadError::ArithmeticOverflow {
+                        resource: "archive payload Arc allocation",
+                    }
+                })?,
+                "archive payload Arc allocation total",
             )?;
             totals.name_bytes = checked_add(
                 totals.name_bytes,
@@ -406,12 +424,6 @@ fn planned_allocation_bytes(
         "archive member output",
     )?;
     let payload_working_copy = totals.payload_bytes;
-    let payload_arc_copy = totals.payload_bytes;
-    let arc_headers = checked_mul(
-        totals.file_count,
-        ARC_ALLOCATION_OVERHEAD,
-        "archive payload Arc headers",
-    )?;
 
     [
         parser_directory,
@@ -424,8 +436,7 @@ fn planned_allocation_bytes(
         totals.name_bytes,
         totals.codec_scratch_bytes,
         payload_working_copy,
-        payload_arc_copy,
-        arc_headers,
+        totals.retained_arc_bytes,
     ]
     .into_iter()
     .try_fold(0_u64, |total, amount| {
@@ -1421,6 +1432,11 @@ mod tests {
         assert_eq!(members[2].wire_ordinal, 3);
         assert_eq!(members[2].member_id.same_name_occurrence(), 1);
         assert_eq!(members[2].bytes.as_ref(), b"second");
+        assert!(
+            members
+                .iter()
+                .all(|member| member.bytes.validate_budget(&budget).is_ok())
+        );
         assert_eq!(budget.usage().members, 4);
         assert_eq!(budget.usage().compressed_bytes, 17);
         assert_eq!(budget.usage().decompressed_bytes, 17);

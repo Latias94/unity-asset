@@ -801,6 +801,10 @@ macro_rules! impl_prepared_workspace_view {
                 prepared_read_object(self.prepared_core(), handle, budget)
             }
 
+            fn source_length(&self, source: SourceId) -> Result<u64, WorkspaceError> {
+                prepared_source_length(self.prepared_core(), source)
+            }
+
             fn read_source_range(
                 &self,
                 source: SourceId,
@@ -994,6 +998,30 @@ fn prepared_read_source_range(
     )?;
     budget.consume_bytes(size)?;
     Ok(range)
+}
+
+fn prepared_source_length(
+    state: &PreparedStateCore,
+    source: SourceId,
+) -> Result<u64, WorkspaceError> {
+    if source.workspace() != state.base.workspace_id() {
+        return Err(ContractError::WorkspaceMismatch {
+            expected: state.base.workspace_id(),
+            actual: source.workspace(),
+        }
+        .into());
+    }
+    if !state.catalog.contains(source) {
+        return Err(WorkspaceError::MissingSource(source));
+    }
+    let Some(binding) = state.source_binding(source) else {
+        return WorkspaceView::source_length(&state.base, source);
+    };
+    state
+        .artifacts
+        .artifact(binding.artifact)
+        .map(PreparedArtifact::len)
+        .map_err(|error| WorkspaceError::operation("prepared source length", error))
 }
 
 #[derive(Clone, Copy)]

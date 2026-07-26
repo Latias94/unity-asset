@@ -8,6 +8,7 @@ members = [
     "crates/unity-asset",
     "crates/unity-asset-search-core",
     "crates/unity-asset-search-index",
+    "crates/unity-asset-search-protocol",
     "apps/unity-asset-cli",
     "apps/unity-asset-search-daemon",
     "apps/unity-asset-search-cli",
@@ -60,7 +61,7 @@ regex = "1.12"
 unicode-normalization = "0.1"
 tantivy = "0.25"
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["trace"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 fuzzy-matcher = "0.3"
 rand = "0.9"
@@ -69,11 +70,18 @@ ignore = "0.4"
 notify = "8"
 zip = "0.6"
 rustix = "1.1.3"
+fs2 = "0.4.3"
+subtle = "2.6.1"
+same-file = "1.0.6"
+url = "2"
 
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[patch.crates-io]
+globset = { path = "vendor/globset" }
 
 # This is now a pure workspace - no package definition
 # Individual crates are in their respective directories:

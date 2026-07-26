@@ -477,7 +477,7 @@ fn budget_uses_checked_arithmetic() {
 }
 
 #[test]
-fn every_budget_configuration_limit_is_nonzero() {
+fn all_non_depth_budget_limits_must_be_nonzero() {
     let invalid = [
         AssetLoadLimits {
             max_entries: 0,
@@ -485,10 +485,6 @@ fn every_budget_configuration_limit_is_nonzero() {
         },
         AssetLoadLimits {
             max_bytes: 0,
-            ..AssetLoadLimits::default()
-        },
-        AssetLoadLimits {
-            max_depth: 0,
             ..AssetLoadLimits::default()
         },
         AssetLoadLimits {
@@ -515,4 +511,23 @@ fn every_budget_configuration_limit_is_nonzero() {
             Err(BudgetError::InvalidLimit { .. })
         ));
     }
+}
+
+#[test]
+fn zero_depth_budget_allows_only_local_depth_zero() {
+    let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_depth: 0,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+
+    budget.observe_depth(0).unwrap();
+    assert!(matches!(
+        budget.observe_depth(1),
+        Err(BudgetError::Exceeded {
+            resource: "depth",
+            limit: 0,
+            requested: 1,
+        })
+    ));
 }

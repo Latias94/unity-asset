@@ -41,7 +41,7 @@ use super::platform::{
     COMMIT_LOCK_FILE, CommitGuard, CommitLockPathError, CommitLockPaths,
     DIRECTORY_VISIT_ENTRY_BYTES, DIRECTORY_VISIT_SETUP_BYTES, DirectoryEntryName,
     DirectoryIdentity, DirectoryVisitError, FileIdentity, JournalAccess, JournalDirectory,
-    LEGACY_COMMIT_LOCK_DIRECTORY, SecurityMetadataError,
+    LEGACY_COMMIT_LOCK_DIRECTORY, SecurityMetadataCopyReservation, SecurityMetadataError,
     capture_external_regular_in_journal_directory, capture_journal_regular,
     copy_security_metadata_between_journal_directories, journal_access, journal_directory_identity,
     observe_directory_identity, open_commit_root, open_existing_journal_namespace,
@@ -49,8 +49,8 @@ use super::platform::{
     open_journal_regular_in_directory, open_readonly_regular_in_parent, opened_file_identity,
     promote_journal_regular_to_external, remove_journal_directory,
     remove_journal_directory_in_directory, remove_journal_regular,
-    remove_journal_regular_in_directory, sync_journal_access, visit_existing_directory_entries,
-    visit_journal_directory_entries,
+    remove_journal_regular_in_directory, reserve_security_metadata_copy, sync_journal_access,
+    visit_existing_directory_entries, visit_journal_directory_entries,
 };
 #[cfg(test)]
 use super::platform::{capture_existing, observe_file_identity};
@@ -1171,6 +1171,7 @@ struct RecoveryArtifactExecution {
     target: PathBuf,
     staging: PathBuf,
     backup: Option<PathBuf>,
+    security_metadata: Option<SecurityMetadataCopyReservation>,
     target_parent_identity: DirectoryIdentity,
     old_digest: Option<DigestV1>,
     old_identity: Option<FileIdentity>,
@@ -1673,39 +1674,37 @@ fn recover_with_intent(
         Err(error) => return Err(blocked(locator, io_reason(error))),
     };
     let access = journal_access(&root, &namespace);
-    match open_journal_directory(&access, layout.directory()) {
+    let has_manifest = match open_journal_directory(&access, layout.directory()) {
         Ok(directory) => {
             match open_journal_regular_in_directory(&directory, layout.manifest_path()) {
-                Ok(_) => {
-                    let mut journal = Journal::open_in_access(layout, &access, budget)
-                        .map_err(|error| map_journal_open_error(locator, error))?;
-                    recover_open_journal(
-                        workspace.as_deref_mut(),
-                        &mut journal,
-                        locator,
-                        intent,
-                        budget,
-                    )
+                Ok(manifest) => {
+                    drop(manifest);
+                    true
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    recover_prepared_transaction(
-                        workspace.as_deref(),
-                        &layout,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(_) => {
+                    return Err(blocked(
                         locator,
-                        &access,
-                        budget,
-                    )
+                        invalid_journal("canonical manifest is not a regular file".to_owned()),
+                    ));
                 }
-                Err(_) => Err(blocked(
-                    locator,
-                    invalid_journal("canonical manifest is not a regular file".to_owned()),
-                )),
             }
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            recover_prepared_transaction(workspace.as_deref(), &layout, locator, &access, budget)
-        }
-        Err(error) => Err(blocked(locator, io_reason(error))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(blocked(locator, io_reason(error))),
+    };
+    if has_manifest {
+        let mut journal = Journal::open_in_access(layout, &access, budget)
+            .map_err(|error| map_journal_open_error(locator, error))?;
+        recover_open_journal(
+            workspace.as_deref_mut(),
+            &mut journal,
+            locator,
+            intent,
+            budget,
+        )
+    } else {
+        recover_prepared_transaction(workspace.as_deref(), &layout, locator, &access, budget)
     }
 }
 
@@ -2795,7 +2794,7 @@ fn recover_open_journal(
             budget,
         );
     }
-    let (execution, artifacts) = observe_execution(journal, budget)
+    let (mut execution, artifacts) = observe_execution(journal, budget)
         .map_err(|error| map_observation_error(locator, error))?;
     let mut observation = RecoveryObservation {
         events,
@@ -2908,6 +2907,7 @@ fn recover_open_journal(
             if !already_published {
                 precharge_execution_verification(
                     journal,
+                    &mut execution,
                     &observation.artifacts,
                     RecoveryDisposition::Forward,
                     budget,
@@ -2929,9 +2929,8 @@ fn recover_open_journal(
                     journal,
                     &mut observation.events,
                     &mut observation.artifacts,
-                    &execution,
+                    &mut execution,
                     &mut event_plan,
-                    budget,
                 )
                 .map_err(|error| map_execution_error(locator, error))?;
             }
@@ -2999,6 +2998,7 @@ fn recover_open_journal(
                 .map_err(|error| map_journal_mutation_error(locator, error))?;
             precharge_execution_verification(
                 journal,
+                &mut execution,
                 &observation.artifacts,
                 RecoveryDisposition::Rollback,
                 budget,
@@ -3590,6 +3590,7 @@ impl RecoveryExecutionPlan {
                     budget,
                 )?,
                 backup,
+                security_metadata: None,
                 target_parent_identity: artifact.destination_parent_identity().clone(),
                 old_digest,
                 old_identity,
@@ -3888,11 +3889,14 @@ fn persist_direction(
 
 fn precharge_execution_verification(
     journal: &Journal,
+    execution: &mut RecoveryExecutionPlan,
     observations: &[ArtifactObservation],
     disposition: RecoveryDisposition,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), ObservationError> {
-    if observations.len() != journal.manifest().artifacts().len() {
+    if observations.len() != journal.manifest().artifacts().len()
+        || execution.artifacts.len() != observations.len()
+    {
         return Err(RecoveryBlockedReason::InvalidJournal {
             message: "recovery execution observations are incomplete".to_owned(),
         }
@@ -3900,72 +3904,108 @@ fn precharge_execution_verification(
     }
     let mut entries = 0_u64;
     let mut bytes = 0_u64;
-    for (artifact, observation) in journal.manifest().artifacts().iter().zip(observations) {
-        let (old_reads, new_reads) = match (disposition, observation.had_original) {
-            (RecoveryDisposition::Forward, true) => {
-                match (observation.target, observation.staging, observation.backup) {
-                    (EntryEvidence::Old, EntryEvidence::New, EntryEvidence::Missing) => (2, 2),
-                    (EntryEvidence::Missing, EntryEvidence::New, EntryEvidence::Old) => (1, 2),
-                    (EntryEvidence::New, EntryEvidence::Missing, EntryEvidence::Old) => (0, 1),
-                    _ => return Err(invalid_event("forward verification evidence changed").into()),
+    for ((artifact, observation), execution) in journal
+        .manifest()
+        .artifacts()
+        .iter()
+        .zip(observations)
+        .zip(&mut execution.artifacts)
+    {
+        let (old_reads, new_reads, preserve_security_metadata) =
+            match (disposition, observation.had_original) {
+                (RecoveryDisposition::Forward, true) => {
+                    match (observation.target, observation.staging, observation.backup) {
+                        (EntryEvidence::Old, EntryEvidence::New, EntryEvidence::Missing) => {
+                            (2, 2, true)
+                        }
+                        (EntryEvidence::Missing, EntryEvidence::New, EntryEvidence::Old) => {
+                            (1, 2, true)
+                        }
+                        (EntryEvidence::New, EntryEvidence::Missing, EntryEvidence::Old) => {
+                            (0, 1, false)
+                        }
+                        _ => {
+                            return Err(
+                                invalid_event("forward verification evidence changed").into()
+                            );
+                        }
+                    }
                 }
-            }
-            (RecoveryDisposition::Forward, false) => {
-                match (observation.target, observation.staging, observation.backup) {
-                    (EntryEvidence::Missing, EntryEvidence::New, EntryEvidence::Missing) => (0, 2),
-                    (EntryEvidence::New, EntryEvidence::Missing, EntryEvidence::Missing) => (0, 1),
-                    _ => return Err(invalid_event("forward verification evidence changed").into()),
+                (RecoveryDisposition::Forward, false) => {
+                    match (observation.target, observation.staging, observation.backup) {
+                        (EntryEvidence::Missing, EntryEvidence::New, EntryEvidence::Missing) => {
+                            (0, 2, false)
+                        }
+                        (EntryEvidence::New, EntryEvidence::Missing, EntryEvidence::Missing) => {
+                            (0, 1, false)
+                        }
+                        _ => {
+                            return Err(
+                                invalid_event("forward verification evidence changed").into()
+                            );
+                        }
+                    }
                 }
-            }
-            (RecoveryDisposition::Rollback, true) => {
-                match (observation.target, observation.staging, observation.backup) {
-                    (
-                        EntryEvidence::Old,
-                        EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
-                        EntryEvidence::Missing,
-                    )
-                    | (
-                        EntryEvidence::Missing,
-                        EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
-                        EntryEvidence::CorruptOld,
-                    )
-                    | (
-                        EntryEvidence::New | EntryEvidence::CorruptNew,
-                        EntryEvidence::Missing,
-                        EntryEvidence::CorruptOld,
-                    ) => (0, 0),
-                    (
-                        EntryEvidence::Missing,
-                        EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
-                        EntryEvidence::Old,
-                    )
-                    | (
-                        EntryEvidence::New | EntryEvidence::CorruptNew,
-                        EntryEvidence::Missing,
-                        EntryEvidence::Old,
-                    ) => (1, 0),
-                    _ => return Err(invalid_event("rollback verification evidence changed").into()),
+                (RecoveryDisposition::Rollback, true) => {
+                    match (observation.target, observation.staging, observation.backup) {
+                        (
+                            EntryEvidence::Old,
+                            EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
+                            EntryEvidence::Missing,
+                        )
+                        | (
+                            EntryEvidence::Missing,
+                            EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
+                            EntryEvidence::CorruptOld,
+                        )
+                        | (
+                            EntryEvidence::New | EntryEvidence::CorruptNew,
+                            EntryEvidence::Missing,
+                            EntryEvidence::CorruptOld,
+                        ) => (0, 0, false),
+                        (
+                            EntryEvidence::Missing,
+                            EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
+                            EntryEvidence::Old,
+                        )
+                        | (
+                            EntryEvidence::New | EntryEvidence::CorruptNew,
+                            EntryEvidence::Missing,
+                            EntryEvidence::Old,
+                        ) => (1, 0, false),
+                        _ => {
+                            return Err(
+                                invalid_event("rollback verification evidence changed").into()
+                            );
+                        }
+                    }
                 }
-            }
-            (RecoveryDisposition::Rollback, false) => {
-                match (observation.target, observation.staging, observation.backup) {
-                    (
-                        EntryEvidence::Missing,
-                        EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
-                        EntryEvidence::Missing,
-                    )
-                    | (
-                        EntryEvidence::New | EntryEvidence::CorruptNew,
-                        EntryEvidence::Missing,
-                        EntryEvidence::Missing,
-                    ) => (0, 0),
-                    _ => return Err(invalid_event("rollback verification evidence changed").into()),
+                (RecoveryDisposition::Rollback, false) => {
+                    match (observation.target, observation.staging, observation.backup) {
+                        (
+                            EntryEvidence::Missing,
+                            EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
+                            EntryEvidence::Missing,
+                        )
+                        | (
+                            EntryEvidence::New | EntryEvidence::CorruptNew,
+                            EntryEvidence::Missing,
+                            EntryEvidence::Missing,
+                        ) => (0, 0, false),
+                        _ => {
+                            return Err(
+                                invalid_event("rollback verification evidence changed").into()
+                            );
+                        }
+                    }
                 }
-            }
-            (RecoveryDisposition::Blocked, _) => {
-                return Err(invalid_event("blocked recovery cannot enter execution").into());
-            }
-        };
+                (RecoveryDisposition::Blocked, _) => {
+                    return Err(invalid_event("blocked recovery cannot enter execution").into());
+                }
+            };
+        if preserve_security_metadata {
+            execution.security_metadata = Some(reserve_security_metadata_copy(budget)?);
+        }
         if old_reads != 0 {
             add_verification_reads(
                 &mut entries,
@@ -4136,7 +4176,7 @@ fn execute_owned_corruption_repairs(
                     backup,
                     &paths.target,
                     old_identity,
-                    paths.old_digest,
+                    None,
                     &paths.target_parent_identity,
                 )?;
             }
@@ -4164,9 +4204,8 @@ fn roll_forward(
     journal: &mut Journal,
     facts: &mut EventFacts,
     observations: &mut [ArtifactObservation],
-    execution: &RecoveryExecutionPlan,
+    execution: &mut RecoveryExecutionPlan,
     event_plan: &mut JournalEventPlan,
-    budget: &mut AssetLoadBudget,
 ) -> Result<(), ExecutionError> {
     if facts.artifacts.len() != execution.artifacts.len()
         || observations.len() != execution.artifacts.len()
@@ -4189,15 +4228,7 @@ fn roll_forward(
     )?;
 
     for index in 0..execution.artifacts.len() {
-        forward_artifact(
-            journal,
-            facts,
-            observations,
-            execution,
-            index,
-            event_plan,
-            budget,
-        )?;
+        forward_artifact(journal, facts, observations, execution, index, event_plan)?;
     }
     if observations.iter().any(|artifact| !artifact.is_published()) {
         return Err(ExecutionError::Blocked(
@@ -4267,12 +4298,11 @@ fn forward_artifact(
     journal: &mut Journal,
     facts: &mut EventFacts,
     observations: &mut [ArtifactObservation],
-    execution: &RecoveryExecutionPlan,
+    execution: &mut RecoveryExecutionPlan,
     index: usize,
     event_plan: &mut JournalEventPlan,
-    budget: &mut AssetLoadBudget,
 ) -> Result<(), ExecutionError> {
-    let paths = execution.artifacts.get(index).ok_or_else(|| {
+    let paths = execution.artifacts.get_mut(index).ok_or_else(|| {
         ExecutionError::Blocked(invalid_event(
             "recovery execution ordinal is outside its execution plan",
         ))
@@ -4333,7 +4363,15 @@ fn forward_artifact(
                     &paths.staging,
                     old_identity,
                     &paths.new_identity,
-                    budget,
+                    paths
+                        .security_metadata
+                        .as_mut()
+                        .ok_or_else(|| {
+                            ExecutionError::Blocked(invalid_event(
+                                "recovery has no reserved security metadata budget",
+                            ))
+                        })?
+                        .budget_mut(),
                 )
                 .map_err(map_security_metadata_execution_error)?;
                 append_artifact_once(
@@ -4363,7 +4401,15 @@ fn forward_artifact(
                     &paths.staging,
                     old_identity,
                     &paths.new_identity,
-                    budget,
+                    paths
+                        .security_metadata
+                        .as_mut()
+                        .ok_or_else(|| {
+                            ExecutionError::Blocked(invalid_event(
+                                "recovery has no reserved security metadata budget",
+                            ))
+                        })?
+                        .budget_mut(),
                 )
                 .map_err(map_security_metadata_execution_error)?;
                 append_artifact_once(
@@ -4934,12 +4980,17 @@ mod tests {
     }
 
     fn mutation_plan(workspace: &AssetWorkspace, before: &str, after: &str) -> MutationPlan {
+        let locator = SourceLocator::path(SOURCE_ALIAS).expect("source locator");
+        let source = workspace
+            .snapshot()
+            .resolve_source(&locator, &mut AssetLoadBudget::default())
+            .expect("resolve source for mutation plan");
+        let WorkspaceLookup::Resolved(source) = source else {
+            panic!("mutation plan source must resolve");
+        };
         MutationPlan::new(
             workspace.revision(),
-            vec![SourceExpectation::new(
-                SourceLocator::path(SOURCE_ALIAS).expect("source locator"),
-                SourceFingerprint::from_bytes(SourceKind::Yaml, YAML),
-            )],
+            vec![SourceExpectation::new(locator, source.fingerprint())],
             Vec::new(),
             vec![GenericMutation::FieldReplace {
                 target: address(),

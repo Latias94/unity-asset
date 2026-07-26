@@ -10,7 +10,8 @@ use unity_asset_binary::file::{UnityFileKind, sniff_unity_file_kind_prefix};
 use unity_asset_binary::shared_bytes::SharedBytes;
 use unity_asset_binary::webfile::{WebFile, WebFileProbeError};
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, ContractError, SourceMemberId, arc_slice_allocation_bytes,
+    AssetLoadBudget, BudgetError, BudgetedSourceBytes, ContractError, SourceMemberId,
+    arc_slice_allocation_bytes,
 };
 
 const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
@@ -45,6 +46,16 @@ impl BinaryWorkspaceAdapter {
         image: Arc<[u8]>,
         budget: &mut AssetLoadBudget,
     ) -> Result<BinaryPayload, BinaryAdapterError> {
+        self.parse_root_image(image, budget)
+    }
+
+    /// Parses a logical source whose backing is already charged to `budget`.
+    pub(crate) fn parse_budgeted(
+        &self,
+        image: &BudgetedSourceBytes,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<BinaryPayload, BinaryAdapterError> {
+        let image = image.clone_backing(budget)?;
         self.parse_root_image(image, budget)
     }
 
@@ -116,7 +127,7 @@ impl BinaryWorkspaceAdapter {
                 }
             })?;
             let content = self.member_content(
-                Arc::clone(&image),
+                &image,
                 BinaryContainerKind::AssetBundle,
                 wire_ordinal,
                 budget,
@@ -171,12 +182,8 @@ impl BinaryWorkspaceAdapter {
                     source,
                 }
             })?;
-            let content = self.member_content(
-                Arc::clone(&image),
-                BinaryContainerKind::WebFile,
-                wire_ordinal,
-                budget,
-            )?;
+            let content =
+                self.member_content(&image, BinaryContainerKind::WebFile, wire_ordinal, budget)?;
             members.push(BinaryMember {
                 wire_ordinal,
                 identity,
@@ -189,11 +196,12 @@ impl BinaryWorkspaceAdapter {
 
     fn member_content(
         &self,
-        image: Arc<[u8]>,
+        image: &BudgetedSourceBytes,
         container: BinaryContainerKind,
         wire_ordinal: u64,
         budget: &mut AssetLoadBudget,
     ) -> Result<BinaryMemberContent, BinaryAdapterError> {
+        let image = image.clone_backing(budget)?;
         self.try_parse_member_image(image, budget)
             .map(|payload| match payload {
                 Some(payload) => BinaryMemberContent::Parsed(payload),
@@ -308,12 +316,19 @@ pub(crate) enum BinaryPayload {
 pub(crate) struct BinaryMember {
     wire_ordinal: u64,
     identity: SourceMemberId,
-    image: Arc<[u8]>,
+    image: BudgetedSourceBytes,
     content: BinaryMemberContent,
 }
 
 impl BinaryMember {
-    pub(crate) fn into_parts(self) -> (u64, SourceMemberId, Arc<[u8]>, BinaryMemberContent) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        u64,
+        SourceMemberId,
+        BudgetedSourceBytes,
+        BinaryMemberContent,
+    ) {
         (self.wire_ordinal, self.identity, self.image, self.content)
     }
 }
@@ -506,23 +521,22 @@ fn copy_member_identity(
     })
 }
 
-fn copy_member_image(bytes: &[u8], budget: &mut AssetLoadBudget) -> Result<Arc<[u8]>, BinaryError> {
+fn copy_member_image(
+    bytes: &[u8],
+    budget: &mut AssetLoadBudget,
+) -> Result<BudgetedSourceBytes, BinaryError> {
     let byte_count = checked_arc_slice_allocation_bytes(bytes.len())?;
     budget.check_bytes(byte_count)?;
-    budget.consume_bytes(byte_count)?;
-    Ok(Arc::from(bytes))
+    BudgetedSourceBytes::from_arc(Arc::from(bytes), budget).map_err(BinaryError::from)
 }
 
 fn promote_member_image(
     bytes: Vec<u8>,
     budget: &mut AssetLoadBudget,
-) -> Result<Arc<[u8]>, BinaryError> {
-    let byte_count = checked_arc_slice_allocation_bytes(bytes.len())?;
+) -> Result<BudgetedSourceBytes, BinaryError> {
     // Bundle extraction owns a temporary Vec. Promoting it to Arc allocates the retained image,
     // so both allocations remain visible in the monotonic budget.
-    budget.check_bytes(byte_count)?;
-    budget.consume_bytes(byte_count)?;
-    Ok(Arc::from(bytes))
+    BudgetedSourceBytes::from_vec(bytes, budget).map_err(BinaryError::from)
 }
 
 fn checked_arc_slice_allocation_bytes(length: usize) -> Result<u64, BinaryError> {
@@ -572,6 +586,13 @@ mod tests {
     use unity_asset_core::AssetLoadLimits;
 
     use super::*;
+
+    fn budgeted_image(
+        bytes: impl Into<Arc<[u8]>>,
+        budget: &mut AssetLoadBudget,
+    ) -> BudgetedSourceBytes {
+        BudgetedSourceBytes::from_arc(bytes.into(), budget).unwrap()
+    }
 
     fn webfile_with_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let head_length = entries.iter().fold(20_usize, |length, (name, _)| {
@@ -683,7 +704,8 @@ mod tests {
         ]);
         let adapter = BinaryWorkspaceAdapter::new();
         let mut budget = AssetLoadBudget::default();
-        let payload = adapter.parse(Arc::from(webfile), &mut budget).unwrap();
+        let image = budgeted_image(webfile, &mut budget);
+        let payload = adapter.parse_budgeted(&image, &mut budget).unwrap();
         assert_eq!(budget.usage().members, 2);
 
         let members = adapter.members(&payload, &mut budget).unwrap();
@@ -697,6 +719,11 @@ mod tests {
         assert_eq!(members[1].identity.same_name_occurrence(), 1);
         assert_eq!(members[0].image.as_ref(), raw);
         assert_eq!(members[1].image.as_ref(), nested_bundle.as_slice());
+        assert!(
+            members
+                .iter()
+                .all(|member| member.image.validate_budget(&budget).is_ok())
+        );
         assert!(matches!(
             &members[0].content,
             BinaryMemberContent::RawResource
@@ -719,10 +746,12 @@ mod tests {
                 ..AssetLoadLimits::default()
             })
             .unwrap();
+            let image = budgeted_image(image, &mut budget);
+            let before_bytes = budget.usage().bytes;
 
             let error = {
                 let mut scoped = budget.enter_depth(1).unwrap();
-                adapter.parse(Arc::from(image), &mut scoped).unwrap_err()
+                adapter.parse_budgeted(&image, &mut scoped).unwrap_err()
             };
 
             assert!(matches!(
@@ -734,7 +763,7 @@ mod tests {
                 })
             ));
             assert_eq!(budget.usage().decompressed_bytes, 0);
-            assert_eq!(budget.usage().bytes, 0);
+            assert_eq!(budget.usage().bytes, before_bytes);
         }
     }
 
@@ -747,9 +776,10 @@ mod tests {
         ] {
             let adapter = BinaryWorkspaceAdapter::new();
             let mut budget = AssetLoadBudget::default();
+            let image = budgeted_image(gzip(&decoded), &mut budget);
 
             let error = adapter
-                .parse(Arc::from(gzip(&decoded)), &mut budget)
+                .parse_budgeted(&image, &mut budget)
                 .expect_err("recognized corrupt WebFile must not become a format mismatch");
 
             assert!(matches!(
@@ -771,7 +801,8 @@ mod tests {
             let outer = webfile_with_entries(&[("nested.web", nested.as_slice())]);
             let adapter = BinaryWorkspaceAdapter::new();
             let mut budget = AssetLoadBudget::default();
-            let payload = adapter.parse(Arc::from(outer), &mut budget).unwrap();
+            let image = budgeted_image(outer, &mut budget);
+            let payload = adapter.parse_budgeted(&image, &mut budget).unwrap();
 
             let error = adapter
                 .members(&payload, &mut budget)
@@ -793,15 +824,17 @@ mod tests {
         let encoded = gzip(b"ordinary gzip payload");
         let adapter = BinaryWorkspaceAdapter::new();
         let mut root_budget = AssetLoadBudget::default();
+        let root_image = budgeted_image(encoded.clone(), &mut root_budget);
 
         let root_error = adapter
-            .parse(Arc::from(encoded.clone()), &mut root_budget)
+            .parse_budgeted(&root_image, &mut root_budget)
             .expect_err("gzip alone does not establish a root WebFile");
         assert!(matches!(root_error, BinaryAdapterError::FormatMismatch));
 
         let outer = webfile_with_entries(&[("ordinary.gz", encoded.as_slice())]);
         let mut member_budget = AssetLoadBudget::default();
-        let payload = adapter.parse(Arc::from(outer), &mut member_budget).unwrap();
+        let image = budgeted_image(outer, &mut member_budget);
+        let payload = adapter.parse_budgeted(&image, &mut member_budget).unwrap();
         let members = adapter.members(&payload, &mut member_budget).unwrap();
 
         assert!(matches!(
@@ -881,7 +914,8 @@ mod tests {
         let webfile = webfile_with_entries(&[("broken.bundle", b"UnityFS\0")]);
         let adapter = BinaryWorkspaceAdapter::new();
         let mut budget = AssetLoadBudget::default();
-        let payload = adapter.parse(Arc::from(webfile), &mut budget).unwrap();
+        let image = budgeted_image(webfile, &mut budget);
+        let payload = adapter.parse_budgeted(&image, &mut budget).unwrap();
 
         let error = adapter.members(&payload, &mut budget).unwrap_err();
         let source = error
@@ -899,8 +933,9 @@ mod tests {
         let bytes = fs::read(bundle_path).expect("read sample AssetBundle");
         let adapter = BinaryWorkspaceAdapter::new();
         let mut budget = AssetLoadBudget::default();
+        let image = budgeted_image(bytes, &mut budget);
 
-        let payload = adapter.parse(Arc::from(bytes), &mut budget).unwrap();
+        let payload = adapter.parse_budgeted(&image, &mut budget).unwrap();
         let BinaryPayload::AssetBundle(bundle) = &payload else {
             panic!("sample is an AssetBundle");
         };

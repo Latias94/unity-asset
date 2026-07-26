@@ -1,3 +1,8 @@
+use std::collections::TryReserveError;
+use std::convert::Infallible;
+use std::error::Error as StdError;
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::canonical_combining_class;
@@ -15,36 +20,124 @@ pub fn normalize_for_match(input: &str) -> String {
     input.nfkc().collect::<String>().to_lowercase()
 }
 
-pub fn to_terms(input: &str) -> String {
-    let normalized: Vec<char> = input.nfkc().collect();
-    let mut out = String::with_capacity(input.len());
-    let mut previous: Option<char> = None;
+/// Failure produced while reserving the normalized term output.
+#[derive(Debug)]
+pub enum TryToTermsError<E> {
+    ReserveHook {
+        requested: usize,
+        source: E,
+    },
+    Allocation {
+        requested: usize,
+        source: TryReserveError,
+    },
+}
 
-    for (index, ch) in normalized.iter().copied().enumerate() {
+impl<E: fmt::Display> fmt::Display for TryToTermsError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReserveHook { requested, .. } => write!(
+                formatter,
+                "term output reserve hook rejected a {requested}-byte result layout"
+            ),
+            Self::Allocation { requested, .. } => write!(
+                formatter,
+                "failed to reserve a {requested}-byte term output layout"
+            ),
+        }
+    }
+}
+
+impl<E: StdError + 'static> StdError for TryToTermsError<E> {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::ReserveHook { source, .. } => Some(source),
+            Self::Allocation { source, .. } => Some(source),
+        }
+    }
+}
+
+pub fn to_terms(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let result = tokenize_terms(input, |ch| {
+        out.push(ch);
+        Ok::<(), Infallible>(())
+    });
+    match result {
+        Ok(()) => out,
+        Err(never) => match never {},
+    }
+}
+
+/// Normalizes `input` into search terms using fallible output allocation.
+///
+/// Before each reserve, `before_reserve` receives the complete minimum byte layout requested for
+/// the resulting `String`, not an allocator-rounded capacity or a growth delta.
+pub fn try_to_terms<E>(
+    input: &str,
+    mut before_reserve: impl FnMut(usize) -> Result<(), E>,
+) -> Result<String, TryToTermsError<E>> {
+    let mut out = String::new();
+    try_reserve_terms(&mut out, input.len(), &mut before_reserve)?;
+    tokenize_terms(input, |ch| {
+        try_reserve_terms(&mut out, ch.len_utf8(), &mut before_reserve)?;
+        out.push(ch);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn try_reserve_terms<E>(
+    out: &mut String,
+    additional: usize,
+    before_reserve: &mut impl FnMut(usize) -> Result<(), E>,
+) -> Result<(), TryToTermsError<E>> {
+    if additional <= out.capacity().saturating_sub(out.len()) {
+        return Ok(());
+    }
+    let requested = out.len().saturating_add(additional);
+    before_reserve(requested)
+        .map_err(|source| TryToTermsError::ReserveHook { requested, source })?;
+    out.try_reserve(additional)
+        .map_err(|source| TryToTermsError::Allocation { requested, source })
+}
+
+fn tokenize_terms<E>(input: &str, mut push: impl FnMut(char) -> Result<(), E>) -> Result<(), E> {
+    let mut normalized = input.nfkc().peekable();
+    let mut previous: Option<char> = None;
+    let mut has_output = false;
+    let mut pending_boundary = false;
+
+    while let Some(ch) = normalized.next() {
         if is_term_separator(ch) {
-            push_term_boundary(&mut out);
+            pending_boundary = has_output;
             previous = None;
             continue;
         }
 
-        let next = normalized.get(index + 1).copied();
+        let next = normalized.peek().copied();
         if let Some(previous) = previous {
             let camel_boundary = ch.is_uppercase()
                 && (previous.is_lowercase()
                     || (previous.is_uppercase() && next.is_some_and(|next| next.is_lowercase())));
             let digit_boundary = ch.is_numeric() != previous.is_numeric();
             if camel_boundary || digit_boundary {
-                push_term_boundary(&mut out);
+                pending_boundary = has_output;
             }
         }
 
         for lower in ch.to_lowercase() {
-            out.push(lower);
+            if pending_boundary {
+                push(' ')?;
+                pending_boundary = false;
+            }
+            push(lower)?;
+            has_output = true;
         }
         previous = Some(ch);
     }
 
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    Ok(())
 }
 
 fn is_term_separator(ch: char) -> bool {
@@ -67,12 +160,6 @@ fn is_term_separator(ch: char) -> bool {
                 | '"'
                 | '\''
         )
-}
-
-fn push_term_boundary(out: &mut String) {
-    if !out.is_empty() && !out.ends_with(' ') {
-        out.push(' ');
-    }
 }
 
 pub fn highlight_html(text: &str, query_tokens: &[String]) -> Option<String> {
@@ -240,6 +327,8 @@ fn push_normalized_cluster(
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+
     use super::*;
 
     #[test]
@@ -248,6 +337,147 @@ mod tests {
             to_terms("Assets/UI/MainMenu/Button2D.prefab"),
             "assets ui main menu button 2 d prefab"
         );
+    }
+
+    #[test]
+    fn fallible_terms_match_the_previous_tokenizer_semantics() {
+        assert_eq!(to_terms("ＦｏｏＢａｒ１２/Kelvin"), "foo bar 12 kelvin");
+        assert_eq!(to_terms("Cafe\u{301}/İstanbul"), "café i\u{307}stanbul");
+
+        let corpus = [
+            "",
+            "  /--__::;;,,.()[]{}\"'  ",
+            "Assets/UI/MainMenu/Button2D.prefab",
+            "XMLHttpRequest42D",
+            "ＦｏｏＢａｒ１２/Kelvin",
+            "Cafe\u{301}/İstanbul",
+            "A___B---C...D///E\\\\F",
+            "JSON2XML99Bottles",
+            "Straße_ΔValue٣D",
+            "trailing/separators///",
+        ];
+
+        for input in corpus {
+            let expected = legacy_to_terms(input);
+            assert_eq!(to_terms(input), expected, "infallible input: {input:?}");
+            assert_eq!(
+                try_to_terms(input, |_| Ok::<(), Infallible>(())).unwrap(),
+                expected,
+                "fallible input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserve_hook_failure_precedes_the_first_allocation() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct Rejected;
+
+        impl fmt::Display for Rejected {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("rejected")
+            }
+        }
+
+        impl StdError for Rejected {}
+
+        let mut calls = 0;
+        let error = try_to_terms("Button2D", |requested| {
+            calls += 1;
+            assert_eq!(requested, "Button2D".len());
+            Err(Rejected)
+        })
+        .unwrap_err();
+
+        assert_eq!(calls, 1);
+        assert!(matches!(
+            error,
+            TryToTermsError::ReserveHook {
+                requested: 8,
+                source: Rejected
+            }
+        ));
+    }
+
+    #[test]
+    fn nfkc_growth_reports_the_second_requested_layout_and_error_source() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct Rejected;
+
+        impl fmt::Display for Rejected {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("rejected")
+            }
+        }
+
+        impl StdError for Rejected {}
+
+        let input = "\u{fdfa}";
+        let mut requests = Vec::new();
+        let error = try_to_terms(input, |requested| {
+            requests.push(requested);
+            if requests.len() == 2 {
+                Err(Rejected)
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(requests.first(), Some(&input.len()));
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1] > input.len());
+        assert!(matches!(
+            &error,
+            TryToTermsError::ReserveHook {
+                requested,
+                source: Rejected
+            } if *requested == requests[1]
+        ));
+        assert!(
+            StdError::source(&error)
+                .and_then(|source| source.downcast_ref::<Rejected>())
+                .is_some()
+        );
+    }
+
+    fn legacy_to_terms(input: &str) -> String {
+        let normalized: Vec<char> = input.nfkc().collect();
+        let mut out = String::with_capacity(input.len());
+        let mut previous: Option<char> = None;
+
+        for (index, ch) in normalized.iter().copied().enumerate() {
+            if is_term_separator(ch) {
+                legacy_push_term_boundary(&mut out);
+                previous = None;
+                continue;
+            }
+
+            let next = normalized.get(index + 1).copied();
+            if let Some(previous) = previous {
+                let camel_boundary = ch.is_uppercase()
+                    && (previous.is_lowercase()
+                        || (previous.is_uppercase()
+                            && next.is_some_and(|next| next.is_lowercase())));
+                let digit_boundary = ch.is_numeric() != previous.is_numeric();
+                if camel_boundary || digit_boundary {
+                    legacy_push_term_boundary(&mut out);
+                }
+            }
+
+            for lower in ch.to_lowercase() {
+                out.push(lower);
+            }
+            previous = Some(ch);
+        }
+
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn legacy_push_term_boundary(out: &mut String) {
+        if !out.is_empty() && !out.ends_with(' ') {
+            out.push(' ');
+        }
     }
 
     #[test]

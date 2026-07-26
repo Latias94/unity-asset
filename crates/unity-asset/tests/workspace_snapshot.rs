@@ -389,6 +389,40 @@ fn old_snapshots_survive_reload_unload_and_physical_file_changes() {
 }
 
 #[test]
+fn cloned_workspace_is_an_independent_mutation_branch() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("scene.prefab");
+    fs::write(&path, FIRST_YAML).unwrap();
+    let mut authoritative = workspace(2);
+    let root = authoritative
+        .load_path(&path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let authoritative_revision = authoritative.revision();
+    let mut candidate = authoritative.clone();
+
+    candidate
+        .unload_source(root, &mut AssetLoadBudget::default())
+        .unwrap();
+
+    assert_eq!(authoritative.revision(), authoritative_revision);
+    assert_ne!(candidate.revision(), authoritative_revision);
+    assert!(matches!(
+        authoritative
+            .snapshot()
+            .source(root, &mut AssetLoadBudget::default())
+            .unwrap(),
+        WorkspaceLookup::Resolved(_)
+    ));
+    assert!(matches!(
+        candidate
+            .snapshot()
+            .source(root, &mut AssetLoadBudget::default())
+            .unwrap(),
+        WorkspaceLookup::Missing
+    ));
+}
+
+#[test]
 fn source_ranges_support_bounded_read_seek_and_streaming_copy() {
     struct FailingWriter;
 
@@ -410,6 +444,10 @@ fn source_ranges_support_bounded_read_seek_and_streaming_copy() {
         .load_path(&path, &mut AssetLoadBudget::default())
         .unwrap();
     let snapshot = asset_workspace.snapshot();
+    assert_eq!(
+        snapshot.source_length(source).unwrap(),
+        u64::try_from(FIRST_YAML.len()).unwrap()
+    );
     let bytes = snapshot
         .read_source_range(source, 2, 7, &mut AssetLoadBudget::default())
         .unwrap();
@@ -472,6 +510,12 @@ fn source_ranges_support_bounded_read_seek_and_streaming_copy() {
         workspace(42)
             .snapshot()
             .read_source_range(source, 0, 1, &mut AssetLoadBudget::default(),),
+        Err(WorkspaceError::Contract(
+            ContractError::WorkspaceMismatch { .. }
+        ))
+    ));
+    assert!(matches!(
+        workspace(42).snapshot().source_length(source),
         Err(WorkspaceError::Contract(
             ContractError::WorkspaceMismatch { .. }
         ))

@@ -897,6 +897,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "fs4"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1063,8 +1073,6 @@ dependencies = [
 [[package]]
 name = "globset"
 version = "0.4.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52dfc19153a48bde0cbd630453615c8151bce3a5adfac7a0aebfbf0a1e1f57e3"
 dependencies = [
  "aho-corasick",
  "bstr",
@@ -3602,6 +3610,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "unity-asset-search-index",
+ "unity-asset-search-protocol",
 ]
 
 [[package]]
@@ -3621,14 +3631,24 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "fs2",
  "hex",
  "notify",
  "rand 0.9.2",
+ "rustix",
  "serde",
  "serde_json",
+ "subtle",
+ "tempfile",
  "tokio",
+ "tower",
  "tower-http",
+ "tracing",
+ "tracing-subscriber",
  "unity-asset-search-index",
+ "unity-asset-search-protocol",
+ "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3636,17 +3656,31 @@ name = "unity-asset-search-index"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "fs2",
  "hex",
  "ignore",
- "once_cell",
  "regex",
+ "rustix",
+ "same-file",
  "serde",
  "serde_json",
  "tantivy",
  "tempfile",
+ "unity-asset",
  "unity-asset-binary",
  "unity-asset-core",
  "unity-asset-search-core",
+ "unity-asset-yaml",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "unity-asset-search-protocol"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "unity-asset-search-index",
 ]
 
 [[package]]
@@ -3684,6 +3718,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "unity-asset-core",
+ "yaml-rust2",
 ]
 
 [[package]]

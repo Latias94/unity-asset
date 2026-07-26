@@ -1,34 +1,34 @@
 //! Unity Asset YAML Parser
 //!
-//! YAML format support for Unity asset parsing, providing a robust and efficient
-//! Unity YAML loader based on the mature serde_yaml library.
+//! YAML format support for Unity assets. The crate provides a caller-budgeted,
+//! non-recursive event parser for owned source images together with compatibility
+//! loading, serialization, and reference-scanning APIs.
 //!
-//! This crate provides parsing of Unity YAML files while maintaining exact
-//! compatibility with Unity's format.
-//!
-//! # Examples
+//! # Budgeted parsing
 //!
 //! ```rust
-//! use unity_asset_yaml::serde_unity_loader::SerdeUnityLoader;
+//! use std::sync::Arc;
 //!
-//! let loader = SerdeUnityLoader::new();
-//! let yaml = r#"
-//! GameObject:
-//!   m_Name: Player
-//!   m_IsActive: 1
-//! "#;
+//! use unity_asset_yaml::{AssetLoadBudget, UnityDocument, parse_budgeted_yaml_source};
 //!
-//! let classes = loader.load_from_str(yaml)?;
+//! let encoded: Arc<[u8]> = Arc::from(
+//!     b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &42\nGameObject:\n  m_Name: Player\n"
+//!         .as_slice(),
+//! );
+//! let mut budget = AssetLoadBudget::default();
+//! let source = parse_budgeted_yaml_source(encoded, &mut budget)?;
+//! assert_eq!(source.document().entries().len(), 1);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 // Re-export core types
 pub use unity_asset_core::{
-    DocumentFormat, Result, UnityAssetError, UnityClass, UnityClassRegistry, UnityValue,
-    constants::*,
+    AssetLoadBudget, AssetLoadLimits, BudgetError, BudgetedSourceBytes, DocumentFormat, Result,
+    UnityAssetError, UnityClass, UnityClassRegistry, UnityDocument, UnityValue, constants::*,
 };
 
 // Core modules
+mod budgeted;
 pub mod constants;
 pub mod python_like_api;
 pub mod reference;
@@ -37,6 +37,10 @@ pub mod unity_yaml_serializer;
 pub mod yaml_document;
 
 // Re-export main types
+pub use budgeted::{
+    BudgetedYamlError, BudgetedYamlSource, parse_budgeted_yaml_source,
+    parse_prebudgeted_yaml_source,
+};
 pub use reference::{
     YamlReferenceDiagnostic, YamlReferenceField, YamlReferenceOccurrence, YamlReferenceRawTarget,
     YamlReferenceRawTargetRef, YamlReferenceScan, YamlReferenceScanError, YamlReferenceScanStats,
@@ -58,5 +62,15 @@ mod tests {
 
         // Test that we can create a YAML document
         let _doc = YamlDocument::new();
+    }
+
+    #[test]
+    fn budgeted_parser_is_available_from_the_crate_root() {
+        let encoded: std::sync::Arc<[u8]> = std::sync::Arc::from(b"root: value\n".as_slice());
+        let mut budget = AssetLoadBudget::default();
+        let parsed: std::result::Result<BudgetedYamlSource, BudgetedYamlError> =
+            parse_budgeted_yaml_source(encoded, &mut budget);
+
+        assert_eq!(parsed.unwrap().document().entries().len(), 1);
     }
 }

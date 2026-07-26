@@ -18,6 +18,8 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+unity-asset-search-index = { path = "../../crates/unity-asset-search-index", version = "0.3.0" }
+unity-asset-search-protocol = { path = "../../crates/unity-asset-search-protocol", version = "0.3.0" }
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

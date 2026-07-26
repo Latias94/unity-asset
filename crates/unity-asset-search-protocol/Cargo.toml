@@ -1,0 +1,22 @@
+[package]
+name = "unity-asset-search-protocol"
+version = "0.3.0"
+edition.workspace = true
+authors.workspace = true
+description = "Versioned HTTP contracts for unity-asset search clients and daemons"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/unity-asset-search-protocol"
+keywords = ["unity", "search", "protocol", "http"]
+categories = ["command-line-utilities", "game-development"]
+
+[dependencies]
+serde.workspace = true
+unity-asset-search-index = { path = "../unity-asset-search-index", version = "0.3.0" }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]

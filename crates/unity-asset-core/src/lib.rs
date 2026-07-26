@@ -50,7 +50,9 @@ pub use semantic_digest::{
     SemanticDigestError, field_schema_digest, observe_semantic_value, semantic_value_digest,
     yaml_field_schema_digest, yaml_schema_digest,
 };
-pub use source_image::{VerifiedSourceImage, VerifiedSourceImageError, VerifiedSourceRebinding};
+pub use source_image::{
+    BudgetedSourceBytes, VerifiedSourceImage, VerifiedSourceImageError, VerifiedSourceRebinding,
+};
 pub use unity_class::{UnityClass, UnityClassRegistry};
 pub use unity_value::{UnityValue, UnityValueCloneError, UnityValueKind, ValuePathError};
 

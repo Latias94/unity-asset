@@ -8,4 +8,7 @@ pub use policy::{
     RetrievalStage, RetrievalTerm, SearchDiagnostic, SearchDiagnosticSeverity, SearchKind,
     SearchLimits, SearchOutcome, SearchPolicy, SearchRequest, TermExplanation, parse_query,
 };
-pub use text::{HighlightRange, highlight_html, highlight_ranges, normalize_for_match, to_terms};
+pub use text::{
+    HighlightRange, TryToTermsError, highlight_html, highlight_ranges, normalize_for_match,
+    to_terms, try_to_terms,
+};

@@ -1,11 +1,15 @@
 use std::io::{self, Read};
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Finite limits applied before parsing, allocation, recursion, or decompression.
+///
+/// `max_depth` is zero-based and may be zero to permit only a parser's local root. Every other
+/// configured limit must be non-zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssetLoadLimits {
@@ -43,18 +47,44 @@ pub struct AssetLoadUsage {
 }
 
 /// Mutable ledger shared by all readers participating in one load operation.
-#[derive(Debug, Default)]
+///
+/// Every value created by [`Default::default`] or [`Self::new`] owns a distinct proof domain.
+/// Depth scopes borrow that same domain, so accounted source images remain transferable
+/// throughout one load.
+#[derive(Debug)]
 pub struct AssetLoadBudget {
+    domain: Arc<AssetLoadBudgetDomain>,
     limits: AssetLoadLimits,
     usage: AssetLoadUsage,
     depth_base: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct AssetLoadBudgetDomain {
+    _private: (),
+}
+
+impl AssetLoadBudgetDomain {
+    fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl Default for AssetLoadBudget {
+    fn default() -> Self {
+        Self {
+            domain: Arc::new(AssetLoadBudgetDomain::new()),
+            limits: AssetLoadLimits::default(),
+            usage: AssetLoadUsage::default(),
+            depth_base: 0,
+        }
+    }
 }
 
 impl AssetLoadBudget {
     pub fn new(limits: AssetLoadLimits) -> Result<Self, BudgetError> {
         validate_limit("entries", u128::from(limits.max_entries))?;
         validate_limit("bytes", u128::from(limits.max_bytes))?;
-        validate_limit("depth", u128::from(limits.max_depth))?;
         validate_limit("members", u128::from(limits.max_members))?;
         validate_limit("compressed_bytes", u128::from(limits.max_compressed_bytes))?;
         validate_limit(
@@ -63,10 +93,19 @@ impl AssetLoadBudget {
         )?;
         validate_limit("expansion_ratio", u128::from(limits.max_expansion_ratio))?;
         Ok(Self {
+            domain: Arc::new(AssetLoadBudgetDomain::new()),
             limits,
             usage: AssetLoadUsage::default(),
             depth_base: 0,
         })
+    }
+
+    pub(crate) fn domain(&self) -> Arc<AssetLoadBudgetDomain> {
+        Arc::clone(&self.domain)
+    }
+
+    pub(crate) fn belongs_to_domain(&self, domain: &Arc<AssetLoadBudgetDomain>) -> bool {
+        Arc::ptr_eq(&self.domain, domain)
     }
 
     pub fn consume_entries(&mut self, amount: u64) -> Result<(), BudgetError> {
@@ -438,6 +477,8 @@ pub enum BudgetError {
     InvalidLimit { resource: &'static str },
     #[error("asset load budget arithmetic overflow for {resource}")]
     ArithmeticOverflow { resource: &'static str },
+    #[error("asset load proof for {resource} belongs to a different budget domain")]
+    DomainMismatch { resource: &'static str },
     #[error("asset load budget exceeded for {resource}: requested {requested}, limit {limit}")]
     Exceeded {
         resource: &'static str,

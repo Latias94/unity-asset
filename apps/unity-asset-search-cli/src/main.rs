@@ -1,6 +1,17 @@
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use reqwest::RequestBuilder;
+use serde::de::DeserializeOwned;
+use unity_asset_search_index::{
+    ApiError, ReferenceRequest, ReferencesResponse, ReindexIntent, SearchResponse, StatusResponse,
+    SuggestResponse,
+};
+use unity_asset_search_protocol::{
+    HEALTH_ENDPOINT, HealthResponse, REFERENCES_ENDPOINT, REINDEX_ENDPOINT, ReindexResponse,
+    SEARCH_ENDPOINT, STATUS_ENDPOINT, SUGGEST_ENDPOINT, ValidateContractVersion,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "unity-asset-search")]
@@ -8,6 +19,7 @@ struct Args {
     #[arg(long, default_value = "http://127.0.0.1:9781")]
     base_url: String,
 
+    /// Bearer token used only by reindex requests.
     #[arg(long)]
     token: Option<String>,
 
@@ -39,8 +51,9 @@ enum Cmd {
     References {
         guid: String,
 
-        #[arg(long)]
-        file_id: Option<u64>,
+        /// Signed Unity YAML fileID or binary pathID.
+        #[arg(long, allow_negative_numbers = true)]
+        file_id: Option<i64>,
 
         #[arg(long, default_value_t = 50)]
         limit: usize,
@@ -69,11 +82,17 @@ enum Cmd {
     },
     Status,
     Reindex {
-        #[arg(long)]
+        /// Rebuild all indexed content.
+        #[arg(long, conflicts_with_all = ["reconcile", "path"])]
         full: bool,
 
+        /// Reconcile project state against the active generation (the default mode).
+        #[arg(long, conflicts_with_all = ["full", "path"])]
+        reconcile: bool,
+
+        /// Reindex a changed project-relative path; may be repeated.
         #[arg(long, value_name = "PATH")]
-        path: Vec<String>,
+        path: Vec<PathBuf>,
     },
 }
 
@@ -105,8 +124,17 @@ async fn main() -> Result<()> {
             limit,
         } => bench(&args.base_url, &query, &query_file, warmup, repeat, limit).await?,
         Cmd::Status => status(&args.base_url).await?,
-        Cmd::Reindex { full, path } => {
-            reindex(&args.base_url, args.token.as_deref(), full, &path).await?
+        Cmd::Reindex {
+            full,
+            reconcile,
+            path,
+        } => {
+            reindex(
+                &args.base_url,
+                args.token.as_deref(),
+                reindex_intent(full, reconcile, &path)?,
+            )
+            .await?
         }
     }
     Ok(())
@@ -133,60 +161,63 @@ fn build_search_query(raw: &str, kind: Option<&str>, in_path: Option<&str>) -> S
 }
 
 async fn health(base_url: &str) -> Result<()> {
-    let url = format!("{base_url}/v1/health");
-    let json = fetch_json(reqwest::Client::new().get(url), "GET /v1/health").await?;
-    println!("{}", serde_json::to_string_pretty(&json)?);
+    let response: HealthResponse = fetch_json(
+        reqwest::Client::new().get(endpoint_url(base_url, HEALTH_ENDPOINT)),
+        "GET health",
+    )
+    .await?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 
 async fn search(base_url: &str, query: &str, limit: usize) -> Result<()> {
-    let url = format!("{base_url}/v1/search");
-    let json = fetch_json(
+    let response: SearchResponse = fetch_json(
         reqwest::Client::new()
-            .get(url)
+            .get(endpoint_url(base_url, SEARCH_ENDPOINT))
             .query(&[("q", query), ("limit", &limit.to_string())]),
-        "GET /v1/search",
+        "GET search",
     )
     .await?;
-    println!("{}", serde_json::to_string_pretty(&json)?);
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 
 async fn status(base_url: &str) -> Result<()> {
-    let url = format!("{base_url}/v1/status");
-    let json = fetch_json(reqwest::Client::new().get(url), "GET /v1/status").await?;
-    println!("{}", serde_json::to_string_pretty(&json)?);
+    let response: StatusResponse = fetch_json(
+        reqwest::Client::new().get(endpoint_url(base_url, STATUS_ENDPOINT)),
+        "GET status",
+    )
+    .await?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 
 async fn suggest(base_url: &str, prefix: &str, limit: usize) -> Result<()> {
-    let url = format!("{base_url}/v1/suggest");
-    let json = fetch_json(
+    let response: SuggestResponse = fetch_json(
         reqwest::Client::new()
-            .get(url)
+            .get(endpoint_url(base_url, SUGGEST_ENDPOINT))
             .query(&[("prefix", prefix), ("limit", &limit.to_string())]),
-        "GET /v1/suggest",
+        "GET suggest",
     )
     .await?;
-    println!("{}", serde_json::to_string_pretty(&json)?);
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 
-async fn references(base_url: &str, guid: &str, file_id: Option<u64>, limit: usize) -> Result<()> {
-    let url = format!("{base_url}/v1/references");
-    let mut params: Vec<(String, String)> = vec![
-        ("guid".to_string(), guid.to_string()),
-        ("limit".to_string(), limit.to_string()),
-    ];
-    if let Some(file_id) = file_id {
-        params.push(("file_id".to_string(), file_id.to_string()));
-    }
-    let json = fetch_json(
-        reqwest::Client::new().get(url).query(&params),
-        "GET /v1/references",
+fn reference_request(guid: &str, file_id: Option<i64>, limit: usize) -> ReferenceRequest {
+    ReferenceRequest::incoming_guid(guid, file_id, limit)
+}
+
+async fn references(base_url: &str, guid: &str, file_id: Option<i64>, limit: usize) -> Result<()> {
+    let request = reference_request(guid, file_id, limit);
+    let response: ReferencesResponse = fetch_json(
+        reqwest::Client::new()
+            .post(endpoint_url(base_url, REFERENCES_ENDPOINT))
+            .json(&request),
+        "POST references",
     )
     .await?;
-    println!("{}", serde_json::to_string_pretty(&json)?);
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 
@@ -247,20 +278,14 @@ async fn search_once(
     query: &str,
     limit: usize,
 ) -> Result<u128> {
-    let url = format!("{base_url}/v1/search");
-    let json = fetch_json(
+    let response: SearchResponse = fetch_json(
         client
-            .get(url)
+            .get(endpoint_url(base_url, SEARCH_ENDPOINT))
             .query(&[("q", query), ("limit", &limit.to_string())]),
-        &format!("GET /v1/search (q={query})"),
+        &format!("GET search (q={query})"),
     )
     .await?;
-    let took_ms = json
-        .get("took_ms")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u128)
-        .unwrap_or(0);
-    Ok(took_ms)
+    Ok(response.took_ms)
 }
 
 fn load_queries_from_file(path: &str) -> Result<Vec<String>> {
@@ -282,52 +307,69 @@ fn percentile(sorted: &[u128], p: f64) -> u128 {
     sorted[idx]
 }
 
-async fn reindex(base_url: &str, token: Option<&str>, full: bool, paths: &[String]) -> Result<()> {
-    let mut url = reqwest::Url::parse(&format!("{base_url}/v1/reindex"))?;
-    {
-        let mut qp = url.query_pairs_mut();
-        if full {
-            qp.append_pair("full", "true");
-        }
-        for p in paths {
-            qp.append_pair("path", p);
-        }
+fn reindex_intent(full: bool, reconcile: bool, paths: &[PathBuf]) -> Result<ReindexIntent> {
+    match (full, reconcile, paths) {
+        (true, false, []) => Ok(ReindexIntent::full()),
+        (false, _, []) => Ok(ReindexIntent::reconcile()),
+        (false, false, paths) => Ok(ReindexIntent::changed_paths(paths.to_vec())),
+        _ => anyhow::bail!("reindex modes --full, --reconcile, and --path are mutually exclusive"),
     }
+}
 
-    let mut req = reqwest::Client::new().post(url);
+async fn reindex(base_url: &str, token: Option<&str>, intent: ReindexIntent) -> Result<()> {
+    let mut req = reqwest::Client::new()
+        .post(endpoint_url(base_url, REINDEX_ENDPOINT))
+        .json(&intent);
     if let Some(token) = token {
         req = req.bearer_auth(token);
     }
 
-    let json = fetch_json(req, "POST /v1/reindex").await?;
-    println!("{}", serde_json::to_string_pretty(&json)?);
+    let response: ReindexResponse = fetch_json(req, "POST reindex").await?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 
-async fn fetch_json(req: RequestBuilder, ctx: &str) -> Result<serde_json::Value> {
+fn endpoint_url(base_url: &str, endpoint: &str) -> String {
+    format!("{}{endpoint}", base_url.trim_end_matches('/'))
+}
+
+async fn fetch_json<T>(req: RequestBuilder, ctx: &str) -> Result<T>
+where
+    T: DeserializeOwned + ValidateContractVersion,
+{
     let resp = req.send().await.with_context(|| format!("request {ctx}"))?;
     let status = resp.status();
     let body = resp
-        .text()
+        .bytes()
         .await
         .with_context(|| format!("read body {ctx}"))?;
 
-    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&body);
     if !status.is_success() {
-        if let Ok(json) = &parsed
-            && let Some(msg) = json.get("error").and_then(|v| v.as_str())
-        {
-            anyhow::bail!("{ctx} failed: {status}: {msg}");
-        }
-        anyhow::bail!("{ctx} failed: {status}: {body}");
+        let error: ApiError = serde_json::from_slice(&body)
+            .with_context(|| format!("parse API error {ctx} ({status})"))?;
+        error
+            .validate_contract_version()
+            .with_context(|| format!("validate API error contract {ctx} ({status})"))?;
+        let error_json = serde_json::to_string(&error).context("serialize API error")?;
+        anyhow::bail!("{ctx} failed: {status}: {error_json}");
     }
 
-    parsed.with_context(|| format!("parse json {ctx}"))
+    let response: T = serde_json::from_slice(&body).with_context(|| format!("parse json {ctx}"))?;
+    response
+        .validate_contract_version()
+        .with_context(|| format!("validate response contract {ctx}"))?;
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::percentile;
+    use std::path::PathBuf;
+
+    use anyhow::Result;
+    use clap::Parser;
+    use serde_json::json;
+
+    use super::{Args, Cmd, percentile, reference_request, reindex_intent};
 
     #[test]
     fn percentile_handles_empty() {
@@ -339,5 +381,114 @@ mod tests {
         let sorted = [10u128, 20, 30, 40];
         assert_eq!(percentile(&sorted, 0.0), 10);
         assert_eq!(percentile(&sorted, 1.0), 40);
+    }
+
+    #[test]
+    fn signed_reference_request_matches_wire_contract() -> Result<()> {
+        let request = reference_request("deadbeefdeadbeefdeadbeefdeadbeef", Some(-11_500_000), 50);
+
+        assert_eq!(
+            serde_json::to_value(request)?,
+            json!({
+                "contract_version": 1,
+                "direction": "incoming",
+                "selector": {
+                    "kind": "guid",
+                    "guid": "deadbeefdeadbeefdeadbeefdeadbeef",
+                    "file_id": -11_500_000
+                },
+                "limit": 50
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reindex_modes_match_exact_wire_contract() -> Result<()> {
+        assert_eq!(
+            serde_json::to_value(reindex_intent(true, false, &[])?)?,
+            json!({
+                "contract_version": 1,
+                "scope": { "kind": "full" }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(reindex_intent(false, false, &[])?)?,
+            json!({
+                "contract_version": 1,
+                "scope": { "kind": "reconcile" }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(reindex_intent(false, true, &[])?)?,
+            json!({
+                "contract_version": 1,
+                "scope": { "kind": "reconcile" }
+            })
+        );
+
+        let paths = [
+            PathBuf::from("Assets/UI/Menu.prefab"),
+            PathBuf::from("Packages/com.example/Runtime.asset"),
+        ];
+        assert_eq!(
+            serde_json::to_value(reindex_intent(false, false, &paths)?)?,
+            json!({
+                "contract_version": 1,
+                "scope": {
+                    "kind": "changed_paths",
+                    "paths": [
+                        "Assets/UI/Menu.prefab",
+                        "Packages/com.example/Runtime.asset"
+                    ]
+                }
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clap_rejects_conflicting_reindex_modes() {
+        assert!(
+            Args::try_parse_from(["unity-asset-search", "reindex", "--full", "--reconcile"])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "unity-asset-search",
+                "reindex",
+                "--full",
+                "--path",
+                "Assets/UI/Menu.prefab"
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "unity-asset-search",
+                "reindex",
+                "--reconcile",
+                "--path",
+                "Assets/UI/Menu.prefab"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn clap_accepts_negative_reference_file_id() -> Result<()> {
+        let args = Args::try_parse_from([
+            "unity-asset-search",
+            "references",
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+            "--file-id",
+            "-11500000",
+        ])?;
+
+        let Cmd::References { file_id, .. } = args.cmd else {
+            anyhow::bail!("expected references command");
+        };
+        assert_eq!(file_id, Some(-11_500_000));
+        Ok(())
     }
 }

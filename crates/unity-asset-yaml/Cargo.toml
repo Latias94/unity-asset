@@ -27,6 +27,7 @@ unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
 # Workspace dependencies
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+yaml-rust2 = { workspace = true }
 indexmap = { workspace = true }
 thiserror = { workspace = true }
 

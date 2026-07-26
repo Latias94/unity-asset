@@ -12,9 +12,11 @@ use unity_asset_binary::typetree::{
     CompositeTypeTreeRegistry, TypeTree, TypeTreeNode, TypeTreeParseMode, TypeTreeParseOptions,
     TypeTreeRegistry,
 };
+#[cfg(test)]
+use unity_asset_core::arc_slice_allocation_bytes;
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, SourceAlias, SourceId, SourceKind, SourceMemberId, UnityClass,
-    UnityDocument, WorkspaceId, WorkspaceRevision, YamlAnchor, arc_slice_allocation_bytes,
+    AssetLoadBudget, BudgetError, BudgetedSourceBytes, SourceAlias, SourceId, SourceKind,
+    SourceMemberId, UnityClass, UnityDocument, WorkspaceId, WorkspaceRevision, YamlAnchor,
     arc_value_allocation_bytes,
 };
 use unity_asset_yaml::YamlDocument;
@@ -26,7 +28,7 @@ use super::adapter::binary::{
     BinaryAdapterAllocationUnit, BinaryAdapterError, BinaryContainerKind, BinaryMemberContent,
     BinaryPayload, BinaryWorkspaceAdapter,
 };
-use super::adapter::yaml::{ParsedYamlSource, YamlAdapterError, parse_yaml_source};
+use super::adapter::yaml::{YamlAdapterError, parse_prebudgeted_yaml_source};
 use super::snapshot::WorkspaceSnapshot;
 use super::source_catalog::{PhysicalOrigin, SourceDescriptor};
 use super::state::WorkspaceState;
@@ -158,7 +160,13 @@ impl SourceOpenRequest {
     }
 }
 
+enum SourceImageInput {
+    Unaccounted(Arc<[u8]>),
+    Budgeted(BudgetedSourceBytes),
+}
+
 /// Mutable owner of one revisioned Unity source namespace.
+#[derive(Clone)]
 pub struct AssetWorkspace {
     state: Arc<WorkspaceState>,
     config: Arc<WorkspaceConfig>,
@@ -293,6 +301,67 @@ impl AssetWorkspace {
         self.publish_prepared(alias, origin, prepared, budget)
     }
 
+    /// Loads one caller-owned source image without reopening its physical path.
+    ///
+    /// The supplied bytes are the authoritative image retained by the resulting workspace
+    /// revision. The path still establishes the durable physical origin used by publication and
+    /// recovery checks, which will reject later on-disk divergence from this image's fingerprint.
+    pub fn load_source_bytes(
+        &mut self,
+        request: SourceOpenRequest,
+        image: Arc<[u8]>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SourceId, WorkspaceError> {
+        self.load_source_image(request, SourceImageInput::Unaccounted(image), budget)
+    }
+
+    /// Loads a source backing whose shared allocation has already been charged to `budget`.
+    ///
+    /// This ownership-transfer entry point prevents cooperating scanners from charging the same
+    /// immutable allocation again when the workspace retains it. Proofs minted by another load
+    /// budget are rejected before workspace allocations are charged.
+    pub fn load_budgeted_source_bytes(
+        &mut self,
+        request: SourceOpenRequest,
+        image: BudgetedSourceBytes,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SourceId, WorkspaceError> {
+        self.load_source_image(request, SourceImageInput::Budgeted(image), budget)
+    }
+
+    fn load_source_image(
+        &mut self,
+        request: SourceOpenRequest,
+        image: SourceImageInput,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SourceId, WorkspaceError> {
+        let SourceOpenRequest {
+            path,
+            alias,
+            kind_hint,
+        } = request;
+        let absolute = absolute_path(&path)?;
+        let origin = PhysicalOrigin::from_existing_path(&absolute)
+            .map_err(|source| WorkspaceError::operation("physical-origin validation", source))?;
+        let image = match image {
+            SourceImageInput::Unaccounted(image) => BudgetedSourceBytes::from_arc(image, budget)?,
+            SourceImageInput::Budgeted(image) => {
+                image.validate_budget(budget)?;
+                image
+            }
+        };
+        account_root_descriptor_backing(&alias, &origin, budget)?;
+        let prepared = prepare_root(
+            &path,
+            kind_hint,
+            image,
+            &self.binary,
+            self.source_registry.as_ref(),
+            budget,
+        )?;
+        self.publish_prepared(alias, origin, prepared, budget)
+    }
+
     pub fn unload_source(
         &mut self,
         root: SourceId,
@@ -366,7 +435,7 @@ impl AssetWorkspace {
 #[derive(Debug)]
 struct PreparedSource {
     kind: SourceKind,
-    image: Arc<[u8]>,
+    image: BudgetedSourceBytes,
     parsed: PreparedParse,
     children: Vec<PreparedChild>,
 }
@@ -439,11 +508,12 @@ impl FrozenTypeTreeRegistry {
 fn prepare_root(
     path: &Path,
     kind_hint: Option<SourceKind>,
-    image: Arc<[u8]>,
+    image: BudgetedSourceBytes,
     binary: &BinaryWorkspaceAdapter,
     source_registry: Option<&Arc<dyn TypeTreeRegistry>>,
     budget: &mut AssetLoadBudget,
 ) -> Result<PreparedSource, WorkspaceError> {
+    image.validate_budget(budget)?;
     observe_container_depth(0, budget)?;
     match kind_hint {
         Some(SourceKind::Yaml) => prepare_yaml(image, budget, 0),
@@ -453,7 +523,7 @@ fn prepare_root(
             expected @ (SourceKind::SerializedFile | SourceKind::AssetBundle | SourceKind::WebFile),
         ) => {
             let payload = binary
-                .parse(Arc::clone(&image), budget)
+                .parse_budgeted(&image, budget)
                 .map_err(map_binary_adapter_error)?;
             let actual = binary_payload_kind(&payload);
             if actual != expected {
@@ -474,7 +544,7 @@ fn prepare_root(
         None if has_resource_extension(path) => Ok(prepared_raw(image)),
         None => {
             let payload = binary
-                .parse(Arc::clone(&image), budget)
+                .parse_budgeted(&image, budget)
                 .map_err(map_binary_adapter_error)?;
             prepare_binary_payload(image, payload, binary, source_registry, budget, 0)
         }
@@ -482,34 +552,34 @@ fn prepare_root(
 }
 
 fn prepare_yaml(
-    image: Arc<[u8]>,
+    image: BudgetedSourceBytes,
     budget: &mut AssetLoadBudget,
     depth: u32,
 ) -> Result<PreparedSource, WorkspaceError> {
     let mut scoped = budget.enter_depth(depth)?;
-    let parsed = parse_yaml_source(Arc::clone(&image), &mut scoped)
+    let parsed = parse_prebudgeted_yaml_source(image, &mut scoped)
         .map_err(|error| map_yaml_adapter_error("YAML source parsing", error))?;
+    let (image, document) = parsed.into_budgeted_parts(&scoped)?;
     drop(scoped);
-    finish_prepared_yaml(image, parsed, budget)
+    finish_prepared_yaml(image, document, budget)
 }
 
 fn finish_prepared_yaml(
-    image: Arc<[u8]>,
-    parsed: ParsedYamlSource,
+    image: BudgetedSourceBytes,
+    document: Arc<YamlDocument>,
     budget: &mut AssetLoadBudget,
 ) -> Result<PreparedSource, WorkspaceError> {
-    debug_assert_eq!(parsed.encoded().as_ref(), image.as_ref());
-    validate_yaml_identities(parsed.document(), budget)?;
+    validate_yaml_identities(&document, budget)?;
     Ok(PreparedSource {
         kind: SourceKind::Yaml,
         image,
-        parsed: PreparedParse::Yaml(Arc::clone(parsed.document())),
+        parsed: PreparedParse::Yaml(document),
         children: Vec::new(),
     })
 }
 
 fn prepare_binary_or_yaml(
-    image: Arc<[u8]>,
+    image: BudgetedSourceBytes,
     binary: &BinaryWorkspaceAdapter,
     source_registry: Option<&Arc<dyn TypeTreeRegistry>>,
     budget: &mut AssetLoadBudget,
@@ -517,7 +587,7 @@ fn prepare_binary_or_yaml(
 ) -> Result<PreparedSource, WorkspaceError> {
     let binary_result = {
         let mut scoped = budget.enter_depth(depth)?;
-        binary.parse(Arc::clone(&image), &mut scoped)
+        binary.parse_budgeted(&image, &mut scoped)
     };
     match binary_result {
         Ok(payload) => {
@@ -529,12 +599,13 @@ fn prepare_binary_or_yaml(
 }
 
 fn prepare_archive(
-    image: Arc<[u8]>,
+    image: BudgetedSourceBytes,
     binary: &BinaryWorkspaceAdapter,
     source_registry: Option<&Arc<dyn TypeTreeRegistry>>,
     budget: &mut AssetLoadBudget,
     depth: u32,
 ) -> Result<PreparedSource, WorkspaceError> {
+    image.validate_budget(budget)?;
     observe_container_depth(depth, budget)?;
     let plan = preflight_zip_archive(&image, budget)
         .map_err(|error| map_archive_error("ZIP archive preflight", error))?;
@@ -543,7 +614,8 @@ fn prepare_archive(
         .then(|| next_container_depth(depth, budget))
         .transpose()?;
     let mut scoped = budget.enter_depth(depth)?;
-    let members = load_preflighted_zip_archive(Arc::clone(&image), plan, &mut scoped)
+    let archive_backing = image.clone_backing(&scoped)?;
+    let members = load_preflighted_zip_archive(archive_backing, plan, &mut scoped)
         .map_err(|error| map_archive_error("ZIP archive loading", error))?;
     drop(scoped);
     let mut children = reserve_prepared_children(members.len(), budget)?;
@@ -558,7 +630,7 @@ fn prepare_archive(
         previous_wire_ordinal = Some(member.wire_ordinal);
         let source = prepare_member(
             member.member_id.name(),
-            Arc::clone(&member.bytes),
+            member.bytes,
             binary,
             source_registry,
             budget,
@@ -585,13 +657,14 @@ fn prepare_archive(
 }
 
 fn prepare_binary_payload(
-    image: Arc<[u8]>,
+    image: BudgetedSourceBytes,
     payload: BinaryPayload,
     binary: &BinaryWorkspaceAdapter,
     source_registry: Option<&Arc<dyn TypeTreeRegistry>>,
     budget: &mut AssetLoadBudget,
     depth: u32,
 ) -> Result<PreparedSource, WorkspaceError> {
+    image.validate_budget(budget)?;
     observe_container_depth(depth, budget)?;
     let kind = binary_payload_kind(&payload);
     let relation = match kind {
@@ -686,13 +759,14 @@ fn prepare_binary_payload(
 
 fn prepare_member(
     name: &str,
-    image: Arc<[u8]>,
+    image: BudgetedSourceBytes,
     binary: &BinaryWorkspaceAdapter,
     source_registry: Option<&Arc<dyn TypeTreeRegistry>>,
     budget: &mut AssetLoadBudget,
     depth: u32,
     binary_already_rejected: bool,
 ) -> Result<PreparedSource, WorkspaceError> {
+    image.validate_budget(budget)?;
     observe_container_depth(depth, budget)?;
     let path = Path::new(name);
     if looks_like_zip(&image) || has_extension(path, &["zip", "apk"]) {
@@ -714,7 +788,7 @@ fn prepare_member(
 
     let binary_result = {
         let mut scoped = budget.enter_depth(depth)?;
-        binary.parse(Arc::clone(&image), &mut scoped)
+        binary.parse_budgeted(&image, &mut scoped)
     };
     match binary_result {
         Ok(payload) => {
@@ -725,7 +799,7 @@ fn prepare_member(
     }
 }
 
-fn prepared_raw(image: Arc<[u8]>) -> PreparedSource {
+fn prepared_raw(image: BudgetedSourceBytes) -> PreparedSource {
     PreparedSource {
         kind: SourceKind::StreamedResource,
         image,
@@ -961,7 +1035,7 @@ fn register_prepared(
         parsed,
         children,
     } = prepared;
-    let image = unity_asset_core::VerifiedSourceImage::verify(kind, image);
+    let image = unity_asset_core::VerifiedSourceImage::verify(kind, image.into_backing(budget)?);
     let fingerprint = image.fingerprint();
     let source = catalog.register(descriptor, fingerprint, budget)?;
     let parse = match parsed {
@@ -1049,11 +1123,15 @@ pub(super) fn map_yaml_adapter_error(
 ) -> WorkspaceError {
     match error {
         YamlAdapterError::Budget(error) => WorkspaceError::Budget(error),
-        YamlAdapterError::AllocationFailed { context, requested } => WorkspaceError::Allocation {
+        YamlAdapterError::AllocationFailed {
+            context,
+            requested,
+            source,
+        } => WorkspaceError::Allocation {
             resource: context,
             requested,
             unit: WorkspaceAllocationUnit::Bytes,
-            message: "allocator rejected the requested capacity".to_owned(),
+            message: source.to_string(),
         },
         YamlAdapterError::DepthExceeded { actual, limit } => {
             WorkspaceError::Budget(BudgetError::Exceeded {
@@ -1270,7 +1348,7 @@ fn account_root_descriptor_backing(
 fn read_owned_image(
     origin: &PhysicalOrigin,
     budget: &mut AssetLoadBudget,
-) -> Result<Arc<[u8]>, WorkspaceError> {
+) -> Result<BudgetedSourceBytes, WorkspaceError> {
     let path = origin.path();
     let mut file = File::open(path).map_err(|error| WorkspaceError::io(path, error))?;
     let length = file
@@ -1313,14 +1391,7 @@ fn read_owned_image(
             path: path.to_path_buf(),
         });
     }
-    let arc_allocation = arc_slice_allocation_bytes::<u8>(length_usize).map_err(|_| {
-        BudgetError::ArithmeticOverflow {
-            resource: "workspace_source_arc",
-        }
-    })?;
-    budget.check_bytes(arc_allocation)?;
-    budget.consume_bytes(arc_allocation)?;
-    Ok(Arc::from(bytes))
+    BudgetedSourceBytes::from_vec(bytes, budget).map_err(WorkspaceError::from)
 }
 
 fn looks_like_zip(bytes: &[u8]) -> bool {
@@ -1467,6 +1538,112 @@ mod tests {
         let image = read_owned_image(&origin, &mut exact).unwrap();
         assert_eq!(image.as_ref(), b"four");
         assert_eq!(exact.usage().bytes, exact_bytes);
+    }
+
+    #[test]
+    fn caller_owned_root_image_is_retained_without_reopening_the_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("payload.resource");
+        fs::write(&path, b"on disk").unwrap();
+        let supplied: Arc<[u8]> = Arc::from(&b"supplied"[..]);
+        let mut workspace = AssetWorkspace::new().unwrap();
+
+        let source = workspace
+            .load_source_bytes(
+                SourceOpenRequest::from_path(&path).unwrap(),
+                Arc::clone(&supplied),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            workspace
+                .state()
+                .store()
+                .get(source)
+                .unwrap()
+                .image()
+                .as_bytes(),
+            supplied.as_ref()
+        );
+    }
+
+    #[test]
+    fn budgeted_root_image_transfers_without_duplicate_arc_accounting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("payload.resource");
+        fs::write(&path, b"four").unwrap();
+        let image: Arc<[u8]> = Arc::from(&b"four"[..]);
+        let request = || SourceOpenRequest::from_path(&path).unwrap();
+
+        let mut direct_budget = AssetLoadBudget::default();
+        AssetWorkspace::new()
+            .unwrap()
+            .load_source_bytes(request(), Arc::clone(&image), &mut direct_budget)
+            .unwrap();
+
+        let mut transferred_budget = AssetLoadBudget::default();
+        let budgeted =
+            BudgetedSourceBytes::from_arc(Arc::clone(&image), &mut transferred_budget).unwrap();
+        AssetWorkspace::new()
+            .unwrap()
+            .load_budgeted_source_bytes(request(), budgeted, &mut transferred_budget)
+            .unwrap();
+
+        assert_eq!(transferred_budget.usage(), direct_budget.usage());
+    }
+
+    #[test]
+    fn budgeted_root_image_rejects_a_different_budget_domain_before_accounting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("payload.resource");
+        fs::write(&path, b"four").unwrap();
+        let mut source_budget = AssetLoadBudget::default();
+        let image =
+            BudgetedSourceBytes::from_arc(Arc::from(&b"four"[..]), &mut source_budget).unwrap();
+        let mut load_budget = AssetLoadBudget::default();
+
+        let error = AssetWorkspace::new()
+            .unwrap()
+            .load_budgeted_source_bytes(
+                SourceOpenRequest::from_path(&path).unwrap(),
+                image,
+                &mut load_budget,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WorkspaceError::Budget(BudgetError::DomainMismatch {
+                resource: "source bytes"
+            })
+        ));
+        assert_eq!(load_budget.usage(), Default::default());
+    }
+
+    #[test]
+    fn budgeted_yaml_root_does_not_charge_its_source_backing_twice() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("payload.prefab");
+        let encoded: Arc<[u8]> = Arc::from(b"root: value\n".as_slice());
+        fs::write(&path, encoded.as_ref()).unwrap();
+        let request = || SourceOpenRequest::from_path(&path).unwrap();
+
+        let mut direct_budget = AssetLoadBudget::default();
+        AssetWorkspace::new()
+            .unwrap()
+            .load_source_bytes(request(), Arc::clone(&encoded), &mut direct_budget)
+            .unwrap();
+
+        let mut transferred_budget = AssetLoadBudget::default();
+        let image =
+            BudgetedSourceBytes::from_arc(Arc::clone(&encoded), &mut transferred_budget).unwrap();
+        AssetWorkspace::new()
+            .unwrap()
+            .load_budgeted_source_bytes(request(), image, &mut transferred_budget)
+            .unwrap();
+
+        assert_eq!(transferred_budget.usage(), direct_budget.usage());
     }
 
     #[test]
