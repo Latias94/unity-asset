@@ -2,12 +2,10 @@
 
 use std::mem::size_of;
 
-use unity_asset_binary::typetree::{
-    TypeTreeTraversalStats, TypeTreeWriteError, TypeTreeWriteResult as Result,
-};
 use unity_asset_core::{AssetLoadBudget, BudgetError};
 
-use crate::binary_writer::Endian;
+use crate::reader::ByteOrder;
+use crate::typetree::{TypeTreeTraversalStats, TypeTreeWriteError, TypeTreeWriteResult as Result};
 
 #[derive(Debug, Clone, Copy)]
 struct PreparedAppend {
@@ -42,17 +40,17 @@ pub(crate) trait TypeTreeSink {
 /// used by later writes, so allocator over-allocation never becomes free output capacity.
 pub(crate) struct TypeTreeOutput<'budget> {
     bytes: Vec<u8>,
-    endian: Endian,
+    byte_order: ByteOrder,
     budget: &'budget mut AssetLoadBudget,
     stats: TypeTreeTraversalStats,
     accounted_capacity: usize,
 }
 
 impl<'budget> TypeTreeOutput<'budget> {
-    pub(crate) fn new(endian: Endian, budget: &'budget mut AssetLoadBudget) -> Self {
+    pub(crate) fn new(byte_order: ByteOrder, budget: &'budget mut AssetLoadBudget) -> Self {
         Self {
             bytes: Vec::new(),
-            endian,
+            byte_order,
             budget,
             stats: TypeTreeTraversalStats::default(),
             accounted_capacity: 0,
@@ -70,9 +68,9 @@ impl<'budget> TypeTreeOutput<'budget> {
     }
 
     pub(crate) fn write_i32(&mut self, value: i32) -> Result<()> {
-        let bytes = match self.endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
+        let bytes = match self.byte_order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
         };
         self.write_bytes(&bytes)
     }
@@ -287,13 +285,23 @@ impl TypeTreeSink for TypeTreeOutput<'_> {
 pub(crate) struct TypeTreeValidation<'budget> {
     budget: &'budget mut AssetLoadBudget,
     stats: TypeTreeTraversalStats,
+    preserves_unnamed_fields: bool,
 }
 
 impl<'budget> TypeTreeValidation<'budget> {
-    pub(crate) fn new(budget: &'budget mut AssetLoadBudget) -> Self {
+    pub(crate) fn for_encoding(budget: &'budget mut AssetLoadBudget) -> Self {
         Self {
             budget,
             stats: TypeTreeTraversalStats::default(),
+            preserves_unnamed_fields: false,
+        }
+    }
+
+    pub(crate) fn for_rewrite(budget: &'budget mut AssetLoadBudget) -> Self {
+        Self {
+            budget,
+            stats: TypeTreeTraversalStats::default(),
+            preserves_unnamed_fields: true,
         }
     }
 
@@ -331,7 +339,7 @@ impl<'budget> TypeTreeValidation<'budget> {
 
 impl TypeTreeSink for TypeTreeValidation<'_> {
     fn skips_template_preserved_unnamed_fields(&self) -> bool {
-        true
+        self.preserves_unnamed_fields
     }
 
     fn write_i32(&mut self, _value: i32) -> Result<()> {
@@ -439,7 +447,7 @@ mod tests {
     #[test]
     fn alignment_appends_budgeted_zero_padding() {
         let mut budget = budget_with_bytes(16);
-        let mut output = TypeTreeOutput::new(Endian::Little, &mut budget);
+        let mut output = TypeTreeOutput::new(ByteOrder::Little, &mut budget);
         output.write_bytes(&[0xaa]).unwrap();
         output.align_to(4).unwrap();
         output.align_to(4).unwrap();
@@ -455,7 +463,7 @@ mod tests {
     #[test]
     fn budget_failure_does_not_change_output_stats_or_usage() {
         let mut budget = budget_with_bytes(4);
-        let mut output = TypeTreeOutput::new(Endian::Little, &mut budget);
+        let mut output = TypeTreeOutput::new(ByteOrder::Little, &mut budget);
         output.write_bytes(&[7]).unwrap();
 
         let before_bytes = output.bytes.clone();
@@ -471,7 +479,7 @@ mod tests {
     #[test]
     fn allocator_spare_capacity_is_never_free_logical_capacity() {
         let mut budget = budget_with_bytes(32);
-        let mut output = TypeTreeOutput::new(Endian::Little, &mut budget);
+        let mut output = TypeTreeOutput::new(ByteOrder::Little, &mut budget);
         output.bytes.reserve_exact(64);
         assert!(output.bytes.capacity() >= 64);
         assert_eq!(output.accounted_capacity, 0);
@@ -488,7 +496,7 @@ mod tests {
     #[test]
     fn repeated_tiny_writes_grow_logical_capacity_geometrically() {
         let mut budget = budget_with_bytes(13);
-        let mut output = TypeTreeOutput::new(Endian::Little, &mut budget);
+        let mut output = TypeTreeOutput::new(ByteOrder::Little, &mut budget);
 
         for (value, expected_capacity) in [1_u8, 2, 3, 4, 5].into_iter().zip([1_usize, 2, 4, 4, 8])
         {
@@ -506,7 +514,7 @@ mod tests {
     #[test]
     fn traversal_metrics_and_budget_ledgers_share_one_accounting_model() {
         let mut budget = budget_with_limits(64, 8, 8, 4);
-        let mut output = TypeTreeOutput::new(Endian::Little, &mut budget);
+        let mut output = TypeTreeOutput::new(ByteOrder::Little, &mut budget);
         output.enter_node(2).unwrap();
         output.enter_nodes(3, 4).unwrap();
         output.consume_members(7).unwrap();

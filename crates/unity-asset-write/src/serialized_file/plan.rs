@@ -15,7 +15,7 @@ use crate::serialized_file::sink::{CountingSink, EndianSink, SinkBackend};
 use crate::serialized_file::types_write::{
     write_file_identifier_to, write_local_serialized_object_identifier_to, write_serialized_type_to,
 };
-use crate::{BinaryWriter, Endian, Result};
+use crate::{BinaryWriter, ByteOrder, Result};
 
 /// Verified source image and the complete SerializedFile range within it.
 ///
@@ -52,7 +52,7 @@ pub(crate) struct SerializedFilePlan<'source> {
     edits: &'source SerializedFileEdits,
     object_source: ObjectSource<'source>,
     format: SerializedFileFormat,
-    endian: Endian,
+    byte_order: ByteOrder,
     layout: SerializedFileLayout,
     metadata_body_size: u64,
     data_size: u64,
@@ -132,10 +132,7 @@ impl<'source> SerializedFilePlan<'source> {
         let external_table = PlannedExternalTable::build(file, edits).map_err(|error| {
             UnityAssetError::with_source("Invalid SerializedFile external table", error)
         })?;
-        let endian = match file.header.byte_order() {
-            unity_asset_binary::reader::ByteOrder::Little => Endian::Little,
-            unity_asset_binary::reader::ByteOrder::Big => Endian::Big,
-        };
+        let byte_order = file.header.byte_order();
 
         let mut data_size = 0_u64;
         for info in file.objects() {
@@ -166,7 +163,7 @@ impl<'source> SerializedFilePlan<'source> {
             edits,
             object_source,
             format,
-            endian,
+            byte_order,
             layout: SerializedFileLayout {
                 header_size: 0,
                 metadata_size: 0,
@@ -177,7 +174,7 @@ impl<'source> SerializedFilePlan<'source> {
             data_size,
             external_table,
         };
-        let mut metadata = EndianSink::new(CountingSink::default(), endian);
+        let mut metadata = EndianSink::new(CountingSink::default(), byte_order);
         plan.write_metadata(&mut metadata)?;
         plan.metadata_body_size = metadata.into_inner().length();
         let legacy_hint = matches!(
@@ -299,7 +296,7 @@ impl<'source> SerializedFilePlan<'source> {
                         "SerializedFile header must start at zero, got {start}"
                     )));
                 }
-                let mut writer = EndianSink::new(&mut *backend, Endian::Big);
+                let mut writer = EndianSink::new(&mut *backend, ByteOrder::Big);
                 write_header(&mut writer, self.file, self.format, self.layout)?;
                 if includes_legacy_data_padding {
                     pad_to(&mut writer, expected_end, "legacy data offset")?;
@@ -309,7 +306,7 @@ impl<'source> SerializedFilePlan<'source> {
                 includes_legacy_endian,
                 includes_modern_data_padding,
             } => {
-                let mut writer = EndianSink::new(&mut *backend, self.endian);
+                let mut writer = EndianSink::new(&mut *backend, self.byte_order);
                 if includes_legacy_endian {
                     writer.write_u8(self.file.header.endian)?;
                 }
@@ -334,12 +331,12 @@ impl<'source> SerializedFilePlan<'source> {
                 bytes,
                 padding_after,
             } => {
-                let mut writer = EndianSink::new(&mut *backend, self.endian);
+                let mut writer = EndianSink::new(&mut *backend, self.byte_order);
                 writer.write(bytes)?;
                 write_zeroes(&mut writer, padding_after)?;
             }
             GeneratedRegion::Alignment { length } => {
-                let mut writer = EndianSink::new(&mut *backend, self.endian);
+                let mut writer = EndianSink::new(&mut *backend, self.byte_order);
                 write_zeroes(&mut writer, length)?;
             }
         }
@@ -392,7 +389,7 @@ impl<'source> SerializedFilePlan<'source> {
     }
 
     pub(crate) fn encode_to_vec(&self) -> Result<Vec<u8>> {
-        let mut output = BinaryWriter::new(Endian::Big);
+        let mut output = BinaryWriter::new(ByteOrder::Big);
         self.visit_segments(|segment| {
             match segment {
                 SerializedFileSegment::Generated(region) => {

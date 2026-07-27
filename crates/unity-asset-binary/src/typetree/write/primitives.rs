@@ -1,12 +1,12 @@
 use std::fmt;
 
-use unity_asset_binary::typetree::{
-    PrimitiveKind, SchemaNode, TypeTreeWriteError, TypeTreeWriteResult as Result,
-};
 use unity_asset_core::UnityValue;
 
 use super::output::TypeTreeSink;
-use crate::binary_writer::Endian;
+use crate::reader::ByteOrder;
+use crate::typetree::{
+    PrimitiveKind, SchemaNode, TypeTreeWriteError, TypeTreeWriteResult as Result,
+};
 
 const BULK_STACK_BYTES: usize = 4 * 1024;
 
@@ -62,9 +62,9 @@ pub(crate) fn write_primitive<S: TypeTreeSink + ?Sized>(
     output: &mut S,
     kind: PrimitiveKind,
     value: &UnityValue,
-    endian: Endian,
+    byte_order: ByteOrder,
 ) -> Result<()> {
-    let (bytes, width) = encode_primitive(kind, value, endian)?;
+    let (bytes, width) = encode_primitive(kind, value, byte_order)?;
     output.write_scalar_bytes(&bytes[..width])
 }
 
@@ -72,7 +72,7 @@ pub(crate) fn write_primitive_run<S: TypeTreeSink + ?Sized>(
     output: &mut S,
     kind: PrimitiveKind,
     values: &[UnityValue],
-    endian: Endian,
+    byte_order: ByteOrder,
 ) -> Result<()> {
     let width = usize::from(kind.width());
     let values_per_chunk = BULK_STACK_BYTES / width;
@@ -81,7 +81,7 @@ pub(crate) fn write_primitive_run<S: TypeTreeSink + ?Sized>(
     for values in values.chunks(values_per_chunk) {
         let mut used = 0;
         for value in values {
-            let (encoded, encoded_width) = encode_primitive(kind, value, endian)?;
+            let (encoded, encoded_width) = encode_primitive(kind, value, byte_order)?;
             debug_assert_eq!(encoded_width, width);
             let end = used + encoded_width;
             chunk[used..end].copy_from_slice(&encoded[..encoded_width]);
@@ -96,7 +96,7 @@ pub(crate) fn write_primitive_run<S: TypeTreeSink + ?Sized>(
 fn encode_primitive(
     kind: PrimitiveKind,
     value: &UnityValue,
-    endian: Endian,
+    byte_order: ByteOrder,
 ) -> Result<([u8; 8], usize)> {
     let mut encoded = [0_u8; 8];
     let width = usize::from(kind.width());
@@ -121,47 +121,47 @@ fn encode_primitive(
         PrimitiveKind::I16 => {
             let value =
                 i16::try_from(as_i64(kind, value)?).map_err(|_| out_of_range(kind, value))?;
-            encoded[..width].copy_from_slice(&match endian {
-                Endian::Little => value.to_le_bytes(),
-                Endian::Big => value.to_be_bytes(),
+            encoded[..width].copy_from_slice(&match byte_order {
+                ByteOrder::Little => value.to_le_bytes(),
+                ByteOrder::Big => value.to_be_bytes(),
             });
         }
         PrimitiveKind::U16 => {
             let value =
                 u16::try_from(as_u64(kind, value)?).map_err(|_| out_of_range(kind, value))?;
-            encoded[..width].copy_from_slice(&match endian {
-                Endian::Little => value.to_le_bytes(),
-                Endian::Big => value.to_be_bytes(),
+            encoded[..width].copy_from_slice(&match byte_order {
+                ByteOrder::Little => value.to_le_bytes(),
+                ByteOrder::Big => value.to_be_bytes(),
             });
         }
         PrimitiveKind::I32 => {
             let value =
                 i32::try_from(as_i64(kind, value)?).map_err(|_| out_of_range(kind, value))?;
-            encoded[..width].copy_from_slice(&match endian {
-                Endian::Little => value.to_le_bytes(),
-                Endian::Big => value.to_be_bytes(),
+            encoded[..width].copy_from_slice(&match byte_order {
+                ByteOrder::Little => value.to_le_bytes(),
+                ByteOrder::Big => value.to_be_bytes(),
             });
         }
         PrimitiveKind::U32 => {
             let value =
                 u32::try_from(as_u64(kind, value)?).map_err(|_| out_of_range(kind, value))?;
-            encoded[..width].copy_from_slice(&match endian {
-                Endian::Little => value.to_le_bytes(),
-                Endian::Big => value.to_be_bytes(),
+            encoded[..width].copy_from_slice(&match byte_order {
+                ByteOrder::Little => value.to_le_bytes(),
+                ByteOrder::Big => value.to_be_bytes(),
             });
         }
         PrimitiveKind::I64 => {
             let value = as_i64(kind, value)?;
-            encoded[..width].copy_from_slice(&match endian {
-                Endian::Little => value.to_le_bytes(),
-                Endian::Big => value.to_be_bytes(),
+            encoded[..width].copy_from_slice(&match byte_order {
+                ByteOrder::Little => value.to_le_bytes(),
+                ByteOrder::Big => value.to_be_bytes(),
             });
         }
         PrimitiveKind::U64 => {
             let value = as_u64(kind, value)?;
-            encoded[..width].copy_from_slice(&match endian {
-                Endian::Little => value.to_le_bytes(),
-                Endian::Big => value.to_be_bytes(),
+            encoded[..width].copy_from_slice(&match byte_order {
+                ByteOrder::Little => value.to_le_bytes(),
+                ByteOrder::Big => value.to_be_bytes(),
             });
         }
         PrimitiveKind::F32 => {
@@ -170,16 +170,16 @@ fn encode_primitive(
             if source.is_finite() && !converted.is_finite() {
                 return Err(out_of_range(kind, value));
             }
-            encoded[..width].copy_from_slice(&match endian {
-                Endian::Little => converted.to_le_bytes(),
-                Endian::Big => converted.to_be_bytes(),
+            encoded[..width].copy_from_slice(&match byte_order {
+                ByteOrder::Little => converted.to_le_bytes(),
+                ByteOrder::Big => converted.to_be_bytes(),
             });
         }
         PrimitiveKind::F64 => {
             let value = as_f64(kind, value)?;
-            encoded[..width].copy_from_slice(&match endian {
-                Endian::Little => value.to_le_bytes(),
-                Endian::Big => value.to_be_bytes(),
+            encoded[..width].copy_from_slice(&match byte_order {
+                ByteOrder::Little => value.to_le_bytes(),
+                ByteOrder::Big => value.to_be_bytes(),
             });
         }
     }

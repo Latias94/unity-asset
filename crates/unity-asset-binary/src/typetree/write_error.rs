@@ -12,6 +12,7 @@ pub type TypeTreeWriteResult<T> = std::result::Result<T, TypeTreeWriteError>;
 
 /// Failure produced while validating, encoding, or rewriting a TypeTree value.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TypeTreeWriteError {
     /// A semantic object does not match the writable fields in its schema.
     #[error(

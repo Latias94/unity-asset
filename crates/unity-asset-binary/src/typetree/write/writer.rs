@@ -1,31 +1,31 @@
 use indexmap::IndexMap;
-use unity_asset_binary::reader::BinaryReader;
-use unity_asset_binary::typetree::{
+use unity_asset_core::{AssetLoadBudget, UnityValue};
+
+use crate::reader::{BinaryReader, ByteOrder};
+use crate::typetree::{
     PPtrLayout, PairLayout, PrimitiveKind, ReferencedObjectLayout, SchemaNode, SemanticKind,
     SemanticLayout, SequenceLayout, TypeTreeSchema, TypeTreeTraversalContext,
     TypeTreeTraversalStats, TypeTreeWriteError, TypeTreeWriteResult as Result,
 };
-use unity_asset_core::{AssetLoadBudget, UnityValue};
 
 use super::output::{TypeTreeOutput, TypeTreeSink, TypeTreeValidation};
 use super::primitives::{
     checked_i32_length, expect_pair, summarize_value, usize_to_u64, write_primitive,
     write_primitive_run,
 };
-use crate::binary_writer::Endian;
 
 pub(crate) fn encode_object(
     schema: &TypeTreeSchema,
     properties: &IndexMap<String, UnityValue>,
-    endian: Endian,
+    byte_order: ByteOrder,
     budget: &mut AssetLoadBudget,
 ) -> Result<(Vec<u8>, TypeTreeTraversalStats)> {
-    let mut output = TypeTreeOutput::new(endian, budget);
+    let mut output = TypeTreeOutput::new(byte_order, budget);
     write_object_node(
         schema,
         schema.root(),
         properties,
-        endian,
+        byte_order,
         &mut output,
         TypeTreeTraversalContext::root(),
         0,
@@ -33,36 +33,104 @@ pub(crate) fn encode_object(
     Ok(output.finish())
 }
 
+/// Validates a canonical root object without allocating an output buffer.
+pub(crate) fn validate_object(
+    schema: &TypeTreeSchema,
+    properties: &IndexMap<String, UnityValue>,
+    byte_order: ByteOrder,
+    budget: &mut AssetLoadBudget,
+) -> Result<TypeTreeTraversalStats> {
+    let mut validation = TypeTreeValidation::for_encoding(budget);
+    write_object_node(
+        schema,
+        schema.root(),
+        properties,
+        byte_order,
+        &mut validation,
+        TypeTreeTraversalContext::root(),
+        0,
+    )?;
+    Ok(validation.finish())
+}
+
 /// Validates one canonical value through the same traversal used by the materializing writer.
 pub(crate) fn validate_value(
     schema: &TypeTreeSchema,
     node: SchemaNode<'_>,
     value: &UnityValue,
-    endian: Endian,
+    byte_order: ByteOrder,
     budget: &mut AssetLoadBudget,
     context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<TypeTreeTraversalStats> {
-    let mut validation = TypeTreeValidation::new(budget);
-    write_value(schema, node, value, endian, &mut validation, context, depth)?;
+    validate_value_with_sink(
+        schema,
+        node,
+        value,
+        byte_order,
+        TypeTreeValidation::for_encoding(budget),
+        context,
+        depth,
+    )
+}
+
+/// Validates one rewrite value while allowing unnamed fields to remain in the template.
+pub(crate) fn validate_rewrite_value(
+    schema: &TypeTreeSchema,
+    node: SchemaNode<'_>,
+    value: &UnityValue,
+    byte_order: ByteOrder,
+    budget: &mut AssetLoadBudget,
+    context: TypeTreeTraversalContext,
+    depth: u32,
+) -> Result<TypeTreeTraversalStats> {
+    validate_value_with_sink(
+        schema,
+        node,
+        value,
+        byte_order,
+        TypeTreeValidation::for_rewrite(budget),
+        context,
+        depth,
+    )
+}
+
+fn validate_value_with_sink(
+    schema: &TypeTreeSchema,
+    node: SchemaNode<'_>,
+    value: &UnityValue,
+    byte_order: ByteOrder,
+    mut validation: TypeTreeValidation<'_>,
+    context: TypeTreeTraversalContext,
+    depth: u32,
+) -> Result<TypeTreeTraversalStats> {
+    write_value(
+        schema,
+        node,
+        value,
+        byte_order,
+        &mut validation,
+        context,
+        depth,
+    )?;
     Ok(validation.finish())
 }
 
 /// Writes one canonical schema node into a caller-owned, budgeted output.
 ///
 /// Template rewriting uses this adapter for every value that does not need byte preservation.
-/// `endian` must match the byte order used to construct `output`.
+/// `byte_order` must match the byte order used to construct `output`.
 pub(crate) fn write_value<S: TypeTreeSink + ?Sized>(
     schema: &TypeTreeSchema,
     node: SchemaNode<'_>,
     value: &UnityValue,
-    endian: Endian,
+    byte_order: ByteOrder,
     output: &mut S,
     context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<()> {
     output.enter_node(depth)?;
-    write_value_body(schema, node, value, endian, output, context, depth)?;
+    write_value_body(schema, node, value, byte_order, output, context, depth)?;
     align_after_node(node, output)
 }
 
@@ -70,34 +138,34 @@ fn write_value_body<S: TypeTreeSink + ?Sized>(
     schema: &TypeTreeSchema,
     node: SchemaNode<'_>,
     value: &UnityValue,
-    endian: Endian,
+    byte_order: ByteOrder,
     output: &mut S,
     context: TypeTreeTraversalContext,
     depth: u32,
 ) -> Result<()> {
     match node.semantic_layout() {
-        SemanticLayout::Scalar(kind) => write_primitive(output, kind, value, endian),
+        SemanticLayout::Scalar(kind) => write_primitive(output, kind, value, byte_order),
         SemanticLayout::String => write_string(output, value),
         SemanticLayout::TypelessData => write_sized_bytes(output, node, value),
-        SemanticLayout::Sequence(layout) | SemanticLayout::Map(layout) => {
-            write_sequence(schema, node, layout, value, endian, output, context, depth)
-        }
-        SemanticLayout::Pair(layout) => {
-            write_pair(schema, node, layout, value, endian, output, context, depth)
-        }
-        SemanticLayout::PPtr(layout) => {
-            write_pptr(schema, node, layout, value, endian, output, context, depth)
-        }
-        SemanticLayout::ReferencedObject(layout) => {
-            write_referenced_object(schema, node, layout, value, endian, output, context, depth)
-        }
+        SemanticLayout::Sequence(layout) | SemanticLayout::Map(layout) => write_sequence(
+            schema, node, layout, value, byte_order, output, context, depth,
+        ),
+        SemanticLayout::Pair(layout) => write_pair(
+            schema, node, layout, value, byte_order, output, context, depth,
+        ),
+        SemanticLayout::PPtr(layout) => write_pptr(
+            schema, node, layout, value, byte_order, output, context, depth,
+        ),
+        SemanticLayout::ReferencedObject(layout) => write_referenced_object(
+            schema, node, layout, value, byte_order, output, context, depth,
+        ),
         SemanticLayout::ManagedPayload => Err(TypeTreeWriteError::invalid_value(format!(
             "Dynamic managed payload '{}' requires a ReferencedObject type dispatch",
             node.name()
         ))),
         SemanticLayout::ManagedRegistry | SemanticLayout::Record => {
             let object = expect_object(node, value)?;
-            write_record_body(schema, node, object, endian, output, context, depth)
+            write_record_body(schema, node, object, byte_order, output, context, depth)
         }
         SemanticLayout::OpaqueFixed { byte_size } => {
             write_fixed_bytes(output, node, value, byte_size)
@@ -109,7 +177,7 @@ fn write_object_node<S: TypeTreeSink + ?Sized>(
     schema: &TypeTreeSchema,
     node: SchemaNode<'_>,
     properties: &IndexMap<String, UnityValue>,
-    endian: Endian,
+    byte_order: ByteOrder,
     output: &mut S,
     context: TypeTreeTraversalContext,
     depth: u32,
@@ -125,7 +193,7 @@ fn write_object_node<S: TypeTreeSink + ?Sized>(
     }
 
     output.enter_node(depth)?;
-    write_record_body(schema, node, properties, endian, output, context, depth)?;
+    write_record_body(schema, node, properties, byte_order, output, context, depth)?;
     align_after_node(node, output)
 }
 
@@ -133,7 +201,7 @@ fn write_record_body<S: TypeTreeSink + ?Sized>(
     schema: &TypeTreeSchema,
     node: SchemaNode<'_>,
     object: &IndexMap<String, UnityValue>,
-    endian: Endian,
+    byte_order: ByteOrder,
     output: &mut S,
     mut context: TypeTreeTraversalContext,
     depth: u32,
@@ -157,7 +225,7 @@ fn write_record_body<S: TypeTreeSink + ?Sized>(
             schema,
             child,
             value,
-            endian,
+            byte_order,
             output,
             child_context,
             child_depth,
@@ -171,7 +239,7 @@ fn write_sequence<S: TypeTreeSink + ?Sized>(
     node: SchemaNode<'_>,
     layout: SequenceLayout<'_>,
     value: &UnityValue,
-    endian: Endian,
+    byte_order: ByteOrder,
     output: &mut S,
     context: TypeTreeTraversalContext,
     depth: u32,
@@ -220,13 +288,21 @@ fn write_sequence<S: TypeTreeSink + ?Sized>(
     if let Some(kind) = layout.bulk_primitive() {
         if members != 0 {
             output.enter_nodes(child_depth, members)?;
-            write_primitive_run(output, kind, values, endian)?;
+            write_primitive_run(output, kind, values, byte_order)?;
         }
         return Ok(());
     }
 
     for value in values {
-        write_value(schema, element, value, endian, output, context, child_depth)?;
+        write_value(
+            schema,
+            element,
+            value,
+            byte_order,
+            output,
+            context,
+            child_depth,
+        )?;
     }
     Ok(())
 }
@@ -236,7 +312,7 @@ fn write_pair<S: TypeTreeSink + ?Sized>(
     node: SchemaNode<'_>,
     layout: PairLayout<'_>,
     value: &UnityValue,
-    endian: Endian,
+    byte_order: ByteOrder,
     output: &mut S,
     context: TypeTreeTraversalContext,
     depth: u32,
@@ -248,7 +324,7 @@ fn write_pair<S: TypeTreeSink + ?Sized>(
         schema,
         layout.first(),
         &values[0],
-        endian,
+        byte_order,
         output,
         context,
         child_depth,
@@ -257,7 +333,7 @@ fn write_pair<S: TypeTreeSink + ?Sized>(
         schema,
         layout.second(),
         &values[1],
-        endian,
+        byte_order,
         output,
         context,
         child_depth,
@@ -269,7 +345,7 @@ fn write_pptr<S: TypeTreeSink + ?Sized>(
     node: SchemaNode<'_>,
     layout: PPtrLayout<'_>,
     value: &UnityValue,
-    endian: Endian,
+    byte_order: ByteOrder,
     output: &mut S,
     mut context: TypeTreeTraversalContext,
     depth: u32,
@@ -320,7 +396,7 @@ fn write_pptr<S: TypeTreeSink + ?Sized>(
             schema,
             child,
             field,
-            endian,
+            byte_order,
             output,
             child_context,
             child_depth,
@@ -361,7 +437,7 @@ fn write_referenced_object<S: TypeTreeSink + ?Sized>(
     node: SchemaNode<'_>,
     layout: ReferencedObjectLayout<'_>,
     value: &UnityValue,
-    endian: Endian,
+    byte_order: ByteOrder,
     output: &mut S,
     mut context: TypeTreeTraversalContext,
     depth: u32,
@@ -393,7 +469,7 @@ fn write_referenced_object<S: TypeTreeSink + ?Sized>(
                 schema,
                 child,
                 type_value,
-                endian,
+                byte_order,
                 output,
                 child_context,
                 child_depth,
@@ -422,7 +498,7 @@ fn write_referenced_object<S: TypeTreeSink + ?Sized>(
                 schema,
                 target,
                 payload,
-                endian,
+                byte_order,
                 output,
                 child_context,
                 child_depth,
@@ -435,7 +511,7 @@ fn write_referenced_object<S: TypeTreeSink + ?Sized>(
             schema,
             child,
             child_value,
-            endian,
+            byte_order,
             output,
             child_context,
             child_depth,
@@ -617,8 +693,8 @@ fn child_depth(depth: u32) -> Result<u32> {
 mod tests {
     use super::super::test_support::{node, sequence};
     use super::*;
-    use unity_asset_binary::asset::SerializedType;
-    use unity_asset_binary::typetree::{TypeTree, TypeTreeNode};
+    use crate::asset::SerializedType;
+    use crate::typetree::{TypeTree, TypeTreeNode};
 
     const ALIGN_BYTES: i32 = 0x4000;
 
@@ -642,10 +718,10 @@ mod tests {
     fn encode(
         schema: &TypeTreeSchema,
         properties: IndexMap<String, UnityValue>,
-        endian: Endian,
+        byte_order: ByteOrder,
     ) -> Result<Vec<u8>> {
         let mut budget = AssetLoadBudget::default();
-        encode_object(schema, &properties, endian, &mut budget).map(|(bytes, _)| bytes)
+        encode_object(schema, &properties, byte_order, &mut budget).map(|(bytes, _)| bytes)
     }
 
     #[test]
@@ -657,11 +733,11 @@ mod tests {
         let properties = IndexMap::from([("m_Value".to_owned(), UnityValue::Integer(0x0102))]);
 
         assert_eq!(
-            encode(&schema, properties.clone(), Endian::Little).unwrap(),
+            encode(&schema, properties.clone(), ByteOrder::Little).unwrap(),
             [0x02, 0x01, 0, 0]
         );
         assert_eq!(
-            encode(&schema, properties, Endian::Big).unwrap(),
+            encode(&schema, properties, ByteOrder::Big).unwrap(),
             [0x01, 0x02, 0, 0]
         );
     }
@@ -675,7 +751,7 @@ mod tests {
         ]);
 
         assert!(matches!(
-            encode(&schema, properties, Endian::Little),
+            encode(&schema, properties, ByteOrder::Little),
             Err(TypeTreeWriteError::Shape {
                 expected_fields: 1,
                 actual_fields: 2,
@@ -684,7 +760,7 @@ mod tests {
 
         let wrong_field = IndexMap::from([("m_Other".to_owned(), UnityValue::Integer(1))]);
         assert!(matches!(
-            encode(&schema, wrong_field, Endian::Little),
+            encode(&schema, wrong_field, ByteOrder::Little),
             Err(TypeTreeWriteError::Shape {
                 expected_fields: 1,
                 actual_fields: 1,
@@ -705,7 +781,7 @@ mod tests {
             &schema,
             schema.root(),
             &value,
-            Endian::Little,
+            ByteOrder::Little,
             &mut budget,
             TypeTreeTraversalContext::root(),
             0,
@@ -732,7 +808,7 @@ mod tests {
             &schema,
             schema.root(),
             &value,
-            Endian::Little,
+            ByteOrder::Little,
             &mut budget,
             TypeTreeTraversalContext::root(),
             0,
@@ -745,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_allows_template_preserved_unnamed_record_fields() {
+    fn rewrite_validation_allows_template_preserved_unnamed_record_fields() {
         let schema = compile(
             record("Base", vec![node("int", ""), node("int", "m_Named")]),
             &[],
@@ -756,11 +832,11 @@ mod tests {
         )]));
         let mut budget = AssetLoadBudget::default();
 
-        validate_value(
+        validate_rewrite_value(
             &schema,
             schema.root(),
             &value,
-            Endian::Little,
+            ByteOrder::Little,
             &mut budget,
             TypeTreeTraversalContext::root(),
             0,
@@ -773,7 +849,7 @@ mod tests {
                     UnityValue::Object(properties) => properties,
                     _ => unreachable!("test constructs an object"),
                 },
-                Endian::Little,
+                ByteOrder::Little,
             )
             .is_err()
         );
@@ -784,14 +860,14 @@ mod tests {
         let wide = compile(record("Base", vec![node("UInt64", "m_Value")]), &[]);
         let properties = IndexMap::from([("m_Value".to_owned(), UnityValue::Unsigned(u64::MAX))]);
         assert_eq!(
-            encode(&wide, properties, Endian::Little).unwrap(),
+            encode(&wide, properties, ByteOrder::Little).unwrap(),
             u64::MAX.to_le_bytes()
         );
 
         let narrow = compile(record("Base", vec![node("UInt8", "m_Value")]), &[]);
         for value in [UnityValue::Integer(-1), UnityValue::Integer(256)] {
             let properties = IndexMap::from([("m_Value".to_owned(), value)]);
-            assert!(encode(&narrow, properties, Endian::Little).is_err());
+            assert!(encode(&narrow, properties, ByteOrder::Little).is_err());
         }
     }
 
@@ -801,7 +877,7 @@ mod tests {
         let value = "x".repeat(BinaryReader::DEFAULT_MAX_STRING_LEN + 1);
         let properties = IndexMap::from([("m_Value".to_owned(), UnityValue::String(value))]);
 
-        assert!(encode(&schema, properties, Endian::Little).is_err());
+        assert!(encode(&schema, properties, ByteOrder::Little).is_err());
     }
 
     #[test]
@@ -814,7 +890,7 @@ mod tests {
             UnityValue::Array(vec![UnityValue::Integer(1), UnityValue::Integer(0x0203)]),
         )]);
         assert_eq!(
-            encode(&schema, properties, Endian::Little).unwrap(),
+            encode(&schema, properties, ByteOrder::Little).unwrap(),
             [1, 3, 2, 0]
         );
 
@@ -825,7 +901,7 @@ mod tests {
                 ("second".to_owned(), UnityValue::Integer(2)),
             ])),
         )]);
-        assert!(encode(&schema, invalid, Endian::Little).is_err());
+        assert!(encode(&schema, invalid, ByteOrder::Little).is_err());
     }
 
     #[test]
@@ -846,7 +922,7 @@ mod tests {
         )]);
 
         assert_eq!(
-            encode(&schema, properties, Endian::Little).unwrap(),
+            encode(&schema, properties, ByteOrder::Little).unwrap(),
             [2, 0, 0, 0, 1, 10, 2, 20]
         );
     }
@@ -858,7 +934,10 @@ mod tests {
         let schema = compile(record("Base", vec![pointer]), &[]);
 
         let null = IndexMap::from([("m_Texture".to_owned(), UnityValue::Null)]);
-        assert_eq!(encode(&schema, null, Endian::Little).unwrap(), [0_u8; 12]);
+        assert_eq!(
+            encode(&schema, null, ByteOrder::Little).unwrap(),
+            [0_u8; 12]
+        );
 
         let pointer = UnityValue::Object(IndexMap::from([
             ("m_FileID".to_owned(), UnityValue::Integer(1)),
@@ -869,7 +948,7 @@ mod tests {
         ]));
         let properties = IndexMap::from([("m_Texture".to_owned(), pointer)]);
         assert_eq!(
-            encode(&schema, properties, Endian::Little).unwrap(),
+            encode(&schema, properties, ByteOrder::Little).unwrap(),
             [1, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1]
         );
 
@@ -878,7 +957,7 @@ mod tests {
             ("pathID".to_owned(), UnityValue::Integer(2)),
         ]));
         let properties = IndexMap::from([("m_Texture".to_owned(), aliases)]);
-        assert!(encode(&schema, properties, Endian::Little).is_err());
+        assert!(encode(&schema, properties, ByteOrder::Little).is_err());
     }
 
     #[test]
@@ -903,7 +982,7 @@ mod tests {
             encode(
                 &schema,
                 IndexMap::from([("m_Texture".to_owned(), pointer)]),
-                Endian::Little,
+                ByteOrder::Little,
             )
             .unwrap(),
             [8, 7, 6, 5, 4, 3, 2, 1, 0xAA, 1, 0, 0, 0]
@@ -924,7 +1003,7 @@ mod tests {
             encode(
                 &schema,
                 IndexMap::from([("m_Texture".to_owned(), UnityValue::Null)]),
-                Endian::Little,
+                ByteOrder::Little,
             )
             .is_err()
         );
@@ -953,7 +1032,7 @@ mod tests {
                 encode(
                     &schema,
                     IndexMap::from([("m_Texture".to_owned(), pointer)]),
-                    Endian::Little,
+                    ByteOrder::Little,
                 )
                 .is_err()
             );
@@ -1001,7 +1080,7 @@ mod tests {
         let bytes = encode(
             &schema,
             IndexMap::from([("m_Ref".to_owned(), resolved)]),
-            Endian::Little,
+            ByteOrder::Little,
         )
         .unwrap();
         assert_eq!(bytes.len(), 28);
@@ -1019,7 +1098,7 @@ mod tests {
             encode(
                 &schema,
                 IndexMap::from([("m_Ref".to_owned(), empty)]),
-                Endian::Little,
+                ByteOrder::Little,
             )
             .unwrap(),
             [0_u8; 12]
@@ -1040,7 +1119,7 @@ mod tests {
             encode(
                 &schema,
                 IndexMap::from([("m_Ref".to_owned(), empty_with_payload)]),
-                Endian::Little,
+                ByteOrder::Little,
             ),
             Err(TypeTreeWriteError::Shape {
                 expected_fields: 1,
@@ -1060,7 +1139,7 @@ mod tests {
             encode(
                 &schema,
                 IndexMap::from([("m_Ref".to_owned(), unresolved)]),
-                Endian::Little,
+                ByteOrder::Little,
             )
             .is_err()
         );
@@ -1081,7 +1160,7 @@ mod tests {
             )])),
         )]);
 
-        assert_eq!(encode(&schema, properties, Endian::Little).unwrap(), [9]);
+        assert_eq!(encode(&schema, properties, ByteOrder::Little).unwrap(), [9]);
     }
 
     #[test]
@@ -1092,7 +1171,7 @@ mod tests {
         );
         let properties = IndexMap::from([("m_Data".to_owned(), UnityValue::Bytes(vec![1, 2, 3]))]);
         assert_eq!(
-            encode(&bytes_schema, properties, Endian::Little).unwrap(),
+            encode(&bytes_schema, properties, ByteOrder::Little).unwrap(),
             [3, 0, 0, 0, 1, 2, 3]
         );
 
@@ -1101,6 +1180,6 @@ mod tests {
             &[],
         );
         let properties = IndexMap::from([("m_Data".to_owned(), UnityValue::Bytes(vec![1, 2, 3]))]);
-        assert!(encode(&words_schema, properties, Endian::Little).is_err());
+        assert!(encode(&words_schema, properties, ByteOrder::Little).is_err());
     }
 }

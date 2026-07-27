@@ -6,7 +6,7 @@
 
 use std::io::{self, Seek, Write};
 
-use crate::{BinaryWriter, Endian, Result, UnityAssetError};
+use crate::{BinaryWriter, ByteOrder, Result, UnityAssetError};
 
 /// Minimal fallible backend required by the SerializedFile wire encoder.
 pub(crate) trait SinkBackend {
@@ -64,15 +64,18 @@ where
 /// Primitive writer with an explicit wire byte order.
 pub(crate) struct EndianSink<B> {
     backend: B,
-    endian: Endian,
+    byte_order: ByteOrder,
 }
 
 impl<B> EndianSink<B>
 where
     B: SinkBackend,
 {
-    pub(crate) const fn new(backend: B, endian: Endian) -> Self {
-        Self { backend, endian }
+    pub(crate) const fn new(backend: B, byte_order: ByteOrder) -> Self {
+        Self {
+            backend,
+            byte_order,
+        }
     }
 
     pub(crate) fn into_inner(self) -> B {
@@ -96,49 +99,49 @@ where
     }
 
     pub(crate) fn write_u16(&mut self, value: u16) -> Result<()> {
-        let bytes = match self.endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
+        let bytes = match self.byte_order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
         };
         self.write(&bytes)
     }
 
     pub(crate) fn write_i16(&mut self, value: i16) -> Result<()> {
-        let bytes = match self.endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
+        let bytes = match self.byte_order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
         };
         self.write(&bytes)
     }
 
     pub(crate) fn write_u32(&mut self, value: u32) -> Result<()> {
-        let bytes = match self.endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
+        let bytes = match self.byte_order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
         };
         self.write(&bytes)
     }
 
     pub(crate) fn write_i32(&mut self, value: i32) -> Result<()> {
-        let bytes = match self.endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
+        let bytes = match self.byte_order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
         };
         self.write(&bytes)
     }
 
     pub(crate) fn write_u64(&mut self, value: u64) -> Result<()> {
-        let bytes = match self.endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
+        let bytes = match self.byte_order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
         };
         self.write(&bytes)
     }
 
     pub(crate) fn write_i64(&mut self, value: i64) -> Result<()> {
-        let bytes = match self.endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
+        let bytes = match self.byte_order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
         };
         self.write(&bytes)
     }

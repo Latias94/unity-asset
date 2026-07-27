@@ -9,7 +9,7 @@ typed operation without parsing display text.
 - `unity-asset`: high-level `AssetWorkspace`, immutable views, inspection, mutation, references,
   extraction planning, and recovery.
 - `unity-asset-cli`: typed JSON-facing commands for the same workspace workflows.
-- `unity-asset-binary`: low-level AssetBundle, SerializedFile, and WebFile parsing.
+- `unity-asset-binary`: low-level binary parsing and canonical TypeTree wire execution.
 - `unity-asset-yaml`: Unity YAML parsing and serialization.
 - `unity-asset-decode`: optional Texture2D, Sprite, and AudioClip representations.
 - `unity-asset-search-daemon` and `unity-asset-search-cli`: a consumer-owned local search read

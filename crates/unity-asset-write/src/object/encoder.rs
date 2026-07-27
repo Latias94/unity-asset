@@ -12,8 +12,8 @@ use unity_asset_binary::object::ObjectHandle;
 use unity_asset_binary::reader::{BinaryReader, ByteOrder};
 use unity_asset_binary::typetree::{
     PrimitiveKind, SchemaNode, SemanticKind, SemanticLayout, TypeTreeParseMode,
-    TypeTreeParseOptions, TypeTreeSchema, TypeTreeSemanticDigestError, TypeTreeTraversalContext,
-    TypeTreeTraversalStats, TypeTreeWriteError,
+    TypeTreeParseOptions, TypeTreeRewriteStats, TypeTreeSchema, TypeTreeSemanticDigestError,
+    TypeTreeTraversalContext, TypeTreeTraversalStats, TypeTreeWriteError,
 };
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, DigestV1, FieldPath, FieldPathSegment, SemanticDigestError,
@@ -324,9 +324,6 @@ pub enum SerializedValueSchemaError {
         length: usize,
     },
 }
-
-use crate::Endian;
-use crate::typetree::{TemplateRewriteStats, rewrite_object, validate_value};
 
 const MAX_TYPETREE_SEQUENCE_LENGTH: usize = i32::MAX as usize;
 
@@ -864,7 +861,7 @@ pub struct SerializedObjectCandidate<'file> {
     original: &'file [u8],
     original_digest: DigestV1,
     root: UnityValue,
-    endian: Endian,
+    byte_order: ByteOrder,
     parse_stats: TypeTreeTraversalStats,
     previous_ordinal: Option<u32>,
     operation_count: u64,
@@ -988,7 +985,7 @@ impl<'file> SerializedObjectEncoder<'file> {
             original,
             original_digest,
             root: UnityValue::Object(parsed.properties),
-            endian: endian_for(self.handle.file().header.byte_order()),
+            byte_order: self.handle.file().header.byte_order(),
             parse_stats: parsed.stats,
             previous_ordinal: None,
             operation_count: 0,
@@ -1225,7 +1222,7 @@ impl<'file> SerializedObjectCandidate<'file> {
                 path_id: self.path_id(),
                 schema: &self.schema,
                 object_schema_digest: self.schema_digest,
-                endian: self.endian,
+                byte_order: self.byte_order,
                 root: &mut self.root,
                 previous_ordinal: self.previous_ordinal,
                 validation_stats: self.validation_stats,
@@ -1258,7 +1255,7 @@ impl<'file> SerializedObjectCandidate<'file> {
             self.path_id(),
             &self.schema,
             self.schema_digest,
-            self.endian,
+            self.byte_order,
             &mut self.root,
             &mut self.previous_ordinal,
             &mut self.validation_stats,
@@ -1286,7 +1283,7 @@ impl<'file> SerializedObjectCandidate<'file> {
             original,
             original_digest,
             root,
-            endian,
+            byte_order,
             parse_stats,
             operation_count,
             validation_stats,
@@ -1298,8 +1295,10 @@ impl<'file> SerializedObjectCandidate<'file> {
         let UnityValue::Object(properties) = root else {
             return Err(SerializedObjectEncodeError::RootTypeInvariant { actual });
         };
-        let (bytes, rewrite_stats) = rewrite_object(&schema, &properties, original, endian, budget)
+        let rewrite = schema
+            .rewrite_object(original, &properties, byte_order, budget)
             .map_err(|error| map_rewrite_error(path_id, error))?;
+        let (bytes, rewrite_stats) = rewrite.into_parts();
         let output_digest = DigestV1::hash_bytes(&bytes);
         let semantic_value = UnityValue::Object(properties);
 
@@ -1326,7 +1325,7 @@ struct FieldReplacementValidation<'schema, 'candidate> {
     path_id: i64,
     schema: &'schema TypeTreeSchema,
     object_schema_digest: DigestV1,
-    endian: Endian,
+    byte_order: ByteOrder,
     root: &'candidate mut UnityValue,
     previous_ordinal: Option<u32>,
     validation_stats: OperationValidationStats,
@@ -1429,11 +1428,10 @@ fn prepare_validated_field_replacement<'candidate>(
         .root
         .value_at_segments(&path.segments()[..validation.path_len])
     {
-        Ok(candidate) => Ok(validate_value(
-            state.schema,
+        Ok(candidate) => Ok(state.schema.validate_rewrite_candidate_with_context(
             validation.schema.node,
             candidate,
-            state.endian,
+            state.byte_order,
             budget,
             validation.schema.context,
             validation.schema.depth,
@@ -1477,7 +1475,7 @@ fn apply_operation(
     path_id: i64,
     schema: &TypeTreeSchema,
     object_schema_digest: DigestV1,
-    endian: Endian,
+    byte_order: ByteOrder,
     root: &mut UnityValue,
     previous_ordinal: &mut Option<u32>,
     validation_stats: &mut OperationValidationStats,
@@ -1511,7 +1509,7 @@ fn apply_operation(
                     path_id,
                     schema,
                     object_schema_digest,
-                    endian,
+                    byte_order,
                     root,
                     previous_ordinal: *previous_ordinal,
                     validation_stats: *validation_stats,
@@ -1527,11 +1525,10 @@ fn apply_operation(
         SerializedObjectMutationKind::ReplaceObject { guard, replacement } => {
             verify_object_guard(ordinal, guard, object_schema_digest, root, budget)?;
             let replacement = UnityValue::Object(replacement);
-            match validate_value(
-                schema,
+            match schema.validate_rewrite_candidate_with_context(
                 schema.root(),
                 &replacement,
-                endian,
+                byte_order,
                 budget,
                 TypeTreeTraversalContext::root(),
                 0,
@@ -1582,11 +1579,10 @@ fn apply_operation(
                         resource: "sequence element depth",
                     },
                 )?;
-                match validate_value(
-                    schema,
+                match schema.validate_rewrite_candidate_with_context(
                     element,
                     value,
-                    endian,
+                    byte_order,
                     budget,
                     location.context,
                     element_depth,
@@ -2216,7 +2212,7 @@ fn charge_path(
 fn semantic_stats(
     parse: TypeTreeTraversalStats,
     validation: OperationValidationStats,
-    rewrite: TemplateRewriteStats,
+    rewrite: TypeTreeRewriteStats,
     operations_applied: u64,
 ) -> SerializedObjectEncodingStats {
     SerializedObjectEncodingStats {
@@ -2226,16 +2222,9 @@ fn semantic_stats(
         operations_applied,
         parse,
         validation: validation.traversal,
-        rewrite_input: rewrite.input,
-        rewrite_output: rewrite.output,
-        preserved_bytes: rewrite.preserved_bytes,
-    }
-}
-
-fn endian_for(byte_order: ByteOrder) -> Endian {
-    match byte_order {
-        ByteOrder::Big => Endian::Big,
-        ByteOrder::Little => Endian::Little,
+        rewrite_input: rewrite.input(),
+        rewrite_output: rewrite.output(),
+        preserved_bytes: rewrite.preserved_bytes(),
     }
 }
 
@@ -2316,9 +2305,18 @@ fn usize_to_u64(value: usize, resource: &'static str) -> Result<u64, SerializedO
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::typetree::test_support::{node, record};
     use unity_asset_binary::asset::SerializedType;
     use unity_asset_binary::typetree::{TypeTree, TypeTreeNode};
+
+    fn node(type_name: &str, name: &str) -> TypeTreeNode {
+        TypeTreeNode::with_info(type_name.to_owned(), name.to_owned(), -1)
+    }
+
+    fn record(children: Vec<TypeTreeNode>) -> TypeTreeNode {
+        let mut root = node("Root", "Root");
+        root.children = children;
+        root
+    }
 
     fn compile(root: TypeTreeNode, referenced_types: &[SerializedType]) -> TypeTreeSchema {
         let mut tree = TypeTree::new();
@@ -2471,7 +2469,7 @@ mod tests {
             91,
             &schema,
             digest,
-            Endian::Little,
+            ByteOrder::Little,
             &mut root,
             &mut previous,
             &mut validation,
@@ -2521,7 +2519,7 @@ mod tests {
                 path_id: 93,
                 schema: &schema,
                 object_schema_digest: digest,
-                endian: Endian::Little,
+                byte_order: ByteOrder::Little,
                 root: &mut root,
                 previous_ordinal: previous,
                 validation_stats: validation,
@@ -2554,7 +2552,7 @@ mod tests {
                 path_id: 93,
                 schema: &schema,
                 object_schema_digest: digest,
-                endian: Endian::Little,
+                byte_order: ByteOrder::Little,
                 root: &mut root,
                 previous_ordinal: previous,
                 validation_stats: validation,
@@ -2650,7 +2648,7 @@ mod tests {
             92,
             &schema,
             digest,
-            Endian::Little,
+            ByteOrder::Little,
             &mut root,
             &mut previous,
             &mut validation,

@@ -11,6 +11,7 @@ mod schema;
 pub mod tpk;
 mod traversal;
 pub mod types;
+mod write;
 mod write_error;
 
 pub use execution::{
@@ -33,4 +34,5 @@ pub use schema::{
 pub use tpk::TpkTypeTreeRegistry;
 pub use traversal::{TypeTreeTraversalStats, TypeTreeTraversalStatsOverflow};
 pub use types::{TypeTree, TypeTreeNode, TypeTreeStatistics};
+pub use write::{TypeTreeEncodeOutput, TypeTreeRewriteOutput, TypeTreeRewriteStats};
 pub use write_error::{TypeTreeWriteError, TypeTreeWriteResult};

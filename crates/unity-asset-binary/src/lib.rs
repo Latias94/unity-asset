@@ -1,6 +1,6 @@
-//! Unity Binary Asset Parser
+//! Unity binary asset wire-format engine.
 //!
-//! This crate provides functionality to parse Unity binary file formats including:
+//! This crate provides canonical parsing, inspection, and TypeTree wire execution for:
 //! - AssetBundle files (.bundle, .unity3d)
 //! - Serialized Asset files (.assets)
 //! - Resource files
@@ -9,13 +9,14 @@
 //!
 //! - **AssetBundle parsing**: Support for UnityFS format
 //! - **Compression support**: LZ4, LZMA, and other compression formats
-//! - **TypeTree parsing**: Dynamic type information for objects
+//! - **TypeTree execution**: Read, skip, scan, validate, encode, and byte-preserving rewrite
 //! - **Object extraction**: Extract Unity objects from binary data
 //!
 //! ## Feature Flags
 //!
-//! This crate is intentionally **parser-only**.
-//! For decoding/export helpers (Texture/Audio/Sprite), use the `unity-asset-decode` crate.
+//! This crate owns wire-format rules, not editing workflows or publication. For guarded object
+//! mutation and prepared artifacts, use `unity-asset-write`; for Texture/Audio/Sprite decoding and
+//! export helpers, use `unity-asset-decode`.
 //!
 //! # Example
 //!

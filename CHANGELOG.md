@@ -23,7 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - **Breaking:** Replaced mutable high-level loading and editing with `AssetWorkspace`, immutable `WorkspaceView` values, guarded plans, prepare, preview, recoverable commit, and explicit recovery.
 - **Breaking:** Replaced broad text-oriented CLI inspection and export surfaces with typed `workspace`, `references`, `extract`, and `split-yaml` commands that exchange versioned JSON contracts.
-- Unified TypeTree read, skip, PPtr scan, write, and byte-preserving rewrite on one compiled `TypeTreeSchema`, including unsigned values, numeric bulk paths, and exact unnamed-field preservation.
+- **Breaking:** Unified TypeTree read, skip, PPtr scan, validation, encoding, and byte-preserving rewrite on one compiled `TypeTreeSchema`; TypeTree write errors now use `TypeTreeWriteError`, and `unity_asset_write::Endian` was replaced by the shared `ByteOrder`.
 - Made JSON and TPK TypeTree ingestion caller-budgeted, deterministic, depth-bounded, and immutable; workspace loads retain only required schemas in frozen per-source registries.
 - Reworked source loading, archive/WebFile/bundle expansion, edits, serialization, and publication to stage complete candidate state before one authority-changing commit.
 - Replaced contiguous output images with budgeted seekable segment graphs that retain unchanged source ranges, independently reparse candidate artifacts, and stream verified bytes during publication.

@@ -4,51 +4,30 @@ use std::mem::size_of;
 use std::ops::Range;
 
 use indexmap::IndexMap;
-use unity_asset_binary::BinaryError;
-use unity_asset_binary::reader::{BinaryReader, ByteOrder};
-use unity_asset_binary::typetree::{
+use unity_asset_core::{AssetLoadBudget, UnityValue};
+
+use crate::BinaryError;
+use crate::reader::{BinaryReader, ByteOrder};
+use crate::typetree::{
     PPtrLayout, PairLayout, SchemaNode, SemanticKind, SemanticLayout, SequenceLayout,
     TypeTreeSchema, TypeTreeTraversalContext, TypeTreeTraversalStats, TypeTreeWriteError,
     TypeTreeWriteResult as Result,
 };
-use unity_asset_core::{AssetLoadBudget, UnityValue};
 
+use super::TypeTreeRewriteStats;
 use super::output::TypeTreeOutput;
 use super::primitives::{checked_i32_length, expect_pair, summarize_value, usize_to_u64};
 use super::writer::{
-    encode_object, validate_object_shape, validate_pptr_file_id, validate_pptr_path_id, write_value,
+    validate_object_shape, validate_pptr_file_id, validate_pptr_path_id, write_value,
 };
-use crate::binary_writer::Endian;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TemplateRewriteStats {
-    pub(crate) input: TypeTreeTraversalStats,
-    pub(crate) output: TypeTreeTraversalStats,
-    pub(crate) preserved_bytes: u64,
-}
 
 pub(crate) fn rewrite_object(
     schema: &TypeTreeSchema,
     properties: &IndexMap<String, UnityValue>,
     original_bytes: &[u8],
-    endian: Endian,
+    byte_order: ByteOrder,
     budget: &mut AssetLoadBudget,
-) -> Result<(Vec<u8>, TemplateRewriteStats)> {
-    if original_bytes.is_empty() {
-        let (bytes, output) = encode_object(schema, properties, endian, budget)?;
-        return Ok((
-            bytes,
-            TemplateRewriteStats {
-                output,
-                ..TemplateRewriteStats::default()
-            },
-        ));
-    }
-
-    let byte_order = match endian {
-        Endian::Big => ByteOrder::Big,
-        Endian::Little => ByteOrder::Little,
-    };
+) -> Result<(Vec<u8>, TypeTreeRewriteStats)> {
     let mut reader = BinaryReader::new(original_bytes, byte_order);
     let mut planner = RewritePlanner::new(original_bytes);
     planner.plan_record(
@@ -61,7 +40,8 @@ pub(crate) fn rewrite_object(
         0,
     )?;
 
-    let root_end = position_to_usize(reader.position(), "TypeTree root extent")?;
+    let root_end =
+        template_position_to_usize(schema.root(), "locate object extent", reader.position())?;
     if root_end < original_bytes.len() {
         planner.push(
             RewriteAction::PreserveTail {
@@ -73,7 +53,7 @@ pub(crate) fn rewrite_object(
 
     let (actions, input) = planner.finish();
     let original = original_bytes;
-    let mut output = TypeTreeOutput::new(endian, budget);
+    let mut output = TypeTreeOutput::new(byte_order, budget);
     let mut preserved_bytes = 0_u64;
 
     for action in actions {
@@ -89,7 +69,7 @@ pub(crate) fn rewrite_object(
                     output.enter_node(depth)?;
                     copy_range(&mut output, original, range, &mut preserved_bytes)?;
                 } else {
-                    write_value(schema, node, value, endian, &mut output, context, depth)?;
+                    write_value(schema, node, value, byte_order, &mut output, context, depth)?;
                 }
             }
             RewriteAction::PreserveOpaque { range, node, depth } => {
@@ -115,7 +95,7 @@ pub(crate) fn rewrite_object(
                 context,
                 depth,
             } => {
-                write_value(schema, node, value, endian, &mut output, context, depth)?;
+                write_value(schema, node, value, byte_order, &mut output, context, depth)?;
             }
             RewriteAction::EnterComposite { depth, members } => {
                 output.enter_node(depth)?;
@@ -166,7 +146,7 @@ pub(crate) fn rewrite_object(
     let (bytes, output_stats) = output.finish();
     Ok((
         bytes,
-        TemplateRewriteStats {
+        TypeTreeRewriteStats {
             input,
             output: output_stats,
             preserved_bytes,
@@ -534,7 +514,13 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
                 context,
                 child_depth,
             )?;
-            checked_range(element_start, reader.position(), self.original.len())?;
+            checked_template_range(
+                node,
+                "scan sequence element extent",
+                element_start,
+                reader.position(),
+                self.original.len(),
+            )?;
         }
 
         for _ in shared_length..header.length {
@@ -545,7 +531,13 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
                     template_input_error(node, "scan removed sequence element", error)
                 })?;
             self.observe_input(stats)?;
-            checked_range(element_start, reader.position(), self.original.len())?;
+            checked_template_range(
+                node,
+                "scan removed sequence element extent",
+                element_start,
+                reader.position(),
+                self.original.len(),
+            )?;
         }
 
         for value in values.iter().skip(header.length) {
@@ -574,21 +566,35 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
 
         let start = reader.position();
         let end = start.checked_add(HEADER_BYTES).ok_or_else(|| {
-            TypeTreeWriteError::invalid_value("TypeTree rewrite sequence header position overflow")
+            template_input_error(
+                node,
+                "read sequence header",
+                BinaryError::invalid_data("TypeTree sequence header position overflow"),
+            )
         })?;
-        let range = checked_range(start, end, self.original.len())?;
+        let range = checked_template_range(
+            node,
+            "read sequence header",
+            start,
+            end,
+            self.original.len(),
+        )?;
         let encoded: [u8; 4] = self
             .original
             .get(range.clone())
             .ok_or_else(|| {
-                TypeTreeWriteError::invalid_value(
-                    "TypeTree rewrite sequence header is outside its input",
+                template_input_error(
+                    node,
+                    "read sequence header",
+                    BinaryError::invalid_data("TypeTree sequence header is outside its input"),
                 )
             })?
             .try_into()
             .map_err(|_| {
-                TypeTreeWriteError::invalid_value(
-                    "TypeTree rewrite sequence header has invalid extent",
+                template_input_error(
+                    node,
+                    "read sequence header",
+                    BinaryError::invalid_data("TypeTree sequence header has invalid extent"),
                 )
             })?;
         let raw_length = match reader.byte_order() {
@@ -627,9 +633,9 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
         budget.consume_bytes(HEADER_BYTES).map_err(|error| {
             TypeTreeWriteError::budget("charge TypeTree input sequence header", error)
         })?;
-        reader.set_position(end).map_err(|error| {
-            TypeTreeWriteError::binary("advance TypeTree input sequence header", error)
-        })?;
+        reader
+            .set_position(end)
+            .map_err(|error| template_input_error(node, "advance sequence header", error))?;
 
         self.input.node_visits = node_visits;
         self.input.wire_bytes = wire_bytes;
@@ -682,7 +688,13 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
             .compare_value_with_context(reader, budget, node, context, depth, value)
             .map_err(|error| template_input_error(node, "compare value", error))?;
         self.observe_input(stats)?;
-        let range = checked_range(start, reader.position(), self.original.len())?;
+        let range = checked_template_range(
+            node,
+            "compare value",
+            start,
+            reader.position(),
+            self.original.len(),
+        )?;
         if equal {
             self.push(
                 RewriteAction::PreserveOrEncode {
@@ -721,7 +733,13 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
             .skip_value_with_context(reader, budget, node, context, depth)
             .map_err(|error| template_input_error(node, "scan unnamed field", error))?;
         self.observe_input(stats)?;
-        let range = checked_range(start, reader.position(), self.original.len())?;
+        let range = checked_template_range(
+            node,
+            "scan unnamed field",
+            start,
+            reader.position(),
+            self.original.len(),
+        )?;
         self.push(RewriteAction::PreserveOpaque { range, node, depth }, budget)
     }
 
@@ -738,18 +756,28 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
         let payload_end = reader.position();
         let padding = (4 - payload_end % 4) % 4;
         let aligned_end = payload_end.checked_add(padding).ok_or_else(|| {
-            TypeTreeWriteError::invalid_value("TypeTree rewrite input alignment overflow")
+            template_input_error(
+                node,
+                "align input",
+                BinaryError::invalid_data("TypeTree input alignment position overflow"),
+            )
         })?;
-        let original_padding = checked_range(payload_end, aligned_end, self.original.len())?;
+        let original_padding = checked_template_range(
+            node,
+            "align input",
+            payload_end,
+            aligned_end,
+            self.original.len(),
+        )?;
         let wire_bytes = self.input.wire_bytes.checked_add(padding).ok_or_else(|| {
             TypeTreeWriteError::invalid_value("TypeTree rewrite input wire byte counter overflow")
         })?;
         budget
             .check_bytes(padding)
             .map_err(|error| TypeTreeWriteError::budget("check TypeTree input padding", error))?;
-        reader.set_position(aligned_end).map_err(|error| {
-            TypeTreeWriteError::binary("advance TypeTree input alignment", error)
-        })?;
+        reader
+            .set_position(aligned_end)
+            .map_err(|error| template_input_error(node, "advance input alignment", error))?;
         budget
             .consume_bytes(padding)
             .map_err(|error| TypeTreeWriteError::budget("charge TypeTree input padding", error))?;
@@ -867,13 +895,23 @@ fn template_input_error(
     )
 }
 
-fn checked_range(start: u64, end: u64, len: usize) -> Result<Range<usize>> {
-    let start = position_to_usize(start, "TypeTree range start")?;
-    let end = position_to_usize(end, "TypeTree range end")?;
+fn checked_template_range(
+    node: SchemaNode<'_>,
+    operation: &'static str,
+    start: u64,
+    end: u64,
+    len: usize,
+) -> Result<Range<usize>> {
+    let start = template_position_to_usize(node, operation, start)?;
+    let end = template_position_to_usize(node, operation, end)?;
     if start > end || end > len {
-        return Err(TypeTreeWriteError::invalid_value(format!(
-            "TypeTree rewrite range {start}..{end} exceeds original length {len}"
-        )));
+        return Err(template_input_error(
+            node,
+            operation,
+            BinaryError::invalid_data(format!(
+                "TypeTree template range {start}..{end} exceeds input length {len}"
+            )),
+        ));
     }
     Ok(start..end)
 }
@@ -894,20 +932,29 @@ fn next_depth(depth: u32) -> Result<u32> {
         .ok_or_else(|| TypeTreeWriteError::invalid_value("TypeTree rewrite depth overflow"))
 }
 
-fn position_to_usize(value: u64, label: &str) -> Result<usize> {
+fn template_position_to_usize(
+    node: SchemaNode<'_>,
+    operation: &'static str,
+    value: u64,
+) -> Result<usize> {
     usize::try_from(value).map_err(|_| {
-        TypeTreeWriteError::invalid_value(format!("{label} does not fit usize: {value}"))
+        template_input_error(
+            node,
+            operation,
+            BinaryError::invalid_data(format!(
+                "TypeTree template position does not fit usize: {value}"
+            )),
+        )
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{aligned, map, node, pptr, record, sequence};
+    use super::super::writer::encode_object;
     use super::*;
-    use unity_asset_binary::asset::SerializedType;
-    use unity_asset_binary::typetree::{
-        TypeTree, TypeTreeNode, TypeTreeParseMode, TypeTreeParseOptions,
-    };
+    use crate::asset::SerializedType;
+    use crate::typetree::{TypeTree, TypeTreeNode, TypeTreeParseMode, TypeTreeParseOptions};
     use unity_asset_core::{AssetLoadLimits, BudgetError};
 
     fn registry(name: &str) -> TypeTreeNode {
@@ -940,8 +987,14 @@ mod tests {
         let mut budget = AssetLoadBudget::default();
         let schema = schema(root, &mut budget);
 
-        let (rewritten, stats) =
-            rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget).unwrap();
+        let (rewritten, stats) = rewrite_object(
+            &schema,
+            &properties,
+            &original,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap();
 
         assert_eq!(rewritten, original);
         assert_eq!(stats.preserved_bytes, original.len() as u64);
@@ -965,7 +1018,7 @@ mod tests {
                 &schema,
                 &properties,
                 &original,
-                Endian::Little,
+                ByteOrder::Little,
                 &mut rewrite_budget,
             ),
             Err(TypeTreeWriteError::Budget {
@@ -1026,8 +1079,14 @@ mod tests {
         let mut budget = AssetLoadBudget::default();
         let schema = schema(root, &mut budget);
 
-        let (rewritten, stats) =
-            rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget).unwrap();
+        let (rewritten, stats) = rewrite_object(
+            &schema,
+            &properties,
+            &original,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap();
 
         assert_eq!(rewritten, original);
         assert_eq!(stats.input.node_visits, 4);
@@ -1052,7 +1111,13 @@ mod tests {
         let schema = schema(root, &mut budget);
 
         assert!(matches!(
-            rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget,),
+            rewrite_object(
+                &schema,
+                &properties,
+                &original,
+                ByteOrder::Little,
+                &mut budget,
+            ),
             Err(TypeTreeWriteError::Shape {
                 expected_fields: 1,
                 actual_fields: 2,
@@ -1117,7 +1182,7 @@ mod tests {
         let mut budget = AssetLoadBudget::default();
         let schema = schema(root, &mut budget);
         let (encoded, _) =
-            encode_object(&schema, &properties, Endian::Little, &mut budget).unwrap();
+            encode_object(&schema, &properties, ByteOrder::Little, &mut budget).unwrap();
 
         let mut expected = Vec::new();
         expected.extend_from_slice(&7_i32.to_le_bytes());
@@ -1135,8 +1200,8 @@ mod tests {
             .read_object(
                 &mut reader,
                 &mut budget,
-                unity_asset_binary::typetree::TypeTreeParseOptions {
-                    mode: unity_asset_binary::typetree::TypeTreeParseMode::Strict,
+                crate::typetree::TypeTreeParseOptions {
+                    mode: crate::typetree::TypeTreeParseMode::Strict,
                 },
             )
             .unwrap();
@@ -1155,8 +1220,14 @@ mod tests {
         assert!(scan.external.is_empty());
         assert_eq!(reader.position(), encoded.len() as u64);
 
-        let (rewritten, _) =
-            rewrite_object(&schema, &properties, &encoded, Endian::Little, &mut budget).unwrap();
+        let (rewritten, _) = rewrite_object(
+            &schema,
+            &properties,
+            &encoded,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap();
         assert_eq!(rewritten, encoded);
     }
 
@@ -1272,15 +1343,15 @@ mod tests {
             let mut budget = AssetLoadBudget::default();
             let schema = schema_with_refs(root, &[managed_type], &mut budget);
             let (encoded, _) =
-                encode_object(&schema, &properties, Endian::Little, &mut budget).unwrap();
+                encode_object(&schema, &properties, ByteOrder::Little, &mut budget).unwrap();
 
             let mut reader = BinaryReader::new(&encoded, ByteOrder::Little);
             let read = schema
                 .read_object(
                     &mut reader,
                     &mut budget,
-                    unity_asset_binary::typetree::TypeTreeParseOptions {
-                        mode: unity_asset_binary::typetree::TypeTreeParseMode::Strict,
+                    crate::typetree::TypeTreeParseOptions {
+                        mode: crate::typetree::TypeTreeParseMode::Strict,
                     },
                 )
                 .unwrap();
@@ -1304,9 +1375,14 @@ mod tests {
             assert!(scan.external.is_empty());
             assert_eq!(reader.position(), encoded.len() as u64);
 
-            let (preserved, _) =
-                rewrite_object(&schema, &properties, &encoded, Endian::Little, &mut budget)
-                    .unwrap();
+            let (preserved, _) = rewrite_object(
+                &schema,
+                &properties,
+                &encoded,
+                ByteOrder::Little,
+                &mut budget,
+            )
+            .unwrap();
             assert_eq!(preserved, encoded);
 
             let reference = properties
@@ -1318,9 +1394,14 @@ mod tests {
                 .and_then(UnityValue::as_object_mut)
                 .unwrap()
                 .insert("m_ManagedPtr".to_owned(), pointer_value(404));
-            let (rewritten, _) =
-                rewrite_object(&schema, &properties, &encoded, Endian::Little, &mut budget)
-                    .unwrap();
+            let (rewritten, _) = rewrite_object(
+                &schema,
+                &properties,
+                &encoded,
+                ByteOrder::Little,
+                &mut budget,
+            )
+            .unwrap();
             let mut reader = BinaryReader::new(&rewritten, ByteOrder::Little);
             assert_eq!(
                 schema
@@ -1351,8 +1432,14 @@ mod tests {
         let mut budget = AssetLoadBudget::default();
         let schema = schema(root, &mut budget);
 
-        let (rewritten, _) =
-            rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget).unwrap();
+        let (rewritten, _) = rewrite_object(
+            &schema,
+            &properties,
+            &original,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap();
 
         let mut expected = 2_i32.to_le_bytes().to_vec();
         expected.extend_from_slice(&[0x7f, 0xa1, 0xb2, 0xc3]);
@@ -1397,7 +1484,7 @@ mod tests {
             &schema,
             &properties,
             &original,
-            Endian::Little,
+            ByteOrder::Little,
             &mut rewrite_budget,
         )
         .expect("existing sequence elements must retain unnamed template fields");
@@ -1438,7 +1525,7 @@ mod tests {
             &schema,
             &properties,
             &original,
-            Endian::Little,
+            ByteOrder::Little,
             &mut rewrite_budget,
         )
         .unwrap();
@@ -1481,7 +1568,7 @@ mod tests {
             &schema,
             &properties,
             &original,
-            Endian::Little,
+            ByteOrder::Little,
             &mut rewrite_budget,
         )
         .expect_err("a new element cannot borrow an unnamed field from an existing element");
@@ -1528,7 +1615,7 @@ mod tests {
             &schema,
             &properties,
             &original,
-            Endian::Little,
+            ByteOrder::Little,
             &mut rewrite_budget,
         )
         .unwrap();
@@ -1552,8 +1639,14 @@ mod tests {
         let mut budget = AssetLoadBudget::default();
         let schema = schema(root, &mut budget);
 
-        let (rewritten, _) =
-            rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget).unwrap();
+        let (rewritten, _) = rewrite_object(
+            &schema,
+            &properties,
+            &original,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap();
 
         let mut expected = 4_i32.to_le_bytes().to_vec();
         expected.extend_from_slice(&[1, 2, 3, 4, 0x7f, 0, 0, 0]);
@@ -1577,8 +1670,14 @@ mod tests {
         let mut budget = AssetLoadBudget::default();
         let schema = schema(root, &mut budget);
 
-        let (rewritten, _) =
-            rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget).unwrap();
+        let (rewritten, _) = rewrite_object(
+            &schema,
+            &properties,
+            &original,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap();
 
         assert_eq!(rewritten, [1, 0, 0, 0, 0x11, 0, 0, 0, 0x7f]);
     }
@@ -1603,8 +1702,14 @@ mod tests {
         let schema = schema(root, &mut compile_budget);
         let mut budget = AssetLoadBudget::default();
 
-        let (rewritten, stats) =
-            rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget).unwrap();
+        let (rewritten, stats) = rewrite_object(
+            &schema,
+            &properties,
+            &original,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap();
 
         let mut expected = 1_i32.to_le_bytes().to_vec();
         expected.push(0x11);
@@ -1686,12 +1791,19 @@ mod tests {
         assert_eq!(reader.position(), 0);
 
         let mut budget = AssetLoadBudget::new(depth_limits).unwrap();
-        let error = encode_object(&schema, &properties, Endian::Little, &mut budget).unwrap_err();
+        let error =
+            encode_object(&schema, &properties, ByteOrder::Little, &mut budget).unwrap_err();
         assert!(error.to_string().contains("depth"));
 
         let mut budget = AssetLoadBudget::new(depth_limits).unwrap();
-        let error = rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget)
-            .expect_err("depth-two atomic field must exceed max_depth one");
+        let error = rewrite_object(
+            &schema,
+            &properties,
+            &original,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .expect_err("depth-two atomic field must exceed max_depth one");
 
         assert!(error.to_string().contains("depth"));
         assert_eq!(budget.usage().max_observed_depth, 1);
@@ -1726,14 +1838,14 @@ mod tests {
         let schema = schema(root, &mut compile_budget);
         let mut encode_budget = AssetLoadBudget::default();
         let (original, _) =
-            encode_object(&schema, &properties, Endian::Little, &mut encode_budget).unwrap();
+            encode_object(&schema, &properties, ByteOrder::Little, &mut encode_budget).unwrap();
         let mut rewrite_budget = AssetLoadBudget::default();
 
         let (rewritten, stats) = rewrite_object(
             &schema,
             &properties,
             &original,
-            Endian::Little,
+            ByteOrder::Little,
             &mut rewrite_budget,
         )
         .unwrap();
@@ -1762,7 +1874,7 @@ mod tests {
             &schema,
             &changed,
             &original,
-            Endian::Little,
+            ByteOrder::Little,
             &mut changed_budget,
         )
         .unwrap();
@@ -1839,8 +1951,14 @@ mod tests {
             assert_eq!(reader.position(), 4);
         }
         let mut budget = AssetLoadBudget::default();
-        let error = rewrite_object(&schema, &properties, &negative, Endian::Little, &mut budget)
-            .unwrap_err();
+        let error = rewrite_object(
+            &schema,
+            &properties,
+            &negative,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1875,8 +1993,8 @@ mod tests {
             assert_eq!(reader.position(), 4);
         }
         let mut budget = AssetLoadBudget::new(member_limits).unwrap();
-        let error =
-            rewrite_object(&schema, &properties, &huge, Endian::Little, &mut budget).unwrap_err();
+        let error = rewrite_object(&schema, &properties, &huge, ByteOrder::Little, &mut budget)
+            .unwrap_err();
         assert!(error.to_string().contains("members"));
 
         let oversized_properties = IndexMap::from([(
@@ -1884,8 +2002,13 @@ mod tests {
             UnityValue::Array(vec![UnityValue::Integer(0); 9]),
         )]);
         let mut budget = AssetLoadBudget::new(member_limits).unwrap();
-        let error =
-            encode_object(&schema, &oversized_properties, Endian::Little, &mut budget).unwrap_err();
+        let error = encode_object(
+            &schema,
+            &oversized_properties,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("members"));
     }
 
@@ -1945,12 +2068,12 @@ mod tests {
         assert_eq!(reader.position(), 4);
 
         let mut budget = AssetLoadBudget::new(limits).unwrap();
-        let mut output = TypeTreeOutput::new(Endian::Little, &mut budget);
+        let mut output = TypeTreeOutput::new(ByteOrder::Little, &mut budget);
         let write_error = write_value(
             &schema,
             sequence,
             &UnityValue::Array(Vec::new()),
-            Endian::Little,
+            ByteOrder::Little,
             &mut output,
             TypeTreeTraversalContext::root(),
             u32::MAX,
@@ -2011,7 +2134,7 @@ mod tests {
         let schema = schema_with_refs(root, &[managed_type], &mut compile_budget);
         let mut encode_budget = AssetLoadBudget::default();
         let (encoded, _) =
-            encode_object(&schema, &properties, Endian::Little, &mut encode_budget).unwrap();
+            encode_object(&schema, &properties, ByteOrder::Little, &mut encode_budget).unwrap();
         let limits = AssetLoadLimits {
             max_depth: 3,
             ..AssetLoadLimits::default()
@@ -2048,13 +2171,20 @@ mod tests {
         assert_eq!(failure_boundary, Some(36));
 
         let mut budget = AssetLoadBudget::new(limits).unwrap();
-        let error = encode_object(&schema, &properties, Endian::Little, &mut budget).unwrap_err();
+        let error =
+            encode_object(&schema, &properties, ByteOrder::Little, &mut budget).unwrap_err();
         assert!(error.to_string().contains("depth"));
         assert_eq!(budget.usage().max_observed_depth, 3);
 
         let mut budget = AssetLoadBudget::new(limits).unwrap();
-        let error = rewrite_object(&schema, &properties, &encoded, Endian::Little, &mut budget)
-            .unwrap_err();
+        let error = rewrite_object(
+            &schema,
+            &properties,
+            &encoded,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("depth"));
         assert_eq!(budget.usage().max_observed_depth, 3);
     }
@@ -2079,15 +2209,21 @@ mod tests {
         let mut budget = AssetLoadBudget::default();
         let schema = schema(root, &mut budget);
 
-        let (rewritten, stats) =
-            rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget).unwrap();
+        let (rewritten, stats) = rewrite_object(
+            &schema,
+            &properties,
+            &original,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap();
 
         assert_eq!(rewritten, original);
         assert_eq!(stats.preserved_bytes, original.len() as u64);
     }
 
     #[test]
-    fn every_adapter_consumes_the_same_extent_in_both_endian_modes() {
+    fn every_adapter_consumes_the_same_extent_in_both_byte_orders() {
         let mut root = record(vec![
             node("UInt64", "m_Id"),
             pptr("m_Target"),
@@ -2116,15 +2252,12 @@ mod tests {
             ])]),
         );
 
-        for (endian, byte_order) in [
-            (Endian::Little, ByteOrder::Little),
-            (Endian::Big, ByteOrder::Big),
-        ] {
+        for byte_order in [ByteOrder::Little, ByteOrder::Big] {
             let mut compile_budget = AssetLoadBudget::default();
             let schema = schema(root.clone(), &mut compile_budget);
             let mut write_budget = AssetLoadBudget::default();
             let (encoded, write_stats) =
-                encode_object(&schema, &properties, endian, &mut write_budget).unwrap();
+                encode_object(&schema, &properties, byte_order, &mut write_budget).unwrap();
             assert!(write_stats.bulk_runs > 0);
 
             let mut read_budget = AssetLoadBudget::default();
@@ -2133,8 +2266,8 @@ mod tests {
                 .read_object(
                     &mut reader,
                     &mut read_budget,
-                    unity_asset_binary::typetree::TypeTreeParseOptions {
-                        mode: unity_asset_binary::typetree::TypeTreeParseMode::Strict,
+                    crate::typetree::TypeTreeParseOptions {
+                        mode: crate::typetree::TypeTreeParseMode::Strict,
                     },
                 )
                 .unwrap();
@@ -2157,9 +2290,14 @@ mod tests {
             assert_eq!(reader.position(), encoded.len() as u64);
 
             let mut rewrite_budget = AssetLoadBudget::default();
-            let (rewritten, _) =
-                rewrite_object(&schema, &properties, &encoded, endian, &mut rewrite_budget)
-                    .unwrap();
+            let (rewritten, _) = rewrite_object(
+                &schema,
+                &properties,
+                &encoded,
+                byte_order,
+                &mut rewrite_budget,
+            )
+            .unwrap();
             assert_eq!(rewritten, encoded);
         }
     }
@@ -2183,7 +2321,7 @@ mod tests {
         let mut budget = AssetLoadBudget::default();
         let schema = schema(record(vec![pointer]), &mut budget);
         let (encoded, _) =
-            encode_object(&schema, &properties, Endian::Little, &mut budget).unwrap();
+            encode_object(&schema, &properties, ByteOrder::Little, &mut budget).unwrap();
 
         let mut reader = BinaryReader::new(&encoded, ByteOrder::Little);
         let scan = schema.scan_pptrs(&mut reader, &mut budget).unwrap();
@@ -2191,8 +2329,14 @@ mod tests {
         assert_eq!(scan.stats.unity_values_materialized, 0);
         assert_eq!(reader.position(), encoded.len() as u64);
 
-        let (rewritten, stats) =
-            rewrite_object(&schema, &properties, &encoded, Endian::Little, &mut budget).unwrap();
+        let (rewritten, stats) = rewrite_object(
+            &schema,
+            &properties,
+            &encoded,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap();
         assert_eq!(rewritten, encoded);
         assert_eq!(stats.preserved_bytes, encoded.len() as u64);
         assert_eq!(stats.input.unity_values_materialized, 0);
@@ -2228,8 +2372,14 @@ mod tests {
         let mut budget = AssetLoadBudget::default();
         let schema = schema(record(vec![pointer]), &mut budget);
 
-        let (rewritten, stats) =
-            rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget).unwrap();
+        let (rewritten, stats) = rewrite_object(
+            &schema,
+            &properties,
+            &original,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap();
 
         assert_eq!(&rewritten[..4], &2_i32.to_le_bytes());
         assert_eq!(&rewritten[4..12], extension_bytes);
@@ -2259,8 +2409,14 @@ mod tests {
         let mut budget = AssetLoadBudget::default();
         let schema = schema(record(vec![pointer]), &mut budget);
 
-        let (rewritten, stats) =
-            rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget).unwrap();
+        let (rewritten, stats) = rewrite_object(
+            &schema,
+            &properties,
+            &original,
+            ByteOrder::Little,
+            &mut budget,
+        )
+        .unwrap();
 
         assert_eq!(&rewritten[..4], &3_i32.to_le_bytes());
         assert_eq!(&rewritten[4..8], &opaque);

@@ -2,17 +2,18 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
-use unity_asset_binary::reader::{BinaryReader, ByteOrder};
-use unity_asset_binary::typetree::{
+use unity_asset_core::{AssetLoadBudget, AssetLoadUsage, UnityValue};
+
+use crate::reader::{BinaryReader, ByteOrder};
+use crate::typetree::{
     TypeTree, TypeTreeNode, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeSchema,
     TypeTreeTraversalStats,
 };
-use unity_asset_core::{AssetLoadBudget, AssetLoadUsage, UnityValue};
 
-use super::template::{TemplateRewriteStats, rewrite_object};
+use super::TypeTreeRewriteStats;
+use super::template::rewrite_object;
 use super::test_support::{aligned, map, node, pptr, record, sequence};
 use super::writer::encode_object;
-use crate::binary_writer::Endian;
 
 const LARGE_BYTE_COUNT: usize = 256 * 1024;
 const LARGE_SIGNED_BYTE_COUNT: usize = 64 * 1024;
@@ -59,7 +60,7 @@ struct RewriteObservation {
 }
 
 impl RewriteObservation {
-    fn new(stats: TemplateRewriteStats, usage: AssetLoadUsage) -> Self {
+    fn new(stats: TypeTreeRewriteStats, usage: AssetLoadUsage) -> Self {
         let traversed_wire = stats
             .input
             .wire_bytes
@@ -135,7 +136,7 @@ fn rewrite_comparison_borrows_large_payloads_and_nested_values() {
     let (wire, _) = encode_object(
         &fixture.schema,
         &fixture.properties,
-        Endian::Little,
+        ByteOrder::Little,
         &mut encode_budget,
     )
     .expect("borrowed fixture must encode");
@@ -145,7 +146,7 @@ fn rewrite_comparison_borrows_large_payloads_and_nested_values() {
         &fixture.schema,
         &fixture.properties,
         &wire,
-        Endian::Little,
+        ByteOrder::Little,
         &mut rewrite_budget,
     )
     .expect("borrowed fixture must rewrite without changes");
@@ -176,7 +177,7 @@ fn rewrite_comparison_borrows_large_payloads_and_nested_values() {
         &fixture.schema,
         &changed,
         &wire,
-        Endian::Little,
+        ByteOrder::Little,
         &mut changed_budget,
     )
     .expect("borrowed fixture must rewrite a nested change");
@@ -240,7 +241,7 @@ fn characterize(fixture: &Fixture) -> Characterization {
     let (wire, write_stats) = encode_object(
         &fixture.schema,
         &fixture.properties,
-        Endian::Little,
+        ByteOrder::Little,
         &mut write_budget,
     )
     .expect("fixture must encode");
@@ -291,7 +292,7 @@ fn characterize(fixture: &Fixture) -> Characterization {
         &fixture.schema,
         &fixture.properties,
         &wire,
-        Endian::Little,
+        ByteOrder::Little,
         &mut rewrite_budget,
     )
     .expect("fixture must rewrite");
@@ -865,7 +866,7 @@ fn encoded_fixture(fixture: &Fixture) -> Vec<u8> {
     encode_object(
         &fixture.schema,
         &fixture.properties,
-        Endian::Little,
+        ByteOrder::Little,
         &mut budget,
     )
     .expect("fixture must encode")
@@ -912,7 +913,7 @@ fn run_sample_iteration(adapter: Adapter, fixture: &Fixture, wire: &[u8]) -> Sam
             let (output, stats) = encode_object(
                 &fixture.schema,
                 &fixture.properties,
-                Endian::Little,
+                ByteOrder::Little,
                 &mut budget,
             )
             .expect("sample write must succeed");
@@ -924,7 +925,7 @@ fn run_sample_iteration(adapter: Adapter, fixture: &Fixture, wire: &[u8]) -> Sam
                 &fixture.schema,
                 &fixture.properties,
                 wire,
-                Endian::Little,
+                ByteOrder::Little,
                 &mut budget,
             )
             .expect("sample rewrite must succeed");

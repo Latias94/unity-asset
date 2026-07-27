@@ -218,7 +218,7 @@ fn visit_preorder<'tree>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BinaryWriter, Endian};
+    use crate::{BinaryWriter, ByteOrder};
 
     #[test]
     fn typetree_legacy_dump_v2_includes_variable_count() {
@@ -237,10 +237,10 @@ mod tests {
         let mut tree = TypeTree::new();
         tree.nodes = vec![root];
 
-        let mut writer = BinaryWriter::new(Endian::Big);
+        let mut writer = BinaryWriter::new(ByteOrder::Big);
         tree.version = 2;
-        let endian = writer.endian();
-        let mut sink = EndianSink::new(&mut writer, endian);
+        let byte_order = writer.byte_order();
+        let mut sink = EndianSink::new(&mut writer, byte_order);
         dump_typetree_to(&tree, &mut sink, SerializedFileFormat::new(2).unwrap()).unwrap();
         let out = writer.into_result().unwrap();
 

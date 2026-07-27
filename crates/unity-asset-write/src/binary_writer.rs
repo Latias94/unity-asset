@@ -1,11 +1,5 @@
+use unity_asset_binary::reader::ByteOrder;
 use unity_asset_core::{Result, UnityAssetError};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Endian {
-    Big,
-    #[default]
-    Little,
-}
 
 /// An in-memory binary writer with UnityPy-like ergonomics.
 ///
@@ -15,38 +9,38 @@ pub enum Endian {
 /// - supports `align_stream`
 #[derive(Debug, Clone)]
 pub struct BinaryWriter {
-    endian: Endian,
+    byte_order: ByteOrder,
     buf: Vec<u8>,
     pos: usize,
     error: Option<String>,
 }
 
 impl BinaryWriter {
-    pub fn new(endian: Endian) -> Self {
+    pub fn new(byte_order: ByteOrder) -> Self {
         Self {
-            endian,
+            byte_order,
             buf: Vec::new(),
             pos: 0,
             error: None,
         }
     }
 
-    pub fn with_bytes(endian: Endian, bytes: Vec<u8>) -> Self {
+    pub fn with_bytes(byte_order: ByteOrder, bytes: Vec<u8>) -> Self {
         let pos = bytes.len();
         Self {
-            endian,
+            byte_order,
             buf: bytes,
             pos,
             error: None,
         }
     }
 
-    pub fn endian(&self) -> Endian {
-        self.endian
+    pub const fn byte_order(&self) -> ByteOrder {
+        self.byte_order
     }
 
-    pub fn set_endian(&mut self, endian: Endian) {
-        self.endian = endian;
+    pub fn set_byte_order(&mut self, byte_order: ByteOrder) {
+        self.byte_order = byte_order;
     }
 
     pub fn position(&self) -> usize {
@@ -166,49 +160,49 @@ impl BinaryWriter {
     }
 
     pub fn write_u16(&mut self, value: u16) {
-        let bytes = match self.endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
+        let bytes = match self.byte_order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
         };
         self.write(&bytes);
     }
 
     pub fn write_i16(&mut self, value: i16) {
-        let bytes = match self.endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
+        let bytes = match self.byte_order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
         };
         self.write(&bytes);
     }
 
     pub fn write_u32(&mut self, value: u32) {
-        let bytes = match self.endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
+        let bytes = match self.byte_order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
         };
         self.write(&bytes);
     }
 
     pub fn write_i32(&mut self, value: i32) {
-        let bytes = match self.endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
+        let bytes = match self.byte_order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
         };
         self.write(&bytes);
     }
 
     pub fn write_u64(&mut self, value: u64) {
-        let bytes = match self.endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
+        let bytes = match self.byte_order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
         };
         self.write(&bytes);
     }
 
     pub fn write_i64(&mut self, value: i64) {
-        let bytes = match self.endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
+        let bytes = match self.byte_order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
         };
         self.write(&bytes);
     }
@@ -268,7 +262,7 @@ impl BinaryWriter {
 
 impl Default for BinaryWriter {
     fn default() -> Self {
-        Self::new(Endian::Little)
+        Self::new(ByteOrder::Little)
     }
 }
 
@@ -277,13 +271,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endian_writes_match_expected_bytes() {
-        let mut w = BinaryWriter::new(Endian::Big);
+    fn byte_order_writes_match_expected_bytes() {
+        let mut w = BinaryWriter::new(ByteOrder::Big);
         w.write_i32(0x0102_0304);
         w.write_u16(0x0506);
         assert_eq!(w.bytes(), &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
 
-        let mut w = BinaryWriter::new(Endian::Little);
+        let mut w = BinaryWriter::new(ByteOrder::Little);
         w.write_i32(0x0102_0304);
         w.write_u16(0x0506);
         assert_eq!(w.bytes(), &[0x04, 0x03, 0x02, 0x01, 0x06, 0x05]);

@@ -1,4 +1,4 @@
-use unity_asset_binary::typetree::TypeTreeNode;
+use crate::typetree::TypeTreeNode;
 
 pub(crate) fn node(type_name: &str, name: &str) -> TypeTreeNode {
     TypeTreeNode::with_info(type_name.to_owned(), name.to_owned(), -1)

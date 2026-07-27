@@ -20,6 +20,9 @@ This is the only non-historical document that names removed public symbols and c
 | `UnityClassRegistry` | Direct immutable class values and schema provenance; no constructor registry |
 | `PythonLikeUnityDocument` / `PythonLikeUnityClass` | Typed `YamlDocument`, `UnityClass`, `UnityValue`, and Workspace inspection |
 | `DynamicAccess` / `DynamicValue` | `UnityClass` and `UnityValue` typed accessors |
+| `UnityAssetError::TypeTreeShape` | `TypeTreeWriteError::Shape`; object mutations report `SerializedObjectEncodeError::ReplacementShape` |
+| `SerializedObjectEncodeError::{ReplacementValue, Rewrite}` with `UnityAssetError` sources | The same variants with `TypeTreeWriteError` sources |
+| `unity_asset_write::Endian` | `unity_asset_write::ByteOrder`, re-exported from `unity-asset-binary` |
 | Direct mutable class/document and `save*` APIs | `MutationPlan`, schema recipes, `prepare`, preview, and `commit` |
 | Legacy dependency/session graph types | `ReferenceGraph` |
 | Legacy export manifest and export sessions | `ExtractionRequest`, `ExtractionPlan`, `ExtractionManifest`, and `ExtractionReport` |
@@ -75,6 +78,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Registry order is deterministic: earlier paths take precedence. Runtime generator callbacks are
 not retained by snapshots.
+
+## Low-Level TypeTree Writes
+
+Canonical TypeTree validation, encoding, and byte-preserving rewrite now belong to the compiled
+`unity_asset_binary::typetree::TypeTreeSchema`. This is a breaking boundary change in the
+unreleased workspace release. Callers that inspect object-encoding errors must update their source
+matches from `UnityAssetError` to `TypeTreeWriteError`.
+
+`TypeTreeWriteError::Budget` is promoted to `SerializedObjectEncodeError::Budget`. A
+`TypeTreeWriteError::Shape` raised while applying a mutation becomes
+`SerializedObjectEncodeError::ReplacementShape`; other value-validation failures remain under
+`ReplacementValue`, and template failures remain under `Rewrite`.
 
 ## Source and Object Identity
 

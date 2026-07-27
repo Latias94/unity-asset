@@ -22,7 +22,7 @@ use unity_asset_write::object::{
 };
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
 use unity_asset_write::webfile::WebFilePackingPolicy;
-use unity_asset_write::{BinaryWriter, Endian, PackingPolicy, compress_lzma_unity_with_size};
+use unity_asset_write::{BinaryWriter, PackingPolicy, compress_lzma_unity_with_size};
 
 use support::{OrderedBundleEntry, ordered_bundle_entries, prepare_bundle_bytes};
 use webfile_support::{ordered_webfile_members, prepare_webfile_bytes};
@@ -309,7 +309,7 @@ fn build_minimal_legacy_bundle(
         .saturating_add(4 * 2);
     file_info_header_size = (file_info_header_size.saturating_add(3)) & !3;
 
-    let mut directory_info_writer = BinaryWriter::new(Endian::Big);
+    let mut directory_info_writer = BinaryWriter::new(ByteOrder::Big);
     directory_info_writer.write_i32(1);
     directory_info_writer.write_string_to_null(file_name);
     directory_info_writer.write_u32(u32::try_from(file_info_header_size)?);
@@ -338,7 +338,7 @@ fn build_minimal_legacy_bundle(
         (blob, uncompressed_size_u32)
     };
 
-    let mut writer = BinaryWriter::new(Endian::Big);
+    let mut writer = BinaryWriter::new(ByteOrder::Big);
     writer.write_string_to_null(signature);
     writer.write_u32(3); // version
     writer.write_string_to_null(version_player);
@@ -1242,7 +1242,7 @@ fn write_ae6_serialized_type(
 }
 
 fn build_ae6_payload() -> anyhow::Result<Vec<u8>> {
-    let mut writer = BinaryWriter::new(Endian::Little);
+    let mut writer = BinaryWriter::new(ByteOrder::Little);
     writer.write_u8(0xA5);
     writer.write_i32(1);
     writer.write_u8(0x7F);
@@ -1285,7 +1285,7 @@ fn build_ae6_serialized_file() -> anyhow::Result<Vec<u8>> {
     let (root_tree, ref_types) = ae6_type_trees();
     let payload = build_ae6_payload()?;
 
-    let mut metadata = BinaryWriter::new(Endian::Little);
+    let mut metadata = BinaryWriter::new(ByteOrder::Little);
     metadata.write_string_to_null("2022.3.0f1");
     metadata.write_i32(13);
     metadata.write_bool(true);
@@ -1317,7 +1317,7 @@ fn build_ae6_serialized_file() -> anyhow::Result<Vec<u8>> {
         .checked_add(payload.len())
         .ok_or_else(|| anyhow::anyhow!("AE6 file size overflow"))?;
 
-    let mut header = BinaryWriter::new(Endian::Big);
+    let mut header = BinaryWriter::new(ByteOrder::Big);
     header.write_u32(0);
     header.write_u32(0);
     header.write_u32(22);

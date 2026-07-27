@@ -1009,7 +1009,7 @@ mod tests {
         AssetLoadLimits, ObjectAddress, ObjectId, SourceId, SourceLocator, WorkspaceId,
     };
     use unity_asset_write::object::SerializedObjectEncoder;
-    use unity_asset_write::{BinaryWriter, Endian};
+    use unity_asset_write::{BinaryWriter, ByteOrder};
 
     use super::*;
     use crate::workspace::{
@@ -1554,7 +1554,7 @@ mod tests {
         managed_b.old_type_hash = [0x52; 16];
         managed_b.type_tree = fixture_tree(fixture_record("ManagedB", "ManagedB", vec![pointer]));
 
-        let mut owner = BinaryWriter::new(Endian::Little);
+        let mut owner = BinaryWriter::new(ByteOrder::Little);
         owner.write_i32(1);
         owner.write_aligned_string("ManagedA").unwrap();
         owner.write_aligned_string(MANAGED_NAMESPACE).unwrap();
@@ -1562,7 +1562,7 @@ mod tests {
         owner.write_i32(7);
         let owner = owner.into_result().unwrap();
 
-        let mut target = BinaryWriter::new(Endian::Little);
+        let mut target = BinaryWriter::new(ByteOrder::Little);
         target.write_i32(0);
         let target = target.into_result().unwrap();
         let target_offset = owner.len().checked_add(15).unwrap() & !15;
@@ -1570,7 +1570,7 @@ mod tests {
         payload.resize(target_offset, 0);
         payload.extend_from_slice(&target);
 
-        let mut metadata = BinaryWriter::new(Endian::Little);
+        let mut metadata = BinaryWriter::new(ByteOrder::Little);
         metadata.write_string_to_null("2022.3.0f1");
         metadata.write_i32(13);
         metadata.write_bool(true);
@@ -1596,7 +1596,7 @@ mod tests {
         let data_offset = 48_usize.checked_add(metadata.len()).unwrap();
         let data_offset = data_offset.checked_add(15).unwrap() & !15;
         let file_size = data_offset.checked_add(payload.len()).unwrap();
-        let mut header = BinaryWriter::new(Endian::Big);
+        let mut header = BinaryWriter::new(ByteOrder::Big);
         header.write_u32(0);
         header.write_u32(0);
         header.write_u32(22);
