@@ -272,14 +272,15 @@ impl TypeTreeSchema {
             ));
         }
         let mut cursor = TraversalCursor::new(reader, budget)?;
-        let equal = compare_wire_value(
-            self,
-            &mut cursor,
-            node,
-            context,
-            depth,
-            ExpectedWireValue::Borrowed(expected),
-        )?;
+        let mut adapter = CompareAdapter::new(ExpectedWireValue::Borrowed(expected));
+        let equal = match traverse_value(self, &mut cursor, &mut adapter, node, context, depth)? {
+            TraverseOutcome::Complete(equal) => equal,
+            TraverseOutcome::Terminal => {
+                return Err(BinaryError::invalid_data(
+                    "Strict TypeTree comparison terminated without an error",
+                ));
+            }
+        };
         Ok((equal, cursor.into_stats()))
     }
 
@@ -424,6 +425,13 @@ enum ChildResult<T> {
     Terminal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PPtrChildRole {
+    FileId,
+    PathId,
+    Extra,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum WirePrimitive {
     Bool(bool),
@@ -466,528 +474,6 @@ impl<'value> ExpectedWireValue<'value> {
             .and_then(|object| object.get(name))
             .map_or(Self::Missing, Self::Borrowed)
     }
-}
-
-fn compare_wire_value(
-    schema: &TypeTreeSchema,
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    node: SchemaNode<'_>,
-    context: TypeTreeTraversalContext,
-    depth: u32,
-    expected: ExpectedWireValue<'_>,
-) -> Result<bool> {
-    cursor.enter_node(depth)?;
-    let equal = match node.semantic_layout() {
-        SemanticLayout::Scalar(primitive) => {
-            wire_matches_expected(read_wire_primitive(cursor, primitive)?, expected)
-        }
-        SemanticLayout::String => compare_string(cursor, expected)?,
-        SemanticLayout::TypelessData => compare_sized_bytes(cursor, "TypelessData", expected)?,
-        SemanticLayout::Sequence(layout) | SemanticLayout::Map(layout) => {
-            compare_sequence(schema, cursor, layout, context, depth, expected)?
-        }
-        SemanticLayout::Record | SemanticLayout::ManagedRegistry => {
-            compare_record(schema, cursor, node, context, depth, expected)?
-        }
-        SemanticLayout::Pair(layout) => {
-            compare_pair(schema, cursor, layout, context, depth, expected)?
-        }
-        SemanticLayout::PPtr(layout) => {
-            compare_pptr(schema, cursor, node, layout, context, depth, expected)?
-        }
-        SemanticLayout::ReferencedObject(layout) => {
-            compare_referenced_object(schema, cursor, node, layout, context, depth, expected)?
-        }
-        SemanticLayout::ManagedPayload => {
-            return Err(BinaryError::invalid_data(format!(
-                "Managed payload '{}' has no statically provable extent",
-                node.name()
-            )));
-        }
-        SemanticLayout::OpaqueFixed { byte_size } => {
-            let length = usize::try_from(byte_size).map_err(|_| {
-                BinaryError::invalid_data("Opaque TypeTree extent does not fit usize")
-            })?;
-            compare_borrowed_bytes(cursor, length, expected)?
-        }
-    };
-    align_completed_node(cursor, node)?;
-    Ok(equal)
-}
-
-fn compare_string(
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    expected: ExpectedWireValue<'_>,
-) -> Result<bool> {
-    let length = read_length(cursor, "string", BinaryReader::DEFAULT_MAX_STRING_LEN)?;
-    let expected = match expected.borrowed() {
-        Some(UnityValue::String(value)) if value.len() == length => Some(value.as_bytes()),
-        _ => None,
-    };
-    cursor.with_borrowed_slice(length, |bytes| {
-        std::str::from_utf8(bytes)?;
-        Ok(expected == Some(bytes))
-    })
-}
-
-fn compare_sized_bytes(
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    label: &str,
-    expected: ExpectedWireValue<'_>,
-) -> Result<bool> {
-    let length = read_length(cursor, label, usize::MAX)?;
-    compare_borrowed_bytes(cursor, length, expected)
-}
-
-fn compare_borrowed_bytes(
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    length: usize,
-    expected: ExpectedWireValue<'_>,
-) -> Result<bool> {
-    let expected = match expected.borrowed() {
-        Some(UnityValue::Bytes(value)) if value.len() == length => Some(value.as_slice()),
-        _ => None,
-    };
-    cursor.with_borrowed_slice(length, |bytes| Ok(expected == Some(bytes)))
-}
-
-fn compare_sequence(
-    schema: &TypeTreeSchema,
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    layout: SequenceLayout<'_>,
-    context: TypeTreeTraversalContext,
-    depth: u32,
-    expected: ExpectedWireValue<'_>,
-) -> Result<bool> {
-    let raw_length = cursor.read_i32()?;
-    if raw_length < 0 {
-        return Err(BinaryError::invalid_data(format!(
-            "Negative TypeTree sequence length: {raw_length}"
-        )));
-    }
-    let length = usize::try_from(raw_length)
-        .map_err(|_| BinaryError::invalid_data("TypeTree sequence length does not fit usize"))?;
-    cursor.consume_members(usize_to_u64(length, "sequence length")?)?;
-    let child_depth = next_depth(depth)?;
-
-    if let Some(primitive) = layout.bulk_primitive() {
-        if length != 0 {
-            cursor.enter_nodes(
-                child_depth,
-                usize_to_u64(length, "bulk sequence element count")?,
-            )?;
-        }
-        return compare_bulk_sequence(cursor, primitive, length, expected);
-    }
-
-    let expected_values = expected.array();
-    let mut equal = expected_values.is_some_and(|values| values.len() == length);
-    for index in 0..length {
-        let element_expected = expected_values
-            .and_then(|values| values.get(index))
-            .map_or(ExpectedWireValue::Missing, ExpectedWireValue::Borrowed);
-        let element_equal = compare_wire_value(
-            schema,
-            cursor,
-            layout.element(),
-            context,
-            child_depth,
-            element_expected,
-        )?;
-        equal &= element_equal;
-    }
-    Ok(equal)
-}
-
-fn compare_bulk_sequence(
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    primitive: PrimitiveKind,
-    length: usize,
-    expected: ExpectedWireValue<'_>,
-) -> Result<bool> {
-    let expected_bytes = match expected.borrowed() {
-        Some(UnityValue::Bytes(value))
-            if matches!(primitive, PrimitiveKind::I8 | PrimitiveKind::U8)
-                && value.len() == length =>
-        {
-            Some(value.as_slice())
-        }
-        _ => None,
-    };
-    let expected_values = expected.array().filter(|values| values.len() == length);
-    let byte_length = bulk_byte_length(primitive, length)?;
-    if expected_bytes.is_none() && expected_values.is_none() {
-        cursor.with_wire_slice(byte_length, |_, _| Ok(()))?;
-        cursor.record_scalar_elements(usize_to_u64(length, "bulk comparison element count")?)?;
-        return Ok(false);
-    }
-    let equal = cursor.with_wire_slice(byte_length, |bytes, byte_order| {
-        if let Some(expected_bytes) = expected_bytes {
-            return Ok(bytes == expected_bytes);
-        }
-
-        let mut equal = expected_values.is_some();
-        for (index, chunk) in bytes
-            .chunks_exact(usize::from(primitive.width()))
-            .enumerate()
-        {
-            let wire = decode_wire_primitive(primitive, chunk, byte_order)?;
-            let element_equal = expected_values
-                .and_then(|values| values.get(index))
-                .is_some_and(|value| wire_matches_unity_value(wire, value));
-            equal &= element_equal;
-        }
-        Ok(equal)
-    })?;
-    if expected_bytes.is_none() {
-        cursor.record_scalar_elements(usize_to_u64(length, "bulk comparison element count")?)?;
-    }
-    Ok(equal)
-}
-
-fn compare_record(
-    schema: &TypeTreeSchema,
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    node: SchemaNode<'_>,
-    mut context: TypeTreeTraversalContext,
-    depth: u32,
-    expected: ExpectedWireValue<'_>,
-) -> Result<bool> {
-    cursor.consume_members(usize_to_u64(node.child_count(), "record child count")?)?;
-    let child_depth = next_depth(depth)?;
-    let expected_object = expected.object();
-    let mut equal = expected_object.is_some();
-    let mut named_fields = 0_usize;
-
-    for child in node.children() {
-        let Some(child_context) = context.descend(node, child) else {
-            continue;
-        };
-        let child_expected = if child.name().is_empty() {
-            ExpectedWireValue::Missing
-        } else {
-            named_fields = named_fields.checked_add(1).ok_or_else(|| {
-                BinaryError::invalid_data("TypeTree compared field count overflow")
-            })?;
-            expected.property(child.name())
-        };
-        let child_equal = compare_wire_value(
-            schema,
-            cursor,
-            child,
-            child_context,
-            child_depth,
-            child_expected,
-        )?;
-        if !child.name().is_empty() {
-            equal &= child_equal;
-        }
-    }
-
-    if let Some(object) = expected_object {
-        equal &= object.len() == named_fields;
-    }
-    Ok(equal)
-}
-
-fn compare_pair(
-    schema: &TypeTreeSchema,
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    layout: PairLayout<'_>,
-    context: TypeTreeTraversalContext,
-    depth: u32,
-    expected: ExpectedWireValue<'_>,
-) -> Result<bool> {
-    cursor.consume_members(2)?;
-    let child_depth = next_depth(depth)?;
-    let expected_values = expected.array();
-    let mut equal = expected_values.is_some_and(|values| values.len() == 2);
-
-    for (index, child) in layout.children().into_iter().enumerate() {
-        let child_expected = expected_values
-            .and_then(|values| values.get(index))
-            .map_or(ExpectedWireValue::Missing, ExpectedWireValue::Borrowed);
-        equal &= compare_wire_value(schema, cursor, child, context, child_depth, child_expected)?;
-    }
-    Ok(equal)
-}
-
-fn compare_pptr(
-    schema: &TypeTreeSchema,
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    node: SchemaNode<'_>,
-    layout: PPtrLayout<'_>,
-    mut context: TypeTreeTraversalContext,
-    depth: u32,
-    expected: ExpectedWireValue<'_>,
-) -> Result<bool> {
-    cursor.consume_members(usize_to_u64(node.child_count(), "PPtr child count")?)?;
-    let child_depth = next_depth(depth)?;
-    let expected_object = expected.object();
-    let expected_null = matches!(expected.borrowed(), Some(UnityValue::Null));
-    let mut equal = expected_object.is_some() || expected_null;
-    let mut named_fields = 0_usize;
-
-    for child in node.children() {
-        let Some(child_context) = context.descend(node, child) else {
-            continue;
-        };
-        let is_file = child == layout.file_child();
-        let is_path = child == layout.path_child();
-        let child_expected = if expected_null && (is_file || is_path) {
-            ExpectedWireValue::IntegerZero
-        } else if child.name().is_empty() {
-            ExpectedWireValue::Missing
-        } else {
-            named_fields = named_fields.checked_add(1).ok_or_else(|| {
-                BinaryError::invalid_data("TypeTree compared PPtr field count overflow")
-            })?;
-            expected.property(child.name())
-        };
-
-        let child_equal = if is_file || is_path {
-            let primitive = if is_file {
-                layout.file_primitive()
-            } else {
-                layout.path_primitive()
-            };
-            let (equal, wire) =
-                compare_integer_node(cursor, child, primitive, child_depth, child_expected)?;
-            if is_file {
-                wire.into_file_id()?;
-            } else {
-                wire.into_path_id()?;
-            }
-            equal
-        } else {
-            compare_wire_value(
-                schema,
-                cursor,
-                child,
-                child_context,
-                child_depth,
-                child_expected,
-            )?
-        };
-        if !child.name().is_empty() {
-            equal &= child_equal;
-        }
-    }
-
-    if let Some(object) = expected_object {
-        equal &= object.len() == named_fields;
-    }
-    Ok(equal)
-}
-
-fn compare_integer_node(
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    node: SchemaNode<'_>,
-    primitive: PrimitiveKind,
-    depth: u32,
-    expected: ExpectedWireValue<'_>,
-) -> Result<(bool, WirePrimitive)> {
-    cursor.enter_node(depth)?;
-    let wire = read_wire_primitive(cursor, primitive)?;
-    let equal = wire_matches_expected(wire, expected);
-    align_completed_node(cursor, node)?;
-    Ok((equal, wire))
-}
-
-fn compare_referenced_object(
-    schema: &TypeTreeSchema,
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    node: SchemaNode<'_>,
-    layout: ReferencedObjectLayout<'_>,
-    context: TypeTreeTraversalContext,
-    depth: u32,
-    expected: ExpectedWireValue<'_>,
-) -> Result<bool> {
-    cursor.consume_members(usize_to_u64(
-        node.child_count(),
-        "ReferencedObject child count",
-    )?)?;
-    let child_depth = next_depth(depth)?;
-    let expected_object = expected.object();
-    let mut equal = expected_object.is_some();
-    let mut named_fields = 0_usize;
-    let mut key = ManagedTypeKey::default();
-
-    for child in node.children() {
-        let child_expected = if child.name().is_empty() {
-            ExpectedWireValue::Missing
-        } else {
-            named_fields = named_fields.checked_add(1).ok_or_else(|| {
-                BinaryError::invalid_data("TypeTree compared referenced field count overflow")
-            })?;
-            expected.property(child.name())
-        };
-        let child_equal = if layout.is_type_node(child) {
-            let (equal, parsed_key) = compare_managed_type(
-                schema,
-                cursor,
-                child,
-                layout,
-                context,
-                child_depth,
-                child_expected,
-            )?;
-            key = parsed_key;
-            equal
-        } else if layout.is_payload(child) {
-            compare_managed_payload(
-                schema,
-                cursor,
-                layout.payload(),
-                &key,
-                context,
-                child_depth,
-                child_expected,
-            )?
-        } else {
-            compare_wire_value(schema, cursor, child, context, child_depth, child_expected)?
-        };
-        if !child.name().is_empty() {
-            equal &= child_equal;
-        }
-    }
-
-    if let Some(object) = expected_object {
-        equal &= object.len() == named_fields;
-    }
-    Ok(equal)
-}
-
-fn compare_managed_type(
-    schema: &TypeTreeSchema,
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    node: SchemaNode<'_>,
-    layout: super::schema::ReferencedObjectLayout<'_>,
-    mut context: TypeTreeTraversalContext,
-    depth: u32,
-    expected: ExpectedWireValue<'_>,
-) -> Result<(bool, ManagedTypeKey)> {
-    cursor.enter_node(depth)?;
-    cursor.consume_members(usize_to_u64(
-        node.child_count(),
-        "managed type child count",
-    )?)?;
-    let child_depth = next_depth(depth)?;
-    let expected_object = expected.object();
-    let mut equal = expected_object.is_some();
-    let mut named_fields = 0_usize;
-    let mut key = ManagedTypeKey::default();
-
-    for child in node.children() {
-        let Some(child_context) = context.descend(node, child) else {
-            continue;
-        };
-        let child_expected = if child.name().is_empty() {
-            ExpectedWireValue::Missing
-        } else {
-            named_fields = named_fields.checked_add(1).ok_or_else(|| {
-                BinaryError::invalid_data("TypeTree compared managed type field count overflow")
-            })?;
-            expected.property(child.name())
-        };
-        let is_key_field = child == layout.class_field()
-            || child == layout.namespace_field()
-            || child == layout.assembly_field();
-        let child_equal = if is_key_field {
-            let (equal, text) =
-                compare_captured_string(cursor, child, child_depth, child_expected)?;
-            if child == layout.class_field() {
-                key.class_name = Some(text);
-            } else if child == layout.namespace_field() {
-                key.namespace = Some(text);
-            } else {
-                key.assembly_name = Some(text);
-            }
-            equal
-        } else {
-            compare_wire_value(
-                schema,
-                cursor,
-                child,
-                child_context,
-                child_depth,
-                child_expected,
-            )?
-        };
-        if !child.name().is_empty() {
-            equal &= child_equal;
-        }
-    }
-
-    if let Some(object) = expected_object {
-        equal &= object.len() == named_fields;
-    }
-    align_completed_node(cursor, node)?;
-    Ok((equal, key))
-}
-
-fn compare_captured_string(
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    node: SchemaNode<'_>,
-    depth: u32,
-    expected: ExpectedWireValue<'_>,
-) -> Result<(bool, String)> {
-    cursor.enter_node(depth)?;
-    let length = read_length(
-        cursor,
-        "managed type string",
-        BinaryReader::DEFAULT_MAX_STRING_LEN,
-    )?;
-    let text = String::from_utf8(cursor.read_bytes(length)?)?;
-    let equal = matches!(expected.borrowed(), Some(UnityValue::String(value)) if value == &text);
-    align_completed_node(cursor, node)?;
-    Ok((equal, text))
-}
-
-fn compare_managed_payload(
-    schema: &TypeTreeSchema,
-    cursor: &mut TraversalCursor<'_, '_, '_>,
-    payload: ManagedPayload<'_>,
-    key: &ManagedTypeKey,
-    context: TypeTreeTraversalContext,
-    depth: u32,
-    expected: ExpectedWireValue<'_>,
-) -> Result<bool> {
-    if key.class_name.as_deref() == Some("") {
-        cursor.enter_node(depth)?;
-        return Ok(matches!(
-            expected,
-            ExpectedWireValue::Borrowed(UnityValue::Null) | ExpectedWireValue::Missing
-        ));
-    }
-
-    if let (Some(class_name), Some(namespace), Some(assembly_name)) = (
-        key.class_name.as_deref(),
-        key.namespace.as_deref(),
-        key.assembly_name.as_deref(),
-    ) && let Some(root) = schema.resolve_managed_root(class_name, namespace, assembly_name)
-    {
-        return compare_wire_value(schema, cursor, root, context, depth, expected);
-    }
-
-    if let Some(fallback) = payload.fallback() {
-        return compare_wire_value(schema, cursor, fallback, context, depth, expected);
-    }
-
-    cursor.enter_node(depth)?;
-    let key_description = match (
-        key.class_name.as_deref(),
-        key.namespace.as_deref(),
-        key.assembly_name.as_deref(),
-    ) {
-        (Some(class_name), Some(namespace), Some(assembly_name)) => {
-            format!("{class_name}|{namespace}|{assembly_name}")
-        }
-        _ => "<incomplete managed type key>".to_string(),
-    };
-    Err(BinaryError::invalid_data(format!(
-        "Managed type '{key_description}' is unresolved and its payload extent is unknown"
-    )))
 }
 
 fn wire_matches_expected(wire: WirePrimitive, expected: ExpectedWireValue<'_>) -> bool {
@@ -1052,6 +538,7 @@ trait TraversalAdapter<'schema> {
     type Value;
     type Sequence;
     type Record;
+    type PathCheckpoint: Copy;
 
     fn parse_mode(&self) -> TypeTreeParseMode;
 
@@ -1151,15 +638,25 @@ trait TraversalAdapter<'schema> {
         child: SchemaNode<'schema>,
     ) -> Result<()>;
 
+    fn enter_pptr_child(
+        &mut self,
+        cursor: &mut TraversalCursor<'_, '_, '_>,
+        index: usize,
+        child: SchemaNode<'schema>,
+        _role: PPtrChildRole,
+    ) -> Result<()> {
+        self.enter_record_child(cursor, SemanticKind::PPtr, index, child)
+    }
+
     fn enter_sequence_element(
         &mut self,
         cursor: &mut TraversalCursor<'_, '_, '_>,
         index: usize,
     ) -> Result<()>;
 
-    fn path_checkpoint(&self) -> usize;
+    fn path_checkpoint(&self) -> Self::PathCheckpoint;
 
-    fn restore_path(&mut self, checkpoint: usize);
+    fn restore_path(&mut self, checkpoint: Self::PathCheckpoint);
 
     fn warning(
         &mut self,
@@ -1167,6 +664,375 @@ trait TraversalAdapter<'schema> {
         child: SchemaNode<'schema>,
         error: &BinaryError,
     ) -> Result<()>;
+}
+
+struct CompareAdapter<'value> {
+    current_expected: ExpectedWireValue<'value>,
+}
+
+struct CompareSequence {
+    equal: bool,
+}
+
+enum CompareRecord {
+    Pair {
+        equal: bool,
+    },
+    Object {
+        equal: bool,
+        expected_fields: Option<usize>,
+        named_fields: usize,
+    },
+}
+
+impl<'value> CompareAdapter<'value> {
+    fn new(root_expected: ExpectedWireValue<'value>) -> Self {
+        Self {
+            current_expected: root_expected,
+        }
+    }
+
+    fn current_expected(&self) -> ExpectedWireValue<'value> {
+        self.current_expected
+    }
+
+    fn record_child_expected(
+        &self,
+        kind: SemanticKind,
+        index: usize,
+        child: SchemaNode<'_>,
+    ) -> ExpectedWireValue<'value> {
+        let parent = self.current_expected();
+        if kind == SemanticKind::Pair {
+            return parent
+                .array()
+                .and_then(|values| values.get(index))
+                .map_or(ExpectedWireValue::Missing, ExpectedWireValue::Borrowed);
+        }
+        if child.name().is_empty() {
+            ExpectedWireValue::Missing
+        } else {
+            parent.property(child.name())
+        }
+    }
+
+    fn compare_bulk_sequence(
+        &self,
+        cursor: &mut TraversalCursor<'_, '_, '_>,
+        primitive: PrimitiveKind,
+        length: usize,
+    ) -> Result<bool> {
+        let expected = self.current_expected();
+        let expected_bytes = match expected.borrowed() {
+            Some(UnityValue::Bytes(value))
+                if matches!(primitive, PrimitiveKind::I8 | PrimitiveKind::U8)
+                    && value.len() == length =>
+            {
+                Some(value.as_slice())
+            }
+            _ => None,
+        };
+        let expected_values = expected.array().filter(|values| values.len() == length);
+        let byte_length = bulk_byte_length(primitive, length)?;
+
+        if expected_bytes.is_none() && expected_values.is_none() {
+            cursor.with_wire_slice(byte_length, |_, _| Ok(()))?;
+            cursor
+                .record_scalar_elements(usize_to_u64(length, "bulk comparison element count")?)?;
+            return Ok(false);
+        }
+
+        let equal = cursor.with_wire_slice(byte_length, |bytes, byte_order| {
+            if let Some(expected_bytes) = expected_bytes {
+                return Ok(bytes == expected_bytes);
+            }
+
+            let mut equal = expected_values.is_some();
+            for (index, chunk) in bytes
+                .chunks_exact(usize::from(primitive.width()))
+                .enumerate()
+            {
+                let wire = decode_wire_primitive(primitive, chunk, byte_order)?;
+                let element_equal = expected_values
+                    .and_then(|values| values.get(index))
+                    .is_some_and(|value| wire_matches_unity_value(wire, value));
+                equal &= element_equal;
+            }
+            Ok(equal)
+        })?;
+        if expected_bytes.is_none() {
+            cursor
+                .record_scalar_elements(usize_to_u64(length, "bulk comparison element count")?)?;
+        }
+        Ok(equal)
+    }
+}
+
+impl<'schema, 'value> TraversalAdapter<'schema> for CompareAdapter<'value> {
+    type Value = bool;
+    type Sequence = CompareSequence;
+    type Record = CompareRecord;
+    type PathCheckpoint = ExpectedWireValue<'value>;
+
+    fn parse_mode(&self) -> TypeTreeParseMode {
+        TypeTreeParseMode::Strict
+    }
+
+    fn scalar(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        value: WirePrimitive,
+    ) -> Result<Self::Value> {
+        Ok(wire_matches_expected(value, self.current_expected()))
+    }
+
+    fn string_payload(
+        &mut self,
+        cursor: &mut TraversalCursor<'_, '_, '_>,
+        length: usize,
+    ) -> Result<Self::Value> {
+        let expected = match self.current_expected().borrowed() {
+            Some(UnityValue::String(value)) if value.len() == length => Some(value.as_bytes()),
+            _ => None,
+        };
+        cursor.with_borrowed_slice(length, |bytes| {
+            std::str::from_utf8(bytes)?;
+            Ok(expected == Some(bytes))
+        })
+    }
+
+    fn captured_string(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        value: &str,
+    ) -> Result<Self::Value> {
+        Ok(matches!(
+            self.current_expected().borrowed(),
+            Some(UnityValue::String(expected)) if expected == value
+        ))
+    }
+
+    fn bytes_payload(
+        &mut self,
+        cursor: &mut TraversalCursor<'_, '_, '_>,
+        length: usize,
+    ) -> Result<Self::Value> {
+        let expected = match self.current_expected().borrowed() {
+            Some(UnityValue::Bytes(value)) if value.len() == length => Some(value.as_slice()),
+            _ => None,
+        };
+        cursor.with_borrowed_slice(length, |bytes| Ok(expected == Some(bytes)))
+    }
+
+    fn bulk_sequence(
+        &mut self,
+        cursor: &mut TraversalCursor<'_, '_, '_>,
+        primitive: PrimitiveKind,
+        length: usize,
+    ) -> Result<Self::Value> {
+        self.compare_bulk_sequence(cursor, primitive, length)
+    }
+
+    fn begin_sequence(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        length: usize,
+    ) -> Result<Self::Sequence> {
+        Ok(CompareSequence {
+            equal: self
+                .current_expected()
+                .array()
+                .is_some_and(|values| values.len() == length),
+        })
+    }
+
+    fn push_sequence(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        sequence: &mut Self::Sequence,
+        value: Self::Value,
+    ) -> Result<()> {
+        sequence.equal &= value;
+        Ok(())
+    }
+
+    fn finish_sequence(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        sequence: Self::Sequence,
+    ) -> Result<Self::Value> {
+        Ok(sequence.equal)
+    }
+
+    fn begin_record(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        kind: SemanticKind,
+        child_count: usize,
+        _label: &'static str,
+    ) -> Result<Self::Record> {
+        let expected = self.current_expected();
+        if kind == SemanticKind::Pair {
+            return Ok(CompareRecord::Pair {
+                equal: expected
+                    .array()
+                    .is_some_and(|values| values.len() == child_count),
+            });
+        }
+
+        let expected_object = expected.object();
+        let equal = expected_object.is_some()
+            || (kind == SemanticKind::PPtr
+                && matches!(expected.borrowed(), Some(UnityValue::Null)));
+        Ok(CompareRecord::Object {
+            equal,
+            expected_fields: expected_object.map(IndexMap::len),
+            named_fields: 0,
+        })
+    }
+
+    fn push_record(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        record: &mut Self::Record,
+        child: SchemaNode<'schema>,
+        value: Self::Value,
+    ) -> Result<()> {
+        match record {
+            CompareRecord::Pair { equal } => *equal &= value,
+            CompareRecord::Object {
+                equal,
+                named_fields,
+                ..
+            } if !child.name().is_empty() => {
+                *named_fields = named_fields.checked_add(1).ok_or_else(|| {
+                    BinaryError::invalid_data("TypeTree compared field count overflow")
+                })?;
+                *equal &= value;
+            }
+            CompareRecord::Object { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn recovered_record_field(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        record: &mut Self::Record,
+        child: SchemaNode<'schema>,
+    ) -> Result<()> {
+        match record {
+            CompareRecord::Pair { equal } => *equal = false,
+            CompareRecord::Object {
+                equal,
+                named_fields,
+                ..
+            } if !child.name().is_empty() => {
+                *named_fields = named_fields.checked_add(1).ok_or_else(|| {
+                    BinaryError::invalid_data("TypeTree compared field count overflow")
+                })?;
+                *equal = false;
+            }
+            CompareRecord::Object { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn finish_record(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        record: Self::Record,
+    ) -> Result<Self::Value> {
+        Ok(match record {
+            CompareRecord::Pair { equal } => equal,
+            CompareRecord::Object {
+                mut equal,
+                expected_fields,
+                named_fields,
+            } => {
+                if let Some(expected_fields) = expected_fields {
+                    equal &= expected_fields == named_fields;
+                }
+                equal
+            }
+        })
+    }
+
+    fn null(&mut self, _cursor: &mut TraversalCursor<'_, '_, '_>) -> Result<Self::Value> {
+        Ok(matches!(
+            self.current_expected(),
+            ExpectedWireValue::Borrowed(UnityValue::Null) | ExpectedWireValue::Missing
+        ))
+    }
+
+    fn emit_pptr(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        _file_id: i32,
+        _path_id: i64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn enter_record_child(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        kind: SemanticKind,
+        index: usize,
+        child: SchemaNode<'schema>,
+    ) -> Result<()> {
+        self.current_expected = self.record_child_expected(kind, index, child);
+        Ok(())
+    }
+
+    fn enter_pptr_child(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        index: usize,
+        child: SchemaNode<'schema>,
+        role: PPtrChildRole,
+    ) -> Result<()> {
+        let expected = if matches!(self.current_expected().borrowed(), Some(UnityValue::Null))
+            && matches!(role, PPtrChildRole::FileId | PPtrChildRole::PathId)
+        {
+            ExpectedWireValue::IntegerZero
+        } else {
+            self.record_child_expected(SemanticKind::PPtr, index, child)
+        };
+        self.current_expected = expected;
+        Ok(())
+    }
+
+    fn enter_sequence_element(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        index: usize,
+    ) -> Result<()> {
+        let expected = self
+            .current_expected()
+            .array()
+            .and_then(|values| values.get(index))
+            .map_or(ExpectedWireValue::Missing, ExpectedWireValue::Borrowed);
+        self.current_expected = expected;
+        Ok(())
+    }
+
+    fn path_checkpoint(&self) -> Self::PathCheckpoint {
+        self.current_expected
+    }
+
+    fn restore_path(&mut self, checkpoint: Self::PathCheckpoint) {
+        self.current_expected = checkpoint;
+    }
+
+    fn warning(
+        &mut self,
+        _cursor: &mut TraversalCursor<'_, '_, '_>,
+        _child: SchemaNode<'schema>,
+        _error: &BinaryError,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct ReadAdapter {
@@ -1207,6 +1073,7 @@ impl<'schema> TraversalAdapter<'schema> for ReadAdapter {
     type Value = UnityValue;
     type Sequence = TraversalVec<UnityValue>;
     type Record = ReadRecord;
+    type PathCheckpoint = ();
 
     fn parse_mode(&self) -> TypeTreeParseMode {
         self.mode
@@ -1407,11 +1274,9 @@ impl<'schema> TraversalAdapter<'schema> for ReadAdapter {
         Ok(())
     }
 
-    fn path_checkpoint(&self) -> usize {
-        0
-    }
+    fn path_checkpoint(&self) -> Self::PathCheckpoint {}
 
-    fn restore_path(&mut self, _checkpoint: usize) {}
+    fn restore_path(&mut self, _checkpoint: Self::PathCheckpoint) {}
 
     fn warning(
         &mut self,
@@ -1692,6 +1557,7 @@ impl<'schema, S: ReferenceSink<'schema>> TraversalAdapter<'schema> for UnitAdapt
     type Value = ();
     type Sequence = ();
     type Record = ();
+    type PathCheckpoint = usize;
 
     fn parse_mode(&self) -> TypeTreeParseMode {
         self.mode
@@ -1831,11 +1697,11 @@ impl<'schema, S: ReferenceSink<'schema>> TraversalAdapter<'schema> for UnitAdapt
         self.sink.enter_sequence_element(cursor, index)
     }
 
-    fn path_checkpoint(&self) -> usize {
+    fn path_checkpoint(&self) -> Self::PathCheckpoint {
         self.sink.path_checkpoint()
     }
 
-    fn restore_path(&mut self, checkpoint: usize) {
+    fn restore_path(&mut self, checkpoint: Self::PathCheckpoint) {
         self.sink.restore_path(checkpoint);
     }
 
@@ -2087,11 +1953,18 @@ fn traverse_pptr<'schema, A: TraversalAdapter<'schema>>(
         let Some(child_context) = context.descend(node, child) else {
             continue;
         };
+        let role = if child == layout.file_child() {
+            PPtrChildRole::FileId
+        } else if child == layout.path_child() {
+            PPtrChildRole::PathId
+        } else {
+            PPtrChildRole::Extra
+        };
         let path_checkpoint = adapter.path_checkpoint();
-        adapter.enter_record_child(cursor, SemanticKind::PPtr, index, child)?;
+        adapter.enter_pptr_child(cursor, index, child, role)?;
         let checkpoint = cursor.checkpoint();
-        if child == layout.file_child() || child == layout.path_child() {
-            let primitive = if child == layout.file_child() {
+        if role != PPtrChildRole::Extra {
+            let primitive = if role == PPtrChildRole::FileId {
                 layout.file_primitive()
             } else {
                 layout.path_primitive()
@@ -2099,7 +1972,7 @@ fn traverse_pptr<'schema, A: TraversalAdapter<'schema>>(
             let attempt = traverse_integer_node(cursor, adapter, child, primitive, child_depth)
                 .and_then(|outcome| match outcome {
                     TraverseOutcome::Complete((value, wire)) => {
-                        let converted = if child == layout.file_child() {
+                        let converted = if role == PPtrChildRole::FileId {
                             PPtrInteger::File(wire.into_file_id()?)
                         } else {
                             PPtrInteger::Path(wire.into_path_id()?)
@@ -2600,9 +2473,277 @@ fn usize_to_u64(value: usize, label: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::typetree::types::{TypeTree, TypeTreeNode};
+    use unity_asset_core::{AssetLoadLimits, BudgetError};
+
+    fn node(type_name: &str, name: &str) -> TypeTreeNode {
+        TypeTreeNode::with_info(type_name.to_owned(), name.to_owned(), -1)
+    }
+
+    fn compile(root: TypeTreeNode) -> TypeTreeSchema {
+        let mut tree = TypeTree::new();
+        tree.add_node(root);
+        TypeTreeSchema::compile(&tree, &[], &mut AssetLoadBudget::default()).unwrap()
+    }
+
+    fn object(fields: impl IntoIterator<Item = (&'static str, UnityValue)>) -> UnityValue {
+        UnityValue::Object(
+            fields
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value))
+                .collect(),
+        )
+    }
+
+    fn push_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(
+            &i32::try_from(value.len())
+                .expect("test string must fit in i32")
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(value.as_bytes());
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+    }
+
+    #[test]
+    fn comparison_adapter_reuses_record_and_numeric_bulk_traversal() {
+        let mut array = node("Array", "Array");
+        array.children = vec![node("int", "size"), node("UInt32", "data")];
+        let mut values = node("vector", "values");
+        values.children.push(array);
+        let mut root = node("Root", "Root");
+        root.children = vec![node("int", "number"), values];
+        let schema = compile(root);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&7_i32.to_le_bytes());
+        bytes.extend_from_slice(&3_i32.to_le_bytes());
+        for value in [11_u32, 22, 33] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let expected = object([
+            ("number", UnityValue::Integer(7)),
+            (
+                "values",
+                UnityValue::Array(vec![
+                    UnityValue::Integer(11),
+                    UnityValue::Integer(22),
+                    UnityValue::Integer(33),
+                ]),
+            ),
+        ]);
+        let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+        let (equal, stats) = schema
+            .compare_value(
+                &mut reader,
+                &mut AssetLoadBudget::default(),
+                schema.root(),
+                &expected,
+            )
+            .unwrap();
+        assert!(equal);
+        assert_eq!(reader.position(), u64::try_from(bytes.len()).unwrap());
+        assert_eq!(stats.bulk_runs, 1);
+        assert_eq!(stats.bulk_bytes, 12);
+        assert_eq!(stats.scalar_element_ops, 4);
+        assert_eq!(stats.unity_values_materialized, 0);
+
+        let mismatched = object([
+            ("number", UnityValue::Integer(8)),
+            ("values", UnityValue::String("not an array".to_owned())),
+        ]);
+        let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+        let (equal, mismatched_stats) = schema
+            .compare_value(
+                &mut reader,
+                &mut AssetLoadBudget::default(),
+                schema.root(),
+                &mismatched,
+            )
+            .unwrap();
+        assert!(!equal);
+        assert_eq!(reader.position(), u64::try_from(bytes.len()).unwrap());
+        assert_eq!(mismatched_stats.bulk_runs, 1);
+        assert_eq!(mismatched_stats.bulk_bytes, 12);
+        assert_eq!(mismatched_stats.scalar_element_ops, 4);
+        assert_eq!(mismatched_stats.unity_values_materialized, 0);
+    }
+
+    #[test]
+    fn comparison_adapter_preserves_null_pptr_zero_semantics() {
+        let mut pointer = node("PPtr<Object>", "target");
+        pointer.children = vec![node("UInt32", "m_FileID"), node("UInt64", "m_PathID")];
+        let schema = compile(pointer);
+
+        let zero = [0_u8; 12];
+        let mut reader = BinaryReader::new(&zero, ByteOrder::Little);
+        let (equal, stats) = schema
+            .compare_value(
+                &mut reader,
+                &mut AssetLoadBudget::default(),
+                schema.root(),
+                &UnityValue::Null,
+            )
+            .unwrap();
+        assert!(equal);
+        assert_eq!(stats.unity_values_materialized, 0);
+
+        let mut nonzero = Vec::new();
+        nonzero.extend_from_slice(&1_u32.to_le_bytes());
+        nonzero.extend_from_slice(&2_u64.to_le_bytes());
+        let mut reader = BinaryReader::new(&nonzero, ByteOrder::Little);
+        let (equal, _) = schema
+            .compare_value(
+                &mut reader,
+                &mut AssetLoadBudget::default(),
+                schema.root(),
+                &UnityValue::Null,
+            )
+            .unwrap();
+        assert!(!equal);
+    }
+
+    #[test]
+    fn comparison_adapter_uses_managed_payload_fallback() {
+        let mut managed_type = node("ReferencedObjectType", "type");
+        managed_type.children = vec![
+            node("string", "class"),
+            node("string", "ns"),
+            node("string", "asm"),
+        ];
+        let mut payload = node("ReferencedObjectData", "data");
+        payload.children.push(node("int", "value"));
+        let mut referenced = node("ReferencedObject", "reference");
+        referenced.children = vec![managed_type, payload];
+        let schema = compile(referenced);
+
+        let mut bytes = Vec::new();
+        push_string(&mut bytes, "Missing");
+        push_string(&mut bytes, "Tests");
+        push_string(&mut bytes, "Tests");
+        bytes.extend_from_slice(&42_i32.to_le_bytes());
+
+        let expected_type = object([
+            ("class", UnityValue::String("Missing".to_owned())),
+            ("ns", UnityValue::String("Tests".to_owned())),
+            ("asm", UnityValue::String("Tests".to_owned())),
+        ]);
+        let expected = object([
+            ("type", expected_type),
+            ("data", object([("value", UnityValue::Integer(42))])),
+        ]);
+        let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+        let (equal, stats) = schema
+            .compare_value(
+                &mut reader,
+                &mut AssetLoadBudget::default(),
+                schema.root(),
+                &expected,
+            )
+            .unwrap();
+        assert!(equal);
+        assert_eq!(reader.position(), u64::try_from(bytes.len()).unwrap());
+        assert_eq!(stats.unity_values_materialized, 0);
+
+        let mismatched = object([
+            (
+                "type",
+                object([
+                    ("class", UnityValue::String("Missing".to_owned())),
+                    ("ns", UnityValue::String("Tests".to_owned())),
+                    ("asm", UnityValue::String("Tests".to_owned())),
+                ]),
+            ),
+            ("data", object([("value", UnityValue::Integer(41))])),
+        ]);
+        let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+        let (equal, _) = schema
+            .compare_value(
+                &mut reader,
+                &mut AssetLoadBudget::default(),
+                schema.root(),
+                &mismatched,
+            )
+            .unwrap();
+        assert!(!equal);
+    }
+
+    #[test]
+    fn comparison_checkpoint_has_no_parser_depth_cap() {
+        std::thread::Builder::new()
+            .name("deep-typetree-compare".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let depth = u32::try_from(MAX_TYPE_TREE_DEPTH).unwrap() + 1;
+                let mut root = node("int", "value");
+                let mut expected = UnityValue::Integer(7);
+                for _ in 0..depth {
+                    let mut parent = node("Nested", "value");
+                    parent.children.push(root);
+                    root = parent;
+                    expected = object([("value", expected)]);
+                }
+
+                let mut tree = TypeTree::new();
+                tree.add_node(root);
+                let limits = AssetLoadLimits {
+                    max_depth: depth,
+                    ..AssetLoadLimits::default()
+                };
+                let mut compile_budget = AssetLoadBudget::new(limits).unwrap();
+                let schema = TypeTreeSchema::compile(&tree, &[], &mut compile_budget).unwrap();
+                let bytes = 7_i32.to_le_bytes();
+
+                let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+                let mut compare_budget = AssetLoadBudget::new(limits).unwrap();
+                let (equal, stats) = schema
+                    .compare_value(&mut reader, &mut compare_budget, schema.root(), &expected)
+                    .unwrap();
+                assert!(equal);
+                assert_eq!(stats.node_visits, u64::from(depth) + 1);
+                assert_eq!(stats.unity_values_materialized, 0);
+
+                let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
+                let error = schema
+                    .compare_value(
+                        &mut reader,
+                        &mut AssetLoadBudget::default(),
+                        schema.root(),
+                        &expected,
+                    )
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    BinaryError::Budget(BudgetError::Exceeded {
+                        resource: "depth",
+                        limit,
+                        requested,
+                    }) if limit == u64::try_from(MAX_TYPE_TREE_DEPTH).unwrap()
+                        && requested == u64::from(depth)
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[test]
     fn pptr_wire_roles_preserve_ranges_and_errors() {
+        assert!(wire_matches_expected(
+            WirePrimitive::Signed(0),
+            ExpectedWireValue::IntegerZero
+        ));
+        assert!(wire_matches_expected(
+            WirePrimitive::Unsigned(0),
+            ExpectedWireValue::IntegerZero
+        ));
+        assert!(!wire_matches_expected(
+            WirePrimitive::Signed(1),
+            ExpectedWireValue::IntegerZero
+        ));
         assert_eq!(
             WirePrimitive::Signed(i64::from(i32::MIN))
                 .into_file_id()
