@@ -6,8 +6,7 @@ use super::format::{
 };
 use super::header::SerializedFileHeader;
 use super::object_type_resolver::ObjectTypeResolver;
-use super::serialized_file::ParsedParts;
-pub use super::serialized_file::{FileStatistics, SerializedFile};
+use super::serialized_file::{ParsedParts, SerializedFile};
 use super::types::{
     FileIdentifier, LocalSerializedObjectIdentifier, ObjectInfo, ObjectMetadata,
     ObjectTypeReference, SerializedType,
@@ -37,8 +36,15 @@ pub struct SerializedFileInspection {
     metadata_size: u32,
     data_offset: u64,
     declared_file_size: u64,
+    unity_version: String,
+    target_platform: i32,
+    type_tree_enabled: bool,
+    type_count: u64,
+    legacy_big_id: Option<i32>,
     objects: Vec<ObjectInfo>,
+    script_type_count: u64,
     externals: Vec<FileIdentifier>,
+    reference_type_count: u64,
 }
 
 impl SerializedFileInspection {
@@ -62,6 +68,34 @@ impl SerializedFileInspection {
         self.declared_file_size
     }
 
+    pub fn unity_version(&self) -> &str {
+        &self.unity_version
+    }
+
+    pub const fn target_platform(&self) -> i32 {
+        self.target_platform
+    }
+
+    pub const fn type_tree_enabled(&self) -> bool {
+        self.type_tree_enabled
+    }
+
+    pub const fn type_count(&self) -> u64 {
+        self.type_count
+    }
+
+    pub const fn legacy_big_id(&self) -> Option<i32> {
+        self.legacy_big_id
+    }
+
+    pub const fn script_type_count(&self) -> u64 {
+        self.script_type_count
+    }
+
+    pub const fn reference_type_count(&self) -> u64 {
+        self.reference_type_count
+    }
+
     /// Returns the validated object table in its original wire order.
     ///
     /// Object byte offsets are absolute within the inspected SerializedFile image.
@@ -76,8 +110,13 @@ impl SerializedFileInspection {
 
     /// Returns the heap retained exclusively by this inspection proof.
     pub fn retained_heap_bytes(&self) -> Result<u64> {
-        let mut bytes = vec_allocation_bytes::<ObjectInfo>(self.objects.capacity())
+        let mut bytes = string_allocation_bytes(self.unity_version.capacity())
             .map_err(serialized_file_inspection_allocation_error)?;
+        add_serialized_file_inspection_bytes(
+            &mut bytes,
+            vec_allocation_bytes::<ObjectInfo>(self.objects.capacity())
+                .map_err(serialized_file_inspection_allocation_error)?,
+        )?;
         add_serialized_file_inspection_bytes(
             &mut bytes,
             vec_allocation_bytes::<FileIdentifier>(self.externals.capacity())
@@ -230,18 +269,38 @@ impl SerializedFileParser {
         }
         let ParsedParts {
             header,
+            unity_version,
+            target_platform,
+            enable_type_tree,
+            types,
+            legacy_big_id,
             objects,
+            script_types,
             externals,
+            ref_types,
             ..
         } = parts;
+        let type_count = u64::try_from(types.len())
+            .map_err(|_| BinaryError::invalid_data("SerializedType count does not fit u64"))?;
+        let script_type_count = u64::try_from(script_types.len())
+            .map_err(|_| BinaryError::invalid_data("script type count does not fit u64"))?;
+        let reference_type_count = u64::try_from(ref_types.len())
+            .map_err(|_| BinaryError::invalid_data("reference type count does not fit u64"))?;
         Ok(SerializedFileInspection {
             version: header.version,
             byte_order: header.byte_order(),
             metadata_size: header.metadata_size,
             data_offset: header.data_offset,
             declared_file_size: header.file_size,
+            unity_version,
+            target_platform,
+            type_tree_enabled: enable_type_tree,
+            type_count,
+            legacy_big_id,
             objects,
+            script_type_count,
             externals,
+            reference_type_count,
         })
     }
 

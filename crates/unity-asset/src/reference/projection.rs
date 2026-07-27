@@ -11,7 +11,10 @@ use super::fact::{RawReferenceTarget, ReferenceFact, ReferenceGuid, ReferenceRes
 use super::index::ReferenceIndex;
 use super::{ReferenceGraphError, ReferenceTruncationKind};
 
-const PROJECTION_SCHEMA: &str = "unity-asset.reference-graph.v1";
+/// Stable schema name emitted by all reference graph projections.
+pub const REFERENCE_GRAPH_PROJECTION_SCHEMA: &str = "unity-asset.reference-graph.v1";
+/// Current wire version of the reference graph projection schema.
+pub const REFERENCE_GRAPH_PROJECTION_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReferenceProjectionFormat {
@@ -352,7 +355,7 @@ fn write_json<W: Write + ?Sized>(
     plan: ProjectionPlan,
 ) -> Result<(), ReferenceGraphError> {
     let document = JsonDocument {
-        schema: PROJECTION_SCHEMA,
+        schema: REFERENCE_GRAPH_PROJECTION_SCHEMA,
         workspace: index.workspace(),
         revision: index.revision(),
         complete: plan.complete,
@@ -380,7 +383,7 @@ fn write_json_lines<W: Write + ?Sized>(
 ) -> Result<(), ReferenceGraphError> {
     let header = JsonLineHeader {
         kind: "header",
-        schema: PROJECTION_SCHEMA,
+        schema: REFERENCE_GRAPH_PROJECTION_SCHEMA,
         workspace: index.workspace(),
         revision: index.revision(),
         complete: plan.complete,
@@ -441,7 +444,10 @@ fn write_dot<W: Write + ?Sized>(
         writeln!(writer, "digraph unity_asset_references {{"),
         writer,
     )?;
-    dot_io(writeln!(writer, "  // schema={PROJECTION_SCHEMA}"), writer)?;
+    dot_io(
+        writeln!(writer, "  // schema={REFERENCE_GRAPH_PROJECTION_SCHEMA}"),
+        writer,
+    )?;
     dot_io(
         writeln!(writer, "  // revision={}", index.revision()),
         writer,

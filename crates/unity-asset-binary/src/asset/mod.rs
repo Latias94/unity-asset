@@ -1,7 +1,7 @@
 //! Unity SerializedFile model and parser.
 //!
 //! Parse in-memory data with [`SerializedFileParser`]. For filesystem paths,
-//! use [`crate::file::load_serialized_file`] so file access, memory mapping,
+//! use [`crate::file::load_serialized_file_with_budget`] so file access, memory mapping,
 //! and cumulative load budgets stay on the crate's unified loading path.
 //!
 //! # Architecture
@@ -45,7 +45,8 @@ pub use format::{
     SerializedFileLayout, SerializedFileRegions, TypeTreeEnablement, TypeTreeEncoding,
 };
 pub use header::SerializedFileHeader;
-pub use parser::{FileStatistics, SerializedFile, SerializedFileInspection, SerializedFileParser};
+pub use parser::{SerializedFileInspection, SerializedFileParser};
+pub use serialized_file::{FileStatistics, SerializedFile};
 pub use types::{
     FileIdentifier, ObjectInfo, ObjectMetadata, ObjectTypeReference, SerializedType, TypeRegistry,
     class_ids,

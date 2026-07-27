@@ -3,7 +3,9 @@
 use unity_asset_core::BudgetError;
 
 mod artifact;
+mod container;
 mod executor;
+mod json_contract;
 mod manifest;
 mod model;
 mod selection;
@@ -22,6 +24,12 @@ fn source_budget_error<'error>(
     None
 }
 
+pub use container::{
+    BUNDLE_CONTAINER_QUERY_CONTRACT, BUNDLE_CONTAINER_QUERY_VERSION,
+    BUNDLE_CONTAINER_RESULT_CONTRACT, BUNDLE_CONTAINER_RESULT_VERSION,
+    BundleContainerContractError, BundleContainerOccurrence, BundleContainerQuery,
+    BundleContainerRawTarget, BundleContainerResolution, BundleContainerResult,
+};
 pub use executor::{
     ExistingOutputPolicy, ExtractionExecutionError, ExtractionExecutionLimits,
     ExtractionExecutionOptions, ExtractionExecutor, ExtractionFailurePolicy,

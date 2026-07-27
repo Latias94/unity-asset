@@ -205,6 +205,12 @@ impl SourceAlias {
     pub const fn retained_clone_bytes(&self) -> usize {
         self.0.len()
     }
+
+    /// Returns the backing capacity retained when this owned alias is moved without cloning.
+    #[must_use]
+    pub const fn retained_owned_bytes(&self) -> usize {
+        self.0.capacity()
+    }
 }
 
 impl fmt::Display for SourceAlias {

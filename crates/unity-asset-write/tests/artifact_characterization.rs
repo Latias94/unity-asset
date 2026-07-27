@@ -1,3 +1,5 @@
+mod support;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -8,8 +10,9 @@ use unity_asset_binary::bundle::{BundleLoadOptions, BundleParser};
 use unity_asset_binary::webfile::WebFile;
 use unity_asset_core::{AssetLoadBudget, DigestV1};
 use unity_asset_write::PackingPolicy;
-use unity_asset_write::bundle::{BundleEdits, BundleWriter};
 use unity_asset_write::webfile::{WebFileEdits, WebFilePackingPolicy, WebFileWriter};
+
+use support::{ordered_bundle_entries, prepare_bundle_bytes};
 
 struct SamplingAllocator;
 
@@ -167,11 +170,12 @@ fn build_uncompressed_webfile(entries: Vec<(String, Vec<u8>)>) -> Vec<u8> {
 }
 
 fn emit_sample(
+    implementation: &str,
     fixture: &str,
     input_bytes: u64,
     source_bytes_read: u64,
     decompressed_bytes: u64,
-    legacy_materializations: u64,
+    known_image_materializations: Option<u64>,
     output_bytes: u64,
     output_digest: DigestV1,
     runtime: RuntimeSample,
@@ -190,7 +194,7 @@ fn emit_sample(
         "{}",
         json!({
             "schema": "unity-asset.prepared-artifact-characterization.v1",
-            "implementation": "legacy-contiguous-writers",
+            "implementation": implementation,
             "fixture": fixture,
             "input_bytes": input_bytes,
             "output_bytes": output_bytes,
@@ -204,7 +208,7 @@ fn emit_sample(
             "allocated_request_bytes": runtime.allocations.allocated_bytes,
             "source_bytes_read": source_bytes_read,
             "decompressed_bytes": decompressed_bytes,
-            "known_image_materializations": legacy_materializations,
+            "known_image_materializations": known_image_materializations,
         })
     );
 }
@@ -253,26 +257,26 @@ fn prepared_artifact_legacy_sample_representative() {
             .filter(|node| node.is_file())
             .map(|node| node.size)
             .sum::<u64>();
-        let file_count =
-            u64::try_from(bundle.nodes.iter().filter(|node| node.is_file()).count()).unwrap();
-        let output = BundleWriter::save(&bundle, &BundleEdits::default(), PackingPolicy::Preserve)
-            .expect("legacy bundle writer should encode representative fixture");
+        let entries = ordered_bundle_entries(&bundle)
+            .expect("representative bundle entries should adapt in wire order");
+        let output = prepare_bundle_bytes(&bundle, &entries, PackingPolicy::Preserve)
+            .expect("prepared bundle writer should encode representative fixture");
         let summary = (
             u64::try_from(output.len()).unwrap(),
             DigestV1::hash_bytes(&output),
             input_len.saturating_add(source_payload_bytes),
             load_budget.usage().decompressed_bytes,
-            file_count.saturating_add(3),
         );
         drop(output);
         summary
     });
     emit_sample(
+        "prepared-artifact-bundle-test-adapter",
         "representative-unityfs",
         input_len,
         summary.2,
         summary.3,
-        summary.4,
+        None,
         summary.0,
         summary.1,
         runtime,
@@ -281,7 +285,7 @@ fn prepared_artifact_legacy_sample_representative() {
 
 #[test]
 #[ignore = "opt-in release characterization; emits allocation, timing, and process observations"]
-fn prepared_artifact_legacy_sample_generated_large() {
+fn legacy_contiguous_sample_generated_large() {
     const ENTRY_COUNT: usize = 32;
     const ENTRY_BYTES: usize = 1024 * 1024;
     let entries = (0..ENTRY_COUNT)
@@ -316,11 +320,12 @@ fn prepared_artifact_legacy_sample_generated_large() {
         summary
     });
     emit_sample(
+        "legacy-contiguous-writers",
         "generated-large-webfile",
         input_len,
         summary.2,
         summary.3,
-        summary.4,
+        Some(summary.4),
         summary.0,
         summary.1,
         runtime,
@@ -329,7 +334,7 @@ fn prepared_artifact_legacy_sample_generated_large() {
 
 #[test]
 #[ignore = "opt-in release characterization; emits allocation, timing, and process observations"]
-fn prepared_artifact_legacy_sample_adversarial_wide() {
+fn legacy_contiguous_sample_adversarial_wide() {
     const ENTRY_COUNT: usize = 8_192;
     let entries = (0..ENTRY_COUNT)
         .map(|index| {
@@ -363,11 +368,12 @@ fn prepared_artifact_legacy_sample_adversarial_wide() {
         summary
     });
     emit_sample(
+        "legacy-contiguous-writers",
         "adversarial-wide-webfile",
         input_len,
         summary.2,
         summary.3,
-        summary.4,
+        Some(summary.4),
         summary.0,
         summary.1,
         runtime,

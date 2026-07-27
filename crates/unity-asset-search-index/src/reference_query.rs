@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, TryReserveError, btree_map::Entry};
+use std::collections::{BinaryHeap, TryReserveError};
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
@@ -8,19 +8,19 @@ use std::time::Instant;
 
 use serde::Serialize;
 use tantivy::collector::{Collector, Count, SegmentCollector};
-use tantivy::columnar::StrColumn;
+use tantivy::columnar::{Column, StrColumn};
 use tantivy::query::TermQuery;
-use tantivy::schema::{Field, IndexRecordOption, Value as _};
-use tantivy::{DocAddress, DocId, IndexReader, Score, TantivyDocument, Term};
+use tantivy::schema::{Field, IndexRecordOption};
+use tantivy::{DocAddress, DocId, IndexReader, Score, Term};
+#[cfg(test)]
+use unity_asset_core::BudgetedJsonError;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, Diagnostic, DiagnosticError, DigestV1, FieldPath, FieldPathError,
     FieldPathSegment, ObjectAddress, SourceLocator, arc_slice_allocation_bytes,
     string_allocation_bytes, vec_allocation_bytes,
 };
 
-use crate::analysis::{
-    GuidProjection, RawReferenceProjection, ReferenceProjectionFact, ReferenceResolutionProjection,
-};
+use crate::analysis::{GuidProjection, RawReferenceProjection, ReferenceResolutionProjection};
 use crate::contract::{
     ApiErrorCode, Location, MAX_REFERENCE_RESPONSE_DIAGNOSTIC_JSON_BYTES,
     MAX_REFERENCE_RESPONSE_DIAGNOSTICS, ReferenceContext, ReferenceCoverage, ReferenceCursor,
@@ -29,16 +29,14 @@ use crate::contract::{
 };
 use crate::generation::{GenerationStamp, SEARCH_GENERATION_CONTRACT_VERSION};
 use crate::projection::{reference_guid_key, reference_object_key};
-use crate::store::{
-    REFERENCE_SCHEMA_VERSION, ReferenceProjectionFields, ReferenceProjectionReader,
+use crate::reference_payload::{
+    MAX_REFERENCE_PAYLOAD_BYTES, ReferencePayload, ReferencePayloadReadError,
+    ReferencePayloadReader,
 };
+use crate::store::{ReferenceProjectionFields, ReferenceProjectionReader};
 
 pub(crate) const MAX_REFERENCE_QUERY_LIMIT: usize = 500;
-// The writer's default fact cap is 1 MiB. Query-side limits independently defend reopened or
-// corrupted projections and bound both decoded input and serialized page output.
-const MAX_STORED_REFERENCE_JSON_FIELD_BYTES: usize = 1024 * 1024;
-const MAX_STORED_REFERENCE_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_REFERENCE_PAGE_STORED_JSON_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REFERENCE_PAGE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REFERENCE_OBJECTS_PER_HIT: usize = 1024;
 const MAX_REFERENCE_HIT_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REFERENCE_PAGE_HIT_JSON_BYTES: usize = 8 * 1024 * 1024;
@@ -47,9 +45,8 @@ const REFERENCE_CURSOR_BINDING_PREFIX: &str = "reference-query-v1:";
 
 #[derive(Debug, Clone, Copy)]
 struct ReferenceQueryLimits {
-    max_stored_json_field_bytes: usize,
-    max_stored_document_bytes: usize,
-    max_page_stored_json_bytes: usize,
+    max_payload_bytes: usize,
+    max_page_payload_bytes: usize,
     max_hit_json_bytes: usize,
     max_page_hit_json_bytes: usize,
     max_response_diagnostics: usize,
@@ -57,9 +54,8 @@ struct ReferenceQueryLimits {
 }
 
 const REFERENCE_QUERY_LIMITS: ReferenceQueryLimits = ReferenceQueryLimits {
-    max_stored_json_field_bytes: MAX_STORED_REFERENCE_JSON_FIELD_BYTES,
-    max_stored_document_bytes: MAX_STORED_REFERENCE_DOCUMENT_BYTES,
-    max_page_stored_json_bytes: MAX_REFERENCE_PAGE_STORED_JSON_BYTES,
+    max_payload_bytes: MAX_REFERENCE_PAYLOAD_BYTES,
+    max_page_payload_bytes: MAX_REFERENCE_PAGE_PAYLOAD_BYTES,
     max_hit_json_bytes: MAX_REFERENCE_HIT_JSON_BYTES,
     max_page_hit_json_bytes: MAX_REFERENCE_PAGE_HIT_JSON_BYTES,
     max_response_diagnostics: MAX_REFERENCE_RESPONSE_DIAGNOSTICS,
@@ -469,6 +465,7 @@ pub(crate) struct ReferenceQuerySnapshot {
     generation: GenerationStamp,
     reader: IndexReader,
     fields: ReferenceProjectionFields,
+    payloads: ReferencePayloadReader,
     completeness: ReferenceQueryCompleteness,
 }
 
@@ -482,6 +479,7 @@ impl ReferenceQuerySnapshot {
             generation,
             reader: projection.reader().clone(),
             fields: *projection.fields(),
+            payloads: projection.payloads().clone(),
             completeness,
         }
     }
@@ -601,14 +599,16 @@ impl ReferenceQueryEngine {
     pub(crate) fn references(
         &self,
         request: ReferenceRequest,
+        budget: &mut AssetLoadBudget,
     ) -> Result<ReferencesResponse, ReferenceQueryError> {
-        self.references_with_limits(request, REFERENCE_QUERY_LIMITS)
+        self.references_with_limits(request, REFERENCE_QUERY_LIMITS, budget)
     }
 
     fn references_with_limits(
         &self,
         mut request: ReferenceRequest,
         limits: ReferenceQueryLimits,
+        budget: &mut AssetLoadBudget,
     ) -> Result<ReferencesResponse, ReferenceQueryError> {
         let started = Instant::now();
         validate_request(&request, &self.snapshot.generation)?;
@@ -654,56 +654,25 @@ impl ReferenceQueryEngine {
 
         let mut hits = Vec::with_capacity(documents.len());
         let mut diagnostics = ResponseDiagnostics::new(&self.snapshot.completeness, limits)?;
-        let mut stored_json_bytes = 0;
+        let mut payload_bytes = 0;
         let mut hit_json_bytes = 2;
         let mut byte_limit_has_more = false;
         let mut last_returned_stable_id = None;
-        let mut store_readers = BTreeMap::new();
         for selected in &documents {
-            let segment_ord = selected.address.segment_ord;
-            let store_reader = match store_readers.entry(segment_ord) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let reader = searcher
-                        .segment_reader(segment_ord)
-                        .get_store_reader(1)
-                        .map_err(tantivy::TantivyError::from)?;
-                    entry.insert(reader)
-                }
-            };
-            let stored_document_bytes = store_reader.get_document_bytes(selected.address.doc_id)?;
-            if stored_document_bytes.len() > limits.max_stored_document_bytes {
-                return Err(ReferenceQueryError::CorruptDocument {
-                    stable_id: Some(selected.stable_id.clone()),
-                    reason: format!(
-                        "encoded stored document is {} bytes, exceeding the {}-byte materialization \
-                         limit",
-                        stored_document_bytes.len(),
-                        limits.max_stored_document_bytes
-                    ),
-                });
-            }
-            let document: TantivyDocument = store_reader.get(selected.address.doc_id)?;
-            let remaining_stored_json_bytes = limits
-                .max_page_stored_json_bytes
-                .saturating_sub(stored_json_bytes);
-            let Some(decoded) = decode_stored_reference_document(
-                &document,
-                self.snapshot.fields,
-                limits.max_stored_json_field_bytes,
-                remaining_stored_json_bytes,
+            let remaining_payload_bytes =
+                limits.max_page_payload_bytes.saturating_sub(payload_bytes);
+            let Some(decoded) = decode_reference_payload(
+                &self.snapshot.payloads,
+                selected,
+                limits.max_payload_bytes,
+                remaining_payload_bytes,
+                budget,
             )?
             else {
                 byte_limit_has_more = true;
                 break;
             };
             let mut stored = decoded.document;
-            if stored.stable_id != selected.stable_id {
-                return Err(ReferenceQueryError::CorruptDocument {
-                    stable_id: Some(selected.stable_id.clone()),
-                    reason: "stored stable ID differs from the fast-field stable ID".to_owned(),
-                });
-            }
 
             let fact_diagnostics = std::mem::take(&mut stored.fact.diagnostics);
             let hit = reference_hit(stored)?;
@@ -725,7 +694,7 @@ impl ReferenceQueryEngine {
                 break;
             }
 
-            stored_json_bytes += decoded.stored_json_bytes;
+            payload_bytes += decoded.payload_bytes;
             hit_json_bytes += framed_hit_bytes;
             diagnostics.extend_owned(fact_diagnostics)?;
             last_returned_stable_id = Some(selected.stable_id.clone());
@@ -738,7 +707,7 @@ impl ReferenceQueryEngine {
                     .first()
                     .map(|document| document.stable_id.clone())
                     .unwrap_or_default(),
-                stored_json_maximum: limits.max_page_stored_json_bytes,
+                payload_maximum: limits.max_page_payload_bytes,
                 hit_json_maximum: limits.max_page_hit_json_bytes,
             });
         }
@@ -801,6 +770,10 @@ pub(crate) enum ReferenceQueryError {
         stable_id: Option<String>,
         reason: String,
     },
+    Payload {
+        stable_id: String,
+        source: ReferencePayloadReadError,
+    },
     ResponseHitTooLarge {
         stable_id: String,
         actual: usize,
@@ -813,7 +786,7 @@ pub(crate) enum ReferenceQueryError {
     },
     ResponsePageBudgetTooSmall {
         stable_id: String,
-        stored_json_maximum: usize,
+        payload_maximum: usize,
         hit_json_maximum: usize,
     },
     ResponseDiagnostic {
@@ -835,6 +808,7 @@ impl ReferenceQueryError {
             | Self::CursorQueryMismatch => ApiErrorCode::InvalidCursor,
             Self::Index(_)
             | Self::CorruptDocument { .. }
+            | Self::Payload { .. }
             | Self::ResponseHitTooLarge { .. }
             | Self::ResponseHitObjectLimitExceeded { .. }
             | Self::ResponsePageBudgetTooSmall { .. }
@@ -888,6 +862,11 @@ impl fmt::Display for ReferenceQueryError {
                     )
                 }
             }
+            Self::Payload { stable_id, source } => write!(
+                formatter,
+                "reference projection payload for document {stable_id:?} cannot be decoded: \
+                 {source}"
+            ),
             Self::ResponseHitTooLarge {
                 stable_id,
                 actual,
@@ -908,12 +887,12 @@ impl fmt::Display for ReferenceQueryError {
             ),
             Self::ResponsePageBudgetTooSmall {
                 stable_id,
-                stored_json_maximum,
+                payload_maximum,
                 hit_json_maximum,
             } => write!(
                 formatter,
                 "reference hit {stable_id:?} cannot fit within the page budgets of \
-                 {stored_json_maximum} stored-JSON bytes and {hit_json_maximum} response-hit bytes"
+                 {payload_maximum} payload bytes and {hit_json_maximum} response-hit bytes"
             ),
             Self::ResponseDiagnostic { reason } => write!(
                 formatter,
@@ -927,6 +906,7 @@ impl Error for ReferenceQueryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Index(error) => Some(error),
+            Self::Payload { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -1041,6 +1021,9 @@ fn selector_key(
 struct StableReferenceDocument {
     stable_id: String,
     address: DocAddress,
+    payload_offset: u64,
+    payload_length: u64,
+    payload_digest: DigestV1,
 }
 
 impl Ord for StableReferenceDocument {
@@ -1085,12 +1068,26 @@ impl Collector for StableReferenceCollector {
                     "reference stable_id fast field is missing".into(),
                 )
             })?;
+        let payload_offsets = segment_reader.fast_fields().u64("payload_offset")?;
+        let payload_lengths = segment_reader.fast_fields().u64("payload_length")?;
+        let payload_digests = segment_reader
+            .fast_fields()
+            .str("payload_digest")?
+            .ok_or_else(|| {
+                tantivy::TantivyError::SchemaError(
+                    "reference payload_digest fast field is missing".into(),
+                )
+            })?;
         Ok(StableReferenceSegmentCollector {
             limit: self.limit,
             segment_ord: segment_local_id,
             stable_ids,
+            payload_offsets,
+            payload_lengths,
+            payload_digests,
             after_stable_id: self.after_stable_id.clone(),
             scratch: String::new(),
+            digest_scratch: String::new(),
             heap: BinaryHeap::with_capacity(self.limit),
             error: None,
         })
@@ -1120,8 +1117,12 @@ struct StableReferenceSegmentCollector {
     limit: usize,
     segment_ord: u32,
     stable_ids: StrColumn,
+    payload_offsets: Column<u64>,
+    payload_lengths: Column<u64>,
+    payload_digests: StrColumn,
     after_stable_id: Option<Arc<str>>,
     scratch: String,
+    digest_scratch: String,
     heap: BinaryHeap<StableReferenceDocument>,
     error: Option<tantivy::TantivyError>,
 }
@@ -1160,6 +1161,57 @@ impl SegmentCollector for StableReferenceSegmentCollector {
                 return;
             }
         }
+        let payload_offset = match required_fast_u64(&self.payload_offsets, doc, "payload_offset") {
+            Ok(value) => value,
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
+        let payload_length = match required_fast_u64(&self.payload_lengths, doc, "payload_length") {
+            Ok(value) => value,
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
+        self.digest_scratch.clear();
+        let mut digest_ordinals = self.payload_digests.term_ords(doc);
+        let Some(digest_ordinal) = digest_ordinals.next() else {
+            self.error = Some(tantivy::TantivyError::InternalError(
+                "reference document is missing its payload digest".into(),
+            ));
+            return;
+        };
+        if digest_ordinals.next().is_some() {
+            self.error = Some(tantivy::TantivyError::InternalError(
+                "reference document has multiple payload digests".into(),
+            ));
+            return;
+        }
+        match self
+            .payload_digests
+            .ord_to_str(digest_ordinal, &mut self.digest_scratch)
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.error = Some(tantivy::TantivyError::InternalError(
+                    "reference document has an invalid payload digest ordinal".into(),
+                ));
+                return;
+            }
+            Err(error) => {
+                self.error = Some(error.into());
+                return;
+            }
+        }
+        let payload_digest = match payload_digest_from_hex(&self.digest_scratch) {
+            Ok(digest) => digest,
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
         if self
             .after_stable_id
             .as_deref()
@@ -1172,6 +1224,9 @@ impl SegmentCollector for StableReferenceSegmentCollector {
             StableReferenceDocument {
                 stable_id: self.scratch.clone(),
                 address: DocAddress::new(self.segment_ord, doc),
+                payload_offset,
+                payload_length,
+                payload_digest,
             },
             self.limit,
         );
@@ -1185,6 +1240,46 @@ impl SegmentCollector for StableReferenceSegmentCollector {
         documents.sort_unstable();
         Ok(documents)
     }
+}
+
+fn payload_digest_from_hex(encoded: &str) -> tantivy::Result<DigestV1> {
+    if encoded.len() != DigestV1::BYTE_LEN * 2 {
+        return Err(tantivy::TantivyError::InternalError(
+            "reference payload digest has an invalid encoded length".to_owned(),
+        ));
+    }
+    let mut bytes = [0_u8; DigestV1::BYTE_LEN];
+    hex::decode_to_slice(encoded, &mut bytes).map_err(|_| {
+        tantivy::TantivyError::InternalError(
+            "reference payload digest is not valid lowercase hexadecimal".to_owned(),
+        )
+    })?;
+    Ok(DigestV1::from_bytes(bytes))
+}
+
+fn required_fast_u64(
+    column: &Column<u64>,
+    document: DocId,
+    field_name: &'static str,
+) -> tantivy::Result<u64> {
+    exactly_one_fast_u64(column.values_for_doc(document), field_name)
+}
+
+fn exactly_one_fast_u64(
+    mut values: impl Iterator<Item = u64>,
+    field_name: &'static str,
+) -> tantivy::Result<u64> {
+    let Some(value) = values.next() else {
+        return Err(tantivy::TantivyError::InternalError(format!(
+            "reference document is missing {field_name} fast field value"
+        )));
+    };
+    if values.next().is_some() {
+        return Err(tantivy::TantivyError::InternalError(format!(
+            "reference document has multiple {field_name} fast field values"
+        )));
+    }
+    Ok(value)
 }
 
 fn retain_smallest(
@@ -1206,259 +1301,49 @@ fn retain_smallest(
 }
 
 #[derive(Debug)]
-struct StoredReferenceDocument {
-    stable_id: String,
-    source_path: String,
-    source_kind: String,
-    source_guid: Option<String>,
-    source_object: Option<ObjectAddress>,
-    source_file_id: Option<i64>,
-    source_class_id: Option<i32>,
-    fact: ReferenceProjectionFact,
+struct DecodedReferencePayload {
+    document: ReferencePayload,
+    payload_bytes: usize,
 }
 
-#[derive(Debug)]
-struct DecodedStoredReferenceDocument {
-    document: StoredReferenceDocument,
-    stored_json_bytes: usize,
-}
-
-fn decode_stored_reference_document(
-    document: &TantivyDocument,
-    fields: ReferenceProjectionFields,
-    max_json_field_bytes: usize,
-    remaining_page_json_bytes: usize,
-) -> Result<Option<DecodedStoredReferenceDocument>, ReferenceQueryError> {
-    let schema_version = required_u64(document, fields.schema_version(), "schema_version", None)?;
-    if schema_version != u64::from(REFERENCE_SCHEMA_VERSION) {
-        return Err(ReferenceQueryError::CorruptDocument {
-            stable_id: None,
-            reason: format!(
-                "stored schema_version {schema_version} does not match {REFERENCE_SCHEMA_VERSION}"
-            ),
-        });
-    }
-    let stable_id = required_text(document, fields.stable_id(), "stable_id", None)?;
-    if stable_id.is_empty() {
-        return Err(corrupt_field(None, "stable_id", "is empty"));
-    }
-    let source_path = required_text(
-        document,
-        fields.source_path(),
-        "source_path",
-        Some(stable_id),
-    )?;
-    let source_kind = required_text(
-        document,
-        fields.source_kind(),
-        "source_kind",
-        Some(stable_id),
-    )?;
-    let source_guid = optional_text(
-        document,
-        fields.source_guid(),
-        "source_guid",
-        Some(stable_id),
-    )?;
-    let source_object_json = optional_text(
-        document,
-        fields.source_object_json(),
-        "source_object_json",
-        Some(stable_id),
-    )?;
-    let source_file_id = optional_i64(
-        document,
-        fields.source_file_id(),
-        "source_file_id",
-        Some(stable_id),
-    )?;
-    let source_class_id = optional_i64(
-        document,
-        fields.source_class_id(),
-        "source_class_id",
-        Some(stable_id),
-    )?
-    .map(|value| {
-        i32::try_from(value).map_err(|_| ReferenceQueryError::CorruptDocument {
-            stable_id: Some(stable_id.to_owned()),
-            reason: format!("source_class_id {value} does not fit i32"),
-        })
-    })
-    .transpose()?;
-    let fact_json = required_text(document, fields.fact_json(), "fact_json", Some(stable_id))?;
-
-    if let Some(source_object_json) = source_object_json {
-        validate_stored_json_field_size(
-            stable_id,
-            "source_object_json",
-            source_object_json,
-            max_json_field_bytes,
-        )?;
-    }
-    validate_stored_json_field_size(stable_id, "fact_json", fact_json, max_json_field_bytes)?;
-    let stored_json_bytes = source_object_json
-        .map_or(0, str::len)
-        .checked_add(fact_json.len())
-        .ok_or_else(|| ReferenceQueryError::CorruptDocument {
-            stable_id: Some(stable_id.to_owned()),
-            reason: "stored JSON byte count overflows usize".to_owned(),
+fn decode_reference_payload(
+    payloads: &ReferencePayloadReader,
+    selected: &StableReferenceDocument,
+    maximum_payload_bytes: usize,
+    remaining_page_payload_bytes: usize,
+    budget: &mut AssetLoadBudget,
+) -> Result<Option<DecodedReferencePayload>, ReferenceQueryError> {
+    let range = payloads
+        .validate_range(
+            selected.payload_offset,
+            selected.payload_length,
+            maximum_payload_bytes,
+        )
+        .map_err(|source| ReferenceQueryError::Payload {
+            stable_id: selected.stable_id.clone(),
+            source,
         })?;
-    if stored_json_bytes > remaining_page_json_bytes {
+    let payload_bytes = range.encoded_bytes();
+    if payload_bytes > remaining_page_payload_bytes {
         return Ok(None);
     }
 
-    let source_object = source_object_json
-        .map(|encoded| {
-            serde_json::from_str(encoded).map_err(|error| ReferenceQueryError::CorruptDocument {
-                stable_id: Some(stable_id.to_owned()),
-                reason: format!("source_object_json is invalid: {error}"),
-            })
-        })
-        .transpose()?;
-    let fact: ReferenceProjectionFact =
-        serde_json::from_str(fact_json).map_err(|error| ReferenceQueryError::CorruptDocument {
-            stable_id: Some(stable_id.to_owned()),
-            reason: format!("fact_json is invalid: {error}"),
+    let document = payloads
+        .read(range, selected.payload_digest, budget)
+        .map_err(|source| ReferenceQueryError::Payload {
+            stable_id: selected.stable_id.clone(),
+            source,
         })?;
-
-    if fact.source_object != source_object
-        || fact.source_file_id != source_file_id
-        || fact.source_class_id != source_class_id
-    {
-        return Err(ReferenceQueryError::CorruptDocument {
-            stable_id: Some(stable_id.to_owned()),
-            reason: "stored source identity differs from fact_json".to_owned(),
-        });
-    }
-
-    Ok(Some(DecodedStoredReferenceDocument {
-        document: StoredReferenceDocument {
-            stable_id: stable_id.to_owned(),
-            source_path: source_path.to_owned(),
-            source_kind: source_kind.to_owned(),
-            source_guid: source_guid.map(str::to_owned),
-            source_object,
-            source_file_id,
-            source_class_id,
-            fact,
-        },
-        stored_json_bytes,
+    document.validate(&selected.stable_id).map_err(|source| {
+        ReferenceQueryError::CorruptDocument {
+            stable_id: Some(selected.stable_id.clone()),
+            reason: source.to_string(),
+        }
+    })?;
+    Ok(Some(DecodedReferencePayload {
+        document,
+        payload_bytes,
     }))
-}
-
-fn validate_stored_json_field_size(
-    stable_id: &str,
-    field_name: &str,
-    value: &str,
-    maximum: usize,
-) -> Result<(), ReferenceQueryError> {
-    if value.len() > maximum {
-        return Err(ReferenceQueryError::CorruptDocument {
-            stable_id: Some(stable_id.to_owned()),
-            reason: format!(
-                "stored field {field_name:?} is {} bytes, exceeding the {maximum}-byte decode limit",
-                value.len()
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn required_text<'a>(
-    document: &'a TantivyDocument,
-    field: Field,
-    field_name: &str,
-    stable_id: Option<&str>,
-) -> Result<&'a str, ReferenceQueryError> {
-    let mut values = document.get_all(field);
-    let Some(value) = values.next() else {
-        return Err(corrupt_field(stable_id, field_name, "is missing"));
-    };
-    if values.next().is_some() {
-        return Err(corrupt_field(
-            stable_id,
-            field_name,
-            "has multiple stored values",
-        ));
-    }
-    value
-        .as_str()
-        .ok_or_else(|| corrupt_field(stable_id, field_name, "is not text"))
-}
-
-fn optional_text<'a>(
-    document: &'a TantivyDocument,
-    field: Field,
-    field_name: &str,
-    stable_id: Option<&str>,
-) -> Result<Option<&'a str>, ReferenceQueryError> {
-    let mut values = document.get_all(field);
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(corrupt_field(
-            stable_id,
-            field_name,
-            "has multiple stored values",
-        ));
-    }
-    value
-        .as_str()
-        .map(Some)
-        .ok_or_else(|| corrupt_field(stable_id, field_name, "is not text"))
-}
-
-fn optional_i64(
-    document: &TantivyDocument,
-    field: Field,
-    field_name: &str,
-    stable_id: Option<&str>,
-) -> Result<Option<i64>, ReferenceQueryError> {
-    let mut values = document.get_all(field);
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(corrupt_field(
-            stable_id,
-            field_name,
-            "has multiple stored values",
-        ));
-    }
-    value
-        .as_i64()
-        .map(Some)
-        .ok_or_else(|| corrupt_field(stable_id, field_name, "is not i64"))
-}
-
-fn required_u64(
-    document: &TantivyDocument,
-    field: Field,
-    field_name: &str,
-    stable_id: Option<&str>,
-) -> Result<u64, ReferenceQueryError> {
-    let mut values = document.get_all(field);
-    let Some(value) = values.next() else {
-        return Err(corrupt_field(stable_id, field_name, "is missing"));
-    };
-    if values.next().is_some() {
-        return Err(corrupt_field(
-            stable_id,
-            field_name,
-            "has multiple stored values",
-        ));
-    }
-    value
-        .as_u64()
-        .ok_or_else(|| corrupt_field(stable_id, field_name, "is not u64"))
-}
-
-fn corrupt_field(stable_id: Option<&str>, field_name: &str, problem: &str) -> ReferenceQueryError {
-    ReferenceQueryError::CorruptDocument {
-        stable_id: stable_id.map(str::to_owned),
-        reason: format!("stored field {field_name:?} {problem}"),
-    }
 }
 
 #[derive(Default)]
@@ -1490,7 +1375,7 @@ fn reference_hit_json_bytes(hit: &ReferenceHit) -> Result<usize, ReferenceQueryE
     })
 }
 
-fn reference_hit(stored: StoredReferenceDocument) -> Result<ReferenceHit, ReferenceQueryError> {
+fn reference_hit(stored: ReferencePayload) -> Result<ReferenceHit, ReferenceQueryError> {
     let object_count = 1usize.saturating_add(resolution_object_count(&stored.fact.resolution));
     if object_count > MAX_REFERENCE_OBJECTS_PER_HIT {
         return Err(ReferenceQueryError::ResponseHitObjectLimitExceeded {
@@ -1555,9 +1440,7 @@ const fn resolution_hint(resolution: &ReferenceResolutionProjection) -> &'static
     }
 }
 
-fn raw_reference_object(
-    stored: &StoredReferenceDocument,
-) -> Result<ReferenceObject, ReferenceQueryError> {
+fn raw_reference_object(stored: &ReferencePayload) -> Result<ReferenceObject, ReferenceQueryError> {
     match &stored.fact.raw_target {
         RawReferenceProjection::Binary {
             file_id,
@@ -1661,7 +1544,7 @@ fn raw_reference_object(
 }
 
 fn resolution_objects(
-    stored: &StoredReferenceDocument,
+    stored: &ReferencePayload,
 ) -> Result<Vec<ReferenceObject>, ReferenceQueryError> {
     let mut objects = Vec::new();
     match &stored.fact.resolution {
@@ -1771,6 +1654,10 @@ fn source_stable_id(source: &SourceLocator) -> Result<String, ReferenceQueryErro
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use tantivy::{Index, TantivyDocument};
     use tempfile::tempdir;
     use unity_asset_core::{
         AssetLoadLimits, AssetLoadUsage, DiagnosticSeverity, FieldPath, WorkspaceId,
@@ -1778,9 +1665,12 @@ mod tests {
     };
 
     use super::*;
-    use crate::analysis::{BinaryExternalProjection, ReferenceDependencyKey};
+    use crate::analysis::{
+        BinaryExternalProjection, ReferenceDependencyKey, ReferenceProjectionFact,
+    };
     use crate::generation::SearchGenerationId;
     use crate::projection::{GenerationProjection, ProjectionMetrics, ReferenceDocument};
+    use crate::reference_payload::REFERENCE_PAYLOAD_FILE;
     use crate::store::{ProjectionReaders, ProjectionStore};
 
     const GUID: &str = "abababababababababababababababab";
@@ -1850,17 +1740,8 @@ mod tests {
         }
     }
 
-    fn stored_reference(projected: ReferenceDocument) -> StoredReferenceDocument {
-        StoredReferenceDocument {
-            stable_id: projected.stable_id,
-            source_path: projected.source_path,
-            source_kind: projected.source_kind,
-            source_guid: projected.source_guid,
-            source_object: projected.source_object,
-            source_file_id: projected.source_file_id,
-            source_class_id: projected.source_class_id,
-            fact: projected.fact,
-        }
+    fn stored_reference(projected: ReferenceDocument) -> ReferencePayload {
+        ReferencePayload::from_document(projected)
     }
 
     fn projection(documents: Vec<ReferenceDocument>) -> GenerationProjection {
@@ -1887,9 +1768,38 @@ mod tests {
     ) -> (tempfile::TempDir, ReferenceQueryEngine) {
         let directory = tempdir().unwrap();
         ProjectionStore::build(directory.path(), &projection(documents)).unwrap();
-        let readers = ProjectionReaders::open(directory.path()).unwrap();
+        let readers =
+            ProjectionReaders::open(directory.path(), &mut AssetLoadBudget::default()).unwrap();
         let snapshot = ReferenceQuerySnapshot::new(stamp, readers.references(), completeness);
         (directory, ReferenceQueryEngine::new(Arc::new(snapshot)))
+    }
+
+    fn open_engine(directory: &Path, stamp: GenerationStamp) -> ReferenceQueryEngine {
+        let readers = ProjectionReaders::open(directory, &mut AssetLoadBudget::default()).unwrap();
+        let snapshot = ReferenceQuerySnapshot::new(
+            stamp,
+            readers.references(),
+            ReferenceQueryCompleteness::complete(),
+        );
+        ReferenceQueryEngine::new(Arc::new(snapshot))
+    }
+
+    fn payload_path(directory: &Path) -> PathBuf {
+        directory.join("references").join(REFERENCE_PAYLOAD_FILE)
+    }
+
+    #[test]
+    fn payload_fast_fields_require_exactly_one_value() {
+        let missing = exactly_one_fast_u64(std::iter::empty(), "payload_offset").unwrap_err();
+        let duplicate =
+            exactly_one_fast_u64([7_u64, 8_u64].into_iter(), "payload_length").unwrap_err();
+
+        assert!(missing.to_string().contains("missing payload_offset"));
+        assert!(duplicate.to_string().contains("multiple payload_length"));
+        assert_eq!(
+            exactly_one_fast_u64([9_u64].into_iter(), "payload_offset").unwrap(),
+            9
+        );
     }
 
     #[test]
@@ -2139,6 +2049,7 @@ mod tests {
                     max_response_diagnostic_json_bytes: exact_bytes,
                     ..REFERENCE_QUERY_LIMITS
                 },
+                &mut AssetLoadBudget::default(),
             )
             .unwrap();
         assert_eq!(exact.diagnostics.len(), 2);
@@ -2172,6 +2083,7 @@ mod tests {
                     max_response_diagnostic_json_bytes: exact_bytes - 1,
                     ..REFERENCE_QUERY_LIMITS
                 },
+                &mut AssetLoadBudget::default(),
             )
             .unwrap();
         assert_eq!(one_over.diagnostics.len(), 1);
@@ -2188,11 +2100,10 @@ mod tests {
         let stamp = generation(b"one");
         let (_directory, engine) = engine(vec![projected_reference("reference-a", -7)], stamp);
         let response = engine
-            .references(ReferenceRequest::incoming_guid(
-                GUID.to_ascii_uppercase(),
-                Some(-99),
-                10,
-            ))
+            .references(
+                ReferenceRequest::incoming_guid(GUID.to_ascii_uppercase(), Some(-99), 10),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap();
 
         assert_eq!(
@@ -2231,7 +2142,10 @@ mod tests {
         let (_directory, engine) = engine(Vec::new(), stamp);
 
         let error = engine
-            .references(ReferenceRequest::incoming_guid("not-a-guid", None, 10))
+            .references(
+                ReferenceRequest::incoming_guid("not-a-guid", None, 10),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap_err();
 
         assert!(matches!(error, ReferenceQueryError::InvalidGuid));
@@ -2246,16 +2160,22 @@ mod tests {
         let (_directory, engine) = engine(vec![document], stamp);
 
         let incoming = engine
-            .references(ReferenceRequest::incoming_guid(GUID, None, 10))
+            .references(
+                ReferenceRequest::incoming_guid(GUID, None, 10),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap();
         let outgoing = engine
-            .references(ReferenceRequest {
-                contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-                direction: ReferenceDirection::Outgoing,
-                selector: ReferenceSelector::Object { address: source },
-                limit: 10,
-                cursor: None,
-            })
+            .references(
+                ReferenceRequest {
+                    contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+                    direction: ReferenceDirection::Outgoing,
+                    selector: ReferenceSelector::Object { address: source },
+                    limit: 10,
+                    cursor: None,
+                },
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap();
 
         assert_eq!(incoming.hits.len(), 1);
@@ -2274,11 +2194,10 @@ mod tests {
         let (_directory, engine) = engine(documents, stamp.clone());
 
         let first = engine
-            .references(ReferenceRequest::incoming_guid(
-                GUID.to_ascii_uppercase(),
-                Some(-99),
-                1,
-            ))
+            .references(
+                ReferenceRequest::incoming_guid(GUID.to_ascii_uppercase(), Some(-99), 1),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap();
         assert_eq!(first.hits[0].stable_id, "reference-a");
         assert_eq!(first.coverage.total, Some(3));
@@ -2292,16 +2211,19 @@ mod tests {
             serde_json::from_value(serde_json::to_value(cursor).unwrap()).unwrap();
 
         let second = engine
-            .references(ReferenceRequest {
-                contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-                direction: ReferenceDirection::Incoming,
-                selector: ReferenceSelector::Guid {
-                    guid: GUID.to_owned(),
-                    file_id: Some(-99),
+            .references(
+                ReferenceRequest {
+                    contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+                    direction: ReferenceDirection::Incoming,
+                    selector: ReferenceSelector::Guid {
+                        guid: GUID.to_owned(),
+                        file_id: Some(-99),
+                    },
+                    limit: 1,
+                    cursor: Some(cursor),
                 },
-                limit: 1,
-                cursor: Some(cursor),
-            })
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap();
         assert_eq!(second.hits[0].stable_id, "reference-b");
     }
@@ -2311,20 +2233,23 @@ mod tests {
         let stamp = generation(b"active");
         let (_directory, engine) = engine(vec![projected_reference("reference-a", -7)], stamp);
         let error = engine
-            .references(ReferenceRequest {
-                contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-                direction: ReferenceDirection::Incoming,
-                selector: ReferenceSelector::Guid {
-                    guid: GUID.to_owned(),
-                    file_id: None,
+            .references(
+                ReferenceRequest {
+                    contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+                    direction: ReferenceDirection::Incoming,
+                    selector: ReferenceSelector::Guid {
+                        guid: GUID.to_owned(),
+                        file_id: None,
+                    },
+                    limit: 10,
+                    cursor: Some(ReferenceCursor {
+                        generation: generation(b"old").generation,
+                        after_stable_id: "reference-a".to_owned(),
+                        query_binding: None,
+                    }),
                 },
-                limit: 10,
-                cursor: Some(ReferenceCursor {
-                    generation: generation(b"old").generation,
-                    after_stable_id: "reference-a".to_owned(),
-                    query_binding: None,
-                }),
-            })
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -2346,7 +2271,10 @@ mod tests {
         let (_directory, engine) = engine(vec![projected_reference("reference-a", -7)], stamp);
 
         let error = engine
-            .references(ReferenceRequest::incoming_guid(GUID, None, 10).with_cursor(legacy_cursor))
+            .references(
+                ReferenceRequest::incoming_guid(GUID, None, 10).with_cursor(legacy_cursor),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -2365,14 +2293,20 @@ mod tests {
         ];
         let (_directory, engine) = engine(documents, stamp);
         let cursor = engine
-            .references(ReferenceRequest::incoming_guid(GUID, Some(-99), 1))
+            .references(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 1),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap()
             .coverage
             .next_cursor
             .unwrap();
 
         let error = engine
-            .references(ReferenceRequest::outgoing_guid(GUID, Some(-99), 1).with_cursor(cursor))
+            .references(
+                ReferenceRequest::outgoing_guid(GUID, Some(-99), 1).with_cursor(cursor),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap_err();
 
         assert!(matches!(&error, ReferenceQueryError::CursorQueryMismatch));
@@ -2388,14 +2322,20 @@ mod tests {
         ];
         let (_directory, engine) = engine(documents, stamp);
         let cursor = engine
-            .references(ReferenceRequest::incoming_guid(GUID, Some(-99), 1))
+            .references(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 1),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap()
             .coverage
             .next_cursor
             .unwrap();
 
         let error = engine
-            .references(ReferenceRequest::incoming_guid(GUID, None, 1).with_cursor(cursor))
+            .references(
+                ReferenceRequest::incoming_guid(GUID, None, 1).with_cursor(cursor),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap_err();
 
         assert!(matches!(&error, ReferenceQueryError::CursorQueryMismatch));
@@ -2411,7 +2351,10 @@ mod tests {
         ];
         let (_directory, engine) = engine(documents, stamp);
         let mut cursor = engine
-            .references(ReferenceRequest::incoming_guid(GUID, Some(-99), 1))
+            .references(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 1),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap()
             .coverage
             .next_cursor
@@ -2419,7 +2362,10 @@ mod tests {
         cursor.query_binding = Some("reference-query-v1:not-a-digest".to_owned());
 
         let error = engine
-            .references(ReferenceRequest::incoming_guid(GUID, Some(-99), 1).with_cursor(cursor))
+            .references(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 1).with_cursor(cursor),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -2447,7 +2393,10 @@ mod tests {
         );
 
         let response = engine
-            .references(ReferenceRequest::incoming_guid(GUID, None, 10))
+            .references(
+                ReferenceRequest::incoming_guid(GUID, None, 10),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap();
 
         assert!(!response.coverage.complete);
@@ -2456,97 +2405,245 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_stored_fact_json_is_not_silently_ignored() {
+    fn corrupt_payload_json_is_not_silently_ignored() {
         let directory = tempdir().unwrap();
-        ProjectionStore::build(directory.path(), &projection(Vec::new())).unwrap();
-        let readers = ProjectionReaders::open(directory.path()).unwrap();
-        let fields = *readers.references().fields();
-        let mut document = TantivyDocument::default();
-        document.add_u64(fields.schema_version(), u64::from(REFERENCE_SCHEMA_VERSION));
-        document.add_text(fields.stable_id(), "corrupt-reference");
-        document.add_text(fields.source_path(), "Assets/Corrupt.asset");
-        document.add_text(fields.source_kind(), "SerializedAsset");
-        document.add_text(fields.fact_json(), "{not-json");
-
-        let error = decode_stored_reference_document(
-            &document,
-            fields,
-            MAX_STORED_REFERENCE_JSON_FIELD_BYTES,
-            MAX_REFERENCE_PAGE_STORED_JSON_BYTES,
+        ProjectionStore::build(
+            directory.path(),
+            &projection(vec![projected_reference("reference-a", -7)]),
         )
-        .unwrap_err();
-        assert!(matches!(error, ReferenceQueryError::CorruptDocument { .. }));
-    }
+        .unwrap();
+        let path = payload_path(directory.path());
+        let mut encoded = fs::read(&path).unwrap();
+        encoded[0] = b'!';
+        fs::write(&path, encoded).unwrap();
+        let engine = open_engine(directory.path(), generation(b"corrupt-payload"));
 
-    #[test]
-    fn stored_json_limit_is_checked_before_fact_decoding() {
-        let directory = tempdir().unwrap();
-        ProjectionStore::build(directory.path(), &projection(Vec::new())).unwrap();
-        let readers = ProjectionReaders::open(directory.path()).unwrap();
-        let fields = *readers.references().fields();
-        let mut document = TantivyDocument::default();
-        document.add_u64(fields.schema_version(), u64::from(REFERENCE_SCHEMA_VERSION));
-        document.add_text(fields.stable_id(), "oversized-reference");
-        document.add_text(fields.source_path(), "Assets/Oversized.asset");
-        document.add_text(fields.source_kind(), "SerializedAsset");
-        document.add_text(fields.fact_json(), "{not-json");
-
-        let error = decode_stored_reference_document(&document, fields, 4, usize::MAX).unwrap_err();
-
-        match error {
-            ReferenceQueryError::CorruptDocument { reason, .. } => {
-                assert!(reason.contains("decode limit"));
-                assert!(!reason.contains("is invalid"));
+        let error = engine
+            .references(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 1),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            ReferenceQueryError::Payload {
+                source: ReferencePayloadReadError::Json(BudgetedJsonError::Json(_)),
+                ..
             }
-            other => panic!("expected corrupt stored JSON, got {other:?}"),
-        }
+        ));
     }
 
     #[test]
-    fn stored_document_limit_is_checked_before_materialization() {
-        let stamp = generation(b"stored-document-limit");
+    fn payload_stable_id_must_match_the_fast_field() {
+        let directory = tempdir().unwrap();
+        let projected = projected_reference("reference-a", -7);
+        ProjectionStore::build(directory.path(), &projection(vec![projected.clone()])).unwrap();
+        let path = payload_path(directory.path());
+        let mut encoded = fs::read(&path).unwrap();
+        let stable_id = b"reference-a";
+        let offset = encoded
+            .windows(stable_id.len())
+            .position(|window| window == stable_id)
+            .unwrap();
+        encoded[offset..offset + stable_id.len()].copy_from_slice(b"reference-x");
+        fs::write(&path, &encoded).unwrap();
+
+        let references = directory.path().join("references");
+        let index = Index::open_in_dir(references).unwrap();
+        let schema = index.schema();
+        let stable_id_field = schema.get_field("stable_id").unwrap();
+        let incoming_key_field = schema.get_field("incoming_key").unwrap();
+        let outgoing_key_field = schema.get_field("outgoing_key").unwrap();
+        let payload_offset_field = schema.get_field("payload_offset").unwrap();
+        let payload_length_field = schema.get_field("payload_length").unwrap();
+        let payload_digest_field = schema.get_field("payload_digest").unwrap();
+        let payload_length = u64::try_from(encoded.len() - 1).unwrap();
+        let digest = DigestV1::hash_bytes(&encoded[..encoded.len() - 1]);
+        let mut replacement = TantivyDocument::default();
+        replacement.add_text(stable_id_field, &projected.stable_id);
+        for key in &projected.incoming_keys {
+            replacement.add_text(incoming_key_field, key);
+        }
+        for key in &projected.outgoing_keys {
+            replacement.add_text(outgoing_key_field, key);
+        }
+        replacement.add_u64(payload_offset_field, 0);
+        replacement.add_u64(payload_length_field, payload_length);
+        replacement.add_text(payload_digest_field, hex::encode(digest.as_bytes()));
+        let mut writer = index
+            .writer_with_num_threads::<TantivyDocument>(1, 15_000_000)
+            .unwrap();
+        writer.delete_term(Term::from_field_text(stable_id_field, &projected.stable_id));
+        writer.add_document(replacement).unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+
+        let engine = open_engine(directory.path(), generation(b"stable-id-mismatch"));
+
+        let error = engine
+            .references(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 1),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ReferenceQueryError::CorruptDocument {
+                reason,
+                ..
+            } if reason.contains("stable ID differs")
+        ));
+    }
+
+    #[test]
+    fn deeply_nested_payload_fails_contract_validation() {
+        let directory = tempdir().unwrap();
+        ProjectionStore::build(
+            directory.path(),
+            &projection(vec![projected_reference("reference-a", -7)]),
+        )
+        .unwrap();
+        let path = payload_path(directory.path());
+        let mut encoded = fs::read(&path).unwrap();
+        let payload_length = encoded.iter().position(|byte| *byte == b'\n').unwrap();
+        let nesting = 64;
+        let mut replacement =
+            format!("{}null{}", "[".repeat(nesting), "]".repeat(nesting)).into_bytes();
+        assert!(replacement.len() <= payload_length);
+        replacement.resize(payload_length, b' ');
+        encoded[..payload_length].copy_from_slice(&replacement);
+        fs::write(&path, encoded).unwrap();
+        let engine = open_engine(directory.path(), generation(b"deep-payload"));
+
+        let error = engine
+            .references(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 1),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ReferenceQueryError::Payload {
+                source: ReferencePayloadReadError::Json(
+                    BudgetedJsonError::StructureLimitExceeded {
+                        resource: "depth",
+                        ..
+                    }
+                ),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn payload_limit_is_checked_before_materialization() {
+        let stamp = generation(b"payload-limit");
         let (_directory, engine) = engine(vec![projected_reference("reference-a", -7)], stamp);
         let limits = ReferenceQueryLimits {
-            max_stored_document_bytes: 1,
+            max_payload_bytes: 1,
             ..REFERENCE_QUERY_LIMITS
         };
 
         let error = engine
-            .references_with_limits(ReferenceRequest::incoming_guid(GUID, Some(-99), 1), limits)
+            .references_with_limits(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 1),
+                limits,
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap_err();
 
         assert_eq!(error.api_code(), ApiErrorCode::Internal);
-        match error {
-            ReferenceQueryError::CorruptDocument { reason, .. } => {
-                assert!(reason.contains("materialization limit"));
+        assert!(matches!(
+            error,
+            ReferenceQueryError::Payload {
+                source: ReferencePayloadReadError::PayloadTooLarge { maximum: 1, .. },
+                ..
             }
-            other => panic!("expected oversized stored document, got {other:?}"),
-        }
+        ));
     }
 
     #[test]
-    fn stored_json_page_budget_truncates_with_a_bound_cursor() {
+    fn payload_page_budget_truncates_with_a_bound_cursor() {
         let first_document = projected_reference("reference-a", -7);
-        let stored_json_bytes = serde_json::to_string(&first_document.fact).unwrap().len()
-            + serde_json::to_string(first_document.source_object.as_ref().unwrap())
-                .unwrap()
-                .len();
-        let stamp = generation(b"stored-json-page-budget");
+        let stamp = generation(b"payload-page-budget");
         let documents = vec![first_document, projected_reference("reference-b", -8)];
-        let (_directory, engine) = engine(documents, stamp);
+        let (directory, engine) = engine(documents, stamp);
+        let encoded = fs::read(payload_path(directory.path())).unwrap();
+        let first_payload_bytes = encoded.iter().position(|byte| *byte == b'\n').unwrap();
         let limits = ReferenceQueryLimits {
-            max_page_stored_json_bytes: stored_json_bytes,
+            max_page_payload_bytes: first_payload_bytes,
             ..REFERENCE_QUERY_LIMITS
         };
 
         let first = engine
-            .references_with_limits(ReferenceRequest::incoming_guid(GUID, Some(-99), 2), limits)
+            .references_with_limits(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 2),
+                limits,
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap();
 
         assert_eq!(first.hits.len(), 1);
         assert_eq!(first.hits[0].stable_id, "reference-a");
         assert!(first.coverage.truncated);
         assert!(first.coverage.next_cursor.is_some());
+    }
+
+    #[test]
+    fn reference_page_accumulates_all_payloads_in_one_caller_budget() {
+        let stamp = generation(b"payload-cumulative-budget");
+        let documents = vec![
+            projected_reference("reference-a", -7),
+            projected_reference("reference-b", -8),
+        ];
+        let (_directory, engine) = engine(documents, stamp);
+        let mut first_hit_budget = AssetLoadBudget::default();
+        engine
+            .references(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 1),
+                &mut first_hit_budget,
+            )
+            .expect("measure one decoded hit");
+        let first_hit_usage = first_hit_budget.usage();
+
+        let mut page_budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: first_hit_usage.bytes,
+            ..AssetLoadLimits::default()
+        })
+        .expect("one-hit page budget");
+        let error = engine
+            .references(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 2),
+                &mut page_budget,
+            )
+            .expect_err("second hit must consume the same page budget");
+
+        assert!(
+            matches!(
+                &error,
+                ReferenceQueryError::Payload {
+                    source: ReferencePayloadReadError::Json(BudgetedJsonError::Budget(
+                        BudgetError::Exceeded {
+                            resource: "bytes",
+                            ..
+                        }
+                    )),
+                    ..
+                }
+            ),
+            "unexpected cumulative payload budget error: {error:?}"
+        );
+        assert!(matches!(
+            error
+                .source()
+                .and_then(|source| source.source())
+                .and_then(|source| source.downcast_ref::<BudgetedJsonError>()),
+            Some(BudgetedJsonError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+        assert_eq!(page_budget.usage(), first_hit_usage);
     }
 
     #[test]
@@ -2559,7 +2656,11 @@ mod tests {
         };
 
         let error = engine
-            .references_with_limits(ReferenceRequest::incoming_guid(GUID, Some(-99), 1), limits)
+            .references_with_limits(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 1),
+                limits,
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -2594,7 +2695,10 @@ mod tests {
         ];
         let (_directory, engine) = engine(documents, stamp);
         let baseline = engine
-            .references(ReferenceRequest::incoming_guid(GUID, Some(-99), 1))
+            .references(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 1),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap();
         let first_hit_bytes = reference_hit_json_bytes(&baseline.hits[0]).unwrap();
         let limits = ReferenceQueryLimits {
@@ -2603,7 +2707,11 @@ mod tests {
         };
 
         let first = engine
-            .references_with_limits(ReferenceRequest::incoming_guid(GUID, Some(-99), 2), limits)
+            .references_with_limits(
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 2),
+                limits,
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap();
         assert_eq!(first.hits.len(), 1);
         assert_eq!(first.hits[0].stable_id, "reference-a");
@@ -2614,6 +2722,7 @@ mod tests {
             .references_with_limits(
                 ReferenceRequest::incoming_guid(GUID, Some(-99), 2).with_cursor(cursor),
                 limits,
+                &mut AssetLoadBudget::default(),
             )
             .unwrap();
         assert_eq!(second.hits.len(), 1);

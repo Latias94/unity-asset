@@ -104,7 +104,7 @@ impl SpriteProcessor {
 
     /// Decode one Texture2D for reuse by every Sprite that references it.
     pub fn decode_sprite_texture(&self, texture: &Texture2D) -> Result<DecodedSpriteTexture> {
-        let converter = crate::texture::Texture2DConverter::new(self.parser.version().clone());
+        let converter = crate::texture::Texture2DConverter::new();
         converter
             .decode_to_image(texture)
             .map(|image| DecodedSpriteTexture { image })
@@ -344,12 +344,6 @@ impl SpriteProcessor {
     }
 }
 
-impl Default for SpriteProcessor {
-    fn default() -> Self {
-        Self::new(UnityVersion::default())
-    }
-}
-
 /// Sprite processing statistics
 #[derive(Debug, Clone, Default)]
 pub struct SpriteStats {
@@ -368,11 +362,15 @@ pub struct SpriteStats {
 mod tests {
     use super::*;
 
+    fn test_version() -> UnityVersion {
+        UnityVersion::parse_version("2020.3.12f1").unwrap()
+    }
+
     #[test]
     fn test_processor_creation() {
-        let version = UnityVersion::default();
-        let processor = SpriteProcessor::new(version);
-        assert_eq!(processor.version(), &UnityVersion::default());
+        let version = test_version();
+        let processor = SpriteProcessor::new(version.clone());
+        assert_eq!(processor.version(), &version);
     }
 
     #[test]
@@ -389,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_sprite_validation() {
-        let processor = SpriteProcessor::default();
+        let processor = SpriteProcessor::new(test_version());
         let mut sprite = Sprite::default();
 
         // Invalid sprite (zero dimensions)

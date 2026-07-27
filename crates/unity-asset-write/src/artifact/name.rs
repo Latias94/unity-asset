@@ -22,6 +22,25 @@ impl LogicalArtifactName {
         Self::from_string(value)
     }
 
+    /// Validates an owned name and transfers its retained storage into `budget`.
+    ///
+    /// The input allocation is already caller-owned. This method bounds the additional
+    /// portability-key allocation against the combined live working set, then charges the exact
+    /// capacities retained by the returned name.
+    pub fn from_string_with_budget(
+        value: String,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, ArtifactNameError> {
+        validate_logical_name(&value)?;
+        let portability_key = portability_key_with_budget(&value, budget)?;
+        let name = Self {
+            value,
+            portability_key,
+        };
+        budget.consume_bytes(name.heap_bytes()?)?;
+        Ok(name)
+    }
+
     /// Derive a portable content-addressed name for a generated sidecar artifact.
     pub fn sidecar(
         directory: Option<&Self>,
@@ -244,14 +263,7 @@ fn sidecar_logical_name_with_budget(
     budget: &mut AssetLoadBudget,
 ) -> Result<LogicalArtifactName, ArtifactNameError> {
     let value = sidecar_logical_name_value(directory, base_name, digest, Some(budget))?;
-    validate_logical_name(&value)?;
-    let portability_key = portability_key_with_budget(&value, budget)?;
-    let name = LogicalArtifactName {
-        value,
-        portability_key,
-    };
-    budget.consume_bytes(name.heap_bytes()?)?;
-    Ok(name)
+    LogicalArtifactName::from_string_with_budget(value, budget)
 }
 
 fn sidecar_logical_name_value(
@@ -869,6 +881,37 @@ mod tests {
         for base in [".", "..", "CON", "payload.", "payload "] {
             assert!(LogicalArtifactName::sidecar(None, base, digest).is_err());
         }
+    }
+
+    #[test]
+    fn owned_budgeted_name_charges_exact_retained_capacities() {
+        let value = "reports/extraction-manifest.json".to_owned();
+        let expected = LogicalArtifactName::new(&value).unwrap();
+        let retained = expected.retained_bytes().unwrap();
+        let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: retained,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let actual =
+            LogicalArtifactName::from_string_with_budget(value.clone(), &mut exact).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(exact.usage().bytes, retained);
+
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: retained - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            LogicalArtifactName::from_string_with_budget(value, &mut one_short),
+            Err(ArtifactNameError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+        assert_eq!(one_short.usage(), Default::default());
     }
 
     #[test]

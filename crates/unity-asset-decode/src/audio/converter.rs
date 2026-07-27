@@ -6,9 +6,36 @@
 use super::formats::AudioCompressionFormat;
 use super::types::{AudioClip, AudioClipMeta, StreamingInfo};
 use crate::error::{BinaryError, Result};
+use crate::media::{MediaPayloadRef, StreamDataRef, is_plausible_stream_path};
 use crate::object::UnityObject;
+use crate::reader::{BinaryReader, ByteOrder};
 use crate::unity_version::UnityVersion;
 use unity_asset_core::UnityValue;
+
+/// Allocation-free AudioClip metadata used by planners and inventory tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioClipLayout<'a> {
+    compression_format: AudioCompressionFormat,
+    payload: MediaPayloadRef<'a>,
+}
+
+impl<'a> AudioClipLayout<'a> {
+    /// Inspects an AudioClip without cloning its embedded or streamed media.
+    pub fn inspect(obj: &'a UnityObject, version: &UnityVersion) -> Result<Self> {
+        inspect_audio_typetree(obj)
+            .map_or_else(|| inspect_audio_binary(obj.raw_data(), version), Ok)
+    }
+
+    #[must_use]
+    pub const fn compression_format(self) -> AudioCompressionFormat {
+        self.compression_format
+    }
+
+    #[must_use]
+    pub const fn payload(self) -> MediaPayloadRef<'a> {
+        self.payload
+    }
+}
 
 /// Main audio converter
 ///
@@ -49,7 +76,7 @@ impl AudioClipConverter {
             v.as_f64().map(|n| n as f32)
         }
 
-        let props = obj.class.properties();
+        let props = obj.as_unity_class().properties();
 
         let name = props
             .get("m_Name")
@@ -214,20 +241,14 @@ impl AudioClipConverter {
             let resource_pos = reader.position();
             let mut parsed_resource = false;
 
-            if let Ok(source) = reader.read_aligned_string() {
-                let looks_like_source = source.is_empty()
-                    || source.contains("archive:/")
-                    || source.contains('/')
-                    || source.contains('\\')
-                    || source.ends_with(".resS")
-                    || source.ends_with(".resource");
-                if looks_like_source {
-                    resource_source = source;
-                    resource_offset = reader.read_u64().unwrap_or(0);
-                    resource_size = reader.read_u32().unwrap_or(0);
-                    let _ = reader.align();
-                    parsed_resource = true;
-                }
+            if let Ok(source) = reader.read_aligned_string()
+                && is_plausible_stream_path(&source)
+            {
+                resource_source = source;
+                resource_offset = reader.read_u64().unwrap_or(0);
+                resource_size = reader.read_u32().unwrap_or(0);
+                let _ = reader.align();
+                parsed_resource = true;
             }
 
             if !parsed_resource {
@@ -329,71 +350,140 @@ impl AudioClipConverter {
     pub fn can_process(&self, format: AudioCompressionFormat) -> bool {
         self.supported_formats().contains(&format)
     }
-
-    /// Load streaming data from external file
-    pub fn load_streaming_data(&self, clip: &AudioClip) -> Result<Vec<u8>> {
-        if clip.stream_info.path.is_empty() {
-            return Err(BinaryError::invalid_data("No streaming path specified"));
-        }
-
-        // Try to read from the streaming file
-        use std::fs;
-        use std::path::Path;
-
-        let stream_path = Path::new(&clip.stream_info.path);
-
-        // Try different possible locations for the streaming file
-        let possible_paths = [
-            stream_path.to_path_buf(),
-            Path::new("StreamingAssets").join(stream_path),
-            Path::new("..").join(stream_path),
-        ];
-
-        for path in &possible_paths {
-            if path.exists() {
-                match fs::File::open(path) {
-                    Ok(mut file) => {
-                        use std::io::{Read, Seek, SeekFrom};
-
-                        // Seek to the specified offset
-                        if file.seek(SeekFrom::Start(clip.stream_info.offset)).is_err() {
-                            continue; // Try next path
-                        }
-
-                        // Read the specified amount of data
-                        let mut buffer = vec![0u8; clip.stream_info.size as usize];
-                        match file.read_exact(&mut buffer) {
-                            Ok(_) => return Ok(buffer),
-                            Err(_) => continue, // Try next path
-                        }
-                    }
-                    Err(_) => continue, // Try next path
-                }
-            }
-        }
-
-        Err(BinaryError::generic(format!(
-            "Could not load streaming data from: {}",
-            clip.stream_info.path
-        )))
-    }
-
-    /// Get audio data (either embedded or streamed)
-    pub fn get_audio_data(&self, clip: &AudioClip) -> Result<Vec<u8>> {
-        if !clip.data.is_empty() {
-            // Use embedded data
-            Ok(clip.data.clone())
-        } else if clip.is_streamed() {
-            // Load streaming data
-            self.load_streaming_data(clip)
-        } else {
-            Err(BinaryError::invalid_data("No audio data available"))
-        }
-    }
 }
 
-// Legacy compatibility - alias for the old processor name
-pub type AudioClipProcessor = AudioClipConverter;
+fn inspect_audio_typetree(obj: &UnityObject) -> Option<AudioClipLayout<'_>> {
+    let props = obj.as_unity_class().properties();
+    props.get("m_Name").and_then(UnityValue::as_str)?;
+
+    let compression_format = props
+        .get("m_CompressionFormat")
+        .and_then(UnityValue::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(0);
+    let compression_format = AudioCompressionFormat::from(compression_format);
+
+    let embedded_byte_len = match props.get("m_AudioData") {
+        Some(UnityValue::Bytes(bytes)) => bytes.len(),
+        Some(UnityValue::Array(items)) => {
+            items.iter().filter(|item| item.as_i64().is_some()).count()
+        }
+        _ => 0,
+    };
+    let stream = props
+        .get("m_Resource")
+        .and_then(|value| match value {
+            UnityValue::Object(resource) => Some(resource),
+            _ => None,
+        })
+        .and_then(|resource| {
+            let path = resource.get("m_Source").and_then(UnityValue::as_str)?;
+            let offset = resource
+                .get("m_Offset")
+                .and_then(UnityValue::as_u64)
+                .unwrap_or(0);
+            let size = resource
+                .get("m_Size")
+                .and_then(UnityValue::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(0);
+            StreamDataRef::new(path, offset, size)
+        });
+
+    let payload = MediaPayloadRef::select(embedded_byte_len, stream)?;
+    Some(AudioClipLayout {
+        compression_format,
+        payload,
+    })
+}
+
+fn inspect_audio_binary<'a>(data: &'a [u8], version: &UnityVersion) -> Result<AudioClipLayout<'a>> {
+    if data.is_empty() {
+        return Err(BinaryError::invalid_data("Empty audio data"));
+    }
+
+    let mut reader = BinaryReader::new(data, ByteOrder::Little);
+    reader.read_aligned_string_ref()?;
+    if version.major < 5 {
+        return Err(BinaryError::unsupported_version(
+            "allocation-free AudioClip inspection requires Unity 5 or newer",
+        ));
+    }
+
+    reader.read_i32()?;
+    reader.read_i32()?;
+    reader.read_i32()?;
+    reader.read_i32()?;
+    reader.read_f32()?;
+    reader.read_bool()?;
+    reader.align()?;
+    reader.read_i32()?;
+    reader.read_bool()?;
+    reader.read_bool()?;
+    reader.read_bool()?;
+    reader.align()?;
+
+    let resource_position = reader.position();
+    let mut compression_format = AudioCompressionFormat::Unknown;
+    let mut compression_format_read = false;
+    let resource = if let Some(resource) = try_read_path_first_stream(&mut reader) {
+        resource
+    } else {
+        reader.set_position(resource_position)?;
+        compression_format = AudioCompressionFormat::from(reader.read_i32()?);
+        compression_format_read = true;
+        if version.major >= 2017 {
+            reader.read_bool()?;
+            reader.align()?;
+        }
+        let path = reader.read_aligned_string_ref()?;
+        let offset = reader.read_u64()?;
+        let size = reader.read_u32()?;
+        let _ = reader.align();
+        (path, offset, size)
+    };
+    let stream = StreamDataRef::new(resource.0, resource.1, resource.2);
+
+    let declared_size = reader.read_u32().unwrap_or(0);
+    let embedded_byte_len = if declared_size > 0
+        && reader.remaining() >= usize::try_from(declared_size).unwrap_or(usize::MAX)
+    {
+        let size = declared_size as usize;
+        reader.skip_bytes(size)?;
+        size
+    } else if stream.is_none() {
+        reader.remaining()
+    } else {
+        0
+    };
+
+    if !compression_format_read
+        && reader.remaining() >= 4
+        && let Ok(value) = reader.read_i32()
+        && (-1..=25).contains(&value)
+    {
+        compression_format = AudioCompressionFormat::from(value);
+    }
+
+    let payload = MediaPayloadRef::select(embedded_byte_len, stream).ok_or_else(|| {
+        BinaryError::invalid_data("AudioClip did not contain embedded bytes or stream data")
+    })?;
+    Ok(AudioClipLayout {
+        compression_format,
+        payload,
+    })
+}
+
+fn try_read_path_first_stream<'a>(reader: &mut BinaryReader<'a>) -> Option<(&'a str, u64, u32)> {
+    let path = reader.read_aligned_string_ref().ok()?;
+    if !is_plausible_stream_path(path) {
+        return None;
+    }
+    let offset = reader.read_u64().ok()?;
+    let size = reader.read_u32().ok()?;
+    let _ = reader.align();
+    Some((path, offset, size))
+}
 
 #[cfg(test)]
 mod tests {
@@ -402,33 +492,115 @@ mod tests {
     use indexmap::IndexMap;
     use unity_asset_core::UnityClass;
 
+    fn test_version() -> UnityVersion {
+        UnityVersion::parse_version("2020.3.12f1").unwrap()
+    }
+
     #[test]
     fn typetree_stream_offset_preserves_unsigned_range() {
-        let mut class = UnityClass::new(
+        let class = UnityClass::with_properties(
             class_ids::AUDIO_CLIP,
             "AudioClip".to_string(),
             "1".to_string(),
-        );
-        class.set("m_Name".to_string(), UnityValue::String("Clip".to_string()));
-        class.set(
-            "m_Resource".to_string(),
-            UnityValue::Object(IndexMap::from([
+            IndexMap::from([
+                ("m_Name".to_string(), UnityValue::String("Clip".to_string())),
                 (
-                    "m_Source".to_string(),
-                    UnityValue::String("archive:/CAB-a/CAB-a.resS".to_string()),
+                    "m_Resource".to_string(),
+                    UnityValue::Object(IndexMap::from([
+                        (
+                            "m_Source".to_string(),
+                            UnityValue::String("archive:/CAB-a/CAB-a.resS".to_string()),
+                        ),
+                        ("m_Offset".to_string(), UnityValue::from(u64::MAX)),
+                        ("m_Size".to_string(), UnityValue::Integer(1)),
+                    ])),
                 ),
-                ("m_Offset".to_string(), UnityValue::from(u64::MAX)),
-                ("m_Size".to_string(), UnityValue::Integer(1)),
-            ])),
+            ]),
         );
         let info = ObjectInfo::for_standalone_class(1, 0, 0, class_ids::AUDIO_CLIP)
             .expect("valid standalone audio object");
         let object = UnityObject::from_info_and_class(info, class);
 
-        let clip = AudioClipConverter::new(UnityVersion::default())
+        let version = test_version();
+        let clip = AudioClipConverter::new(version.clone())
             .from_unity_object(&object)
             .unwrap();
 
         assert_eq!(clip.stream_info.offset, u64::MAX);
+
+        let layout = AudioClipLayout::inspect(&object, &version).unwrap();
+        assert_eq!(layout.payload().stream().unwrap().offset(), u64::MAX);
+        assert_eq!(layout.compression_format(), clip.compression_format());
+    }
+
+    #[test]
+    fn typetree_layout_counts_embedded_audio_without_owning_it() {
+        let class = UnityClass::with_properties(
+            class_ids::AUDIO_CLIP,
+            "AudioClip".to_string(),
+            "1".to_string(),
+            IndexMap::from([
+                ("m_Name".to_string(), UnityValue::String("Clip".to_string())),
+                (
+                    "m_CompressionFormat".to_string(),
+                    UnityValue::Integer(AudioCompressionFormat::Vorbis as i64),
+                ),
+                (
+                    "m_AudioData".to_string(),
+                    UnityValue::Bytes(vec![7; 1024 * 1024]),
+                ),
+            ]),
+        );
+        let info = ObjectInfo::for_standalone_class(1, 0, 0, class_ids::AUDIO_CLIP)
+            .expect("valid standalone audio object");
+        let object = UnityObject::from_info_and_class(info, class);
+
+        let version = test_version();
+        let layout = AudioClipLayout::inspect(&object, &version).unwrap();
+
+        assert_eq!(
+            layout.payload(),
+            MediaPayloadRef::Embedded {
+                byte_len: 1024 * 1024
+            }
+        );
+        assert_eq!(layout.compression_format(), AudioCompressionFormat::Vorbis);
+    }
+
+    #[test]
+    fn raw_layout_borrows_stream_path() {
+        let path = "archive:/CAB-a/CAB-a.resS";
+        let mut data = Vec::new();
+        data.extend_from_slice(&0_i32.to_le_bytes());
+        data.extend_from_slice(&0_i32.to_le_bytes());
+        data.extend_from_slice(&2_i32.to_le_bytes());
+        data.extend_from_slice(&44_100_i32.to_le_bytes());
+        data.extend_from_slice(&16_i32.to_le_bytes());
+        data.extend_from_slice(&0_f32.to_le_bytes());
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        data.extend_from_slice(&0_i32.to_le_bytes());
+        data.extend_from_slice(&[1, 0, 0, 0]);
+        data.extend_from_slice(&(path.len() as i32).to_le_bytes());
+        let path_offset = data.len();
+        data.extend_from_slice(path.as_bytes());
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&17_u64.to_le_bytes());
+        data.extend_from_slice(&23_u32.to_le_bytes());
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&0_u32.to_le_bytes());
+        data.extend_from_slice(&(AudioCompressionFormat::Vorbis as i32).to_le_bytes());
+
+        let layout = inspect_audio_binary(&data, &test_version()).unwrap();
+        let stream = layout.payload().stream().unwrap();
+
+        assert_eq!(stream.path(), path);
+        assert_eq!(stream.path().as_ptr(), data[path_offset..].as_ptr());
+        assert_eq!(stream.offset(), 17);
+        assert_eq!(stream.size(), 23);
+        assert_eq!(layout.compression_format(), AudioCompressionFormat::Vorbis);
     }
 }

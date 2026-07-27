@@ -44,7 +44,10 @@ The index is built in tiers to keep cold-start acceptable:
 - Tier-2 (on-demand): deep decoding
   - best-effort enrichment (object name/type/field context) for a small set of results or "deep mode"
 
-Incremental indexing is driven by fingerprints per GUID (e.g. `mtime/size/hash`), so the steady-state cost is proportional to the change set, not project size.
+Incremental indexing has two distinct ownership paths. The filesystem daemon admits only full,
+reconcile, and changed-path requests. Authoritative workspace consumers call the search-index
+library with revision-bound `ChangeSet` values after committing workspace state. A committed search
+generation records one coherent view of documents, reverse references, and status.
 
 ### Storage location
 
@@ -54,13 +57,16 @@ Incremental indexing is driven by fingerprints per GUID (e.g. `mtime/size/hash`)
 ### API shape
 
 - Bind to `127.0.0.1` only.
-- Require a per-project token for write or reindex endpoints.
+- Require a per-project token for mutation endpoints.
+- Reject unknown fields, methods, and contract versions.
 - Core endpoints:
-  - `GET /v1/search`
-  - `GET /v1/suggest`
-  - `GET /v1/references` (Find References by `{guid, fileID?}` for YAML / `{guid, pathID?}` for binary)
-  - `GET /v1/status` (index progress, versions, last update)
-  - `POST /v1/reindex` (scoped reindex)
+  - `GET /v2/health`
+  - `GET /v2/search`
+  - `GET /v2/suggest`
+  - `POST /v2/references` with a versioned `ReferenceRequest`
+  - `GET /v2/status`
+  - `POST /v2/reindex` with a versioned filesystem reindex intent
+  - `POST /v2/token/rotate`
 
 ### Implementation split (workspace crates)
 
@@ -71,7 +77,12 @@ Create dedicated crates to keep concerns separated:
 - `unity-asset-search-daemon`: HTTP server + orchestration
 - `unity-asset-search-cli`: developer-facing client
 
-The existing parsing crates remain the source for deep extraction (Tier-2) and any binary-specific metadata.
+The workspace and parsing crates remain authoritative for deep extraction and binary-specific
+metadata. The daemon owns only the derived search generation.
+
+The daemon does not expose a workspace transaction queue. Its HTTP and coordinator types cannot
+represent `ChangeSet`; clients that own an authoritative workspace snapshot use the
+`unity-asset-search-index` library boundary directly.
 
 ## Consequences
 
@@ -96,6 +107,10 @@ The existing parsing crates remain the source for deep extraction (Tier-2) and a
 
 ## Implementation status
 
-- Tier-0 shipped (path/name/type indexing).
-- Tier-1 started (basic YAML extraction: `m_Name`, tags, `{guid, fileID}` references; script GUIDs are resolved to best-effort C# class/namespace terms for searching).
-- Tier-1 started (prefab/scene hierarchy paths: best-effort `Root/Child/...` paths are indexed for searching).
+- Tier-0 path, name, type, query, suggestion, and incremental reconciliation are implemented.
+- Tier-1 YAML names, tags, script terms, hierarchy paths, and reference facts are implemented on a
+  best-effort basis.
+- Binary PPtr facts and optional AssetBundle container paths can contribute to the index.
+- `/v2` request and response contracts, bearer-token reindexing, token rotation, and coordinator
+  status are implemented.
+- Richer binary field extraction and exact editor object navigation remain roadmap work.

@@ -1,8 +1,12 @@
 use std::fs;
+use std::path::Path;
 
 use serde::Serialize;
 use tempfile::TempDir;
-use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
+use unity_asset_core::{
+    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BudgetError, BudgetedJsonError, DigestV1,
+    WorkspaceId, WorkspaceRevision,
+};
 use unity_asset_search_index::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationBuild, GenerationFailpoint,
     GenerationProjectionDigests, GenerationPublishWarningKind, GenerationStore,
@@ -16,6 +20,43 @@ fn digest(label: &str) -> DigestV1 {
 
 fn revision(label: &str) -> WorkspaceRevision {
     WorkspaceRevision::new(digest(label))
+}
+
+fn open_store(
+    root: impl AsRef<Path>,
+    options: GenerationStoreOptions,
+) -> Result<GenerationStore, GenerationStoreError> {
+    GenerationStore::open(root, options, &mut AssetLoadBudget::default())
+}
+
+fn budget_for_usage(usage: AssetLoadUsage, max_bytes: u64) -> AssetLoadBudget {
+    AssetLoadBudget::new(AssetLoadLimits {
+        max_entries: usage.entries.max(1),
+        max_bytes,
+        max_depth: usage.max_observed_depth,
+        max_members: usage.members.max(1),
+        ..AssetLoadLimits::default()
+    })
+    .unwrap()
+}
+
+fn assert_byte_budget_error(error: GenerationStoreError) {
+    assert!(
+        matches!(
+            &error,
+            GenerationStoreError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }) | GenerationStoreError::ContractJson {
+                source: BudgetedJsonError::Budget(BudgetError::Exceeded {
+                    resource: "bytes",
+                    ..
+                }),
+                ..
+            }
+        ),
+        "unexpected generation-store budget error: {error:?}"
+    );
 }
 
 #[cfg(windows)]
@@ -133,29 +174,27 @@ fn publish_generation(
 #[test]
 fn writer_lease_rejects_a_second_store_until_the_first_drops() {
     let temporary = TempDir::new().unwrap();
-    let mut store =
-        GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     let build = store.begin().unwrap();
 
     assert!(matches!(
-        GenerationStore::open(temporary.path(), GenerationStoreOptions::default()),
+        open_store(temporary.path(), GenerationStoreOptions::default()),
         Err(GenerationStoreError::WriterLeaseUnavailable { .. })
     ));
 
     drop(store);
     assert!(matches!(
-        GenerationStore::open(temporary.path(), GenerationStoreOptions::default()),
+        open_store(temporary.path(), GenerationStoreOptions::default()),
         Err(GenerationStoreError::WriterLeaseUnavailable { .. })
     ));
     drop(build);
-    GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
 }
 
 #[test]
 fn dropped_builds_and_reopened_stores_recover_owned_staging() {
     let temporary = TempDir::new().unwrap();
-    let mut store =
-        GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     let dropped_path = {
         let build = store.begin().unwrap();
         let path = build.directory().to_path_buf();
@@ -172,8 +211,7 @@ fn dropped_builds_and_reopened_stores_recover_owned_staging() {
     fs::create_dir(&abandoned).unwrap();
     fs::write(abandoned.join("partial"), b"partial").unwrap();
 
-    let reopened =
-        GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let reopened = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     assert!(!abandoned.exists());
     drop(reopened);
 }
@@ -184,7 +222,7 @@ fn staging_recovery_rejects_nested_links_without_touching_the_target() {
     use std::os::unix::fs::symlink;
 
     let temporary = TempDir::new().unwrap();
-    let store = GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     drop(store);
 
     let target = temporary.path().join("external-target");
@@ -198,7 +236,7 @@ fn staging_recovery_rejects_nested_links_without_touching_the_target() {
     symlink(&target, abandoned.join("escape")).unwrap();
 
     assert!(matches!(
-        GenerationStore::open(temporary.path(), GenerationStoreOptions::default()),
+        open_store(temporary.path(), GenerationStoreOptions::default()),
         Err(GenerationStoreError::Symlink { .. })
     ));
     assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"keep");
@@ -326,8 +364,7 @@ fn reindex_receipt_defaults_missing_execution_evidence() {
 #[test]
 fn reopen_ignores_incomplete_staging_and_malformed_activation() {
     let temporary = TempDir::new().unwrap();
-    let mut store =
-        GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     let generation = publish_generation(&mut store, "baseline", None);
 
     let incomplete = store.begin().unwrap();
@@ -343,12 +380,152 @@ fn reopen_ignores_incomplete_staging_and_malformed_activation() {
     drop(incomplete);
     drop(store);
 
-    let mut reopened =
-        GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let mut reopened = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     assert_eq!(reopened.active().unwrap().generation(), generation);
     let next = publish_generation(&mut reopened, "after-gap", Some(generation));
     assert_eq!(reopened.active().unwrap().activation_ordinal(), 1_000);
     assert_eq!(reopened.active().unwrap().generation(), next);
+}
+
+#[test]
+fn reopen_budget_is_exact_and_corrupt_candidate_work_accumulates() {
+    let temporary = TempDir::new().unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let generation = publish_generation(&mut store, "baseline", None);
+    drop(store);
+
+    let mut baseline_budget = AssetLoadBudget::default();
+    let baseline = GenerationStore::open(
+        temporary.path(),
+        GenerationStoreOptions::default(),
+        &mut baseline_budget,
+    )
+    .unwrap();
+    assert_eq!(baseline.active().unwrap().generation(), generation);
+    let baseline_usage = baseline_budget.usage();
+    drop(baseline);
+
+    for ordinal in 100_u64..103 {
+        fs::write(
+            temporary
+                .path()
+                .join("activations")
+                .join(format!("{ordinal:020}.json")),
+            b"{",
+        )
+        .unwrap();
+    }
+
+    let mut measured_budget = AssetLoadBudget::default();
+    let measured = GenerationStore::open(
+        temporary.path(),
+        GenerationStoreOptions::default(),
+        &mut measured_budget,
+    )
+    .unwrap();
+    assert_eq!(measured.active().unwrap().generation(), generation);
+    let measured_usage = measured_budget.usage();
+    drop(measured);
+    assert!(measured_usage.bytes > baseline_usage.bytes);
+    assert!(measured_usage.entries > baseline_usage.entries);
+
+    let mut exact = budget_for_usage(measured_usage, measured_usage.bytes);
+    let reopened = GenerationStore::open(
+        temporary.path(),
+        GenerationStoreOptions::default(),
+        &mut exact,
+    )
+    .unwrap();
+    assert_eq!(reopened.active().unwrap().generation(), generation);
+    assert_eq!(exact.usage(), measured_usage);
+    drop(reopened);
+
+    let mut one_short = budget_for_usage(measured_usage, measured_usage.bytes - 1);
+    let error = GenerationStore::open(
+        temporary.path(),
+        GenerationStoreOptions::default(),
+        &mut one_short,
+    )
+    .unwrap_err();
+    assert_byte_budget_error(error);
+}
+
+#[test]
+fn activation_contract_rejects_deep_wide_and_trailing_candidates() {
+    let temporary = TempDir::new().unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let baseline = publish_generation(&mut store, "baseline", None);
+    drop(store);
+
+    let activations = temporary.path().join("activations");
+    let valid_activation = fs::read(
+        fs::read_dir(&activations)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    let mut deep = serde_json::json!(0);
+    for _ in 0..4 {
+        deep = serde_json::json!([deep]);
+    }
+    fs::write(
+        activations.join("00000000000000000100.json"),
+        serde_json::to_vec(&deep).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        activations.join("00000000000000000101.json"),
+        serde_json::to_vec(&vec![0_u8; 64]).unwrap(),
+    )
+    .unwrap();
+    let mut trailing = valid_activation;
+    trailing.extend_from_slice(b" null");
+    fs::write(activations.join("00000000000000000102.json"), trailing).unwrap();
+
+    let reopened = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    assert_eq!(reopened.active().unwrap().generation(), baseline);
+}
+
+#[test]
+fn manifest_contract_rejects_deep_wide_and_trailing_candidates() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions {
+        retain_previous_generations: 8,
+    };
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let first = publish_generation(&mut store, "first", None);
+    let second = publish_generation(&mut store, "second", Some(first));
+    let second_directory = store.generation_directory(second);
+    let third = publish_generation(&mut store, "third", Some(second));
+    let third_directory = store.generation_directory(third);
+    let fourth = publish_generation(&mut store, "fourth", Some(third));
+    let fourth_directory = store.generation_directory(fourth);
+    drop(store);
+
+    let mut deep = serde_json::json!(0);
+    for _ in 0..10 {
+        deep = serde_json::json!([deep]);
+    }
+    fs::write(
+        second_directory.join("manifest.json"),
+        serde_json::to_vec(&deep).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        third_directory.join("manifest.json"),
+        serde_json::to_vec(&vec![0_u8; 5_000]).unwrap(),
+    )
+    .unwrap();
+    let manifest_path = fourth_directory.join("manifest.json");
+    let mut trailing = fs::read(&manifest_path).unwrap();
+    trailing.extend_from_slice(b" null");
+    fs::write(manifest_path, trailing).unwrap();
+
+    let reopened = open_store(temporary.path(), options).unwrap();
+    assert_eq!(reopened.active().unwrap().generation(), first);
 }
 
 #[test]
@@ -357,14 +534,14 @@ fn corrupted_latest_generation_falls_back_to_previous_activation() {
     let options = GenerationStoreOptions {
         retain_previous_generations: 1,
     };
-    let mut store = GenerationStore::open(temporary.path(), options).unwrap();
+    let mut store = open_store(temporary.path(), options).unwrap();
     let first = publish_generation(&mut store, "first", None);
     let second = publish_generation(&mut store, "second", Some(first));
     let second_search = store.active().unwrap().search_directory().join("segments");
     fs::write(second_search, b"corrupt").unwrap();
     drop(store);
 
-    let reopened = GenerationStore::open(temporary.path(), options).unwrap();
+    let reopened = open_store(temporary.path(), options).unwrap();
     assert_eq!(reopened.active().unwrap().generation(), first);
     assert_ne!(reopened.active().unwrap().generation(), second);
 }
@@ -375,7 +552,7 @@ fn pre_commit_publish_failures_never_change_the_active_generation() {
     let options = GenerationStoreOptions {
         retain_previous_generations: 8,
     };
-    let mut store = GenerationStore::open(temporary.path(), options).unwrap();
+    let mut store = open_store(temporary.path(), options).unwrap();
     let baseline = publish_generation(&mut store, "baseline", None);
 
     for (index, failpoint) in [
@@ -403,7 +580,7 @@ fn pre_commit_publish_failures_never_change_the_active_generation() {
         assert_eq!(store.active().unwrap().generation(), baseline);
 
         drop(store);
-        store = GenerationStore::open(temporary.path(), options).unwrap();
+        store = open_store(temporary.path(), options).unwrap();
         assert_eq!(store.active().unwrap().generation(), baseline);
     }
 
@@ -418,7 +595,7 @@ fn pre_commit_publish_failures_never_change_the_active_generation() {
     assert_ne!(repaired.active.generation(), baseline);
 
     drop(store);
-    let reopened = GenerationStore::open(temporary.path(), options).unwrap();
+    let reopened = open_store(temporary.path(), options).unwrap();
     assert_eq!(
         reopened.active().unwrap().generation(),
         repaired.active.generation()
@@ -431,7 +608,7 @@ fn activation_directory_sync_failure_returns_committed_generation_consistent_wit
     let options = GenerationStoreOptions {
         retain_previous_generations: 1,
     };
-    let mut store = GenerationStore::open(temporary.path(), options).unwrap();
+    let mut store = open_store(temporary.path(), options).unwrap();
     let baseline = publish_generation(&mut store, "baseline", None);
     let build = store.begin().unwrap();
     write_artifacts(&build, "sync-warning");
@@ -456,7 +633,7 @@ fn activation_directory_sync_failure_returns_committed_generation_consistent_wit
     }));
 
     drop(store);
-    let reopened = GenerationStore::open(temporary.path(), options).unwrap();
+    let reopened = open_store(temporary.path(), options).unwrap();
     assert_eq!(reopened.active().unwrap().generation(), candidate);
 }
 
@@ -466,7 +643,7 @@ fn activation_cleanup_failure_returns_committed_generation_consistent_with_reope
     let options = GenerationStoreOptions {
         retain_previous_generations: 1,
     };
-    let mut store = GenerationStore::open(temporary.path(), options).unwrap();
+    let mut store = open_store(temporary.path(), options).unwrap();
     let baseline = publish_generation(&mut store, "baseline", None);
     let build = store.begin().unwrap();
     write_artifacts(&build, "cleanup-warning");
@@ -492,7 +669,7 @@ fn activation_cleanup_failure_returns_committed_generation_consistent_with_reope
     }));
 
     drop(store);
-    let reopened = GenerationStore::open(temporary.path(), options).unwrap();
+    let reopened = open_store(temporary.path(), options).unwrap();
     assert_eq!(reopened.active().unwrap().generation(), candidate);
     assert!(!abandoned_staging_activation.exists());
 }
@@ -500,8 +677,7 @@ fn activation_cleanup_failure_returns_committed_generation_consistent_with_reope
 #[test]
 fn prepared_generation_is_readable_before_activation_and_reusable_if_dropped() {
     let temporary = TempDir::new().unwrap();
-    let mut store =
-        GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     let baseline = publish_generation(&mut store, "baseline", None);
     let build = store.begin().unwrap();
     write_artifacts(&build, "candidate");
@@ -528,8 +704,7 @@ fn prepared_generation_is_readable_before_activation_and_reusable_if_dropped() {
 #[test]
 fn publish_rejects_source_state_that_does_not_match_the_manifest() {
     let temporary = TempDir::new().unwrap();
-    let mut store =
-        GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     let baseline = publish_generation(&mut store, "baseline", None);
     let build = store.begin().unwrap();
     write_artifacts(&build, "candidate");
@@ -564,7 +739,7 @@ fn corrupt_completed_orphan_is_replaced_by_the_same_logical_generation() {
     let options = GenerationStoreOptions {
         retain_previous_generations: 2,
     };
-    let mut store = GenerationStore::open(temporary.path(), options).unwrap();
+    let mut store = open_store(temporary.path(), options).unwrap();
     let baseline = publish_generation(&mut store, "baseline", None);
 
     let build = store.begin().unwrap();
@@ -618,7 +793,7 @@ fn retention_keeps_active_and_configured_previous_generations() {
     let options = GenerationStoreOptions {
         retain_previous_generations: 1,
     };
-    let mut store = GenerationStore::open(temporary.path(), options).unwrap();
+    let mut store = open_store(temporary.path(), options).unwrap();
     let first = publish_generation(&mut store, "first", None);
     let second = publish_generation(&mut store, "second", Some(first));
     let third = publish_generation(&mut store, "third", Some(second));
@@ -629,7 +804,7 @@ fn retention_keeps_active_and_configured_previous_generations() {
     assert_eq!(store.active().unwrap().generation(), third);
 
     drop(store);
-    let reopened = GenerationStore::open(temporary.path(), options).unwrap();
+    let reopened = open_store(temporary.path(), options).unwrap();
     assert_eq!(reopened.active().unwrap().generation(), third);
 }
 
@@ -639,7 +814,7 @@ fn retention_bounds_activation_history_with_generation_history() {
     let options = GenerationStoreOptions {
         retain_previous_generations: 1,
     };
-    let mut store = GenerationStore::open(temporary.path(), options).unwrap();
+    let mut store = open_store(temporary.path(), options).unwrap();
     let mut parent = None;
     for label in ["one", "two", "three", "four", "five"] {
         parent = Some(publish_generation(&mut store, label, parent));
@@ -665,7 +840,7 @@ fn disk_estimate_accounts_for_old_and_new_generations() {
     let options = GenerationStoreOptions {
         retain_previous_generations: 0,
     };
-    let mut store = GenerationStore::open(temporary.path(), options).unwrap();
+    let mut store = open_store(temporary.path(), options).unwrap();
     publish_generation(&mut store, "baseline", None);
 
     let estimate = store.estimate_publish(4_096).unwrap();
@@ -687,7 +862,7 @@ fn store_rejects_symbolic_links_in_managed_directories() {
     use std::os::unix::fs::symlink;
 
     let temporary = TempDir::new().unwrap();
-    let store = GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     drop(store);
     let target = temporary.path().join("target.json");
     fs::write(&target, b"{}").unwrap();
@@ -701,7 +876,7 @@ fn store_rejects_symbolic_links_in_managed_directories() {
     .unwrap();
 
     assert!(matches!(
-        GenerationStore::open(temporary.path(), GenerationStoreOptions::default()),
+        open_store(temporary.path(), GenerationStoreOptions::default()),
         Err(GenerationStoreError::Symlink { .. })
     ));
 }
@@ -710,8 +885,7 @@ fn store_rejects_symbolic_links_in_managed_directories() {
 #[test]
 fn publish_syncs_read_only_artifacts_before_activation() {
     let temporary = TempDir::new().unwrap();
-    let mut store =
-        GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     let build = store.begin().unwrap();
     write_artifacts(&build, "read-only");
     let artifact = build.search_directory().join("segments");
@@ -735,14 +909,14 @@ fn publish_syncs_read_only_artifacts_before_activation() {
 #[test]
 fn store_rejects_windows_junctions_in_managed_directories() {
     let temporary = TempDir::new().unwrap();
-    let store = GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     drop(store);
     let target = temporary.path().join("junction-target");
     let junction = temporary.path().join("activations").join("junction");
     fs::create_dir(&target).unwrap();
     create_junction(&junction, &target);
 
-    let reopened = GenerationStore::open(temporary.path(), GenerationStoreOptions::default());
+    let reopened = open_store(temporary.path(), GenerationStoreOptions::default());
     fs::remove_dir(&junction).unwrap();
     assert!(
         matches!(&reopened, Err(GenerationStoreError::ReparsePoint { .. })),
@@ -754,8 +928,7 @@ fn store_rejects_windows_junctions_in_managed_directories() {
 #[test]
 fn artifact_measurement_rejects_nested_windows_junctions() {
     let temporary = TempDir::new().unwrap();
-    let mut store =
-        GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     let build = store.begin().unwrap();
     let target = temporary.path().join("artifact-junction-target");
     let junction = build.search_directory().join("junction");

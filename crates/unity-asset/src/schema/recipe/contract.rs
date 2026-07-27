@@ -621,7 +621,7 @@ pub enum RecipeError {
     #[error(transparent)]
     Plan(#[from] MutationPlanError),
     #[error(transparent)]
-    Workspace(WorkspaceError),
+    Workspace(Box<WorkspaceError>),
 }
 
 impl From<WorkspaceError> for RecipeError {
@@ -652,7 +652,7 @@ impl From<WorkspaceError> for RecipeError {
             }
             source = current.source();
         }
-        Self::Workspace(error)
+        Self::Workspace(Box::new(error))
     }
 }
 

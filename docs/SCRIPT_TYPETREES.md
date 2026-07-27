@@ -1,23 +1,18 @@
-# Script TypeTrees (MonoBehaviour) Workflow
+# Script TypeTrees for MonoBehaviour Data
 
-UnityPy can generate MonoBehaviour TypeTrees dynamically using `TypeTreeGeneratorAPI` by inspecting game assemblies (managed `.dll` or IL2CPP metadata).
+MonoBehaviour payloads in builds with stripped TypeTrees require a script-specific schema. The
+workspace accepts immutable JSON or TPK registries so schema discovery remains outside the trusted
+asset-loading path.
 
-This Rust rewrite intentionally keeps that mechanism **pluggable**:
+## Contract
 
-- At runtime, the parser can resolve script-specific TypeTrees via a `script_id` lookup (Hash128 from `SerializedType`).
-- You can feed those TypeTrees from an **external workflow** (recommended for now), or implement a native generator later.
+Registry resolution uses:
 
-This document describes the external workflow that produces a JSON registry (`schema: 2`) consumable by this repository.
+- the SerializedFile Unity version;
+- class ID `114` for MonoBehaviour;
+- the 16-byte script ID from `SerializedType`, when present.
 
-## Why this exists
-
-Modern games often ship **stripped TypeTrees**. For MonoBehaviours, that means you can usually read the base header, but you cannot reliably parse or write the script-defined fields without a script-specific TypeTree.
-
-UnityPy solves this using `Environment.typetree_generator` (backed by `TypeTreeGeneratorAPI`). This repo mirrors the capability via a `script_id`-keyed registry hook.
-
-## Output format (JSON registry schema 2)
-
-The exporter writes a JSON file like:
+The JSON registry schema is version `2`:
 
 ```json
 {
@@ -33,76 +28,95 @@ The exporter writes a JSON file like:
 }
 ```
 
-Notes:
-- `script_id` is a 16-byte `Hash128`, encoded as 32 lowercase hex chars.
-- Unknown and duplicate fields are rejected so malformed registries cannot silently change meaning.
+`script_id` is 32 lowercase hexadecimal characters. Unknown fields, malformed IDs, duplicate
+keys, unsupported schemas, and over-budget inputs are rejected. Registry order is significant:
+the first matching registry wins.
 
-## Prerequisites
+## Generate a JSON Registry
 
-- Python 3.10+ recommended
-- A Python environment that can import UnityPy dependencies
-- `TypeTreeGeneratorAPI` installed in that environment
-- The repo’s vendored UnityPy snapshot (already present at `repo-ref/UnityPy`)
+The included Python exporter can use managed assemblies or IL2CPP metadata through an installed
+UnityPy and `TypeTreeGeneratorAPI` toolchain.
 
-## Export script TypeTrees from UnityPy
-
-Script: `scripts/export_unitypy_script_typetrees.py`
-
-### Managed build (Mono / IL2CPP disabled)
-
-Provide the `Managed` directory containing your game’s `.dll` files:
+For a managed build:
 
 ```powershell
 python scripts/export_unitypy_script_typetrees.py `
-  --input "D:\path\to\some.bundle" `
-  --managed-dir "D:\path\to\Game_Data\Managed" `
-  --output "D:\tmp\script-typetrees.json" `
+  --input "D:\Game\Game_Data\game.bundle" `
+  --managed-dir "D:\Game\Game_Data\Managed" `
+  --output "D:\Schemas\script-typetrees.json" `
   --verbose
 ```
 
-### IL2CPP build
-
-Provide the game root (the folder that contains `GameAssembly.dll` and `*_Data/`):
+For an IL2CPP build:
 
 ```powershell
 python scripts/export_unitypy_script_typetrees.py `
-  --input "D:\path\to\some.bundle" `
-  --game-root "D:\path\to\Game" `
-  --output "D:\tmp\script-typetrees.json" `
+  --input "D:\Game\Game_Data\game.bundle" `
+  --game-root "D:\Game" `
+  --output "D:\Schemas\script-typetrees.json" `
   --verbose
 ```
 
-### Multiple inputs
+Repeat `--input` to scan several bundles or SerializedFiles. The exporter de-duplicates script IDs
+in deterministic first-seen order.
 
-You can repeat `--input` to scan multiple bundles / `.assets` files. The exporter de-duplicates by `script_id` (first seen wins).
+The Python exporter is an optional compatibility tool, not a runtime dependency of the Rust
+workspace. Its output must still pass the Rust registry parser and caller-owned budget.
 
-## Load the registry in Rust
+## Load Registries into a Workspace
 
-The simplest is to load the JSON registry into the `Environment` so `ObjectHandle` can resolve stripped TypeTrees:
+`WorkspaceOptions::with_type_tree_registry_paths` parses every JSON/TPK registry under the same
+`AssetLoadBudget` used by the caller. During source loading, only required lookup keys and their
+trees are copied into a frozen per-source registry. Snapshot lookup is therefore immutable and
+allocation-free.
 
 ```rust
 use std::path::PathBuf;
-use unity_asset::AssetLoadBudget;
-use unity_asset::environment::Environment;
 
-fn load_with_script_typetrees() -> unity_asset::Result<Environment> {
-    let mut env = Environment::new();
-    let registry_paths = [PathBuf::from("D:\\tmp\\script-typetrees.json")];
+use unity_asset::AssetLoadBudget;
+use unity_asset::workspace::{AssetWorkspace, WorkspaceOptions};
+
+fn load_with_script_types() -> Result<AssetWorkspace, Box<dyn std::error::Error>> {
+    let registry_paths = [
+        PathBuf::from(r"D:\Schemas\script-typetrees.json"),
+        PathBuf::from(r"D:\Schemas\engine.tpk"),
+    ];
     let mut budget = AssetLoadBudget::default();
-    env.set_type_tree_registry_from_paths(&registry_paths, &mut budget)?;
-    env.load("D:\\path\\to\\bundles", &mut budget)?;
-    Ok(env)
+    let options =
+        WorkspaceOptions::strict().with_type_tree_registry_paths(&registry_paths, &mut budget)?;
+    let mut workspace = AssetWorkspace::with_options(options)?;
+    workspace.load_path(r"D:\Game\Game_Data", &mut budget)?;
+    Ok(workspace)
 }
 ```
 
-If you only need the lower-level loader, use
-`unity_asset_binary::typetree::JsonTypeTreeRegistry` and attach it to a `SerializedFile` via
-`set_type_tree_registry(...)`. Registry ingestion is budgeted as well: pass the same caller-owned
-`AssetLoadBudget` to JSON `from_reader`/`from_path` or TPK `from_bytes`/`from_path` and the later
-asset operation.
+The CLI exposes the same policy:
 
-## Validation checklist
+```powershell
+cargo run -p unity-asset-cli --bin unity-asset -- `
+  --typetree-registry D:\Schemas\script-typetrees.json `
+  --typetree-registry D:\Schemas\engine.tpk `
+  workspace inspect objects --input D:\Game\Game_Data
+```
 
-- A MonoBehaviour that previously parsed as raw bytes (`_raw_data_len` present) now parses as structured fields.
-- After edits, the saved asset/bundle can be loaded by UnityPy and the changes are observable.
+Use `WorkspaceOptions::strict()` when missing script schemas must fail the operation.
+`WorkspaceOptions::lenient()` preserves structured diagnostics and raw-object fallbacks where the
+format adapter supports them.
 
+## Low-Level Integration
+
+Format-adapter authors may construct JSON or TPK registries from `unity-asset-binary` and attach a
+registry directly to a `SerializedFile`. Every constructor still requires a caller-owned budget.
+Application code should prefer `WorkspaceOptions`, because it freezes the exact schemas retained
+by snapshots and prevents arbitrary callback behavior from crossing revision boundaries.
+
+## Validation
+
+- `workspace inspect objects` emits structured MonoBehaviour fields instead of only a raw payload.
+- The object inspection reports the expected workspace ID, revision, source locator, class, and
+  script metadata.
+- A no-op prepare preserves the original bytes.
+- A guarded mutation prepares, independently reparses, commits, and can be reopened at the new
+  revision.
+- A missing, ambiguous, malformed, or over-budget schema produces a structured diagnostic rather
+  than a guessed layout.

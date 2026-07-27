@@ -1,22 +1,31 @@
 //! Embeddable HTTP boundary for the search daemon.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{Query, RawQuery, State};
-use axum::http::header::AUTHORIZATION;
+use axum::body::Bytes;
+use axum::extract::rejection::{BytesRejection, QueryRejection};
+use axum::extract::{DefaultBodyLimit, Query, RawQuery, Request, State};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use tokio::sync::RwLock;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 
-use crate::coordinator::{CoordinatorError, ReindexCoordinator, ReindexSource};
+use crate::coordinator::{
+    CoordinatorError, FilesystemReindexIntent, FilesystemReindexScope, ReindexCoordinator,
+    ReindexSource,
+};
 use crate::security::{DaemonToken, TokenStore, verify_bearer_token};
+use unity_asset_core::{
+    AssetLoadBudget, AssetLoadLimits, ContractJsonLimits, ContractJsonResourceModel,
+    read_contract_json_slice,
+};
 use unity_asset_search_index::{
-    ApiError, ApiErrorCode, ReferenceRequest, ReindexIntent, ReindexScope, SearchIndex,
-    SearchIndexError, SearchRequest, StatusResponse,
+    ApiError, ApiErrorCode, SearchIndex, SearchIndexError, SearchRequest, StatusResponse,
 };
 use unity_asset_search_protocol::{
     HEALTH_ENDPOINT, HealthResponse, REFERENCES_ENDPOINT, REINDEX_ENDPOINT, ReindexResponse,
@@ -28,6 +37,62 @@ const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 200;
 const DEFAULT_SUGGEST_LIMIT: usize = 10;
 const MAX_SUGGEST_LIMIT: usize = 50;
+
+const REFERENCES_JSON_MAX_BYTES: usize = 64 * 1024;
+// Object selectors permit 64 containment steps; this covers their complete wire tree.
+const REFERENCES_JSON_MAX_ENTRIES: u64 = 512;
+const REFERENCES_JSON_MAX_MEMBERS: u64 = 512;
+const REFERENCES_JSON_MATERIALIZATION_FIXED_BYTES: u64 = 64 * 1024;
+const REFERENCES_JSON_MATERIALIZATION_BYTES_PER_ENTRY: u64 = 256;
+const REFERENCES_JSON_BUDGET_BYTES: u64 = 1024 * 1024;
+// A page can decode two persisted fields for each of 500 hits. Four GiB covers
+// their fixed reserves, 8 MiB of stored JSON parser work, and up to two million
+// typed structure entries at the larger per-entry materialization rate.
+const REFERENCE_QUERY_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const REFERENCE_QUERY_BUDGET_ENTRIES: u64 = 2 * 1024 * 1024;
+const REFERENCE_QUERY_BUDGET_MEMBERS: u64 = 2 * 1024 * 1024;
+const REFERENCE_QUERY_BUDGET_DEPTH: u32 = 32;
+
+const REINDEX_JSON_MAX_BYTES: usize = 1024 * 1024;
+// Bound changed-path cardinality independently from individual path lengths and raw bytes.
+const REINDEX_JSON_MAX_ENTRIES: u64 = 32 * 1024;
+const REINDEX_JSON_MAX_MEMBERS: u64 = 32 * 1024;
+const REINDEX_JSON_MATERIALIZATION_FIXED_BYTES: u64 = 1024 * 1024;
+const REINDEX_JSON_MATERIALIZATION_BYTES_PER_ENTRY: u64 = 256;
+const REINDEX_JSON_BUDGET_BYTES: u64 = 24 * 1024 * 1024;
+
+const CONTRACT_JSON_MAX_DEPTH: u32 = 32;
+const CONTRACT_JSON_PARSER_WORK_MULTIPLIER: u64 = 6;
+const CONTRACT_JSON_PARSER_FIXED_WORK_BYTES: u64 = 4 * 1024;
+
+const REFERENCES_JSON_RESOURCES: ContractJsonResourceModel = ContractJsonResourceModel::new(
+    CONTRACT_JSON_PARSER_WORK_MULTIPLIER,
+    CONTRACT_JSON_PARSER_FIXED_WORK_BYTES,
+    REFERENCES_JSON_MATERIALIZATION_FIXED_BYTES,
+    REFERENCES_JSON_MATERIALIZATION_BYTES_PER_ENTRY,
+);
+const REFERENCES_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
+    "daemon.references.request",
+    REFERENCES_JSON_MAX_BYTES,
+    CONTRACT_JSON_MAX_DEPTH,
+    REFERENCES_JSON_MAX_ENTRIES,
+    REFERENCES_JSON_MAX_MEMBERS,
+    REFERENCES_JSON_RESOURCES,
+);
+const REINDEX_JSON_RESOURCES: ContractJsonResourceModel = ContractJsonResourceModel::new(
+    CONTRACT_JSON_PARSER_WORK_MULTIPLIER,
+    CONTRACT_JSON_PARSER_FIXED_WORK_BYTES,
+    REINDEX_JSON_MATERIALIZATION_FIXED_BYTES,
+    REINDEX_JSON_MATERIALIZATION_BYTES_PER_ENTRY,
+);
+const REINDEX_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
+    "daemon.reindex.request",
+    REINDEX_JSON_MAX_BYTES,
+    CONTRACT_JSON_MAX_DEPTH,
+    REINDEX_JSON_MAX_ENTRIES,
+    REINDEX_JSON_MAX_MEMBERS,
+    REINDEX_JSON_RESOURCES,
+);
 
 struct AppState {
     index: SearchIndex,
@@ -55,8 +120,19 @@ pub fn router(
         .route(STATUS_ENDPOINT, get(status))
         .route(SEARCH_ENDPOINT, get(search))
         .route(SUGGEST_ENDPOINT, get(suggest))
-        .route(REFERENCES_ENDPOINT, post(references))
-        .route(REINDEX_ENDPOINT, post(reindex))
+        .route(
+            REFERENCES_ENDPOINT,
+            post(references).layer(DefaultBodyLimit::max(REFERENCES_JSON_MAX_BYTES)),
+        )
+        .route(
+            REINDEX_ENDPOINT,
+            post(reindex)
+                .layer(DefaultBodyLimit::max(REINDEX_JSON_MAX_BYTES))
+                .route_layer(middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    authorize_reindex,
+                )),
+        )
         .route(TOKEN_ROTATE_ENDPOINT, post(rotate_token))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
@@ -132,13 +208,53 @@ async fn suggest(
 
 async fn references(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<ReferenceRequest>, JsonRejection>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
 ) -> HttpResult<Json<unity_asset_search_index::ReferencesResponse>> {
-    let Json(request) = parse_json(body)?;
+    require_json_content_type(&headers)?;
+    let request = parse_contract_json(
+        body,
+        REFERENCES_JSON_LIMITS,
+        REFERENCES_JSON_BUDGET_BYTES,
+        REFERENCES_JSON_MAX_ENTRIES,
+        REFERENCES_JSON_MAX_MEMBERS,
+    )?;
     let index = state.index.clone();
-    blocking_index(move || index.references(request))
+    let mut budget = reference_query_budget()?;
+    blocking_index(move || index.references(request, &mut budget))
         .await
         .map(Json)
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilesystemReindexRequest {
+    contract_version: u16,
+    scope: FilesystemReindexRequestScope,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum FilesystemReindexRequestScope {
+    Full {},
+    Reconcile {},
+    ChangedPaths { paths: Vec<PathBuf> },
+}
+
+impl From<FilesystemReindexRequest> for FilesystemReindexIntent {
+    fn from(intent: FilesystemReindexRequest) -> Self {
+        let scope = match intent.scope {
+            FilesystemReindexRequestScope::Full {} => FilesystemReindexScope::Full,
+            FilesystemReindexRequestScope::Reconcile {} => FilesystemReindexScope::Reconcile,
+            FilesystemReindexRequestScope::ChangedPaths { paths } => {
+                FilesystemReindexScope::ChangedPaths { paths }
+            }
+        };
+        Self {
+            contract_version: intent.contract_version,
+            scope,
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -152,17 +268,19 @@ async fn reindex(
     headers: HeaderMap,
     query: Result<Query<ReindexQuery>, QueryRejection>,
     raw_query: RawQuery,
-    body: Result<Json<ReindexIntent>, JsonRejection>,
+    body: Result<Bytes, BytesRejection>,
 ) -> HttpResult<Response> {
-    require_authorized(&headers, &state).await?;
+    require_json_content_type(&headers)?;
     let Query(query) = parse_query(query)?;
     reject_unknown_query_fields(&raw_query, &["wait"])?;
-    let Json(intent) = parse_json(body)?;
-    if matches!(&intent.scope, ReindexScope::ChangeSet { .. }) {
-        return Err(HttpError::invalid_request(
-            "change-set reindex requires an authoritative workspace view",
-        ));
-    }
+    let intent = parse_contract_json::<FilesystemReindexRequest>(
+        body,
+        REINDEX_JSON_LIMITS,
+        REINDEX_JSON_BUDGET_BYTES,
+        REINDEX_JSON_MAX_ENTRIES,
+        REINDEX_JSON_MAX_MEMBERS,
+    )?
+    .into();
     let wait = query.wait.unwrap_or(true);
 
     if !wait {
@@ -247,6 +365,17 @@ enum TokenRotationError {
     Failed,
 }
 
+async fn authorize_reindex(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match require_authorized(request.headers(), &state).await {
+        Ok(()) => next.run(request).await,
+        Err(error) => error.into_response(),
+    }
+}
+
 async fn require_authorized(headers: &HeaderMap, state: &AppState) -> HttpResult<()> {
     let token = state.token.read().await;
     let authorization = headers
@@ -278,8 +407,51 @@ fn parse_query<T>(query: Result<Query<T>, QueryRejection>) -> HttpResult<Query<T
     query.map_err(|_| HttpError::invalid_request("invalid query parameters"))
 }
 
-fn parse_json<T>(body: Result<Json<T>, JsonRejection>) -> HttpResult<Json<T>> {
-    body.map_err(|_| HttpError::invalid_request("invalid JSON request body"))
+fn require_json_content_type(headers: &HeaderMap) -> HttpResult<()> {
+    let is_json = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<mime::Mime>().ok())
+        .is_some_and(|mime| {
+            mime.type_() == mime::APPLICATION
+                && (mime.subtype() == mime::JSON || mime.suffix() == Some(mime::JSON))
+        });
+    if is_json {
+        Ok(())
+    } else {
+        Err(HttpError::invalid_request("invalid JSON request body"))
+    }
+}
+
+fn parse_contract_json<T: serde::de::DeserializeOwned>(
+    body: Result<Bytes, BytesRejection>,
+    limits: ContractJsonLimits,
+    max_budget_bytes: u64,
+    max_entries: u64,
+    max_members: u64,
+) -> HttpResult<T> {
+    let body = body.map_err(|_| HttpError::invalid_request("invalid JSON request body"))?;
+    let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: max_budget_bytes,
+        max_depth: CONTRACT_JSON_MAX_DEPTH,
+        max_entries,
+        max_members,
+        ..AssetLoadLimits::default()
+    })
+    .map_err(|_| HttpError::internal("daemon JSON budget is invalid"))?;
+    read_contract_json_slice(&body, &mut budget, limits)
+        .map_err(|_| HttpError::invalid_request("invalid JSON request body"))
+}
+
+fn reference_query_budget() -> HttpResult<AssetLoadBudget> {
+    AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: REFERENCE_QUERY_BUDGET_BYTES,
+        max_depth: REFERENCE_QUERY_BUDGET_DEPTH,
+        max_entries: REFERENCE_QUERY_BUDGET_ENTRIES,
+        max_members: REFERENCE_QUERY_BUDGET_MEMBERS,
+        ..AssetLoadLimits::default()
+    })
+    .map_err(|_| HttpError::internal("reference query budget is invalid"))
 }
 
 fn reject_unknown_query_fields(raw_query: &RawQuery, allowed: &[&str]) -> HttpResult<()> {
@@ -350,16 +522,6 @@ impl HttpError {
                 .with_detail("actual", actual.to_string())
                 .with_detail("expected", expected.to_string()),
             ),
-            CoordinatorError::SynchronousChangeSetUnsupported => Self::from_api(ApiError::new(
-                ApiErrorCode::InvalidRequest,
-                "change-set reindex requires an authoritative workspace view",
-                false,
-            )),
-            CoordinatorError::MissingTransaction => Self::from_api(ApiError::new(
-                ApiErrorCode::InvalidRequest,
-                "change-set reindex requires a transaction",
-                false,
-            )),
             CoordinatorError::CompletionWaiterLimit { maximum } => Self::from_api(
                 ApiError::new(
                     ApiErrorCode::Busy,
@@ -395,36 +557,11 @@ impl HttpError {
                 )
                 .with_detail("admission", format!("{:?}", admission.disposition)),
             ),
-            CoordinatorError::TransactionConflict {
-                transaction,
-                existing_change_set,
-                incoming_change_set,
-            } => Self::from_api(
-                ApiError::new(
-                    ApiErrorCode::InvalidRequest,
-                    "transaction was reused for a different change set",
-                    false,
-                )
-                .with_detail("transaction", transaction.to_string())
-                .with_detail("existing_change_set", existing_change_set.to_string())
-                .with_detail("incoming_change_set", incoming_change_set.to_string()),
-            ),
-            CoordinatorError::TransactionBinding(_) => {
-                Self::internal("change-set transaction binding failed")
-            }
             CoordinatorError::PathOutsideProject { .. } => Self::from_api(ApiError::new(
                 ApiErrorCode::InvalidRequest,
                 "changed path is outside the configured project",
                 false,
             )),
-            CoordinatorError::TransactionQueueFull { maximum } => Self::from_api(
-                ApiError::new(
-                    ApiErrorCode::Busy,
-                    "reindex transaction queue is full",
-                    true,
-                )
-                .with_detail("maximum", maximum.to_string()),
-            ),
             CoordinatorError::InvalidConfiguration(_) => {
                 Self::internal("reindex coordinator configuration is invalid")
             }

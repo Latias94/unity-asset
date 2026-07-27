@@ -1,4 +1,4 @@
-# TypeTree U3 Performance Baseline
+# TypeTree Traversal Performance Baseline
 
 This document records the deterministic performance contract and the opt-in runtime sample for
 the U3 semantic traversal replacement. It is a characterization artifact, not a claim that wall
@@ -7,9 +7,9 @@ clock results are portable across machines.
 ## Code Points
 
 - `3d514982f30bb2a80a185e0f866b8abe67b4838c` (`3d51498`) is the repository HEAD before the
-  working-tree U3 facade deletion and semantic traversal replacement are committed. The removed
-  paths were not reconstructed or rerun, so pre-replacement CPU, allocation, and RSS values are
-  **not available**. No speedup percentage is claimed.
+  U3 semantic traversal replacement. Superseded paths were not reconstructed or rerun, so
+  pre-replacement CPU, allocation, and RSS values are **not available**. No speedup percentage is
+  claimed.
 - The replacement baseline below was measured from the U3 working tree on
   `2026-07-17T18:43:22+08:00`.
 - The deterministic contract lives in
@@ -93,7 +93,7 @@ reason to loosen these deterministic ceilings.
 
 ## Runtime Sample
 
-Environment:
+Measurement host:
 
 - Windows 11 Pro `10.0.26200`, x86-64 MSVC
 - Intel Core i9-13900KF, 24 cores / 32 logical processors

@@ -28,7 +28,6 @@ unity-asset-yaml = { path = "../unity-asset-yaml", version = "0.3.0" }
 unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
 unity-asset-write = { path = "../unity-asset-write", version = "0.3.0" }
 unity-asset-decode = { path = "../unity-asset-decode", version = "0.3.0", features = ["audio", "texture-advanced", "sprite"], optional = true }
-ignore = { workspace = true }
 zip = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

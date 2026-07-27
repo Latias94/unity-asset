@@ -7,7 +7,8 @@ MonoBehaviour TypeTree generation (UnityPy uses TypeTreeGeneratorAPI).
 
 Output format:
 - JSON registry schema 2, with `script_id` entries (32-hex Hash128)
-- Each entry contains a `type_tree` that can be loaded via `Environment::set_type_tree_registry_from_paths`.
+- Each entry contains a `type_tree` that can be loaded via
+  `WorkspaceOptions::with_type_tree_registry_paths`.
 
 Requirements:
 - Python environment that can import UnityPy dependencies

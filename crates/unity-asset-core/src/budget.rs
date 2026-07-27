@@ -1,8 +1,8 @@
-use std::io::{self, Read};
+use std::fmt;
+use std::io;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -59,6 +59,39 @@ pub struct AssetLoadBudget {
     depth_base: u32,
 }
 
+/// Opaque identity for one caller-owned asset-load budget domain.
+///
+/// Containers that retain already-accounted allocations can store this token and reject use with
+/// a different budget. The token proves domain identity only; it does not represent remaining
+/// capacity or authorize an allocation that has not already been charged.
+#[derive(Clone)]
+pub struct AssetLoadBudgetDomainToken {
+    domain: Arc<AssetLoadBudgetDomain>,
+}
+
+impl AssetLoadBudgetDomainToken {
+    /// Rejects a budget that did not mint this domain token.
+    pub fn validate(
+        &self,
+        budget: &AssetLoadBudget,
+        resource: &'static str,
+    ) -> Result<(), BudgetError> {
+        if budget.belongs_to_domain(&self.domain) {
+            Ok(())
+        } else {
+            Err(BudgetError::DomainMismatch { resource })
+        }
+    }
+}
+
+impl fmt::Debug for AssetLoadBudgetDomainToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AssetLoadBudgetDomainToken")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct AssetLoadBudgetDomain {
     _private: (),
@@ -98,6 +131,14 @@ impl AssetLoadBudget {
             usage: AssetLoadUsage::default(),
             depth_base: 0,
         })
+    }
+
+    /// Mints an opaque identity token for this budget domain.
+    #[must_use]
+    pub fn domain_token(&self) -> AssetLoadBudgetDomainToken {
+        AssetLoadBudgetDomainToken {
+            domain: Arc::clone(&self.domain),
+        }
     }
 
     pub(crate) fn domain(&self) -> Arc<AssetLoadBudgetDomain> {
@@ -252,36 +293,6 @@ impl AssetLoadBudget {
             load: self,
             usage: DecompressionUsage::default(),
         }
-    }
-
-    /// Deserializes an untrusted JSON document after enforcing the remaining byte budget.
-    ///
-    /// Type-level Serde visitors can bound decoded values, but a streaming JSON parser may
-    /// allocate scratch space before those visitors run. This entry point bounds the encoded
-    /// document first and should be used for persisted automation contracts.
-    pub fn deserialize_json<T: DeserializeOwned>(
-        &mut self,
-        mut reader: impl Read,
-    ) -> Result<T, BudgetedJsonError> {
-        let mut encoded = Vec::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            let amount = u64::try_from(read)
-                .map_err(|_| BudgetError::ArithmeticOverflow { resource: "bytes" })?;
-            self.consume_bytes(amount)?;
-            encoded
-                .try_reserve(read)
-                .map_err(|error| BudgetedJsonError::AllocationFailed {
-                    requested: read,
-                    message: error.to_string(),
-                })?;
-            encoded.extend_from_slice(&buffer[..read]);
-        }
-        Ok(serde_json::from_slice(&encoded)?)
     }
 
     #[must_use]
@@ -501,8 +512,30 @@ pub enum BudgetedJsonError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Budget(#[from] BudgetError),
-    #[error("failed to reserve {requested} bytes for JSON contract: {message}")]
-    AllocationFailed { requested: usize, message: String },
+    #[error("failed to reserve {requested} bytes for JSON contract")]
+    AllocationFailed { requested: usize },
     #[error("invalid JSON contract: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("JSON contract {contract} has an invalid limit for {resource}")]
+    InvalidLimit {
+        contract: &'static str,
+        resource: &'static str,
+    },
+    #[error(
+        "JSON contract {contract} encoded input exceeded its limit: requested {requested} bytes, limit {limit}"
+    )]
+    EncodedLimitExceeded {
+        contract: &'static str,
+        limit: usize,
+        requested: usize,
+    },
+    #[error(
+        "JSON contract {contract} exceeded its {resource} limit: requested {requested}, limit {limit}"
+    )]
+    StructureLimitExceeded {
+        contract: &'static str,
+        resource: &'static str,
+        limit: u64,
+        requested: u64,
+    },
 }

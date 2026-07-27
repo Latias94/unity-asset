@@ -1270,6 +1270,7 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
+    use indexmap::IndexMap;
     use unity_asset_core::{
         AssetLoadLimits, AssetLoadUsage, SourceFingerprint, SourceKind, SourceLocator, UnityClass,
         UnityValue, WorkspaceId,
@@ -1396,9 +1397,12 @@ mod tests {
         const SECOND_GUID: &str = "22222222222222222222222222222222";
 
         fn guid_class(guid: &str) -> UnityClass {
-            let mut class = UnityClass::new(0, "YamlDocument".to_owned(), "0".to_owned());
-            class.set("guid".to_owned(), UnityValue::String(guid.to_owned()));
-            class
+            UnityClass::with_properties(
+                0,
+                "YamlDocument".to_owned(),
+                "0".to_owned(),
+                IndexMap::from([("guid".to_owned(), UnityValue::String(guid.to_owned()))]),
+            )
         }
 
         let workspace = WorkspaceId::from_u128(1).unwrap();
@@ -1411,13 +1415,14 @@ mod tests {
         let target_locator = SourceLocator::path("folder/target.prefab").unwrap();
         let meta_locator = SourceLocator::path("folder/target.prefab.meta").unwrap();
         let duplicate_locator = SourceLocator::path("other/target.prefab").unwrap();
-        let target_document = YamlDocument::new();
-        let duplicate_document = YamlDocument::new();
-        let mut meta_document = YamlDocument::new();
-        meta_document.add_entry(guid_class(SECOND_GUID));
-        meta_document.add_entry(guid_class("not-a-guid"));
-        meta_document.add_entry(guid_class(FIRST_GUID));
-        meta_document.add_entry(guid_class(SECOND_GUID));
+        let target_document = YamlDocument::from_entries(Vec::new());
+        let duplicate_document = YamlDocument::from_entries(Vec::new());
+        let meta_document = YamlDocument::from_entries(vec![
+            guid_class(SECOND_GUID),
+            guid_class("not-a-guid"),
+            guid_class(FIRST_GUID),
+            guid_class(SECOND_GUID),
+        ]);
 
         let sources = [
             ReferenceSource::yaml(

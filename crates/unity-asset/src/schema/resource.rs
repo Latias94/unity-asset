@@ -96,12 +96,12 @@ fn validate_audio_clip(
     output: &mut RecipeOutputBuilder<'_>,
 ) -> Result<(), RecipeError> {
     let class = audio_clip.class();
-    if class.class_id != class_ids::AUDIO_CLIP || class.class_name != class_names::AUDIO_CLIP {
+    if class.class_id() != class_ids::AUDIO_CLIP || class.class_name() != class_names::AUDIO_CLIP {
         return Err(RecipeError::WrongClass {
             expected_id: class_ids::AUDIO_CLIP,
             expected_name: class_names::AUDIO_CLIP,
-            actual_id: class.class_id,
-            actual_name: output.string(&class.class_name, "recipe class diagnostic")?,
+            actual_id: class.class_id(),
+            actual_name: output.string(class.class_name(), "recipe class diagnostic")?,
         });
     }
     validate_recipe_provenance(audio_clip)

@@ -4,12 +4,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Barrier, Mutex, Semaphore, mpsc};
+use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
 use unity_asset_search_daemon::coordinator::{
-    CoordinatorError, ReindexCoordinator, ReindexCoordinatorConfig, ReindexScopeKind, ReindexSource,
+    CoordinatorError, FilesystemReindexIntent, FilesystemReindexScope, ReindexCoordinator,
+    ReindexCoordinatorConfig, ReindexScopeKind, ReindexSource,
 };
 use unity_asset_search_index::{
-    ReindexDisposition, ReindexIntent, ReindexReceipt, ReindexScope,
-    SEARCH_GENERATION_CONTRACT_VERSION,
+    GenerationStamp, ReindexDisposition, ReindexIntent, ReindexReceipt, ReindexScope,
+    SEARCH_GENERATION_CONTRACT_VERSION, SearchGenerationId,
 };
 
 fn project_root() -> PathBuf {
@@ -37,8 +39,8 @@ fn terminal_receipt(intent: &ReindexIntent) -> ReindexReceipt {
     }
 }
 
-fn changed(path: impl AsRef<Path>) -> ReindexIntent {
-    ReindexIntent::changed_paths(vec![path.as_ref().to_path_buf()])
+fn changed(path: impl AsRef<Path>) -> FilesystemReindexIntent {
+    FilesystemReindexIntent::changed_paths(vec![path.as_ref().to_path_buf()])
 }
 
 async fn wait_for_idle(coordinator: &ReindexCoordinator) {
@@ -66,41 +68,6 @@ async fn wait_for_http_admissions(coordinator: &ReindexCoordinator, expected: u6
     .expect("HTTP admissions must be observed before the test deadline");
 }
 
-fn digest(byte: u8) -> String {
-    let encoded_byte = format!("{byte:02x}");
-    format!("blake3-v1:{}", encoded_byte.repeat(32))
-}
-
-fn change_set_intent(id: u8) -> ReindexIntent {
-    change_set_intent_with_payload(id, id)
-}
-
-fn change_set_intent_with_payload(transaction: u8, payload: u8) -> ReindexIntent {
-    let workspace = "workspace-v1:00000000000000000000000000000001";
-    let value = serde_json::json!({
-        "contract_version": SEARCH_GENERATION_CONTRACT_VERSION,
-        "scope": {
-            "kind": "change_set",
-            "changes": {
-                "version": 1,
-                "transaction": digest(transaction),
-                "workspace": workspace,
-                "from_revision": digest(payload.wrapping_add(64)),
-                "to_revision": digest(payload.wrapping_add(128)),
-                "changed_sources": [{
-                    "version": 1,
-                    "workspace": workspace,
-                    "kind": "serialized_file",
-                    "local": format!("{:032x}", u128::from(payload) + 1),
-                }],
-                "changed_objects": [],
-                "identity_remaps": [],
-            },
-        },
-    });
-    serde_json::from_value(value).expect("test ChangeSet must satisfy the public wire contract")
-}
-
 #[test]
 fn unrepresentable_debounce_deadline_is_rejected_before_runner_start() {
     let result = ReindexCoordinator::new(
@@ -114,7 +81,7 @@ fn unrepresentable_debounce_deadline_is_rejected_before_runner_start() {
 }
 
 #[tokio::test]
-async fn four_entry_points_share_one_atomic_admission_and_one_build() {
+async fn four_filesystem_entry_points_share_one_atomic_admission_and_one_build() {
     let builds = Arc::new(AtomicUsize::new(0));
     let active = Arc::new(AtomicUsize::new(0));
     let overlap = Arc::new(AtomicBool::new(false));
@@ -220,135 +187,6 @@ async fn four_entry_points_share_one_atomic_admission_and_one_build() {
 }
 
 #[tokio::test]
-async fn same_transaction_is_coalesced_in_flight_then_reported_as_applied() {
-    let builds = Arc::new(AtomicUsize::new(0));
-    let started = Arc::new(Barrier::new(2));
-    let release = Arc::new(Semaphore::new(0));
-    let coordinator = ReindexCoordinator::new(config(), {
-        let builds = Arc::clone(&builds);
-        let started = Arc::clone(&started);
-        let release = Arc::clone(&release);
-        move |intent| {
-            let builds = Arc::clone(&builds);
-            let started = Arc::clone(&started);
-            let release = Arc::clone(&release);
-            async move {
-                builds.fetch_add(1, Ordering::SeqCst);
-                wait_at_barrier(&started).await;
-                tokio::time::timeout(Duration::from_secs(5), release.acquire())
-                    .await
-                    .expect("release permit must arrive before the test deadline")
-                    .expect("test semaphore must stay open")
-                    .forget();
-                Ok(terminal_receipt(&intent))
-            }
-        }
-    })
-    .expect("coordinator must be constructible");
-    let intent = change_set_intent(1);
-
-    let first = coordinator
-        .admit(ReindexSource::ChangeSet, intent.clone())
-        .await
-        .expect("first transaction must queue");
-    assert_eq!(first.disposition, ReindexDisposition::Queued);
-    wait_at_barrier(&started).await;
-
-    let duplicate = coordinator
-        .admit(ReindexSource::Http, intent.clone())
-        .await
-        .expect("duplicate admission must be classified");
-    assert_eq!(duplicate.disposition, ReindexDisposition::Coalesced);
-
-    release.add_permits(1);
-    wait_for_idle(&coordinator).await;
-    let applied = coordinator
-        .admit(ReindexSource::ChangeSet, intent)
-        .await
-        .expect("applied transaction must be classified");
-    assert_eq!(applied.disposition, ReindexDisposition::AlreadyApplied);
-    assert_eq!(builds.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn reused_transaction_with_different_change_set_conflicts_while_queued_and_applied() {
-    let builds = Arc::new(AtomicUsize::new(0));
-    let started = Arc::new(Barrier::new(2));
-    let release = Arc::new(Semaphore::new(0));
-    let blocker = change_set_intent(41);
-    let blocker_transaction = blocker.scope.transaction();
-    let coordinator = ReindexCoordinator::new(config(), {
-        let builds = Arc::clone(&builds);
-        let started = Arc::clone(&started);
-        let release = Arc::clone(&release);
-        move |intent| {
-            let builds = Arc::clone(&builds);
-            let started = Arc::clone(&started);
-            let release = Arc::clone(&release);
-            async move {
-                builds.fetch_add(1, Ordering::SeqCst);
-                if intent.scope.transaction() == blocker_transaction {
-                    wait_at_barrier(&started).await;
-                    tokio::time::timeout(Duration::from_secs(5), release.acquire())
-                        .await
-                        .expect("release permit must arrive before the test deadline")
-                        .expect("test semaphore must stay open")
-                        .forget();
-                }
-                Ok(terminal_receipt(&intent))
-            }
-        }
-    })
-    .expect("coordinator must be constructible");
-    let original = change_set_intent_with_payload(42, 1);
-    let conflicting = change_set_intent_with_payload(42, 2);
-
-    coordinator
-        .admit(ReindexSource::ChangeSet, blocker)
-        .await
-        .expect("blocking transaction must queue");
-    wait_at_barrier(&started).await;
-    coordinator
-        .admit(ReindexSource::ChangeSet, original)
-        .await
-        .expect("tested transaction must remain queued behind the blocker");
-
-    let tracked_conflict = coordinator
-        .admit(ReindexSource::ChangeSet, conflicting.clone())
-        .await;
-    assert!(matches!(
-        tracked_conflict,
-        Err(CoordinatorError::TransactionConflict {
-            transaction,
-            existing_change_set,
-            incoming_change_set,
-        }) if transaction.to_string() == digest(42)
-            && existing_change_set != incoming_change_set
-    ));
-    assert_eq!(coordinator.snapshot().await.pending_transactions, 1);
-
-    release.add_permits(1);
-    wait_for_idle(&coordinator).await;
-
-    let applied_conflict = coordinator
-        .admit(ReindexSource::ChangeSet, conflicting)
-        .await;
-    assert!(matches!(
-        applied_conflict,
-        Err(CoordinatorError::TransactionConflict {
-            transaction,
-            existing_change_set,
-            incoming_change_set,
-        }) if transaction.to_string() == digest(42)
-            && existing_change_set != incoming_change_set
-    ));
-    assert_eq!(builds.load(Ordering::SeqCst), 2);
-    let snapshot = coordinator.snapshot().await;
-    assert_eq!(snapshot.tracked_transactions, 0);
-    assert_eq!(snapshot.applied_transactions, 2);
-}
-
-#[tokio::test]
 async fn full_scope_absorbs_pending_reconcile_and_changed_paths() {
     let executed = Arc::new(Mutex::new(Vec::new()));
     let coordinator = ReindexCoordinator::new(config(), {
@@ -373,7 +211,7 @@ async fn full_scope_absorbs_pending_reconcile_and_changed_paths() {
     );
     assert_eq!(
         coordinator
-            .admit(ReindexSource::Timer, ReindexIntent::reconcile())
+            .admit(ReindexSource::Timer, FilesystemReindexIntent::reconcile(),)
             .await
             .expect("reconcile must merge")
             .disposition,
@@ -381,7 +219,7 @@ async fn full_scope_absorbs_pending_reconcile_and_changed_paths() {
     );
     assert_eq!(
         coordinator
-            .admit(ReindexSource::Http, ReindexIntent::full())
+            .admit(ReindexSource::Http, FilesystemReindexIntent::full())
             .await
             .expect("full must merge")
             .disposition,
@@ -395,231 +233,31 @@ async fn full_scope_absorbs_pending_reconcile_and_changed_paths() {
 }
 
 #[tokio::test]
-async fn failed_transaction_is_not_marked_applied_and_can_retry() {
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let coordinator = ReindexCoordinator::new(config(), {
-        let attempts = Arc::clone(&attempts);
+async fn dirty_path_limits_and_watcher_overflow_upgrade_to_full() {
+    let threshold_executed = Arc::new(Mutex::new(Vec::new()));
+    let threshold_coordinator = ReindexCoordinator::new(config().with_max_dirty_paths(2), {
+        let threshold_executed = Arc::clone(&threshold_executed);
         move |intent| {
-            let attempts = Arc::clone(&attempts);
+            let threshold_executed = Arc::clone(&threshold_executed);
             async move {
-                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                    anyhow::bail!("injected build failure");
-                }
+                threshold_executed.lock().await.push(intent.clone());
                 Ok(terminal_receipt(&intent))
             }
         }
     })
-    .expect("coordinator must be constructible");
-    let intent = change_set_intent(2);
-
-    coordinator
-        .admit(ReindexSource::ChangeSet, intent.clone())
-        .await
-        .expect("first attempt must queue");
-    wait_for_idle(&coordinator).await;
-    let failed = coordinator.snapshot().await;
-    assert_eq!(failed.applied_transactions, 0);
-    assert_eq!(failed.tracked_transactions, 0);
-    assert_eq!(failed.failures.len(), 1);
-    assert!(
-        failed.failures[0]
-            .message
-            .contains("injected build failure")
-    );
-
-    let retry = coordinator
-        .admit(ReindexSource::ChangeSet, intent.clone())
-        .await
-        .expect("failed transaction must be retryable");
-    assert_eq!(retry.disposition, ReindexDisposition::Queued);
-    wait_for_idle(&coordinator).await;
-
-    let duplicate = coordinator
-        .admit(ReindexSource::ChangeSet, intent)
-        .await
-        .expect("successful retry must be remembered");
-    assert_eq!(duplicate.disposition, ReindexDisposition::AlreadyApplied);
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
-async fn synchronous_executor_panic_releases_transaction_for_retry() {
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let coordinator = ReindexCoordinator::new(config(), {
-        let attempts = Arc::clone(&attempts);
-        move |intent| {
-            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("injected synchronous executor panic");
-            }
-            async move { Ok(terminal_receipt(&intent)) }
-        }
-    })
-    .expect("coordinator must be constructible");
-    let intent = change_set_intent(3);
-
-    coordinator
-        .admit(ReindexSource::ChangeSet, intent.clone())
-        .await
-        .expect("panicking transaction must first queue");
-    wait_for_idle(&coordinator).await;
-    let failed = coordinator.snapshot().await;
-    assert_eq!(failed.tracked_transactions, 0);
-    assert_eq!(failed.applied_transactions, 0);
-    assert!(
-        failed.failures[0]
-            .message
-            .contains("panicked before returning")
-    );
-
-    coordinator
-        .admit(ReindexSource::ChangeSet, intent)
-        .await
-        .expect("transaction must be retryable after synchronous panic");
-    wait_for_idle(&coordinator).await;
-    assert_eq!(coordinator.snapshot().await.applied_transactions, 1);
-}
-
-#[tokio::test]
-async fn asynchronous_executor_panic_releases_transaction_and_wakes_idle_waiters() {
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let coordinator = ReindexCoordinator::new(config(), {
-        let attempts = Arc::clone(&attempts);
-        move |intent| {
-            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-            async move {
-                if attempt == 0 {
-                    panic!("injected asynchronous executor panic");
-                }
-                Ok(terminal_receipt(&intent))
-            }
-        }
-    })
-    .expect("coordinator must be constructible");
-    let intent = change_set_intent(4);
-
-    coordinator
-        .admit(ReindexSource::ChangeSet, intent.clone())
-        .await
-        .expect("panicking transaction must first queue");
-    wait_for_idle(&coordinator).await;
-    let failed = coordinator.snapshot().await;
-    assert_eq!(failed.tracked_transactions, 0);
-    assert_eq!(failed.applied_transactions, 0);
-    assert!(
-        failed.failures[0].message.contains("task") && failed.failures[0].message.contains("panic")
-    );
-
-    coordinator
-        .admit(ReindexSource::ChangeSet, intent)
-        .await
-        .expect("transaction must be retryable after asynchronous panic");
-    wait_for_idle(&coordinator).await;
-    assert_eq!(coordinator.snapshot().await.applied_transactions, 1);
-}
-
-#[tokio::test]
-async fn cancelled_executor_child_releases_transaction_and_wakes_idle_waiters() {
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let coordinator = ReindexCoordinator::new(config(), {
-        let attempts = Arc::clone(&attempts);
-        move |intent| {
-            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-            async move {
-                if attempt == 0 {
-                    let child = tokio::spawn(std::future::pending::<()>());
-                    child.abort();
-                    match child.await {
-                        Err(error) if error.is_cancelled() => {
-                            anyhow::bail!("injected cancelled build child")
-                        }
-                        Ok(()) => anyhow::bail!("cancelled build child unexpectedly completed"),
-                        Err(error) => {
-                            anyhow::bail!("build child failed without cancellation: {error}")
-                        }
-                    }
-                }
-                Ok(terminal_receipt(&intent))
-            }
-        }
-    })
-    .expect("coordinator must be constructible");
-    let intent = change_set_intent(5);
-
-    coordinator
-        .admit(ReindexSource::ChangeSet, intent.clone())
-        .await
-        .expect("cancelled transaction must first queue");
-    wait_for_idle(&coordinator).await;
-    let failed = coordinator.snapshot().await;
-    assert_eq!(failed.tracked_transactions, 0);
-    assert_eq!(failed.applied_transactions, 0);
-    assert!(failed.failures[0].message.contains("cancelled build child"));
-
-    coordinator
-        .admit(ReindexSource::ChangeSet, intent)
-        .await
-        .expect("transaction must be retryable after cancellation");
-    wait_for_idle(&coordinator).await;
-    assert_eq!(coordinator.snapshot().await.applied_transactions, 1);
-}
-
-#[tokio::test]
-async fn dirty_path_event_and_watcher_overflow_limits_upgrade_to_full() {
-    let executed = Arc::new(Mutex::new(Vec::new()));
-    let coordinator = ReindexCoordinator::new(
-        config().with_max_dirty_paths(2).with_max_pending_events(8),
-        {
-            let executed = Arc::clone(&executed);
-            move |intent| {
-                let executed = Arc::clone(&executed);
-                async move {
-                    executed.lock().await.push(intent.clone());
-                    Ok(terminal_receipt(&intent))
-                }
-            }
-        },
-    )
-    .expect("coordinator must be constructible");
-
-    for path in ["Assets/c.prefab", "Assets/a.prefab", "Assets/b.prefab"] {
-        coordinator
+    .expect("threshold coordinator must be constructible");
+    for path in ["Assets/a.prefab", "Assets/b.prefab", "Assets/c.prefab"] {
+        threshold_coordinator
             .admit(ReindexSource::Watcher, changed(path))
             .await
-            .expect("watcher path must be accepted");
+            .expect("dirty path must be admitted");
     }
-    wait_for_idle(&coordinator).await;
+    wait_for_idle(&threshold_coordinator).await;
     assert!(matches!(
-        &executed.lock().await[0].scope,
+        &threshold_executed.lock().await[0].scope,
         ReindexScope::Full
     ));
-    assert_eq!(coordinator.snapshot().await.full_escalations, 1);
-
-    let event_executed = Arc::new(Mutex::new(Vec::new()));
-    let event_coordinator = ReindexCoordinator::new(
-        config().with_max_dirty_paths(8).with_max_pending_events(2),
-        {
-            let event_executed = Arc::clone(&event_executed);
-            move |intent| {
-                let event_executed = Arc::clone(&event_executed);
-                async move {
-                    event_executed.lock().await.push(intent.clone());
-                    Ok(terminal_receipt(&intent))
-                }
-            }
-        },
-    )
-    .expect("event coordinator must be constructible");
-    for _ in 0..3 {
-        event_coordinator
-            .admit(ReindexSource::Watcher, changed("Assets/repeated.prefab"))
-            .await
-            .expect("watcher event must be accepted");
-    }
-    wait_for_idle(&event_coordinator).await;
-    assert!(matches!(
-        &event_executed.lock().await[0].scope,
-        ReindexScope::Full
-    ));
+    assert_eq!(threshold_coordinator.snapshot().await.full_escalations, 1);
 
     let overflow_executed = Arc::new(Mutex::new(Vec::new()));
     let overflow_coordinator = ReindexCoordinator::new(config(), {
@@ -652,6 +290,33 @@ async fn dirty_path_event_and_watcher_overflow_limits_upgrade_to_full() {
     let snapshot = overflow_coordinator.snapshot().await;
     assert_eq!(snapshot.watcher_overflows, 1);
     assert_eq!(snapshot.full_escalations, 1);
+}
+
+#[tokio::test]
+async fn paths_outside_the_project_are_rejected_before_execution() {
+    let builds = Arc::new(AtomicUsize::new(0));
+    let coordinator = ReindexCoordinator::new(config(), {
+        let builds = Arc::clone(&builds);
+        move |intent| {
+            builds.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(terminal_receipt(&intent)) }
+        }
+    })
+    .expect("coordinator must be constructible");
+    let outside = if cfg!(windows) {
+        PathBuf::from(r"D:\outside.prefab")
+    } else {
+        PathBuf::from("/outside.prefab")
+    };
+
+    assert!(matches!(
+        coordinator
+            .admit(ReindexSource::Http, changed(outside))
+            .await,
+        Err(CoordinatorError::PathOutsideProject { .. })
+    ));
+    assert_eq!(builds.load(Ordering::SeqCst), 0);
+    assert!(coordinator.snapshot().await.is_idle());
 }
 
 #[tokio::test]
@@ -698,89 +363,42 @@ async fn continuous_events_cannot_postpone_build_past_max_debounce() {
 }
 
 #[tokio::test]
-async fn transaction_queue_and_histories_remain_bounded() {
-    let started = Arc::new(Barrier::new(2));
-    let release = Arc::new(Semaphore::new(0));
-    let active = Arc::new(AtomicUsize::new(0));
-    let overlap = Arc::new(AtomicBool::new(false));
-    let coordinator = ReindexCoordinator::new(
-        config()
-            .with_max_pending_transactions(1)
-            .with_max_transaction_history(2)
-            .with_max_failure_history(2),
-        {
-            let started = Arc::clone(&started);
-            let release = Arc::clone(&release);
-            let active = Arc::clone(&active);
-            let overlap = Arc::clone(&overlap);
-            move |intent| {
-                let started = Arc::clone(&started);
-                let release = Arc::clone(&release);
-                let active = Arc::clone(&active);
-                let overlap = Arc::clone(&overlap);
-                async move {
-                    if active.fetch_add(1, Ordering::SeqCst) != 0 {
-                        overlap.store(true, Ordering::SeqCst);
-                    }
-                    if intent.scope.transaction() == change_set_intent(10).scope.transaction() {
-                        wait_at_barrier(&started).await;
-                        tokio::time::timeout(Duration::from_secs(5), release.acquire())
-                            .await
-                            .expect("release permit must arrive before the test deadline")
-                            .expect("test semaphore must stay open")
-                            .forget();
-                    }
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    Ok(terminal_receipt(&intent))
+async fn filesystem_failures_are_bounded_and_new_admissions_can_retry() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let coordinator = ReindexCoordinator::new(config().with_max_failure_history(2), {
+        let attempts = Arc::clone(&attempts);
+        move |intent| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt < 3 {
+                    anyhow::bail!("injected filesystem build failure {attempt}");
                 }
+                Ok(terminal_receipt(&intent))
             }
-        },
-    )
+        }
+    })
     .expect("coordinator must be constructible");
 
-    coordinator
-        .admit(ReindexSource::ChangeSet, change_set_intent(10))
-        .await
-        .expect("first transaction must queue");
-    wait_at_barrier(&started).await;
-    coordinator
-        .admit(ReindexSource::ChangeSet, change_set_intent(11))
-        .await
-        .expect("one queued transaction must fit");
-    assert_eq!(active.load(Ordering::SeqCst), 1);
-    assert!(matches!(
-        coordinator
-            .admit(ReindexSource::ChangeSet, change_set_intent(12))
-            .await,
-        Err(CoordinatorError::TransactionQueueFull { maximum: 1 })
-    ));
-    release.add_permits(1);
-    wait_for_idle(&coordinator).await;
-
-    coordinator
-        .admit(ReindexSource::ChangeSet, change_set_intent(12))
-        .await
-        .expect("transaction must fit after drain");
-    wait_for_idle(&coordinator).await;
-    assert_eq!(coordinator.snapshot().await.applied_transactions, 2);
-    assert!(!overlap.load(Ordering::SeqCst));
-
-    let failure_coordinator =
-        ReindexCoordinator::new(config().with_max_failure_history(2), |_intent| async {
-            anyhow::bail!("bounded failure")
-        })
-        .expect("failure coordinator must be constructible");
     for _ in 0..3 {
-        failure_coordinator
-            .admit(ReindexSource::Http, ReindexIntent::full())
+        coordinator
+            .admit(ReindexSource::Http, FilesystemReindexIntent::full())
             .await
-            .expect("failed full build must still be admitted");
-        wait_for_idle(&failure_coordinator).await;
+            .expect("failed build must still be admitted");
+        wait_for_idle(&coordinator).await;
     }
-    let failures = failure_coordinator.snapshot().await.failures;
+    let failures = coordinator.snapshot().await.failures;
     assert_eq!(failures.len(), 2);
     assert_eq!(failures[0].sequence, 2);
     assert_eq!(failures[1].sequence, 3);
+    assert_eq!(failures[1].scope, ReindexScopeKind::Full);
+
+    coordinator
+        .admit(ReindexSource::Http, FilesystemReindexIntent::full())
+        .await
+        .expect("a new filesystem request must retry after failure");
+    wait_for_idle(&coordinator).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    assert_eq!(coordinator.snapshot().await.failures.len(), 2);
 }
 
 #[tokio::test]
@@ -791,43 +409,46 @@ async fn synchronous_admission_returns_initial_and_terminal_receipts() {
             |intent| async move { Ok(terminal_receipt(&intent)) },
         )
         .expect("coordinator must be constructible");
-    let intent = ReindexIntent::reconcile();
 
     let completion = tokio::time::timeout(
         Duration::from_secs(5),
-        coordinator.admit_and_wait(ReindexSource::Http, intent.clone()),
+        coordinator.admit_and_wait(ReindexSource::Http, FilesystemReindexIntent::reconcile()),
     )
     .await
     .expect("synchronous admission must complete before the test deadline")
     .expect("synchronous admission must succeed");
 
     assert_eq!(completion.admission.disposition, ReindexDisposition::Queued);
-    assert_eq!(completion.terminal, terminal_receipt(&intent));
+    assert_eq!(
+        completion.terminal,
+        terminal_receipt(&ReindexIntent::reconcile())
+    );
 
     let unsupported = coordinator
-        .admit_and_wait(ReindexSource::Http, change_set_intent(91))
+        .admit_and_wait(
+            ReindexSource::Http,
+            FilesystemReindexIntent {
+                contract_version: SEARCH_GENERATION_CONTRACT_VERSION + 1,
+                scope: FilesystemReindexScope::Full,
+            },
+        )
         .await;
     assert!(matches!(
         unsupported,
-        Err(CoordinatorError::SynchronousChangeSetUnsupported)
+        Err(CoordinatorError::UnsupportedContractVersion { .. })
     ));
 }
 
 #[tokio::test]
-async fn synchronous_admission_reports_executor_errors_directly() {
-    let coordinator = ReindexCoordinator::new(config(), |_intent| async {
+async fn synchronous_admission_reports_executor_errors_and_invalid_receipts() {
+    let failed = ReindexCoordinator::new(config(), |_intent| async {
         anyhow::bail!("injected synchronous HTTP build failure")
     })
-    .expect("coordinator must be constructible");
-
-    let error = tokio::time::timeout(
-        Duration::from_secs(5),
-        coordinator.admit_and_wait(ReindexSource::Http, ReindexIntent::full()),
-    )
-    .await
-    .expect("failed synchronous admission must complete before the test deadline")
-    .expect_err("executor failure must reach the waiting caller");
-
+    .expect("failure coordinator must be constructible");
+    let error = failed
+        .admit_and_wait(ReindexSource::Http, FilesystemReindexIntent::full())
+        .await
+        .expect_err("executor failure must reach the waiting caller");
     assert!(matches!(
         error,
         CoordinatorError::ExecutionFailed {
@@ -836,6 +457,50 @@ async fn synchronous_admission_reports_executor_errors_directly() {
             message,
         } if admission.disposition == ReindexDisposition::Queued
             && message.contains("injected synchronous HTTP build failure")
+    ));
+
+    let invalid_receipt = ReindexCoordinator::new(config(), |_intent| async {
+        Ok(ReindexReceipt {
+            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+            disposition: ReindexDisposition::Queued,
+            transaction: None,
+            target_revision: None,
+            generation: None,
+            evidence: Default::default(),
+        })
+    })
+    .expect("receipt validation coordinator must be constructible");
+    let error = invalid_receipt
+        .admit_and_wait(ReindexSource::Http, FilesystemReindexIntent::reconcile())
+        .await
+        .expect_err("non-terminal executor receipt must be rejected");
+    assert!(matches!(
+        error,
+        CoordinatorError::ExecutionFailed { message, .. }
+            if message.contains("non-terminal disposition")
+    ));
+
+    let invalid_generation_version = ReindexCoordinator::new(config(), |intent| async move {
+        let digest = DigestV1::hash_bytes(b"invalid nested generation version");
+        let mut generation = GenerationStamp::current(
+            SearchGenerationId::new(digest),
+            WorkspaceId::from_u128(1).expect("nonzero workspace ID"),
+            WorkspaceRevision::new(digest),
+        );
+        generation.contract_version += 1;
+        let mut receipt = terminal_receipt(&intent);
+        receipt.generation = Some(generation);
+        Ok(receipt)
+    })
+    .expect("nested version coordinator must be constructible");
+    let error = invalid_generation_version
+        .admit_and_wait(ReindexSource::Http, FilesystemReindexIntent::full())
+        .await
+        .expect_err("unsupported nested generation version must be rejected");
+    assert!(matches!(
+        error,
+        CoordinatorError::ExecutionFailed { message, .. }
+            if message.contains("reindex receipt generation contract version")
     ));
 }
 
@@ -850,7 +515,7 @@ async fn synchronous_admission_reports_panics_and_cancelled_executor_tasks() {
     })
     .expect("synchronous panic coordinator must be constructible");
     let error = synchronous_panic
-        .admit_and_wait(ReindexSource::Http, ReindexIntent::full())
+        .admit_and_wait(ReindexSource::Http, FilesystemReindexIntent::full())
         .await
         .expect_err("synchronous executor panic must reach the waiter");
     assert!(matches!(
@@ -866,7 +531,7 @@ async fn synchronous_admission_reports_panics_and_cancelled_executor_tasks() {
     })
     .expect("asynchronous panic coordinator must be constructible");
     let error = asynchronous_panic
-        .admit_and_wait(ReindexSource::Http, ReindexIntent::reconcile())
+        .admit_and_wait(ReindexSource::Http, FilesystemReindexIntent::reconcile())
         .await
         .expect_err("asynchronous executor panic must reach the waiter");
     assert!(matches!(
@@ -883,7 +548,7 @@ async fn synchronous_admission_reports_panics_and_cancelled_executor_tasks() {
     })
     .expect("cancelled task coordinator must be constructible");
     let error = cancelled
-        .admit_and_wait(ReindexSource::Http, ReindexIntent::reconcile())
+        .admit_and_wait(ReindexSource::Http, FilesystemReindexIntent::reconcile())
         .await
         .expect_err("cancelled executor child must reach the waiter");
     assert!(matches!(
@@ -910,8 +575,8 @@ async fn coalesced_synchronous_waiters_receive_the_same_terminal_receipt() {
 
     let completions = tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(
-            coordinator.admit_and_wait(ReindexSource::Http, changed("Assets/first.prefab")),
-            coordinator.admit_and_wait(ReindexSource::Http, ReindexIntent::reconcile()),
+            coordinator.admit_and_wait(ReindexSource::Http, changed("Assets/first.prefab"),),
+            coordinator.admit_and_wait(ReindexSource::Http, FilesystemReindexIntent::reconcile(),),
         )
     })
     .await
@@ -979,7 +644,7 @@ async fn cancelling_one_coalesced_waiter_does_not_affect_another() {
         let coordinator = coordinator.clone();
         tokio::spawn(async move {
             coordinator
-                .admit_and_wait(ReindexSource::Http, ReindexIntent::reconcile())
+                .admit_and_wait(ReindexSource::Http, FilesystemReindexIntent::reconcile())
                 .await
         })
     };
@@ -992,7 +657,7 @@ async fn cancelling_one_coalesced_waiter_does_not_affect_another() {
             .expect_err("cancelled waiter task must not complete")
             .is_cancelled()
     );
-    release.add_permits(2);
+    release.add_permits(1);
     let completion = tokio::time::timeout(Duration::from_secs(5), survivor)
         .await
         .expect("surviving waiter must complete before the test deadline")
@@ -1051,14 +716,14 @@ async fn synchronous_completion_waiters_are_bounded() {
     wait_for_http_admissions(&coordinator, 2).await;
 
     let rejected = coordinator
-        .admit_and_wait(ReindexSource::Http, ReindexIntent::reconcile())
+        .admit_and_wait(ReindexSource::Http, FilesystemReindexIntent::reconcile())
         .await;
     assert!(matches!(
         rejected,
         Err(CoordinatorError::CompletionWaiterLimit { maximum: 2 })
     ));
 
-    release.add_permits(2);
+    release.add_permits(1);
     for waiter in [first, second] {
         tokio::time::timeout(Duration::from_secs(5), waiter)
             .await

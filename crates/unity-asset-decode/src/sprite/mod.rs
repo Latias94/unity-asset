@@ -37,7 +37,7 @@ pub mod processor;
 pub mod types;
 
 // Re-export main types for easy access
-pub use parser::SpriteParser;
+pub use parser::{SpriteParser, SpriteTextureReference};
 pub use processor::{DecodedSpriteTexture, SpriteProcessor, SpriteStats};
 pub use types::{
     // Core sprite types
@@ -145,12 +145,6 @@ impl SpriteManager {
     }
 }
 
-impl Default for SpriteManager {
-    fn default() -> Self {
-        Self::new(crate::unity_version::UnityVersion::default())
-    }
-}
-
 /// Convenience functions for common operations
 /// Create a sprite manager with default settings
 pub fn create_manager(version: crate::unity_version::UnityVersion) -> SpriteManager {
@@ -197,12 +191,6 @@ pub fn extract_sprite_image(
 ) -> crate::error::Result<Vec<u8>> {
     let processor = SpriteProcessor::new(version.clone());
     processor.extract_sprite_image(sprite, texture)
-}
-
-/// Validate sprite data (convenience function)
-pub fn validate_sprite(sprite: &Sprite) -> crate::error::Result<()> {
-    let processor = SpriteProcessor::default();
-    processor.validate_sprite(sprite)
 }
 
 /// Get sprite area in pixels
@@ -300,16 +288,20 @@ impl Default for ProcessingOptions {
 mod tests {
     use super::*;
 
+    fn test_version() -> crate::unity_version::UnityVersion {
+        crate::unity_version::UnityVersion::parse_version("2020.3.12f1").unwrap()
+    }
+
     #[test]
     fn test_manager_creation() {
-        let version = crate::unity_version::UnityVersion::default();
+        let version = test_version();
         let manager = create_manager(version);
         assert!(manager.get_supported_features().contains(&"basic_sprite"));
     }
 
     #[test]
     fn test_performance_manager() {
-        let version = crate::unity_version::UnityVersion::default();
+        let version = test_version();
         let manager = create_performance_manager(version);
         assert!(!manager.config().extract_images);
         assert!(!manager.config().process_atlas);
@@ -317,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_full_manager() {
-        let version = crate::unity_version::UnityVersion::default();
+        let version = test_version();
         let manager = create_full_manager(version);
         assert!(manager.config().extract_images);
         assert!(manager.config().process_atlas);

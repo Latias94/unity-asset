@@ -1,6 +1,10 @@
 use super::super::{FieldGuard, MutationValue, ObjectGuard, PlanBytes};
 use super::*;
-use unity_asset_core::{SourceFingerprint, SourceKind};
+use unity_asset_core::{SourceFingerprint, SourceKind, WorkspaceId};
+
+fn workspace_id() -> WorkspaceId {
+    WorkspaceId::from_u128(1).unwrap()
+}
 
 fn revision() -> WorkspaceRevision {
     WorkspaceRevision::new(DigestV1::hash_bytes(b"plan-builder-tests"))
@@ -48,7 +52,8 @@ fn fragment(
     payloads: Vec<PlanPayload>,
     actions: Vec<GenericMutation>,
 ) -> MutationPlanFragment {
-    MutationPlanFragment::from_recipe(revision(), vec![source], payloads, actions).unwrap()
+    MutationPlanFragment::from_recipe(workspace_id(), revision(), vec![source], payloads, actions)
+        .unwrap()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +89,7 @@ fn logical_state(builder: &MutationPlanBuilder) -> BuilderLogicalState {
 
 #[test]
 fn append_rejects_source_conflicts_without_mutating_the_builder() {
-    let mut builder = MutationPlanBuilder::new(revision());
+    let mut builder = MutationPlanBuilder::new(workspace_id(), revision());
     builder
         .append(fragment(
             source(b"first"),
@@ -118,6 +123,30 @@ fn append_rejects_source_conflicts_without_mutating_the_builder() {
 }
 
 #[test]
+fn append_rejects_a_fragment_from_another_workspace_without_mutation() {
+    let mut builder = MutationPlanBuilder::new(workspace_id(), revision());
+    let other_workspace = WorkspaceId::from_u128(2).unwrap();
+    let fragment = MutationPlanFragment::from_recipe(
+        other_workspace,
+        revision(),
+        vec![source(b"same")],
+        Vec::new(),
+        vec![field_action(address("1"), &["m_Name"])],
+    )
+    .unwrap();
+    let before = logical_state(&builder);
+
+    assert!(matches!(
+        builder.append(fragment),
+        Err(MutationPlanBuilderError::WorkspaceMismatch {
+            expected,
+            actual,
+        }) if expected == workspace_id() && actual == other_workspace
+    ));
+    assert_eq!(logical_state(&builder), before);
+}
+
+#[test]
 fn append_rejects_payload_conflicts_without_mutating_the_builder() {
     let digest = DigestV1::hash_bytes(b"declared payload");
     let first = PlanPayload {
@@ -134,7 +163,7 @@ fn append_rejects_payload_conflicts_without_mutating_the_builder() {
         guard: guard(),
         payload: digest,
     };
-    let mut builder = MutationPlanBuilder::new(revision());
+    let mut builder = MutationPlanBuilder::new(workspace_id(), revision());
     builder
         .append(fragment(
             source(b"same"),
@@ -161,7 +190,7 @@ fn append_rejects_payload_conflicts_without_mutating_the_builder() {
 #[test]
 fn builder_rejects_overlapping_recipe_writes_at_every_scope() {
     let target = address("1");
-    let mut builder = MutationPlanBuilder::new(revision());
+    let mut builder = MutationPlanBuilder::new(workspace_id(), revision());
     let same_fragment = fragment(
         source(b"same"),
         Vec::new(),
@@ -206,7 +235,7 @@ fn builder_rejects_overlapping_recipe_writes_at_every_scope() {
 
 #[test]
 fn builder_allows_the_same_path_on_distinct_objects() {
-    let mut builder = MutationPlanBuilder::new(revision());
+    let mut builder = MutationPlanBuilder::new(workspace_id(), revision());
     for anchor in ["1", "2"] {
         builder
             .append(fragment(
@@ -226,7 +255,7 @@ fn builder_rejects_cross_fragment_ancestor_and_descendant_paths() {
         (["m_Vector"].as_slice(), ["m_Vector", "x"].as_slice()),
         (["m_Vector", "x"].as_slice(), ["m_Vector"].as_slice()),
     ] {
-        let mut builder = MutationPlanBuilder::new(revision());
+        let mut builder = MutationPlanBuilder::new(workspace_id(), revision());
         builder
             .append(fragment(
                 source(b"same"),
@@ -253,7 +282,7 @@ fn builder_rejects_cross_fragment_ancestor_and_descendant_paths() {
 #[test]
 fn builder_reports_the_earliest_overlapping_prior_write() {
     let target = address("1");
-    let mut builder = MutationPlanBuilder::new(revision());
+    let mut builder = MutationPlanBuilder::new(workspace_id(), revision());
     builder
         .append(fragment(
             source(b"same"),
@@ -347,7 +376,7 @@ fn builder_uses_incremental_indexes_for_many_distinct_fragments() {
     const FRAGMENT_COUNT: usize = 10_000;
 
     let expected_source = source(b"same");
-    let mut builder = MutationPlanBuilder::new(revision());
+    let mut builder = MutationPlanBuilder::new(workspace_id(), revision());
     for index in 0..FRAGMENT_COUNT {
         let payload = PlanPayload::new(index.to_le_bytes().to_vec());
         let digest = payload.digest();
@@ -399,7 +428,7 @@ fn builder_indexes_many_same_target_sibling_paths_linearly() {
     let payload = PlanPayload::new(b"same payload".to_vec());
     let payload_digest = payload.digest();
     let target = address("1");
-    let mut builder = MutationPlanBuilder::new(revision());
+    let mut builder = MutationPlanBuilder::new(workspace_id(), revision());
     for index in 0..FRAGMENT_COUNT {
         let field = format!("m_Field{index}");
         builder
@@ -464,7 +493,7 @@ fn builder_allows_disjoint_sibling_and_sequence_element_paths() {
         ],
     );
 
-    let mut builder = MutationPlanBuilder::new(revision());
+    let mut builder = MutationPlanBuilder::new(workspace_id(), revision());
     builder.append(fragment).unwrap();
     assert_eq!(builder.build().unwrap().operations().len(), 4);
 }

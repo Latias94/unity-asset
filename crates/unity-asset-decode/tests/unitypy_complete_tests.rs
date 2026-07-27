@@ -20,7 +20,7 @@ use unity_asset_decode::bundle::BundleParser;
 use unity_asset_decode::object::UnityObject;
 use unity_asset_decode::unity_version::UnityVersion;
 use unity_asset_decode::{
-    audio::AudioProcessor, mesh::MeshProcessor, sprite::SpriteProcessor, texture::TextureProcessor,
+    audio::AudioProcessor, sprite::SpriteProcessor, texture::TextureProcessor,
 };
 
 const SAMPLES_DIR: &str = "tests/samples";
@@ -479,13 +479,6 @@ fn test_extractor() {
                                         extractable_objects += 1;
                                         // TODO: Implement actual sprite extraction
                                         // let sprite = SpriteProcessor::process(obj);
-                                        extracted_objects += 1;
-                                    }
-                                    43 => {
-                                        // Mesh
-                                        extractable_objects += 1;
-                                        // TODO: Implement actual mesh extraction
-                                        // let mesh = MeshProcessor::process(obj);
                                         extracted_objects += 1;
                                     }
                                     _ => {

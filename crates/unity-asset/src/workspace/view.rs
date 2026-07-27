@@ -494,7 +494,7 @@ pub(super) fn validate_prepared_artifact(
     if let PreparedArtifactFormat::VerbatimSource(proof) = format {
         if proof.source_id() != source {
             return Err(WorkspaceError::PreparedArtifactSourceProvenanceMismatch {
-                expected: source,
+                expected: Box::new(source),
                 actual: proof.source_id(),
             });
         }
@@ -509,7 +509,7 @@ pub(super) fn validate_prepared_artifact(
     }
     if artifact.digest() != fingerprint.digest() {
         return Err(WorkspaceError::PreparedArtifactDigestMismatch {
-            source_id: source,
+            source_id: Box::new(source),
             expected: fingerprint.digest(),
             actual: artifact.digest(),
         });
@@ -604,9 +604,9 @@ impl fmt::Debug for WorkspaceYamlObject {
         formatter
             .debug_struct("WorkspaceYamlObject")
             .field("document_index", &self.document_index())
-            .field("class_id", &class.class_id)
-            .field("class_name", &class.class_name)
-            .field("anchor", &class.anchor)
+            .field("class_id", &class.class_id())
+            .field("class_name", &class.class_name())
+            .field("anchor", &class.anchor())
             .finish()
     }
 }
@@ -754,6 +754,13 @@ pub trait WorkspaceView: sealed::Sealed + Send + Sync {
         budget: &mut AssetLoadBudget,
     ) -> Result<WorkspaceLookup<RevisionedObjectHandle>, WorkspaceError>;
 
+    /// Projects a revision-bound handle into its versioned persistent address.
+    fn object_address(
+        &self,
+        handle: &RevisionedObjectHandle,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<ObjectAddress, WorkspaceError>;
+
     fn read_object(
         &self,
         handle: &RevisionedObjectHandle,
@@ -876,6 +883,14 @@ pub enum WorkspaceError {
     MissingSource(SourceId),
     #[error("object is not present in this workspace revision: {0:?}")]
     MissingObject(Box<ObjectAddress>),
+    #[error(
+        "source {source_id:?} changed after inspection: expected {expected}, observed {actual}"
+    )]
+    ObservedSourceChanged {
+        source_id: Box<SourceId>,
+        expected: SourceFingerprint,
+        actual: SourceFingerprint,
+    },
     #[error("object identity is ambiguous in source {source_id:?}: {matches} matches")]
     AmbiguousObject { source_id: SourceId, matches: usize },
     #[error("source byte range overflows: offset={offset}, size={size}")]
@@ -906,7 +921,7 @@ pub enum WorkspaceError {
     },
     #[error("prepared artifact for source {source_id:?} has digest {actual}, expected {expected}")]
     PreparedArtifactDigestMismatch {
-        source_id: SourceId,
+        source_id: Box<SourceId>,
         expected: DigestV1,
         actual: DigestV1,
     },
@@ -920,7 +935,7 @@ pub enum WorkspaceError {
     },
     #[error("prepared verbatim artifact source is {actual:?}, expected {expected:?}")]
     PreparedArtifactSourceProvenanceMismatch {
-        expected: SourceId,
+        expected: Box<SourceId>,
         actual: SourceId,
     },
     #[error("prepared verbatim artifact fingerprint is {actual}, expected {expected}")]

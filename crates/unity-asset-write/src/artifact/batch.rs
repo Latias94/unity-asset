@@ -1554,7 +1554,7 @@ pub enum ArtifactBuildError {
     #[error(transparent)]
     Digest(#[from] DigestBuildError),
     #[error(transparent)]
-    Payload(#[from] ArtifactPayloadError),
+    Payload(ArtifactPayloadError),
     #[error("failed to consume a prepared dependency: {0}")]
     DependencyIo(std::io::Error),
     #[error("invalid UTF-8 in YAML artifact at byte offset {offset}")]
@@ -1696,6 +1696,15 @@ impl ArtifactBuildError {
     fn independent_reparse(source: Self) -> Self {
         Self::IndependentReparse {
             source: Box::new(source),
+        }
+    }
+}
+
+impl From<ArtifactPayloadError> for ArtifactBuildError {
+    fn from(error: ArtifactPayloadError) -> Self {
+        match error {
+            ArtifactPayloadError::Budget(error) => Self::Budget(error),
+            error => Self::Payload(error),
         }
     }
 }

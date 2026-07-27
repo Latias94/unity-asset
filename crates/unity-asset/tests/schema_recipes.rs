@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-use unity_asset::environment::{BinarySource, BinarySourceKind, Environment};
 use unity_asset::schema::{
     AudioClipResourceRecipe, ChildPlacement, DeclaredUnityVersion, HierarchyNode, HierarchyRecipe,
     HierarchyState, MaterialRecipe, MaterialTextureChange, PersistentArgument, PersistentCall,
@@ -13,13 +12,16 @@ use unity_asset::schema::{
 use unity_asset::workspace::{
     AssetWorkspace, FieldGuard, GenericMutation, MutationPlan, MutationPlanBuilder,
     MutationPlanBuilderError, MutationPlanFragment, MutationValue, MutationValueRef, PlanPayload,
-    PrepareOptions, PublicationTarget, ReferenceTarget, SequenceMutation,
+    PrepareOptions, ReferenceTarget, SequenceMutation,
 };
 use unity_asset::{
-    AssetLoadBudget, AssetLoadLimits, FieldPath, ObjectAddress, SourceLocator, UnityValue,
-    WorkspaceRevision,
+    AssetLoadBudget, AssetLoadLimits, FieldPath, ObjectAddress, SourceId, SourceLocator,
+    UnityValue, WorkspaceRevision,
 };
 use unity_asset_core::{semantic_value_digest, yaml_field_schema_digest};
+
+#[path = "support/source_replacement.rs"]
+mod source_replacement;
 
 const MATERIAL_YAML: &str = r#"%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
@@ -247,6 +249,7 @@ struct Fixture {
     _directory: tempfile::TempDir,
     workspace: AssetWorkspace,
     alias: String,
+    source: SourceId,
 }
 
 impl Fixture {
@@ -255,13 +258,14 @@ impl Fixture {
         let path = directory.path().join(alias);
         fs::write(&path, yaml).unwrap();
         let mut workspace = AssetWorkspace::new().unwrap();
-        workspace
+        let source = workspace
             .load_path(&path, &mut AssetLoadBudget::default())
             .unwrap();
         Self {
             _directory: directory,
             workspace,
             alias: alias.to_owned(),
+            source,
         }
     }
 
@@ -444,6 +448,7 @@ fn generic_field_replace_rejects_semantic_owners_and_preserves_path_errors() {
         semantic_value_digest(value, &mut guard_budget).unwrap(),
     );
     let plan = MutationPlan::new(
+        hierarchy.workspace.workspace_id(),
         hierarchy_revision,
         vec![child.source_expectation().clone()],
         Vec::new(),
@@ -1123,8 +1128,8 @@ fn binary_hierarchy_recipe_uses_the_same_guarded_sequence_contract() {
         .unwrap();
 
     for object in [&parent, &child] {
-        assert_eq!(object.class().class_id, 4);
-        assert_eq!(object.class().class_name, "Transform");
+        assert_eq!(object.class().class_id(), 4);
+        assert_eq!(object.class().class_name(), "Transform");
         assert_eq!(object.provenance().origin(), SchemaOrigin::EmbeddedTypeTree);
         assert!(object.provenance().schema_digest().is_some());
         assert!(matches!(
@@ -1196,97 +1201,6 @@ fn binary_hierarchy_recipe_uses_the_same_guarded_sequence_contract() {
             ..
         }
     ));
-}
-
-#[test]
-fn cross_source_reference_commit_is_discoverable_by_read_only_environment() {
-    let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "../unity-asset-write/tests/fixtures/serialized_file_wire/transform_hierarchy_v22.assets.bin",
-    );
-    let directory = tempfile::tempdir().unwrap();
-    let owner_path = directory.path().join("owner.assets");
-    let dependency_directory = directory.path().join("deps");
-    let target_path = dependency_directory.join("target.assets");
-    fs::create_dir_all(&dependency_directory).unwrap();
-    fs::copy(&sample, &owner_path).unwrap();
-    fs::copy(&sample, &target_path).unwrap();
-
-    let mut workspace = AssetWorkspace::new().unwrap();
-    workspace
-        .load_path(&owner_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    workspace
-        .load_path(&target_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let snapshot = workspace.snapshot();
-    let owner_locator = SourceLocator::path("owner.assets").unwrap();
-    let target_locator = SourceLocator::path("target.assets").unwrap();
-    let owner_parent = ObjectAddress::binary_direct(owner_locator.clone(), 1).unwrap();
-    let owner_child = ObjectAddress::binary_direct(owner_locator, 2).unwrap();
-    let target_parent = ObjectAddress::binary_direct(target_locator, 1).unwrap();
-    let planner = SchemaRecipePlanner::new(&snapshot);
-    let child = planner
-        .inspect(&owner_child, &mut AssetLoadBudget::default())
-        .unwrap();
-    let lowering = planner
-        .lower_reference(
-            &child,
-            FieldPath::root().push_field("m_Father").unwrap(),
-            ReferenceTarget::object(owner_parent),
-            ReferenceTarget::object(target_parent),
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
-    let fragment = changed(lowering);
-    let mut builder = MutationPlanBuilder::new(snapshot.revision());
-    builder.append(fragment).unwrap();
-    let prepared = workspace
-        .prepare(
-            builder.build().unwrap(),
-            PrepareOptions::default(),
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
-    workspace
-        .commit(
-            prepared,
-            PublicationTarget::in_place(directory.path()).unwrap(),
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
-
-    let owner_path = fs::canonicalize(owner_path).unwrap();
-    let target_path = fs::canonicalize(target_path).unwrap();
-    let mut environment = Environment::new();
-    environment
-        .load_file(&owner_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let owner_source = BinarySource::path(&owner_path);
-    let child_key = environment
-        .binary_object_infos()
-        .find(|object| object.source == &owner_source && object.object.path_id() == 2)
-        .expect("owner fixture must retain its child Transform")
-        .key();
-    assert_eq!(
-        environment
-            .resolve_pptr_path_key(&child_key, "m_Father", &mut AssetLoadBudget::default())
-            .unwrap(),
-        None
-    );
-
-    let resolved = environment
-        .resolve_pptr_path_key_best_effort(&child_key, "m_Father", &mut AssetLoadBudget::default())
-        .unwrap()
-        .expect("best-effort lookup must load the nested dependency");
-    assert_eq!(resolved.source, BinarySource::path(&target_path));
-    assert_eq!(resolved.source_kind, BinarySourceKind::SerializedFile);
-    assert_eq!(resolved.asset_index, None);
-    assert_eq!(resolved.path_id, 1);
-    assert!(
-        environment
-            .binary_assets()
-            .contains_key(&BinarySource::path(target_path))
-    );
 }
 
 #[test]
@@ -1498,7 +1412,7 @@ fn plan_builder_preserves_recipe_order_and_rejects_snapshot_overlap() {
         .unwrap(),
     );
     let duplicate = first.clone();
-    let mut builder = MutationPlanBuilder::new(planner.revision());
+    let mut builder = MutationPlanBuilder::new(planner.workspace_id(), planner.revision());
     builder.append(first).unwrap();
     assert!(matches!(
         builder.append(duplicate),
@@ -1511,7 +1425,7 @@ fn plan_builder_preserves_recipe_order_and_rejects_snapshot_overlap() {
     assert!(!canonical.contains("schema_provenance"));
 
     let wrong_revision = WorkspaceRevision::new(unity_asset::DigestV1::hash_bytes(b"other"));
-    let mut wrong = MutationPlanBuilder::new(wrong_revision);
+    let mut wrong = MutationPlanBuilder::new(planner.workspace_id(), wrong_revision);
     let fragment = changed(
         TransformRecipe::lower_transform(
             &planner,
@@ -1584,13 +1498,12 @@ fn recipe_lowering_rejects_an_object_inspected_from_a_stale_snapshot() {
 
     let changed_yaml = MATERIAL_YAML.replacen("m_Scale: {x: 1, y: 1}", "m_Scale: {x: 2, y: 2}", 1);
     fs::write(fixture._directory.path().join(&fixture.alias), changed_yaml).unwrap();
-    fixture
-        .workspace
-        .load_path(
-            fixture._directory.path().join(&fixture.alias),
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
+    fixture.source = source_replacement::replace_source_path(
+        &mut fixture.workspace,
+        fixture.source,
+        &fixture._directory.path().join(&fixture.alias),
+        &fixture.alias,
+    );
     let second_snapshot = fixture.workspace.snapshot();
     assert_ne!(first_snapshot.revision(), second_snapshot.revision());
     let second_planner = SchemaRecipePlanner::new(&second_snapshot);
@@ -1824,13 +1737,14 @@ fn material_scan_to_the_last_property_is_budgeted() {
 
 fn equivalent_plan_pair(fragment: MutationPlanFragment) -> (MutationPlan, MutationPlan) {
     let direct = MutationPlan::new(
+        fragment.workspace_id(),
         fragment.base_revision(),
         fragment.sources().to_vec(),
         fragment.payloads().to_vec(),
         fragment.actions().to_vec(),
     )
     .unwrap();
-    let mut builder = MutationPlanBuilder::new(fragment.base_revision());
+    let mut builder = MutationPlanBuilder::new(fragment.workspace_id(), fragment.base_revision());
     builder.append(fragment).unwrap();
     let recipe = builder.build().unwrap();
     assert_eq!(

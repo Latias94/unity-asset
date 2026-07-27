@@ -1709,11 +1709,20 @@ fn parse_legacy_inspection_directory(
         directory_size,
         decoded_size,
     )?;
-    if directory_end != directory_data.len() {
-        return Err(BinaryError::invalid_data(format!(
-            "Legacy directory contains {} trailing bytes",
-            directory_data.len() - directory_end
-        )));
+    let padding = &directory_data[directory_end..];
+    if !padding.is_empty() {
+        let expected_padding = (4 - (directory_end % 4)) % 4;
+        if padding.len() != expected_padding {
+            return Err(BinaryError::invalid_data(format!(
+                "Legacy directory contains {} trailing bytes",
+                padding.len()
+            )));
+        }
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(BinaryError::invalid_data(
+                "Legacy directory alignment padding is not zero-filled",
+            ));
+        }
     }
     let retained_bytes = size_of::<BundleDirectoryInspection>()
         .checked_mul(file_count)
@@ -2177,6 +2186,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_alignment_uses_version_when_revision_is_empty() {
+        let modern = BundleHeader {
+            unity_version: "2019.4.0f1".to_string(),
+            unity_revision: String::new(),
+            ..BundleHeader::default()
+        };
+        assert!(BundleParser::should_probe_legacy_alignment(&modern));
+
+        let old = BundleHeader {
+            unity_version: "2019.3.15f1".to_string(),
+            unity_revision: String::new(),
+            ..BundleHeader::default()
+        };
+        assert!(!BundleParser::should_probe_legacy_alignment(&old));
+    }
+
+    #[test]
     fn load_assets_rejects_out_of_bounds_node() {
         let header = BundleHeader {
             signature: "UnityFS".to_string(),
@@ -2391,6 +2417,53 @@ mod tests {
         assert!(bundle.files.is_empty());
         assert_eq!(budget.usage().members, 0);
         assert_eq!(budget.usage().entries, 0);
+    }
+
+    #[test]
+    fn legacy_inspection_accepts_zero_filled_directory_alignment() {
+        let mut data = 1_i32.to_be_bytes().to_vec();
+        data.extend_from_slice(b"test.txt\0");
+        data.extend_from_slice(&24_u32.to_be_bytes());
+        data.extend_from_slice(&3_u32.to_be_bytes());
+        data.extend_from_slice(&[0; 3]);
+
+        let directory = parse_legacy_inspection_directory(
+            &data,
+            24,
+            27,
+            &BundleLoadOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+        assert_eq!(directory.len(), 1);
+        assert_eq!(directory[0].name, "test.txt");
+        assert_eq!(directory[0].offset, 24);
+        assert_eq!(directory[0].length, 3);
+    }
+
+    #[test]
+    fn legacy_inspection_rejects_nonzero_directory_alignment() {
+        let mut data = 1_i32.to_be_bytes().to_vec();
+        data.extend_from_slice(b"test.txt\0");
+        data.extend_from_slice(&24_u32.to_be_bytes());
+        data.extend_from_slice(&3_u32.to_be_bytes());
+        data.extend_from_slice(&[0, 1, 0]);
+
+        let error = parse_legacy_inspection_directory(
+            &data,
+            24,
+            27,
+            &BundleLoadOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("alignment padding is not zero-filled")
+        );
     }
 
     #[test]

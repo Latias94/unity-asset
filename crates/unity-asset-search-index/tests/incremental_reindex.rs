@@ -161,6 +161,7 @@ fn name_guard(value: &str) -> FieldGuard {
 
 fn commit_target_name(fixture: &mut Fixture, replacement: &str) -> ChangeSet {
     let plan = MutationPlan::new(
+        fixture.workspace.workspace_id(),
         fixture.workspace.revision(),
         vec![SourceExpectation::new(
             SourceLocator::path(TARGET_ALIAS).unwrap(),
@@ -258,7 +259,10 @@ fn reference_response_at_generation(
 ) -> ReferencesResponse {
     let status_before = serde_json::to_value(index.status().unwrap()).unwrap();
     let response = index
-        .references(ReferenceRequest::incoming_guid(guid, Some(file_id), 20))
+        .references(
+            ReferenceRequest::incoming_guid(guid, Some(file_id), 20),
+            &mut AssetLoadBudget::default(),
+        )
         .unwrap();
     assert_eq!(&response.generation, generation);
     let status_after = serde_json::to_value(index.status().unwrap()).unwrap();

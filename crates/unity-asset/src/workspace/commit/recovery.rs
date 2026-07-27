@@ -20,7 +20,7 @@ use std::sync::Arc;
 #[cfg(all(test, unix))]
 use std::sync::{Mutex, OnceLock};
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, DigestV1, TransactionId, WorkspaceId, WorkspaceRevision,
@@ -67,12 +67,46 @@ pub(crate) enum RecoveryDisposition {
     Blocked,
 }
 
+/// Version of the rollback-receipt response contract.
+pub const ROLLBACK_RECEIPT_VERSION: u8 = 1;
+
 /// Stable receipt for a transaction whose pre-publication state was restored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A deserialized receipt is historical evidence only. Recovery remains an
+/// explicit operation against a caller-authorized [`RecoveryLocator`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackReceipt {
+    version: u8,
     workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     recovery: RecoveryLocator,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollbackReceiptWire {
+    version: u8,
+    workspace_id: WorkspaceId,
+    base_revision: WorkspaceRevision,
+    recovery: RecoveryLocator,
+}
+
+impl<'de> Deserialize<'de> for RollbackReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RollbackReceiptWire::deserialize(deserializer)?;
+        let receipt = Self {
+            version: wire.version,
+            workspace_id: wire.workspace_id,
+            base_revision: wire.base_revision,
+            recovery: wire.recovery,
+        };
+        receipt.validate().map_err(serde::de::Error::custom)?;
+        Ok(receipt)
+    }
 }
 
 impl RollbackReceipt {
@@ -82,10 +116,16 @@ impl RollbackReceipt {
         recovery: RecoveryLocator,
     ) -> Self {
         Self {
+            version: ROLLBACK_RECEIPT_VERSION,
             workspace_id,
             base_revision,
             recovery,
         }
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> u8 {
+        self.version
     }
 
     #[must_use]
@@ -102,9 +142,24 @@ impl RollbackReceipt {
     pub const fn recovery(&self) -> &RecoveryLocator {
         &self.recovery
     }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.version != ROLLBACK_RECEIPT_VERSION {
+            return Err("unsupported rollback receipt version");
+        }
+        Ok(())
+    }
 }
 
+/// Version of the terminal recovery-outcome response contract.
+pub const RECOVERY_OUTCOME_VERSION: u8 = 1;
+
 /// Terminal result of recovering one transaction.
+///
+/// Serialized outcomes retain the live operation's exact status. Deserialization
+/// deliberately downgrades current-state assertions to historical receipts:
+/// untrusted JSON can describe evidence, but it cannot authorize recovery or
+/// assert that a filesystem or workspace is still current.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryOutcome {
     /// Publication bytes are durable, but a trusted workspace must still attach them.
@@ -123,7 +178,100 @@ pub enum RecoveryOutcome {
     NoTransaction(RecoveryLocator),
 }
 
+#[derive(Serialize)]
+struct RecoveryOutcomeRef<'value> {
+    version: u8,
+    outcome: RecoveryOutcomeRefKind<'value>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum RecoveryOutcomeRefKind<'value> {
+    FilesystemRecovered { report: &'value CommitReport },
+    Finalized { report: &'value CommitReport },
+    HistoricalCommitReceipt { report: &'value CommitReport },
+    RolledBack { receipt: &'value RollbackReceipt },
+    HistoricalRollbackReceipt { receipt: &'value RollbackReceipt },
+    NoTransaction { recovery: &'value RecoveryLocator },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryOutcomeWire {
+    version: u8,
+    outcome: RecoveryOutcomeWireKind,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum RecoveryOutcomeWireKind {
+    FilesystemRecovered { report: Box<CommitReport> },
+    Finalized { report: Box<CommitReport> },
+    HistoricalCommitReceipt { report: Box<CommitReport> },
+    RolledBack { receipt: RollbackReceipt },
+    HistoricalRollbackReceipt { receipt: RollbackReceipt },
+    NoTransaction { recovery: RecoveryLocator },
+}
+
+impl Serialize for RecoveryOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let outcome = match self {
+            Self::FilesystemRecovered(report) => {
+                RecoveryOutcomeRefKind::FilesystemRecovered { report }
+            }
+            Self::Finalized(report) => RecoveryOutcomeRefKind::Finalized { report },
+            Self::HistoricalCommitReceipt(report) => {
+                RecoveryOutcomeRefKind::HistoricalCommitReceipt { report }
+            }
+            Self::RolledBack(receipt) => RecoveryOutcomeRefKind::RolledBack { receipt },
+            Self::HistoricalRollbackReceipt(receipt) => {
+                RecoveryOutcomeRefKind::HistoricalRollbackReceipt { receipt }
+            }
+            Self::NoTransaction(recovery) => RecoveryOutcomeRefKind::NoTransaction { recovery },
+        };
+        RecoveryOutcomeRef {
+            version: RECOVERY_OUTCOME_VERSION,
+            outcome,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RecoveryOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RecoveryOutcomeWire::deserialize(deserializer)?;
+        if wire.version != RECOVERY_OUTCOME_VERSION {
+            return Err(serde::de::Error::custom(
+                "unsupported recovery outcome version",
+            ));
+        }
+        Ok(match wire.outcome {
+            RecoveryOutcomeWireKind::FilesystemRecovered { report }
+            | RecoveryOutcomeWireKind::Finalized { report }
+            | RecoveryOutcomeWireKind::HistoricalCommitReceipt { report } => {
+                Self::HistoricalCommitReceipt(report)
+            }
+            RecoveryOutcomeWireKind::RolledBack { receipt }
+            | RecoveryOutcomeWireKind::HistoricalRollbackReceipt { receipt } => {
+                Self::HistoricalRollbackReceipt(receipt)
+            }
+            RecoveryOutcomeWireKind::NoTransaction { recovery } => Self::NoTransaction(recovery),
+        })
+    }
+}
+
 impl RecoveryOutcome {
+    #[must_use]
+    pub const fn version(&self) -> u8 {
+        RECOVERY_OUTCOME_VERSION
+    }
+
     #[must_use]
     pub const fn committed(&self) -> Option<&CommitReport> {
         match self {
@@ -4937,6 +5085,7 @@ mod tests {
         SourceLocator, UnityClass, UnityValue,
     };
 
+    use super::super::RECOVERY_LOCATOR_VERSION;
     use super::*;
 
     const SOURCE_ALIAS: &str = "recovery.prefab";
@@ -4989,6 +5138,7 @@ mod tests {
             panic!("mutation plan source must resolve");
         };
         MutationPlan::new(
+            workspace.workspace_id(),
             workspace.revision(),
             vec![SourceExpectation::new(locator, source.fingerprint())],
             Vec::new(),
@@ -5037,6 +5187,7 @@ mod tests {
         );
         let payload = PlanPayload::new(RESOURCE_PAYLOAD.to_vec());
         MutationPlan::new(
+            workspace.workspace_id(),
             workspace.revision(),
             vec![SourceExpectation::new(
                 SourceLocator::path(RESOURCE_ALIAS).expect("resource locator"),
@@ -6839,6 +6990,215 @@ mod tests {
         assert!(attached.historical_commit_receipt().is_some());
         assert_eq!(workspace.revision(), second.committed_revision());
         assert_target_unchanged(&path, &successor_bytes);
+    }
+
+    #[test]
+    fn rollback_receipt_wire_is_versioned_strict_and_round_trippable() {
+        let (_directory, _path, _workspace, report) = committed_fixture();
+        let receipt = RollbackReceipt::new(
+            report.workspace_id(),
+            report.base_revision(),
+            report.recovery().clone(),
+        );
+        let encoded = serde_json::to_value(&receipt).expect("serialize rollback receipt");
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "version": ROLLBACK_RECEIPT_VERSION,
+                "workspace_id": report.workspace_id(),
+                "base_revision": report.base_revision(),
+                "recovery": report.recovery(),
+            })
+        );
+        assert_eq!(
+            encoded["recovery"]["version"],
+            serde_json::json!(RECOVERY_LOCATOR_VERSION)
+        );
+        let decoded = serde_json::from_value::<RollbackReceipt>(encoded.clone())
+            .expect("deserialize rollback receipt");
+        assert_eq!(decoded, receipt);
+        assert_eq!(decoded.version(), ROLLBACK_RECEIPT_VERSION);
+
+        let mut unsupported = encoded.clone();
+        unsupported["version"] = serde_json::json!(ROLLBACK_RECEIPT_VERSION + 1);
+        assert!(
+            serde_json::from_value::<RollbackReceipt>(unsupported)
+                .expect_err("unsupported rollback receipt version")
+                .to_string()
+                .contains("unsupported rollback receipt version")
+        );
+
+        let mut unknown = encoded;
+        unknown
+            .as_object_mut()
+            .expect("rollback receipt object")
+            .insert("unexpected".to_owned(), serde_json::Value::Null);
+        assert!(
+            serde_json::from_value::<RollbackReceipt>(unknown)
+                .expect_err("unknown rollback receipt field")
+                .to_string()
+                .contains("unknown field")
+        );
+    }
+
+    #[test]
+    fn recovery_outcome_wire_is_stably_tagged_and_downgrades_live_claims() {
+        let (_directory, _path, _workspace, report) = committed_fixture();
+        let live = RecoveryOutcome::Finalized(Box::new(report.clone()));
+        let encoded_text = serde_json::to_string(&live).expect("serialize live recovery outcome");
+        assert!(
+            encoded_text
+                .starts_with("{\"version\":1,\"outcome\":{\"status\":\"finalized\",\"report\":")
+        );
+        let encoded =
+            serde_json::from_str::<serde_json::Value>(&encoded_text).expect("outcome JSON");
+        assert_eq!(
+            encoded["version"],
+            serde_json::json!(RECOVERY_OUTCOME_VERSION)
+        );
+        assert_eq!(encoded["outcome"]["status"], serde_json::json!("finalized"));
+        let decoded = serde_json::from_value::<RecoveryOutcome>(encoded)
+            .expect("deserialize live recovery outcome as history");
+        assert_eq!(
+            decoded,
+            RecoveryOutcome::HistoricalCommitReceipt(Box::new(report.clone()))
+        );
+        assert!(decoded.finalized().is_none());
+        assert!(decoded.historical_commit_receipt().is_some());
+        assert_eq!(decoded.version(), RECOVERY_OUTCOME_VERSION);
+
+        let historical = RecoveryOutcome::HistoricalCommitReceipt(Box::new(report));
+        let round_trip = serde_json::from_value::<RecoveryOutcome>(
+            serde_json::to_value(&historical).expect("serialize historical outcome"),
+        )
+        .expect("deserialize historical outcome");
+        assert_eq!(round_trip, historical);
+    }
+
+    #[test]
+    fn recovery_outcome_wire_downgrades_live_rollback_claims() {
+        let (_directory, _path, _workspace, report) = committed_fixture();
+        let receipt = RollbackReceipt::new(
+            report.workspace_id(),
+            report.base_revision(),
+            report.recovery().clone(),
+        );
+        let live = RecoveryOutcome::RolledBack(receipt.clone());
+        let encoded = serde_json::to_value(&live).expect("serialize live rollback outcome");
+        assert_eq!(
+            encoded["outcome"]["status"],
+            serde_json::json!("rolled_back")
+        );
+        let decoded = serde_json::from_value::<RecoveryOutcome>(encoded)
+            .expect("deserialize live rollback outcome as history");
+        assert_eq!(decoded, RecoveryOutcome::HistoricalRollbackReceipt(receipt));
+        assert!(decoded.rolled_back().is_none());
+        assert!(decoded.historical_rollback_receipt().is_some());
+
+        let absent = RecoveryOutcome::NoTransaction(report.recovery().clone());
+        let round_trip = serde_json::from_value::<RecoveryOutcome>(
+            serde_json::to_value(&absent).expect("serialize absent outcome"),
+        )
+        .expect("deserialize absent outcome");
+        assert_eq!(round_trip, absent);
+    }
+
+    #[test]
+    fn recovery_outcome_wire_rejects_unknown_versions_and_fields() {
+        let (_directory, _path, _workspace, report) = committed_fixture();
+        let outcome = RecoveryOutcome::HistoricalCommitReceipt(Box::new(report));
+        let encoded = serde_json::to_value(&outcome).expect("serialize recovery outcome");
+
+        let mut unsupported = encoded.clone();
+        unsupported["version"] = serde_json::json!(RECOVERY_OUTCOME_VERSION + 1);
+        assert!(
+            serde_json::from_value::<RecoveryOutcome>(unsupported)
+                .expect_err("unsupported recovery outcome version")
+                .to_string()
+                .contains("unsupported recovery outcome version")
+        );
+
+        let mut unknown_outer = encoded.clone();
+        unknown_outer
+            .as_object_mut()
+            .expect("recovery outcome object")
+            .insert("unexpected".to_owned(), serde_json::Value::Null);
+        assert!(
+            serde_json::from_value::<RecoveryOutcome>(unknown_outer)
+                .expect_err("unknown recovery outcome field")
+                .to_string()
+                .contains("unknown field")
+        );
+
+        let mut unknown_variant = encoded;
+        unknown_variant["outcome"]
+            .as_object_mut()
+            .expect("tagged recovery outcome")
+            .insert("unexpected".to_owned(), serde_json::Value::Null);
+        assert!(
+            serde_json::from_value::<RecoveryOutcome>(unknown_variant)
+                .expect_err("unknown tagged recovery outcome field")
+                .to_string()
+                .contains("unknown field")
+        );
+    }
+
+    #[test]
+    fn recovery_outcome_wire_validates_nested_receipts_and_reports() {
+        let (_directory, _path, _workspace, report) = committed_fixture();
+        let outcome = RecoveryOutcome::HistoricalCommitReceipt(Box::new(report.clone()));
+        let encoded = serde_json::to_value(&outcome).expect("serialize recovery outcome");
+
+        let mut unknown_report = encoded.clone();
+        unknown_report["outcome"]["report"]
+            .as_object_mut()
+            .expect("nested commit report")
+            .insert("unexpected".to_owned(), serde_json::Value::Null);
+        assert!(
+            serde_json::from_value::<RecoveryOutcome>(unknown_report)
+                .expect_err("unknown nested commit report field")
+                .to_string()
+                .contains("unknown field")
+        );
+
+        let mut invalid_report = encoded;
+        let base_revision = invalid_report["outcome"]["report"]["base_revision"].clone();
+        invalid_report["outcome"]["report"]["committed_revision"] = base_revision;
+        assert!(
+            serde_json::from_value::<RecoveryOutcome>(invalid_report)
+                .expect_err("invalid nested commit report")
+                .to_string()
+                .contains("revisions and change set disagree")
+        );
+
+        let receipt = RollbackReceipt::new(
+            report.workspace_id(),
+            report.base_revision(),
+            report.recovery().clone(),
+        );
+        let rollback = RecoveryOutcome::HistoricalRollbackReceipt(receipt);
+        let mut invalid_receipt =
+            serde_json::to_value(&rollback).expect("serialize rollback outcome");
+        invalid_receipt["outcome"]["receipt"]["version"] =
+            serde_json::json!(ROLLBACK_RECEIPT_VERSION + 1);
+        assert!(
+            serde_json::from_value::<RecoveryOutcome>(invalid_receipt)
+                .expect_err("invalid nested rollback receipt")
+                .to_string()
+                .contains("unsupported rollback receipt version")
+        );
+
+        let absent = RecoveryOutcome::NoTransaction(report.recovery().clone());
+        let mut invalid_locator =
+            serde_json::to_value(&absent).expect("serialize absent recovery outcome");
+        invalid_locator["outcome"]["recovery"]["version"] =
+            serde_json::json!(RECOVERY_LOCATOR_VERSION + 1);
+        assert!(
+            serde_json::from_value::<RecoveryOutcome>(invalid_locator)
+                .expect_err("invalid nested recovery locator")
+                .to_string()
+                .contains("recovery locator version 2 is unsupported")
+        );
     }
 
     #[test]

@@ -5,11 +5,12 @@ use std::path::Path;
 use tempfile::TempDir;
 use unity_asset::workspace::{
     AssetWorkspace, FieldGuard, GenericMutation, MutationPlan, MutationValue, PrepareOptions,
-    PrepareStage, SourceExpectation, SourceOpenRequest, WorkspaceLookup, WorkspaceView,
+    PrepareStage, SourceExpectation, SourceOpenRequest, WorkspaceLookup, WorkspaceOptions,
+    WorkspaceView,
 };
 use unity_asset::{
     AssetLoadBudget, FieldPath, ObjectAddress, SourceAlias, SourceFingerprint, SourceKind,
-    SourceLocator, UnityValue,
+    SourceLocator, UnityValue, WorkspaceId,
 };
 use unity_asset_core::{semantic_value_digest, yaml_field_schema_digest};
 
@@ -18,10 +19,15 @@ const YAML: &str =
     "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Before\n";
 
 fn workspace_fixture() -> (TempDir, std::path::PathBuf, AssetWorkspace) {
+    workspace_fixture_with(AssetWorkspace::new().unwrap())
+}
+
+fn workspace_fixture_with(
+    mut workspace: AssetWorkspace,
+) -> (TempDir, std::path::PathBuf, AssetWorkspace) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join(SOURCE_ALIAS);
     fs::write(&path, YAML).unwrap();
-    let mut workspace = AssetWorkspace::new().unwrap();
     workspace
         .load_source(
             SourceOpenRequest::new(&path, SourceAlias::new(SOURCE_ALIAS).unwrap())
@@ -69,6 +75,7 @@ fn guard_for(value: &str) -> FieldGuard {
 
 fn plan(workspace: &AssetWorkspace, actions: Vec<GenericMutation>) -> MutationPlan {
     MutationPlan::new(
+        workspace.workspace_id(),
         workspace.revision(),
         vec![SourceExpectation::new(
             SourceLocator::path(SOURCE_ALIAS).unwrap(),
@@ -123,6 +130,37 @@ fn prepare_reads_earlier_field_replacement_and_performs_no_filesystem_write() {
     assert_eq!(read_name(&workspace.snapshot()), "Before");
     assert_eq!(fs::read(&path).unwrap(), before_bytes);
     assert_eq!(directory_entries(directory.path()), before_entries);
+}
+
+#[test]
+fn prepare_rejects_a_plan_from_another_workspace_before_source_validation() {
+    let first = AssetWorkspace::with_workspace_id(
+        WorkspaceId::from_u128(1).unwrap(),
+        WorkspaceOptions::default(),
+    )
+    .unwrap();
+    let second = AssetWorkspace::with_workspace_id(
+        WorkspaceId::from_u128(2).unwrap(),
+        WorkspaceOptions::default(),
+    )
+    .unwrap();
+    let (_first_directory, _first_path, first) = workspace_fixture_with(first);
+    let (_second_directory, _second_path, second) = workspace_fixture_with(second);
+    assert_ne!(first.workspace_id(), second.workspace_id());
+    let change = plan(&first, vec![replace(guard_for("Before"), "After")]);
+    let mut budget = AssetLoadBudget::default();
+    let before_usage = budget.usage();
+
+    let error = second
+        .prepare(change, PrepareOptions::default(), &mut budget)
+        .unwrap_err();
+
+    assert_eq!(budget.usage(), before_usage);
+    assert_eq!(error.report().diagnostics().len(), 1);
+    let diagnostic = &error.report().diagnostics()[0];
+    assert_eq!(diagnostic.ordinal(), None);
+    assert_eq!(diagnostic.stage(), PrepareStage::PlanIdentity);
+    assert_eq!(diagnostic.diagnostic().code(), "PREPARE_WORKSPACE_MISMATCH");
 }
 
 #[test]

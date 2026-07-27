@@ -1,10 +1,13 @@
+mod support;
+
 use std::path::{Path, PathBuf};
 
 use unity_asset_binary::bundle::AssetBundle;
-use unity_asset_binary::file::UnityFile;
+use unity_asset_binary::file::{UnityFile, UnityFileLoadOutcome};
 use unity_asset_write::PackingPolicy;
-use unity_asset_write::bundle::{BundleEdits, BundleWriter};
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
+
+use support::{ordered_bundle_entries, prepare_bundle_bytes};
 
 fn repo_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is `.../crates/unity-asset-write`.
@@ -48,7 +51,8 @@ fn roundtrip_bundle_noop(bundle: &AssetBundle) -> anyhow::Result<()> {
         .map(|n| n.name.clone())
         .collect();
 
-    let saved = BundleWriter::save(bundle, &BundleEdits::default(), PackingPolicy::Preserve)?;
+    let entries = ordered_bundle_entries(bundle)?;
+    let saved = prepare_bundle_bytes(bundle, &entries, PackingPolicy::Preserve)?;
 
     let reparsed = unity_asset_binary::bundle::BundleParser::from_bytes(saved)?;
 
@@ -102,9 +106,19 @@ fn corpus_roundtrip_noop_save_is_loadable() -> anyhow::Result<()> {
 
     for path in samples {
         let bytes = std::fs::read(&path)?;
-        let parsed = match unity_asset_binary::file::load_unity_file_from_memory(bytes) {
-            Ok(v) => v,
-            Err(_) => {
+        let mut budget = unity_asset_core::AssetLoadBudget::default();
+        let parsed = match unity_asset_binary::file::try_load_unity_file_from_memory_with_budget(
+            bytes,
+            &mut budget,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "recognized Unity container failed to parse for {}: {error}",
+                file_label(&path)
+            )
+        })? {
+            UnityFileLoadOutcome::Recognized(file) => file,
+            UnityFileLoadOutcome::Unrecognized => {
                 // `tests/samples` can also contain raw resource blobs (`.resS`/`.resource`) or
                 // other non-container artifacts; skip those in this corpus test.
                 skipped += 1;

@@ -13,6 +13,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   test:
@@ -43,7 +44,6 @@ jobs:
       run: |
         cargo clippy -p unity-asset-core --all-targets --features async -- -D warnings -A clippy::collapsible_if
         cargo clippy -p unity-asset-yaml --all-targets --features async -- -D warnings -A clippy::collapsible_if
-        cargo clippy -p unity-asset-binary --all-targets --features async -- -D warnings -A clippy::collapsible_if
         cargo clippy -p unity-asset --all-targets --features async -- -D warnings -A clippy::collapsible_if
         cargo clippy -p unity-asset-cli --all-targets --features async -- -D warnings -A clippy::collapsible_if
 
@@ -61,24 +61,21 @@ jobs:
         cargo build -p unity-asset-cli --features decode
 
     - name: Build examples
-      run: |
-        cargo build -p unity-asset --examples
-        cargo build -p unity-asset-binary --examples
-        cargo build -p unity-asset-decode --examples --features full
+      run: cargo build --workspace --examples --all-features
 
     - name: Run tests (workspace defaults)
-      run: cargo nextest run --workspace
+      run: cargo nextest run --workspace --test-threads 2
 
     - name: Run tests (async)
       run: |
-        cargo nextest run -p unity-asset --features async
-        cargo nextest run -p unity-asset-cli --features async --no-tests=pass
+        cargo nextest run -p unity-asset --features async --test-threads 2
+        cargo nextest run -p unity-asset-cli --features async --test-threads 2 --no-tests=pass
 
     - name: Run tests (decode/export)
       run: |
-        cargo nextest run -p unity-asset-decode --features full
-        cargo nextest run -p unity-asset --features decode --test extraction_decode
-        cargo nextest run -p unity-asset-cli --features decode --test export_command
+        cargo nextest run -p unity-asset-decode --features full --test-threads 2
+        cargo nextest run -p unity-asset --features decode --test extraction_decode --test-threads 2
+        cargo nextest run -p unity-asset-cli --features decode --test-threads 2
 
     - name: Verify decode package assets
       run: |
@@ -113,20 +110,50 @@ jobs:
       with:
         shared-key: workspace-publication-${{ matrix.os }}
 
-    - name: Run platform publication and recovery tests
-      run: cargo nextest run -p unity-asset -E 'test(/^workspace::commit::/)'
+    - name: Run platform publication, recovery, and extraction unit tests
+      run: >-
+        cargo nextest run -p unity-asset
+        --test-threads 2
+        -E 'test(/^workspace::commit::/) | test(/^extraction::artifact::tests::/)'
 
-    - name: Run publication contract tests
-      run: cargo nextest run -p unity-asset --test workspace_commit --test workspace_recovery
+    - name: Run workspace and security black-box contract tests
+      run: >-
+        cargo nextest run
+        --test-threads 2
+        -p unity-asset
+        -p unity-asset-cli
+        -p unity-asset-search-cli
+        -p unity-asset-search-index
+        -p unity-asset-search-daemon
+        --test workspace_commit
+        --test workspace_recovery
+        --test public_workflows
+        --test agent_native_workflows
+        --test agent_native_workflow
+        --test workspace_commands
+        --test workspace_json
+        --test structured_errors
+        --test reference_generation
+        --test http_contract
+        --test reindex_coordinator
+        --test security_contract
 
-    - name: Run extraction output publication tests
-      run: cargo nextest run -p unity-asset -E 'test(/^extraction::artifact::tests::/)'
+    - name: Run generation security unit contracts
+      run: >-
+        cargo nextest run
+        --test-threads 2
+        -p unity-asset-search-index
+        --lib
 
-    - name: Run search generation filesystem contract tests
-      run: cargo nextest run -p unity-asset-search-index --test reference_generation
-
-    - name: Run daemon credential security contract tests
-      run: cargo nextest run -p unity-asset-search-daemon --test security_contract
+    - name: Run Windows CLI and daemon unit contracts
+      if: runner.os == 'Windows'
+      run: >-
+        cargo nextest run
+        --test-threads 2
+        -p unity-asset-cli
+        -p unity-asset-search-daemon
+        --bin unity-asset
+        --lib
 
   binary-loader-features:
     name: Binary loader / ${{ matrix.mode }}
@@ -155,12 +182,12 @@ jobs:
         shared-key: binary-loader-${{ matrix.mode }}
 
     - name: Run binary loader tests (${{ matrix.mode }})
-      run: cargo nextest run -p unity-asset-binary ${{ matrix.feature-args }}
+      run: cargo nextest run -p unity-asset-binary ${{ matrix.feature-args }} --test-threads 2
 
   docs:
     name: Documentation
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable

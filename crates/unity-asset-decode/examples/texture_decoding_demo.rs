@@ -3,7 +3,6 @@
 //! This example shows how to use the Texture2DConverter to decode texture data.
 
 use unity_asset_decode::texture::{Texture2D, Texture2DConverter, TextureFormat};
-use unity_asset_decode::unity_version::UnityVersion;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Unity Asset Parser - Texture2D Decoding Demo");
@@ -13,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let texture = create_demo_texture();
 
     // Create converter
-    let converter = Texture2DConverter::new(UnityVersion::default());
+    let converter = Texture2DConverter::new();
 
     println!("\nTexture Information:");
     println!("  Name: {}", texture.name);

@@ -333,7 +333,7 @@ mod tests {
     fn yaml_source_rejects_a_non_yaml_source_identity() {
         let owner = Arc::<[u8]>::from([]);
         let locator = SourceLocator::path("source.prefab").unwrap();
-        let document = YamlDocument::new();
+        let document = YamlDocument::from_entries(Vec::new());
         let source = source(SourceKind::SerializedFile);
         let error = ReferenceSource::yaml(
             source,
@@ -360,7 +360,7 @@ mod tests {
     fn yaml_source_rejects_a_non_yaml_fingerprint() {
         let owner = Arc::<[u8]>::from([]);
         let locator = SourceLocator::path("source.prefab").unwrap();
-        let document = YamlDocument::new();
+        let document = YamlDocument::from_entries(Vec::new());
         let source = source(SourceKind::Yaml);
         let error = ReferenceSource::yaml(
             source,

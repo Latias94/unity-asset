@@ -14,7 +14,8 @@ fn registry_can_restore_typetree_parsing_when_stripped() {
             other => panic!("expected AssetBundle, got {:?}", other.kind()),
         };
 
-    let file = bundle.assets.get_mut(0).expect("bundle has asset 0");
+    assert!(!bundle.assets.is_empty(), "bundle has asset 0");
+    let file = bundle.assets.remove(0);
 
     let original_tree = file
         .types()
@@ -27,11 +28,15 @@ fn registry_can_restore_typetree_parsing_when_stripped() {
     let mut registry = InMemoryTypeTreeRegistry::default();
     registry.insert_any(28, original_tree);
 
-    file.set_type_tree_enabled(false);
-    for t in file.types_mut().iter_mut() {
+    let mut types = file.types().to_vec();
+    for t in &mut types {
         t.type_tree.clear();
     }
-    file.set_type_tree_registry(Some(Arc::new(registry)));
+    let ref_types = file.ref_types().to_vec();
+    let file = file
+        .with_type_tables(types, ref_types)
+        .without_embedded_type_trees()
+        .with_type_tree_registry(Some(Arc::new(registry)));
 
     let handle = file
         .find_object_handle(-3875358842991402074)

@@ -11,13 +11,14 @@ use unity_asset::schema::{
 };
 use unity_asset::workspace::{
     AssetWorkspace, MutationPlanBuilder, MutationPlanError, MutationValue, PrepareOptions,
-    ReferenceTarget, SourceOpenRequest, WorkspaceError, WorkspaceLookup, WorkspaceObjectValue,
-    WorkspaceOptions, WorkspaceSourceContainer, WorkspaceSourceMemberIdentityError, WorkspaceView,
+    ReferenceTarget, SourceAdmissionBatch, SourceOpenRequest, WorkspaceError, WorkspaceLookup,
+    WorkspaceObjectValue, WorkspaceOptions, WorkspaceSourceContainer,
+    WorkspaceSourceMemberIdentityError, WorkspaceView,
 };
 use unity_asset::{
     AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BinaryError, BudgetError, ContainmentKind,
     ContractError, FieldPath, ObjectAddress, SourceAlias, SourceKind, SourceLocator,
-    SourceMemberId,
+    SourceMemberId, WorkspaceId,
 };
 use unity_asset_binary::asset::SerializedFileParser;
 use unity_asset_binary::bundle::BundleParser;
@@ -25,6 +26,9 @@ use unity_asset_core::arc_slice_allocation_bytes;
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
+
+#[path = "support/source_replacement.rs"]
+mod source_replacement;
 
 const V22_SERIALIZED_FIXTURE: &[u8] =
     include_bytes!("../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin");
@@ -188,21 +192,25 @@ fn duplicate_path_id_serialized_fixture_bytes() -> Vec<u8> {
 
 fn stripped_serialized_fixture_bytes() -> Vec<u8> {
     let mut file = SerializedFileParser::from_bytes(serialized_fixture_bytes()).unwrap();
-    file.set_type_tree_enabled(false);
-    for serialized_type in file.types_mut() {
+    let mut types = file.types().to_vec();
+    for serialized_type in &mut types {
         serialized_type.type_tree = Default::default();
         serialized_type.type_dependencies.clear();
         serialized_type.class_name.clear();
         serialized_type.namespace.clear();
         serialized_type.assembly_name.clear();
     }
-    for serialized_type in file.ref_types_mut() {
+    let mut ref_types = file.ref_types().to_vec();
+    for serialized_type in &mut ref_types {
         serialized_type.type_tree = Default::default();
         serialized_type.type_dependencies.clear();
         serialized_type.class_name.clear();
         serialized_type.namespace.clear();
         serialized_type.assembly_name.clear();
     }
+    file = file
+        .with_type_tables(types, ref_types)
+        .without_embedded_type_trees();
     SerializedFileWriter::save(&file, &SerializedFileEdits::default()).unwrap()
 }
 
@@ -336,9 +344,8 @@ fn old_snapshots_survive_reload_unload_and_physical_file_changes() {
     assert_eq!(first_bytes.contiguous(), Some(FIRST_YAML.as_bytes()));
 
     fs::write(&path, SECOND_YAML).unwrap();
-    let reloaded = workspace
-        .load_path(&path, &mut AssetLoadBudget::default())
-        .unwrap();
+    let reloaded =
+        source_replacement::replace_source_path(&mut workspace, root, &path, "scene.prefab");
     assert_eq!(reloaded, root);
     assert_ne!(workspace.revision(), first_revision);
     let second = workspace.snapshot();
@@ -385,40 +392,6 @@ fn old_snapshots_survive_reload_unload_and_physical_file_changes() {
             .source(root, &mut AssetLoadBudget::default())
             .unwrap(),
         WorkspaceLookup::Resolved(_)
-    ));
-}
-
-#[test]
-fn cloned_workspace_is_an_independent_mutation_branch() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("scene.prefab");
-    fs::write(&path, FIRST_YAML).unwrap();
-    let mut authoritative = workspace(2);
-    let root = authoritative
-        .load_path(&path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let authoritative_revision = authoritative.revision();
-    let mut candidate = authoritative.clone();
-
-    candidate
-        .unload_source(root, &mut AssetLoadBudget::default())
-        .unwrap();
-
-    assert_eq!(authoritative.revision(), authoritative_revision);
-    assert_ne!(candidate.revision(), authoritative_revision);
-    assert!(matches!(
-        authoritative
-            .snapshot()
-            .source(root, &mut AssetLoadBudget::default())
-            .unwrap(),
-        WorkspaceLookup::Resolved(_)
-    ));
-    assert!(matches!(
-        candidate
-            .snapshot()
-            .source(root, &mut AssetLoadBudget::default())
-            .unwrap(),
-        WorkspaceLookup::Missing
     ));
 }
 
@@ -540,7 +513,7 @@ fn failed_load_is_atomic_and_query_caches_do_not_change_revision() {
         .read_object(&handles[0], &mut AssetLoadBudget::default())
         .unwrap();
     assert!(matches!(object.value(), WorkspaceObjectValue::Yaml(_)));
-    assert_eq!(object.class().class_name, "GameObject");
+    assert_eq!(object.class().class_name(), "GameObject");
     assert_eq!(workspace.revision(), revision);
 
     fs::write(&path, SECOND_YAML.repeat(8)).unwrap();
@@ -556,7 +529,7 @@ fn failed_load_is_atomic_and_query_caches_do_not_change_revision() {
             .read_object(&handles[0], &mut AssetLoadBudget::default())
             .unwrap()
             .class()
-            .class_name,
+            .class_name(),
         "GameObject"
     );
 }
@@ -567,7 +540,7 @@ fn handles_reject_foreign_and_stale_workspace_contexts() {
     let path = directory.path().join("scene.prefab");
     fs::write(&path, FIRST_YAML).unwrap();
     let mut first_workspace = workspace(3);
-    first_workspace
+    let root = first_workspace
         .load_path(&path, &mut AssetLoadBudget::default())
         .unwrap();
     let old_snapshot = first_workspace.snapshot();
@@ -587,9 +560,7 @@ fn handles_reject_foreign_and_stale_workspace_contexts() {
     ));
 
     fs::write(&path, SECOND_YAML).unwrap();
-    first_workspace
-        .load_path(&path, &mut AssetLoadBudget::default())
-        .unwrap();
+    source_replacement::replace_source_path(&mut first_workspace, root, &path, "scene.prefab");
     assert!(matches!(
         first_workspace
             .snapshot()
@@ -1166,6 +1137,10 @@ fn root_descriptor_backing_is_budgeted_before_the_source_image() {
     let retained_bytes =
         u64::try_from(alias.retained_clone_bytes() + canonical.as_os_str().len()).unwrap();
     let request = SourceOpenRequest::new(path, alias);
+    let mut batch_probe = AssetLoadBudget::default();
+    let batch = SourceAdmissionBatch::with_capacity(1, &mut batch_probe).unwrap();
+    let expected_usage = batch_probe.usage();
+    drop(batch);
     let mut workspace = workspace(0);
     let revision = workspace.revision();
     let mut budget = AssetLoadBudget::new(AssetLoadLimits {
@@ -1178,7 +1153,7 @@ fn root_descriptor_backing_is_budgeted_before_the_source_image() {
         workspace.load_source(request, &mut budget),
         Err(WorkspaceError::Budget(_))
     ));
-    assert_eq!(budget.usage(), AssetLoadUsage::default());
+    assert_eq!(budget.usage(), expected_usage);
     assert_eq!(workspace.revision(), revision);
 }
 
@@ -1389,7 +1364,7 @@ fn embedded_binary_schema_provenance_records_declared_version_and_wire_format() 
         .inspect(&address, &mut AssetLoadBudget::default())
         .unwrap();
 
-    assert_eq!(object.class().class_name, "Transform");
+    assert_eq!(object.class().class_name(), "Transform");
     assert_eq!(object.provenance().origin(), SchemaOrigin::EmbeddedTypeTree);
     assert!(object.provenance().schema_digest().is_some());
     let binary_version = object.provenance().binary_version().unwrap();
@@ -1433,7 +1408,7 @@ fn rewritten_unknown_unity_versions_remain_readable_but_reject_all_recipes() {
             .inspect(&address, &mut AssetLoadBudget::default())
             .unwrap();
 
-        assert_eq!(object.class().class_name, "Transform");
+        assert_eq!(object.class().class_name(), "Transform");
         assert!(object.class().has_property("m_Father"));
         assert_eq!(object.provenance().origin(), SchemaOrigin::EmbeddedTypeTree);
         assert!(object.provenance().schema_digest().is_some());
@@ -1536,7 +1511,7 @@ fn registry_paths_are_loaded_once_and_frozen_type_trees_drive_prepare() {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-    let mut builder = MutationPlanBuilder::new(snapshot.revision());
+    let mut builder = MutationPlanBuilder::new(snapshot.workspace_id(), snapshot.revision());
     builder.append(fragment).unwrap();
     let prepared = workspace
         .prepare(
@@ -1572,4 +1547,57 @@ fn registry_paths_are_loaded_once_and_frozen_type_trees_drive_prepare() {
         rewritten.schema_provenance().origin(),
         SchemaOrigin::FrozenRegistry
     );
+}
+
+#[test]
+fn typetree_parse_mode_participates_in_workspace_revision_identity() {
+    let workspace_id = WorkspaceId::from_u128(0xA11CE).unwrap();
+    let strict =
+        AssetWorkspace::with_workspace_id(workspace_id, WorkspaceOptions::strict()).unwrap();
+    let lenient =
+        AssetWorkspace::with_workspace_id(workspace_id, WorkspaceOptions::lenient()).unwrap();
+
+    assert_ne!(strict.revision(), lenient.revision());
+}
+
+#[test]
+fn effective_frozen_registry_semantics_participate_in_workspace_revision_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_registry = directory.path().join("first-registry.json");
+    let second_registry = directory.path().join("second-registry.json");
+    fs::write(&first_registry, EXTERNAL_TYPE_TREE_REGISTRY).unwrap();
+    fs::write(
+        &second_registry,
+        EXTERNAL_TYPE_TREE_REGISTRY.replace("m_Value", "m_Other"),
+    )
+    .unwrap();
+    let source = directory.path().join("stripped.assets");
+    fs::write(&source, stripped_serialized_fixture_bytes()).unwrap();
+
+    let mut first_registry_budget = AssetLoadBudget::default();
+    let first_options = WorkspaceOptions::strict()
+        .with_type_tree_registry_paths(
+            std::slice::from_ref(&first_registry),
+            &mut first_registry_budget,
+        )
+        .unwrap();
+    let mut second_registry_budget = AssetLoadBudget::default();
+    let second_options = WorkspaceOptions::strict()
+        .with_type_tree_registry_paths(
+            std::slice::from_ref(&second_registry),
+            &mut second_registry_budget,
+        )
+        .unwrap();
+
+    let workspace_id = WorkspaceId::from_u128(0xB0A7D).unwrap();
+    let mut first = AssetWorkspace::with_workspace_id(workspace_id, first_options).unwrap();
+    let mut second = AssetWorkspace::with_workspace_id(workspace_id, second_options).unwrap();
+    first
+        .load_path(&source, &mut AssetLoadBudget::default())
+        .unwrap();
+    second
+        .load_path(&source, &mut AssetLoadBudget::default())
+        .unwrap();
+
+    assert_ne!(first.revision(), second.revision());
 }

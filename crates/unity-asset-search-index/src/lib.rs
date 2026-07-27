@@ -17,6 +17,7 @@ mod generation;
 mod pipeline;
 mod projection;
 mod query;
+mod reference_payload;
 mod reference_query;
 mod scan;
 mod state;
@@ -186,8 +187,9 @@ impl SearchIndex {
 
     /// Opens an existing generation store or creates an empty one.
     ///
-    /// Loading persisted source state is caller-budgeted. The store acquires an exclusive
-    /// process-scoped writer lease for the lifetime of this handle.
+    /// Discovering persisted generations and loading their source state share the caller's
+    /// budget. The store acquires an exclusive process-scoped writer lease for the lifetime of
+    /// this handle.
     pub fn open_or_create_with_options(
         paths: IndexPaths,
         options: SearchIndexOptions,
@@ -302,13 +304,16 @@ impl SearchIndex {
         Ok(active.suggest(prefix, limit))
     }
 
+    /// Queries the active reference projection while charging every persisted
+    /// JSON field decoded for the response page to the caller-owned budget.
     pub fn references(
         &self,
         request: ReferenceRequest,
+        budget: &mut AssetLoadBudget,
     ) -> Result<ReferencesResponse, SearchIndexError> {
         let active = self.active_generation()?;
         active
-            .references(request)
+            .references(request, budget)
             .map_err(|error| SearchIndexError::from_reference(error, Some(active.stamp().clone())))
     }
 
@@ -641,7 +646,10 @@ GameObject:
 
     fn incoming_paths(index: &SearchIndex, guid: &str) -> Vec<String> {
         index
-            .references(ReferenceRequest::incoming_guid(guid, Some(100), 20))
+            .references(
+                ReferenceRequest::incoming_guid(guid, Some(100), 20),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap()
             .hits
             .into_iter()
@@ -661,6 +669,48 @@ GameObject:
             vec![OWNER_PATH.to_owned()]
         );
         assert!(incoming_paths(index, OTHER_GUID).is_empty());
+    }
+
+    fn rewrite_reference_marker_as_legacy(paths: &IndexPaths, generation: SearchGenerationId) {
+        let generation_directory = paths
+            .index_root()
+            .join("generations")
+            .join(generation.directory_name());
+        let reference_directory = generation_directory.join("references");
+        let marker_path = reference_directory.join("schema-contract.json");
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        marker["schema_version"] = serde_json::Value::from(2);
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let manifest_path = generation_directory.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["artifacts"]["references"] = serde_json::to_value(
+            crate::state::measure_artifact_tree(&reference_directory).unwrap(),
+        )
+        .unwrap();
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(&manifest_path, &manifest_bytes).unwrap();
+
+        let generation_value = serde_json::to_value(generation).unwrap();
+        let manifest_digest = serde_json::to_value(DigestV1::hash_bytes(&manifest_bytes)).unwrap();
+        let mut matching_activations = 0;
+        for entry in fs::read_dir(paths.index_root().join("activations")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let mut activation: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            if activation["generation"] != generation_value {
+                continue;
+            }
+            activation["manifest_digest"] = manifest_digest.clone();
+            fs::write(path, serde_json::to_vec(&activation).unwrap()).unwrap();
+            matching_activations += 1;
+        }
+        assert_eq!(matching_activations, 1);
     }
 
     fn assert_publish_failpoint_is_atomic(failpoint: GenerationFailpoint) {
@@ -756,6 +806,37 @@ GameObject:
         ] {
             assert_publish_failpoint_is_atomic(failpoint);
         }
+    }
+
+    #[test]
+    fn older_reference_projection_rebuilds_without_reusing_its_generation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        write_generation_fixture(&project);
+        let paths =
+            IndexPaths::for_project(project, Some(temporary.path().join("index")), None).unwrap();
+        let index =
+            SearchIndex::open_or_create(paths.clone(), &mut AssetLoadBudget::default()).unwrap();
+        let baseline = index
+            .reindex(ReindexIntent::full(), &mut AssetLoadBudget::default())
+            .unwrap()
+            .generation
+            .unwrap();
+        assert_baseline_generation(&index, &baseline);
+        drop(index);
+
+        rewrite_reference_marker_as_legacy(&paths, baseline.generation);
+
+        let reopened = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+        assert!(reopened.status().unwrap().generation.active.is_none());
+
+        let receipt = reopened
+            .reindex(ReindexIntent::reconcile(), &mut AssetLoadBudget::default())
+            .unwrap();
+        assert!(receipt.evidence.forced_full_scan);
+        let rebuilt = receipt.generation.unwrap();
+        assert_ne!(rebuilt.generation, baseline.generation);
+        assert_baseline_generation(&reopened, &rebuilt);
     }
 
     #[test]

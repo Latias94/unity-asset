@@ -1,13 +1,8 @@
-//! Unity asset edit/write support.
+//! Wire-faithful Unity asset encoding and prepared artifact construction.
 //!
-//! This crate is the home for UnityPy-parity write pipelines:
-//! - TypeTree-driven object encoding
-//! - SerializedFile rebuild/save
-//! - Bundle/WebFile repacking
-//! - `.resS` / streamed resource write support
-//!
-//! The initial milestones intentionally ship APIs and scaffolding first, before wiring up the full
-//! implementation.
+//! The crate owns TypeTree-driven object encoding, SerializedFile rebuilds, Bundle/WebFile
+//! repacking, streamed-resource output, and segmented prepared artifacts that preserve unchanged
+//! source ranges. Workspace transaction authority remains in the high-level `unity-asset` crate.
 
 pub mod artifact;
 mod binary_writer;
@@ -21,6 +16,6 @@ mod typetree;
 pub mod webfile;
 
 pub use binary_writer::{BinaryWriter, Endian};
-pub use compression::*;
+pub use compression::{compress_lz4, compress_lzma_unity, compress_lzma_unity_with_size};
 pub use packer::{PackingPolicy, PackingPolicyParseError};
 pub use unity_asset_core::{Result, UnityAssetError};

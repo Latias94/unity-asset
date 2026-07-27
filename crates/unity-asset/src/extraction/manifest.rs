@@ -2,7 +2,6 @@
 
 use std::io::{self, Read, Write};
 
-use serde::de::DeserializeOwned;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -11,6 +10,7 @@ use unity_asset_core::{
     WorkspaceId, WorkspaceRevision,
 };
 
+use super::json_contract::{large_contract_limits, read_json_bounded};
 use super::model::{
     ExtractionArtifactKind, ExtractionModelError, ExtractionPath, ExtractionPlan,
     ExtractionRequest, ExtractionSourceExpectation, PlannedArtifact, first_path_conflict,
@@ -21,6 +21,11 @@ pub const EXTRACTION_MANIFEST_VERSION: u8 = 1;
 pub const EXTRACTION_REPORT_VERSION: u8 = 1;
 pub const EXTRACTION_MANIFEST_CONTRACT: &str = "unity_asset.extraction_manifest";
 pub const EXTRACTION_REPORT_CONTRACT: &str = "unity_asset.extraction_report";
+
+const EXTRACTION_MANIFEST_JSON_LIMITS: unity_asset_core::ContractJsonLimits =
+    large_contract_limits(EXTRACTION_MANIFEST_CONTRACT);
+const EXTRACTION_REPORT_JSON_LIMITS: unity_asset_core::ContractJsonLimits =
+    large_contract_limits(EXTRACTION_REPORT_CONTRACT);
 
 /// Stable, machine-actionable extraction diagnostic categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -350,7 +355,7 @@ impl ExtractionManifest {
         reader: impl Read,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, BudgetedJsonError> {
-        read_json_bounded(reader, budget)
+        read_json_bounded(reader, budget, EXTRACTION_MANIFEST_JSON_LIMITS)
     }
 
     pub fn canonical_json(&self) -> Result<Vec<u8>, ExtractionCanonicalError> {
@@ -506,6 +511,18 @@ impl ExtractionReport {
         self.counts
     }
 
+    pub fn canonical_json(&self) -> Result<Vec<u8>, ExtractionCanonicalError> {
+        canonical_json(self)
+    }
+
+    pub fn write_canonical_json(&self, writer: impl Write) -> Result<(), ExtractionCanonicalError> {
+        write_canonical_json(writer, self)
+    }
+
+    pub fn digest(&self) -> Result<DigestV1, ExtractionCanonicalError> {
+        canonical_digest(self)
+    }
+
     pub fn canonical_manifest_json(&self) -> Result<Vec<u8>, ExtractionCanonicalError> {
         self.manifest.canonical_json()
     }
@@ -525,7 +542,7 @@ impl ExtractionReport {
         reader: impl Read,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, BudgetedJsonError> {
-        read_json_bounded(reader, budget)
+        read_json_bounded(reader, budget, EXTRACTION_REPORT_JSON_LIMITS)
     }
 }
 
@@ -879,13 +896,6 @@ fn report_counts(
         skipped_existing: count(ExtractionArtifactStatus::SkippedExisting)?,
         failed: count(ExtractionArtifactStatus::Failed)?,
     })
-}
-
-pub(crate) fn read_json_bounded<T: DeserializeOwned>(
-    reader: impl Read,
-    budget: &mut AssetLoadBudget,
-) -> Result<T, BudgetedJsonError> {
-    budget.deserialize_json(reader)
 }
 
 pub(crate) fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ExtractionCanonicalError> {

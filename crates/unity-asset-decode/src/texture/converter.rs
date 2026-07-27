@@ -7,26 +7,54 @@ use super::decoders::TextureDecoder;
 use super::formats::TextureFormat;
 use super::types::Texture2D;
 use crate::error::{BinaryError, Result};
+use crate::media::{MediaPayloadRef, StreamDataRef, is_plausible_stream_path};
 use crate::object::UnityObject;
-use crate::unity_version::UnityVersion;
+use crate::reader::{BinaryReader, ByteOrder};
 use image::RgbaImage;
 use unity_asset_core::UnityValue;
+
+/// Allocation-free Texture2D metadata used by planners and inventory tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Texture2DLayout<'a> {
+    width: i32,
+    height: i32,
+    payload: MediaPayloadRef<'a>,
+}
+
+impl<'a> Texture2DLayout<'a> {
+    /// Inspects a Texture2D without cloning its embedded or streamed media.
+    pub fn inspect(obj: &'a UnityObject) -> Result<Self> {
+        inspect_texture_typetree(obj).map_or_else(|| inspect_texture_binary(obj.raw_data()), Ok)
+    }
+
+    #[must_use]
+    pub const fn width(self) -> i32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(self) -> i32 {
+        self.height
+    }
+
+    #[must_use]
+    pub const fn payload(self) -> MediaPayloadRef<'a> {
+        self.payload
+    }
+}
 
 /// Main texture converter
 ///
 /// This struct handles the conversion of Unity objects to Texture2D structures
 /// and provides methods for processing texture data.
 pub struct Texture2DConverter {
-    #[allow(dead_code)]
-    version: UnityVersion,
     decoder: TextureDecoder,
 }
 
 impl Texture2DConverter {
     /// Create a new Texture2D converter
-    pub fn new(version: UnityVersion) -> Self {
+    pub fn new() -> Self {
         Self {
-            version,
             decoder: TextureDecoder::new(),
         }
     }
@@ -56,7 +84,7 @@ impl Texture2DConverter {
             v.as_f64().map(|n| n as f32)
         }
 
-        let props = obj.class.properties();
+        let props = obj.as_unity_class().properties();
 
         let name = props
             .get("m_Name")
@@ -223,13 +251,7 @@ impl Texture2DConverter {
 
                     // Attempt 1: `path (aligned string) -> offset (u64) -> size (u32)`
                     if let Ok(path) = reader.read_aligned_string() {
-                        let looks_like_path = path.is_empty()
-                            || path.contains("archive:/")
-                            || path.contains('/')
-                            || path.contains('\\')
-                            || path.ends_with(".resS")
-                            || path.ends_with(".resource");
-                        if looks_like_path {
+                        if is_plausible_stream_path(&path) {
                             let offset = reader.read_u64().unwrap_or(0);
                             let size = reader.read_u32().unwrap_or(0);
                             let _ = reader.align();
@@ -245,13 +267,7 @@ impl Texture2DConverter {
                     let offset = reader.read_u64().ok()?;
                     let size = reader.read_u32().ok()?;
                     let path = reader.read_aligned_string().ok()?;
-                    let looks_like_path = path.is_empty()
-                        || path.contains("archive:/")
-                        || path.contains('/')
-                        || path.contains('\\')
-                        || path.ends_with(".resS")
-                        || path.ends_with(".resource");
-                    if !path.is_empty() && looks_like_path && size > 0 {
+                    if !path.is_empty() && is_plausible_stream_path(&path) && size > 0 {
                         return Some((path, offset, size));
                     }
 
@@ -288,5 +304,220 @@ impl Texture2DConverter {
     }
 }
 
-// Legacy compatibility - alias for the old processor name
-pub type Texture2DProcessor = Texture2DConverter;
+impl Default for Texture2DConverter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn inspect_texture_typetree(obj: &UnityObject) -> Option<Texture2DLayout<'_>> {
+    let props = obj.as_unity_class().properties();
+    let width = props
+        .get("m_Width")
+        .and_then(UnityValue::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(0);
+    let height = props
+        .get("m_Height")
+        .and_then(UnityValue::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(0);
+    (width > 0 && height > 0).then_some(())?;
+
+    let embedded_byte_len = props
+        .get("image_data")
+        .or_else(|| props.get("image data"))
+        .or_else(|| props.get("m_ImageData"))
+        .map(typetree_texture_byte_len)
+        .unwrap_or(0);
+    let stream = props
+        .get("m_StreamData")
+        .and_then(|value| match value {
+            UnityValue::Object(resource) => Some(resource),
+            _ => None,
+        })
+        .and_then(|resource| {
+            let path = resource.get("path").and_then(UnityValue::as_str)?;
+            let offset = resource
+                .get("offset")
+                .and_then(UnityValue::as_u64)
+                .unwrap_or(0);
+            let size = resource
+                .get("size")
+                .and_then(UnityValue::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(0);
+            StreamDataRef::new(path, offset, size)
+        });
+    let payload = MediaPayloadRef::select(embedded_byte_len, stream)?;
+
+    Some(Texture2DLayout {
+        width,
+        height,
+        payload,
+    })
+}
+
+fn typetree_texture_byte_len(value: &UnityValue) -> usize {
+    match value {
+        UnityValue::Bytes(bytes) => bytes.len(),
+        UnityValue::Array(items) => items
+            .iter()
+            .map_while(|item| item.as_i64().and_then(|value| u8::try_from(value).ok()))
+            .count(),
+        _ => 0,
+    }
+}
+
+fn inspect_texture_binary(data: &[u8]) -> Result<Texture2DLayout<'_>> {
+    if data.is_empty() {
+        return Err(BinaryError::invalid_data("Empty texture data"));
+    }
+
+    let mut reader = BinaryReader::new(data, ByteOrder::Little);
+    reader.read_aligned_string_ref()?;
+    let width = reader.read_i32()?;
+    let height = reader.read_i32()?;
+    reader.read_i32()?;
+    reader.read_i32()?;
+    reader.read_bool()?;
+    reader.read_bool()?;
+    reader.align()?;
+    validate_dimensions(width, height)?;
+
+    let declared_size = reader.read_i32()?;
+    let embedded_byte_len = usize::try_from(declared_size)
+        .ok()
+        .filter(|size| *size != 0 && reader.remaining() >= *size);
+    let payload = if let Some(byte_len) = embedded_byte_len {
+        reader.skip_bytes(byte_len)?;
+        MediaPayloadRef::Embedded { byte_len }
+    } else if let Some(stream) = try_read_texture_stream(&mut reader) {
+        MediaPayloadRef::Streamed(stream)
+    } else if reader.remaining() != 0 {
+        MediaPayloadRef::Embedded {
+            byte_len: reader.remaining(),
+        }
+    } else {
+        return Err(BinaryError::invalid_data(
+            "Texture2D did not contain embedded bytes or stream data",
+        ));
+    };
+
+    Ok(Texture2DLayout {
+        width,
+        height,
+        payload,
+    })
+}
+
+fn try_read_texture_stream<'a>(reader: &mut BinaryReader<'a>) -> Option<StreamDataRef<'a>> {
+    let position = reader.position();
+    if let Some(stream) = try_read_path_first_texture_stream(reader) {
+        return Some(stream);
+    }
+    reader.set_position(position).ok()?;
+
+    let stream = (|| {
+        let offset = reader.read_u64().ok()?;
+        let size = reader.read_u32().ok()?;
+        let path = reader.read_aligned_string_ref().ok()?;
+        StreamDataRef::new(path, offset, size)
+            .filter(|stream| is_plausible_stream_path(stream.path()))
+    })();
+    if stream.is_some() {
+        return stream;
+    }
+    reader.set_position(position).ok()?;
+    None
+}
+
+fn try_read_path_first_texture_stream<'a>(
+    reader: &mut BinaryReader<'a>,
+) -> Option<StreamDataRef<'a>> {
+    let path = reader.read_aligned_string_ref().ok()?;
+    if !is_plausible_stream_path(path) {
+        return None;
+    }
+    let offset = reader.read_u64().ok()?;
+    let size = reader.read_u32().ok()?;
+    let _ = reader.align();
+    StreamDataRef::new(path, offset, size)
+}
+
+fn validate_dimensions(width: i32, height: i32) -> Result<()> {
+    if width <= 0 || height <= 0 {
+        return Err(BinaryError::invalid_data(
+            "Texture2D missing positive dimensions",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use crate::asset::{ObjectInfo, class_ids};
+    use indexmap::IndexMap;
+    use unity_asset_core::UnityClass;
+
+    #[test]
+    fn typetree_layout_counts_embedded_texture_without_owning_it() {
+        let class = UnityClass::with_properties(
+            class_ids::TEXTURE_2D,
+            "Texture2D".to_string(),
+            "1".to_string(),
+            IndexMap::from([
+                ("m_Width".to_string(), UnityValue::Integer(512)),
+                ("m_Height".to_string(), UnityValue::Integer(512)),
+                (
+                    "image_data".to_string(),
+                    UnityValue::Bytes(vec![3; 1024 * 1024]),
+                ),
+            ]),
+        );
+        let info = ObjectInfo::for_standalone_class(1, 0, 0, class_ids::TEXTURE_2D)
+            .expect("valid standalone texture object");
+        let object = UnityObject::from_info_and_class(info, class);
+
+        let layout = Texture2DLayout::inspect(&object).unwrap();
+
+        assert_eq!(layout.width(), 512);
+        assert_eq!(layout.height(), 512);
+        assert_eq!(
+            layout.payload(),
+            MediaPayloadRef::Embedded {
+                byte_len: 1024 * 1024
+            }
+        );
+    }
+
+    #[test]
+    fn raw_layout_borrows_stream_path() {
+        let path = "archive:/CAB-a/CAB-a.resS";
+        let mut data = Vec::new();
+        data.extend_from_slice(&0_i32.to_le_bytes());
+        data.extend_from_slice(&4_i32.to_le_bytes());
+        data.extend_from_slice(&8_i32.to_le_bytes());
+        data.extend_from_slice(&128_i32.to_le_bytes());
+        data.extend_from_slice(&4_i32.to_le_bytes());
+        data.extend_from_slice(&[0, 1, 0, 0]);
+        data.extend_from_slice(&0_i32.to_le_bytes());
+        data.extend_from_slice(&(path.len() as i32).to_le_bytes());
+        let path_offset = data.len();
+        data.extend_from_slice(path.as_bytes());
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&17_u64.to_le_bytes());
+        data.extend_from_slice(&23_u32.to_le_bytes());
+
+        let layout = inspect_texture_binary(&data).unwrap();
+        let stream = layout.payload().stream().unwrap();
+
+        assert_eq!(stream.path(), path);
+        assert_eq!(stream.path().as_ptr(), data[path_offset..].as_ptr());
+        assert_eq!(stream.offset(), 17);
+        assert_eq!(stream.size(), 23);
+    }
+}

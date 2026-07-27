@@ -54,6 +54,7 @@ fn guard_for(value: &str) -> FieldGuard {
 
 fn plan(workspace: &AssetWorkspace) -> MutationPlan {
     MutationPlan::new(
+        workspace.workspace_id(),
         workspace.revision(),
         vec![SourceExpectation::new(
             yaml_locator(),

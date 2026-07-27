@@ -18,8 +18,9 @@
 //! use unity_asset_decode::audio::{AudioCompressionFormat, AudioClipConverter, AudioDecoder};
 //! use unity_asset_decode::unity_version::UnityVersion;
 //!
-//! // Create a converter
-//! let converter = AudioClipConverter::new(UnityVersion::default());
+//! // Create a converter for the version observed in the serialized source.
+//! let version = UnityVersion::parse_version("2020.3.12f1")?;
+//! let converter = AudioClipConverter::new(version);
 //!
 //! // Convert Unity object to AudioClip (assuming you have a UnityObject)
 //! // let audio_clip = converter.from_unity_object(&unity_object)?;
@@ -41,7 +42,7 @@ mod ogg;
 pub mod types;
 
 // Re-export main types for easy access
-pub use converter::{AudioClipConverter, AudioClipProcessor}; // Processor is legacy alias
+pub use converter::{AudioClipConverter, AudioClipLayout};
 pub use decoder::AudioDecoder;
 pub use export::{
     AudioExporter, AudioFormat, AudioSourceError, ExportOptions, PreparedAudioSource,
@@ -84,11 +85,6 @@ impl AudioProcessor {
         self.decoder.decode(clip)
     }
 
-    /// Get audio data (either embedded or streamed)
-    pub fn get_audio_data(&self, clip: &AudioClip) -> crate::error::Result<Vec<u8>> {
-        self.converter.get_audio_data(clip)
-    }
-
     /// Full pipeline: convert object -> decode -> export
     pub fn process_and_export<P: AsRef<std::path::Path>>(
         &self,
@@ -116,23 +112,6 @@ impl AudioProcessor {
             .filter(|format| decoder_formats.contains(format))
             .collect()
     }
-
-    /// Load streaming data from external file
-    pub fn load_streaming_data(&self, clip: &AudioClip) -> crate::error::Result<Vec<u8>> {
-        self.converter.load_streaming_data(clip)
-    }
-}
-
-impl Default for AudioProcessor {
-    fn default() -> Self {
-        Self::new(crate::unity_version::UnityVersion::default())
-    }
-}
-
-/// Convenience functions for common operations
-/// Create an audio processor with default settings
-pub fn create_processor() -> AudioProcessor {
-    AudioProcessor::default()
 }
 
 /// Quick function to check if a format is supported
@@ -196,7 +175,8 @@ mod tests {
 
     #[test]
     fn test_processor_creation() {
-        let processor = create_processor();
+        let version = crate::unity_version::UnityVersion::parse_version("2020.3.12f1").unwrap();
+        let processor = AudioProcessor::new(version);
         // Basic test - processor should be created successfully
         assert!(
             !processor.supported_formats().is_empty() || processor.supported_formats().is_empty()

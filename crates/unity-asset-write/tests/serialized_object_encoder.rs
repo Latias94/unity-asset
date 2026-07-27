@@ -52,7 +52,7 @@ fn observe_name(file: &SerializedFile) -> ObservedName {
         let Some((field, value)) = ["m_Name", "name"].into_iter().find_map(|field| {
             materialized
                 .object()
-                .class
+                .as_unity_class()
                 .get(field)
                 .filter(|value| matches!(value, UnityValue::String(name) if !name.is_empty()))
                 .cloned()
@@ -82,14 +82,18 @@ fn observe_short_sequence(file: &SerializedFile) -> ObservedSequence {
         let Some(schema) = materialized.schema() else {
             continue;
         };
-        let Some((field, values)) = materialized.object().class.properties().iter().find_map(
-            |(field, value)| match value {
+        let Some((field, values)) = materialized
+            .object()
+            .as_unity_class()
+            .properties()
+            .iter()
+            .find_map(|(field, value)| match value {
                 UnityValue::Array(values) if !values.is_empty() && values.len() <= 64 => {
                     Some((field.clone(), values))
                 }
                 _ => None,
-            },
-        ) else {
+            })
+        else {
             continue;
         };
         let schema_digest = schema
@@ -184,7 +188,7 @@ fn ordered_mutations_observe_prior_results_and_rewrite_once() {
         .read(&mut AssetLoadBudget::default())
         .expect("read edited object");
     assert_eq!(
-        object.class.get(observed.field),
+        object.as_unity_class().get(observed.field),
         Some(&UnityValue::String(final_name.to_owned()))
     );
 }
@@ -522,7 +526,7 @@ fn sequence_edit_uses_the_same_guarded_single_rewrite_pipeline() {
         .read(&mut AssetLoadBudget::default())
         .expect("read sequence object");
     let values = object
-        .class
+        .as_unity_class()
         .get(&observed.field)
         .and_then(UnityValue::as_array)
         .expect("edited field remains a sequence");
@@ -539,7 +543,8 @@ fn object_replacement_rejects_fields_absent_from_the_typetree() {
         .expect("observed object exists")
         .materialize(&mut AssetLoadBudget::default())
         .expect("materialize observed object");
-    let original_root = UnityValue::Object(materialized.object().class.properties().clone());
+    let original_root =
+        UnityValue::Object(materialized.object().as_unity_class().properties().clone());
     let guard = SerializedObjectGuard::from_observed(
         observed.schema_digest,
         &original_root,
@@ -574,10 +579,9 @@ fn object_replacement_rejects_fields_absent_from_the_typetree() {
 
 #[test]
 fn missing_typetree_is_a_structured_rejection() {
-    let mut file = sample_serialized_file();
+    let file = sample_serialized_file().without_embedded_type_trees();
     let path_id = file.objects()[0].path_id();
     let class_id = file.objects()[0].class_id();
-    file.set_type_tree_enabled(false);
     let guard = SerializedFieldGuard::new(
         DigestV1::from_bytes([0; DigestV1::BYTE_LEN]),
         DigestV1::from_bytes([0; DigestV1::BYTE_LEN]),

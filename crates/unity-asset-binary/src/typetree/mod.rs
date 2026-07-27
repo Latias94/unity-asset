@@ -21,8 +21,7 @@ pub use parser::{
     TypeTreeParser,
 };
 pub use registry::{
-    CompositeTypeTreeRegistry, InMemoryTypeTreeRegistry, JsonTypeTreeRegistry,
-    ScriptTypeTreeGenerator, ScriptTypeTreeGeneratorRegistry, TypeTreeRegistry,
+    CompositeTypeTreeRegistry, InMemoryTypeTreeRegistry, JsonTypeTreeRegistry, TypeTreeRegistry,
 };
 pub(crate) use schema::ManagedReferenceCatalog;
 pub use schema::{

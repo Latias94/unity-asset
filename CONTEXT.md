@@ -38,11 +38,27 @@ _Avoid_: Display string, raw key fields
 
 **Asset Workspace**:
 A coherent, revisioned set of Asset Sources and the views derived from them.
-_Avoid_: Mutable environment, edit session
+_Avoid_: Mutable loader, edit session
 
 **Workspace Snapshot**:
 An immutable view of an Asset Workspace at one Workspace Revision.
 _Avoid_: Cache
+
+**Workspace View**:
+The read-only contract shared by a committed Workspace Snapshot and the read-your-writes view of a Prepared Change.
+_Avoid_: Mutable workspace reference
+
+**Workspace Inspector**:
+The budgeted, format-aware interface for source inventory, object inventory, exact Object Address lookup, and streamed-resource resolution over a Workspace View.
+_Avoid_: Debug dump, display-text parser
+
+**Workspace Capability Catalog**:
+The stable machine-readable description of supported workspace operations, source kinds, mutation families, wire versions, publication guarantees, and automation constraints.
+_Avoid_: Generic command bus, prose feature list
+
+**Workspace Lookup**:
+A structured exact-resolution result that distinguishes resolved, missing, ambiguous, and invalid addresses.
+_Avoid_: Nullable object, first match
 
 **Workspace Revision**:
 The content identity of the sources and format contracts represented by a Workspace Snapshot.
@@ -61,7 +77,7 @@ A deterministic, serializable sequence of guarded changes against one Workspace 
 _Avoid_: Callback edit, setter batch
 
 **Prepared Change**:
-A fully resolved and validated Mutation Plan with a read-your-writes view and a complete artifact manifest, ready for commit.
+A fully resolved and validated Mutation Plan with a read-your-writes view and a complete artifact manifest, ready for one commit attempt. It is opaque, single-use, and cannot be reconstructed from its report.
 _Avoid_: Pending writes
 
 **Publication Target**:
@@ -80,6 +96,18 @@ _Avoid_: Changed flag
 The canonical, transaction-keyed result of publication, including the achieved atomicity, Change Set, identity remap, and recovery locator; recovery can redeliver it idempotently.
 _Avoid_: Save success boolean
 
+**Recovery Locator**:
+The versioned, validated address of durable recovery evidence under a Publication Target.
+_Avoid_: Journal path string
+
+**Recovery Outcome**:
+The versioned result of resuming publication, including completed, still-pending, or structurally blocked states.
+_Avoid_: Recovery success boolean
+
+**Rollback Receipt**:
+The versioned proof that an unfinished publication was abandoned only after the journal established that rollback was safe.
+_Avoid_: Best-effort cleanup
+
 **Artifact Set**:
 The complete, collision-checked set of output artifacts produced by a Prepared Change or an Extraction Plan.
 _Avoid_: Output files
@@ -96,6 +124,14 @@ _Avoid_: Dependency graph, object graph
 A deterministic selection and representation plan that maps resolved objects to an Artifact Set.
 _Avoid_: Export job list
 
+**Extraction Manifest**:
+The canonical, revision-bound record of written, resumed, skipped, or failed extraction artifacts and their digests.
+_Avoid_: Directory listing
+
 **Search Generation**:
 A committed Search Everything read model whose search documents, reverse references, and state all represent the same Workspace Revision.
 _Avoid_: Index state file
+
+**Search Handoff**:
+The transaction-keyed Change Set delivered after commit to a consumer-owned search pipeline. The workspace remains authoritative for source bytes and revisions; the index remains a derived read model.
+_Avoid_: Shared mutable index

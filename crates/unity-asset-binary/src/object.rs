@@ -572,7 +572,7 @@ pub enum ObjectPayloadProvenance {
 #[derive(Debug, Clone)]
 pub struct UnityObject {
     pub info: ObjectInfo,
-    pub class: UnityClass,
+    class: UnityClass,
     byte_order: ByteOrder,
     raw: ObjectBytes,
     payload_provenance: ObjectPayloadProvenance,
@@ -780,7 +780,7 @@ impl UnityObject {
     }
 
     pub fn class_name(&self) -> &str {
-        &self.class.class_name
+        self.class.class_name()
     }
 
     pub fn name(&self) -> Option<String> {
@@ -794,10 +794,6 @@ impl UnityObject {
         self.class.get(key)
     }
 
-    pub fn set(&mut self, key: String, value: UnityValue) {
-        self.class.set(key, value);
-    }
-
     pub fn has_property(&self, key: &str) -> bool {
         self.class.has_property(key)
     }
@@ -808,10 +804,6 @@ impl UnityObject {
 
     pub fn as_unity_class(&self) -> &UnityClass {
         &self.class
-    }
-
-    pub fn as_unity_class_mut(&mut self) -> &mut UnityClass {
-        &mut self.class
     }
 
     pub fn as_gameobject(&self) -> Result<GameObject> {
@@ -1138,12 +1130,14 @@ mod tests {
         let mut tree = TypeTree::new();
         tree.add_node(root);
 
-        let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
-        file.types_mut()
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let mut types = file.types().to_vec();
+        types
             .first_mut()
             .expect("wire fixture has one serialized type")
             .type_tree = tree;
-        file
+        let ref_types = file.ref_types().to_vec();
+        file.with_type_tables(types, ref_types)
     }
 
     fn push_i32(bytes: &mut Vec<u8>, value: i32, byte_order: ByteOrder) {
@@ -1547,8 +1541,7 @@ mod tests {
 
     #[test]
     fn replacement_read_requires_a_canonical_schema() {
-        let mut file = replacement_fixture();
-        file.set_type_tree_enabled(false);
+        let file = replacement_fixture().without_embedded_type_trees();
         let handle = file.object_handles().next().unwrap();
 
         let error = handle
@@ -1571,10 +1564,11 @@ mod tests {
 
     #[test]
     fn parser_preload_state_drives_handles_and_owned_objects() {
-        let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec())
+            .unwrap()
+            .without_embedded_type_trees();
         // This wire fixture intentionally uses a scalar root to exercise SerializedFile state,
         // not object materialization. Keep this test on the raw-object path.
-        file.set_type_tree_enabled(false);
         let path_id = file.objects()[0].path_id();
         let original = file
             .find_object_handle(path_id)
@@ -1592,9 +1586,9 @@ mod tests {
             ObjectPayloadProvenance::Committed
         );
 
-        let mut preloaded =
-            SerializedFileParser::from_bytes_with_options(V22_FIXTURE.to_vec(), true).unwrap();
-        preloaded.set_type_tree_enabled(false);
+        let preloaded = SerializedFileParser::from_bytes_with_options(V22_FIXTURE.to_vec(), true)
+            .unwrap()
+            .without_embedded_type_trees();
         let handle = preloaded.find_object_handle(path_id).unwrap();
         assert_eq!(handle.raw_data().unwrap(), original);
         let loaded = read(handle);
@@ -1613,7 +1607,7 @@ mod tests {
             object.payload_provenance(),
             ObjectPayloadProvenance::Synthetic
         );
-        assert!(object.class.properties().is_empty());
+        assert!(object.as_unity_class().properties().is_empty());
         assert_eq!(object.typetree_stats(), TypeTreeTraversalStats::default());
     }
 
@@ -1662,7 +1656,7 @@ mod tests {
 
     #[test]
     fn ordinary_schema_ignores_an_unrelated_malformed_managed_catalog() {
-        let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
         let mut malformed_tree = TypeTree::new();
         malformed_tree.add_node(TypeTreeNode::with_info(
             "BrokenManagedType".to_owned(),
@@ -1671,7 +1665,8 @@ mod tests {
         ));
         let mut malformed = SerializedType::new(114);
         malformed.type_tree = malformed_tree;
-        *file.ref_types_mut() = vec![malformed];
+        let types = file.types().to_vec();
+        let file = file.with_type_tables(types, vec![malformed]);
 
         let handle = file.object_handles().next().unwrap();
         let schema = handle.schema(&mut AssetLoadBudget::default()).unwrap();
@@ -1701,13 +1696,11 @@ mod tests {
             tree
         }
 
-        let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
         let mut first_type = SerializedType::new(1);
         first_type.type_tree = object_tree("FirstRoot");
         let mut second_type = SerializedType::new(1);
         second_type.type_tree = object_tree("SecondRoot");
-        *file.types_mut() = vec![first_type, second_type];
-
         let mut referenced_root = node("ManagedRoot", "ManagedRoot");
         referenced_root.children.push(node("int", "m_Value"));
         let mut referenced_tree = TypeTree::new();
@@ -1717,7 +1710,7 @@ mod tests {
         referenced_type.namespace = "Tests".to_owned();
         referenced_type.assembly_name = "Tests".to_owned();
         referenced_type.type_tree = referenced_tree;
-        *file.ref_types_mut() = vec![referenced_type];
+        let file = file.with_type_tables(vec![first_type, second_type], vec![referenced_type]);
 
         let first_info = ObjectInfo::from_wire(
             1,
@@ -1786,7 +1779,7 @@ mod tests {
     }
 
     #[test]
-    fn mutating_the_type_table_invalidates_cached_object_schemas() {
+    fn replacing_the_type_table_invalidates_cached_object_schemas() {
         let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
         let first = file
             .object_handles()
@@ -1808,7 +1801,10 @@ mod tests {
         ));
         let mut replacement = TypeTree::new();
         replacement.add_node(replacement_root);
-        file.types_mut()[0].type_tree = replacement;
+        let mut types = file.types().to_vec();
+        types[0].type_tree = replacement;
+        let ref_types = file.ref_types().to_vec();
+        file = file.with_type_tables(types, ref_types);
 
         let second = file
             .object_handles()
@@ -1822,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn mutating_ref_types_invalidates_cached_managed_catalogs() {
+    fn replacing_ref_types_invalidates_cached_managed_catalogs() {
         fn node(type_name: &str, name: &str) -> TypeTreeNode {
             TypeTreeNode::with_info(type_name.to_owned(), name.to_owned(), -1)
         }
@@ -1849,13 +1845,14 @@ mod tests {
         object_tree.add_node(object_root);
 
         let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
-        file.types_mut()[0].type_tree = object_tree;
+        let mut types = file.types().to_vec();
+        types[0].type_tree = object_tree;
         let mut ref_type = SerializedType::new(114);
         ref_type.class_name = "Managed".to_owned();
         ref_type.namespace = "Tests".to_owned();
         ref_type.assembly_name = "Tests".to_owned();
         ref_type.type_tree = managed_tree("FirstManaged");
-        *file.ref_types_mut() = vec![ref_type];
+        file = file.with_type_tables(types, vec![ref_type]);
 
         let first = file
             .object_handles()
@@ -1872,7 +1869,10 @@ mod tests {
             "FirstManaged"
         );
 
-        file.ref_types_mut()[0].type_tree = managed_tree("SecondManaged");
+        let types = file.types().to_vec();
+        let mut ref_types = file.ref_types().to_vec();
+        ref_types[0].type_tree = managed_tree("SecondManaged");
+        file = file.with_type_tables(types, ref_types);
         let second = file
             .object_handles()
             .next()
@@ -1914,16 +1914,15 @@ mod tests {
         let mut ref_tree = TypeTree::new();
         ref_tree.add_node(ref_root);
 
-        let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
         let mut object_type = SerializedType::new(1);
         object_type.type_tree = object_tree;
-        *file.types_mut() = vec![object_type];
         let mut ref_type = SerializedType::new(114);
         ref_type.class_name = "Managed".to_owned();
         ref_type.namespace = "Tests".to_owned();
         ref_type.assembly_name = "Tests".to_owned();
         ref_type.type_tree = ref_tree;
-        *file.ref_types_mut() = vec![ref_type];
+        let file = file.with_type_tables(vec![object_type], vec![ref_type]);
         let info = ObjectInfo::for_standalone_class(1, 0, 0, 1).unwrap();
         let handle = ObjectHandle::new(&file, &info);
 
@@ -1966,11 +1965,12 @@ mod tests {
         let mut managed_tree = TypeTree::new();
         managed_tree.add_node(node("Managed", "Managed"));
 
-        let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
-        file.types_mut()[0].type_tree = object_tree;
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
+        let mut types = file.types().to_vec();
+        types[0].type_tree = object_tree;
         let mut malformed = SerializedType::new(114);
         malformed.type_tree = managed_tree;
-        *file.ref_types_mut() = vec![malformed];
+        let file = file.with_type_tables(types, vec![malformed]);
 
         let handle = file.object_handles().next().unwrap();
         let mut budget = AssetLoadBudget::default();
@@ -2010,12 +2010,13 @@ mod tests {
 
     #[test]
     fn replacement_materialization_uses_the_exact_external_registry_schema() {
-        let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
-        file.set_type_tree_enabled(false);
         let registry = Arc::new(ChangingRegistry {
             calls: AtomicUsize::new(0),
         });
-        file.set_type_tree_registry(Some(registry.clone()));
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec())
+            .unwrap()
+            .without_embedded_type_trees()
+            .with_type_tree_registry(Some(registry.clone()));
         let handle = file.object_handles().next().unwrap();
         let mut replacement = Vec::new();
         push_i32(&mut replacement, 77, file.header.byte_order());
@@ -2049,12 +2050,13 @@ mod tests {
 
     #[test]
     fn external_registry_results_are_not_cached_without_a_stable_identity() {
-        let mut file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec()).unwrap();
-        file.set_type_tree_enabled(false);
         let registry = Arc::new(ChangingRegistry {
             calls: AtomicUsize::new(0),
         });
-        file.set_type_tree_registry(Some(registry.clone()));
+        let file = SerializedFileParser::from_bytes(V22_FIXTURE.to_vec())
+            .unwrap()
+            .without_embedded_type_trees()
+            .with_type_tree_registry(Some(registry.clone()));
         let handle = file.object_handles().next().unwrap();
         let mut budget = AssetLoadBudget::default();
 

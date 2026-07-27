@@ -3,12 +3,38 @@
 //! This module provides the main parsing logic for Unity Sprite objects.
 
 use super::types::*;
-use crate::error::Result;
+use crate::error::{BinaryError, Result};
 use crate::object::UnityObject;
 use crate::reader::BinaryReader;
 use crate::unity_version::UnityVersion;
 use indexmap::IndexMap;
 use unity_asset_core::UnityValue;
+
+/// The Texture2D PPtr selected by a Sprite without materializing the Sprite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpriteTextureReference {
+    file_id: i32,
+    path_id: i64,
+}
+
+impl SpriteTextureReference {
+    /// Inspects only the texture reference needed for dependency planning.
+    pub fn inspect(obj: &UnityObject) -> Result<Self> {
+        inspect_texture_reference_typetree(obj)
+            .or_else(|| inspect_texture_reference_binary(obj.raw_data()).ok())
+            .ok_or_else(|| BinaryError::invalid_data("Sprite missing texture reference"))
+    }
+
+    #[must_use]
+    pub const fn file_id(self) -> i32 {
+        self.file_id
+    }
+
+    #[must_use]
+    pub const fn path_id(self) -> i64 {
+        self.path_id
+    }
+}
 
 /// Sprite parser
 ///
@@ -27,7 +53,7 @@ impl SpriteParser {
     /// Parse Sprite from UnityObject
     pub fn parse_from_unity_object(&self, obj: &UnityObject) -> Result<SpriteResult> {
         let sprite = self
-            .parse_from_typetree(obj.class.properties())
+            .parse_from_typetree(obj.as_unity_class().properties())
             .or_else(|_| self.parse_from_binary_data(obj.raw_data()))?;
 
         Ok(SpriteResult::new(sprite))
@@ -305,25 +331,59 @@ impl SpriteParser {
     }
 }
 
-impl Default for SpriteParser {
-    fn default() -> Self {
-        Self::new(UnityVersion::default())
+fn inspect_texture_reference_typetree(obj: &UnityObject) -> Option<SpriteTextureReference> {
+    let UnityValue::Object(render_data) = obj.get("m_RD")? else {
+        return None;
+    };
+    let UnityValue::Object(texture) = render_data.get("texture")? else {
+        return None;
+    };
+    let file_id = texture
+        .get("m_FileID")
+        .and_then(UnityValue::as_i64)
+        .map_or(Some(0), |value| i32::try_from(value).ok())?;
+    let path_id = texture.get("m_PathID").and_then(UnityValue::as_i64)?;
+    (path_id != 0).then_some(SpriteTextureReference { file_id, path_id })
+}
+
+fn inspect_texture_reference_binary(data: &[u8]) -> Result<SpriteTextureReference> {
+    let mut reader = BinaryReader::new(data, crate::reader::ByteOrder::Little);
+    reader.read_aligned_string_ref()?;
+    reader.skip_bytes(13 * std::mem::size_of::<f32>())?;
+    reader.read_u8()?;
+    reader.align_to(4)?;
+    reader.read_bool()?;
+    reader.align_to(4)?;
+    let path_id = reader.read_i64()?;
+    if path_id == 0 {
+        return Err(BinaryError::invalid_data(
+            "Sprite binary texture path ID is zero",
+        ));
     }
+    Ok(SpriteTextureReference {
+        file_id: 0,
+        path_id,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_version() -> UnityVersion {
+        UnityVersion::parse_version("2020.3.12f1").unwrap()
+    }
+
     #[test]
     fn test_parser_creation() {
-        let parser = SpriteParser::new(UnityVersion::default());
-        assert_eq!(parser.version(), &UnityVersion::default());
+        let version = test_version();
+        let parser = SpriteParser::new(version.clone());
+        assert_eq!(parser.version(), &version);
     }
 
     #[test]
     fn test_extract_rect() {
-        let parser = SpriteParser::default();
+        let parser = SpriteParser::new(test_version());
         let mut sprite = Sprite::default();
 
         let mut rect_obj = IndexMap::new();
@@ -339,5 +399,43 @@ mod tests {
         assert_eq!(sprite.rect_y, 20.0);
         assert_eq!(sprite.rect_width, 100.0);
         assert_eq!(sprite.rect_height, 200.0);
+    }
+
+    #[test]
+    fn texture_reference_inspection_ignores_unrelated_sprite_allocations() {
+        let class = unity_asset_core::UnityClass::with_properties(
+            crate::asset::class_ids::SPRITE,
+            "Sprite".to_string(),
+            "1".to_string(),
+            IndexMap::from([
+                (
+                    "m_Name".to_string(),
+                    UnityValue::String("large sprite metadata".repeat(4096)),
+                ),
+                (
+                    "m_RD".to_string(),
+                    UnityValue::Object(IndexMap::from([(
+                        "texture".to_string(),
+                        UnityValue::Object(IndexMap::from([
+                            ("m_FileID".to_string(), UnityValue::Integer(3)),
+                            ("m_PathID".to_string(), UnityValue::Integer(42)),
+                        ])),
+                    )])),
+                ),
+            ]),
+        );
+        let info = crate::asset::ObjectInfo::for_standalone_class(
+            1,
+            0,
+            0,
+            crate::asset::class_ids::SPRITE,
+        )
+        .unwrap();
+        let object = UnityObject::from_info_and_class(info, class);
+
+        let reference = SpriteTextureReference::inspect(&object).unwrap();
+
+        assert_eq!(reference.file_id(), 3);
+        assert_eq!(reference.path_id(), 42);
     }
 }

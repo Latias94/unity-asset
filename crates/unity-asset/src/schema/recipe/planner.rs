@@ -113,7 +113,13 @@ impl RecipeObject {
         planner.validate_object(self)?;
         let mut sources = output.vec::<SourceExpectation>(1, "recipe fragment sources")?;
         sources.push(output.source(&self.source)?);
-        output.fragment(self.object.handle().revision(), sources, payloads, actions)
+        output.fragment(
+            self.object.handle().workspace(),
+            self.object.handle().revision(),
+            sources,
+            payloads,
+            actions,
+        )
     }
 }
 
@@ -130,6 +136,12 @@ impl<'view> SchemaRecipePlanner<'view> {
     #[must_use]
     pub fn revision(&self) -> WorkspaceRevision {
         self.view.revision()
+    }
+
+    /// Returns the immutable workspace identity observed by this planner.
+    #[must_use]
+    pub fn workspace_id(&self) -> unity_asset_core::WorkspaceId {
+        self.view.workspace_id()
     }
 
     pub fn inspect(
@@ -270,7 +282,7 @@ impl<'view> SchemaRecipePlanner<'view> {
         let mut output = RecipeOutputBuilder::new(budget);
         let guard = object.field_guard(&path, output.budget())?;
         if let Some(owner) = protected_plain_field_owner(
-            object.class().class_id,
+            object.class().class_id(),
             object.address.kind(),
             object.class().properties(),
             &path,
@@ -319,7 +331,7 @@ fn validate_inspection(
         || object.handle() != handle
         || !key_matches
         || object.schema_provenance().object_kind() != address.kind()
-        || object.schema_provenance().class_id() != object.class().class_id
+        || object.schema_provenance().class_id() != object.class().class_id()
     {
         return Err(RecipeError::InspectionContractMismatch);
     }
@@ -542,13 +554,13 @@ fn aliased_reference_integer(
 
 fn transform_applicability(object: &RecipeObject) -> RecipeApplicability {
     let class = object.class();
-    if class.class_id == unity_asset_core::class_ids::TRANSFORM
-        && class.class_name == class_names::TRANSFORM
+    if class.class_id() == unity_asset_core::class_ids::TRANSFORM
+        && class.class_name() == class_names::TRANSFORM
     {
         return RecipeApplicability::applicable(RecipeId::TransformV1, SchemaVariantId::Transform);
     }
-    if class.class_id == unity_asset_core::class_ids::RECT_TRANSFORM
-        && class.class_name == class_names::RECT_TRANSFORM
+    if class.class_id() == unity_asset_core::class_ids::RECT_TRANSFORM
+        && class.class_name() == class_names::RECT_TRANSFORM
     {
         let modern = class.has_property("m_AnchoredPosition");
         let legacy = class.has_property("m_Position");
@@ -575,8 +587,8 @@ fn material_applicability(
     budget: &mut AssetLoadBudget,
 ) -> Result<RecipeApplicability, RecipeError> {
     let class = object.class();
-    if class.class_id != unity_asset_core::class_ids::MATERIAL
-        || class.class_name != class_names::MATERIAL
+    if class.class_id() != unity_asset_core::class_ids::MATERIAL
+        || class.class_name() != class_names::MATERIAL
     {
         return Ok(RecipeApplicability::rejected(
             RecipeId::MaterialTextureEnvironmentV1,
@@ -711,8 +723,8 @@ fn hierarchy_applicability(object: &RecipeObject) -> RecipeApplicability {
 
 fn resource_applicability(object: &RecipeObject) -> RecipeApplicability {
     let class = object.class();
-    if class.class_id != unity_asset_core::class_ids::AUDIO_CLIP
-        || class.class_name != class_names::AUDIO_CLIP
+    if class.class_id() != unity_asset_core::class_ids::AUDIO_CLIP
+        || class.class_name() != class_names::AUDIO_CLIP
     {
         return RecipeApplicability::rejected(
             RecipeId::AudioClipStreamedResourceV1,
@@ -751,7 +763,7 @@ mod tests {
     use std::sync::Arc;
 
     use unity_asset_binary::object::UnityObject;
-    use unity_asset_core::{AssetLoadBudget, FieldPath, SourceLocator, UnityValue};
+    use unity_asset_core::{AssetLoadBudget, FieldPath, SourceLocator, UnityClass, UnityValue};
 
     use crate::workspace::{
         AssetWorkspace, ReferenceTarget, WorkspaceObject, WorkspaceObjectValue,
@@ -788,8 +800,9 @@ mod tests {
             let WorkspaceObjectValue::Binary(binary) = object.into_value() else {
                 panic!("expected the binary fixture to yield a binary object");
             };
-            let mut binary = (*binary).clone();
-            let Some(UnityValue::Object(fields)) = binary.class.get_mut("m_Father") else {
+            let binary = (*binary).clone();
+            let (header, mut properties) = binary.as_unity_class().clone().into_parts();
+            let Some(UnityValue::Object(fields)) = properties.get_mut("m_Father") else {
                 panic!("expected the Transform fixture to contain m_Father");
             };
             assert_eq!(fields.get("m_FileID").and_then(UnityValue::as_i64), Some(0));
@@ -802,6 +815,7 @@ mod tests {
                 "pathID".to_owned(),
                 UnityValue::Integer(compatibility_path_id),
             );
+            let class = UnityClass::from_parts(header, properties);
             let object = RecipeObject {
                 address,
                 source,
@@ -809,7 +823,7 @@ mod tests {
                     handle,
                     WorkspaceObjectValue::Binary(Arc::new(UnityObject::from_info_and_class(
                         binary.info,
-                        binary.class,
+                        class,
                     ))),
                     provenance,
                 ),

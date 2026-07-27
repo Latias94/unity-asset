@@ -8,6 +8,12 @@ use unity_asset_binary::object::UnityObject;
 use unity_asset_binary::unity_objects::{GameObject, Transform};
 use unity_asset_core::{UnityClass, UnityValue};
 
+fn with_property(class: UnityClass, key: impl Into<String>, value: UnityValue) -> UnityClass {
+    let (header, mut properties) = class.into_parts();
+    properties.insert(key.into(), value);
+    UnityClass::from_parts(header, properties)
+}
+
 #[test]
 fn test_unity_object_gameobject_detection() {
     // Create UnityObjectInfo for a GameObject (class_id = 1)
@@ -15,16 +21,18 @@ fn test_unity_object_gameobject_detection() {
 
     // Create a UnityClass with GameObject properties
     let mut unity_class = UnityClass::new(1, "GameObject".to_string(), "12345".to_string());
-    unity_class.set(
+    unity_class = with_property(
+        unity_class,
         "m_Name".to_string(),
         UnityValue::String("TestObject".to_string()),
     );
-    unity_class.set("m_Layer".to_string(), UnityValue::Integer(0));
-    unity_class.set(
+    unity_class = with_property(unity_class, "m_Layer", UnityValue::Integer(0));
+    unity_class = with_property(
+        unity_class,
         "m_Tag".to_string(),
         UnityValue::String("Untagged".to_string()),
     );
-    unity_class.set("m_IsActive".to_string(), UnityValue::Bool(true));
+    unity_class = with_property(unity_class, "m_IsActive", UnityValue::Bool(true));
 
     let unity_object = UnityObject::from_info_and_class(info, unity_class);
 
@@ -58,7 +66,7 @@ fn test_unity_object_transform_detection() {
     position.insert("x".to_string(), UnityValue::Float(1.0));
     position.insert("y".to_string(), UnityValue::Float(2.0));
     position.insert("z".to_string(), UnityValue::Float(3.0));
-    unity_class.set("m_LocalPosition".to_string(), UnityValue::Object(position));
+    unity_class = with_property(unity_class, "m_LocalPosition", UnityValue::Object(position));
 
     // Add rotation (identity quaternion)
     let mut rotation = IndexMap::new();
@@ -66,14 +74,14 @@ fn test_unity_object_transform_detection() {
     rotation.insert("y".to_string(), UnityValue::Float(0.0));
     rotation.insert("z".to_string(), UnityValue::Float(0.0));
     rotation.insert("w".to_string(), UnityValue::Float(1.0));
-    unity_class.set("m_LocalRotation".to_string(), UnityValue::Object(rotation));
+    unity_class = with_property(unity_class, "m_LocalRotation", UnityValue::Object(rotation));
 
     // Add scale
     let mut scale = IndexMap::new();
     scale.insert("x".to_string(), UnityValue::Float(1.0));
     scale.insert("y".to_string(), UnityValue::Float(1.0));
     scale.insert("z".to_string(), UnityValue::Float(1.0));
-    unity_class.set("m_LocalScale".to_string(), UnityValue::Object(scale));
+    unity_class = with_property(unity_class, "m_LocalScale", UnityValue::Object(scale));
 
     let unity_object = UnityObject::from_info_and_class(info, unity_class);
 
@@ -101,7 +109,8 @@ fn test_unity_object_describe() {
     let info = ObjectInfo::for_standalone_class(12345, 0, 4, 1).expect("valid class ID");
 
     let mut unity_class = UnityClass::new(1, "GameObject".to_string(), "12345".to_string());
-    unity_class.set(
+    unity_class = with_property(
+        unity_class,
         "m_Name".to_string(),
         UnityValue::String("MyGameObject".to_string()),
     );
@@ -133,16 +142,18 @@ fn test_unity_object_with_complex_gameobject() {
     let info = ObjectInfo::for_standalone_class(11111, 0, 4, 1).expect("valid class ID");
 
     let mut unity_class = UnityClass::new(1, "GameObject".to_string(), "11111".to_string());
-    unity_class.set(
+    unity_class = with_property(
+        unity_class,
         "m_Name".to_string(),
         UnityValue::String("ComplexObject".to_string()),
     );
-    unity_class.set("m_Layer".to_string(), UnityValue::Integer(5));
-    unity_class.set(
+    unity_class = with_property(unity_class, "m_Layer", UnityValue::Integer(5));
+    unity_class = with_property(
+        unity_class,
         "m_Tag".to_string(),
         UnityValue::String("Player".to_string()),
     );
-    unity_class.set("m_IsActive".to_string(), UnityValue::Bool(false));
+    unity_class = with_property(unity_class, "m_IsActive", UnityValue::Bool(false));
 
     // Add components
     let mut component1 = IndexMap::new();
@@ -157,7 +168,7 @@ fn test_unity_object_with_complex_gameobject() {
         UnityValue::Object(component1),
         UnityValue::Object(component2),
     ];
-    unity_class.set("m_Component".to_string(), UnityValue::Array(components));
+    unity_class = with_property(unity_class, "m_Component", UnityValue::Array(components));
 
     let unity_object = UnityObject::from_info_and_class(info, unity_class);
 
@@ -184,7 +195,7 @@ fn test_unity_object_with_complex_transform() {
     position.insert("x".to_string(), UnityValue::Float(10.5));
     position.insert("y".to_string(), UnityValue::Float(-5.2));
     position.insert("z".to_string(), UnityValue::Float(0.0));
-    unity_class.set("m_LocalPosition".to_string(), UnityValue::Object(position));
+    unity_class = with_property(unity_class, "m_LocalPosition", UnityValue::Object(position));
 
     // Rotation (90 degrees around Y axis)
     let mut rotation = IndexMap::new();
@@ -192,20 +203,20 @@ fn test_unity_object_with_complex_transform() {
     rotation.insert("y".to_string(), UnityValue::Float(0.707));
     rotation.insert("z".to_string(), UnityValue::Float(0.0));
     rotation.insert("w".to_string(), UnityValue::Float(0.707));
-    unity_class.set("m_LocalRotation".to_string(), UnityValue::Object(rotation));
+    unity_class = with_property(unity_class, "m_LocalRotation", UnityValue::Object(rotation));
 
     // Scale
     let mut scale = IndexMap::new();
     scale.insert("x".to_string(), UnityValue::Float(2.0));
     scale.insert("y".to_string(), UnityValue::Float(1.5));
     scale.insert("z".to_string(), UnityValue::Float(0.5));
-    unity_class.set("m_LocalScale".to_string(), UnityValue::Object(scale));
+    unity_class = with_property(unity_class, "m_LocalScale", UnityValue::Object(scale));
 
     // Parent
     let mut parent = IndexMap::new();
     parent.insert("fileID".to_string(), UnityValue::Integer(0));
     parent.insert("pathID".to_string(), UnityValue::Integer(55555));
-    unity_class.set("m_Father".to_string(), UnityValue::Object(parent));
+    unity_class = with_property(unity_class, "m_Father", UnityValue::Object(parent));
 
     // Children
     let mut child1 = IndexMap::new();
@@ -217,7 +228,7 @@ fn test_unity_object_with_complex_transform() {
     child2.insert("pathID".to_string(), UnityValue::Integer(77777));
 
     let children = vec![UnityValue::Object(child1), UnityValue::Object(child2)];
-    unity_class.set("m_Children".to_string(), UnityValue::Array(children));
+    unity_class = with_property(unity_class, "m_Children", UnityValue::Array(children));
 
     let unity_object = UnityObject::from_info_and_class(info, unity_class);
 

@@ -39,15 +39,19 @@ fn main() -> unity_asset_binary::Result<()> {
         .unwrap_or_else(|| PathBuf::from("tests/samples/banner_1"));
 
     let mut budget = AssetLoadBudget::default();
-    let mut file = load_unity_file_with_budget(&path, &mut budget)?;
-    let sf = match &mut file {
+    let mut sf = match load_unity_file_with_budget(&path, &mut budget)? {
         UnityFile::SerializedFile(sf) => sf,
-        UnityFile::AssetBundle(bundle) => bundle.assets.get_mut(0).ok_or_else(|| {
-            unity_asset_binary::BinaryError::invalid_data("bundle has no asset 0")
-        })?,
+        UnityFile::AssetBundle(mut bundle) => {
+            if bundle.assets.is_empty() {
+                return Err(unity_asset_binary::BinaryError::invalid_data(
+                    "bundle has no asset 0",
+                ));
+            }
+            bundle.assets.remove(0)
+        }
         UnityFile::WebFile(_) => {
             return Err(unity_asset_binary::BinaryError::invalid_format(
-                "WebFile container: pick an entry and parse it via unity-asset Environment/CLI",
+                "WebFile container: inspect entries through AssetWorkspace or the typed CLI",
             ));
         }
     };
@@ -77,11 +81,15 @@ fn main() -> unity_asset_binary::Result<()> {
             .unwrap_or_default()
     );
 
-    sf.set_type_tree_enabled(false);
-    for t in sf.types_mut().iter_mut() {
+    let mut types = sf.types().to_vec();
+    for t in &mut types {
         t.type_tree.clear();
     }
-    sf.set_type_tree_registry(None);
+    let ref_types = sf.ref_types().to_vec();
+    sf = sf
+        .with_type_tables(types, ref_types)
+        .without_embedded_type_trees()
+        .with_type_tree_registry(None);
 
     let stripped = sf
         .find_object_handle(path_id)
@@ -106,7 +114,7 @@ fn main() -> unity_asset_binary::Result<()> {
     })?;
 
     let registry = JsonTypeTreeRegistry::from_path(&reg_path, &mut budget)?;
-    sf.set_type_tree_registry(Some(Arc::new(registry)));
+    sf = sf.with_type_tree_registry(Some(Arc::new(registry)));
 
     let restored = sf
         .find_object_handle(path_id)

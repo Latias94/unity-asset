@@ -1,10 +1,13 @@
+mod support;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use unity_asset_binary::bundle::{BundleLoadOptions, BundleParser};
+use unity_asset_binary::bundle::{AssetBundle, BundleLayoutKind, BundleLoadOptions, BundleParser};
 use unity_asset_write::PackingPolicy;
-use unity_asset_write::bundle::{BundleEdits, BundleWriter};
+
+use support::{ordered_bundle_entries, prepare_bundle_bytes};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -81,6 +84,21 @@ fn parse_packing_policy_env() -> anyhow::Result<PackingPolicy> {
     raw.parse::<PackingPolicy>().map_err(|error| {
         anyhow::anyhow!("Invalid UNITY_ASSET_EXTERNAL_CORPUS_PACKER={raw:?}: {error}")
     })
+}
+
+fn supports_packing_policy(bundle: &AssetBundle, policy: PackingPolicy) -> bool {
+    match bundle.header.layout_kind() {
+        Ok(BundleLayoutKind::FileStream) => true,
+        Ok(BundleLayoutKind::Legacy) => match bundle.header.signature.as_str() {
+            "UnityRaw" => matches!(
+                policy,
+                PackingPolicy::Preserve | PackingPolicy::Uncompressed
+            ),
+            "UnityWeb" => matches!(policy, PackingPolicy::Preserve | PackingPolicy::Lzma),
+            _ => false,
+        },
+        Err(_) => false,
+    }
 }
 
 fn read_prefix(path: &Path, max: usize) -> anyhow::Result<Vec<u8>> {
@@ -170,9 +188,11 @@ fn external_corpus_bundle_roundtrip_and_optional_unitypy_validation() -> anyhow:
     let verbose = env_flag("UNITY_ASSET_EXTERNAL_CORPUS_VERBOSE");
     let packing_policy = parse_packing_policy_env()?;
 
+    let mut inspected_bundles = 0usize;
     let mut attempted = 0usize;
     let mut skipped_too_large = 0usize;
     let mut skipped_not_bundle = 0usize;
+    let mut skipped_incompatible_policy = 0usize;
     let mut failures: Vec<(PathBuf, String)> = Vec::new();
     let mut unitypy_checked = 0usize;
 
@@ -196,12 +216,10 @@ fn external_corpus_bundle_roundtrip_and_optional_unitypy_validation() -> anyhow:
             return Ok(true);
         }
 
-        attempted += 1;
+        inspected_bundles += 1;
         if verbose {
             eprintln!(
-                "[external-corpus] ({}/{}) {} ({} bytes, sig={})",
-                attempted,
-                limit,
+                "[external-corpus] inspect {} ({} bytes, sig={})",
                 path.display(),
                 meta.len(),
                 sig
@@ -228,6 +246,28 @@ fn external_corpus_bundle_roundtrip_and_optional_unitypy_validation() -> anyhow:
             return Ok(true);
         }
 
+        if !supports_packing_policy(&bundle, packing_policy) {
+            skipped_incompatible_policy += 1;
+            if verbose {
+                eprintln!(
+                    "[external-corpus] skip incompatible policy={} for signature={} version={}",
+                    packing_policy, bundle.header.signature, bundle.header.version
+                );
+            }
+            return Ok(true);
+        }
+
+        attempted += 1;
+        if verbose {
+            eprintln!(
+                "[external-corpus] roundtrip ({}/{}) {} policy={}",
+                attempted,
+                limit,
+                path.display(),
+                packing_policy
+            );
+        }
+
         let expected_files: Vec<String> = bundle
             .nodes
             .iter()
@@ -235,7 +275,14 @@ fn external_corpus_bundle_roundtrip_and_optional_unitypy_validation() -> anyhow:
             .map(|n| n.name.clone())
             .collect();
 
-        let saved = match BundleWriter::save(&bundle, &BundleEdits::default(), packing_policy) {
+        let entries = match ordered_bundle_entries(&bundle) {
+            Ok(entries) => entries,
+            Err(error) => {
+                failures.push((path.to_path_buf(), format!("adapt entries failed: {error}")));
+                return Ok(true);
+            }
+        };
+        let saved = match prepare_bundle_bytes(&bundle, &entries, packing_policy) {
             Ok(b) => b,
             Err(e) => {
                 failures.push((path.to_path_buf(), format!("save failed: {e}")));
@@ -340,22 +387,15 @@ assert len(got) == expected_len, (len(got), expected_len, type(item))
         Ok(true)
     })?;
 
-    if attempted == 0 {
-        anyhow::bail!(
-            "No candidate bundles processed under {} (skipped_not_bundle={}, skipped_too_large={}).",
-            root.display(),
-            skipped_not_bundle,
-            skipped_too_large
-        );
-    }
-
     if !failures.is_empty() {
         let mut msg = format!(
-            "External corpus failures: {} (attempted={}, skipped_not_bundle={}, skipped_too_large={}).\n",
+            "External corpus failures: {} (inspected_bundles={}, attempted={}, skipped_not_bundle={}, skipped_too_large={}, skipped_incompatible_policy={}).\n",
             failures.len(),
+            inspected_bundles,
             attempted,
             skipped_not_bundle,
-            skipped_too_large
+            skipped_too_large,
+            skipped_incompatible_policy
         );
         for (path, err) in failures.iter().take(10) {
             msg.push_str(&format!("- {}: {}\n", path.display(), err));
@@ -363,9 +403,26 @@ assert len(got) == expected_len, (len(got), expected_len, type(item))
         anyhow::bail!(msg);
     }
 
+    if attempted == 0 {
+        anyhow::bail!(
+            "No policy-compatible candidate bundles processed under {} (inspected_bundles={}, policy={}, skipped_not_bundle={}, skipped_too_large={}, skipped_incompatible_policy={}).",
+            root.display(),
+            inspected_bundles,
+            packing_policy,
+            skipped_not_bundle,
+            skipped_too_large,
+            skipped_incompatible_policy
+        );
+    }
+
     eprintln!(
-        "External corpus OK: attempted={}, skipped_not_bundle={}, skipped_too_large={}, unitypy_checked={}",
-        attempted, skipped_not_bundle, skipped_too_large, unitypy_checked
+        "External corpus OK: inspected_bundles={}, attempted={}, skipped_not_bundle={}, skipped_too_large={}, skipped_incompatible_policy={}, unitypy_checked={}",
+        inspected_bundles,
+        attempted,
+        skipped_not_bundle,
+        skipped_too_large,
+        skipped_incompatible_policy,
+        unitypy_checked
     );
 
     Ok(())

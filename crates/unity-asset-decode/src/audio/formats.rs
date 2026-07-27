@@ -239,7 +239,7 @@ impl AudioCompressionFormat {
     }
 
     /// Get recommended file extension
-    pub fn extension(&self) -> &str {
+    pub const fn extension(&self) -> &'static str {
         match self {
             AudioCompressionFormat::PCM | AudioCompressionFormat::ADPCM => "wav",
             AudioCompressionFormat::Vorbis => "ogg",

@@ -5,7 +5,14 @@
 
 use std::path::Path;
 use unity_asset_core::{UnityClass, UnityDocument, UnityValue};
-use unity_asset_yaml::YamlDocument;
+use unity_asset_yaml::{
+    AssetLoadBudget, BudgetedYamlSource, YamlDocument, load_budgeted_yaml_path,
+};
+
+fn load_fixture(path: &Path) -> BudgetedYamlSource {
+    let mut budget = AssetLoadBudget::default();
+    load_budgeted_yaml_path(path, &mut budget).unwrap()
+}
 
 /// Test the filter() method with various combinations
 #[test]
@@ -17,14 +24,15 @@ fn test_filter_method() {
         return;
     }
 
-    let doc = YamlDocument::load_yaml(fixture_path, false).unwrap();
+    let source = load_fixture(fixture_path);
+    let doc = source.document();
     println!("Loaded document with {} entries", doc.entries().len());
 
     // Test 1: Filter by class name only
     let gameobjects = doc.filter(Some(&["GameObject"]), None);
     println!("Found {} GameObjects", gameobjects.len());
     assert_eq!(gameobjects.len(), 1);
-    assert_eq!(gameobjects[0].class_name, "GameObject");
+    assert_eq!(gameobjects[0].class_name(), "GameObject");
 
     // Test 2: Filter by multiple class names
     let transforms_and_mono = doc.filter(Some(&["Transform", "MonoBehaviour"]), None);
@@ -39,14 +47,14 @@ fn test_filter_method() {
     println!("Found {} objects with m_Enabled", enabled_objects.len());
     for obj in &enabled_objects {
         assert!(obj.has_property("m_Enabled"));
-        println!("  - {} has m_Enabled", obj.class_name);
+        println!("  - {} has m_Enabled", obj.class_name());
     }
 
     // Test 4: Filter by class name AND attributes
     let enabled_mono = doc.filter(Some(&["MonoBehaviour"]), Some(&["m_Enabled"]));
     println!("Found {} MonoBehaviour with m_Enabled", enabled_mono.len());
     for obj in &enabled_mono {
-        assert_eq!(obj.class_name, "MonoBehaviour");
+        assert_eq!(obj.class_name(), "MonoBehaviour");
         assert!(obj.has_property("m_Enabled"));
     }
 
@@ -69,18 +77,19 @@ fn test_get_method() {
         return;
     }
 
-    let doc = YamlDocument::load_yaml(fixture_path, false).unwrap();
+    let source = load_fixture(fixture_path);
+    let doc = source.document();
 
     // Test 1: Get by class name
     let gameobject = doc.get(Some("GameObject"), None).unwrap();
-    assert_eq!(gameobject.class_name, "GameObject");
-    println!("✓ Found GameObject: {}", gameobject.class_name);
+    assert_eq!(gameobject.class_name(), "GameObject");
+    println!("✓ Found GameObject: {}", gameobject.class_name());
 
     // Test 2: Get by class name and attributes
     let transform = doc
         .get(Some("Transform"), Some(&["m_LocalPosition"]))
         .unwrap();
-    assert_eq!(transform.class_name, "Transform");
+    assert_eq!(transform.class_name(), "Transform");
     assert!(transform.has_property("m_LocalPosition"));
     println!("✓ Found Transform with m_LocalPosition");
 
@@ -105,7 +114,8 @@ fn test_complex_attribute_filtering() {
         return;
     }
 
-    let doc = YamlDocument::load_yaml(fixture_path, false).unwrap();
+    let source = load_fixture(fixture_path);
+    let doc = source.document();
 
     // Find objects that have multiple specific attributes
     let complex_filter = doc.filter(None, Some(&["m_ObjectHideFlags", "m_GameObject"]));
@@ -117,7 +127,7 @@ fn test_complex_attribute_filtering() {
     for obj in &complex_filter {
         assert!(obj.has_property("m_ObjectHideFlags"));
         assert!(obj.has_property("m_GameObject"));
-        println!("  - {} has both properties", obj.class_name);
+        println!("  - {} has both properties", obj.class_name());
     }
 
     // Test with attributes that should exist in specific classes
@@ -128,7 +138,7 @@ fn test_complex_attribute_filtering() {
     );
 
     for obj in &mono_with_script {
-        assert_eq!(obj.class_name, "MonoBehaviour");
+        assert_eq!(obj.class_name(), "MonoBehaviour");
         assert!(obj.has_property("m_Script"));
     }
 }
@@ -143,7 +153,8 @@ fn test_filtering_edge_cases() {
         return;
     }
 
-    let doc = YamlDocument::load_yaml(fixture_path, false).unwrap();
+    let source = load_fixture(fixture_path);
+    let doc = source.document();
 
     // Test with empty class names array
     let empty_class_filter = doc.filter(Some(&[]), None);
@@ -175,7 +186,8 @@ fn test_filtering_preserves_references() {
         return;
     }
 
-    let doc = YamlDocument::load_yaml(fixture_path, false).unwrap();
+    let source = load_fixture(fixture_path);
+    let doc = source.document();
 
     // Get a reference through filtering
     let gameobjects = doc.filter(Some(&["GameObject"]), None);
@@ -187,7 +199,7 @@ fn test_filtering_preserves_references() {
     let direct_gameobject = doc
         .entries()
         .iter()
-        .find(|entry| entry.class_name == "GameObject")
+        .find(|entry| entry.class_name() == "GameObject")
         .unwrap();
 
     // They should be the same object (same memory address)
@@ -207,35 +219,49 @@ fn test_filtering_preserves_references() {
 #[test]
 fn test_filtering_performance() {
     // Create a synthetic document with many entries for performance testing
-    let mut doc = YamlDocument::new();
+    let mut entries = Vec::new();
 
     // Add many different types of objects
     for i in 0..100 {
-        let mut gameobject = UnityClass::new(1, "GameObject".to_string(), format!("go_{}", i));
-        gameobject.set(
-            "m_Name".to_string(),
-            UnityValue::String(format!("GameObject_{}", i)),
-        );
-        gameobject.set("m_IsActive".to_string(), UnityValue::Bool(i % 2 == 0));
-        doc.add_entry(gameobject);
+        entries.push(UnityClass::with_properties(
+            1,
+            "GameObject".to_string(),
+            format!("go_{}", i),
+            indexmap::IndexMap::from([
+                (
+                    "m_Name".to_string(),
+                    UnityValue::String(format!("GameObject_{}", i)),
+                ),
+                ("m_IsActive".to_string(), UnityValue::Bool(i % 2 == 0)),
+            ]),
+        ));
 
-        let mut transform = UnityClass::new(4, "Transform".to_string(), format!("tr_{}", i));
-        transform.set(
-            "m_LocalPosition".to_string(),
-            UnityValue::Object(indexmap::IndexMap::new()),
-        );
-        doc.add_entry(transform);
+        entries.push(UnityClass::with_properties(
+            4,
+            "Transform".to_string(),
+            format!("tr_{}", i),
+            indexmap::IndexMap::from([(
+                "m_LocalPosition".to_string(),
+                UnityValue::Object(indexmap::IndexMap::new()),
+            )]),
+        ));
 
         if i % 3 == 0 {
-            let mut mono = UnityClass::new(114, "MonoBehaviour".to_string(), format!("mb_{}", i));
-            mono.set("m_Enabled".to_string(), UnityValue::Bool(true));
-            mono.set(
-                "m_Script".to_string(),
-                UnityValue::Object(indexmap::IndexMap::new()),
-            );
-            doc.add_entry(mono);
+            entries.push(UnityClass::with_properties(
+                114,
+                "MonoBehaviour".to_string(),
+                format!("mb_{}", i),
+                indexmap::IndexMap::from([
+                    ("m_Enabled".to_string(), UnityValue::Bool(true)),
+                    (
+                        "m_Script".to_string(),
+                        UnityValue::Object(indexmap::IndexMap::new()),
+                    ),
+                ]),
+            ));
         }
     }
+    let doc = YamlDocument::from_entries(entries);
 
     println!(
         "Created synthetic document with {} entries",

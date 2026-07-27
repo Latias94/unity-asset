@@ -1,11 +1,12 @@
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{HashMap, TryReserveError, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
 };
 
 use thiserror::Error;
 use unity_asset_core::{
-    DigestV1, FieldPath, FieldPathSegment, ObjectAddress, SourceLocator, WorkspaceRevision,
+    DigestV1, FieldPath, FieldPathSegment, ObjectAddress, SourceLocator, WorkspaceId,
+    WorkspaceRevision,
 };
 
 use super::{
@@ -59,6 +60,7 @@ impl WriteSummaryIndex {
 /// snapshot, so overlapping object or field writes are rejected before assembly.
 #[derive(Debug)]
 pub struct MutationPlanBuilder {
+    workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     sources: Vec<SourceExpectation>,
     payloads: Vec<PlanPayload>,
@@ -75,9 +77,11 @@ pub struct MutationPlanBuilder {
 }
 
 impl MutationPlanBuilder {
+    /// Creates an assembler bound to one exact workspace identity and base revision.
     #[must_use]
-    pub fn new(base_revision: WorkspaceRevision) -> Self {
+    pub fn new(workspace_id: WorkspaceId, base_revision: WorkspaceRevision) -> Self {
         Self {
+            workspace_id,
             base_revision,
             sources: Vec::new(),
             payloads: Vec::new(),
@@ -94,10 +98,28 @@ impl MutationPlanBuilder {
         }
     }
 
+    /// Returns the workspace identity accepted by this assembler.
+    #[must_use]
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    /// Returns the base revision accepted by this assembler.
+    #[must_use]
+    pub const fn base_revision(&self) -> WorkspaceRevision {
+        self.base_revision
+    }
+
     pub fn append(
         &mut self,
         fragment: MutationPlanFragment,
     ) -> Result<(), MutationPlanBuilderError> {
+        if fragment.workspace_id != self.workspace_id {
+            return Err(MutationPlanBuilderError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                actual: fragment.workspace_id,
+            });
+        }
         if fragment.base_revision != self.base_revision {
             return Err(MutationPlanBuilderError::RevisionMismatch {
                 expected: self.base_revision,
@@ -227,13 +249,14 @@ impl MutationPlanBuilder {
 
     pub fn build(self) -> Result<MutationPlan, MutationPlanError> {
         let Self {
+            workspace_id,
             base_revision,
             sources,
             payloads,
             actions,
             ..
         } = self;
-        MutationPlan::new(base_revision, sources, payloads, actions)
+        MutationPlan::new(workspace_id, base_revision, sources, payloads, actions)
     }
 }
 
@@ -285,7 +308,7 @@ fn reserve_append<T>(
         .map_err(|error| MutationPlanBuilderError::AllocationFailed {
             resource,
             requested: additional,
-            message: error.to_string(),
+            error,
         })
 }
 
@@ -299,7 +322,7 @@ fn reserve_index<K: Eq + Hash, V>(
         .map_err(|error| MutationPlanBuilderError::AllocationFailed {
             resource,
             requested: additional,
-            message: error.to_string(),
+            error,
         })
 }
 
@@ -605,6 +628,11 @@ fn paths_overlap(left: Option<&FieldPath>, right: Option<&FieldPath>) -> bool {
 /// Failure while assembling independently observed recipe fragments.
 #[derive(Debug, Error)]
 pub enum MutationPlanBuilderError {
+    #[error("recipe fragment targets workspace {actual}, but the builder targets {expected}")]
+    WorkspaceMismatch {
+        expected: WorkspaceId,
+        actual: WorkspaceId,
+    },
     #[error("recipe fragment targets revision {actual}, but the builder targets {expected}")]
     RevisionMismatch {
         expected: WorkspaceRevision,
@@ -622,11 +650,12 @@ pub enum MutationPlanBuilderError {
     },
     #[error("recipe fragment requires too many {resource} index entries")]
     IndexEntryCountOverflow { resource: &'static str },
-    #[error("failed to allocate {resource} capacity for {requested} elements: {message}")]
+    #[error("failed to allocate {resource} capacity for {requested} elements: {error}")]
     AllocationFailed {
         resource: &'static str,
         requested: usize,
-        message: String,
+        #[source]
+        error: TryReserveError,
     },
     #[error(transparent)]
     Plan(#[from] MutationPlanError),

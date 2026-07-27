@@ -10,40 +10,6 @@ pub fn compress_lz4(data: &[u8]) -> Vec<u8> {
     lz4_flex::block::compress(data)
 }
 
-/// Compress data using UnityPy-style Brotli compression.
-///
-/// Note: UnityPy uses `brotli.compress(data)` with default parameters.
-pub fn compress_brotli(data: &[u8]) -> Vec<u8> {
-    use std::io::Write;
-
-    // UnityPy uses defaults; this matches the common defaults (quality=11, lgwin=22).
-    let mut out = Vec::new();
-    {
-        let mut w = brotli::CompressorWriter::new(&mut out, 4096, 11, 22);
-        w.write_all(data)
-            .expect("writing brotli-compressed bytes into Vec should not fail");
-    }
-    out
-}
-
-/// Compress data using UnityPy-style GZIP compression.
-///
-/// UnityPy uses `gzip.compress(data)` which defaults to `compresslevel=9` and `mtime=0`.
-pub fn compress_gzip(data: &[u8]) -> Vec<u8> {
-    use flate2::{Compression, GzBuilder};
-    use std::io::Write;
-
-    let mut encoder = GzBuilder::new()
-        .mtime(0)
-        .write(Vec::new(), Compression::best());
-    encoder
-        .write_all(data)
-        .expect("writing gzip-compressed bytes into Vec should not fail");
-    encoder
-        .finish()
-        .expect("finishing gzip-compressed bytes into Vec should not fail")
-}
-
 /// Compress data using UnityPy-style Unity LZMA encoding.
 ///
 /// UnityPy's `compress_lzma(..., write_decompressed_size=False)` produces:

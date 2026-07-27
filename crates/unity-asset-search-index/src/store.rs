@@ -1,13 +1,25 @@
-use std::fs::{self, File, OpenOptions};
+use std::ffi::OsStr;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::mem::size_of;
-use std::path::{Path, PathBuf};
+use std::ops::Range;
+use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tantivy::HasLen;
+use tantivy::directory::{
+    Directory, DirectoryLock, FileHandle, Lock, OwnedBytes, WatchCallback, WatchHandle, WritePtr,
+    error::{DeleteError, LockError, OpenReadError, OpenWriteError},
+};
 use tantivy::schema::{FAST, Field, INDEXED, STORED, STRING, Schema, TEXT};
-use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument};
-use unity_asset_core::{AssetLoadBudget, DigestV1, DigestV1Builder};
+use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, TantivyError};
+use unity_asset_core::{
+    AssetLoadBudget, ContractJsonLimits, ContractJsonResourceModel, DigestV1, DigestV1Builder,
+    read_contract_json,
+};
 use unity_asset_search_core::normalize_for_match;
 
 use crate::generation::{
@@ -15,7 +27,12 @@ use crate::generation::{
     SEARCH_GENERATION_CONTRACT_VERSION,
 };
 use crate::projection::{GenerationProjection, ReferenceDocument, SearchDocument};
+use crate::reference_payload::{
+    REFERENCE_PAYLOAD_FILE, ReferencePayloadLocation, ReferencePayloadReader,
+    ReferencePayloadWriter,
+};
 use crate::state::measure_artifact_tree;
+use crate::state::secure_read::{ReadDirectory as SecureReadDirectory, SecureReadError};
 
 const SEARCH_ARTIFACT_DIRECTORY: &str = "search";
 const REFERENCE_ARTIFACT_DIRECTORY: &str = "references";
@@ -25,8 +42,19 @@ const PATH_CATALOG_MAGIC: &[u8] = b"unity-asset:path-catalog:v1\0";
 const SEARCH_SCHEMA_CONTRACT: &str = "unity-asset.search-projection";
 const REFERENCE_SCHEMA_CONTRACT: &str = "unity-asset.reference-projection";
 pub(crate) const SEARCH_SCHEMA_VERSION: u16 = 1;
-pub(crate) const REFERENCE_SCHEMA_VERSION: u16 = 1;
+pub(crate) const REFERENCE_SCHEMA_VERSION: u16 = 3;
 const MAX_SCHEMA_MARKER_BYTES: u64 = 16 * 1024;
+// The fixed reserve covers one maximum-sized contract string, its typed copy, and Serde scratch.
+const SCHEMA_MARKER_JSON_RESOURCES: ContractJsonResourceModel =
+    ContractJsonResourceModel::new(6, 4 * 1024, 32 * 1024, 256);
+const SCHEMA_MARKER_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
+    "search.projection_schema_marker",
+    MAX_SCHEMA_MARKER_BYTES as usize,
+    2,
+    4,
+    3,
+    SCHEMA_MARKER_JSON_RESOURCES,
+);
 const SEARCH_LOGICAL_DOMAIN: &[u8] = b"unity-asset:search-generation:search-projection:v1\0";
 const REFERENCE_LOGICAL_DOMAIN: &[u8] = b"unity-asset:search-generation:reference-projection:v1\0";
 const MIN_WRITER_MEMORY_PER_THREAD: usize = 15_000_000;
@@ -34,6 +62,34 @@ const MAX_WRITER_MEMORY_PER_THREAD: usize = u32::MAX as usize - 1_000_000;
 const MAX_WRITER_THREADS: usize = 8;
 // The path catalog exposes this bound before allocating an entry buffer.
 const MAX_PROJECTED_PATH_BYTES: usize = 64 * 1024;
+
+/// A completed projection whose on-disk layout is safe to discard and rebuild.
+///
+/// This deliberately identifies only an older reference projection schema under the current
+/// generation contract. Corruption, I/O, allocation, and security failures remain fatal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RebuildableProjectionSchemaVersion {
+    actual: u16,
+    expected: u16,
+}
+
+impl std::fmt::Display for RebuildableProjectionSchemaVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "reference projection schema version {} is older than required version {}",
+            self.actual, self.expected
+        )
+    }
+}
+
+impl std::error::Error for RebuildableProjectionSchemaVersion {}
+
+pub(crate) fn is_rebuildable_projection_schema_version(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RebuildableProjectionSchemaVersion>()
+        .is_some()
+}
 
 /// Bounded Tantivy writer settings for immutable projection materialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +243,186 @@ fn validate_projection(projection: &GenerationProjection) -> Result<()> {
     Ok(())
 }
 
+/// Read-only Tantivy directory rooted at an already-opened generation child directory.
+///
+/// Tantivy's mmap directory reopens every segment by pathname. Completed generations are
+/// untrusted persisted input, so doing that after pinning the generation would reintroduce a
+/// replacement race. This adapter accepts only one ordinary leaf name and resolves it through
+/// `SecureReadDirectory`; its file handles retain the exact opened descriptor.
+#[derive(Clone)]
+struct AnchoredTantivyDirectory {
+    directory: Arc<SecureReadDirectory>,
+}
+
+impl AnchoredTantivyDirectory {
+    fn new(directory: Arc<SecureReadDirectory>) -> Self {
+        Self { directory }
+    }
+
+    fn leaf(path: &Path) -> io::Result<&OsStr> {
+        let mut components = path.components();
+        let Some(std::path::Component::Normal(name)) = components.next() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Tantivy requested an invalid anchored index path",
+            ));
+        };
+        if components.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Tantivy requested a nested anchored index path",
+            ));
+        }
+        Ok(name)
+    }
+
+    fn open_error(path: &Path, error: SecureReadError) -> OpenReadError {
+        match error {
+            SecureReadError::Io(source) if source.kind() == io::ErrorKind::NotFound => {
+                OpenReadError::FileDoesNotExist(path.to_path_buf())
+            }
+            source => OpenReadError::wrap_io_error(
+                io::Error::other(format!("anchored Tantivy read rejected: {source}")),
+                path.to_path_buf(),
+            ),
+        }
+    }
+
+    fn rejected_write(path: &Path) -> OpenWriteError {
+        OpenWriteError::wrap_io_error(
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "completed generation Tantivy directories are read-only",
+            ),
+            path.to_path_buf(),
+        )
+    }
+}
+
+impl std::fmt::Debug for AnchoredTantivyDirectory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AnchoredTantivyDirectory(..)")
+    }
+}
+
+impl Directory for AnchoredTantivyDirectory {
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        let name = Self::leaf(path)
+            .map_err(|error| OpenReadError::wrap_io_error(error, path.to_path_buf()))?;
+        let file = self
+            .directory
+            .open_regular(name)
+            .map_err(|error| Self::open_error(path, error))?;
+        Ok(Arc::new(AnchoredTantivyFile {
+            file: Arc::new(file),
+        }))
+    }
+
+    fn delete(&self, path: &Path) -> Result<(), DeleteError> {
+        Err(DeleteError::IoError {
+            io_error: Arc::new(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "completed generation Tantivy directories are read-only",
+            )),
+            filepath: path.to_path_buf(),
+        })
+    }
+
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+        let name = Self::leaf(path)
+            .map_err(|error| OpenReadError::wrap_io_error(error, path.to_path_buf()))?;
+        match self.directory.open_regular(name) {
+            Ok(_) => Ok(true),
+            Err(SecureReadError::Io(source)) if source.kind() == io::ErrorKind::NotFound => {
+                Ok(false)
+            }
+            Err(error) => Err(Self::open_error(path, error)),
+        }
+    }
+
+    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+        Err(Self::rejected_write(path))
+    }
+
+    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        let handle = self.get_file_handle(path)?;
+        handle
+            .read_bytes(0..handle.len())
+            .map(|bytes| bytes.as_slice().to_vec())
+            .map_err(|error| OpenReadError::wrap_io_error(error, path.to_path_buf()))
+    }
+
+    fn atomic_write(&self, _path: &Path, _data: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "completed generation Tantivy directories are read-only",
+        ))
+    }
+
+    fn sync_directory(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn acquire_lock(&self, _lock: &Lock) -> Result<DirectoryLock, LockError> {
+        // Completed generations are immutable and already protected by the generation-store
+        // writer lease. Tantivy readers still request META_LOCK while opening a snapshot, but its
+        // default implementation would create a lockfile through this deliberately read-only
+        // adapter. A process-local guard preserves the reader protocol without enabling writes.
+        Ok(DirectoryLock::from(Box::new(())))
+    }
+
+    fn watch(&self, _watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+        Err(TantivyError::SystemError(
+            "completed generation Tantivy directories do not support watching".to_owned(),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct AnchoredTantivyFile {
+    file: Arc<crate::state::secure_read::RegularFile>,
+}
+
+impl HasLen for AnchoredTantivyFile {
+    fn len(&self) -> usize {
+        usize::try_from(self.file.length()).unwrap_or(usize::MAX)
+    }
+}
+
+#[async_trait]
+impl FileHandle for AnchoredTantivyFile {
+    fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Tantivy requested an invalid anchored file range",
+            ));
+        }
+        let offset = u64::try_from(range.start)
+            .map_err(|_| io::Error::other("Tantivy file range offset exceeds u64"))?;
+        let length = u64::try_from(range.end - range.start)
+            .map_err(|_| io::Error::other("Tantivy file range length exceeds u64"))?;
+        if range.is_empty() {
+            return Ok(OwnedBytes::new(Vec::new()));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(range.end - range.start)
+            .map_err(|error| {
+                io::Error::other(format!("reserve anchored Tantivy range: {error}"))
+            })?;
+        bytes.resize(range.end - range.start, 0);
+        let mut reader = self.file.range(offset, length).map_err(|error| {
+            io::Error::other(format!("validate anchored Tantivy range: {error}"))
+        })?;
+        reader.read_exact(&mut bytes)?;
+        self.file.ensure_unchanged().map_err(|error| {
+            io::Error::other(format!("revalidate anchored Tantivy file: {error}"))
+        })?;
+        Ok(OwnedBytes::new(bytes))
+    }
+}
+
 /// A pair of immutable readers pinned to one completed generation directory.
 pub(crate) struct ProjectionReaders {
     search: SearchProjectionReader,
@@ -194,19 +430,31 @@ pub(crate) struct ProjectionReaders {
 }
 
 impl ProjectionReaders {
-    pub(crate) fn open(complete_generation_dir: &Path) -> Result<Self> {
+    pub(crate) fn open(
+        complete_generation_dir: &Path,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self> {
         ensure_directory_no_follow(complete_generation_dir)
             .context("validate completed projection generation directory")?;
 
         let search_directory = complete_generation_dir.join(SEARCH_ARTIFACT_DIRECTORY);
         let reference_directory = complete_generation_dir.join(REFERENCE_ARTIFACT_DIRECTORY);
-        ensure_artifact_tree_safe(&search_directory)
-            .context("validate completed search artifact tree")?;
-        ensure_artifact_tree_safe(&reference_directory)
-            .context("validate completed reference artifact tree")?;
+        let generation = SecureReadDirectory::open(complete_generation_dir)
+            .context("open completed projection generation directory without following links")?;
+        let opened_search = Arc::new(
+            generation
+                .open_directory(OsStr::new(SEARCH_ARTIFACT_DIRECTORY))
+                .context("open completed search artifact directory without following links")?,
+        );
+        let opened_references = Arc::new(
+            generation
+                .open_directory(OsStr::new(REFERENCE_ARTIFACT_DIRECTORY))
+                .context("open completed reference artifact directory without following links")?,
+        );
 
-        let search = SearchProjectionReader::open(&search_directory)?;
-        let references = ReferenceProjectionReader::open(&reference_directory)?;
+        let search = SearchProjectionReader::open(&search_directory, &opened_search, budget)?;
+        let references =
+            ReferenceProjectionReader::open(&reference_directory, &opened_references, budget)?;
         Ok(Self { search, references })
     }
 
@@ -222,20 +470,31 @@ impl ProjectionReaders {
 pub(crate) struct SearchProjectionReader {
     index: Index,
     reader: IndexReader,
-    #[cfg(test)]
-    fields: SearchProjectionFields,
-    path_catalog: PathBuf,
+    path_catalog: Arc<crate::state::secure_read::RegularFile>,
 }
 
 impl SearchProjectionReader {
-    fn open(directory: &Path) -> Result<Self> {
-        validate_schema_marker(directory, SEARCH_SCHEMA_CONTRACT, SEARCH_SCHEMA_VERSION)?;
-        let index = Index::open_in_dir(directory)
-            .with_context(|| format!("open search projection index at {}", directory.display()))?;
+    fn open(
+        directory: &Path,
+        opened_directory: &Arc<SecureReadDirectory>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self> {
+        validate_schema_marker(
+            directory,
+            opened_directory,
+            SEARCH_SCHEMA_CONTRACT,
+            SEARCH_SCHEMA_VERSION,
+            budget,
+        )?;
+        let index = Index::open(AnchoredTantivyDirectory::new(Arc::clone(opened_directory)))
+            .with_context(|| {
+                format!(
+                    "open search projection index through its anchored directory at {}",
+                    directory.display()
+                )
+            })?;
         let expected = search_schema();
         validate_schema(&index.schema(), &expected, SEARCH_SCHEMA_CONTRACT)?;
-        #[cfg(test)]
-        let fields = SearchProjectionFields::from_schema(&expected)?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -249,20 +508,25 @@ impl SearchProjectionReader {
                 .all(|segment| segment.num_docs() == segment.max_doc()),
             "immutable search projection contains deleted documents"
         );
-        let path_catalog = directory.join(PATH_CATALOG_FILE);
-        let (mut catalog, catalog_documents) = open_path_catalog(&path_catalog)?;
+        let (path_catalog, catalog_documents) = open_path_catalog(opened_directory, directory)?;
         ensure!(
             catalog_documents == searcher.num_docs(),
             "path catalog contains {catalog_documents} documents but the search projection has {}",
             searcher.num_docs()
         );
-        validate_path_catalog_entries(&mut catalog, catalog_documents)?;
+        let mut catalog_validation = path_catalog
+            .range(0, path_catalog.length())
+            .context("open anchored path catalog validation range")?;
+        let _ =
+            read_path_catalog_header(&mut catalog_validation, path_catalog.length(), directory)?;
+        validate_path_catalog_entries(&mut catalog_validation, catalog_documents)?;
+        path_catalog
+            .ensure_unchanged()
+            .context("revalidate anchored path catalog after validation")?;
         Ok(Self {
             index,
             reader,
-            #[cfg(test)]
-            fields,
-            path_catalog,
+            path_catalog: Arc::new(path_catalog),
         })
     }
 
@@ -272,11 +536,6 @@ impl SearchProjectionReader {
 
     pub(crate) const fn reader(&self) -> &IndexReader {
         &self.reader
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn fields(&self) -> &SearchProjectionFields {
-        &self.fields
     }
 
     /// Returns the live generation paths using only the persisted search projection.
@@ -294,7 +553,15 @@ impl SearchProjectionReader {
             "immutable search projection contains deleted documents"
         );
         let live_document_count = searcher.num_docs();
-        let (mut catalog, catalog_document_count) = open_path_catalog(&self.path_catalog)?;
+        let mut catalog = self
+            .path_catalog
+            .range(0, self.path_catalog.length())
+            .context("open anchored path catalog for stored paths")?;
+        let catalog_document_count = read_path_catalog_header(
+            &mut catalog,
+            self.path_catalog.length(),
+            Path::new(PATH_CATALOG_FILE),
+        )?;
         ensure!(
             catalog_document_count == live_document_count,
             "path catalog contains {catalog_document_count} documents but the search projection \
@@ -370,6 +637,9 @@ impl SearchProjectionReader {
                 == 0,
             "path catalog contains trailing bytes after {catalog_document_count} entries"
         );
+        self.path_catalog
+            .ensure_unchanged()
+            .context("revalidate anchored path catalog after stored path read")?;
         paths.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         paths.dedup();
         Ok(paths)
@@ -379,27 +649,52 @@ impl SearchProjectionReader {
 pub(crate) struct ReferenceProjectionReader {
     reader: IndexReader,
     fields: ReferenceProjectionFields,
+    payloads: ReferencePayloadReader,
 }
 
 impl ReferenceProjectionReader {
-    fn open(directory: &Path) -> Result<Self> {
+    fn open(
+        directory: &Path,
+        opened_directory: &Arc<SecureReadDirectory>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self> {
         validate_schema_marker(
             directory,
+            opened_directory,
             REFERENCE_SCHEMA_CONTRACT,
             REFERENCE_SCHEMA_VERSION,
+            budget,
         )?;
-        let index = Index::open_in_dir(directory).with_context(|| {
-            format!("open reference projection index at {}", directory.display())
-        })?;
+        let index = Index::open(AnchoredTantivyDirectory::new(Arc::clone(opened_directory)))
+            .with_context(|| {
+                format!(
+                    "open reference projection index through its anchored directory at {}",
+                    directory.display()
+                )
+            })?;
         let expected = reference_schema();
         validate_schema(&index.schema(), &expected, REFERENCE_SCHEMA_CONTRACT)?;
         let fields = ReferenceProjectionFields::from_schema(&expected)?;
+        let payload_path = directory.join(REFERENCE_PAYLOAD_FILE);
+        let payload = opened_directory
+            .open_regular(OsStr::new(REFERENCE_PAYLOAD_FILE))
+            .with_context(|| {
+                format!(
+                    "open reference payload sidecar without following links at {}",
+                    payload_path.display()
+                )
+            })?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
+            .doc_store_cache_num_blocks(0)
             .try_into()
             .context("open immutable reference projection reader")?;
-        Ok(Self { reader, fields })
+        Ok(Self {
+            reader,
+            fields,
+            payloads: ReferencePayloadReader::new(payload),
+        })
     }
 
     pub(crate) const fn reader(&self) -> &IndexReader {
@@ -408,6 +703,10 @@ impl ReferenceProjectionReader {
 
     pub(crate) const fn fields(&self) -> &ReferenceProjectionFields {
         &self.fields
+    }
+
+    pub(crate) const fn payloads(&self) -> &ReferencePayloadReader {
+        &self.payloads
     }
 }
 
@@ -454,66 +753,24 @@ impl SearchProjectionFields {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReferenceProjectionFields {
-    schema_version: Field,
     stable_id: Field,
-    source_path: Field,
-    source_kind: Field,
-    source_guid: Field,
-    source_object_json: Field,
-    source_file_id: Field,
-    source_class_id: Field,
     incoming_key: Field,
     outgoing_key: Field,
-    fact_json: Field,
+    payload_offset: Field,
+    payload_length: Field,
+    payload_digest: Field,
 }
 
 impl ReferenceProjectionFields {
     fn from_schema(schema: &Schema) -> Result<Self> {
         Ok(Self {
-            schema_version: schema.get_field("schema_version")?,
             stable_id: schema.get_field("stable_id")?,
-            source_path: schema.get_field("source_path")?,
-            source_kind: schema.get_field("source_kind")?,
-            source_guid: schema.get_field("source_guid")?,
-            source_object_json: schema.get_field("source_object_json")?,
-            source_file_id: schema.get_field("source_file_id")?,
-            source_class_id: schema.get_field("source_class_id")?,
             incoming_key: schema.get_field("incoming_key")?,
             outgoing_key: schema.get_field("outgoing_key")?,
-            fact_json: schema.get_field("fact_json")?,
+            payload_offset: schema.get_field("payload_offset")?,
+            payload_length: schema.get_field("payload_length")?,
+            payload_digest: schema.get_field("payload_digest")?,
         })
-    }
-
-    pub(crate) const fn schema_version(self) -> Field {
-        self.schema_version
-    }
-
-    pub(crate) const fn stable_id(self) -> Field {
-        self.stable_id
-    }
-
-    pub(crate) const fn source_path(self) -> Field {
-        self.source_path
-    }
-
-    pub(crate) const fn source_kind(self) -> Field {
-        self.source_kind
-    }
-
-    pub(crate) const fn source_guid(self) -> Field {
-        self.source_guid
-    }
-
-    pub(crate) const fn source_object_json(self) -> Field {
-        self.source_object_json
-    }
-
-    pub(crate) const fn source_file_id(self) -> Field {
-        self.source_file_id
-    }
-
-    pub(crate) const fn source_class_id(self) -> Field {
-        self.source_class_id
     }
 
     pub(crate) const fn incoming_key(self) -> Field {
@@ -522,10 +779,6 @@ impl ReferenceProjectionFields {
 
     pub(crate) const fn outgoing_key(self) -> Field {
         self.outgoing_key
-    }
-
-    pub(crate) const fn fact_json(self) -> Field {
-        self.fact_json
     }
 }
 
@@ -573,16 +826,23 @@ fn build_reference_index(
             options.reference_writer_memory_bytes,
         )
         .context("create bounded reference projection writer")?;
+    let mut payloads = ReferencePayloadWriter::create(directory).with_context(|| {
+        format!(
+            "create reference payload sidecar in {}",
+            directory.display()
+        )
+    })?;
 
     for projected in &projection.reference_documents {
-        let document =
-            reference_document(&fields, projected, options.max_reference_fact_json_bytes)
-                .with_context(|| {
-                    format!(
-                        "encode reference projection document `{}`",
-                        projected.stable_id
-                    )
-                })?;
+        let payload = payloads
+            .append(projected, options.max_reference_fact_json_bytes)
+            .with_context(|| {
+                format!(
+                    "encode reference payload for projection document `{}`",
+                    projected.stable_id
+                )
+            })?;
+        let document = reference_document(&fields, projected, payload);
         writer.add_document(document).with_context(|| {
             format!(
                 "add reference projection document `{}`",
@@ -596,6 +856,9 @@ fn build_reference_index(
     writer
         .wait_merging_threads()
         .context("finish reference projection index workers")?;
+    payloads
+        .finish()
+        .context("finish reference payload sidecar")?;
     write_schema_marker(
         directory,
         REFERENCE_SCHEMA_CONTRACT,
@@ -636,47 +899,23 @@ fn search_document(fields: &SearchProjectionFields, projected: &SearchDocument) 
 fn reference_document(
     fields: &ReferenceProjectionFields,
     projected: &ReferenceDocument,
-    max_fact_json_bytes: usize,
-) -> Result<TantivyDocument> {
-    let fact_json =
-        bounded_json_string(&projected.fact, max_fact_json_bytes, "reference fact JSON")?;
-    let source_object_json = projected
-        .source_object
-        .as_ref()
-        .map(|address| {
-            bounded_json_string(
-                address,
-                max_fact_json_bytes,
-                "reference source object address JSON",
-            )
-        })
-        .transpose()?;
-
+    payload: ReferencePayloadLocation,
+) -> TantivyDocument {
     let mut document = TantivyDocument::default();
-    document.add_u64(fields.schema_version, u64::from(REFERENCE_SCHEMA_VERSION));
     document.add_text(fields.stable_id, &projected.stable_id);
-    document.add_text(fields.source_path, &projected.source_path);
-    document.add_text(fields.source_kind, &projected.source_kind);
-    if let Some(source_guid) = &projected.source_guid {
-        document.add_text(fields.source_guid, source_guid);
-    }
-    if let Some(source_object_json) = source_object_json {
-        document.add_text(fields.source_object_json, source_object_json);
-    }
-    if let Some(source_file_id) = projected.source_file_id {
-        document.add_i64(fields.source_file_id, source_file_id);
-    }
-    if let Some(source_class_id) = projected.source_class_id {
-        document.add_i64(fields.source_class_id, i64::from(source_class_id));
-    }
     for key in &projected.incoming_keys {
         document.add_text(fields.incoming_key, key);
     }
     for key in &projected.outgoing_keys {
         document.add_text(fields.outgoing_key, key);
     }
-    document.add_text(fields.fact_json, fact_json);
-    Ok(document)
+    document.add_u64(fields.payload_offset, payload.offset());
+    document.add_u64(fields.payload_length, payload.length());
+    document.add_text(
+        fields.payload_digest,
+        hex::encode(payload.digest().as_bytes()),
+    );
+    document
 }
 
 fn search_schema() -> Schema {
@@ -701,17 +940,12 @@ fn search_schema() -> Schema {
 
 fn reference_schema() -> Schema {
     let mut builder = Schema::builder();
-    builder.add_u64_field("schema_version", INDEXED | STORED);
-    builder.add_text_field("stable_id", STRING | STORED | FAST);
-    builder.add_text_field("source_path", STRING | STORED);
-    builder.add_text_field("source_kind", STRING | STORED);
-    builder.add_text_field("source_guid", STRING | STORED);
-    builder.add_text_field("source_object_json", STORED);
-    builder.add_i64_field("source_file_id", INDEXED | STORED);
-    builder.add_i64_field("source_class_id", INDEXED | STORED);
-    builder.add_text_field("incoming_key", STRING | STORED);
-    builder.add_text_field("outgoing_key", STRING | STORED);
-    builder.add_text_field("fact_json", STORED);
+    builder.add_text_field("stable_id", STRING | FAST);
+    builder.add_text_field("incoming_key", STRING);
+    builder.add_text_field("outgoing_key", STRING);
+    builder.add_u64_field("payload_offset", FAST);
+    builder.add_u64_field("payload_length", FAST);
+    builder.add_text_field("payload_digest", STRING | FAST);
     builder.build()
 }
 
@@ -786,40 +1020,50 @@ fn write_path_catalog(directory: &Path, projection: &GenerationProjection) -> Re
         .with_context(|| format!("sync path catalog {}", path.display()))
 }
 
-fn open_path_catalog(path: &Path) -> Result<(File, u64)> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect path catalog {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        bail!("path catalog is a symlink: {}", path.display());
-    }
-    ensure!(
-        metadata.is_file(),
-        "path catalog is not a regular file: {}",
-        path.display()
-    );
+fn open_path_catalog(
+    directory: &SecureReadDirectory,
+    directory_path: &Path,
+) -> Result<(crate::state::secure_read::RegularFile, u64)> {
+    let path = directory_path.join(PATH_CATALOG_FILE);
+    let file = directory
+        .open_regular(OsStr::new(PATH_CATALOG_FILE))
+        .with_context(|| format!("open anchored path catalog {}", path.display()))?;
+    let file_length = file.length();
+    let mut reader = file
+        .range(0, file_length)
+        .with_context(|| format!("open anchored path catalog range {}", path.display()))?;
+    let document_count = read_path_catalog_header(&mut reader, file_length, &path)?;
+    file.ensure_unchanged()
+        .with_context(|| format!("revalidate anchored path catalog {}", path.display()))?;
+    Ok((file, document_count))
+}
 
+fn read_path_catalog_header(
+    reader: &mut impl Read,
+    file_length: u64,
+    display_path: &Path,
+) -> Result<u64> {
     let header_bytes = u64::try_from(PATH_CATALOG_MAGIC.len())
         .ok()
         .and_then(|length| length.checked_add(8))
         .ok_or_else(|| anyhow!("path catalog header length overflow"))?;
     ensure!(
-        metadata.len() >= header_bytes,
+        file_length >= header_bytes,
         "path catalog {} is {} bytes, shorter than its {header_bytes}-byte header",
-        path.display(),
-        metadata.len()
+        display_path.display(),
+        file_length
     );
 
-    let mut file =
-        File::open(path).with_context(|| format!("open path catalog {}", path.display()))?;
     let mut magic = [0_u8; PATH_CATALOG_MAGIC.len()];
-    file.read_exact(&mut magic)
-        .with_context(|| format!("read path catalog magic {}", path.display()))?;
+    reader
+        .read_exact(&mut magic)
+        .with_context(|| format!("read path catalog magic {}", display_path.display()))?;
     ensure!(
         magic.as_slice() == PATH_CATALOG_MAGIC,
         "path catalog {} has an unsupported magic/version",
-        path.display()
+        display_path.display()
     );
-    let document_count = read_u64(&mut file, "read path catalog document count")?;
+    let document_count = read_u64(reader, "read path catalog document count")?;
     let minimum_bytes = document_count
         .checked_mul(5)
         .and_then(|bytes| bytes.checked_add(header_bytes))
@@ -833,14 +1077,14 @@ fn open_path_catalog(path: &Path) -> Result<(File, u64)> {
         .and_then(|bytes| bytes.checked_add(header_bytes))
         .ok_or_else(|| anyhow!("maximum path catalog length overflow"))?;
     ensure!(
-        (minimum_bytes..=maximum_bytes).contains(&metadata.len()),
+        (minimum_bytes..=maximum_bytes).contains(&file_length),
         "path catalog {} is {} bytes; count {document_count} requires {}..={} bytes",
-        path.display(),
-        metadata.len(),
+        display_path.display(),
+        file_length,
         minimum_bytes,
         maximum_bytes
     );
-    Ok((file, document_count))
+    Ok(document_count)
 }
 
 fn read_u32(reader: &mut impl Read, context: &'static str) -> Result<u32> {
@@ -883,39 +1127,43 @@ fn validate_path_catalog_entries(reader: &mut impl Read, document_count: u64) ->
     Ok(())
 }
 
-fn validate_schema_marker(directory: &Path, contract: &str, version: u16) -> Result<()> {
+fn validate_schema_marker(
+    directory: &Path,
+    opened_directory: &SecureReadDirectory,
+    contract: &str,
+    version: u16,
+    budget: &mut AssetLoadBudget,
+) -> Result<()> {
     let path = directory.join(SCHEMA_MARKER_FILE);
-    let metadata = fs::symlink_metadata(&path)
-        .with_context(|| format!("inspect schema marker {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        bail!("schema marker is a symlink: {}", path.display());
-    }
+    let mut file = opened_directory
+        .open_regular(OsStr::new(SCHEMA_MARKER_FILE))
+        .with_context(|| format!("open schema marker {}", path.display()))?;
     ensure!(
-        metadata.is_file(),
-        "schema marker is not a regular file: {}",
-        path.display()
-    );
-    ensure!(
-        metadata.len() <= MAX_SCHEMA_MARKER_BYTES,
+        file.length() <= MAX_SCHEMA_MARKER_BYTES,
         "schema marker {} is {} bytes, exceeding the {}-byte limit",
         path.display(),
-        metadata.len(),
+        file.length(),
         MAX_SCHEMA_MARKER_BYTES
     );
 
-    let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
-    File::open(&path)
-        .with_context(|| format!("open schema marker {}", path.display()))?
-        .take(MAX_SCHEMA_MARKER_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read schema marker {}", path.display()))?;
-    ensure!(
-        bytes.len() <= MAX_SCHEMA_MARKER_BYTES as usize,
-        "schema marker grew beyond its byte limit while being read"
-    );
-    let actual: SchemaMarker = serde_json::from_slice(&bytes)
-        .with_context(|| format!("decode schema marker {}", path.display()))?;
+    let decoded: std::result::Result<SchemaMarker, _> =
+        read_contract_json(file.file_mut(), budget, SCHEMA_MARKER_JSON_LIMITS);
+    file.ensure_unchanged()
+        .with_context(|| format!("revalidate schema marker {}", path.display()))?;
+    let actual = decoded.with_context(|| format!("decode schema marker {}", path.display()))?;
     let expected = SchemaMarker::new(contract, version);
+    if contract == REFERENCE_SCHEMA_CONTRACT
+        && version == REFERENCE_SCHEMA_VERSION
+        && actual.generation_contract_version == SEARCH_GENERATION_CONTRACT_VERSION
+        && actual.schema_contract == contract
+        && matches!(actual.schema_version, 1 | 2)
+    {
+        return Err(RebuildableProjectionSchemaVersion {
+            actual: actual.schema_version,
+            expected: REFERENCE_SCHEMA_VERSION,
+        }
+        .into());
+    }
     ensure!(
         actual == expected,
         "schema marker for `{contract}` does not match version {version}"
@@ -964,26 +1212,6 @@ where
     builder
         .finalize()
         .context("finalize logical projection digest")
-}
-
-fn bounded_json_string<T>(value: &T, maximum: usize, resource: &str) -> Result<String>
-where
-    T: Serialize,
-{
-    let encoded_len = json_encoded_len(value)?;
-    let maximum_u64 = u64::try_from(maximum).unwrap_or(u64::MAX);
-    ensure!(
-        encoded_len <= maximum_u64,
-        "{resource} is {encoded_len} bytes, exceeding the configured {maximum}-byte limit"
-    );
-    let encoded_len = usize::try_from(encoded_len)
-        .map_err(|_| anyhow!("{resource} length exceeds the platform address space"))?;
-    let mut encoded = Vec::new();
-    encoded
-        .try_reserve_exact(encoded_len)
-        .map_err(|error| anyhow!("reserve {encoded_len} bytes for {resource}: {error}"))?;
-    serde_json::to_writer(&mut encoded, value).with_context(|| format!("serialize {resource}"))?;
-    String::from_utf8(encoded).map_err(|error| anyhow!("{resource} is not UTF-8: {error}"))
 }
 
 fn canonical_json_digest<T>(value: &T) -> Result<DigestV1>
@@ -1071,32 +1299,6 @@ fn prepare_empty_artifact_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_artifact_tree_safe(root: &Path) -> Result<()> {
-    ensure_directory_no_follow(root)?;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in read_directory_entries(&directory)? {
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .with_context(|| format!("inspect artifact entry {}", path.display()))?;
-            if file_type.is_symlink() {
-                bail!("artifact tree contains a symlink: {}", path.display());
-            }
-            if file_type.is_dir() {
-                pending.push(path);
-            } else {
-                ensure!(
-                    file_type.is_file(),
-                    "artifact tree contains an unsupported file type: {}",
-                    path.display()
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
 fn ensure_directory_no_follow(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect directory {}", path.display()))?;
@@ -1109,15 +1311,6 @@ fn ensure_directory_no_follow(path: &Path) -> Result<()> {
         path.display()
     );
     Ok(())
-}
-
-fn read_directory_entries(directory: &Path) -> Result<Vec<fs::DirEntry>> {
-    let mut entries = fs::read_dir(directory)
-        .with_context(|| format!("read directory {}", directory.display()))?
-        .collect::<io::Result<Vec<_>>>()
-        .with_context(|| format!("enumerate directory {}", directory.display()))?;
-    entries.sort_unstable_by_key(fs::DirEntry::file_name);
-    Ok(entries)
 }
 
 fn validate_writer_options(kind: &str, threads: usize, memory_bytes: usize) -> Result<()> {
@@ -1141,11 +1334,12 @@ fn validate_writer_options(kind: &str, threads: usize, memory_bytes: usize) -> R
 #[cfg(test)]
 mod tests {
     use std::io::{Seek, SeekFrom};
+    use std::path::PathBuf;
 
     use tantivy::Term;
     use tantivy::merge_policy::NoMergePolicy;
     use tempfile::tempdir;
-    use unity_asset_core::{AssetLoadLimits, AssetLoadUsage};
+    use unity_asset_core::{AssetLoadLimits, AssetLoadUsage, BudgetError, BudgetedJsonError};
 
     use super::*;
     use crate::projection::ProjectionMetrics;
@@ -1187,12 +1381,152 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn schema_marker_contract_accepts_exact_and_rejects_one_short_budget() {
+        let directory = tempdir().unwrap();
+        write_schema_marker(
+            directory.path(),
+            SEARCH_SCHEMA_CONTRACT,
+            SEARCH_SCHEMA_VERSION,
+        )
+        .unwrap();
+        let opened = SecureReadDirectory::open(directory.path()).unwrap();
+
+        let mut measured = AssetLoadBudget::default();
+        validate_schema_marker(
+            directory.path(),
+            &opened,
+            SEARCH_SCHEMA_CONTRACT,
+            SEARCH_SCHEMA_VERSION,
+            &mut measured,
+        )
+        .unwrap();
+        let usage = measured.usage();
+
+        let exact_limits = AssetLoadLimits {
+            max_entries: usage.entries,
+            max_bytes: usage.bytes,
+            max_depth: usage.max_observed_depth,
+            max_members: usage.members,
+            ..AssetLoadLimits::default()
+        };
+        let mut exact = AssetLoadBudget::new(exact_limits).unwrap();
+        validate_schema_marker(
+            directory.path(),
+            &opened,
+            SEARCH_SCHEMA_CONTRACT,
+            SEARCH_SCHEMA_VERSION,
+            &mut exact,
+        )
+        .unwrap();
+        assert_eq!(exact.usage(), usage);
+
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: usage.bytes.checked_sub(1).unwrap(),
+            ..exact_limits
+        })
+        .unwrap();
+        let error = validate_schema_marker(
+            directory.path(),
+            &opened,
+            SEARCH_SCHEMA_CONTRACT,
+            SEARCH_SCHEMA_VERSION,
+            &mut one_short,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<BudgetedJsonError>(),
+            Some(BudgetedJsonError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn only_older_reference_markers_are_rebuildable() {
+        for schema_version in [1, 2] {
+            let directory = tempdir().unwrap();
+            write_schema_marker(directory.path(), REFERENCE_SCHEMA_CONTRACT, schema_version)
+                .unwrap();
+            let opened = SecureReadDirectory::open(directory.path()).unwrap();
+            let error = validate_schema_marker(
+                directory.path(),
+                &opened,
+                REFERENCE_SCHEMA_CONTRACT,
+                REFERENCE_SCHEMA_VERSION,
+                &mut generous_load_budget(),
+            )
+            .unwrap_err();
+            assert!(is_rebuildable_projection_schema_version(&error));
+        }
+
+        let future = tempdir().unwrap();
+        write_schema_marker(
+            future.path(),
+            REFERENCE_SCHEMA_CONTRACT,
+            REFERENCE_SCHEMA_VERSION + 1,
+        )
+        .unwrap();
+        let opened = SecureReadDirectory::open(future.path()).unwrap();
+        let error = validate_schema_marker(
+            future.path(),
+            &opened,
+            REFERENCE_SCHEMA_CONTRACT,
+            REFERENCE_SCHEMA_VERSION,
+            &mut generous_load_budget(),
+        )
+        .unwrap_err();
+        assert!(!is_rebuildable_projection_schema_version(&error));
+
+        let wrong_projection = tempdir().unwrap();
+        write_schema_marker(
+            wrong_projection.path(),
+            REFERENCE_SCHEMA_CONTRACT,
+            REFERENCE_SCHEMA_VERSION - 1,
+        )
+        .unwrap();
+        let opened = SecureReadDirectory::open(wrong_projection.path()).unwrap();
+        let error = validate_schema_marker(
+            wrong_projection.path(),
+            &opened,
+            SEARCH_SCHEMA_CONTRACT,
+            SEARCH_SCHEMA_VERSION,
+            &mut generous_load_budget(),
+        )
+        .unwrap_err();
+        assert!(!is_rebuildable_projection_schema_version(&error));
+    }
+
+    #[test]
+    fn anchored_directory_reader_locks_do_not_enable_writes() {
+        let directory = tempdir().unwrap();
+        let anchored = AnchoredTantivyDirectory::new(Arc::new(
+            SecureReadDirectory::open(directory.path()).unwrap(),
+        ));
+        let lock_path = PathBuf::from("reader.lock");
+        let lock = Lock {
+            filepath: lock_path.clone(),
+            is_blocking: false,
+        };
+
+        let _guard = anchored.acquire_lock(&lock).unwrap();
+
+        assert!(!directory.path().join(&lock_path).exists());
+        assert!(anchored.open_write(Path::new("forbidden")).is_err());
+        assert!(!directory.path().join("forbidden").exists());
+    }
+
     fn validate_catalog_bytes(bytes: &[u8]) -> Result<()> {
         let directory = tempdir().unwrap();
         let path = directory.path().join(PATH_CATALOG_FILE);
         fs::write(&path, bytes).unwrap();
-        let (mut file, document_count) = open_path_catalog(&path)?;
-        validate_path_catalog_entries(&mut file, document_count)
+        let opened = SecureReadDirectory::open(directory.path())
+            .map_err(|error| anyhow!("open catalog test directory: {error}"))?;
+        let (file, document_count) = open_path_catalog(&opened, directory.path())?;
+        let mut range = file.range(0, file.length())?;
+        let _ = read_path_catalog_header(&mut range, file.length(), &path)?;
+        validate_path_catalog_entries(&mut range, document_count)
     }
 
     fn catalog_header(document_count: u64) -> Vec<u8> {
@@ -1212,7 +1546,8 @@ mod tests {
             projected_search_document("c", "Assets/Alpha.asset"),
         ];
         ProjectionStore::build(directory.path(), &projection).unwrap();
-        let readers = ProjectionReaders::open(directory.path()).unwrap();
+        let readers =
+            ProjectionReaders::open(directory.path(), &mut AssetLoadBudget::default()).unwrap();
         let mut budget = generous_load_budget();
 
         let paths = readers.search().stored_paths(&mut budget).unwrap();
@@ -1324,7 +1659,8 @@ mod tests {
         catalog.sync_all().unwrap();
         drop(catalog);
 
-        let error = match ProjectionReaders::open(directory.path()) {
+        let error = match ProjectionReaders::open(directory.path(), &mut AssetLoadBudget::default())
+        {
             Ok(_) => panic!("mismatched path catalog count must be rejected"),
             Err(error) => error,
         };
@@ -1337,7 +1673,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_paths_reject_deleted_segments_even_when_live_count_matches() {
+    fn projection_reader_rejects_deleted_segments_even_when_live_count_matches() {
         let directory = tempdir().unwrap();
         let mut projection = empty_projection();
         projection.search_documents = vec![
@@ -1345,33 +1681,35 @@ mod tests {
             projected_search_document("kept", "Assets/Kept.asset"),
         ];
         ProjectionStore::build(directory.path(), &projection).unwrap();
-        let readers = ProjectionReaders::open(directory.path()).unwrap();
-        let search = readers.search();
-        let mut writer = search
-            .index()
+        let search_directory = directory.path().join(SEARCH_ARTIFACT_DIRECTORY);
+        let index = Index::open_in_dir(search_directory).unwrap();
+        let fields = SearchProjectionFields::from_schema(&index.schema()).unwrap();
+        let mut writer = index
             .writer_with_num_threads::<TantivyDocument>(1, MIN_WRITER_MEMORY_PER_THREAD)
             .unwrap();
         writer.set_merge_policy(Box::new(NoMergePolicy));
-        writer.delete_term(Term::from_field_text(search.fields().id, "deleted"));
+        writer.delete_term(Term::from_field_text(fields.id, "deleted"));
         writer
             .add_document(search_document(
-                search.fields(),
+                &fields,
                 &projected_search_document("replacement", "Assets/Replacement.asset"),
             ))
             .unwrap();
         writer.commit().unwrap();
         drop(writer);
-        search.reader().reload().unwrap();
-        let mut budget = generous_load_budget();
+        drop(index);
 
-        let error = search.stored_paths(&mut budget).unwrap_err();
+        let error = match ProjectionReaders::open(directory.path(), &mut AssetLoadBudget::default())
+        {
+            Ok(_) => panic!("deleted search segments must be rejected before publication"),
+            Err(error) => error,
+        };
 
         assert!(
             error
                 .to_string()
                 .contains("immutable search projection contains deleted documents")
         );
-        assert_eq!(budget.usage(), AssetLoadUsage::default());
     }
 
     #[test]
@@ -1380,7 +1718,8 @@ mod tests {
         let mut projection = empty_projection();
         projection.search_documents = vec![projected_search_document("only", "Assets/Only.asset")];
         ProjectionStore::build(directory.path(), &projection).unwrap();
-        let readers = ProjectionReaders::open(directory.path()).unwrap();
+        let readers =
+            ProjectionReaders::open(directory.path(), &mut AssetLoadBudget::default()).unwrap();
         let mut budget = AssetLoadBudget::new(AssetLoadLimits {
             max_entries: 1,
             max_bytes: u64::try_from(size_of::<String>() - 1).unwrap(),
@@ -1400,12 +1739,11 @@ mod tests {
     }
 
     #[test]
-    fn stored_paths_reject_overlong_catalog_entry_before_path_allocation() {
+    fn projection_reader_rejects_overlong_catalog_entry_before_publication() {
         let directory = tempdir().unwrap();
         let mut projection = empty_projection();
         projection.search_documents = vec![projected_search_document("only", "Assets/Only.asset")];
         ProjectionStore::build(directory.path(), &projection).unwrap();
-        let readers = ProjectionReaders::open(directory.path()).unwrap();
         let catalog_path = directory
             .path()
             .join(SEARCH_ARTIFACT_DIRECTORY)
@@ -1422,17 +1760,14 @@ mod tests {
             .unwrap();
         catalog.sync_all().unwrap();
         drop(catalog);
-        let mut budget = generous_load_budget();
 
-        let error = readers.search().stored_paths(&mut budget).unwrap_err();
+        let error = match ProjectionReaders::open(directory.path(), &mut AssetLoadBudget::default())
+        {
+            Ok(_) => panic!("overlong path catalog entries must be rejected before publication"),
+            Err(error) => error,
+        };
 
         assert!(error.to_string().contains("expected 1..=65536"));
-        assert_eq!(budget.usage().entries, 1);
-        assert_eq!(budget.usage().members, 1);
-        assert_eq!(
-            budget.usage().bytes,
-            u64::try_from(size_of::<String>()).unwrap()
-        );
     }
 
     #[test]
@@ -1479,9 +1814,24 @@ mod tests {
         assert!(evidence.search_artifact().files() > 0);
         assert!(evidence.reference_artifact().files() > 0);
 
-        let readers = ProjectionReaders::open(directory.path()).unwrap();
+        let readers =
+            ProjectionReaders::open(directory.path(), &mut AssetLoadBudget::default()).unwrap();
         assert_eq!(readers.search().reader().searcher().num_docs(), 0);
         assert_eq!(readers.references().reader().searcher().num_docs(), 0);
+    }
+
+    #[test]
+    fn reference_payload_sidecar_is_part_of_artifact_evidence() {
+        let directory = tempdir().unwrap();
+        let evidence = ProjectionStore::build(directory.path(), &empty_projection()).unwrap();
+        let reference_directory = directory.path().join(REFERENCE_ARTIFACT_DIRECTORY);
+        let payload = reference_directory.join(REFERENCE_PAYLOAD_FILE);
+
+        assert!(payload.is_file());
+        fs::write(&payload, b"tampered").unwrap();
+        let tampered = measure_artifact_tree(&reference_directory).unwrap();
+
+        assert_ne!(tampered, evidence.reference_artifact());
     }
 
     #[test]
@@ -1511,19 +1861,6 @@ mod tests {
         let error = ProjectionStore::build(directory.path(), &projection).unwrap_err();
 
         assert!(error.to_string().contains("strictly ordered and unique"));
-    }
-
-    #[test]
-    fn bounded_json_is_measured_before_materialization() {
-        let value = "x".repeat(128);
-
-        let error = bounded_json_string(&value, 64, "test JSON").unwrap_err();
-
-        assert!(error.to_string().contains("exceeding the configured"));
-        assert_eq!(
-            bounded_json_string(&"ok", 4, "test JSON").unwrap(),
-            "\"ok\""
-        );
     }
 
     #[test]

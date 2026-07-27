@@ -19,6 +19,10 @@ use unity_asset_decode::unity_version::UnityVersion;
 
 const SAMPLES_DIR: &str = "tests/samples";
 
+fn test_version() -> UnityVersion {
+    UnityVersion::parse_version("2020.3.12f1").unwrap()
+}
+
 /// Test texture format detection compatibility with UnityPy
 ///
 /// UnityPy equivalent:
@@ -126,7 +130,7 @@ fn test_texture_decoding_unitypy_compat() {
     ];
 
     // Test decoding (should work like UnityPy's data.image)
-    let converter = Texture2DConverter::new(UnityVersion::default());
+    let converter = Texture2DConverter::new();
     match converter.decode_to_image(&texture) {
         Ok(image) => {
             assert_eq!(image.width(), 2);
@@ -154,7 +158,7 @@ fn test_texture_decoding_unitypy_compat() {
     texture.width = 1;
     texture.height = 1;
 
-    let converter = Texture2DConverter::new(UnityVersion::default());
+    let converter = Texture2DConverter::new();
     match converter.decode_to_image(&texture) {
         Ok(image) => {
             assert_eq!(image.width(), 1);
@@ -206,7 +210,7 @@ fn test_texture_export_unitypy_compat() {
     std::fs::create_dir_all("target").ok();
 
     // Use converter to decode and save as PNG
-    let converter = Texture2DConverter::new(UnityVersion::default());
+    let converter = Texture2DConverter::new();
     match converter.decode_to_image(&texture) {
         Ok(image) => {
             match image.save(png_path) {
@@ -233,7 +237,7 @@ fn test_texture_export_unitypy_compat() {
     let jpeg_path = "target/test_export.jpg";
 
     // Use converter to decode and save as JPEG
-    let converter = Texture2DConverter::new(UnityVersion::default());
+    let converter = Texture2DConverter::new();
     match converter.decode_to_image(&texture) {
         Ok(image) => {
             // Convert to RGB for JPEG (no alpha channel)
@@ -257,59 +261,6 @@ fn test_texture_export_unitypy_compat() {
             panic!("JPEG export failed: {}", e);
         }
     }
-}
-
-/// Test texture processor version compatibility
-#[test]
-fn test_texture_processor_version_compat() {
-    println!("Testing texture processor version compatibility...");
-
-    let test_versions = vec![
-        ("5.0.0f1", vec![TextureFormat::RGBA32, TextureFormat::RGB24]),
-        (
-            "5.3.0f1",
-            vec![
-                TextureFormat::DXT1,
-                TextureFormat::DXT5,
-                TextureFormat::ETC_RGB4,
-            ],
-        ),
-        (
-            "2017.1.0f1",
-            vec![TextureFormat::ETC2_RGB, TextureFormat::ETC2_RGBA8],
-        ),
-        (
-            "2018.1.0f1",
-            vec![TextureFormat::ASTC_RGBA_4x4, TextureFormat::BC7],
-        ),
-    ];
-
-    for (version_str, expected_formats) in test_versions {
-        let version = UnityVersion::parse_version(version_str).unwrap();
-        let _converter = Texture2DConverter::new(version);
-
-        // Test format support by checking if format info indicates support
-        let mut supported_count = 0;
-        for expected_format in expected_formats {
-            let format_info = expected_format.info();
-            if format_info.supported {
-                supported_count += 1;
-                println!(
-                    "    ✓ Format {:?} is supported ({})",
-                    expected_format, format_info.name
-                );
-            } else {
-                println!("    ! Format {:?} is not yet supported", expected_format);
-            }
-        }
-
-        println!(
-            "  Version {}: {} formats checked",
-            version_str, supported_count
-        );
-    }
-
-    println!("  ✓ Texture processor version compatibility working");
 }
 
 /// Test texture information extraction (like UnityPy's texture properties)
@@ -371,7 +322,7 @@ fn test_texture_error_handling_unitypy_compat() {
     texture.height = 0;
     texture.format = TextureFormat::RGBA32;
 
-    let converter = Texture2DConverter::new(UnityVersion::default());
+    let converter = Texture2DConverter::new();
     match converter.decode_to_image(&texture) {
         Err(_) => println!("  ✓ Invalid dimensions properly rejected"),
         Ok(_) => panic!("Should reject invalid dimensions"),
@@ -424,7 +375,7 @@ fn test_advanced_texture_decoding() {
     );
 
     // Try to decode the texture
-    let converter = Texture2DConverter::new(UnityVersion::default());
+    let converter = Texture2DConverter::new();
     match converter.decode_to_image(&texture) {
         Ok(image) => {
             println!(
@@ -454,7 +405,7 @@ fn test_advanced_texture_decoding() {
         texture.image_data.len()
     );
 
-    let converter = Texture2DConverter::new(UnityVersion::default());
+    let converter = Texture2DConverter::new();
     match converter.decode_to_image(&texture) {
         Ok(image) => {
             println!(
@@ -480,7 +431,7 @@ fn test_advanced_texture_decoding() {
         texture.image_data.len()
     );
 
-    let converter = Texture2DConverter::new(UnityVersion::default());
+    let converter = Texture2DConverter::new();
     match converter.decode_to_image(&texture) {
         Ok(image) => {
             println!(
@@ -552,7 +503,7 @@ fn test_sprite_image_extraction() {
     );
 
     // Extract sprite image using processor
-    let sprite_processor = SpriteProcessor::new(UnityVersion::default());
+    let sprite_processor = SpriteProcessor::new(test_version());
     match sprite_processor.extract_sprite_image(&sprite, &texture) {
         Ok(sprite_image_data) => {
             println!(
@@ -598,7 +549,7 @@ fn test_sprite_image_extraction() {
     std::fs::create_dir_all("target").ok();
 
     // Use sprite processor to extract and save PNG
-    let sprite_processor = SpriteProcessor::new(UnityVersion::default());
+    let sprite_processor = SpriteProcessor::new(test_version());
     match sprite_processor.extract_sprite_image(&sprite, &texture) {
         Ok(png_data) => {
             match std::fs::write(png_path, &png_data) {

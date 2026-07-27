@@ -25,11 +25,10 @@ exclude = [
 unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
 
 # Workspace dependencies
-serde = { workspace = true }
-serde_yaml = { workspace = true }
 yaml-rust2 = { workspace = true }
 indexmap = { workspace = true }
 thiserror = { workspace = true }
+same-file.workspace = true
 
 # Async support (optional)
 tokio = { workspace = true, optional = true }
@@ -37,8 +36,7 @@ async-trait = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 
 [dev-dependencies]
-anyhow = { workspace = true }
-tokio-test = "0.4"
+tempfile.workspace = true
 
 [features]
 default = []

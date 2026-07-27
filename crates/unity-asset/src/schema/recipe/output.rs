@@ -2,7 +2,7 @@ use std::mem::size_of;
 
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, FieldPath, FieldPathSegment, ObjectAddress, SourceLocator,
-    WorkspaceRevision,
+    WorkspaceId, WorkspaceRevision,
 };
 
 use crate::workspace::{GenericMutation, MutationPlanFragment, PlanPayload, SourceExpectation};
@@ -171,13 +171,18 @@ impl<'budget> RecipeOutputBuilder<'budget> {
 
     pub(crate) fn fragment(
         &mut self,
+        workspace_id: WorkspaceId,
         revision: WorkspaceRevision,
         sources: Vec<SourceExpectation>,
         payloads: Vec<PlanPayload>,
         actions: Vec<GenericMutation>,
     ) -> Result<MutationPlanFragment, RecipeError> {
         Ok(MutationPlanFragment::from_recipe(
-            revision, sources, payloads, actions,
+            workspace_id,
+            revision,
+            sources,
+            payloads,
+            actions,
         )?)
     }
 

@@ -10,12 +10,10 @@ use tokio::sync::mpsc;
 
 use unity_asset_search_daemon::app::router as daemon_router;
 use unity_asset_search_daemon::coordinator::{
-    ReindexCoordinator, ReindexCoordinatorConfig, ReindexSource,
+    FilesystemReindexIntent, ReindexCoordinator, ReindexCoordinatorConfig, ReindexSource,
 };
 use unity_asset_search_daemon::security::{TokenStore, validate_listen_addr};
-use unity_asset_search_index::{
-    AssetLoadBudget, IndexPaths, ReindexIntent, SearchIndex, SearchIndexOptions,
-};
+use unity_asset_search_index::{AssetLoadBudget, IndexPaths, SearchIndex, SearchIndexOptions};
 
 const WATCH_CHANNEL_CAPACITY: usize = 1_024;
 
@@ -143,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
 
     if !args.no_auto_reindex {
         coordinator
-            .admit(ReindexSource::Startup, ReindexIntent::reconcile())
+            .admit(ReindexSource::Startup, FilesystemReindexIntent::reconcile())
             .await?;
     }
 
@@ -282,7 +280,10 @@ async fn watch_and_reindex(
         match signal {
             WatchSignal::Changed(paths) => {
                 if let Err(error) = coordinator
-                    .admit(ReindexSource::Watcher, ReindexIntent::changed_paths(paths))
+                    .admit(
+                        ReindexSource::Watcher,
+                        FilesystemReindexIntent::changed_paths(paths),
+                    )
                     .await
                 {
                     eprintln!("watcher reindex admission failed: {error}");
@@ -290,7 +291,7 @@ async fn watch_and_reindex(
             }
             WatchSignal::Full => {
                 if let Err(error) = coordinator
-                    .admit(ReindexSource::Watcher, ReindexIntent::full())
+                    .admit(ReindexSource::Watcher, FilesystemReindexIntent::full())
                     .await
                 {
                     eprintln!("watcher full reindex admission failed: {error}");
@@ -339,7 +340,7 @@ async fn reconcile_loop(coordinator: ReindexCoordinator, interval: Duration) {
     loop {
         tokio::time::sleep(interval).await;
         if let Err(error) = coordinator
-            .admit(ReindexSource::Timer, ReindexIntent::reconcile())
+            .admit(ReindexSource::Timer, FilesystemReindexIntent::reconcile())
             .await
         {
             eprintln!("timer reindex admission failed: {error}");

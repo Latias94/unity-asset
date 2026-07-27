@@ -9,19 +9,26 @@ use crate::typetree::{TypeTree, TypeTreeNode};
 use crate::{error::BinaryError, error::Result};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::io::Read;
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::sync::atomic::AtomicUsize;
-use unity_asset_core::{AssetLoadBudget, BudgetError};
+use unity_asset_core::{AssetLoadBudget, BudgetError, DigestV1};
 
 pub trait TypeTreeRegistry: Send + Sync + std::fmt::Debug {
     fn resolve(&self, unity_version: &str, class_id: i32) -> Option<Arc<TypeTree>>;
+
+    /// Returns a stable digest when this registry can participate in revision identity.
+    ///
+    /// Mutable or callback-backed registries should keep the default `None`. Revisioned
+    /// workspaces freeze every lookup they retain into an immutable registry that supplies a
+    /// digest, so a snapshot never depends on unidentifiable external state.
+    fn semantic_digest(&self) -> Option<DigestV1> {
+        None
+    }
 
     /// Resolve a script type tree (e.g. MonoBehaviour) using the script's 16-byte ID.
     ///
@@ -35,83 +42,6 @@ pub trait TypeTreeRegistry: Send + Sync + std::fmt::Debug {
         _script_id: [u8; 16],
     ) -> Option<Arc<TypeTree>> {
         None
-    }
-}
-
-/// A generator hook for script-specific TypeTrees (UnityPy `typetree_generator` equivalent).
-///
-/// Unity's `SerializedType` entries for `MonoBehaviour` can carry a `script_id` (16-byte Hash128),
-/// and UnityPy uses `TypeTreeGeneratorAPI` to generate TypeTrees for those scripts on demand.
-///
-/// This trait allows injecting an equivalent generator. A generator can be backed by:
-/// - a precomputed mapping table (e.g. `script_id -> TypeTree`),
-/// - a local binding to an external generator (IL2CPP/managed), etc.
-pub trait ScriptTypeTreeGenerator: Send + Sync + std::fmt::Debug {
-    fn generate(&self, unity_version: &str, class_id: i32, script_id: [u8; 16])
-    -> Option<TypeTree>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ScriptCacheKey {
-    unity_version: String,
-    class_id: i32,
-    script_id: [u8; 16],
-}
-
-/// A `TypeTreeRegistry` adapter that calls a script TypeTree generator on demand and caches results.
-#[derive(Debug)]
-pub struct ScriptTypeTreeGeneratorRegistry {
-    generator: Arc<dyn ScriptTypeTreeGenerator>,
-    cache: RwLock<HashMap<ScriptCacheKey, Arc<TypeTree>>>,
-}
-
-impl ScriptTypeTreeGeneratorRegistry {
-    pub fn new(generator: Arc<dyn ScriptTypeTreeGenerator>) -> Self {
-        Self {
-            generator,
-            cache: RwLock::new(HashMap::new()),
-        }
-    }
-}
-
-impl TypeTreeRegistry for ScriptTypeTreeGeneratorRegistry {
-    fn resolve(&self, _unity_version: &str, _class_id: i32) -> Option<Arc<TypeTree>> {
-        None
-    }
-
-    fn resolve_script(
-        &self,
-        unity_version: &str,
-        class_id: i32,
-        script_id: [u8; 16],
-    ) -> Option<Arc<TypeTree>> {
-        let key = ScriptCacheKey {
-            unity_version: unity_version.to_string(),
-            class_id,
-            script_id,
-        };
-
-        if let Ok(cache) = self.cache.read()
-            && let Some(hit) = cache.get(&key)
-        {
-            return Some(hit.clone());
-        }
-
-        let generated = self
-            .generator
-            .generate(unity_version, class_id, script_id)?;
-        let arc = Arc::new(generated);
-
-        match self.cache.write() {
-            Ok(mut cache) => {
-                cache.insert(key, arc.clone());
-            }
-            Err(e) => {
-                e.into_inner().insert(key, arc.clone());
-            }
-        }
-
-        Some(arc)
     }
 }
 
@@ -642,6 +572,12 @@ pub struct JsonTypeTreeRegistry {
 }
 
 const MAX_JSON_TYPE_TREE_DEPTH: u32 = 59;
+/// Maximum encoded size accepted by the external JSON TypeTree registry contract.
+///
+/// TPK registries remain the compact format for larger catalogs. Keeping a contract-level cap
+/// here prevents a permissive caller budget from turning an untrusted JSON file into a GiB-scale
+/// retained input and parser workload.
+pub const MAX_JSON_TYPE_TREE_REGISTRY_BYTES: usize = 128 * 1024 * 1024;
 const JSON_PARSER_WORK_MULTIPLIER: u64 = 6;
 const JSON_ERROR_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 
@@ -700,18 +636,8 @@ impl JsonTypeTreeRegistry {
                 .map_err(|_| BudgetError::ArithmeticOverflow { resource: "bytes" })?,
         )?;
 
-        let mut encoded = BudgetedVec::default();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            // Reserve Serde's input-proportional scratch before retaining the corresponding input.
-            budget.consume_bytes(json_parser_chunk_work_bytes(read)?)?;
-            encoded.reserve_budgeted(read, budget, "registry JSON input")?;
-            encoded.values.extend_from_slice(&buffer[..read]);
-        }
+        let encoded =
+            read_registry_json_input(&mut reader, budget, MAX_JSON_TYPE_TREE_REGISTRY_BYTES)?;
 
         let mut context = JsonLoadContext {
             budget,
@@ -753,6 +679,40 @@ impl JsonTypeTreeRegistry {
         let mut file = std::fs::File::open(path.as_ref())?;
         Self::from_reader(&mut file, budget)
     }
+}
+
+fn read_registry_json_input(
+    reader: &mut impl Read,
+    budget: &mut AssetLoadBudget,
+    max_encoded_bytes: usize,
+) -> Result<BudgetedVec<u8>> {
+    debug_assert!(max_encoded_bytes > 0);
+    let mut encoded = BudgetedVec::default();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let requested =
+            encoded
+                .values
+                .len()
+                .checked_add(read)
+                .ok_or(BudgetError::ArithmeticOverflow {
+                    resource: "registry JSON input",
+                })?;
+        if requested > max_encoded_bytes {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "TypeTree registry JSON input requested {requested} bytes, limit {max_encoded_bytes}"
+            )));
+        }
+        // Reserve Serde's input-proportional scratch before retaining the corresponding input.
+        budget.consume_bytes(json_parser_chunk_work_bytes(read)?)?;
+        encoded.reserve_budgeted(read, budget, "registry JSON input")?;
+        encoded.values.extend_from_slice(&buffer[..read]);
+    }
+    Ok(encoded)
 }
 
 fn reserve_exact_budgeted_vec<T>(
@@ -1798,7 +1758,6 @@ fn hex_nibble(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const DEEP_REGISTRY_JSON: &str = r#"{
         "schema": 1,
@@ -2193,38 +2152,6 @@ mod tests {
     }
 
     #[test]
-    fn script_generator_registry_caches_results() {
-        #[derive(Debug)]
-        struct Generator {
-            calls: AtomicUsize,
-        }
-
-        impl ScriptTypeTreeGenerator for Generator {
-            fn generate(
-                &self,
-                _unity_version: &str,
-                _class_id: i32,
-                _script_id: [u8; 16],
-            ) -> Option<TypeTree> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                Some(dummy_tree(42))
-            }
-        }
-
-        let generator = Arc::new(Generator {
-            calls: AtomicUsize::new(0),
-        });
-        let reg = ScriptTypeTreeGeneratorRegistry::new(generator.clone());
-
-        let script_id = [0x02u8; 16];
-        let t1 = reg.resolve_script("2020.3.48f1", 114, script_id).unwrap();
-        let t2 = reg.resolve_script("2020.3.48f1", 114, script_id).unwrap();
-        assert_eq!(t1.version, 42);
-        assert_eq!(t2.version, 42);
-        assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
     fn budgeted_vec_grows_geometrically_and_preflights_capacity() {
         use unity_asset_core::{AssetLoadBudget, AssetLoadLimits, BudgetError};
 
@@ -2295,6 +2222,30 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn json_registry_input_hard_cap_is_checked_before_retention_and_parser_work() {
+        let mut exact_budget = AssetLoadBudget::default();
+        let exact =
+            read_registry_json_input(&mut FragmentedReader::new(b"1234", 1), &mut exact_budget, 4)
+                .unwrap();
+        assert_eq!(exact.as_slice(), b"1234");
+
+        let mut over_budget = AssetLoadBudget::default();
+        let error =
+            read_registry_json_input(&mut FragmentedReader::new(b"12345", 1), &mut over_budget, 4)
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            BinaryError::ResourceLimitExceeded(message)
+                if message.contains("requested 5 bytes, limit 4")
+        ));
+        assert_eq!(
+            over_budget.usage(),
+            exact_budget.usage(),
+            "the rejected byte must not consume parser or retained-input budget"
+        );
     }
 
     #[test]

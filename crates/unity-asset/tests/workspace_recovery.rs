@@ -34,6 +34,7 @@ fn mutation_plan_with_values(
         semantic_value_digest(&before, &mut budget).unwrap(),
     );
     MutationPlan::new(
+        workspace.workspace_id(),
         workspace.revision(),
         vec![SourceExpectation::new(
             SourceLocator::path(SOURCE_ALIAS).unwrap(),

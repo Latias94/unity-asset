@@ -6,9 +6,10 @@
 //! If no path is provided, a small repo fixture is used.
 
 use std::path::PathBuf;
-use unity_asset::{UnityDocument, YamlDocument};
+use unity_asset::{AssetLoadBudget, UnityDocument};
+use unity_asset_yaml::load_budgeted_yaml_path;
 
-fn main() -> unity_asset::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
@@ -16,25 +17,21 @@ fn main() -> unity_asset::Result<()> {
             PathBuf::from("unity-asset-yaml/tests/fixtures/MinimalGameObjectTransform.prefab")
         });
 
-    let (doc, warnings) = YamlDocument::load_yaml_with_warnings(&path, false)?;
+    let mut budget = AssetLoadBudget::default();
+    let source = load_budgeted_yaml_path(&path, &mut budget)?;
+    let doc = source.document();
     println!("loaded: {}", path.display());
     println!("documents: 1");
     println!("objects: {}", doc.entries().len());
-
-    if warnings.is_empty() {
-        println!("warnings: 0");
-    } else {
-        println!("warnings: {}", warnings.len());
-        for w in warnings {
-            println!("  - doc_index={}: {}", w.doc_index, w.error);
-        }
-    }
+    println!("budgeted bytes: {}", budget.usage().bytes);
 
     for obj in doc.entries().iter().take(5) {
         let name = obj.get("m_Name").and_then(|v| v.as_str()).unwrap_or("");
         println!(
             "object: class={} anchor=&{} name={}",
-            obj.class_name, obj.anchor, name
+            obj.class_name(),
+            obj.anchor(),
+            name
         );
     }
 

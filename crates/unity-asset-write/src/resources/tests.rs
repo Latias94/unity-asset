@@ -8,7 +8,7 @@ use unity_asset_core::{
 use super::*;
 use crate::artifact::{
     ArtifactBatchDeclaration, ArtifactBudget, ArtifactBudgetError, ArtifactBudgetUsage,
-    ArtifactBuildError, ArtifactLimits, ArtifactPayload, ArtifactPayloadError, LogicalArtifactName,
+    ArtifactBuildError, ArtifactLimits, ArtifactPayload, LogicalArtifactName,
     PreparedArtifactFormat,
 };
 
@@ -481,13 +481,11 @@ fn generated_chunk_budget_failure_rolls_back_the_complete_resource_transaction()
             StreamedResourceError::Artifact(error)
                 if matches!(
                     *error,
-                    ArtifactBuildError::Payload(ArtifactPayloadError::Budget(
-                        ArtifactBudgetError::Exceeded {
+                    ArtifactBuildError::Budget(ArtifactBudgetError::Exceeded {
                             resource: "generated_chunk_bytes",
                             requested: 5,
                             limit: 4,
-                        }
-                    ))
+                        })
                 )
         ));
         assert!(matches!(

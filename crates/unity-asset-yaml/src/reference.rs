@@ -601,22 +601,22 @@ fn selector_ref(
         return Ok(SelectorRef::Ordinal(document_index));
     }
 
-    YamlAnchor::validate(&class.anchor).map_err(|source| {
+    YamlAnchor::validate(class.anchor()).map_err(|source| {
         YamlReferenceScanError::InvalidDocumentSelector {
             document_index,
             source,
         }
     })?;
     Ok(SelectorRef::Anchored {
-        anchor: &class.anchor,
+        anchor: class.anchor(),
         document_index,
     })
 }
 
 fn is_synthetic_document_anchor(class: &UnityClass, document_index: usize) -> bool {
-    class.class_id == 0
+    class.class_id() == 0
         && class
-            .anchor
+            .anchor()
             .strip_prefix("doc_")
             .and_then(|ordinal| ordinal.parse::<usize>().ok())
             == Some(document_index)

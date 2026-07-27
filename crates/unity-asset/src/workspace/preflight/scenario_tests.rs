@@ -180,6 +180,7 @@ fn replacement(expected: &str, replacement: &str) -> GenericMutation {
 
 fn plan(workspace: &AssetWorkspace, actions: Vec<GenericMutation>) -> MutationPlan {
     MutationPlan::new(
+        workspace.workspace_id(),
         workspace.revision(),
         vec![SourceExpectation::new(
             SourceLocator::path(TARGET_ALIAS).unwrap(),
@@ -233,6 +234,7 @@ fn resource_plan(
     let guard = observed_field_guard(workspace, &target, &path);
     let payload = PlanPayload::new(payload_bytes.to_vec());
     MutationPlan::new(
+        workspace.workspace_id(),
         workspace.revision(),
         vec![SourceExpectation::new(
             locator,

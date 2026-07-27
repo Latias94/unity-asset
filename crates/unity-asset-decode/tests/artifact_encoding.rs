@@ -9,6 +9,7 @@ use unity_asset_decode::audio::{
 };
 use unity_asset_decode::sprite::{Sprite, SpriteProcessor};
 use unity_asset_decode::texture::{Texture2D, TextureDecoder, TextureExporter, TextureFormat};
+use unity_asset_decode::unity_version::UnityVersion;
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const SHORT_VORBIS: &[u8] = include_bytes!("fixtures/short_vorbis.fsb");
@@ -211,7 +212,8 @@ fn sprite_vec_export_delegates_to_png_writer() -> Result<(), Box<dyn std::error:
         rect_height: 1.0,
         ..Default::default()
     };
-    let processor = SpriteProcessor::default();
+    let version = UnityVersion::parse_version("2020.3.12f1")?;
+    let processor = SpriteProcessor::new(version);
 
     let png_bytes = processor.extract_sprite_image(&sprite, &texture)?;
     let mut png_sink = Cursor::new(Vec::new());

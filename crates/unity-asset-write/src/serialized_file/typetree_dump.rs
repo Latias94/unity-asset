@@ -240,10 +240,7 @@ mod tests {
         let mut writer = BinaryWriter::new(Endian::Big);
         tree.version = 2;
         let endian = writer.endian();
-        let mut sink = EndianSink::new(
-            crate::serialized_file::sink::BinaryWriterSink::new(&mut writer),
-            endian,
-        );
+        let mut sink = EndianSink::new(&mut writer, endian);
         dump_typetree_to(&tree, &mut sink, SerializedFileFormat::new(2).unwrap()).unwrap();
         let out = writer.into_result().unwrap();
 

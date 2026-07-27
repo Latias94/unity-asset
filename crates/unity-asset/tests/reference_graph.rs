@@ -26,6 +26,9 @@ use unity_asset_write::serialized_file::{
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+#[path = "support/source_replacement.rs"]
+mod source_replacement;
+
 const V22_BINARY: &[u8] =
     include_bytes!("../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin");
 
@@ -267,6 +270,22 @@ fn load_incremental_parity_sources(
 }
 
 fn load_with_alias(workspace: &mut AssetWorkspace, path: &Path, alias: &str) -> SourceId {
+    let canonical_path = fs::canonicalize(path).unwrap();
+    let existing = workspace
+        .snapshot()
+        .sources(&mut AssetLoadBudget::default())
+        .unwrap()
+        .into_iter()
+        .find(|source| {
+            source.parent().is_none()
+                && (source.locator().root_alias().as_str() == alias
+                    || source.physical_origin() == Some(canonical_path.as_path()))
+        })
+        .map(|source| source.id());
+    if let Some(existing) = existing {
+        return source_replacement::replace_source_path(workspace, existing, path, alias);
+    }
+
     workspace
         .load_source(
             SourceOpenRequest::new(path, SourceAlias::new(alias).unwrap()),

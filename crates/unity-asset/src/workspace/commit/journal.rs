@@ -15,13 +15,14 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
-    de::{DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
+    de::{DeserializeOwned, SeqAccess, Visitor},
 };
 use thiserror::Error;
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, ChangeSet, DigestV1, DigestV1Builder, IdentityRemap, ObjectId,
+    AssetLoadBudget, BudgetError, BudgetedJsonError, ChangeSet, ContractJsonLimits,
+    ContractJsonResourceModel, DigestV1, DigestV1Builder, IdentityRemap, ObjectId,
     SourceFingerprint, SourceId, SourceKind, SourceMemberId, TransactionId, WorkspaceId,
-    WorkspaceRevision, vec_allocation_bytes,
+    WorkspaceRevision, read_contract_json, vec_allocation_bytes,
 };
 
 use super::platform::{
@@ -159,7 +160,9 @@ pub(crate) const STAGE_DIRECTORY: &str = "stage";
 pub(crate) const BACKUP_DIRECTORY: &str = "backup";
 pub(crate) const BASELINE_DIRECTORY: &str = "baseline";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MANIFEST_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EVENT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_EVENT_ENCODED_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EVENT_COUNT: usize = 65_536;
 const EVENT_FILENAME_BYTES: usize = 20 + 1 + DigestV1::BYTE_LEN * 2 + 5;
 const EVENT_TEMPORARY_FILENAME_BYTES: usize = 1 + EVENT_FILENAME_BYTES + 9 + 8 + 4;
@@ -168,6 +171,64 @@ const MAX_REASON_BYTES: usize = 8 * 1024;
 const MAX_JOURNAL_DEPTH: u32 = 64;
 const PARSER_WORK_BYTES_PER_INPUT_BYTE: u64 = 6;
 const PARSER_FIXED_WORK_BYTES: u64 = 4 * 1024;
+const MANIFEST_MATERIALIZATION_FIXED_BYTES: u64 = MAX_MANIFEST_BYTES;
+const MANIFEST_MATERIALIZATION_BYTES_PER_ENTRY: u64 = 1024;
+const PREPARATION_MATERIALIZATION_FIXED_BYTES: u64 = MAX_MANIFEST_BYTES;
+const PREPARATION_MATERIALIZATION_BYTES_PER_ENTRY: u64 = 1024;
+const EVENT_MATERIALIZATION_FIXED_BYTES: u64 = MAX_EVENT_BYTES;
+const EVENT_MATERIALIZATION_BYTES_PER_ENTRY: u64 = 512;
+
+// Each read charges parser_fixed + encoded * (1 + parser_multiplier), then
+// materialization_fixed + size_of::<T>() + entries * materialization_per_entry.
+// The first term covers the source image and parser; the second covers decoded
+// strings up to the raw cap plus retained structs and collection capacity. Both
+// coexist at the deserialization boundary, so these are not duplicate charges.
+// Later budget-aware validation continues to charge only its added resources.
+// A valid JSON document cannot contain more value or member nodes than encoded
+// bytes, so the raw cap is also a non-breaking local structure ceiling.
+const MANIFEST_JSON_RESOURCES: ContractJsonResourceModel = ContractJsonResourceModel::new(
+    PARSER_WORK_BYTES_PER_INPUT_BYTE,
+    PARSER_FIXED_WORK_BYTES,
+    MANIFEST_MATERIALIZATION_FIXED_BYTES,
+    MANIFEST_MATERIALIZATION_BYTES_PER_ENTRY,
+);
+const PREPARATION_JSON_RESOURCES: ContractJsonResourceModel = ContractJsonResourceModel::new(
+    PARSER_WORK_BYTES_PER_INPUT_BYTE,
+    PARSER_FIXED_WORK_BYTES,
+    PREPARATION_MATERIALIZATION_FIXED_BYTES,
+    PREPARATION_MATERIALIZATION_BYTES_PER_ENTRY,
+);
+const EVENT_JSON_RESOURCES: ContractJsonResourceModel = ContractJsonResourceModel::new(
+    PARSER_WORK_BYTES_PER_INPUT_BYTE,
+    PARSER_FIXED_WORK_BYTES,
+    EVENT_MATERIALIZATION_FIXED_BYTES,
+    EVENT_MATERIALIZATION_BYTES_PER_ENTRY,
+);
+
+const MANIFEST_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
+    "unity_asset.journal.manifest",
+    MAX_MANIFEST_ENCODED_BYTES,
+    MAX_JOURNAL_DEPTH,
+    MAX_MANIFEST_BYTES,
+    MAX_MANIFEST_BYTES,
+    MANIFEST_JSON_RESOURCES,
+);
+const PREPARATION_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
+    "unity_asset.journal.preparation",
+    MAX_MANIFEST_ENCODED_BYTES,
+    MAX_JOURNAL_DEPTH,
+    MAX_MANIFEST_BYTES,
+    MAX_MANIFEST_BYTES,
+    PREPARATION_JSON_RESOURCES,
+);
+const EVENT_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
+    "unity_asset.journal.event",
+    MAX_EVENT_ENCODED_BYTES,
+    MAX_JOURNAL_DEPTH,
+    MAX_EVENT_BYTES,
+    MAX_EVENT_BYTES,
+    EVENT_JSON_RESOURCES,
+);
 const EXISTING_TARGET_EVENT_COUNT: usize = 4;
 const ABSENT_TARGET_EVENT_COUNT: usize = 2;
 const TRANSACTION_EVENT_RESERVE: usize = 6;
@@ -2402,7 +2463,7 @@ impl Journal {
                 &transaction,
                 layout.manifest_path(),
             )?,
-            MAX_MANIFEST_BYTES,
+            MANIFEST_JSON_LIMITS,
             budget,
         )?;
         let preparation = JournalPreparation::open_in_access(&layout, access, budget)?;
@@ -2460,7 +2521,7 @@ impl Journal {
             let event: JournalEvent = read_json_bounded_from_file(
                 &path,
                 super::platform::open_journal_regular_in_directory(&directories.events, &path)?,
-                MAX_EVENT_BYTES,
+                EVENT_JSON_LIMITS,
                 budget,
             )?;
             if event.sequence() != sequence || event.digest() != digest {
@@ -3012,23 +3073,28 @@ fn encode_json_bounded<T: Serialize>(
 fn read_json_bounded_in_parent<T: DeserializeOwned>(
     path: &Path,
     expected_parent: &DirectoryIdentity,
-    maximum: u64,
+    limits: ContractJsonLimits,
     budget: &mut AssetLoadBudget,
 ) -> Result<T, JournalError> {
     read_json_bounded_from_file(
         path,
         open_readonly_regular_in_parent(path, expected_parent)?,
-        maximum,
+        limits,
         budget,
     )
 }
 
 fn read_json_bounded_from_file<T: DeserializeOwned>(
     path: &Path,
-    mut file: File,
-    maximum: u64,
+    file: File,
+    limits: ContractJsonLimits,
     budget: &mut AssetLoadBudget,
 ) -> Result<T, JournalError> {
+    let maximum = u64::try_from(limits.max_encoded_bytes()).map_err(|_| {
+        JournalError::Budget(BudgetError::ArithmeticOverflow {
+            resource: "journal JSON encoded limit",
+        })
+    })?;
     let metadata = file.metadata()?;
     if metadata.len() > maximum {
         return Err(JournalError::DocumentTooLarge {
@@ -3037,233 +3103,113 @@ fn read_json_bounded_from_file<T: DeserializeOwned>(
             maximum,
         });
     }
-    let capacity = usize::try_from(metadata.len()).map_err(|_| JournalError::DocumentTooLarge {
-        path: path.to_owned(),
-        bytes: metadata.len(),
-        maximum,
-    })?;
-    let parser_work = metadata
-        .len()
-        .checked_mul(PARSER_WORK_BYTES_PER_INPUT_BYTE)
-        .and_then(|bytes| bytes.checked_add(PARSER_FIXED_WORK_BYTES))
-        .ok_or(BudgetError::ArithmeticOverflow {
-            resource: "journal parser work",
-        })?;
-    let planned =
-        metadata
-            .len()
-            .checked_add(parser_work)
-            .ok_or(BudgetError::ArithmeticOverflow {
-                resource: "journal input",
-            })?;
-    budget.check_bytes(planned)?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(capacity)
-        .map_err(|error| JournalError::Allocation {
-            resource: "journal input",
-            requested: capacity,
-            message: error.to_string(),
-        })?;
-    let retained = u64::try_from(bytes.capacity()).map_err(|_| {
-        JournalError::Budget(BudgetError::ArithmeticOverflow {
-            resource: "journal input",
-        })
-    })?;
-    let actual_charge =
-        retained
-            .checked_add(parser_work)
-            .ok_or(BudgetError::ArithmeticOverflow {
-                resource: "journal input",
-            })?;
-    budget.check_bytes(actual_charge)?;
-    budget.consume_bytes(actual_charge)?;
-    bytes.resize(capacity, 0);
-    file.read_exact(&mut bytes)?;
-    let mut extra = [0_u8; 1];
-    if file.read(&mut extra)? != 0 {
-        return Err(JournalError::InvalidEvent(
-            "journal entry length changed while it was read".to_owned(),
-        ));
+    let reader = ExactLengthJournalJsonReader::new(file, metadata.len());
+    read_contract_json(reader, budget, limits).map_err(|error| map_contract_json_error(path, error))
+}
+
+struct ExactLengthJournalJsonReader {
+    file: File,
+    expected: u64,
+    observed: u64,
+}
+
+impl ExactLengthJournalJsonReader {
+    fn new(file: File, expected: u64) -> Self {
+        Self {
+            file,
+            expected,
+            observed: 0,
+        }
     }
-    probe_json(&bytes, budget)?;
-    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-    deserializer.disable_recursion_limit();
-    let value = T::deserialize(&mut deserializer)?;
-    deserializer.end()?;
-    Ok(value)
 }
 
-fn probe_json(encoded: &[u8], budget: &mut AssetLoadBudget) -> Result<(), JournalError> {
-    budget.consume_entries(1)?;
-    let mut state = JsonProbeState {
-        budget,
-        failure: None,
-    };
-    let mut deserializer = serde_json::Deserializer::from_slice(encoded);
-    deserializer.disable_recursion_limit();
-    let result = JsonProbeSeed {
-        state: &mut state,
-        depth: 0,
-        charge_entry: false,
-        charge_member: false,
+impl Read for ExactLengthJournalJsonReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let read = self.file.read(buffer)?;
+        let read_u64 = u64::try_from(read).map_err(|_| journal_length_changed_grew())?;
+        let observed = self
+            .observed
+            .checked_add(read_u64)
+            .ok_or_else(journal_length_changed_grew)?;
+        if observed > self.expected {
+            return Err(journal_length_changed_grew());
+        }
+        self.observed = observed;
+        if read == 0 && observed != self.expected {
+            return Err(journal_length_changed_shrank());
+        }
+        Ok(read)
     }
-    .deserialize(&mut deserializer);
-    if let Some(failure) = state.failure {
-        return Err(match failure {
-            JsonProbeFailure::Budget(error) => JournalError::Budget(error),
-            JsonProbeFailure::Depth { actual } => JournalError::NestingDepthExceeded { actual },
-        });
-    }
-    result?;
-    deserializer.end()?;
-    Ok(())
 }
 
-struct JsonProbeState<'budget> {
-    budget: &'budget mut AssetLoadBudget,
-    failure: Option<JsonProbeFailure>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+enum JournalLengthChange {
+    #[error("journal entry grew while it was read")]
+    Grew,
+    #[error("journal entry shrank while it was read")]
+    Shrank,
 }
 
-enum JsonProbeFailure {
-    Budget(BudgetError),
-    Depth { actual: u32 },
+fn journal_length_changed_grew() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, JournalLengthChange::Grew)
 }
 
-struct JsonProbeSeed<'state, 'budget> {
-    state: &'state mut JsonProbeState<'budget>,
-    depth: u32,
-    charge_entry: bool,
-    charge_member: bool,
+fn journal_length_changed_shrank() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, JournalLengthChange::Shrank)
 }
 
-impl<'de> DeserializeSeed<'de> for JsonProbeSeed<'_, '_> {
-    type Value = ();
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        if self.charge_member {
-            if let Err(error) = self.state.budget.check_members(1) {
-                self.state.failure = Some(JsonProbeFailure::Budget(error));
-                return Err(serde::de::Error::custom(
-                    "journal JSON member budget exceeded",
-                ));
-            }
-            if let Err(error) = self.state.budget.consume_members(1) {
-                self.state.failure = Some(JsonProbeFailure::Budget(error));
-                return Err(serde::de::Error::custom(
-                    "journal JSON member budget changed after preflight",
-                ));
+fn map_contract_json_error(path: &Path, error: BudgetedJsonError) -> JournalError {
+    match error {
+        BudgetedJsonError::Io(source) => {
+            let length_change = source
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<JournalLengthChange>())
+                .copied();
+            if length_change == Some(JournalLengthChange::Grew) {
+                JournalError::InvalidEvent(
+                    "journal entry length changed while it was read".to_owned(),
+                )
+            } else {
+                JournalError::Io(source)
             }
         }
-        if self.charge_entry {
-            if let Err(error) = self.state.budget.check_entries(1) {
-                self.state.failure = Some(JsonProbeFailure::Budget(error));
-                return Err(serde::de::Error::custom(
-                    "journal JSON entry budget exceeded",
-                ));
-            }
-            if let Err(error) = self.state.budget.consume_entries(1) {
-                self.state.failure = Some(JsonProbeFailure::Budget(error));
-                return Err(serde::de::Error::custom(
-                    "journal JSON entry budget changed after preflight",
-                ));
-            }
+        BudgetedJsonError::Budget(source) => JournalError::Budget(source),
+        BudgetedJsonError::AllocationFailed { requested } => JournalError::Allocation {
+            resource: "journal JSON input",
+            requested,
+            message: "contract JSON input allocation failed".to_owned(),
+        },
+        BudgetedJsonError::Json(source) => JournalError::Json(source),
+        BudgetedJsonError::InvalidLimit { resource, .. } => {
+            JournalError::Budget(BudgetError::InvalidLimit { resource })
         }
-        deserializer.deserialize_any(JsonProbeVisitor {
-            state: self.state,
-            depth: self.depth,
-        })
-    }
-}
-
-struct JsonProbeVisitor<'state, 'budget> {
-    state: &'state mut JsonProbeState<'budget>,
-    depth: u32,
-}
-
-impl<'de> Visitor<'de> for JsonProbeVisitor<'_, '_> {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a bounded journal JSON value")
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
-    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
-    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
-    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
-    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
-    fn visit_seq<A>(mut self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let child_depth = self.enter_container::<A::Error>()?;
-        while sequence
-            .next_element_seed(JsonProbeSeed {
-                state: &mut *self.state,
-                depth: child_depth,
-                charge_entry: true,
-                charge_member: true,
-            })?
-            .is_some()
-        {}
-        Ok(())
-    }
-
-    fn visit_map<A>(mut self, mut mapping: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let child_depth = self.enter_container::<A::Error>()?;
-        while mapping.next_key::<IgnoredAny>()?.is_some() {
-            mapping.next_value_seed(JsonProbeSeed {
-                state: &mut *self.state,
-                depth: child_depth,
-                charge_entry: true,
-                charge_member: true,
-            })?;
-        }
-        Ok(())
-    }
-}
-
-impl JsonProbeVisitor<'_, '_> {
-    fn enter_container<E>(&mut self) -> Result<u32, E>
-    where
-        E: serde::de::Error,
-    {
-        let actual = self.depth.saturating_add(1);
-        if actual > MAX_JOURNAL_DEPTH {
-            self.state.failure = Some(JsonProbeFailure::Depth { actual });
-            return Err(E::custom("journal JSON nesting limit exceeded"));
-        }
-        if let Err(error) = self.state.budget.observe_depth(actual) {
-            self.state.failure = Some(JsonProbeFailure::Budget(error));
-            return Err(E::custom("journal JSON depth budget exceeded"));
-        }
-        Ok(actual)
+        BudgetedJsonError::EncodedLimitExceeded {
+            limit, requested, ..
+        } => JournalError::DocumentTooLarge {
+            path: path.to_owned(),
+            bytes: u64::try_from(requested).unwrap_or(u64::MAX),
+            maximum: u64::try_from(limit).unwrap_or(u64::MAX),
+        },
+        BudgetedJsonError::StructureLimitExceeded {
+            resource: "depth",
+            requested,
+            ..
+        } => JournalError::NestingDepthExceeded {
+            actual: u32::try_from(requested).unwrap_or(u32::MAX),
+        },
+        BudgetedJsonError::StructureLimitExceeded {
+            resource,
+            limit,
+            requested,
+            ..
+        } => JournalError::Budget(BudgetError::Exceeded {
+            resource,
+            limit,
+            requested,
+        }),
     }
 }
 
@@ -3332,6 +3278,141 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use unity_asset_core::{AssetLoadLimits, BudgetError, SourceKind, WorkspaceId};
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct MaterializationProbe;
+
+    impl<'de> Deserialize<'de> for MaterializationProbe {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            <serde::de::IgnoredAny as serde::Deserialize<'de>>::deserialize(deserializer)?;
+            Ok(Self)
+        }
+    }
+
+    #[derive(Debug)]
+    struct DeserializationMustNotStart;
+
+    impl<'de> Deserialize<'de> for DeserializationMustNotStart {
+        fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            panic!("typed journal deserialization started before materialization was reserved");
+        }
+    }
+
+    fn materialization_gate_bytes(fixed: u64, per_entry: u64) -> u64 {
+        let encoded = u64::try_from(b"null".len()).expect("fixture length");
+        let parser_and_input = encoded
+            .checked_mul(PARSER_WORK_BYTES_PER_INPUT_BYTE + 1)
+            .and_then(|bytes| bytes.checked_add(PARSER_FIXED_WORK_BYTES))
+            .expect("parser charge");
+        parser_and_input
+            .checked_add(fixed)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(size_of::<MaterializationProbe>()).expect("root layout"),
+                )
+            })
+            .and_then(|bytes| bytes.checked_add(per_entry))
+            .expect("materialization charge")
+    }
+
+    fn assert_materialization_gate(
+        fixture_name: &str,
+        limits: ContractJsonLimits,
+        fixed: u64,
+        per_entry: u64,
+    ) {
+        assert_eq!(
+            size_of::<MaterializationProbe>(),
+            size_of::<DeserializationMustNotStart>()
+        );
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join(fixture_name);
+        fs::write(&path, b"null").expect("write JSON fixture");
+        let required = materialization_gate_bytes(fixed, per_entry);
+        let load_limits = AssetLoadLimits {
+            max_entries: 1,
+            max_bytes: required,
+            max_depth: MAX_JOURNAL_DEPTH,
+            max_members: 1,
+            ..AssetLoadLimits::default()
+        };
+
+        let mut exact = AssetLoadBudget::new(load_limits).expect("exact materialization budget");
+        let value = read_json_bounded_from_file::<MaterializationProbe>(
+            &path,
+            File::open(&path).expect("open JSON fixture"),
+            limits,
+            &mut exact,
+        )
+        .expect("exact materialization budget must permit deserialization");
+        assert_eq!(value, MaterializationProbe);
+        assert_eq!(exact.usage().bytes, required);
+
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: required - 1,
+            ..load_limits
+        })
+        .expect("one-short materialization budget");
+        let error = read_json_bounded_from_file::<DeserializationMustNotStart>(
+            &path,
+            File::open(&path).expect("reopen JSON fixture"),
+            limits,
+            &mut one_short,
+        )
+        .expect_err("one-short materialization budget must fail");
+        assert!(matches!(
+            error,
+            JournalError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            }) if limit == required - 1 && requested == required
+        ));
+        let root_layout =
+            u64::try_from(size_of::<DeserializationMustNotStart>()).expect("sentinel root layout");
+        let materialization = fixed
+            .checked_add(root_layout)
+            .and_then(|bytes| bytes.checked_add(per_entry))
+            .expect("materialization reservation");
+        assert_eq!(one_short.usage().bytes, required - materialization);
+        assert_eq!(one_short.usage().entries, 1);
+    }
+
+    #[test]
+    fn preparation_contract_reserves_materialization_before_deserialization() {
+        assert_materialization_gate(
+            "preparation.json",
+            PREPARATION_JSON_LIMITS,
+            PREPARATION_MATERIALIZATION_FIXED_BYTES,
+            PREPARATION_MATERIALIZATION_BYTES_PER_ENTRY,
+        );
+    }
+
+    #[test]
+    fn manifest_contract_reserves_materialization_before_deserialization() {
+        assert_materialization_gate(
+            "manifest.json",
+            MANIFEST_JSON_LIMITS,
+            MANIFEST_MATERIALIZATION_FIXED_BYTES,
+            MANIFEST_MATERIALIZATION_BYTES_PER_ENTRY,
+        );
+    }
+
+    #[test]
+    fn event_contract_reserves_materialization_before_deserialization() {
+        assert_materialization_gate(
+            "event.json",
+            EVENT_JSON_LIMITS,
+            EVENT_MATERIALIZATION_FIXED_BYTES,
+            EVENT_MATERIALIZATION_BYTES_PER_ENTRY,
+        );
+    }
 
     fn journal_fixture(
         parent: &Path,
@@ -3817,7 +3898,7 @@ mod tests {
         let error = read_json_bounded_in_parent::<serde_json::Value>(
             &event,
             &expected_parent,
-            MAX_EVENT_BYTES,
+            EVENT_JSON_LIMITS,
             &mut budget,
         )
         .expect_err("replacement event parent must be rejected");

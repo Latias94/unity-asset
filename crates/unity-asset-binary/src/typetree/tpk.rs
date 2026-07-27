@@ -312,7 +312,7 @@ fn encode_unity_version(major: u16, minor: u16, build: u16, type_byte: u8, type_
 fn parse_unity_version_key(version: &str) -> Option<u64> {
     let raw = version.trim();
     if raw.is_empty() {
-        return Some(encode_unity_version(2020, 3, 0, 3, 1));
+        return None;
     }
     let raw = raw.split_whitespace().next().unwrap_or(raw);
     let mut parts = raw.splitn(3, '.');
@@ -343,7 +343,7 @@ fn parse_unity_version_key(version: &str) -> Option<u64> {
     let type_number = if number.is_empty() {
         0
     } else {
-        number.parse::<u8>().unwrap_or(0)
+        number.parse::<u8>().ok()?
     };
     let type_byte = if type_string.eq_ignore_ascii_case("a") {
         0
@@ -1207,6 +1207,7 @@ pub(crate) mod tests {
             "2020.3.0f1 (8c4f651ec7e6)",
             "2022.3.1t2",
             "2022.3.1f1c2",
+            "2020.3.0f999",
         ] {
             assert_eq!(
                 parse_unity_version_key(version),
@@ -1214,6 +1215,7 @@ pub(crate) mod tests {
                 "version key drift for {version:?}"
             );
         }
+        assert_eq!(parse_unity_version_key(""), None);
     }
 
     #[test]

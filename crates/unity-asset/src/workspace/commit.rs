@@ -7,7 +7,7 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ChangeSet, ContainmentKind, DigestV1, SourceFingerprint,
@@ -69,13 +69,16 @@ fn test_crash_artifact_failpoint(point: &str, ordinal: u32) {
 }
 
 pub use recovery::{
-    RECOVERY_DISCOVERY_VERSION, RecoveryBlockedReason, RecoveryDiscovery,
-    RecoveryDiscoveryBlockedReason, RecoveryDiscoveryError, RecoveryError, RecoveryOutcome,
-    RollbackReceipt,
+    RECOVERY_DISCOVERY_VERSION, RECOVERY_OUTCOME_VERSION, ROLLBACK_RECEIPT_VERSION,
+    RecoveryBlockedReason, RecoveryDiscovery, RecoveryDiscoveryBlockedReason,
+    RecoveryDiscoveryError, RecoveryError, RecoveryOutcome, RollbackReceipt,
 };
 
 /// Current canonical commit-report wire version.
 pub const COMMIT_REPORT_VERSION: u8 = 1;
+
+/// Current canonical recovery-locator wire version.
+pub const RECOVERY_LOCATOR_VERSION: u8 = 1;
 
 /// Durability boundary promised for a publication set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,12 +207,63 @@ fn validate_publication_root(root: &Path) -> Result<PathBuf, PublicationTargetEr
 }
 
 /// Stable on-disk address for a recoverable or finalized transaction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryLocator {
     root: PathBuf,
     transaction: TransactionId,
     root_identity: DirectoryIdentity,
+}
+
+#[derive(Serialize)]
+struct RecoveryLocatorRef<'value> {
+    version: u8,
+    root: &'value Path,
+    transaction: TransactionId,
+    root_identity: &'value DirectoryIdentity,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryLocatorWire {
+    version: u8,
+    root: PathBuf,
+    transaction: TransactionId,
+    root_identity: DirectoryIdentity,
+}
+
+impl Serialize for RecoveryLocator {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        RecoveryLocatorRef {
+            version: RECOVERY_LOCATOR_VERSION,
+            root: &self.root,
+            transaction: self.transaction,
+            root_identity: &self.root_identity,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RecoveryLocator {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RecoveryLocatorWire::deserialize(deserializer)?;
+        if wire.version != RECOVERY_LOCATOR_VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "recovery locator version {} is unsupported",
+                wire.version
+            )));
+        }
+        Ok(Self {
+            root: wire.root,
+            transaction: wire.transaction,
+            root_identity: wire.root_identity,
+        })
+    }
 }
 
 impl RecoveryLocator {
@@ -223,6 +277,11 @@ impl RecoveryLocator {
             transaction,
             root_identity,
         }
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> u8 {
+        RECOVERY_LOCATOR_VERSION
     }
 
     #[must_use]
@@ -288,7 +347,7 @@ impl CommitArtifactReport {
 }
 
 /// Canonical, idempotency-keyed result of one durable publication.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommitReport {
     version: u8,
@@ -301,6 +360,44 @@ pub struct CommitReport {
     artifacts: Vec<CommitArtifactReport>,
     changes: ChangeSet,
     recovery: RecoveryLocator,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommitReportWire {
+    version: u8,
+    transaction: TransactionId,
+    workspace_id: WorkspaceId,
+    base_revision: WorkspaceRevision,
+    committed_revision: WorkspaceRevision,
+    plan_digest: DigestV1,
+    atomicity: CommitAtomicity,
+    artifacts: Vec<CommitArtifactReport>,
+    changes: ChangeSet,
+    recovery: RecoveryLocator,
+}
+
+impl<'de> Deserialize<'de> for CommitReport {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CommitReportWire::deserialize(deserializer)?;
+        let report = Self {
+            version: wire.version,
+            transaction: wire.transaction,
+            workspace_id: wire.workspace_id,
+            base_revision: wire.base_revision,
+            committed_revision: wire.committed_revision,
+            plan_digest: wire.plan_digest,
+            atomicity: wire.atomicity,
+            artifacts: wire.artifacts,
+            changes: wire.changes,
+            recovery: wire.recovery,
+        };
+        report.validate().map_err(serde::de::Error::custom)?;
+        Ok(report)
+    }
 }
 
 impl CommitReport {
@@ -2723,10 +2820,63 @@ mod tests {
 
         let locator = target.recovery_locator(transaction);
 
+        assert_eq!(locator.version(), RECOVERY_LOCATOR_VERSION);
         assert_eq!(locator.transaction(), transaction);
         assert_eq!(
             locator.root(),
             JournalLayout::new(target.root(), transaction, target.identity().clone()).directory()
+        );
+    }
+
+    #[test]
+    fn recovery_locator_wire_is_versioned_strict_and_canonical() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = PublicationTarget::in_place(directory.path()).unwrap();
+        let transaction = TransactionId::new(DigestV1::hash_bytes(b"recovery locator wire"));
+        let locator = target.recovery_locator(transaction);
+
+        let encoded_text = serde_json::to_string(&locator).unwrap();
+        let mut cursor = 0;
+        for field in ["version", "root", "transaction", "root_identity"] {
+            let marker = format!("\"{field}\":");
+            let offset = encoded_text[cursor..]
+                .find(&marker)
+                .unwrap_or_else(|| panic!("missing canonical recovery locator field {field}"));
+            cursor += offset + marker.len();
+        }
+        let encoded = serde_json::to_value(&locator).unwrap();
+        assert_eq!(
+            encoded["version"],
+            serde_json::json!(RECOVERY_LOCATOR_VERSION)
+        );
+        assert_eq!(encoded["root"], serde_json::json!(locator.root()));
+        assert_eq!(encoded["transaction"], serde_json::json!(transaction));
+        assert!(encoded.get("root_identity").is_some());
+        assert_eq!(encoded.as_object().unwrap().len(), 4);
+        assert_eq!(
+            serde_json::from_value::<RecoveryLocator>(encoded.clone()).unwrap(),
+            locator
+        );
+
+        let mut unsupported = encoded.clone();
+        unsupported["version"] = serde_json::json!(RECOVERY_LOCATOR_VERSION + 1);
+        assert!(
+            serde_json::from_value::<RecoveryLocator>(unsupported)
+                .unwrap_err()
+                .to_string()
+                .contains("recovery locator version 2 is unsupported")
+        );
+
+        let mut unknown = encoded;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_owned(), serde_json::Value::Null);
+        assert!(
+            serde_json::from_value::<RecoveryLocator>(unknown)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field")
         );
     }
 
@@ -2761,6 +2911,177 @@ mod tests {
         assert_eq!(report.source(), source);
         assert_eq!(report.digest(), digest);
         assert_eq!(report.bytes(), 8);
+    }
+
+    fn commit_report_fixture() -> CommitReport {
+        let directory = tempfile::tempdir().unwrap();
+        let target = PublicationTarget::in_place(directory.path()).unwrap();
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let source = SourceId::new(workspace, SourceKind::Yaml, 1).unwrap();
+        let transaction = TransactionId::new(DigestV1::hash_bytes(b"commit report transaction"));
+        let base_revision = WorkspaceRevision::new(DigestV1::hash_bytes(b"base revision"));
+        let committed_revision =
+            WorkspaceRevision::new(DigestV1::hash_bytes(b"committed revision"));
+        let changes = ChangeSet::new(
+            transaction,
+            workspace,
+            base_revision,
+            committed_revision,
+            vec![source],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        CommitReport::new(
+            transaction,
+            workspace,
+            base_revision,
+            committed_revision,
+            DigestV1::hash_bytes(b"commit report plan"),
+            CommitAtomicity::PerArtifactRecoverable,
+            vec![
+                CommitArtifactReport::new(
+                    "root-00000000".to_owned(),
+                    source,
+                    DigestV1::hash_bytes(b"first artifact"),
+                    14,
+                ),
+                CommitArtifactReport::new(
+                    "root-00000001".to_owned(),
+                    source,
+                    DigestV1::hash_bytes(b"second artifact"),
+                    15,
+                ),
+            ],
+            changes,
+            target.recovery_locator(transaction),
+        )
+    }
+
+    #[test]
+    fn commit_report_wire_round_trips_in_canonical_field_order() {
+        let report = commit_report_fixture();
+        let encoded = serde_json::to_string(&report).unwrap();
+        let decoded = serde_json::from_str::<CommitReport>(&encoded).unwrap();
+
+        assert_eq!(decoded, report);
+        let mut cursor = 0;
+        for field in [
+            "version",
+            "transaction",
+            "workspace_id",
+            "base_revision",
+            "committed_revision",
+            "plan_digest",
+            "atomicity",
+            "artifacts",
+            "changes",
+            "recovery",
+        ] {
+            let marker = format!("\"{field}\":");
+            let offset = encoded[cursor..]
+                .find(&marker)
+                .unwrap_or_else(|| panic!("missing canonical commit report field {field}"));
+            cursor += offset + marker.len();
+        }
+    }
+
+    #[test]
+    fn commit_report_wire_rejects_unknown_versions_and_fields() {
+        let report = commit_report_fixture();
+        let mut unsupported = serde_json::to_value(&report).unwrap();
+        unsupported["version"] = serde_json::json!(COMMIT_REPORT_VERSION + 1);
+        assert!(
+            serde_json::from_value::<CommitReport>(unsupported)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
+
+        let mut unknown = serde_json::to_value(&report).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_owned(), serde_json::Value::Null);
+        assert!(
+            serde_json::from_value::<CommitReport>(unknown)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field")
+        );
+
+        let mut unsupported_locator = serde_json::to_value(&report).unwrap();
+        unsupported_locator["recovery"]["version"] =
+            serde_json::json!(RECOVERY_LOCATOR_VERSION + 1);
+        assert!(
+            serde_json::from_value::<CommitReport>(unsupported_locator)
+                .unwrap_err()
+                .to_string()
+                .contains("recovery locator version 2 is unsupported")
+        );
+    }
+
+    #[test]
+    fn commit_report_wire_runs_cross_field_validation() {
+        let report = commit_report_fixture();
+
+        let mut transaction_mismatch = serde_json::to_value(&report).unwrap();
+        let other_transaction = transaction_mismatch["plan_digest"].clone();
+        transaction_mismatch["transaction"] = other_transaction;
+        assert!(
+            serde_json::from_value::<CommitReport>(transaction_mismatch)
+                .unwrap_err()
+                .to_string()
+                .contains("transaction and change set disagree")
+        );
+
+        let mut workspace_mismatch = serde_json::to_value(&report).unwrap();
+        workspace_mismatch["workspace_id"] =
+            serde_json::to_value(WorkspaceId::from_u128(2).unwrap()).unwrap();
+        assert!(
+            serde_json::from_value::<CommitReport>(workspace_mismatch)
+                .unwrap_err()
+                .to_string()
+                .contains("workspace and change set disagree")
+        );
+
+        let mut revision_mismatch = serde_json::to_value(&report).unwrap();
+        let base_revision = revision_mismatch["base_revision"].clone();
+        revision_mismatch["committed_revision"] = base_revision;
+        assert!(
+            serde_json::from_value::<CommitReport>(revision_mismatch)
+                .unwrap_err()
+                .to_string()
+                .contains("revisions and change set disagree")
+        );
+
+        let mut recovery_mismatch = serde_json::to_value(&report).unwrap();
+        let other_transaction = recovery_mismatch["plan_digest"].clone();
+        recovery_mismatch["recovery"]["transaction"] = other_transaction;
+        assert!(
+            serde_json::from_value::<CommitReport>(recovery_mismatch)
+                .unwrap_err()
+                .to_string()
+                .contains("recovery locator belongs to another transaction")
+        );
+
+        let mut empty = serde_json::to_value(&report).unwrap();
+        empty["artifacts"] = serde_json::json!([]);
+        assert!(
+            serde_json::from_value::<CommitReport>(empty)
+                .unwrap_err()
+                .to_string()
+                .contains("contains no artifacts")
+        );
+
+        let mut unordered = serde_json::to_value(&report).unwrap();
+        unordered["artifacts"].as_array_mut().unwrap().swap(0, 1);
+        assert!(
+            serde_json::from_value::<CommitReport>(unordered)
+                .unwrap_err()
+                .to_string()
+                .contains("strict logical-name order")
+        );
     }
 
     #[test]

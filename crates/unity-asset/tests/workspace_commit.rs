@@ -55,6 +55,7 @@ fn guard(value: &str) -> FieldGuard {
 
 fn plan(workspace: &AssetWorkspace, bytes: &[u8], before: &str, after: &str) -> MutationPlan {
     MutationPlan::new(
+        workspace.workspace_id(),
         workspace.revision(),
         vec![SourceExpectation::new(
             SourceLocator::path(SOURCE_ALIAS).unwrap(),
@@ -566,7 +567,7 @@ fn cross_source_reference_commit_rebases_the_workspace_and_preserves_old_snapsho
     let fragment = lowering
         .into_fragment()
         .expect("changing the parent reference must produce a mutation fragment");
-    let mut builder = MutationPlanBuilder::new(base.revision());
+    let mut builder = MutationPlanBuilder::new(base.workspace_id(), base.revision());
     builder.append(fragment).unwrap();
     let prepared = workspace
         .prepare(

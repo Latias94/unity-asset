@@ -39,8 +39,8 @@ pub fn yaml_schema_digest(
     let total = checked_add_len(YAML_SCHEMA_DOMAIN.len() as u64, body_len)?;
     let mut builder = DigestV1Builder::new(total);
     builder.update(YAML_SCHEMA_DOMAIN)?;
-    write_i32(&mut builder, class.class_id)?;
-    write_bytes(&mut builder, class.class_name.as_bytes())?;
+    write_i32(&mut builder, class.class_id())?;
+    write_bytes(&mut builder, class.class_name().as_bytes())?;
     write_schema_object(&mut builder, class.properties(), budget, 1)?;
     Ok(builder.finalize()?)
 }
@@ -53,7 +53,7 @@ pub fn yaml_field_schema_digest(
     budget: &mut AssetLoadBudget,
 ) -> Result<DigestV1, SemanticDigestError> {
     let body_len = checked_add_len(
-        checked_add_len(4, framed_len(class.class_name.as_bytes())?)?,
+        checked_add_len(4, framed_len(class.class_name().as_bytes())?)?,
         checked_add_len(
             field_path_encoded_len(path)?,
             schema_value_len(value, 1, budget)?,
@@ -62,8 +62,8 @@ pub fn yaml_field_schema_digest(
     let total = checked_add_len(YAML_FIELD_SCHEMA_DOMAIN.len() as u64, body_len)?;
     let mut builder = DigestV1Builder::new(total);
     builder.update(YAML_FIELD_SCHEMA_DOMAIN)?;
-    write_i32(&mut builder, class.class_id)?;
-    write_bytes(&mut builder, class.class_name.as_bytes())?;
+    write_i32(&mut builder, class.class_id())?;
+    write_bytes(&mut builder, class.class_name().as_bytes())?;
     write_field_path(&mut builder, path)?;
     write_schema_value(&mut builder, value, budget, 1)?;
     Ok(builder.finalize()?)
@@ -104,7 +104,7 @@ fn schema_class_len(
     budget: &mut AssetLoadBudget,
 ) -> Result<u64, SemanticDigestError> {
     let mut total = 4_u64;
-    total = checked_add_len(total, framed_len(class.class_name.as_bytes())?)?;
+    total = checked_add_len(total, framed_len(class.class_name().as_bytes())?)?;
     checked_add_len(total, schema_object_len(class.properties(), 1, budget)?)
 }
 

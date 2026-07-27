@@ -15,17 +15,18 @@
 //! ## Feature Flags
 //!
 //! This crate is intentionally **parser-only**.
-//! For decoding/export helpers (Texture/Audio/Sprite/Mesh), use the `unity-asset-decode` crate.
+//! For decoding/export helpers (Texture/Audio/Sprite), use the `unity-asset-decode` crate.
 //!
 //! # Example
 //!
 //! ```rust,no_run
-//! use unity_asset_binary::bundle::load_bundle_from_memory;
-//! use std::fs;
+//! use unity_asset_binary::bundle::BundleParser;
+//! use unity_asset_core::AssetLoadBudget;
 //!
 //! // Load an AssetBundle file
-//! let data = fs::read("example.bundle")?;
-//! let bundle = load_bundle_from_memory(data)?;
+//! let data = std::fs::read("example.bundle")?;
+//! let mut budget = AssetLoadBudget::default();
+//! let bundle = BundleParser::from_bytes_with_budget(data, &mut budget)?;
 //!
 //! // Access contained assets
 //! for asset in &bundle.assets {
@@ -46,10 +47,7 @@ pub mod compression;
 pub mod data_view;
 pub mod error;
 pub mod file;
-pub mod formats;
-pub mod metadata;
 pub mod object;
-pub mod performance;
 mod random_access;
 pub mod reader;
 pub mod reference;
@@ -67,6 +65,5 @@ pub use random_access::{ByteSegment, SegmentedBytes};
 // Intentionally avoid massive top-level re-exports.
 //
 // Prefer importing from:
-// - `unity_asset_binary::formats::{bundle, serialized, web}`
 // - `unity_asset_binary::{bundle, asset, webfile, object, typetree, ...}`
-// - `unity_asset_binary::file::{load_unity_file, load_unity_file_from_memory}`
+// - `unity_asset_binary::file::{load_unity_file_with_budget, load_unity_file_from_memory_with_budget}`

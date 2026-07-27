@@ -1,16 +1,23 @@
 use std::fs;
+use std::mem::size_of;
 
-use unity_asset::AssetLoadBudget;
 #[cfg(not(feature = "decode"))]
 use unity_asset::extraction::ExtractionFilter;
 use unity_asset::extraction::{
-    ExistingOutputPolicy, ExtractionArtifactStatus, ExtractionDiagnosticCode,
-    ExtractionExecutionError, ExtractionExecutionLimits, ExtractionExecutionOptions,
-    ExtractionExecutor, ExtractionFailurePolicy, ExtractionManifest, ExtractionPlanError,
-    ExtractionPlanner, ExtractionRepresentationPolicy, ExtractionRequest,
+    BundleContainerQuery, BundleContainerResolution, ExistingOutputPolicy,
+    ExtractionArtifactStatus, ExtractionDiagnosticCode, ExtractionExecutionError,
+    ExtractionExecutionLimits, ExtractionExecutionOptions, ExtractionExecutor,
+    ExtractionFailurePolicy, ExtractionManifest, ExtractionPlanError, ExtractionPlanner,
+    ExtractionReport, ExtractionRepresentationPolicy, ExtractionRequest,
 };
-use unity_asset::reference::ReferenceGraphBuildOptions;
-use unity_asset::workspace::{AssetWorkspace, WorkspaceLookup, WorkspaceView};
+use unity_asset::reference::{RawReferenceTarget, ReferenceGraphBuildOptions};
+use unity_asset::workspace::{AssetWorkspace, WorkspaceError, WorkspaceLookup, WorkspaceView};
+use unity_asset::{AssetLoadBudget, AssetLoadLimits, BudgetError, DigestV1};
+use unity_asset_binary::asset::{SerializedFileParser, class_ids};
+use unity_asset_binary::bundle::BundleParser;
+
+#[path = "support/source_replacement.rs"]
+mod source_replacement;
 
 const FIRST_SOURCE: &str = r#"%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
@@ -36,6 +43,97 @@ fn sample(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/samples")
         .join(name)
+}
+
+fn serialized_file_with_duplicate_container_target() -> (Vec<u8>, [String; 2]) {
+    let bundle = BundleParser::from_bytes(fs::read(sample("char_118_yuki.ab")).unwrap()).unwrap();
+    let node = bundle
+        .nodes
+        .iter()
+        .find(|node| node.is_serialized_file())
+        .expect("fixture bundle must contain a SerializedFile");
+    let mut image = bundle.extract_node_data(node).unwrap();
+    let serialized = SerializedFileParser::from_bytes(image.clone()).unwrap();
+    assert_eq!(serialized.header.endian, 0, "fixture must be little-endian");
+    let bundle_object = serialized
+        .objects()
+        .iter()
+        .find(|object| object.class_id() == class_ids::ASSET_BUNDLE)
+        .expect("fixture SerializedFile must contain an AssetBundle object");
+    let entries = serialized
+        .assetbundle_container_raw(bundle_object, &mut AssetLoadBudget::default())
+        .unwrap();
+    let first = entries.first().cloned().expect("fixture container entry");
+    let second = entries
+        .get(1)
+        .cloned()
+        .expect("second fixture container entry");
+    assert_ne!(first.2, second.2);
+
+    let object_start = usize::try_from(bundle_object.byte_start()).unwrap();
+    let object_end = usize::try_from(bundle_object.byte_end().unwrap()).unwrap();
+    let object = &image[object_start..object_end];
+    let first_offset = container_path_id_offset(object, &first.0, first.1, first.2);
+    let second_offset = container_path_id_offset(object, &second.0, second.1, second.2);
+    assert_ne!(first_offset, second_offset);
+
+    let second_start = object_start + second_offset;
+    image[second_start..second_start + size_of::<i64>()].copy_from_slice(&first.2.to_le_bytes());
+
+    let reparsed = SerializedFileParser::from_bytes(image.clone()).unwrap();
+    let reparsed_bundle = reparsed
+        .objects()
+        .iter()
+        .find(|object| object.class_id() == class_ids::ASSET_BUNDLE)
+        .unwrap();
+    let reparsed_entries = reparsed
+        .assetbundle_container_raw(reparsed_bundle, &mut AssetLoadBudget::default())
+        .unwrap();
+    assert_eq!(reparsed_entries[0].2, reparsed_entries[1].2);
+
+    (image, [first.0, second.0])
+}
+
+fn container_path_id_offset(object: &[u8], asset_path: &str, file_id: i32, path_id: i64) -> usize {
+    let path = asset_path.as_bytes();
+    let encoded_length = i32::try_from(path.len()).unwrap().to_le_bytes();
+    let encoded_file_id = file_id.to_le_bytes();
+    let encoded_path_id = path_id.to_le_bytes();
+    let mut matches = Vec::new();
+
+    for (path_start, candidate) in object.windows(path.len()).enumerate() {
+        if candidate != path || path_start < size_of::<i32>() {
+            continue;
+        }
+        if object[path_start - size_of::<i32>()..path_start] != encoded_length {
+            continue;
+        }
+
+        let aligned_end = (path_start + path.len() + 3) & !3;
+        for path_id_offset in [
+            aligned_end + size_of::<i32>(),
+            aligned_end + 3 * size_of::<i32>(),
+        ] {
+            let file_id_offset = path_id_offset - size_of::<i32>();
+            let Some(encoded_pointer) =
+                object.get(file_id_offset..path_id_offset + size_of::<i64>())
+            else {
+                continue;
+            };
+            if encoded_pointer[..size_of::<i32>()] == encoded_file_id
+                && encoded_pointer[size_of::<i32>()..] == encoded_path_id
+            {
+                matches.push(path_id_offset);
+            }
+        }
+    }
+
+    assert_eq!(
+        matches.len(),
+        1,
+        "fixture entry {asset_path:?} must have one unambiguous pointer"
+    );
+    matches[0]
 }
 
 fn options(workers: usize, existing: ExistingOutputPolicy) -> ExtractionExecutionOptions {
@@ -98,6 +196,71 @@ fn require_decoded_reports_feature_unavailable_without_decode_support() {
     assert!(matches!(
         error,
         ExtractionPlanError::RequiredDecodedUnavailable { .. }
+    ));
+}
+
+#[test]
+fn extraction_plan_finalization_obeys_exact_and_one_short_budgets() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("objects.prefab");
+    fs::write(&source_path, FIRST_SOURCE).unwrap();
+
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(&source_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let planner = ExtractionPlanner::new(&snapshot);
+
+    let mut measured = AssetLoadBudget::default();
+    let expected = planner
+        .plan(
+            ExtractionRequest::all(ExtractionRepresentationPolicy::RawOnly),
+            &mut measured,
+        )
+        .unwrap();
+    let usage = measured.usage();
+    assert!(usage.bytes > 1);
+    let exact_limits = AssetLoadLimits {
+        max_entries: usage.entries.max(1),
+        max_bytes: usage.bytes,
+        max_depth: usage.max_observed_depth,
+        max_members: usage.members.max(1),
+        max_compressed_bytes: usage.compressed_bytes.max(1),
+        max_decompressed_bytes: usage.decompressed_bytes.max(1),
+        ..AssetLoadLimits::default()
+    };
+
+    let mut exact = AssetLoadBudget::new(exact_limits).unwrap();
+    let actual = planner
+        .plan(
+            ExtractionRequest::all(ExtractionRepresentationPolicy::RawOnly),
+            &mut exact,
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(exact.usage(), usage);
+
+    let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: usage.bytes - 1,
+        ..exact_limits
+    })
+    .unwrap();
+    let error = planner
+        .plan(
+            ExtractionRequest::all(ExtractionRepresentationPolicy::RawOnly),
+            &mut one_short,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ExtractionPlanError::Budget(BudgetError::Exceeded {
+            resource: "bytes",
+            ..
+        }) | ExtractionPlanError::Workspace(WorkspaceError::Budget(BudgetError::Exceeded {
+            resource: "bytes",
+            ..
+        }))
     ));
 }
 
@@ -245,6 +408,27 @@ fn planning_is_write_free_and_worker_count_does_not_change_manifest() {
     let decoded =
         ExtractionManifest::read_json(encoded.as_slice(), &mut AssetLoadBudget::default()).unwrap();
     assert_eq!(&decoded, one.manifest());
+
+    let report_encoded = one.canonical_json().unwrap();
+    let report_decoded =
+        ExtractionReport::read_json(report_encoded.as_slice(), &mut AssetLoadBudget::default())
+            .unwrap();
+    assert_eq!(report_decoded, one);
+    assert_eq!(one.digest().unwrap(), DigestV1::hash_bytes(&report_encoded));
+
+    let canonical_report: serde_json::Value = serde_json::from_slice(&report_encoded).unwrap();
+    for field in ["written", "resumed", "skipped_existing", "failed"] {
+        let mut tampered = canonical_report.clone();
+        let count = tampered["counts"][field].as_u64().unwrap();
+        tampered["counts"][field] = serde_json::Value::from(count.checked_add(1).unwrap());
+        let tampered = serde_json::to_vec(&tampered).unwrap();
+
+        assert!(
+            ExtractionReport::read_json(tampered.as_slice(), &mut AssetLoadBudget::default())
+                .is_err(),
+            "tampered {field} count must be rejected"
+        );
+    }
 }
 
 #[test]
@@ -278,7 +462,8 @@ fn corrupted_resume_output_requires_explicit_replacement_authority() {
 
     let corrupted = &first.manifest().artifacts()[0];
     let corrupted_path = output.join(corrupted.path().as_str());
-    let mut bytes = fs::read(&corrupted_path).unwrap();
+    let correct_bytes = fs::read(&corrupted_path).unwrap();
+    let mut bytes = correct_bytes.clone();
     bytes[0] ^= 0xff;
     fs::write(&corrupted_path, &bytes).unwrap();
 
@@ -312,8 +497,11 @@ fn corrupted_resume_output_requires_explicit_replacement_authority() {
     let rebuilt = &resumed.manifest().artifacts()[0];
     assert_eq!(rebuilt.status(), ExtractionArtifactStatus::Written);
     assert_eq!(rebuilt.digest(), corrupted.digest());
+    let actual = fs::read(&corrupted_path).unwrap();
+    assert_eq!(actual, correct_bytes);
+    assert_eq!(rebuilt.digest(), Some(DigestV1::hash_bytes(&actual)));
     assert_eq!(
-        fs::metadata(corrupted_path).unwrap().len(),
+        u64::try_from(actual.len()).unwrap(),
         corrupted.length().unwrap()
     );
 }
@@ -567,7 +755,7 @@ fn revision_mismatch_fails_before_creating_the_output_root() {
     fs::write(&source_path, FIRST_SOURCE).unwrap();
 
     let mut workspace = AssetWorkspace::new().unwrap();
-    workspace
+    let source = workspace
         .load_path(&source_path, &mut AssetLoadBudget::default())
         .unwrap();
     let old_snapshot = workspace.snapshot();
@@ -579,9 +767,7 @@ fn revision_mismatch_fails_before_creating_the_output_root() {
         .unwrap();
 
     fs::write(&source_path, SECOND_SOURCE).unwrap();
-    workspace
-        .load_path(&source_path, &mut AssetLoadBudget::default())
-        .unwrap();
+    source_replacement::replace_source_path(&mut workspace, source, &source_path, "objects.prefab");
     let new_snapshot = workspace.snapshot();
     let error = ExtractionExecutor::new()
         .execute(
@@ -602,6 +788,88 @@ fn revision_mismatch_fails_before_creating_the_output_root() {
 }
 
 #[test]
+fn bundle_container_query_preserves_same_target_occurrences_and_exact_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("duplicate-target.assets");
+    let (image, asset_paths) = serialized_file_with_duplicate_container_target();
+    fs::write(&source_path, image).unwrap();
+
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(&source_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let graph = snapshot
+        .reference_graph(
+            ReferenceGraphBuildOptions::unbounded(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let planner = ExtractionPlanner::new(&snapshot).with_reference_graph(&graph);
+
+    let mut measured = AssetLoadBudget::default();
+    let result = planner
+        .bundle_container_occurrences(BundleContainerQuery::new("*").unwrap(), &mut measured)
+        .unwrap();
+    let (first_index, first) = result
+        .occurrences()
+        .iter()
+        .enumerate()
+        .find(|(_, occurrence)| occurrence.asset_path() == asset_paths[0])
+        .expect("first patched occurrence");
+    let (second_index, second) = result
+        .occurrences()
+        .iter()
+        .enumerate()
+        .find(|(_, occurrence)| occurrence.asset_path() == asset_paths[1])
+        .expect("second patched occurrence");
+    assert_ne!(first.ordinal(), second.ordinal());
+    assert_ne!(first.field_path(), second.field_path());
+    assert!(first_index < second_index);
+    assert!(first.ordinal() < second.ordinal());
+    assert_eq!(
+        first.resolution().resolved(),
+        second.resolution().resolved()
+    );
+    assert!(first.resolution().resolved().is_some());
+
+    let usage = measured.usage();
+    assert!(usage.bytes > 1);
+    let exact_limits = AssetLoadLimits {
+        max_entries: usage.entries,
+        max_bytes: usage.bytes,
+        max_depth: usage.max_observed_depth,
+        max_members: usage.members,
+        ..AssetLoadLimits::default()
+    };
+    let mut exact = AssetLoadBudget::new(exact_limits).unwrap();
+    let exact_result = planner
+        .bundle_container_occurrences(BundleContainerQuery::new("*").unwrap(), &mut exact)
+        .unwrap();
+    assert_eq!(exact_result, result);
+    assert_eq!(exact.usage(), usage);
+
+    let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: usage.bytes - 1,
+        ..exact_limits
+    })
+    .unwrap();
+    let error = planner
+        .bundle_container_occurrences(BundleContainerQuery::new("*").unwrap(), &mut one_short)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ExtractionPlanError::Budget(BudgetError::Exceeded {
+            resource: "bytes",
+            ..
+        }) | ExtractionPlanError::Workspace(WorkspaceError::Budget(BudgetError::Exceeded {
+            resource: "bytes",
+            ..
+        }))
+    ));
+}
+
+#[test]
 fn bundle_container_and_explicit_handle_publish_identical_artifact_bytes() {
     let mut workspace = AssetWorkspace::new().unwrap();
     workspace
@@ -615,11 +883,52 @@ fn bundle_container_and_explicit_handle_publish_identical_artifact_bytes() {
         )
         .unwrap();
     let planner = ExtractionPlanner::new(&snapshot).with_reference_graph(&graph);
-    let address = planner
-        .bundle_container_addresses("*", &mut AssetLoadBudget::default())
-        .unwrap()
-        .into_iter()
-        .next()
+    let occurrences = planner
+        .bundle_container_occurrences(
+            BundleContainerQuery::new("*").unwrap(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    assert!(occurrences.is_complete());
+    assert!(!occurrences.occurrences().is_empty());
+    for occurrence in occurrences.occurrences() {
+        assert!(!occurrence.asset_path().is_empty());
+        assert!(!occurrence.field_path().segments().is_empty());
+        assert_eq!(
+            occurrence.raw_target().path_id() == 0,
+            matches!(occurrence.resolution(), BundleContainerResolution::Null)
+        );
+        let exact_facts = graph
+            .facts()
+            .iter()
+            .filter(|fact| {
+                graph.address(fact.source()).ok() == Some(occurrence.owner())
+                    && fact.field_path() == occurrence.field_path()
+                    && matches!(
+                        fact.raw_target(),
+                        RawReferenceTarget::Binary {
+                            file_id,
+                            path_id,
+                            ..
+                        } if *file_id == occurrence.raw_target().file_id()
+                            && *path_id == occurrence.raw_target().path_id()
+                    )
+            })
+            .count();
+        assert_eq!(exact_facts, 1);
+    }
+    let canonical = occurrences.canonical_json().unwrap();
+    let decoded = unity_asset::extraction::BundleContainerResult::read_json(
+        canonical.as_slice(),
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap();
+    assert_eq!(decoded, occurrences);
+    let address = occurrences
+        .occurrences()
+        .iter()
+        .find_map(|occurrence| occurrence.resolution().resolved())
+        .cloned()
         .expect("the fixture AssetBundle must expose at least one container entry");
     let WorkspaceLookup::Resolved(handle) = snapshot
         .resolve_object(&address, &mut AssetLoadBudget::default())
@@ -693,12 +1002,13 @@ fn unsupported_binary_classes_are_reported_without_silent_raw_downgrade() {
         .unwrap();
     let snapshot = workspace.snapshot();
     let planner = ExtractionPlanner::new(&snapshot);
-    let preferred = planner
-        .plan(
-            ExtractionRequest::all(ExtractionRepresentationPolicy::PreferDecoded),
-            &mut AssetLoadBudget::default(),
-        )
+    let request = || ExtractionRequest::all(ExtractionRepresentationPolicy::PreferDecoded);
+    let cold_plan = planner
+        .plan(request(), &mut AssetLoadBudget::default())
         .unwrap();
+    let mut measured = AssetLoadBudget::default();
+    let preferred = planner.plan(request(), &mut measured).unwrap();
+    assert_eq!(preferred, cold_plan);
     let artifact = preferred
         .artifacts()
         .iter()
@@ -709,6 +1019,35 @@ fn unsupported_binary_classes_are_reported_without_silent_raw_downgrade() {
                 .any(|diagnostic| diagnostic.code() == ExtractionDiagnosticCode::UnsupportedClass)
         })
         .expect("fixture must contain a binary class without a media decoder");
+    let usage = measured.usage();
+    let exact_limits = AssetLoadLimits {
+        max_entries: usage.entries.max(1),
+        max_bytes: usage.bytes,
+        max_depth: usage.max_observed_depth,
+        max_members: usage.members.max(1),
+        max_compressed_bytes: usage.compressed_bytes.max(1),
+        max_decompressed_bytes: usage.decompressed_bytes.max(1),
+        ..AssetLoadLimits::default()
+    };
+    let mut exact = AssetLoadBudget::new(exact_limits).unwrap();
+    assert_eq!(planner.plan(request(), &mut exact).unwrap(), preferred);
+    assert_eq!(exact.usage(), usage);
+    let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: usage.bytes - 1,
+        ..exact_limits
+    })
+    .unwrap();
+    let error = planner.plan(request(), &mut one_short).unwrap_err();
+    assert!(matches!(
+        error,
+        ExtractionPlanError::Budget(BudgetError::Exceeded {
+            resource: "bytes",
+            ..
+        }) | ExtractionPlanError::Workspace(WorkspaceError::Budget(BudgetError::Exceeded {
+            resource: "bytes",
+            ..
+        }))
+    ));
 
     assert_eq!(
         artifact.preferred_kind(),

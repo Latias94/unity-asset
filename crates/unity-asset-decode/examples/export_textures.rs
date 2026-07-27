@@ -8,9 +8,9 @@
 
 use std::path::PathBuf;
 use unity_asset_core::{AssetLoadBudget, constants::class_ids};
-use unity_asset_decode::file::load_unity_file;
+use unity_asset_decode::file::load_unity_file_with_budget;
+use unity_asset_decode::object::ObjectHandle;
 use unity_asset_decode::texture::Texture2DConverter;
-use unity_asset_decode::{object::ObjectHandle, unity_version::UnityVersion};
 
 fn main() -> unity_asset_decode::Result<()> {
     let path = std::env::args_os()
@@ -30,8 +30,9 @@ fn main() -> unity_asset_decode::Result<()> {
         ))
     })?;
 
-    let file = load_unity_file(&path)?;
-    let converter = Texture2DConverter::new(UnityVersion::default());
+    let mut budget = AssetLoadBudget::default();
+    let file = load_unity_file_with_budget(&path, &mut budget)?;
+    let converter = Texture2DConverter::new();
     let mut budget = AssetLoadBudget::default();
 
     let mut exported = 0usize;
@@ -73,7 +74,7 @@ fn main() -> unity_asset_decode::Result<()> {
         }
         unity_asset_decode::file::UnityFile::WebFile(_) => {
             return Err(unity_asset_decode::BinaryError::invalid_format(
-                "WebFile container: pick an entry and parse it via unity-asset Environment/CLI",
+                "WebFile container: inspect entries through AssetWorkspace or the typed CLI",
             ));
         }
     }

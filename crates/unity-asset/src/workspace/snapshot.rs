@@ -355,10 +355,10 @@ impl WorkspaceView for WorkspaceSnapshot {
                     for (index, class) in document.entries().iter().enumerate() {
                         if !is_plain_yaml_document(index, class) {
                             yaml_anchor_bytes = yaml_anchor_bytes
-                                .checked_add(class.anchor.len())
+                                .checked_add(class.anchor().len())
                                 .ok_or(BudgetError::ArithmeticOverflow {
-                                resource: "workspace_object_results",
-                            })?;
+                                    resource: "workspace_object_results",
+                                })?;
                         }
                     }
                 }
@@ -517,6 +517,14 @@ impl WorkspaceView for WorkspaceSnapshot {
         }
     }
 
+    fn object_address(
+        &self,
+        handle: &RevisionedObjectHandle,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<ObjectAddress, WorkspaceError> {
+        super::inspection::object_address_for_view(self, handle, budget)
+    }
+
     fn read_object(
         &self,
         handle: &RevisionedObjectHandle,
@@ -635,7 +643,7 @@ impl WorkspaceView for WorkspaceSnapshot {
                     budget,
                 )?;
                 let provenance = SchemaProvenance::yaml(
-                    document.entries()[matched_index].class_id,
+                    document.entries()[matched_index].class_id(),
                     yaml_schema_digest(&document.entries()[matched_index], budget).map_err(
                         |error| WorkspaceError::operation("YAML semantic schema digest", error),
                     )?,
@@ -902,15 +910,15 @@ pub(super) fn yaml_object_id(
         })?;
         Ok(ObjectId::yaml_document(source, index)?)
     } else {
-        Ok(ObjectId::yaml(source, class.anchor.as_str())?)
+        Ok(ObjectId::yaml(source, class.anchor())?)
     }
 }
 
 pub(super) fn is_plain_yaml_document(index: usize, class: &UnityClass) -> bool {
-    class.class_id == 0
-        && class.class_name == "YamlDocument"
+    class.class_id() == 0
+        && class.class_name() == "YamlDocument"
         && class
-            .anchor
+            .anchor()
             .strip_prefix("doc_")
             .and_then(|ordinal| ordinal.parse::<usize>().ok())
             == Some(index)
@@ -923,7 +931,7 @@ fn yaml_selector_matches(
 ) -> bool {
     match selector {
         YamlDocumentSelector::Anchored { anchor } => {
-            !is_plain_yaml_document(index, class) && class.anchor == anchor.as_str()
+            !is_plain_yaml_document(index, class) && class.anchor() == anchor.as_str()
         }
         YamlDocumentSelector::Unanchored { document_index } => {
             usize::try_from(*document_index) == Ok(index) && is_plain_yaml_document(index, class)
@@ -933,7 +941,7 @@ fn yaml_selector_matches(
 
 fn yaml_object_matches(object: &ObjectId, index: usize, class: &UnityClass) -> bool {
     if let Some(anchor) = object.yaml_anchor() {
-        !is_plain_yaml_document(index, class) && class.anchor == anchor
+        !is_plain_yaml_document(index, class) && class.anchor() == anchor
     } else {
         object
             .yaml_document_ordinal()

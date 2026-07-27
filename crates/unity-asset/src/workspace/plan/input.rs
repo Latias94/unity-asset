@@ -1,33 +1,67 @@
+use std::collections::TryReserveError;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::mem::size_of;
 
-use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+#[cfg(test)]
+use serde::Deserialize;
+use serde::de::{DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Serialize, Serializer};
 use thiserror::Error;
 use unity_asset_core::{AssetLoadBudget, BudgetError};
 use yaml_rust2::parser::{Event, Parser};
 use yaml_rust2::scanner::{Marker, Scanner, TScalarStyle, TokenType};
 
-use super::{MAX_PLAN_WIRE_DEPTH, MutationPlan, MutationPlanWire};
+#[cfg(test)]
+use super::MutationPlanWire;
+use super::{MAX_PLAN_WIRE_DEPTH, MutationPlan};
 
-const DIAGNOSTIC_SCRATCH_BYTES: u64 = 4 * 1024;
+// The 186-level wire ceiling needs materially more fixed stack/scratch allowance than the generic
+// 64-level JSON contract reader. One KiB per level plus the read buffer and diagnostics fits below
+// this power-of-two reservation.
+const PARSER_FIXED_WORK_BYTES: u64 = 256 * 1024;
+// The encoded byte itself is charged separately. Six additional bytes cover power-of-two input
+// capacity slack plus YAML scanning, the structure-only JSON pass, and typed JSON parser work.
 const PARSER_WORK_BYTES_PER_INPUT_BYTE: u64 = 6;
+// Each JSON value pays for the largest retained wire layout plus Serde's internally-tagged enum
+// representation and collection capacity slack.
+const WIRE_LAYOUT_BYTES_PER_ENTRY: u64 = 512;
+// `from_wire` can temporarily own both operation/action buffers; validation can additionally own
+// target indexes, and Vec-to-boxed-slice conversion may briefly retain old and new allocations.
+const FROM_WIRE_TRANSITION_BYTES_PER_ENTRY: u64 = 1024;
+// Covers root layouts and fixed Serde/validation state not proportional to entries or text.
+const MATERIALIZATION_FIXED_BYTES: u64 = 64 * 1024;
 
 impl MutationPlan {
+    /// Independent hard limit for encoded JSON or YAML Mutation Plan input.
+    ///
+    /// 128 MiB admits the existing 64 MiB semantic string contract and large hexadecimal
+    /// [`super::PlanBytes`] payloads while bounding retained input and both parser passes even when
+    /// a caller supplies a larger [`AssetLoadBudget`].
+    pub const MAX_ENCODED_INPUT_BYTES: usize = 128 * 1024 * 1024;
+
+    /// Independent hard limit for JSON normalized from YAML before typed materialization.
+    ///
+    /// YAML escaping can expand during normalization, so this is enforced independently from
+    /// [`Self::MAX_ENCODED_INPUT_BYTES`].
+    pub const MAX_NORMALIZED_JSON_BYTES: usize = 128 * 1024 * 1024;
+
     /// Reads an untrusted JSON plan with caller-owned allocation and structure budgets.
+    ///
+    /// Encoded input is capped by [`Self::MAX_ENCODED_INPUT_BYTES`] independently of the caller
+    /// budget. Parser scratch, wire structure, strings, hexadecimal byte decoding, and `from_wire`
+    /// transition storage are conservatively charged before typed deserialization starts.
+    ///
+    /// Only the current wire version is accepted; older plans must be regenerated from a current
+    /// workspace snapshot.
     pub fn from_json_reader(
         reader: impl Read,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, MutationPlanReadError> {
         let encoded = read_contract_bytes(reader, budget)?;
-        probe_json(&encoded, budget)?;
-
-        let mut deserializer = serde_json::Deserializer::from_slice(&encoded);
-        deserializer.disable_recursion_limit();
-        let wire = MutationPlanWire::deserialize(&mut deserializer)?;
-        deserializer.end()?;
+        let structure = probe_json(&encoded, budget)?;
+        let wire = deserialize_after_materialization_reservation(&encoded, structure, budget)?;
         Ok(Self::from_wire(wire)?)
     }
 
@@ -42,7 +76,10 @@ impl MutationPlan {
     /// Reads a strict YAML representation of the JSON plan data model.
     ///
     /// YAML is an input convenience only. Aliases, anchors, tags, complex keys, duplicate keys,
-    /// and multiple documents are rejected; persisted identity always uses canonical JSON.
+    /// and multiple documents are rejected; persisted identity always uses canonical JSON. The
+    /// encoded document and normalized JSON are independently capped by
+    /// [`Self::MAX_ENCODED_INPUT_BYTES`] and [`Self::MAX_NORMALIZED_JSON_BYTES`]. Only the current
+    /// wire version is accepted.
     pub fn from_yaml_reader(
         reader: impl Read,
         budget: &mut AssetLoadBudget,
@@ -54,11 +91,8 @@ impl MutationPlan {
             })?;
         let node = parse_yaml_node(text, budget)?;
         let json = serialize_yaml_node(node, budget)?;
-
-        let mut deserializer = serde_json::Deserializer::from_slice(&json);
-        deserializer.disable_recursion_limit();
-        let wire = MutationPlanWire::deserialize(&mut deserializer)?;
-        deserializer.end()?;
+        let structure = probe_normalized_json(&json, budget)?;
+        let wire = deserialize_after_materialization_reservation(&json, structure, budget)?;
         Ok(Self::from_wire(wire)?)
     }
 
@@ -72,16 +106,39 @@ impl MutationPlan {
 }
 
 fn read_contract_bytes(
-    mut reader: impl Read,
+    reader: impl Read,
     budget: &mut AssetLoadBudget,
 ) -> Result<Vec<u8>, MutationPlanReadError> {
-    budget.consume_bytes(DIAGNOSTIC_SCRATCH_BYTES)?;
+    read_contract_bytes_with_limit(reader, budget, MutationPlan::MAX_ENCODED_INPUT_BYTES)
+}
+
+fn read_contract_bytes_with_limit(
+    mut reader: impl Read,
+    budget: &mut AssetLoadBudget,
+    maximum: usize,
+) -> Result<Vec<u8>, MutationPlanReadError> {
+    budget.consume_bytes(PARSER_FIXED_WORK_BYTES)?;
     let mut encoded = Vec::new();
     let mut chunk = [0_u8; 64 * 1024];
     loop {
-        let read = reader.read(&mut chunk)?;
+        let remaining = maximum.saturating_sub(encoded.len());
+        let read_limit = chunk.len().min(remaining.saturating_add(1));
+        let read = reader.read(&mut chunk[..read_limit])?;
         if read == 0 {
             break;
+        }
+        let requested =
+            encoded
+                .len()
+                .checked_add(read)
+                .ok_or(MutationPlanReadError::CapacityOverflow {
+                    resource: "mutation plan encoded input",
+                })?;
+        if requested > maximum {
+            return Err(MutationPlanReadError::EncodedInputLimitExceeded {
+                limit: maximum,
+                requested,
+            });
         }
         let amount = u64::try_from(read).map_err(|_| BudgetError::ArithmeticOverflow {
             resource: "mutation_plan_bytes",
@@ -97,7 +154,7 @@ fn read_contract_bytes(
                 resource: "mutation_plan_bytes",
             })?;
         budget.check_bytes(total)?;
-        ensure_capacity(&mut encoded, read, "mutation plan input")?;
+        ensure_capacity(&mut encoded, read, maximum, "mutation plan input")?;
         budget.consume_bytes(total)?;
         encoded.extend_from_slice(&chunk[..read]);
     }
@@ -107,6 +164,7 @@ fn read_contract_bytes(
 fn ensure_capacity<T>(
     values: &mut Vec<T>,
     additional: usize,
+    maximum: usize,
     resource: &'static str,
 ) -> Result<(), MutationPlanReadError> {
     let required = values
@@ -118,7 +176,8 @@ fn ensure_capacity<T>(
     }
     let target = required
         .checked_next_power_of_two()
-        .ok_or(MutationPlanReadError::CapacityOverflow { resource })?;
+        .unwrap_or(maximum)
+        .min(maximum);
     let additional_capacity = target
         .checked_sub(values.len())
         .ok_or(MutationPlanReadError::CapacityOverflow { resource })?;
@@ -127,17 +186,48 @@ fn ensure_capacity<T>(
         .map_err(|error| MutationPlanReadError::AllocationFailed {
             resource,
             requested: target,
-            message: error.to_string(),
+            error,
         })?;
     debug_assert!(values.capacity() >= required);
     Ok(())
 }
 
-fn probe_json(encoded: &[u8], budget: &mut AssetLoadBudget) -> Result<(), MutationPlanReadError> {
-    budget.consume_entries(1)?;
+fn probe_json(
+    encoded: &[u8],
+    budget: &mut AssetLoadBudget,
+) -> Result<JsonStructure, MutationPlanReadError> {
+    probe_json_structure(encoded, budget, true)
+}
+
+fn probe_normalized_json(
+    encoded: &[u8],
+    budget: &mut AssetLoadBudget,
+) -> Result<JsonStructure, MutationPlanReadError> {
+    // YAML parsing already charged every scalar, container, and collection member.
+    probe_json_structure(encoded, budget, false)
+}
+
+fn probe_json_structure(
+    encoded: &[u8],
+    budget: &mut AssetLoadBudget,
+    charge_structure_budget: bool,
+) -> Result<JsonStructure, MutationPlanReadError> {
+    let encoded_bytes =
+        u64::try_from(encoded.len()).map_err(|_| BudgetError::ArithmeticOverflow {
+            resource: "mutation_plan_materialization",
+        })?;
+    if charge_structure_budget {
+        budget.consume_entries(1)?;
+    }
     let mut state = JsonProbeState {
         budget,
         failure: None,
+        charge_structure_budget,
+        structure: JsonStructure {
+            encoded_bytes,
+            entries: 1,
+            string_bytes: 0,
+        },
     };
     let mut deserializer = serde_json::Deserializer::from_slice(encoded);
     deserializer.disable_recursion_limit();
@@ -145,7 +235,6 @@ fn probe_json(encoded: &[u8], budget: &mut AssetLoadBudget) -> Result<(), Mutati
         state: &mut state,
         depth: 0,
         charge_entry: false,
-        charge_member: false,
     }
     .deserialize(&mut deserializer);
     if let Some(failure) = state.failure {
@@ -153,12 +242,124 @@ fn probe_json(encoded: &[u8], budget: &mut AssetLoadBudget) -> Result<(), Mutati
     }
     result?;
     deserializer.end()?;
+    Ok(state.structure)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JsonStructure {
+    encoded_bytes: u64,
+    entries: u64,
+    string_bytes: u64,
+}
+
+fn materialization_bytes<T>(structure: JsonStructure) -> Result<u64, BudgetError> {
+    let root_layout =
+        u64::try_from(size_of::<T>()).map_err(|_| BudgetError::ArithmeticOverflow {
+            resource: "mutation_plan_materialization",
+        })?;
+    let wire_layout = structure
+        .entries
+        .checked_mul(WIRE_LAYOUT_BYTES_PER_ENTRY)
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "mutation_plan_materialization",
+        })?;
+    let transition_layout = structure
+        .entries
+        .checked_mul(FROM_WIRE_TRANSITION_BYTES_PER_ENTRY)
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "mutation_plan_materialization",
+        })?;
+
+    // Two encoded-size copies cover owned strings, enum-content scratch, mapping keys, capacity
+    // slack, and the parser pass over normalized YAML. Treating every string as hexadecimal
+    // additionally bounds all PlanBytes decoding without having to start typed deserialization to
+    // discover its variant.
+    let textual_storage =
+        structure
+            .encoded_bytes
+            .checked_mul(2)
+            .ok_or(BudgetError::ArithmeticOverflow {
+                resource: "mutation_plan_materialization",
+            })?;
+    let decoded_plan_bytes = structure
+        .string_bytes
+        .checked_div(2)
+        .and_then(|bytes| bytes.checked_add(structure.string_bytes % 2))
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "mutation_plan_materialization",
+        })?;
+
+    MATERIALIZATION_FIXED_BYTES
+        .checked_add(root_layout)
+        .and_then(|bytes| bytes.checked_add(wire_layout))
+        .and_then(|bytes| bytes.checked_add(transition_layout))
+        .and_then(|bytes| bytes.checked_add(textual_storage))
+        .and_then(|bytes| bytes.checked_add(decoded_plan_bytes))
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "mutation_plan_materialization",
+        })
+}
+
+fn charge_materialization<T>(
+    structure: JsonStructure,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), MutationPlanReadError> {
+    let bytes = materialization_bytes::<T>(structure)?;
+    budget.check_bytes(bytes)?;
+    budget.consume_bytes(bytes)?;
     Ok(())
+}
+
+fn deserialize_after_materialization_reservation<T: DeserializeOwned>(
+    encoded: &[u8],
+    structure: JsonStructure,
+    budget: &mut AssetLoadBudget,
+) -> Result<T, MutationPlanReadError> {
+    charge_materialization::<T>(structure, budget)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(encoded);
+    deserializer.disable_recursion_limit();
+    let value = T::deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
 }
 
 struct JsonProbeState<'budget> {
     budget: &'budget mut AssetLoadBudget,
     failure: Option<JsonProbeFailure>,
+    charge_structure_budget: bool,
+    structure: JsonStructure,
+}
+
+impl JsonProbeState<'_> {
+    fn charge_value(&mut self) -> Result<(), BudgetError> {
+        let entries =
+            self.structure
+                .entries
+                .checked_add(1)
+                .ok_or(BudgetError::ArithmeticOverflow {
+                    resource: "mutation_plan_entries",
+                })?;
+        if self.charge_structure_budget {
+            self.budget.check_members(1)?;
+            self.budget.check_entries(1)?;
+            self.budget.consume_members(1)?;
+            self.budget.consume_entries(1)?;
+        }
+        self.structure.entries = entries;
+        Ok(())
+    }
+
+    fn observe_string(&mut self, length: usize) -> Result<(), BudgetError> {
+        let length = u64::try_from(length).map_err(|_| BudgetError::ArithmeticOverflow {
+            resource: "mutation_plan_string_bytes",
+        })?;
+        self.structure.string_bytes = self.structure.string_bytes.checked_add(length).ok_or(
+            BudgetError::ArithmeticOverflow {
+                resource: "mutation_plan_string_bytes",
+            },
+        )?;
+        Ok(())
+    }
 }
 
 enum JsonProbeFailure {
@@ -183,7 +384,6 @@ struct JsonProbeSeed<'state, 'budget> {
     state: &'state mut JsonProbeState<'budget>,
     depth: u32,
     charge_entry: bool,
-    charge_member: bool,
 }
 
 impl<'de> DeserializeSeed<'de> for JsonProbeSeed<'_, '_> {
@@ -193,36 +393,12 @@ impl<'de> DeserializeSeed<'de> for JsonProbeSeed<'_, '_> {
     where
         D: serde::Deserializer<'de>,
     {
-        if self.charge_member
-            && let Err(error) = self.state.budget.check_members(1)
-        {
-            self.state.failure = Some(JsonProbeFailure::Budget(error));
-            return Err(serde::de::Error::custom(
-                "mutation plan JSON member budget exceeded",
-            ));
-        }
         if self.charge_entry
-            && let Err(error) = self.state.budget.check_entries(1)
+            && let Err(error) = self.state.charge_value()
         {
             self.state.failure = Some(JsonProbeFailure::Budget(error));
             return Err(serde::de::Error::custom(
-                "mutation plan JSON entry budget exceeded",
-            ));
-        }
-        if self.charge_member
-            && let Err(error) = self.state.budget.consume_members(1)
-        {
-            self.state.failure = Some(JsonProbeFailure::Budget(error));
-            return Err(serde::de::Error::custom(
-                "mutation plan JSON member budget changed after preflight",
-            ));
-        }
-        if self.charge_entry
-            && let Err(error) = self.state.budget.consume_entries(1)
-        {
-            self.state.failure = Some(JsonProbeFailure::Budget(error));
-            return Err(serde::de::Error::custom(
-                "mutation plan JSON entry budget changed after preflight",
+                "mutation plan JSON structure budget exceeded",
             ));
         }
         deserializer.deserialize_any(JsonProbeVisitor {
@@ -264,7 +440,14 @@ impl<'de> Visitor<'de> for JsonProbeVisitor<'_, '_> {
         Ok(())
     }
 
-    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if let Err(error) = self.state.observe_string(value.len()) {
+            self.state.failure = Some(JsonProbeFailure::Budget(error));
+            return Err(E::custom("mutation plan JSON string accounting overflow"));
+        }
         Ok(())
     }
 
@@ -278,7 +461,6 @@ impl<'de> Visitor<'de> for JsonProbeVisitor<'_, '_> {
                 state: &mut *self.state,
                 depth: child_depth,
                 charge_entry: true,
-                charge_member: true,
             })?
             .is_some()
         {}
@@ -295,7 +477,6 @@ impl<'de> Visitor<'de> for JsonProbeVisitor<'_, '_> {
                 state: &mut *self.state,
                 depth: child_depth,
                 charge_entry: true,
-                charge_member: true,
             })?;
         }
         Ok(())
@@ -484,9 +665,10 @@ fn parse_yaml_node(
                 }
                 // Unique keys make this deterministic; unstable sort avoids unbudgeted scratch.
                 entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-                if let Some(duplicate) = entries.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+                if let Some(index) = entries.windows(2).position(|pair| pair[0].0 == pair[1].0) {
+                    let key = entries.remove(index).0;
                     return Err(MutationPlanReadError::YamlDuplicateKey {
-                        key: duplicate[0].0.clone(),
+                        key,
                         line: marker.line(),
                         column: marker.col() + 1,
                     });
@@ -707,7 +889,7 @@ fn try_push_budgeted<T>(
             MutationPlanReadError::AllocationFailed {
                 resource,
                 requested: target,
-                message: error.to_string(),
+                error,
             }
         })?;
         budget.consume_bytes(allocation_bytes)?;
@@ -720,10 +902,19 @@ fn serialize_yaml_node(
     node: YamlNode,
     budget: &mut AssetLoadBudget,
 ) -> Result<Vec<u8>, MutationPlanReadError> {
+    serialize_yaml_node_with_limit(node, budget, MutationPlan::MAX_NORMALIZED_JSON_BYTES)
+}
+
+fn serialize_yaml_node_with_limit(
+    node: YamlNode,
+    budget: &mut AssetLoadBudget,
+    maximum: usize,
+) -> Result<Vec<u8>, MutationPlanReadError> {
     let mut output = BudgetedOutput {
         bytes: Vec::new(),
         budget,
         failure: None,
+        maximum,
     };
     let result = serde_json::to_writer(&mut output, &node);
     if let Some(failure) = output.failure.take() {
@@ -735,22 +926,32 @@ fn serialize_yaml_node(
 
 enum OutputFailure {
     Budget(BudgetError),
-    Allocation { requested: usize, message: String },
+    Allocation {
+        requested: usize,
+        error: TryReserveError,
+    },
     Capacity,
+    Limit {
+        limit: usize,
+        requested: usize,
+    },
 }
 
 impl OutputFailure {
     fn into_read_error(self) -> MutationPlanReadError {
         match self {
             Self::Budget(error) => MutationPlanReadError::Budget(error),
-            Self::Allocation { requested, message } => MutationPlanReadError::AllocationFailed {
+            Self::Allocation { requested, error } => MutationPlanReadError::AllocationFailed {
                 resource: "YAML normalized JSON",
                 requested,
-                message,
+                error,
             },
             Self::Capacity => MutationPlanReadError::CapacityOverflow {
                 resource: "YAML normalized JSON",
             },
+            Self::Limit { limit, requested } => {
+                MutationPlanReadError::NormalizedJsonLimitExceeded { limit, requested }
+            }
         }
     }
 }
@@ -759,6 +960,7 @@ struct BudgetedOutput<'budget> {
     bytes: Vec<u8>,
     budget: &'budget mut AssetLoadBudget,
     failure: Option<OutputFailure>,
+    maximum: usize,
 }
 
 impl Write for BudgetedOutput<'_> {
@@ -770,12 +972,18 @@ impl Write for BudgetedOutput<'_> {
             self.failure = Some(OutputFailure::Capacity);
             return Err(io::Error::other("YAML normalized JSON capacity overflow"));
         };
+        if required > self.maximum {
+            self.failure = Some(OutputFailure::Limit {
+                limit: self.maximum,
+                requested: required,
+            });
+            return Err(io::Error::other("YAML normalized JSON hard limit exceeded"));
+        }
         let target = if required > self.bytes.capacity() {
-            let Some(target) = required.checked_next_power_of_two() else {
-                self.failure = Some(OutputFailure::Capacity);
-                return Err(io::Error::other("YAML normalized JSON capacity overflow"));
-            };
-            target
+            required
+                .checked_next_power_of_two()
+                .unwrap_or(self.maximum)
+                .min(self.maximum)
         } else {
             self.bytes.capacity()
         };
@@ -800,7 +1008,7 @@ impl Write for BudgetedOutput<'_> {
         {
             self.failure = Some(OutputFailure::Allocation {
                 requested: target,
-                message: error.to_string(),
+                error,
             });
             return Err(io::Error::other(
                 "failed to reserve YAML normalized JSON output",
@@ -837,14 +1045,21 @@ pub enum MutationPlanReadError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Budget(#[from] BudgetError),
-    #[error("failed to allocate {resource} capacity {requested}: {message}")]
+    #[error("failed to allocate {resource} capacity {requested}: {error}")]
     AllocationFailed {
         resource: &'static str,
         requested: usize,
-        message: String,
+        #[source]
+        error: TryReserveError,
     },
     #[error("{resource} capacity arithmetic overflow")]
     CapacityOverflow { resource: &'static str },
+    #[error(
+        "mutation plan encoded input length {requested} exceeds independent hard limit {limit}"
+    )]
+    EncodedInputLimitExceeded { limit: usize, requested: usize },
+    #[error("YAML normalized JSON length {requested} exceeds independent hard limit {limit}")]
+    NormalizedJsonLimitExceeded { limit: usize, requested: usize },
     #[error("invalid mutation plan JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -902,6 +1117,15 @@ pub enum MutationPlanReadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unity_asset_core::AssetLoadLimits;
+
+    fn byte_budget(max_bytes: u64) -> AssetLoadBudget {
+        AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap()
+    }
 
     struct FragmentedReader {
         bytes: Vec<u8>,
@@ -930,9 +1154,35 @@ mod tests {
         let mut values = Vec::with_capacity(32 * 1024);
         values.resize(20 * 1024, 0_u8);
 
-        ensure_capacity(&mut values, 40 * 1024, "fragmented input").unwrap();
+        ensure_capacity(
+            &mut values,
+            40 * 1024,
+            MutationPlan::MAX_ENCODED_INPUT_BYTES,
+            "fragmented input",
+        )
+        .unwrap();
 
         assert!(values.capacity() >= 60 * 1024);
+    }
+
+    #[test]
+    fn encoded_input_hard_cap_accepts_exactly_the_limit_and_rejects_one_more_byte() {
+        assert_eq!(MutationPlan::MAX_ENCODED_INPUT_BYTES, 128 * 1024 * 1024);
+
+        let encoded =
+            read_contract_bytes_with_limit(b"null".as_slice(), &mut AssetLoadBudget::default(), 4)
+                .unwrap();
+        assert_eq!(encoded, b"null");
+
+        let mut one_over_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            read_contract_bytes_with_limit(b"null ".as_slice(), &mut one_over_budget, 4,),
+            Err(MutationPlanReadError::EncodedInputLimitExceeded {
+                limit: 4,
+                requested: 5,
+            })
+        ));
+        assert_eq!(one_over_budget.usage().bytes, PARSER_FIXED_WORK_BYTES);
     }
 
     #[test]
@@ -951,8 +1201,132 @@ mod tests {
         assert_eq!(encoded, bytes);
         assert_eq!(
             budget.usage().bytes,
-            DIAGNOSTIC_SCRATCH_BYTES
+            PARSER_FIXED_WORK_BYTES
                 + u64::try_from(encoded.len()).unwrap() * (PARSER_WORK_BYTES_PER_INPUT_BYTE + 1)
+        );
+    }
+
+    #[test]
+    fn materialization_reservation_has_an_exact_budget_boundary() {
+        let structure = JsonStructure {
+            encoded_bytes: 37,
+            entries: 9,
+            string_bytes: 17,
+        };
+        let required = materialization_bytes::<MutationPlanWire>(structure).unwrap();
+
+        let mut exact = byte_budget(required);
+        charge_materialization::<MutationPlanWire>(structure, &mut exact).unwrap();
+        assert_eq!(exact.usage().bytes, required);
+
+        let mut one_short = byte_budget(required - 1);
+        assert!(matches!(
+            charge_materialization::<MutationPlanWire>(structure, &mut one_short),
+            Err(MutationPlanReadError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            })) if limit == required - 1 && requested == required
+        ));
+        assert_eq!(one_short.usage().bytes, 0);
+    }
+
+    #[test]
+    fn large_plan_bytes_fail_before_typed_deserialization_starts() {
+        struct DeserializationMustNotStart;
+
+        impl<'de> Deserialize<'de> for DeserializationMustNotStart {
+            fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                panic!("typed deserialization started before materialization was reserved");
+            }
+        }
+
+        const PLAN_BYTES: usize = 1024 * 1024;
+        let encoded = format!(r#"{{"bytes":"{}"}}"#, "00".repeat(PLAN_BYTES));
+        let structure = probe_json(encoded.as_bytes(), &mut AssetLoadBudget::default()).unwrap();
+        assert_eq!(
+            structure.string_bytes,
+            u64::try_from(PLAN_BYTES * 2).unwrap()
+        );
+        let required = materialization_bytes::<DeserializationMustNotStart>(structure).unwrap();
+        let mut one_short = byte_budget(required - 1);
+
+        assert!(matches!(
+            deserialize_after_materialization_reservation::<DeserializationMustNotStart>(
+                encoded.as_bytes(),
+                structure,
+                &mut one_short,
+            ),
+            Err(MutationPlanReadError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            })) if limit == required - 1 && requested == required
+        ));
+    }
+
+    #[test]
+    fn yaml_normalized_json_has_an_independent_exact_hard_cap() {
+        assert_eq!(MutationPlan::MAX_NORMALIZED_JSON_BYTES, 128 * 1024 * 1024);
+
+        let normalized = serialize_yaml_node_with_limit(
+            YamlNode::String("ab".to_owned()),
+            &mut AssetLoadBudget::default(),
+            4,
+        )
+        .unwrap();
+        assert_eq!(normalized, br#""ab""#);
+
+        assert!(matches!(
+            serialize_yaml_node_with_limit(
+                YamlNode::String("ab".to_owned()),
+                &mut AssetLoadBudget::default(),
+                3,
+            ),
+            Err(MutationPlanReadError::NormalizedJsonLimitExceeded {
+                limit: 3,
+                requested: 4,
+            })
+        ));
+
+        let mut output_budget = AssetLoadBudget::default();
+        let mut output = BudgetedOutput {
+            bytes: Vec::new(),
+            budget: &mut output_budget,
+            failure: None,
+            maximum: 3,
+        };
+        Write::write_all(&mut output, b"abc").unwrap();
+        let charged_at_limit = output.budget.usage().bytes;
+        assert!(Write::write_all(&mut output, b"d").is_err());
+        assert_eq!(output.bytes, b"abc");
+        assert_eq!(output.budget.usage().bytes, charged_at_limit);
+        assert!(matches!(
+            output.failure,
+            Some(OutputFailure::Limit {
+                limit: 3,
+                requested: 4,
+            })
+        ));
+    }
+
+    #[test]
+    fn per_entry_materialization_model_covers_known_transition_layouts() {
+        assert!(
+            WIRE_LAYOUT_BYTES_PER_ENTRY
+                >= u64::try_from(size_of::<super::super::MutationOperation>()).unwrap()
+        );
+        assert!(
+            FROM_WIRE_TRANSITION_BYTES_PER_ENTRY
+                >= u64::try_from(
+                    size_of::<super::super::MutationOperation>()
+                        + size_of::<super::super::GenericMutation>()
+                        + size_of::<usize>() * 2
+                )
+                .unwrap()
         );
     }
 

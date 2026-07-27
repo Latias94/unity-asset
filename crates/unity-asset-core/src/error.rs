@@ -64,7 +64,7 @@ pub enum UnityAssetError {
 
     /// Wrap an underlying error while preserving its type as a `source()`.
     ///
-    /// This is used by higher-level crates (e.g. environment) to add context without losing
+    /// This is used by higher-level crates (e.g. workspace) to add context without losing
     /// the original error kind (I/O, binary parser errors, etc).
     #[error("{message}: {source}")]
     WithSource {

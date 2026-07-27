@@ -45,26 +45,49 @@ fn request_normalization_makes_input_order_irrelevant() {
 }
 
 #[test]
-fn request_json_requires_exact_caller_owned_input_budget() {
+fn request_json_requires_exact_caller_owned_resource_budget() {
     let request = request();
     let encoded = request.canonical_json().unwrap();
-    let encoded_len = u64::try_from(encoded.len()).unwrap();
+    let mut measured = AssetLoadBudget::default();
+    let measured_request = ExtractionRequest::read_json(encoded.as_slice(), &mut measured).unwrap();
+    assert_eq!(measured_request, request);
+    let required_bytes = measured.usage().bytes;
 
     let decoded =
-        ExtractionRequest::read_json(encoded.as_slice(), &mut budget_with_bytes(encoded_len))
+        ExtractionRequest::read_json(encoded.as_slice(), &mut budget_with_bytes(required_bytes))
             .unwrap();
     assert_eq!(decoded, request);
 
-    let error =
-        ExtractionRequest::read_json(encoded.as_slice(), &mut budget_with_bytes(encoded_len - 1))
-            .unwrap_err();
+    let error = ExtractionRequest::read_json(
+        encoded.as_slice(),
+        &mut budget_with_bytes(required_bytes - 1),
+    )
+    .unwrap_err();
     assert!(matches!(
         error,
         BudgetedJsonError::Budget(BudgetError::Exceeded {
             resource: "bytes",
             limit,
             requested,
-        }) if limit == encoded_len - 1 && requested == encoded_len
+        }) if limit == required_bytes - 1 && requested == required_bytes
+    ));
+}
+
+#[test]
+fn request_json_rejects_structure_beyond_its_contract_profile() {
+    let nested = format!("{}0{}", "[".repeat(64), "]".repeat(64));
+    let encoded = format!(r#"{{"unexpected":{nested}}}"#);
+    let error = ExtractionRequest::read_json(encoded.as_bytes(), &mut AssetLoadBudget::default())
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        BudgetedJsonError::StructureLimitExceeded {
+            contract: "unity_asset.extraction_request",
+            resource: "depth",
+            limit: 64,
+            requested: 65,
+        }
     ));
 }
 

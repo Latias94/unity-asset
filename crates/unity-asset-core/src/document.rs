@@ -3,10 +3,11 @@
 //! This module provides abstract traits and types for Unity documents
 //! that can be implemented by different format-specific parsers.
 
-use crate::error::Result;
 use crate::unity_class::UnityClass;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "async")]
+use crate::{AssetLoadBudget, error::Result};
 #[cfg(feature = "async")]
 use async_trait::async_trait;
 #[cfg(feature = "async")]
@@ -22,25 +23,18 @@ pub enum DocumentFormat {
 /// Abstract trait for Unity documents
 pub trait UnityDocument {
     /// Get the first entry (main object) in the document
-    fn entry(&self) -> Option<&UnityClass>;
-
-    /// Get a mutable reference to the first entry
-    fn entry_mut(&mut self) -> Option<&mut UnityClass>;
+    fn entry(&self) -> Option<&UnityClass> {
+        self.entries().first()
+    }
 
     /// Get all entries in the document
     fn entries(&self) -> &[UnityClass];
-
-    /// Get mutable access to all entries
-    fn entries_mut(&mut self) -> &mut Vec<UnityClass>;
-
-    /// Add a new Unity object to the document
-    fn add_entry(&mut self, entry: UnityClass);
 
     /// Filter entries by class name
     fn filter_by_class(&self, class_name: &str) -> Vec<&UnityClass> {
         self.entries()
             .iter()
-            .filter(|entry| entry.class_name == class_name)
+            .filter(|entry| entry.class_name() == class_name)
             .collect()
     }
 
@@ -48,7 +42,7 @@ pub trait UnityDocument {
     fn filter_by_classes(&self, class_names: &[&str]) -> Vec<&UnityClass> {
         self.entries()
             .iter()
-            .filter(|entry| class_names.contains(&entry.class_name.as_str()))
+            .filter(|entry| class_names.contains(&entry.class_name()))
             .collect()
     }
 
@@ -67,7 +61,7 @@ pub trait UnityDocument {
     fn find_by_class_and_property(&self, class_name: &str, property: &str) -> Option<&UnityClass> {
         self.entries()
             .iter()
-            .find(|entry| entry.class_name == class_name && entry.has_property(property))
+            .find(|entry| entry.class_name() == class_name && entry.has_property(property))
     }
 
     /// Get the file path this document was loaded from
@@ -82,12 +76,6 @@ pub trait UnityDocument {
     fn len(&self) -> usize {
         self.entries().len()
     }
-
-    /// Save the document back to its original file
-    fn save(&self) -> Result<()>;
-
-    /// Save the document to a specific file
-    fn save_to<P: AsRef<Path>>(&self, path: P) -> Result<()>;
 
     /// Get the document format
     fn format(&self) -> DocumentFormat;
@@ -140,13 +128,15 @@ impl DocumentMetadata {
 #[cfg(feature = "async")]
 #[async_trait]
 pub trait AsyncUnityDocument: Send + Sync {
-    /// Load document from file path asynchronously
-    async fn load_from_path_async<P: AsRef<Path> + Send>(path: P) -> Result<Self>
+    type LoadError: std::error::Error + Send + Sync + 'static;
+
+    /// Loads a document from a file path under one caller-owned budget.
+    async fn load_from_path_async(
+        path: &Path,
+        budget: &mut AssetLoadBudget,
+    ) -> std::result::Result<Self, Self::LoadError>
     where
         Self: Sized;
-
-    /// Save document to file path asynchronously
-    async fn save_to_path_async<P: AsRef<Path> + Send>(&self, path: P) -> Result<()>;
 
     /// Get all entries in the document (sync access for already loaded data)
     fn entries(&self) -> &[UnityClass];
@@ -189,36 +179,12 @@ mod tests {
     }
 
     impl UnityDocument for MockDocument {
-        fn entry(&self) -> Option<&UnityClass> {
-            self.entries.first()
-        }
-
-        fn entry_mut(&mut self) -> Option<&mut UnityClass> {
-            self.entries.first_mut()
-        }
-
         fn entries(&self) -> &[UnityClass] {
             &self.entries
         }
 
-        fn entries_mut(&mut self) -> &mut Vec<UnityClass> {
-            &mut self.entries
-        }
-
-        fn add_entry(&mut self, entry: UnityClass) {
-            self.entries.push(entry);
-        }
-
         fn file_path(&self) -> Option<&Path> {
             self.metadata.file_path.as_deref()
-        }
-
-        fn save(&self) -> Result<()> {
-            Ok(()) // Mock implementation
-        }
-
-        fn save_to<P: AsRef<Path>>(&self, _path: P) -> Result<()> {
-            Ok(()) // Mock implementation
         }
 
         fn format(&self) -> DocumentFormat {
@@ -228,16 +194,14 @@ mod tests {
 
     #[test]
     fn test_document_trait() {
-        let mut doc = MockDocument {
-            entries: Vec::new(),
+        let doc = MockDocument {
+            entries: vec![UnityClass::new(
+                1,
+                "GameObject".to_string(),
+                "123".to_string(),
+            )],
             metadata: DocumentMetadata::new(DocumentFormat::Yaml),
         };
-
-        assert!(doc.is_empty());
-        assert_eq!(doc.len(), 0);
-
-        let class = UnityClass::new(1, "GameObject".to_string(), "123".to_string());
-        doc.add_entry(class);
 
         assert!(!doc.is_empty());
         assert_eq!(doc.len(), 1);
@@ -246,16 +210,13 @@ mod tests {
 
     #[test]
     fn test_document_filtering() {
-        let mut doc = MockDocument {
-            entries: Vec::new(),
+        let doc = MockDocument {
+            entries: vec![
+                UnityClass::new(1, "GameObject".to_string(), "123".to_string()),
+                UnityClass::new(114, "MonoBehaviour".to_string(), "456".to_string()),
+            ],
             metadata: DocumentMetadata::new(DocumentFormat::Yaml),
         };
-
-        let game_object = UnityClass::new(1, "GameObject".to_string(), "123".to_string());
-        let behaviour = UnityClass::new(114, "MonoBehaviour".to_string(), "456".to_string());
-
-        doc.add_entry(game_object);
-        doc.add_entry(behaviour);
 
         let game_objects = doc.filter_by_class("GameObject");
         assert_eq!(game_objects.len(), 1);

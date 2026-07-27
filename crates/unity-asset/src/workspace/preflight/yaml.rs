@@ -1,6 +1,7 @@
-use std::mem::{size_of, take};
+use std::mem::size_of;
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use thiserror::Error;
 use unity_asset_core::{
     AllocationSizeError, AssetLoadBudget, BudgetError, DigestBuildError, DigestV1, FieldPath,
@@ -37,7 +38,7 @@ pub(super) struct YamlObjectCandidate {
     object: ObjectId,
     lineage: Arc<CandidateLineage>,
     document_index: usize,
-    class: UnityClass,
+    class: Option<UnityClass>,
     previous_ordinal: Option<u32>,
 }
 
@@ -67,16 +68,17 @@ impl ValidatedYamlFieldGuard {
 #[derive(Debug)]
 #[must_use = "commit the prepared field replacement after dependent allocations succeed"]
 pub(super) struct PreparedYamlFieldReplace<'candidate> {
-    target: &'candidate mut UnityValue,
+    class: &'candidate mut Option<UnityClass>,
     previous_ordinal: &'candidate mut Option<u32>,
+    path: FieldPath,
     replacement: UnityValue,
     ordinal: u32,
 }
 
 impl PreparedYamlFieldReplace<'_> {
-    /// Installs the already validated replacement without allocation or further path resolution.
+    /// Installs the already validated replacement without allocation or fallible work.
     pub(super) fn commit(self) {
-        *self.target = self.replacement;
+        replace_class_value(self.class, &self.path, self.replacement);
         *self.previous_ordinal = Some(self.ordinal);
     }
 }
@@ -113,10 +115,10 @@ impl YamlObjectCandidate {
                 actual: schema.object_kind(),
             });
         }
-        if schema.class_id() != base.class_id {
+        if schema.class_id() != base.class_id() {
             return Err(YamlCandidateBuildError::SchemaClassMismatch {
                 schema: schema.class_id(),
-                class: base.class_id,
+                class: base.class_id(),
             });
         }
         if !yaml_identity_matches(&object, document_index, base) {
@@ -131,7 +133,7 @@ impl YamlObjectCandidate {
             object,
             lineage: Arc::new(CandidateLineage),
             document_index,
-            class,
+            class: Some(class),
             previous_ordinal: None,
         })
     }
@@ -145,8 +147,10 @@ impl YamlObjectCandidate {
         self.document_index
     }
 
-    pub(super) const fn class(&self) -> &UnityClass {
-        &self.class
+    pub(super) fn class(&self) -> &UnityClass {
+        self.class
+            .as_ref()
+            .expect("a YAML candidate always owns its class outside a rebuild")
     }
 
     /// Verifies an ordered field guard without borrowing or changing the candidate.
@@ -210,17 +214,17 @@ impl YamlObjectCandidate {
                 document_index: self.document_index,
             });
         }
-        let target = self
-            .class
-            .value_at_path_mut(&validated.path)
+        self.class()
+            .value_at_path(&validated.path)
             .map_err(|source| YamlCandidateError::Path {
                 ordinal: validated.ordinal,
                 document_index: self.document_index,
                 source,
             })?;
         Ok(PreparedYamlFieldReplace {
-            target,
+            class: &mut self.class,
             previous_ordinal: &mut self.previous_ordinal,
+            path: validated.path,
             replacement,
             ordinal: validated.ordinal,
         })
@@ -282,7 +286,9 @@ impl YamlObjectCandidate {
     pub(super) fn finish(self) -> FinishedYamlObject {
         FinishedYamlObject {
             document_index: self.document_index,
-            class: self.class,
+            class: self
+                .class
+                .expect("a finished YAML candidate still owns its class"),
         }
     }
 
@@ -301,15 +307,7 @@ impl YamlObjectCandidate {
             });
         }
         self.verify_field_guard(ordinal, path, guard, budget)?;
-        let current =
-            self.class
-                .value_at_path_mut(path)
-                .map_err(|source| YamlCandidateError::Path {
-                    ordinal,
-                    document_index: self.document_index,
-                    source,
-                })?;
-        *current = replacement;
+        replace_class_value(&mut self.class, path, replacement);
         Ok(())
     }
 
@@ -329,7 +327,7 @@ impl YamlObjectCandidate {
                 actual,
             });
         };
-        *self.class.properties_mut() = properties;
+        replace_class_properties(&mut self.class, properties);
         Ok(())
     }
 
@@ -348,23 +346,14 @@ impl YamlObjectCandidate {
             });
         }
         self.verify_field_guard(ordinal, path, guard, budget)?;
-        let current =
-            self.class
-                .value_at_path_mut(path)
-                .map_err(|source| YamlCandidateError::Path {
-                    ordinal,
-                    document_index: self.document_index,
-                    source,
-                })?;
-        let actual = current.kind();
-        let UnityValue::Array(values) = current else {
-            return Err(YamlCandidateError::SequenceTypeMismatch {
-                ordinal,
-                document_index: self.document_index,
-                actual,
-            });
-        };
-        apply_sequence_edit(ordinal, self.document_index, values, edit, budget)
+        edit_class_sequence(
+            &mut self.class,
+            ordinal,
+            self.document_index,
+            path,
+            edit,
+            budget,
+        )
     }
 
     fn verify_field_guard(
@@ -375,14 +364,14 @@ impl YamlObjectCandidate {
         budget: &mut AssetLoadBudget,
     ) -> Result<(), YamlCandidateError> {
         let current =
-            self.class
+            self.class()
                 .value_at_path(path)
                 .map_err(|source| YamlCandidateError::Path {
                     ordinal,
                     document_index: self.document_index,
                     source,
                 })?;
-        let actual_schema = yaml_field_schema_digest(&self.class, path, current, budget)
+        let actual_schema = yaml_field_schema_digest(self.class(), path, current, budget)
             .map_err(|source| self.digest_error(ordinal, YamlDigestPhase::FieldSchema, source))?;
         if guard.schema_digest() != actual_schema {
             return Err(YamlCandidateError::FieldSchemaGuardMismatch {
@@ -411,7 +400,7 @@ impl YamlObjectCandidate {
         guard: ObjectGuard,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), YamlCandidateError> {
-        let actual_schema = yaml_schema_digest(&self.class, budget)
+        let actual_schema = yaml_schema_digest(self.class(), budget)
             .map_err(|source| self.digest_error(ordinal, YamlDigestPhase::ObjectSchema, source))?;
         if guard.schema_digest() != actual_schema {
             return Err(YamlCandidateError::ObjectSchemaGuardMismatch {
@@ -421,8 +410,12 @@ impl YamlObjectCandidate {
                 actual: actual_schema,
             });
         }
-        let actual_value = semantic_class_value_digest(&mut self.class, budget)
-            .map_err(|source| self.digest_error(ordinal, YamlDigestPhase::ObjectValue, source))?;
+        let actual_value = match semantic_class_value_digest(&mut self.class, budget) {
+            Ok(value) => value,
+            Err(source) => {
+                return Err(self.digest_error(ordinal, YamlDigestPhase::ObjectValue, source));
+            }
+        };
         if guard.value_digest() != actual_value {
             return Err(YamlCandidateError::ObjectValueGuardMismatch {
                 ordinal,
@@ -451,23 +444,90 @@ impl YamlObjectCandidate {
 
 fn yaml_identity_matches(object: &ObjectId, document_index: usize, class: &UnityClass) -> bool {
     match (object.yaml_anchor(), object.yaml_document_ordinal()) {
-        (Some(anchor), None) => anchor == class.anchor,
+        (Some(anchor), None) => anchor == class.anchor(),
         (None, Some(ordinal)) => usize::try_from(ordinal) == Ok(document_index),
         (Some(_), Some(_)) | (None, None) => false,
     }
 }
 
+fn replace_class_value(class: &mut Option<UnityClass>, path: &FieldPath, replacement: UnityValue) {
+    let owned = class
+        .take()
+        .expect("a YAML candidate owns its class while committing a field");
+    let (header, properties) = owned.into_parts();
+    let mut root = UnityValue::Object(properties);
+    *root
+        .value_at_path_mut(path)
+        .expect("the field path was validated against the unchanged candidate") = replacement;
+    let UnityValue::Object(properties) = root else {
+        unreachable!("a class property root remains an object")
+    };
+    *class = Some(UnityClass::from_parts(header, properties));
+}
+
+fn replace_class_properties(
+    class: &mut Option<UnityClass>,
+    replacement: IndexMap<String, UnityValue>,
+) {
+    let owned = class
+        .take()
+        .expect("a YAML candidate owns its class while committing a schema");
+    let (header, _) = owned.into_parts();
+    *class = Some(UnityClass::from_parts(header, replacement));
+}
+
+fn edit_class_sequence(
+    class: &mut Option<UnityClass>,
+    ordinal: u32,
+    document_index: usize,
+    path: &FieldPath,
+    edit: YamlSequenceEdit,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), YamlCandidateError> {
+    let owned = class
+        .take()
+        .expect("a YAML candidate owns its class while editing a sequence");
+    let (header, properties) = owned.into_parts();
+    let mut root = UnityValue::Object(properties);
+    let result = (|| {
+        let current = root
+            .value_at_path_mut(path)
+            .map_err(|source| YamlCandidateError::Path {
+                ordinal,
+                document_index,
+                source,
+            })?;
+        let actual = current.kind();
+        let UnityValue::Array(values) = current else {
+            return Err(YamlCandidateError::SequenceTypeMismatch {
+                ordinal,
+                document_index,
+                actual,
+            });
+        };
+        apply_sequence_edit(ordinal, document_index, values, edit, budget)
+    })();
+    let UnityValue::Object(properties) = root else {
+        unreachable!("a class property root remains an object")
+    };
+    *class = Some(UnityClass::from_parts(header, properties));
+    result
+}
+
 fn semantic_class_value_digest(
-    class: &mut UnityClass,
+    class: &mut Option<UnityClass>,
     budget: &mut AssetLoadBudget,
 ) -> Result<DigestV1, SemanticDigestError> {
-    let properties = take(class.properties_mut());
+    let owned = class
+        .take()
+        .expect("a YAML candidate owns its class while computing a digest");
+    let (header, properties) = owned.into_parts();
     let root = UnityValue::Object(properties);
     let result = semantic_value_digest(&root, budget);
     let UnityValue::Object(properties) = root else {
         unreachable!("the temporary class root is always an object")
     };
-    *class.properties_mut() = properties;
+    *class = Some(UnityClass::from_parts(header, properties));
     result
 }
 
@@ -913,7 +973,7 @@ pub(super) enum YamlCandidateError {
 mod tests {
     use indexmap::IndexMap;
     use unity_asset_core::{
-        AssetLoadLimits, RevisionedObjectHandle, SourceId, SourceKind, UnityDocument, WorkspaceId,
+        AssetLoadLimits, RevisionedObjectHandle, SourceId, SourceKind, WorkspaceId,
         WorkspaceRevision, semantic_value_digest,
     };
 
@@ -946,7 +1006,7 @@ mod tests {
         YamlObjectCandidate::from_class(
             test_object(),
             0,
-            Arc::new(SchemaProvenance::yaml(class.class_id, schema_digest)),
+            Arc::new(SchemaProvenance::yaml(class.class_id(), schema_digest)),
             class,
             &mut AssetLoadBudget::default(),
         )
@@ -962,10 +1022,10 @@ mod tests {
         )
     }
 
-    fn object_guard(class: &mut UnityClass) -> ObjectGuard {
+    fn object_guard(candidate: &mut YamlObjectCandidate) -> ObjectGuard {
         let mut budget = AssetLoadBudget::default();
-        let schema = yaml_schema_digest(class, &mut budget).unwrap();
-        let value = semantic_class_value_digest(class, &mut budget).unwrap();
+        let schema = yaml_schema_digest(candidate.class(), &mut budget).unwrap();
+        let value = semantic_class_value_digest(&mut candidate.class, &mut budget).unwrap();
         ObjectGuard::new(schema, value)
     }
 
@@ -978,8 +1038,7 @@ mod tests {
         let handle =
             RevisionedObjectHandle::new(object.source().workspace(), observed_revision, object)
                 .unwrap();
-        let mut document = crate::YamlDocument::new();
-        document.add_entry(class);
+        let document = crate::YamlDocument::from_entries(vec![class]);
         let base = WorkspaceObject::from_shared(
             handle,
             WorkspaceObjectValue::Yaml(WorkspaceYamlObject::new(Arc::new(document), 0)),
@@ -1229,7 +1288,7 @@ mod tests {
     #[test]
     fn schema_replace_finishes_the_exact_class_for_independent_reparse() {
         let mut candidate = candidate_from(&test_class());
-        let guard = object_guard(&mut candidate.class);
+        let guard = object_guard(&mut candidate);
         let replacement = UnityValue::Object(IndexMap::from([(
             "replacement".to_owned(),
             UnityValue::Unsigned(u64::MAX),
@@ -1266,7 +1325,7 @@ mod tests {
             YamlObjectCandidate::from_class(
                 test_object(),
                 0,
-                Arc::new(SchemaProvenance::yaml(class.class_id, schema_digest)),
+                Arc::new(SchemaProvenance::yaml(class.class_id(), schema_digest)),
                 &class,
                 &mut clone_budget,
             ),

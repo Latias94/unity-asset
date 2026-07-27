@@ -22,9 +22,11 @@ tower-http.workspace = true
 rand.workspace = true
 hex.workspace = true
 notify.workspace = true
+mime.workspace = true
 subtle.workspace = true
 fs2.workspace = true
 url.workspace = true
+unity-asset-core = { path = "../../crates/unity-asset-core", version = "0.3.0" }
 unity-asset-search-index = { path = "../../crates/unity-asset-search-index", version = "0.3.0" }
 unity-asset-search-protocol = { path = "../../crates/unity-asset-search-protocol", version = "0.3.0" }
 

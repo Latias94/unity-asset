@@ -11,12 +11,15 @@ use unity_asset_core::{
 };
 use unity_asset_yaml::YamlDocument;
 
+use super::inspection::WorkspaceSourceFormatInspection;
+
 /// One immutable source entry and the parse state proven before publication.
 #[derive(Debug)]
 pub(crate) struct SourceEntry {
     source: SourceId,
     image: VerifiedSourceImage,
     parse: FrozenSourceParse,
+    format: WorkspaceSourceFormatInspection,
 }
 
 /// Parse state frozen before a source entry is published into a workspace snapshot.
@@ -73,6 +76,7 @@ impl SourceEntry {
         source: SourceId,
         image: &VerifiedSourceImage,
         parse: &FrozenSourceParse,
+        format: &WorkspaceSourceFormatInspection,
     ) -> Result<(), SourceStoreError> {
         if source.kind() != image.kind() {
             return Err(SourceStoreError::SourceKindMismatch {
@@ -86,6 +90,13 @@ impl SourceEntry {
                 source_id: source,
                 source_kind: image.kind(),
                 parse_kind: parse.label(),
+            });
+        }
+        if format.kind() != image.kind() {
+            return Err(SourceStoreError::FrozenInspectionKindMismatch {
+                source_id: source,
+                source_kind: image.kind(),
+                inspection_kind: format.kind(),
             });
         }
         if let FrozenSourceParse::Serialized(parsed) = parse {
@@ -105,11 +116,17 @@ impl SourceEntry {
         Ok(())
     }
 
-    fn new(source: SourceId, image: VerifiedSourceImage, parse: FrozenSourceParse) -> Self {
+    fn new(
+        source: SourceId,
+        image: VerifiedSourceImage,
+        parse: FrozenSourceParse,
+        format: WorkspaceSourceFormatInspection,
+    ) -> Self {
         Self {
             source,
             image,
             parse,
+            format,
         }
     }
 
@@ -121,6 +138,11 @@ impl SourceEntry {
     #[must_use]
     pub(crate) fn image(&self) -> &VerifiedSourceImage {
         &self.image
+    }
+
+    #[must_use]
+    pub(crate) const fn format(&self) -> &WorkspaceSourceFormatInspection {
+        &self.format
     }
 
     #[must_use]
@@ -165,15 +187,16 @@ impl SourceStore {
         }
     }
 
-    pub(crate) fn insert(
+    pub(crate) fn insert_inspected(
         &mut self,
         source: SourceId,
         image: VerifiedSourceImage,
         mut parse: FrozenSourceParse,
+        format: WorkspaceSourceFormatInspection,
         budget: &mut AssetLoadBudget,
     ) -> Result<Arc<SourceEntry>, SourceStoreError> {
         self.ensure_workspace(source)?;
-        SourceEntry::validate_parts(source, &image, &parse)?;
+        SourceEntry::validate_parts(source, &image, &parse, &format)?;
 
         let previous = self.by_id.get(&source);
         if let Some(existing) = previous
@@ -208,7 +231,7 @@ impl SourceStore {
             }
             None => (image, 1),
         };
-        SourceEntry::validate_parts(source, &image, &parse)?;
+        SourceEntry::validate_parts(source, &image, &parse, &format)?;
         let previous_digest = previous
             .map(|entry| self.validate_content_reference(source, entry))
             .transpose()?;
@@ -220,7 +243,7 @@ impl SourceStore {
             budget.check_entries(1)?;
         }
         budget.check_bytes(retained_bytes)?;
-        let entry = Arc::new(SourceEntry::new(source, image, parse));
+        let entry = Arc::new(SourceEntry::new(source, image, parse, format));
         if new_source {
             budget.consume_entries(1)?;
         }
@@ -242,6 +265,18 @@ impl SourceStore {
         }
         self.by_id.insert(source, Arc::clone(&entry));
         Ok(entry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert(
+        &mut self,
+        source: SourceId,
+        image: VerifiedSourceImage,
+        parse: FrozenSourceParse,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Arc<SourceEntry>, SourceStoreError> {
+        let format = WorkspaceSourceFormatInspection::minimal_for_test(source.kind());
+        self.insert_inspected(source, image, parse, format, budget)
     }
 
     pub(crate) fn clone_for_update(
@@ -388,7 +423,7 @@ impl SourceStore {
                     entry: entry.source(),
                 });
             }
-            SourceEntry::validate_parts(*source, &entry.image, &entry.parse)?;
+            SourceEntry::validate_parts(*source, &entry.image, &entry.parse, &entry.format)?;
             let digest = entry.image.fingerprint().digest();
             self.validate_content_reference(*source, entry)?;
             referenced_digests.push(digest);
@@ -498,6 +533,14 @@ pub(crate) enum SourceStoreError {
         source_id: SourceId,
         source_kind: SourceKind,
         parse_kind: &'static str,
+    },
+    #[error(
+        "source {source_id:?} of kind {source_kind:?} cannot retain inspection kind {inspection_kind:?}"
+    )]
+    FrozenInspectionKindMismatch {
+        source_id: SourceId,
+        source_kind: SourceKind,
+        inspection_kind: SourceKind,
     },
     #[error("serialized parse for source {source_id:?} does not use its verified complete backing")]
     FrozenSerializedBackingMismatch { source_id: SourceId },
@@ -1098,7 +1141,7 @@ mod tests {
             .insert(
                 source,
                 image(b"bytes"),
-                FrozenSourceParse::Yaml(Arc::new(YamlDocument::new())),
+                FrozenSourceParse::Yaml(Arc::new(YamlDocument::from_entries(Vec::new()))),
                 &mut budget,
             )
             .unwrap_err();

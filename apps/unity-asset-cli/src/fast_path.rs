@@ -2,18 +2,12 @@ use anyhow::Result;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use unity_asset::AssetLoadBudget;
-use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions, DirectoryNode};
-use unity_asset_binary::error::BinaryError;
+use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions};
 
 const BUNDLE_SNIFF_PREFIX_LEN: usize = 16;
-const SERIALIZED_SNIFF_PREFIX_LEN: usize = 64;
 
 pub(crate) fn bundle_list_options() -> BundleLoadOptions {
     BundleLoadOptions::lazy()
-}
-
-pub(crate) fn looks_like_unityfs_bundle_prefix(prefix: &[u8]) -> bool {
-    unity_asset_binary::file::looks_like_unityfs_bundle_prefix(prefix)
 }
 
 pub(crate) fn sniff_unity_file_kind_prefix(
@@ -22,27 +16,12 @@ pub(crate) fn sniff_unity_file_kind_prefix(
     unity_asset_binary::file::sniff_unity_file_kind_prefix(prefix)
 }
 
-pub(crate) fn is_unityfs_bundle_path(path: &Path) -> bool {
-    let Ok(prefix) = read_prefix(path, BUNDLE_SNIFF_PREFIX_LEN) else {
-        return false;
-    };
-    looks_like_unityfs_bundle_prefix(&prefix)
-}
-
 pub(crate) fn is_assetbundle_path(path: &Path) -> bool {
     let Ok(prefix) = read_prefix(path, BUNDLE_SNIFF_PREFIX_LEN) else {
         return false;
     };
     sniff_unity_file_kind_prefix(&prefix)
         == Some(unity_asset_binary::file::UnityFileKind::AssetBundle)
-}
-
-pub(crate) fn is_serialized_file_path(path: &Path) -> bool {
-    let Ok(prefix) = read_prefix(path, SERIALIZED_SNIFF_PREFIX_LEN) else {
-        return false;
-    };
-    sniff_unity_file_kind_prefix(&prefix)
-        == Some(unity_asset_binary::file::UnityFileKind::SerializedFile)
 }
 
 pub(crate) fn collect_candidate_paths(input: &Path) -> Result<Vec<PathBuf>> {
@@ -137,7 +116,12 @@ fn collect_files_recursive_budgeted(
                 )?;
             }
         } else if file_type.is_file() {
-            let slot_bytes = usize::from(output.len() == output.capacity())
+            let additional = if output.len() == output.capacity() {
+                output.capacity().max(1)
+            } else {
+                0
+            };
+            let slot_bytes = additional
                 .checked_mul(size_of::<PathBuf>())
                 .ok_or_else(|| anyhow::anyhow!("candidate path slot allocation overflow"))?;
             let allocation = path
@@ -147,25 +131,13 @@ fn collect_files_recursive_budgeted(
                 .ok_or_else(|| anyhow::anyhow!("candidate path allocation overflow"))?;
             budget.check_bytes(u64::try_from(allocation)?)?;
             if slot_bytes != 0 {
-                output.try_reserve_exact(1)?;
+                output.try_reserve_exact(additional)?;
             }
             budget.consume_bytes(u64::try_from(allocation)?)?;
             output.push(path);
         }
     }
     Ok(())
-}
-
-pub(crate) fn path_matches_requested(candidate: &Path, requested: &Path) -> bool {
-    if candidate == requested {
-        return true;
-    }
-    let candidate_str = candidate.to_string_lossy().replace('\\', "/");
-    let requested_str = requested.to_string_lossy().replace('\\', "/");
-    if candidate_str.ends_with(&requested_str) || requested_str.ends_with(&candidate_str) {
-        return true;
-    }
-    candidate.file_name() == requested.file_name()
 }
 
 pub(crate) fn read_prefix(path: &Path, max_len: usize) -> Result<Vec<u8>> {
@@ -181,39 +153,10 @@ pub(crate) fn read_prefix_into(path: &Path, output: &mut [u8]) -> Result<usize> 
     Ok(std::fs::File::open(path)?.read(output)?)
 }
 
-pub(crate) fn load_bundle_for_list(path: &Path, options: BundleLoadOptions) -> Result<AssetBundle> {
-    Ok(unity_asset_binary::file::load_bundle_file_with_options(
-        path, options,
-    )?)
-}
-
-pub(crate) fn bundle_asset_nodes(bundle: &AssetBundle) -> Vec<DirectoryNode> {
-    bundle
-        .nodes
-        .iter()
-        .filter(|n| n.is_file())
-        .filter(|n| !n.name.ends_with(".resS") && !n.name.ends_with(".resource"))
-        .cloned()
-        .collect()
-}
-
-pub(crate) fn node_range(node: &DirectoryNode) -> Result<(usize, usize)> {
-    let end_u64 = node
-        .offset
-        .checked_add(node.size)
-        .ok_or_else(|| anyhow::anyhow!("node offset+size overflow"))?;
-    let start = usize::try_from(node.offset).map_err(|_| {
-        anyhow::anyhow!(BinaryError::ResourceLimitExceeded(
-            "Node offset does not fit in usize".to_string()
-        ))
-    })?;
-    let end = usize::try_from(end_u64).map_err(|_| {
-        anyhow::anyhow!(BinaryError::ResourceLimitExceeded(
-            "Node end offset does not fit in usize".to_string()
-        ))
-    })?;
-    if start > end {
-        anyhow::bail!("node slice start exceeds end");
-    }
-    Ok((start, end))
+pub(crate) fn load_bundle_for_list(
+    path: &Path,
+    options: BundleLoadOptions,
+    budget: &mut AssetLoadBudget,
+) -> Result<AssetBundle> {
+    Ok(unity_asset_binary::file::load_bundle_file_with_options_and_budget(path, options, budget)?)
 }

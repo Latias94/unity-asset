@@ -196,16 +196,6 @@ fn sniff_serialized_file(data: &[u8]) -> bool {
         .is_ok()
 }
 
-/// Parse a Unity binary file from memory, returning a tagged [`UnityFile`] enum.
-///
-/// Notes:
-/// - The detection order is: bundle → serialized file → webfile.
-/// - WebFile detection can involve decompression, so it is attempted last.
-pub fn load_unity_file_from_memory(data: Vec<u8>) -> Result<UnityFile> {
-    let mut budget = AssetLoadBudget::default();
-    load_unity_file_from_memory_with_budget(data, &mut budget)
-}
-
 /// Parse a Unity binary file from memory through a caller-owned cumulative load budget.
 pub fn load_unity_file_from_memory_with_budget(
     data: Vec<u8>,
@@ -214,17 +204,6 @@ pub fn load_unity_file_from_memory_with_budget(
     let shared = SharedBytes::from_vec(data);
     let len = shared.len();
     load_unity_file_from_shared_range_with_budget(shared, 0..len, budget)
-}
-
-/// Parse a Unity binary file from a shared backing buffer + byte range.
-///
-/// This is useful for container formats that can provide a view into a larger buffer (e.g. WebFile entries).
-pub fn load_unity_file_from_shared_range(
-    data: SharedBytes,
-    range: Range<usize>,
-) -> Result<UnityFile> {
-    let mut budget = AssetLoadBudget::default();
-    load_unity_file_from_shared_range_with_budget(data, range, &mut budget)
 }
 
 /// Parse a shared byte range through a caller-owned cumulative load budget.
@@ -362,12 +341,6 @@ fn load_recognized_unity_file_view_with_budget(
     }
 }
 
-/// Parse a Unity binary file from a filesystem path.
-pub fn load_unity_file<P: AsRef<Path>>(path: P) -> Result<UnityFile> {
-    let mut budget = AssetLoadBudget::default();
-    load_unity_file_with_budget(path, &mut budget)
-}
-
 /// Parse a Unity binary file from a path through a caller-owned cumulative load budget.
 pub fn load_unity_file_with_budget<P: AsRef<Path>>(
     path: P,
@@ -437,15 +410,6 @@ pub fn try_load_unity_file_with_budget<P: AsRef<Path>>(
     }
 }
 
-/// Load an AssetBundle from a filesystem path with explicit parser options.
-pub fn load_bundle_file_with_options<P: AsRef<Path>>(
-    path: P,
-    options: BundleLoadOptions,
-) -> Result<AssetBundle> {
-    let mut budget = AssetLoadBudget::default();
-    load_bundle_file_with_options_and_budget(path, options, &mut budget)
-}
-
 /// Load an AssetBundle with explicit parser options and a caller-owned load budget.
 pub fn load_bundle_file_with_options_and_budget<P: AsRef<Path>>(
     path: P,
@@ -464,15 +428,6 @@ pub fn load_bundle_file_with_options_and_budget<P: AsRef<Path>>(
         let data = read_file_with_budget(path.as_ref(), budget)?;
         BundleParser::from_bytes_with_options_and_budget(data, options, budget)
     }
-}
-
-/// Load a SerializedFile from a filesystem path.
-pub fn load_serialized_file<P: AsRef<Path>>(
-    path: P,
-    preload_object_data: bool,
-) -> Result<SerializedFile> {
-    let mut budget = AssetLoadBudget::default();
-    load_serialized_file_with_budget(path, preload_object_data, &mut budget)
 }
 
 /// Load a SerializedFile through a caller-owned cumulative load budget.

@@ -18,6 +18,7 @@ use unity_asset_core::{
 pub(crate) struct PhysicalOrigin(PathBuf);
 
 impl PhysicalOrigin {
+    #[cfg(test)]
     pub(crate) fn from_existing_path(path: impl AsRef<Path>) -> Result<Self, PhysicalOriginError> {
         let requested = path.as_ref();
         if !requested.is_absolute() {
@@ -33,6 +34,17 @@ impl PhysicalOrigin {
         Self::from_canonical_path(canonical)
     }
 
+    pub(crate) fn from_existing_path_budgeted(
+        path: impl AsRef<Path>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, CatalogError> {
+        let canonical = BudgetedCanonicalPath::resolve(path.as_ref(), budget)?;
+        let retained_bytes = canonical.planned_bytes();
+        let origin = Self::from_canonical_path(canonical.into_path())?;
+        budget.consume_bytes(retained_bytes)?;
+        Ok(origin)
+    }
+
     fn from_canonical_path(canonical: PathBuf) -> Result<Self, PhysicalOriginError> {
         let metadata =
             fs::metadata(&canonical).map_err(|error| PhysicalOriginError::io(&canonical, error))?;
@@ -45,6 +57,24 @@ impl PhysicalOrigin {
     #[must_use]
     pub(crate) fn path(&self) -> &Path {
         &self.0
+    }
+
+    #[must_use]
+    pub(crate) fn retained_owned_bytes(&self) -> usize {
+        self.0.capacity()
+    }
+
+    #[must_use]
+    pub(crate) fn into_path(self) -> PathBuf {
+        self.0
+    }
+
+    pub(crate) fn try_clone_for_index(&self) -> Result<Self, std::collections::TryReserveError> {
+        let mut path = PathBuf::new();
+        path.as_mut_os_string()
+            .try_reserve(self.0.as_os_str().len())?;
+        path.push(&self.0);
+        Ok(Self(path))
     }
 }
 
@@ -109,7 +139,8 @@ fn validate_windows_origin_path(path: &Path) -> Result<(), PhysicalOriginError> 
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 /// Placement shape exposed for structured source inspection.
 pub enum SourceLocationKind {
     Root,
@@ -371,6 +402,13 @@ struct SourceRecord {
     source_locator: Arc<SourceLocator>,
     physical_origin: Option<Arc<PhysicalOrigin>>,
     canonical_key: Arc<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct SubtreeRemoval {
+    sources: Vec<SourceId>,
+    #[cfg(test)]
+    index_visits: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -697,7 +735,7 @@ fn revalidate_physical_contents(
     Ok(())
 }
 
-fn physical_file_identity(
+pub(super) fn physical_file_identity(
     file: &fs::File,
     path: &Path,
 ) -> Result<PhysicalFileIdentity, CatalogError> {
@@ -758,7 +796,9 @@ fn physical_node_identity(
     })
 }
 
-fn physical_file_identity_from_path(path: &Path) -> Result<PhysicalFileIdentity, CatalogError> {
+pub(super) fn physical_file_identity_from_path(
+    path: &Path,
+) -> Result<PhysicalFileIdentity, CatalogError> {
     let file =
         open_verified_file(path).map_err(|error| CatalogError::verified_binding_io(path, error))?;
     physical_file_identity(&file, path)
@@ -778,7 +818,7 @@ fn path_is_symlink(path: &Path) -> Result<bool, CatalogError> {
         .map_err(|error| CatalogError::verified_binding_io(path, error))
 }
 
-fn open_verified_file(path: &Path) -> io::Result<fs::File> {
+pub(super) fn open_verified_file(path: &Path) -> io::Result<fs::File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
@@ -872,6 +912,14 @@ pub(crate) enum LocatorResolution {
     Unloaded,
     Missing,
     Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootAdmissionDecision {
+    Vacant,
+    Unchanged(SourceId),
+    AliasConflict { existing: SourceId },
+    PhysicalOriginConflict { existing: SourceId },
 }
 
 impl SourceCatalog {
@@ -1034,6 +1082,31 @@ impl SourceCatalog {
             }
         };
         Ok(existing.filter(|source| source.kind() == descriptor.kind))
+    }
+
+    fn root_admission_decision(
+        &self,
+        alias: &SourceAlias,
+        origin: &PhysicalOrigin,
+        fingerprint: SourceFingerprint,
+    ) -> Result<RootAdmissionDecision, CatalogError> {
+        let alias_source = self.find_root_by_alias(alias);
+        let origin_source = self.find_physical(origin);
+        let Some(existing) = alias_source else {
+            return Ok(match origin_source {
+                Some(existing) => RootAdmissionDecision::PhysicalOriginConflict { existing },
+                None => RootAdmissionDecision::Vacant,
+            });
+        };
+        if self.fingerprint(existing)? != fingerprint {
+            return Ok(RootAdmissionDecision::AliasConflict { existing });
+        }
+        if origin_source == Some(existing) {
+            return Ok(RootAdmissionDecision::Unchanged(existing));
+        }
+        Ok(RootAdmissionDecision::PhysicalOriginConflict {
+            existing: origin_source.unwrap_or(existing),
+        })
     }
 
     fn checked_registration_bytes(
@@ -1332,6 +1405,8 @@ impl SourceCatalog {
             failed: false,
             #[cfg(test)]
             last_physical_domain_owner_resolutions: 0,
+            #[cfg(test)]
+            subtree_removal_index_visits: 0,
         })
     }
 
@@ -1930,34 +2005,36 @@ impl SourceCatalog {
         &mut self,
         root: SourceId,
         budget: &mut AssetLoadBudget,
-    ) -> Result<Vec<SourceId>, CatalogError> {
+    ) -> Result<SubtreeRemoval, CatalogError> {
         self.resolve(root)?;
-        let scratch_bytes =
-            u64::try_from(self.by_id.len().checked_mul(size_of::<SourceId>()).ok_or(
-                CatalogError::AllocationSizeOverflow {
-                    resource: "source catalog subtree scratch",
-                },
-            )?)
-            .map_err(|_| CatalogError::AllocationSizeOverflow {
+        let source_count = self.count_subtree_sources(root)?;
+        let planned_bytes = vec_allocation_bytes::<SourceId>(source_count).map_err(|_| {
+            CatalogError::AllocationSizeOverflow {
                 resource: "source catalog subtree scratch",
-            })?;
-        budget.check_bytes(scratch_bytes)?;
+            }
+        })?;
+        budget.check_bytes(planned_bytes)?;
         let mut removed = Vec::new();
-        removed
-            .try_reserve_exact(self.by_id.len())
-            .map_err(|error| CatalogError::AllocationFailed {
+        removed.try_reserve_exact(source_count).map_err(|error| {
+            CatalogError::AllocationFailed {
                 resource: "source catalog subtree scratch",
-                requested: self.by_id.len(),
+                requested: source_count,
                 unit: CatalogAllocationUnit::Elements,
                 message: error.to_string(),
-            })?;
-        budget.consume_bytes(scratch_bytes)?;
-
-        for source in self.by_id.keys().copied() {
-            if self.is_owned_by(source, root)? {
-                removed.push(source);
             }
-        }
+        })?;
+        let retained_bytes =
+            vec_allocation_bytes::<SourceId>(removed.capacity()).map_err(|_| {
+                CatalogError::AllocationSizeOverflow {
+                    resource: "source catalog subtree scratch",
+                }
+            })?;
+        budget.check_bytes(retained_bytes)?;
+        budget.consume_bytes(retained_bytes)?;
+
+        self.collect_subtree_sources(root, &mut removed);
+        debug_assert_eq!(removed.len(), source_count);
+        removed.sort_unstable();
         for source in &removed {
             let record = self
                 .by_id
@@ -1976,35 +2053,78 @@ impl SourceCatalog {
                 }
                 SourcePlacement::Member { parent, step, .. }
                 | SourcePlacement::Companion { parent, step, .. } => {
-                    if let Some(children) = self.children_by_parent.get_mut(parent) {
-                        children.remove(step);
+                    let remove_parent_index =
+                        self.children_by_parent
+                            .get_mut(parent)
+                            .is_some_and(|children| {
+                                children.remove(step);
+                                children.is_empty()
+                            });
+                    if remove_parent_index {
+                        self.children_by_parent.remove(parent);
                     }
                 }
             }
+            self.children_by_parent.remove(source);
         }
-        self.children_by_parent
-            .retain(|_, children| !children.is_empty());
-        Ok(removed)
+        Ok(SubtreeRemoval {
+            sources: removed,
+            #[cfg(test)]
+            index_visits: source_count.checked_mul(2).ok_or(
+                CatalogError::AllocationSizeOverflow {
+                    resource: "source catalog subtree visit count",
+                },
+            )?,
+        })
     }
 
-    fn is_owned_by(&self, source: SourceId, root: SourceId) -> Result<bool, CatalogError> {
-        let mut current = source;
-        for _ in 0..=self.by_id.len() {
-            if current == root {
-                return Ok(true);
+    fn count_subtree_sources(&self, source: SourceId) -> Result<usize, CatalogError> {
+        let record = self
+            .by_id
+            .get(&source)
+            .ok_or(CatalogError::UnknownSource(source))?;
+        let parent_depth = record.source_locator.members().len();
+        let mut count = 1_usize;
+        if let Some(children) = self.children_by_parent.get(&source) {
+            for child in children.values().copied() {
+                let child_record =
+                    self.by_id
+                        .get(&child)
+                        .ok_or(CatalogError::InvariantMissingIndex {
+                            source_id: child,
+                            index: "subtree child target",
+                        })?;
+                let expected_depth =
+                    parent_depth
+                        .checked_add(1)
+                        .ok_or(CatalogError::AllocationSizeOverflow {
+                            resource: "source catalog subtree depth",
+                        })?;
+                if child_record.descriptor.parent() != Some(source)
+                    || child_record.source_locator.members().len() != expected_depth
+                {
+                    return Err(CatalogError::InvariantRecordMismatch {
+                        source_id: child,
+                        field: "subtree child index",
+                    });
+                }
+                count = count
+                    .checked_add(self.count_subtree_sources(child)?)
+                    .ok_or(CatalogError::AllocationSizeOverflow {
+                        resource: "source catalog subtree size",
+                    })?;
             }
-            let Some(parent) = self
-                .by_id
-                .get(&current)
-                .ok_or(CatalogError::UnknownSource(current))?
-                .descriptor
-                .parent()
-            else {
-                return Ok(false);
-            };
-            current = parent;
         }
-        Err(CatalogError::InvariantOwnershipCycle { source_id: source })
+        Ok(count)
+    }
+
+    fn collect_subtree_sources(&self, source: SourceId, output: &mut Vec<SourceId>) {
+        output.push(source);
+        if let Some(children) = self.children_by_parent.get(&source) {
+            for child in children.values().copied() {
+                self.collect_subtree_sources(child, output);
+            }
+        }
     }
 
     fn resolve_placement(
@@ -2478,9 +2598,41 @@ pub(crate) struct SourceCatalogTransaction {
     failed: bool,
     #[cfg(test)]
     last_physical_domain_owner_resolutions: usize,
+    #[cfg(test)]
+    subtree_removal_index_visits: usize,
 }
 
 impl SourceCatalogTransaction {
+    pub(crate) fn root_admission_decision(
+        &mut self,
+        alias: &SourceAlias,
+        origin: &PhysicalOrigin,
+        fingerprint: SourceFingerprint,
+    ) -> Result<RootAdmissionDecision, CatalogError> {
+        self.ensure_active()?;
+        match self
+            .candidate
+            .root_admission_decision(alias, origin, fingerprint)
+        {
+            Ok(decision) => Ok(decision),
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn is_root(&mut self, source: SourceId) -> Result<bool, CatalogError> {
+        self.ensure_active()?;
+        match self.candidate.resolve(source) {
+            Ok(descriptor) => Ok(descriptor.parent().is_none()),
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn register(
         &mut self,
         descriptor: SourceDescriptor,
@@ -2554,9 +2706,16 @@ impl SourceCatalogTransaction {
         budget: &mut AssetLoadBudget,
     ) -> Result<(), CatalogError> {
         self.ensure_active()?;
-        let batch = self
+        let batch = match self
             .candidate
-            .prepare_physical_domain_rewrite_batch(changes, budget)?;
+            .prepare_physical_domain_rewrite_batch(changes, budget)
+        {
+            Ok(batch) => batch,
+            Err(error) => {
+                self.failed = true;
+                return Err(error);
+            }
+        };
         self.rewrite_physical_domains(batch, budget)
     }
 
@@ -2567,7 +2726,13 @@ impl SourceCatalogTransaction {
     ) -> Result<Vec<SourceId>, CatalogError> {
         self.ensure_active()?;
         match self.candidate.remove_subtree(root, budget) {
-            Ok(removed) => Ok(removed),
+            Ok(removed) => {
+                #[cfg(test)]
+                {
+                    self.subtree_removal_index_visits += removed.index_visits;
+                }
+                Ok(removed.sources)
+            }
             Err(error) => {
                 self.failed = true;
                 Err(error)
@@ -2583,9 +2748,14 @@ impl SourceCatalogTransaction {
         budget: &mut AssetLoadBudget,
     ) -> Result<Vec<SourceId>, CatalogError> {
         self.ensure_active()?;
-        if let Err(error) = self.candidate.remove_subtree(root, budget) {
-            self.failed = true;
-            return Err(error);
+        match self.candidate.remove_subtree(root, budget) {
+            Ok(removed) => {
+                self.subtree_removal_index_visits += removed.index_visits;
+            }
+            Err(error) => {
+                self.failed = true;
+                return Err(error);
+            }
         }
         let mut inserted = Vec::new();
         for (descriptor, fingerprint) in replacements {
@@ -3480,6 +3650,37 @@ mod tests {
     }
 
     #[test]
+    fn physical_domain_preparation_failure_sticky_aborts_transaction() {
+        let (catalog, _, webfile, _, _) = physical_domain_fixture();
+        let changes = [PhysicalDomainChange::new(
+            webfile,
+            fingerprint(SourceKind::WebFile, b"changed webfile"),
+        )];
+        let mut measured = AssetLoadBudget::default();
+        let prepared = catalog
+            .prepare_physical_domain_rewrite_batch(&changes, &mut measured)
+            .unwrap();
+        drop(prepared);
+        let usage = measured.usage();
+
+        let mut transaction = catalog
+            .begin_transaction(&mut AssetLoadBudget::default())
+            .unwrap();
+        let mut one_short = budget_with(usage.bytes - 1, usage.entries);
+        assert!(matches!(
+            transaction.rewrite_physical_domains_from_changes(&changes, &mut one_short),
+            Err(CatalogError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+        assert!(matches!(
+            transaction.commit(&mut one_short),
+            Err(CatalogError::TransactionAborted)
+        ));
+    }
+
+    #[test]
     fn physical_domain_batch_ignores_unaffected_domain_drift() {
         let (mut catalog, _, webfile, _, _) = physical_domain_fixture();
         let other_root = catalog
@@ -3875,6 +4076,32 @@ mod tests {
         let observed = BudgetedCanonicalPath::from_path(exact_path, 0, &exact).unwrap();
         assert_eq!(observed.planned_bytes(), exact_bytes);
         assert_eq!(exact.usage().bytes, 0);
+        assert_eq!(exact.usage().entries, 0);
+    }
+
+    #[test]
+    fn physical_origin_materialization_is_exact_budgeted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.assets");
+        fs::write(&path, b"asset").unwrap();
+        let canonical = BudgetedCanonicalPath::resolve(&path, &AssetLoadBudget::default()).unwrap();
+        let planned = canonical.planned_bytes();
+
+        let mut one_short = budget_with(planned - 1, 1);
+        assert!(matches!(
+            PhysicalOrigin::from_existing_path_budgeted(&path, &mut one_short),
+            Err(CatalogError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            })) if limit == planned - 1 && requested == planned
+        ));
+        assert_eq!(one_short.usage().bytes, 0);
+
+        let mut exact = budget_with(planned, 1);
+        let origin = PhysicalOrigin::from_existing_path_budgeted(&path, &mut exact).unwrap();
+        assert_eq!(origin.path(), canonical.path());
+        assert_eq!(exact.usage().bytes, planned);
         assert_eq!(exact.usage().entries, 0);
     }
 
@@ -4343,6 +4570,76 @@ mod tests {
                     if actual == kind
             ));
         }
+    }
+
+    #[test]
+    fn wide_root_removal_visits_and_budgets_only_removed_subtrees() {
+        const ROOT_COUNT: usize = 128;
+
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let mut catalog = SourceCatalog::new(workspace);
+        let mut roots = Vec::new();
+        for ordinal in 0..ROOT_COUNT {
+            let alias = format!("root-{ordinal}.assets");
+            roots.push(
+                catalog
+                    .register(
+                        root_descriptor(SourceKind::SerializedFile, &alias, alias.as_bytes()),
+                        fingerprint(SourceKind::SerializedFile, alias.as_bytes()),
+                    )
+                    .unwrap(),
+            );
+        }
+
+        let mut single = catalog
+            .begin_transaction(&mut AssetLoadBudget::default())
+            .unwrap();
+        let mut single_budget = AssetLoadBudget::default();
+        single.remove_subtree(roots[0], &mut single_budget).unwrap();
+        let single_usage = single_budget.usage();
+
+        let mut measured = catalog
+            .begin_transaction(&mut AssetLoadBudget::default())
+            .unwrap();
+        let mut measured_budget = AssetLoadBudget::default();
+        for root in &roots {
+            assert_eq!(
+                measured
+                    .remove_subtree(*root, &mut measured_budget)
+                    .unwrap(),
+                [*root]
+            );
+        }
+        assert_eq!(measured.subtree_removal_index_visits, ROOT_COUNT * 2);
+        let usage = measured_budget.usage();
+        assert_eq!(usage.bytes, single_usage.bytes * ROOT_COUNT as u64);
+
+        let mut exact = catalog
+            .begin_transaction(&mut AssetLoadBudget::default())
+            .unwrap();
+        let mut exact_budget = budget_with(usage.bytes, 1);
+        for root in &roots {
+            exact.remove_subtree(*root, &mut exact_budget).unwrap();
+        }
+        assert_eq!(exact_budget.usage().bytes, usage.bytes);
+        assert!(exact.commit(&mut exact_budget).unwrap().is_empty());
+
+        let mut rejected = catalog
+            .begin_transaction(&mut AssetLoadBudget::default())
+            .unwrap();
+        let mut one_short = budget_with(usage.bytes - 1, 1);
+        let mut failed = false;
+        for root in &roots {
+            if rejected.remove_subtree(*root, &mut one_short).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed);
+        assert!(matches!(
+            rejected.commit(&mut one_short),
+            Err(CatalogError::TransactionAborted)
+        ));
     }
 
     #[test]

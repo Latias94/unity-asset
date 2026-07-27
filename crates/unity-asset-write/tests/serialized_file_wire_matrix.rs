@@ -492,8 +492,16 @@ fn rewrites_wire_goldens_without_reconstructing_object_metadata() {
         let file = parse_case(case, case.bytes.to_vec());
         let original_payload = [case.version as u8, 0xAA, 0xBB, 0xCC];
 
-        let no_op = prepare_serialized_file(&file, &SerializedFileEdits::default())
+        let no_op_edits = SerializedFileEdits::default();
+        let contiguous = SerializedFileWriter::save(&file, &no_op_edits)
+            .unwrap_or_else(|error| panic!("failed to save v{} fixture: {error}", case.version));
+        let no_op = prepare_serialized_file(&file, &no_op_edits)
             .unwrap_or_else(|error| panic!("failed to rewrite v{} fixture: {error}", case.version));
+        assert_eq!(
+            contiguous, no_op,
+            "v{} contiguous and prepared encoders diverged",
+            case.version
+        );
         let reparsed = parse_case(case, no_op);
         assert_wire_case(case, &reparsed, &original_payload);
 
@@ -506,12 +514,20 @@ fn rewrites_wire_goldens_without_reconstructing_object_metadata() {
             edited_payload.to_vec(),
             &mut AssetLoadBudget::default(),
         );
+        let contiguous = SerializedFileWriter::save(&file, &edits).unwrap_or_else(|error| {
+            panic!("failed to save edited v{} fixture: {error}", case.version)
+        });
         let edited = prepare_serialized_file(&file, &edits).unwrap_or_else(|error| {
             panic!(
                 "failed to edit and rewrite v{} fixture: {error}",
                 case.version
             )
         });
+        assert_eq!(
+            contiguous, edited,
+            "edited v{} contiguous and prepared encoders diverged",
+            case.version
+        );
         let reparsed = parse_case(case, edited);
         assert_wire_case(case, &reparsed, &edited_payload);
     }
@@ -611,13 +627,18 @@ fn writer_rejects_publicly_constructible_unrepresentable_states() {
         match case.rejection {
             WriterRejection::HeaderVersionMismatch => file.header.version = 21,
             WriterRejection::InvalidEndian => file.header.endian = 2,
-            WriterRejection::DisableImplicitTypeTree => file.set_type_tree_enabled(false),
+            WriterRejection::DisableImplicitTypeTree => {
+                file = file.without_embedded_type_trees();
+            }
             WriterRejection::UnsupportedUnityVersion => {
                 file.unity_version = "not-representable".to_string();
             }
             WriterRejection::UnsupportedReferenceTypes => {
                 let unsupported = file.types()[0].clone();
-                file.ref_types_mut().push(unsupported);
+                let types = file.types().to_vec();
+                let mut ref_types = file.ref_types().to_vec();
+                ref_types.push(unsupported);
+                file = file.with_type_tables(types, ref_types);
             }
         }
 
@@ -658,7 +679,7 @@ fn external_allocator_rejects_conflicting_metadata_before_writer_planning() {
 }
 
 #[test]
-fn legacy_and_artifact_writers_share_the_external_table_plan() {
+fn contiguous_and_prepared_writers_share_the_external_table_plan() {
     let wire_case = wire_case(22);
     let file = parse_case(wire_case, wire_case.bytes.to_vec());
     let addition = FileIdentifier {
@@ -676,14 +697,14 @@ fn legacy_and_artifact_writers_share_the_external_table_plan() {
     );
     let edits = allocator.finish();
 
-    let legacy = SerializedFileWriter::save(&file, &edits).unwrap();
+    let contiguous = SerializedFileWriter::save(&file, &edits).unwrap();
     let artifact = prepare_serialized_file(&file, &edits).unwrap();
-    let legacy_file = SerializedFileParser::from_bytes(legacy.clone()).unwrap();
+    let contiguous_file = SerializedFileParser::from_bytes(contiguous.clone()).unwrap();
     let artifact_file = SerializedFileParser::from_bytes(artifact.clone()).unwrap();
 
-    assert_eq!(legacy_file.externals, artifact_file.externals);
-    assert_eq!(legacy_file.externals.last(), Some(&addition));
-    assert_eq!(legacy, artifact);
+    assert_eq!(contiguous_file.externals, artifact_file.externals);
+    assert_eq!(contiguous_file.externals.last(), Some(&addition));
+    assert_eq!(contiguous, artifact);
 }
 
 #[test]
@@ -756,7 +777,10 @@ fn writer_rejects_an_ambiguous_legacy_type_table_before_encoding() {
     )
     .expect("parse v15 wire fixture");
     let duplicate = file.types()[0].clone();
-    file.types_mut().push(duplicate);
+    let mut types = file.types().to_vec();
+    types.push(duplicate);
+    let ref_types = file.ref_types().to_vec();
+    file = file.with_type_tables(types, ref_types);
 
     let error = SerializedFileWriter::save(&file, &SerializedFileEdits::default())
         .expect_err("ambiguous legacy type identity must fail before encoding");

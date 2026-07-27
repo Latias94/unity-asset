@@ -1,96 +1,195 @@
 # Examples
 
-This repository maintains runnable examples per crate (built in CI).
+The checked-in examples are compiled in CI. The high-level library and CLI use the same
+revision-bound contracts, so an agent can discover capabilities through JSON and then choose a
+typed operation without parsing display text.
 
 ## Crate Guide
 
-- `unity-asset` (library): main user-facing API. Use `AssetWorkspace` for immutable revision-bound YAML and binary inspection; legacy `Environment` remains for workflows not yet migrated.
-- Examples live in `crates/unity-asset/examples/`.
-- `unity-asset-binary` (parser): low-level binary parsers (AssetBundle / SerializedFile / WebFile) plus fast helpers (`sniff_*`, `ObjectHandle::peek_name`, `ObjectHandle::scan_pptrs`).
-  - Examples live in `crates/unity-asset-binary/examples/`.
-- `unity-asset-yaml` (YAML): Unity YAML parsing/serialization utilities. Most users can access this via `unity-asset::YamlDocument`.
-- `unity-asset-decode` (decode/export): optional heavier decode/export helpers (Texture/Audio/Sprite/Mesh) behind feature flags.
-  - Examples live in `crates/unity-asset-decode/examples/`.
-- `unity-asset-cli` (CLI): command-line tools. Not needed for library integration.
-- `unity-asset-search-daemon` (experimental): local "Search Everything" daemon (`localhost` HTTP API).
-- `unity-asset-search-cli` (experimental): CLI client for the search daemon (search/status/suggest/reindex/bench).
-- Unity Editor plugin (experimental UPM package): `com.frankorz.asset-hero`.
+- `unity-asset`: high-level `AssetWorkspace`, immutable views, inspection, mutation, references,
+  extraction planning, and recovery.
+- `unity-asset-cli`: typed JSON-facing commands for the same workspace workflows.
+- `unity-asset-binary`: low-level AssetBundle, SerializedFile, and WebFile parsing.
+- `unity-asset-yaml`: Unity YAML parsing and serialization.
+- `unity-asset-decode`: optional Texture2D, Sprite, and AudioClip representations.
+- `unity-asset-search-daemon` and `unity-asset-search-cli`: a consumer-owned local search read
+  model and its client.
 
-## unity-asset (library)
+## Workspace Library
 
-- YAML load summary:
-  - `cargo run -p unity-asset --example yaml_load_summary`
-- Environment load + list:
-  - `cargo run -p unity-asset --example env_load_and_list -- tests/samples`
-- Load a Unity project root (index `.meta` GUIDs + scan binaries, skip `.meta` documents by default):
-  - `cargo run -p unity-asset --example env_load_and_list -- repo-ref/BoatAttack` (or use `Environment::load_project` in code)
-- Build and project one revision-bound Reference Graph for a source:
-  - JSON Lines: `cargo run -p unity-asset --example workspace_reference_graph -- tests/samples/char_118_yuki.ab jsonl`
-  - DOT: `cargo run -p unity-asset --example workspace_reference_graph -- tests/samples/char_118_yuki.ab dot > graph.dot`
-- Build a project Reference Graph with deterministic discovery:
-  - Binaries and `.meta`: `cargo run --bin unity-asset -- project-graph -i repo-ref/BoatAttack --format summary`
-  - Include YAML documents: `cargo run --bin unity-asset -- project-graph -i repo-ref/BoatAttack --yaml --format jsonl`
-- Bundle container lookup (UnityPy-like discovery):
-  - `cargo run -p unity-asset --example env_container_lookup -- tests/samples Assets/`
-- Find by `path_id` and dump JSON:
-  - `cargo run -p unity-asset --example env_find_and_dump -- <path> <path_id>`
-- Export a stable binary object index (JSONL):
-  - `cargo run -p unity-asset --example env_export_index_jsonl -- <path> [limit]`
-- Read streamed resource bytes (m_Resource / m_StreamData):
-  - `cargo run -p unity-asset --example env_read_stream_data -- <path> [path_id]`
-- List WebFile entries (UnityWebData* containers):
-  - `cargo run -p unity-asset --example env_webfile_list_entries -- <path-to-UnityWebData>`
+List every loaded source, including exact nested container members and streamed-resource
+sidecars:
 
-## unity-asset-binary (parser)
+```powershell
+cargo run -p unity-asset --example workspace_source_inventory -- D:\GameProject\Assets
+```
 
-- Sniff file kind from a prefix:
-  - `cargo run -p unity-asset-binary --example sniff_kind -- tests/samples/char_118_yuki.ab`
-- Load and print summary:
-  - `cargo run -p unity-asset-binary --example load_and_list -- tests/samples/char_118_yuki.ab`
-- Scan `PPtr` references (TypeTree required):
-  - `cargo run -p unity-asset-binary --example scan_pptrs -- <path> <path_id> [asset_index]`
-- JSON TypeTree registry for stripped assets:
-  - `cargo run -p unity-asset-binary --example typetree_registry_json -- <path>`
+Inspect YAML and SerializedFile objects as versioned JSON Lines. A signed binary `path_id` and an
+output limit are optional:
 
-## unity-asset-decode (optional decode/export)
+```powershell
+cargo run -p unity-asset --example workspace_object_inspection -- D:\GameProject 0 100
+```
 
-- Export Texture2D PNGs:
-  - `cargo run -p unity-asset-decode --example export_textures --features texture -- tests/samples/char_118_yuki.ab target/out`
+Build one revision-bound `ReferenceGraph` and emit a deterministic JSON, JSON Lines, or DOT
+projection:
 
-## unity-asset-search (experimental)
+```powershell
+cargo run -p unity-asset --example workspace_reference_graph -- D:\GameProject jsonl
+cargo run -p unity-asset --example workspace_reference_graph -- D:\GameProject dot > graph.dot
+```
 
-- Install the tools:
-  - `cargo install unity-asset-search-daemon`
-  - `cargo install unity-asset-search-cli`
-- Start the daemon (auto reindex on first run):
-  - `cargo run -p unity-asset-search-daemon -- --project-root repo-ref/BoatAttack --watch`
-- Start the daemon with an Everything-like experience (indexes bundle container paths; disables `.gitignore`):
-  - `cargo run -p unity-asset-search-daemon -- --project-root repo-ref/BoatAttack --watch --search-everything`
-- Exclude paths (recommended):
-  - Use `.gitignore` (supported) or `.ignore` (supported), or add a `.unity-asset-search-ignore` file at project root for tool-specific ignores.
-- Query from the CLI:
-  - `cargo run -p unity-asset-search-cli -- health`
-  - `cargo run -p unity-asset-search-cli -- search "player" --limit 20`
-  - `cargo run -p unity-asset-search-cli -- search "PlayerController" --limit 20`
-  - `cargo run -p unity-asset-search-cli -- search "UI StartButton" --limit 20`
-  - Search bundle container paths (requires daemon `--search-everything` or `--index-bundle-container-entries`):
-    - `cargo run -p unity-asset-search-cli -- search "type:bundlecontainer statements_iron" --limit 20`
-  - `cargo run -p unity-asset-search-cli -- suggest "t:pr" --limit 10`
-  - `cargo run -p unity-asset-search-cli -- status`
-  - Find references by GUID:
-    - `cargo run -p unity-asset-search-cli -- references deadbeefdeadbeefdeadbeefdeadbeef --limit 50`
-    - `cargo run -p unity-asset-search-cli -- references deadbeefdeadbeefdeadbeefdeadbeef --file-id 11500000 --limit 50` (YAML `fileID` / binary `pathID`)
-    - The response includes `hits[].stable_id` + `hits[].location` (for navigation) and `hits[].objects[]` (Rider-like object grouping with `field_hints[]`).
-- Run the BoatAttack benchmark harness:
-  - `scripts/bench_boat_attack.zsh repo-ref/BoatAttack`
-- Stress test incremental watcher indexing (burst changes):
-  - `scripts/stress_incremental_watch.zsh repo-ref/BoatAttack`
-- Stress test watcher-driven directory rename/move:
-  - `scripts/stress_rename_watch.zsh repo-ref/BoatAttack`
-- Stress test watcher-driven git checkout / branch switching:
-  - `scripts/stress_git_checkout_watch.zsh repo-ref/BoatAttack`
-  - The script prints a JSON summary (p50/p95/max) and counts how many times the daemon fell back to a full scan due to watcher storms.
-  - If the project is large, you may want to lower debounce or tune the fallback threshold:
-    - `DEBOUNCE_MS=200 scripts/stress_git_checkout_watch.zsh repo-ref/BoatAttack`
-    - `cargo run -p unity-asset-search-daemon -- --project-root repo-ref/BoatAttack --watch --watch-debounce-ms 200 --watch-full-scan-threshold 5000 --watch-reconcile-interval-ms 300000`
-  - Note: when watcher storms trigger a fallback, the daemon runs a sharded full scan (one `scan_root` at a time) to reduce I/O on large projects.
+Query every exact `AssetBundle.m_Container` occurrence matching a pattern:
+
+```powershell
+cargo run -p unity-asset --example bundle_container_query -- D:\GameProject\game.bundle "Assets/UI/*"
+```
+
+Resolve a streamed-resource range from sources already loaded into the snapshot. Resolution never
+probes the filesystem for an undeclared sidecar:
+
+```powershell
+cargo run -p unity-asset --example workspace_streamed_resource -- D:\GameProject\game.bundle -42
+```
+
+The YAML-only adapter remains useful for small tools:
+
+```powershell
+cargo run -p unity-asset --example yaml_load_summary -- D:\GameProject\Assets\Scene.prefab
+```
+
+## Typed Workspace CLI
+
+All successful machine-facing commands write one JSON document to stdout. Failures write the
+versioned `unity_asset.cli_error` contract to stderr. A JSON input path may be `-` when the command
+accepts stdin.
+
+Discover the exact operation set and current wire versions:
+
+```powershell
+cargo run -p unity-asset-cli --bin unity-asset -- workspace capabilities
+```
+
+Inspect committed sources and objects:
+
+```powershell
+cargo run -p unity-asset-cli --bin unity-asset -- workspace inspect sources --input D:\GameProject
+cargo run -p unity-asset-cli --bin unity-asset -- workspace inspect objects --input D:\GameProject
+cargo run -p unity-asset-cli --bin unity-asset -- workspace inspect object --input D:\GameProject --address-json object-address.json
+cargo run -p unity-asset-cli --bin unity-asset -- workspace inspect bundle-containers --input D:\GameProject --query-json container-query.json
+```
+
+Validate and canonicalize a `MutationPlan` v2 before loading a workspace:
+
+```powershell
+cargo run -p unity-asset-cli --bin unity-asset -- workspace plan validate --plan mutation-plan.json
+```
+
+Prepare is side-effect free and emits a `PrepareReport`. Preview reparses the same plan and
+inspects the prepared read-your-writes view. The report is evidence only: it cannot recreate the
+single-use `PreparedChange` authority.
+
+```powershell
+cargo run -p unity-asset-cli --bin unity-asset -- workspace prepare --input D:\GameProject --plan mutation-plan.json
+cargo run -p unity-asset-cli --bin unity-asset -- workspace preview --input D:\GameProject --plan mutation-plan.json --address-json object-address.json
+```
+
+Commit re-prepares the exact plan and publishes below an existing absolute containment root:
+
+```powershell
+cargo run -p unity-asset-cli --bin unity-asset -- workspace commit --input D:\GameProject --plan mutation-plan.json --publication-root D:\GameProject
+```
+
+Recovery is explicit and typed. Discovery emits canonical locators; resume and abandon operate on
+filesystem evidence, while finalize also reloads trusted workspace sources before attaching the
+recovered revision:
+
+```powershell
+cargo run -p unity-asset-cli --bin unity-asset -- workspace recover discover --publication-root D:\GameProject
+cargo run -p unity-asset-cli --bin unity-asset -- workspace recover resume --locator-json recovery-locator.json
+cargo run -p unity-asset-cli --bin unity-asset -- workspace recover abandon --locator-json recovery-locator.json
+cargo run -p unity-asset-cli --bin unity-asset -- workspace recover finalize --input D:\GameProject --locator-json recovery-locator.json
+```
+
+Supply one or more immutable JSON/TPK TypeTree registries before the subcommand. Earlier paths
+have lookup priority:
+
+```powershell
+cargo run -p unity-asset-cli --bin unity-asset -- --typetree-registry script-types.json --typetree-registry engine.tpk workspace inspect objects --input D:\GameProject
+```
+
+## References
+
+The CLI emits a versioned, deterministic projection whose coverage and resolution states are
+bound to the loaded workspace revision:
+
+```powershell
+cargo run -p unity-asset-cli --bin unity-asset -- references graph --input D:\GameProject --unity-project --max-facts 200000
+```
+
+`ReferenceGraph` only resolves against sources present in its `WorkspaceView`; it does not discover
+or open additional files while answering a query.
+
+## Extraction
+
+An `ExtractionRequest` v1 selects objects and representation policy. A dry run emits the canonical
+`ExtractionPlan` v1 without writing artifacts:
+
+```powershell
+cargo run -p unity-asset-cli --bin unity-asset -- extract --input D:\GameProject --output D:\Exports --request extraction-request.json --dry-run
+```
+
+Execute either a request or a previously captured plan. A durable manifest may be published below
+the output root, and a later process can verify and resume completed artifacts:
+
+```powershell
+cargo run -p unity-asset-cli --bin unity-asset -- extract --input D:\GameProject --output D:\Exports --request extraction-request.json --manifest reports/manifest.json
+cargo run -p unity-asset-cli --bin unity-asset -- extract --input D:\GameProject --output D:\Exports --plan extraction-plan.json --resume D:\Exports\reports\manifest.json
+```
+
+Output collision policy is `error`, `skip`, or `replace`. Failure policy is `collect-all` or
+`stop-in-plan-order`. Worker, in-flight byte, open-file, output-byte, and report-byte limits are
+explicit CLI options.
+
+## Low-Level Parsers
+
+```powershell
+cargo run -p unity-asset-binary --example sniff_kind -- D:\GameProject\game.bundle
+cargo run -p unity-asset-binary --example load_and_list -- D:\GameProject\game.bundle
+cargo run -p unity-asset-binary --example scan_pptrs -- D:\GameProject\game.bundle -42 0
+cargo run -p unity-asset-binary --example typetree_registry_json -- D:\GameProject\game.bundle
+cargo run -p unity-asset-decode --example export_textures --features texture -- D:\GameProject\game.bundle D:\Exports
+```
+
+Use these APIs when building a format adapter. Application workflows should prefer
+`AssetWorkspace`, because it owns identity, revision, budget, and publication invariants.
+
+## Local Search
+
+Start the local daemon and incrementally reconcile a Unity project:
+
+```powershell
+cargo run -p unity-asset-search-daemon -- --project-root D:\GameProject --watch
+```
+
+Index AssetBundle container paths and ignore the project root's `.gitignore`:
+
+```powershell
+cargo run -p unity-asset-search-daemon -- --project-root D:\GameProject --watch --search-everything
+```
+
+The versioned HTTP contract is `/v2`. Read endpoints are localhost-only; reindex and token
+rotation require the persisted bearer token.
+
+```powershell
+cargo run -p unity-asset-search-cli -- health
+cargo run -p unity-asset-search-cli -- status
+cargo run -p unity-asset-search-cli -- search "type:Prefab in:Assets/UI start button" --limit 20
+cargo run -p unity-asset-search-cli -- suggest "t:pr" --limit 10
+cargo run -p unity-asset-search-cli -- references deadbeefdeadbeefdeadbeefdeadbeef --file-id -11500000 --limit 50
+cargo run -p unity-asset-search-cli -- --token $env:UNITY_ASSET_SEARCH_TOKEN reindex --path Assets\UI\StartButton.prefab
+```
+
+The search index is a derived, consumer-owned `SearchGeneration`. Workspace commits hand off a
+revision-bound, transaction-keyed `ChangeSet`; the daemon never becomes authoritative for asset
+bytes.

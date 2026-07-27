@@ -67,6 +67,7 @@ fn prepared_reference_is_one_revision_across_object_and_graph_queries() {
     )
     .unwrap();
     let plan = MutationPlan::new(
+        workspace.workspace_id(),
         workspace.revision(),
         vec![SourceExpectation::new(
             SourceLocator::path(SOURCE_ALIAS).unwrap(),

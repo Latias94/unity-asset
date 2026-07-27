@@ -1,34 +1,29 @@
 //! Serial admission and execution for every daemon reindex trigger.
 //!
-//! Admission is intentionally centralized here. Filesystem events, timers, HTTP requests,
-//! startup reconciliation, and workspace transactions must not grow independent scheduling
-//! rules around the index builder.
+//! Admission is intentionally centralized here. Filesystem events, timers, HTTP requests, and
+//! startup reconciliation must not grow independent scheduling rules around the index builder.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
 use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::time::Instant;
 use unity_asset_search_index::{
-    DigestV1, DigestV1Builder, ReindexDisposition, ReindexIntent, ReindexReceipt, ReindexScope,
-    SEARCH_GENERATION_CONTRACT_VERSION,
+    ReindexDisposition, ReindexIntent, ReindexReceipt, SEARCH_GENERATION_CONTRACT_VERSION,
 };
+use unity_asset_search_protocol::ValidateContractVersion;
 
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(75);
 const DEFAULT_MAX_DEBOUNCE: Duration = Duration::from_millis(750);
 const DEFAULT_MAX_DIRTY_PATHS: usize = 4_096;
 const DEFAULT_MAX_PENDING_EVENTS: usize = 32_768;
-const DEFAULT_MAX_PENDING_TRANSACTIONS: usize = 1_024;
-const DEFAULT_MAX_TRANSACTION_HISTORY: usize = 65_536;
 const DEFAULT_MAX_FAILURE_HISTORY: usize = 64;
 const MAX_FAILURE_MESSAGE_BYTES: usize = 4_096;
 
@@ -44,7 +39,6 @@ pub enum ReindexSource {
     Watcher,
     Timer,
     Http,
-    ChangeSet,
 }
 
 impl ReindexSource {
@@ -54,7 +48,6 @@ impl ReindexSource {
             Self::Watcher => 1,
             Self::Timer => 2,
             Self::Http => 3,
-            Self::ChangeSet => 4,
         }
     }
 }
@@ -67,8 +60,6 @@ pub struct ReindexCoordinatorConfig {
     max_debounce: Duration,
     max_dirty_paths: usize,
     max_pending_events: usize,
-    max_pending_transactions: usize,
-    max_transaction_history: usize,
     max_failure_history: usize,
 }
 
@@ -81,8 +72,6 @@ impl ReindexCoordinatorConfig {
             max_debounce: DEFAULT_MAX_DEBOUNCE,
             max_dirty_paths: DEFAULT_MAX_DIRTY_PATHS,
             max_pending_events: DEFAULT_MAX_PENDING_EVENTS,
-            max_pending_transactions: DEFAULT_MAX_PENDING_TRANSACTIONS,
-            max_transaction_history: DEFAULT_MAX_TRANSACTION_HISTORY,
             max_failure_history: DEFAULT_MAX_FAILURE_HISTORY,
         }
     }
@@ -108,18 +97,6 @@ impl ReindexCoordinatorConfig {
     #[must_use]
     pub fn with_max_pending_events(mut self, maximum: usize) -> Self {
         self.max_pending_events = maximum;
-        self
-    }
-
-    #[must_use]
-    pub fn with_max_pending_transactions(mut self, maximum: usize) -> Self {
-        self.max_pending_transactions = maximum;
-        self
-    }
-
-    #[must_use]
-    pub fn with_max_transaction_history(mut self, maximum: usize) -> Self {
-        self.max_transaction_history = maximum;
         self
     }
 
@@ -154,8 +131,6 @@ impl ReindexCoordinatorConfig {
         for (name, value) in [
             ("max_dirty_paths", self.max_dirty_paths),
             ("max_pending_events", self.max_pending_events),
-            ("max_pending_transactions", self.max_pending_transactions),
-            ("max_transaction_history", self.max_transaction_history),
             ("max_failure_history", self.max_failure_history),
         ] {
             if value == 0 {
@@ -166,22 +141,71 @@ impl ReindexCoordinatorConfig {
     }
 }
 
+/// A daemon-owned reindex request over the configured filesystem project.
+///
+/// Authoritative workspace change sets intentionally cannot be represented at this boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesystemReindexIntent {
+    pub contract_version: u16,
+    pub scope: FilesystemReindexScope,
+}
+
+impl FilesystemReindexIntent {
+    #[must_use]
+    pub const fn full() -> Self {
+        Self {
+            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+            scope: FilesystemReindexScope::Full,
+        }
+    }
+
+    #[must_use]
+    pub const fn reconcile() -> Self {
+        Self {
+            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+            scope: FilesystemReindexScope::Reconcile,
+        }
+    }
+
+    #[must_use]
+    pub fn changed_paths(paths: Vec<PathBuf>) -> Self {
+        Self {
+            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+            scope: FilesystemReindexScope::ChangedPaths { paths },
+        }
+    }
+
+    fn into_library_intent(self) -> ReindexIntent {
+        match self.scope {
+            FilesystemReindexScope::Full => ReindexIntent::full(),
+            FilesystemReindexScope::Reconcile => ReindexIntent::reconcile(),
+            FilesystemReindexScope::ChangedPaths { paths } => ReindexIntent::changed_paths(paths),
+        }
+    }
+}
+
+/// Filesystem work that the daemon can schedule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilesystemReindexScope {
+    Full,
+    Reconcile,
+    ChangedPaths { paths: Vec<PathBuf> },
+}
+
 /// Stable scope label used by status and failure reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReindexScopeKind {
     Full,
     Reconcile,
     ChangedPaths,
-    ChangeSet,
 }
 
 impl ReindexScopeKind {
-    const fn from_intent(intent: &ReindexIntent) -> Self {
+    const fn from_intent(intent: &FilesystemReindexIntent) -> Self {
         match &intent.scope {
-            ReindexScope::Full => Self::Full,
-            ReindexScope::Reconcile => Self::Reconcile,
-            ReindexScope::ChangedPaths { .. } => Self::ChangedPaths,
-            ReindexScope::ChangeSet { .. } => Self::ChangeSet,
+            FilesystemReindexScope::Full => Self::Full,
+            FilesystemReindexScope::Reconcile => Self::Reconcile,
+            FilesystemReindexScope::ChangedPaths { .. } => Self::ChangedPaths,
         }
     }
 }
@@ -191,7 +215,6 @@ impl ReindexScopeKind {
 pub struct ReindexFailure {
     pub sequence: u64,
     pub scope: ReindexScopeKind,
-    pub transaction: Option<String>,
     pub message: String,
 }
 
@@ -202,17 +225,15 @@ pub struct ReindexAdmissionCounts {
     pub watcher: u64,
     pub timer: u64,
     pub http: u64,
-    pub change_set: u64,
 }
 
 impl ReindexAdmissionCounts {
-    fn from_array(counts: [u64; 5]) -> Self {
+    fn from_array(counts: [u64; 4]) -> Self {
         Self {
             startup: counts[0],
             watcher: counts[1],
             timer: counts[2],
             http: counts[3],
-            change_set: counts[4],
         }
     }
 }
@@ -223,9 +244,6 @@ pub struct ReindexCoordinatorSnapshot {
     pub running: bool,
     pub in_flight: Option<ReindexScopeKind>,
     pub pending_general: Option<ReindexScopeKind>,
-    pub pending_transactions: usize,
-    pub tracked_transactions: usize,
-    pub applied_transactions: usize,
     pub failures: Vec<ReindexFailure>,
     pub full_escalations: u64,
     pub watcher_overflows: u64,
@@ -235,10 +253,7 @@ pub struct ReindexCoordinatorSnapshot {
 impl ReindexCoordinatorSnapshot {
     #[must_use]
     pub const fn is_idle(&self) -> bool {
-        !self.running
-            && self.in_flight.is_none()
-            && self.pending_general.is_none()
-            && self.pending_transactions == 0
+        !self.running && self.in_flight.is_none() && self.pending_general.is_none()
     }
 }
 
@@ -296,18 +311,16 @@ impl ReindexCoordinator {
     pub async fn admit(
         &self,
         source: ReindexSource,
-        intent: ReindexIntent,
+        intent: FilesystemReindexIntent,
     ) -> Result<ReindexReceipt, CoordinatorError> {
         self.admit_inner(source, intent, false).await
     }
 
     /// Atomically admits one filesystem-backed request and waits for its merged build result.
-    ///
-    /// Change-set requests require an authoritative workspace view and are rejected by this API.
     pub async fn admit_and_wait(
         &self,
         source: ReindexSource,
-        intent: ReindexIntent,
+        intent: FilesystemReindexIntent,
     ) -> Result<ReindexCompletion, CoordinatorError> {
         if intent.contract_version != SEARCH_GENERATION_CONTRACT_VERSION {
             return Err(CoordinatorError::UnsupportedContractVersion {
@@ -315,10 +328,6 @@ impl ReindexCoordinator {
                 expected: SEARCH_GENERATION_CONTRACT_VERSION,
             });
         }
-        if matches!(&intent.scope, ReindexScope::ChangeSet { .. }) {
-            return Err(CoordinatorError::SynchronousChangeSetUnsupported);
-        }
-
         let normalized = normalize_general_scope(&intent, &self.inner.config)?;
         let (completion_sender, completion_receiver) = oneshot::channel();
         let (admission, should_start) = {
@@ -336,7 +345,7 @@ impl ReindexCoordinator {
                 state.full_escalations = state.full_escalations.saturating_add(1);
             }
             let should_start = state.start_runner_if_needed();
-            (admission_receipt(disposition, &intent), should_start)
+            (admission_receipt(disposition), should_start)
         };
 
         self.signal_runner_after_admission(should_start);
@@ -363,8 +372,12 @@ impl ReindexCoordinator {
 
     /// Records a lossy watcher overflow and upgrades pending filesystem work to a full scan.
     pub async fn watcher_overflow(&self) -> Result<ReindexReceipt, CoordinatorError> {
-        self.admit_inner(ReindexSource::Watcher, ReindexIntent::full(), true)
-            .await
+        self.admit_inner(
+            ReindexSource::Watcher,
+            FilesystemReindexIntent::full(),
+            true,
+        )
+        .await
     }
 
     /// Waits until the runner has drained every admitted request.
@@ -389,7 +402,7 @@ impl ReindexCoordinator {
     async fn admit_inner(
         &self,
         source: ReindexSource,
-        intent: ReindexIntent,
+        intent: FilesystemReindexIntent,
         watcher_overflow: bool,
     ) -> Result<ReindexReceipt, CoordinatorError> {
         if intent.contract_version != SEARCH_GENERATION_CONTRACT_VERSION {
@@ -398,13 +411,6 @@ impl ReindexCoordinator {
                 expected: SEARCH_GENERATION_CONTRACT_VERSION,
             });
         }
-        let transaction = match &intent.scope {
-            ReindexScope::ChangeSet { .. } => Some(transaction_record(&intent)?),
-            ReindexScope::Full | ReindexScope::Reconcile | ReindexScope::ChangedPaths { .. } => {
-                None
-            }
-        };
-
         let mut state = self.inner.state.lock().await;
         state.admissions[source.index()] = state.admissions[source.index()].saturating_add(1);
 
@@ -418,8 +424,6 @@ impl ReindexCoordinator {
                 true,
                 None,
             )?
-        } else if let Some(transaction) = transaction {
-            state.admit_transaction(&intent, transaction, &self.inner.config)?
         } else {
             let scope = normalize_general_scope(&intent, &self.inner.config)?;
             if scope.escalated {
@@ -435,7 +439,7 @@ impl ReindexCoordinator {
         };
 
         let should_start = state.start_runner_if_needed();
-        let receipt = admission_receipt(disposition, &intent);
+        let receipt = admission_receipt(disposition);
         drop(state);
 
         self.signal_runner_after_admission(should_start);
@@ -462,71 +466,20 @@ struct CoordinatorInner {
     changed: Notify,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TransactionBinding {
-    workspace: u128,
-    from_revision: DigestV1,
-    to_revision: DigestV1,
-    change_set_digest: DigestV1,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TransactionRecord {
-    transaction: DigestV1,
-    binding: TransactionBinding,
-}
-
-#[derive(Debug)]
-struct PendingTransaction {
-    intent: ReindexIntent,
-    record: TransactionRecord,
-}
-
 #[derive(Default)]
 struct CoordinatorState {
     runner_running: bool,
-    in_flight: Option<ReindexIntent>,
+    in_flight: Option<FilesystemReindexIntent>,
     pending_general: Option<PendingGeneral>,
-    transaction_queue: VecDeque<PendingTransaction>,
-    tracked_transactions: BTreeMap<DigestV1, TransactionBinding>,
-    applied_transactions: BTreeMap<DigestV1, TransactionBinding>,
-    applied_order: VecDeque<DigestV1>,
     failures: VecDeque<ReindexFailure>,
     failure_sequence: u64,
     full_escalations: u64,
     watcher_overflows: u64,
-    admissions: [u64; 5],
+    admissions: [u64; 4],
     completion_waiter_count: usize,
 }
 
 impl CoordinatorState {
-    fn admit_transaction(
-        &mut self,
-        intent: &ReindexIntent,
-        record: TransactionRecord,
-        config: &ReindexCoordinatorConfig,
-    ) -> Result<ReindexDisposition, CoordinatorError> {
-        if let Some(existing) = self.applied_transactions.get(&record.transaction) {
-            return classify_duplicate(record, *existing, ReindexDisposition::AlreadyApplied);
-        }
-        if let Some(existing) = self.tracked_transactions.get(&record.transaction) {
-            return classify_duplicate(record, *existing, ReindexDisposition::Coalesced);
-        }
-        if self.transaction_queue.len() >= config.max_pending_transactions {
-            return Err(CoordinatorError::TransactionQueueFull {
-                maximum: config.max_pending_transactions,
-            });
-        }
-
-        self.tracked_transactions
-            .insert(record.transaction, record.binding);
-        self.transaction_queue.push_back(PendingTransaction {
-            intent: intent.clone(),
-            record,
-        });
-        Ok(ReindexDisposition::Queued)
-    }
-
     fn admit_general(
         &mut self,
         incoming: GeneralScope,
@@ -575,8 +528,7 @@ impl CoordinatorState {
     }
 
     fn start_runner_if_needed(&mut self) -> bool {
-        let should_start = !self.runner_running
-            && (self.pending_general.is_some() || !self.transaction_queue.is_empty());
+        let should_start = !self.runner_running && self.pending_general.is_some();
         if should_start {
             self.runner_running = true;
         }
@@ -594,17 +546,7 @@ impl CoordinatorState {
             self.in_flight = Some(intent.clone());
             return RunnerAction::Execute {
                 intent: Box::new(intent),
-                transaction: None,
                 waiters,
-            };
-        }
-
-        if let Some(transaction) = self.transaction_queue.pop_front() {
-            self.in_flight = Some(transaction.intent.clone());
-            return RunnerAction::Execute {
-                intent: Box::new(transaction.intent),
-                transaction: Some(transaction.record),
-                waiters: Vec::new(),
             };
         }
 
@@ -618,8 +560,7 @@ impl CoordinatorState {
 
     fn finish(
         &mut self,
-        intent: &ReindexIntent,
-        transaction: Option<TransactionRecord>,
+        intent: &FilesystemReindexIntent,
         outcome: &CompletionOutcome,
         completed_waiters: usize,
         config: &ReindexCoordinatorConfig,
@@ -628,43 +569,21 @@ impl CoordinatorState {
         self.completion_waiter_count = self
             .completion_waiter_count
             .saturating_sub(completed_waiters);
-        let Some(record) = transaction else {
-            if let Err(failure) = outcome {
-                self.record_failure(intent, failure.message.clone(), config.max_failure_history);
-            }
-            return;
-        };
-
-        self.tracked_transactions.remove(&record.transaction);
-        match outcome {
-            Ok(_) => self.record_applied(record, config.max_transaction_history),
-            Err(failure) => {
-                self.record_failure(intent, failure.message.clone(), config.max_failure_history)
-            }
+        if let Err(failure) = outcome {
+            self.record_failure(intent, failure.message.clone(), config.max_failure_history);
         }
     }
 
-    fn record_applied(&mut self, record: TransactionRecord, maximum: usize) {
-        if self
-            .applied_transactions
-            .insert(record.transaction, record.binding)
-            .is_none()
-        {
-            self.applied_order.push_back(record.transaction);
-        }
-        while self.applied_order.len() > maximum {
-            if let Some(evicted) = self.applied_order.pop_front() {
-                self.applied_transactions.remove(&evicted);
-            }
-        }
-    }
-
-    fn record_failure(&mut self, intent: &ReindexIntent, message: String, maximum: usize) {
+    fn record_failure(
+        &mut self,
+        intent: &FilesystemReindexIntent,
+        message: String,
+        maximum: usize,
+    ) {
         self.failure_sequence = self.failure_sequence.saturating_add(1);
         self.failures.push_back(ReindexFailure {
             sequence: self.failure_sequence,
             scope: ReindexScopeKind::from_intent(intent),
-            transaction: transaction_key(intent).map(|transaction| transaction.to_string()),
             message: truncate_message(message),
         });
         while self.failures.len() > maximum {
@@ -680,9 +599,6 @@ impl CoordinatorState {
                 .pending_general
                 .as_ref()
                 .map(|pending| pending.scope.kind()),
-            pending_transactions: self.transaction_queue.len(),
-            tracked_transactions: self.tracked_transactions.len(),
-            applied_transactions: self.applied_transactions.len(),
             failures: self.failures.iter().cloned().collect(),
             full_escalations: self.full_escalations,
             watcher_overflows: self.watcher_overflows,
@@ -693,8 +609,7 @@ impl CoordinatorState {
 
 enum RunnerAction {
     Execute {
-        intent: Box<ReindexIntent>,
-        transaction: Option<TransactionRecord>,
+        intent: Box<FilesystemReindexIntent>,
         waiters: Vec<CompletionSender>,
     },
     WaitUntil(Instant),
@@ -710,15 +625,11 @@ async fn run_coordinator(inner: Arc<CoordinatorInner>) {
         };
 
         match action {
-            RunnerAction::Execute {
-                intent,
-                transaction,
-                waiters,
-            } => {
+            RunnerAction::Execute { intent, waiters } => {
                 inner.changed.notify_waiters();
                 let outcome = execute(&inner.executor, &intent).await;
                 let mut state = inner.state.lock().await;
-                state.finish(&intent, transaction, &outcome, waiters.len(), &inner.config);
+                state.finish(&intent, &outcome, waiters.len(), &inner.config);
                 drop(state);
                 for waiter in waiters {
                     let _receiver_was_dropped = waiter.send(outcome.clone());
@@ -747,7 +658,7 @@ struct ExecutionFailure {
 }
 
 impl ExecutionFailure {
-    fn new(intent: &ReindexIntent, message: String) -> Self {
+    fn new(intent: &FilesystemReindexIntent, message: String) -> Self {
         Self {
             scope: ReindexScopeKind::from_intent(intent),
             message: truncate_message(message),
@@ -755,10 +666,14 @@ impl ExecutionFailure {
     }
 }
 
-async fn execute(executor: &Arc<BuildExecutor>, intent: &ReindexIntent) -> CompletionOutcome {
-    let outcome = match catch_unwind(AssertUnwindSafe(|| executor(intent.clone()))) {
+async fn execute(
+    executor: &Arc<BuildExecutor>,
+    intent: &FilesystemReindexIntent,
+) -> CompletionOutcome {
+    let library_intent = intent.clone().into_library_intent();
+    let outcome = match catch_unwind(AssertUnwindSafe(|| executor(library_intent.clone()))) {
         Ok(future) => {
-            let validation_intent = intent.clone();
+            let validation_intent = library_intent;
             match tokio::spawn(async move {
                 match future.await {
                     Ok(receipt) => validate_execution_receipt(&validation_intent, receipt),
@@ -780,12 +695,9 @@ fn validate_execution_receipt(
     intent: &ReindexIntent,
     receipt: ReindexReceipt,
 ) -> Result<ReindexReceipt, String> {
-    if receipt.contract_version != SEARCH_GENERATION_CONTRACT_VERSION {
-        return Err(format!(
-            "executor returned receipt contract version {}, expected {}",
-            receipt.contract_version, SEARCH_GENERATION_CONTRACT_VERSION
-        ));
-    }
+    receipt
+        .validate_contract_version()
+        .map_err(|error| format!("executor returned an invalid receipt: {error}"))?;
     if receipt.transaction != intent.scope.transaction() {
         return Err("executor returned a receipt for a different transaction".to_owned());
     }
@@ -811,19 +723,19 @@ struct NormalizedGeneralScope {
 }
 
 fn normalize_general_scope(
-    intent: &ReindexIntent,
+    intent: &FilesystemReindexIntent,
     config: &ReindexCoordinatorConfig,
 ) -> Result<NormalizedGeneralScope, CoordinatorError> {
     match &intent.scope {
-        ReindexScope::Full => Ok(NormalizedGeneralScope {
+        FilesystemReindexScope::Full => Ok(NormalizedGeneralScope {
             scope: GeneralScope::Full,
             escalated: false,
         }),
-        ReindexScope::Reconcile => Ok(NormalizedGeneralScope {
+        FilesystemReindexScope::Reconcile => Ok(NormalizedGeneralScope {
             scope: GeneralScope::Reconcile,
             escalated: false,
         }),
-        ReindexScope::ChangedPaths { paths } => {
+        FilesystemReindexScope::ChangedPaths { paths } => {
             let mut normalized = BTreeSet::new();
             for path in paths {
                 let Some(path) = normalize_changed_path(&config.project_root, path)? else {
@@ -851,7 +763,6 @@ fn normalize_general_scope(
                 escalated: false,
             })
         }
-        ReindexScope::ChangeSet { .. } => Err(CoordinatorError::MissingTransaction),
     }
 }
 
@@ -901,11 +812,13 @@ impl GeneralScope {
         }
     }
 
-    fn into_intent(self) -> ReindexIntent {
+    fn into_intent(self) -> FilesystemReindexIntent {
         match self {
-            Self::Full => ReindexIntent::full(),
-            Self::Reconcile => ReindexIntent::reconcile(),
-            Self::ChangedPaths(paths) => ReindexIntent::changed_paths(paths.into_iter().collect()),
+            Self::Full => FilesystemReindexIntent::full(),
+            Self::Reconcile => FilesystemReindexIntent::reconcile(),
+            Self::ChangedPaths(paths) => {
+                FilesystemReindexIntent::changed_paths(paths.into_iter().collect())
+            }
         }
     }
 }
@@ -1015,98 +928,12 @@ fn normalize_changed_path(
     Ok((!normalized.as_os_str().is_empty()).then_some(normalized))
 }
 
-fn transaction_record(intent: &ReindexIntent) -> Result<TransactionRecord, CoordinatorError> {
-    let ReindexScope::ChangeSet { changes } = &intent.scope else {
-        return Err(CoordinatorError::MissingTransaction);
-    };
-    let change_set_digest = canonical_json_digest(changes)?;
-    Ok(TransactionRecord {
-        transaction: changes.transaction().digest(),
-        binding: TransactionBinding {
-            workspace: changes.workspace().get(),
-            from_revision: changes.from_revision().digest(),
-            to_revision: changes.to_revision().digest(),
-            change_set_digest,
-        },
-    })
-}
-
-fn classify_duplicate(
-    incoming: TransactionRecord,
-    existing: TransactionBinding,
-    disposition: ReindexDisposition,
-) -> Result<ReindexDisposition, CoordinatorError> {
-    if incoming.binding == existing {
-        Ok(disposition)
-    } else {
-        Err(CoordinatorError::TransactionConflict {
-            transaction: incoming.transaction,
-            existing_change_set: existing.change_set_digest,
-            incoming_change_set: incoming.binding.change_set_digest,
-        })
-    }
-}
-
-fn canonical_json_digest(value: &impl Serialize) -> Result<DigestV1, CoordinatorError> {
-    let mut counter = JsonByteCounter::default();
-    serde_json::to_writer(&mut counter, value)
-        .map_err(|error| CoordinatorError::TransactionBinding(error.to_string()))?;
-
-    let mut builder = DigestV1Builder::new(counter.bytes);
-    serde_json::to_writer(DigestWriter(&mut builder), value)
-        .map_err(|error| CoordinatorError::TransactionBinding(error.to_string()))?;
-    builder
-        .finalize()
-        .map_err(|error| CoordinatorError::TransactionBinding(error.to_string()))
-}
-
-#[derive(Default)]
-struct JsonByteCounter {
-    bytes: u64,
-}
-
-impl Write for JsonByteCounter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let amount = u64::try_from(buffer.len())
-            .map_err(|_| io::Error::other("canonical ChangeSet JSON length overflow"))?;
-        self.bytes = self
-            .bytes
-            .checked_add(amount)
-            .ok_or_else(|| io::Error::other("canonical ChangeSet JSON length overflow"))?;
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-struct DigestWriter<'builder>(&'builder mut DigestV1Builder);
-
-impl Write for DigestWriter<'_> {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.0.update(buffer).map_err(io::Error::other)?;
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn transaction_key(intent: &ReindexIntent) -> Option<DigestV1> {
-    intent
-        .scope
-        .transaction()
-        .map(|transaction| transaction.digest())
-}
-
-fn admission_receipt(disposition: ReindexDisposition, intent: &ReindexIntent) -> ReindexReceipt {
+fn admission_receipt(disposition: ReindexDisposition) -> ReindexReceipt {
     ReindexReceipt {
         contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
         disposition,
-        transaction: intent.scope.transaction(),
-        target_revision: intent.scope.target_revision(),
+        transaction: None,
+        target_revision: None,
         generation: None,
         evidence: Default::default(),
     }
@@ -1133,7 +960,6 @@ pub enum CoordinatorError {
         actual: u16,
         expected: u16,
     },
-    SynchronousChangeSetUnsupported,
     CompletionWaiterLimit {
         maximum: usize,
     },
@@ -1146,19 +972,9 @@ pub enum CoordinatorError {
     CompletionChannelClosed {
         admission: Box<ReindexReceipt>,
     },
-    MissingTransaction,
-    TransactionBinding(String),
-    TransactionConflict {
-        transaction: DigestV1,
-        existing_change_set: DigestV1,
-        incoming_change_set: DigestV1,
-    },
     PathOutsideProject {
         path: PathBuf,
         project_root: PathBuf,
-    },
-    TransactionQueueFull {
-        maximum: usize,
     },
 }
 
@@ -1175,8 +991,6 @@ impl fmt::Display for CoordinatorError {
                 formatter,
                 "reindex intent contract version {actual} is unsupported; expected {expected}"
             ),
-            Self::SynchronousChangeSetUnsupported => formatter
-                .write_str("synchronous completion is unavailable for ChangeSet reindex requests"),
             Self::CompletionWaiterLimit { maximum } => write!(
                 formatter,
                 "reindex completion waiter limit reached; maximum pending waiters is {maximum}"
@@ -1190,30 +1004,11 @@ impl fmt::Display for CoordinatorError {
             Self::CompletionChannelClosed { .. } => {
                 formatter.write_str("reindex completion channel closed before reporting a result")
             }
-            Self::MissingTransaction => {
-                formatter.write_str("ChangeSet reindex intent is missing its transaction")
-            }
-            Self::TransactionBinding(message) => {
-                write!(formatter, "could not bind ChangeSet transaction: {message}")
-            }
-            Self::TransactionConflict {
-                transaction,
-                existing_change_set,
-                incoming_change_set,
-            } => write!(
-                formatter,
-                "transaction {transaction} was reused for a different ChangeSet \
-                 (existing {existing_change_set}, incoming {incoming_change_set})"
-            ),
             Self::PathOutsideProject { path, project_root } => write!(
                 formatter,
                 "changed path {} is outside project root {}",
                 path.display(),
                 project_root.display()
-            ),
-            Self::TransactionQueueFull { maximum } => write!(
-                formatter,
-                "reindex transaction queue is full; maximum pending transactions is {maximum}"
             ),
         }
     }

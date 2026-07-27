@@ -7,11 +7,11 @@ use image::ImageFormat;
 use unity_asset::extraction::{
     ExistingOutputPolicy, ExtractionArtifactKind, ExtractionArtifactStatus,
     ExtractionExecutionLimits, ExtractionExecutionOptions, ExtractionExecutor,
-    ExtractionFailurePolicy, ExtractionFilter, ExtractionPlanner, ExtractionRepresentationPolicy,
-    ExtractionRequest,
+    ExtractionFailurePolicy, ExtractionFilter, ExtractionPlanError, ExtractionPlanner,
+    ExtractionRepresentationPolicy, ExtractionRequest,
 };
-use unity_asset::workspace::AssetWorkspace;
-use unity_asset::{AssetLoadBudget, DigestV1};
+use unity_asset::workspace::{AssetWorkspace, WorkspaceError};
+use unity_asset::{AssetLoadBudget, AssetLoadLimits, BudgetError, DigestV1};
 use unity_asset_decode::audio::{AudioCompressionFormat, decode_audio_data};
 
 fn sample(name: &str) -> PathBuf {
@@ -71,16 +71,53 @@ fn banner_texture_exports_as_revision_bound_png() {
         .load_path(sample("banner_1"), &mut AssetLoadBudget::default())
         .unwrap();
     let snapshot = workspace.snapshot();
-    let request = ExtractionRequest::all(ExtractionRepresentationPolicy::RequireDecoded)
-        .with_filter(ExtractionFilter::new([28], None, None, None).unwrap());
-    let plan = ExtractionPlanner::new(&snapshot)
-        .plan(request, &mut AssetLoadBudget::default())
+    let planner = ExtractionPlanner::new(&snapshot);
+    let request = || {
+        ExtractionRequest::all(ExtractionRepresentationPolicy::RequireDecoded)
+            .with_filter(ExtractionFilter::new([28], None, None, None).unwrap())
+    };
+    let cold_plan = planner
+        .plan(request(), &mut AssetLoadBudget::default())
         .unwrap();
+    let mut measured = AssetLoadBudget::default();
+    let plan = planner.plan(request(), &mut measured).unwrap();
+    assert_eq!(plan, cold_plan);
     assert_eq!(plan.artifacts().len(), 1);
     assert_eq!(
         plan.artifacts()[0].preferred_kind(),
         ExtractionArtifactKind::TexturePng
     );
+    let usage = measured.usage();
+    assert!(usage.bytes > 1);
+    let exact_limits = AssetLoadLimits {
+        max_entries: usage.entries.max(1),
+        max_bytes: usage.bytes,
+        max_depth: usage.max_observed_depth,
+        max_members: usage.members.max(1),
+        max_compressed_bytes: usage.compressed_bytes.max(1),
+        max_decompressed_bytes: usage.decompressed_bytes.max(1),
+        ..AssetLoadLimits::default()
+    };
+    let mut exact = AssetLoadBudget::new(exact_limits).unwrap();
+    assert_eq!(planner.plan(request(), &mut exact).unwrap(), plan);
+    assert_eq!(exact.usage(), usage);
+
+    let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: usage.bytes - 1,
+        ..exact_limits
+    })
+    .unwrap();
+    let error = planner.plan(request(), &mut one_short).unwrap_err();
+    assert!(matches!(
+        error,
+        ExtractionPlanError::Budget(BudgetError::Exceeded {
+            resource: "bytes",
+            ..
+        }) | ExtractionPlanError::Workspace(WorkspaceError::Budget(BudgetError::Exceeded {
+            resource: "bytes",
+            ..
+        }))
+    ));
 
     let directory = tempfile::tempdir().unwrap();
     let report = ExtractionExecutor::new()
@@ -118,17 +155,55 @@ fn streamed_audio_is_resolved_by_the_plan_and_written_without_filesystem_probing
         .load_path(sample("char_118_yuki.ab"), &mut AssetLoadBudget::default())
         .unwrap();
     let snapshot = workspace.snapshot();
-    let request = ExtractionRequest::all(ExtractionRepresentationPolicy::RequireDecoded)
-        .with_filter(ExtractionFilter::new([83], None, None, None).unwrap());
-    let plan = ExtractionPlanner::new(&snapshot)
-        .plan(request, &mut AssetLoadBudget::default())
+    let planner = ExtractionPlanner::new(&snapshot);
+    let request = || {
+        ExtractionRequest::all(ExtractionRepresentationPolicy::RequireDecoded)
+            .with_filter(ExtractionFilter::new([83], None, None, None).unwrap())
+    };
+    let cold_plan = planner
+        .plan(request(), &mut AssetLoadBudget::default())
         .unwrap();
+    let mut measured = AssetLoadBudget::default();
+    let plan = planner.plan(request(), &mut measured).unwrap();
+    assert_eq!(plan, cold_plan);
     assert!(!plan.artifacts().is_empty());
     assert!(
         plan.artifacts()
             .iter()
             .all(|artifact| artifact.preferred_kind() == ExtractionArtifactKind::Audio)
     );
+    let usage = measured.usage();
+    assert!(usage.bytes > 1);
+    let exact_limits = AssetLoadLimits {
+        max_entries: usage.entries.max(1),
+        max_bytes: usage.bytes,
+        max_depth: usage.max_observed_depth,
+        max_members: usage.members.max(1),
+        max_compressed_bytes: usage.compressed_bytes.max(1),
+        max_decompressed_bytes: usage.decompressed_bytes.max(1),
+        ..AssetLoadLimits::default()
+    };
+    let mut exact = AssetLoadBudget::new(exact_limits).unwrap();
+    let exact_plan = planner.plan(request(), &mut exact).unwrap();
+    assert_eq!(exact_plan, plan);
+    assert_eq!(exact.usage(), usage);
+
+    let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: usage.bytes - 1,
+        ..exact_limits
+    })
+    .unwrap();
+    let error = planner.plan(request(), &mut one_short).unwrap_err();
+    assert!(matches!(
+        error,
+        ExtractionPlanError::Budget(BudgetError::Exceeded {
+            resource: "bytes",
+            ..
+        }) | ExtractionPlanError::Workspace(WorkspaceError::Budget(BudgetError::Exceeded {
+            resource: "bytes",
+            ..
+        }))
+    ));
 
     let directory = tempfile::tempdir().unwrap();
     let report = ExtractionExecutor::new()

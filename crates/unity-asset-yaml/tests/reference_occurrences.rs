@@ -1,20 +1,25 @@
 use indexmap::IndexMap;
+use std::sync::Arc;
 use unity_asset_core::{
     AssetLoadBudget, AssetLoadLimits, BudgetError, FieldPath, UnityClass, UnityDocument,
     UnityValue, YamlDocumentSelector,
 };
 use unity_asset_yaml::{
-    SerdeUnityLoader, YamlDocument, YamlReferenceDiagnostic, YamlReferenceField,
-    YamlReferenceOccurrence, YamlReferenceScanError, YamlReferenceShape, YamlValueKind,
+    YamlDocument, YamlReferenceDiagnostic, YamlReferenceField, YamlReferenceOccurrence,
+    YamlReferenceScanError, YamlReferenceShape, YamlValueKind, parse_budgeted_yaml_source,
     scan_reference_class_occurrences, scan_reference_occurrences,
 };
 
-fn parse_document(input: &str) -> YamlDocument {
-    let mut document = YamlDocument::new();
-    for class in SerdeUnityLoader::new().load_from_str(input).unwrap() {
-        document.add_entry(class);
-    }
-    document
+fn parse_document(input: &str) -> Arc<YamlDocument> {
+    let mut budget = AssetLoadBudget::default();
+    let source = parse_budgeted_yaml_source(Arc::from(input.as_bytes()), &mut budget).unwrap();
+    Arc::clone(source.document())
+}
+
+fn with_property(class: UnityClass, key: impl Into<String>, value: UnityValue) -> UnityClass {
+    let (header, mut properties) = class.into_parts();
+    properties.insert(key.into(), value);
+    UnityClass::from_parts(header, properties)
 }
 
 fn path(fields: &[PathPart<'_>]) -> FieldPath {
@@ -112,7 +117,9 @@ MonoBehaviour:
 #[test]
 fn emits_structured_invalid_shapes_and_preserves_decodable_raw_fields() {
     let document = parse_document(
-        r#"--- !u!114 &9
+        r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &9
 MonoBehaviour:
   m_NullScalar: {fileID: null}
   m_BadGuidLength: {fileID: 1, guid: abc, type: 3}
@@ -235,10 +242,12 @@ fn accepts_unity_alias_spellings_and_preserves_unanchored_document_identity() {
     );
     pointer.insert("m_Type".to_string(), UnityValue::Integer(-3));
 
-    let mut class = UnityClass::new(0, "PlainDocument".to_string(), "doc_0".to_string());
-    class.set("target".to_string(), UnityValue::Object(pointer));
-    let mut document = YamlDocument::new();
-    document.add_entry(class);
+    let class = with_property(
+        UnityClass::new(0, "PlainDocument".to_string(), "doc_0".to_string()),
+        "target",
+        UnityValue::Object(pointer),
+    );
+    let document = YamlDocument::from_entries(vec![class]);
 
     let scan = scan_reference_occurrences(&document, &mut AssetLoadBudget::default()).unwrap();
     assert_eq!(scan.occurrences.len(), 1);
@@ -255,7 +264,9 @@ fn accepts_unity_alias_spellings_and_preserves_unanchored_document_identity() {
 #[test]
 fn exact_budget_succeeds_and_one_short_budget_fails_as_a_typed_resource_error() {
     let document = parse_document(
-        r#"--- !u!1 &1
+        r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &1
 GameObject:
   m_Targets:
     - {fileID: 0}
@@ -309,13 +320,17 @@ GameObject:
 
 #[test]
 fn rejects_duplicate_anchored_object_selectors_before_emitting_occurrences() {
-    let mut first = UnityClass::new(1, "GameObject".to_string(), "100".to_string());
-    first.set("target".to_string(), UnityValue::Object(pointer(1)));
-    let mut second = UnityClass::new(4, "Transform".to_string(), "100".to_string());
-    second.set("target".to_string(), UnityValue::Object(pointer(2)));
-    let mut document = YamlDocument::new();
-    document.add_entry(first);
-    document.add_entry(second);
+    let first = with_property(
+        UnityClass::new(1, "GameObject".to_string(), "100".to_string()),
+        "target",
+        UnityValue::Object(pointer(1)),
+    );
+    let second = with_property(
+        UnityClass::new(4, "Transform".to_string(), "100".to_string()),
+        "target",
+        UnityValue::Object(pointer(2)),
+    );
+    let document = YamlDocument::from_entries(vec![first, second]);
 
     assert!(matches!(
         scan_reference_occurrences(&document, &mut AssetLoadBudget::default()),
@@ -332,10 +347,12 @@ fn emits_an_occurrence_at_the_maximum_representable_field_path_depth() {
     for _ in 0..511 {
         value = UnityValue::Array(vec![value]);
     }
-    let mut class = UnityClass::new(1, "GameObject".to_string(), "1".to_string());
-    class.set("root".to_string(), value);
-    let mut document = YamlDocument::new();
-    document.add_entry(class);
+    let class = with_property(
+        UnityClass::new(1, "GameObject".to_string(), "1".to_string()),
+        "root",
+        value,
+    );
+    let document = YamlDocument::from_entries(vec![class]);
 
     let scan = scan_reference_occurrences(&document, &mut AssetLoadBudget::default()).unwrap();
     assert_eq!(scan.occurrences.len(), 1);
@@ -348,16 +365,23 @@ fn emits_an_occurrence_at_the_maximum_representable_field_path_depth() {
 
 #[test]
 fn indexed_class_projection_scans_sparse_replacements_without_cloning_the_document() {
-    let mut first = UnityClass::new(1, "GameObject".to_string(), "100".to_string());
-    first.set("target".to_string(), UnityValue::Object(pointer(1)));
-    let mut second = UnityClass::new(4, "Transform".to_string(), "200".to_string());
-    second.set("target".to_string(), UnityValue::Object(pointer(2)));
-    let mut document = YamlDocument::new();
-    document.add_entry(first);
-    document.add_entry(second);
+    let first = with_property(
+        UnityClass::new(1, "GameObject".to_string(), "100".to_string()),
+        "target",
+        UnityValue::Object(pointer(1)),
+    );
+    let second = with_property(
+        UnityClass::new(4, "Transform".to_string(), "200".to_string()),
+        "target",
+        UnityValue::Object(pointer(2)),
+    );
+    let document = YamlDocument::from_entries(vec![first, second]);
 
-    let mut replacement = UnityClass::new(1, "GameObject".to_string(), "100".to_string());
-    replacement.set("target".to_string(), UnityValue::Object(pointer(91)));
+    let replacement = with_property(
+        UnityClass::new(1, "GameObject".to_string(), "100".to_string()),
+        "target",
+        UnityValue::Object(pointer(91)),
+    );
     let scan = scan_reference_class_occurrences(
         document.entries().len(),
         |index| match index {

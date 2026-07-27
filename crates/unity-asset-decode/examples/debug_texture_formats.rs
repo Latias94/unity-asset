@@ -3,13 +3,12 @@
 //! This example helps debug specific texture format issues.
 
 use unity_asset_decode::texture::{Texture2D, Texture2DConverter, TextureFormat};
-use unity_asset_decode::unity_version::UnityVersion;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Debug Texture Format Decoding");
     println!("=============================");
 
-    let converter = Texture2DConverter::new(UnityVersion::default());
+    let converter = Texture2DConverter::new();
 
     // Test RGBA4444 specifically
     println!("\n🔍 Testing RGBA4444:");

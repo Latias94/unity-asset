@@ -37,14 +37,17 @@ Rationale:
 
 The Unity plugin uses:
 
-- `GET /v1/health`
-- `GET /v1/status`
-- `GET /v1/search?q=...&limit=...`
-- `GET /v1/suggest?prefix=...&limit=...`
-- `GET /v1/references?guid=...&file_id=...&limit=...`
-- `POST /v1/reindex?...` (authenticated via token)
+- `GET /v2/health`
+- `GET /v2/status`
+- `GET /v2/search?q=...&limit=...`
+- `GET /v2/suggest?prefix=...&limit=...`
+- `POST /v2/references` with a versioned JSON request
+- `POST /v2/reindex` with a versioned JSON intent and bearer token
+- `POST /v2/token/rotate` with a bearer token
 
-The daemon stays localhost-only by default. Authorization uses the existing bearer token file stored in the index directory.
+The daemon stays localhost-only by default. Authorization uses the bearer token stored in the
+index directory. The plugin validates response contract versions and does not infer behavior from
+display text.
 
 ### 3) Process management inside Unity Editor
 
@@ -85,7 +88,7 @@ MVP navigation supports:
 Follow-up work can add object-level navigation:
 
 - prefabs/scenes: use `fileID` and extracted hierarchy paths to locate objects,
-- serialized files: map `pathID` to object handles for richer inspection.
+- serialized files: pass a structured object address to workspace inspection.
 
 ## Consequences
 

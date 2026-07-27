@@ -1,9 +1,11 @@
 use std::io::Cursor;
+use std::mem::size_of;
 use std::str::FromStr;
 
 use unity_asset_core::{
-    AssetLoadBudget, AssetLoadLimits, BudgetError, BudgetedJsonError, DigestBuildError,
-    DigestParseError, DigestV1, DigestV1Builder,
+    AssetLoadBudget, AssetLoadLimits, BudgetError, BudgetedJsonError, ContractJsonLimits,
+    ContractJsonResourceModel, DigestBuildError, DigestParseError, DigestV1, DigestV1Builder,
+    read_contract_json,
 };
 
 fn constrained_limits() -> AssetLoadLimits {
@@ -378,22 +380,44 @@ fn decompression_preflight_checks_each_stream_ratio_without_charging() {
 }
 
 #[test]
-fn budgeted_json_bounds_the_encoded_document_before_serde_allocations() {
-    let mut budget = AssetLoadBudget::new(constrained_limits()).unwrap();
-    let value: String = budget.deserialize_json(Cursor::new(br#""small""#)).unwrap();
+fn contract_json_precharges_parser_work_and_typed_materialization() {
+    let contract_limits = ContractJsonLimits::new(
+        "test.contract",
+        64,
+        3,
+        4,
+        2,
+        ContractJsonResourceModel::new(1, 4 * 1024, 16, 8),
+    );
+    let parser_bytes = 4_096 + 2 * u64::try_from(br#""small""#.len()).unwrap();
+    let required_bytes = parser_bytes + 16 + u64::try_from(size_of::<String>()).unwrap() + 8;
+    let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: required_bytes,
+        ..constrained_limits()
+    })
+    .unwrap();
+    let value: String =
+        read_contract_json(Cursor::new(br#""small""#), &mut budget, contract_limits).unwrap();
     assert_eq!(value, "small");
-    assert_eq!(budget.usage().bytes, 7);
+    assert_eq!(budget.usage().bytes, required_bytes);
 
-    let mut budget = AssetLoadBudget::new(constrained_limits()).unwrap();
-    let oversized = format!(r#""{}""#, "x".repeat(17));
-    assert!(matches!(
-        budget.deserialize_json::<String>(Cursor::new(oversized)),
+    let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: required_bytes - 1,
+        ..constrained_limits()
+    })
+    .unwrap();
+    match read_contract_json::<String>(Cursor::new(br#""small""#), &mut budget, contract_limits) {
         Err(BudgetedJsonError::Budget(BudgetError::Exceeded {
             resource: "bytes",
-            ..
-        }))
-    ));
-    assert_eq!(budget.usage().bytes, 0);
+            limit,
+            requested,
+        })) => {
+            assert_eq!(limit, required_bytes - 1);
+            assert_eq!(requested, required_bytes);
+        }
+        result => panic!("expected the typed materialization budget to fail: {result:?}"),
+    }
+    assert_eq!(budget.usage().bytes, parser_bytes);
 }
 
 #[test]
@@ -530,4 +554,21 @@ fn zero_depth_budget_allows_only_local_depth_zero() {
             requested: 1,
         })
     ));
+}
+
+#[test]
+fn budget_domain_tokens_reject_an_unrelated_budget() {
+    let budget = AssetLoadBudget::default();
+    let token = budget.domain_token();
+    token
+        .validate(&budget, "retained test allocation")
+        .expect("the minting budget must validate");
+
+    let unrelated = AssetLoadBudget::default();
+    assert_eq!(
+        token.validate(&unrelated, "retained test allocation"),
+        Err(BudgetError::DomainMismatch {
+            resource: "retained test allocation",
+        })
+    );
 }

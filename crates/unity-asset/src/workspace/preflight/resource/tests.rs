@@ -28,8 +28,8 @@ fn path(name: &str) -> FieldPath {
     FieldPath::root().push_field(name).unwrap()
 }
 
-fn stream_data_class(size: u64) -> UnityClass {
-    UnityClass::with_properties(
+fn stream_data_class(size: u64) -> TestUnityClassCandidate {
+    TestUnityClassCandidate::new(UnityClass::with_properties(
         class_ids::AUDIO_CLIP,
         "AudioClip".to_owned(),
         "1".to_owned(),
@@ -42,11 +42,11 @@ fn stream_data_class(size: u64) -> UnityClass {
                 ("untouched".to_owned(), UnityValue::Bool(true)),
             ])),
         )]),
-    )
+    ))
 }
 
-fn resource_class() -> UnityClass {
-    UnityClass::with_properties(
+fn resource_class() -> TestUnityClassCandidate {
+    TestUnityClassCandidate::new(UnityClass::with_properties(
         class_ids::AUDIO_CLIP,
         "AudioClip".to_owned(),
         "1".to_owned(),
@@ -61,12 +61,12 @@ fn resource_class() -> UnityClass {
                 ("m_Size".to_owned(), UnityValue::Integer(34)),
             ])),
         )]),
-    )
+    ))
 }
 
 fn provenance(class: &UnityClass) -> SchemaProvenance {
     let digest = yaml_schema_digest(class, &mut AssetLoadBudget::default()).unwrap();
-    SchemaProvenance::yaml(class.class_id, digest)
+    SchemaProvenance::yaml(class.class_id(), digest)
 }
 
 fn guard(class: &UnityClass, path: &FieldPath) -> FieldGuard {
@@ -106,7 +106,7 @@ fn resource_fields<'class>(
 }
 
 fn yaml_candidate(class: &UnityClass) -> YamlObjectCandidate {
-    let object = ObjectId::yaml(source(SourceKind::Yaml, 2), class.anchor.clone()).unwrap();
+    let object = ObjectId::yaml(source(SourceKind::Yaml, 2), class.anchor().to_owned()).unwrap();
     YamlObjectCandidate::from_class(
         object,
         0,
@@ -243,29 +243,40 @@ fn stale_resource_preview_cannot_replay_after_the_builder_advances() {
     let current = builder
         .preview_next(payloads[0].ordinal, payloads[0].digest())
         .unwrap();
-    let mut first_target = UnityValue::Null;
+    let target_path = path("m_StreamData");
+    let mut first_candidate = stream_data_class(0);
 
     builder
         .commit_prepared(
             current,
             PreparedUnityFieldReplace {
-                target: &mut first_target,
+                candidate: &mut first_candidate,
+                path: &target_path,
                 replacement: UnityValue::Unsigned(1),
             },
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-    assert_eq!(first_target, UnityValue::Unsigned(1));
+    assert_eq!(
+        first_candidate.class().value_at_path(&target_path),
+        Ok(&UnityValue::Unsigned(1))
+    );
     assert_eq!(builder.extent_count(), 1);
 
-    let mut replay_target = UnityValue::Null;
+    let mut replay_candidate = stream_data_class(0);
+    let replay_before = replay_candidate
+        .class()
+        .value_at_path(&target_path)
+        .unwrap()
+        .clone();
     let mut budget = AssetLoadBudget::default();
     let before = budget.usage();
     let error = builder
         .commit_prepared(
             stale,
             PreparedUnityFieldReplace {
-                target: &mut replay_target,
+                candidate: &mut replay_candidate,
+                path: &target_path,
                 replacement: UnityValue::Unsigned(2),
             },
             &mut budget,
@@ -280,7 +291,10 @@ fn stale_resource_preview_cannot_replay_after_the_builder_advances() {
             actual_index: 1,
         }
     ));
-    assert_eq!(replay_target, UnityValue::Null);
+    assert_eq!(
+        replay_candidate.class().value_at_path(&target_path),
+        Ok(&replay_before)
+    );
     assert_eq!(builder.extent_count(), 1);
     assert_eq!(budget.usage(), before);
 }

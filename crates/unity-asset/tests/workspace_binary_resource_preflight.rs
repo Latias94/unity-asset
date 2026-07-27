@@ -97,7 +97,7 @@ fn resource_value(view: &impl WorkspaceView) -> UnityValue {
     let object = view
         .read_object(&handle, &mut AssetLoadBudget::default())
         .unwrap();
-    assert_eq!(object.class().class_id, 28);
+    assert_eq!(object.class().class_id(), 28);
     object
         .class()
         .value_at_path(&resource_path())
@@ -137,6 +137,7 @@ fn resource_plan(fixture: &Fixture) -> MutationPlan {
     let payload = PlanPayload::new(PAYLOAD.to_vec());
 
     MutationPlan::new(
+        snapshot.workspace_id(),
         snapshot.revision(),
         vec![SourceExpectation::new(locator, source.fingerprint())],
         vec![payload.clone()],

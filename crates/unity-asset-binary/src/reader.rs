@@ -4,7 +4,7 @@ pub use crate::byte_order::ByteOrder;
 use crate::error::{BinaryError, Result};
 use crate::random_access::ByteCursor;
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Seek, SeekFrom};
 
 /// Primitive binary reading without resource-allocation semantics.
 pub(crate) trait BinaryRead {
@@ -243,12 +243,25 @@ impl<'a> BinaryReader<'a> {
 
     /// Read a fixed number of bytes
     pub fn read_bytes(&mut self, count: usize) -> Result<Vec<u8>> {
+        Ok(self.read_bytes_ref(count)?.to_vec())
+    }
+
+    /// Borrow a fixed number of bytes from the input without allocating.
+    pub fn read_bytes_ref(&mut self, count: usize) -> Result<&'a [u8]> {
         if !self.has_bytes(count) {
             return Err(BinaryError::not_enough_data(count, self.remaining()));
         }
-        let mut buffer = vec![0u8; count];
-        self.cursor.read_exact(&mut buffer)?;
-        Ok(buffer)
+        let start = usize::try_from(self.position())
+            .map_err(|_| BinaryError::invalid_data("reader position does not fit in usize"))?;
+        let end = start
+            .checked_add(count)
+            .ok_or_else(|| BinaryError::invalid_data("borrowed byte range overflows usize"))?;
+        self.cursor.set_position(
+            u64::try_from(end)
+                .map_err(|_| BinaryError::invalid_data("reader position does not fit in u64"))?,
+        );
+        let data: &'a [u8] = self.cursor.get_ref();
+        Ok(&data[start..end])
     }
 
     /// Skip a fixed number of bytes without allocating.
@@ -302,6 +315,16 @@ impl<'a> BinaryReader<'a> {
     ///
     /// Unity typically encodes these lengths as signed 32-bit integers.
     pub fn read_string_limited(&mut self, max_len: usize) -> Result<String> {
+        Ok(self.read_string_ref_limited(max_len)?.to_owned())
+    }
+
+    /// Borrow a length-prefixed UTF-8 string from the input without allocating.
+    pub fn read_string_ref(&mut self) -> Result<&'a str> {
+        self.read_string_ref_limited(Self::DEFAULT_MAX_STRING_LEN)
+    }
+
+    /// Borrow a length-prefixed UTF-8 string with an explicit maximum size.
+    pub fn read_string_ref_limited(&mut self, max_len: usize) -> Result<&'a str> {
         let length = self.read_i32()?;
         if length < 0 {
             return Err(BinaryError::invalid_data(format!(
@@ -324,8 +347,8 @@ impl<'a> BinaryReader<'a> {
             return Err(BinaryError::not_enough_data(length, remaining));
         }
 
-        let bytes = self.read_bytes(length)?;
-        Ok(String::from_utf8(bytes)?)
+        let bytes = self.read_bytes_ref(length)?;
+        Ok(std::str::from_utf8(bytes)?)
     }
 
     /// Read a string with a specific length
@@ -338,7 +361,12 @@ impl<'a> BinaryReader<'a> {
 
     /// Read an aligned string (Unity format)
     pub fn read_aligned_string(&mut self) -> Result<String> {
-        let string = self.read_string()?;
+        Ok(self.read_aligned_string_ref()?.to_owned())
+    }
+
+    /// Borrow an aligned Unity string from the input without allocating.
+    pub fn read_aligned_string_ref(&mut self) -> Result<&'a str> {
+        let string = self.read_string_ref()?;
         // Align to 4-byte boundary
         self.align()?;
         Ok(string)
@@ -573,6 +601,24 @@ mod tests {
 
         assert_eq!(reader.read_cstring().unwrap(), "Hello");
         assert_eq!(reader.read_cstring().unwrap(), "World");
+    }
+
+    #[test]
+    fn borrowed_reads_alias_the_input_and_advance_the_cursor() {
+        let data = [
+            3, 0, 0, 0, b'f', b'o', b'o', 0, b'p', b'a', b'y', b'l', b'o', b'a', b'd',
+        ];
+        let mut reader = BinaryReader::new(&data, ByteOrder::Little);
+
+        let value = reader.read_aligned_string_ref().unwrap();
+        assert_eq!(value, "foo");
+        assert_eq!(value.as_ptr(), data[4..].as_ptr());
+        assert_eq!(reader.position(), 8);
+
+        let payload = reader.read_bytes_ref(7).unwrap();
+        assert_eq!(payload, b"payload");
+        assert_eq!(payload.as_ptr(), data[8..].as_ptr());
+        assert_eq!(reader.remaining(), 0);
     }
 
     #[test]

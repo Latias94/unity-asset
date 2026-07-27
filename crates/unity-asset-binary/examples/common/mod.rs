@@ -13,7 +13,6 @@ fn is_skippable_object_error(error: &BinaryError) -> bool {
             | BinaryError::InvalidSignature { .. }
             | BinaryError::Unsupported(_)
             | BinaryError::CorruptedData(_)
-            | BinaryError::VersionCompatibility(_)
     )
 }
 

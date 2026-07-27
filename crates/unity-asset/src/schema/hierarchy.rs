@@ -246,18 +246,18 @@ fn validate_transform_or_rect_transform_class(
 ) -> Result<(), RecipeError> {
     validate_recipe_provenance(object)?;
     let class = object.class();
-    let valid = class.class_id == class_ids::TRANSFORM
-        && class.class_name == class_names::TRANSFORM
-        || class.class_id == class_ids::RECT_TRANSFORM
-            && class.class_name == class_names::RECT_TRANSFORM;
+    let valid = class.class_id() == class_ids::TRANSFORM
+        && class.class_name() == class_names::TRANSFORM
+        || class.class_id() == class_ids::RECT_TRANSFORM
+            && class.class_name() == class_names::RECT_TRANSFORM;
     if valid {
         Ok(())
     } else {
         Err(RecipeError::WrongClass {
             expected_id: class_ids::TRANSFORM,
             expected_name: "Transform or RectTransform",
-            actual_id: class.class_id,
-            actual_name: output.string(&class.class_name, "recipe class diagnostic")?,
+            actual_id: class.class_id(),
+            actual_name: output.string(class.class_name(), "recipe class diagnostic")?,
         })
     }
 }
@@ -267,16 +267,16 @@ fn validate_rect_transform_class(
     output: &mut RecipeOutputBuilder<'_>,
 ) -> Result<(), RecipeError> {
     let class = object.class();
-    if class.class_id == class_ids::RECT_TRANSFORM
-        && class.class_name == class_names::RECT_TRANSFORM
+    if class.class_id() == class_ids::RECT_TRANSFORM
+        && class.class_name() == class_names::RECT_TRANSFORM
     {
         validate_recipe_provenance(object)
     } else {
         Err(RecipeError::WrongClass {
             expected_id: class_ids::RECT_TRANSFORM,
             expected_name: class_names::RECT_TRANSFORM,
-            actual_id: class.class_id,
-            actual_name: output.string(&class.class_name, "recipe class diagnostic")?,
+            actual_id: class.class_id(),
+            actual_name: output.string(class.class_name(), "recipe class diagnostic")?,
         })
     }
 }
@@ -538,8 +538,13 @@ impl HierarchyRecipe {
             sources.push(output.source(new_parent.object.source_expectation())?);
         }
 
-        let fragment =
-            output.fragment(child_node.object.revision(), sources, Vec::new(), actions)?;
+        let fragment = output.fragment(
+            child_node.object.workspace_id(),
+            child_node.object.revision(),
+            sources,
+            Vec::new(),
+            actions,
+        )?;
         RecipeLowering::changed(
             RecipeId::HierarchyReparentV1,
             SchemaVariantId::HierarchyLocalReferences,

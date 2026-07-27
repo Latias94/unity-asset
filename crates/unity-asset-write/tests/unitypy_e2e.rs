@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,7 +14,6 @@ use unity_asset_binary::typetree::{
     TypeTreeRegistry,
 };
 use unity_asset_core::{AssetLoadBudget, DigestV1, FieldPath, UnityValue};
-use unity_asset_write::bundle::{BundleEdits, BundleWriter};
 use unity_asset_write::object::{
     SerializedFieldGuard, SerializedObjectCandidate, SerializedObjectEncoder,
     SerializedObjectMutation, UnsafeRawObjectAcknowledgement, UnsafeRawObjectReplacement,
@@ -20,6 +21,8 @@ use unity_asset_write::object::{
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
 use unity_asset_write::webfile::{WebFileEdits, WebFilePackingPolicy, WebFileWriter};
 use unity_asset_write::{BinaryWriter, Endian, PackingPolicy, compress_lzma_unity_with_size};
+
+use support::{OrderedBundleEntry, ordered_bundle_entries, prepare_bundle_bytes};
 
 fn repo_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is `.../crates/unity-asset-write`.
@@ -393,7 +396,8 @@ fn unitypy_can_load_saved_unityfs_bundle() -> anyhow::Result<()> {
         .cloned()
         .unwrap_or_else(|| expected_files.first().cloned().unwrap_or_default());
 
-    let saved = BundleWriter::save(&bundle, &BundleEdits::default(), PackingPolicy::Preserve)?;
+    let entries = ordered_bundle_entries(&bundle)?;
+    let saved = prepare_bundle_bytes(&bundle, &entries, PackingPolicy::Preserve)?;
 
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), &saved)?;
@@ -438,9 +442,12 @@ fn unitypy_can_load_saved_legacy_unityraw_bundle() -> anyhow::Result<()> {
     let input = build_minimal_legacy_bundle("UnityRaw", "test.txt", b"abc")?;
     let bundle = unity_asset_binary::bundle::BundleParser::from_bytes(input)?;
 
-    let mut edits = BundleEdits::default();
-    edits.replace_file_bytes("test.txt", b"abcd".to_vec());
-    let saved = BundleWriter::save(&bundle, &edits, PackingPolicy::Uncompressed)?;
+    let mut entries = ordered_bundle_entries(&bundle)?;
+    let OrderedBundleEntry::File { bytes, .. } = &mut entries[0] else {
+        panic!("legacy fixture entry is a file");
+    };
+    *bytes = Arc::from(&b"abcd"[..]);
+    let saved = prepare_bundle_bytes(&bundle, &entries, PackingPolicy::Uncompressed)?;
 
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), &saved)?;
@@ -486,9 +493,12 @@ fn unitypy_can_load_saved_legacy_unityweb_bundle() -> anyhow::Result<()> {
     let input = build_minimal_legacy_bundle("UnityWeb", "test.txt", b"abc")?;
     let bundle = unity_asset_binary::bundle::BundleParser::from_bytes(input)?;
 
-    let mut edits = BundleEdits::default();
-    edits.replace_file_bytes("test.txt", b"abcd".to_vec());
-    let saved = BundleWriter::save(&bundle, &edits, PackingPolicy::Uncompressed)?;
+    let mut entries = ordered_bundle_entries(&bundle)?;
+    let OrderedBundleEntry::File { bytes, .. } = &mut entries[0] else {
+        panic!("legacy fixture entry is a file");
+    };
+    *bytes = Arc::from(&b"abcd"[..]);
+    let saved = prepare_bundle_bytes(&bundle, &entries, PackingPolicy::Preserve)?;
 
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), &saved)?;
@@ -947,9 +957,17 @@ fn unitypy_observes_rust_typetree_edit_in_repacked_bundle() -> anyhow::Result<()
     edits.try_insert_encoded_object(encoded, &mut budget)?;
     let saved_serialized = SerializedFileWriter::save(&serialized, &edits)?;
 
-    let mut bundle_edits = BundleEdits::default();
-    bundle_edits.replace_file_bytes(node_name.clone(), saved_serialized);
-    let saved_bundle = BundleWriter::save(&bundle, &bundle_edits, PackingPolicy::Preserve)?;
+    let node_index = bundle
+        .nodes
+        .iter()
+        .position(|node| node.is_file() && node.name == node_name)
+        .expect("serialized bundle member still has its directory ordinal");
+    let mut entries = ordered_bundle_entries(&bundle)?;
+    let OrderedBundleEntry::File { bytes, .. } = &mut entries[node_index] else {
+        panic!("serialized bundle member is a file");
+    };
+    *bytes = Arc::from(saved_serialized);
+    let saved_bundle = prepare_bundle_bytes(&bundle, &entries, PackingPolicy::Preserve)?;
 
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), &saved_bundle)?;
@@ -1758,7 +1776,7 @@ fn unitypy_script_typetree_registry_enables_monobehaviour_parse() -> anyhow::Res
         );
     }
 
-    serialized.set_type_tree_registry(Some(registry));
+    serialized = serialized.with_type_tree_registry(Some(registry));
     {
         let info = &serialized.objects()[idx];
         let after =

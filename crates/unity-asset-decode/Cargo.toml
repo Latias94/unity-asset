@@ -3,7 +3,7 @@ name = "unity-asset-decode"
 version = "0.3.0"
 edition.workspace = true
 authors.workspace = true
-description = "Decode/export helpers for Unity assets (Texture/Audio/Sprite/Mesh) built on unity-asset-binary"
+description = "Decode/export helpers for Unity assets (Texture/Audio/Sprite) built on unity-asset-binary"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -20,7 +20,6 @@ image = { workspace = true, optional = true }
 symphonia = { version = "0.5", features = ["all"], optional = true }
 hound = { version = "3.5", optional = true }
 texture2ddecoder = { version = "0.1", optional = true }
-obj = { version = "0.10", optional = true }
 indexmap = { workspace = true }
 base64 = { version = "0.22", optional = true }
 ogg = { version = "0.9", optional = true }
@@ -39,11 +38,9 @@ audio = [
     "dep:serde_json",
     "dep:symphonia",
 ]
-mesh = []
-mesh-export = ["mesh", "dep:obj"]
 sprite = ["texture"]
 
-full = ["texture", "texture-advanced", "audio", "mesh", "mesh-export", "sprite"]
+full = ["texture", "texture-advanced", "audio", "sprite"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

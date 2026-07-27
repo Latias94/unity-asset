@@ -26,22 +26,16 @@ impl SinkBackend for BinaryWriter {
     }
 }
 
-/// Borrowed adapter used by the transitional `BinaryWriter` entry points.
-pub(crate) struct BinaryWriterSink<'writer>(&'writer mut BinaryWriter);
-
-impl<'writer> BinaryWriterSink<'writer> {
-    pub(crate) const fn new(writer: &'writer mut BinaryWriter) -> Self {
-        Self(writer)
-    }
-}
-
-impl SinkBackend for BinaryWriterSink<'_> {
+impl<T> SinkBackend for &mut T
+where
+    T: SinkBackend + ?Sized,
+{
     fn position(&mut self) -> Result<u64> {
-        SinkBackend::position(self.0)
+        SinkBackend::position(&mut **self)
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-        SinkBackend::write_all(self.0, bytes)
+        SinkBackend::write_all(&mut **self, bytes)
     }
 }
 

@@ -8,15 +8,16 @@
 mod artifact_writer;
 mod edit;
 mod external_table;
+mod plan;
 mod sink;
 mod types_write;
 mod typetree_dump;
 mod writer;
 
-pub use artifact_writer::SerializedFileSource;
 pub use edit::{SerializedFileEditError, SerializedFileEdits};
 pub use external_table::{
     BudgetedExternalPath, ExternalIdentifierField, ExternalMetadataField, ExternalTableAllocator,
     ExternalTableError, PreparedExternalPath,
 };
-pub use writer::{SerializedFileSaveOptions, SerializedFileWriter};
+pub use plan::SerializedFileSource;
+pub use writer::SerializedFileWriter;

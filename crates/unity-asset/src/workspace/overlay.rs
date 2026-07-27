@@ -140,7 +140,7 @@ impl PreparedObjectBinding {
         let (handle, value, schema) = object.into_shared_parts();
         let observed_revision = handle.revision();
         let object = handle.into_object();
-        if schema.object_kind() != object.kind() || value.class().class_id != schema.class_id() {
+        if schema.object_kind() != object.kind() || value.class().class_id() != schema.class_id() {
             return Err(invalid_prepared_state(
                 "exact object identity, value, and schema provenance disagree",
             ));
@@ -445,7 +445,7 @@ impl PreparedStateCore {
                 .into());
             }
             if let PreparedObjectProjection::Exact { value, schema } = &binding.projection
-                && schema.class_id() != value.class().class_id
+                && schema.class_id() != value.class().class_id()
             {
                 return Err(invalid_prepared_state(
                     "prepared object class does not match exact schema provenance",
@@ -454,7 +454,10 @@ impl PreparedStateCore {
             }
         }
 
-        let revision = catalog.revision().map_err(WorkspaceError::from)?;
+        let revision = base
+            .state()
+            .revision_for_catalog(&catalog)
+            .map_err(WorkspaceError::from)?;
         budget
             .consume_bytes(arc_value_allocation_bytes::<Self>().map_err(|error| {
                 WorkspaceError::operation("prepared state core allocation", error)
@@ -791,6 +794,14 @@ macro_rules! impl_prepared_workspace_view {
                 budget: &mut AssetLoadBudget,
             ) -> Result<WorkspaceLookup<RevisionedObjectHandle>, WorkspaceError> {
                 prepared_resolve_object(self.prepared_core(), address, budget)
+            }
+
+            fn object_address(
+                &self,
+                handle: &RevisionedObjectHandle,
+                budget: &mut AssetLoadBudget,
+            ) -> Result<ObjectAddress, WorkspaceError> {
+                super::inspection::object_address_for_view(self, handle, budget)
             }
 
             fn read_object(
@@ -1203,7 +1214,7 @@ fn prove_yaml_source(
     {
         let baseline_object = yaml_object_id(source, document_index, baseline_class)?;
         let exact_object = yaml_object_id(source, document_index, exact_class)?;
-        if baseline_object != exact_object || baseline_class.class_id != exact_class.class_id {
+        if baseline_object != exact_object || baseline_class.class_id() != exact_class.class_id() {
             return Err(invalid_prepared_state(
                 "prepared YAML changed object order, identity, or class",
             ));
@@ -1221,7 +1232,10 @@ fn prove_yaml_source(
                 Arc::clone(&exact),
                 document_index,
             )),
-            Arc::new(SchemaProvenance::yaml(exact_class.class_id, schema_digest)),
+            Arc::new(SchemaProvenance::yaml(
+                exact_class.class_id(),
+                schema_digest,
+            )),
         );
         object_bindings.push(PreparedObjectBinding::exact(object)?);
     }

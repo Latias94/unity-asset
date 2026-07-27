@@ -4,7 +4,6 @@
 
 use unity_asset_decode::object::UnityObject;
 use unity_asset_decode::texture::Texture2DConverter;
-use unity_asset_decode::unity_version::UnityVersion;
 
 fn aligned_string_bytes(s: &str) -> Vec<u8> {
     let mut out = Vec::new();
@@ -45,7 +44,7 @@ fn texture2d_raw_parsing_can_extract_streamdata() {
     }
 
     let obj = UnityObject::from_raw(28, 1, data).expect("valid standalone texture object");
-    let converter = Texture2DConverter::new(UnityVersion::default());
+    let converter = Texture2DConverter::new();
     let tex = converter.from_unity_object(&obj).unwrap();
 
     assert_eq!(tex.name, "Tex");

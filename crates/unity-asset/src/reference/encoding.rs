@@ -763,20 +763,24 @@ mod tests {
                 type_id: DEFAULT_YAML_EXTERNAL_TYPE_ID,
             },
         );
-        let mut class = UnityClass::new(1, "GameObject".to_owned(), "1".to_owned());
-        class.set(
-            "m_Target".to_owned(),
-            UnityValue::Object(IndexMap::from([
-                ("fileID".to_owned(), UnityValue::Integer(3)),
-                (
-                    "guid".to_owned(),
-                    UnityValue::String("11111111111111111111111111111111".to_owned()),
-                ),
-                (
-                    "type".to_owned(),
-                    UnityValue::Integer(DEFAULT_YAML_EXTERNAL_TYPE_ID),
-                ),
-            ])),
+        let class = UnityClass::with_properties(
+            1,
+            "GameObject".to_owned(),
+            "1".to_owned(),
+            IndexMap::from([(
+                "m_Target".to_owned(),
+                UnityValue::Object(IndexMap::from([
+                    ("fileID".to_owned(), UnityValue::Integer(3)),
+                    (
+                        "guid".to_owned(),
+                        UnityValue::String("11111111111111111111111111111111".to_owned()),
+                    ),
+                    (
+                        "type".to_owned(),
+                        UnityValue::Integer(DEFAULT_YAML_EXTERNAL_TYPE_ID),
+                    ),
+                ])),
+            )]),
         );
         let scan =
             scan_reference_class_occurrences(1, |_| Some(&class), &mut AssetLoadBudget::default())

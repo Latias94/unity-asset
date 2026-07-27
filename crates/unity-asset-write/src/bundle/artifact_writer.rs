@@ -8,19 +8,21 @@ use std::collections::TryReserveError;
 use std::io::{self, BufRead, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 
+use flate2::Crc;
 use thiserror::Error;
-use unity_asset_binary::bundle::header::LegacyWebRawHeader;
 use unity_asset_binary::bundle::{AssetBundle, BundleHeader, BundleLayoutKind, DirectoryNode};
 use unity_asset_binary::compression::CompressionBlock;
 use unity_asset_binary::unity_version::UnityVersion;
-use unity_asset_core::UnityAssetError;
+use unity_asset_core::{DigestV1, DigestV1Builder, UnityAssetError};
 
 use crate::PackingPolicy;
 use crate::artifact::{
     ArtifactBatch, ArtifactBuildError, ArtifactBuildFailurePhase, ArtifactHandle,
 };
 
-use super::writer::BundleWriter;
+/// Namespace for canonical prepared Bundle encoding.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BundleWriter;
 
 /// One ordered member supplied to a prepared bundle encoder.
 ///
@@ -184,6 +186,8 @@ pub enum BundleArtifactError {
     EmbeddedNul { entry: usize },
     #[error("bundle entry count {count} does not fit the signed wire count")]
     EntryCountOverflow { count: usize },
+    #[error("bundle block count {count} does not fit the signed wire count")]
+    BlockCountOverflow { count: usize },
     #[error("bundle file entry {entry} has the directory flag: {flags:#x}")]
     FileEntryHasDirectoryFlag { entry: usize, flags: u32 },
     #[error("bundle file entry {entry} has the deleted flag: {flags:#x}")]
@@ -218,6 +222,10 @@ pub enum BundleArtifactError {
     DataLengthOverflow { entry: usize },
     #[error("file-stream bundle contains no data blocks; at least one non-empty file is required")]
     EmptyFileStreamData,
+    #[error("preserve packing requires at least one original file-stream block")]
+    MissingFileStreamBlocks,
+    #[error("original file-stream block {block} has zero uncompressed bytes")]
+    ZeroLengthFileStreamBlock { block: usize },
     #[error("bundle signature {signature:?} does not support packing policy {policy}")]
     UnsupportedPackingPolicy {
         signature: String,
@@ -276,26 +284,350 @@ struct FileStreamBlock {
     flags: u16,
 }
 
-impl BundleWriter {
-    /// Build one exact, independently reparsed bundle artifact in `batch`.
-    ///
-    /// `entries` are consumed in the supplied order. This is intentionally separate from the
-    /// legacy `BundleEdits` name map so duplicate directory entries remain representable.
-    pub fn prepare_artifact(
-        batch: &mut ArtifactBatch<'_, '_>,
-        bundle: &AssetBundle,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileStreamCompression {
+    None,
+    Lzma,
+    Lz4,
+}
+
+impl FileStreamCompression {
+    fn from_switch(
+        compression_switch: u32,
+        resource: &'static str,
+    ) -> Result<Self, BundleArtifactError> {
+        match compression_switch {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Lzma),
+            2 | 3 => Ok(Self::Lz4),
+            other => Err(BundleArtifactError::Compression {
+                message: format!("unsupported {resource} compression switch: {other}"),
+            }),
+        }
+    }
+
+    fn chunk_size(self) -> u64 {
+        match self {
+            Self::None | Self::Lzma => u64::from(u32::MAX),
+            Self::Lz4 => 0x0002_0000,
+        }
+    }
+
+    fn from_validated_flags(flags: u32) -> Self {
+        match flags & 0x3f {
+            0 => Self::None,
+            1 => Self::Lzma,
+            2 | 3 => Self::Lz4,
+            _ => unreachable!("file-stream block flags were validated by the layout plan"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FileStreamBlockLayoutSource<'a> {
+    Uniform {
+        flags: u32,
+        compression: FileStreamCompression,
+    },
+    Preserve {
+        blocks: &'a [CompressionBlock],
+        tail_flags: u32,
+        tail_compression: FileStreamCompression,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileStreamBlockLayout<'a> {
+    total: u64,
+    count: usize,
+    compressed_count: usize,
+    source: FileStreamBlockLayoutSource<'a>,
+}
+
+impl<'a> FileStreamBlockLayout<'a> {
+    fn uniform(
+        total: u64,
+        flags: u32,
+        compression: FileStreamCompression,
+    ) -> Result<Self, BundleArtifactError> {
+        let count = usize_value(
+            total.div_ceil(compression.chunk_size()),
+            "file-stream block count",
+        )?;
+        Ok(Self {
+            total,
+            count,
+            compressed_count: if compression == FileStreamCompression::None {
+                0
+            } else {
+                count
+            },
+            source: FileStreamBlockLayoutSource::Uniform { flags, compression },
+        })
+    }
+
+    fn preserve(total: u64, blocks: &'a [CompressionBlock]) -> Result<Self, BundleArtifactError> {
+        let last = blocks
+            .last()
+            .ok_or(BundleArtifactError::MissingFileStreamBlocks)?;
+        let tail_flags = u32::from(last.flags);
+        let tail_compression =
+            FileStreamCompression::from_switch(tail_flags & 0x3f, "file-stream block")?;
+        let mut covered = 0_u64;
+        let mut count = 0_usize;
+        let mut compressed_count = 0_usize;
+        for (block, original) in blocks.iter().enumerate() {
+            if original.uncompressed_size == 0 {
+                return Err(BundleArtifactError::ZeroLengthFileStreamBlock { block });
+            }
+            let flags = u32::from(original.flags);
+            let compression =
+                FileStreamCompression::from_switch(flags & 0x3f, "file-stream block")?;
+            if covered >= total {
+                continue;
+            }
+            covered = covered
+                .checked_add(u64::from(original.uncompressed_size))
+                .ok_or(BundleArtifactError::ArithmeticOverflow {
+                    resource: "original file-stream block coverage",
+                })?
+                .min(total);
+            count = count
+                .checked_add(1)
+                .ok_or(BundleArtifactError::ArithmeticOverflow {
+                    resource: "file-stream block count",
+                })?;
+            if compression != FileStreamCompression::None {
+                compressed_count = compressed_count.checked_add(1).ok_or(
+                    BundleArtifactError::ArithmeticOverflow {
+                        resource: "compressed file-stream block count",
+                    },
+                )?;
+            }
+        }
+        if covered < total {
+            let tail_count = usize_value(
+                (total - covered).div_ceil(tail_compression.chunk_size()),
+                "file-stream tail block count",
+            )?;
+            count =
+                count
+                    .checked_add(tail_count)
+                    .ok_or(BundleArtifactError::ArithmeticOverflow {
+                        resource: "file-stream block count",
+                    })?;
+            if tail_compression != FileStreamCompression::None {
+                compressed_count = compressed_count.checked_add(tail_count).ok_or(
+                    BundleArtifactError::ArithmeticOverflow {
+                        resource: "compressed file-stream block count",
+                    },
+                )?;
+            }
+        }
+        Ok(Self {
+            total,
+            count,
+            compressed_count,
+            source: FileStreamBlockLayoutSource::Preserve {
+                blocks,
+                tail_flags,
+                tail_compression,
+            },
+        })
+    }
+
+    const fn len(self) -> usize {
+        self.count
+    }
+
+    const fn compressed_len(self) -> usize {
+        self.compressed_count
+    }
+
+    fn iter(self) -> FileStreamBlockLayoutIter<'a> {
+        FileStreamBlockLayoutIter {
+            layout: self,
+            start: 0,
+            original_index: 0,
+            remaining: self.count,
+        }
+    }
+}
+
+struct PlannedFileStreamBlock {
+    range: Range<u64>,
+    flags: u32,
+    compression: FileStreamCompression,
+}
+
+struct FileStreamBlockLayoutIter<'a> {
+    layout: FileStreamBlockLayout<'a>,
+    start: u64,
+    original_index: usize,
+    remaining: usize,
+}
+
+impl Iterator for FileStreamBlockLayoutIter<'_> {
+    type Item = PlannedFileStreamBlock;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let (length, flags, compression) = match self.layout.source {
+            FileStreamBlockLayoutSource::Uniform { flags, compression } => {
+                (compression.chunk_size(), flags, compression)
+            }
+            FileStreamBlockLayoutSource::Preserve {
+                blocks,
+                tail_flags,
+                tail_compression,
+            } => {
+                if let Some(block) = blocks.get(self.original_index) {
+                    self.original_index += 1;
+                    let flags = u32::from(block.flags);
+                    (
+                        u64::from(block.uncompressed_size),
+                        flags,
+                        FileStreamCompression::from_validated_flags(flags),
+                    )
+                } else {
+                    (tail_compression.chunk_size(), tail_flags, tail_compression)
+                }
+            }
+        };
+        let start = self.start;
+        let end = start.saturating_add(length).min(self.layout.total);
+        self.start = end;
+        self.remaining -= 1;
+        Some(PlannedFileStreamBlock {
+            range: start..end,
+            flags,
+            compression,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for FileStreamBlockLayoutIter<'_> {}
+
+#[derive(Debug, Clone, Copy)]
+struct FileStreamPlan<'a> {
+    header_flags: u32,
+    block_info_compression: FileStreamCompression,
+    block_layout: FileStreamBlockLayout<'a>,
+    block_info_uncompressed_len: u64,
+    total_data_len: u64,
+    header_len: u64,
+    at_end: bool,
+    signature_byte: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LegacyIntegrity {
+    hash: [u8; 16],
+    crc: u32,
+    content_digest: DigestV1,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LegacyPlan {
+    compress: bool,
+    levels_before_streaming: u32,
+    directory_len: u64,
+    member_bytes: u64,
+    uncompressed_len: u64,
+    header_len: u64,
+    integrity: Option<LegacyIntegrity>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BundleEncodingPlan<'a> {
+    FileStream(FileStreamPlan<'a>),
+    Legacy(LegacyPlan),
+}
+
+impl<'a> BundleEncodingPlan<'a> {
+    fn new(
+        bundle: &'a AssetBundle,
         entries: &[BundleArtifactEntry<'_>],
         policy: PackingPolicy,
-    ) -> Result<ArtifactHandle, BundleArtifactError> {
+    ) -> Result<Self, BundleArtifactError> {
         let layout = bundle.header.layout_kind()?;
         validate_entries(layout, entries)?;
-        for member in entries.iter().filter_map(|entry| entry.file_member()) {
-            batch.artifact_len(member.artifact())?;
-        }
-        preflight_bundle(bundle, entries, policy)?;
         match layout {
             BundleLayoutKind::FileStream => {
-                prepare_file_stream(batch, &bundle.header, &bundle.blocks, entries, policy)
+                let header_flags = resolve_file_stream_header_flags(&bundle.header, policy);
+                if header_flags & 0x40 == 0 {
+                    return Err(BundleArtifactError::Unity(UnityAssetError::format(
+                        "file-stream bundle writer requires DirectoryInfo (flags must include 0x40)",
+                    )));
+                }
+                let unity_version = parse_bundle_unity_version(&bundle.header)?;
+                reject_file_stream_encryption(&bundle.header, &bundle.blocks, &unity_version)?;
+                let signature_byte = if bundle.header.signature == "UnityFS" {
+                    None
+                } else {
+                    Some(bundle.header.file_stream_header_byte.ok_or_else(|| {
+                        BundleArtifactError::MissingFileStreamHeaderByte {
+                            signature: bundle.header.signature.clone(),
+                        }
+                    })?)
+                };
+
+                let total_data_len = total_entry_data_length(entries)?;
+                if total_data_len == 0 {
+                    return Err(BundleArtifactError::EmptyFileStreamData);
+                }
+                let block_info_compression =
+                    FileStreamCompression::from_switch(header_flags & 0x3f, "blocks-info")?;
+                let block_layout = match policy {
+                    PackingPolicy::Preserve => {
+                        FileStreamBlockLayout::preserve(total_data_len, &bundle.blocks)?
+                    }
+                    PackingPolicy::Uncompressed | PackingPolicy::Lz4 | PackingPolicy::Lzma => {
+                        let compression_switch = match policy {
+                            PackingPolicy::Uncompressed => 0,
+                            PackingPolicy::Lz4 => 2,
+                            PackingPolicy::Lzma => 1,
+                            PackingPolicy::Preserve => unreachable!(),
+                        };
+                        let flags = bundle
+                            .blocks
+                            .first()
+                            .map_or(0, |block| u32::from(block.flags) & !0x3f)
+                            | compression_switch;
+                        let compression = FileStreamCompression::from_switch(
+                            compression_switch,
+                            "file-stream block",
+                        )?;
+                        FileStreamBlockLayout::uniform(total_data_len, flags, compression)?
+                    }
+                };
+                i32::try_from(block_layout.len()).map_err(|_| {
+                    BundleArtifactError::BlockCountOverflow {
+                        count: block_layout.len(),
+                    }
+                })?;
+                let block_info_uncompressed_len =
+                    file_stream_block_info_length(block_layout.len(), entries)?;
+                u32_value(block_info_uncompressed_len, "uncompressed block-info size")?;
+                let uses_alignment = uses_block_alignment(&bundle.header, &unity_version);
+                let header_len = file_stream_header_length(&bundle.header, uses_alignment)?;
+
+                Ok(Self::FileStream(FileStreamPlan {
+                    header_flags,
+                    block_info_compression,
+                    block_layout,
+                    block_info_uncompressed_len,
+                    total_data_len,
+                    header_len,
+                    at_end: header_flags & 0x80 != 0,
+                    signature_byte,
+                }))
             }
             BundleLayoutKind::Legacy => {
                 let legacy = bundle.header.legacy_web_raw.as_ref().ok_or(
@@ -303,102 +635,98 @@ impl BundleWriter {
                         version: bundle.header.version,
                     },
                 )?;
-                prepare_legacy(batch, &bundle.header, legacy, entries, policy)
+                if !(3..=5).contains(&bundle.header.version) {
+                    return Err(BundleArtifactError::UnsupportedLegacyVersion {
+                        version: bundle.header.version,
+                    });
+                }
+                if legacy.level_count != 1 {
+                    return Err(BundleArtifactError::UnsupportedLegacyLevelCount {
+                        count: legacy.level_count,
+                    });
+                }
+                let compress = match (bundle.header.signature.as_str(), policy) {
+                    ("UnityRaw", PackingPolicy::Preserve | PackingPolicy::Uncompressed) => false,
+                    ("UnityWeb", PackingPolicy::Preserve | PackingPolicy::Lzma) => true,
+                    _ => {
+                        return Err(BundleArtifactError::UnsupportedPackingPolicy {
+                            signature: bundle.header.signature.clone(),
+                            policy,
+                        });
+                    }
+                };
+                let integrity = if bundle.header.version >= 4 {
+                    let hash = legacy
+                        .hash
+                        .as_deref()
+                        .and_then(|hash| <[u8; 16]>::try_from(hash).ok())
+                        .ok_or(BundleArtifactError::MissingLegacyIntegrity {
+                            version: bundle.header.version,
+                        })?;
+                    let crc = legacy
+                        .crc
+                        .ok_or(BundleArtifactError::MissingLegacyIntegrity {
+                            version: bundle.header.version,
+                        })?;
+                    Some(LegacyIntegrity {
+                        hash,
+                        crc,
+                        content_digest: DigestV1::hash_bytes(bundle.data_checked()?),
+                    })
+                } else {
+                    None
+                };
+
+                let directory_len = legacy_directory_length(entries)?;
+                let member_bytes = total_entry_data_length(entries)?;
+                let uncompressed_len = directory_len.checked_add(member_bytes).ok_or(
+                    BundleArtifactError::ArithmeticOverflow {
+                        resource: "legacy uncompressed content length",
+                    },
+                )?;
+                u32_value(uncompressed_len, "legacy uncompressed content size")?;
+                let header_len = legacy_header_length(&bundle.header)?;
+
+                Ok(Self::Legacy(LegacyPlan {
+                    compress,
+                    levels_before_streaming: legacy.number_of_levels_to_download_before_streaming,
+                    directory_len,
+                    member_bytes,
+                    uncompressed_len,
+                    header_len,
+                    integrity,
+                }))
             }
         }
     }
 }
 
-fn preflight_bundle(
-    bundle: &AssetBundle,
-    entries: &[BundleArtifactEntry<'_>],
-    policy: PackingPolicy,
-) -> Result<(), BundleArtifactError> {
-    match bundle.header.layout_kind()? {
-        BundleLayoutKind::FileStream => {
-            let (header_flags, block_flags) =
-                resolve_file_stream_flags(&bundle.header, &bundle.blocks, policy)?;
-            if header_flags & 0x40 == 0 {
-                return Err(BundleArtifactError::Unity(UnityAssetError::format(
-                    "file-stream bundle writer requires DirectoryInfo (flags must include 0x40)",
-                )));
-            }
-            reject_file_stream_encryption(&bundle.header, &bundle.blocks)?;
-            if bundle.header.signature != "UnityFS"
-                && bundle.header.file_stream_header_byte.is_none()
-            {
-                return Err(BundleArtifactError::MissingFileStreamHeaderByte {
-                    signature: bundle.header.signature.clone(),
-                });
-            }
-            let total = entries.iter().try_fold(0_u64, |total, entry| {
-                total
-                    .checked_add(entry.data_len())
-                    .ok_or(BundleArtifactError::ArithmeticOverflow {
-                        resource: "file-stream entry data length",
-                    })
-            })?;
-            if total == 0 {
-                return Err(BundleArtifactError::EmptyFileStreamData);
-            }
-            let _ = plan_block_ranges(total, block_flags & 0x3f)?;
-            validate_compression_switch(header_flags & 0x3f, "blocks-info")?;
-            let _ =
-                file_stream_header_length(&bundle.header, uses_block_alignment(&bundle.header))?;
-            Ok(())
+impl BundleWriter {
+    /// Build one exact, independently reparsed bundle artifact in `batch`.
+    ///
+    /// `entries` are consumed in the supplied order so duplicate directory entries remain
+    /// representable.
+    ///
+    /// Legacy v4/v5 integrity fields are preserved when the canonical uncompressed content is
+    /// unchanged. If it changes, the writer recomputes the content CRC and writes an all-zero
+    /// Unity build hash as an explicit invalidation marker because that build-system identity
+    /// cannot be reconstructed from archive bytes alone.
+    pub fn prepare_artifact(
+        batch: &mut ArtifactBatch<'_, '_>,
+        bundle: &AssetBundle,
+        entries: &[BundleArtifactEntry<'_>],
+        policy: PackingPolicy,
+    ) -> Result<ArtifactHandle, BundleArtifactError> {
+        let plan = BundleEncodingPlan::new(bundle, entries, policy)?;
+        for member in entries.iter().filter_map(|entry| entry.file_member()) {
+            batch.artifact_len(member.artifact())?;
         }
-        BundleLayoutKind::Legacy => {
-            let legacy = bundle.header.legacy_web_raw.as_ref().ok_or(
-                BundleArtifactError::MissingLegacyHeader {
-                    version: bundle.header.version,
-                },
-            )?;
-            if !(3..=5).contains(&bundle.header.version) {
-                return Err(BundleArtifactError::UnsupportedLegacyVersion {
-                    version: bundle.header.version,
-                });
+        match plan {
+            BundleEncodingPlan::FileStream(plan) => batch
+                .run_fail_stop(|batch| prepare_file_stream(batch, &bundle.header, entries, plan)),
+            BundleEncodingPlan::Legacy(plan) => {
+                batch.run_fail_stop(|batch| prepare_legacy(batch, &bundle.header, entries, plan))
             }
-            if legacy.level_count != 1 {
-                return Err(BundleArtifactError::UnsupportedLegacyLevelCount {
-                    count: legacy.level_count,
-                });
-            }
-            match (bundle.header.signature.as_str(), policy) {
-                ("UnityRaw", PackingPolicy::Preserve | PackingPolicy::Uncompressed)
-                | ("UnityWeb", PackingPolicy::Preserve | PackingPolicy::Lzma) => {}
-                _ => {
-                    return Err(BundleArtifactError::UnsupportedPackingPolicy {
-                        signature: bundle.header.signature.clone(),
-                        policy,
-                    });
-                }
-            }
-            if bundle.header.version >= 4
-                && (legacy.hash.as_ref().is_none_or(|hash| hash.len() != 16)
-                    || legacy.crc.is_none())
-            {
-                return Err(BundleArtifactError::MissingLegacyIntegrity {
-                    version: bundle.header.version,
-                });
-            }
-            let directory_len = legacy_directory_length(entries)?;
-            let member_len = entries.iter().try_fold(0_u64, |total, entry| {
-                total
-                    .checked_add(entry.data_len())
-                    .ok_or(BundleArtifactError::ArithmeticOverflow {
-                        resource: "legacy entry data length",
-                    })
-            })?;
-            u32_value(
-                directory_len.checked_add(member_len).ok_or(
-                    BundleArtifactError::ArithmeticOverflow {
-                        resource: "legacy content length",
-                    },
-                )?,
-                "legacy content length",
-            )?;
-            let _ = legacy_header_length(&bundle.header)?;
-            Ok(())
         }
     }
 }
@@ -484,6 +812,9 @@ fn validate_entries(
         total = total
             .checked_add(length)
             .ok_or(BundleArtifactError::DataLengthOverflow { entry })?;
+        if layout == BundleLayoutKind::FileStream && total > i64::MAX as u64 {
+            return Err(BundleArtifactError::DataLengthOverflow { entry });
+        }
         if layout == BundleLayoutKind::Legacy && total > u64::from(u32::MAX) {
             return Err(BundleArtifactError::DataLengthOverflow { entry });
         }
@@ -494,58 +825,49 @@ fn validate_entries(
 fn prepare_file_stream(
     batch: &mut ArtifactBatch<'_, '_>,
     header: &BundleHeader,
-    original_blocks: &[CompressionBlock],
     entries: &[BundleArtifactEntry<'_>],
-    policy: PackingPolicy,
+    plan: FileStreamPlan<'_>,
 ) -> Result<ArtifactHandle, BundleArtifactError> {
-    let (header_flags, block_flags) = resolve_file_stream_flags(header, original_blocks, policy)?;
-    if header_flags & 0x40 == 0 {
-        return Err(BundleArtifactError::Unity(UnityAssetError::format(
-            "file-stream bundle writer requires DirectoryInfo (flags must include 0x40)",
-        )));
-    }
-    reject_file_stream_encryption(header, original_blocks)?;
-
-    let total_data_len = total_entry_data_length(entries)?;
-    if total_data_len == 0 {
-        return Err(BundleArtifactError::EmptyFileStreamData);
-    }
-    let block_switch = block_flags & 0x3f;
-    let block_info_switch = header_flags & 0x3f;
-    validate_compression_switch(block_info_switch, "blocks-info")?;
-    let ranges = plan_block_ranges(total_data_len, block_switch)?;
     let mut data_chunks = Vec::new();
     let mut blocks = Vec::new();
+    let mut data_len = 0_u64;
     blocks
-        .try_reserve_exact(ranges.len())
+        .try_reserve_exact(plan.block_layout.len())
         .map_err(|source| BundleArtifactError::Allocation {
             resource: "file-stream blocks",
-            requested: ranges.len(),
+            requested: plan.block_layout.len(),
             source,
         })?;
-    if block_switch != 0 {
+    if plan.block_layout.compressed_len() != 0 {
         data_chunks
-            .try_reserve_exact(ranges.len())
+            .try_reserve_exact(plan.block_layout.compressed_len())
             .map_err(|source| BundleArtifactError::Allocation {
                 resource: "file-stream data chunks",
-                requested: ranges.len(),
+                requested: plan.block_layout.compressed_len(),
                 source,
             })?;
     }
 
-    for range in ranges {
+    for planned_block in plan.block_layout.iter() {
+        let range = planned_block.range;
         let uncompressed = range.end - range.start;
-        if block_switch == 0 {
+        if planned_block.compression == FileStreamCompression::None {
+            data_len = data_len.checked_add(uncompressed).ok_or(
+                BundleArtifactError::ArithmeticOverflow {
+                    resource: "file-stream data length",
+                },
+            )?;
             blocks.push(FileStreamBlock {
                 uncompressed_size: u32_value(uncompressed, "block uncompressed size")?,
                 compressed_size: u32_value(uncompressed, "block compressed size")?,
-                flags: u16_value(block_flags, "block flags")?,
+                flags: u16_value(planned_block.flags, "block flags")?,
             });
             continue;
         }
 
-        let mut compressed_len = 0_u64;
-        let mut encoded_flags = 0_u16;
+        let block_flags = planned_block.flags;
+        let block_compression = planned_block.compression;
+        let encoded_flags = u16_value(block_flags, "block flags")?;
         let chunk = batch.derive_generated_chunk(|derived| {
             let mut raw = derived.generated_chunk_writer()?;
             visit_file_range(entries, range.clone(), |member, local_start, length| {
@@ -568,8 +890,13 @@ fn prepare_file_stream(
             })?;
 
             let raw_len = raw.len();
-            let compressed = match block_switch {
-                1 => {
+            let compressed = match block_compression {
+                FileStreamCompression::None => {
+                    return Err(ArtifactBuildError::InternalInvariant {
+                        message: "uncompressed block entered generated compression path",
+                    });
+                }
+                FileStreamCompression::Lzma => {
                     let mut encoded = derived.generated_chunk_writer()?;
                     {
                         let mut sink = SkipBytesWriter {
@@ -580,28 +907,10 @@ fn prepare_file_stream(
                         let mut input = Cursor::new(raw.as_slice());
                         compress_lzma(&mut input, &mut sink, None)?;
                     }
-                    let encoded_len = encoded.len();
-                    if encoded_len > raw_len {
-                        encoded_flags = u16_value(block_flags & !0x3f, "block flags")?;
-                        compressed_len = u64::try_from(raw_len).map_err(|_| {
-                            ArtifactBuildError::InternalInvariant {
-                                message: "raw block length does not fit u64",
-                            }
-                        })?;
-                        drop(encoded);
-                        raw
-                    } else {
-                        encoded_flags = u16_value(block_flags, "block flags")?;
-                        compressed_len = u64::try_from(encoded_len).map_err(|_| {
-                            ArtifactBuildError::InternalInvariant {
-                                message: "compressed block length does not fit u64",
-                            }
-                        })?;
-                        drop(raw);
-                        encoded
-                    }
+                    drop(raw);
+                    encoded
                 }
-                2 | 3 => {
+                FileStreamCompression::Lz4 => {
                     let max_len = lz4_flex::block::get_maximum_output_size(raw_len);
                     let mut encoded = derived.generated_chunk_writer()?;
                     encoded.resize_zero(max_len)?;
@@ -611,47 +920,31 @@ fn prepare_file_stream(
                                 io::Error::other(format!("LZ4 block compression: {error}"))
                             })?;
                     encoded.resize_zero(encoded_len)?;
-                    if encoded_len > raw_len {
-                        encoded_flags = u16_value(block_flags & !0x3f, "block flags")?;
-                        compressed_len = u64::try_from(raw_len).map_err(|_| {
-                            ArtifactBuildError::InternalInvariant {
-                                message: "raw block length does not fit u64",
-                            }
-                        })?;
-                        drop(encoded);
-                        raw
-                    } else {
-                        encoded_flags = u16_value(block_flags, "block flags")?;
-                        compressed_len = u64::try_from(encoded_len).map_err(|_| {
-                            ArtifactBuildError::InternalInvariant {
-                                message: "compressed block length does not fit u64",
-                            }
-                        })?;
-                        drop(raw);
-                        encoded
-                    }
-                }
-                other => {
-                    return Err(ArtifactBuildError::DependencyIo(io::Error::other(format!(
-                        "unsupported file-stream compression switch: {other}"
-                    ))));
+                    drop(raw);
+                    encoded
                 }
             };
             derived.finish_generated_chunk(compressed)
         })?;
+        let compressed_len = chunk.len();
         blocks.push(FileStreamBlock {
             uncompressed_size: u32_value(uncompressed, "block uncompressed size")?,
             compressed_size: u32_value(compressed_len, "block compressed size")?,
             flags: encoded_flags,
         });
+        data_len =
+            data_len
+                .checked_add(chunk.len())
+                .ok_or(BundleArtifactError::ArithmeticOverflow {
+                    resource: "file-stream compressed data length",
+                })?;
         data_chunks.push(chunk);
     }
 
     // Block information is itself an exact generated chunk. Empty file artifacts are attached
     // here so a zero-byte file entry remains reachable without adding wire bytes. Empty
     // directories deliberately have no dependency.
-    let mut block_info_uncompressed_len = 0_u64;
-    let mut block_info_compressed_len = 0_u64;
+    let block_info_uncompressed_len = plan.block_info_uncompressed_len;
     let block_info = batch.derive_generated_chunk(|derived| {
         for member in entries
             .iter()
@@ -683,14 +976,14 @@ fn prepare_file_stream(
             raw.write_all(&entry.flags().to_be_bytes())?;
             write_cstring(&mut raw, entry.name())?;
         }
-        block_info_uncompressed_len =
-            u64::try_from(raw.len()).map_err(|_| ArtifactBuildError::InternalInvariant {
-                message: "block-info length does not fit u64",
-            })?;
+        debug_assert_eq!(
+            u64::try_from(raw.len()).ok(),
+            Some(block_info_uncompressed_len)
+        );
 
-        let encoded = match block_info_switch {
-            0 => raw,
-            1 => {
+        let encoded = match plan.block_info_compression {
+            FileStreamCompression::None => raw,
+            FileStreamCompression::Lzma => {
                 let mut encoded = derived.generated_chunk_writer()?;
                 {
                     let mut sink = SkipBytesWriter {
@@ -704,7 +997,7 @@ fn prepare_file_stream(
                 drop(raw);
                 encoded
             }
-            2 | 3 => {
+            FileStreamCompression::Lz4 => {
                 let max_len = lz4_flex::block::get_maximum_output_size(raw.len());
                 let mut encoded = derived.generated_chunk_writer()?;
                 encoded.resize_zero(max_len)?;
@@ -717,47 +1010,34 @@ fn prepare_file_stream(
                 drop(raw);
                 encoded
             }
-            other => {
-                return Err(ArtifactBuildError::DependencyIo(io::Error::other(format!(
-                    "unsupported block-info compression switch: {other}"
-                ))));
-            }
         };
-        block_info_compressed_len =
-            u64::try_from(encoded.len()).map_err(|_| ArtifactBuildError::InternalInvariant {
-                message: "compressed block-info length does not fit u64",
-            })?;
         derived.finish_generated_chunk(encoded)
     })?;
+    let block_info_compressed_len = block_info.len();
 
-    let uses_alignment = uses_block_alignment(header);
-    let header_len = file_stream_header_length(header, uses_alignment)?;
-    let at_end = (header_flags & 0x80) != 0;
-    let pad_position = if at_end {
-        header_len
+    let pad_position = if plan.at_end {
+        plan.header_len
     } else {
-        header_len.checked_add(block_info_compressed_len).ok_or(
-            BundleArtifactError::ArithmeticOverflow {
+        plan.header_len
+            .checked_add(block_info_compressed_len)
+            .ok_or(BundleArtifactError::ArithmeticOverflow {
                 resource: "file-stream padding position",
-            },
-        )?
+            })?
     };
-    let padding_len = if header_flags & 0x200 != 0 {
+    let padding_len = if plan.header_flags & 0x200 != 0 {
         align_up(pad_position, 16)? - pad_position
     } else {
         0
     };
-    let data_len = if block_switch == 0 {
-        total_data_len
-    } else {
-        data_chunks.iter().try_fold(0_u64, |sum, chunk| {
-            sum.checked_add(chunk.len())
-                .ok_or(BundleArtifactError::ArithmeticOverflow {
-                    resource: "file-stream compressed data length",
-                })
-        })?
-    };
-    let total_len = header_len
+    debug_assert_eq!(
+        blocks
+            .iter()
+            .map(|block| u64::from(block.uncompressed_size))
+            .sum::<u64>(),
+        plan.total_data_len
+    );
+    let total_len = plan
+        .header_len
         .checked_add(padding_len)
         .and_then(|value| value.checked_add(block_info_compressed_len))
         .and_then(|value| value.checked_add(data_len))
@@ -777,18 +1057,11 @@ fn prepare_file_stream(
         writer.write_all(
             &u32_value(block_info_uncompressed_len, "uncompressed block-info size")?.to_be_bytes(),
         )?;
-        writer.write_all(&header_flags.to_be_bytes())?;
-        if header.signature != "UnityFS" {
-            let byte = header.file_stream_header_byte.ok_or_else(|| {
-                ArtifactBuildError::DependencyIo(io::Error::other(
-                    BundleArtifactError::MissingFileStreamHeaderByte {
-                        signature: header.signature.clone(),
-                    },
-                ))
-            })?;
+        writer.write_all(&plan.header_flags.to_be_bytes())?;
+        if let Some(byte) = plan.signature_byte {
             writer.write_all(&[byte])?;
         }
-        writer.resize_zero(usize_value(header_len, "file-stream header length")?)?;
+        writer.resize_zero(usize_value(plan.header_len, "file-stream header length")?)?;
         derived.finish_generated_chunk(writer)
     })?;
     let padding = if padding_len == 0 {
@@ -804,42 +1077,55 @@ fn prepare_file_stream(
     batch
         .prepare_asset_bundle(total_len, |encoder| {
             encoder.push_derived_generated_chunk(header_chunk)?;
-            if at_end {
-                if let Some(padding) = padding {
-                    encoder.push_derived_generated_chunk(padding)?;
-                }
-                if block_switch == 0 {
-                    for member in entries
-                        .iter()
-                        .filter_map(|entry| entry.file_member())
-                        .filter(|member| member.length() != 0)
-                    {
-                        encoder.append_dependency(member.artifact())?;
-                    }
+            let mut block_info = Some(block_info);
+            if !plan.at_end {
+                encoder.push_derived_generated_chunk(block_info.take().ok_or(
+                    ArtifactBuildError::InternalInvariant {
+                        message: "file-stream block info was already emitted",
+                    },
+                )?)?;
+            }
+            if let Some(padding) = padding {
+                encoder.push_derived_generated_chunk(padding)?;
+            }
+
+            let mut compressed_chunks = data_chunks.into_iter();
+            for planned_block in plan.block_layout.iter() {
+                if planned_block.compression == FileStreamCompression::None {
+                    visit_file_range(
+                        entries,
+                        planned_block.range,
+                        |member, local_start, length| {
+                            let local_end = local_start.checked_add(length).ok_or(
+                                ArtifactBuildError::InternalInvariant {
+                                    message: "bundle dependency range overflow",
+                                },
+                            )?;
+                            encoder
+                                .append_dependency_range(member.artifact(), local_start..local_end)
+                        },
+                    )?;
                 } else {
-                    for chunk in data_chunks {
-                        encoder.push_derived_generated_chunk(chunk)?;
-                    }
+                    let chunk =
+                        compressed_chunks
+                            .next()
+                            .ok_or(ArtifactBuildError::InternalInvariant {
+                                message: "missing compressed bundle block chunk",
+                            })?;
+                    encoder.push_derived_generated_chunk(chunk)?;
                 }
-                encoder.push_derived_generated_chunk(block_info)?;
-            } else {
-                encoder.push_derived_generated_chunk(block_info)?;
-                if let Some(padding) = padding {
-                    encoder.push_derived_generated_chunk(padding)?;
-                }
-                if block_switch == 0 {
-                    for member in entries
-                        .iter()
-                        .filter_map(|entry| entry.file_member())
-                        .filter(|member| member.length() != 0)
-                    {
-                        encoder.append_dependency(member.artifact())?;
-                    }
-                } else {
-                    for chunk in data_chunks {
-                        encoder.push_derived_generated_chunk(chunk)?;
-                    }
-                }
+            }
+            if compressed_chunks.next().is_some() {
+                return Err(ArtifactBuildError::InternalInvariant {
+                    message: "unused compressed bundle block chunk",
+                });
+            }
+            if plan.at_end {
+                encoder.push_derived_generated_chunk(block_info.take().ok_or(
+                    ArtifactBuildError::InternalInvariant {
+                        message: "file-stream block info was already emitted",
+                    },
+                )?)?;
             }
             Ok(())
         })
@@ -849,43 +1135,10 @@ fn prepare_file_stream(
 fn prepare_legacy(
     batch: &mut ArtifactBatch<'_, '_>,
     header: &BundleHeader,
-    legacy: &LegacyWebRawHeader,
     entries: &[BundleArtifactEntry<'_>],
-    policy: PackingPolicy,
+    plan: LegacyPlan,
 ) -> Result<ArtifactHandle, BundleArtifactError> {
-    if !(3..=5).contains(&header.version) {
-        return Err(BundleArtifactError::UnsupportedLegacyVersion {
-            version: header.version,
-        });
-    }
-    if legacy.level_count != 1 {
-        return Err(BundleArtifactError::UnsupportedLegacyLevelCount {
-            count: legacy.level_count,
-        });
-    }
-    let compress = match (header.signature.as_str(), policy) {
-        ("UnityRaw", PackingPolicy::Preserve | PackingPolicy::Uncompressed) => false,
-        ("UnityWeb", PackingPolicy::Preserve | PackingPolicy::Lzma) => true,
-        _ => {
-            return Err(BundleArtifactError::UnsupportedPackingPolicy {
-                signature: header.signature.clone(),
-                policy,
-            });
-        }
-    };
-
-    let directory_len = legacy_directory_length(entries)?;
-    let member_bytes = total_entry_data_length(entries)?;
-    let uncompressed_len =
-        directory_len
-            .checked_add(member_bytes)
-            .ok_or(BundleArtifactError::ArithmeticOverflow {
-                resource: "legacy uncompressed content length",
-            })?;
-    u32_value(uncompressed_len, "legacy uncompressed content size")?;
-
-    let mut compressed_len = 0_u64;
-    let content = if compress {
+    let (content, compressed_len) = if plan.compress {
         let content = batch.derive_generated_chunk(|derived| {
             for member in entries
                 .iter()
@@ -895,43 +1148,42 @@ fn prepare_legacy(
                 derived.record_empty_dependency(member.artifact())?;
             }
             let mut raw = derived.generated_chunk_writer()?;
-            write_legacy_directory(&mut raw, entries, directory_len)?;
-            visit_file_range(entries, 0..member_bytes, |member, local_start, length| {
-                let mut reader = derived.dependency_reader(member.artifact())?;
-                reader.seek(SeekFrom::Start(local_start))?;
-                let mut limited = reader.take(length);
-                let copied = io::copy(&mut limited, &mut raw)?;
-                if copied != length {
-                    return Err(ArtifactBuildError::DependencyIo(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "legacy bundle member {} supplied {} bytes, expected {}",
-                            member.name(),
-                            copied,
-                            length
-                        ),
-                    )));
-                }
-                Ok(())
-            })?;
+            write_legacy_directory(&mut raw, entries, plan.directory_len)?;
+            visit_file_range(
+                entries,
+                0..plan.member_bytes,
+                |member, local_start, length| {
+                    let mut reader = derived.dependency_reader(member.artifact())?;
+                    reader.seek(SeekFrom::Start(local_start))?;
+                    let mut limited = reader.take(length);
+                    let copied = io::copy(&mut limited, &mut raw)?;
+                    if copied != length {
+                        return Err(ArtifactBuildError::DependencyIo(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "legacy bundle member {} supplied {} bytes, expected {}",
+                                member.name(),
+                                copied,
+                                length
+                            ),
+                        )));
+                    }
+                    Ok(())
+                },
+            )?;
             let mut encoded = derived.generated_chunk_writer()?;
             let mut input = Cursor::new(raw.as_slice());
-            compress_lzma(&mut input, &mut encoded, Some(uncompressed_len))?;
-            compressed_len = u64::try_from(encoded.len()).map_err(|_| {
-                ArtifactBuildError::InternalInvariant {
-                    message: "legacy compressed length does not fit u64",
-                }
-            })?;
+            compress_lzma(&mut input, &mut encoded, Some(plan.uncompressed_len))?;
             drop(raw);
             derived.finish_generated_chunk(encoded)
         })?;
-        Some(content)
+        let compressed_len = content.len();
+        (Some(content), compressed_len)
     } else {
-        compressed_len = uncompressed_len;
-        None
+        (None, plan.uncompressed_len)
     };
 
-    let directory = if compress {
+    let directory = if plan.compress {
         None
     } else {
         Some(batch.derive_generated_chunk(|derived| {
@@ -943,58 +1195,71 @@ fn prepare_legacy(
                 derived.record_empty_dependency(member.artifact())?;
             }
             let mut writer = derived.generated_chunk_writer()?;
-            write_legacy_directory(&mut writer, entries, directory_len)?;
+            write_legacy_directory(&mut writer, entries, plan.directory_len)?;
             derived.finish_generated_chunk(writer)
         })?)
     };
 
-    let header_len = legacy_header_length(header)?;
-    let total_len =
-        header_len
-            .checked_add(compressed_len)
-            .ok_or(BundleArtifactError::ArithmeticOverflow {
-                resource: "legacy bundle length",
-            })?;
+    let total_len = plan.header_len.checked_add(compressed_len).ok_or(
+        BundleArtifactError::ArithmeticOverflow {
+            resource: "legacy bundle length",
+        },
+    )?;
     u32_value(total_len, "legacy complete file size")?;
     let header_chunk = batch.derive_generated_chunk(|derived| {
+        let encoded_integrity = if let Some(integrity) = plan.integrity {
+            let mut checksum = LegacyIntegrityWriter::new(plan.uncompressed_len);
+            write_legacy_directory(&mut checksum, entries, plan.directory_len)?;
+            for member in entries.iter().filter_map(|entry| entry.file_member()) {
+                if member.length() == 0 {
+                    derived.record_empty_dependency(member.artifact())?;
+                    continue;
+                }
+                let mut reader = derived.dependency_reader(member.artifact())?;
+                let mut limited = reader.by_ref().take(member.length());
+                let copied = io::copy(&mut limited, &mut checksum)?;
+                if copied != member.length() {
+                    return Err(ArtifactBuildError::DependencyIo(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "legacy bundle member {} supplied {} bytes, expected {} while computing integrity",
+                            member.name(),
+                            copied,
+                            member.length()
+                        ),
+                    )));
+                }
+            }
+            let (content_digest, computed_crc) = checksum.finish()?;
+            if content_digest == integrity.content_digest {
+                Some((integrity.hash, integrity.crc))
+            } else {
+                Some(([0_u8; 16], computed_crc))
+            }
+        } else {
+            None
+        };
+
         let mut writer = derived.generated_chunk_writer()?;
         write_cstring(&mut writer, &header.signature)?;
         writer.write_all(&header.version.to_be_bytes())?;
         write_cstring(&mut writer, &header.unity_version)?;
         write_cstring(&mut writer, &header.unity_revision)?;
-        if header.version >= 4 {
-            let hash = legacy
-                .hash
-                .as_deref()
-                .filter(|hash| hash.len() == 16)
-                .ok_or_else(|| {
-                    ArtifactBuildError::DependencyIo(io::Error::other(
-                        BundleArtifactError::MissingLegacyIntegrity {
-                            version: header.version,
-                        },
-                    ))
-                })?;
-            let crc = legacy.crc.ok_or_else(|| {
-                ArtifactBuildError::DependencyIo(io::Error::other(
-                    BundleArtifactError::MissingLegacyIntegrity {
-                        version: header.version,
-                    },
-                ))
-            })?;
-            writer.write_all(hash)?;
+        if let Some((hash, crc)) = encoded_integrity {
+            writer.write_all(&hash)?;
             writer.write_all(&crc.to_be_bytes())?;
         }
         let total_u32 = u32_value(total_len, "legacy complete file size")?;
         writer.write_all(&total_u32.to_be_bytes())?;
-        writer.write_all(&u32_value(header_len, "legacy header size")?.to_be_bytes())?;
-        writer.write_all(&1_u32.to_be_bytes())?;
+        writer.write_all(&u32_value(plan.header_len, "legacy header size")?.to_be_bytes())?;
+        writer.write_all(&plan.levels_before_streaming.to_be_bytes())?;
         writer.write_all(&1_i32.to_be_bytes())?;
         writer.write_all(&u32_value(compressed_len, "legacy compressed size")?.to_be_bytes())?;
         writer
-            .write_all(&u32_value(uncompressed_len, "legacy uncompressed size")?.to_be_bytes())?;
+            .write_all(&u32_value(plan.uncompressed_len, "legacy uncompressed size")?.to_be_bytes())?;
         writer.write_all(&total_u32.to_be_bytes())?;
-        writer.write_all(&u32_value(directory_len, "legacy directory size")?.to_be_bytes())?;
-        writer.resize_zero(usize_value(header_len, "legacy header length")?)?;
+        writer.write_all(&u32_value(plan.directory_len, "legacy directory size")?.to_be_bytes())?;
+        writer.resize_zero(usize_value(plan.header_len, "legacy header length")?)?;
         derived.finish_generated_chunk(writer)
     })?;
 
@@ -1022,31 +1287,22 @@ fn prepare_legacy(
         .map_err(Into::into)
 }
 
-fn resolve_file_stream_flags(
-    header: &BundleHeader,
-    original_blocks: &[CompressionBlock],
-    policy: PackingPolicy,
-) -> Result<(u32, u32), BundleArtifactError> {
-    let original_block = original_blocks
-        .first()
-        .map_or(0x40, |block| u32::from(block.flags));
-    let (header_switch, block_switch) = match policy {
-        PackingPolicy::Preserve => return Ok((header.flags, original_block)),
-        PackingPolicy::Uncompressed => (0, 0),
-        PackingPolicy::Lz4 => (2, 2),
-        PackingPolicy::Lzma => (1, 1),
+fn resolve_file_stream_header_flags(header: &BundleHeader, policy: PackingPolicy) -> u32 {
+    let compression_switch = match policy {
+        PackingPolicy::Preserve => return header.flags,
+        PackingPolicy::Uncompressed => 0,
+        PackingPolicy::Lz4 => 2,
+        PackingPolicy::Lzma => 1,
     };
-    Ok((
-        (header.flags & !0x3f) | header_switch,
-        (original_block & !0x3f) | block_switch,
-    ))
+    (header.flags & !0x3f) | compression_switch
 }
 
 fn reject_file_stream_encryption(
     header: &BundleHeader,
     blocks: &[CompressionBlock],
+    unity_version: &UnityVersion,
 ) -> Result<(), BundleArtifactError> {
-    let uses_old_flags = uses_old_archive_flags(header).unwrap_or(false);
+    let uses_old_flags = uses_old_archive_flags(unity_version);
     let encryption_mask = if uses_old_flags { 0x200 } else { 0x1400 };
     let encrypted_header = header.flags & encryption_mask;
     let encrypted_block = blocks
@@ -1063,12 +1319,15 @@ fn reject_file_stream_encryption(
     Ok(())
 }
 
-fn uses_old_archive_flags(header: &BundleHeader) -> Option<bool> {
-    let parsed = UnityVersion::parse_version(&header.unity_revision)
+fn parse_bundle_unity_version(header: &BundleHeader) -> Result<UnityVersion, BundleArtifactError> {
+    UnityVersion::parse_version(&header.unity_revision)
         .or_else(|_| UnityVersion::parse_version(&header.unity_version))
-        .ok()?;
-    let (major, minor, build) = (parsed.major, parsed.minor, parsed.build);
-    Some(if major < 2020 {
+        .map_err(Into::into)
+}
+
+fn uses_old_archive_flags(version: &UnityVersion) -> bool {
+    let (major, minor, build) = (version.major, version.minor, version.build);
+    if major < 2020 {
         true
     } else if major == 2020 {
         minor < 3 || (minor == 3 && build < 34)
@@ -1078,72 +1337,14 @@ fn uses_old_archive_flags(header: &BundleHeader) -> Option<bool> {
         minor < 1 || (minor == 1 && build < 1)
     } else {
         false
-    })
+    }
 }
 
-fn uses_block_alignment(header: &BundleHeader) -> bool {
+fn uses_block_alignment(header: &BundleHeader, unity_version: &UnityVersion) -> bool {
     if header.version >= 7 {
         return true;
     }
-    let parsed = UnityVersion::parse_version(&header.unity_revision)
-        .or_else(|_| UnityVersion::parse_version(&header.unity_version));
-    let Ok(parsed) = parsed else {
-        return false;
-    };
-    parsed.major > 2019 || (parsed.major == 2019 && parsed.minor >= 4)
-}
-
-fn plan_block_ranges(total: u64, switch: u32) -> Result<Vec<Range<u64>>, BundleArtifactError> {
-    let chunk_size = match switch {
-        0 => {
-            u32_value(total, "uncompressed file-stream block")?;
-            let mut ranges = Vec::new();
-            ranges
-                .try_reserve_exact(1)
-                .map_err(|source| BundleArtifactError::Allocation {
-                    resource: "file-stream block ranges",
-                    requested: 1,
-                    source,
-                })?;
-            ranges.push(0..total);
-            return Ok(ranges);
-        }
-        1 => u64::from(u32::MAX),
-        2 | 3 => 0x0002_0000,
-        other => {
-            return Err(BundleArtifactError::Compression {
-                message: format!("unsupported file-stream compression switch: {other}"),
-            });
-        }
-    };
-    let mut ranges = Vec::new();
-    let block_count = usize_value(total.div_ceil(chunk_size), "file-stream block count")?;
-    ranges
-        .try_reserve_exact(block_count)
-        .map_err(|source| BundleArtifactError::Allocation {
-            resource: "file-stream block ranges",
-            requested: block_count,
-            source,
-        })?;
-    let mut start = 0_u64;
-    while start < total {
-        let end = start.saturating_add(chunk_size).min(total);
-        ranges.push(start..end);
-        start = end;
-    }
-    Ok(ranges)
-}
-
-fn validate_compression_switch(
-    switch: u32,
-    resource: &'static str,
-) -> Result<(), BundleArtifactError> {
-    if switch > 3 {
-        return Err(BundleArtifactError::Compression {
-            message: format!("unsupported {resource} compression switch: {switch}"),
-        });
-    }
-    Ok(())
+    unity_version.major > 2019 || (unity_version.major == 2019 && unity_version.minor >= 4)
 }
 
 fn visit_file_range(
@@ -1185,6 +1386,44 @@ fn total_entry_data_length(
                 resource: "bundle entry data length",
             })
     })
+}
+
+fn file_stream_block_info_length(
+    block_count: usize,
+    entries: &[BundleArtifactEntry<'_>],
+) -> Result<u64, BundleArtifactError> {
+    let block_count =
+        u64::try_from(block_count).map_err(|_| BundleArtifactError::ArithmeticOverflow {
+            resource: "file-stream block-info length",
+        })?;
+    let blocks = block_count
+        .checked_mul(10)
+        .ok_or(BundleArtifactError::ArithmeticOverflow {
+            resource: "file-stream block-info length",
+        })?;
+    entries.iter().try_fold(
+        16_u64
+            .checked_add(4)
+            .and_then(|length| length.checked_add(blocks))
+            .and_then(|length| length.checked_add(4))
+            .ok_or(BundleArtifactError::ArithmeticOverflow {
+                resource: "file-stream block-info length",
+            })?,
+        |length, entry| {
+            let name = u64::try_from(entry.name().len()).map_err(|_| {
+                BundleArtifactError::ArithmeticOverflow {
+                    resource: "file-stream block-info length",
+                }
+            })?;
+            length
+                .checked_add(8 + 8 + 4)
+                .and_then(|length| length.checked_add(name))
+                .and_then(|length| length.checked_add(1))
+                .ok_or(BundleArtifactError::ArithmeticOverflow {
+                    resource: "file-stream block-info length",
+                })
+        },
+    )
 }
 
 fn file_stream_header_length(
@@ -1316,6 +1555,37 @@ fn compress_lzma(
         unpacked_size: lzma_rs::compress::UnpackedSize::WriteToHeader(unpacked_size),
     };
     lzma_rs::lzma_compress_with_options(input, output, &options)
+}
+
+struct LegacyIntegrityWriter {
+    digest: DigestV1Builder,
+    crc: Crc,
+}
+
+impl LegacyIntegrityWriter {
+    fn new(content_len: u64) -> Self {
+        Self {
+            digest: DigestV1Builder::new(content_len),
+            crc: Crc::new(),
+        }
+    }
+
+    fn finish(self) -> io::Result<(DigestV1, u32)> {
+        let digest = self.digest.finalize().map_err(io::Error::other)?;
+        Ok((digest, self.crc.sum()))
+    }
+}
+
+impl Write for LegacyIntegrityWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.digest.update(bytes).map_err(io::Error::other)?;
+        self.crc.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct SkipBytesWriter<'writer, W> {
@@ -1452,7 +1722,7 @@ mod tests {
             file_stream_header_byte: (signature != "UnityFS").then_some(0x5a),
         };
         let mut bundle = AssetBundle::new(header, Vec::new());
-        bundle.blocks.push(CompressionBlock::new(1, 1, 2));
+        bundle.blocks.push(CompressionBlock::new(0x0002_0000, 1, 2));
         bundle
     }
 
@@ -1479,6 +1749,44 @@ mod tests {
         AssetBundle::new(header, Vec::new())
     }
 
+    fn canonical_legacy_content(name: &str, bytes: &[u8]) -> Vec<u8> {
+        let directory_len =
+            align_up(u64::try_from(4 + name.len() + 1 + 4 + 4).unwrap(), 4).unwrap();
+        let mut content = Vec::new();
+        content.extend_from_slice(&1_i32.to_be_bytes());
+        content.extend_from_slice(name.as_bytes());
+        content.push(0);
+        content.extend_from_slice(&u32::try_from(directory_len).unwrap().to_be_bytes());
+        content.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_be_bytes());
+        content.resize(usize::try_from(directory_len).unwrap(), 0);
+        content.extend_from_slice(bytes);
+        content
+    }
+
+    fn legacy_bundle_with_version(
+        signature: &str,
+        version: u32,
+        original_name: &str,
+        original_bytes: &[u8],
+    ) -> AssetBundle {
+        let mut bundle = legacy_bundle(signature);
+        bundle.header.version = version;
+        if version >= 4 {
+            let legacy = bundle
+                .header
+                .legacy_web_raw
+                .as_mut()
+                .expect("legacy fixture header");
+            legacy.hash = Some(vec![0x5a; 16]);
+            legacy.crc = Some(0x1234_5678);
+            legacy.number_of_levels_to_download_before_streaming = version;
+        }
+        AssetBundle::new(
+            bundle.header,
+            canonical_legacy_content(original_name, original_bytes),
+        )
+    }
+
     fn build_uncompressed_directory_bundle(
         directory_name: &str,
         max_generated_chunk_bytes: u64,
@@ -1503,12 +1811,21 @@ mod tests {
                 flags: DirectoryNode::DIRECTORY_FLAG,
             },
         ];
-        let root = BundleWriter::prepare_artifact(
+        let root = match BundleWriter::prepare_artifact(
             &mut batch,
             &bundle,
             &entries,
             PackingPolicy::Uncompressed,
-        )?;
+        ) {
+            Ok(root) => root,
+            Err(error) => {
+                assert!(matches!(
+                    batch.finish(),
+                    Err(ArtifactBuildError::PoisonedBatch)
+                ));
+                return Err(error);
+            }
+        };
         batch.bind_output(output, root)?;
         let set = batch.finish()?;
         let mut bytes = Vec::new();
@@ -1519,6 +1836,55 @@ mod tests {
             .stream_verified_to(&mut bytes)
             .expect("verified artifact stream");
         Ok(bytes)
+    }
+
+    #[derive(Debug)]
+    struct Lz4ScratchFailure {
+        error: BundleArtifactError,
+        poison: ArtifactBuildError,
+    }
+
+    fn build_lz4_bundle_with_scratch_limit(
+        max_scratch_bytes: u64,
+    ) -> Result<(Vec<u8>, u64), Box<Lz4ScratchFailure>> {
+        let bundle = file_stream_bundle("UnityFS", 7, 0xc2);
+        let payload = source_payload(41, &[b'z'; 0x0002_0000]);
+        let limits = ArtifactLimits::default().with_max_scratch_bytes(max_scratch_bytes);
+        let mut artifact_budget = ArtifactBudget::new(limits).expect("valid artifact limits");
+        let mut load_budget = AssetLoadBudget::default();
+        let mut declaration =
+            ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut load_budget)
+                .expect("declaration metadata fits compression test limit");
+        let output = declaration
+            .declare_output(LogicalArtifactName::new("bundle").unwrap())
+            .expect("output metadata fits compression test limit");
+        let mut batch = declaration
+            .seal_output_names()
+            .expect("sealed namespace fits compression test limit");
+        let payload_handle = prepare_payload(&mut batch, &payload);
+        let entries = [BundleArtifactEntry::file(&batch, "payload", 0, payload_handle).unwrap()];
+        let root =
+            match BundleWriter::prepare_artifact(&mut batch, &bundle, &entries, PackingPolicy::Lz4)
+            {
+                Ok(root) => root,
+                Err(error) => {
+                    let poison = batch
+                        .finish()
+                        .expect_err("compression failure poisons the artifact batch");
+                    return Err(Box::new(Lz4ScratchFailure { error, poison }));
+                }
+            };
+        batch.bind_output(output, root).unwrap();
+        let set = batch.finish().unwrap();
+        let mut bytes = Vec::new();
+        set.outputs()
+            .next()
+            .unwrap()
+            .artifact()
+            .stream_verified_to(&mut bytes)
+            .unwrap();
+        let peak = artifact_budget.usage().peak_scratch_bytes();
+        Ok((bytes, peak))
     }
 
     #[test]
@@ -1562,6 +1928,59 @@ mod tests {
             second.bytes()
         );
         assert_eq!(set.source_dependencies().len(), 2);
+    }
+
+    #[test]
+    fn uncompressed_file_stream_reuses_member_artifact_without_generated_copy() {
+        let bundle = file_stream_bundle("UnityFS", 7, 0xc2);
+        let payload_bytes = vec![b'u'; 1024 * 1024];
+        let payload = source_payload(42, &payload_bytes);
+        let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+        let mut load_budget = AssetLoadBudget::default();
+        let mut declaration =
+            ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut load_budget).unwrap();
+        let output = declaration
+            .declare_output(LogicalArtifactName::new("bundle").unwrap())
+            .unwrap();
+        let mut batch = declaration.seal_output_names().unwrap();
+        let payload_handle = prepare_payload(&mut batch, &payload);
+        let entries = [BundleArtifactEntry::file(&batch, "payload", 0, payload_handle).unwrap()];
+        let root = BundleWriter::prepare_artifact(
+            &mut batch,
+            &bundle,
+            &entries,
+            PackingPolicy::Uncompressed,
+        )
+        .unwrap();
+        batch.bind_output(output, root).unwrap();
+        let set = batch.finish().unwrap();
+
+        let logical_source_bytes = payload.len() * 2;
+        assert_eq!(set.source_dependencies().len(), 1);
+        assert_eq!(
+            set.source_dependencies()[0].referenced_bytes(),
+            logical_source_bytes
+        );
+        assert_eq!(
+            set.footprint().referenced_source_bytes(),
+            logical_source_bytes
+        );
+        assert_eq!(
+            set.footprint().pinned_source_bytes(),
+            payload.backing().allocation_bytes().unwrap()
+        );
+        assert_eq!(set.build_counters().source_ranges(), 1);
+        assert!(set.footprint().generated_bytes() < payload.len());
+
+        let mut bytes = Vec::new();
+        let root = set.outputs().next().unwrap().artifact();
+        assert_eq!(root.build_counters().source_ranges(), 0);
+        root.stream_verified_to(&mut bytes).unwrap();
+        let reparsed = BundleParser::from_bytes(bytes).unwrap();
+        assert_eq!(
+            reparsed.extract_node_data(&reparsed.nodes[0]).unwrap(),
+            payload.bytes()
+        );
     }
 
     #[test]
@@ -1820,6 +2239,35 @@ mod tests {
     }
 
     #[test]
+    fn file_stream_plan_rejects_old_and_new_encryption_flags() {
+        let mut old = file_stream_bundle("UnityFS", 7, 0xc2 | 0x200);
+        old.header.unity_revision = "2020.3.33f1".to_string();
+        old.header.unity_version = "2020.3.33f1".to_string();
+        old.blocks[0].flags |= 0x200;
+        let old_error = BundleEncodingPlan::new(&old, &[], PackingPolicy::Preserve).unwrap_err();
+        assert!(old_error.to_string().contains("encryption flags"));
+
+        let mut new = file_stream_bundle("UnityFS", 7, 0xc2 | 0x200 | 0x1000);
+        new.header.unity_revision = "2020.3.34f1".to_string();
+        new.header.unity_version = "2020.3.34f1".to_string();
+        new.blocks[0].flags |= 0x1000;
+        let new_error = BundleEncodingPlan::new(&new, &[], PackingPolicy::Preserve).unwrap_err();
+        assert!(new_error.to_string().contains("encryption flags"));
+    }
+
+    #[test]
+    fn file_stream_plan_rejects_unparseable_archive_flag_version() {
+        let mut bundle = file_stream_bundle("UnityFS", 7, 0xc2);
+        bundle.header.unity_revision = "not-a-version".to_string();
+        bundle.header.unity_version = "also-not-a-version".to_string();
+
+        assert!(matches!(
+            BundleEncodingPlan::new(&bundle, &[], PackingPolicy::Preserve),
+            Err(BundleArtifactError::Binary(_))
+        ));
+    }
+
+    #[test]
     fn legacy_layout_rejects_directory_metadata_it_cannot_preserve() {
         let bundle = legacy_bundle("UnityRaw");
         let payload = source_payload(14, b"x");
@@ -1911,6 +2359,32 @@ mod tests {
     }
 
     #[test]
+    fn lz4_block_peak_is_bounded_and_one_short_failure_poisons_batch() {
+        let (bytes, peak) =
+            build_lz4_bundle_with_scratch_limit(ArtifactLimits::default().max_scratch_bytes())
+                .expect("default scratch budget must encode one LZ4 block");
+        let reparsed = BundleParser::from_bytes(bytes).unwrap();
+        let extracted = reparsed.extract_node_data(&reparsed.nodes[0]).unwrap();
+        assert_eq!(extracted.len(), 0x0002_0000);
+        assert!(extracted.iter().all(|byte| *byte == b'z'));
+
+        let raw_bytes = 0x0002_0000_u64;
+        let maximum_encoded_bytes = u64::try_from(lz4_flex::block::get_maximum_output_size(
+            usize::try_from(raw_bytes).unwrap(),
+        ))
+        .unwrap();
+        assert!(peak >= raw_bytes + maximum_encoded_bytes);
+        assert!(peak <= raw_bytes + maximum_encoded_bytes + 64 * 1024);
+
+        let failure = build_lz4_bundle_with_scratch_limit(peak - 1)
+            .expect_err("one byte below the observed compression peak must fail");
+        let Lz4ScratchFailure { error, poison } = *failure;
+        assert_eq!(error.failure_phase(), ArtifactBuildFailurePhase::Encoding);
+        assert!(matches!(poison, ArtifactBuildError::PoisonedBatch));
+        assert!(error.to_string().contains("scratch_bytes"));
+    }
+
+    #[test]
     fn file_stream_v6_preserves_non_unityfs_signature_byte() {
         let bundle = file_stream_bundle("UnityWeb", 6, 0x42);
         let payload = source_payload(3, b"v6-payload");
@@ -1942,6 +2416,7 @@ mod tests {
         assert_eq!(reparsed.header.signature, "UnityWeb");
         assert_eq!(reparsed.header.version, 6);
         assert_eq!(reparsed.header.file_stream_header_byte, Some(0x5a));
+        assert_eq!(reparsed.blocks[0].flags & 0x3f, 2);
         assert_eq!(
             reparsed.extract_node_data(&reparsed.nodes[0]).unwrap(),
             b"v6-payload"
@@ -1980,6 +2455,140 @@ mod tests {
         let reparsed = BundleParser::from_bytes(bytes).unwrap();
         assert_eq!(reparsed.header.flags & 0x3f, 1);
         assert!(reparsed.blocks.iter().all(|block| block.flags & 0x3f == 2));
+        assert_eq!(
+            reparsed.extract_node_data(&reparsed.nodes[0]).unwrap(),
+            payload.bytes()
+        );
+    }
+
+    #[test]
+    fn file_stream_preserve_keeps_mixed_block_boundaries_and_flags() {
+        let mut bundle = file_stream_bundle("UnityFS", 7, 0xc2);
+        bundle.blocks = vec![
+            CompressionBlock::new(3, 3, 0x40),
+            CompressionBlock::new(100_000, 1, 0x82),
+        ];
+        let mut payload_bytes = b"raw".to_vec();
+        payload_bytes.extend(std::iter::repeat_n(b'c', 100_000));
+        payload_bytes.extend(std::iter::repeat_n(b'd', 10));
+        let payload = source_payload(81, &payload_bytes);
+        let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+        let mut load_budget = AssetLoadBudget::default();
+        let mut declaration =
+            ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut load_budget).unwrap();
+        let output = declaration
+            .declare_output(LogicalArtifactName::new("bundle").unwrap())
+            .unwrap();
+        let mut batch = declaration.seal_output_names().unwrap();
+        let payload_handle = prepare_payload(&mut batch, &payload);
+        let entries = [BundleArtifactEntry::file(&batch, "payload", 0, payload_handle).unwrap()];
+        let root =
+            BundleWriter::prepare_artifact(&mut batch, &bundle, &entries, PackingPolicy::Preserve)
+                .unwrap();
+        batch.bind_output(output, root).unwrap();
+        let set = batch.finish().unwrap();
+        let mut bytes = Vec::new();
+        set.outputs()
+            .next()
+            .unwrap()
+            .artifact()
+            .stream_verified_to(&mut bytes)
+            .unwrap();
+
+        let reparsed = BundleParser::from_bytes(bytes).unwrap();
+        assert_eq!(reparsed.blocks.len(), 3);
+        assert_eq!(reparsed.blocks[0].uncompressed_size, 3);
+        assert_eq!(reparsed.blocks[0].flags, 0x40);
+        assert_eq!(reparsed.blocks[1].uncompressed_size, 100_000);
+        assert_eq!(reparsed.blocks[1].flags, 0x82);
+        assert_eq!(reparsed.blocks[2].uncompressed_size, 10);
+        assert_eq!(reparsed.blocks[2].flags, 0x82);
+        assert_eq!(
+            reparsed.extract_node_data(&reparsed.nodes[0]).unwrap(),
+            payload.bytes()
+        );
+        assert_eq!(set.source_dependencies().len(), 1);
+    }
+
+    #[test]
+    fn file_stream_packing_policies_reparse_with_canonical_switches() {
+        for (ordinal, policy, expected_switch) in [
+            (0_u128, PackingPolicy::Preserve, 2_u32),
+            (1, PackingPolicy::Uncompressed, 0),
+            (2, PackingPolicy::Lz4, 2),
+            (3, PackingPolicy::Lzma, 1),
+        ] {
+            let bundle = file_stream_bundle("UnityFS", 7, 0xc2);
+            let payload = source_payload(70 + ordinal, &[b'p'; 64 * 1024]);
+            let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+            let mut load_budget = AssetLoadBudget::default();
+            let mut declaration =
+                ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut load_budget).unwrap();
+            let output = declaration
+                .declare_output(LogicalArtifactName::new("bundle").unwrap())
+                .unwrap();
+            let mut batch = declaration.seal_output_names().unwrap();
+            let payload_handle = prepare_payload(&mut batch, &payload);
+            let entries =
+                [BundleArtifactEntry::file(&batch, "payload", 0, payload_handle).unwrap()];
+            let root =
+                BundleWriter::prepare_artifact(&mut batch, &bundle, &entries, policy).unwrap();
+            batch.bind_output(output, root).unwrap();
+            let set = batch.finish().unwrap();
+            let mut bytes = Vec::new();
+            set.outputs()
+                .next()
+                .unwrap()
+                .artifact()
+                .stream_verified_to(&mut bytes)
+                .unwrap();
+
+            let reparsed = BundleParser::from_bytes(bytes).unwrap();
+            assert_eq!(reparsed.header.flags & 0x3f, expected_switch);
+            assert!(
+                reparsed
+                    .blocks
+                    .iter()
+                    .all(|block| u32::from(block.flags) & 0x3f == expected_switch)
+            );
+            assert_eq!(
+                reparsed.extract_node_data(&reparsed.nodes[0]).unwrap(),
+                payload.bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn file_stream_preserves_new_archive_padding_flag() {
+        let mut bundle = file_stream_bundle("UnityFS", 7, 0x42 | 0x200);
+        bundle.header.unity_revision = "2021.3.2f1".to_string();
+        bundle.header.unity_version = "2021.3.2f1".to_string();
+        let payload = source_payload(80, b"padding-aware");
+        let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+        let mut load_budget = AssetLoadBudget::default();
+        let mut declaration =
+            ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut load_budget).unwrap();
+        let output = declaration
+            .declare_output(LogicalArtifactName::new("bundle").unwrap())
+            .unwrap();
+        let mut batch = declaration.seal_output_names().unwrap();
+        let payload_handle = prepare_payload(&mut batch, &payload);
+        let entries = [BundleArtifactEntry::file(&batch, "payload", 0, payload_handle).unwrap()];
+        let root =
+            BundleWriter::prepare_artifact(&mut batch, &bundle, &entries, PackingPolicy::Preserve)
+                .unwrap();
+        batch.bind_output(output, root).unwrap();
+        let set = batch.finish().unwrap();
+        let mut bytes = Vec::new();
+        set.outputs()
+            .next()
+            .unwrap()
+            .artifact()
+            .stream_verified_to(&mut bytes)
+            .unwrap();
+
+        let reparsed = BundleParser::from_bytes(bytes).unwrap();
+        assert_ne!(reparsed.header.flags & 0x200, 0);
         assert_eq!(
             reparsed.extract_node_data(&reparsed.nodes[0]).unwrap(),
             payload.bytes()
@@ -2070,6 +2679,110 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(set.source_dependencies().len(), 2);
+    }
+
+    #[test]
+    fn legacy_versions_four_and_five_preserve_integrity_fields() {
+        for (signature, policy) in [
+            ("UnityRaw", PackingPolicy::Uncompressed),
+            ("UnityWeb", PackingPolicy::Lzma),
+        ] {
+            for version in [4, 5] {
+                let original = b"legacy-versioned";
+                let bundle = legacy_bundle_with_version(signature, version, "payload", original);
+                let payload = source_payload(u128::from(version) + 50, original);
+                let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+                let mut load_budget = AssetLoadBudget::default();
+                let mut declaration =
+                    ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut load_budget)
+                        .unwrap();
+                let output = declaration
+                    .declare_output(LogicalArtifactName::new("bundle").unwrap())
+                    .unwrap();
+                let mut batch = declaration.seal_output_names().unwrap();
+                let payload_handle = prepare_payload(&mut batch, &payload);
+                let entries =
+                    [BundleArtifactEntry::file(&batch, "payload", 0, payload_handle).unwrap()];
+                let root =
+                    BundleWriter::prepare_artifact(&mut batch, &bundle, &entries, policy).unwrap();
+                batch.bind_output(output, root).unwrap();
+                let set = batch.finish().unwrap();
+                let mut bytes = Vec::new();
+                set.outputs()
+                    .next()
+                    .unwrap()
+                    .artifact()
+                    .stream_verified_to(&mut bytes)
+                    .unwrap();
+
+                let reparsed = BundleParser::from_bytes(bytes).unwrap();
+                let legacy = reparsed.header.legacy_web_raw.as_ref().unwrap();
+                assert_eq!(reparsed.header.signature, signature);
+                assert_eq!(reparsed.header.version, version);
+                assert_eq!(legacy.hash.as_deref(), Some([0x5a; 16].as_slice()));
+                assert_eq!(legacy.crc, Some(0x1234_5678));
+                assert_eq!(
+                    legacy.number_of_levels_to_download_before_streaming,
+                    version
+                );
+                assert_eq!(
+                    reparsed.extract_node_data(&reparsed.nodes[0]).unwrap(),
+                    payload.bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_versions_four_and_five_recompute_crc_and_invalidate_hash_after_edit() {
+        for (signature, policy) in [
+            ("UnityRaw", PackingPolicy::Uncompressed),
+            ("UnityWeb", PackingPolicy::Lzma),
+        ] {
+            for version in [4, 5] {
+                let bundle =
+                    legacy_bundle_with_version(signature, version, "payload", b"before-edit");
+                let payload = source_payload(u128::from(version) + 60, b"after-edit");
+                let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+                let mut load_budget = AssetLoadBudget::default();
+                let mut declaration =
+                    ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut load_budget)
+                        .unwrap();
+                let output = declaration
+                    .declare_output(LogicalArtifactName::new("bundle").unwrap())
+                    .unwrap();
+                let mut batch = declaration.seal_output_names().unwrap();
+                let payload_handle = prepare_payload(&mut batch, &payload);
+                let entries =
+                    [BundleArtifactEntry::file(&batch, "payload", 0, payload_handle).unwrap()];
+                let root =
+                    BundleWriter::prepare_artifact(&mut batch, &bundle, &entries, policy).unwrap();
+                batch.bind_output(output, root).unwrap();
+                let set = batch.finish().unwrap();
+                let mut bytes = Vec::new();
+                set.outputs()
+                    .next()
+                    .unwrap()
+                    .artifact()
+                    .stream_verified_to(&mut bytes)
+                    .unwrap();
+
+                let reparsed = BundleParser::from_bytes(bytes).unwrap();
+                let legacy = reparsed.header.legacy_web_raw.as_ref().unwrap();
+                let canonical_content = canonical_legacy_content("payload", b"after-edit");
+                let reparsed_content = reparsed.data_checked().unwrap();
+                let mut crc = Crc::new();
+                crc.update(&canonical_content);
+                assert_eq!(reparsed.header.signature, signature);
+                assert_eq!(reparsed_content, canonical_content);
+                assert_eq!(legacy.hash.as_deref(), Some([0_u8; 16].as_slice()));
+                assert_eq!(legacy.crc, Some(crc.sum()));
+                assert_eq!(
+                    reparsed.extract_node_data(&reparsed.nodes[0]).unwrap(),
+                    b"after-edit"
+                );
+            }
+        }
     }
 
     #[test]

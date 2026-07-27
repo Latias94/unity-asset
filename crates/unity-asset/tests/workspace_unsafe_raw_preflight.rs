@@ -76,6 +76,7 @@ fn earlier_stale_raw_guard_precedes_a_lower_path_id_failure() {
     };
     let operations = vec![operation(high_path_id), operation(low_path_id)];
     let plan = MutationPlan::new(
+        workspace.workspace_id(),
         workspace.revision(),
         vec![SourceExpectation::new(
             locator,

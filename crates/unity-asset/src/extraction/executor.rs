@@ -868,7 +868,7 @@ fn prepare_sprite_texture(
         let WorkspaceObjectValue::Binary(texture_object) = texture_object.value() else {
             return Ok(None);
         };
-        let processor = TextureProcessor::new(version.clone());
+        let processor = TextureProcessor::new();
         let Ok(mut texture) = processor.convert_object(texture_object) else {
             return Ok(None);
         };
@@ -1132,9 +1132,7 @@ fn write_content(
             stream,
         } => write_audio(writer, stream, input),
         #[cfg(feature = "decode")]
-        PlannedContent::TexturePng { version, stream } => {
-            write_texture(writer, version, stream, input)
-        }
+        PlannedContent::TexturePng { version: _, stream } => write_texture(writer, stream, input),
         #[cfg(feature = "decode")]
         PlannedContent::SpritePng {
             version,
@@ -1213,14 +1211,13 @@ fn write_audio(
 #[cfg(feature = "decode")]
 fn write_texture(
     writer: &mut dyn Write,
-    version: &unity_asset_binary::unity_version::UnityVersion,
     stream: &Option<ExtractionSourceRange>,
     input: &mut PreparedInput,
 ) -> Result<(), AttemptError> {
     let WorkspaceObjectValue::Binary(object) = input.object.value() else {
         return Err(AttemptError::Decode);
     };
-    let processor = TextureProcessor::new(version.clone());
+    let processor = TextureProcessor::new();
     let mut texture = processor
         .convert_object(object)
         .map_err(|_| AttemptError::Decode)?;

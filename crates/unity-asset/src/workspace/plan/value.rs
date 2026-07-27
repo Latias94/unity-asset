@@ -124,6 +124,14 @@ impl Serialize for PlanBytes {
     }
 }
 
+struct PlanBytesReserveError(std::collections::TryReserveError);
+
+impl fmt::Display for PlanBytesReserveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "failed to reserve plan bytes: {}", self.0)
+    }
+}
+
 impl<'de> Deserialize<'de> for PlanBytes {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -150,7 +158,7 @@ impl<'de> Deserialize<'de> for PlanBytes {
                 let mut decoded = Vec::new();
                 decoded
                     .try_reserve_exact(byte_len)
-                    .map_err(|error| E::custom(format!("failed to reserve plan bytes: {error}")))?;
+                    .map_err(|error| E::custom(PlanBytesReserveError(error)))?;
                 for pair in value.as_bytes().chunks_exact(2) {
                     let high = hex_nibble(pair[0])
                         .ok_or_else(|| E::custom("invalid hexadecimal plan byte"))?;

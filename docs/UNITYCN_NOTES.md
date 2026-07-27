@@ -1,56 +1,75 @@
 # UnityCN / Tuanjie Notes
 
-This document records format quirks observed in UnityCN/Tuanjie projects so we can keep parsing/edit behavior predictable without hardcoding any project paths or bundling proprietary assets.
+This document records format behavior observed in external UnityCN/Tuanjie corpora. It contains no
+project paths or proprietary assets.
 
 ## Version Strings
 
-UnityCN/Tuanjie projects may use version strings like:
+Observed forms include:
 
-- `2022.3.48t6` (Tuanjie channel)
-- `2022.3.48t6 (b281c1694403)` (revision suffix, as seen in `ProjectSettings/ProjectVersion.txt`)
-- `2022.3.48f1c1` (UnityCN-style suffix; UnityPy treats this as an unknown/custom channel `f1c` with number `1`)
+- `2022.3.48t6`
+- `2022.3.48t6 (b281c1694403)`
+- `2022.3.48f1c1`
 
-Rust-side notes:
-
-- `UnityVersion::parse_version(...)` is expected to accept `t*` channels and `f*c*` suffixes.
-- Revision suffixes in parentheses should be ignored for comparisons/heuristics.
+`UnityVersion::parse_version` accepts `t*` channels and `f*c*` suffixes. A revision in parentheses
+is ignored for version comparison and format heuristics.
 
 ## Bundle Header Flags
 
 Modern UnityFS bundles may set:
 
-- `0x200` for `BlockInfoNeedPaddingAtStart` (new flag set)
-- `0x40` for `BlocksAndDirectoryInfoCombined`
-- low bits (`0x3`) for compression type (e.g. LZ4HC)
+- `0x200` for `BlockInfoNeedPaddingAtStart`;
+- `0x40` for `BlocksAndDirectoryInfoCombined`;
+- low bits such as `0x3` for the compression algorithm.
 
-Example seen in the wild: `flags=0x00000243`.
+`0x00000243` has been observed in production data. Some regional-engine encryption flags overlap
+with otherwise known bits depending on engine version, so flag interpretation must be
+version-aware. The current writer structurally rejects encrypted layouts that it cannot reproduce;
+it does not publish an unencrypted artifact under an encrypted source policy.
 
-Important:
-- UnityCN encryption uses bits that can overlap with `0x200` depending on engine version.
-- When saving, we strip encryption flags (UnityPy parity) because we do not re-encrypt outputs.
+## Signed Path IDs
 
-## “Resource IDs” / Path IDs
+Binary object `path_id` is an `i64`. Negative values are valid and must survive parsing,
+inspection, reference resolution, mutation guards, writing, and reopening without conversion to an
+unsigned integer.
 
-Some bundles contain objects whose `path_id` values are negative 64-bit integers (still valid per the format; treat as `i64`).
+Inspect the exact object contract:
 
-Implications:
-- Parsing/edit/save must preserve these values exactly.
-- Any downstream feature that assumes `path_id >= 0` (e.g. converting to `u64`) may drop coverage and should be treated as best-effort.
-
-How to scan (no hardcoded paths):
-
-```
-cargo run -p unity-asset-cli --bin unity-asset -- stats-pathid --input <path-or-dir> --kind bundle --limit 50
-# include duplicate checks (slower):
-cargo run -p unity-asset-cli --bin unity-asset -- stats-pathid --input <path-or-dir> --kind bundle --limit 50 --check-duplicates
+```powershell
+cargo run -p unity-asset-cli --bin unity-asset -- workspace inspect objects --input D:\Corpus > objects.json
 ```
 
-Observed (external UnityCN project corpus, sample):
+One PowerShell summary for the binary object projection is:
 
-- `stats --kind bundle --summary --limit 30` reported `UnityFS flags=0x00000243` for all 30 scanned bundle assets.
-- `stats-pathid --kind bundle --limit 30`:
-  - `files_scanned=30`, `objects_total=4552`
-  - `negative=2253`, `zero=0`, `positive=2299`
-  - `min=-9213568037368421799`, `max=9222975297749798082`
-- `stats-pathid --kind bundle --limit 10 --check-duplicates`:
-  - `files_with_duplicates=0`, `duplicate_path_ids=0`
+```powershell
+$objects = Get-Content -Raw objects.json | ConvertFrom-Json
+$ids = @($objects | Where-Object { $_.format.kind -eq 'binary' } | ForEach-Object { [int64]$_.format.path_id })
+$negative = @($ids | Where-Object { $_ -lt 0 }).Count
+$zero = @($ids | Where-Object { $_ -eq 0 }).Count
+$positive = @($ids | Where-Object { $_ -gt 0 }).Count
+[pscustomobject]@{
+    files_or_members = @($objects | ForEach-Object { $_.address.source } | Sort-Object -Unique).Count
+    objects_total = $ids.Count
+    negative = $negative
+    zero = $zero
+    positive = $positive
+    min = ($ids | Measure-Object -Minimum).Minimum
+    max = ($ids | Measure-Object -Maximum).Maximum
+}
+```
+
+For very large corpora, use `WorkspaceInspector` directly and aggregate while consuming source
+partitions instead of retaining every JSON object.
+
+## Historical Corpus Observation
+
+A superseded aggregate diagnostic captured the following neutral baseline:
+
+- 30 sampled bundle assets all reported UnityFS flags `0x00000243`.
+- Across those 30 assets: `objects_total=4552`, `negative=2253`, `zero=0`, `positive=2299`.
+- The observed range was `-9213568037368421799..=9222975297749798082`.
+- A 10-asset duplicate check reported `files_with_duplicates=0` and
+  `duplicate_path_ids=0`.
+
+These values characterize one corpus, not a format invariant. In particular, path IDs are only
+object-local within a SerializedFile and must never be treated as workspace-global identity.

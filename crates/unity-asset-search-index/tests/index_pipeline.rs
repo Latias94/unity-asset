@@ -467,7 +467,9 @@ fn capture_references(
     active: &GenerationStamp,
     request: ReferenceRequest,
 ) -> ReferenceResponseFact {
-    let response = index.references(request).unwrap();
+    let response = index
+        .references(request, &mut AssetLoadBudget::default())
+        .unwrap();
     assert_eq!(&response.generation, active);
     response.into()
 }

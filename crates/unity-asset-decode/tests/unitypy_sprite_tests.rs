@@ -16,6 +16,10 @@ use unity_asset_decode::sprite::{Sprite, SpriteProcessor};
 use unity_asset_decode::texture::{Texture2D, TextureFormat};
 use unity_asset_decode::unity_version::UnityVersion;
 
+fn test_version() -> UnityVersion {
+    UnityVersion::parse_version("2020.3.12f1").unwrap()
+}
+
 /// Test sprite image extraction compatibility with UnityPy
 ///
 /// UnityPy equivalent:
@@ -75,7 +79,7 @@ fn test_sprite_image_extraction_unitypy_compat() {
     );
 
     // Use SpriteProcessor to extract sprite image
-    let sprite_processor = SpriteProcessor::new(UnityVersion::default());
+    let sprite_processor = SpriteProcessor::new(test_version());
     match sprite_processor.extract_sprite_image(&sprite, &texture) {
         Ok(sprite_image_data) => {
             println!(
@@ -214,7 +218,7 @@ fn test_sprite_atlas_unitypy_compat() {
         );
 
         // Test extraction using SpriteProcessor
-        let sprite_processor = SpriteProcessor::new(UnityVersion::default());
+        let sprite_processor = SpriteProcessor::new(test_version());
         match sprite_processor.extract_sprite_image(&sprite, &atlas_texture) {
             Ok(sprite_image_data) => {
                 assert!(!sprite_image_data.is_empty());
@@ -274,7 +278,7 @@ fn test_sprite_export_unitypy_compat() {
     let png_path = "target/unitypy_compat_sprite.png";
 
     // Use SpriteProcessor to extract and save PNG
-    let sprite_processor = SpriteProcessor::new(UnityVersion::default());
+    let sprite_processor = SpriteProcessor::new(test_version());
     match sprite_processor.extract_sprite_image(&sprite, &texture) {
         Ok(png_data) => {
             match fs::write(png_path, &png_data) {

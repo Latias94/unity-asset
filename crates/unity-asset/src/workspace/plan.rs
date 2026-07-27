@@ -4,13 +4,14 @@ mod builder;
 mod input;
 mod value;
 
+use std::collections::TryReserveError;
 use std::io::{self, Write};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use unity_asset_core::{
     DigestV1, DigestV1Builder, FieldPath, ObjectAddress, ObjectKind, SourceFingerprint, SourceKind,
-    SourceLocator, WorkspaceRevision,
+    SourceLocator, WorkspaceId, WorkspaceRevision,
 };
 
 pub use builder::{MutationPlanBuilder, MutationPlanBuilderError};
@@ -23,7 +24,8 @@ pub(crate) const MAX_PLAN_DEPTH: u32 = 59;
 // allowance covers a sequence edit plus a nested logical ObjectAddress, the deepest supported
 // operation shape. This remains bounded while every valid in-memory value can round-trip.
 pub(crate) const MAX_PLAN_WIRE_DEPTH: u32 = MAX_PLAN_DEPTH * 3 + 9;
-const MUTATION_PLAN_VERSION: u8 = 1;
+/// Current canonical MutationPlan wire version.
+pub const MUTATION_PLAN_VERSION: u8 = 2;
 
 /// Expected identity of one source modified by a plan.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -362,9 +364,10 @@ impl MutationOperation {
     }
 }
 
-/// Deterministic sequence of guarded mutations against one workspace revision.
+/// Deterministic sequence of guarded mutations against one workspace identity and revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutationPlan {
+    workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     sources: Box<[SourceExpectation]>,
     payloads: Box<[PlanPayload]>,
@@ -372,18 +375,20 @@ pub struct MutationPlan {
 }
 
 type MutationPlanParts = (
+    WorkspaceId,
     WorkspaceRevision,
     Box<[SourceExpectation]>,
     Box<[PlanPayload]>,
     Box<[MutationOperation]>,
 );
 
-/// A revision-bound group of generic mutations produced atomically by one schema recipe.
+/// A workspace- and revision-bound group of mutations produced atomically by one schema recipe.
 ///
 /// Fragments are not part of the persisted plan wire contract. They retain recipe ordering until
 /// a [`MutationPlanBuilder`] assigns the final continuous operation ordinals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutationPlanFragment {
+    workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     sources: Vec<SourceExpectation>,
     payloads: Vec<PlanPayload>,
@@ -392,6 +397,7 @@ pub struct MutationPlanFragment {
 
 impl MutationPlanFragment {
     pub(crate) fn from_recipe(
+        workspace_id: WorkspaceId,
         base_revision: WorkspaceRevision,
         sources: Vec<SourceExpectation>,
         payloads: Vec<PlanPayload>,
@@ -410,11 +416,18 @@ impl MutationPlanFragment {
         validate_source_coverage_without_scratch(&sources, &actions)?;
         validate_payload_coverage_without_scratch(&payloads, &actions)?;
         Ok(Self {
+            workspace_id,
             base_revision,
             sources,
             payloads,
             actions,
         })
+    }
+
+    /// Returns the workspace identity observed while lowering this fragment.
+    #[must_use]
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
     }
 
     #[must_use]
@@ -439,7 +452,9 @@ impl MutationPlanFragment {
 }
 
 impl MutationPlan {
+    /// Creates a validated plan bound to one exact workspace identity and base revision.
     pub fn new(
+        workspace_id: WorkspaceId,
         base_revision: WorkspaceRevision,
         sources: Vec<SourceExpectation>,
         payloads: Vec<PlanPayload>,
@@ -465,7 +480,7 @@ impl MutationPlan {
             .map_err(|error| MutationPlanError::AllocationFailed {
                 resource: "mutation operations",
                 requested: actions.len(),
-                message: error.to_string(),
+                error,
             })?;
         for (index, action) in actions.into_iter().enumerate() {
             let ordinal = u32::try_from(index)
@@ -474,11 +489,24 @@ impl MutationPlan {
         }
 
         Ok(Self {
+            workspace_id,
             base_revision,
             sources: sources.into_boxed_slice(),
             payloads: payloads.into_boxed_slice(),
             operations: operations.into_boxed_slice(),
         })
+    }
+
+    /// Returns the persisted wire contract version emitted by this plan.
+    #[must_use]
+    pub const fn version(&self) -> u8 {
+        MUTATION_PLAN_VERSION
+    }
+
+    /// Returns the workspace identity this plan is allowed to mutate.
+    #[must_use]
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
     }
 
     #[must_use]
@@ -504,6 +532,7 @@ impl MutationPlan {
     #[must_use]
     pub(crate) fn into_parts(self) -> MutationPlanParts {
         (
+            self.workspace_id,
             self.base_revision,
             self.sources,
             self.payloads,
@@ -587,6 +616,7 @@ impl Write for DigestWriter<'_> {
 #[derive(Serialize)]
 struct MutationPlanRef<'a> {
     version: u8,
+    workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     sources: &'a [SourceExpectation],
     payloads: &'a [PlanPayload],
@@ -597,6 +627,7 @@ struct MutationPlanRef<'a> {
 #[serde(deny_unknown_fields)]
 struct MutationPlanWire {
     version: u8,
+    workspace_id: Option<WorkspaceId>,
     base_revision: WorkspaceRevision,
     sources: Vec<SourceExpectation>,
     payloads: Vec<PlanPayload>,
@@ -608,6 +639,9 @@ impl MutationPlan {
         if wire.version != MUTATION_PLAN_VERSION {
             return Err(MutationPlanError::UnsupportedVersion(wire.version));
         }
+        let workspace_id = wire
+            .workspace_id
+            .ok_or(MutationPlanError::MissingWorkspaceId)?;
         for (index, operation) in wire.operations.iter().enumerate() {
             let expected = u32::try_from(index)
                 .map_err(|_| MutationPlanError::OperationCountOverflow { count: index + 1 })?;
@@ -625,7 +659,13 @@ impl MutationPlan {
             .into_iter()
             .map(|operation| operation.action)
             .collect();
-        Self::new(wire.base_revision, wire.sources, wire.payloads, actions)
+        Self::new(
+            workspace_id,
+            wire.base_revision,
+            wire.sources,
+            wire.payloads,
+            actions,
+        )
     }
 }
 
@@ -636,6 +676,7 @@ impl Serialize for MutationPlan {
     {
         MutationPlanRef {
             version: MUTATION_PLAN_VERSION,
+            workspace_id: self.workspace_id,
             base_revision: self.base_revision,
             sources: &self.sources,
             payloads: &self.payloads,
@@ -686,7 +727,7 @@ fn validate_source_coverage(
         MutationPlanError::AllocationFailed {
             resource: "mutation source validation",
             requested: actions.len(),
-            message: error.to_string(),
+            error,
         }
     })?;
     targets.extend(
@@ -712,20 +753,60 @@ fn validate_source_coverage(
 }
 
 fn validate_unsafe_raw_exclusivity(actions: &[GenericMutation]) -> Result<(), MutationPlanError> {
-    for (raw_index, action) in actions.iter().enumerate() {
-        if !matches!(action, GenericMutation::UnsafeRawReplace { .. }) {
-            continue;
+    if !actions
+        .iter()
+        .any(|action| matches!(action, GenericMutation::UnsafeRawReplace { .. }))
+    {
+        return Ok(());
+    }
+    let mut indexed = Vec::new();
+    indexed.try_reserve_exact(actions.len()).map_err(|error| {
+        MutationPlanError::AllocationFailed {
+            resource: "unsafe raw exclusivity index",
+            requested: actions.len(),
+            error,
         }
-        if let Some((conflicting_index, _)) = actions
-            .iter()
-            .enumerate()
-            .find(|(index, candidate)| *index != raw_index && candidate.target() == action.target())
+    })?;
+    indexed.extend(actions.iter().enumerate().map(|(index, action)| {
+        (
+            action.target(),
+            index,
+            matches!(action, GenericMutation::UnsafeRawReplace { .. }),
+        )
+    }));
+    indexed.sort_unstable_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let mut earliest: Option<(usize, usize)> = None;
+    let mut start = 0;
+    while start < indexed.len() {
+        let mut end = start + 1;
+        while end < indexed.len() && indexed[end].0 == indexed[start].0 {
+            end += 1;
+        }
+        if end - start > 1
+            && let Some(raw_index) = indexed[start..end]
+                .iter()
+                .filter_map(|(_, index, is_raw)| is_raw.then_some(*index))
+                .min()
         {
-            return Err(MutationPlanError::UnsafeRawNotExclusive {
-                raw_index,
-                conflicting_index,
-            });
+            let first_index = indexed[start].1;
+            let conflicting_index = if first_index == raw_index {
+                indexed[start + 1].1
+            } else {
+                first_index
+            };
+            if earliest.is_none_or(|(current, _)| raw_index < current) {
+                earliest = Some((raw_index, conflicting_index));
+            }
         }
+        start = end;
+    }
+
+    if let Some((raw_index, conflicting_index)) = earliest {
+        return Err(MutationPlanError::UnsafeRawNotExclusive {
+            raw_index,
+            conflicting_index,
+        });
     }
     Ok(())
 }
@@ -784,7 +865,7 @@ fn validate_payload_coverage(
         .map_err(|error| MutationPlanError::AllocationFailed {
             resource: "mutation payload validation",
             requested: actions.len(),
-            message: error.to_string(),
+            error,
         })?;
     referenced.extend(actions.iter().filter_map(GenericMutation::payload));
     referenced.sort_unstable();
@@ -834,6 +915,8 @@ fn validate_payload_coverage_without_scratch(
 pub enum MutationPlanError {
     #[error("mutation plan version {0} is unsupported")]
     UnsupportedVersion(u8),
+    #[error("mutation plan workspace_id is required")]
+    MissingWorkspaceId,
     #[error("mutation plan must contain at least one operation")]
     NoOperations,
     #[error("mutation plan contains too many operations: {count}")]
@@ -894,11 +977,12 @@ pub enum MutationPlanError {
     },
     #[error("{operation} requires a non-root field path; use schema_replace for whole objects")]
     RootFieldPath { operation: &'static str },
-    #[error("failed to allocate {resource} capacity for {requested} elements: {message}")]
+    #[error("failed to allocate {resource} capacity for {requested} elements: {error}")]
     AllocationFailed {
         resource: &'static str,
         requested: usize,
-        message: String,
+        #[source]
+        error: TryReserveError,
     },
     #[error("failed to encode canonical mutation plan JSON: {0}")]
     CanonicalJson(String),
@@ -910,6 +994,10 @@ mod consumption_tests {
 
     fn digest(label: &[u8]) -> DigestV1 {
         DigestV1::hash_bytes(label)
+    }
+
+    fn workspace_id() -> WorkspaceId {
+        WorkspaceId::from_u128(1).unwrap()
     }
 
     #[test]
@@ -963,6 +1051,7 @@ mod consumption_tests {
         };
         let revision = WorkspaceRevision::new(digest(b"revision"));
         let plan = MutationPlan::new(
+            workspace_id(),
             revision,
             vec![source],
             payloads,
@@ -996,7 +1085,9 @@ mod consumption_tests {
         let canonical = plan.canonical_json().unwrap();
         assert_eq!(canonical, serde_json::to_vec(&plan).unwrap());
 
-        let (actual_revision, sources, payloads, operations) = plan.into_parts();
+        let (actual_workspace_id, actual_revision, sources, payloads, operations) =
+            plan.into_parts();
+        assert_eq!(actual_workspace_id, workspace_id());
         assert_eq!(actual_revision, revision);
         assert_eq!(sources.len(), 1);
 
@@ -1087,6 +1178,7 @@ mod consumption_tests {
         let revision = WorkspaceRevision::new(digest(b"revision"));
 
         let error = MutationPlan::new(
+            workspace_id(),
             revision,
             vec![source],
             vec![payload],
@@ -1114,6 +1206,40 @@ mod consumption_tests {
                 raw_index: 0,
                 conflicting_index: 1,
             }
+        ));
+    }
+
+    #[test]
+    fn unsafe_raw_exclusivity_reports_operation_order_after_target_indexing() {
+        let locator = SourceLocator::path("Assets/Data/main.assets").unwrap();
+        let first = ObjectAddress::binary_at(locator.clone(), 1).unwrap();
+        let second = ObjectAddress::binary_at(locator, 2).unwrap();
+        let payload = digest(b"payload");
+        let field = |target| GenericMutation::FieldReplace {
+            target,
+            path: FieldPath::root().push_field("m_Name").unwrap(),
+            guard: FieldGuard::new(digest(b"schema"), digest(b"value")),
+            replacement: MutationValue::string("replacement").unwrap(),
+        };
+        let raw = |target| GenericMutation::UnsafeRawReplace {
+            target,
+            expected_raw_digest: digest(b"raw"),
+            payload,
+            acknowledgement: UnsafeRawAcknowledgement::WireInvariantsAreCallersResponsibilityV1,
+        };
+        let actions = vec![
+            field(first.clone()),
+            raw(second.clone()),
+            raw(first),
+            field(second),
+        ];
+
+        assert!(matches!(
+            validate_unsafe_raw_exclusivity(&actions),
+            Err(MutationPlanError::UnsafeRawNotExclusive {
+                raw_index: 1,
+                conflicting_index: 3,
+            })
         ));
     }
 }

@@ -9,6 +9,10 @@
 use unity_asset_decode::audio::{AudioClip, AudioClipMeta, AudioCompressionFormat, AudioProcessor};
 use unity_asset_decode::unity_version::UnityVersion;
 
+fn test_version() -> UnityVersion {
+    UnityVersion::parse_version("2020.3.12f1").unwrap()
+}
+
 /// Helper function to detect audio format from data content
 fn detect_format_from_data(data: &[u8]) -> AudioCompressionFormat {
     if data.len() < 4 {
@@ -138,7 +142,7 @@ fn test_audio_magic_detection_unitypy_compat() {
     assert_eq!(detected_format, AudioCompressionFormat::Vorbis);
 
     // Test audio processing using AudioProcessor
-    let processor = AudioProcessor::new(UnityVersion::default());
+    let processor = AudioProcessor::new(test_version());
     match processor.decode_audio(&clip) {
         Ok(_decoded) => {
             println!("    ✓ Successfully decoded Ogg audio");
@@ -157,7 +161,7 @@ fn test_audio_magic_detection_unitypy_compat() {
     assert_eq!(detected_format, AudioCompressionFormat::PCM);
 
     // Test audio processing using AudioProcessor
-    let processor = AudioProcessor::new(UnityVersion::default());
+    let processor = AudioProcessor::new(test_version());
     match processor.decode_audio(&clip) {
         Ok(_decoded) => {
             println!("    ✓ Successfully decoded WAV audio");
@@ -176,7 +180,7 @@ fn test_audio_magic_detection_unitypy_compat() {
     assert_eq!(detected_format, AudioCompressionFormat::AAC);
 
     // Test audio processing using AudioProcessor
-    let processor = AudioProcessor::new(UnityVersion::default());
+    let processor = AudioProcessor::new(test_version());
     match processor.decode_audio(&clip) {
         Ok(_decoded) => {
             println!("    ✓ Successfully decoded M4A audio");
@@ -232,7 +236,7 @@ fn test_audio_sample_extraction_unitypy_compat() {
         clip.data = data.clone();
 
         // Test audio processing instead of extract_samples
-        let processor = AudioProcessor::new(UnityVersion::default());
+        let processor = AudioProcessor::new(test_version());
         match processor.decode_audio(&clip) {
             Ok(decoded) => {
                 println!("    ✓ Successfully processed {} audio", name);
@@ -279,7 +283,7 @@ fn test_wav_creation_unitypy_compat() {
     clip.data = vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
 
     // Test audio processing instead of extract_samples
-    let processor = AudioProcessor::new(UnityVersion::default());
+    let processor = AudioProcessor::new(test_version());
     match processor.decode_audio(&clip) {
         Ok(decoded) => {
             println!("    ✓ Successfully processed PCM audio");
@@ -428,7 +432,7 @@ fn test_audio_error_handling_unitypy_compat() {
     clip.data = vec![0; 1024];
 
     // Test audio processing with invalid properties
-    let processor = AudioProcessor::new(UnityVersion::default());
+    let processor = AudioProcessor::new(test_version());
     let result = processor.decode_audio(&clip);
     match result {
         Err(_) => println!("  ✓ Invalid audio properties properly rejected"),

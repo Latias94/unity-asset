@@ -160,9 +160,12 @@ impl SerializedFile {
         self.enable_type_tree
     }
 
-    /// Enables or disables embedded TypeTree lookup without mutating the retained type table.
-    pub fn set_type_tree_enabled(&mut self, enabled: bool) {
-        self.enable_type_tree = enabled;
+    /// Returns a snapshot that does not use embedded TypeTrees for object schemas.
+    #[must_use]
+    pub fn without_embedded_type_trees(mut self) -> Self {
+        self.enable_type_tree = false;
+        self.invalidate_schema_cache();
+        self
     }
 
     /// Returns the validated SerializedType table in wire order.
@@ -170,24 +173,22 @@ impl SerializedFile {
         &self.types
     }
 
-    /// Returns mutable type metadata after invalidating every derived schema.
-    ///
-    /// This exists for format construction and adversarial tests. Normal object consumers should
-    /// treat a parsed SerializedFile as an immutable snapshot and use [`Self::types`].
-    pub fn types_mut(&mut self) -> &mut Vec<SerializedType> {
-        self.invalidate_schema_cache();
-        &mut self.types
-    }
-
     /// Returns the managed-reference type catalog in wire order.
     pub fn ref_types(&self) -> &[SerializedType] {
         &self.ref_types
     }
 
-    /// Returns mutable managed-reference metadata after invalidating every derived schema.
-    pub fn ref_types_mut(&mut self) -> &mut Vec<SerializedType> {
+    /// Returns a snapshot with both schema-bearing type tables replaced atomically.
+    #[must_use]
+    pub fn with_type_tables(
+        mut self,
+        types: Vec<SerializedType>,
+        ref_types: Vec<SerializedType>,
+    ) -> Self {
+        self.types = types;
+        self.ref_types = ref_types;
         self.invalidate_schema_cache();
-        &mut self.ref_types
+        self
     }
 
     /// Returns the external registry used when an embedded TypeTree is unavailable.
@@ -215,8 +216,12 @@ impl SerializedFile {
         self.legacy_big_id.is_some_and(|value| value != 0)
     }
 
-    pub fn set_type_tree_registry(&mut self, registry: Option<Arc<dyn TypeTreeRegistry>>) {
+    /// Returns a snapshot that resolves missing TypeTrees through `registry`.
+    #[must_use]
+    pub fn with_type_tree_registry(mut self, registry: Option<Arc<dyn TypeTreeRegistry>>) -> Self {
         self.type_tree_registry = registry;
+        self.invalidate_schema_cache();
+        self
     }
 
     fn invalidate_schema_cache(&mut self) {

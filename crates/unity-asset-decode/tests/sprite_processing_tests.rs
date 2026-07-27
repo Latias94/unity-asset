@@ -18,6 +18,10 @@ use unity_asset_decode::sprite::{Sprite, SpriteInfo, SpriteProcessor};
 use unity_asset_decode::texture::{Texture2D, TextureFormat};
 use unity_asset_decode::unity_version::UnityVersion;
 
+fn test_version() -> UnityVersion {
+    UnityVersion::parse_version("2020.3.12f1").unwrap()
+}
+
 /// Test comprehensive sprite image extraction
 #[test]
 fn test_sprite_comprehensive_extraction() {
@@ -78,7 +82,7 @@ fn test_sprite_comprehensive_extraction() {
         );
 
         // Extract sprite image using processor
-        let processor = SpriteProcessor::new(UnityVersion::default());
+        let processor = SpriteProcessor::new(test_version());
         match processor.extract_sprite_image(&sprite, &texture) {
             Ok(sprite_image_data) => {
                 println!(
@@ -161,7 +165,7 @@ fn test_sprite_render_data_extraction() {
     );
 
     // Test extraction using processor
-    let processor = SpriteProcessor::new(UnityVersion::default());
+    let processor = SpriteProcessor::new(test_version());
     match processor.extract_sprite_image(&sprite, &texture) {
         Ok(rect_image_data) => {
             println!("    ✓ Rect extraction: {} bytes", rect_image_data.len());
@@ -272,12 +276,15 @@ fn test_sprite_typetree_texture_pptr_uses_path_id() {
     let obj = unity_asset_decode::object::UnityObject::from_info_and_class(
         unity_asset_decode::asset::ObjectInfo::for_standalone_class(1, 0, 0, 213)
             .expect("valid standalone sprite object"),
-        unity_asset_core::UnityClass::new(213, "Sprite".to_string(), "1".to_string()),
+        unity_asset_core::UnityClass::with_properties(
+            213,
+            "Sprite".to_string(),
+            "1".to_string(),
+            props,
+        ),
     );
-    let mut obj = obj;
-    obj.as_unity_class_mut().update_properties(props);
 
-    let processor = SpriteProcessor::new(UnityVersion::default());
+    let processor = SpriteProcessor::new(test_version());
     let result = processor.parse_sprite(&obj).unwrap();
     assert_eq!(result.sprite.render_data.texture_path_id, 123);
 }
@@ -322,7 +329,7 @@ fn test_sprite_png_export() {
     let png_path = "target/test_sprite_export.png";
 
     // Use processor to extract image and save manually
-    let processor = SpriteProcessor::new(UnityVersion::default());
+    let processor = SpriteProcessor::new(test_version());
     match processor.extract_sprite_image(&sprite, &texture) {
         Ok(png_data) => {
             println!("    ✓ PNG extraction successful");

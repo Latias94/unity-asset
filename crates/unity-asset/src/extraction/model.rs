@@ -1,6 +1,7 @@
 //! Versioned, deterministic extraction requests and inert plans.
 
 use std::cmp::Ordering;
+use std::collections::TryReserveError;
 use std::io::{Read, Write};
 use std::num::NonZeroU64;
 
@@ -8,14 +9,15 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use unity_asset_binary::unity_version::{UnityVersion, UnityVersionType};
 use unity_asset_core::{
-    AssetLoadBudget, BudgetedJsonError, DigestV1, ObjectAddress, ObjectKind, SourceFingerprint,
-    SourceKind, SourceLocator, WorkspaceId, WorkspaceRevision,
+    AssetLoadBudget, BudgetError, BudgetedJsonError, DigestV1, ObjectAddress, ObjectKind,
+    SourceFingerprint, SourceKind, SourceLocator, WorkspaceId, WorkspaceRevision,
+    vec_allocation_bytes,
 };
 use unity_asset_write::artifact::{ArtifactNameError, LogicalArtifactName};
 
+use super::json_contract::{large_contract_limits, read_json_bounded, small_contract_limits};
 use super::manifest::{
-    ExtractionCanonicalError, canonical_digest, canonical_json, read_json_bounded,
-    write_canonical_json,
+    ExtractionCanonicalError, canonical_digest, canonical_json, write_canonical_json,
 };
 pub use super::manifest::{ExtractionDiagnostic, ExtractionDiagnosticCode};
 
@@ -26,6 +28,11 @@ pub const EXTRACTION_REPORT_VERSION: u8 = super::manifest::EXTRACTION_REPORT_VER
 pub const EXTRACTION_REQUEST_CONTRACT: &str = "unity_asset.extraction_request";
 pub const EXTRACTION_PLAN_CONTRACT: &str = "unity_asset.extraction_plan";
 
+const EXTRACTION_REQUEST_JSON_LIMITS: unity_asset_core::ContractJsonLimits =
+    small_contract_limits(EXTRACTION_REQUEST_CONTRACT);
+const EXTRACTION_PLAN_JSON_LIMITS: unity_asset_core::ContractJsonLimits =
+    large_contract_limits(EXTRACTION_PLAN_CONTRACT);
+
 const MAX_SELECTION_PATTERN_BYTES: usize = 4_096;
 const MAX_FILTER_TEXT_BYTES: usize = 4_096;
 const MAX_METADATA_TEXT_BYTES: usize = 64 * 1_024;
@@ -34,28 +41,37 @@ const MAX_AUDIO_EXTENSION_BYTES: usize = 16;
 /// A validated relative output path that has portable filesystem semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExtractionPath {
-    value: String,
-    portability_key: String,
+    name: LogicalArtifactName,
 }
 
 impl ExtractionPath {
     pub fn new(value: impl AsRef<str>) -> Result<Self, ExtractionModelError> {
-        let name = LogicalArtifactName::new(value.as_ref())?;
-        let value = name.as_str().to_owned();
-        let portability_key = name.portability_key().to_owned();
         Ok(Self {
-            value,
-            portability_key,
+            name: LogicalArtifactName::new(value)?,
+        })
+    }
+
+    pub(crate) fn from_string_with_budget(
+        value: String,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, ExtractionModelError> {
+        Ok(Self {
+            name: LogicalArtifactName::from_string_with_budget(value, budget)?,
         })
     }
 
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.value
+        self.name.as_str()
     }
 
     pub(crate) fn portability_key(&self) -> &str {
-        &self.portability_key
+        self.name.portability_key()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_bytes(&self) -> Result<u64, ExtractionModelError> {
+        self.name.retained_bytes().map_err(Into::into)
     }
 }
 
@@ -67,7 +83,7 @@ impl PartialOrd for ExtractionPath {
 
 impl Ord for ExtractionPath {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.value.cmp(&other.value)
+        self.as_str().cmp(other.as_str())
     }
 }
 
@@ -489,7 +505,7 @@ impl ExtractionRequest {
         reader: impl Read,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, BudgetedJsonError> {
-        read_json_bounded(reader, budget)
+        read_json_bounded(reader, budget, EXTRACTION_REQUEST_JSON_LIMITS)
     }
 
     pub fn canonical_json(&self) -> Result<Vec<u8>, ExtractionCanonicalError> {
@@ -984,6 +1000,27 @@ impl ExtractionPlan {
         })
     }
 
+    pub(crate) fn new_budgeted(
+        workspace_id: WorkspaceId,
+        revision: WorkspaceRevision,
+        request: ExtractionRequest,
+        sources: Vec<ExtractionSourceExpectation>,
+        artifacts: Vec<PlannedArtifact>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, ExtractionModelError> {
+        let request_digest = request.digest()?;
+        let sources = normalize_source_expectations(sources)?;
+        validate_planned_artifacts_budgeted(&sources, &artifacts, budget)?;
+        Ok(Self {
+            workspace_id,
+            revision,
+            request,
+            request_digest,
+            sources: sources.into_boxed_slice(),
+            artifacts: artifacts.into_boxed_slice(),
+        })
+    }
+
     #[must_use]
     pub const fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
@@ -1030,7 +1067,7 @@ impl ExtractionPlan {
         reader: impl Read,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, BudgetedJsonError> {
-        read_json_bounded(reader, budget)
+        read_json_bounded(reader, budget, EXTRACTION_PLAN_JSON_LIMITS)
     }
 }
 
@@ -1144,8 +1181,39 @@ fn validate_planned_artifacts(
     sources: &[ExtractionSourceExpectation],
     artifacts: &[PlannedArtifact],
 ) -> Result<(), ExtractionModelError> {
-    let mut addresses = Vec::with_capacity(artifacts.len());
-    let mut paths = Vec::with_capacity(artifacts.len().saturating_mul(2));
+    validate_planned_artifacts_with_budget(sources, artifacts, None)
+}
+
+fn validate_planned_artifacts_budgeted(
+    sources: &[ExtractionSourceExpectation],
+    artifacts: &[PlannedArtifact],
+    budget: &mut AssetLoadBudget,
+) -> Result<(), ExtractionModelError> {
+    validate_planned_artifacts_with_budget(sources, artifacts, Some(budget))
+}
+
+fn validate_planned_artifacts_with_budget(
+    sources: &[ExtractionSourceExpectation],
+    artifacts: &[PlannedArtifact],
+    mut budget: Option<&mut AssetLoadBudget>,
+) -> Result<(), ExtractionModelError> {
+    let path_capacity =
+        artifacts
+            .len()
+            .checked_mul(2)
+            .ok_or(ExtractionModelError::ArithmeticOverflow {
+                resource: "extraction plan validation paths",
+            })?;
+    let mut addresses = validation_vec(
+        artifacts.len(),
+        "extraction plan validation addresses",
+        reborrow_budget(&mut budget),
+    )?;
+    let mut paths = validation_vec(
+        path_capacity,
+        "extraction plan validation paths",
+        reborrow_budget(&mut budget),
+    )?;
     for (index, artifact) in artifacts.iter().enumerate() {
         let expected = u32::try_from(index)
             .map_err(|_| ExtractionModelError::ArtifactCountOverflow { count: index + 1 })?;
@@ -1172,6 +1240,47 @@ fn validate_planned_artifacts(
         ));
     }
     validate_unique_paths(paths)
+}
+
+fn reborrow_budget<'borrow>(
+    budget: &'borrow mut Option<&mut AssetLoadBudget>,
+) -> Option<&'borrow mut AssetLoadBudget> {
+    match budget {
+        Some(budget) => Some(&mut **budget),
+        None => None,
+    }
+}
+
+fn validation_vec<T>(
+    capacity: usize,
+    resource: &'static str,
+    budget: Option<&mut AssetLoadBudget>,
+) -> Result<Vec<T>, ExtractionModelError> {
+    let entries =
+        u64::try_from(capacity).map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
+    let minimum_bytes = vec_allocation_bytes::<T>(capacity)
+        .map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
+    if let Some(budget) = budget.as_deref() {
+        budget.check_entries(entries)?;
+        budget.check_bytes(minimum_bytes)?;
+    }
+
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|source| ExtractionModelError::Allocation {
+            resource,
+            requested: capacity,
+            source,
+        })?;
+    if let Some(budget) = budget {
+        let retained_bytes = vec_allocation_bytes::<T>(values.capacity())
+            .map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
+        budget.check_bytes(retained_bytes)?;
+        budget.consume_entries(entries)?;
+        budget.consume_bytes(retained_bytes)?;
+    }
+    Ok(values)
 }
 
 fn validate_content_sources(
@@ -1479,6 +1588,17 @@ pub enum ExtractionModelError {
     InvalidDiagnosticAddress { ordinal: u32 },
     #[error("extraction paths {first:?} and {second:?} cannot coexist on portable filesystems")]
     DuplicateArtifactPath { first: String, second: String },
+    #[error("arithmetic overflow while validating {resource}")]
+    ArithmeticOverflow { resource: &'static str },
+    #[error("failed to reserve {requested} capacity units for {resource}: {source}")]
+    Allocation {
+        resource: &'static str,
+        requested: usize,
+        #[source]
+        source: TryReserveError,
+    },
+    #[error(transparent)]
+    Budget(#[from] BudgetError),
     #[error(transparent)]
     Canonical(#[from] ExtractionCanonicalError),
 }

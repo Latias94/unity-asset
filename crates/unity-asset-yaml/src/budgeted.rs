@@ -1,15 +1,21 @@
 //! Budgeted Unity YAML parsing for caller-owned source images.
 
 use std::collections::TryReserveError;
+use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::fs::{File, Metadata};
+use std::io::{Read, Seek, SeekFrom};
 use std::mem::size_of;
+use std::path::{Path, PathBuf};
 use std::str::{CharIndices, Utf8Error};
 use std::sync::Arc;
+use std::time::SystemTime;
 
+use same_file::Handle as FileIdentity;
 use thiserror::Error;
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, BudgetedSourceBytes, UnityClass, UnityDocument, UnityValue,
-    YamlAnchor, arc_value_allocation_bytes,
+    AssetLoadBudget, BudgetError, BudgetedSourceBytes, UnityClass, UnityClassHeader, UnityValue,
+    YamlAnchor, arc_slice_allocation_bytes, arc_value_allocation_bytes,
 };
 use yaml_rust2::ScanError;
 use yaml_rust2::parser::{Event, Parser, Tag};
@@ -18,8 +24,28 @@ use yaml_rust2::scanner::{Marker, TScalarStyle};
 use crate::YamlDocument;
 
 const MAX_YAML_DEPTH: u32 = 59;
-const PARSER_WORK_MULTIPLIER: u64 = 6;
-const PARSER_FIXED_WORK_BYTES: u64 = 4 * 1024;
+// These constants bound requested container capacities in the locked parser; they do not claim an
+// exact allocator RSS value or include allocator-private bookkeeping.
+// yaml-rust2 0.11.0 requests four 32-byte strings before scanning each plain scalar. A block scalar's
+// only fixed buffer is smaller (100 bytes), so this covers fixed scanner strings at every site.
+const YAML_RUST2_0_11_FIXED_SCANNER_BYTES_PER_LEXICAL_SITE: u64 = 4 * 32;
+// Token, simple-key, indent, parser-state, anchor, and tag slots are each bounded by 16 machine
+// words in yaml-rust2 0.11.0. One lexical start can account for at most four delayed tokens, one slot
+// in each of three stacks, and one entry in either parser map. Doubling eight slots covers the
+// cumulative requested capacities after geometric growth; the fixed allowance below covers the
+// initial minimum capacities of small containers.
+const YAML_RUST2_0_11_CONTAINER_BYTES_PER_LEXICAL_SITE: u64 = 16 * 16 * size_of::<usize>() as u64;
+const YAML_RUST2_0_11_BYTES_PER_LEXICAL_SITE: u64 =
+    YAML_RUST2_0_11_FIXED_SCANNER_BYTES_PER_LEXICAL_SITE
+        + YAML_RUST2_0_11_CONTAINER_BYTES_PER_LEXICAL_SITE;
+// Scalar contents can pass through four scanner strings, token/event ownership, and one tag clone.
+// Sixteen input-sized byte ranges bound those requested capacities, including geometric growth.
+const YAML_RUST2_0_11_VARIABLE_BYTES_PER_INPUT_BYTE: u64 = 16;
+// The scanner's flow level is a u8 and the adapter rejects retained depth 60. At 64-bit pointer
+// width, two-times geometric growth for 256 simple keys plus 60 parser states and 60 indents stays
+// below 96 KiB using the 16-word slot bound. Round up for fixed control/error allocations; any
+// unresolved source-proportional nesting is covered by the per-site term above.
+const YAML_RUST2_0_11_FIXED_CONTAINER_BYTES: u64 = 128 * 1024;
 const UNITY_TAG_PREFIX: &str = "tag:unity3d.com,2011:";
 const UNITY_DOCUMENT_CLASS_NAME: &str = "YamlDocument";
 
@@ -50,12 +76,31 @@ impl BudgetedYamlSource {
         self.budgeted_encoded.validate_budget(budget)?;
         Ok((self.budgeted_encoded, self.document))
     }
+
+    fn attach_path(&mut self, path: PathBuf) {
+        let document = Arc::get_mut(&mut self.document)
+            .expect("a newly parsed YAML source uniquely owns its document");
+        document.set_file_path(path);
+    }
 }
 
 /// Typed failures produced while parsing a budgeted Unity YAML source.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum BudgetedYamlError {
+    #[error("failed to {operation} YAML source {path:?}: {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "YAML source {path:?} has length {length}, which cannot fit in memory on this platform"
+    )]
+    SourceTooLarge { path: PathBuf, length: u64 },
+    #[error("YAML source changed while it was being read: {path:?}")]
+    SourceChanged { path: PathBuf },
     #[error("Unity YAML input is not valid UTF-8 at byte {valid_up_to}: {source}")]
     InvalidUtf8 {
         valid_up_to: usize,
@@ -116,8 +161,7 @@ use BudgetedYamlError as YamlAdapterError;
 
 /// Parses an unaccounted YAML image and charges its shared allocation to `budget`.
 ///
-/// Parsing uses an iterative event stream and does not materialize an intermediate
-/// `serde_yaml::Value`.
+/// Parsing uses an iterative event stream and does not materialize an intermediate value tree.
 pub fn parse_budgeted_yaml_source(
     encoded: Arc<[u8]>,
     budget: &mut AssetLoadBudget,
@@ -134,18 +178,18 @@ pub fn parse_prebudgeted_yaml_source(
     budget: &mut AssetLoadBudget,
 ) -> Result<BudgetedYamlSource, BudgetedYamlError> {
     let encoded = budgeted_encoded.clone_backing(budget)?;
-    charge_parser_work(encoded.len(), budget)?;
     let input = std::str::from_utf8(&encoded).map_err(|source| YamlAdapterError::InvalidUtf8 {
         valid_up_to: source.valid_up_to(),
         source,
     })?;
+    charge_yaml_rust2_allocation_envelope(input, budget)?;
 
     let headers = scan_headers(input, budget)?;
     let parser_input = StrippedHeaderChars::new(input, &headers)?;
     // Unity declares `!u!` once at the beginning of a multi-document file and reuses it for every
     // following document, despite standard YAML limiting tag directives to one document.
     let mut parser = Parser::new(parser_input).keep_tags(true);
-    let mut document = YamlDocument::new();
+    let mut document_entries = Vec::new();
     let mut document_capacity = 0;
     let mut header_cursor = 0;
     let mut document_ordinal = 0_u64;
@@ -184,7 +228,7 @@ pub fn parse_prebudgeted_yaml_source(
                     .take()
                     .ok_or_else(|| invalid_document(mark, "document end without a start"))?;
                 let class = builder.finish(document_ordinal, budget, mark)?;
-                push_document_entry(&mut document, &mut document_capacity, class, budget)?;
+                push_document_entry(&mut document_entries, &mut document_capacity, class, budget)?;
                 document_ordinal =
                     document_ordinal
                         .checked_add(1)
@@ -223,11 +267,341 @@ pub fn parse_prebudgeted_yaml_source(
         .map_err(|_| BudgetError::ArithmeticOverflow { resource: "bytes" })?;
     budget.check_bytes(document_allocation)?;
     budget.consume_bytes(document_allocation)?;
+    let document = YamlDocument::from_entries(document_entries);
     Ok(BudgetedYamlSource {
         encoded,
         budgeted_encoded,
         document: Arc::new(document),
     })
+}
+
+/// Opens, verifies, accounts, and parses one YAML file under a caller-owned budget.
+///
+/// The file length is checked before allocation. The implementation then reads the file twice
+/// through the same handle and rejects truncation, growth, replacement, or same-length content
+/// changes before parsing the already-accounted source image.
+pub fn load_budgeted_yaml_path(
+    path: impl AsRef<Path>,
+    budget: &mut AssetLoadBudget,
+) -> Result<BudgetedYamlSource, BudgetedYamlError> {
+    let path = path.as_ref();
+    let mut file = File::open(path).map_err(|source| io_error("open", path, source))?;
+    let before = file
+        .metadata()
+        .map_err(|source| io_error("inspect", path, source))?;
+    let before = SourceMetadata::from_metadata(&before);
+    let encoded = read_budgeted_yaml_image(&mut file, path, before.length, budget)?;
+    verify_open_file_binding(file, path, before)?;
+
+    let mut source = parse_prebudgeted_yaml_source(encoded, budget)?;
+    source.attach_path(clone_path_budgeted(path, budget)?);
+    Ok(source)
+}
+
+/// Asynchronously opens, verifies, accounts, and parses one YAML file.
+#[cfg(feature = "async")]
+pub async fn load_budgeted_yaml_path_async<P>(
+    path: P,
+    budget: &mut AssetLoadBudget,
+) -> Result<BudgetedYamlSource, BudgetedYamlError>
+where
+    P: AsRef<Path> + Send + Sync,
+{
+    let path = path.as_ref();
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|source| io_error("open", path, source))?;
+    let before = file
+        .metadata()
+        .await
+        .map_err(|source| io_error("inspect", path, source))?;
+    let before = SourceMetadata::from_metadata(&before);
+    let encoded = read_budgeted_yaml_image_async(&mut file, path, before.length, budget).await?;
+    verify_open_file_binding_async(file, path, before).await?;
+
+    let mut source = parse_prebudgeted_yaml_source(encoded, budget)?;
+    source.attach_path(clone_path_budgeted(path, budget)?);
+    Ok(source)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceMetadata {
+    length: u64,
+    modified: Option<SystemTime>,
+}
+
+impl SourceMetadata {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+}
+
+fn verify_open_file_binding(
+    file: File,
+    path: &Path,
+    before: SourceMetadata,
+) -> Result<(), BudgetedYamlError> {
+    let after = file
+        .metadata()
+        .map_err(|source| io_error("reinspect", path, source))?;
+    let opened_identity = FileIdentity::from_file(file)
+        .map_err(|source| io_error("identify opened", path, source))?;
+    let current_identity = FileIdentity::from_path(path)
+        .map_err(|source| io_error("identify current", path, source))?;
+    let current = current_identity
+        .as_file()
+        .metadata()
+        .map_err(|source| io_error("reinspect path for", path, source))?;
+
+    if before != SourceMetadata::from_metadata(&after)
+        || before != SourceMetadata::from_metadata(&current)
+        || opened_identity != current_identity
+    {
+        return Err(source_changed(path));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+async fn verify_open_file_binding_async(
+    file: tokio::fs::File,
+    path: &Path,
+    before: SourceMetadata,
+) -> Result<(), BudgetedYamlError> {
+    let after = file
+        .metadata()
+        .await
+        .map_err(|source| io_error("reinspect", path, source))?;
+    let current_file = tokio::fs::File::open(path)
+        .await
+        .map_err(|source| io_error("reopen current", path, source))?;
+    let current = current_file
+        .metadata()
+        .await
+        .map_err(|source| io_error("reinspect path for", path, source))?;
+
+    if before != SourceMetadata::from_metadata(&after)
+        || before != SourceMetadata::from_metadata(&current)
+    {
+        return Err(source_changed(path));
+    }
+
+    let opened_file = file.into_std().await;
+    let current_file = current_file.into_std().await;
+    let same_identity = tokio::task::spawn_blocking(move || {
+        let opened_identity = FileIdentity::from_file(opened_file)?;
+        let current_identity = FileIdentity::from_file(current_file)?;
+        Ok::<_, std::io::Error>(opened_identity == current_identity)
+    })
+    .await
+    .map_err(|source| {
+        io_error(
+            "join identity check for",
+            path,
+            std::io::Error::other(source),
+        )
+    })?
+    .map_err(|source| io_error("compare identity for", path, source))?;
+    if !same_identity {
+        return Err(source_changed(path));
+    }
+    Ok(())
+}
+
+fn read_budgeted_yaml_image(
+    reader: &mut (impl Read + Seek),
+    path: &Path,
+    length: u64,
+    budget: &mut AssetLoadBudget,
+) -> Result<BudgetedSourceBytes, BudgetedYamlError> {
+    let length_usize = checked_source_length(path, length)?;
+    preflight_source_image(length, length_usize, budget)?;
+
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length_usize)
+        .map_err(|source| YamlAdapterError::AllocationFailed {
+            context: "YAML source image",
+            requested: length_usize,
+            source,
+        })?;
+    budget.consume_bytes(length)?;
+    bytes.resize(length_usize, 0);
+    read_exact_stable(reader, &mut bytes, path)?;
+    verify_stable_contents(reader, &bytes, path, budget)?;
+    BudgetedSourceBytes::from_vec(bytes, budget).map_err(YamlAdapterError::from)
+}
+
+#[cfg(feature = "async")]
+async fn read_budgeted_yaml_image_async(
+    reader: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin),
+    path: &Path,
+    length: u64,
+    budget: &mut AssetLoadBudget,
+) -> Result<BudgetedSourceBytes, BudgetedYamlError> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let length_usize = checked_source_length(path, length)?;
+    preflight_source_image(length, length_usize, budget)?;
+
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length_usize)
+        .map_err(|source| YamlAdapterError::AllocationFailed {
+            context: "YAML source image",
+            requested: length_usize,
+            source,
+        })?;
+    budget.consume_bytes(length)?;
+    bytes.resize(length_usize, 0);
+    reader
+        .read_exact(&mut bytes)
+        .await
+        .map_err(|source| stable_read_error(path, source))?;
+
+    budget.consume_bytes(length)?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .await
+        .map_err(|source| io_error("seek", path, source))?;
+    let mut verified = 0;
+    let mut chunk = [0_u8; 64 * 1024];
+    while verified < bytes.len() {
+        let count = chunk.len().min(bytes.len() - verified);
+        reader
+            .read_exact(&mut chunk[..count])
+            .await
+            .map_err(|source| stable_read_error(path, source))?;
+        if chunk[..count] != bytes[verified..verified + count] {
+            return Err(source_changed(path));
+        }
+        verified += count;
+    }
+    let mut trailing = [0_u8; 1];
+    if reader
+        .read(&mut trailing)
+        .await
+        .map_err(|source| io_error("verify", path, source))?
+        != 0
+    {
+        return Err(source_changed(path));
+    }
+
+    BudgetedSourceBytes::from_vec(bytes, budget).map_err(YamlAdapterError::from)
+}
+
+fn checked_source_length(path: &Path, length: u64) -> Result<usize, BudgetedYamlError> {
+    usize::try_from(length).map_err(|_| YamlAdapterError::SourceTooLarge {
+        path: path.to_path_buf(),
+        length,
+    })
+}
+
+fn preflight_source_image(
+    length: u64,
+    length_usize: usize,
+    budget: &AssetLoadBudget,
+) -> Result<(), BudgetedYamlError> {
+    let retained_bytes = arc_slice_allocation_bytes::<u8>(length_usize).map_err(|_| {
+        BudgetError::ArithmeticOverflow {
+            resource: "YAML source image",
+        }
+    })?;
+    let planned_bytes = length
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(retained_bytes))
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "YAML source image",
+        })?;
+    budget.check_bytes(planned_bytes)?;
+    Ok(())
+}
+
+fn verify_stable_contents(
+    reader: &mut (impl Read + Seek),
+    expected: &[u8],
+    path: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), BudgetedYamlError> {
+    budget.consume_bytes(usize_to_u64(expected.len())?)?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| io_error("seek", path, source))?;
+
+    let mut verified = 0;
+    let mut chunk = [0_u8; 64 * 1024];
+    while verified < expected.len() {
+        let count = chunk.len().min(expected.len() - verified);
+        read_exact_stable(reader, &mut chunk[..count], path)?;
+        if chunk[..count] != expected[verified..verified + count] {
+            return Err(source_changed(path));
+        }
+        verified += count;
+    }
+
+    let mut trailing = [0_u8; 1];
+    if reader
+        .read(&mut trailing)
+        .map_err(|source| io_error("verify", path, source))?
+        != 0
+    {
+        return Err(source_changed(path));
+    }
+    Ok(())
+}
+
+fn read_exact_stable(
+    reader: &mut impl Read,
+    bytes: &mut [u8],
+    path: &Path,
+) -> Result<(), BudgetedYamlError> {
+    reader
+        .read_exact(bytes)
+        .map_err(|source| stable_read_error(path, source))
+}
+
+fn stable_read_error(path: &Path, source: std::io::Error) -> BudgetedYamlError {
+    if source.kind() == std::io::ErrorKind::UnexpectedEof {
+        source_changed(path)
+    } else {
+        io_error("read", path, source)
+    }
+}
+
+fn io_error(operation: &'static str, path: &Path, source: std::io::Error) -> BudgetedYamlError {
+    YamlAdapterError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn source_changed(path: &Path) -> BudgetedYamlError {
+    YamlAdapterError::SourceChanged {
+        path: path.to_path_buf(),
+    }
+}
+
+fn clone_path_budgeted(
+    path: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<PathBuf, BudgetedYamlError> {
+    let requested = path.as_os_str().len();
+    budget.check_bytes(usize_to_u64(requested)?)?;
+    let mut owned = OsString::new();
+    owned
+        .try_reserve_exact(requested)
+        .map_err(|source| YamlAdapterError::AllocationFailed {
+            context: "YAML source path",
+            requested,
+            source,
+        })?;
+    budget.consume_bytes(usize_to_u64(requested)?)?;
+    owned.push(path);
+    Ok(PathBuf::from(owned))
 }
 
 fn current_builder<'a, 'input>(
@@ -239,18 +613,79 @@ fn current_builder<'a, 'input>(
         .ok_or_else(|| invalid_document(mark, "node event outside a document"))
 }
 
-fn charge_parser_work(
-    encoded_len: usize,
+fn charge_yaml_rust2_allocation_envelope(
+    input: &str,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), YamlAdapterError> {
-    let encoded = usize_to_u64(encoded_len)?;
-    let parser_work = encoded
-        .checked_mul(PARSER_WORK_MULTIPLIER)
-        .and_then(|value| value.checked_add(PARSER_FIXED_WORK_BYTES))
-        .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
-    budget.check_bytes(parser_work)?;
-    budget.consume_bytes(parser_work)?;
+    let envelope = yaml_rust2_allocation_envelope(input)?;
+    budget.check_bytes(envelope)?;
+    budget.consume_bytes(envelope)?;
     Ok(())
+}
+
+fn yaml_rust2_allocation_envelope(input: &str) -> Result<u64, YamlAdapterError> {
+    let encoded = usize_to_u64(input.len())?;
+    let lexical_sites = yaml_lexical_allocation_sites(input)?;
+    let lexical_capacity = lexical_sites
+        .checked_mul(YAML_RUST2_0_11_BYTES_PER_LEXICAL_SITE)
+        .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+    let variable_capacity = encoded
+        .checked_mul(YAML_RUST2_0_11_VARIABLE_BYTES_PER_INPUT_BYTE)
+        .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+    let envelope = lexical_capacity
+        .checked_add(variable_capacity)
+        .and_then(|value| value.checked_add(YAML_RUST2_0_11_FIXED_CONTAINER_BYTES))
+        .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+    Ok(envelope)
+}
+
+// Each yaml-rust2 scalar scanner starts at the stream beginning or after YAML separation or an
+// indicator. Counting every nonblank character at those positions therefore over-approximates
+// allocation-producing lexical starts, including malformed input and continuation-line words.
+fn yaml_lexical_allocation_sites(input: &str) -> Result<u64, YamlAdapterError> {
+    let mut sites = 0_u64;
+    let mut previous_is_boundary = true;
+    for character in input.chars() {
+        let blank_or_break = is_yaml_blank_or_break(character);
+        if !blank_or_break && previous_is_boundary {
+            sites = sites
+                .checked_add(1)
+                .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+        }
+        previous_is_boundary = blank_or_break || is_yaml_indicator(character);
+    }
+    Ok(sites)
+}
+
+const fn is_yaml_blank_or_break(character: char) -> bool {
+    matches!(
+        character,
+        ' ' | '\t' | '\r' | '\n' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+const fn is_yaml_indicator(character: char) -> bool {
+    matches!(
+        character,
+        '-' | '?'
+            | ':'
+            | ','
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '#'
+            | '&'
+            | '*'
+            | '!'
+            | '|'
+            | '>'
+            | '\''
+            | '"'
+            | '%'
+            | '@'
+            | '`'
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -297,11 +732,10 @@ fn scan_headers<'a>(
 }
 
 fn validate_tag_directive(line: &str, line_number: usize) -> Result<(), YamlAdapterError> {
-    let trimmed = line.trim_start_matches([' ', '\t']);
-    if !trimmed.starts_with("%TAG") {
+    if line != "%TAG" && !line.starts_with("%TAG ") && !line.starts_with("%TAG\t") {
         return Ok(());
     }
-    let mut tokens = HeaderTokens::new(trimmed);
+    let mut tokens = HeaderTokens::new(line);
     let directive = tokens.next().map(|token| token.text);
     let handle = tokens.next().map(|token| token.text);
     let prefix = tokens.next().map(|token| token.text);
@@ -323,6 +757,9 @@ fn parse_header_line<'a>(
     absolute_start: usize,
     line_number: usize,
 ) -> Result<Option<DocumentHeader<'a>>, YamlAdapterError> {
+    if !line.starts_with("---") {
+        return Ok(None);
+    }
     let mut tokens = HeaderTokens::new(line);
     let Some(document_start) = tokens.next() else {
         return Ok(None);
@@ -897,6 +1334,9 @@ fn parse_scalar(
 }
 
 fn parse_plain_number(value: &str) -> Option<UnityValue> {
+    if is_multi_digit_zero_prefixed_decimal(value) {
+        return None;
+    }
     if let Some(hex) = value.strip_prefix("0x") {
         return parse_radix_number(hex, 16);
     }
@@ -913,6 +1353,13 @@ fn parse_plain_number(value: &str) -> Option<UnityValue> {
         return value.parse::<f64>().ok().map(UnityValue::Float);
     }
     None
+}
+
+fn is_multi_digit_zero_prefixed_decimal(value: &str) -> bool {
+    let unsigned = value.strip_prefix(['-', '+']).unwrap_or(value);
+    unsigned.len() > 1
+        && unsigned.starts_with('0')
+        && unsigned.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn parse_radix_number(value: &str, radix: u32) -> Option<UnityValue> {
@@ -954,12 +1401,15 @@ fn finish_unity_document(
     };
 
     let anchor = clone_string_budgeted(header.anchor, budget, "Unity YAML object anchor")?;
-    let mut class = UnityClass::with_properties(header.class_id, class_name, anchor, properties);
-    if header.stripped_range.is_some() {
-        class.extra_anchor_data =
-            clone_string_budgeted("stripped", budget, "Unity YAML anchor metadata")?;
-    }
-    Ok(class)
+    let extra_anchor_data = if header.stripped_range.is_some() {
+        clone_string_budgeted("stripped", budget, "Unity YAML anchor metadata")?
+    } else {
+        String::new()
+    };
+    Ok(UnityClass::from_parts(
+        UnityClassHeader::new(header.class_id, class_name, anchor, extra_anchor_data),
+        properties,
+    ))
 }
 
 fn finish_plain_document(
@@ -1006,21 +1456,21 @@ fn document_anchor(ordinal: u64, budget: &mut AssetLoadBudget) -> Result<String,
 }
 
 fn push_document_entry(
-    document: &mut YamlDocument,
+    entries: &mut Vec<UnityClass>,
     accounted_capacity: &mut usize,
     class: UnityClass,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), YamlAdapterError> {
     budget.check_members(1)?;
     reserve_budgeted_vec(
-        document.entries_mut(),
+        entries,
         accounted_capacity,
         1,
         budget,
         "Unity YAML document entries",
     )?;
     budget.consume_members(1)?;
-    document.add_entry(class);
+    entries.push(class);
     Ok(())
 }
 
@@ -1154,6 +1604,10 @@ fn invalid_document(mark: Marker, reason: &'static str) -> YamlAdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::fs::FileTimes;
+    #[cfg(unix)]
+    use std::io::Write as _;
     use unity_asset_core::{AssetLoadLimits, UnityDocument, arc_slice_allocation_bytes};
 
     fn parse(input: impl AsRef<[u8]>) -> Result<BudgetedYamlSource, BudgetedYamlError> {
@@ -1169,6 +1623,132 @@ mod tests {
                 Err(error) => return error,
             }
         }
+    }
+
+    struct ChangingReader {
+        initial: std::io::Cursor<&'static [u8]>,
+        changed: std::io::Cursor<&'static [u8]>,
+        verifying: bool,
+    }
+
+    impl Read for ChangingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.verifying {
+                self.changed.read(buffer)
+            } else {
+                self.initial.read(buffer)
+            }
+        }
+    }
+
+    impl Seek for ChangingReader {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.verifying = true;
+            self.changed.seek(position)
+        }
+    }
+
+    #[cfg(unix)]
+    fn replace_file_preserving_observed_metadata(
+        path: &Path,
+        replacement: &Path,
+        replacement_bytes: &[u8],
+        before: SourceMetadata,
+    ) {
+        assert_eq!(
+            u64::try_from(replacement_bytes.len()).unwrap(),
+            before.length
+        );
+        let mut replacement_file = File::create(replacement).unwrap();
+        replacement_file.write_all(replacement_bytes).unwrap();
+        replacement_file
+            .set_times(
+                FileTimes::new().set_modified(
+                    before
+                        .modified
+                        .expect("Unix file metadata should expose a modification time"),
+                ),
+            )
+            .unwrap();
+        drop(replacement_file);
+        std::fs::rename(replacement, path).unwrap();
+
+        assert_eq!(
+            SourceMetadata::from_metadata(&std::fs::metadata(path).unwrap()),
+            before,
+            "the replacement must defeat a length-and-mtime-only check"
+        );
+    }
+
+    #[test]
+    fn source_reader_rejects_growth_and_truncation() {
+        let path = Path::new("changing.yaml");
+
+        let mut grown = std::io::Cursor::new(b"five!".as_slice());
+        let mut grown_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            read_budgeted_yaml_image(&mut grown, path, 4, &mut grown_budget),
+            Err(YamlAdapterError::SourceChanged { .. })
+        ));
+
+        let mut truncated = std::io::Cursor::new(b"four".as_slice());
+        let mut truncated_budget = AssetLoadBudget::default();
+        assert!(matches!(
+            read_budgeted_yaml_image(&mut truncated, path, 5, &mut truncated_budget),
+            Err(YamlAdapterError::SourceChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn source_reader_rejects_same_length_content_change() {
+        let mut reader = ChangingReader {
+            initial: std::io::Cursor::new(b"four".as_slice()),
+            changed: std::io::Cursor::new(b"five".as_slice()),
+            verifying: false,
+        };
+        let mut budget = AssetLoadBudget::default();
+
+        assert!(matches!(
+            read_budgeted_yaml_image(&mut reader, Path::new("changing.yaml"), 4, &mut budget,),
+            Err(YamlAdapterError::SourceChanged { .. })
+        ));
+        assert_eq!(budget.usage().bytes, 8);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synchronous_binding_rejects_same_length_same_mtime_atomic_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.yaml");
+        let replacement = directory.path().join("replacement.yaml");
+        std::fs::write(&path, b"root: old!\n").unwrap();
+        let file = File::open(&path).unwrap();
+        let before = SourceMetadata::from_metadata(&file.metadata().unwrap());
+
+        replace_file_preserving_observed_metadata(&path, &replacement, b"root: new!\n", before);
+
+        assert!(matches!(
+            verify_open_file_binding(file, &path, before),
+            Err(YamlAdapterError::SourceChanged { .. })
+        ));
+    }
+
+    #[cfg(all(unix, feature = "async"))]
+    #[tokio::test]
+    async fn asynchronous_binding_rejects_same_length_same_mtime_atomic_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.yaml");
+        let replacement = directory.path().join("replacement.yaml");
+        std::fs::write(&path, b"root: old!\n").unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let before = SourceMetadata::from_metadata(&file.metadata().await.unwrap());
+
+        replace_file_preserving_observed_metadata(&path, &replacement, b"root: new!\n", before);
+
+        assert!(matches!(
+            verify_open_file_binding_async(file, &path, before).await,
+            Err(YamlAdapterError::SourceChanged { .. })
+        ));
     }
 
     #[test]
@@ -1198,9 +1778,9 @@ MonoBehaviour:
         assert_eq!(parsed.encoded().as_ref(), input.as_bytes());
         let entries = parsed.document().entries();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].class_id, 1);
-        assert_eq!(entries[0].class_name, "GameObject");
-        assert_eq!(entries[0].anchor, "42");
+        assert_eq!(entries[0].class_id(), 1);
+        assert_eq!(entries[0].class_name(), "GameObject");
+        assert_eq!(entries[0].anchor(), "42");
         assert!(matches!(entries[0].get("empty"), Some(UnityValue::Null)));
         assert!(matches!(
             entries[0].get("signed"),
@@ -1228,8 +1808,93 @@ MonoBehaviour:
             entries[0].get("folded").and_then(UnityValue::as_str),
             Some("first second")
         );
-        assert_eq!(entries[1].extra_anchor_data, "stripped");
-        assert_eq!(entries[1].anchor, "9001");
+        assert_eq!(entries[1].extra_anchor_data(), "stripped");
+        assert_eq!(entries[1].anchor(), "9001");
+    }
+
+    #[test]
+    fn preserves_zero_prefixed_decimals_without_changing_other_number_forms() {
+        let input = r#"root:
+  zero: 0
+  positiveZero: +0
+  negativeZero: -0
+  positivePadded: +0012
+  negativePadded: -0012
+  padded: 0012
+  allZeroPadded: 00000000
+  float: 0.0
+  hexadecimal: 0x10
+  octal: 0o10
+  hexadecimalPrefix: 0x
+  octalPrefix: 0o
+  scientific: 0e2
+"#;
+
+        let parsed = parse(input).unwrap();
+        let root = parsed.document().entries()[0]
+            .get("root")
+            .and_then(UnityValue::as_object)
+            .unwrap();
+        assert_eq!(root.get("zero").and_then(UnityValue::as_i64), Some(0));
+        assert_eq!(
+            root.get("positiveZero").and_then(UnityValue::as_i64),
+            Some(0)
+        );
+        assert_eq!(
+            root.get("negativeZero").and_then(UnityValue::as_i64),
+            Some(0)
+        );
+        for (field, expected) in [
+            ("positivePadded", "+0012"),
+            ("negativePadded", "-0012"),
+            ("padded", "0012"),
+            ("allZeroPadded", "00000000"),
+            ("hexadecimalPrefix", "0x"),
+            ("octalPrefix", "0o"),
+        ] {
+            assert_eq!(root.get(field).and_then(UnityValue::as_str), Some(expected));
+        }
+        assert!(matches!(root.get("float"), Some(UnityValue::Float(value)) if *value == 0.0));
+        assert_eq!(
+            root.get("hexadecimal").and_then(UnityValue::as_i64),
+            Some(16)
+        );
+        assert_eq!(root.get("octal").and_then(UnityValue::as_i64), Some(8));
+        assert!(matches!(root.get("scientific"), Some(UnityValue::Float(value)) if *value == 0.0));
+    }
+
+    #[test]
+    fn block_scalar_content_that_looks_like_stream_headers_is_not_prescanned() {
+        let input = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &1
+MonoBehaviour:
+  text: |-
+    %TAG !other! tag:example.com,2026:
+    --- !u!1 &2
+"#;
+
+        let parsed = parse(input).unwrap();
+        assert_eq!(
+            parsed.document().entries()[0]
+                .get("text")
+                .and_then(UnityValue::as_str),
+            Some("%TAG !other! tag:example.com,2026:\n--- !u!1 &2")
+        );
+    }
+
+    #[test]
+    fn empty_stream_is_allowed_but_empty_or_trailing_documents_are_rejected() {
+        assert!(parse("").unwrap().document().entries().is_empty());
+        assert!(matches!(
+            parse("---\n"),
+            Err(YamlAdapterError::InvalidDocument { .. })
+        ));
+        assert!(matches!(
+            parse("---\nroot: value\n---\n"),
+            Err(YamlAdapterError::InvalidDocument { .. })
+        ));
+        assert!(parse("root: value\ntrailing").is_err());
     }
 
     #[test]
@@ -1252,8 +1917,111 @@ MonoBehaviour:
         assert_eq!(virtual_error.info(), materialized_error.info());
     }
 
+    fn assert_dense_parser_budget_boundary(input: &str, minimum_scalar_sites: u64) {
+        let lexical_sites = yaml_lexical_allocation_sites(input).unwrap();
+        assert!(lexical_sites >= minimum_scalar_sites);
+        let envelope = yaml_rust2_allocation_envelope(input).unwrap();
+        assert!(envelope >= minimum_scalar_sites * YAML_RUST2_0_11_BYTES_PER_LEXICAL_SITE);
+        let mut at_envelope = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: envelope,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        charge_yaml_rust2_allocation_envelope(input, &mut at_envelope).unwrap();
+        assert_eq!(at_envelope.usage().bytes, envelope);
+
+        let mut one_short_envelope = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: envelope - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            charge_yaml_rust2_allocation_envelope(input, &mut one_short_envelope),
+            Err(YamlAdapterError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            })) if limit == envelope - 1 && requested == envelope
+        ));
+        assert_eq!(one_short_envelope.usage().bytes, 0);
+
+        let source_allocation = arc_slice_allocation_bytes::<u8>(input.len()).unwrap();
+        let before_parser = source_allocation.checked_add(envelope).unwrap();
+        let mut rejected_before_parser = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: before_parser - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            parse_budgeted_yaml_source(
+                Arc::from(input.as_bytes()),
+                &mut rejected_before_parser,
+            ),
+            Err(YamlAdapterError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            })) if limit == before_parser - 1 && requested == before_parser
+        ));
+        assert_eq!(rejected_before_parser.usage().bytes, source_allocation);
+
+        let encoded: Arc<[u8]> = Arc::from(input.as_bytes());
+        let mut probe = AssetLoadBudget::default();
+        parse_budgeted_yaml_source(Arc::clone(&encoded), &mut probe).unwrap();
+        let reported_boundary = probe.usage().bytes;
+        let mut exact_reported_boundary = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: reported_boundary,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        parse_budgeted_yaml_source(Arc::clone(&encoded), &mut exact_reported_boundary).unwrap();
+        assert_eq!(exact_reported_boundary.usage().bytes, reported_boundary);
+
+        let mut one_short_reported_boundary = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: reported_boundary - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            parse_budgeted_yaml_source(encoded, &mut one_short_reported_boundary),
+            Err(YamlAdapterError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                ..
+            })) if limit == reported_boundary - 1
+        ));
+    }
+
     #[test]
-    fn large_stripped_yaml_uses_one_backing_and_an_exact_budget() {
+    fn dense_single_character_sequence_has_a_preconstructed_parser_envelope() {
+        let mut input = String::from("root: [");
+        for index in 0..4096 {
+            if index != 0 {
+                input.push(',');
+            }
+            input.push('a');
+        }
+        input.push_str("]\n");
+
+        assert_dense_parser_budget_boundary(&input, 4096);
+    }
+
+    #[test]
+    fn dense_single_character_mappings_have_a_preconstructed_parser_envelope() {
+        let mut input = String::from("root: [");
+        for index in 0..1024 {
+            if index != 0 {
+                input.push(',');
+            }
+            input.push_str("{a: a}");
+        }
+        input.push_str("]\n");
+
+        assert_dense_parser_budget_boundary(&input, 2048);
+    }
+
+    #[test]
+    fn large_stripped_yaml_uses_one_backing_and_a_reported_budget_boundary() {
         let payload = "x".repeat(128 * 1024);
         let stripped = format!(
             "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!114 &9001 stripped\nMonoBehaviour:\n  payload: {payload}\n"
@@ -1269,9 +2037,13 @@ MonoBehaviour:
 
         let mut plain_budget = AssetLoadBudget::default();
         parse_budgeted_yaml_source(Arc::from(plain.as_bytes()), &mut plain_budget).unwrap();
+        let envelope_difference = yaml_rust2_allocation_envelope(&stripped).unwrap()
+            - yaml_rust2_allocation_envelope(&plain).unwrap();
         assert_eq!(
             stripped_budget.usage().bytes,
-            plain_budget.usage().bytes + u64::try_from("stripped".len()).unwrap(),
+            plain_budget.usage().bytes
+                + envelope_difference
+                + u64::try_from("stripped".len()).unwrap(),
             "the stripped parser view must not charge a second input-sized backing"
         );
 
@@ -1376,9 +2148,9 @@ MonoBehaviour:
             parse("fileFormatVersion: 2\nguid: abcdef\nPluginImporter:\n  serializedVersion: 3\n")
                 .unwrap();
         let entry = &parsed.document().entries()[0];
-        assert_eq!(entry.class_id, 0);
-        assert_eq!(entry.class_name, UNITY_DOCUMENT_CLASS_NAME);
-        assert_eq!(entry.anchor, "doc_0");
+        assert_eq!(entry.class_id(), 0);
+        assert_eq!(entry.class_name(), UNITY_DOCUMENT_CLASS_NAME);
+        assert_eq!(entry.anchor(), "doc_0");
         assert_eq!(
             entry.get("fileFormatVersion").and_then(UnityValue::as_i64),
             Some(2)

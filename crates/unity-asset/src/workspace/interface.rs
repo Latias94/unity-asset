@@ -1,8 +1,8 @@
 //! Authoritative workspace mutation boundary.
 
+use std::collections::HashMap;
 use std::fmt;
-use std::fs::File;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,13 +10,12 @@ use std::sync::Arc;
 use unity_asset_binary::asset::{ObjectInfo, SerializedFile, SerializedType};
 use unity_asset_binary::typetree::{
     CompositeTypeTreeRegistry, TypeTree, TypeTreeNode, TypeTreeParseMode, TypeTreeParseOptions,
-    TypeTreeRegistry,
+    TypeTreeRegistry, TypeTreeSchema, TypeTreeSemanticDigestError,
 };
-#[cfg(test)]
-use unity_asset_core::arc_slice_allocation_bytes;
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, BudgetedSourceBytes, SourceAlias, SourceId, SourceKind,
-    SourceMemberId, UnityClass, UnityDocument, WorkspaceId, WorkspaceRevision, YamlAnchor,
+    AssetLoadBudget, BudgetError, BudgetedSourceBytes, DigestBuildError, DigestV1, DigestV1Builder,
+    SourceAlias, SourceFingerprint, SourceId, SourceKind, SourceMemberId, UnityClass,
+    UnityDocument, WorkspaceId, WorkspaceRevision, YamlAnchor, arc_slice_allocation_bytes,
     arc_value_allocation_bytes,
 };
 use unity_asset_yaml::YamlDocument;
@@ -29,8 +28,20 @@ use super::adapter::binary::{
     BinaryPayload, BinaryWorkspaceAdapter,
 };
 use super::adapter::yaml::{YamlAdapterError, parse_prebudgeted_yaml_source};
+use super::inspection::{
+    AssetBundleSummary, SerializedFileSummary, WebFileSummary, WorkspaceSourceFormatInspection,
+};
 use super::snapshot::WorkspaceSnapshot;
-use super::source_catalog::{PhysicalOrigin, SourceDescriptor};
+use super::source_admission::{
+    SourceAdmissionBatch, SourceAdmissionBatchAllocationError, SourceAdmissionBatchPhase,
+    SourceAdmissionBatchPushError, SourceAdmissionDisposition, SourceAdmissionError,
+    SourceAdmissionFailure, SourceAdmissionOperation, SourceAdmissionOperationLocation,
+    SourceAdmissionOutcome, SourceAdmissionPolicy, SourceAdmissionRejection, SourceAdmissionReport,
+};
+use super::source_catalog::{
+    CatalogError, PhysicalOrigin, RootAdmissionDecision, SourceDescriptor, open_verified_file,
+    physical_file_identity, physical_file_identity_from_path,
+};
 use super::state::WorkspaceState;
 use super::store::{FrozenSourceParse, SourceStore};
 use super::view::{
@@ -158,15 +169,25 @@ impl SourceOpenRequest {
     pub const fn kind_hint(&self) -> Option<SourceKind> {
         self.kind_hint
     }
+
+    pub(crate) fn retained_admission_bytes(&self) -> Result<u64, BudgetError> {
+        self.path
+            .capacity()
+            .checked_add(self.alias.retained_owned_bytes())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(BudgetError::ArithmeticOverflow {
+                resource: "source admission operation metadata",
+            })
+    }
 }
 
 enum SourceImageInput {
+    Path,
     Unaccounted(Arc<[u8]>),
     Budgeted(BudgetedSourceBytes),
 }
 
 /// Mutable owner of one revisioned Unity source namespace.
-#[derive(Clone)]
 pub struct AssetWorkspace {
     state: Arc<WorkspaceState>,
     config: Arc<WorkspaceConfig>,
@@ -192,6 +213,23 @@ impl AssetWorkspace {
         Self::with_options(WorkspaceOptions::default())
     }
 
+    /// Forks an isolated mutable candidate from the current immutable workspace state.
+    ///
+    /// The candidate initially shares revision-bound backing allocations, but every subsequent
+    /// source admission installs state only in the returned workspace. This is the explicit seam
+    /// for adapters that must finish an external publication before replacing their authoritative
+    /// workspace; it is deliberately not a general [`Clone`] implementation.
+    #[must_use]
+    pub fn fork_candidate(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            config: Arc::clone(&self.config),
+            reference_store: Arc::clone(&self.reference_store),
+            binary: self.binary,
+            source_registry: self.source_registry.clone(),
+        }
+    }
+
     pub fn with_options(options: WorkspaceOptions) -> Result<Self, WorkspaceError> {
         loop {
             if let Ok(workspace) = WorkspaceId::from_u128(rand::random()) {
@@ -210,7 +248,7 @@ impl AssetWorkspace {
         workspace: WorkspaceId,
         options: WorkspaceOptions,
     ) -> Result<Self, WorkspaceError> {
-        let state = WorkspaceState::empty(workspace)
+        let state = WorkspaceState::empty(workspace, options.typetree.mode)
             .map_err(|source| WorkspaceError::operation("initialization", source))?;
         Ok(Self {
             state: Arc::new(state),
@@ -275,30 +313,20 @@ impl AssetWorkspace {
         self.load_source(SourceOpenRequest::from_path(path)?, budget)
     }
 
+    /// Loads one coherent filesystem image into a new immutable workspace revision.
+    ///
+    /// The opened root is scanned twice and its physical identity is revalidated before
+    /// publication. Both passes and the retained shared backing are charged to `budget`.
     pub fn load_source(
         &mut self,
         request: SourceOpenRequest,
         budget: &mut AssetLoadBudget,
     ) -> Result<SourceId, WorkspaceError> {
-        let SourceOpenRequest {
-            path,
-            alias,
-            kind_hint,
-        } = request;
-        let absolute = absolute_path(&path)?;
-        let origin = PhysicalOrigin::from_existing_path(&absolute)
-            .map_err(|source| WorkspaceError::operation("physical-origin validation", source))?;
-        account_root_descriptor_backing(&alias, &origin, budget)?;
-        let image = read_owned_image(&origin, budget)?;
-        let prepared = prepare_root(
-            &path,
-            kind_hint,
-            image,
-            &self.binary,
-            self.source_registry.as_ref(),
-            budget,
-        )?;
-        self.publish_prepared(alias, origin, prepared, budget)
+        let batch = single_admission_batch(SourceAdmissionOperation::LoadPath(request), budget)?;
+        let report = self
+            .admit_sources(batch, SourceAdmissionPolicy::Strict, budget)
+            .map_err(source_admission_error_to_workspace)?;
+        single_loaded_source(report)
     }
 
     /// Loads one caller-owned source image without reopening its physical path.
@@ -312,7 +340,14 @@ impl AssetWorkspace {
         image: Arc<[u8]>,
         budget: &mut AssetLoadBudget,
     ) -> Result<SourceId, WorkspaceError> {
-        self.load_source_image(request, SourceImageInput::Unaccounted(image), budget)
+        let batch = single_admission_batch(
+            SourceAdmissionOperation::LoadBytes { request, image },
+            budget,
+        )?;
+        let report = self
+            .admit_sources(batch, SourceAdmissionPolicy::Strict, budget)
+            .map_err(source_admission_error_to_workspace)?;
+        single_loaded_source(report)
     }
 
     /// Loads a source backing whose shared allocation has already been charged to `budget`.
@@ -326,40 +361,15 @@ impl AssetWorkspace {
         image: BudgetedSourceBytes,
         budget: &mut AssetLoadBudget,
     ) -> Result<SourceId, WorkspaceError> {
-        self.load_source_image(request, SourceImageInput::Budgeted(image), budget)
-    }
-
-    fn load_source_image(
-        &mut self,
-        request: SourceOpenRequest,
-        image: SourceImageInput,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<SourceId, WorkspaceError> {
-        let SourceOpenRequest {
-            path,
-            alias,
-            kind_hint,
-        } = request;
-        let absolute = absolute_path(&path)?;
-        let origin = PhysicalOrigin::from_existing_path(&absolute)
-            .map_err(|source| WorkspaceError::operation("physical-origin validation", source))?;
-        let image = match image {
-            SourceImageInput::Unaccounted(image) => BudgetedSourceBytes::from_arc(image, budget)?,
-            SourceImageInput::Budgeted(image) => {
-                image.validate_budget(budget)?;
-                image
-            }
-        };
-        account_root_descriptor_backing(&alias, &origin, budget)?;
-        let prepared = prepare_root(
-            &path,
-            kind_hint,
-            image,
-            &self.binary,
-            self.source_registry.as_ref(),
+        image.validate_budget(budget)?;
+        let batch = single_admission_batch(
+            SourceAdmissionOperation::LoadBudgetedBytes { request, image },
             budget,
         )?;
-        self.publish_prepared(alias, origin, prepared, budget)
+        let report = self
+            .admit_sources(batch, SourceAdmissionPolicy::Strict, budget)
+            .map_err(source_admission_error_to_workspace)?;
+        single_loaded_source(report)
     }
 
     pub fn unload_source(
@@ -367,68 +377,621 @@ impl AssetWorkspace {
         root: SourceId,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), WorkspaceError> {
-        if root.workspace() != self.workspace_id() {
-            return Err(unity_asset_core::ContractError::WorkspaceMismatch {
-                expected: self.workspace_id(),
-                actual: root.workspace(),
-            }
-            .into());
-        }
-        let descriptor = self.state.catalog().resolve(root)?;
-        if descriptor.parent().is_some() {
-            return Err(WorkspaceError::NotRootSource(root));
-        }
-
-        let mut catalog = self.state.catalog().begin_transaction(budget)?;
-        let removed = catalog.remove_subtree(root, budget)?;
-        let mut store = self
-            .state
-            .store()
-            .clone_for_update(budget)
-            .map_err(WorkspaceError::from)?;
-        store
-            .remove_all(&removed, budget)
-            .map_err(WorkspaceError::from)?;
-        let catalog = catalog.commit(budget)?;
-        let next = WorkspaceState::new(self.workspace_id(), catalog, store, budget)
-            .map_err(WorkspaceError::from)?;
-        consume_arc_allocation::<WorkspaceState>(budget, "workspace_state")?;
-        self.state = Arc::new(next);
-        Ok(())
+        let batch = single_admission_batch(SourceAdmissionOperation::Unload(root), budget)?;
+        let report = self
+            .admit_sources(batch, SourceAdmissionPolicy::Strict, budget)
+            .map_err(source_admission_error_to_workspace)?;
+        single_unloaded_source(report, root)
     }
 
-    fn publish_prepared(
+    /// Prepares and applies an ordered source batch as one authoritative workspace transition.
+    ///
+    /// All load operations are fully parsed before the catalog/store candidate is created. A
+    /// successful call installs at most one immutable state; any returned error leaves the
+    /// authoritative state unchanged.
+    pub fn admit_sources(
         &mut self,
-        alias: SourceAlias,
-        origin: PhysicalOrigin,
-        prepared: PreparedSource,
+        batch: SourceAdmissionBatch,
+        policy: SourceAdmissionPolicy,
         budget: &mut AssetLoadBudget,
-    ) -> Result<SourceId, WorkspaceError> {
-        let existing = self.state.catalog().find_physical(&origin);
-        let mut catalog = self.state.catalog().begin_transaction(budget)?;
+    ) -> Result<SourceAdmissionReport, SourceAdmissionError> {
+        batch.validate_budget(budget).map_err(|error| {
+            admission_batch_workspace_error(
+                SourceAdmissionBatchPhase::Preparation,
+                WorkspaceError::Budget(error),
+            )
+        })?;
+        let base_revision = self.revision();
+        let operations = batch.into_operations();
+        if operations.is_empty() {
+            return Ok(SourceAdmissionReport::new(
+                policy,
+                base_revision,
+                base_revision,
+                false,
+                Vec::new(),
+            ));
+        }
+
+        for (index, operation) in operations.iter().enumerate() {
+            let SourceAdmissionOperation::LoadBudgetedBytes { image, .. } = operation else {
+                continue;
+            };
+            let ordinal = admission_ordinal(index).map_err(|error| {
+                admission_batch_workspace_error(SourceAdmissionBatchPhase::Preparation, error)
+            })?;
+            image.validate_budget(budget).map_err(|error| {
+                SourceAdmissionError::operation(
+                    ordinal,
+                    None,
+                    SourceAdmissionFailure::from(WorkspaceError::from(error)),
+                )
+            })?;
+        }
+
+        let load_count = operations
+            .iter()
+            .filter(|operation| !matches!(operation, SourceAdmissionOperation::Unload(_)))
+            .count();
+        let aliases = (load_count > 1)
+            .then(|| {
+                reserve_admission_index::<SourceAlias, (u64, SourceId)>(
+                    load_count,
+                    budget,
+                    "source admission alias index",
+                )
+            })
+            .transpose()
+            .map_err(|error| {
+                admission_batch_workspace_error(SourceAdmissionBatchPhase::Preparation, error)
+            })?;
+        let origins = (load_count > 1)
+            .then(|| {
+                reserve_admission_index::<PhysicalOrigin, (u64, SourceId)>(
+                    load_count,
+                    budget,
+                    "source admission physical-origin index",
+                )
+            })
+            .transpose()
+            .map_err(|error| {
+                admission_batch_workspace_error(SourceAdmissionBatchPhase::Preparation, error)
+            })?;
+        let mut prepared = reserve_budgeted_vec::<PreparedAdmission>(
+            operations.len(),
+            budget,
+            "source admission preparation",
+        )
+        .map_err(|error| {
+            admission_batch_workspace_error(SourceAdmissionBatchPhase::Preparation, error)
+        })?;
+
+        for (index, operation) in operations.into_iter().enumerate() {
+            let ordinal = admission_ordinal(index).map_err(|error| {
+                admission_batch_workspace_error(SourceAdmissionBatchPhase::Preparation, error)
+            })?;
+            let result = match operation {
+                SourceAdmissionOperation::LoadPath(request) => {
+                    self.prepare_admission_load(ordinal, request, SourceImageInput::Path, budget)
+                }
+                SourceAdmissionOperation::LoadBytes { request, image } => self
+                    .prepare_admission_load(
+                        ordinal,
+                        request,
+                        SourceImageInput::Unaccounted(image),
+                        budget,
+                    ),
+                SourceAdmissionOperation::LoadBudgetedBytes { request, image } => self
+                    .prepare_admission_load(
+                        ordinal,
+                        request,
+                        SourceImageInput::Budgeted(image),
+                        budget,
+                    ),
+                SourceAdmissionOperation::Unload(source) => {
+                    Ok(PreparedAdmission::Unload { ordinal, source })
+                }
+            };
+            match result {
+                Ok(operation) => prepared.push(operation),
+                Err(failure) if policy.tolerates(failure.category()) => {
+                    prepared.push(PreparedAdmission::Rejected {
+                        ordinal,
+                        rejection: SourceAdmissionRejection::new(
+                            failure.location,
+                            *failure.failure,
+                        ),
+                    });
+                }
+                Err(failure) => {
+                    return Err(SourceAdmissionError::operation(
+                        ordinal,
+                        failure.location,
+                        *failure.failure,
+                    ));
+                }
+            }
+        }
+
+        self.apply_prepared_admissions(prepared, aliases, origins, policy, base_revision, budget)
+    }
+
+    fn prepare_admission_load(
+        &self,
+        ordinal: u64,
+        request: SourceOpenRequest,
+        image: SourceImageInput,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<PreparedAdmission, AdmissionOperationFailure> {
+        let SourceOpenRequest {
+            path,
+            alias,
+            kind_hint,
+        } = request;
+        let absolute = match absolute_path(path, budget) {
+            Ok(absolute) => absolute,
+            Err((path, error)) => {
+                return Err(AdmissionOperationFailure::with_location(
+                    SourceAdmissionOperationLocation::RequestPath(path),
+                    SourceAdmissionFailure::from(*error),
+                ));
+            }
+        };
+        let origin = match PhysicalOrigin::from_existing_path_budgeted(&absolute, budget) {
+            Ok(origin) => origin,
+            Err(error) => {
+                return Err(AdmissionOperationFailure::with_location(
+                    SourceAdmissionOperationLocation::RequestPath(absolute),
+                    SourceAdmissionFailure::from(physical_origin_workspace_error(error)),
+                ));
+            }
+        };
+        drop(absolute);
+        let image = match image {
+            SourceImageInput::Path => match read_owned_image(&origin, budget) {
+                Ok(image) => image,
+                Err(error) => {
+                    return Err(AdmissionOperationFailure::with_location(
+                        SourceAdmissionOperationLocation::PhysicalOrigin(origin.into_path()),
+                        SourceAdmissionFailure::from(error),
+                    ));
+                }
+            },
+            SourceImageInput::Unaccounted(image) => {
+                match BudgetedSourceBytes::from_arc(image, budget).map_err(WorkspaceError::from) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        return Err(AdmissionOperationFailure::with_location(
+                            SourceAdmissionOperationLocation::PhysicalOrigin(origin.into_path()),
+                            SourceAdmissionFailure::from(error),
+                        ));
+                    }
+                }
+            }
+            SourceImageInput::Budgeted(image) => {
+                if let Err(error) = image.validate_budget(budget).map_err(WorkspaceError::from) {
+                    return Err(AdmissionOperationFailure::with_location(
+                        SourceAdmissionOperationLocation::PhysicalOrigin(origin.into_path()),
+                        SourceAdmissionFailure::from(error),
+                    ));
+                }
+                image
+            }
+        };
+        let source = match prepare_root(
+            origin.path(),
+            kind_hint,
+            image,
+            &self.binary,
+            self.source_registry.as_ref(),
+            budget,
+        ) {
+            Ok(source) => source,
+            Err(error) => {
+                return Err(AdmissionOperationFailure::with_location(
+                    SourceAdmissionOperationLocation::PhysicalOrigin(origin.into_path()),
+                    SourceAdmissionFailure::from(error),
+                ));
+            }
+        };
+        Ok(PreparedAdmission::Load {
+            ordinal,
+            alias,
+            origin,
+            source,
+        })
+    }
+
+    fn apply_prepared_admissions(
+        &mut self,
+        prepared: Vec<PreparedAdmission>,
+        mut aliases: Option<HashMap<SourceAlias, (u64, SourceId)>>,
+        mut origins: Option<HashMap<PhysicalOrigin, (u64, SourceId)>>,
+        policy: SourceAdmissionPolicy,
+        base_revision: WorkspaceRevision,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SourceAdmissionReport, SourceAdmissionError> {
+        let first_action = prepared.iter().find_map(PreparedAdmission::action_ordinal);
+        let mut outcomes = reserve_budgeted_vec::<SourceAdmissionOutcome>(
+            prepared.len(),
+            budget,
+            "source admission outcomes",
+        )
+        .map_err(|error| {
+            admission_batch_workspace_error(SourceAdmissionBatchPhase::CandidateApplication, error)
+        })?;
+
+        let Some(_) = first_action else {
+            for operation in prepared {
+                let PreparedAdmission::Rejected { ordinal, rejection } = operation else {
+                    return Err(admission_batch_protocol_error(
+                        SourceAdmissionBatchPhase::CandidateApplication,
+                        SourceAdmissionProtocolError::MissingAction,
+                    ));
+                };
+                outcomes.push(SourceAdmissionOutcome::new(
+                    ordinal,
+                    SourceAdmissionDisposition::Rejected(rejection),
+                ));
+            }
+            return Ok(SourceAdmissionReport::new(
+                policy,
+                base_revision,
+                base_revision,
+                false,
+                outcomes,
+            ));
+        };
+        let mut catalog = self
+            .state
+            .catalog()
+            .begin_transaction(budget)
+            .map_err(WorkspaceError::from)
+            .map_err(|error| {
+                admission_batch_workspace_error(
+                    SourceAdmissionBatchPhase::CandidateApplication,
+                    error,
+                )
+            })?;
         let mut store = self
             .state
             .store()
             .clone_for_update(budget)
-            .map_err(WorkspaceError::from)?;
+            .map_err(WorkspaceError::from)
+            .map_err(|error| {
+                admission_batch_workspace_error(
+                    SourceAdmissionBatchPhase::CandidateApplication,
+                    error,
+                )
+            })?;
+        let mut candidate_changed = false;
 
-        if let Some(existing) = existing {
-            let removed = catalog.remove_subtree(existing, budget)?;
-            store
-                .remove_all(&removed, budget)
-                .map_err(WorkspaceError::from)?;
+        for operation in prepared {
+            match operation {
+                PreparedAdmission::Rejected { ordinal, rejection } => {
+                    outcomes.push(SourceAdmissionOutcome::new(
+                        ordinal,
+                        SourceAdmissionDisposition::Rejected(rejection),
+                    ));
+                }
+                PreparedAdmission::Unload { ordinal, source } => {
+                    if source.workspace() != self.workspace_id() {
+                        let error = unity_asset_core::ContractError::WorkspaceMismatch {
+                            expected: self.workspace_id(),
+                            actual: source.workspace(),
+                        };
+                        return Err(admission_workspace_error_at(
+                            ordinal,
+                            SourceAdmissionOperationLocation::Source(source),
+                            error.into(),
+                        ));
+                    }
+                    let is_root = catalog
+                        .is_root(source)
+                        .map_err(WorkspaceError::from)
+                        .map_err(|error| {
+                            admission_workspace_error_at(
+                                ordinal,
+                                SourceAdmissionOperationLocation::Source(source),
+                                error,
+                            )
+                        })?;
+                    if !is_root {
+                        return Err(admission_workspace_error_at(
+                            ordinal,
+                            SourceAdmissionOperationLocation::Source(source),
+                            WorkspaceError::NotRootSource(source),
+                        ));
+                    }
+                    let removed = catalog
+                        .remove_subtree(source, budget)
+                        .map_err(WorkspaceError::from)
+                        .map_err(|error| {
+                            admission_workspace_error_at(
+                                ordinal,
+                                SourceAdmissionOperationLocation::Source(source),
+                                error,
+                            )
+                        })?;
+                    store
+                        .remove_all(&removed, budget)
+                        .map_err(WorkspaceError::from)
+                        .map_err(|error| {
+                            admission_workspace_error_at(
+                                ordinal,
+                                SourceAdmissionOperationLocation::Source(source),
+                                error,
+                            )
+                        })?;
+                    remove_admitted_source_indexes(&mut aliases, &mut origins, source);
+                    candidate_changed = true;
+                    outcomes.push(SourceAdmissionOutcome::new(
+                        ordinal,
+                        SourceAdmissionDisposition::Unloaded { source_id: source },
+                    ));
+                }
+                PreparedAdmission::Load {
+                    ordinal,
+                    alias,
+                    origin,
+                    source,
+                } => {
+                    if let Some((first_operation, _)) =
+                        aliases.as_ref().and_then(|aliases| aliases.get(&alias))
+                    {
+                        retain_admission_conflict(
+                            policy,
+                            ordinal,
+                            SourceAdmissionOperationLocation::Alias(alias),
+                            SourceAdmissionFailure::DuplicateAlias {
+                                first_operation: *first_operation,
+                            },
+                            &mut outcomes,
+                        )?;
+                        continue;
+                    }
+                    if let Some((first_operation, _)) =
+                        origins.as_ref().and_then(|origins| origins.get(&origin))
+                    {
+                        retain_admission_conflict(
+                            policy,
+                            ordinal,
+                            SourceAdmissionOperationLocation::PhysicalOrigin(origin.into_path()),
+                            SourceAdmissionFailure::DuplicatePhysicalOrigin {
+                                first_operation: *first_operation,
+                            },
+                            &mut outcomes,
+                        )?;
+                        continue;
+                    }
+                    let fingerprint = source.fingerprint();
+                    let decision = catalog
+                        .root_admission_decision(&alias, &origin, fingerprint)
+                        .map_err(WorkspaceError::from)
+                        .map_err(|error| admission_workspace_error(ordinal, error))?;
+                    match decision {
+                        RootAdmissionDecision::Vacant => {}
+                        RootAdmissionDecision::Unchanged(existing) => {
+                            let (indexed_alias, indexed_origin) =
+                                match prepare_admitted_source_index_keys(
+                                    &alias,
+                                    &origin,
+                                    aliases.is_some(),
+                                    origins.is_some(),
+                                    budget,
+                                ) {
+                                    Ok(keys) => keys,
+                                    Err(AdmissionIndexKeyError::Alias(error)) => {
+                                        return Err(SourceAdmissionError::operation(
+                                            ordinal,
+                                            Some(SourceAdmissionOperationLocation::Alias(alias)),
+                                            SourceAdmissionFailure::from(*error),
+                                        ));
+                                    }
+                                    Err(AdmissionIndexKeyError::Origin(error)) => {
+                                        return Err(SourceAdmissionError::operation(
+                                            ordinal,
+                                            Some(SourceAdmissionOperationLocation::PhysicalOrigin(
+                                                origin.into_path(),
+                                            )),
+                                            SourceAdmissionFailure::from(*error),
+                                        ));
+                                    }
+                                };
+                            insert_admitted_source_index_keys(
+                                &mut aliases,
+                                &mut origins,
+                                indexed_alias,
+                                indexed_origin,
+                                ordinal,
+                                existing,
+                            );
+                            outcomes.push(SourceAdmissionOutcome::new(
+                                ordinal,
+                                SourceAdmissionDisposition::Unchanged {
+                                    source_id: existing,
+                                },
+                            ));
+                            continue;
+                        }
+                        RootAdmissionDecision::AliasConflict { existing } => {
+                            retain_admission_conflict(
+                                policy,
+                                ordinal,
+                                SourceAdmissionOperationLocation::Alias(alias),
+                                SourceAdmissionFailure::AliasConflict {
+                                    existing_source: existing,
+                                },
+                                &mut outcomes,
+                            )?;
+                            continue;
+                        }
+                        RootAdmissionDecision::PhysicalOriginConflict { existing } => {
+                            retain_admission_conflict(
+                                policy,
+                                ordinal,
+                                SourceAdmissionOperationLocation::PhysicalOrigin(
+                                    origin.into_path(),
+                                ),
+                                SourceAdmissionFailure::PhysicalOriginConflict {
+                                    existing_source: existing,
+                                },
+                                &mut outcomes,
+                            )?;
+                            continue;
+                        }
+                    }
+                    let (indexed_alias, indexed_origin) = match prepare_admitted_source_index_keys(
+                        &alias,
+                        &origin,
+                        aliases.is_some(),
+                        origins.is_some(),
+                        budget,
+                    ) {
+                        Ok(keys) => keys,
+                        Err(AdmissionIndexKeyError::Alias(error)) => {
+                            return Err(SourceAdmissionError::operation(
+                                ordinal,
+                                Some(SourceAdmissionOperationLocation::Alias(alias)),
+                                SourceAdmissionFailure::from(*error),
+                            ));
+                        }
+                        Err(AdmissionIndexKeyError::Origin(error)) => {
+                            return Err(SourceAdmissionError::operation(
+                                ordinal,
+                                Some(SourceAdmissionOperationLocation::PhysicalOrigin(
+                                    origin.into_path(),
+                                )),
+                                SourceAdmissionFailure::from(*error),
+                            ));
+                        }
+                    };
+                    let root_descriptor = SourceDescriptor::root(source.kind, alias, origin);
+                    let root = register_prepared(
+                        source,
+                        root_descriptor,
+                        &mut catalog,
+                        &mut store,
+                        budget,
+                    )
+                    .map_err(|error| admission_workspace_error(ordinal, error))?;
+                    insert_admitted_source_index_keys(
+                        &mut aliases,
+                        &mut origins,
+                        indexed_alias,
+                        indexed_origin,
+                        ordinal,
+                        root,
+                    );
+                    candidate_changed = true;
+                    outcomes.push(SourceAdmissionOutcome::new(
+                        ordinal,
+                        SourceAdmissionDisposition::Loaded { source_id: root },
+                    ));
+                }
+            }
         }
 
-        let root_descriptor = SourceDescriptor::root(prepared.kind, alias, origin);
-        let root = register_prepared(prepared, root_descriptor, &mut catalog, &mut store, budget)?;
-        let catalog = catalog.commit(budget)?;
-        let next = WorkspaceState::new(self.workspace_id(), catalog, store, budget)
-            .map_err(WorkspaceError::from)?;
-        if next.revision() != self.state.revision() {
-            consume_arc_allocation::<WorkspaceState>(budget, "workspace_state")?;
+        if !candidate_changed {
+            return Ok(SourceAdmissionReport::new(
+                policy,
+                base_revision,
+                base_revision,
+                false,
+                outcomes,
+            ));
+        }
+
+        let catalog = catalog
+            .commit(budget)
+            .map_err(WorkspaceError::from)
+            .map_err(|error| {
+                admission_batch_workspace_error(SourceAdmissionBatchPhase::Publication, error)
+            })?;
+        let next = WorkspaceState::new(
+            self.workspace_id(),
+            self.config.typetree.mode,
+            catalog,
+            store,
+            budget,
+        )
+        .map_err(WorkspaceError::from)
+        .map_err(|error| {
+            admission_batch_workspace_error(SourceAdmissionBatchPhase::Publication, error)
+        })?;
+        let revision = next.revision();
+        let state_installed = revision != base_revision;
+        if state_installed {
+            consume_arc_allocation::<WorkspaceState>(budget, "workspace_state").map_err(
+                |error| {
+                    admission_batch_workspace_error(SourceAdmissionBatchPhase::Publication, error)
+                },
+            )?;
             self.state = Arc::new(next);
         }
-        Ok(root)
+        Ok(SourceAdmissionReport::new(
+            policy,
+            base_revision,
+            revision,
+            state_installed,
+            outcomes,
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct AdmissionOperationFailure {
+    location: Option<SourceAdmissionOperationLocation>,
+    failure: Box<SourceAdmissionFailure>,
+}
+
+impl AdmissionOperationFailure {
+    fn with_location(
+        location: SourceAdmissionOperationLocation,
+        failure: SourceAdmissionFailure,
+    ) -> Self {
+        Self {
+            location: Some(location),
+            failure: Box::new(failure),
+        }
+    }
+
+    #[must_use]
+    fn category(&self) -> super::source_admission::SourceAdmissionErrorCategory {
+        self.failure.category()
+    }
+}
+
+#[derive(Debug)]
+enum AdmissionIndexKeyError {
+    Alias(Box<WorkspaceError>),
+    Origin(Box<WorkspaceError>),
+}
+
+#[derive(Debug)]
+enum PreparedAdmission {
+    Load {
+        ordinal: u64,
+        alias: SourceAlias,
+        origin: PhysicalOrigin,
+        source: PreparedSource,
+    },
+    Unload {
+        ordinal: u64,
+        source: SourceId,
+    },
+    Rejected {
+        ordinal: u64,
+        rejection: SourceAdmissionRejection,
+    },
+}
+
+impl PreparedAdmission {
+    const fn action_ordinal(&self) -> Option<u64> {
+        match self {
+            Self::Load { ordinal, .. } | Self::Unload { ordinal, .. } => Some(*ordinal),
+            Self::Rejected { .. } => None,
+        }
     }
 }
 
@@ -437,7 +1000,358 @@ struct PreparedSource {
     kind: SourceKind,
     image: BudgetedSourceBytes,
     parsed: PreparedParse,
+    format: WorkspaceSourceFormatInspection,
     children: Vec<PreparedChild>,
+}
+
+impl PreparedSource {
+    fn fingerprint(&self) -> SourceFingerprint {
+        SourceFingerprint::from_bytes(self.kind, self.image.as_bytes())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum SourceAdmissionProtocolError {
+    #[error("a prepared batch without rejected-only operations has no action")]
+    MissingAction,
+    #[error("a single-operation admission returned {actual} outcomes")]
+    UnexpectedOutcomeCount { actual: usize },
+    #[error("a single load returned a non-load disposition")]
+    UnexpectedLoadDisposition,
+    #[error("a single unload returned a non-unload disposition")]
+    UnexpectedUnloadDisposition,
+}
+
+fn single_admission_batch(
+    operation: SourceAdmissionOperation,
+    budget: &mut AssetLoadBudget,
+) -> Result<SourceAdmissionBatch, WorkspaceError> {
+    let mut batch = SourceAdmissionBatch::with_capacity(1, budget)
+        .map_err(admission_batch_allocation_to_workspace)?;
+    batch
+        .try_push(operation, budget)
+        .map_err(admission_batch_push_to_workspace)?;
+    Ok(batch)
+}
+
+fn admission_batch_allocation_to_workspace(
+    error: SourceAdmissionBatchAllocationError,
+) -> WorkspaceError {
+    match error {
+        SourceAdmissionBatchAllocationError::Budget(error) => WorkspaceError::Budget(error),
+        error @ SourceAdmissionBatchAllocationError::Allocation { .. } => {
+            WorkspaceError::operation("source admission batch allocation", error)
+        }
+    }
+}
+
+fn admission_batch_push_to_workspace(error: SourceAdmissionBatchPushError) -> WorkspaceError {
+    match error {
+        SourceAdmissionBatchPushError::Budget(error) => WorkspaceError::Budget(error),
+        SourceAdmissionBatchPushError::Capacity(error) => {
+            WorkspaceError::operation("single source admission batch", error)
+        }
+    }
+}
+
+fn single_loaded_source(report: SourceAdmissionReport) -> Result<SourceId, WorkspaceError> {
+    let actual = report.outcomes().len();
+    if actual != 1 {
+        return Err(WorkspaceError::operation(
+            "single source admission",
+            SourceAdmissionProtocolError::UnexpectedOutcomeCount { actual },
+        ));
+    }
+    let mut outcomes = report.into_outcomes().into_iter();
+    let Some(outcome) = outcomes.next() else {
+        return Err(WorkspaceError::operation(
+            "single source admission",
+            SourceAdmissionProtocolError::UnexpectedOutcomeCount { actual: 0 },
+        ));
+    };
+    match outcome.into_disposition() {
+        SourceAdmissionDisposition::Loaded { source_id }
+        | SourceAdmissionDisposition::Unchanged { source_id } => Ok(source_id),
+        SourceAdmissionDisposition::Rejected(rejection) => {
+            Err(admission_rejection_to_workspace(rejection))
+        }
+        SourceAdmissionDisposition::Unloaded { .. } => Err(WorkspaceError::operation(
+            "single source admission",
+            SourceAdmissionProtocolError::UnexpectedLoadDisposition,
+        )),
+    }
+}
+
+fn single_unloaded_source(
+    report: SourceAdmissionReport,
+    expected: SourceId,
+) -> Result<(), WorkspaceError> {
+    let actual = report.outcomes().len();
+    if actual != 1 {
+        return Err(WorkspaceError::operation(
+            "single source admission",
+            SourceAdmissionProtocolError::UnexpectedOutcomeCount { actual },
+        ));
+    }
+    let mut outcomes = report.into_outcomes().into_iter();
+    let Some(outcome) = outcomes.next() else {
+        return Err(WorkspaceError::operation(
+            "single source admission",
+            SourceAdmissionProtocolError::UnexpectedOutcomeCount { actual: 0 },
+        ));
+    };
+    match outcome.into_disposition() {
+        SourceAdmissionDisposition::Unloaded { source_id } if source_id == expected => Ok(()),
+        SourceAdmissionDisposition::Rejected(rejection) => {
+            Err(admission_rejection_to_workspace(rejection))
+        }
+        SourceAdmissionDisposition::Loaded { .. }
+        | SourceAdmissionDisposition::Unchanged { .. }
+        | SourceAdmissionDisposition::Unloaded { .. } => Err(WorkspaceError::operation(
+            "single source admission",
+            SourceAdmissionProtocolError::UnexpectedUnloadDisposition,
+        )),
+    }
+}
+
+fn source_admission_error_to_workspace(error: SourceAdmissionError) -> WorkspaceError {
+    let (site, failure) = error.into_parts();
+    located_admission_failure_to_workspace(site.into_operation_location(), failure)
+}
+
+fn admission_rejection_to_workspace(rejection: SourceAdmissionRejection) -> WorkspaceError {
+    let (location, failure) = rejection.into_parts();
+    located_admission_failure_to_workspace(location, failure)
+}
+
+fn located_admission_failure_to_workspace(
+    location: Option<SourceAdmissionOperationLocation>,
+    failure: SourceAdmissionFailure,
+) -> WorkspaceError {
+    match failure {
+        SourceAdmissionFailure::Workspace(error) => *error,
+        failure @ SourceAdmissionFailure::DuplicateAlias { .. }
+        | failure @ SourceAdmissionFailure::DuplicatePhysicalOrigin { .. }
+        | failure @ SourceAdmissionFailure::AliasConflict { .. }
+        | failure @ SourceAdmissionFailure::PhysicalOriginConflict { .. } => match location {
+            Some(SourceAdmissionOperationLocation::Alias(alias)) => WorkspaceError::InvalidSource {
+                path: PathBuf::from(alias.as_str()),
+                message: failure.to_string(),
+            },
+            Some(SourceAdmissionOperationLocation::RequestPath(path))
+            | Some(SourceAdmissionOperationLocation::PhysicalOrigin(path)) => {
+                WorkspaceError::InvalidSource {
+                    path,
+                    message: failure.to_string(),
+                }
+            }
+            Some(SourceAdmissionOperationLocation::Source(_)) | None => {
+                WorkspaceError::operation("source admission", failure)
+            }
+        },
+    }
+}
+
+fn admission_workspace_error(ordinal: u64, error: WorkspaceError) -> SourceAdmissionError {
+    SourceAdmissionError::operation(ordinal, None, SourceAdmissionFailure::from(error))
+}
+
+fn retain_admission_conflict(
+    policy: SourceAdmissionPolicy,
+    ordinal: u64,
+    location: SourceAdmissionOperationLocation,
+    failure: SourceAdmissionFailure,
+    outcomes: &mut Vec<SourceAdmissionOutcome>,
+) -> Result<(), SourceAdmissionError> {
+    if !policy.tolerates(failure.category()) {
+        return Err(SourceAdmissionError::operation(
+            ordinal,
+            Some(location),
+            failure,
+        ));
+    }
+    outcomes.push(SourceAdmissionOutcome::new(
+        ordinal,
+        SourceAdmissionDisposition::Rejected(SourceAdmissionRejection::new(
+            Some(location),
+            failure,
+        )),
+    ));
+    Ok(())
+}
+
+fn prepare_admitted_source_index_keys(
+    alias: &SourceAlias,
+    origin: &PhysicalOrigin,
+    index_alias: bool,
+    index_origin: bool,
+    budget: &mut AssetLoadBudget,
+) -> Result<(Option<SourceAlias>, Option<PhysicalOrigin>), AdmissionIndexKeyError> {
+    let indexed_alias = index_alias
+        .then(|| clone_admission_alias(alias, budget, "source admission alias key"))
+        .transpose()
+        .map_err(|error| AdmissionIndexKeyError::Alias(Box::new(error)))?;
+    let indexed_origin = index_origin
+        .then(|| clone_admission_origin(origin, budget, "source admission physical-origin key"))
+        .transpose()
+        .map_err(|error| AdmissionIndexKeyError::Origin(Box::new(error)))?;
+    Ok((indexed_alias, indexed_origin))
+}
+
+fn insert_admitted_source_index_keys(
+    aliases: &mut Option<HashMap<SourceAlias, (u64, SourceId)>>,
+    origins: &mut Option<HashMap<PhysicalOrigin, (u64, SourceId)>>,
+    indexed_alias: Option<SourceAlias>,
+    indexed_origin: Option<PhysicalOrigin>,
+    ordinal: u64,
+    source: SourceId,
+) {
+    if let Some(indexed_alias) = indexed_alias {
+        aliases
+            .as_mut()
+            .expect("an alias key requires an alias index")
+            .insert(indexed_alias, (ordinal, source));
+    }
+    if let Some(indexed_origin) = indexed_origin {
+        origins
+            .as_mut()
+            .expect("a physical-origin key requires a physical-origin index")
+            .insert(indexed_origin, (ordinal, source));
+    }
+}
+
+fn remove_admitted_source_indexes(
+    aliases: &mut Option<HashMap<SourceAlias, (u64, SourceId)>>,
+    origins: &mut Option<HashMap<PhysicalOrigin, (u64, SourceId)>>,
+    source: SourceId,
+) {
+    if let Some(aliases) = aliases {
+        aliases.retain(|_, (_, indexed_source)| *indexed_source != source);
+    }
+    if let Some(origins) = origins {
+        origins.retain(|_, (_, indexed_source)| *indexed_source != source);
+    }
+}
+
+fn admission_workspace_error_at(
+    ordinal: u64,
+    location: SourceAdmissionOperationLocation,
+    error: WorkspaceError,
+) -> SourceAdmissionError {
+    SourceAdmissionError::operation(ordinal, Some(location), SourceAdmissionFailure::from(error))
+}
+
+fn admission_batch_workspace_error(
+    phase: SourceAdmissionBatchPhase,
+    error: WorkspaceError,
+) -> SourceAdmissionError {
+    SourceAdmissionError::batch(phase, SourceAdmissionFailure::from(error))
+}
+
+fn admission_batch_protocol_error(
+    phase: SourceAdmissionBatchPhase,
+    error: SourceAdmissionProtocolError,
+) -> SourceAdmissionError {
+    admission_batch_workspace_error(
+        phase,
+        WorkspaceError::operation("source admission protocol", error),
+    )
+}
+
+fn physical_origin_workspace_error(error: CatalogError) -> WorkspaceError {
+    match error {
+        CatalogError::InvalidPhysicalOrigin(error) => {
+            WorkspaceError::operation("physical-origin validation", error)
+        }
+        error => WorkspaceError::from(error),
+    }
+}
+
+fn admission_ordinal(index: usize) -> Result<u64, WorkspaceError> {
+    u64::try_from(index).map_err(|_| {
+        WorkspaceError::Budget(BudgetError::ArithmeticOverflow {
+            resource: "source_admission_ordinal",
+        })
+    })
+}
+
+fn reserve_admission_index<K, V>(
+    count: usize,
+    budget: &mut AssetLoadBudget,
+    resource: &'static str,
+) -> Result<HashMap<K, V>, WorkspaceError>
+where
+    K: Eq + std::hash::Hash,
+{
+    // Cover capacity rounding, one control byte per bucket, and the trailing control group.
+    let bucket_bytes = size_of::<(K, V)>()
+        .checked_add(size_of::<u8>())
+        .and_then(|bytes| bytes.checked_mul(count))
+        .and_then(|bytes| bytes.checked_mul(2))
+        .and_then(|bytes| bytes.checked_add(64))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(BudgetError::ArithmeticOverflow { resource })?;
+    budget.check_bytes(bucket_bytes)?;
+    let mut index = HashMap::new();
+    index
+        .try_reserve(count)
+        .map_err(|error| WorkspaceError::Allocation {
+            resource,
+            requested: count,
+            unit: WorkspaceAllocationUnit::Slots,
+            message: error.to_string(),
+        })?;
+    budget.consume_bytes(bucket_bytes)?;
+    Ok(index)
+}
+
+fn clone_admission_alias(
+    alias: &SourceAlias,
+    budget: &mut AssetLoadBudget,
+    resource: &'static str,
+) -> Result<SourceAlias, WorkspaceError> {
+    let length = alias.retained_clone_bytes();
+    let bytes = u64::try_from(length).map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
+    budget.check_bytes(bytes)?;
+    let mut value = String::new();
+    value
+        .try_reserve_exact(length)
+        .map_err(|error| WorkspaceError::Allocation {
+            resource,
+            requested: length,
+            unit: WorkspaceAllocationUnit::Bytes,
+            message: error.to_string(),
+        })?;
+    value.push_str(alias.as_str());
+    let cloned = SourceAlias::new(value).map_err(WorkspaceError::from)?;
+    let retained_bytes = u64::try_from(cloned.retained_owned_bytes())
+        .map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
+    budget.check_bytes(retained_bytes)?;
+    budget.consume_bytes(retained_bytes)?;
+    Ok(cloned)
+}
+
+fn clone_admission_origin(
+    origin: &PhysicalOrigin,
+    budget: &mut AssetLoadBudget,
+    resource: &'static str,
+) -> Result<PhysicalOrigin, WorkspaceError> {
+    let length = origin.path().as_os_str().len();
+    let bytes = u64::try_from(length).map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
+    budget.check_bytes(bytes)?;
+    let cloned = origin
+        .try_clone_for_index()
+        .map_err(|error| WorkspaceError::Allocation {
+            resource,
+            requested: length,
+            unit: WorkspaceAllocationUnit::Bytes,
+            message: error.to_string(),
+        })?;
+    let retained_bytes = u64::try_from(cloned.retained_owned_bytes())
+        .map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
+    budget.check_bytes(retained_bytes)?;
+    budget.consume_bytes(retained_bytes)?;
+    Ok(cloned)
 }
 
 #[derive(Debug)]
@@ -471,16 +1385,22 @@ enum FrozenRegistryKey {
 struct FrozenRegistryEntry {
     key: FrozenRegistryKey,
     tree: Arc<TypeTree>,
+    schema_digest: DigestV1,
 }
 
 #[derive(Debug)]
 struct FrozenTypeTreeRegistry {
     entries: Vec<FrozenRegistryEntry>,
+    digest: DigestV1,
 }
 
 impl TypeTreeRegistry for FrozenTypeTreeRegistry {
     fn resolve(&self, _unity_version: &str, class_id: i32) -> Option<Arc<TypeTree>> {
         self.lookup(FrozenRegistryKey::Class(class_id))
+    }
+
+    fn semantic_digest(&self) -> Option<DigestV1> {
+        Some(self.digest)
     }
 
     fn resolve_script(
@@ -570,10 +1490,12 @@ fn finish_prepared_yaml(
     budget: &mut AssetLoadBudget,
 ) -> Result<PreparedSource, WorkspaceError> {
     validate_yaml_identities(&document, budget)?;
+    let document_count = usize_to_u64(document.entries().len(), "yaml_document_count")?;
     Ok(PreparedSource {
         kind: SourceKind::Yaml,
         image,
         parsed: PreparedParse::Yaml(document),
+        format: WorkspaceSourceFormatInspection::Yaml { document_count },
         children: Vec::new(),
     })
 }
@@ -648,10 +1570,12 @@ fn prepare_archive(
             source,
         });
     }
+    let member_count = usize_to_u64(children.len(), "archive_member_count")?;
     Ok(PreparedSource {
         kind: SourceKind::Archive,
         image,
         parsed: PreparedParse::None,
+        format: WorkspaceSourceFormatInspection::Archive { member_count },
         children,
     })
 }
@@ -694,16 +1618,31 @@ fn prepare_binary_payload(
     } else {
         Vec::new()
     };
-    let parsed = match payload {
-        BinaryPayload::SerializedFile(mut file) => {
-            freeze_serialized_registry(&mut file, source_registry, budget, depth)?;
-            PreparedParse::Serialized(promote_box_to_arc(
-                file,
-                budget,
-                "workspace_serialized_file",
-            )?)
+    let (parsed, format) = match payload {
+        BinaryPayload::SerializedFile(file) => {
+            let file = freeze_serialized_registry(*file, source_registry, budget, depth)?;
+            let summary = SerializedFileSummary::from_file(&file, budget)?;
+            (
+                PreparedParse::Serialized(promote_value_to_arc(
+                    file,
+                    budget,
+                    "workspace_serialized_file",
+                )?),
+                WorkspaceSourceFormatInspection::SerializedFile(summary),
+            )
         }
-        BinaryPayload::AssetBundle(_) | BinaryPayload::WebFile(_) => PreparedParse::None,
+        BinaryPayload::AssetBundle(bundle) => (
+            PreparedParse::None,
+            WorkspaceSourceFormatInspection::AssetBundle(AssetBundleSummary::from_bundle(
+                &bundle, budget,
+            )?),
+        ),
+        BinaryPayload::WebFile(web_file) => (
+            PreparedParse::None,
+            WorkspaceSourceFormatInspection::WebFile(WebFileSummary::from_webfile(
+                &web_file, budget,
+            )?),
+        ),
     };
     let mut children = reserve_prepared_children(members.len(), budget)?;
     for member in members {
@@ -753,6 +1692,7 @@ fn prepare_binary_payload(
         kind,
         image,
         parsed,
+        format,
         children,
     })
 }
@@ -804,6 +1744,7 @@ fn prepared_raw(image: BudgetedSourceBytes) -> PreparedSource {
         kind: SourceKind::StreamedResource,
         image,
         parsed: PreparedParse::None,
+        format: WorkspaceSourceFormatInspection::StreamedResource,
         children: Vec::new(),
     }
 }
@@ -817,14 +1758,14 @@ fn binary_payload_kind(payload: &BinaryPayload) -> SourceKind {
 }
 
 fn freeze_serialized_registry(
-    file: &mut SerializedFile,
+    mut file: SerializedFile,
     source_registry: Option<&Arc<dyn TypeTreeRegistry>>,
     budget: &mut AssetLoadBudget,
     depth: u32,
-) -> Result<(), WorkspaceError> {
-    file.set_type_tree_registry(None);
+) -> Result<SerializedFile, WorkspaceError> {
+    file = file.with_type_tree_registry(None);
     let Some(source_registry) = source_registry else {
-        return Ok(());
+        return Ok(file);
     };
 
     let object_count = file.objects().len();
@@ -840,7 +1781,7 @@ fn freeze_serialized_registry(
         "frozen TypeTree lookup keys",
     )?;
     for object in file.objects() {
-        let serialized_type = serialized_type_for_object(file, object);
+        let serialized_type = serialized_type_for_object(&file, object);
         if file.type_tree_enabled() && serialized_type.is_some_and(SerializedType::has_type_tree) {
             continue;
         }
@@ -873,11 +1814,24 @@ fn freeze_serialized_registry(
         };
         if let Some(tree) = tree {
             account_frozen_type_tree(&tree, budget, depth)?;
-            entries.push(FrozenRegistryEntry { key, tree });
+            let schema = TypeTreeSchema::compile(&tree, file.ref_types(), budget)?;
+            let schema_digest = schema
+                .semantic_digest_with_budget(budget)
+                .map_err(|error| match error {
+                    TypeTreeSemanticDigestError::Budget(error) => WorkspaceError::Budget(error),
+                    TypeTreeSemanticDigestError::Digest(error) => {
+                        WorkspaceError::operation("frozen TypeTree schema identity", error)
+                    }
+                })?;
+            entries.push(FrozenRegistryEntry {
+                key,
+                tree,
+                schema_digest,
+            });
         }
     }
     if entries.is_empty() {
-        return Ok(());
+        return Ok(file);
     }
 
     let allocation = arc_value_allocation_bytes::<FrozenTypeTreeRegistry>().map_err(|_| {
@@ -886,8 +1840,56 @@ fn freeze_serialized_registry(
         }
     })?;
     budget.consume_bytes(allocation)?;
-    file.set_type_tree_registry(Some(Arc::new(FrozenTypeTreeRegistry { entries })));
-    Ok(())
+    let digest = frozen_registry_digest(&entries)
+        .map_err(|error| WorkspaceError::operation("frozen TypeTree registry identity", error))?;
+    Ok(file.with_type_tree_registry(Some(Arc::new(FrozenTypeTreeRegistry { entries, digest }))))
+}
+
+fn frozen_registry_digest(entries: &[FrozenRegistryEntry]) -> Result<DigestV1, DigestBuildError> {
+    const PREFIX: &[u8] = b"unity-asset:frozen-typetree-registry:v1\0";
+    const COMMON_ENTRY_BYTES: u64 = 1 + 4 + DigestV1::BYTE_LEN as u64;
+
+    let mut logical_length =
+        u64::try_from(PREFIX.len()).map_err(|_| DigestBuildError::LengthOverflow)?;
+    logical_length = logical_length
+        .checked_add(8)
+        .ok_or(DigestBuildError::LengthOverflow)?;
+    for entry in entries {
+        logical_length = logical_length
+            .checked_add(COMMON_ENTRY_BYTES)
+            .and_then(|length| {
+                matches!(entry.key, FrozenRegistryKey::Script { .. })
+                    .then(|| length.checked_add(16))
+                    .unwrap_or(Some(length))
+            })
+            .ok_or(DigestBuildError::LengthOverflow)?;
+    }
+
+    let mut digest = DigestV1Builder::new(logical_length);
+    digest.update(PREFIX)?;
+    digest.update(
+        &u64::try_from(entries.len())
+            .map_err(|_| DigestBuildError::LengthOverflow)?
+            .to_le_bytes(),
+    )?;
+    for entry in entries {
+        match entry.key {
+            FrozenRegistryKey::Class(class_id) => {
+                digest.update(&[0])?;
+                digest.update(&class_id.to_le_bytes())?;
+            }
+            FrozenRegistryKey::Script {
+                class_id,
+                script_id,
+            } => {
+                digest.update(&[1])?;
+                digest.update(&class_id.to_le_bytes())?;
+                digest.update(&script_id)?;
+            }
+        }
+        digest.update(entry.schema_digest.as_bytes())?;
+    }
+    digest.finalize()
 }
 
 fn serialized_type_for_object<'file>(
@@ -998,8 +2000,8 @@ pub(super) fn validate_yaml_identities(
                 resource: "yaml_document_ordinal",
             })?;
         } else {
-            YamlAnchor::validate(&class.anchor)?;
-            anchors.push(class.anchor.as_str());
+            YamlAnchor::validate(class.anchor())?;
+            anchors.push(class.anchor());
         }
     }
     anchors.sort_unstable();
@@ -1013,10 +2015,10 @@ pub(super) fn validate_yaml_identities(
 }
 
 fn is_plain_yaml_document(index: usize, class: &UnityClass) -> bool {
-    class.class_id == 0
-        && class.class_name == "YamlDocument"
+    class.class_id() == 0
+        && class.class_name() == "YamlDocument"
         && class
-            .anchor
+            .anchor()
             .strip_prefix("doc_")
             .and_then(|ordinal| ordinal.parse::<usize>().ok())
             == Some(index)
@@ -1033,6 +2035,7 @@ fn register_prepared(
         kind,
         image,
         parsed,
+        format,
         children,
     } = prepared;
     let image = unity_asset_core::VerifiedSourceImage::verify(kind, image.into_backing(budget)?);
@@ -1044,7 +2047,7 @@ fn register_prepared(
         PreparedParse::Yaml(document) => FrozenSourceParse::Yaml(document),
     };
     store
-        .insert(source, image, parse, budget)
+        .insert_inspected(source, image, parse, format, budget)
         .map_err(WorkspaceError::from)?;
 
     for child in children {
@@ -1124,6 +2127,16 @@ pub(super) fn map_yaml_adapter_error(
     match error {
         YamlAdapterError::Budget(error) => WorkspaceError::Budget(error),
         YamlAdapterError::AllocationFailed {
+            context,
+            requested,
+            source,
+        } => WorkspaceError::Allocation {
+            resource: context,
+            requested,
+            unit: WorkspaceAllocationUnit::Bytes,
+            message: source.to_string(),
+        },
+        YamlAdapterError::IndexMapAllocationFailed {
             context,
             requested,
             source,
@@ -1306,43 +2319,90 @@ fn consume_arc_allocation<T>(
     Ok(())
 }
 
-pub(crate) fn promote_box_to_arc<T>(
-    value: Box<T>,
+pub(crate) fn promote_value_to_arc<T>(
+    value: T,
     budget: &mut AssetLoadBudget,
     resource: &'static str,
 ) -> Result<Arc<T>, WorkspaceError> {
     consume_arc_allocation::<T>(budget, resource)?;
-    Ok(Arc::from(value))
+    Ok(Arc::new(value))
 }
 
 fn usize_to_u64(value: usize, resource: &'static str) -> Result<u64, WorkspaceError> {
     u64::try_from(value).map_err(|_| BudgetError::ArithmeticOverflow { resource }.into())
 }
 
-fn absolute_path(path: &Path) -> Result<PathBuf, WorkspaceError> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    std::env::current_dir()
-        .map(|directory| directory.join(path))
-        .map_err(|error| WorkspaceError::io(path, error))
-}
-
-fn account_root_descriptor_backing(
-    alias: &SourceAlias,
-    origin: &PhysicalOrigin,
+fn absolute_path(
+    path: PathBuf,
     budget: &mut AssetLoadBudget,
-) -> Result<(), WorkspaceError> {
-    let retained_bytes = alias
-        .retained_clone_bytes()
-        .checked_add(origin.path().as_os_str().len())
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or(BudgetError::ArithmeticOverflow {
-            resource: "workspace_root_descriptor",
-        })?;
-    budget.check_bytes(retained_bytes)?;
-    budget.consume_bytes(retained_bytes)?;
-    Ok(())
+) -> Result<PathBuf, (PathBuf, Box<WorkspaceError>)> {
+    const RESOURCE: &str = "source admission absolute path";
+
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    let additional = match path.as_os_str().len().checked_add(1) {
+        Some(additional) => additional,
+        None => {
+            return Err((
+                path,
+                Box::new(BudgetError::ArithmeticOverflow { resource: RESOURCE }.into()),
+            ));
+        }
+    };
+    let additional_bytes = match usize_to_u64(additional, RESOURCE) {
+        Ok(additional_bytes) => additional_bytes,
+        Err(error) => return Err((path, Box::new(error))),
+    };
+    if let Err(error) = budget.check_bytes(additional_bytes) {
+        return Err((path, Box::new(error.into())));
+    }
+    let mut directory = match std::env::current_dir() {
+        Ok(directory) => directory,
+        Err(error) => {
+            let error = WorkspaceError::io(&path, error);
+            return Err((path, Box::new(error)));
+        }
+    };
+    let minimum_capacity = match directory.as_os_str().len().checked_add(additional) {
+        Some(minimum_capacity) => minimum_capacity.max(directory.capacity()),
+        None => {
+            return Err((
+                path,
+                Box::new(BudgetError::ArithmeticOverflow { resource: RESOURCE }.into()),
+            ));
+        }
+    };
+    let minimum_bytes = match usize_to_u64(minimum_capacity, RESOURCE) {
+        Ok(minimum_bytes) => minimum_bytes,
+        Err(error) => return Err((path, Box::new(error))),
+    };
+    if let Err(error) = budget.check_bytes(minimum_bytes) {
+        return Err((path, Box::new(error.into())));
+    }
+    if let Err(error) = directory.as_mut_os_string().try_reserve_exact(additional) {
+        return Err((
+            path,
+            Box::new(WorkspaceError::Allocation {
+                resource: RESOURCE,
+                requested: additional,
+                unit: WorkspaceAllocationUnit::Bytes,
+                message: error.to_string(),
+            }),
+        ));
+    }
+    let retained_bytes = match usize_to_u64(directory.capacity(), RESOURCE) {
+        Ok(retained_bytes) => retained_bytes,
+        Err(error) => return Err((path, Box::new(error))),
+    };
+    if let Err(error) = budget.check_bytes(retained_bytes) {
+        return Err((path, Box::new(error.into())));
+    }
+    directory.push(&path);
+    if let Err(error) = budget.consume_bytes(retained_bytes) {
+        return Err((path, Box::new(error.into())));
+    }
+    Ok(directory)
 }
 
 fn read_owned_image(
@@ -1350,16 +2410,25 @@ fn read_owned_image(
     budget: &mut AssetLoadBudget,
 ) -> Result<BudgetedSourceBytes, WorkspaceError> {
     let path = origin.path();
-    let mut file = File::open(path).map_err(|error| WorkspaceError::io(path, error))?;
-    let length = file
-        .metadata()
-        .map_err(|error| WorkspaceError::io(path, error))?
-        .len();
+    let mut file = open_verified_file(path).map_err(|error| WorkspaceError::io(path, error))?;
+    let before = physical_file_identity(&file, path)?;
+    let length = before.length();
     let length_usize = usize::try_from(length).map_err(|_| WorkspaceError::SourceTooLarge {
         path: path.to_path_buf(),
         length,
     })?;
-    budget.check_bytes(length)?;
+    let retained_bytes = arc_slice_allocation_bytes::<u8>(length_usize).map_err(|_| {
+        BudgetError::ArithmeticOverflow {
+            resource: "workspace_source_image",
+        }
+    })?;
+    let planned_bytes = length
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(retained_bytes))
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "workspace_source_image",
+        })?;
+    budget.check_bytes(planned_bytes)?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(length_usize)
@@ -1371,10 +2440,46 @@ fn read_owned_image(
         })?;
     budget.consume_bytes(length)?;
     bytes.resize(length_usize, 0);
-    file.read_exact(&mut bytes)
+    read_exact_stable(&mut file, &mut bytes, path)?;
+    verify_stable_contents(&mut file, &bytes, path, budget)?;
+
+    let after = physical_file_identity(&file, path)?;
+    let current = physical_file_identity_from_path(path)?;
+    if before != after || before != current {
+        return Err(WorkspaceError::SourceChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    BudgetedSourceBytes::from_vec(bytes, budget).map_err(WorkspaceError::from)
+}
+
+fn verify_stable_contents(
+    reader: &mut (impl Read + Seek),
+    expected: &[u8],
+    path: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), WorkspaceError> {
+    let length = usize_to_u64(expected.len(), "workspace_source_verification")?;
+    budget.consume_bytes(length)?;
+    reader
+        .seek(SeekFrom::Start(0))
         .map_err(|error| WorkspaceError::io(path, error))?;
+
+    let mut verified = 0;
+    let mut chunk = [0_u8; 64 * 1024];
+    while verified < expected.len() {
+        let count = chunk.len().min(expected.len() - verified);
+        read_exact_stable(reader, &mut chunk[..count], path)?;
+        if chunk[..count] != expected[verified..verified + count] {
+            return Err(WorkspaceError::SourceChanged {
+                path: path.to_path_buf(),
+            });
+        }
+        verified += count;
+    }
+
     let mut trailing = [0_u8; 1];
-    if file
+    if reader
         .read(&mut trailing)
         .map_err(|error| WorkspaceError::io(path, error))?
         != 0
@@ -1383,15 +2488,23 @@ fn read_owned_image(
             path: path.to_path_buf(),
         });
     }
-    let position = file
-        .stream_position()
-        .map_err(|error| WorkspaceError::io(path, error))?;
-    if position != length {
-        return Err(WorkspaceError::SourceChanged {
-            path: path.to_path_buf(),
-        });
-    }
-    BudgetedSourceBytes::from_vec(bytes, budget).map_err(WorkspaceError::from)
+    Ok(())
+}
+
+fn read_exact_stable(
+    reader: &mut impl Read,
+    bytes: &mut [u8],
+    path: &Path,
+) -> Result<(), WorkspaceError> {
+    reader.read_exact(bytes).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            WorkspaceError::SourceChanged {
+                path: path.to_path_buf(),
+            }
+        } else {
+            WorkspaceError::io(path, error)
+        }
+    })
 }
 
 fn looks_like_zip(bytes: &[u8]) -> bool {
@@ -1455,6 +2568,60 @@ mod tests {
     }
 
     #[test]
+    fn absolute_request_path_transfers_without_a_second_budgeted_allocation() {
+        let path = std::env::current_dir().expect("current directory");
+        let capacity = path.capacity();
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: 1,
+            ..AssetLoadLimits::default()
+        })
+        .expect("valid one-byte budget");
+
+        let absolute = absolute_path(path, &mut budget).expect("transfer absolute path");
+
+        assert!(absolute.is_absolute());
+        assert_eq!(absolute.capacity(), capacity);
+        assert_eq!(budget.usage(), Default::default());
+    }
+
+    #[test]
+    fn relative_request_path_materialization_is_exact_budgeted() {
+        let request = || PathBuf::from("relative").join("source.resource");
+        let mut measured = AssetLoadBudget::default();
+        let absolute =
+            absolute_path(request(), &mut measured).expect("materialize measured absolute path");
+        let measured_usage = measured.usage();
+        assert!(absolute.is_absolute());
+        assert!(absolute.ends_with(request()));
+        assert!(measured_usage.bytes > 0);
+
+        let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: measured_usage.bytes,
+            ..AssetLoadLimits::default()
+        })
+        .expect("valid exact budget");
+        absolute_path(request(), &mut exact).expect("materialize exact absolute path");
+        assert_eq!(exact.usage().bytes, measured_usage.bytes);
+
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: measured_usage.bytes - 1,
+            ..AssetLoadLimits::default()
+        })
+        .expect("valid one-short budget");
+        let (rejected, error) =
+            absolute_path(request(), &mut one_short).expect_err("reject one-short budget");
+        assert_eq!(rejected, request());
+        assert!(matches!(
+            *error,
+            WorkspaceError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            })
+        ));
+        assert_eq!(one_short.usage(), Default::default());
+    }
+
+    #[test]
     fn frozen_leaf_root_uses_the_same_zero_based_depth_as_embedded_trees() {
         let tree = TypeTree {
             nodes: vec![TypeTreeNode::new()],
@@ -1506,13 +2673,13 @@ mod tests {
     }
 
     #[test]
-    fn owned_root_image_accounts_working_and_arc_backings_before_promotion() {
+    fn owned_root_image_accounts_read_verification_and_arc_backing() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("payload.resource");
         fs::write(&path, b"four").unwrap();
         let origin = PhysicalOrigin::from_existing_path(&path).unwrap();
         let arc_bytes = arc_slice_allocation_bytes::<u8>(4).unwrap();
-        let exact_bytes = 4 + arc_bytes;
+        let exact_bytes = 8 + arc_bytes;
 
         let mut short = AssetLoadBudget::new(AssetLoadLimits {
             max_bytes: exact_bytes - 1,
@@ -1528,7 +2695,7 @@ mod tests {
                 requested,
             }) if limit == exact_bytes - 1 && requested == exact_bytes
         ));
-        assert_eq!(short.usage().bytes, 4);
+        assert_eq!(short.usage().bytes, 0);
 
         let mut exact = AssetLoadBudget::new(AssetLoadLimits {
             max_bytes: exact_bytes,
@@ -1538,6 +2705,40 @@ mod tests {
         let image = read_owned_image(&origin, &mut exact).unwrap();
         assert_eq!(image.as_ref(), b"four");
         assert_eq!(exact.usage().bytes, exact_bytes);
+    }
+
+    #[test]
+    fn second_pass_rejects_same_length_content_change() {
+        let path = Path::new("same-length.resource");
+        let mut changed = std::io::Cursor::new(b"five".as_slice());
+        let mut budget = AssetLoadBudget::default();
+
+        let error = verify_stable_contents(&mut changed, b"four", path, &mut budget).unwrap_err();
+
+        assert!(matches!(
+            error,
+            WorkspaceError::SourceChanged { path: changed_path } if changed_path == path
+        ));
+        assert_eq!(budget.usage().bytes, 4);
+    }
+
+    #[test]
+    fn second_pass_classifies_truncation_as_source_change() {
+        let path = Path::new("truncated.resource");
+        let mut truncated = std::io::Cursor::new(b"thr".as_slice());
+
+        let error = verify_stable_contents(
+            &mut truncated,
+            b"four",
+            path,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WorkspaceError::SourceChanged { path: changed_path } if changed_path == path
+        ));
     }
 
     #[test]
@@ -1619,6 +2820,69 @@ mod tests {
             })
         ));
         assert_eq!(load_budget.usage(), Default::default());
+    }
+
+    #[test]
+    fn admitted_physical_origin_retention_is_budgeted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("payload.resource");
+        fs::write(&path, b"payload").unwrap();
+        let run = |budget: &mut AssetLoadBudget| -> Result<_, WorkspaceError> {
+            let workspace = AssetWorkspace::new().unwrap();
+            let alias = SourceAlias::new("first.resource").unwrap();
+            let origin = PhysicalOrigin::from_existing_path_budgeted(&path, budget)
+                .map_err(physical_origin_workspace_error)?;
+            let mut aliases = None;
+            let mut origins = Some(reserve_admission_index::<PhysicalOrigin, (u64, SourceId)>(
+                2,
+                budget,
+                "source admission physical-origin index",
+            )?);
+            let source =
+                SourceId::new(workspace.workspace_id(), SourceKind::StreamedResource, 1).unwrap();
+            let before_index = budget.usage().bytes;
+            let (indexed_alias, indexed_origin) =
+                prepare_admitted_source_index_keys(&alias, &origin, false, true, budget).map_err(
+                    |error| match error {
+                        AdmissionIndexKeyError::Alias(error)
+                        | AdmissionIndexKeyError::Origin(error) => *error,
+                    },
+                )?;
+            insert_admitted_source_index_keys(
+                &mut aliases,
+                &mut origins,
+                indexed_alias,
+                indexed_origin,
+                0,
+                source,
+            );
+            Ok((before_index, origins.unwrap(), origin, source))
+        };
+
+        let mut measured = AssetLoadBudget::default();
+        let (before_index, origins, origin, source) = run(&mut measured).unwrap();
+        assert!(measured.usage().bytes > before_index);
+        assert_eq!(origins.get(&origin), Some(&(0, source)));
+        let usage = measured.usage();
+
+        let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: usage.bytes,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        run(&mut exact).unwrap();
+        assert_eq!(exact.usage().bytes, usage.bytes);
+
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: usage.bytes - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            run(&mut one_short),
+            Err(WorkspaceError::Budget(_))
+        ));
+        assert!(one_short.usage().bytes < usage.bytes);
     }
 
     #[test]

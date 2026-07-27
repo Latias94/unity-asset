@@ -1,17 +1,20 @@
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
+use std::mem::size_of;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use fs2::FileExt;
 use serde::{Deserialize, Deserializer, Serialize};
 use unity_asset_core::{
-    AssetLoadBudget, AssetLoadLimits, BudgetedJsonError, ChangeSet, Diagnostic, DigestBuildError,
-    DigestV1, DigestV1Builder, ObjectAddress, TransactionId, WorkspaceId, WorkspaceRevision,
+    AssetLoadBudget, AssetLoadLimits, BudgetError, BudgetedJsonError, ChangeSet,
+    ContractJsonLimits, ContractJsonResourceModel, Diagnostic, DigestBuildError, DigestV1,
+    DigestV1Builder, ObjectAddress, TransactionId, WorkspaceId, WorkspaceRevision,
+    read_contract_json,
 };
 
 use crate::analysis::{
@@ -24,6 +27,12 @@ use crate::generation::{
     SEARCH_GENERATION_CONTRACT_VERSION, SearchGenerationId, SearchGenerationManifestV1,
 };
 
+pub(crate) mod secure_read;
+
+use secure_read::{
+    ReadDirectory as SecureReadDirectory, RegularFile as SecureRegularFile, SecureReadError,
+};
+
 const GENERATIONS_DIRECTORY: &str = "generations";
 const STAGING_DIRECTORY: &str = ".staging";
 const ACTIVATIONS_DIRECTORY: &str = "activations";
@@ -33,10 +42,54 @@ const SOURCE_STATE_ARTIFACT_DIRECTORY: &str = "state";
 const SOURCE_STATE_FILE: &str = "source-state-v1.json";
 const MANIFEST_FILE: &str = "manifest.json";
 const ACTIVATION_FILE_DIGITS: usize = 20;
-const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_ACTIVATION_BYTES: u64 = 64 * 1024;
+const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MANIFEST_BYTES_U64: u64 = 8 * 1024 * 1024;
+const MAX_ACTIVATION_BYTES: usize = 64 * 1024;
+const MAX_ACTIVATION_BYTES_U64: u64 = 64 * 1024;
+const MAX_ACTIVATION_CANDIDATES: usize = 65_536;
+const ACTIVATION_CANDIDATE_GROWTH: usize = 256;
+const CONTRACT_JSON_PARSER_WORK_MULTIPLIER: u64 = 6;
+const CONTRACT_JSON_PARSER_FIXED_WORK_BYTES: u64 = 4 * 1024;
+// A manifest retains at most 4,096 transaction digests. The remaining 128 values cover every
+// scalar and nested evidence object in the fixed v1 envelope with room for contract evolution.
+const MAX_MANIFEST_JSON_VALUES: u64 = 4_096 + 128;
+// The activation record has no variable-size collections. Four KiB plus 256 bytes per observed
+// value covers its identifiers, digests, Serde temporaries, and the final fixed-size record.
+const ACTIVATION_JSON_RESOURCES: ContractJsonResourceModel = ContractJsonResourceModel::new(
+    CONTRACT_JSON_PARSER_WORK_MULTIPLIER,
+    CONTRACT_JSON_PARSER_FIXED_WORK_BYTES,
+    4 * 1024,
+    256,
+);
+const ACTIVATION_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
+    "search.activation",
+    MAX_ACTIVATION_BYTES,
+    2,
+    32,
+    32,
+    ACTIVATION_JSON_RESOURCES,
+);
+const MANIFEST_JSON_RESOURCES: ContractJsonResourceModel = ContractJsonResourceModel::new(
+    CONTRACT_JSON_PARSER_WORK_MULTIPLIER,
+    CONTRACT_JSON_PARSER_FIXED_WORK_BYTES,
+    // The fixed reserve covers the manifest envelope; 512 bytes per value is deliberately above
+    // a retained 32-byte transaction digest and all nested scalar evidence representations.
+    64 * 1024,
+    512,
+);
+const MANIFEST_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
+    "search.generation_manifest",
+    MAX_MANIFEST_BYTES,
+    8,
+    MAX_MANIFEST_JSON_VALUES,
+    MAX_MANIFEST_JSON_VALUES,
+    MANIFEST_JSON_RESOURCES,
+);
 const MAX_ARTIFACT_RELATIVE_PATH_BYTES: usize = 64 * 1024;
 const ARTIFACT_TREE_DOMAIN: &[u8] = b"unity-asset:search-generation:artifact-tree:v1\0";
+const MAX_PERSISTED_ARTIFACT_TREE_FILES: u64 = 1_000_000;
+const MAX_PERSISTED_ARTIFACT_TREE_DIRECTORIES: u64 = 1_000_000;
+const MAX_PERSISTED_ARTIFACT_TREE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const SOURCE_STATE_CONTRACT_VERSION: u16 = 1;
 const MAX_SOURCE_STATE_ASSETS: usize = 1_000_000;
 const MAX_SOURCE_STATE_SCAN_HINTS: usize = 1_000_000;
@@ -1094,29 +1147,41 @@ fn read_source_state_snapshot(
     budget: &mut AssetLoadBudget,
     limits: SourceStateLimits,
 ) -> Result<SourceStateSnapshot, SourceStateError> {
-    let path = directory.join(SOURCE_STATE_FILE);
-    let metadata = fs::symlink_metadata(&path).map_err(|source| {
-        SourceStateError::store(GenerationStoreError::io(
-            "inspect source state",
-            path.clone(),
+    let opened_directory = SecureReadDirectory::open(directory).map_err(|source| {
+        SourceStateError::store(persisted_read_error(
+            "open source-state directory",
+            directory.to_path_buf(),
             source,
         ))
     })?;
-    reject_link_or_reparse(&path, &metadata).map_err(SourceStateError::store)?;
-    if !metadata.is_file() {
-        return Err(SourceStateError::store(
-            GenerationStoreError::UnsupportedFileType { path },
-        ));
-    }
-    if metadata.len() > limits.max_encoded_bytes {
+    read_source_state_snapshot_in(&opened_directory, directory, budget, limits)
+}
+
+fn read_source_state_snapshot_in(
+    directory: &SecureReadDirectory,
+    directory_path: &Path,
+    budget: &mut AssetLoadBudget,
+    limits: SourceStateLimits,
+) -> Result<SourceStateSnapshot, SourceStateError> {
+    let path = directory_path.join(SOURCE_STATE_FILE);
+    let mut file = directory
+        .open_regular(OsStr::new(SOURCE_STATE_FILE))
+        .map_err(|source| {
+            SourceStateError::store(persisted_read_error(
+                "open source state",
+                path.clone(),
+                source,
+            ))
+        })?;
+    let encoded_length = file.length();
+    if encoded_length > limits.max_encoded_bytes {
         return Err(SourceStateError::EncodedTooLarge {
-            actual: metadata.len(),
+            actual: encoded_length,
             maximum: limits.max_encoded_bytes,
         });
     }
 
-    let read_limit = metadata
-        .len()
+    let read_limit = encoded_length
         .checked_add(1)
         .ok_or(SourceStateError::SizeOverflow {
             resource: "source state read limit",
@@ -1127,13 +1192,6 @@ fn read_source_state_snapshot(
     budget
         .consume_bytes(read_limit)
         .map_err(|source| SourceStateError::Budget(BudgetedJsonError::Budget(source)))?;
-    let mut file = File::open(&path).map_err(|source| {
-        SourceStateError::store(GenerationStoreError::io(
-            "open source state",
-            path.clone(),
-            source,
-        ))
-    })?;
     let capacity = usize::try_from(read_limit).map_err(|_| SourceStateError::SizeOverflow {
         resource: "source state read buffer",
     })?;
@@ -1144,7 +1202,7 @@ fn read_source_state_snapshot(
             requested: capacity,
             message: error.to_string(),
         })?;
-    Read::by_ref(&mut file)
+    Read::by_ref(file.file_mut())
         .take(read_limit)
         .read_to_end(&mut encoded)
         .map_err(|source| {
@@ -1154,6 +1212,13 @@ fn read_source_state_snapshot(
                 source,
             ))
         })?;
+    file.ensure_unchanged().map_err(|source| {
+        SourceStateError::store(persisted_read_error(
+            "revalidate source state",
+            path.clone(),
+            source,
+        ))
+    })?;
     let actual = u64::try_from(encoded.len()).map_err(|_| SourceStateError::SizeOverflow {
         resource: "source state encoded length",
     })?;
@@ -1163,9 +1228,9 @@ fn read_source_state_snapshot(
             maximum: limits.max_encoded_bytes,
         });
     }
-    if actual != metadata.len() {
+    if actual != encoded_length {
         return Err(SourceStateError::EncodedLengthChanged {
-            expected: metadata.len(),
+            expected: encoded_length,
             actual,
         });
     }
@@ -1240,6 +1305,29 @@ fn validate_persisted_source_state(
     directory: &Path,
     manifest: &SearchGenerationManifestV1,
 ) -> Result<(), GenerationStoreError> {
+    let source_state_directory = directory.join(SOURCE_STATE_ARTIFACT_DIRECTORY);
+    let opened_source_state =
+        SecureReadDirectory::open(&source_state_directory).map_err(|source| {
+            persisted_read_error(
+                "open completed source-state directory",
+                source_state_directory.clone(),
+                source,
+            )
+        })?;
+    validate_persisted_source_state_in(
+        directory,
+        &source_state_directory,
+        &opened_source_state,
+        manifest,
+    )
+}
+
+fn validate_persisted_source_state_in(
+    generation_directory: &Path,
+    source_state_directory: &Path,
+    opened_source_state: &SecureReadDirectory,
+    manifest: &SearchGenerationManifestV1,
+) -> Result<(), GenerationStoreError> {
     let source_limits = SourceStateLimits::default();
     let mut load_limits = AssetLoadLimits::default();
     let validation_read_limit = source_limits.max_encoded_bytes.checked_add(1).ok_or(
@@ -1252,18 +1340,19 @@ fn validate_persisted_source_state(
     load_limits.max_depth = 64;
     let mut budget = AssetLoadBudget::new(load_limits).map_err(|source| {
         invalid_source_state(
-            directory,
+            generation_directory,
             SourceStateError::Budget(BudgetedJsonError::Budget(source)),
         )
     })?;
-    let snapshot = read_source_state_snapshot(
-        &directory.join(SOURCE_STATE_ARTIFACT_DIRECTORY),
+    let snapshot = read_source_state_snapshot_in(
+        opened_source_state,
+        source_state_directory,
         &mut budget,
         source_limits,
     )
-    .map_err(|error| invalid_source_state(directory, error))?;
+    .map_err(|error| classify_persisted_source_state_error(generation_directory, error))?;
     validate_source_state_manifest(&snapshot, manifest)
-        .map_err(|error| invalid_source_state(directory, error))
+        .map_err(|error| classify_persisted_source_state_error(generation_directory, error))
 }
 
 fn source_state_entry_count(snapshot: &SourceStateSnapshot) -> Result<u64, SourceStateError> {
@@ -1559,6 +1648,32 @@ fn invalid_source_state(directory: &Path, source: SourceStateError) -> Generatio
     }
 }
 
+fn classify_persisted_source_state_error(
+    directory: &Path,
+    source: SourceStateError,
+) -> GenerationStoreError {
+    match source {
+        SourceStateError::Store(source) if source.is_security_violation() => *source,
+        SourceStateError::Budget(source) => GenerationStoreError::ContractJson {
+            artifact: "source state",
+            path: directory
+                .join(SOURCE_STATE_ARTIFACT_DIRECTORY)
+                .join(SOURCE_STATE_FILE),
+            source,
+        },
+        SourceStateError::AllocationFailed { requested, .. } => {
+            GenerationStoreError::AllocationFailed {
+                resource: "source state materialization",
+                requested,
+            }
+        }
+        SourceStateError::SizeOverflow { resource } => {
+            GenerationStoreError::SizeOverflow { resource }
+        }
+        source => invalid_source_state(directory, source),
+    }
+}
+
 /// Classifies non-fatal work that could not be completed around generation publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationPublishWarningKind {
@@ -1807,21 +1922,38 @@ pub struct GenerationStore {
 }
 
 impl GenerationStore {
+    /// Opens the durable store and selects the newest valid generation within `budget`.
+    ///
+    /// Directory discovery and every activation or manifest candidate share the caller's ledger;
+    /// corrupt candidates may be skipped, but their completed work remains charged.
     pub fn open(
         root: impl AsRef<Path>,
         options: GenerationStoreOptions,
+        budget: &mut AssetLoadBudget,
     ) -> Result<Self, GenerationStoreError> {
         let root = initialize_root(root.as_ref())?;
         let lease = Arc::new(WriterLease::acquire(&root)?);
         let generations = ensure_managed_directory(&root, GENERATIONS_DIRECTORY)?;
         let staging = ensure_managed_directory(&root, STAGING_DIRECTORY)?;
         let activations = ensure_managed_directory(&root, ACTIVATIONS_DIRECTORY)?;
-        recover_owned_staging(&staging)?;
+        let opened_generations = SecureReadDirectory::open(&generations).map_err(|source| {
+            persisted_read_error("open generations directory", generations.clone(), source)
+        })?;
+        let opened_activations = SecureReadDirectory::open(&activations).map_err(|source| {
+            persisted_read_error("open activations directory", activations.clone(), source)
+        })?;
+        recover_owned_staging(&staging, budget)?;
 
-        let next_staging_ordinal = next_staging_ordinal(&staging)?;
+        let next_staging_ordinal = next_staging_ordinal(&staging, budget)?;
         let (activation_candidates, next_activation_ordinal) =
-            activation_candidates(&activations, &staging)?;
-        let active = select_active_generation(&generations, &activation_candidates)?;
+            activation_candidates_for_open(&activations, &staging, budget)?;
+        let active = select_active_generation(
+            &generations,
+            &opened_generations,
+            &opened_activations,
+            &activation_candidates,
+            budget,
+        )?;
 
         Ok(Self {
             root,
@@ -1887,8 +2019,17 @@ impl GenerationStore {
         &self,
         build: &GenerationBuild,
     ) -> Result<GenerationArtifactEvidence, GenerationStoreError> {
+        let mut budget = AssetLoadBudget::default();
+        self.measure_artifacts_with_budget(build, &mut budget)
+    }
+
+    pub fn measure_artifacts_with_budget(
+        &self,
+        build: &GenerationBuild,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<GenerationArtifactEvidence, GenerationStoreError> {
         self.validate_build(build)?;
-        measure_generation_artifacts(&build.directory, None)
+        measure_generation_artifacts(&build.directory, budget, None)
     }
 
     pub fn prepare_publish(
@@ -1896,7 +2037,17 @@ impl GenerationStore {
         build: GenerationBuild,
         manifest: SearchGenerationManifestV1,
     ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
-        self.prepare_publish_inner(build, manifest, None)
+        let mut budget = AssetLoadBudget::default();
+        self.prepare_publish_with_budget(build, manifest, &mut budget)
+    }
+
+    pub fn prepare_publish_with_budget(
+        &mut self,
+        build: GenerationBuild,
+        manifest: SearchGenerationManifestV1,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
+        self.prepare_publish_inner(build, manifest, budget, None)
     }
 
     #[doc(hidden)]
@@ -1906,7 +2057,19 @@ impl GenerationStore {
         manifest: SearchGenerationManifestV1,
         failpoint: GenerationFailpoint,
     ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
-        self.prepare_publish_inner(build, manifest, Some(failpoint))
+        let mut budget = AssetLoadBudget::default();
+        self.prepare_publish_with_failpoint_and_budget(build, manifest, &mut budget, failpoint)
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_publish_with_failpoint_and_budget(
+        &mut self,
+        build: GenerationBuild,
+        manifest: SearchGenerationManifestV1,
+        budget: &mut AssetLoadBudget,
+        failpoint: GenerationFailpoint,
+    ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
+        self.prepare_publish_inner(build, manifest, budget, Some(failpoint))
     }
 
     pub fn estimate_publish(
@@ -2008,11 +2171,12 @@ impl GenerationStore {
         &mut self,
         mut build: GenerationBuild,
         manifest: SearchGenerationManifestV1,
+        budget: &mut AssetLoadBudget,
         failpoint: Option<GenerationFailpoint>,
     ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
         self.validate_build(&build)?;
 
-        let observed = measure_generation_artifacts(&build.directory, failpoint)?;
+        let observed = measure_generation_artifacts(&build.directory, budget, failpoint)?;
         if observed != manifest.artifacts() {
             return Err(GenerationStoreError::ArtifactEvidenceMismatch {
                 expected: Box::new(manifest.artifacts()),
@@ -2028,7 +2192,7 @@ impl GenerationStore {
             .filter(|active| active.generation == generation)
             .cloned()
         {
-            inspect_completed_generation(&active.directory, generation)?;
+            inspect_completed_generation(&active.directory, generation, budget)?;
             build.abort()?;
             return Ok(PreparedGenerationPublish {
                 store: self,
@@ -2042,7 +2206,7 @@ impl GenerationStore {
 
         let completed_directory = self.generation_directory(generation);
         let replace_invalid_completed = if path_exists_no_follow(&completed_directory)? {
-            match inspect_completed_generation(&completed_directory, generation) {
+            match inspect_completed_generation(&completed_directory, generation, budget) {
                 Ok(completed) => {
                     build.abort()?;
                     let activation_ordinal = self.allocate_activation_ordinal()?;
@@ -2078,7 +2242,7 @@ impl GenerationStore {
         let manifest_path = build.directory.join(MANIFEST_FILE);
         write_new_file(&manifest_path, &manifest_bytes)?;
         sync_tree_no_follow(&build.directory)?;
-        let durable_observed = measure_generation_artifacts(&build.directory, None)?;
+        let durable_observed = measure_generation_artifacts(&build.directory, budget, None)?;
         if durable_observed != manifest.artifacts() {
             return Err(GenerationStoreError::ArtifactEvidenceMismatch {
                 expected: Box::new(manifest.artifacts()),
@@ -2306,19 +2470,42 @@ impl GenerationStore {
         let Some(active) = &self.active else {
             return Ok(Vec::new());
         };
+        let opened_activations =
+            SecureReadDirectory::open(&self.activations).map_err(|source| {
+                persisted_read_error(
+                    "open activations directory",
+                    self.activations.clone(),
+                    source,
+                )
+            })?;
+        let opened_generations =
+            SecureReadDirectory::open(&self.generations).map_err(|source| {
+                persisted_read_error(
+                    "open generations directory",
+                    self.generations.clone(),
+                    source,
+                )
+            })?;
         let (mut candidates, _) = activation_candidates(&self.activations, &self.staging)?;
         candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.ordinal));
 
         let mut seen = BTreeSet::new();
         seen.insert(active.generation);
         let mut retained = Vec::new();
+        let mut validation_budget = AssetLoadBudget::default();
         for candidate in candidates {
             if retained.len() >= self.options.retain_previous_generations {
                 break;
             }
-            let record = match read_activation_record(&candidate.path, candidate.ordinal) {
+            let record = match read_activation_record(
+                &opened_activations,
+                &candidate.path,
+                &candidate.file_name,
+                candidate.ordinal,
+                &mut validation_budget,
+            ) {
                 Ok(record) => record,
-                Err(error) if error.is_security_violation() => {
+                Err(error) if error.is_candidate_scan_fatal() => {
                     return Err(error);
                 }
                 Err(_) => continue,
@@ -2326,9 +2513,14 @@ impl GenerationStore {
             if seen.contains(&record.generation) {
                 continue;
             }
-            let generation = match load_completed_generation(&self.generations, &record) {
+            let generation = match load_completed_generation(
+                &self.generations,
+                &opened_generations,
+                &record,
+                &mut validation_budget,
+            ) {
                 Ok(generation) => generation,
-                Err(error) if error.is_security_violation() => {
+                Err(error) if error.is_candidate_scan_fatal() => {
                     return Err(error);
                 }
                 Err(_) => continue,
@@ -2398,6 +2590,7 @@ struct ActivationRecordV1 {
 struct ActivationCandidate {
     ordinal: u64,
     path: PathBuf,
+    file_name: OsString,
 }
 
 #[derive(Debug)]
@@ -2497,60 +2690,166 @@ fn create_build_directories(directory: &Path) -> Result<(), GenerationStoreError
     Ok(())
 }
 
-fn recover_owned_staging(staging: &Path) -> Result<(), GenerationStoreError> {
-    let mut changed = false;
-    for entry in read_directory_entries(staging)? {
+struct BudgetedDirectoryEntry {
+    path: PathBuf,
+    file_name: OsString,
+}
+
+fn visit_directory_entries_budgeted(
+    directory: &Path,
+    budget: &mut AssetLoadBudget,
+    mut visitor: impl FnMut(
+        BudgetedDirectoryEntry,
+        &mut AssetLoadBudget,
+    ) -> Result<(), GenerationStoreError>,
+) -> Result<(), GenerationStoreError> {
+    let entries = fs::read_dir(directory).map_err(|source| {
+        GenerationStoreError::io("read generation directory", directory.to_path_buf(), source)
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            GenerationStoreError::io(
+                "read generation directory entry",
+                directory.to_path_buf(),
+                source,
+            )
+        })?;
         let path = entry.path();
-        let metadata = entry_metadata_no_follow(&entry)?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
+        let file_name = entry.file_name();
+        let fixed_bytes = size_of::<fs::DirEntry>()
+            .checked_add(size_of::<PathBuf>())
+            .and_then(|bytes| bytes.checked_add(size_of::<OsString>()))
+            .ok_or(GenerationStoreError::SizeOverflow {
+                resource: "generation directory entry",
+            })?;
+        let accounted_bytes = u64::try_from(fixed_bytes)
+            .ok()
+            .and_then(|bytes| bytes.checked_add(u64::try_from(path.as_os_str().len()).ok()?))
+            .and_then(|bytes| bytes.checked_add(u64::try_from(file_name.len()).ok()?))
+            .ok_or(GenerationStoreError::SizeOverflow {
+                resource: "generation directory entry",
+            })?;
+        budget
+            .check_entries(1)
+            .and_then(|()| budget.check_bytes(accounted_bytes))
+            .map_err(GenerationStoreError::Budget)?;
+        budget
+            .consume_entries(1)
+            .and_then(|()| budget.consume_bytes(accounted_bytes))
+            .map_err(GenerationStoreError::Budget)?;
+        visitor(BudgetedDirectoryEntry { path, file_name }, budget)?;
+    }
+    Ok(())
+}
+
+fn recover_owned_staging(
+    staging: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), GenerationStoreError> {
+    let mut changed = false;
+    visit_directory_entries_budgeted(staging, budget, |entry, _budget| {
+        let metadata = metadata_no_follow(&entry.path)?;
+        let Some(name) = entry.file_name.to_str() else {
+            return Ok(());
         };
-        if parse_staging_directory_name(&name).is_some() {
+        if parse_staging_directory_name(name).is_some() {
             if !metadata.is_dir() {
-                return Err(GenerationStoreError::UnsupportedFileType { path });
+                return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
             }
-            remove_tree_no_follow(&path)?;
+            remove_tree_no_follow(&entry.path)?;
             changed = true;
-            continue;
+            return Ok(());
         }
-        if parse_quarantine_directory_name(&name).is_some() {
+        if parse_quarantine_directory_name(name).is_some() {
             if !metadata.is_dir() {
-                return Err(GenerationStoreError::UnsupportedFileType { path });
+                return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
             }
-            remove_tree_no_follow(&path)?;
+            remove_tree_no_follow(&entry.path)?;
             changed = true;
-            continue;
+            return Ok(());
         }
-        if parse_activation_staging_file_name(&name).is_some() {
+        if parse_activation_staging_file_name(name).is_some() {
             if !metadata.is_file() {
-                return Err(GenerationStoreError::UnsupportedFileType { path });
+                return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
             }
-            fs::remove_file(&path).map_err(|source| {
-                GenerationStoreError::io("remove abandoned activation staging file", path, source)
+            fs::remove_file(&entry.path).map_err(|source| {
+                GenerationStoreError::io(
+                    "remove abandoned activation staging file",
+                    entry.path,
+                    source,
+                )
             })?;
             changed = true;
         }
-    }
+        Ok(())
+    })?;
     if changed {
         sync_directory(staging)?;
     }
     Ok(())
 }
 
-fn next_staging_ordinal(staging: &Path) -> Result<u64, GenerationStoreError> {
+fn next_staging_ordinal(
+    staging: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<u64, GenerationStoreError> {
     let mut maximum = 0_u64;
-    for entry in read_directory_entries(staging)? {
-        let _ = entry_metadata_no_follow(&entry)?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
+    visit_directory_entries_budgeted(staging, budget, |entry, _budget| {
+        let _ = metadata_no_follow(&entry.path)?;
+        let Some(name) = entry.file_name.to_str() else {
+            return Ok(());
         };
-        if let Some(ordinal) = parse_staging_directory_name(&name) {
+        if let Some(ordinal) = parse_staging_directory_name(name) {
             maximum = maximum.max(ordinal);
         }
-    }
+        Ok(())
+    })?;
     maximum
         .checked_add(1)
         .ok_or(GenerationStoreError::OrdinalOverflow)
+}
+
+fn activation_candidates_for_open(
+    activations: &Path,
+    staging: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<(Vec<ActivationCandidate>, u64), GenerationStoreError> {
+    let mut candidates = Vec::new();
+    let mut maximum = 0_u64;
+    visit_directory_entries_budgeted(activations, budget, |entry, budget| {
+        let _ = metadata_no_follow(&entry.path)?;
+        let Some(name) = entry.file_name.to_str() else {
+            return Ok(());
+        };
+        let Some(ordinal) = parse_activation_file_name(name) else {
+            return Ok(());
+        };
+        maximum = maximum.max(ordinal);
+        push_activation_candidate(
+            &mut candidates,
+            ActivationCandidate {
+                ordinal,
+                path: entry.path,
+                file_name: entry.file_name,
+            },
+            Some(budget),
+        )
+    })?;
+    visit_directory_entries_budgeted(staging, budget, |entry, _budget| {
+        let _ = metadata_no_follow(&entry.path)?;
+        let Some(name) = entry.file_name.to_str() else {
+            return Ok(());
+        };
+        if let Some(ordinal) = parse_activation_staging_file_name(name) {
+            maximum = maximum.max(ordinal);
+        }
+        Ok(())
+    })?;
+    candidates.sort_unstable_by_key(|candidate| candidate.ordinal);
+    let next = maximum
+        .checked_add(1)
+        .ok_or(GenerationStoreError::OrdinalOverflow)?;
+    Ok((candidates, next))
 }
 
 fn activation_candidates(
@@ -2568,10 +2867,15 @@ fn activation_candidates(
             continue;
         };
         maximum = maximum.max(ordinal);
-        candidates.push(ActivationCandidate {
-            ordinal,
-            path: entry.path(),
-        });
+        push_activation_candidate(
+            &mut candidates,
+            ActivationCandidate {
+                ordinal,
+                path: entry.path(),
+                file_name: entry.file_name(),
+            },
+            None,
+        )?;
     }
     for entry in read_directory_entries(staging)? {
         let _ = entry_metadata_no_follow(&entry)?;
@@ -2586,6 +2890,66 @@ fn activation_candidates(
         .checked_add(1)
         .ok_or(GenerationStoreError::OrdinalOverflow)?;
     Ok((candidates, next))
+}
+
+fn push_activation_candidate(
+    candidates: &mut Vec<ActivationCandidate>,
+    candidate: ActivationCandidate,
+    mut budget: Option<&mut AssetLoadBudget>,
+) -> Result<(), GenerationStoreError> {
+    if candidates.len() >= MAX_ACTIVATION_CANDIDATES {
+        return Err(GenerationStoreError::ActivationCandidateLimitExceeded {
+            maximum: MAX_ACTIVATION_CANDIDATES,
+        });
+    }
+    if candidates.len() == candidates.capacity() {
+        let additional = ACTIVATION_CANDIDATE_GROWTH.min(
+            MAX_ACTIVATION_CANDIDATES
+                .checked_sub(candidates.len())
+                .ok_or(GenerationStoreError::SizeOverflow {
+                    resource: "activation candidate capacity",
+                })?,
+        );
+        let requested_bytes = additional
+            .checked_mul(size_of::<ActivationCandidate>())
+            .ok_or(GenerationStoreError::SizeOverflow {
+                resource: "activation candidate vector",
+            })?;
+        if let Some(budget) = budget.as_deref_mut() {
+            budget
+                .check_bytes(u64::try_from(requested_bytes).map_err(|_| {
+                    GenerationStoreError::SizeOverflow {
+                        resource: "activation candidate vector",
+                    }
+                })?)
+                .map_err(GenerationStoreError::Budget)?;
+        }
+        let previous_capacity = candidates.capacity();
+        candidates.try_reserve_exact(additional).map_err(|_| {
+            GenerationStoreError::AllocationFailed {
+                resource: "activation candidate vector",
+                requested: requested_bytes,
+            }
+        })?;
+        if let Some(budget) = budget {
+            let added_capacity = candidates.capacity().checked_sub(previous_capacity).ok_or(
+                GenerationStoreError::SizeOverflow {
+                    resource: "activation candidate vector",
+                },
+            )?;
+            let allocated_bytes = added_capacity
+                .checked_mul(size_of::<ActivationCandidate>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or(GenerationStoreError::SizeOverflow {
+                    resource: "activation candidate vector",
+                })?;
+            budget
+                .consume_bytes(allocated_bytes)
+                .map_err(GenerationStoreError::Budget)?;
+        }
+    }
+    candidates.push(candidate);
+    Ok(())
 }
 
 fn prune_activation_history(
@@ -2621,19 +2985,26 @@ fn prune_activation_history(
 
 fn select_active_generation(
     generations: &Path,
+    opened_generations: &SecureReadDirectory,
+    opened_activations: &SecureReadDirectory,
     candidates: &[ActivationCandidate],
+    budget: &mut AssetLoadBudget,
 ) -> Result<Option<GenerationSnapshot>, GenerationStoreError> {
-    let mut ordered = candidates.iter().collect::<Vec<_>>();
-    ordered.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.ordinal));
-    for candidate in ordered {
-        let record = match read_activation_record(&candidate.path, candidate.ordinal) {
+    for candidate in candidates.iter().rev() {
+        let record = match read_activation_record(
+            opened_activations,
+            &candidate.path,
+            &candidate.file_name,
+            candidate.ordinal,
+            budget,
+        ) {
             Ok(record) => record,
-            Err(error) if error.is_security_violation() => return Err(error),
+            Err(error) if error.is_candidate_scan_fatal() => return Err(error),
             Err(_) => continue,
         };
-        match load_completed_generation(generations, &record) {
+        match load_completed_generation(generations, opened_generations, &record, budget) {
             Ok(generation) => return Ok(Some(generation)),
-            Err(error) if error.is_security_violation() => return Err(error),
+            Err(error) if error.is_candidate_scan_fatal() => return Err(error),
             Err(_) => continue,
         }
     }
@@ -2641,16 +3012,28 @@ fn select_active_generation(
 }
 
 fn read_activation_record(
+    directory: &SecureReadDirectory,
     path: &Path,
+    file_name: &OsStr,
     expected_ordinal: u64,
+    budget: &mut AssetLoadBudget,
 ) -> Result<ActivationRecordV1, GenerationStoreError> {
-    let bytes = read_limited(path, MAX_ACTIVATION_BYTES, "activation record")?;
-    let record = serde_json::from_slice::<ActivationRecordV1>(&bytes).map_err(|source| {
-        GenerationStoreError::Json {
-            artifact: "activation record",
-            path: path.to_path_buf(),
-            source,
-        }
+    let mut file = open_contract_file(
+        directory,
+        file_name,
+        path,
+        MAX_ACTIVATION_BYTES_U64,
+        "activation record",
+    )?;
+    let decoded =
+        read_contract_json::<ActivationRecordV1>(file.file_mut(), budget, ACTIVATION_JSON_LIMITS);
+    file.ensure_unchanged().map_err(|source| {
+        persisted_read_error("revalidate activation record", path.to_path_buf(), source)
+    })?;
+    let record = decoded.map_err(|source| GenerationStoreError::ContractJson {
+        artifact: "activation record",
+        path: path.to_path_buf(),
+        source,
     })?;
     if record.contract_version != SEARCH_GENERATION_CONTRACT_VERSION {
         return Err(GenerationStoreError::UnsupportedVersion {
@@ -2671,10 +3054,23 @@ fn read_activation_record(
 
 fn load_completed_generation(
     generations: &Path,
+    opened_generations: &SecureReadDirectory,
     record: &ActivationRecordV1,
+    budget: &mut AssetLoadBudget,
 ) -> Result<GenerationSnapshot, GenerationStoreError> {
-    let directory = generations.join(record.generation.directory_name());
-    let completed = inspect_completed_generation(&directory, record.generation)?;
+    let directory_name = record.generation.directory_name();
+    let directory = generations.join(&directory_name);
+    let opened_directory = opened_generations
+        .open_directory(OsStr::new(&directory_name))
+        .map_err(|source| {
+            persisted_read_error(
+                "open completed generation directory",
+                directory.clone(),
+                source,
+            )
+        })?;
+    let completed =
+        inspect_completed_generation_in(&directory, &opened_directory, record.generation, budget)?;
     if completed.manifest_digest != record.manifest_digest {
         return Err(GenerationStoreError::ManifestDigestMismatch {
             generation: record.generation,
@@ -2700,18 +3096,56 @@ fn load_completed_generation(
 fn inspect_completed_generation(
     directory: &Path,
     expected_generation: SearchGenerationId,
+    budget: &mut AssetLoadBudget,
 ) -> Result<CompletedGeneration, GenerationStoreError> {
-    ensure_existing_directory_no_follow(directory)?;
-    let manifest_path = directory.join(MANIFEST_FILE);
-    let manifest_bytes = read_limited(&manifest_path, MAX_MANIFEST_BYTES, "generation manifest")?;
-    let manifest_digest = DigestV1::hash_bytes(&manifest_bytes);
-    let manifest = serde_json::from_slice::<SearchGenerationManifestV1>(&manifest_bytes).map_err(
-        |source| GenerationStoreError::Json {
-            artifact: "generation manifest",
-            path: manifest_path,
+    let opened_directory = SecureReadDirectory::open(directory).map_err(|source| {
+        persisted_read_error(
+            "open completed generation directory",
+            directory.to_path_buf(),
             source,
-        },
+        )
+    })?;
+    inspect_completed_generation_in(directory, &opened_directory, expected_generation, budget)
+}
+
+fn inspect_completed_generation_in(
+    directory: &Path,
+    opened_directory: &SecureReadDirectory,
+    expected_generation: SearchGenerationId,
+    budget: &mut AssetLoadBudget,
+) -> Result<CompletedGeneration, GenerationStoreError> {
+    let manifest_path = directory.join(MANIFEST_FILE);
+    let mut manifest_file = open_contract_file(
+        opened_directory,
+        OsStr::new(MANIFEST_FILE),
+        &manifest_path,
+        MAX_MANIFEST_BYTES_U64,
+        "generation manifest",
     )?;
+    let manifest_length = manifest_file.length();
+    let mut reader = DigestingReader::new(manifest_file.file_mut(), manifest_length);
+    let decoded =
+        read_contract_json::<SearchGenerationManifestV1>(&mut reader, budget, MANIFEST_JSON_LIMITS);
+    let manifest_digest = reader.finalize();
+    manifest_file.ensure_unchanged().map_err(|source| {
+        persisted_read_error(
+            "revalidate generation manifest",
+            manifest_path.clone(),
+            source,
+        )
+    })?;
+    let manifest = decoded.map_err(|source| GenerationStoreError::ContractJson {
+        artifact: "generation manifest",
+        path: manifest_path.clone(),
+        source,
+    })?;
+    let manifest_digest = manifest_digest.map_err(|source| {
+        GenerationStoreError::io(
+            "digest generation manifest",
+            manifest_path,
+            io::Error::other(source),
+        )
+    })?;
     let actual_generation = manifest.generation_id();
     if actual_generation != expected_generation {
         return Err(GenerationStoreError::ManifestGenerationMismatch {
@@ -2719,14 +3153,30 @@ fn inspect_completed_generation(
             actual: actual_generation,
         });
     }
-    let actual_artifacts = measure_generation_artifacts(directory, None)?;
+    let actual_artifacts =
+        measure_generation_artifacts_in(directory, opened_directory, budget, None)?;
     if actual_artifacts != manifest.artifacts() {
         return Err(GenerationStoreError::ArtifactEvidenceMismatch {
             expected: Box::new(manifest.artifacts()),
             actual: Box::new(actual_artifacts),
         });
     }
-    validate_persisted_source_state(directory, &manifest)?;
+    let source_state_directory = directory.join(SOURCE_STATE_ARTIFACT_DIRECTORY);
+    let opened_source_state = opened_directory
+        .open_directory(OsStr::new(SOURCE_STATE_ARTIFACT_DIRECTORY))
+        .map_err(|source| {
+            persisted_read_error(
+                "open completed source-state directory",
+                source_state_directory.clone(),
+                source,
+            )
+        })?;
+    validate_persisted_source_state_in(
+        directory,
+        &source_state_directory,
+        &opened_source_state,
+        &manifest,
+    )?;
     Ok(CompletedGeneration {
         manifest,
         manifest_digest,
@@ -2735,14 +3185,73 @@ fn inspect_completed_generation(
 
 fn measure_generation_artifacts(
     directory: &Path,
+    budget: &mut AssetLoadBudget,
+    failpoint: Option<GenerationFailpoint>,
+) -> Result<GenerationArtifactEvidence, GenerationStoreError> {
+    let opened = SecureReadDirectory::open(directory).map_err(|source| {
+        persisted_read_error(
+            "open generation artifact root",
+            directory.to_path_buf(),
+            source,
+        )
+    })?;
+    measure_generation_artifacts_in(directory, &opened, budget, failpoint)
+}
+
+fn measure_generation_artifacts_in(
+    directory: &Path,
+    opened_directory: &SecureReadDirectory,
+    budget: &mut AssetLoadBudget,
     failpoint: Option<GenerationFailpoint>,
 ) -> Result<GenerationArtifactEvidence, GenerationStoreError> {
     inject_failure(failpoint, GenerationFailpoint::Search)?;
-    let search = measure_artifact_tree(&directory.join(SEARCH_ARTIFACT_DIRECTORY))?;
+    let search_directory = directory.join(SEARCH_ARTIFACT_DIRECTORY);
+    let opened_search = opened_directory
+        .open_directory(OsStr::new(SEARCH_ARTIFACT_DIRECTORY))
+        .map_err(|source| {
+            persisted_read_error(
+                "open search artifact directory",
+                search_directory.clone(),
+                source,
+            )
+        })?;
+    let search = measure_anchored_artifact_tree(
+        &directory.join(SEARCH_ARTIFACT_DIRECTORY),
+        opened_search,
+        budget,
+    )?;
     inject_failure(failpoint, GenerationFailpoint::References)?;
-    let references = measure_artifact_tree(&directory.join(REFERENCE_ARTIFACT_DIRECTORY))?;
+    let reference_directory = directory.join(REFERENCE_ARTIFACT_DIRECTORY);
+    let opened_references = opened_directory
+        .open_directory(OsStr::new(REFERENCE_ARTIFACT_DIRECTORY))
+        .map_err(|source| {
+            persisted_read_error(
+                "open reference artifact directory",
+                reference_directory.clone(),
+                source,
+            )
+        })?;
+    let references = measure_anchored_artifact_tree(
+        &directory.join(REFERENCE_ARTIFACT_DIRECTORY),
+        opened_references,
+        budget,
+    )?;
     inject_failure(failpoint, GenerationFailpoint::SourceState)?;
-    let source_state = measure_artifact_tree(&directory.join(SOURCE_STATE_ARTIFACT_DIRECTORY))?;
+    let source_state_directory = directory.join(SOURCE_STATE_ARTIFACT_DIRECTORY);
+    let opened_source_state = opened_directory
+        .open_directory(OsStr::new(SOURCE_STATE_ARTIFACT_DIRECTORY))
+        .map_err(|source| {
+            persisted_read_error(
+                "open source-state artifact directory",
+                source_state_directory.clone(),
+                source,
+            )
+        })?;
+    let source_state = measure_anchored_artifact_tree(
+        &directory.join(SOURCE_STATE_ARTIFACT_DIRECTORY),
+        opened_source_state,
+        budget,
+    )?;
     Ok(GenerationArtifactEvidence::new(
         search,
         references,
@@ -2753,17 +3262,82 @@ fn measure_generation_artifacts(
 pub(crate) fn measure_artifact_tree(
     root: &Path,
 ) -> Result<ArtifactTreeEvidence, GenerationStoreError> {
+    let mut budget = AssetLoadBudget::default();
+    measure_artifact_tree_with_budget(root, &mut budget)
+}
+
+fn measure_artifact_tree_with_budget(
+    root: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<ArtifactTreeEvidence, GenerationStoreError> {
     ensure_existing_directory_no_follow(root)?;
-    let mut pending = vec![root.to_path_buf()];
+    let mut pending = Vec::new();
+    reserve_artifact_vec(
+        &mut pending,
+        1,
+        "artifact directory traversal stack",
+        budget,
+    )?;
+    pending.push((root.to_path_buf(), 0_u32));
     let mut entries = Vec::new();
     let mut total_bytes = 0_u64;
+    let mut directory_count = 0_u64;
 
-    while let Some(directory) = pending.pop() {
-        for entry in read_directory_entries(&directory)? {
+    while let Some((directory, depth)) = pending.pop() {
+        directory_count =
+            directory_count
+                .checked_add(1)
+                .ok_or(GenerationStoreError::SizeOverflow {
+                    resource: "artifact tree directories",
+                })?;
+        if directory_count > MAX_PERSISTED_ARTIFACT_TREE_DIRECTORIES {
+            return Err(GenerationStoreError::PersistedArtifactTooLarge {
+                artifact: "artifact tree directories",
+                actual: directory_count,
+                maximum: MAX_PERSISTED_ARTIFACT_TREE_DIRECTORIES,
+            });
+        }
+        budget
+            .observe_depth(depth)
+            .map_err(GenerationStoreError::Budget)?;
+        let iterator = fs::read_dir(&directory).map_err(|source| {
+            GenerationStoreError::io("read artifact tree directory", directory.clone(), source)
+        })?;
+        for entry in iterator {
+            budget
+                .check_entries(1)
+                .and_then(|()| budget.check_members(1))
+                .map_err(GenerationStoreError::Budget)?;
+            let entry = entry.map_err(|source| {
+                GenerationStoreError::io(
+                    "read artifact tree directory entry",
+                    directory.clone(),
+                    source,
+                )
+            })?;
+            budget
+                .consume_entries(1)
+                .and_then(|()| budget.consume_members(1))
+                .map_err(GenerationStoreError::Budget)?;
             let path = entry.path();
             let metadata = entry_metadata_no_follow(&entry)?;
             if metadata.is_dir() {
-                pending.push(path);
+                let next_depth =
+                    depth
+                        .checked_add(1)
+                        .ok_or(GenerationStoreError::SizeOverflow {
+                            resource: "artifact tree depth",
+                        })?;
+                budget
+                    .check_depth(next_depth)
+                    .map_err(GenerationStoreError::Budget)?;
+                reserve_artifact_vec(
+                    &mut pending,
+                    1,
+                    "artifact directory traversal stack",
+                    budget,
+                )?;
+                pending.push((path, next_depth));
                 continue;
             }
             if !metadata.is_file() {
@@ -2777,13 +3351,44 @@ pub(crate) fn measure_artifact_tree(
                     .ok_or(GenerationStoreError::SizeOverflow {
                         resource: "artifact tree bytes",
                     })?;
+            if total_bytes > MAX_PERSISTED_ARTIFACT_TREE_BYTES {
+                return Err(GenerationStoreError::PersistedArtifactTooLarge {
+                    artifact: "artifact tree bytes",
+                    actual: total_bytes,
+                    maximum: MAX_PERSISTED_ARTIFACT_TREE_BYTES,
+                });
+            }
+            budget
+                .check_bytes(bytes)
+                .and_then(|()| budget.consume_bytes(bytes))
+                .map_err(GenerationStoreError::Budget)?;
             let mut file = File::open(&path).map_err(|source| {
                 GenerationStoreError::io("open artifact file", path.clone(), source)
             })?;
             let digest = DigestV1::hash_reader(&mut file, bytes).map_err(|source| {
                 GenerationStoreError::io("hash artifact file", path.clone(), source)
             })?;
-            let relative_path = portable_relative_path(root, &path)?;
+            let relative_path_bytes = portable_relative_path_byte_len(root, &path)?;
+            let relative_path_bytes = u64::try_from(relative_path_bytes).map_err(|_| {
+                GenerationStoreError::SizeOverflow {
+                    resource: "artifact relative path bytes",
+                }
+            })?;
+            let artifact_entry_bytes = u64::try_from(size_of::<ArtifactEntry>()).map_err(|_| {
+                GenerationStoreError::SizeOverflow {
+                    resource: "artifact entry allocation",
+                }
+            })?;
+            budget
+                .check_bytes(relative_path_bytes)
+                .and_then(|()| budget.check_bytes(artifact_entry_bytes))
+                .map_err(GenerationStoreError::Budget)?;
+            reserve_artifact_vec(&mut entries, 1, "artifact tree entries", budget)?;
+            budget
+                .consume_bytes(relative_path_bytes)
+                .and_then(|()| budget.consume_bytes(artifact_entry_bytes))
+                .map_err(GenerationStoreError::Budget)?;
+            let relative_path = portable_relative_path(root, &path, relative_path_bytes)?;
             entries.push(ArtifactEntry {
                 relative_path,
                 bytes,
@@ -2793,16 +3398,293 @@ pub(crate) fn measure_artifact_tree(
     }
 
     entries.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    let encoded = encode_artifact_tree(&entries)?;
+    let encoded_length = artifact_tree_encoded_len(&entries)?;
+    budget
+        .check_bytes(encoded_length)
+        .map_err(GenerationStoreError::Budget)?;
+    let encoded = encode_artifact_tree(&entries, encoded_length)?;
+    budget
+        .consume_bytes(encoded_length)
+        .map_err(GenerationStoreError::Budget)?;
     let file_count =
         u64::try_from(entries.len()).map_err(|_| GenerationStoreError::SizeOverflow {
             resource: "artifact file count",
         })?;
+    if file_count > MAX_PERSISTED_ARTIFACT_TREE_FILES {
+        return Err(GenerationStoreError::PersistedArtifactTooLarge {
+            artifact: "artifact tree files",
+            actual: file_count,
+            maximum: MAX_PERSISTED_ARTIFACT_TREE_FILES,
+        });
+    }
     Ok(ArtifactTreeEvidence::new(
         DigestV1::hash_bytes(&encoded),
         file_count,
         total_bytes,
     ))
+}
+
+struct AnchoredArtifactDirectory {
+    directory: SecureReadDirectory,
+    listing_path: PathBuf,
+    relative_path: String,
+    depth: u32,
+}
+
+/// Measures a completed artifact through already-opened directory handles.
+///
+/// `read_dir` supplies names only. Each name is then re-opened relative to the retained
+/// descriptor before metadata, hashing, or recursion occurs, so a replacement of any pathname
+/// cannot redirect evidence collection outside the selected generation tree.
+fn measure_anchored_artifact_tree(
+    root: &Path,
+    opened_root: SecureReadDirectory,
+    budget: &mut AssetLoadBudget,
+) -> Result<ArtifactTreeEvidence, GenerationStoreError> {
+    let mut pending = Vec::new();
+    reserve_artifact_vec(
+        &mut pending,
+        1,
+        "anchored artifact directory traversal stack",
+        budget,
+    )?;
+    pending.push(AnchoredArtifactDirectory {
+        directory: opened_root,
+        listing_path: root.to_path_buf(),
+        relative_path: String::new(),
+        depth: 0,
+    });
+    let mut entries = Vec::new();
+    let mut directories = 0_u64;
+    let mut total_bytes = 0_u64;
+
+    while let Some(current) = pending.pop() {
+        directories = directories
+            .checked_add(1)
+            .ok_or(GenerationStoreError::SizeOverflow {
+                resource: "anchored artifact tree directories",
+            })?;
+        if directories > MAX_PERSISTED_ARTIFACT_TREE_DIRECTORIES {
+            return Err(GenerationStoreError::PersistedArtifactTooLarge {
+                artifact: "anchored artifact tree directories",
+                actual: directories,
+                maximum: MAX_PERSISTED_ARTIFACT_TREE_DIRECTORIES,
+            });
+        }
+        budget
+            .observe_depth(current.depth)
+            .map_err(GenerationStoreError::Budget)?;
+
+        let directory_entries = fs::read_dir(&current.listing_path).map_err(|source| {
+            GenerationStoreError::io(
+                "enumerate anchored artifact names",
+                current.listing_path.clone(),
+                source,
+            )
+        })?;
+        for listing_entry in directory_entries {
+            budget
+                .check_entries(1)
+                .and_then(|()| budget.check_members(1))
+                .map_err(GenerationStoreError::Budget)?;
+            let listing_entry = listing_entry.map_err(|source| {
+                GenerationStoreError::io(
+                    "read anchored artifact name",
+                    current.listing_path.clone(),
+                    source,
+                )
+            })?;
+            budget
+                .consume_entries(1)
+                .and_then(|()| budget.consume_members(1))
+                .map_err(GenerationStoreError::Budget)?;
+
+            let name = listing_entry.file_name();
+            let display_path = current.listing_path.join(&name);
+            let relative_path =
+                anchored_relative_path(&current.relative_path, &name, &display_path, budget)?;
+            let file_type = listing_entry.file_type().map_err(|source| {
+                GenerationStoreError::io(
+                    "inspect anchored artifact name type",
+                    display_path.clone(),
+                    source,
+                )
+            })?;
+
+            if file_type.is_symlink() {
+                return Err(persisted_link_error(display_path));
+            }
+            if file_type.is_dir() {
+                let directory = current.directory.open_directory(&name).map_err(|source| {
+                    persisted_read_error(
+                        "open anchored artifact directory",
+                        display_path.clone(),
+                        source,
+                    )
+                })?;
+                let depth =
+                    current
+                        .depth
+                        .checked_add(1)
+                        .ok_or(GenerationStoreError::SizeOverflow {
+                            resource: "anchored artifact tree depth",
+                        })?;
+                budget
+                    .check_depth(depth)
+                    .map_err(GenerationStoreError::Budget)?;
+                reserve_artifact_vec(
+                    &mut pending,
+                    1,
+                    "anchored artifact directory traversal stack",
+                    budget,
+                )?;
+                pending.push(AnchoredArtifactDirectory {
+                    directory,
+                    listing_path: display_path,
+                    relative_path,
+                    depth,
+                });
+                continue;
+            }
+
+            let file = current.directory.open_regular(&name).map_err(|source| {
+                persisted_read_error("open anchored artifact file", display_path.clone(), source)
+            })?;
+            let bytes = file.length();
+            total_bytes =
+                total_bytes
+                    .checked_add(bytes)
+                    .ok_or(GenerationStoreError::SizeOverflow {
+                        resource: "anchored artifact tree bytes",
+                    })?;
+            if total_bytes > MAX_PERSISTED_ARTIFACT_TREE_BYTES {
+                return Err(GenerationStoreError::PersistedArtifactTooLarge {
+                    artifact: "anchored artifact tree bytes",
+                    actual: total_bytes,
+                    maximum: MAX_PERSISTED_ARTIFACT_TREE_BYTES,
+                });
+            }
+            budget
+                .check_bytes(bytes)
+                .and_then(|()| budget.consume_bytes(bytes))
+                .map_err(GenerationStoreError::Budget)?;
+            let digest = DigestV1::hash_reader(
+                file.range(0, bytes).map_err(|source| {
+                    persisted_read_error(
+                        "open anchored artifact hash range",
+                        display_path.clone(),
+                        source,
+                    )
+                })?,
+                bytes,
+            )
+            .map_err(|source| {
+                GenerationStoreError::io(
+                    "hash anchored artifact file",
+                    display_path.clone(),
+                    source,
+                )
+            })?;
+            file.ensure_unchanged().map_err(|source| {
+                persisted_read_error(
+                    "revalidate anchored artifact file",
+                    display_path.clone(),
+                    source,
+                )
+            })?;
+
+            let entry_bytes = u64::try_from(size_of::<ArtifactEntry>()).map_err(|_| {
+                GenerationStoreError::SizeOverflow {
+                    resource: "anchored artifact entry allocation",
+                }
+            })?;
+            budget
+                .check_bytes(entry_bytes)
+                .map_err(GenerationStoreError::Budget)?;
+            reserve_artifact_vec(&mut entries, 1, "anchored artifact tree entries", budget)?;
+            budget
+                .consume_bytes(entry_bytes)
+                .map_err(GenerationStoreError::Budget)?;
+            entries.push(ArtifactEntry {
+                relative_path,
+                bytes,
+                digest,
+            });
+        }
+    }
+
+    entries.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let encoded_length = artifact_tree_encoded_len(&entries)?;
+    budget
+        .check_bytes(encoded_length)
+        .map_err(GenerationStoreError::Budget)?;
+    let encoded = encode_artifact_tree(&entries, encoded_length)?;
+    budget
+        .consume_bytes(encoded_length)
+        .map_err(GenerationStoreError::Budget)?;
+    let file_count =
+        u64::try_from(entries.len()).map_err(|_| GenerationStoreError::SizeOverflow {
+            resource: "anchored artifact file count",
+        })?;
+    if file_count > MAX_PERSISTED_ARTIFACT_TREE_FILES {
+        return Err(GenerationStoreError::PersistedArtifactTooLarge {
+            artifact: "anchored artifact tree files",
+            actual: file_count,
+            maximum: MAX_PERSISTED_ARTIFACT_TREE_FILES,
+        });
+    }
+    Ok(ArtifactTreeEvidence::new(
+        DigestV1::hash_bytes(&encoded),
+        file_count,
+        total_bytes,
+    ))
+}
+
+fn anchored_relative_path(
+    parent: &str,
+    name: &OsStr,
+    display_path: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<String, GenerationStoreError> {
+    let name = name
+        .to_str()
+        .ok_or_else(|| GenerationStoreError::NonPortableArtifactPath {
+            path: display_path.to_path_buf(),
+        })?;
+    let length = parent
+        .len()
+        .checked_add(usize::from(!parent.is_empty()))
+        .and_then(|length| length.checked_add(name.len()))
+        .ok_or(GenerationStoreError::SizeOverflow {
+            resource: "anchored artifact relative path",
+        })?;
+    if length == 0 || length > MAX_ARTIFACT_RELATIVE_PATH_BYTES {
+        return Err(GenerationStoreError::NonPortableArtifactPath {
+            path: display_path.to_path_buf(),
+        });
+    }
+    let bytes = u64::try_from(length).map_err(|_| GenerationStoreError::SizeOverflow {
+        resource: "anchored artifact relative path bytes",
+    })?;
+    budget
+        .check_bytes(bytes)
+        .map_err(GenerationStoreError::Budget)?;
+    let mut result = String::new();
+    result
+        .try_reserve_exact(length)
+        .map_err(|_| GenerationStoreError::AllocationFailed {
+            resource: "anchored artifact relative path",
+            requested: length,
+        })?;
+    budget
+        .consume_bytes(bytes)
+        .map_err(GenerationStoreError::Budget)?;
+    result.push_str(parent);
+    if !parent.is_empty() {
+        result.push('/');
+    }
+    result.push_str(name);
+    Ok(result)
 }
 
 #[derive(Debug)]
@@ -2812,7 +3694,95 @@ struct ArtifactEntry {
     digest: DigestV1,
 }
 
-fn portable_relative_path(root: &Path, path: &Path) -> Result<String, GenerationStoreError> {
+fn reserve_artifact_vec<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    resource: &'static str,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), GenerationStoreError> {
+    let required = values
+        .len()
+        .checked_add(additional)
+        .ok_or(GenerationStoreError::SizeOverflow { resource })?;
+    if required <= values.capacity() {
+        return Ok(());
+    }
+    let current = values.capacity();
+    let next = current
+        .max(1)
+        .checked_mul(2)
+        .map(|capacity| capacity.max(required))
+        .ok_or(GenerationStoreError::SizeOverflow { resource })?;
+    let additional_capacity = next
+        .checked_sub(current)
+        .ok_or(GenerationStoreError::SizeOverflow { resource })?;
+    let requested_bytes = additional_capacity
+        .checked_mul(size_of::<T>())
+        .ok_or(GenerationStoreError::SizeOverflow { resource })?;
+    let budget_bytes = u64::try_from(requested_bytes)
+        .map_err(|_| GenerationStoreError::SizeOverflow { resource })?;
+    budget
+        .check_bytes(budget_bytes)
+        .map_err(GenerationStoreError::Budget)?;
+    values.try_reserve_exact(additional_capacity).map_err(|_| {
+        GenerationStoreError::AllocationFailed {
+            resource,
+            requested: requested_bytes,
+        }
+    })?;
+    budget
+        .consume_bytes(budget_bytes)
+        .map_err(GenerationStoreError::Budget)
+}
+
+fn portable_relative_path_byte_len(
+    root: &Path,
+    path: &Path,
+) -> Result<usize, GenerationStoreError> {
+    let relative =
+        path.strip_prefix(root)
+            .map_err(|_| GenerationStoreError::ArtifactEscapedRoot {
+                root: root.to_path_buf(),
+                path: path.to_path_buf(),
+            })?;
+    let mut encoded_len = 0_usize;
+    for component in relative.components() {
+        let Component::Normal(value) = component else {
+            return Err(GenerationStoreError::ArtifactEscapedRoot {
+                root: root.to_path_buf(),
+                path: path.to_path_buf(),
+            });
+        };
+        let value =
+            value
+                .to_str()
+                .ok_or_else(|| GenerationStoreError::NonPortableArtifactPath {
+                    path: path.to_path_buf(),
+                })?;
+        encoded_len = encoded_len
+            .checked_add(usize::from(encoded_len != 0))
+            .and_then(|length| length.checked_add(value.len()))
+            .ok_or(GenerationStoreError::SizeOverflow {
+                resource: "artifact relative path",
+            })?;
+    }
+    if encoded_len == 0 || encoded_len > MAX_ARTIFACT_RELATIVE_PATH_BYTES {
+        return Err(GenerationStoreError::NonPortableArtifactPath {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(encoded_len)
+}
+
+fn portable_relative_path(
+    root: &Path,
+    path: &Path,
+    encoded_len: u64,
+) -> Result<String, GenerationStoreError> {
+    let capacity =
+        usize::try_from(encoded_len).map_err(|_| GenerationStoreError::SizeOverflow {
+            resource: "artifact relative path bytes",
+        })?;
     let relative =
         path.strip_prefix(root)
             .map_err(|_| GenerationStoreError::ArtifactEscapedRoot {
@@ -2820,6 +3790,12 @@ fn portable_relative_path(root: &Path, path: &Path) -> Result<String, Generation
                 path: path.to_path_buf(),
             })?;
     let mut encoded = String::new();
+    encoded
+        .try_reserve_exact(capacity)
+        .map_err(|_| GenerationStoreError::AllocationFailed {
+            resource: "artifact relative path",
+            requested: capacity,
+        })?;
     for component in relative.components() {
         let Component::Normal(value) = component else {
             return Err(GenerationStoreError::ArtifactEscapedRoot {
@@ -2838,15 +3814,15 @@ fn portable_relative_path(root: &Path, path: &Path) -> Result<String, Generation
         }
         encoded.push_str(value);
     }
-    if encoded.is_empty() || encoded.len() > MAX_ARTIFACT_RELATIVE_PATH_BYTES {
-        return Err(GenerationStoreError::NonPortableArtifactPath {
-            path: path.to_path_buf(),
+    if encoded.len() != capacity {
+        return Err(GenerationStoreError::SizeOverflow {
+            resource: "artifact relative path changed length",
         });
     }
     Ok(encoded)
 }
 
-fn encode_artifact_tree(entries: &[ArtifactEntry]) -> Result<Vec<u8>, GenerationStoreError> {
+fn artifact_tree_encoded_len(entries: &[ArtifactEntry]) -> Result<u64, GenerationStoreError> {
     let mut length =
         ARTIFACT_TREE_DOMAIN
             .len()
@@ -2863,7 +3839,26 @@ fn encode_artifact_tree(entries: &[ArtifactEntry]) -> Result<Vec<u8>, Generation
                 resource: "artifact tree evidence",
             })?;
     }
-    let mut encoded = Vec::with_capacity(length);
+    u64::try_from(length).map_err(|_| GenerationStoreError::SizeOverflow {
+        resource: "artifact tree evidence",
+    })
+}
+
+fn encode_artifact_tree(
+    entries: &[ArtifactEntry],
+    encoded_length: u64,
+) -> Result<Vec<u8>, GenerationStoreError> {
+    let capacity =
+        usize::try_from(encoded_length).map_err(|_| GenerationStoreError::SizeOverflow {
+            resource: "artifact tree evidence",
+        })?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(capacity)
+        .map_err(|_| GenerationStoreError::AllocationFailed {
+            resource: "artifact tree evidence",
+            requested: capacity,
+        })?;
     encoded.extend_from_slice(ARTIFACT_TREE_DOMAIN);
     encoded.extend_from_slice(
         &u64::try_from(entries.len())
@@ -2883,6 +3878,11 @@ fn encode_artifact_tree(entries: &[ArtifactEntry]) -> Result<Vec<u8>, Generation
         encoded.extend_from_slice(entry.relative_path.as_bytes());
         encoded.extend_from_slice(&entry.bytes.to_le_bytes());
         encoded.extend_from_slice(entry.digest.as_bytes());
+    }
+    if encoded.len() != capacity {
+        return Err(GenerationStoreError::SizeOverflow {
+            resource: "artifact tree encoded length changed",
+        });
     }
     Ok(encoded)
 }
@@ -3023,10 +4023,14 @@ fn read_directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>, GenerationSt
 
 fn entry_metadata_no_follow(entry: &fs::DirEntry) -> Result<fs::Metadata, GenerationStoreError> {
     let path = entry.path();
-    let metadata = fs::symlink_metadata(&path).map_err(|source| {
-        GenerationStoreError::io("inspect managed entry", path.clone(), source)
+    metadata_no_follow(&path)
+}
+
+fn metadata_no_follow(path: &Path) -> Result<fs::Metadata, GenerationStoreError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| {
+        GenerationStoreError::io("inspect managed entry", path.to_path_buf(), source)
     })?;
-    reject_link_or_reparse(&path, &metadata)?;
+    reject_link_or_reparse(path, &metadata)?;
     Ok(metadata)
 }
 
@@ -3047,6 +4051,30 @@ fn reject_link_or_reparse(
         });
     }
     Ok(())
+}
+
+fn persisted_read_error(
+    operation: &'static str,
+    path: PathBuf,
+    source: SecureReadError,
+) -> GenerationStoreError {
+    match source {
+        SecureReadError::Io(source) => GenerationStoreError::io(operation, path, source),
+        SecureReadError::LinkOrReparse => persisted_link_error(path),
+        SecureReadError::NotDirectory => GenerationStoreError::NotDirectory { path },
+        SecureReadError::NotRegular => GenerationStoreError::UnsupportedFileType { path },
+        SecureReadError::IdentityChanged => GenerationStoreError::PersistedIdentityChanged { path },
+    }
+}
+
+#[cfg(windows)]
+fn persisted_link_error(path: PathBuf) -> GenerationStoreError {
+    GenerationStoreError::ReparsePoint { path }
+}
+
+#[cfg(not(windows))]
+fn persisted_link_error(path: PathBuf) -> GenerationStoreError {
+    GenerationStoreError::Symlink { path }
 }
 
 #[cfg(windows)]
@@ -3077,56 +4105,53 @@ fn path_exists_no_follow(path: &Path) -> Result<bool, GenerationStoreError> {
     }
 }
 
-fn read_limited(
+fn open_contract_file(
+    directory: &SecureReadDirectory,
+    file_name: &OsStr,
     path: &Path,
     maximum: u64,
     artifact: &'static str,
-) -> Result<Vec<u8>, GenerationStoreError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| {
-        GenerationStoreError::io(
-            "inspect persisted generation file",
-            path.to_path_buf(),
-            source,
-        )
+) -> Result<SecureRegularFile, GenerationStoreError> {
+    let file = directory.open_regular(file_name).map_err(|source| {
+        persisted_read_error("open persisted generation file", path.to_path_buf(), source)
     })?;
-    reject_link_or_reparse(path, &metadata)?;
-    if !metadata.is_file() {
-        return Err(GenerationStoreError::UnsupportedFileType {
-            path: path.to_path_buf(),
-        });
-    }
-    if metadata.len() > maximum {
+    let opened_length = file.length();
+    if opened_length > maximum {
         return Err(GenerationStoreError::PersistedArtifactTooLarge {
             artifact,
-            actual: metadata.len(),
+            actual: opened_length,
             maximum,
         });
     }
-    let mut file = File::open(path).map_err(|source| {
-        GenerationStoreError::io("open persisted generation file", path.to_path_buf(), source)
-    })?;
-    let capacity =
-        usize::try_from(metadata.len()).map_err(|_| GenerationStoreError::SizeOverflow {
-            resource: "persisted artifact read buffer",
-        })?;
-    let mut bytes = Vec::with_capacity(capacity);
-    Read::by_ref(&mut file)
-        .take(maximum.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|source| {
-            GenerationStoreError::io("read persisted generation file", path.to_path_buf(), source)
-        })?;
-    let actual = u64::try_from(bytes.len()).map_err(|_| GenerationStoreError::SizeOverflow {
-        resource: "persisted artifact length",
-    })?;
-    if actual > maximum {
-        return Err(GenerationStoreError::PersistedArtifactTooLarge {
-            artifact,
-            actual,
-            maximum,
-        });
+    Ok(file)
+}
+
+struct DigestingReader<'file> {
+    file: &'file mut File,
+    digest: DigestV1Builder,
+}
+
+impl<'file> DigestingReader<'file> {
+    fn new(file: &'file mut File, length: u64) -> Self {
+        Self {
+            file,
+            digest: DigestV1Builder::new(length),
+        }
     }
-    Ok(bytes)
+
+    fn finalize(self) -> Result<DigestV1, DigestBuildError> {
+        self.digest.finalize()
+    }
+}
+
+impl Read for DigestingReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let amount = self.file.read(output)?;
+        self.digest
+            .update(&output[..amount])
+            .map_err(io::Error::other)?;
+        Ok(amount)
+    }
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), GenerationStoreError> {
@@ -3513,6 +4538,19 @@ pub enum GenerationStoreError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    ContractJson {
+        artifact: &'static str,
+        path: PathBuf,
+        source: BudgetedJsonError,
+    },
+    Budget(BudgetError),
+    AllocationFailed {
+        resource: &'static str,
+        requested: usize,
+    },
+    ActivationCandidateLimitExceeded {
+        maximum: usize,
+    },
     Symlink {
         path: PathBuf,
     },
@@ -3523,6 +4561,9 @@ pub enum GenerationStoreError {
         path: PathBuf,
     },
     UnsupportedFileType {
+        path: PathBuf,
+    },
+    PersistedIdentityChanged {
         path: PathBuf,
     },
     NonPortableArtifactPath {
@@ -3600,7 +4641,35 @@ impl GenerationStoreError {
     fn is_security_violation(&self) -> bool {
         matches!(
             self,
-            Self::Symlink { .. } | Self::ReparsePoint { .. } | Self::UnsupportedFileType { .. }
+            Self::Symlink { .. }
+                | Self::ReparsePoint { .. }
+                | Self::NotDirectory { .. }
+                | Self::UnsupportedFileType { .. }
+                | Self::PersistedIdentityChanged { .. }
+        )
+    }
+
+    fn is_candidate_scan_fatal(&self) -> bool {
+        if self.is_security_violation()
+            || matches!(
+                self,
+                Self::Budget(_)
+                    | Self::AllocationFailed { .. }
+                    | Self::ActivationCandidateLimitExceeded { .. }
+            )
+        {
+            return true;
+        }
+        matches!(
+            self,
+            Self::ContractJson { source, .. }
+                if !matches!(
+                    source,
+                    BudgetedJsonError::Io(_)
+                        | BudgetedJsonError::Json(_)
+                        | BudgetedJsonError::EncodedLimitExceeded { .. }
+                        | BudgetedJsonError::StructureLimitExceeded { .. }
+                )
         )
     }
 
@@ -3608,6 +4677,13 @@ impl GenerationStoreError {
         matches!(
             self,
             Self::Json { .. }
+                | Self::ContractJson {
+                    source: BudgetedJsonError::Io(_)
+                        | BudgetedJsonError::Json(_)
+                        | BudgetedJsonError::EncodedLimitExceeded { .. }
+                        | BudgetedJsonError::StructureLimitExceeded { .. },
+                    ..
+                }
                 | Self::PersistedArtifactTooLarge { .. }
                 | Self::ManifestGenerationMismatch { .. }
                 | Self::ArtifactEvidenceMismatch { .. }
@@ -3646,6 +4722,29 @@ impl fmt::Display for GenerationStoreError {
                 "invalid {artifact} at {}: {source}",
                 path.display()
             ),
+            Self::ContractJson {
+                artifact,
+                path,
+                source,
+            } => write!(
+                formatter,
+                "invalid {artifact} at {}: {source}",
+                path.display()
+            ),
+            Self::Budget(source) => {
+                write!(formatter, "generation store budget exhausted: {source}")
+            }
+            Self::AllocationFailed {
+                resource,
+                requested,
+            } => write!(
+                formatter,
+                "failed to reserve {requested} bytes for {resource}"
+            ),
+            Self::ActivationCandidateLimitExceeded { maximum } => write!(
+                formatter,
+                "generation store contains more than {maximum} activation candidates"
+            ),
             Self::Symlink { path } => write!(
                 formatter,
                 "generation store refuses symbolic link {}",
@@ -3662,6 +4761,11 @@ impl fmt::Display for GenerationStoreError {
             Self::UnsupportedFileType { path } => write!(
                 formatter,
                 "generation store refuses unsupported file type {}",
+                path.display()
+            ),
+            Self::PersistedIdentityChanged { path } => write!(
+                formatter,
+                "persisted generation file identity, link count, or length is unsafe at {}",
                 path.display()
             ),
             Self::NonPortableArtifactPath { path } => {
@@ -3758,8 +4862,154 @@ impl Error for GenerationStoreError {
             Self::Io { source, .. } => Some(source),
             Self::WriterLeaseUnavailable { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
+            Self::ContractJson { source, .. } => Some(source),
+            Self::Budget(source) => Some(source),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod generation_store_tests {
+    use super::*;
+
+    #[test]
+    fn anchored_artifact_measurement_honors_the_exact_caller_budget() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let nested = temporary.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("artifact.bin"), b"anchored artifact").unwrap();
+
+        let mut measured = AssetLoadBudget::default();
+        let evidence = measure_anchored_artifact_tree(
+            temporary.path(),
+            SecureReadDirectory::open(temporary.path()).unwrap(),
+            &mut measured,
+        )
+        .unwrap();
+        let usage = measured.usage();
+        assert!(usage.bytes > 0);
+
+        let exact_limits = AssetLoadLimits {
+            max_entries: usage.entries,
+            max_bytes: usage.bytes,
+            max_depth: usage.max_observed_depth,
+            max_members: usage.members,
+            ..AssetLoadLimits::default()
+        };
+        let mut exact = AssetLoadBudget::new(exact_limits).unwrap();
+        let exact_evidence = measure_anchored_artifact_tree(
+            temporary.path(),
+            SecureReadDirectory::open(temporary.path()).unwrap(),
+            &mut exact,
+        )
+        .unwrap();
+        assert_eq!(exact_evidence, evidence);
+        assert_eq!(exact.usage(), usage);
+
+        let mut one_byte_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: usage.bytes - 1,
+            ..exact_limits
+        })
+        .unwrap();
+        let error = measure_anchored_artifact_tree(
+            temporary.path(),
+            SecureReadDirectory::open(temporary.path()).unwrap(),
+            &mut one_byte_short,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GenerationStoreError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn activation_materialization_is_budgeted_before_typed_deserialization() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let path = temporary.path().join("activation.json");
+        fs::write(&path, br#"{"contract_version":"invalid"}"#).unwrap();
+        let directory = SecureReadDirectory::open(temporary.path()).unwrap();
+
+        let mut measured_budget = AssetLoadBudget::default();
+        let error = read_activation_record(
+            &directory,
+            &path,
+            OsStr::new("activation.json"),
+            0,
+            &mut measured_budget,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GenerationStoreError::ContractJson {
+                source: BudgetedJsonError::Json(_),
+                ..
+            }
+        ));
+
+        let usage = measured_budget.usage();
+        let mut one_byte_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_entries: usage.entries,
+            max_bytes: usage.bytes.checked_sub(1).unwrap(),
+            max_depth: usage.max_observed_depth,
+            max_members: usage.members,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        let error = read_activation_record(
+            &directory,
+            &path,
+            OsStr::new("activation.json"),
+            0,
+            &mut one_byte_short,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GenerationStoreError::ContractJson {
+                source: BudgetedJsonError::Budget(BudgetError::Exceeded {
+                    resource: "bytes",
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn activation_candidate_vector_has_a_hard_limit() {
+        let mut candidates = Vec::new();
+        for ordinal in 0..MAX_ACTIVATION_CANDIDATES {
+            push_activation_candidate(
+                &mut candidates,
+                ActivationCandidate {
+                    ordinal: u64::try_from(ordinal).unwrap(),
+                    path: PathBuf::new(),
+                    file_name: OsString::new(),
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        assert!(matches!(
+            push_activation_candidate(
+                &mut candidates,
+                ActivationCandidate {
+                    ordinal: u64::try_from(MAX_ACTIVATION_CANDIDATES).unwrap(),
+                    path: PathBuf::new(),
+                    file_name: OsString::new(),
+                },
+                None,
+            ),
+            Err(GenerationStoreError::ActivationCandidateLimitExceeded {
+                maximum: MAX_ACTIVATION_CANDIDATES
+            })
+        ));
     }
 }
 
@@ -4224,8 +5474,12 @@ mod source_state_tests {
         let workspace = WorkspaceId::from_u128(0x52).unwrap();
         let revision = WorkspaceRevision::new(digest("revision"));
         let snapshot = source_state(workspace, revision);
-        let mut store =
-            GenerationStore::open(temporary.path(), GenerationStoreOptions::default()).unwrap();
+        let mut store = GenerationStore::open(
+            temporary.path(),
+            GenerationStoreOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
         let build = store.begin().unwrap();
         build
             .write_source_state(&snapshot, SourceStateLimits::default())

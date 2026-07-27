@@ -9,10 +9,10 @@ mod bounded;
 pub mod budget;
 pub mod change;
 pub mod constants;
+pub mod contract_json;
 pub mod diagnostic;
 pub mod digest;
 pub mod document;
-pub mod dynamic_access;
 pub mod error;
 pub mod field_path;
 pub mod identity;
@@ -29,15 +29,17 @@ pub use allocation::{
     vec_allocation_bytes,
 };
 pub use budget::{
-    AssetLoadBudget, AssetLoadDepthScope, AssetLoadLimits, AssetLoadUsage, BudgetError,
-    BudgetedJsonError, DecompressionBudget, DecompressionUsage,
+    AssetLoadBudget, AssetLoadBudgetDomainToken, AssetLoadDepthScope, AssetLoadLimits,
+    AssetLoadUsage, BudgetError, BudgetedJsonError, DecompressionBudget, DecompressionUsage,
 };
 pub use change::{ChangeSet, ChangeSetError, IdentityRemap, TransactionId};
 pub use constants::*;
+pub use contract_json::{
+    ContractJsonLimits, ContractJsonResourceModel, read_contract_json, read_contract_json_slice,
+};
 pub use diagnostic::{Diagnostic, DiagnosticError, DiagnosticSeverity};
 pub use digest::{DigestBuildError, DigestParseError, DigestV1, DigestV1Builder};
 pub use document::{DocumentFormat, UnityDocument};
-pub use dynamic_access::{DynamicAccess, DynamicValue};
 pub use error::{Result, UnityAssetError};
 pub use field_path::{FieldPath, FieldPathError, FieldPathSegment};
 pub use identity::{
@@ -53,7 +55,7 @@ pub use semantic_digest::{
 pub use source_image::{
     BudgetedSourceBytes, VerifiedSourceImage, VerifiedSourceImageError, VerifiedSourceRebinding,
 };
-pub use unity_class::{UnityClass, UnityClassRegistry};
+pub use unity_class::{UnityClass, UnityClassHeader};
 pub use unity_value::{UnityValue, UnityValueCloneError, UnityValueKind, ValuePathError};
 
 /// Get Unity class name from class ID
@@ -74,7 +76,7 @@ mod tests {
     fn test_basic_functionality() {
         // Basic functionality test.
         let class = UnityClass::new(1, "GameObject".to_string(), "123".to_string());
-        assert_eq!(class.class_id, 1);
-        assert_eq!(class.class_name, "GameObject");
+        assert_eq!(class.class_id(), 1);
+        assert_eq!(class.class_name(), "GameObject");
     }
 }

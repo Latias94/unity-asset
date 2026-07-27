@@ -1,0 +1,370 @@
+# Migrating to Asset Workspace
+
+This release deliberately removes the mutable compatibility facade and legacy export commands.
+There are no compatibility aliases. Migrate to the revision-bound Workspace contracts rather than
+wrapping the removed APIs.
+
+This is the only non-historical document that names removed public symbols and commands.
+
+## Migration Summary
+
+| Removed surface | Replacement |
+| --- | --- |
+| `Environment` | `AssetWorkspace` for ownership and mutation; `WorkspaceSnapshot` for immutable reads |
+| `BinarySource` / `BinarySourceKind` | `SourceOpenRequest`, `SourceAlias`, `SourceKind`, `SourceLocator`, and `SourceId` |
+| `BinaryObjectKey` | Persisted `ObjectAddress`; in-process `RevisionedObjectHandle` |
+| `EnvironmentObjectRef` | `WorkspaceObjectInspection`, `WorkspaceObject`, and `WorkspaceObjectValue` |
+| `EnvironmentReporter` / `EnvironmentWarning` | Structured diagnostics and typed reports; formatting belongs to the application |
+| `set_type_tree_registry*` | `WorkspaceOptions::with_type_tree_registry_paths` before workspace creation |
+| `ScriptTypeTreeGenerator` callback | Immutable, budgeted JSON or TPK registry loaded through `WorkspaceOptions` |
+| `UnityClassRegistry` | Direct immutable class values and schema provenance; no constructor registry |
+| `PythonLikeUnityDocument` / `PythonLikeUnityClass` | Typed `YamlDocument`, `UnityClass`, `UnityValue`, and Workspace inspection |
+| `DynamicAccess` / `DynamicValue` | `UnityClass` and `UnityValue` typed accessors |
+| Direct mutable class/document and `save*` APIs | `MutationPlan`, schema recipes, `prepare`, preview, and `commit` |
+| Legacy dependency/session graph types | `ReferenceGraph` |
+| Legacy export manifest and export sessions | `ExtractionRequest`, `ExtractionPlan`, `ExtractionManifest`, and `ExtractionReport` |
+
+## Loading Sources
+
+### Before
+
+```rust,ignore
+let mut env = Environment::new();
+env.load(path_or_directory, &mut budget)?;
+```
+
+### After
+
+```rust,no_run
+use unity_asset::{AssetLoadBudget, SourceAlias, SourceKind};
+use unity_asset::workspace::{AssetWorkspace, SourceOpenRequest};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut budget = AssetLoadBudget::default();
+    let mut workspace = AssetWorkspace::new()?;
+
+    let request = SourceOpenRequest::new(
+        "Build/game.bundle",
+        SourceAlias::new("Build/game.bundle")?,
+    )
+    .with_kind_hint(SourceKind::AssetBundle);
+    workspace.load_source(request, &mut budget)?;
+    Ok(())
+}
+```
+
+The Rust library no longer owns an implicit directory walk. Enumerate caller-trusted files,
+apply the application's ignore policy, assign stable aliases, and call `load_source` for each
+selected root. `load_path` is a convenience for one explicit file. The CLI still accepts a file
+or directory and applies its own budgeted discovery policy.
+
+For external TypeTrees, configure the workspace before loading:
+
+```rust,no_run
+use unity_asset::AssetLoadBudget;
+use unity_asset::workspace::{AssetWorkspace, WorkspaceOptions};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut budget = AssetLoadBudget::default();
+    let options = WorkspaceOptions::lenient()
+        .with_type_tree_registry_paths(&["registry.json", "unity.tpk"], &mut budget)?;
+    let _workspace = AssetWorkspace::with_options(options)?;
+    Ok(())
+}
+```
+
+Registry order is deterministic: earlier paths take precedence. Runtime generator callbacks are
+not retained by snapshots.
+
+## Source and Object Identity
+
+`BinaryObjectKey` combined a physical path, source kind, optional asset index, and path ID. That
+shape admitted invalid combinations and was not revision-bound.
+
+Use the following split:
+
+- `SourceLocator`: portable logical route from a root alias through nested container members;
+- `ObjectAddress`: portable object identity containing a source locator and format-local identity;
+- `SourceId` / `ObjectId`: opaque identity inside one workspace;
+- `RevisionedObjectHandle`: in-process capability bound to one workspace revision.
+
+Do not persist `SourceId`, `ObjectId`, a handle, or `Display` output. Persist the versioned
+`ObjectAddress` JSON and resolve it against the intended snapshot:
+
+```rust,no_run
+use unity_asset::{AssetLoadBudget, ObjectAddress};
+use unity_asset::workspace::{WorkspaceLookup, WorkspaceView};
+
+fn resolve(
+    view: &impl WorkspaceView,
+    address: &ObjectAddress,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match view.resolve_object(address, budget)? {
+        WorkspaceLookup::Resolved(handle) => {
+            let object = view.read_object(&handle, budget)?;
+            println!("{}", object.class().class_name());
+        }
+        WorkspaceLookup::Unloaded => eprintln!("source is known but not loaded"),
+        WorkspaceLookup::Missing => eprintln!("object is missing"),
+        WorkspaceLookup::Ambiguous { candidates } => {
+            eprintln!("{} candidates", candidates.len());
+        }
+        WorkspaceLookup::Invalid { diagnostic } => {
+            eprintln!("{}", diagnostic.message());
+        }
+    }
+    Ok(())
+}
+```
+
+## Inspection
+
+Replace direct access to `Environment::binary_assets`, `Environment::bundles`,
+`Environment::yaml_documents`, `Environment::objects`, and related aggregate maps with
+`WorkspaceInspector`.
+
+```rust,no_run
+use unity_asset::AssetLoadBudget;
+use unity_asset::workspace::{AssetWorkspace, WorkspaceInspector};
+
+fn inspect(workspace: &AssetWorkspace) -> Result<(), Box<dyn std::error::Error>> {
+    let snapshot = workspace.snapshot();
+    let mut budget = AssetLoadBudget::default();
+    let inspector = WorkspaceInspector::new(&snapshot);
+
+    for source in inspector.sources(&mut budget)? {
+        println!("{:?}", source.format());
+    }
+    for object in inspector.objects(&mut budget)? {
+        println!("{:?}", object.address());
+    }
+    Ok(())
+}
+```
+
+Inspection values are owned, versioned, serialize-only projections. They do not expose mutable
+parser maps or require reparsing source bytes.
+
+### Bundle container discovery
+
+Replace `bundle_container_entries`, `find_bundle_container_entries`,
+`find_binary_object_keys_in_bundle_container`, and local `m_Container` fallback parsers with:
+
+1. one `ReferenceGraph`;
+2. `ExtractionPlanner::bundle_container_occurrences`;
+3. a versioned `BundleContainerQuery`.
+
+The result preserves source order, owner address, field path, raw `{fileID, pathID}`, structured
+resolution, and diagnostics. It does not discard unresolved occurrences.
+
+## References
+
+Replace `read_binary_pptr`, `scan_pptr`, ad hoc dependency maps, and the old graph/session
+interfaces with one `ReferenceGraph`:
+
+```rust,no_run
+use unity_asset::AssetLoadBudget;
+use unity_asset::reference::ReferenceGraphBuildOptions;
+use unity_asset::workspace::AssetWorkspace;
+
+fn graph(workspace: &AssetWorkspace) -> Result<(), Box<dyn std::error::Error>> {
+    let snapshot = workspace.snapshot();
+    let graph = snapshot.reference_graph(
+        ReferenceGraphBuildOptions::unbounded(),
+        &mut AssetLoadBudget::default(),
+    )?;
+    println!("{} facts", graph.facts().len());
+    Ok(())
+}
+```
+
+The graph owns incoming, outgoing, roots, leaves, closure, cycle, and deterministic projection
+behavior. Build a graph from `PreparedView` to query staged references before commit.
+
+## Mutation
+
+Direct `UnityClass::set`, `properties_mut`, `value_at_path_mut`, mutable document entry access,
+and `YamlDocument::save*` bypassed source expectations and container rewrites. The replacement is:
+
+```text
+snapshot
+  -> schema inspection or recipe lowering
+  -> canonical MutationPlan
+  -> AssetWorkspace::prepare
+  -> PreparedView inspection
+  -> AssetWorkspace::commit
+  -> CommitReport / RecoveryLocator / ChangeSet
+```
+
+Use `MutationPlanBuilder` to combine validated generic operations or use
+`SchemaRecipePlanner` for domain operations. Every plan is bound to:
+
+- `WorkspaceId`;
+- base `WorkspaceRevision`;
+- expected source fingerprints;
+- continuous operation ordinals;
+- schema/value guards;
+- content-addressed payloads.
+
+`PreparedChange` is deliberately not serializable, cloneable, or reconstructible from
+`PrepareReport`. In a Rust process, keep it alive and pass it directly to `commit`. Across a
+process boundary, persist the canonical plan and re-run prepare.
+
+## Commit and Recovery
+
+Create an existing absolute `PublicationTarget`, then consume the prepared authority:
+
+```rust,no_run
+use std::path::Path;
+
+use unity_asset::AssetLoadBudget;
+use unity_asset::workspace::{
+    AssetWorkspace, CommitReport, MutationPlan, PrepareOptions, PublicationTarget,
+};
+
+fn commit(
+    workspace: &mut AssetWorkspace,
+    plan: MutationPlan,
+    root: &Path,
+) -> Result<CommitReport, Box<dyn std::error::Error>> {
+    let mut budget = AssetLoadBudget::default();
+    let prepared = workspace.prepare(plan, PrepareOptions::default(), &mut budget)?;
+    let target = PublicationTarget::in_place(root)?;
+    Ok(workspace.commit(prepared, target, &mut budget)?)
+}
+```
+
+The reported atomicity is `PerArtifactRecoverable`: each replacement is atomic, while the
+multi-artifact set is made recoverable by its journal. It is not a cross-file atomic visibility
+claim.
+
+After interruption:
+
+1. call `PublicationTarget::discover_recoveries`;
+2. pass a selected `RecoveryLocator` to `AssetWorkspace::recover_at` or
+   `AssetWorkspace::abandon_at`;
+3. if requested by the outcome, recreate the workspace with its persisted `WorkspaceId`, reopen
+   caller-trusted sources, and call `finalize_recovery_at`.
+
+Never discover source paths by parsing journal text.
+
+## CLI Migration
+
+The CLI now has typed command families rather than one command per internal parser path.
+
+| Removed command | Current command |
+| --- | --- |
+| `find-object` | `workspace inspect objects`, or `workspace inspect bundle-containers` for asset-path selection |
+| `inspect-object` | `workspace inspect object --address-json ...` |
+| `list-objects` | `workspace inspect objects` |
+| `scan-pptr` | `references graph` |
+| `deps` | `references graph` |
+| `project-graph` | `references graph --unity-project` |
+| `stats` / `stats-pathid` | `workspace inspect sources` |
+| `export` | `extract` |
+| `export-bundle` | `extract --request ...` or `extract --plan ...` |
+| `export-serialized` | `extract --request ...` or `extract --plan ...` |
+| `dump-typetree-registry` | No dump replacement; supply an immutable JSON/TPK registry with `--typetree-registry` |
+| Separate async command binary | Use the same typed commands; async is an implementation feature, not a second protocol |
+
+Start every automation migration with:
+
+```bash
+unity-asset workspace capabilities
+```
+
+### Object inspection
+
+```bash
+unity-asset workspace inspect objects --input project > objects.json
+unity-asset workspace inspect object \
+  --input project \
+  --address-json object-address.json
+```
+
+Take the structured `address` field from an object inspection result. Do not parse a label or
+copy path ID fields into a new ad hoc key.
+
+### Prepare and preview
+
+```bash
+unity-asset workspace plan validate --plan mutation-plan.json
+unity-asset workspace prepare --input project --plan mutation-plan.json
+unity-asset workspace preview \
+  --input project \
+  --plan mutation-plan.json \
+  --address-json object-address.json
+```
+
+The CLI prepare command emits only `PrepareReport`. Preview re-prepares and reads the staged view.
+Only one structured input may use stdin in a command.
+
+### Commit and recovery
+
+```bash
+unity-asset workspace commit \
+  --input project \
+  --plan mutation-plan.json \
+  --publication-root /absolute/output-root
+
+unity-asset workspace recover discover \
+  --publication-root /absolute/output-root
+unity-asset workspace recover resume \
+  --locator-json recovery-locator.json
+unity-asset workspace recover abandon \
+  --locator-json recovery-locator.json
+unity-asset workspace recover finalize \
+  --input project \
+  --locator-json recovery-locator.json
+```
+
+CLI commit re-prepares from the canonical plan and then commits in the same process. It does not
+accept a serialized prepared session.
+
+### Extraction
+
+Legacy export request JSON and manifests are not accepted. Build a current
+`ExtractionRequest`, use `--dry-run` to obtain its canonical `ExtractionPlan`, then execute that
+plan:
+
+```bash
+unity-asset extract \
+  --input project \
+  --output out \
+  --request extraction-request.json \
+  --dry-run > extraction-plan.json
+
+unity-asset extract \
+  --input project \
+  --output out \
+  --plan extraction-plan.json \
+  --manifest manifest.json
+```
+
+The current manifest records normalized intent, workspace revision, source and plan identities,
+relative artifact paths, statuses, diagnostics, and content digests. It does not use the legacy
+session schema.
+
+## Search Handoff
+
+Commit returns a transaction- and revision-bound `ChangeSet`. Deliver that structured value to the
+search coordinator. Do not call the indexer from inside the workspace transaction and do not roll
+back committed assets when derived indexing fails.
+
+The search consumer is idempotent by transaction identity and publishes a new complete generation
+through its generation barrier. Reconciliation can rebuild any missed handoff.
+
+## No Compatibility Layer
+
+Do not add aliases for `Environment`, reconstruct `BinaryObjectKey`, reintroduce mutable public
+maps, or translate new typed errors into old display strings. Those approaches preserve the
+invalid states this migration removes.
+
+At the boundary of an older application:
+
+1. translate trusted configuration into `SourceOpenRequest`;
+2. persist `SourceLocator` and `ObjectAddress`, not runtime IDs;
+3. replace display parsing with serialized fields;
+4. move writes into canonical plans and the prepare/commit lifecycle;
+5. delete the translation boundary after all callers use the new contracts.

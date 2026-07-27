@@ -114,7 +114,7 @@ fn valid_recipe_plan(fixture: &Fixture) -> MutationPlan {
         &mut AssetLoadBudget::default(),
     )
     .unwrap();
-    let mut builder = MutationPlanBuilder::new(snapshot.revision());
+    let mut builder = MutationPlanBuilder::new(snapshot.workspace_id(), snapshot.revision());
     builder.append(lowering.into_fragment().unwrap()).unwrap();
     builder.build().unwrap()
 }
@@ -125,6 +125,7 @@ fn direct_resource_plan(fixture: &Fixture) -> MutationPlan {
     let guard = observed_resource_guard(fixture, &path);
     let payload = PlanPayload::new(PAYLOAD.to_vec());
     MutationPlan::new(
+        snapshot.workspace_id(),
         snapshot.revision(),
         vec![SourceExpectation::new(
             SourceLocator::path(ALIAS).unwrap(),
@@ -301,6 +302,7 @@ fn earlier_field_guard_failure_precedes_later_missing_resource_target() {
     let payload = PlanPayload::new(PAYLOAD.to_vec());
     let missing = ObjectAddress::yaml(SourceLocator::path(ALIAS).unwrap(), "8300002").unwrap();
     let plan = MutationPlan::new(
+        snapshot.workspace_id(),
         snapshot.revision(),
         vec![SourceExpectation::new(
             SourceLocator::path(ALIAS).unwrap(),
@@ -364,6 +366,7 @@ fn source_expectations_are_global_preconditions_before_resource_guards() {
         DigestV1::hash_bytes(b"stale-resource-value"),
     );
     let plan = MutationPlan::new(
+        snapshot.workspace_id(),
         snapshot.revision(),
         vec![
             SourceExpectation::new(
@@ -418,6 +421,7 @@ fn current_resource_guard_precedes_a_future_same_domain_manifest_budget() {
         DigestV1::hash_bytes(b"stale-resource-value"),
     );
     let plan = MutationPlan::new(
+        snapshot.workspace_id(),
         snapshot.revision(),
         vec![SourceExpectation::new(
             SourceLocator::path(ALIAS).unwrap(),
@@ -467,6 +471,7 @@ fn later_resource_guard_precedes_its_large_payload_budget() {
     let second_payload = PlanPayload::new(vec![0x5a; 1024 * 1024]);
     let original_guard = observed_resource_guard(&fixture, &path);
     let plan = MutationPlan::new(
+        snapshot.workspace_id(),
         snapshot.revision(),
         vec![SourceExpectation::new(
             SourceLocator::path(ALIAS).unwrap(),

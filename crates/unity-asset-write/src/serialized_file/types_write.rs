@@ -1,6 +1,5 @@
 use crate::Result;
-use crate::binary_writer::BinaryWriter;
-use crate::serialized_file::sink::{BinaryWriterSink, EndianSink, SinkBackend};
+use crate::serialized_file::sink::{EndianSink, SinkBackend};
 use crate::serialized_file::typetree_dump::dump_typetree_to;
 use unity_asset_binary::asset::types::LocalSerializedObjectIdentifier;
 use unity_asset_binary::asset::{
@@ -8,16 +7,6 @@ use unity_asset_binary::asset::{
 };
 use unity_asset_binary::typetree::TypeTreeParser;
 use unity_asset_core::UnityAssetError;
-
-pub fn write_file_identifier(
-    value: &FileIdentifier,
-    writer: &mut BinaryWriter,
-    format: SerializedFileFormat,
-) -> Result<()> {
-    let endian = writer.endian();
-    let mut sink = EndianSink::new(BinaryWriterSink::new(writer), endian);
-    write_file_identifier_to(value, &mut sink, format)
-}
 
 pub(crate) fn write_file_identifier_to<B: SinkBackend>(
     v: &FileIdentifier,
@@ -52,16 +41,6 @@ pub(crate) fn write_file_identifier_to<B: SinkBackend>(
     writer.write_string_to_null(&v.path)
 }
 
-pub fn write_local_serialized_object_identifier(
-    value: &LocalSerializedObjectIdentifier,
-    writer: &mut BinaryWriter,
-    format: SerializedFileFormat,
-) -> Result<()> {
-    let endian = writer.endian();
-    let mut sink = EndianSink::new(BinaryWriterSink::new(writer), endian);
-    write_local_serialized_object_identifier_to(value, &mut sink, format)
-}
-
 pub(crate) fn write_local_serialized_object_identifier_to<B: SinkBackend>(
     v: &LocalSerializedObjectIdentifier,
     writer: &mut EndianSink<B>,
@@ -84,24 +63,6 @@ pub(crate) fn write_local_serialized_object_identifier_to<B: SinkBackend>(
         }
     }
     Ok(())
-}
-
-pub fn write_serialized_type(
-    serialized_type: &SerializedType,
-    writer: &mut BinaryWriter,
-    format: SerializedFileFormat,
-    enable_type_tree: bool,
-    is_ref_type: bool,
-) -> Result<()> {
-    let endian = writer.endian();
-    let mut sink = EndianSink::new(BinaryWriterSink::new(writer), endian);
-    write_serialized_type_to(
-        serialized_type,
-        &mut sink,
-        format,
-        enable_type_tree,
-        is_ref_type,
-    )
 }
 
 pub(crate) fn write_serialized_type_to<B: SinkBackend>(

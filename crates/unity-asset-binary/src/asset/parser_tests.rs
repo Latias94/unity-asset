@@ -244,6 +244,8 @@ fn inspection_retained_heap_counts_actual_table_and_external_string_capacities()
         unity_asset_core::vec_allocation_bytes::<ObjectInfo>(inspection.objects.capacity())
             .unwrap();
     expected +=
+        unity_asset_core::string_allocation_bytes(inspection.unity_version.capacity()).unwrap();
+    expected +=
         unity_asset_core::vec_allocation_bytes::<FileIdentifier>(inspection.externals.capacity())
             .unwrap();
     for external in &inspection.externals {

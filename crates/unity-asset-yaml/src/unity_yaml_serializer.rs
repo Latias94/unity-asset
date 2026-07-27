@@ -40,15 +40,6 @@ impl UnityYamlSerializer {
         self
     }
 
-    /// Serialize borrowed Unity classes to a YAML string.
-    pub fn serialize_to_string<'class, I>(&mut self, classes: I) -> Result<String>
-    where
-        I: IntoIterator<Item = &'class UnityClass>,
-    {
-        let mut budget = AssetLoadBudget::default();
-        self.serialize_to_string_with_budget(classes, &mut budget)
-    }
-
     /// Serialize borrowed Unity classes while charging one caller-owned budget.
     pub fn serialize_to_string_with_budget<'class, I>(
         &mut self,
@@ -63,23 +54,12 @@ impl UnityYamlSerializer {
         Ok(output)
     }
 
-    /// Stream borrowed Unity classes directly to an I/O writer.
-    ///
-    /// The serializer does not buffer the complete YAML document and does not flush the writer.
-    /// Any writer failure is returned as [`UnityAssetError::Io`] with the original
-    /// [`io::Error`] intact.
-    pub fn serialize_to_writer<'class, W, I>(&mut self, writer: &mut W, classes: I) -> Result<()>
-    where
-        W: IoWrite + ?Sized,
-        I: IntoIterator<Item = &'class UnityClass>,
-    {
-        let mut budget = AssetLoadBudget::default();
-        self.serialize_to_writer_with_budget(writer, classes, &mut budget)
-    }
-
     /// Stream borrowed Unity classes while charging one caller-owned budget.
     ///
+    /// The serializer does not buffer the complete YAML document and does not flush the writer.
     /// Budget usage accumulates across every class, property, and nested value in the stream.
+    /// Any writer failure is returned as [`UnityAssetError::Io`] with the original
+    /// [`io::Error`] intact.
     pub fn serialize_to_writer_with_budget<'class, W, I>(
         &mut self,
         writer: &mut W,
@@ -157,18 +137,18 @@ impl UnityYamlSerializer {
     ) -> Result<()> {
         observe_serialization_entry(budget, 0)?;
         charge_serialization_members(budget, class.properties().len())?;
-        charge_serialization_bytes(budget, class.anchor.len())?;
-        charge_serialization_bytes(budget, class.extra_anchor_data.len())?;
-        charge_serialization_bytes(budget, class.class_name.len())?;
+        charge_serialization_bytes(budget, class.anchor().len())?;
+        charge_serialization_bytes(budget, class.extra_anchor_data().len())?;
+        charge_serialization_bytes(budget, class.class_name().len())?;
 
         // Write document separator with Unity tag and anchor
-        write!(writer, "--- !u!{} &{}", class.class_id, class.anchor).map_err(|e| {
+        write!(writer, "--- !u!{} &{}", class.class_id(), class.anchor()).map_err(|e| {
             UnityAssetError::format(format!("Failed to write document header: {}", e))
         })?;
 
         // Write extra anchor data if present
-        if !class.extra_anchor_data.is_empty() {
-            write!(writer, " {}", class.extra_anchor_data).map_err(|e| {
+        if !class.extra_anchor_data().is_empty() {
+            write!(writer, " {}", class.extra_anchor_data()).map_err(|e| {
                 UnityAssetError::format(format!("Failed to write extra anchor data: {}", e))
             })?;
         }
@@ -177,8 +157,13 @@ impl UnityYamlSerializer {
             .map_err(|e| UnityAssetError::format(format!("Failed to write line ending: {}", e)))?;
 
         // Write class name and properties
-        write!(writer, "{}:{}", class.class_name, self.line_ending.as_str())
-            .map_err(|e| UnityAssetError::format(format!("Failed to write class name: {}", e)))?;
+        write!(
+            writer,
+            "{}:{}",
+            class.class_name(),
+            self.line_ending.as_str()
+        )
+        .map_err(|e| UnityAssetError::format(format!("Failed to write class name: {}", e)))?;
 
         // Serialize properties
         self.indent_level = 1;
@@ -711,9 +696,10 @@ impl Default for UnityYamlSerializer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SerdeUnityLoader;
+    use crate::parse_budgeted_yaml_source;
     use indexmap::indexmap;
-    use unity_asset_core::AssetLoadLimits;
+    use std::sync::Arc;
+    use unity_asset_core::{AssetLoadLimits, UnityDocument};
 
     #[test]
     fn complex_inline_values_round_trip_without_placeholders() {
@@ -744,15 +730,23 @@ mod tests {
         assert!(encoded.contains("metadata: {label: \"value:quoted\","));
         assert!(encoded.contains("\"flow,key\": \"true\""));
 
-        let first = SerdeUnityLoader::new()
-            .load_from_str(&format!("Container:\n  value: {encoded}\n"))
-            .unwrap();
+        let first_yaml = format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!114 &1\nMonoBehaviour:\n  value: {encoded}\n"
+        );
+        let mut first_budget = AssetLoadBudget::default();
+        let first_source =
+            parse_budgeted_yaml_source(Arc::from(first_yaml.as_bytes()), &mut first_budget)
+                .unwrap();
+        let first = first_source.document().entries();
+        let mut reserialize_budget = AssetLoadBudget::default();
         let reparsed_yaml = UnityYamlSerializer::new()
-            .serialize_to_string(first.iter())
+            .serialize_to_string_with_budget(first.iter(), &mut reserialize_budget)
             .unwrap();
-        let second = SerdeUnityLoader::new()
-            .load_from_str(&reparsed_yaml)
-            .unwrap();
+        let mut second_budget = AssetLoadBudget::default();
+        let second_source =
+            parse_budgeted_yaml_source(Arc::from(reparsed_yaml.as_bytes()), &mut second_budget)
+                .unwrap();
+        let second = second_source.document().entries();
 
         assert_eq!(first[0].get("value"), second[0].get("value"));
     }
@@ -802,9 +796,15 @@ mod tests {
 
     #[test]
     fn budgeted_writer_accumulates_entries_across_fields() {
-        let mut class = UnityClass::new(1, "GameObject".into(), "1".into());
-        class.set("first".into(), UnityValue::Integer(1));
-        class.set("second".into(), UnityValue::Integer(2));
+        let class = UnityClass::with_properties(
+            1,
+            "GameObject".into(),
+            "1".into(),
+            indexmap! {
+                "first".into() => UnityValue::Integer(1),
+                "second".into() => UnityValue::Integer(2),
+            },
+        );
         let limits = AssetLoadLimits {
             max_entries: 2,
             ..AssetLoadLimits::default()
@@ -822,10 +822,18 @@ mod tests {
 
     #[test]
     fn budgeted_writer_accumulates_entries_across_documents() {
-        let mut first = UnityClass::new(1, "GameObject".into(), "1".into());
-        first.set("value".into(), UnityValue::Integer(1));
-        let mut second = UnityClass::new(1, "GameObject".into(), "2".into());
-        second.set("value".into(), UnityValue::Integer(2));
+        let first = UnityClass::with_properties(
+            1,
+            "GameObject".into(),
+            "1".into(),
+            indexmap! {"value".into() => UnityValue::Integer(1)},
+        );
+        let second = UnityClass::with_properties(
+            1,
+            "GameObject".into(),
+            "2".into(),
+            indexmap! {"value".into() => UnityValue::Integer(2)},
+        );
         let limits = AssetLoadLimits {
             max_entries: 3,
             ..AssetLoadLimits::default()

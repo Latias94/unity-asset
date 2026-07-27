@@ -30,6 +30,7 @@ pub use fact::{
     ReferenceResolution,
 };
 pub use projection::{
+    REFERENCE_GRAPH_PROJECTION_SCHEMA, REFERENCE_GRAPH_PROJECTION_VERSION,
     ReferenceProjectionFormat, ReferenceProjectionOptions, ReferenceProjectionReport,
     ReferenceResolutionCounts,
 };

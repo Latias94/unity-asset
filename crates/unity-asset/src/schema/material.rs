@@ -114,12 +114,12 @@ fn validate_material(
     output: &mut RecipeOutputBuilder<'_>,
 ) -> Result<(), RecipeError> {
     let class = material.class();
-    if class.class_id != class_ids::MATERIAL || class.class_name != class_names::MATERIAL {
+    if class.class_id() != class_ids::MATERIAL || class.class_name() != class_names::MATERIAL {
         return Err(RecipeError::WrongClass {
             expected_id: class_ids::MATERIAL,
             expected_name: class_names::MATERIAL,
-            actual_id: class.class_id,
-            actual_name: output.string(&class.class_name, "recipe class diagnostic")?,
+            actual_id: class.class_id(),
+            actual_name: output.string(class.class_name(), "recipe class diagnostic")?,
         });
     }
     validate_recipe_provenance(material)

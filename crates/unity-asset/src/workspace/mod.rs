@@ -1,32 +1,54 @@
 //! Revisioned ownership and source-resolution foundation.
 
 mod adapter;
+mod capabilities;
 pub(crate) mod commit;
+mod inspection;
 mod interface;
 mod overlay;
 mod plan;
 mod portable_path;
 mod preflight;
 mod snapshot;
+mod source_admission;
 mod source_catalog;
 mod state;
 mod store;
 mod view;
 
+pub use capabilities::{
+    WORKSPACE_CAPABILITY_CATALOG_CONTRACT, WORKSPACE_CAPABILITY_CATALOG_VERSION,
+    WorkspaceAutomationCapability, WorkspaceCapability, WorkspaceCapabilityCatalog,
+    WorkspaceContractVersions, WorkspaceInspectionCapability, WorkspaceMutationCapability,
+    WorkspaceMutationFamily, WorkspacePreparedAuthorityCapability, WorkspacePublicationCapability,
+    WorkspaceSearchHandoffArtifact, WorkspaceSearchHandoffCapability, WorkspaceViewCapability,
+    WorkspaceViewKind, workspace_capabilities,
+};
 pub use commit::{
     COMMIT_REPORT_VERSION, CommitArtifactReport, CommitAtomicity, CommitContractError,
     CommitDestinationState, CommitError, CommitReport, PublicationTarget, PublicationTargetError,
-    RECOVERY_DISCOVERY_VERSION, RecoveryBlockedReason, RecoveryDiscovery,
+    RECOVERY_DISCOVERY_VERSION, RECOVERY_LOCATOR_VERSION, RECOVERY_OUTCOME_VERSION,
+    ROLLBACK_RECEIPT_VERSION, RecoveryBlockedReason, RecoveryDiscovery,
     RecoveryDiscoveryBlockedReason, RecoveryDiscoveryError, RecoveryError, RecoveryLocator,
     RecoveryOutcome, RollbackReceipt,
+};
+pub use inspection::{
+    AssetBundleSummary, ResolvedStreamedResource, STREAMED_RESOURCE_QUERY_VERSION,
+    SerializedFileSummary, SerializedPathIdSummary, StreamedResourceCandidate,
+    StreamedResourceQueryResult, StreamedResourceRequest, StreamedResourceRequestError,
+    StreamedResourceResolution, WORKSPACE_OBJECT_INSPECTION_VERSION,
+    WORKSPACE_SOURCE_INSPECTION_VERSION, WebFileSummary, WorkspaceBundleLayout, WorkspaceByteOrder,
+    WorkspaceCompression, WorkspaceInspector, WorkspaceObjectFormatInspection,
+    WorkspaceObjectInspection, WorkspaceSourceFormatInspection, WorkspaceSourceInspection,
 };
 pub use interface::{AssetWorkspace, SourceOpenRequest, WorkspaceOptions};
 pub use overlay::PreparedView;
 pub use plan::{
-    FieldGuard, Float64Bits, GenericMutation, MutationField, MutationOperation, MutationPlan,
-    MutationPlanBuilder, MutationPlanBuilderError, MutationPlanError, MutationPlanFragment,
-    MutationPlanReadError, MutationValue, MutationValueRef, ObjectGuard, PlanBytes, PlanPayload,
-    ReferenceTarget, SequenceMutation, SourceExpectation, UnsafeRawAcknowledgement,
+    FieldGuard, Float64Bits, GenericMutation, MUTATION_PLAN_VERSION, MutationField,
+    MutationOperation, MutationPlan, MutationPlanBuilder, MutationPlanBuilderError,
+    MutationPlanError, MutationPlanFragment, MutationPlanReadError, MutationValue,
+    MutationValueRef, ObjectGuard, PlanBytes, PlanPayload, ReferenceTarget, SequenceMutation,
+    SourceExpectation, UnsafeRawAcknowledgement,
 };
 pub use preflight::{
     PREPARE_REPORT_VERSION, PrepareArtifactReport, PrepareDiagnostic, PrepareError,
@@ -34,6 +56,13 @@ pub use preflight::{
     PreparedSourceReport,
 };
 pub use snapshot::WorkspaceSnapshot;
+pub use source_admission::{
+    SourceAdmissionBatch, SourceAdmissionBatchAllocationError, SourceAdmissionBatchCapacityError,
+    SourceAdmissionBatchPhase, SourceAdmissionBatchPushError, SourceAdmissionDisposition,
+    SourceAdmissionError, SourceAdmissionErrorCategory, SourceAdmissionFailure,
+    SourceAdmissionFailureSite, SourceAdmissionOperation, SourceAdmissionOperationLocation,
+    SourceAdmissionOutcome, SourceAdmissionPolicy, SourceAdmissionRejection, SourceAdmissionReport,
+};
 pub use source_catalog::SourceLocationKind;
 pub use view::{
     WorkspaceAllocationUnit, WorkspaceByteRange, WorkspaceByteRangeReader, WorkspaceError,
@@ -42,6 +71,7 @@ pub use view::{
     WorkspaceView, WorkspaceYamlObject,
 };
 
+pub(crate) use inspection::StreamedResourceResolver;
 pub(crate) use state::WorkspaceState;
 
 #[doc(hidden)]

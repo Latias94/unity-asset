@@ -90,7 +90,7 @@ fn main() -> Result<()> {
         }
         UnityFile::WebFile(_) => {
             return Err(unity_asset_binary::BinaryError::invalid_format(
-                "WebFile container: pick an entry and parse it via unity-asset Environment/CLI",
+                "WebFile container: inspect entries through AssetWorkspace or the typed CLI",
             ));
         }
     };

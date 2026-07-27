@@ -170,15 +170,66 @@ impl PreparedResourceFieldReplace for PreparedSerializedFieldReplace<'_> {
 }
 
 #[cfg(test)]
-struct PreparedUnityFieldReplace<'candidate> {
-    target: &'candidate mut UnityValue,
+struct TestUnityClassCandidate {
+    class: Option<UnityClass>,
+}
+
+#[cfg(test)]
+impl TestUnityClassCandidate {
+    fn new(class: UnityClass) -> Self {
+        Self { class: Some(class) }
+    }
+
+    fn class(&self) -> &UnityClass {
+        self.class
+            .as_ref()
+            .expect("a test candidate owns its class outside a rebuild")
+    }
+
+    fn replace(&mut self, path: &FieldPath, replacement: UnityValue) {
+        let class = self
+            .class
+            .take()
+            .expect("a test candidate owns its class while committing");
+        let (header, properties) = class.into_parts();
+        let mut root = UnityValue::Object(properties);
+        *root
+            .value_at_path_mut(path)
+            .expect("the test candidate path was validated before commit") = replacement;
+        let UnityValue::Object(properties) = root else {
+            unreachable!("a class property root remains an object")
+        };
+        self.class = Some(UnityClass::from_parts(header, properties));
+    }
+}
+
+#[cfg(test)]
+impl Clone for TestUnityClassCandidate {
+    fn clone(&self) -> Self {
+        Self::new(self.class().clone())
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestUnityClassCandidate {
+    type Target = UnityClass;
+
+    fn deref(&self) -> &Self::Target {
+        self.class()
+    }
+}
+
+#[cfg(test)]
+struct PreparedUnityFieldReplace<'candidate, 'path> {
+    candidate: &'candidate mut TestUnityClassCandidate,
+    path: &'path FieldPath,
     replacement: UnityValue,
 }
 
 #[cfg(test)]
-impl PreparedResourceFieldReplace for PreparedUnityFieldReplace<'_> {
+impl PreparedResourceFieldReplace for PreparedUnityFieldReplace<'_, '_> {
     fn commit(self) {
-        *self.target = self.replacement;
+        self.candidate.replace(self.path, self.replacement);
     }
 }
 
@@ -455,29 +506,27 @@ impl<'payload> ResourceSidecarBuilder<'payload> {
     /// complete replacement field then run against a detached field copy. The planner append is
     /// the last fallible step; only after it succeeds is the staged class updated infallibly.
     #[cfg(test)]
-    pub(super) fn apply(
+    fn apply(
         &mut self,
         ordinal: u32,
         payload_digest: DigestV1,
         path: &FieldPath,
         guard: FieldGuard,
         provenance: &SchemaProvenance,
-        candidate: &mut UnityClass,
+        candidate: &mut TestUnityClassCandidate,
         budget: &mut AssetLoadBudget,
     ) -> Result<StreamedResourceAllocation, ResourceReplaceError> {
         let preview = self.preview_next(ordinal, payload_digest)?;
-        validate_resource_guard(ordinal, path, guard, provenance, candidate, budget)?;
+        validate_resource_guard(ordinal, path, guard, provenance, candidate.class(), budget)?;
         let current = candidate
             .value_at_path(path)
             .map_err(|source| ResourceReplaceError::Path { ordinal, source })?;
         let staged = self.stage_preview(&preview, path, current, budget)?;
-        let target = candidate
-            .value_at_path_mut(path)
-            .map_err(|source| ResourceReplaceError::Path { ordinal, source })?;
         self.commit_prepared(
             preview,
             PreparedUnityFieldReplace {
-                target,
+                candidate,
+                path,
                 replacement: staged,
             },
             budget,
@@ -859,11 +908,11 @@ fn validate_provenance(
     provenance: &SchemaProvenance,
     candidate: &UnityClass,
 ) -> Result<(), ResourceReplaceError> {
-    if provenance.class_id() != candidate.class_id {
+    if provenance.class_id() != candidate.class_id() {
         return Err(ResourceReplaceError::SchemaClassMismatch {
             ordinal,
             expected: provenance.class_id(),
-            actual: candidate.class_id,
+            actual: candidate.class_id(),
         });
     }
     let valid = matches!(

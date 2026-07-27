@@ -97,12 +97,11 @@ fn byte_range(start: u64, end: u64) -> Range<u64> {
 
 #[test]
 fn committed_yaml_object_borrows_its_document_class_without_cloning_it() {
-    let mut document = YamlDocument::new();
-    document.add_entry(UnityClass::new(
+    let document = YamlDocument::from_entries(vec![UnityClass::new(
         1,
         "GameObject".to_owned(),
         "1001".to_owned(),
-    ));
+    )]);
     let document = Arc::new(document);
     let expected_class = std::ptr::from_ref(&document.entries()[0]);
 
@@ -117,13 +116,22 @@ fn committed_yaml_object_borrows_its_document_class_without_cloning_it() {
 
 #[test]
 fn yaml_object_debug_is_bounded_and_omits_sibling_values() {
-    let mut class = UnityClass::new(114, "MonoBehaviour".to_owned(), "4201".to_owned());
-    class.set("m_Secret".to_owned(), "selected-object-sensitive-property");
-    let mut sibling = UnityClass::new(1, "SiblingObject".to_owned(), "9001".to_owned());
-    sibling.set("m_Secret".to_owned(), "sibling-sensitive-property");
-    let mut document = YamlDocument::new();
-    document.add_entry(class);
-    document.add_entry(sibling);
+    let class = UnityClass::with_properties(
+        114,
+        "MonoBehaviour".to_owned(),
+        "4201".to_owned(),
+        indexmap::IndexMap::from([(
+            "m_Secret".to_owned(),
+            "selected-object-sensitive-property".into(),
+        )]),
+    );
+    let sibling = UnityClass::with_properties(
+        1,
+        "SiblingObject".to_owned(),
+        "9001".to_owned(),
+        indexmap::IndexMap::from([("m_Secret".to_owned(), "sibling-sensitive-property".into())]),
+    );
+    let document = YamlDocument::from_entries(vec![class, sibling]);
 
     let committed = WorkspaceYamlObject::new(Arc::new(document), 0);
     let committed_debug = format!("{committed:?}");
@@ -222,7 +230,7 @@ fn prepared_range_rejects_digest_and_range_mismatches() {
             source_id,
             expected,
             actual,
-        } if source_id == fixture.source
+        } if *source_id == fixture.source
             && expected == wrong_digest
             && actual == fixture.fingerprint.digest()
     ));
@@ -274,7 +282,7 @@ fn prepared_verbatim_range_rejects_source_and_fingerprint_provenance_mismatches(
         WorkspaceError::PreparedArtifactSourceProvenanceMismatch {
             expected,
             actual,
-        } if expected == foreign_source && actual == fixture.source
+        } if *expected == foreign_source && actual == fixture.source
     ));
 
     let foreign_fingerprint = SourceFingerprint::from_bytes(SourceKind::AssetBundle, b"other");

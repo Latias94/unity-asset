@@ -19,9 +19,9 @@ use super::write_encoded_atomic_with_temporary_path_tracked;
 use super::{
     BoundedSequence, JOURNAL_VERSION, JournalArtifact, JournalBaseline, JournalError,
     JournalExpectedDestination, JournalLayout, JournalManifest, JournalTransactionOutputSeed,
-    JournalTransactionSeed, MAX_ARTIFACT_COUNT, MAX_MANIFEST_BYTES, budgeted_journal_string,
-    encode_json_bounded, journal_budgeted_vec, read_json_bounded_from_file,
-    transaction_id_from_seed, validate_event_capacity,
+    JournalTransactionSeed, MAX_ARTIFACT_COUNT, MAX_MANIFEST_BYTES, PREPARATION_JSON_LIMITS,
+    budgeted_journal_string, encode_json_bounded, journal_budgeted_vec,
+    read_json_bounded_from_file, transaction_id_from_seed, validate_event_capacity,
     write_encoded_atomic_in_journal_access_tracked,
 };
 use crate::workspace::commit::{CommitAtomicity, CommitReport};
@@ -339,7 +339,8 @@ impl JournalPreparation {
     ) -> Result<OpenedJournalPreparation, JournalError> {
         let file = open_readonly_regular_in_parent(path, parent_identity)?;
         let identity = opened_file_identity(&file)?;
-        let document = read_json_bounded_from_file::<Self>(path, file, MAX_MANIFEST_BYTES, budget)?;
+        let document =
+            read_json_bounded_from_file::<Self>(path, file, PREPARATION_JSON_LIMITS, budget)?;
         document.validate(layout.parent(), layout.root_identity(), budget)?;
         if document.transaction != layout.transaction() {
             return Err(JournalError::TransactionMismatch {
@@ -358,7 +359,8 @@ impl JournalPreparation {
     ) -> Result<OpenedJournalPreparation, JournalError> {
         let file = open_journal_regular(access, path)?;
         let identity = opened_file_identity(&file)?;
-        let document = read_json_bounded_from_file::<Self>(path, file, MAX_MANIFEST_BYTES, budget)?;
+        let document =
+            read_json_bounded_from_file::<Self>(path, file, PREPARATION_JSON_LIMITS, budget)?;
         document.validate(layout.parent(), layout.root_identity(), budget)?;
         if document.transaction != layout.transaction() {
             return Err(JournalError::TransactionMismatch {

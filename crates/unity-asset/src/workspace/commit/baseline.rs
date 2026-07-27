@@ -6,15 +6,22 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, SourceFingerprint, SourceId, SourceKind, VerifiedSourceImage,
-    arc_slice_allocation_bytes, arc_value_allocation_bytes, vec_allocation_bytes,
+    AssetLoadBudget, BudgetError, SourceFingerprint, SourceId, SourceKind, UnityDocument,
+    VerifiedSourceImage, arc_slice_allocation_bytes, arc_value_allocation_bytes,
+    vec_allocation_bytes,
 };
-use unity_asset_write::artifact::{ArtifactHandle, ArtifactStreamError, PreparedArtifactSet};
+use unity_asset_write::artifact::{
+    ArtifactHandle, ArtifactStreamError, PreparedArtifactFormat, PreparedArtifactSet,
+};
 
 use super::super::adapter::binary::{BinaryPayload, BinaryWorkspaceAdapter};
 use super::super::adapter::yaml::parse_yaml_source;
+use super::super::inspection::{
+    AssetBundleSummary, SerializedFileSummary, WebFileSummary, WorkspaceSourceFormatInspection,
+};
 use super::super::interface::{
-    map_binary_adapter_error, map_yaml_adapter_error, promote_box_to_arc, validate_yaml_identities,
+    map_binary_adapter_error, map_yaml_adapter_error, promote_value_to_arc,
+    validate_yaml_identities,
 };
 use super::super::overlay::PreparedStateCore;
 use super::super::preflight::PreparedChange;
@@ -26,7 +33,8 @@ use super::journal::{
     Journal, JournalBaselineImage, JournalBaselineSource, JournalCatalogAction, JournalError,
 };
 use super::platform::{
-    DirectoryIdentity, observe_directory_identity, open_readonly_regular_in_parent,
+    DirectoryIdentity, FileIdentity, observe_directory_identity, open_readonly_regular_in_parent,
+    opened_file_identity,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -76,6 +84,7 @@ pub(crate) fn read_artifact_image(
         artifact.source(),
         SourceFingerprint::new(artifact.source().kind(), artifact.new_digest()),
         artifact.bytes(),
+        Some(artifact.new_identity()),
         budget,
     )
 }
@@ -250,7 +259,6 @@ pub(crate) fn build(
 
     for binding in core.source_bindings() {
         let image = images.materialize(artifacts, binding.artifact(), budget)?;
-        let parse = parse_source(binding.source(), Arc::clone(&image), base, binary, budget)?;
         let verified = VerifiedSourceImage::verify(binding.source().kind(), image);
         if verified.fingerprint() != binding.fingerprint() {
             return Err(BaselineBuildError::Fingerprint {
@@ -259,13 +267,36 @@ pub(crate) fn build(
                 actual: verified.fingerprint(),
             });
         }
+        if store
+            .get(binding.source())
+            .is_some_and(|entry| entry.image().fingerprint() == verified.fingerprint())
+        {
+            continue;
+        }
+        let artifact = artifacts
+            .artifact(binding.artifact())
+            .map_err(|error| BaselineBuildError::Artifact(error.to_string()))?;
+        let parse = parse_source(
+            binding.source(),
+            Arc::clone(verified.backing()),
+            base,
+            binary,
+            budget,
+        )?;
+        let format = format_from_artifact(binding.source(), artifact.format(), base, budget)?;
         store
-            .insert(binding.source(), verified, parse, budget)
+            .insert_inspected(binding.source(), verified, parse, format, budget)
             .map_err(BaselineBuildError::Store)?;
     }
 
-    let next = WorkspaceState::new(core.base().workspace_id(), catalog, store, budget)
-        .map_err(BaselineBuildError::state)?;
+    let next = WorkspaceState::new(
+        core.base().workspace_id(),
+        base.typetree_mode(),
+        catalog,
+        store,
+        budget,
+    )
+    .map_err(BaselineBuildError::state)?;
     let retained = arc_value_allocation_bytes::<WorkspaceState>().map_err(|_| {
         BudgetError::ArithmeticOverflow {
             resource: "workspace baseline state",
@@ -393,6 +424,12 @@ pub(crate) fn build_from_journal_with_images(
                 actual: verified.fingerprint(),
             });
         }
+        if store
+            .get(source.source())
+            .is_some_and(|entry| entry.image().fingerprint() == verified.fingerprint())
+        {
+            continue;
+        }
         let parse = parse_source(
             source.source(),
             Arc::clone(verified.backing()),
@@ -400,13 +437,27 @@ pub(crate) fn build_from_journal_with_images(
             binary,
             budget,
         )?;
+        let format = inspect_recovered_source(
+            source.source(),
+            verified.backing(),
+            &parse,
+            base,
+            binary,
+            budget,
+        )?;
         store
-            .insert(source.source(), verified, parse, budget)
+            .insert_inspected(source.source(), verified, parse, format, budget)
             .map_err(BaselineBuildError::Store)?;
     }
 
-    let next = WorkspaceState::new(base.workspace(), catalog, store, budget)
-        .map_err(BaselineBuildError::state)?;
+    let next = WorkspaceState::new(
+        base.workspace(),
+        base.typetree_mode(),
+        catalog,
+        store,
+        budget,
+    )
+    .map_err(BaselineBuildError::state)?;
     if next.revision() != manifest.committed_revision() {
         return Err(BaselineBuildError::Revision {
             expected: manifest.committed_revision(),
@@ -481,7 +532,7 @@ fn recovery_image(
     published_images: Option<&[Option<Arc<[u8]>>]>,
     budget: &mut AssetLoadBudget,
 ) -> Result<Arc<[u8]>, BaselineBuildError> {
-    let (path, expected_bytes, parent_identity) = match source.image() {
+    let (path, expected_bytes, parent_identity, expected_identity) = match source.image() {
         JournalBaselineImage::Published { artifact } => {
             let index =
                 usize::try_from(*artifact).map_err(|_| BaselineBuildError::RecoveryBinding {
@@ -509,6 +560,7 @@ fn recovery_image(
                     .map_err(map_journal_path_error)?,
                 artifact.bytes(),
                 artifact.destination_parent_identity(),
+                Some(artifact.new_identity()),
             )
         }
         JournalBaselineImage::Blob { path, bytes, .. } => (
@@ -520,6 +572,7 @@ fn recovery_image(
             .map_err(map_journal_path_error)?,
             *bytes,
             journal.manifest().directories().baseline(),
+            None,
         ),
     };
     read_recovery_image(
@@ -528,6 +581,7 @@ fn recovery_image(
         source.source(),
         source.fingerprint(),
         expected_bytes,
+        expected_identity,
         budget,
     )
 }
@@ -556,6 +610,7 @@ fn read_recovery_image(
     source: SourceId,
     expected: SourceFingerprint,
     expected_bytes: u64,
+    expected_identity: Option<&FileIdentity>,
     budget: &mut AssetLoadBudget,
 ) -> Result<Arc<[u8]>, BaselineBuildError> {
     verify_recovery_parent(path, expected_parent, source)?;
@@ -565,6 +620,16 @@ fn read_recovery_image(
             message: error.to_string(),
         }
     })?;
+    let identity_before =
+        opened_file_identity(&file).map_err(|error| BaselineBuildError::RecoveryImage {
+            source_id: source,
+            message: format!("recovery image identity cannot be captured: {error}"),
+        })?;
+    if expected_identity.is_some_and(|expected| expected != &identity_before) {
+        return Err(BaselineBuildError::RecoveryBinding {
+            message: format!("recovery image identity changed for source {source:?}"),
+        });
+    }
     let metadata = file
         .metadata()
         .map_err(|error| BaselineBuildError::RecoveryImage {
@@ -612,6 +677,27 @@ fn read_recovery_image(
         return Err(BaselineBuildError::RecoveryImage {
             source_id: source,
             message: "recovery image grew while it was read".to_owned(),
+        });
+    }
+    let identity_after =
+        opened_file_identity(&file).map_err(|error| BaselineBuildError::RecoveryImage {
+            source_id: source,
+            message: format!("recovery image identity cannot be revalidated: {error}"),
+        })?;
+    let current = open_readonly_regular_in_parent(path, expected_parent).map_err(|error| {
+        BaselineBuildError::RecoveryImage {
+            source_id: source,
+            message: format!("recovery image path cannot be revalidated: {error}"),
+        }
+    })?;
+    let current_identity =
+        opened_file_identity(&current).map_err(|error| BaselineBuildError::RecoveryImage {
+            source_id: source,
+            message: format!("current recovery image identity cannot be captured: {error}"),
+        })?;
+    if identity_before != identity_after || identity_after != current_identity {
+        return Err(BaselineBuildError::RecoveryBinding {
+            message: format!("recovery image binding changed while source {source:?} was read"),
         });
     }
     let arc_bytes = arc_slice_allocation_bytes::<u8>(length_usize).map_err(|_| {
@@ -694,19 +780,21 @@ fn parse_source(
                 .parse(Arc::clone(&image), budget)
                 .map_err(map_binary_adapter_error)
                 .map_err(map_workspace_parse_error)?;
-            let BinaryPayload::SerializedFile(mut file) = payload else {
+            let BinaryPayload::SerializedFile(file) = payload else {
                 return Err(BaselineBuildError::Parse {
                     message: "serialized source reparsed as a different binary kind".to_owned(),
                 });
             };
-            if let Some(previous) = base
+            let file = if let Some(previous) = base
                 .store()
                 .get(source)
                 .and_then(|entry| entry.cached_serialized())
             {
-                file.set_type_tree_registry(previous.type_tree_registry().cloned());
-            }
-            let file = promote_box_to_arc(file, budget, "baseline serialized parse")
+                (*file).with_type_tree_registry(previous.type_tree_registry().cloned())
+            } else {
+                *file
+            };
+            let file = promote_value_to_arc(file, budget, "baseline serialized parse")
                 .map_err(map_workspace_parse_error)?;
             Ok(FrozenSourceParse::Serialized(file))
         }
@@ -722,6 +810,131 @@ fn parse_source(
         | SourceKind::WebFile
         | SourceKind::Archive
         | SourceKind::StreamedResource => Ok(FrozenSourceParse::None),
+    }
+}
+
+fn format_from_artifact(
+    source: SourceId,
+    format: &PreparedArtifactFormat,
+    base: &WorkspaceState,
+    budget: &mut AssetLoadBudget,
+) -> Result<WorkspaceSourceFormatInspection, BaselineBuildError> {
+    match format {
+        PreparedArtifactFormat::SerializedFile(proof) => {
+            Ok(WorkspaceSourceFormatInspection::SerializedFile(
+                SerializedFileSummary::from_proof(proof, budget)
+                    .map_err(map_workspace_parse_error)?,
+            ))
+        }
+        PreparedArtifactFormat::AssetBundle(proof) => {
+            Ok(WorkspaceSourceFormatInspection::AssetBundle(
+                AssetBundleSummary::from_proof(proof, budget).map_err(map_workspace_parse_error)?,
+            ))
+        }
+        PreparedArtifactFormat::WebFile(proof) => Ok(WorkspaceSourceFormatInspection::WebFile(
+            WebFileSummary::from_proof(proof, budget).map_err(map_workspace_parse_error)?,
+        )),
+        PreparedArtifactFormat::StreamedResource(_) => {
+            Ok(WorkspaceSourceFormatInspection::StreamedResource)
+        }
+        PreparedArtifactFormat::Yaml(proof) => Ok(WorkspaceSourceFormatInspection::Yaml {
+            document_count: proof.documents(),
+        }),
+        PreparedArtifactFormat::VerbatimSource(_) => base
+            .store()
+            .get(source)
+            .ok_or_else(|| BaselineBuildError::Parse {
+                message: format!("verbatim artifact source {source:?} is absent from the baseline"),
+            })?
+            .format()
+            .try_clone_with_budget(budget)
+            .map_err(map_workspace_parse_error),
+        _ => Err(BaselineBuildError::Parse {
+            message: "prepared artifact uses an unsupported inspection format".to_owned(),
+        }),
+    }
+}
+
+fn inspect_recovered_source(
+    source: SourceId,
+    image: &Arc<[u8]>,
+    parse: &FrozenSourceParse,
+    base: &WorkspaceState,
+    binary: &BinaryWorkspaceAdapter,
+    budget: &mut AssetLoadBudget,
+) -> Result<WorkspaceSourceFormatInspection, BaselineBuildError> {
+    match (source.kind(), parse) {
+        (SourceKind::SerializedFile, FrozenSourceParse::Serialized(file)) => {
+            Ok(WorkspaceSourceFormatInspection::SerializedFile(
+                SerializedFileSummary::from_file(file, budget)
+                    .map_err(map_workspace_parse_error)?,
+            ))
+        }
+        (SourceKind::Yaml, FrozenSourceParse::Yaml(document)) => {
+            let document_count = u64::try_from(document.entries().len()).map_err(|_| {
+                BaselineBuildError::Budget(BudgetError::ArithmeticOverflow {
+                    resource: "recovery_yaml_document_count",
+                })
+            })?;
+            Ok(WorkspaceSourceFormatInspection::Yaml { document_count })
+        }
+        (SourceKind::AssetBundle, FrozenSourceParse::None) => {
+            let payload = binary
+                .parse(Arc::clone(image), budget)
+                .map_err(map_binary_adapter_error)
+                .map_err(map_workspace_parse_error)?;
+            let BinaryPayload::AssetBundle(bundle) = payload else {
+                return Err(BaselineBuildError::Parse {
+                    message: "AssetBundle recovery image reparsed as a different kind".to_owned(),
+                });
+            };
+            Ok(WorkspaceSourceFormatInspection::AssetBundle(
+                AssetBundleSummary::from_bundle(&bundle, budget)
+                    .map_err(map_workspace_parse_error)?,
+            ))
+        }
+        (SourceKind::WebFile, FrozenSourceParse::None) => {
+            let payload = binary
+                .parse(Arc::clone(image), budget)
+                .map_err(map_binary_adapter_error)
+                .map_err(map_workspace_parse_error)?;
+            let BinaryPayload::WebFile(web_file) = payload else {
+                return Err(BaselineBuildError::Parse {
+                    message: "WebFile recovery image reparsed as a different kind".to_owned(),
+                });
+            };
+            Ok(WorkspaceSourceFormatInspection::WebFile(
+                WebFileSummary::from_webfile(&web_file, budget)
+                    .map_err(map_workspace_parse_error)?,
+            ))
+        }
+        (SourceKind::Archive, FrozenSourceParse::None) => {
+            let existing = base
+                .store()
+                .get(source)
+                .ok_or_else(|| BaselineBuildError::Parse {
+                    message: format!("archive source {source:?} is absent from the baseline"),
+                })?;
+            let actual = SourceFingerprint::from_bytes(SourceKind::Archive, image);
+            if actual != existing.image().fingerprint() {
+                return Err(BaselineBuildError::Parse {
+                    message: "changed ZIP archive recovery is not a supported mutation output"
+                        .to_owned(),
+                });
+            }
+            existing
+                .format()
+                .try_clone_with_budget(budget)
+                .map_err(map_workspace_parse_error)
+        }
+        (SourceKind::StreamedResource, FrozenSourceParse::None) => {
+            Ok(WorkspaceSourceFormatInspection::StreamedResource)
+        }
+        _ => Err(BaselineBuildError::Parse {
+            message: format!(
+                "source {source:?} has a frozen parse incompatible with recovery inspection"
+            ),
+        }),
     }
 }
 

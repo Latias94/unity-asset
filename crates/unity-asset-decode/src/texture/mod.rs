@@ -16,10 +16,9 @@
 //!
 //! ```rust,no_run
 //! use unity_asset_decode::texture::{TextureFormat, Texture2DConverter, TextureDecoder};
-//! use unity_asset_decode::unity_version::UnityVersion;
 //!
 //! // Create a converter
-//! let converter = Texture2DConverter::new(UnityVersion::default());
+//! let converter = Texture2DConverter::new();
 //!
 //! // Convert Unity object to Texture2D (assuming you have a UnityObject)
 //! // let texture = converter.from_unity_object(&unity_object)?;
@@ -39,7 +38,7 @@ pub mod helpers;
 pub mod types;
 
 // Re-export main types for easy access
-pub use converter::{Texture2DConverter, Texture2DProcessor}; // Processor is legacy alias
+pub use converter::{Texture2DConverter, Texture2DLayout};
 pub use decoders::{Decoder, TextureDecoder};
 pub use formats::{TextureFormat, TextureFormatInfo};
 pub use helpers::{TextureExporter, TextureSwizzler};
@@ -62,9 +61,9 @@ pub struct TextureProcessor {
 
 impl TextureProcessor {
     /// Create a new texture processor
-    pub fn new(version: crate::unity_version::UnityVersion) -> Self {
+    pub fn new() -> Self {
         Self {
-            converter: Texture2DConverter::new(version),
+            converter: Texture2DConverter::new(),
             decoder: TextureDecoder::new(),
         }
     }
@@ -106,7 +105,7 @@ impl TextureProcessor {
 
 impl Default for TextureProcessor {
     fn default() -> Self {
-        Self::new(crate::unity_version::UnityVersion::default())
+        Self::new()
     }
 }
 

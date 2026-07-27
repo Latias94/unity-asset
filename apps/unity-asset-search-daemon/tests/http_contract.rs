@@ -155,6 +155,18 @@ fn empty_request(method: Method, uri: &str, token: Option<&DaemonToken>) -> Requ
 }
 
 fn json_request(uri: &str, value: &impl Serialize, token: Option<&DaemonToken>) -> Request<Body> {
+    raw_json_request(
+        uri,
+        serde_json::to_vec(value).expect("test request contract must serialize"),
+        token,
+    )
+}
+
+fn raw_json_request(
+    uri: &str,
+    body: impl Into<Body>,
+    token: Option<&DaemonToken>,
+) -> Request<Body> {
     let mut builder = Request::builder()
         .method(Method::POST)
         .uri(uri)
@@ -163,9 +175,7 @@ fn json_request(uri: &str, value: &impl Serialize, token: Option<&DaemonToken>) 
         builder = builder.header(AUTHORIZATION, bearer(token));
     }
     builder
-        .body(Body::from(
-            serde_json::to_vec(value).expect("test request contract must serialize"),
-        ))
+        .body(body.into())
         .expect("test request must be valid")
 }
 
@@ -366,10 +376,7 @@ async fn malformed_and_versioned_requests_return_typed_api_errors() {
         StatusCode::BAD_REQUEST,
         ApiErrorCode::InvalidRequest,
     );
-    assert_eq!(
-        error.message,
-        "change-set reindex requires an authoritative workspace view"
-    );
+    assert_eq!(error.message, "invalid JSON request body");
 
     let mut nested_intent =
         serde_json::to_value(ReindexIntent::reconcile()).expect("reindex intent must serialize");
@@ -385,6 +392,133 @@ async fn malformed_and_versioned_requests_return_typed_api_errors() {
     .await;
     assert_api_error(
         &response,
+        StatusCode::BAD_REQUEST,
+        ApiErrorCode::InvalidRequest,
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn request_json_boundaries_reject_raw_depth_width_and_trailing_input() {
+    let fixture = AppFixture::new();
+
+    let oversized_references = dispatch(
+        &fixture.router,
+        raw_json_request(REFERENCES_ENDPOINT, vec![b' '; 64 * 1024 + 1], None),
+    )
+    .await;
+    assert_api_error(
+        &oversized_references,
+        StatusCode::BAD_REQUEST,
+        ApiErrorCode::InvalidRequest,
+    );
+
+    let deeply_nested = format!("{{\"unknown\":{}0{}}}", "[".repeat(33), "]".repeat(33));
+    let depth = dispatch(
+        &fixture.router,
+        raw_json_request(REFERENCES_ENDPOINT, deeply_nested, None),
+    )
+    .await;
+    assert_api_error(
+        &depth,
+        StatusCode::BAD_REQUEST,
+        ApiErrorCode::InvalidRequest,
+    );
+
+    let wide = serde_json::json!({ "unknown": vec![0_u8; 513] });
+    let width = dispatch(
+        &fixture.router,
+        json_request(REFERENCES_ENDPOINT, &wide, None),
+    )
+    .await;
+    assert_api_error(
+        &width,
+        StatusCode::BAD_REQUEST,
+        ApiErrorCode::InvalidRequest,
+    );
+
+    let valid = serde_json::to_string(&ReferenceRequest::incoming_guid(REFERENCE_GUID, None, 8))
+        .expect("reference request must serialize");
+    let trailing = dispatch(
+        &fixture.router,
+        raw_json_request(REFERENCES_ENDPOINT, format!("{valid} null"), None),
+    )
+    .await;
+    assert_api_error(
+        &trailing,
+        StatusCode::BAD_REQUEST,
+        ApiErrorCode::InvalidRequest,
+    );
+
+    let oversized_reindex = dispatch(
+        &fixture.router,
+        raw_json_request(
+            REINDEX_ENDPOINT,
+            vec![b' '; 1024 * 1024 + 1],
+            Some(&fixture.current_token),
+        ),
+    )
+    .await;
+    assert_api_error(
+        &oversized_reindex,
+        StatusCode::BAD_REQUEST,
+        ApiErrorCode::InvalidRequest,
+    );
+
+    let reindex_depth = format!(
+        "{{\"contract_version\":{SEARCH_GENERATION_CONTRACT_VERSION},\"scope\":{{\"kind\":\"reconcile\",\"unknown\":{}0{}}}}}",
+        "[".repeat(33),
+        "]".repeat(33),
+    );
+    let depth = dispatch(
+        &fixture.router,
+        raw_json_request(
+            REINDEX_ENDPOINT,
+            reindex_depth,
+            Some(&fixture.current_token),
+        ),
+    )
+    .await;
+    assert_api_error(
+        &depth,
+        StatusCode::BAD_REQUEST,
+        ApiErrorCode::InvalidRequest,
+    );
+
+    let wide_reindex = serde_json::json!({
+        "contract_version": SEARCH_GENERATION_CONTRACT_VERSION,
+        "scope": {
+            "kind": "changed_paths",
+            "paths": vec![""; 32 * 1024],
+        },
+    });
+    let width = dispatch(
+        &fixture.router,
+        json_request(
+            REINDEX_ENDPOINT,
+            &wide_reindex,
+            Some(&fixture.current_token),
+        ),
+    )
+    .await;
+    assert_api_error(
+        &width,
+        StatusCode::BAD_REQUEST,
+        ApiErrorCode::InvalidRequest,
+    );
+
+    let valid_reindex =
+        serde_json::to_string(&ReindexIntent::reconcile()).expect("reindex intent must serialize");
+    let trailing = dispatch(
+        &fixture.router,
+        raw_json_request(
+            REINDEX_ENDPOINT,
+            format!("{valid_reindex} null"),
+            Some(&fixture.current_token),
+        ),
+    )
+    .await;
+    assert_api_error(
+        &trailing,
         StatusCode::BAD_REQUEST,
         ApiErrorCode::InvalidRequest,
     );
@@ -641,6 +775,16 @@ async fn mutations_require_the_current_project_token_and_rotation_leaks_no_secre
         .body(Body::from("{"))
         .expect("malformed test request must still be constructible");
     let response = dispatch(&fixture.router, malformed_unauthenticated).await;
+    assert_api_error(
+        &response,
+        StatusCode::UNAUTHORIZED,
+        ApiErrorCode::Unauthorized,
+    );
+    responses.push(response);
+
+    let oversized_unauthenticated =
+        raw_json_request(REINDEX_ENDPOINT, vec![b' '; 1024 * 1024 + 1], None);
+    let response = dispatch(&fixture.router, oversized_unauthenticated).await;
     assert_api_error(
         &response,
         StatusCode::UNAUTHORIZED,

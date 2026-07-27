@@ -95,6 +95,22 @@ fn prepare_with_observer(
     observer: &mut impl FnMut(PrepareCheckpoint),
 ) -> Result<PreparedChange, PrepareError> {
     let snapshot = workspace.snapshot();
+    if plan.workspace_id() != snapshot.workspace_id() {
+        return Err(reject(
+            &snapshot,
+            None,
+            RunnerFailure::new(
+                None,
+                PrepareStage::PlanIdentity,
+                "PREPARE_WORKSPACE_MISMATCH",
+                format!(
+                    "plan workspace {} does not match workspace {}",
+                    plan.workspace_id(),
+                    snapshot.workspace_id()
+                ),
+            ),
+        ));
+    }
     let plan_digest = plan.digest().map_err(|error| {
         reject(
             &snapshot,
@@ -107,7 +123,8 @@ fn prepare_with_observer(
             ),
         )
     })?;
-    let (base_revision, sources, payloads, operations) = plan.into_parts();
+    let (plan_workspace_id, base_revision, sources, payloads, operations) = plan.into_parts();
+    debug_assert_eq!(plan_workspace_id, snapshot.workspace_id());
     let operation_count = u32::try_from(operations.len()).map_err(|_| {
         reject(
             &snapshot,
@@ -580,18 +597,21 @@ fn prepare_with_observer(
 
     let candidate_catalog = build_candidate_catalog(graph_catalog, &graph, &artifacts, budget)
         .map_err(|failure| reject(&snapshot, Some(plan_digest), failure))?;
-    let prepared_revision = candidate_catalog.revision().map_err(|error| {
-        reject(
-            &snapshot,
-            Some(plan_digest),
-            RunnerFailure::new(
-                None,
-                PrepareStage::PreparedView,
-                "PREPARE_CANDIDATE_REVISION_REJECTED",
-                error.to_string(),
-            ),
-        )
-    })?;
+    let prepared_revision = snapshot
+        .state()
+        .revision_for_catalog(&candidate_catalog)
+        .map_err(|error| {
+            reject(
+                &snapshot,
+                Some(plan_digest),
+                RunnerFailure::new(
+                    None,
+                    PrepareStage::PreparedView,
+                    "PREPARE_CANDIDATE_REVISION_REJECTED",
+                    error.to_string(),
+                ),
+            )
+        })?;
     let (source_bindings, source_reports) = build_source_bindings_and_reports(
         snapshot.state().catalog(),
         graph_catalog,
@@ -1478,7 +1498,7 @@ fn stage_yaml_operation(
             ..
         } => {
             if let Some(owner) = protected_plain_field_owner(
-                entry.candidate.class().class_id,
+                entry.candidate.class().class_id(),
                 ObjectKind::Yaml,
                 entry.candidate.class().properties(),
                 &path,
@@ -4424,6 +4444,7 @@ mod tests {
         let guard = FieldGuard::new(digest, digest);
         let payload = PlanPayload::new(b"payload".to_vec());
         let plan = MutationPlan::new(
+            snapshot.workspace_id(),
             snapshot.revision(),
             vec![
                 SourceExpectation::new(
@@ -4470,7 +4491,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let (_, _, payloads, operations) = plan.into_parts();
+        let (_, _, _, payloads, operations) = plan.into_parts();
         let LocatorResolution::Resolved(first_source) = snapshot
             .state()
             .catalog()

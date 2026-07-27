@@ -1,9 +1,9 @@
-# Prepared Artifact U11 Performance Baseline
+# Prepared Artifact Performance Baseline
 
-This document records the pre-U11 contiguous-writer baseline, the supported-workload decision
-gate, and the metrics that the segmented Prepared Artifact implementation must preserve. Runtime
-numbers are diagnostic observations from one machine; deterministic counters and budget ceilings
-are the conformance contract.
+This document records the superseded contiguous-writer baseline captured before the U11
+implementation, the supported-workload decision gate, and the metrics preserved by segmented
+Prepared Artifacts. Runtime numbers are diagnostic observations from one machine; deterministic
+counters and budget ceilings are the conformance contract.
 
 ## Code Point
 
@@ -42,9 +42,9 @@ reads happen before sampling so operating-system cache noise does not dominate t
 - Short Windows samples may report zero process CPU because `GetProcessTimes` is coarsely
   quantized. Wall time and allocator counters remain available.
 
-## Pre-Refactor Observations
+## Superseded Aggregate Writer Observations
 
-Environment:
+Measurement host:
 
 - Windows 11 Pro `10.0.26200`, x86-64 MSVC
 - Intel Core i9-13900KF, 24 cores / 32 logical processors
@@ -91,9 +91,9 @@ unavoidable cost of whole-stream LZMA, Gzip, Brotli, or changed compressed bundl
 artifact whose exact compressed output exceeds retained or live-memory limits is rejected. It is
 not written to a temporary file and is not re-encoded during commit.
 
-## Replacement Gates
+## Replacement Acceptance Gates
 
-The U11 path must satisfy all of the following before the legacy writers are deleted:
+The segmented implementation was accepted against the following gates:
 
 - `full_image_materializations == 0` and `spool_bytes == 0` for Prepared Artifact construction.
 - Unchanged SerializedFile objects and uncompressed container members retain their immutable

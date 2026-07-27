@@ -1,11 +1,17 @@
-//! Comprehensive tests using real Unity YAML files from the reference library
+//! Comprehensive tests using real Unity YAML files
 //!
-//! These tests use the same fixture files as the Python unity-yaml-parser
-//! to ensure full compatibility with real Unity files.
+//! These tests exercise the production budgeted parser against representative files.
 
 use std::path::Path;
 use unity_asset_core::{UnityDocument, UnityValue};
-use unity_asset_yaml::{SerdeUnityLoader, YamlDocument};
+use unity_asset_yaml::{
+    AssetLoadBudget, BudgetedYamlError, BudgetedYamlSource, load_budgeted_yaml_path,
+};
+
+fn load_fixture(path: &Path) -> Result<BudgetedYamlSource, BudgetedYamlError> {
+    let mut budget = AssetLoadBudget::default();
+    load_budgeted_yaml_path(path, &mut budget)
+}
 
 /// Test loading a complex single document Unity file (PlayerSettings)
 #[test]
@@ -17,14 +23,15 @@ fn test_single_doc_player_settings() {
         return;
     }
 
-    let result = YamlDocument::load_yaml(fixture_path, false);
+    let result = load_fixture(fixture_path);
     assert!(
         result.is_ok(),
         "Failed to load SingleDoc.asset: {:?}",
         result.err()
     );
 
-    let doc = result.unwrap();
+    let source = result.unwrap();
+    let doc = source.document();
 
     // Should have exactly one entry (PlayerSettings)
     assert_eq!(doc.entries().len(), 1);
@@ -32,9 +39,9 @@ fn test_single_doc_player_settings() {
     let player_settings = &doc.entries()[0];
 
     // Verify it's a PlayerSettings class (Unity class ID 129)
-    assert_eq!(player_settings.class_id, 129);
-    assert_eq!(player_settings.class_name, "PlayerSettings");
-    assert_eq!(player_settings.anchor, "1");
+    assert_eq!(player_settings.class_id(), 129);
+    assert_eq!(player_settings.class_name(), "PlayerSettings");
+    assert_eq!(player_settings.anchor(), "1");
 
     // Check some key properties exist
     assert!(player_settings.get("m_ObjectHideFlags").is_some());
@@ -91,14 +98,15 @@ fn test_multi_doc_prefab() {
         return;
     }
 
-    let result = YamlDocument::load_yaml(fixture_path, false);
+    let result = load_fixture(fixture_path);
     assert!(
         result.is_ok(),
         "Failed to load MultiDoc.asset: {:?}",
         result.err()
     );
 
-    let doc = result.unwrap();
+    let source = result.unwrap();
+    let doc = source.document();
 
     // Should have multiple entries (Prefab, GameObject, Transform, MonoBehaviour, SpriteRenderer)
     assert_eq!(doc.entries().len(), 5);
@@ -111,11 +119,11 @@ fn test_multi_doc_prefab() {
     let mut found_spriterenderer = false;
 
     for entry in doc.entries() {
-        match entry.class_name.as_str() {
+        match entry.class_name() {
             "Prefab" => {
                 found_prefab = true;
-                assert_eq!(entry.class_id, 129);
-                assert_eq!(entry.anchor, "100100000");
+                assert_eq!(entry.class_id(), 129);
+                assert_eq!(entry.anchor(), "100100000");
 
                 // Check prefab-specific properties
                 assert!(entry.get("m_ObjectHideFlags").is_some());
@@ -124,8 +132,8 @@ fn test_multi_doc_prefab() {
             }
             "GameObject" => {
                 found_gameobject = true;
-                assert_eq!(entry.class_id, 1);
-                assert_eq!(entry.anchor, "1158508787625206");
+                assert_eq!(entry.class_id(), 1);
+                assert_eq!(entry.anchor(), "1158508787625206");
 
                 if let Some(UnityValue::String(name)) = entry.get("m_Name") {
                     assert_eq!(name, "HealthPiece");
@@ -138,8 +146,8 @@ fn test_multi_doc_prefab() {
             }
             "Transform" => {
                 found_transform = true;
-                assert_eq!(entry.class_id, 4);
-                assert_eq!(entry.anchor, "4694383200289498");
+                assert_eq!(entry.class_id(), 4);
+                assert_eq!(entry.anchor(), "4694383200289498");
 
                 // Check transform properties
                 if let Some(UnityValue::Object(pos)) = entry.get("m_LocalPosition") {
@@ -153,8 +161,8 @@ fn test_multi_doc_prefab() {
             }
             "MonoBehaviour" => {
                 found_monobehaviour = true;
-                assert_eq!(entry.class_id, 114);
-                assert_eq!(entry.anchor, "114056957583938824");
+                assert_eq!(entry.class_id(), 114);
+                assert_eq!(entry.anchor(), "114056957583938824");
 
                 // Check MonoBehaviour properties
                 if let Some(UnityValue::Integer(x_index)) = entry.get("xIndex") {
@@ -166,8 +174,8 @@ fn test_multi_doc_prefab() {
             }
             "SpriteRenderer" => {
                 found_spriterenderer = true;
-                assert_eq!(entry.class_id, 212);
-                assert_eq!(entry.anchor, "212685313502090504");
+                assert_eq!(entry.class_id(), 212);
+                assert_eq!(entry.anchor(), "212685313502090504");
 
                 // Check SpriteRenderer properties
                 if let Some(UnityValue::Object(color)) = entry.get("m_Color") {
@@ -178,7 +186,7 @@ fn test_multi_doc_prefab() {
                 }
             }
             _ => {
-                panic!("Unexpected class type: {}", entry.class_name);
+                panic!("Unexpected class type: {}", entry.class_name());
             }
         }
     }
@@ -202,41 +210,16 @@ fn test_unity_extra_anchor_data() {
         return;
     }
 
-    // For now, just test that we can load the file without crashing
-    // The "stripped" keyword is Unity-specific and may not be fully supported yet
-    let result = YamlDocument::load_yaml(fixture_path, false);
+    let source = load_fixture(fixture_path).unwrap();
+    let doc = source.document();
+    assert!(!doc.entries().is_empty());
 
-    match result {
-        Ok(doc) => {
-            println!(
-                "✓ UnityExtraAnchorData.prefab loaded successfully with {} entries",
-                doc.entries().len()
-            );
-
-            // Check that we have some entries
-            assert!(!doc.entries().is_empty());
-
-            // Look for MonoBehaviour entries
-            let monobehaviour_count = doc
-                .entries()
-                .iter()
-                .filter(|entry| entry.class_name == "MonoBehaviour")
-                .count();
-
-            println!("  Found {} MonoBehaviour components", monobehaviour_count);
-            assert!(monobehaviour_count > 0);
-        }
-        Err(e) => {
-            // If we can't parse it yet due to "stripped" keyword, that's expected
-            println!(
-                "⚠ UnityExtraAnchorData.prefab parsing failed (expected): {}",
-                e
-            );
-            println!(
-                "  This may be due to Unity-specific 'stripped' keyword not being fully supported"
-            );
-        }
-    }
+    let monobehaviour_count = doc
+        .entries()
+        .iter()
+        .filter(|entry| entry.class_name() == "MonoBehaviour")
+        .count();
+    assert!(monobehaviour_count > 0);
 }
 
 /// Test meta file without YAML tags
@@ -249,36 +232,22 @@ fn test_meta_file_without_tags() {
         return;
     }
 
-    let result = YamlDocument::load_yaml(fixture_path, false);
+    let source = load_fixture(fixture_path).unwrap();
+    let doc = source.document();
+    assert!(!doc.entries().is_empty());
 
-    match result {
-        Ok(doc) => {
-            println!(
-                "✓ MetaFileWithoutTags.meta loaded successfully with {} entries",
-                doc.entries().len()
-            );
-
-            // Should have at least one entry
-            assert!(!doc.entries().is_empty());
-
-            // Check the first entry
-            let entry = &doc.entries()[0];
-            println!(
-                "  First entry: {} (ID: {}, Anchor: {})",
-                entry.class_name, entry.class_id, entry.anchor
-            );
-        }
-        Err(e) => {
-            println!("⚠ MetaFileWithoutTags.meta parsing failed: {}", e);
-            println!("  This may be expected if the file has non-standard YAML format");
-        }
-    }
+    let entry = &doc.entries()[0];
+    println!(
+        "First entry: {} (ID: {}, Anchor: {})",
+        entry.class_name(),
+        entry.class_id(),
+        entry.anchor()
+    );
 }
 
-/// Test that we can handle all fixture files with the serde loader directly
+/// Test that the production parser handles all supported fixtures.
 #[test]
-fn test_serde_loader_with_all_fixtures() {
-    let loader = SerdeUnityLoader::new();
+fn test_budgeted_parser_with_all_fixtures() {
     let fixtures = [
         ("SingleDoc.asset", "PlayerSettings"),
         ("MultiDoc.asset", "Multi-component prefab"),
@@ -299,33 +268,18 @@ fn test_serde_loader_with_all_fixtures() {
 
         println!("Testing {} ({})", filename, description);
 
-        match std::fs::read_to_string(&fixture_path) {
-            Ok(content) => {
-                match loader.load_from_str(&content) {
-                    Ok(classes) => {
-                        println!("  ✓ Loaded {} Unity classes", classes.len());
-
-                        for (i, class) in classes.iter().enumerate() {
-                            println!(
-                                "    [{}]: {} (ID: {}, Anchor: {}, {} properties)",
-                                i,
-                                class.class_name,
-                                class.class_id,
-                                class.anchor,
-                                class.properties().len()
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        println!("  ⚠ Failed to parse: {}", e);
-                        // Don't fail the test - some files may have Unity-specific features
-                        // that aren't fully supported yet
-                    }
-                }
-            }
-            Err(e) => {
-                println!("  ✗ Failed to read file: {}", e);
-            }
+        let source = load_fixture(&fixture_path).unwrap();
+        let classes = source.document().entries();
+        assert!(!classes.is_empty(), "{filename} should contain an entry");
+        for (i, class) in classes.iter().enumerate() {
+            println!(
+                "    [{}]: {} (ID: {}, Anchor: {}, {} properties)",
+                i,
+                class.class_name(),
+                class.class_id(),
+                class.anchor(),
+                class.properties().len()
+            );
         }
 
         println!();

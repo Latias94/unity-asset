@@ -294,6 +294,10 @@ fn serialized_inspection_tables_are_charged_exactly_to_artifact_metadata() {
     let mut empty_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
     let empty_set = prepare_serialized_set(&empty_tables, &mut empty_budget).unwrap();
     let empty_metadata = empty_budget.committed_usage().metadata_bytes();
+    let empty_proof_heap = match empty_set.outputs().next().unwrap().artifact().format() {
+        PreparedArtifactFormat::SerializedFile(proof) => proof.retained_heap_bytes().unwrap(),
+        format => panic!("expected SerializedFile proof, found {format:?}"),
+    };
     drop(empty_set);
 
     let mut probe_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
@@ -303,8 +307,11 @@ fn serialized_inspection_tables_are_charged_exactly_to_artifact_metadata() {
         PreparedArtifactFormat::SerializedFile(proof) => proof.retained_heap_bytes().unwrap(),
         format => panic!("expected SerializedFile proof, found {format:?}"),
     };
-    assert!(proof_heap > 0);
-    assert_eq!(populated_metadata - empty_metadata, proof_heap);
+    assert!(proof_heap > empty_proof_heap);
+    assert_eq!(
+        populated_metadata - empty_metadata,
+        proof_heap - empty_proof_heap
+    );
     drop(probe_set);
 
     let exact_limits = ArtifactLimits::default().with_max_metadata_bytes(populated_metadata);

@@ -607,14 +607,14 @@ impl AssetAnalyzer {
             }
 
             let class = object.class();
-            state.terms.append(&class.class_name, budget)?;
+            state.terms.append(class.class_name(), budget)?;
             if let Some(name) = class.name().filter(|name| !name.trim().is_empty()) {
                 state.terms.append(name, budget)?;
                 if state.primary_name.is_none() {
                     charge_string(name, budget)?;
                     state.primary_name = Some(name.to_owned());
                 }
-                if class.class_id == 1
+                if class.class_id() == 1
                     && let Some(address) = address.as_ref()
                 {
                     charge_string(name, budget)?;
@@ -623,7 +623,7 @@ impl AssetAnalyzer {
                 }
             }
             if let Some(address) = address {
-                class_by_address.insert(address, class.class_id);
+                class_by_address.insert(address, class.class_id());
             }
 
             self.walk_class(class, state, &mut value_traversal, budget)?;
@@ -673,7 +673,7 @@ impl AssetAnalyzer {
             traversal.truncated = true;
         }
         for (field, value) in class.properties().iter().take(remaining).rev() {
-            if class.class_id == 142 && field == "m_Container" {
+            if class.class_id() == 142 && field == "m_Container" {
                 self.collect_container_entries(value, state, traversal, budget)?;
             } else {
                 push_value_frame(

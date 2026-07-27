@@ -127,10 +127,6 @@ pub enum BinaryError {
     #[error("Corrupted data detected: {0}")]
     CorruptedData(String),
 
-    /// Version compatibility error
-    #[error("Version compatibility error: {0}")]
-    VersionCompatibility(String),
-
     /// Generic error with context
     #[error("Error: {0}")]
     Generic(String),
@@ -263,11 +259,6 @@ impl BinaryError {
         BinaryError::CorruptedData(msg.into())
     }
 
-    /// Create a version compatibility error
-    pub fn version_compatibility(msg: impl Into<String>) -> Self {
-        BinaryError::VersionCompatibility(msg.into())
-    }
-
     /// Check if this error is recoverable
     pub fn is_recoverable(&self) -> bool {
         match self {
@@ -288,7 +279,6 @@ impl BinaryError {
             BinaryError::ResourceLimitExceeded(_) => true, // Might reduce limits
             BinaryError::Budget(_) => true,  // Might retry with a larger load budget
             BinaryError::CorruptedData(_) => true, // Might skip corrupted section
-            BinaryError::VersionCompatibility(_) => true, // Might use compatibility mode
             BinaryError::Generic(_) => true, // Generic errors are usually recoverable
         }
     }
@@ -313,7 +303,6 @@ impl BinaryError {
             BinaryError::ResourceLimitExceeded(_) => ErrorSeverity::Medium,
             BinaryError::Budget(_) => ErrorSeverity::Medium,
             BinaryError::CorruptedData(_) => ErrorSeverity::Medium,
-            BinaryError::VersionCompatibility(_) => ErrorSeverity::Low,
             BinaryError::Generic(_) => ErrorSeverity::Medium,
         }
     }
@@ -330,7 +319,6 @@ impl BinaryError {
             BinaryError::ResourceLimitExceeded(_) => Some("Reduce processing limits"),
             BinaryError::Budget(_) => Some("Increase load limits or reduce the input scope"),
             BinaryError::CorruptedData(_) => Some("Skip corrupted section"),
-            BinaryError::VersionCompatibility(_) => Some("Enable compatibility mode"),
             BinaryError::ObjectIdentity(_) => Some("Skip malformed SerializedFile"),
             BinaryError::ObjectReplacement(_) => Some("Reject the invalid object replacement"),
             _ => None,
