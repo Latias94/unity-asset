@@ -1,7 +1,9 @@
 use std::fmt;
 
-use unity_asset_binary::typetree::{PrimitiveKind, SchemaNode};
-use unity_asset_core::{Result, UnityAssetError, UnityValue};
+use unity_asset_binary::typetree::{
+    PrimitiveKind, SchemaNode, TypeTreeWriteError, TypeTreeWriteResult as Result,
+};
+use unity_asset_core::UnityValue;
 
 use super::output::TypeTreeSink;
 use crate::binary_writer::Endian;
@@ -31,13 +33,15 @@ pub(crate) const fn summarize_value(value: &UnityValue) -> UnityValueSummary<'_>
 }
 
 pub(crate) fn checked_i32_length(length: usize, label: &str) -> Result<i32> {
-    i32::try_from(length)
-        .map_err(|_| UnityAssetError::format(format!("{label} length exceeds i32: {length}")))
+    i32::try_from(length).map_err(|_| {
+        TypeTreeWriteError::invalid_value(format!("{label} length exceeds i32: {length}"))
+    })
 }
 
 pub(crate) fn usize_to_u64(value: usize, label: &str) -> Result<u64> {
-    u64::try_from(value)
-        .map_err(|_| UnityAssetError::format(format!("{label} does not fit u64: {value}")))
+    u64::try_from(value).map_err(|_| {
+        TypeTreeWriteError::invalid_value(format!("{label} does not fit u64: {value}"))
+    })
 }
 
 pub(crate) fn expect_pair<'value>(
@@ -46,7 +50,7 @@ pub(crate) fn expect_pair<'value>(
 ) -> Result<&'value [UnityValue]> {
     match value {
         UnityValue::Array(values) if values.len() == 2 => Ok(values),
-        _ => Err(UnityAssetError::format(format!(
+        _ => Err(TypeTreeWriteError::invalid_value(format!(
             "TypeTree pair '{}' requires an Array with exactly two values, got {}",
             node.name(),
             summarize_value(value)
@@ -211,15 +215,15 @@ fn type_mismatch(
     kind: PrimitiveKind,
     expected: &'static str,
     value: &UnityValue,
-) -> UnityAssetError {
-    UnityAssetError::format(format!(
+) -> TypeTreeWriteError {
+    TypeTreeWriteError::invalid_value(format!(
         "TypeTree write expected {expected} for {kind:?}, got {}",
         summarize_value(value)
     ))
 }
 
-fn out_of_range(kind: PrimitiveKind, value: &UnityValue) -> UnityAssetError {
-    UnityAssetError::format(format!(
+fn out_of_range(kind: PrimitiveKind, value: &UnityValue) -> TypeTreeWriteError {
+    TypeTreeWriteError::invalid_value(format!(
         "TypeTree write {} is out of range for {kind:?}",
         summarize_value(value)
     ))

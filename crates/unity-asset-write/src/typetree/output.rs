@@ -2,8 +2,10 @@
 
 use std::mem::size_of;
 
-use unity_asset_binary::typetree::TypeTreeTraversalStats;
-use unity_asset_core::{AssetLoadBudget, BudgetError, Result, UnityAssetError};
+use unity_asset_binary::typetree::{
+    TypeTreeTraversalStats, TypeTreeWriteError, TypeTreeWriteResult as Result,
+};
+use unity_asset_core::{AssetLoadBudget, BudgetError};
 
 use crate::binary_writer::Endian;
 
@@ -92,7 +94,7 @@ impl<'budget> TypeTreeOutput<'budget> {
     /// Pads the output to the next absolute alignment boundary.
     pub(crate) fn align_to(&mut self, alignment: usize) -> Result<()> {
         if alignment == 0 {
-            return Err(UnityAssetError::format(
+            return Err(TypeTreeWriteError::invalid_value(
                 "TypeTree output alignment must be nonzero",
             ));
         }
@@ -172,11 +174,10 @@ impl<'budget> TypeTreeOutput<'budget> {
     }
 
     fn prepare_append(&self, count: usize, kind: AppendKind) -> Result<PreparedAppend> {
-        let new_len = self
-            .bytes
-            .len()
-            .checked_add(count)
-            .ok_or_else(|| UnityAssetError::format("TypeTree output length overflow"))?;
+        let new_len =
+            self.bytes.len().checked_add(count).ok_or_else(|| {
+                TypeTreeWriteError::invalid_value("TypeTree output length overflow")
+            })?;
         let accounted_capacity = if new_len <= self.accounted_capacity {
             self.accounted_capacity
         } else if self.accounted_capacity == 0 {
@@ -184,18 +185,24 @@ impl<'budget> TypeTreeOutput<'budget> {
         } else {
             self.accounted_capacity
                 .checked_mul(2)
-                .ok_or_else(|| UnityAssetError::format("TypeTree output capacity overflow"))?
+                .ok_or_else(|| {
+                    TypeTreeWriteError::invalid_value("TypeTree output capacity overflow")
+                })?
                 .max(new_len)
         };
         let added_capacity = accounted_capacity
             .checked_sub(self.accounted_capacity)
-            .ok_or_else(|| UnityAssetError::format("TypeTree output capacity ledger is invalid"))?;
-        let wire = u64::try_from(count)
-            .map_err(|_| UnityAssetError::format("TypeTree output extent does not fit in u64"))?;
-        let owned = u64::try_from(added_capacity)
-            .map_err(|_| UnityAssetError::format("TypeTree output capacity does not fit in u64"))?;
+            .ok_or_else(|| {
+                TypeTreeWriteError::invalid_value("TypeTree output capacity ledger is invalid")
+            })?;
+        let wire = u64::try_from(count).map_err(|_| {
+            TypeTreeWriteError::invalid_value("TypeTree output extent does not fit in u64")
+        })?;
+        let owned = u64::try_from(added_capacity).map_err(|_| {
+            TypeTreeWriteError::invalid_value("TypeTree output capacity does not fit in u64")
+        })?;
         let combined_bytes = wire.checked_add(owned).ok_or_else(|| {
-            UnityAssetError::format("TypeTree output wire and owned byte total overflow")
+            TypeTreeWriteError::invalid_value("TypeTree output wire and owned byte total overflow")
         })?;
 
         let mut stats = self.stats;
@@ -228,12 +235,11 @@ impl<'budget> TypeTreeOutput<'budget> {
             .map_err(|error| budget_error("check TypeTree output bytes", error))?;
         let reserve = target_capacity
             .checked_sub(self.bytes.len())
-            .ok_or_else(|| UnityAssetError::format("TypeTree output capacity ledger is invalid"))?;
+            .ok_or_else(|| {
+                TypeTreeWriteError::invalid_value("TypeTree output capacity ledger is invalid")
+            })?;
         self.bytes.try_reserve_exact(reserve).map_err(|error| {
-            UnityAssetError::with_source(
-                format!("failed to reserve {reserve} bytes for TypeTree output"),
-                error,
-            )
+            TypeTreeWriteError::allocation("reserve TypeTree output bytes", error)
         })?;
         Ok(())
     }
@@ -297,8 +303,9 @@ impl<'budget> TypeTreeValidation<'budget> {
     }
 
     fn advance(&mut self, amount: usize, kind: AppendKind) -> Result<()> {
-        let amount = u64::try_from(amount)
-            .map_err(|_| UnityAssetError::format("TypeTree validation extent does not fit u64"))?;
+        let amount = u64::try_from(amount).map_err(|_| {
+            TypeTreeWriteError::invalid_value("TypeTree validation extent does not fit u64")
+        })?;
         self.stats.wire_bytes =
             checked_add_metric(self.stats.wire_bytes, amount, "validation wire bytes")?;
         match kind {
@@ -345,10 +352,10 @@ impl TypeTreeSink for TypeTreeValidation<'_> {
 
     fn align_to(&mut self, alignment: usize) -> Result<()> {
         let alignment = u64::try_from(alignment).map_err(|_| {
-            UnityAssetError::format("TypeTree validation alignment does not fit u64")
+            TypeTreeWriteError::invalid_value("TypeTree validation alignment does not fit u64")
         })?;
         if alignment == 0 {
-            return Err(UnityAssetError::format(
+            return Err(TypeTreeWriteError::invalid_value(
                 "TypeTree output alignment must be nonzero",
             ));
         }
@@ -400,13 +407,13 @@ impl TypeTreeSink for TypeTreeValidation<'_> {
 }
 
 fn checked_add_metric(current: u64, amount: u64, label: &str) -> Result<u64> {
-    current
-        .checked_add(amount)
-        .ok_or_else(|| UnityAssetError::format(format!("TypeTree output {label} metric overflow")))
+    current.checked_add(amount).ok_or_else(|| {
+        TypeTreeWriteError::invalid_value(format!("TypeTree output {label} metric overflow"))
+    })
 }
 
-fn budget_error(operation: &'static str, error: BudgetError) -> UnityAssetError {
-    UnityAssetError::with_source(operation, error)
+fn budget_error(operation: &'static str, error: BudgetError) -> TypeTreeWriteError {
+    TypeTreeWriteError::budget(operation, error)
 }
 
 #[cfg(test)]

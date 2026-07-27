@@ -1,7 +1,6 @@
 //! Atomic, schema-aware encoding for one SerializedFile object.
 
 use std::collections::TryReserveError;
-use std::error::Error as StdError;
 use std::mem::{replace, size_of};
 use std::sync::Arc;
 
@@ -14,11 +13,11 @@ use unity_asset_binary::reader::{BinaryReader, ByteOrder};
 use unity_asset_binary::typetree::{
     PrimitiveKind, SchemaNode, SemanticKind, SemanticLayout, TypeTreeParseMode,
     TypeTreeParseOptions, TypeTreeSchema, TypeTreeSemanticDigestError, TypeTreeTraversalContext,
-    TypeTreeTraversalStats,
+    TypeTreeTraversalStats, TypeTreeWriteError,
 };
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, DigestV1, FieldPath, FieldPathSegment, SemanticDigestError,
-    UnityAssetError, UnityValue, ValuePathError, arc_value_allocation_bytes, field_schema_digest,
+    UnityValue, ValuePathError, arc_value_allocation_bytes, field_schema_digest,
     semantic_value_digest,
 };
 
@@ -716,7 +715,7 @@ pub enum SerializedObjectEncodeError {
         ordinal: u32,
         path: FieldPath,
         #[source]
-        source: UnityAssetError,
+        source: TypeTreeWriteError,
     },
     #[error("operation {ordinal} cannot resolve field path {path} at segment {segment}")]
     PathMissing {
@@ -824,7 +823,7 @@ pub enum SerializedObjectEncodeError {
     Rewrite {
         path_id: i64,
         #[source]
-        source: UnityAssetError,
+        source: TypeTreeWriteError,
     },
     #[error("raw replacement digest guard failed for object {path_id}")]
     RawDigestMismatch {
@@ -1567,7 +1566,7 @@ fn apply_operation(
             let element = match location.node.semantic_layout() {
                 SemanticLayout::Sequence(layout) | SemanticLayout::Map(layout) => layout.element(),
                 layout => {
-                    let error = UnityAssetError::format(format!(
+                    let error = TypeTreeWriteError::invalid_value(format!(
                         "TypeTree node '{}' has {:?} semantics, not an editable sequence",
                         location.node.name(),
                         layout.kind()
@@ -1614,7 +1613,7 @@ fn verify_field_guard(
 ) -> Result<(), FieldGuardFailure> {
     let actual_schema = field_schema_digest(object_schema_digest, path)
         .map_err(map_guard_digest_error)
-        .map_err(FieldGuardFailure::Encoding)?;
+        .map_err(FieldGuardFailure::encoding)?;
     if guard.schema_digest != actual_schema {
         return Err(FieldGuardFailure::Schema {
             expected: guard.schema_digest,
@@ -1623,7 +1622,7 @@ fn verify_field_guard(
     }
     let actual_value = semantic_value_digest(value, budget)
         .map_err(map_guard_digest_error)
-        .map_err(FieldGuardFailure::Encoding)?;
+        .map_err(FieldGuardFailure::encoding)?;
     if guard.value_digest != actual_value {
         return Err(FieldGuardFailure::Value {
             expected: guard.value_digest,
@@ -1642,10 +1641,14 @@ enum FieldGuardFailure {
         expected: DigestV1,
         actual: DigestV1,
     },
-    Encoding(SerializedObjectEncodeError),
+    Encoding(Box<SerializedObjectEncodeError>),
 }
 
 impl FieldGuardFailure {
+    fn encoding(error: SerializedObjectEncodeError) -> Self {
+        Self::Encoding(Box::new(error))
+    }
+
     fn into_error(self, ordinal: u32, path: FieldPath) -> SerializedObjectEncodeError {
         match self {
             Self::Schema { expected, actual } => {
@@ -1664,7 +1667,7 @@ impl FieldGuardFailure {
                     actual,
                 }
             }
-            Self::Encoding(error) => error,
+            Self::Encoding(error) => *error,
         }
     }
 }
@@ -2269,10 +2272,10 @@ fn map_operation_value_error(
     path_id: i64,
     ordinal: u32,
     path: FieldPath,
-    error: UnityAssetError,
+    error: TypeTreeWriteError,
 ) -> SerializedObjectEncodeError {
     match error {
-        UnityAssetError::TypeTreeShape {
+        TypeTreeWriteError::Shape {
             expected_fields,
             actual_fields,
         } => SerializedObjectEncodeError::ReplacementShape {
@@ -2282,25 +2285,20 @@ fn map_operation_value_error(
             expected_fields,
             actual_fields,
         },
-        error => match budget_from_error(&error) {
-            Some(error) => SerializedObjectEncodeError::Budget(error),
-            None => SerializedObjectEncodeError::ReplacementValue {
-                path_id,
-                ordinal,
-                path,
-                source: error,
-            },
+        TypeTreeWriteError::Budget { source, .. } => SerializedObjectEncodeError::Budget(source),
+        source => SerializedObjectEncodeError::ReplacementValue {
+            path_id,
+            ordinal,
+            path,
+            source,
         },
     }
 }
 
-fn map_rewrite_error(path_id: i64, error: UnityAssetError) -> SerializedObjectEncodeError {
-    match budget_from_error(&error) {
-        Some(error) => SerializedObjectEncodeError::Budget(error),
-        None => SerializedObjectEncodeError::Rewrite {
-            path_id,
-            source: error,
-        },
+fn map_rewrite_error(path_id: i64, error: TypeTreeWriteError) -> SerializedObjectEncodeError {
+    match error {
+        TypeTreeWriteError::Budget { source, .. } => SerializedObjectEncodeError::Budget(source),
+        source => SerializedObjectEncodeError::Rewrite { path_id, source },
     }
 }
 
@@ -2309,17 +2307,6 @@ fn map_guard_digest_error(error: SemanticDigestError) -> SerializedObjectEncodeE
         SemanticDigestError::Budget(error) => SerializedObjectEncodeError::Budget(error),
         source => SerializedObjectEncodeError::GuardDigest { source },
     }
-}
-
-fn budget_from_error(error: &(dyn StdError + 'static)) -> Option<BudgetError> {
-    let mut current = Some(error);
-    while let Some(error) = current {
-        if let Some(budget) = error.downcast_ref::<BudgetError>() {
-            return Some(budget.clone());
-        }
-        current = error.source();
-    }
-    None
 }
 
 fn usize_to_u64(value: usize, resource: &'static str) -> Result<u64, SerializedObjectEncodeError> {
@@ -2344,6 +2331,73 @@ mod tests {
         schema
             .semantic_digest_with_budget(&mut AssetLoadBudget::default())
             .expect("digest test TypeTree")
+    }
+
+    #[test]
+    fn write_shape_error_maps_to_operation_context() {
+        let path = FieldPath::root();
+        let error = map_operation_value_error(41, 7, path.clone(), TypeTreeWriteError::shape(2, 3));
+
+        assert!(matches!(
+            error,
+            SerializedObjectEncodeError::ReplacementShape {
+                path_id: 41,
+                ordinal: 7,
+                path: actual_path,
+                expected_fields: 2,
+                actual_fields: 3,
+            } if actual_path == path
+        ));
+    }
+
+    #[test]
+    fn write_budget_error_maps_to_public_budget() {
+        let error = map_operation_value_error(
+            41,
+            7,
+            FieldPath::root(),
+            TypeTreeWriteError::budget(
+                "validate replacement",
+                BudgetError::Exceeded {
+                    resource: "entries",
+                    limit: 1,
+                    requested: 2,
+                },
+            ),
+        );
+
+        assert!(matches!(
+            error,
+            SerializedObjectEncodeError::Budget(BudgetError::Exceeded {
+                resource: "entries",
+                limit: 1,
+                requested: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn rewrite_budget_error_maps_to_public_budget() {
+        let error = map_rewrite_error(
+            41,
+            TypeTreeWriteError::budget(
+                "rewrite object",
+                BudgetError::Exceeded {
+                    resource: "bytes",
+                    limit: 3,
+                    requested: 4,
+                },
+            ),
+        );
+
+        assert!(matches!(
+            error,
+            SerializedObjectEncodeError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit: 3,
+                requested: 4,
+            })
+        ));
     }
 
     #[test]

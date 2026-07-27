@@ -4,12 +4,14 @@ use std::mem::size_of;
 use std::ops::Range;
 
 use indexmap::IndexMap;
+use unity_asset_binary::BinaryError;
 use unity_asset_binary::reader::{BinaryReader, ByteOrder};
 use unity_asset_binary::typetree::{
     PPtrLayout, PairLayout, SchemaNode, SemanticKind, SemanticLayout, SequenceLayout,
-    TypeTreeSchema, TypeTreeTraversalContext, TypeTreeTraversalStats,
+    TypeTreeSchema, TypeTreeTraversalContext, TypeTreeTraversalStats, TypeTreeWriteError,
+    TypeTreeWriteResult as Result,
 };
-use unity_asset_core::{AssetLoadBudget, Result, UnityAssetError, UnityValue};
+use unity_asset_core::{AssetLoadBudget, UnityValue};
 
 use super::output::TypeTreeOutput;
 use super::primitives::{checked_i32_length, expect_pair, summarize_value, usize_to_u64};
@@ -101,7 +103,7 @@ pub(crate) fn rewrite_object(
                         output.align_to(4)?;
                     }
                 } else {
-                    return Err(UnityAssetError::format(format!(
+                    return Err(TypeTreeWriteError::invalid_value(format!(
                         "Cannot relocate byte-preserved unnamed TypeTree field '{}' across an alignment boundary",
                         node.type_name()
                     )));
@@ -151,7 +153,7 @@ pub(crate) fn rewrite_object(
             RewriteAction::PreserveTail { range } => {
                 let expected = usize_to_u64(range.start, "TypeTree tail offset")?;
                 if output.position() != expected {
-                    return Err(UnityAssetError::format(format!(
+                    return Err(TypeTreeWriteError::invalid_value(format!(
                         "Cannot relocate {} trailing bytes outside the TypeTree schema",
                         range.len()
                     )));
@@ -233,25 +235,25 @@ impl<'value, 'schema> RewritePlan<'value, 'schema> {
                 1
             } else {
                 self.accounted_capacity.checked_mul(2).ok_or_else(|| {
-                    UnityAssetError::format("TypeTree rewrite plan capacity overflow")
+                    TypeTreeWriteError::invalid_value("TypeTree rewrite plan capacity overflow")
                 })?
             };
             let additional_slots = target_capacity - self.accounted_capacity;
             let allocation = additional_slots
                 .checked_mul(size_of::<RewriteAction<'value, 'schema>>())
                 .ok_or_else(|| {
-                    UnityAssetError::format("TypeTree rewrite plan allocation overflow")
+                    TypeTreeWriteError::invalid_value("TypeTree rewrite plan allocation overflow")
                 })?;
             let allocation = usize_to_u64(allocation, "TypeTree rewrite action allocation")?;
             budget.check_bytes(allocation).map_err(|error| {
-                UnityAssetError::with_source("check TypeTree rewrite plan allocation", error)
+                TypeTreeWriteError::budget("check TypeTree rewrite plan allocation", error)
             })?;
             let reserve = target_capacity - self.actions.len();
             self.actions.try_reserve_exact(reserve).map_err(|error| {
-                UnityAssetError::with_source("reserve TypeTree rewrite actions", error)
+                TypeTreeWriteError::allocation("reserve TypeTree rewrite actions", error)
             })?;
             budget.consume_bytes(allocation).map_err(|error| {
-                UnityAssetError::with_source("charge TypeTree rewrite plan allocation", error)
+                TypeTreeWriteError::budget("charge TypeTree rewrite plan allocation", error)
             })?;
             self.accounted_capacity = target_capacity;
         }
@@ -340,7 +342,7 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
             node.kind(),
             SemanticKind::Record | SemanticKind::ManagedRegistry
         ) {
-            return Err(UnityAssetError::format(format!(
+            return Err(TypeTreeWriteError::invalid_value(format!(
                 "TypeTree template root '{}' is not a record",
                 node.name()
             )));
@@ -368,7 +370,7 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
                 continue;
             }
             let value = object.get(child.name()).ok_or_else(|| {
-                UnityAssetError::format(format!(
+                TypeTreeWriteError::invalid_value(format!(
                     "Missing required field '{}' while template-rewriting '{}'",
                     child.name(),
                     node.name()
@@ -438,14 +440,14 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
     ) -> Result<()> {
         validate_object_shape(node, object, context)?;
         let file_id = object.get(layout.file_child().name()).ok_or_else(|| {
-            UnityAssetError::format(format!(
+            TypeTreeWriteError::invalid_value(format!(
                 "Missing required field '{}' while template-rewriting '{}'",
                 layout.file_child().name(),
                 node.name()
             ))
         })?;
         let path_id = object.get(layout.path_child().name()).ok_or_else(|| {
-            UnityAssetError::format(format!(
+            TypeTreeWriteError::invalid_value(format!(
                 "Missing required field '{}' while template-rewriting '{}'",
                 layout.path_child().name(),
                 node.name()
@@ -473,7 +475,7 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
                 continue;
             }
             let value = object.get(child.name()).ok_or_else(|| {
-                UnityAssetError::format(format!(
+                TypeTreeWriteError::invalid_value(format!(
                     "Missing required field '{}' while template-rewriting '{}'",
                     child.name(),
                     node.name()
@@ -572,55 +574,61 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
 
         let start = reader.position();
         let end = start.checked_add(HEADER_BYTES).ok_or_else(|| {
-            UnityAssetError::format("TypeTree rewrite sequence header position overflow")
+            TypeTreeWriteError::invalid_value("TypeTree rewrite sequence header position overflow")
         })?;
         let range = checked_range(start, end, self.original.len())?;
         let encoded: [u8; 4] = self
             .original
             .get(range.clone())
             .ok_or_else(|| {
-                UnityAssetError::format("TypeTree rewrite sequence header is outside its input")
+                TypeTreeWriteError::invalid_value(
+                    "TypeTree rewrite sequence header is outside its input",
+                )
             })?
             .try_into()
             .map_err(|_| {
-                UnityAssetError::format("TypeTree rewrite sequence header has invalid extent")
+                TypeTreeWriteError::invalid_value(
+                    "TypeTree rewrite sequence header has invalid extent",
+                )
             })?;
         let raw_length = match reader.byte_order() {
             ByteOrder::Big => i32::from_be_bytes(encoded),
             ByteOrder::Little => i32::from_le_bytes(encoded),
         };
         let node_visits = self.input.node_visits.checked_add(1).ok_or_else(|| {
-            UnityAssetError::format("TypeTree rewrite input node counter overflow")
+            TypeTreeWriteError::invalid_value("TypeTree rewrite input node counter overflow")
         })?;
         let wire_bytes = self
             .input
             .wire_bytes
             .checked_add(HEADER_BYTES)
             .ok_or_else(|| {
-                UnityAssetError::format("TypeTree rewrite input wire byte counter overflow")
+                TypeTreeWriteError::invalid_value(
+                    "TypeTree rewrite input wire byte counter overflow",
+                )
             })?;
 
         budget
             .check_depth(depth)
-            .map_err(|error| UnityAssetError::with_source("check TypeTree input depth", error))?;
+            .map_err(|error| TypeTreeWriteError::budget("check TypeTree input depth", error))?;
         budget
             .check_entries(1)
-            .map_err(|error| UnityAssetError::with_source("check TypeTree input node", error))?;
+            .map_err(|error| TypeTreeWriteError::budget("check TypeTree input node", error))?;
         budget.check_bytes(HEADER_BYTES).map_err(|error| {
-            UnityAssetError::with_source("check TypeTree input sequence header", error)
+            TypeTreeWriteError::budget("check TypeTree input sequence header", error)
         })?;
 
         budget
             .consume_entries(1)
-            .map_err(|error| UnityAssetError::with_source("charge TypeTree input node", error))?;
+            .map_err(|error| TypeTreeWriteError::budget("charge TypeTree input node", error))?;
         budget
             .observe_depth(depth)
-            .map_err(|error| UnityAssetError::with_source("observe TypeTree input depth", error))?;
+            .map_err(|error| TypeTreeWriteError::budget("observe TypeTree input depth", error))?;
         budget.consume_bytes(HEADER_BYTES).map_err(|error| {
-            UnityAssetError::with_source("charge TypeTree input sequence header", error)
+            TypeTreeWriteError::budget("charge TypeTree input sequence header", error)
         })?;
         reader.set_position(end).map_err(|error| {
-            UnityAssetError::with_source("advance TypeTree input sequence header", error)
+            TypeTreeWriteError::binary("advance TypeTree input sequence header", error)
         })?;
 
         self.input.node_visits = node_visits;
@@ -629,7 +637,7 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
             return Err(template_input_error(
                 node,
                 "read sequence length",
-                unity_asset_binary::BinaryError::invalid_data(format!(
+                BinaryError::invalid_data(format!(
                     "Negative TypeTree sequence length: {raw_length}"
                 )),
             ));
@@ -638,20 +646,18 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
             template_input_error(
                 node,
                 "read sequence length",
-                unity_asset_binary::BinaryError::invalid_data(
-                    "TypeTree sequence length does not fit usize",
-                ),
+                BinaryError::invalid_data("TypeTree sequence length does not fit usize"),
             )
         })?;
         let members = usize_to_u64(length, "TypeTree input sequence length")?;
         let total_members = self.input.members.checked_add(members).ok_or_else(|| {
-            UnityAssetError::format("TypeTree rewrite input member counter overflow")
+            TypeTreeWriteError::invalid_value("TypeTree rewrite input member counter overflow")
         })?;
         budget.check_members(members).map_err(|error| {
-            UnityAssetError::with_source("check TypeTree input sequence members", error)
+            TypeTreeWriteError::budget("check TypeTree input sequence members", error)
         })?;
         budget.consume_members(members).map_err(|error| {
-            UnityAssetError::with_source("charge TypeTree input sequence members", error)
+            TypeTreeWriteError::budget("charge TypeTree input sequence members", error)
         })?;
         self.input.members = total_members;
         Ok(InputSequenceHeader {
@@ -731,22 +737,22 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
 
         let payload_end = reader.position();
         let padding = (4 - payload_end % 4) % 4;
-        let aligned_end = payload_end
-            .checked_add(padding)
-            .ok_or_else(|| UnityAssetError::format("TypeTree rewrite input alignment overflow"))?;
+        let aligned_end = payload_end.checked_add(padding).ok_or_else(|| {
+            TypeTreeWriteError::invalid_value("TypeTree rewrite input alignment overflow")
+        })?;
         let original_padding = checked_range(payload_end, aligned_end, self.original.len())?;
         let wire_bytes = self.input.wire_bytes.checked_add(padding).ok_or_else(|| {
-            UnityAssetError::format("TypeTree rewrite input wire byte counter overflow")
+            TypeTreeWriteError::invalid_value("TypeTree rewrite input wire byte counter overflow")
         })?;
         budget
             .check_bytes(padding)
-            .map_err(|error| UnityAssetError::with_source("check TypeTree input padding", error))?;
+            .map_err(|error| TypeTreeWriteError::budget("check TypeTree input padding", error))?;
         reader.set_position(aligned_end).map_err(|error| {
-            UnityAssetError::with_source("advance TypeTree input alignment", error)
+            TypeTreeWriteError::binary("advance TypeTree input alignment", error)
         })?;
-        budget.consume_bytes(padding).map_err(|error| {
-            UnityAssetError::with_source("charge TypeTree input padding", error)
-        })?;
+        budget
+            .consume_bytes(padding)
+            .map_err(|error| TypeTreeWriteError::budget("charge TypeTree input padding", error))?;
         self.input.wire_bytes = wire_bytes;
         self.push(RewriteAction::Align { original_padding }, budget)
     }
@@ -759,30 +765,30 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
     ) -> Result<()> {
         let members = usize_to_u64(node.child_count(), "TypeTree composite child count")?;
         let node_visits = self.input.node_visits.checked_add(1).ok_or_else(|| {
-            UnityAssetError::format("TypeTree rewrite input node counter overflow")
+            TypeTreeWriteError::invalid_value("TypeTree rewrite input node counter overflow")
         })?;
         let total_members = self.input.members.checked_add(members).ok_or_else(|| {
-            UnityAssetError::format("TypeTree rewrite input member counter overflow")
+            TypeTreeWriteError::invalid_value("TypeTree rewrite input member counter overflow")
         })?;
 
         budget
             .check_depth(depth)
-            .map_err(|error| UnityAssetError::with_source("check TypeTree input depth", error))?;
+            .map_err(|error| TypeTreeWriteError::budget("check TypeTree input depth", error))?;
         budget
             .check_entries(1)
-            .map_err(|error| UnityAssetError::with_source("check TypeTree input node", error))?;
+            .map_err(|error| TypeTreeWriteError::budget("check TypeTree input node", error))?;
         budget
             .check_members(members)
-            .map_err(|error| UnityAssetError::with_source("check TypeTree input members", error))?;
+            .map_err(|error| TypeTreeWriteError::budget("check TypeTree input members", error))?;
         budget
             .consume_entries(1)
-            .map_err(|error| UnityAssetError::with_source("charge TypeTree input node", error))?;
-        budget.consume_members(members).map_err(|error| {
-            UnityAssetError::with_source("charge TypeTree input members", error)
-        })?;
+            .map_err(|error| TypeTreeWriteError::budget("charge TypeTree input node", error))?;
+        budget
+            .consume_members(members)
+            .map_err(|error| TypeTreeWriteError::budget("charge TypeTree input members", error))?;
         budget
             .observe_depth(depth)
-            .map_err(|error| UnityAssetError::with_source("observe TypeTree input depth", error))?;
+            .map_err(|error| TypeTreeWriteError::budget("observe TypeTree input depth", error))?;
 
         self.input.node_visits = node_visits;
         self.input.members = total_members;
@@ -791,7 +797,7 @@ impl<'bytes, 'value, 'schema> RewritePlanner<'bytes, 'value, 'schema> {
 
     fn observe_input(&mut self, stats: TypeTreeTraversalStats) -> Result<()> {
         self.input = self.input.checked_add(stats).map_err(|error| {
-            UnityAssetError::format(format!(
+            TypeTreeWriteError::invalid_value(format!(
                 "TypeTree rewrite input statistic overflow: {}",
                 error.field()
             ))
@@ -807,7 +813,7 @@ fn copy_range(
     preserved_bytes: &mut u64,
 ) -> Result<()> {
     let bytes = original.get(range.clone()).ok_or_else(|| {
-        UnityAssetError::format(format!(
+        TypeTreeWriteError::invalid_value(format!(
             "TypeTree rewrite produced an invalid original byte range {}..{}",
             range.start, range.end
         ))
@@ -815,7 +821,9 @@ fn copy_range(
     output.write_bytes(bytes)?;
     *preserved_bytes = preserved_bytes
         .checked_add(usize_to_u64(bytes.len(), "preserved TypeTree bytes")?)
-        .ok_or_else(|| UnityAssetError::format("preserved TypeTree byte count overflow"))?;
+        .ok_or_else(|| {
+            TypeTreeWriteError::invalid_value("preserved TypeTree byte count overflow")
+        })?;
     Ok(())
 }
 
@@ -825,7 +833,7 @@ fn expect_object<'value>(
 ) -> Result<&'value IndexMap<String, UnityValue>> {
     match value {
         UnityValue::Object(object) => Ok(object),
-        _ => Err(UnityAssetError::format(format!(
+        _ => Err(TypeTreeWriteError::invalid_value(format!(
             "TypeTree record '{}' requires an Object, got {}",
             node.name(),
             summarize_value(value)
@@ -839,7 +847,7 @@ fn expect_sequence<'value>(
 ) -> Result<&'value [UnityValue]> {
     match value {
         UnityValue::Array(values) => Ok(values),
-        _ => Err(UnityAssetError::format(format!(
+        _ => Err(TypeTreeWriteError::invalid_value(format!(
             "TypeTree sequence '{}' requires an Array, got {}",
             node.name(),
             summarize_value(value)
@@ -849,15 +857,12 @@ fn expect_sequence<'value>(
 
 fn template_input_error(
     node: SchemaNode<'_>,
-    operation: &str,
-    error: unity_asset_binary::BinaryError,
-) -> UnityAssetError {
-    UnityAssetError::with_source(
-        format!(
-            "Failed to {operation} for TypeTree template field '{}' ({})",
-            node.name(),
-            node.type_name()
-        ),
+    operation: &'static str,
+    error: BinaryError,
+) -> TypeTreeWriteError {
+    TypeTreeWriteError::malformed_template(
+        format!("{} ({})", node.name(), node.type_name()),
+        operation,
         error,
     )
 }
@@ -866,7 +871,7 @@ fn checked_range(start: u64, end: u64, len: usize) -> Result<Range<usize>> {
     let start = position_to_usize(start, "TypeTree range start")?;
     let end = position_to_usize(end, "TypeTree range end")?;
     if start > end || end > len {
-        return Err(UnityAssetError::format(format!(
+        return Err(TypeTreeWriteError::invalid_value(format!(
             "TypeTree rewrite range {start}..{end} exceeds original length {len}"
         )));
     }
@@ -886,12 +891,13 @@ fn is_position_independent_opaque_leaf(node: SchemaNode<'_>) -> bool {
 fn next_depth(depth: u32) -> Result<u32> {
     depth
         .checked_add(1)
-        .ok_or_else(|| UnityAssetError::format("TypeTree rewrite depth overflow"))
+        .ok_or_else(|| TypeTreeWriteError::invalid_value("TypeTree rewrite depth overflow"))
 }
 
 fn position_to_usize(value: u64, label: &str) -> Result<usize> {
-    usize::try_from(value)
-        .map_err(|_| UnityAssetError::format(format!("{label} does not fit usize: {value}")))
+    usize::try_from(value).map_err(|_| {
+        TypeTreeWriteError::invalid_value(format!("{label} does not fit usize: {value}"))
+    })
 }
 
 #[cfg(test)]
@@ -902,7 +908,7 @@ mod tests {
     use unity_asset_binary::typetree::{
         TypeTree, TypeTreeNode, TypeTreeParseMode, TypeTreeParseOptions,
     };
-    use unity_asset_core::AssetLoadLimits;
+    use unity_asset_core::{AssetLoadLimits, BudgetError};
 
     fn registry(name: &str) -> TypeTreeNode {
         let mut registry = node("ManagedReferencesRegistry", name);
@@ -939,6 +945,38 @@ mod tests {
 
         assert_eq!(rewritten, original);
         assert_eq!(stats.preserved_bytes, original.len() as u64);
+    }
+
+    #[test]
+    fn rewrite_promotes_compare_budget_errors() {
+        let properties = IndexMap::from([("m_Value".to_owned(), UnityValue::Unsigned(7))]);
+        let original = 7_u32.to_le_bytes();
+        let mut schema_budget = AssetLoadBudget::default();
+        let schema = schema(record(vec![node("UInt32", "m_Value")]), &mut schema_budget);
+        let plan_allocation = size_of::<RewriteAction<'static, 'static>>() as u64;
+        let mut rewrite_budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: plan_allocation + 3,
+            ..AssetLoadLimits::default()
+        })
+        .expect("valid rewrite budget");
+
+        assert!(matches!(
+            rewrite_object(
+                &schema,
+                &properties,
+                &original,
+                Endian::Little,
+                &mut rewrite_budget,
+            ),
+            Err(TypeTreeWriteError::Budget {
+                operation: "compare value",
+                source: BudgetError::Exceeded {
+                    resource: "bytes",
+                    limit,
+                    requested,
+                },
+            }) if limit == plan_allocation + 3 && requested == plan_allocation + 4
+        ));
     }
 
     #[test]
@@ -1015,7 +1053,7 @@ mod tests {
 
         assert!(matches!(
             rewrite_object(&schema, &properties, &original, Endian::Little, &mut budget,),
-            Err(UnityAssetError::TypeTreeShape {
+            Err(TypeTreeWriteError::Shape {
                 expected_fields: 1,
                 actual_fields: 2,
             })
