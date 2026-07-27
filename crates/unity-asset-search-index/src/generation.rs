@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize};
-use unity_asset_core::{ChangeSet, DigestV1, TransactionId, WorkspaceId, WorkspaceRevision};
+use unity_asset_core::{DigestV1, TransactionId, WorkspaceId, WorkspaceRevision};
 
 pub const SEARCH_GENERATION_CONTRACT_VERSION: u16 = 1;
 const GENERATION_DIRECTORY_PREFIX: &str = "generation-v1-";
@@ -93,16 +93,19 @@ impl GenerationStamp {
     }
 }
 
+/// Filesystem discovery work accepted by [`crate::SearchIndex::reindex`].
+///
+/// Authoritative workspace change sets are intentionally not representable here; they require
+/// [`crate::SearchIndex::reindex_workspace`] and its revision-bound [`unity_asset::workspace::WorkspaceView`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ReindexScope {
+pub enum FilesystemReindexScope {
     Full,
     Reconcile,
     ChangedPaths { paths: Vec<PathBuf> },
-    ChangeSet { changes: ChangeSet },
 }
 
-impl<'de> Deserialize<'de> for ReindexScope {
+impl<'de> Deserialize<'de> for FilesystemReindexScope {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -113,49 +116,30 @@ impl<'de> Deserialize<'de> for ReindexScope {
             Full {},
             Reconcile {},
             ChangedPaths { paths: Vec<PathBuf> },
-            ChangeSet { changes: ChangeSet },
         }
 
         Ok(match WireScope::deserialize(deserializer)? {
             WireScope::Full {} => Self::Full,
             WireScope::Reconcile {} => Self::Reconcile,
             WireScope::ChangedPaths { paths } => Self::ChangedPaths { paths },
-            WireScope::ChangeSet { changes } => Self::ChangeSet { changes },
         })
     }
 }
 
-impl ReindexScope {
-    #[must_use]
-    pub const fn target_revision(&self) -> Option<WorkspaceRevision> {
-        match self {
-            Self::ChangeSet { changes } => Some(changes.to_revision()),
-            Self::Full | Self::Reconcile | Self::ChangedPaths { .. } => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn transaction(&self) -> Option<TransactionId> {
-        match self {
-            Self::ChangeSet { changes } => Some(changes.transaction()),
-            Self::Full | Self::Reconcile | Self::ChangedPaths { .. } => None,
-        }
-    }
-}
-
+/// Versioned request for one filesystem-backed search generation build.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ReindexIntent {
+pub struct FilesystemReindexIntent {
     pub contract_version: u16,
-    pub scope: ReindexScope,
+    pub scope: FilesystemReindexScope,
 }
 
-impl ReindexIntent {
+impl FilesystemReindexIntent {
     #[must_use]
     pub const fn full() -> Self {
         Self {
             contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-            scope: ReindexScope::Full,
+            scope: FilesystemReindexScope::Full,
         }
     }
 
@@ -163,7 +147,7 @@ impl ReindexIntent {
     pub const fn reconcile() -> Self {
         Self {
             contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-            scope: ReindexScope::Reconcile,
+            scope: FilesystemReindexScope::Reconcile,
         }
     }
 
@@ -171,15 +155,7 @@ impl ReindexIntent {
     pub fn changed_paths(paths: Vec<PathBuf>) -> Self {
         Self {
             contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-            scope: ReindexScope::ChangedPaths { paths },
-        }
-    }
-
-    #[must_use]
-    pub fn change_set(changes: ChangeSet) -> Self {
-        Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-            scope: ReindexScope::ChangeSet { changes },
+            scope: FilesystemReindexScope::ChangedPaths { paths },
         }
     }
 }

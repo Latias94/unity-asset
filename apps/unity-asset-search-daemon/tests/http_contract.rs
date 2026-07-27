@@ -18,8 +18,8 @@ use unity_asset_search_daemon::app::router as daemon_router;
 use unity_asset_search_daemon::coordinator::{ReindexCoordinator, ReindexCoordinatorConfig};
 use unity_asset_search_daemon::security::{DaemonToken, TokenStore};
 use unity_asset_search_index::{
-    ApiError, ApiErrorCode, AssetLoadBudget, IndexPaths, ReferenceRequest, ReferencesResponse,
-    ReindexDisposition, ReindexIntent, ReindexReceipt, SEARCH_GENERATION_CONTRACT_VERSION,
+    ApiError, ApiErrorCode, AssetLoadBudget, FilesystemReindexIntent, IndexPaths, ReferenceRequest,
+    ReferencesResponse, ReindexDisposition, ReindexReceipt, SEARCH_GENERATION_CONTRACT_VERSION,
     SearchIndex, SearchResponse, StatusResponse, SuggestResponse,
 };
 use unity_asset_search_protocol::{
@@ -59,7 +59,7 @@ impl AppFixture {
     fn with_executor<Factory, Executor, BuildFuture>(factory: Factory) -> Self
     where
         Factory: FnOnce(SearchIndex) -> Executor,
-        Executor: Fn(ReindexIntent) -> BuildFuture + Send + Sync + 'static,
+        Executor: Fn(FilesystemReindexIntent) -> BuildFuture + Send + Sync + 'static,
         BuildFuture: Future<Output = anyhow::Result<ReindexReceipt>> + Send + 'static,
     {
         let temporary = TempDir::new().expect("temporary directory must be creatable");
@@ -76,7 +76,10 @@ impl AppFixture {
         let index = SearchIndex::open_or_create(paths.clone(), &mut AssetLoadBudget::default())
             .expect("test index must open");
         index
-            .reindex(ReindexIntent::full(), &mut AssetLoadBudget::default())
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
             .expect("initial test generation must build");
 
         let token_store =
@@ -338,8 +341,8 @@ async fn malformed_and_versioned_requests_return_typed_api_errors() {
         ApiErrorCode::InvalidRequest,
     );
 
-    let mut intent =
-        serde_json::to_value(ReindexIntent::reconcile()).expect("reindex intent must serialize");
+    let mut intent = serde_json::to_value(FilesystemReindexIntent::reconcile())
+        .expect("reindex intent must serialize");
     intent["contract_version"] = unknown_version.into();
     let response = dispatch(
         &fixture.router,
@@ -366,7 +369,7 @@ async fn malformed_and_versioned_requests_return_typed_api_errors() {
         &fixture.router,
         json_request(
             REINDEX_ENDPOINT,
-            &change_set_intent(),
+            &change_set_request(),
             Some(&fixture.current_token),
         ),
     )
@@ -378,8 +381,8 @@ async fn malformed_and_versioned_requests_return_typed_api_errors() {
     );
     assert_eq!(error.message, "invalid JSON request body");
 
-    let mut nested_intent =
-        serde_json::to_value(ReindexIntent::reconcile()).expect("reindex intent must serialize");
+    let mut nested_intent = serde_json::to_value(FilesystemReindexIntent::reconcile())
+        .expect("reindex intent must serialize");
     nested_intent["scope"]["unknown_nested"] = true.into();
     let response = dispatch(
         &fixture.router,
@@ -506,8 +509,8 @@ async fn request_json_boundaries_reject_raw_depth_width_and_trailing_input() {
         ApiErrorCode::InvalidRequest,
     );
 
-    let valid_reindex =
-        serde_json::to_string(&ReindexIntent::reconcile()).expect("reindex intent must serialize");
+    let valid_reindex = serde_json::to_string(&FilesystemReindexIntent::reconcile())
+        .expect("reindex intent must serialize");
     let trailing = dispatch(
         &fixture.router,
         raw_json_request(
@@ -532,7 +535,7 @@ async fn reindex_wait_modes_report_admission_and_the_real_terminal_generation() 
         &fixture.router,
         json_request(
             &format!("{REINDEX_ENDPOINT}?wait=false"),
-            &ReindexIntent::reconcile(),
+            &FilesystemReindexIntent::reconcile(),
             Some(&fixture.current_token),
         ),
     )
@@ -550,7 +553,7 @@ async fn reindex_wait_modes_report_admission_and_the_real_terminal_generation() 
         &fixture.router,
         json_request(
             REINDEX_ENDPOINT,
-            &ReindexIntent::reconcile(),
+            &FilesystemReindexIntent::reconcile(),
             Some(&fixture.current_token),
         ),
     )
@@ -585,7 +588,7 @@ async fn waited_reindex_maps_executor_errors_panics_and_cancellation_to_typed_fa
         &failed.router,
         json_request(
             REINDEX_ENDPOINT,
-            &ReindexIntent::full(),
+            &FilesystemReindexIntent::full(),
             Some(&failed.current_token),
         ),
     )
@@ -612,7 +615,7 @@ async fn waited_reindex_maps_executor_errors_panics_and_cancellation_to_typed_fa
         &panicked.router,
         json_request(
             REINDEX_ENDPOINT,
-            &ReindexIntent::reconcile(),
+            &FilesystemReindexIntent::reconcile(),
             Some(&panicked.current_token),
         ),
     )
@@ -645,7 +648,7 @@ async fn waited_reindex_maps_executor_errors_panics_and_cancellation_to_typed_fa
         &cancelled.router,
         json_request(
             REINDEX_ENDPOINT,
-            &ReindexIntent::reconcile(),
+            &FilesystemReindexIntent::reconcile(),
             Some(&cancelled.current_token),
         ),
     )
@@ -698,11 +701,11 @@ async fn every_endpoint_returns_typed_method_errors_and_unknown_paths_return_typ
     }
 }
 
-fn change_set_intent() -> ReindexIntent {
+fn change_set_request() -> serde_json::Value {
     let digest = format!("blake3-v1:{}", "11".repeat(32));
     let from_revision = format!("blake3-v1:{}", "22".repeat(32));
     let to_revision = format!("blake3-v1:{}", "33".repeat(32));
-    serde_json::from_value(serde_json::json!({
+    serde_json::json!({
         "contract_version": SEARCH_GENERATION_CONTRACT_VERSION,
         "scope": {
             "kind": "change_set",
@@ -722,8 +725,7 @@ fn change_set_intent() -> ReindexIntent {
                 "identity_remaps": [],
             },
         },
-    }))
-    .expect("test ChangeSet must satisfy the public wire contract")
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -737,7 +739,11 @@ impl MutatingRoute {
 
     fn request(self, token: Option<&DaemonToken>) -> Request<Body> {
         match self {
-            Self::Reindex => json_request(REINDEX_ENDPOINT, &ReindexIntent::reconcile(), token),
+            Self::Reindex => json_request(
+                REINDEX_ENDPOINT,
+                &FilesystemReindexIntent::reconcile(),
+                token,
+            ),
             Self::RotateToken => empty_request(Method::POST, TOKEN_ROTATE_ENDPOINT, token),
         }
     }

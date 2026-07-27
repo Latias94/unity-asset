@@ -12,8 +12,9 @@ use unity_asset::{
 };
 use unity_asset_core::{semantic_value_digest, yaml_field_schema_digest};
 use unity_asset_search_index::{
-    ApiErrorCode, GenerationStamp, IndexPaths, ReferenceRequest, ReferencesResponse,
-    ReindexDisposition, ReindexIntent, ReindexReceipt, SearchIndex, SearchRequest, SearchResponse,
+    ApiErrorCode, FilesystemReindexIntent, GenerationStamp, IndexPaths, ReferenceRequest,
+    ReferencesResponse, ReindexDisposition, ReindexReceipt, SearchIndex, SearchRequest,
+    SearchResponse,
 };
 
 const OWNER_ALIAS: &str = "Assets/owner.prefab";
@@ -86,7 +87,10 @@ fn fixture() -> Fixture {
     let index =
         SearchIndex::open_or_create(paths.clone(), &mut AssetLoadBudget::default()).unwrap();
     let baseline_receipt = index
-        .reindex(ReindexIntent::full(), &mut AssetLoadBudget::default())
+        .reindex(
+            FilesystemReindexIntent::full(),
+            &mut AssetLoadBudget::default(),
+        )
         .unwrap();
     assert_eq!(baseline_receipt.disposition, ReindexDisposition::Applied);
     assert!(baseline_receipt.evidence.analysis.assets_visited > 0);
@@ -510,7 +514,10 @@ fn filesystem_reconciliation_preserves_lagging_change_set_receipts_across_reopen
     .unwrap();
     let reconciled = fixture
         .index
-        .reindex(ReindexIntent::reconcile(), &mut AssetLoadBudget::default())
+        .reindex(
+            FilesystemReindexIntent::reconcile(),
+            &mut AssetLoadBudget::default(),
+        )
         .unwrap();
     assert_eq!(reconciled.disposition, ReindexDisposition::Applied);
     let reconciled_generation = assert_active_receipt(&fixture.index, &reconciled);
@@ -590,7 +597,10 @@ fn failed_delivery_keeps_the_stale_generation_queryable_until_reconciliation() {
 
     let reconciled = fixture
         .index
-        .reindex(ReindexIntent::reconcile(), &mut AssetLoadBudget::default())
+        .reindex(
+            FilesystemReindexIntent::reconcile(),
+            &mut AssetLoadBudget::default(),
+        )
         .unwrap();
     assert_eq!(reconciled.disposition, ReindexDisposition::Applied);
     assert!(reconciled.evidence.dependency_closure_assets >= 1);

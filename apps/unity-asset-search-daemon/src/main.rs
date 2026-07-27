@@ -10,10 +10,12 @@ use tokio::sync::mpsc;
 
 use unity_asset_search_daemon::app::router as daemon_router;
 use unity_asset_search_daemon::coordinator::{
-    FilesystemReindexIntent, ReindexCoordinator, ReindexCoordinatorConfig, ReindexSource,
+    ReindexCoordinator, ReindexCoordinatorConfig, ReindexSource,
 };
 use unity_asset_search_daemon::security::{TokenStore, validate_listen_addr};
-use unity_asset_search_index::{AssetLoadBudget, IndexPaths, SearchIndex, SearchIndexOptions};
+use unity_asset_search_index::{
+    AssetLoadBudget, FilesystemReindexIntent, IndexPaths, SearchIndex, SearchIndexOptions,
+};
 
 const WATCH_CHANNEL_CAPACITY: usize = 1_024;
 

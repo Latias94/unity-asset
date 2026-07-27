@@ -1,6 +1,5 @@
 //! Embeddable HTTP boundary for the search daemon.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -15,17 +14,15 @@ use axum::{Json, Router};
 use tokio::sync::RwLock;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 
-use crate::coordinator::{
-    CoordinatorError, FilesystemReindexIntent, FilesystemReindexScope, ReindexCoordinator,
-    ReindexSource,
-};
+use crate::coordinator::{CoordinatorError, ReindexCoordinator, ReindexSource};
 use crate::security::{DaemonToken, TokenStore, verify_bearer_token};
 use unity_asset_core::{
     AssetLoadBudget, AssetLoadLimits, ContractJsonLimits, ContractJsonResourceModel,
     read_contract_json_slice,
 };
 use unity_asset_search_index::{
-    ApiError, ApiErrorCode, SearchIndex, SearchIndexError, SearchRequest, StatusResponse,
+    ApiError, ApiErrorCode, FilesystemReindexIntent, SearchIndex, SearchIndexError, SearchRequest,
+    StatusResponse,
 };
 use unity_asset_search_protocol::{
     HEALTH_ENDPOINT, HealthResponse, REFERENCES_ENDPOINT, REINDEX_ENDPOINT, ReindexResponse,
@@ -228,37 +225,6 @@ async fn references(
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FilesystemReindexRequest {
-    contract_version: u16,
-    scope: FilesystemReindexRequestScope,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum FilesystemReindexRequestScope {
-    Full {},
-    Reconcile {},
-    ChangedPaths { paths: Vec<PathBuf> },
-}
-
-impl From<FilesystemReindexRequest> for FilesystemReindexIntent {
-    fn from(intent: FilesystemReindexRequest) -> Self {
-        let scope = match intent.scope {
-            FilesystemReindexRequestScope::Full {} => FilesystemReindexScope::Full,
-            FilesystemReindexRequestScope::Reconcile {} => FilesystemReindexScope::Reconcile,
-            FilesystemReindexRequestScope::ChangedPaths { paths } => {
-                FilesystemReindexScope::ChangedPaths { paths }
-            }
-        };
-        Self {
-            contract_version: intent.contract_version,
-            scope,
-        }
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReindexQuery {
     wait: Option<bool>,
 }
@@ -273,14 +239,13 @@ async fn reindex(
     require_json_content_type(&headers)?;
     let Query(query) = parse_query(query)?;
     reject_unknown_query_fields(&raw_query, &["wait"])?;
-    let intent = parse_contract_json::<FilesystemReindexRequest>(
+    let intent = parse_contract_json::<FilesystemReindexIntent>(
         body,
         REINDEX_JSON_LIMITS,
         REINDEX_JSON_BUDGET_BYTES,
         REINDEX_JSON_MAX_ENTRIES,
         REINDEX_JSON_MAX_MEMBERS,
-    )?
-    .into();
+    )?;
     let wait = query.wait.unwrap_or(true);
 
     if !wait {

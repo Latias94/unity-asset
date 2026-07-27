@@ -6,12 +6,11 @@ use std::time::Duration;
 use tokio::sync::{Barrier, Mutex, Semaphore, mpsc};
 use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
 use unity_asset_search_daemon::coordinator::{
-    CoordinatorError, FilesystemReindexIntent, FilesystemReindexScope, ReindexCoordinator,
-    ReindexCoordinatorConfig, ReindexScopeKind, ReindexSource,
+    CoordinatorError, ReindexCoordinator, ReindexCoordinatorConfig, ReindexScopeKind, ReindexSource,
 };
 use unity_asset_search_index::{
-    GenerationStamp, ReindexDisposition, ReindexIntent, ReindexReceipt, ReindexScope,
-    SEARCH_GENERATION_CONTRACT_VERSION, SearchGenerationId,
+    FilesystemReindexIntent, FilesystemReindexScope, GenerationStamp, ReindexDisposition,
+    ReindexReceipt, SEARCH_GENERATION_CONTRACT_VERSION, SearchGenerationId,
 };
 
 fn project_root() -> PathBuf {
@@ -28,12 +27,12 @@ fn config() -> ReindexCoordinatorConfig {
         .with_max_debounce(Duration::from_millis(500))
 }
 
-fn terminal_receipt(intent: &ReindexIntent) -> ReindexReceipt {
+fn terminal_receipt(_intent: &FilesystemReindexIntent) -> ReindexReceipt {
     ReindexReceipt {
         contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
         disposition: ReindexDisposition::Applied,
-        transaction: intent.scope.transaction(),
-        target_revision: intent.scope.target_revision(),
+        transaction: None,
+        target_revision: None,
         generation: None,
         evidence: Default::default(),
     }
@@ -167,7 +166,7 @@ async fn four_filesystem_entry_points_share_one_atomic_admission_and_one_build()
     );
 
     let executed = executed.lock().await;
-    let ReindexScope::ChangedPaths { paths } = &executed[0].scope else {
+    let FilesystemReindexScope::ChangedPaths { paths } = &executed[0].scope else {
         panic!("four changed-path requests must remain one changed-path build");
     };
     assert_eq!(
@@ -229,7 +228,7 @@ async fn full_scope_absorbs_pending_reconcile_and_changed_paths() {
     wait_for_idle(&coordinator).await;
     let executed = executed.lock().await;
     assert_eq!(executed.len(), 1);
-    assert!(matches!(&executed[0].scope, ReindexScope::Full));
+    assert!(matches!(&executed[0].scope, FilesystemReindexScope::Full));
 }
 
 #[tokio::test]
@@ -255,7 +254,7 @@ async fn dirty_path_limits_and_watcher_overflow_upgrade_to_full() {
     wait_for_idle(&threshold_coordinator).await;
     assert!(matches!(
         &threshold_executed.lock().await[0].scope,
-        ReindexScope::Full
+        FilesystemReindexScope::Full
     ));
     assert_eq!(threshold_coordinator.snapshot().await.full_escalations, 1);
 
@@ -285,7 +284,7 @@ async fn dirty_path_limits_and_watcher_overflow_upgrade_to_full() {
     wait_for_idle(&overflow_coordinator).await;
     assert!(matches!(
         &overflow_executed.lock().await[0].scope,
-        ReindexScope::Full
+        FilesystemReindexScope::Full
     ));
     let snapshot = overflow_coordinator.snapshot().await;
     assert_eq!(snapshot.watcher_overflows, 1);
@@ -421,7 +420,7 @@ async fn synchronous_admission_returns_initial_and_terminal_receipts() {
     assert_eq!(completion.admission.disposition, ReindexDisposition::Queued);
     assert_eq!(
         completion.terminal,
-        terminal_receipt(&ReindexIntent::reconcile())
+        terminal_receipt(&FilesystemReindexIntent::reconcile())
     );
 
     let unsupported = coordinator

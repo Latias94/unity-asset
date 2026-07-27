@@ -32,10 +32,10 @@ use crate::analyzer::{AnalysisError, AnalyzerLimits, AssetAnalyzer, WorkspaceAna
 use crate::config::{IndexPaths, SearchIndexOptions};
 use crate::contract::{ApiErrorCode, ReferencesResponse, SearchResponse, SuggestResponse};
 use crate::generation::{
-    GenerationManifestError, GenerationProjectionDigests, GenerationProjectionSummary,
-    GenerationStamp, ReindexAnalysisEvidence, ReindexDisposition, ReindexEvidence, ReindexIntent,
-    ReindexReceipt, ReindexScope, SEARCH_GENERATION_CONTRACT_VERSION, SearchGenerationIdentityV1,
-    SearchGenerationManifestV1,
+    FilesystemReindexIntent, FilesystemReindexScope, GenerationManifestError,
+    GenerationProjectionDigests, GenerationProjectionSummary, GenerationStamp,
+    ReindexAnalysisEvidence, ReindexDisposition, ReindexEvidence, ReindexReceipt,
+    SEARCH_GENERATION_CONTRACT_VERSION, SearchGenerationIdentityV1, SearchGenerationManifestV1,
 };
 use crate::projection::{
     GenerationProjection, ProjectionCategory, ProjectionError, ProjectionLimits, ProjectionMetrics,
@@ -444,18 +444,15 @@ impl SearchGenerationPipeline {
 
     pub(crate) fn reindex_filesystem(
         &mut self,
-        intent: ReindexIntent,
+        intent: FilesystemReindexIntent,
         budget: &mut AssetLoadBudget,
     ) -> Result<PipelineBuildOutput, PipelineError> {
         validate_intent_version(&intent)?;
         let started = Instant::now();
         let requested = match intent.scope {
-            ReindexScope::Full => ScanIntent::Full,
-            ReindexScope::Reconcile => ScanIntent::Reconcile,
-            ReindexScope::ChangedPaths { paths } => ScanIntent::ChangedPaths(paths),
-            ReindexScope::ChangeSet { .. } => {
-                return Err(PipelineError::WorkspaceViewRequired);
-            }
+            FilesystemReindexScope::Full => ScanIntent::Full,
+            FilesystemReindexScope::Reconcile => ScanIntent::Reconcile,
+            FilesystemReindexScope::ChangedPaths { paths } => ScanIntent::ChangedPaths(paths),
         };
         let force_full = !self.workspace_hydrated || !self.active_options_match;
         let scan_intent = if force_full {
@@ -2131,7 +2128,7 @@ fn canonical_transaction_ids(
     Ok(transactions)
 }
 
-fn validate_intent_version(intent: &ReindexIntent) -> Result<(), PipelineError> {
+fn validate_intent_version(intent: &FilesystemReindexIntent) -> Result<(), PipelineError> {
     if intent.contract_version == SEARCH_GENERATION_CONTRACT_VERSION {
         Ok(())
     } else {
@@ -3293,7 +3290,6 @@ pub(crate) enum PipelineError {
         actual: u16,
         expected: u16,
     },
-    WorkspaceViewRequired,
     WorkspaceMismatch {
         expected: WorkspaceId,
         actual: WorkspaceId,
@@ -3363,7 +3359,6 @@ impl PipelineError {
     pub(crate) fn api_code(&self) -> ApiErrorCode {
         match self {
             Self::UnsupportedContractVersion { .. }
-            | Self::WorkspaceViewRequired
             | Self::Configuration(_)
             | Self::Contract(_)
             | Self::Diagnostic(_)
@@ -3442,7 +3437,6 @@ impl PipelineError {
                 )
             ),
             Self::UnsupportedContractVersion { .. }
-            | Self::WorkspaceViewRequired
             | Self::WorkspaceMismatch { .. }
             | Self::ViewRevisionMismatch { .. }
             | Self::RevisionBarrierMismatch { .. }
@@ -3477,9 +3471,6 @@ impl fmt::Display for PipelineError {
             Self::UnsupportedContractVersion { actual, expected } => write!(
                 formatter,
                 "reindex contract version {actual} is unsupported; expected {expected}"
-            ),
-            Self::WorkspaceViewRequired => formatter.write_str(
-                "ChangeSet reindexing requires the authoritative WorkspaceView at to_revision",
             ),
             Self::WorkspaceMismatch { expected, actual } => write!(
                 formatter,
@@ -3605,7 +3596,6 @@ impl StdError for PipelineError {
             Self::Json(error) => Some(error),
             Self::Allocation { source, .. } => Some(source),
             Self::UnsupportedContractVersion { .. }
-            | Self::WorkspaceViewRequired
             | Self::WorkspaceMismatch { .. }
             | Self::ViewRevisionMismatch { .. }
             | Self::RevisionBarrierMismatch { .. }

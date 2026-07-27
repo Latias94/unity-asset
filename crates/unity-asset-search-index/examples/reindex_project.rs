@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use unity_asset_core::AssetLoadBudget;
-use unity_asset_search_index::{IndexPaths, ReindexIntent, SearchIndex, SearchIndexOptions};
+use unity_asset_search_index::{
+    FilesystemReindexIntent, IndexPaths, SearchIndex, SearchIndexOptions,
+};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -63,7 +65,7 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     let start = Instant::now();
-    let receipt = index.reindex(ReindexIntent::full(), &mut budget)?;
+    let receipt = index.reindex(FilesystemReindexIntent::full(), &mut budget)?;
     let elapsed = start.elapsed();
 
     let status = index.status()?;

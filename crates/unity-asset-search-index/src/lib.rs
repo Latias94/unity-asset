@@ -32,11 +32,12 @@ pub use contract::{
     SearchResponse, StatusResponse, SuggestResponse,
 };
 pub use generation::{
-    ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationFailure, GenerationManifestError,
+    ArtifactTreeEvidence, FilesystemReindexIntent, FilesystemReindexScope,
+    GenerationArtifactEvidence, GenerationFailure, GenerationManifestError,
     GenerationProjectionDigests, GenerationProjectionSummary, GenerationStamp, GenerationStatus,
     ReindexAnalysisEvidence, ReindexDiskEstimate, ReindexDisposition, ReindexEvidence,
-    ReindexIntent, ReindexReceipt, ReindexScope, SEARCH_GENERATION_CONTRACT_VERSION,
-    SearchGenerationId, SearchGenerationIdentityV1, SearchGenerationManifestV1,
+    ReindexReceipt, SEARCH_GENERATION_CONTRACT_VERSION, SearchGenerationId,
+    SearchGenerationIdentityV1, SearchGenerationManifestV1,
 };
 pub use state::{
     GenerationBuild, GenerationDiskEstimate, GenerationFailpoint, GenerationPublishReport,
@@ -254,18 +255,12 @@ impl SearchIndex {
     }
 
     /// Runs a filesystem-backed full, reconciliation, or changed-path build.
-    ///
-    /// [`ReindexScope::ChangeSet`] requires [`Self::reindex_workspace`] because a Change Set does
-    /// not contain source paths or source bytes.
     pub fn reindex(
         &self,
-        intent: ReindexIntent,
+        intent: FilesystemReindexIntent,
         budget: &mut AssetLoadBudget,
     ) -> Result<ReindexReceipt, SearchIndexError> {
-        let target_revision = intent.scope.target_revision();
-        self.execute_build(target_revision, |pipeline| {
-            pipeline.reindex_filesystem(intent, budget)
-        })
+        self.execute_build(None, |pipeline| pipeline.reindex_filesystem(intent, budget))
     }
 
     /// Applies a transaction-keyed Change Set against its authoritative target view.
@@ -723,7 +718,10 @@ GameObject:
         let index =
             SearchIndex::open_or_create(paths.clone(), &mut AssetLoadBudget::default()).unwrap();
         let baseline = index
-            .reindex(ReindexIntent::full(), &mut AssetLoadBudget::default())
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap()
             .generation
             .unwrap();
@@ -732,7 +730,7 @@ GameObject:
         fs::write(project.join(OWNER_PATH), OWNER_AFTER).unwrap();
         index.inject_generation_failpoint(failpoint).unwrap();
         let failed = index.reindex(
-            ReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
+            FilesystemReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
             &mut AssetLoadBudget::default(),
         );
         assert!(failed.is_err(), "{failpoint:?} must stop publication");
@@ -759,7 +757,7 @@ GameObject:
         assert_baseline_generation(&reopened, &baseline);
         let recovered = reopened
             .reindex(
-                ReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
+                FilesystemReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
                 &mut AssetLoadBudget::default(),
             )
             .unwrap()
@@ -818,7 +816,10 @@ GameObject:
         let index =
             SearchIndex::open_or_create(paths.clone(), &mut AssetLoadBudget::default()).unwrap();
         let baseline = index
-            .reindex(ReindexIntent::full(), &mut AssetLoadBudget::default())
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap()
             .generation
             .unwrap();
@@ -831,7 +832,10 @@ GameObject:
         assert!(reopened.status().unwrap().generation.active.is_none());
 
         let receipt = reopened
-            .reindex(ReindexIntent::reconcile(), &mut AssetLoadBudget::default())
+            .reindex(
+                FilesystemReindexIntent::reconcile(),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap();
         assert!(receipt.evidence.forced_full_scan);
         let rebuilt = receipt.generation.unwrap();
@@ -848,7 +852,10 @@ GameObject:
             IndexPaths::for_project(project, Some(temporary.path().join("index")), None).unwrap();
         let index = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
         index
-            .reindex(ReindexIntent::full(), &mut AssetLoadBudget::default())
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap();
 
         let empty = index.suggest("", 1).unwrap();
@@ -894,7 +901,10 @@ GameObject:
                 .unwrap();
         let index = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
         let baseline = index
-            .reindex(ReindexIntent::full(), &mut AssetLoadBudget::default())
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap()
             .generation
             .unwrap();
@@ -907,7 +917,7 @@ GameObject:
         let build_index = index.clone();
         let build = thread::spawn(move || {
             build_index.reindex(
-                ReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
+                FilesystemReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
                 &mut AssetLoadBudget::default(),
             )
         });

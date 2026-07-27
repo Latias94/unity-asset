@@ -15,8 +15,8 @@ use unity_asset_core::{
     read_contract_json_slice,
 };
 use unity_asset_search_index::{
-    ApiError, ApiErrorCode, ReferenceRequest, ReferencesResponse, ReindexIntent, SearchResponse,
-    StatusResponse, SuggestResponse,
+    ApiError, ApiErrorCode, FilesystemReindexIntent, ReferenceRequest, ReferencesResponse,
+    SearchResponse, StatusResponse, SuggestResponse,
 };
 use unity_asset_search_protocol::{
     HEALTH_ENDPOINT, HealthResponse, REFERENCES_ENDPOINT, REINDEX_ENDPOINT, ReindexResponse,
@@ -686,11 +686,15 @@ fn percentile(sorted: &[u128], p: f64) -> u128 {
     sorted[idx]
 }
 
-fn reindex_intent(full: bool, reconcile: bool, paths: &[PathBuf]) -> Result<ReindexIntent> {
+fn reindex_intent(
+    full: bool,
+    reconcile: bool,
+    paths: &[PathBuf],
+) -> Result<FilesystemReindexIntent> {
     match (full, reconcile, paths) {
-        (true, false, []) => Ok(ReindexIntent::full()),
-        (false, _, []) => Ok(ReindexIntent::reconcile()),
-        (false, false, paths) => Ok(ReindexIntent::changed_paths(paths.to_vec())),
+        (true, false, []) => Ok(FilesystemReindexIntent::full()),
+        (false, _, []) => Ok(FilesystemReindexIntent::reconcile()),
+        (false, false, paths) => Ok(FilesystemReindexIntent::changed_paths(paths.to_vec())),
         _ => anyhow::bail!("reindex modes --full, --reconcile, and --path are mutually exclusive"),
     }
 }
@@ -699,7 +703,7 @@ async fn reindex(
     http: &HttpSession,
     base_url: &str,
     token: Option<&str>,
-    intent: ReindexIntent,
+    intent: FilesystemReindexIntent,
 ) -> CliResult<()> {
     let mut req = http
         .client

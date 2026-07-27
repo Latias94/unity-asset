@@ -16,7 +16,8 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::time::Instant;
 use unity_asset_search_index::{
-    ReindexDisposition, ReindexIntent, ReindexReceipt, SEARCH_GENERATION_CONTRACT_VERSION,
+    FilesystemReindexIntent, FilesystemReindexScope, ReindexDisposition, ReindexReceipt,
+    SEARCH_GENERATION_CONTRACT_VERSION,
 };
 use unity_asset_search_protocol::ValidateContractVersion;
 
@@ -28,7 +29,7 @@ const DEFAULT_MAX_FAILURE_HISTORY: usize = 64;
 const MAX_FAILURE_MESSAGE_BYTES: usize = 4_096;
 
 type BuildFuture = Pin<Box<dyn Future<Output = anyhow::Result<ReindexReceipt>> + Send + 'static>>;
-type BuildExecutor = dyn Fn(ReindexIntent) -> BuildFuture + Send + Sync + 'static;
+type BuildExecutor = dyn Fn(FilesystemReindexIntent) -> BuildFuture + Send + Sync + 'static;
 type CompletionOutcome = Result<ReindexReceipt, ExecutionFailure>;
 type CompletionSender = oneshot::Sender<CompletionOutcome>;
 
@@ -141,57 +142,6 @@ impl ReindexCoordinatorConfig {
     }
 }
 
-/// A daemon-owned reindex request over the configured filesystem project.
-///
-/// Authoritative workspace change sets intentionally cannot be represented at this boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FilesystemReindexIntent {
-    pub contract_version: u16,
-    pub scope: FilesystemReindexScope,
-}
-
-impl FilesystemReindexIntent {
-    #[must_use]
-    pub const fn full() -> Self {
-        Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-            scope: FilesystemReindexScope::Full,
-        }
-    }
-
-    #[must_use]
-    pub const fn reconcile() -> Self {
-        Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-            scope: FilesystemReindexScope::Reconcile,
-        }
-    }
-
-    #[must_use]
-    pub fn changed_paths(paths: Vec<PathBuf>) -> Self {
-        Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-            scope: FilesystemReindexScope::ChangedPaths { paths },
-        }
-    }
-
-    fn into_library_intent(self) -> ReindexIntent {
-        match self.scope {
-            FilesystemReindexScope::Full => ReindexIntent::full(),
-            FilesystemReindexScope::Reconcile => ReindexIntent::reconcile(),
-            FilesystemReindexScope::ChangedPaths { paths } => ReindexIntent::changed_paths(paths),
-        }
-    }
-}
-
-/// Filesystem work that the daemon can schedule.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FilesystemReindexScope {
-    Full,
-    Reconcile,
-    ChangedPaths { paths: Vec<PathBuf> },
-}
-
 /// Stable scope label used by status and failure reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReindexScopeKind {
@@ -290,7 +240,7 @@ impl ReindexCoordinator {
         executor: F,
     ) -> Result<Self, CoordinatorError>
     where
-        F: Fn(ReindexIntent) -> Fut + Send + Sync + 'static,
+        F: Fn(FilesystemReindexIntent) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = anyhow::Result<ReindexReceipt>> + Send + 'static,
     {
         let config = config.validate()?;
@@ -670,13 +620,12 @@ async fn execute(
     executor: &Arc<BuildExecutor>,
     intent: &FilesystemReindexIntent,
 ) -> CompletionOutcome {
-    let library_intent = intent.clone().into_library_intent();
-    let outcome = match catch_unwind(AssertUnwindSafe(|| executor(library_intent.clone()))) {
+    let execution_intent = intent.clone();
+    let outcome = match catch_unwind(AssertUnwindSafe(|| executor(execution_intent))) {
         Ok(future) => {
-            let validation_intent = library_intent;
             match tokio::spawn(async move {
                 match future.await {
-                    Ok(receipt) => validate_execution_receipt(&validation_intent, receipt),
+                    Ok(receipt) => validate_execution_receipt(receipt),
                     Err(error) => Err(error.to_string()),
                 }
             })
@@ -691,17 +640,14 @@ async fn execute(
     outcome.map_err(|message| ExecutionFailure::new(intent, message))
 }
 
-fn validate_execution_receipt(
-    intent: &ReindexIntent,
-    receipt: ReindexReceipt,
-) -> Result<ReindexReceipt, String> {
+fn validate_execution_receipt(receipt: ReindexReceipt) -> Result<ReindexReceipt, String> {
     receipt
         .validate_contract_version()
         .map_err(|error| format!("executor returned an invalid receipt: {error}"))?;
-    if receipt.transaction != intent.scope.transaction() {
+    if receipt.transaction.is_some() {
         return Err("executor returned a receipt for a different transaction".to_owned());
     }
-    if receipt.target_revision != intent.scope.target_revision() {
+    if receipt.target_revision.is_some() {
         return Err("executor returned a receipt for a different target revision".to_owned());
     }
     if !matches!(

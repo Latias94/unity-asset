@@ -8,10 +8,11 @@ use unity_asset_search_core::{
     SearchDiagnostic,
 };
 use unity_asset_search_index::{
-    ApiErrorCode, AssetLoadBudget, GenerationStamp, IndexPaths, Location, ReferenceContext,
-    ReferenceCoverage, ReferenceHit, ReferenceObject, ReferenceRequest, ReferencesResponse,
-    ReindexDisposition, ReindexIntent, ReindexReceipt, SearchCapabilities, SearchHit, SearchIndex,
-    SearchIndexOptions, SearchRequest, SearchResponse, StatusResponse, SuggestResponse,
+    ApiErrorCode, AssetLoadBudget, FilesystemReindexIntent, GenerationStamp, IndexPaths, Location,
+    ReferenceContext, ReferenceCoverage, ReferenceHit, ReferenceObject, ReferenceRequest,
+    ReferencesResponse, ReindexDisposition, ReindexReceipt, SearchCapabilities, SearchHit,
+    SearchIndex, SearchIndexOptions, SearchRequest, SearchResponse, StatusResponse,
+    SuggestResponse,
 };
 
 const PREFAB_GUID: &str = "fedcba98765432100123456789abcdef";
@@ -422,7 +423,7 @@ fn open_index_with(
     .unwrap()
 }
 
-fn reindex(index: &SearchIndex, intent: ReindexIntent) -> ReindexReceipt {
+fn reindex(index: &SearchIndex, intent: FilesystemReindexIntent) -> ReindexReceipt {
     let mut budget = AssetLoadBudget::default();
     index.reindex(intent, &mut budget).unwrap()
 }
@@ -603,14 +604,14 @@ fn full_reconcile_and_changed_paths_converge_on_public_generation_facts() {
     let fixture = ProjectFixture::new(ProjectVersion::Final);
     let index = open_index(&fixture);
 
-    let full_receipt = reindex(&index, ReindexIntent::full());
+    let full_receipt = reindex(&index, FilesystemReindexIntent::full());
     assert!(full_receipt.evidence.forced_full_scan);
     let full_stamp = published_stamp(&index, &full_receipt);
     assert_version_is_queryable(&index, &full_stamp, "FinalHero", "DraftHero");
     let full = capture_public_facts(&index);
 
     fixture.write_version(ProjectVersion::Draft);
-    let reconcile_draft_receipt = reindex(&index, ReindexIntent::full());
+    let reconcile_draft_receipt = reindex(&index, FilesystemReindexIntent::full());
     let reconcile_draft_stamp = published_stamp(&index, &reconcile_draft_receipt);
     assert_ne!(
         reconcile_draft_stamp.generation, full_stamp.generation,
@@ -619,7 +620,7 @@ fn full_reconcile_and_changed_paths_converge_on_public_generation_facts() {
     assert_version_is_queryable(&index, &reconcile_draft_stamp, "DraftHero", "FinalHero");
 
     fixture.write_version(ProjectVersion::Final);
-    let reconcile_receipt = reindex(&index, ReindexIntent::reconcile());
+    let reconcile_receipt = reindex(&index, FilesystemReindexIntent::reconcile());
     assert!(!reconcile_receipt.evidence.forced_full_scan);
     let reconcile_stamp = published_stamp(&index, &reconcile_receipt);
     assert_ne!(
@@ -630,7 +631,7 @@ fn full_reconcile_and_changed_paths_converge_on_public_generation_facts() {
     let reconcile = capture_public_facts(&index);
 
     fixture.write_version(ProjectVersion::Draft);
-    let changed_draft_receipt = reindex(&index, ReindexIntent::full());
+    let changed_draft_receipt = reindex(&index, FilesystemReindexIntent::full());
     let changed_draft_stamp = published_stamp(&index, &changed_draft_receipt);
     assert_ne!(
         changed_draft_stamp.generation, reconcile_stamp.generation,
@@ -641,7 +642,10 @@ fn full_reconcile_and_changed_paths_converge_on_public_generation_facts() {
     fixture.write_version(ProjectVersion::Final);
     let changed_receipt = reindex(
         &index,
-        ReindexIntent::changed_paths(vec![PathBuf::from(HERO_PATH), PathBuf::from(SCRIPT_PATH)]),
+        FilesystemReindexIntent::changed_paths(vec![
+            PathBuf::from(HERO_PATH),
+            PathBuf::from(SCRIPT_PATH),
+        ]),
     );
     assert!(!changed_receipt.evidence.forced_full_scan);
     let changed_stamp = published_stamp(&index, &changed_receipt);
@@ -675,7 +679,10 @@ fn unchanged_tier_zero_asset_is_reanalyzed_when_source_retention_increases() {
     .unwrap();
 
     let tier_zero_receipt = tier_zero
-        .reindex(ReindexIntent::full(), &mut AssetLoadBudget::default())
+        .reindex(
+            FilesystemReindexIntent::full(),
+            &mut AssetLoadBudget::default(),
+        )
         .unwrap();
     assert_eq!(tier_zero_receipt.disposition, ReindexDisposition::Applied);
     assert!(tier_zero.status().unwrap().incomplete_assets > 0);
@@ -695,7 +702,10 @@ fn unchanged_tier_zero_asset_is_reanalyzed_when_source_retention_increases() {
     )
     .unwrap();
     let hydrated_receipt = hydrated
-        .reindex(ReindexIntent::full(), &mut AssetLoadBudget::default())
+        .reindex(
+            FilesystemReindexIntent::full(),
+            &mut AssetLoadBudget::default(),
+        )
         .unwrap();
 
     assert_eq!(hydrated_receipt.disposition, ReindexDisposition::Applied);
@@ -730,8 +740,8 @@ fn non_overlapping_scan_root_shards_match_a_single_project_scan_root() {
         ],
     );
 
-    let single_receipt = reindex(&single, ReindexIntent::full());
-    let sharded_receipt = reindex(&sharded, ReindexIntent::full());
+    let single_receipt = reindex(&single, FilesystemReindexIntent::full());
+    let sharded_receipt = reindex(&sharded, FilesystemReindexIntent::full());
     published_stamp(&single, &single_receipt);
     published_stamp(&sharded, &sharded_receipt);
     let single_facts = capture_public_facts(&single);
@@ -769,7 +779,7 @@ fn non_overlapping_scan_root_shards_match_a_single_project_scan_root() {
 fn structured_yaml_pptrs_and_published_results_survive_source_changes() {
     let fixture = ProjectFixture::new(ProjectVersion::Final);
     let index = open_index(&fixture);
-    let receipt = reindex(&index, ReindexIntent::full());
+    let receipt = reindex(&index, FilesystemReindexIntent::full());
     let active = published_stamp(&index, &receipt);
     let status_before_published_queries = serde_json::to_value(index.status().unwrap()).unwrap();
     let published = capture_public_facts(&index);
@@ -858,7 +868,7 @@ fn structured_yaml_pptrs_and_published_results_survive_source_changes() {
 fn failed_changed_path_reindex_keeps_the_prior_generation_queryable() {
     let fixture = ProjectFixture::new(ProjectVersion::Final);
     let index = open_index(&fixture);
-    let receipt = reindex(&index, ReindexIntent::full());
+    let receipt = reindex(&index, FilesystemReindexIntent::full());
     let before = published_stamp(&index, &receipt);
     let before_search = capture_search(&index, &before, "FinalHero");
     let before_references = capture_references(
@@ -874,7 +884,7 @@ fn failed_changed_path_reindex_keeps_the_prior_generation_queryable() {
     let mut budget = AssetLoadBudget::default();
     let error = index
         .reindex(
-            ReindexIntent::changed_paths(vec![outside_path]),
+            FilesystemReindexIntent::changed_paths(vec![outside_path]),
             &mut budget,
         )
         .unwrap_err();
