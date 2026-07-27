@@ -1,4 +1,6 @@
 mod support;
+#[path = "support/webfile.rs"]
+mod webfile_support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
@@ -10,9 +12,10 @@ use unity_asset_binary::bundle::{BundleLoadOptions, BundleParser};
 use unity_asset_binary::webfile::WebFile;
 use unity_asset_core::{AssetLoadBudget, DigestV1};
 use unity_asset_write::PackingPolicy;
-use unity_asset_write::webfile::{WebFileEdits, WebFilePackingPolicy, WebFileWriter};
+use unity_asset_write::webfile::WebFilePackingPolicy;
 
 use support::{ordered_bundle_entries, prepare_bundle_bytes};
+use webfile_support::{ordered_webfile_members, prepare_webfile_bytes};
 
 struct SamplingAllocator;
 
@@ -214,27 +217,23 @@ fn emit_sample(
 }
 
 #[test]
-fn legacy_characterization_fixture_contract_is_reproducible() {
+fn prepared_webfile_fixture_contract_is_reproducible() {
     let input = build_uncompressed_webfile(vec![
         ("a.bin".to_owned(), vec![1; 17]),
         ("b.bin".to_owned(), vec![2; 31]),
         ("c.bin".to_owned(), vec![3; 47]),
     ]);
     let web = WebFile::from_bytes(input.clone()).expect("fixture should parse");
-    let output = WebFileWriter::save(
-        &web,
-        &WebFileEdits::default(),
-        WebFilePackingPolicy::Uncompressed,
-    )
-    .expect("legacy writer should encode fixture");
-    let reparsed = WebFile::from_bytes(output.clone()).expect("legacy output should reparse");
+    let members = ordered_webfile_members(&web).expect("fixture members should adapt");
+    let output = prepare_webfile_bytes(&web, &members, WebFilePackingPolicy::Uncompressed)
+        .expect("prepared writer should encode fixture");
+    let reparsed = WebFile::from_bytes(output.clone()).expect("prepared output should reparse");
 
     assert_eq!(reparsed.files().len(), 3);
     assert_eq!(reparsed.extract_file_slice("a.bin").unwrap(), &[1; 17]);
     assert_eq!(reparsed.extract_file_slice("b.bin").unwrap(), &[2; 31]);
     assert_eq!(reparsed.extract_file_slice("c.bin").unwrap(), &[3; 47]);
     assert_eq!(output, input);
-    assert_eq!(legacy_webfile_materializations(&web), 4);
 }
 
 #[test]
@@ -285,7 +284,7 @@ fn prepared_artifact_legacy_sample_representative() {
 
 #[test]
 #[ignore = "opt-in release characterization; emits allocation, timing, and process observations"]
-fn legacy_contiguous_sample_generated_large() {
+fn prepared_artifact_sample_generated_large_webfile() {
     const ENTRY_COUNT: usize = 32;
     const ENTRY_BYTES: usize = 1024 * 1024;
     let entries = (0..ENTRY_COUNT)
@@ -303,29 +302,26 @@ fn legacy_contiguous_sample_generated_large() {
         let web = WebFile::from_bytes_with_budget(input, &mut load_budget)
             .expect("generated large WebFile should parse");
         let source_payload_bytes = web.files().iter().map(|entry| entry.size).sum::<u64>();
-        let output = WebFileWriter::save(
-            &web,
-            &WebFileEdits::default(),
-            WebFilePackingPolicy::Uncompressed,
-        )
-        .expect("legacy WebFile writer should encode generated fixture");
+        let members =
+            ordered_webfile_members(&web).expect("generated WebFile members should adapt");
+        let output = prepare_webfile_bytes(&web, &members, WebFilePackingPolicy::Uncompressed)
+            .expect("prepared WebFile writer should encode generated fixture");
         let summary = (
             u64::try_from(output.len()).unwrap(),
             DigestV1::hash_bytes(&output),
             input_len.saturating_add(source_payload_bytes),
             load_budget.usage().decompressed_bytes,
-            legacy_webfile_materializations(&web),
         );
         drop(output);
         summary
     });
     emit_sample(
-        "legacy-contiguous-writers",
+        "prepared-artifact-webfile-test-adapter",
         "generated-large-webfile",
         input_len,
         summary.2,
         summary.3,
-        Some(summary.4),
+        None,
         summary.0,
         summary.1,
         runtime,
@@ -334,7 +330,7 @@ fn legacy_contiguous_sample_generated_large() {
 
 #[test]
 #[ignore = "opt-in release characterization; emits allocation, timing, and process observations"]
-fn legacy_contiguous_sample_adversarial_wide() {
+fn prepared_artifact_sample_adversarial_wide_webfile() {
     const ENTRY_COUNT: usize = 8_192;
     let entries = (0..ENTRY_COUNT)
         .map(|index| {
@@ -351,39 +347,30 @@ fn legacy_contiguous_sample_adversarial_wide() {
         let web = WebFile::from_bytes_with_budget(input, &mut load_budget)
             .expect("adversarial wide WebFile should parse");
         let source_payload_bytes = web.files().iter().map(|entry| entry.size).sum::<u64>();
-        let output = WebFileWriter::save(
-            &web,
-            &WebFileEdits::default(),
-            WebFilePackingPolicy::Uncompressed,
-        )
-        .expect("legacy WebFile writer should encode adversarial fixture");
+        let members =
+            ordered_webfile_members(&web).expect("adversarial WebFile members should adapt");
+        let output = prepare_webfile_bytes(&web, &members, WebFilePackingPolicy::Uncompressed)
+            .expect("prepared WebFile writer should encode adversarial fixture");
         let summary = (
             u64::try_from(output.len()).unwrap(),
             DigestV1::hash_bytes(&output),
             input_len.saturating_add(source_payload_bytes),
             load_budget.usage().decompressed_bytes,
-            legacy_webfile_materializations(&web),
         );
         drop(output);
         summary
     });
     emit_sample(
-        "legacy-contiguous-writers",
+        "prepared-artifact-webfile-test-adapter",
         "adversarial-wide-webfile",
         input_len,
         summary.2,
         summary.3,
-        Some(summary.4),
+        None,
         summary.0,
         summary.1,
         runtime,
     );
-}
-
-fn legacy_webfile_materializations(web: &WebFile) -> u64 {
-    u64::try_from(web.files().len())
-        .unwrap_or(u64::MAX)
-        .saturating_add(1)
 }
 
 fn duration_ns(duration: Duration) -> u64 {

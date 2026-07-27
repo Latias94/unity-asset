@@ -1,4 +1,6 @@
 mod support;
+#[path = "support/webfile.rs"]
+mod webfile_support;
 
 use std::path::{Path, PathBuf};
 
@@ -6,8 +8,10 @@ use unity_asset_binary::bundle::AssetBundle;
 use unity_asset_binary::file::{UnityFile, UnityFileLoadOutcome};
 use unity_asset_write::PackingPolicy;
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
+use unity_asset_write::webfile::WebFilePackingPolicy;
 
 use support::{ordered_bundle_entries, prepare_bundle_bytes};
+use webfile_support::{ordered_webfile_members, prepare_webfile_bytes};
 
 fn repo_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is `.../crates/unity-asset-write`.
@@ -161,11 +165,9 @@ fn corpus_roundtrip_noop_save_is_loadable() -> anyhow::Result<()> {
             }
             UnityFile::WebFile(web) => {
                 // Corpus currently doesn't vendor WebFile samples, but keep this branch for completeness.
-                let saved = unity_asset_write::webfile::WebFileWriter::save(
-                    &web,
-                    &unity_asset_write::webfile::WebFileEdits::default(),
-                    unity_asset_write::webfile::WebFilePackingPolicy::Uncompressed,
-                )?;
+                let members = ordered_webfile_members(&web)?;
+                let saved =
+                    prepare_webfile_bytes(&web, &members, WebFilePackingPolicy::Uncompressed)?;
                 let reparsed = unity_asset_binary::webfile::WebFile::from_bytes(saved)?;
                 assert_eq!(reparsed.files().len(), web.files().len());
             }

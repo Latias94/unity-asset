@@ -1,7 +1,5 @@
-//! Unity WebFile rebuild/save support (UnityPy parity).
+//! Budgeted Unity WebFile Prepared Artifact encoding.
 
-mod edits;
 mod writer;
 
-pub use edits::WebFileEdits;
 pub use writer::{WebFileArtifactMember, WebFilePackingPolicy, WebFileWriteError, WebFileWriter};

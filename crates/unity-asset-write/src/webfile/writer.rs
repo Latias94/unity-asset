@@ -1,16 +1,12 @@
-use std::collections::HashSet;
 use std::io::{self, Read, Write};
 
 use flate2::{Compression, GzBuilder};
 use thiserror::Error;
 use unity_asset_binary::webfile::{WebFile, WebFileCompression};
-use unity_asset_core::{Result, UnityAssetError};
 
 use crate::artifact::{
     ArtifactBatch, ArtifactBuildError, ArtifactBuildFailurePhase, ArtifactHandle, encode_brotli,
 };
-
-use super::WebFileEdits;
 
 const MAX_MEMBER_NAME_BYTES: usize = 16 * 1024;
 
@@ -112,12 +108,6 @@ impl From<ArtifactBuildError> for WebFileWriteError {
 struct WebFileLayout {
     head_length: u64,
     total_length: u64,
-}
-
-#[derive(Debug)]
-struct LegacyMember<'bytes> {
-    name: &'bytes str,
-    bytes: &'bytes [u8],
 }
 
 pub struct WebFileWriter;
@@ -251,114 +241,6 @@ impl WebFileWriter {
                     encoder.push_derived_generated_chunk(derived)
                 })?;
                 Ok(handle)
-            }
-        }
-    }
-
-    /// Compatibility save adapter for callers that still hold a parsed WebFile and raw edits.
-    ///
-    /// New workspace code should use [`Self::prepare`] so unchanged members remain shared proof
-    /// ranges. This adapter intentionally keeps the legacy `Vec<u8>` return shape for existing
-    /// integrations and tests while retaining duplicate member occurrences deterministically.
-    pub fn save(
-        web: &WebFile,
-        edits: &WebFileEdits,
-        policy: WebFilePackingPolicy,
-    ) -> Result<Vec<u8>> {
-        let mut members =
-            Vec::with_capacity(web.files().len().saturating_add(edits.iter().count()));
-        let mut existing_names = HashSet::with_capacity(web.files().len());
-
-        for info in web.files() {
-            let bytes = if let Some(replacement) = edits.get(&info.name) {
-                replacement
-            } else {
-                web.extract_file_slice_by_info(info).map_err(|error| {
-                    UnityAssetError::with_source(
-                        format!("Failed to extract WebFile entry bytes: {}", info.name),
-                        error,
-                    )
-                })?
-            };
-            existing_names.insert(info.name.as_str());
-            members.push(LegacyMember {
-                name: info.name.as_str(),
-                bytes,
-            });
-        }
-
-        // HashMap-backed edits have no stable iteration order; sort only genuinely new entries so
-        // compatibility output is deterministic across processes.
-        let mut extras: Vec<(&str, &[u8])> = edits
-            .iter()
-            .filter(|(name, _)| !existing_names.contains(*name))
-            .collect();
-        extras.sort_unstable_by_key(|(name, _)| *name);
-        members.extend(
-            extras
-                .into_iter()
-                .map(|(name, bytes)| LegacyMember { name, bytes }),
-        );
-
-        let member_layouts = members
-            .iter()
-            .map(|member| {
-                u64::try_from(member.bytes.len())
-                    .map(|length| (member.name, length))
-                    .map_err(|_| WebFileWriteError::ArithmeticOverflow {
-                        resource: "member_length",
-                    })
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| {
-                UnityAssetError::with_source("Failed to plan WebFile members", error)
-            })?;
-        let layout = plan_layout(web.signature.as_str(), member_layouts.iter().copied()).map_err(
-            |error| UnityAssetError::with_source("Failed to plan WebFile layout", error),
-        )?;
-        let compression = resolve_packing(web.compression, policy);
-
-        match compression {
-            ResolvedPacking::Uncompressed => {
-                let mut output = Vec::new();
-                write_header(
-                    &mut output,
-                    web.signature.as_str(),
-                    layout,
-                    member_layouts.iter().copied(),
-                )?;
-                for member in &members {
-                    output.write_all(member.bytes)?;
-                }
-                Ok(output)
-            }
-            ResolvedPacking::Gzip => {
-                let mut compressor = GzBuilder::new()
-                    .mtime(0)
-                    .write(Vec::new(), Compression::best());
-                write_header(
-                    &mut compressor,
-                    web.signature.as_str(),
-                    layout,
-                    member_layouts.iter().copied(),
-                )?;
-                for member in &members {
-                    compressor.write_all(member.bytes)?;
-                }
-                Ok(compressor.finish()?)
-            }
-            ResolvedPacking::Brotli => {
-                let mut compressor = brotli::CompressorWriter::new(Vec::new(), 4096, 11, 22);
-                write_header(
-                    &mut compressor,
-                    web.signature.as_str(),
-                    layout,
-                    member_layouts.iter().copied(),
-                )?;
-                for member in &members {
-                    compressor.write_all(member.bytes)?;
-                }
-                Ok(compressor.into_inner())
             }
         }
     }

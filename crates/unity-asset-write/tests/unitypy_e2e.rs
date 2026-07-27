@@ -1,4 +1,6 @@
 mod support;
+#[path = "support/webfile.rs"]
+mod webfile_support;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,10 +21,11 @@ use unity_asset_write::object::{
     SerializedObjectMutation, UnsafeRawObjectAcknowledgement, UnsafeRawObjectReplacement,
 };
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
-use unity_asset_write::webfile::{WebFileEdits, WebFilePackingPolicy, WebFileWriter};
+use unity_asset_write::webfile::WebFilePackingPolicy;
 use unity_asset_write::{BinaryWriter, Endian, PackingPolicy, compress_lzma_unity_with_size};
 
 use support::{OrderedBundleEntry, ordered_bundle_entries, prepare_bundle_bytes};
+use webfile_support::{ordered_webfile_members, prepare_webfile_bytes};
 
 fn repo_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is `.../crates/unity-asset-write`.
@@ -861,11 +864,8 @@ fn unitypy_can_load_saved_webfile() -> anyhow::Result<()> {
     let web_bytes = build_uncompressed_webfile(vec![(entry_name.clone(), bundle_bytes)]);
 
     let web = unity_asset_binary::webfile::WebFile::from_bytes(web_bytes)?;
-    let saved = WebFileWriter::save(
-        &web,
-        &WebFileEdits::default(),
-        WebFilePackingPolicy::Uncompressed,
-    )?;
+    let members = ordered_webfile_members(&web)?;
+    let saved = prepare_webfile_bytes(&web, &members, WebFilePackingPolicy::Uncompressed)?;
 
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), &saved)?;
