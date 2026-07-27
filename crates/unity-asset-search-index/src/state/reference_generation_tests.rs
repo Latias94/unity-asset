@@ -1,17 +1,19 @@
 use std::fs;
 use std::path::Path;
 
+use super::{
+    GenerationBuild, GenerationFailpoint, GenerationPublishWarningKind, GenerationStore,
+    GenerationStoreError, GenerationStoreOptions,
+};
+use crate::generation::{
+    ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests, ReindexReceipt,
+    SearchGenerationId, SearchGenerationIdentityV1, SearchGenerationManifestV1,
+};
 use serde::Serialize;
 use tempfile::TempDir;
 use unity_asset_core::{
     AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BudgetError, BudgetedJsonError, DigestV1,
     WorkspaceId, WorkspaceRevision,
-};
-use unity_asset_search_index::{
-    ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationBuild, GenerationFailpoint,
-    GenerationProjectionDigests, GenerationPublishWarningKind, GenerationStore,
-    GenerationStoreError, GenerationStoreOptions, ReindexReceipt, SearchGenerationId,
-    SearchGenerationIdentityV1, SearchGenerationManifestV1,
 };
 
 fn digest(label: &str) -> DigestV1 {

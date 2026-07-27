@@ -107,7 +107,7 @@ const WRITER_LEASE_FILE: &str = ".writer.lock";
 const QUARANTINE_DIRECTORY_PREFIX: &str = "quarantine-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GenerationStoreOptions {
+pub(crate) struct GenerationStoreOptions {
     pub retain_previous_generations: usize,
 }
 
@@ -974,7 +974,7 @@ fn validate_source_state_relative_path(
 
 /// A store-owned staging directory. All writable paths are derived from its ordinal.
 #[derive(Debug)]
-pub struct GenerationBuild {
+pub(crate) struct GenerationBuild {
     store_root: PathBuf,
     ordinal: u64,
     directory: PathBuf,
@@ -984,20 +984,17 @@ pub struct GenerationBuild {
 
 impl GenerationBuild {
     #[must_use]
-    pub const fn ordinal(&self) -> u64 {
-        self.ordinal
-    }
-
-    #[must_use]
     pub fn directory(&self) -> &Path {
         &self.directory
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn search_directory(&self) -> PathBuf {
         self.directory.join(SEARCH_ARTIFACT_DIRECTORY)
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn reference_directory(&self) -> PathBuf {
         self.directory.join(REFERENCE_ARTIFACT_DIRECTORY)
@@ -1082,7 +1079,7 @@ impl Drop for GenerationBuild {
 
 /// Immutable view of one activated generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GenerationSnapshot {
+pub(crate) struct GenerationSnapshot {
     activation_ordinal: u64,
     generation: SearchGenerationId,
     manifest: SearchGenerationManifestV1,
@@ -1110,14 +1107,10 @@ impl GenerationSnapshot {
         &self.directory
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn search_directory(&self) -> PathBuf {
         self.directory.join(SEARCH_ARTIFACT_DIRECTORY)
-    }
-
-    #[must_use]
-    pub fn reference_directory(&self) -> PathBuf {
-        self.directory.join(REFERENCE_ARTIFACT_DIRECTORY)
     }
 
     #[must_use]
@@ -1676,7 +1669,7 @@ fn classify_persisted_source_state_error(
 
 /// Classifies non-fatal work that could not be completed around generation publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GenerationPublishWarningKind {
+pub(crate) enum GenerationPublishWarningKind {
     /// Cleanup of an inactive completed-generation preparation could not be finished.
     PreparationCleanup,
     /// The activation is visible, but crash durability could not be confirmed.
@@ -1689,7 +1682,7 @@ pub enum GenerationPublishWarningKind {
 
 /// Typed evidence for non-fatal generation publication work.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GenerationPublishWarning {
+pub(crate) struct GenerationPublishWarning {
     kind: GenerationPublishWarningKind,
     message: String,
 }
@@ -1702,11 +1695,13 @@ impl GenerationPublishWarning {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub const fn kind(&self) -> GenerationPublishWarningKind {
         self.kind
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
@@ -1734,7 +1729,7 @@ fn platform_durability_warnings() -> Vec<GenerationPublishWarning> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GenerationPublishReport {
+pub(crate) struct GenerationPublishReport {
     pub active: GenerationSnapshot,
     pub pruned_generations: Vec<SearchGenerationId>,
     pub warnings: Vec<GenerationPublishWarning>,
@@ -1746,7 +1741,7 @@ pub struct GenerationPublishReport {
 /// prepared or activated out of order. Dropping it leaves a valid, inactive completed generation
 /// that recovery can safely reuse.
 #[derive(Debug)]
-pub struct PreparedGenerationPublish<'store> {
+pub(crate) struct PreparedGenerationPublish<'store> {
     store: &'store mut GenerationStore,
     snapshot: GenerationSnapshot,
     activation: PreparedActivation,
@@ -1808,7 +1803,7 @@ enum PreparedActivation {
 
 /// Preflight estimate for the period where the old and new generations coexist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GenerationDiskEstimate {
+pub(crate) struct GenerationDiskEstimate {
     pub existing_generation_bytes: u64,
     pub old_active_generation_bytes: u64,
     pub new_generation_bytes: u64,
@@ -1833,7 +1828,7 @@ impl From<GenerationDiskEstimate> for ReindexDiskEstimate {
 /// Deterministic failure injection checkpoints used by state-machine tests.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GenerationFailpoint {
+pub(crate) enum GenerationFailpoint {
     Search,
     References,
     SourceState,
@@ -1909,7 +1904,7 @@ impl Drop for WriterLease {
 }
 
 #[derive(Debug)]
-pub struct GenerationStore {
+pub(crate) struct GenerationStore {
     root: PathBuf,
     generations: PathBuf,
     staging: PathBuf,
@@ -1969,11 +1964,6 @@ impl GenerationStore {
     }
 
     #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    #[must_use]
     pub const fn active(&self) -> Option<&GenerationSnapshot> {
         self.active.as_ref()
     }
@@ -2015,6 +2005,7 @@ impl GenerationStore {
         }
     }
 
+    #[cfg(test)]
     pub fn measure_artifacts(
         &self,
         build: &GenerationBuild,
@@ -2032,6 +2023,7 @@ impl GenerationStore {
         measure_generation_artifacts(&build.directory, budget, None)
     }
 
+    #[cfg(test)]
     pub fn prepare_publish(
         &mut self,
         build: GenerationBuild,
@@ -2050,7 +2042,7 @@ impl GenerationStore {
         self.prepare_publish_inner(build, manifest, budget, None)
     }
 
-    #[doc(hidden)]
+    #[cfg(test)]
     pub fn prepare_publish_with_failpoint(
         &mut self,
         build: GenerationBuild,
@@ -2061,7 +2053,7 @@ impl GenerationStore {
         self.prepare_publish_with_failpoint_and_budget(build, manifest, &mut budget, failpoint)
     }
 
-    #[doc(hidden)]
+    #[cfg(test)]
     pub fn prepare_publish_with_failpoint_and_budget(
         &mut self,
         build: GenerationBuild,
@@ -4523,7 +4515,7 @@ impl Error for SourceStateError {
 }
 
 #[derive(Debug)]
-pub enum GenerationStoreError {
+pub(crate) enum GenerationStoreError {
     Io {
         operation: &'static str,
         path: PathBuf,
@@ -4868,6 +4860,10 @@ impl Error for GenerationStoreError {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "state/reference_generation_tests.rs"]
+mod reference_generation_tests;
 
 #[cfg(test)]
 mod generation_store_tests {

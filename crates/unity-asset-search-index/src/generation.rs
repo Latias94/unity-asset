@@ -27,7 +27,7 @@ impl SearchGenerationId {
 
     /// Returns the portable directory component used by the generation store.
     #[must_use]
-    pub fn directory_name(self) -> String {
+    pub(crate) fn directory_name(self) -> String {
         format!(
             "{GENERATION_DIRECTORY_PREFIX}{}",
             hex::encode(self.0.as_bytes())
@@ -36,7 +36,7 @@ impl SearchGenerationId {
 
     /// Parses a directory component emitted by [`Self::directory_name`].
     #[must_use]
-    pub fn from_directory_name(value: &str) -> Option<Self> {
+    pub(crate) fn from_directory_name(value: &str) -> Option<Self> {
         let encoded = value.strip_prefix(GENERATION_DIRECTORY_PREFIX)?;
         if encoded.len() != DigestV1::BYTE_LEN * 2
             || !encoded
@@ -265,7 +265,7 @@ impl Default for GenerationStatus {
 
 /// Evidence for one immutable artifact tree in a completed generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct ArtifactTreeEvidence {
+pub(crate) struct ArtifactTreeEvidence {
     contract_version: u16,
     digest: DigestV1,
     files: u64,
@@ -283,19 +283,10 @@ impl ArtifactTreeEvidence {
         }
     }
 
-    #[must_use]
-    pub const fn digest(self) -> DigestV1 {
-        self.digest
-    }
-
+    #[cfg(test)]
     #[must_use]
     pub const fn files(self) -> u64 {
         self.files
-    }
-
-    #[must_use]
-    pub const fn bytes(self) -> u64 {
-        self.bytes
     }
 }
 
@@ -321,7 +312,7 @@ impl<'de> Deserialize<'de> for ArtifactTreeEvidence {
 
 /// Physical evidence for every independently readable generation projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct GenerationArtifactEvidence {
+pub(crate) struct GenerationArtifactEvidence {
     contract_version: u16,
     search: ArtifactTreeEvidence,
     references: ArtifactTreeEvidence,
@@ -341,16 +332,6 @@ impl GenerationArtifactEvidence {
             references,
             source_state,
         }
-    }
-
-    #[must_use]
-    pub const fn search(self) -> ArtifactTreeEvidence {
-        self.search
-    }
-
-    #[must_use]
-    pub const fn references(self) -> ArtifactTreeEvidence {
-        self.references
     }
 
     #[must_use]
@@ -392,7 +373,7 @@ impl<'de> Deserialize<'de> for GenerationArtifactEvidence {
 
 /// Logical digests produced by the shared search and reference projection pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GenerationProjectionDigests {
+pub(crate) struct GenerationProjectionDigests {
     search: DigestV1,
     references: DigestV1,
 }
@@ -419,7 +400,7 @@ impl GenerationProjectionDigests {
 /// These values are produced during projection and must be reused after restart. Recomputing them
 /// from source state with current options would describe a different logical generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct GenerationProjectionSummary {
+pub(crate) struct GenerationProjectionSummary {
     contract_version: u16,
     assets: u64,
     search_documents: u64,
@@ -525,7 +506,7 @@ impl<'de> Deserialize<'de> for GenerationProjectionSummary {
 
 /// Canonical logical identity used to construct a generation manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SearchGenerationIdentityV1 {
+pub(crate) struct SearchGenerationIdentityV1 {
     workspace: WorkspaceId,
     revision: WorkspaceRevision,
     projections: GenerationProjectionDigests,
@@ -574,7 +555,7 @@ impl SearchGenerationIdentityV1 {
 /// produce a different segment layout while representing the same revision and logical
 /// projections; that implementation detail must not change the generation's logical identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SearchGenerationManifestV1 {
+pub(crate) struct SearchGenerationManifestV1 {
     contract_version: u16,
     workspace: WorkspaceId,
     revision: WorkspaceRevision,
@@ -611,11 +592,6 @@ impl SearchGenerationManifestV1 {
     }
 
     #[must_use]
-    pub const fn contract_version(&self) -> u16 {
-        self.contract_version
-    }
-
-    #[must_use]
     pub const fn workspace(&self) -> WorkspaceId {
         self.workspace
     }
@@ -623,16 +599,6 @@ impl SearchGenerationManifestV1 {
     #[must_use]
     pub const fn revision(&self) -> WorkspaceRevision {
         self.revision
-    }
-
-    #[must_use]
-    pub const fn search_projection_digest(&self) -> DigestV1 {
-        self.search_projection_digest
-    }
-
-    #[must_use]
-    pub const fn reference_projection_digest(&self) -> DigestV1 {
-        self.reference_projection_digest
     }
 
     #[must_use]
@@ -781,7 +747,7 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GenerationManifestError {
+pub(crate) enum GenerationManifestError {
     UnsupportedVersion {
         contract: &'static str,
         actual: u16,

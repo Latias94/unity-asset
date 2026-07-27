@@ -32,17 +32,9 @@ pub use contract::{
     SearchResponse, StatusResponse, SuggestResponse,
 };
 pub use generation::{
-    ArtifactTreeEvidence, FilesystemReindexIntent, FilesystemReindexScope,
-    GenerationArtifactEvidence, GenerationFailure, GenerationManifestError,
-    GenerationProjectionDigests, GenerationProjectionSummary, GenerationStamp, GenerationStatus,
-    ReindexAnalysisEvidence, ReindexDiskEstimate, ReindexDisposition, ReindexEvidence,
-    ReindexReceipt, SEARCH_GENERATION_CONTRACT_VERSION, SearchGenerationId,
-    SearchGenerationIdentityV1, SearchGenerationManifestV1,
-};
-pub use state::{
-    GenerationBuild, GenerationDiskEstimate, GenerationFailpoint, GenerationPublishReport,
-    GenerationPublishWarning, GenerationPublishWarningKind, GenerationSnapshot, GenerationStore,
-    GenerationStoreError, GenerationStoreOptions, PreparedGenerationPublish,
+    FilesystemReindexIntent, FilesystemReindexScope, GenerationFailure, GenerationStamp,
+    GenerationStatus, ReindexAnalysisEvidence, ReindexDiskEstimate, ReindexDisposition,
+    ReindexEvidence, ReindexReceipt, SEARCH_GENERATION_CONTRACT_VERSION, SearchGenerationId,
 };
 pub use unity_asset::workspace::WorkspaceView;
 pub use unity_asset_core::{AssetLoadBudget, ChangeSet, DigestV1, DigestV1Builder};
@@ -50,6 +42,8 @@ pub use unity_asset_search_core::{SearchKind, SearchRequest};
 
 use pipeline::{ActiveGeneration, PipelineBuildOutput, PipelineError, SearchGenerationPipeline};
 use reference_query::ReferenceQueryError;
+#[cfg(test)]
+use state::GenerationFailpoint;
 
 /// Maximum UTF-8 byte length accepted by [`SearchIndex::suggest`].
 pub const MAX_SUGGEST_PREFIX_BYTES: usize = 4 * 1024;
