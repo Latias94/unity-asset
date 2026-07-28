@@ -31,9 +31,9 @@ use super::super::portable_path::{PortablePathError, slash_key};
 
 use super::journal::{
     BACKUP_DIRECTORY, BASELINE_DIRECTORY, EVENTS_DIRECTORY, Journal, JournalArtifact,
-    JournalBaselineImage, JournalError, JournalEvent, JournalEventKey, JournalEventKind,
-    JournalEventPlan, JournalLayout, JournalPath, JournalPreparation, MANIFEST_TEMPORARY_FILE,
-    OpenedJournalPreparation, RECOVERY_DIRECTORY, RECOVERY_VERSION_DIRECTORY, RecoveryDirection,
+    JournalBaselineImage, JournalError, JournalEvent, JournalEventKind, JournalEventPlan,
+    JournalLayout, JournalPath, JournalPreparation, MANIFEST_TEMPORARY_FILE,
+    OpenedJournalPreparation, PlannedJournalEvent, RECOVERY_DIRECTORY, RECOVERY_VERSION_DIRECTORY,
     RecoveryEvidenceName, STAGE_DIRECTORY, matches_ordinal_journal_path,
     parse_recovery_evidence_name,
 };
@@ -54,18 +54,13 @@ use super::platform::{
 };
 #[cfg(test)]
 use super::platform::{capture_existing, observe_file_identity};
-use super::{AssetWorkspace, CommitReport, PublicationTarget, RecoveryLocator};
-
-/// Direction selected by deterministic journal recovery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RecoveryDisposition {
-    /// Finish publishing the exact prepared artifact set.
-    Forward,
-    /// Restore the complete pre-publication artifact set.
-    Rollback,
-    /// Preserve all evidence because neither direction is provably safe.
-    Blocked,
-}
+use super::publication_protocol::{
+    ArtifactObservation, ArtifactProgress, BaselineObservation, EntryEvidence, PreparedTransition,
+    ProtocolBlock, ProtocolError, ProtocolEvent, ProtocolPlanError, PublicationAction,
+    PublicationState, RecoveryDecision, RecoveryDirection, RecoveryIntent, RecoveryRequest,
+    append_recovery_program, decide_recovery,
+};
+use super::{AssetWorkspace, CommitReport, PublicationTarget, RecoveryLocator, VerificationCharge};
 
 /// Version of the rollback-receipt response contract.
 pub const ROLLBACK_RECEIPT_VERSION: u8 = 1;
@@ -1099,208 +1094,15 @@ fn discovery_blocked(reason: RecoveryDiscoveryBlockedReason) -> RecoveryDiscover
     RecoveryDiscoveryError::Blocked { reason }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EntryEvidence {
-    Missing,
-    Old,
-    New,
-    CorruptOld,
-    CorruptNew,
-    Unexpected,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ArtifactObservation {
-    target: EntryEvidence,
-    staging: EntryEvidence,
-    backup: EntryEvidence,
-    had_original: bool,
-}
-
-impl ArtifactObservation {
-    const fn can_forward(self) -> bool {
-        if self.had_original {
-            matches!(
-                (self.target, self.staging, self.backup),
-                (
-                    EntryEvidence::Old,
-                    EntryEvidence::New,
-                    EntryEvidence::Missing
-                ) | (
-                    EntryEvidence::Missing,
-                    EntryEvidence::New,
-                    EntryEvidence::Old
-                ) | (
-                    EntryEvidence::New,
-                    EntryEvidence::Missing,
-                    EntryEvidence::Old
-                )
-            )
-        } else {
-            matches!(
-                (self.target, self.staging, self.backup),
-                (
-                    EntryEvidence::Missing,
-                    EntryEvidence::New,
-                    EntryEvidence::Missing
-                ) | (
-                    EntryEvidence::New,
-                    EntryEvidence::Missing,
-                    EntryEvidence::Missing
-                )
-            )
-        }
-    }
-
-    const fn can_rollback(self) -> bool {
-        if self.had_original {
-            matches!(
-                (self.target, self.staging, self.backup),
-                (
-                    EntryEvidence::Old,
-                    EntryEvidence::Missing | EntryEvidence::New,
-                    EntryEvidence::Missing
-                ) | (
-                    EntryEvidence::Missing,
-                    EntryEvidence::Missing | EntryEvidence::New,
-                    EntryEvidence::Old
-                ) | (
-                    EntryEvidence::New | EntryEvidence::CorruptNew,
-                    EntryEvidence::Missing,
-                    EntryEvidence::Old
-                ) | (
-                    EntryEvidence::Missing,
-                    EntryEvidence::Missing | EntryEvidence::New,
-                    EntryEvidence::CorruptOld
-                ) | (
-                    EntryEvidence::New | EntryEvidence::CorruptNew,
-                    EntryEvidence::Missing,
-                    EntryEvidence::CorruptOld
-                )
-            )
-        } else {
-            matches!(
-                (self.target, self.staging, self.backup),
-                (
-                    EntryEvidence::Missing,
-                    EntryEvidence::Missing | EntryEvidence::New,
-                    EntryEvidence::Missing
-                ) | (
-                    EntryEvidence::New | EntryEvidence::CorruptNew,
-                    EntryEvidence::Missing,
-                    EntryEvidence::Missing
-                )
-            )
-        }
-    }
-
-    fn is_published(self) -> bool {
-        self.target == EntryEvidence::New
-            && self.staging == EntryEvidence::Missing
-            && if self.had_original {
-                self.backup == EntryEvidence::Old
-            } else {
-                self.backup == EntryEvidence::Missing
-            }
-    }
-
-    fn is_rolled_back(self) -> bool {
-        let target_matches = if self.had_original {
-            self.target == EntryEvidence::Old
-        } else {
-            self.target == EntryEvidence::Missing
-        };
-        target_matches
-            && self.staging != EntryEvidence::Unexpected
-            && self.backup == EntryEvidence::Missing
-    }
-
-    fn contains_unexpected(self) -> bool {
-        self.target == EntryEvidence::Unexpected
-            || self.staging == EntryEvidence::Unexpected
-            || self.backup == EntryEvidence::Unexpected
-    }
-
-    fn contains_corrupt_owned(self) -> bool {
-        matches!(
-            self.target,
-            EntryEvidence::CorruptOld | EntryEvidence::CorruptNew
-        ) || matches!(
-            self.staging,
-            EntryEvidence::CorruptOld | EntryEvidence::CorruptNew
-        ) || matches!(
-            self.backup,
-            EntryEvidence::CorruptOld | EntryEvidence::CorruptNew
-        )
-    }
-
-    fn has_repairable_owned_corruption(self) -> bool {
-        if self.had_original {
-            matches!(
-                (self.target, self.staging, self.backup),
-                (
-                    EntryEvidence::CorruptNew,
-                    EntryEvidence::Missing,
-                    EntryEvidence::Old | EntryEvidence::CorruptOld
-                ) | (
-                    EntryEvidence::New,
-                    EntryEvidence::Missing,
-                    EntryEvidence::CorruptOld
-                ) | (
-                    EntryEvidence::Missing,
-                    EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
-                    EntryEvidence::CorruptOld
-                ) | (
-                    EntryEvidence::Missing,
-                    EntryEvidence::CorruptNew,
-                    EntryEvidence::Old
-                )
-            )
-        } else {
-            matches!(
-                (self.target, self.staging, self.backup),
-                (
-                    EntryEvidence::CorruptNew,
-                    EntryEvidence::Missing,
-                    EntryEvidence::Missing
-                )
-            )
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BaselineObservation {
-    Base,
-    Committed,
-    Other,
-    Detached,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ArtifactEventFacts {
-    backup_intent: bool,
-    backup_captured: bool,
-    promotion_intent: bool,
-    promoted: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-struct EventFacts {
-    staging_verified: bool,
-    journaled: bool,
-    artifacts: Vec<ArtifactEventFacts>,
-    published: bool,
-    baseline_installed: bool,
-    abandoned: bool,
-    finalized: bool,
-    direction: Option<RecoveryDirection>,
+#[derive(Debug)]
+struct ObservedProtocol {
+    state: PublicationState,
     blocked_reason: Option<String>,
 }
 
 #[derive(Debug)]
 struct RecoveryObservation {
-    events: EventFacts,
+    events: ObservedProtocol,
     artifacts: Vec<ArtifactObservation>,
     baseline: BaselineObservation,
 }
@@ -1327,236 +1129,12 @@ struct RecoveryArtifactExecution {
     new_identity: FileIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RecoveryPlan {
-    disposition: RecoveryDisposition,
-    blocked: Option<RecoveryBlockedReason>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecoveryIntent {
-    Resume,
-    Abandon,
-}
-
-impl RecoveryPlan {
-    const fn forward() -> Self {
-        Self {
-            disposition: RecoveryDisposition::Forward,
-            blocked: None,
-        }
-    }
-
-    const fn rollback() -> Self {
-        Self {
-            disposition: RecoveryDisposition::Rollback,
-            blocked: None,
-        }
-    }
-
-    fn blocked(reason: RecoveryBlockedReason) -> Self {
-        Self {
-            disposition: RecoveryDisposition::Blocked,
-            blocked: Some(reason),
-        }
-    }
-}
-
-fn decide_recovery(observation: &RecoveryObservation) -> RecoveryPlan {
-    if let Some(reason) = &observation.events.blocked_reason {
-        return RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
-            message: format!("a previous recovery was blocked: {reason}"),
-        });
-    }
-    if let Some((index, _)) = observation
-        .artifacts
-        .iter()
-        .enumerate()
-        .find(|(_, artifact)| artifact.contains_unexpected())
-    {
-        return RecoveryPlan::blocked(RecoveryBlockedReason::UnexpectedEvidence {
-            artifact: format!("artifact-{index:08}"),
-        });
-    }
-
-    if observation.events.abandoned {
-        return if observation
-            .artifacts
-            .iter()
-            .all(|artifact| artifact.is_rolled_back())
-            && matches!(
-                observation.baseline,
-                BaselineObservation::Base | BaselineObservation::Detached
-            ) {
-            RecoveryPlan::rollback()
-        } else {
-            RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
-                message: "an abandoned transaction is not fully rolled back".to_owned(),
-            })
-        };
-    }
-
-    if observation.events.published
-        || observation.events.baseline_installed
-        || observation.events.finalized
-    {
-        if let Some((index, _)) = observation
-            .artifacts
-            .iter()
-            .enumerate()
-            .find(|(_, artifact)| artifact.contains_corrupt_owned())
-        {
-            return RecoveryPlan::blocked(RecoveryBlockedReason::UnexpectedEvidence {
-                artifact: format!("artifact-{index:08}"),
-            });
-        }
-        if !observation
-            .artifacts
-            .iter()
-            .all(|artifact| artifact.is_published())
-        {
-            return RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
-                message: "a published transaction does not retain every new artifact".to_owned(),
-            });
-        }
-        return RecoveryPlan::forward();
-    }
-
-    match observation.events.direction {
-        Some(RecoveryDirection::Forward) => {
-            if observation
-                .artifacts
-                .iter()
-                .all(|artifact| artifact.can_forward())
-            {
-                RecoveryPlan::forward()
-            } else {
-                RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
-                    message: "the sticky forward decision no longer has complete evidence"
-                        .to_owned(),
-                })
-            }
-        }
-        Some(RecoveryDirection::Rollback) => {
-            if observation
-                .artifacts
-                .iter()
-                .all(|artifact| artifact.can_rollback())
-            {
-                RecoveryPlan::rollback()
-            } else {
-                RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
-                    message: "the sticky rollback decision no longer has complete evidence"
-                        .to_owned(),
-                })
-            }
-        }
-        None if observation
-            .artifacts
-            .iter()
-            .all(|artifact| artifact.can_forward()) =>
-        {
-            RecoveryPlan::forward()
-        }
-        None if observation
-            .artifacts
-            .iter()
-            .all(|artifact| artifact.can_rollback()) =>
-        {
-            RecoveryPlan::rollback()
-        }
-        None => {
-            if let Some((index, _)) = observation
-                .artifacts
-                .iter()
-                .enumerate()
-                .find(|(_, artifact)| artifact.contains_corrupt_owned())
-            {
-                RecoveryPlan::blocked(RecoveryBlockedReason::UnexpectedEvidence {
-                    artifact: format!("artifact-{index:08}"),
-                })
-            } else {
-                RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
-                    message: "neither forward publication nor rollback has complete evidence"
-                        .to_owned(),
-                })
-            }
-        }
-    }
-}
-
-fn decide_abandon(observation: &RecoveryObservation) -> RecoveryPlan {
-    if let Some(reason) = &observation.events.blocked_reason {
-        return RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
-            message: format!("a previous recovery was blocked: {reason}"),
-        });
-    }
-    if let Some((index, _)) = observation
-        .artifacts
-        .iter()
-        .enumerate()
-        .find(|(_, artifact)| artifact.contains_unexpected())
-    {
-        return RecoveryPlan::blocked(RecoveryBlockedReason::UnexpectedEvidence {
-            artifact: format!("artifact-{index:08}"),
-        });
-    }
-    if observation.events.abandoned {
-        return if observation
-            .artifacts
-            .iter()
-            .all(|artifact| artifact.is_rolled_back())
-            && observation.baseline == BaselineObservation::Base
-        {
-            RecoveryPlan::rollback()
-        } else {
-            RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
-                message: "an abandoned transaction is not fully rolled back".to_owned(),
-            })
-        };
-    }
-    if observation.events.published
-        || observation.events.baseline_installed
-        || observation.events.finalized
-    {
-        return RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
-            message: "a published or finalized transaction cannot be explicitly abandoned"
-                .to_owned(),
-        });
-    }
-    if observation.events.direction == Some(RecoveryDirection::Forward) {
-        return RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
-            message: "a transaction with a sticky forward decision cannot be abandoned".to_owned(),
-        });
-    }
-    if !matches!(
-        observation.baseline,
-        BaselineObservation::Base | BaselineObservation::Detached
-    ) {
-        return RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
-            message: "explicit abandon requires the workspace base revision".to_owned(),
-        });
-    }
-    if observation
-        .artifacts
-        .iter()
-        .all(|artifact| artifact.can_rollback())
-    {
-        RecoveryPlan::rollback()
-    } else {
-        RecoveryPlan::blocked(RecoveryBlockedReason::InvalidEventSequence {
-            message: "transaction evidence cannot be safely rolled back for explicit abandon"
-                .to_owned(),
-        })
-    }
-}
-
-fn recovery_event_keys(
+fn recovery_event_program(
     observation: &RecoveryObservation,
-    disposition: RecoveryDisposition,
+    direction: RecoveryDirection,
     finalize_workspace: bool,
     budget: &mut AssetLoadBudget,
-) -> Result<Vec<JournalEventKey>, ObservationError> {
+) -> Result<Vec<PublicationAction>, ObservationError> {
     let capacity = observation
         .artifacts
         .len()
@@ -1565,132 +1143,16 @@ fn recovery_event_keys(
         .ok_or(BudgetError::ArithmeticOverflow {
             resource: "recovery event plan keys",
         })?;
-    let mut keys = recovery_vec(capacity, "recovery event plan keys", budget)?;
-    let direction = match disposition {
-        RecoveryDisposition::Forward => RecoveryDirection::Forward,
-        RecoveryDisposition::Rollback => RecoveryDirection::Rollback,
-        RecoveryDisposition::Blocked => return Ok(keys),
-    };
-    if observation.events.direction.is_none() {
-        keys.push(JournalEventKey::RecoveryDecision(direction));
-    }
-    if disposition == RecoveryDisposition::Rollback {
-        if !observation.events.abandoned {
-            keys.push(JournalEventKey::Abandoned);
-        }
-        if !observation.events.finalized {
-            keys.push(JournalEventKey::Finalized);
-        }
-        return Ok(keys);
-    }
-
-    if !observation.events.staging_verified {
-        keys.push(JournalEventKey::StagingVerified);
-    }
-    if !observation.events.journaled {
-        keys.push(JournalEventKey::Journaled);
-    }
-    let already_published = observation
-        .artifacts
-        .iter()
-        .all(|artifact| artifact.is_published());
-    for (index, (artifact, facts)) in observation
-        .artifacts
-        .iter()
-        .zip(&observation.events.artifacts)
-        .enumerate()
-    {
-        let ordinal = u32::try_from(index).map_err(|_| RecoveryBlockedReason::InvalidJournal {
-            message: "recovery artifact ordinal overflowed".to_owned(),
-        })?;
-        if already_published {
-            if artifact.had_original && !facts.backup_captured {
-                return Err(
-                    invalid_event("promoted replacement has no captured backup event").into(),
-                );
-            }
-            if !facts.promotion_intent {
-                return Err(invalid_event("promoted target has no durable intent").into());
-            }
-            if !facts.promoted {
-                keys.push(JournalEventKey::Promoted(ordinal));
-            }
-            continue;
-        }
-
-        if artifact.had_original {
-            match (artifact.target, artifact.staging, artifact.backup) {
-                (EntryEvidence::Old, EntryEvidence::New, EntryEvidence::Missing) => {
-                    if !facts.backup_intent {
-                        keys.push(JournalEventKey::BackupIntent(ordinal));
-                    }
-                    if !facts.backup_captured {
-                        keys.push(JournalEventKey::BackupCaptured(ordinal));
-                    }
-                }
-                (EntryEvidence::Missing, EntryEvidence::New, EntryEvidence::Old) => {
-                    if !facts.backup_intent {
-                        return Err(invalid_event("captured backup has no durable intent").into());
-                    }
-                    if !facts.backup_captured {
-                        keys.push(JournalEventKey::BackupCaptured(ordinal));
-                    }
-                }
-                (EntryEvidence::New, EntryEvidence::Missing, EntryEvidence::Old) => {
-                    if !facts.promotion_intent {
-                        return Err(invalid_event("promoted target has no durable intent").into());
-                    }
-                    if !facts.promoted {
-                        keys.push(JournalEventKey::Promoted(ordinal));
-                    }
-                    continue;
-                }
-                _ => {
-                    return Err(RecoveryBlockedReason::UnexpectedEvidence {
-                        artifact: format!("artifact-{index:08}"),
-                    }
-                    .into());
-                }
-            }
-        } else {
-            match (artifact.target, artifact.staging, artifact.backup) {
-                (EntryEvidence::Missing, EntryEvidence::New, EntryEvidence::Missing) => {}
-                (EntryEvidence::New, EntryEvidence::Missing, EntryEvidence::Missing) => {
-                    if !facts.promotion_intent {
-                        return Err(invalid_event("promoted target has no durable intent").into());
-                    }
-                    if !facts.promoted {
-                        keys.push(JournalEventKey::Promoted(ordinal));
-                    }
-                    continue;
-                }
-                _ => {
-                    return Err(RecoveryBlockedReason::UnexpectedEvidence {
-                        artifact: format!("artifact-{index:08}"),
-                    }
-                    .into());
-                }
-            }
-        }
-        if !facts.promotion_intent {
-            keys.push(JournalEventKey::PromotionIntent(ordinal));
-        }
-        if !facts.promoted {
-            keys.push(JournalEventKey::Promoted(ordinal));
-        }
-    }
-    if !observation.events.published {
-        keys.push(JournalEventKey::Published);
-    }
-    if finalize_workspace {
-        if !observation.events.baseline_installed {
-            keys.push(JournalEventKey::BaselineInstalled);
-        }
-        if !observation.events.finalized {
-            keys.push(JournalEventKey::Finalized);
-        }
-    }
-    Ok(keys)
+    let mut actions = recovery_vec(capacity, "recovery event plan keys", budget)?;
+    append_recovery_program(
+        &observation.events.state,
+        &observation.artifacts,
+        direction,
+        finalize_workspace,
+        &mut actions,
+    )
+    .map_err(map_protocol_plan_error)?;
+    Ok(actions)
 }
 
 fn prebuild_recovery_baseline(
@@ -2787,47 +2249,15 @@ fn recover_finalized_journal(
     locator: &RecoveryLocator,
     intent: RecoveryIntent,
     report: CommitReport,
-    events: &EventFacts,
+    events: &ObservedProtocol,
     baseline: BaselineObservation,
     budget: &mut AssetLoadBudget,
 ) -> Result<RecoveryOutcome, RecoveryError> {
-    if events.blocked_reason.is_some() {
-        return Err(blocked(
-            locator,
-            RecoveryBlockedReason::InvalidEventSequence {
-                message: "a finalized receipt retains a prior recovery-blocked event".to_owned(),
-            },
-        ));
-    }
-    if events.abandoned {
-        if events.published
-            || events.baseline_installed
-            || events.direction != Some(RecoveryDirection::Rollback)
-        {
-            return Err(blocked(
-                locator,
-                RecoveryBlockedReason::InvalidEventSequence {
-                    message: "finalized rollback receipt has incompatible events".to_owned(),
-                },
-            ));
-        }
+    if events.state.abandoned() {
         // A rollback receipt is historical evidence. Its former target bytes
         // may have been superseded by a later publication, so terminal
         // redelivery must never inspect or restore them.
         return Ok(historical_rollback_receipt(&report));
-    }
-    if !events.published
-        || !events.baseline_installed
-        || events.artifacts.iter().any(|artifact| !artifact.promoted)
-    {
-        return Err(blocked(
-            locator,
-            RecoveryBlockedReason::InvalidEventSequence {
-                message:
-                    "finalized publication does not contain a complete canonical event sequence"
-                        .to_owned(),
-            },
-        ));
     }
     if intent == RecoveryIntent::Abandon {
         return Err(blocked(
@@ -2856,13 +2286,22 @@ fn recover_finalized_journal(
                 source,
             }),
         },
-        BaselineObservation::Base => {
+        BaselineObservation::Base | BaselineObservation::Other => {
+            let may_be_partial = matches!(baseline, BaselineObservation::Other);
             // Installing a baseline changes in-memory state, so it remains a
             // stronger operation than receipt redelivery. Verify the current
             // publication image only in this branch before rebuilding it.
-            let (_, artifacts) = observe_execution(journal, budget)
-                .map_err(|error| map_observation_error(locator, error))?;
+            let (execution, artifacts) = match observe_execution(journal, budget) {
+                Ok(observation) => observation,
+                Err(ObservationError::Blocked(_)) if may_be_partial => {
+                    return Ok(historical_commit_receipt(report));
+                }
+                Err(error) => return Err(map_observation_error(locator, error)),
+            };
             if artifacts.iter().any(|artifact| !artifact.is_published()) {
+                if may_be_partial {
+                    return Ok(historical_commit_receipt(report));
+                }
                 return Err(blocked(
                     locator,
                     RecoveryBlockedReason::UnexpectedEvidence {
@@ -2870,20 +2309,31 @@ fn recover_finalized_journal(
                     },
                 ));
             }
+            precharge_published_verification(journal, budget)
+                .map_err(|error| map_observation_error(locator, error))?;
             let rebuilt =
-                prebuild_recovery_baseline(workspace, journal, &artifacts, locator, budget)?;
-            if !workspace.install_state_if_current(&rebuilt.expected, rebuilt.next) {
-                return Err(blocked(
-                    locator,
-                    RecoveryBlockedReason::BaselineUnavailable {
-                        expected: report.committed_revision(),
-                        actual: workspace.revision(),
-                    },
-                ));
-            }
+                match prebuild_recovery_baseline(workspace, journal, &artifacts, locator, budget) {
+                    Ok(rebuilt) => rebuilt,
+                    Err(RecoveryError::Budget { locator, source }) => {
+                        return Err(RecoveryError::Budget { locator, source });
+                    }
+                    Err(_) if may_be_partial => {
+                        return Ok(historical_commit_receipt(report));
+                    }
+                    Err(error) => return Err(error),
+                };
+            verify_and_install_recovery_baseline(
+                journal,
+                &artifacts,
+                &execution,
+                workspace,
+                &mut Some(rebuilt),
+                report.committed_revision(),
+            )
+            .map_err(|error| map_execution_error(locator, error))?;
             Ok(commit_outcome(report, true))
         }
-        BaselineObservation::Other | BaselineObservation::Detached => {
+        BaselineObservation::Detached => {
             // The same workspace can legitimately have advanced through a
             // successor transaction. Redeliver the immutable receipt without
             // replacing its newer state.
@@ -2916,7 +2366,7 @@ fn recover_open_journal(
         ));
     }
 
-    let events = EventFacts::from_journal(journal, budget)
+    let events = ObservedProtocol::from_journal(journal, budget)
         .map_err(|error| map_observation_error(locator, error))?;
     let baseline = match workspace.as_deref() {
         Some(workspace) if workspace.revision() == report.committed_revision() => {
@@ -2928,7 +2378,7 @@ fn recover_open_journal(
         Some(_) => BaselineObservation::Other,
         None => BaselineObservation::Detached,
     };
-    if events.finalized {
+    if events.state.finalized() {
         validate_manifest_paths(journal, budget)
             .map_err(|error| map_observation_error(locator, error))?;
         return recover_finalized_journal(
@@ -2950,7 +2400,7 @@ fn recover_open_journal(
         baseline,
     };
     if workspace.is_some()
-        && (!observation.events.published
+        && (!observation.events.state.published()
             || !observation
                 .artifacts
                 .iter()
@@ -2961,22 +2411,18 @@ fn recover_open_journal(
             RecoveryBlockedReason::FilesystemRecoveryRequired,
         ));
     }
-    let plan = match intent {
-        RecoveryIntent::Resume => decide_recovery(&observation),
-        RecoveryIntent::Abandon => decide_abandon(&observation),
-    };
+    let plan = decide_recovery(RecoveryRequest {
+        intent,
+        state: &observation.events.state,
+        artifacts: &observation.artifacts,
+        baseline: observation.baseline,
+    });
 
-    match plan.disposition {
-        RecoveryDisposition::Blocked => {
-            let reason =
-                plan.blocked
-                    .unwrap_or_else(|| RecoveryBlockedReason::InvalidEventSequence {
-                        message: "recovery was blocked without a reason".to_owned(),
-                    });
+    match plan {
+        RecoveryDecision::Blocked(block) => {
+            let reason = map_protocol_block(block, observation.events.blocked_reason.as_deref());
             if matches!(reason, RecoveryBlockedReason::InvalidEventSequence { .. })
-                && (observation.events.published
-                    || observation.events.baseline_installed
-                    || observation.events.finalized)
+                && observation.events.state.published()
                 && workspace
                     .as_deref()
                     .is_some_and(|workspace| workspace.revision() != report.committed_revision())
@@ -2993,10 +2439,8 @@ fn recover_open_journal(
                     },
                 ));
             }
-            if observation.events.direction == Some(RecoveryDirection::Forward)
-                && !observation.events.published
-                && !observation.events.baseline_installed
-                && !observation.events.finalized
+            if observation.events.state.direction() == Some(RecoveryDirection::Forward)
+                && !observation.events.state.published()
                 && observation
                     .artifacts
                     .iter()
@@ -3017,18 +2461,9 @@ fn recover_open_journal(
             if intent == RecoveryIntent::Abandon {
                 return Err(blocked(locator, reason));
             }
-            block_and_record(journal, locator, reason, budget)
+            block_and_record(journal, &mut observation.events, locator, reason, budget)
         }
-        RecoveryDisposition::Forward => {
-            if observation.events.finalized
-                && observation.baseline == BaselineObservation::Committed
-            {
-                return Ok(commit_outcome(report, workspace_attached));
-            }
-            let already_published = observation
-                .artifacts
-                .iter()
-                .all(|artifact| artifact.is_published());
+        RecoveryDecision::Forward => {
             let finalize_workspace = workspace.is_some();
             let prebuilt_baseline = if matches!(
                 observation.baseline,
@@ -3046,83 +2481,41 @@ fn recover_open_journal(
             } else {
                 None
             };
-            let event_keys =
-                recovery_event_keys(&observation, plan.disposition, finalize_workspace, budget)
-                    .map_err(|error| map_observation_error(locator, error))?;
-            let mut event_plan = journal
+            let event_keys = recovery_event_program(
+                &observation,
+                RecoveryDirection::Forward,
+                finalize_workspace,
+                budget,
+            )
+            .map_err(|error| map_observation_error(locator, error))?;
+            let event_plan = journal
                 .plan_events(&event_keys, budget)
                 .map_err(|error| map_journal_mutation_error(locator, error))?;
-            if !already_published {
-                precharge_execution_verification(
-                    journal,
-                    &mut execution,
-                    &observation.artifacts,
-                    RecoveryDisposition::Forward,
-                    budget,
-                )
-                .map_err(|error| map_observation_error(locator, error))?;
-            }
-            persist_direction(
+            precharge_execution_verification(
+                journal,
+                &mut execution,
+                &observation.artifacts,
+                &event_keys,
+                RecoveryDirection::Forward,
+                budget,
+            )
+            .map_err(|error| map_observation_error(locator, error))?;
+            #[cfg(test)]
+            super::test_run_publication_hook("before_recovery_execution");
+            execute_forward_program(
                 journal,
                 &mut observation.events,
-                RecoveryDirection::Forward,
-                &mut event_plan,
+                &mut observation.artifacts,
+                &mut execution,
+                event_plan,
+                workspace.as_deref_mut(),
+                prebuilt_baseline,
+                report.committed_revision(),
             )
-            .map_err(|error| map_journal_mutation_error(locator, error))?;
-            if already_published {
-                finish_published_events(journal, &mut observation.events, &mut event_plan)
-                    .map_err(|error| map_execution_error(locator, error))?;
-            } else {
-                roll_forward(
-                    journal,
-                    &mut observation.events,
-                    &mut observation.artifacts,
-                    &mut execution,
-                    &mut event_plan,
-                )
-                .map_err(|error| map_execution_error(locator, error))?;
-            }
-
-            if let Some(workspace) = workspace.as_deref_mut() {
-                if workspace.revision() != report.committed_revision() {
-                    let baseline = prebuilt_baseline
-                        .expect("non-committed recovery prebuilds its workspace baseline");
-                    if !workspace.install_state_if_current(&baseline.expected, baseline.next) {
-                        return Err(blocked(
-                            locator,
-                            RecoveryBlockedReason::BaselineUnavailable {
-                                expected: report.committed_revision(),
-                                actual: workspace.revision(),
-                            },
-                        ));
-                    }
-                    observation.baseline = BaselineObservation::Committed;
-                }
-                append_once(
-                    journal,
-                    &mut observation.events.baseline_installed,
-                    JournalEventKey::BaselineInstalled,
-                    &mut event_plan,
-                )
-                .and_then(|_| {
-                    append_once(
-                        journal,
-                        &mut observation.events.finalized,
-                        JournalEventKey::Finalized,
-                        &mut event_plan,
-                    )
-                })
-                .map_err(|error| map_journal_mutation_error(locator, error))?;
-            }
-            event_plan
-                .finish()
-                .map_err(|error| map_journal_mutation_error(locator, error))?;
+            .map_err(|error| map_execution_error(locator, error))?;
             Ok(commit_outcome(report, workspace_attached))
         }
-        RecoveryDisposition::Rollback => {
-            if observation.events.finalized && observation.events.abandoned {
-                return Ok(rollback_outcome(&report));
-            }
+        RecoveryDecision::Rollback => {
             if !matches!(
                 observation.baseline,
                 BaselineObservation::Base | BaselineObservation::Detached
@@ -3139,46 +2532,31 @@ fn recover_open_journal(
                     },
                 ));
             }
-            let event_keys = recovery_event_keys(&observation, plan.disposition, true, budget)
-                .map_err(|error| map_observation_error(locator, error))?;
-            let mut event_plan = journal
+            let event_keys =
+                recovery_event_program(&observation, RecoveryDirection::Rollback, true, budget)
+                    .map_err(|error| map_observation_error(locator, error))?;
+            let event_plan = journal
                 .plan_events(&event_keys, budget)
                 .map_err(|error| map_journal_mutation_error(locator, error))?;
             precharge_execution_verification(
                 journal,
                 &mut execution,
                 &observation.artifacts,
-                RecoveryDisposition::Rollback,
+                &event_keys,
+                RecoveryDirection::Rollback,
                 budget,
             )
             .map_err(|error| map_observation_error(locator, error))?;
-            persist_direction(
+            #[cfg(test)]
+            super::test_run_publication_hook("before_recovery_execution");
+            execute_rollback_program(
                 journal,
                 &mut observation.events,
-                RecoveryDirection::Rollback,
-                &mut event_plan,
+                &mut observation.artifacts,
+                &execution,
+                event_plan,
             )
-            .map_err(|error| map_journal_mutation_error(locator, error))?;
-            roll_back(journal, &mut observation.artifacts, &execution)
-                .map_err(|error| map_execution_error(locator, error))?;
-            append_once(
-                journal,
-                &mut observation.events.abandoned,
-                JournalEventKey::Abandoned,
-                &mut event_plan,
-            )
-            .and_then(|_| {
-                append_once(
-                    journal,
-                    &mut observation.events.finalized,
-                    JournalEventKey::Finalized,
-                    &mut event_plan,
-                )
-            })
-            .map_err(|error| map_journal_mutation_error(locator, error))?;
-            event_plan
-                .finish()
-                .map_err(|error| map_journal_mutation_error(locator, error))?;
+            .map_err(|error| map_execution_error(locator, error))?;
             Ok(rollback_outcome(&report))
         }
     }
@@ -3212,7 +2590,7 @@ fn historical_rollback_receipt(report: &CommitReport) -> RecoveryOutcome {
     ))
 }
 
-impl EventFacts {
+impl ObservedProtocol {
     fn from_journal(
         journal: &Journal,
         budget: &mut AssetLoadBudget,
@@ -3242,183 +2620,133 @@ impl EventFacts {
             "recovery artifact event facts",
             budget,
         )?;
-        artifacts.resize_with(manifest.artifacts().len(), ArtifactEventFacts::default);
-        let mut facts = Self {
-            artifacts,
-            ..Self::default()
+        artifacts.extend(
+            manifest
+                .artifacts()
+                .iter()
+                .map(|artifact| ArtifactProgress::new(artifact.backup().is_some())),
+        );
+        let mut observed = Self {
+            state: PublicationState::new(artifacts),
+            blocked_reason: None,
         };
 
         for event in journal.events() {
-            facts
-                .apply(event, manifest.artifacts(), &by_target)
+            observed
+                .replay_event(event, manifest.artifacts(), &by_target)
                 .map_err(ObservationError::Blocked)?;
         }
-        Ok(facts)
+        Ok(observed)
     }
 
-    fn apply(
+    fn replay_event(
         &mut self,
         event: &JournalEvent,
         artifacts: &[JournalArtifact],
         by_target: &[usize],
     ) -> Result<(), RecoveryBlockedReason> {
-        if self.finalized && !matches!(event.kind(), JournalEventKind::Marker { .. }) {
-            return Err(invalid_event("a non-marker event follows Finalized"));
-        }
-        if self.direction == Some(RecoveryDirection::Rollback)
-            && matches!(
-                event.kind(),
-                JournalEventKind::StagingVerified
-                    | JournalEventKind::Journaled
-                    | JournalEventKind::BackupIntent { .. }
-                    | JournalEventKind::BackupCaptured { .. }
-                    | JournalEventKind::PromotionIntent { .. }
-                    | JournalEventKind::Promoted { .. }
-                    | JournalEventKind::Published
-                    | JournalEventKind::BaselineInstalled
-            )
-        {
-            return Err(invalid_event(
-                "a forward publication event follows a rollback decision",
-            ));
-        }
-        if matches!(
-            event.kind(),
-            JournalEventKind::BackupIntent { .. }
-                | JournalEventKind::BackupCaptured { .. }
-                | JournalEventKind::PromotionIntent { .. }
-                | JournalEventKind::Promoted { .. }
-        ) && !self.journaled
-        {
-            return Err(invalid_event("an artifact event precedes Journaled"));
-        }
-        match event.kind() {
-            JournalEventKind::StagingVerified => set_once(
-                &mut self.staging_verified,
-                "StagingVerified appears more than once",
-            )?,
-            JournalEventKind::Journaled => {
-                if !self.staging_verified {
-                    return Err(invalid_event("Journaled precedes StagingVerified"));
-                }
-                set_once(&mut self.journaled, "Journaled appears more than once")?;
+        let protocol_event = match event.kind() {
+            JournalEventKind::StagingVerified => {
+                ProtocolEvent::Action(PublicationAction::StagingVerified)
             }
+            JournalEventKind::Journaled => ProtocolEvent::Action(PublicationAction::Journaled),
             JournalEventKind::BackupIntent { artifact } => {
-                let index = event_artifact(artifacts, by_target, artifact)?;
-                if artifacts[index].backup().is_none() {
-                    return Err(invalid_event(
-                        "backup intent names an artifact without a backup",
-                    ));
-                }
-                set_once(
-                    &mut self.artifacts[index].backup_intent,
-                    "backup intent appears more than once",
-                )?;
+                ProtocolEvent::Action(PublicationAction::BackupIntent(event_artifact_ordinal(
+                    artifacts, by_target, artifact,
+                )?))
             }
             JournalEventKind::BackupCaptured { artifact } => {
-                let index = event_artifact(artifacts, by_target, artifact)?;
-                if !self.artifacts[index].backup_intent {
-                    return Err(invalid_event("backup capture has no durable intent"));
-                }
-                set_once(
-                    &mut self.artifacts[index].backup_captured,
-                    "backup capture appears more than once",
-                )?;
+                ProtocolEvent::Action(PublicationAction::BackupCaptured(event_artifact_ordinal(
+                    artifacts, by_target, artifact,
+                )?))
             }
             JournalEventKind::PromotionIntent { artifact } => {
-                let index = event_artifact(artifacts, by_target, artifact)?;
-                if artifacts[index].backup().is_some() && !self.artifacts[index].backup_captured {
-                    return Err(invalid_event("promotion intent precedes backup capture"));
-                }
-                set_once(
-                    &mut self.artifacts[index].promotion_intent,
-                    "promotion intent appears more than once",
-                )?;
+                ProtocolEvent::Action(PublicationAction::PromotionIntent(event_artifact_ordinal(
+                    artifacts, by_target, artifact,
+                )?))
             }
             JournalEventKind::Promoted { artifact } => {
-                let index = event_artifact(artifacts, by_target, artifact)?;
-                if !self.artifacts[index].promotion_intent {
-                    return Err(invalid_event("promotion completion has no durable intent"));
-                }
-                set_once(
-                    &mut self.artifacts[index].promoted,
-                    "promotion completion appears more than once",
-                )?;
+                ProtocolEvent::Action(PublicationAction::Promoted(event_artifact_ordinal(
+                    artifacts, by_target, artifact,
+                )?))
             }
-            JournalEventKind::Published => {
-                if self.artifacts.iter().any(|artifact| !artifact.promoted) {
-                    return Err(invalid_event("Published precedes an artifact promotion"));
-                }
-                set_once(&mut self.published, "Published appears more than once")?;
-            }
+            JournalEventKind::Published => ProtocolEvent::Action(PublicationAction::Published),
             JournalEventKind::BaselineInstalled => {
-                if !self.published || self.abandoned {
-                    return Err(invalid_event(
-                        "BaselineInstalled does not follow a published transaction",
-                    ));
-                }
-                set_once(
-                    &mut self.baseline_installed,
-                    "BaselineInstalled appears more than once",
-                )?;
+                ProtocolEvent::Action(PublicationAction::BaselineInstalled)
             }
-            JournalEventKind::Finalized => {
-                if !self.baseline_installed && !self.abandoned {
-                    return Err(invalid_event(
-                        "Finalized has neither an installed baseline nor rollback",
-                    ));
-                }
-                set_once(&mut self.finalized, "Finalized appears more than once")?;
-            }
+            JournalEventKind::Finalized => ProtocolEvent::Action(PublicationAction::Finalized),
             JournalEventKind::RecoveryDecision { direction } => {
-                if *direction == RecoveryDirection::Rollback
-                    && (self.published || self.baseline_installed || self.abandoned)
-                {
-                    return Err(invalid_event(
-                        "a rollback decision follows completed forward publication",
-                    ));
-                }
-                if self.direction.replace(*direction).is_some() {
-                    return Err(RecoveryBlockedReason::ConflictingDecision);
-                }
+                ProtocolEvent::Action(PublicationAction::RecoveryDecision(*direction))
             }
-            JournalEventKind::Abandoned => {
-                if self.direction != Some(RecoveryDirection::Rollback)
-                    || self.published
-                    || self.baseline_installed
-                {
-                    return Err(invalid_event("Abandoned has no valid rollback decision"));
-                }
-                set_once(&mut self.abandoned, "Abandoned appears more than once")?;
-            }
+            JournalEventKind::Abandoned => ProtocolEvent::Action(PublicationAction::Abandoned),
             JournalEventKind::RecoveryBlocked { reason } => {
-                if self.blocked_reason.replace(reason.clone()).is_some() {
-                    return Err(invalid_event("RecoveryBlocked appears more than once"));
-                }
+                self.state
+                    .apply(ProtocolEvent::RecoveryBlocked)
+                    .map_err(map_protocol_error)?;
+                self.blocked_reason = Some(reason.clone());
+                return Ok(());
             }
-            JournalEventKind::Marker { .. } => {}
-        }
-        Ok(())
+            JournalEventKind::Marker { .. } => ProtocolEvent::LegacyMarker,
+        };
+        self.state.apply(protocol_event).map_err(map_protocol_error)
     }
 }
 
-fn event_artifact(
+fn event_artifact_ordinal(
     artifacts: &[JournalArtifact],
     by_target: &[usize],
     artifact: &super::journal::JournalPath,
-) -> Result<usize, RecoveryBlockedReason> {
-    by_target
+) -> Result<u32, RecoveryBlockedReason> {
+    let index = by_target
         .binary_search_by(|index| artifacts[*index].target().cmp(artifact))
         .map(|position| by_target[position])
-        .map_err(|_| invalid_event("an event names an artifact outside the manifest"))
+        .map_err(|_| invalid_event("an event names an artifact outside the manifest"))?;
+    u32::try_from(index).map_err(|_| invalid_event("artifact event ordinal overflowed"))
 }
 
-fn set_once(value: &mut bool, message: &'static str) -> Result<(), RecoveryBlockedReason> {
-    if *value {
-        return Err(invalid_event(message));
+fn map_protocol_error(error: ProtocolError) -> RecoveryBlockedReason {
+    match error {
+        ProtocolError::ConflictingDecision => RecoveryBlockedReason::ConflictingDecision,
+        error => invalid_event(error.to_string()),
     }
-    *value = true;
-    Ok(())
+}
+
+fn map_protocol_plan_error(error: ProtocolPlanError) -> RecoveryBlockedReason {
+    match error {
+        ProtocolPlanError::InvalidState(message) => invalid_event(message),
+        ProtocolPlanError::UnexpectedEvidence { artifact } => {
+            RecoveryBlockedReason::UnexpectedEvidence {
+                artifact: format!("artifact-{artifact:08}"),
+            }
+        }
+        ProtocolPlanError::ArtifactOrdinalOverflow => RecoveryBlockedReason::InvalidJournal {
+            message: error.to_string(),
+        },
+    }
+}
+
+fn map_protocol_block(
+    block: ProtocolBlock,
+    previous_reason: Option<&str>,
+) -> RecoveryBlockedReason {
+    match block {
+        ProtocolBlock::PreviousRecoveryBlocked => RecoveryBlockedReason::InvalidEventSequence {
+            message: format!(
+                "a previous recovery was blocked: {}",
+                previous_reason.unwrap_or("reason unavailable")
+            ),
+        },
+        ProtocolBlock::UnexpectedEvidence { artifact } => {
+            RecoveryBlockedReason::UnexpectedEvidence {
+                artifact: format!("artifact-{artifact:08}"),
+            }
+        }
+        ProtocolBlock::InvalidEventSequence(message) => {
+            RecoveryBlockedReason::InvalidEventSequence {
+                message: message.to_owned(),
+            }
+        }
+    }
 }
 
 fn invalid_event(message: impl Into<String>) -> RecoveryBlockedReason {
@@ -3992,6 +3320,8 @@ fn read_digest(
     })?;
     budget.consume_entries(1)?;
     budget.consume_bytes(length)?;
+    #[cfg(test)]
+    super::test_record_verification_hash(length);
     let digest = match DigestV1::hash_reader(&mut file, length) {
         Ok(digest) => digest,
         Err(error)
@@ -4016,32 +3346,57 @@ fn read_digest(
     Ok(Some((digest, length, identity)))
 }
 
-fn persist_direction(
-    journal: &mut Journal,
-    facts: &mut EventFacts,
-    direction: RecoveryDirection,
-    event_plan: &mut JournalEventPlan,
-) -> Result<(), super::journal::JournalError> {
-    match facts.direction {
-        Some(existing) if existing == direction => Ok(()),
-        Some(_) => Err(super::journal::JournalError::InvalidEvent(
-            "recovery direction changed after it was persisted".to_owned(),
-        )),
-        None => {
-            journal.append_planned(event_plan, JournalEventKey::RecoveryDecision(direction))?;
-            facts.direction = Some(direction);
-            Ok(())
-        }
-    }
-}
-
 fn precharge_execution_verification(
     journal: &Journal,
     execution: &mut RecoveryExecutionPlan,
     observations: &[ArtifactObservation],
-    disposition: RecoveryDisposition,
+    actions: &[PublicationAction],
+    direction: RecoveryDirection,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), ObservationError> {
+    let plan = execution_verification_charge(journal, execution, observations, actions, direction)?;
+    let security_bytes = u64::try_from(plan.security_metadata_copies)
+        .map_err(|_| BudgetError::ArithmeticOverflow {
+            resource: "recovery security metadata reservations",
+        })?
+        .checked_mul(super::platform::SECURITY_METADATA_COPY_RESERVATION_BYTES)
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "recovery security metadata reservations",
+        })?;
+    let total_bytes =
+        plan.charge
+            .bytes
+            .checked_add(security_bytes)
+            .ok_or(BudgetError::ArithmeticOverflow {
+                resource: "recovery execution verification bytes",
+            })?;
+    budget.check_entries(plan.charge.entries)?;
+    budget.check_bytes(total_bytes)?;
+    for action in actions {
+        if let PublicationAction::BackupCaptured(ordinal) = *action {
+            let index = verification_artifact_index(execution, observations, ordinal)?;
+            execution.artifacts[index].security_metadata =
+                Some(reserve_security_metadata_copy(budget)?);
+        }
+    }
+    budget.consume_entries(plan.charge.entries)?;
+    budget.consume_bytes(plan.charge.bytes)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExecutionVerificationPlan {
+    charge: VerificationCharge,
+    security_metadata_copies: usize,
+}
+
+fn execution_verification_charge(
+    journal: &Journal,
+    execution: &RecoveryExecutionPlan,
+    observations: &[ArtifactObservation],
+    actions: &[PublicationAction],
+    direction: RecoveryDirection,
+) -> Result<ExecutionVerificationPlan, ObservationError> {
     if observations.len() != journal.manifest().artifacts().len()
         || execution.artifacts.len() != observations.len()
     {
@@ -4050,143 +3405,255 @@ fn precharge_execution_verification(
         }
         .into());
     }
-    let mut entries = 0_u64;
-    let mut bytes = 0_u64;
-    for ((artifact, observation), execution) in journal
-        .manifest()
-        .artifacts()
-        .iter()
-        .zip(observations)
-        .zip(&mut execution.artifacts)
-    {
-        let (old_reads, new_reads, preserve_security_metadata) =
-            match (disposition, observation.had_original) {
-                (RecoveryDisposition::Forward, true) => {
-                    match (observation.target, observation.staging, observation.backup) {
-                        (EntryEvidence::Old, EntryEvidence::New, EntryEvidence::Missing) => {
-                            (2, 2, true)
-                        }
-                        (EntryEvidence::Missing, EntryEvidence::New, EntryEvidence::Old) => {
-                            (1, 2, true)
-                        }
-                        (EntryEvidence::New, EntryEvidence::Missing, EntryEvidence::Old) => {
-                            (0, 1, false)
-                        }
-                        _ => {
-                            return Err(
-                                invalid_event("forward verification evidence changed").into()
-                            );
-                        }
-                    }
+    let mut charge = VerificationCharge::default();
+    let mut security_metadata_copies = 0_usize;
+    for action in actions {
+        match *action {
+            PublicationAction::BackupIntent(ordinal) => {
+                let index = verification_artifact_index(execution, observations, ordinal)?;
+                let artifact = &journal.manifest().artifacts()[index];
+                add_old_verification_reads(&mut charge, artifact, 1)?;
+            }
+            PublicationAction::BackupCaptured(ordinal) => {
+                let index = verification_artifact_index(execution, observations, ordinal)?;
+                let artifact = &journal.manifest().artifacts()[index];
+                let old_reads = backup_capture_old_reads(observations[index])
+                    .ok_or_else(|| invalid_event("backup verification evidence changed"))?;
+                add_old_verification_reads(&mut charge, artifact, old_reads)?;
+                security_metadata_copies = security_metadata_copies.checked_add(1).ok_or(
+                    BudgetError::ArithmeticOverflow {
+                        resource: "recovery security metadata reservations",
+                    },
+                )?;
+            }
+            PublicationAction::PromotionIntent(ordinal) => {
+                let index = verification_artifact_index(execution, observations, ordinal)?;
+                add_verification_reads(
+                    &mut charge,
+                    journal.manifest().artifacts()[index].new_identity(),
+                    1,
+                )?;
+            }
+            PublicationAction::Promoted(ordinal) => {
+                let index = verification_artifact_index(execution, observations, ordinal)?;
+                let new_reads = promoted_new_reads(observations[index])
+                    .ok_or_else(|| invalid_event("promotion verification evidence changed"))?;
+                add_verification_reads(
+                    &mut charge,
+                    journal.manifest().artifacts()[index].new_identity(),
+                    new_reads,
+                )?;
+            }
+            PublicationAction::Published | PublicationAction::BaselineInstalled => {
+                add_published_verification_reads(journal, &mut charge)?;
+            }
+            PublicationAction::Finalized if direction == RecoveryDirection::Forward => {
+                add_published_verification_reads(journal, &mut charge)?;
+            }
+            PublicationAction::Abandoned => {
+                for (artifact, observation) in
+                    journal.manifest().artifacts().iter().zip(observations)
+                {
+                    add_rollback_verification_reads(&mut charge, artifact, *observation)?;
                 }
-                (RecoveryDisposition::Forward, false) => {
-                    match (observation.target, observation.staging, observation.backup) {
-                        (EntryEvidence::Missing, EntryEvidence::New, EntryEvidence::Missing) => {
-                            (0, 2, false)
-                        }
-                        (EntryEvidence::New, EntryEvidence::Missing, EntryEvidence::Missing) => {
-                            (0, 1, false)
-                        }
-                        _ => {
-                            return Err(
-                                invalid_event("forward verification evidence changed").into()
-                            );
-                        }
-                    }
-                }
-                (RecoveryDisposition::Rollback, true) => {
-                    match (observation.target, observation.staging, observation.backup) {
-                        (
-                            EntryEvidence::Old,
-                            EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
-                            EntryEvidence::Missing,
-                        )
-                        | (
-                            EntryEvidence::Missing,
-                            EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
-                            EntryEvidence::CorruptOld,
-                        )
-                        | (
-                            EntryEvidence::New | EntryEvidence::CorruptNew,
-                            EntryEvidence::Missing,
-                            EntryEvidence::CorruptOld,
-                        ) => (0, 0, false),
-                        (
-                            EntryEvidence::Missing,
-                            EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
-                            EntryEvidence::Old,
-                        )
-                        | (
-                            EntryEvidence::New | EntryEvidence::CorruptNew,
-                            EntryEvidence::Missing,
-                            EntryEvidence::Old,
-                        ) => (1, 0, false),
-                        _ => {
-                            return Err(
-                                invalid_event("rollback verification evidence changed").into()
-                            );
-                        }
-                    }
-                }
-                (RecoveryDisposition::Rollback, false) => {
-                    match (observation.target, observation.staging, observation.backup) {
-                        (
-                            EntryEvidence::Missing,
-                            EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
-                            EntryEvidence::Missing,
-                        )
-                        | (
-                            EntryEvidence::New | EntryEvidence::CorruptNew,
-                            EntryEvidence::Missing,
-                            EntryEvidence::Missing,
-                        ) => (0, 0, false),
-                        _ => {
-                            return Err(
-                                invalid_event("rollback verification evidence changed").into()
-                            );
-                        }
-                    }
-                }
-                (RecoveryDisposition::Blocked, _) => {
-                    return Err(invalid_event("blocked recovery cannot enter execution").into());
-                }
-            };
-        if preserve_security_metadata {
-            execution.security_metadata = Some(reserve_security_metadata_copy(budget)?);
+            }
+            PublicationAction::StagingVerified
+            | PublicationAction::Journaled
+            | PublicationAction::Finalized
+            | PublicationAction::RecoveryDecision(_) => {}
         }
-        if old_reads != 0 {
-            add_verification_reads(
-                &mut entries,
-                &mut bytes,
-                artifact
-                    .old_identity()
-                    .ok_or_else(|| RecoveryBlockedReason::InvalidJournal {
-                        message: "existing artifact has no old identity".to_owned(),
-                    })?,
-                old_reads,
-            )?;
-        }
-        add_verification_reads(&mut entries, &mut bytes, artifact.new_identity(), new_reads)?;
     }
-    budget.check_entries(entries)?;
-    budget.check_bytes(bytes)?;
-    budget.consume_entries(entries)?;
-    budget.consume_bytes(bytes)?;
+    Ok(ExecutionVerificationPlan {
+        charge,
+        security_metadata_copies,
+    })
+}
+
+fn add_published_verification_reads(
+    journal: &Journal,
+    charge: &mut VerificationCharge,
+) -> Result<(), ObservationError> {
+    for artifact in journal.manifest().artifacts() {
+        add_verification_reads(charge, artifact.new_identity(), 1)?;
+        if artifact.old_identity().is_some() {
+            add_old_verification_reads(charge, artifact, 1)?;
+        }
+        add_verification_entries(charge, 1)?;
+    }
     Ok(())
 }
 
-fn add_verification_reads(
-    entries: &mut u64,
-    bytes: &mut u64,
-    identity: &FileIdentity,
+fn precharge_published_verification(
+    journal: &Journal,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), ObservationError> {
+    let mut charge = VerificationCharge::default();
+    add_published_verification_reads(journal, &mut charge)?;
+    budget.check_entries(charge.entries)?;
+    budget.check_bytes(charge.bytes)?;
+    budget.consume_entries(charge.entries)?;
+    budget.consume_bytes(charge.bytes)?;
+    Ok(())
+}
+
+fn backup_capture_old_reads(observation: ArtifactObservation) -> Option<u64> {
+    match observation {
+        ArtifactObservation {
+            target: EntryEvidence::Old,
+            staging: EntryEvidence::New,
+            backup: EntryEvidence::Missing,
+            had_original: true,
+        } => Some(3),
+        ArtifactObservation {
+            target: EntryEvidence::Missing,
+            staging: EntryEvidence::New,
+            backup: EntryEvidence::Old,
+            had_original: true,
+        } => Some(1),
+        _ => None,
+    }
+}
+
+fn promoted_new_reads(observation: ArtifactObservation) -> Option<u64> {
+    match (observation.target, observation.staging) {
+        (EntryEvidence::New, EntryEvidence::Missing) => Some(1),
+        (EntryEvidence::Old | EntryEvidence::Missing, EntryEvidence::New) => Some(3),
+        _ => None,
+    }
+}
+
+fn verification_artifact_index(
+    execution: &RecoveryExecutionPlan,
+    observations: &[ArtifactObservation],
+    ordinal: u32,
+) -> Result<usize, ObservationError> {
+    let index = usize::try_from(ordinal)
+        .map_err(|_| invalid_event("recovery verification ordinal overflowed"))?;
+    observations
+        .get(index)
+        .ok_or_else(|| invalid_event("recovery verification observation is missing"))?;
+    let artifact = execution
+        .artifacts
+        .get(index)
+        .ok_or_else(|| invalid_event("recovery verification execution plan is missing"))?;
+    if artifact.ordinal != ordinal {
+        return Err(
+            invalid_event("recovery verification artifact ordinals are not contiguous").into(),
+        );
+    }
+    Ok(index)
+}
+
+fn add_old_verification_reads(
+    charge: &mut VerificationCharge,
+    artifact: &JournalArtifact,
+    count: u64,
+) -> Result<(), ObservationError> {
+    let identity =
+        artifact
+            .old_identity()
+            .ok_or_else(|| RecoveryBlockedReason::InvalidJournal {
+                message: "existing artifact has no old identity".to_owned(),
+            })?;
+    add_verification_reads(charge, identity, count)?;
+    Ok(())
+}
+
+fn add_rollback_verification_reads(
+    charge: &mut VerificationCharge,
+    artifact: &JournalArtifact,
+    observation: ArtifactObservation,
+) -> Result<(), ObservationError> {
+    let cost = rollback_verification_cost(observation)
+        .ok_or_else(|| invalid_event("rollback verification evidence changed"))?;
+    if cost.old_reads != 0 {
+        add_old_verification_reads(charge, artifact, cost.old_reads)?;
+    }
+    add_verification_reads(charge, artifact.new_identity(), cost.new_reads)?;
+    add_verification_entries(charge, cost.entry_checks)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerificationCost {
+    old_reads: u64,
+    new_reads: u64,
+    entry_checks: u64,
+}
+
+fn rollback_verification_cost(observation: ArtifactObservation) -> Option<VerificationCost> {
+    let (old_reads, new_reads, entry_checks) = if observation.had_original {
+        match (observation.target, observation.staging, observation.backup) {
+            (
+                EntryEvidence::Old,
+                EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
+                EntryEvidence::Missing,
+            ) => (1, 0, 2),
+            (
+                EntryEvidence::Missing,
+                EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
+                EntryEvidence::Old,
+            ) => (4, 0, 2),
+            (EntryEvidence::New, EntryEvidence::Missing, EntryEvidence::Old) => (4, 2, 2),
+            (EntryEvidence::CorruptNew, EntryEvidence::Missing, EntryEvidence::Old) => (4, 0, 2),
+            (
+                EntryEvidence::Missing,
+                EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
+                EntryEvidence::CorruptOld,
+            )
+            | (EntryEvidence::CorruptNew, EntryEvidence::Missing, EntryEvidence::CorruptOld) => {
+                (0, 0, 0)
+            }
+            (EntryEvidence::New, EntryEvidence::Missing, EntryEvidence::CorruptOld) => (0, 2, 0),
+            _ => return None,
+        }
+    } else {
+        match (observation.target, observation.staging, observation.backup) {
+            (
+                EntryEvidence::Missing,
+                EntryEvidence::Missing | EntryEvidence::New | EntryEvidence::CorruptNew,
+                EntryEvidence::Missing,
+            ) => (0, 0, 2),
+            (EntryEvidence::New, EntryEvidence::Missing, EntryEvidence::Missing) => (0, 2, 2),
+            (EntryEvidence::CorruptNew, EntryEvidence::Missing, EntryEvidence::Missing) => {
+                (0, 0, 2)
+            }
+            _ => return None,
+        }
+    };
+    Some(VerificationCost {
+        old_reads,
+        new_reads,
+        entry_checks,
+    })
+}
+
+fn add_verification_entries(
+    charge: &mut VerificationCharge,
     count: u64,
 ) -> Result<(), BudgetError> {
-    *entries = entries
+    charge.entries = charge
+        .entries
         .checked_add(count)
         .ok_or(BudgetError::ArithmeticOverflow {
             resource: "recovery verification entries",
         })?;
-    *bytes = bytes
+    Ok(())
+}
+
+fn add_verification_reads(
+    charge: &mut VerificationCharge,
+    identity: &FileIdentity,
+    count: u64,
+) -> Result<(), BudgetError> {
+    charge.entries = charge
+        .entries
+        .checked_add(count)
+        .ok_or(BudgetError::ArithmeticOverflow {
+            resource: "recovery verification entries",
+        })?;
+    charge.bytes = charge
+        .bytes
         .checked_add(identity.length().checked_mul(count).ok_or(
             BudgetError::ArithmeticOverflow {
                 resource: "recovery verification bytes",
@@ -4348,315 +3815,403 @@ fn execute_owned_corruption_repairs(
     Ok(())
 }
 
-fn roll_forward(
+fn execute_forward_program(
     journal: &mut Journal,
-    facts: &mut EventFacts,
+    protocol: &mut ObservedProtocol,
     observations: &mut [ArtifactObservation],
     execution: &mut RecoveryExecutionPlan,
-    event_plan: &mut JournalEventPlan,
+    event_plan: JournalEventPlan,
+    mut workspace: Option<&mut AssetWorkspace>,
+    prebuilt_baseline: Option<super::baseline::PreparedBaseline>,
+    committed_revision: WorkspaceRevision,
 ) -> Result<(), ExecutionError> {
-    if facts.artifacts.len() != execution.artifacts.len()
+    if protocol.state.artifacts().len() != execution.artifacts.len()
         || observations.len() != execution.artifacts.len()
     {
         return Err(ExecutionError::Blocked(invalid_event(
             "recovery execution plan does not cover every artifact",
         )));
     }
-    append_once(
-        journal,
-        &mut facts.staging_verified,
-        JournalEventKey::StagingVerified,
-        event_plan,
-    )?;
-    append_once(
-        journal,
-        &mut facts.journaled,
-        JournalEventKey::Journaled,
-        event_plan,
-    )?;
-
-    for index in 0..execution.artifacts.len() {
-        forward_artifact(journal, facts, observations, execution, index, event_plan)?;
+    let mut prebuilt_baseline = prebuilt_baseline;
+    for planned in event_plan {
+        let action = planned.action();
+        let transition = protocol
+            .state
+            .prepare(action)
+            .map_err(protocol_execution_error)?;
+        match action {
+            PublicationAction::RecoveryDecision(RecoveryDirection::Forward)
+            | PublicationAction::StagingVerified
+            | PublicationAction::Journaled => {}
+            PublicationAction::BackupIntent(ordinal) => {
+                verify_recovery_backup_intent(observations, execution, ordinal)?;
+            }
+            PublicationAction::BackupCaptured(ordinal) => {
+                execute_recovery_backup_capture(journal, observations, execution, ordinal)?;
+            }
+            PublicationAction::PromotionIntent(ordinal) => {
+                verify_recovery_promotion_intent(journal, observations, execution, ordinal)?;
+            }
+            PublicationAction::Promoted(ordinal) => {
+                execute_recovery_promotion(journal, observations, execution, ordinal)?;
+            }
+            PublicationAction::Published => {
+                verify_published_artifacts(journal, observations, execution)?;
+            }
+            PublicationAction::BaselineInstalled => {
+                let workspace = workspace.as_deref_mut().ok_or_else(|| {
+                    ExecutionError::Blocked(invalid_event(
+                        "detached recovery cannot install a workspace baseline",
+                    ))
+                })?;
+                verify_and_install_recovery_baseline(
+                    journal,
+                    observations,
+                    execution,
+                    workspace,
+                    &mut prebuilt_baseline,
+                    committed_revision,
+                )?;
+            }
+            PublicationAction::Finalized => {
+                if let Some(workspace) = workspace.as_deref_mut() {
+                    verify_and_install_recovery_baseline(
+                        journal,
+                        observations,
+                        execution,
+                        workspace,
+                        &mut prebuilt_baseline,
+                        committed_revision,
+                    )?;
+                }
+            }
+            PublicationAction::RecoveryDecision(RecoveryDirection::Rollback)
+            | PublicationAction::Abandoned => {
+                return Err(ExecutionError::Blocked(invalid_event(
+                    "forward recovery program contains a rollback action",
+                )));
+            }
+        }
+        append_prepared_recovery_event(journal, protocol, planned, transition)?;
     }
-    if observations.iter().any(|artifact| !artifact.is_published()) {
-        return Err(ExecutionError::Blocked(
-            RecoveryBlockedReason::UnexpectedEvidence {
-                artifact: "publication-set".to_owned(),
-            },
-        ));
-    }
-    append_once(
-        journal,
-        &mut facts.published,
-        JournalEventKey::Published,
-        event_plan,
-    )?;
     Ok(())
 }
 
-fn finish_published_events(
+fn execute_rollback_program(
     journal: &mut Journal,
-    facts: &mut EventFacts,
-    event_plan: &mut JournalEventPlan,
-) -> Result<(), ExecutionError> {
-    append_once(
-        journal,
-        &mut facts.staging_verified,
-        JournalEventKey::StagingVerified,
-        event_plan,
-    )?;
-    append_once(
-        journal,
-        &mut facts.journaled,
-        JournalEventKey::Journaled,
-        event_plan,
-    )?;
-    for index in 0..journal.manifest().artifacts().len() {
-        let artifact = &journal.manifest().artifacts()[index];
-        if !facts.artifacts[index].promotion_intent {
-            return Err(ExecutionError::Blocked(invalid_event(
-                "promoted target has no durable intent",
-            )));
-        }
-        if artifact.old_digest().is_some() && !facts.artifacts[index].backup_captured {
-            return Err(ExecutionError::Blocked(invalid_event(
-                "promoted replacement has no captured backup event",
-            )));
-        }
-        append_artifact_once(
-            journal,
-            &mut facts.artifacts[index].promoted,
-            u32::try_from(index).map_err(|_| {
-                ExecutionError::Blocked(invalid_event("artifact ordinal overflowed"))
-            })?,
-            ArtifactEvent::Promoted,
-            event_plan,
-        )?;
-    }
-    append_once(
-        journal,
-        &mut facts.published,
-        JournalEventKey::Published,
-        event_plan,
-    )?;
-    Ok(())
-}
-
-fn forward_artifact(
-    journal: &mut Journal,
-    facts: &mut EventFacts,
+    protocol: &mut ObservedProtocol,
     observations: &mut [ArtifactObservation],
-    execution: &mut RecoveryExecutionPlan,
-    index: usize,
-    event_plan: &mut JournalEventPlan,
+    execution: &RecoveryExecutionPlan,
+    event_plan: JournalEventPlan,
 ) -> Result<(), ExecutionError> {
-    let paths = execution.artifacts.get_mut(index).ok_or_else(|| {
+    for planned in event_plan {
+        let action = planned.action();
+        let transition = protocol
+            .state
+            .prepare(action)
+            .map_err(protocol_execution_error)?;
+        match action {
+            PublicationAction::RecoveryDecision(RecoveryDirection::Rollback)
+            | PublicationAction::Finalized => {}
+            PublicationAction::Abandoned => {
+                #[cfg(test)]
+                super::test_run_publication_hook("before_recovery_rollback");
+                roll_back(journal, observations, execution)?;
+            }
+            PublicationAction::RecoveryDecision(RecoveryDirection::Forward)
+            | PublicationAction::StagingVerified
+            | PublicationAction::Journaled
+            | PublicationAction::BackupIntent(_)
+            | PublicationAction::BackupCaptured(_)
+            | PublicationAction::PromotionIntent(_)
+            | PublicationAction::Promoted(_)
+            | PublicationAction::Published
+            | PublicationAction::BaselineInstalled => {
+                return Err(ExecutionError::Blocked(invalid_event(
+                    "rollback recovery program contains a forward action",
+                )));
+            }
+        }
+        append_prepared_recovery_event(journal, protocol, planned, transition)?;
+    }
+    Ok(())
+}
+
+fn verify_and_install_recovery_baseline(
+    journal: &Journal,
+    observations: &[ArtifactObservation],
+    execution: &RecoveryExecutionPlan,
+    workspace: &mut AssetWorkspace,
+    prebuilt_baseline: &mut Option<super::baseline::PreparedBaseline>,
+    committed_revision: WorkspaceRevision,
+) -> Result<(), ExecutionError> {
+    #[cfg(test)]
+    super::test_run_publication_hook("before_recovery_baseline_install");
+    verify_published_artifacts(journal, observations, execution)?;
+    if workspace.revision() == committed_revision {
+        return Ok(());
+    }
+    let baseline = prebuilt_baseline.take().ok_or_else(|| {
         ExecutionError::Blocked(invalid_event(
-            "recovery execution ordinal is outside its execution plan",
+            "recovery baseline was not prepared before execution",
         ))
     })?;
-    let observation = *observations.get(index).ok_or_else(|| {
-        ExecutionError::Blocked(invalid_event("recovery execution observation is missing"))
-    })?;
-    let facts = facts.artifacts.get_mut(index).ok_or_else(|| {
-        ExecutionError::Blocked(invalid_event("recovery execution facts are missing"))
-    })?;
-
-    if let Some(old) = paths.old_digest {
-        let old_identity = paths.old_identity.as_ref().ok_or_else(|| {
-            ExecutionError::Blocked(invalid_event(
-                "recovery existing artifact has no old identity",
-            ))
-        })?;
-        let backup = paths.backup.as_ref().ok_or_else(|| {
-            ExecutionError::Blocked(invalid_event(
-                "recovery existing artifact has no backup path",
-            ))
-        })?;
-        match (observation.target, observation.staging, observation.backup) {
-            (EntryEvidence::Old, EntryEvidence::New, EntryEvidence::Missing) => {
-                verify_digest_precharged(
-                    &paths.target,
-                    old,
-                    old_identity,
-                    &paths.target_parent_identity,
-                )?;
-                append_artifact_once(
-                    journal,
-                    &mut facts.backup_intent,
-                    paths.ordinal,
-                    ArtifactEvent::BackupIntent,
-                    event_plan,
-                )?;
-                capture_external_regular_in_journal_directory(
-                    &paths.target,
-                    journal.backup_directory(),
-                    backup,
-                    old_identity,
-                    Some(old),
-                    &paths.target_parent_identity,
-                )?;
-                verify_journal_digest_precharged(
-                    journal.backup_directory(),
-                    backup,
-                    old,
-                    old_identity,
-                )?;
-                observations[index].target = EntryEvidence::Missing;
-                observations[index].backup = EntryEvidence::Old;
-                copy_security_metadata_between_journal_directories(
-                    journal.backup_directory(),
-                    backup,
-                    journal.stage_directory(),
-                    &paths.staging,
-                    old_identity,
-                    &paths.new_identity,
-                    paths
-                        .security_metadata
-                        .as_mut()
-                        .ok_or_else(|| {
-                            ExecutionError::Blocked(invalid_event(
-                                "recovery has no reserved security metadata budget",
-                            ))
-                        })?
-                        .budget_mut(),
-                )
-                .map_err(map_security_metadata_execution_error)?;
-                append_artifact_once(
-                    journal,
-                    &mut facts.backup_captured,
-                    paths.ordinal,
-                    ArtifactEvent::BackupCaptured,
-                    event_plan,
-                )?;
-            }
-            (EntryEvidence::Missing, EntryEvidence::New, EntryEvidence::Old) => {
-                if !facts.backup_intent {
-                    return Err(ExecutionError::Blocked(invalid_event(
-                        "captured backup has no durable intent",
-                    )));
-                }
-                verify_journal_digest_precharged(
-                    journal.backup_directory(),
-                    backup,
-                    old,
-                    old_identity,
-                )?;
-                copy_security_metadata_between_journal_directories(
-                    journal.backup_directory(),
-                    backup,
-                    journal.stage_directory(),
-                    &paths.staging,
-                    old_identity,
-                    &paths.new_identity,
-                    paths
-                        .security_metadata
-                        .as_mut()
-                        .ok_or_else(|| {
-                            ExecutionError::Blocked(invalid_event(
-                                "recovery has no reserved security metadata budget",
-                            ))
-                        })?
-                        .budget_mut(),
-                )
-                .map_err(map_security_metadata_execution_error)?;
-                append_artifact_once(
-                    journal,
-                    &mut facts.backup_captured,
-                    paths.ordinal,
-                    ArtifactEvent::BackupCaptured,
-                    event_plan,
-                )?;
-            }
-            (EntryEvidence::New, EntryEvidence::Missing, EntryEvidence::Old) => {
-                if !facts.promotion_intent {
-                    return Err(ExecutionError::Blocked(invalid_event(
-                        "promoted target has no durable intent",
-                    )));
-                }
-                verify_digest_precharged(
-                    &paths.target,
-                    paths.new_digest,
-                    &paths.new_identity,
-                    &paths.target_parent_identity,
-                )?;
-                append_artifact_once(
-                    journal,
-                    &mut facts.promoted,
-                    paths.ordinal,
-                    ArtifactEvent::Promoted,
-                    event_plan,
-                )?;
-                return Ok(());
-            }
-            _ => return Err(unexpected_execution_artifact(paths.ordinal)),
-        }
+    if workspace.install_state_if_current(&baseline.expected, baseline.next) {
+        Ok(())
     } else {
-        match (observation.target, observation.staging, observation.backup) {
-            (EntryEvidence::Missing, EntryEvidence::New, EntryEvidence::Missing) => {}
-            (EntryEvidence::New, EntryEvidence::Missing, EntryEvidence::Missing) => {
-                if !facts.promotion_intent {
-                    return Err(ExecutionError::Blocked(invalid_event(
-                        "promoted target has no durable intent",
-                    )));
-                }
-                verify_digest_precharged(
-                    &paths.target,
-                    paths.new_digest,
-                    &paths.new_identity,
-                    &paths.target_parent_identity,
-                )?;
-                append_artifact_once(
-                    journal,
-                    &mut facts.promoted,
-                    paths.ordinal,
-                    ArtifactEvent::Promoted,
-                    event_plan,
-                )?;
-                return Ok(());
-            }
-            _ => return Err(unexpected_execution_artifact(paths.ordinal)),
-        }
+        Err(ExecutionError::Blocked(
+            RecoveryBlockedReason::BaselineUnavailable {
+                expected: committed_revision,
+                actual: workspace.revision(),
+            },
+        ))
     }
+}
 
-    // Revalidate from a fresh no-follow handle immediately before persisting promotion intent.
-    // Existing corruption is rejected before the target is renamed.
+fn recovery_artifact_index(
+    observations: &[ArtifactObservation],
+    execution: &RecoveryExecutionPlan,
+    ordinal: u32,
+) -> Result<usize, ExecutionError> {
+    let index = usize::try_from(ordinal).map_err(|_| {
+        ExecutionError::Blocked(invalid_event("recovery artifact ordinal overflowed"))
+    })?;
+    observations.get(index).ok_or_else(|| {
+        ExecutionError::Blocked(invalid_event(
+            "recovery action has no filesystem observation",
+        ))
+    })?;
+    let artifact = execution.artifacts.get(index).ok_or_else(|| {
+        ExecutionError::Blocked(invalid_event(
+            "recovery action has no physical execution plan",
+        ))
+    })?;
+    if artifact.ordinal != ordinal {
+        return Err(ExecutionError::Blocked(invalid_event(
+            "recovery execution artifact ordinals are not contiguous",
+        )));
+    }
+    Ok(index)
+}
+
+fn verify_recovery_backup_intent(
+    observations: &[ArtifactObservation],
+    execution: &RecoveryExecutionPlan,
+    ordinal: u32,
+) -> Result<(), ExecutionError> {
+    let index = recovery_artifact_index(observations, execution, ordinal)?;
+    let observation = observations[index];
+    let paths = &execution.artifacts[index];
+    if !matches!(
+        (observation.target, observation.staging, observation.backup),
+        (
+            EntryEvidence::Old,
+            EntryEvidence::New,
+            EntryEvidence::Missing
+        )
+    ) {
+        return Err(unexpected_execution_artifact(ordinal));
+    }
+    let old = paths.old_digest.ok_or_else(|| {
+        ExecutionError::Blocked(invalid_event(
+            "backup intent names an artifact without an old digest",
+        ))
+    })?;
+    let old_identity = paths.old_identity.as_ref().ok_or_else(|| {
+        ExecutionError::Blocked(invalid_event(
+            "backup intent names an artifact without an old identity",
+        ))
+    })?;
+    verify_digest_precharged(
+        &paths.target,
+        old,
+        old_identity,
+        &paths.target_parent_identity,
+    )
+}
+
+fn execute_recovery_backup_capture(
+    journal: &Journal,
+    observations: &mut [ArtifactObservation],
+    execution: &mut RecoveryExecutionPlan,
+    ordinal: u32,
+) -> Result<(), ExecutionError> {
+    let index = recovery_artifact_index(observations, execution, ordinal)?;
+    let observation = observations[index];
+    let paths = &mut execution.artifacts[index];
+    let old = paths.old_digest.ok_or_else(|| {
+        ExecutionError::Blocked(invalid_event(
+            "backup completion names an artifact without an old digest",
+        ))
+    })?;
+    let old_identity = paths.old_identity.as_ref().ok_or_else(|| {
+        ExecutionError::Blocked(invalid_event(
+            "backup completion names an artifact without an old identity",
+        ))
+    })?;
+    let backup = paths.backup.as_ref().ok_or_else(|| {
+        ExecutionError::Blocked(invalid_event(
+            "backup completion names an artifact without a backup path",
+        ))
+    })?;
+    match (observation.target, observation.staging, observation.backup) {
+        (EntryEvidence::Old, EntryEvidence::New, EntryEvidence::Missing) => {
+            capture_external_regular_in_journal_directory(
+                &paths.target,
+                journal.backup_directory(),
+                backup,
+                old_identity,
+                Some(old),
+                &paths.target_parent_identity,
+            )?;
+            verify_journal_digest_precharged(
+                journal.backup_directory(),
+                backup,
+                old,
+                old_identity,
+            )?;
+            observations[index].target = EntryEvidence::Missing;
+            observations[index].backup = EntryEvidence::Old;
+        }
+        (EntryEvidence::Missing, EntryEvidence::New, EntryEvidence::Old) => {
+            verify_journal_digest_precharged(
+                journal.backup_directory(),
+                backup,
+                old,
+                old_identity,
+            )?;
+        }
+        _ => return Err(unexpected_execution_artifact(ordinal)),
+    }
+    copy_security_metadata_between_journal_directories(
+        journal.backup_directory(),
+        backup,
+        journal.stage_directory(),
+        &paths.staging,
+        old_identity,
+        &paths.new_identity,
+        paths
+            .security_metadata
+            .as_mut()
+            .ok_or_else(|| {
+                ExecutionError::Blocked(invalid_event(
+                    "recovery has no reserved security metadata budget",
+                ))
+            })?
+            .budget_mut(),
+    )
+    .map_err(map_security_metadata_execution_error)
+}
+
+fn verify_recovery_promotion_intent(
+    journal: &Journal,
+    observations: &[ArtifactObservation],
+    execution: &RecoveryExecutionPlan,
+    ordinal: u32,
+) -> Result<(), ExecutionError> {
+    let index = recovery_artifact_index(observations, execution, ordinal)?;
+    let observation = observations[index];
+    let paths = &execution.artifacts[index];
+    let expected_backup = if observation.had_original {
+        EntryEvidence::Old
+    } else {
+        EntryEvidence::Missing
+    };
+    if (observation.target, observation.staging, observation.backup)
+        != (EntryEvidence::Missing, EntryEvidence::New, expected_backup)
+    {
+        return Err(unexpected_execution_artifact(ordinal));
+    }
     verify_journal_digest_precharged(
         journal.stage_directory(),
         &paths.staging,
         paths.new_digest,
         &paths.new_identity,
-    )?;
-    append_artifact_once(
-        journal,
-        &mut facts.promotion_intent,
-        paths.ordinal,
-        ArtifactEvent::PromotionIntent,
-        event_plan,
-    )?;
-    promote_journal_regular_to_external(
-        journal.stage_directory(),
-        &paths.staging,
-        &paths.target,
-        &paths.new_identity,
-        Some(paths.new_digest),
-        &paths.target_parent_identity,
-    )?;
-    verify_digest_precharged(
-        &paths.target,
-        paths.new_digest,
-        &paths.new_identity,
-        &paths.target_parent_identity,
-    )?;
-    observations[index].target = EntryEvidence::New;
-    observations[index].staging = EntryEvidence::Missing;
-    append_artifact_once(
-        journal,
-        &mut facts.promoted,
-        paths.ordinal,
-        ArtifactEvent::Promoted,
-        event_plan,
-    )?;
+    )
+}
+
+fn execute_recovery_promotion(
+    journal: &Journal,
+    observations: &mut [ArtifactObservation],
+    execution: &RecoveryExecutionPlan,
+    ordinal: u32,
+) -> Result<(), ExecutionError> {
+    let index = recovery_artifact_index(observations, execution, ordinal)?;
+    let observation = observations[index];
+    let paths = &execution.artifacts[index];
+    let expected_backup = if observation.had_original {
+        EntryEvidence::Old
+    } else {
+        EntryEvidence::Missing
+    };
+    match (observation.target, observation.staging, observation.backup) {
+        (EntryEvidence::Missing, EntryEvidence::New, backup) if backup == expected_backup => {
+            promote_journal_regular_to_external(
+                journal.stage_directory(),
+                &paths.staging,
+                &paths.target,
+                &paths.new_identity,
+                Some(paths.new_digest),
+                &paths.target_parent_identity,
+            )?;
+            verify_digest_precharged(
+                &paths.target,
+                paths.new_digest,
+                &paths.new_identity,
+                &paths.target_parent_identity,
+            )?;
+            observations[index].target = EntryEvidence::New;
+            observations[index].staging = EntryEvidence::Missing;
+        }
+        (EntryEvidence::New, EntryEvidence::Missing, backup) if backup == expected_backup => {
+            verify_digest_precharged(
+                &paths.target,
+                paths.new_digest,
+                &paths.new_identity,
+                &paths.target_parent_identity,
+            )?;
+        }
+        _ => return Err(unexpected_execution_artifact(ordinal)),
+    }
+    Ok(())
+}
+
+fn verify_published_artifacts(
+    journal: &Journal,
+    observations: &[ArtifactObservation],
+    execution: &RecoveryExecutionPlan,
+) -> Result<(), ExecutionError> {
+    if observations.len() != execution.artifacts.len() {
+        return Err(ExecutionError::Blocked(invalid_event(
+            "published verification does not cover every artifact",
+        )));
+    }
+    for (observation, paths) in observations.iter().zip(&execution.artifacts) {
+        if !observation.is_published() {
+            return Err(unexpected_execution_artifact(paths.ordinal));
+        }
+        verify_digest_precharged(
+            &paths.target,
+            paths.new_digest,
+            &paths.new_identity,
+            &paths.target_parent_identity,
+        )?;
+        if let Some(old) = paths.old_digest {
+            let old_identity = paths.old_identity.as_ref().ok_or_else(|| {
+                ExecutionError::Blocked(invalid_event("published replacement has no old identity"))
+            })?;
+            let backup = paths.backup.as_ref().ok_or_else(|| {
+                ExecutionError::Blocked(invalid_event("published replacement has no backup path"))
+            })?;
+            verify_journal_digest_precharged(
+                journal.backup_directory(),
+                backup,
+                old,
+                old_identity,
+            )?;
+        }
+        verify_journal_absent_precharged(journal.stage_directory(), &paths.staging)?;
+    }
     Ok(())
 }
 
@@ -4808,15 +4363,45 @@ fn roll_back(
             }
         }
     }
-    if observations
-        .iter()
-        .any(|artifact| !artifact.is_rolled_back())
-    {
-        return Err(ExecutionError::Blocked(
-            RecoveryBlockedReason::UnexpectedEvidence {
-                artifact: "rollback-set".to_owned(),
-            },
-        ));
+    verify_rolled_back_artifacts(journal, observations, execution)
+}
+
+fn verify_rolled_back_artifacts(
+    journal: &Journal,
+    observations: &[ArtifactObservation],
+    execution: &RecoveryExecutionPlan,
+) -> Result<(), ExecutionError> {
+    if observations.len() != execution.artifacts.len() {
+        return Err(ExecutionError::Blocked(invalid_event(
+            "rollback verification does not cover every artifact",
+        )));
+    }
+    for (observation, paths) in observations.iter().zip(&execution.artifacts) {
+        if !observation.is_rolled_back() {
+            return Err(unexpected_execution_artifact(paths.ordinal));
+        }
+        if let Some(old) = paths.old_digest {
+            let old_identity = paths.old_identity.as_ref().ok_or_else(|| {
+                ExecutionError::Blocked(invalid_event("rolled-back artifact has no old identity"))
+            })?;
+            verify_digest_precharged(
+                &paths.target,
+                old,
+                old_identity,
+                &paths.target_parent_identity,
+            )?;
+        } else {
+            verify_absent_precharged(&paths.target, &paths.target_parent_identity)?;
+        }
+        if let Some(backup) = &paths.backup {
+            verify_journal_absent_precharged(journal.backup_directory(), backup)?;
+        }
+        verify_journal_owned_or_absent_precharged(
+            journal.stage_directory(),
+            &paths.staging,
+            observation.staging,
+            &paths.new_identity,
+        )?;
     }
     Ok(())
 }
@@ -4827,41 +4412,23 @@ fn unexpected_execution_artifact(ordinal: u32) -> ExecutionError {
     })
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ArtifactEvent {
-    BackupIntent,
-    BackupCaptured,
-    PromotionIntent,
-    Promoted,
-}
-
-fn append_artifact_once(
+fn append_prepared_recovery_event(
     journal: &mut Journal,
-    value: &mut bool,
-    ordinal: u32,
-    event: ArtifactEvent,
-    event_plan: &mut JournalEventPlan,
-) -> Result<(), super::journal::JournalError> {
-    let key = match event {
-        ArtifactEvent::BackupIntent => JournalEventKey::BackupIntent(ordinal),
-        ArtifactEvent::BackupCaptured => JournalEventKey::BackupCaptured(ordinal),
-        ArtifactEvent::PromotionIntent => JournalEventKey::PromotionIntent(ordinal),
-        ArtifactEvent::Promoted => JournalEventKey::Promoted(ordinal),
-    };
-    append_once(journal, value, key, event_plan)
-}
-
-fn append_once(
-    journal: &mut Journal,
-    value: &mut bool,
-    event: JournalEventKey,
-    event_plan: &mut JournalEventPlan,
-) -> Result<(), super::journal::JournalError> {
-    if !*value {
-        journal.append_planned(event_plan, event)?;
-        *value = true;
-    }
+    protocol: &mut ObservedProtocol,
+    planned: PlannedJournalEvent,
+    transition: PreparedTransition,
+) -> Result<(), ExecutionError> {
+    journal.append_planned(planned)?;
+    protocol.state.apply_prepared(transition);
     Ok(())
+}
+
+fn protocol_journal_error(error: ProtocolError) -> super::journal::JournalError {
+    super::journal::JournalError::InvalidEvent(error.to_string())
+}
+
+fn protocol_execution_error(error: ProtocolError) -> ExecutionError {
+    protocol_journal_error(error).into()
 }
 
 fn verify_digest_precharged(
@@ -4886,11 +4453,64 @@ fn verify_digest_precharged(
     if &identity != expected_identity {
         return Err(unexpected_verification());
     }
+    #[cfg(test)]
+    super::test_record_verification_hash(expected_identity.length());
     let actual = DigestV1::hash_reader(&mut file, expected_identity.length())?;
     if actual == expected {
         Ok(())
     } else {
         Err(unexpected_verification())
+    }
+}
+
+fn verify_absent_precharged(
+    path: &Path,
+    expected_parent: &DirectoryIdentity,
+) -> Result<(), ExecutionError> {
+    #[cfg(test)]
+    super::test_record_verification_entry();
+    match open_readonly_regular_in_parent(path, expected_parent) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Err(unexpected_verification()),
+        Err(error) => Err(ExecutionError::Io(error)),
+        Ok(_) => Err(unexpected_verification()),
+    }
+}
+
+fn verify_journal_absent_precharged(
+    directory: &JournalDirectory,
+    path: &Path,
+) -> Result<(), ExecutionError> {
+    #[cfg(test)]
+    super::test_record_verification_entry();
+    match open_journal_regular_in_directory(directory, path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Err(unexpected_verification()),
+        Err(error) => Err(ExecutionError::Io(error)),
+        Ok(_) => Err(unexpected_verification()),
+    }
+}
+
+fn verify_journal_owned_or_absent_precharged(
+    directory: &JournalDirectory,
+    path: &Path,
+    evidence: EntryEvidence,
+    expected_identity: &FileIdentity,
+) -> Result<(), ExecutionError> {
+    match evidence {
+        EntryEvidence::Missing => verify_journal_absent_precharged(directory, path),
+        EntryEvidence::New | EntryEvidence::CorruptNew => {
+            #[cfg(test)]
+            super::test_record_verification_entry();
+            let file =
+                open_journal_regular_in_directory(directory, path).map_err(ExecutionError::Io)?;
+            if opened_file_identity(&file)? == *expected_identity {
+                Ok(())
+            } else {
+                Err(unexpected_verification())
+            }
+        }
+        _ => Err(unexpected_verification()),
     }
 }
 
@@ -4916,6 +4536,8 @@ fn verify_journal_digest_precharged(
     if &identity != expected_identity {
         return Err(unexpected_verification());
     }
+    #[cfg(test)]
+    super::test_record_verification_hash(expected_identity.length());
     let actual = DigestV1::hash_reader(&mut file, expected_identity.length())?;
     if actual == expected {
         Ok(())
@@ -4944,24 +4566,38 @@ enum ExecutionError {
 
 fn block_and_record<T>(
     journal: &mut Journal,
+    protocol: &mut ObservedProtocol,
     locator: &RecoveryLocator,
     reason: RecoveryBlockedReason,
     budget: &mut AssetLoadBudget,
 ) -> Result<T, RecoveryError> {
-    let terminal = journal
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind(), JournalEventKind::Finalized));
-    if !terminal
-        && !journal
-            .events()
-            .iter()
-            .any(|event| matches!(event.kind(), JournalEventKind::RecoveryBlocked { .. }))
-    {
+    if !protocol.state.recovery_blocked() {
+        protocol
+            .state
+            .validate(ProtocolEvent::RecoveryBlocked)
+            .map_err(|error| {
+                blocked(
+                    locator,
+                    RecoveryBlockedReason::InvalidEventSequence {
+                        message: error.to_string(),
+                    },
+                )
+            })?;
         let record = reason.to_string();
         journal
             .append(JournalEventKind::RecoveryBlocked { reason: record }, budget)
             .map_err(|error| map_journal_mutation_error(locator, error))?;
+        protocol
+            .state
+            .apply(ProtocolEvent::RecoveryBlocked)
+            .map_err(|error| {
+                blocked(
+                    locator,
+                    RecoveryBlockedReason::InvalidEventSequence {
+                        message: error.to_string(),
+                    },
+                )
+            })?;
     }
     Err(blocked(locator, reason))
 }
@@ -5076,9 +4712,9 @@ mod tests {
     use unity_asset_core::{semantic_value_digest, yaml_field_schema_digest};
 
     use crate::workspace::{
-        AssetWorkspace, FieldGuard, GenericMutation, MutationPlan, MutationValue, PlanPayload,
-        PrepareOptions, PublicationTarget, SourceExpectation, SourceOpenRequest, WorkspaceLookup,
-        WorkspaceOptions, WorkspaceView,
+        AssetWorkspace, CommitError, FieldGuard, GenericMutation, MutationPlan, MutationValue,
+        PlanPayload, PrepareOptions, PublicationTarget, SourceExpectation, SourceOpenRequest,
+        WorkspaceLookup, WorkspaceOptions, WorkspaceView,
     };
     use crate::{
         AssetLoadBudget, FieldPath, ObjectAddress, SourceAlias, SourceFingerprint, SourceKind,
@@ -5233,6 +4869,52 @@ mod tests {
         (directory, path, workspace, report)
     }
 
+    fn replace_with_same_bytes(path: &Path) {
+        let bytes = fs::read(path).expect("replacement source bytes");
+        let replacement = path.with_extension("external-replacement.tmp");
+        fs::write(&replacement, bytes).expect("replacement file");
+        fs::remove_file(path).expect("remove replaced target");
+        fs::rename(replacement, path).expect("install replacement target");
+    }
+
+    fn planned_recovery_verification_charge(
+        report: &CommitReport,
+        baseline: BaselineObservation,
+        direction: RecoveryDirection,
+        finalize_workspace: bool,
+    ) -> VerificationCharge {
+        let journal = Journal::open(
+            test_layout_from_locator(report.recovery()).expect("journal layout"),
+            &mut AssetLoadBudget::default(),
+        )
+        .expect("open journal");
+        let events = ObservedProtocol::from_journal(&journal, &mut AssetLoadBudget::default())
+            .expect("observe protocol");
+        let (execution, artifacts) =
+            observe_execution(&journal, &mut AssetLoadBudget::default()).expect("observe paths");
+        let observation = RecoveryObservation {
+            events,
+            artifacts,
+            baseline,
+        };
+        let actions = recovery_event_program(
+            &observation,
+            direction,
+            finalize_workspace,
+            &mut AssetLoadBudget::default(),
+        )
+        .expect("recovery event program");
+        execution_verification_charge(
+            &journal,
+            &execution,
+            &observation.artifacts,
+            &actions,
+            direction,
+        )
+        .expect("recovery verification charge")
+        .charge
+    }
+
     fn crash_workspace_id() -> WorkspaceId {
         WorkspaceId::from_u128(CRASH_WORKSPACE_ID).expect("workspace id")
     }
@@ -5337,6 +5019,302 @@ mod tests {
         let locator = crash_resource_locator(directory.path(), &path);
         run_crash_child(directory.path(), point, Some(RESOURCE_CRASH_SCENARIO));
         (directory, path, locator)
+    }
+
+    #[test]
+    fn execution_verification_costs_cover_atomic_hash_passes() {
+        let existing = |target, staging, backup| ArtifactObservation {
+            target,
+            staging,
+            backup,
+            had_original: true,
+        };
+        let absent = |target, staging| ArtifactObservation {
+            target,
+            staging,
+            backup: EntryEvidence::Missing,
+            had_original: false,
+        };
+
+        assert_eq!(
+            backup_capture_old_reads(existing(
+                EntryEvidence::Old,
+                EntryEvidence::New,
+                EntryEvidence::Missing,
+            )),
+            Some(3)
+        );
+        assert_eq!(
+            backup_capture_old_reads(existing(
+                EntryEvidence::Missing,
+                EntryEvidence::New,
+                EntryEvidence::Old,
+            )),
+            Some(1)
+        );
+        assert_eq!(
+            promoted_new_reads(existing(
+                EntryEvidence::Missing,
+                EntryEvidence::New,
+                EntryEvidence::Old,
+            )),
+            Some(3)
+        );
+        assert_eq!(
+            promoted_new_reads(existing(
+                EntryEvidence::New,
+                EntryEvidence::Missing,
+                EntryEvidence::Old,
+            )),
+            Some(1)
+        );
+
+        let cases = [
+            (
+                existing(
+                    EntryEvidence::Old,
+                    EntryEvidence::New,
+                    EntryEvidence::Missing,
+                ),
+                VerificationCost {
+                    old_reads: 1,
+                    new_reads: 0,
+                    entry_checks: 2,
+                },
+            ),
+            (
+                existing(
+                    EntryEvidence::Missing,
+                    EntryEvidence::New,
+                    EntryEvidence::Old,
+                ),
+                VerificationCost {
+                    old_reads: 4,
+                    new_reads: 0,
+                    entry_checks: 2,
+                },
+            ),
+            (
+                existing(
+                    EntryEvidence::New,
+                    EntryEvidence::Missing,
+                    EntryEvidence::Old,
+                ),
+                VerificationCost {
+                    old_reads: 4,
+                    new_reads: 2,
+                    entry_checks: 2,
+                },
+            ),
+            (
+                absent(EntryEvidence::New, EntryEvidence::Missing),
+                VerificationCost {
+                    old_reads: 0,
+                    new_reads: 2,
+                    entry_checks: 2,
+                },
+            ),
+        ];
+        for (observation, expected) in cases {
+            assert_eq!(rollback_verification_cost(observation), Some(expected));
+        }
+    }
+
+    #[test]
+    fn terminal_verification_rejects_target_changes_after_observation() {
+        let (_directory, published_path, _workspace, published_report, published) =
+            published_restart_fixture();
+        let published_layout =
+            test_layout_from_locator(published_report.recovery()).expect("published layout");
+        let published_journal = Journal::open(published_layout, &mut AssetLoadBudget::default())
+            .expect("open published journal");
+        let (published_execution, published_observations) =
+            observe_execution(&published_journal, &mut AssetLoadBudget::default())
+                .expect("observe published execution");
+        replace_with_same_bytes(&published_path);
+        assert_eq!(
+            fs::read(&published_path).expect("replacement target"),
+            published
+        );
+        assert!(matches!(
+            verify_published_artifacts(
+                &published_journal,
+                &published_observations,
+                &published_execution,
+            ),
+            Err(ExecutionError::Blocked(
+                RecoveryBlockedReason::UnexpectedEvidence { .. }
+            ))
+        ));
+
+        let (_directory, rollback_path, _workspace, rollback_report, _) =
+            journaled_restart_fixture();
+        let rollback_layout =
+            test_layout_from_locator(rollback_report.recovery()).expect("rollback layout");
+        let rollback_journal = Journal::open(rollback_layout, &mut AssetLoadBudget::default())
+            .expect("open rollback journal");
+        let (rollback_execution, rollback_observations) =
+            observe_execution(&rollback_journal, &mut AssetLoadBudget::default())
+                .expect("observe rollback execution");
+        replace_with_same_bytes(&rollback_path);
+        assert_eq!(fs::read(&rollback_path).expect("replacement target"), YAML);
+        assert!(matches!(
+            verify_rolled_back_artifacts(
+                &rollback_journal,
+                &rollback_observations,
+                &rollback_execution,
+            ),
+            Err(ExecutionError::Blocked(
+                RecoveryBlockedReason::UnexpectedEvidence { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn live_multi_artifact_publication_rejects_replacement_before_published() {
+        let directory = tempfile::tempdir().expect("publication directory");
+        let path = directory.path().join(RESOURCE_ALIAS);
+        fs::write(&path, RESOURCE_YAML).expect("resource fixture");
+        let mut workspace = open_crash_resource_workspace(&path, crash_workspace_id());
+        let base_revision = workspace.revision();
+        let prepared = workspace
+            .prepare(
+                resource_plan(&workspace),
+                PrepareOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("prepare resource publication");
+        let hook_path = path.clone();
+        super::super::test_set_publication_hook("before_live_published_verification", move || {
+            replace_with_same_bytes(&hook_path)
+        });
+
+        let error = workspace
+            .commit(
+                prepared,
+                PublicationTarget::in_place(directory.path()).expect("publication target"),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect_err("replacement before Published must require recovery");
+        let CommitError::RecoveryRequired { locator, .. } = error else {
+            panic!("replacement must return RecoveryRequired");
+        };
+
+        assert_eq!(workspace.revision(), base_revision);
+        let journal = Journal::open(
+            test_layout_from_locator(&locator).expect("journal layout"),
+            &mut AssetLoadBudget::default(),
+        )
+        .expect("open interrupted journal");
+        assert!(
+            !journal
+                .events()
+                .iter()
+                .any(|event| matches!(event.kind(), JournalEventKind::Published))
+        );
+        assert_eq!(
+            journal
+                .events()
+                .iter()
+                .filter(|event| matches!(event.kind(), JournalEventKind::Promoted { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn live_verification_charge_matches_multi_artifact_execution() {
+        let directory = tempfile::tempdir().expect("publication directory");
+        let path = directory.path().join(RESOURCE_ALIAS);
+        fs::write(&path, RESOURCE_YAML).expect("resource fixture");
+        let mut workspace = open_crash_resource_workspace(&path, crash_workspace_id());
+        let prepared = workspace
+            .prepare(
+                resource_plan(&workspace),
+                PrepareOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("prepare resource publication");
+        let target = PublicationTarget::in_place(directory.path()).expect("publication target");
+        let preflight =
+            super::super::preflight_commit(&prepared, &target, &mut AssetLoadBudget::default())
+                .expect("preflight publication");
+        let expected = super::super::live_execution_verification_charge(&preflight.publications)
+            .expect("live verification charge");
+        super::super::test_set_publication_hook("before_live_execution", || {
+            super::super::test_begin_verification_measurement();
+        });
+
+        workspace
+            .commit(prepared, target, &mut AssetLoadBudget::default())
+            .expect("publish resource artifacts");
+
+        assert_eq!(
+            super::super::test_finish_verification_measurement(),
+            expected
+        );
+    }
+
+    #[test]
+    fn recovery_verification_charges_match_forward_and_rollback_execution() {
+        let (_forward_directory, _forward_path, _workspace, forward_report, _published) =
+            journaled_restart_fixture();
+        let forward_expected = planned_recovery_verification_charge(
+            &forward_report,
+            BaselineObservation::Detached,
+            RecoveryDirection::Forward,
+            false,
+        );
+        super::super::test_set_publication_hook("before_recovery_execution", || {
+            super::super::test_begin_verification_measurement();
+        });
+        AssetWorkspace::recover_at(forward_report.recovery(), &mut AssetLoadBudget::default())
+            .expect("forward recovery");
+        assert_eq!(
+            super::super::test_finish_verification_measurement(),
+            forward_expected
+        );
+
+        let (_rollback_directory, _rollback_path, _workspace, rollback_report, _published) =
+            journaled_restart_fixture();
+        let rollback_expected = planned_recovery_verification_charge(
+            &rollback_report,
+            BaselineObservation::Detached,
+            RecoveryDirection::Rollback,
+            true,
+        );
+        super::super::test_set_publication_hook("before_recovery_execution", || {
+            super::super::test_begin_verification_measurement();
+        });
+        AssetWorkspace::abandon_at(rollback_report.recovery(), &mut AssetLoadBudget::default())
+            .expect("rollback recovery");
+        assert_eq!(
+            super::super::test_finish_verification_measurement(),
+            rollback_expected
+        );
+    }
+
+    #[test]
+    fn published_baseline_charge_matches_recovery_execution() {
+        let (_directory, _path, mut workspace, report, _published) = published_restart_fixture();
+        let expected = planned_recovery_verification_charge(
+            &report,
+            BaselineObservation::Base,
+            RecoveryDirection::Forward,
+            true,
+        );
+        super::super::test_set_publication_hook("before_recovery_execution", || {
+            super::super::test_begin_verification_measurement();
+        });
+
+        workspace
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("published baseline recovery");
+
+        assert_eq!(
+            super::super::test_finish_verification_measurement(),
+            expected
+        );
     }
 
     #[test]
@@ -5488,6 +5466,120 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.workspace_id(), Some(crash_workspace_id()));
         assert!(first.rolled_back().is_some());
+    }
+
+    #[test]
+    fn rollback_retry_one_short_budget_preserves_the_terminal_receipt() {
+        let retry_fixture = || {
+            let (directory, path, locator) = run_crashing_commit("preparation_installed");
+            let rolled_back = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+                .expect("create terminal rollback receipt");
+            let receipt = rolled_back
+                .rolled_back()
+                .expect("premanifest recovery must roll back")
+                .clone();
+            let layout = test_layout_from_locator(&locator).expect("retry layout");
+            assert!(layout.rollback_path().is_file());
+            assert!(!layout.preparation_path().exists());
+
+            let workspace = open_crash_workspace(&path, receipt.workspace_id());
+            let prepared = workspace
+                .prepare(
+                    mutation_plan(&workspace, "Before", "After"),
+                    PrepareOptions::default(),
+                    &mut AssetLoadBudget::default(),
+                )
+                .expect("prepare rollback retry");
+            (directory, path, locator, layout, workspace, prepared)
+        };
+
+        let (
+            measured_directory,
+            _measured_path,
+            _measured_locator,
+            _measured_layout,
+            mut measured_workspace,
+            measured_prepared,
+        ) = retry_fixture();
+        let _ = super::super::test_take_live_precharge();
+        measured_workspace
+            .commit(
+                measured_prepared,
+                PublicationTarget::in_place(measured_directory.path())
+                    .expect("measured retry target"),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("measure rollback retry");
+        let (usage_before, verification_charge) =
+            super::super::test_take_live_precharge().expect("measured live precharge");
+        assert!(verification_charge.bytes > 0);
+
+        let (directory, path, locator, layout, mut workspace, prepared) = retry_fixture();
+        let max_bytes = usage_before
+            .bytes
+            .checked_add(verification_charge.bytes)
+            .expect("one-short byte limit")
+            - 1;
+        let mut one_short = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
+            max_bytes,
+            ..unity_asset_core::AssetLoadLimits::default()
+        })
+        .expect("one-short retry budget");
+        let _ = super::super::test_take_live_precharge();
+
+        let error = workspace
+            .commit(
+                prepared,
+                PublicationTarget::in_place(directory.path()).expect("one-short retry target"),
+                &mut one_short,
+            )
+            .expect_err("one-short verification budget must fail before durable replacement");
+
+        assert!(matches!(error, CommitError::Budget { .. }));
+        assert_eq!(
+            super::super::test_take_live_precharge(),
+            Some((usage_before, verification_charge))
+        );
+        assert_eq!(one_short.usage(), usage_before);
+        assert!(layout.rollback_path().is_file());
+        assert!(!layout.preparation_path().exists());
+        assert!(!locator.root().exists());
+        assert_target_unchanged(&path, YAML);
+        assert!(
+            AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+                .expect("redeliver preserved rollback receipt")
+                .rolled_back()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rollback_retry_crash_after_preparation_install_preserves_both_records() {
+        let (directory, path, locator) = run_crashing_commit("preparation_installed");
+        let receipt = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect("create terminal rollback receipt");
+        assert!(receipt.rolled_back().is_some());
+        let layout = test_layout_from_locator(&locator).expect("retry layout");
+        assert!(!layout.preparation_path().exists());
+        assert!(layout.rollback_path().is_file());
+
+        run_crash_child(
+            directory.path(),
+            "preparation_installed_before_rollback_ack",
+            None,
+        );
+
+        assert!(layout.preparation_path().is_file());
+        assert!(layout.rollback_path().is_file());
+        assert!(!layout.directory().exists());
+        assert_target_unchanged(&path, YAML);
+
+        let recovered = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
+            .expect("reconcile retry preparation with terminal rollback");
+        assert_eq!(recovered, receipt);
+        assert!(!layout.preparation_path().exists());
+        assert!(layout.rollback_path().is_file());
+        assert_target_unchanged(&path, YAML);
     }
 
     #[test]
@@ -5886,6 +5978,47 @@ mod tests {
         (directory, path, reopened, report, published)
     }
 
+    fn baseline_installed_restart_fixture() -> (
+        TempDir,
+        std::path::PathBuf,
+        AssetWorkspace,
+        CommitReport,
+        Vec<u8>,
+    ) {
+        let (directory, path, workspace, report) = committed_fixture();
+        let workspace_id = workspace.workspace_id();
+        let published = fs::read(&path).expect("published target");
+        truncate_events_after(&report, |kind| {
+            matches!(kind, JournalEventKind::BaselineInstalled)
+        });
+        drop(workspace);
+
+        fs::write(&path, YAML).expect("restore base target for reopen");
+        let reopened = reopen_base_workspace(workspace_id, &path);
+        assert_eq!(reopened.revision(), report.base_revision());
+        fs::write(&path, &published).expect("restore published target");
+        (directory, path, reopened, report, published)
+    }
+
+    fn finalized_base_restart_fixture() -> (
+        TempDir,
+        std::path::PathBuf,
+        AssetWorkspace,
+        CommitReport,
+        Vec<u8>,
+    ) {
+        let (directory, path, workspace, report) = committed_fixture();
+        let workspace_id = workspace.workspace_id();
+        let published = fs::read(&path).expect("published target");
+        drop(workspace);
+
+        fs::write(&path, YAML).expect("restore base target for reopen");
+        let reopened = reopen_base_workspace(workspace_id, &path);
+        assert_eq!(reopened.revision(), report.base_revision());
+        fs::write(&path, &published).expect("restore published target");
+        (directory, path, reopened, report, published)
+    }
+
     fn journaled_restart_fixture() -> (
         TempDir,
         std::path::PathBuf,
@@ -5941,251 +6074,6 @@ mod tests {
         read_name_at(workspace, &address())
     }
 
-    fn existing(
-        target: EntryEvidence,
-        staging: EntryEvidence,
-        backup: EntryEvidence,
-    ) -> ArtifactObservation {
-        ArtifactObservation {
-            target,
-            staging,
-            backup,
-            had_original: true,
-        }
-    }
-
-    fn absent(target: EntryEvidence, staging: EntryEvidence) -> ArtifactObservation {
-        ArtifactObservation {
-            target,
-            staging,
-            backup: EntryEvidence::Missing,
-            had_original: false,
-        }
-    }
-
-    fn observation(artifacts: Vec<ArtifactObservation>) -> RecoveryObservation {
-        RecoveryObservation {
-            events: EventFacts {
-                artifacts: vec![ArtifactEventFacts::default(); artifacts.len()],
-                ..EventFacts::default()
-            },
-            artifacts,
-            baseline: BaselineObservation::Base,
-        }
-    }
-
-    #[test]
-    fn rollback_direction_rejects_later_forward_events() {
-        let rollback = JournalEvent::new(
-            0,
-            None,
-            JournalEventKind::RecoveryDecision {
-                direction: RecoveryDirection::Rollback,
-            },
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
-        let staging = JournalEvent::new(
-            1,
-            Some(rollback.digest()),
-            JournalEventKind::StagingVerified,
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
-        let mut facts = EventFacts::default();
-        facts.apply(&rollback, &[], &[]).unwrap();
-
-        assert!(matches!(
-            facts.apply(&staging, &[], &[]),
-            Err(RecoveryBlockedReason::InvalidEventSequence { .. })
-        ));
-    }
-
-    #[test]
-    fn published_transaction_rejects_late_rollback_decision() {
-        let rollback = JournalEvent::new(
-            0,
-            None,
-            JournalEventKind::RecoveryDecision {
-                direction: RecoveryDirection::Rollback,
-            },
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
-        let mut facts = EventFacts {
-            published: true,
-            ..EventFacts::default()
-        };
-
-        assert!(matches!(
-            facts.apply(&rollback, &[], &[]),
-            Err(RecoveryBlockedReason::InvalidEventSequence { .. })
-        ));
-    }
-
-    #[test]
-    fn complete_staging_prefers_forward() {
-        let state = observation(vec![
-            existing(
-                EntryEvidence::Old,
-                EntryEvidence::New,
-                EntryEvidence::Missing,
-            ),
-            absent(EntryEvidence::Missing, EntryEvidence::New),
-        ]);
-        assert_eq!(
-            decide_recovery(&state).disposition,
-            RecoveryDisposition::Forward
-        );
-    }
-
-    #[test]
-    fn partial_promotion_still_prefers_forward() {
-        let state = observation(vec![
-            existing(
-                EntryEvidence::New,
-                EntryEvidence::Missing,
-                EntryEvidence::Old,
-            ),
-            absent(EntryEvidence::Missing, EntryEvidence::New),
-        ]);
-        assert_eq!(
-            decide_recovery(&state).disposition,
-            RecoveryDisposition::Forward
-        );
-    }
-
-    #[test]
-    fn missing_unpromoted_stage_forces_rollback() {
-        let state = observation(vec![
-            existing(
-                EntryEvidence::New,
-                EntryEvidence::Missing,
-                EntryEvidence::Old,
-            ),
-            absent(EntryEvidence::Missing, EntryEvidence::Missing),
-        ]);
-        assert_eq!(
-            decide_recovery(&state).disposition,
-            RecoveryDisposition::Rollback
-        );
-    }
-
-    #[test]
-    fn persisted_rollback_direction_is_sticky() {
-        let mut state = observation(vec![existing(
-            EntryEvidence::New,
-            EntryEvidence::Missing,
-            EntryEvidence::Old,
-        )]);
-        state.events.direction = Some(RecoveryDirection::Rollback);
-        assert_eq!(
-            decide_recovery(&state).disposition,
-            RecoveryDisposition::Rollback
-        );
-    }
-
-    #[test]
-    fn unexpected_bytes_block_both_directions() {
-        let state = observation(vec![existing(
-            EntryEvidence::Unexpected,
-            EntryEvidence::New,
-            EntryEvidence::Missing,
-        )]);
-        assert_eq!(
-            decide_recovery(&state).disposition,
-            RecoveryDisposition::Blocked
-        );
-    }
-
-    #[test]
-    fn corrupt_staging_before_target_mutation_is_not_recoverable() {
-        let state = observation(vec![existing(
-            EntryEvidence::Old,
-            EntryEvidence::CorruptNew,
-            EntryEvidence::Missing,
-        )]);
-        assert_eq!(
-            decide_recovery(&state).disposition,
-            RecoveryDisposition::Blocked
-        );
-    }
-
-    #[test]
-    fn corrupt_owned_target_before_publication_forces_rollback() {
-        let state = observation(vec![existing(
-            EntryEvidence::CorruptNew,
-            EntryEvidence::Missing,
-            EntryEvidence::Old,
-        )]);
-        assert_eq!(
-            decide_recovery(&state).disposition,
-            RecoveryDisposition::Rollback
-        );
-    }
-
-    #[test]
-    fn corrupt_captured_backup_is_restored_before_blocking() {
-        let state = observation(vec![existing(
-            EntryEvidence::Missing,
-            EntryEvidence::New,
-            EntryEvidence::CorruptOld,
-        )]);
-        assert_eq!(
-            decide_recovery(&state).disposition,
-            RecoveryDisposition::Rollback
-        );
-    }
-
-    #[test]
-    fn published_bytes_with_base_revision_choose_forward_rebuild() {
-        let mut state = observation(vec![existing(
-            EntryEvidence::New,
-            EntryEvidence::Missing,
-            EntryEvidence::Old,
-        )]);
-        state.events.published = true;
-        state.events.artifacts[0].promoted = true;
-        state.baseline = BaselineObservation::Base;
-        assert_eq!(
-            decide_recovery(&state).disposition,
-            RecoveryDisposition::Forward
-        );
-    }
-
-    #[test]
-    fn finalized_commit_redelivers_only_with_committed_baseline() {
-        let mut state = observation(vec![absent(EntryEvidence::New, EntryEvidence::Missing)]);
-        state.events.published = true;
-        state.events.baseline_installed = true;
-        state.events.finalized = true;
-        state.events.artifacts[0].promoted = true;
-        state.baseline = BaselineObservation::Committed;
-        assert_eq!(
-            decide_recovery(&state).disposition,
-            RecoveryDisposition::Forward
-        );
-
-        state.baseline = BaselineObservation::Base;
-        assert_eq!(
-            decide_recovery(&state).disposition,
-            RecoveryDisposition::Forward
-        );
-    }
-
-    #[test]
-    fn promoted_existing_target_without_backup_is_blocked() {
-        let state = observation(vec![existing(
-            EntryEvidence::New,
-            EntryEvidence::Missing,
-            EntryEvidence::Missing,
-        )]);
-        assert_eq!(
-            decide_recovery(&state).disposition,
-            RecoveryDisposition::Blocked
-        );
-    }
-
     #[test]
     fn finalized_recovery_redelivers_the_same_report_idempotently() {
         let (_directory, _path, mut workspace, report) = committed_fixture();
@@ -6198,6 +6086,88 @@ mod tests {
             .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect("idempotent finalized recovery");
         assert_eq!(second, first);
+    }
+
+    #[test]
+    fn finalized_receipt_reinstalls_a_base_workspace_before_redelivery() {
+        let (_directory, _path, mut reopened, report, _published) =
+            finalized_base_restart_fixture();
+
+        let outcome = reopened
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("install finalized baseline");
+
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
+        );
+        assert_eq!(reopened.revision(), report.committed_revision());
+        assert_eq!(read_name(&reopened), "After");
+    }
+
+    #[test]
+    fn finalized_receipt_rejects_same_bytes_replacement_before_cas() {
+        let (_directory, path, mut reopened, report, published) = finalized_base_restart_fixture();
+        let events = report.recovery().root().join(EVENTS_DIRECTORY);
+        let before = fs::read_dir(&events).expect("events").count();
+        let hook_path = path.clone();
+        super::super::test_set_publication_hook("before_recovery_baseline_install", move || {
+            replace_with_same_bytes(&hook_path)
+        });
+
+        let error = reopened
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect_err("replacement before finalized baseline CAS must block");
+
+        assert!(matches!(
+            error.blocked_reason(),
+            Some(RecoveryBlockedReason::UnexpectedEvidence { .. })
+        ));
+        assert_eq!(reopened.revision(), report.base_revision());
+        assert_eq!(fs::read(&path).expect("replacement target"), published);
+        assert_eq!(fs::read_dir(events).expect("events").count(), before);
+    }
+
+    #[test]
+    fn committed_baseline_rechecks_published_identity_before_finalized() {
+        let (_directory, path, mut workspace, report) = committed_fixture();
+        truncate_events_after(&report, |kind| {
+            matches!(kind, JournalEventKind::BaselineInstalled)
+        });
+        let events = report.recovery().root().join(EVENTS_DIRECTORY);
+        let before = fs::read_dir(&events).expect("events").count();
+        let hook_path = path.clone();
+        super::super::test_set_publication_hook("before_recovery_execution", move || {
+            replace_with_same_bytes(&hook_path)
+        });
+
+        let error = workspace
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect_err("replacement before finalized must block committed workspace");
+
+        assert!(matches!(
+            error.blocked_reason(),
+            Some(RecoveryBlockedReason::UnexpectedEvidence { .. })
+        ));
+        assert_eq!(workspace.revision(), report.committed_revision());
+        assert_eq!(fs::read_dir(events).expect("events").count(), before + 1);
+        let journal = Journal::open(
+            test_layout_from_locator(report.recovery()).expect("journal layout"),
+            &mut AssetLoadBudget::default(),
+        )
+        .expect("open blocked finalization journal");
+        assert!(matches!(
+            journal.events().last().map(JournalEvent::kind),
+            Some(JournalEventKind::RecoveryDecision {
+                direction: RecoveryDirection::Forward
+            })
+        ));
+        assert!(
+            !journal
+                .events()
+                .iter()
+                .any(|event| matches!(event.kind(), JournalEventKind::Finalized))
+        );
     }
 
     #[test]
@@ -6236,6 +6206,61 @@ mod tests {
         );
         assert_eq!(reopened.revision(), report.committed_revision());
         assert_eq!(read_name(&reopened), "After");
+    }
+
+    #[test]
+    fn durable_baseline_event_replays_process_local_install_before_finalized() {
+        let (_directory, _path, mut reopened, report, _published) =
+            baseline_installed_restart_fixture();
+        let events = report.recovery().root().join(EVENTS_DIRECTORY);
+        let before = fs::read_dir(&events).expect("events").count();
+
+        let outcome = reopened
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("replay process-local baseline install");
+
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
+        );
+        assert_eq!(reopened.revision(), report.committed_revision());
+        assert_eq!(read_name(&reopened), "After");
+        assert_eq!(fs::read_dir(events).expect("events").count(), before + 2);
+    }
+
+    #[test]
+    fn baseline_replay_rejects_same_bytes_replacement_before_cas() {
+        let (_directory, path, mut reopened, report, published) =
+            baseline_installed_restart_fixture();
+        let events = report.recovery().root().join(EVENTS_DIRECTORY);
+        let before = fs::read_dir(&events).expect("events").count();
+        let hook_path = path.clone();
+        super::super::test_set_publication_hook("before_recovery_baseline_install", move || {
+            replace_with_same_bytes(&hook_path)
+        });
+
+        let error = reopened
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect_err("replacement before baseline CAS must block recovery");
+
+        assert!(matches!(
+            error.blocked_reason(),
+            Some(RecoveryBlockedReason::UnexpectedEvidence { .. })
+        ));
+        assert_eq!(reopened.revision(), report.base_revision());
+        assert_eq!(fs::read(&path).expect("replacement target"), published);
+        assert_eq!(fs::read_dir(&events).expect("events").count(), before + 1);
+        let journal = Journal::open(
+            test_layout_from_locator(report.recovery()).expect("journal layout"),
+            &mut AssetLoadBudget::default(),
+        )
+        .expect("open blocked journal");
+        assert!(
+            !journal
+                .events()
+                .iter()
+                .any(|event| matches!(event.kind(), JournalEventKind::Finalized))
+        );
     }
 
     #[test]
@@ -6279,6 +6304,80 @@ mod tests {
         assert!(matches!(error, RecoveryError::Budget { .. }));
         assert_eq!(short_workspace.revision(), short_report.base_revision());
         assert_eq!(fs::read(short_path).expect("published target"), published);
+        assert_eq!(fs::read_dir(events).expect("events").count(), event_count);
+
+        let (
+            _entry_short_directory,
+            entry_short_path,
+            mut entry_short_workspace,
+            entry_short_report,
+            published,
+        ) = published_restart_fixture();
+        let events = entry_short_report.recovery().root().join(EVENTS_DIRECTORY);
+        let event_count = fs::read_dir(&events).expect("events").count();
+        let mut one_entry_short = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
+            max_entries: usage.entries - 1,
+            ..exact_limits
+        })
+        .expect("one-entry-short budget");
+
+        let error = entry_short_workspace
+            .finalize_recovery_at(entry_short_report.recovery(), &mut one_entry_short)
+            .expect_err("one-entry-short recovery must fail");
+        assert!(matches!(error, RecoveryError::Budget { .. }));
+        assert_eq!(
+            entry_short_workspace.revision(),
+            entry_short_report.base_revision()
+        );
+        assert_eq!(
+            fs::read(entry_short_path).expect("published target"),
+            published
+        );
+        assert_eq!(fs::read_dir(events).expect("events").count(), event_count);
+    }
+
+    #[test]
+    fn durable_baseline_replay_obeys_exact_and_one_short_entry_budgets() {
+        let (_measured_directory, _measured_path, mut measured_workspace, measured_report, _) =
+            baseline_installed_restart_fixture();
+        let mut measured = AssetLoadBudget::default();
+        measured_workspace
+            .finalize_recovery_at(measured_report.recovery(), &mut measured)
+            .expect("measure durable baseline replay");
+        let usage = measured.usage();
+        let exact_limits = unity_asset_core::AssetLoadLimits {
+            max_entries: usage.entries,
+            max_bytes: usage.bytes,
+            max_depth: usage.max_observed_depth,
+            max_members: usage.members,
+            ..unity_asset_core::AssetLoadLimits::default()
+        };
+
+        let (_exact_directory, _exact_path, mut exact_workspace, exact_report, _) =
+            baseline_installed_restart_fixture();
+        let mut exact = AssetLoadBudget::new(exact_limits).expect("exact replay budget");
+        exact_workspace
+            .finalize_recovery_at(exact_report.recovery(), &mut exact)
+            .expect("exact durable baseline replay");
+        assert_eq!(exact.usage(), usage);
+
+        let (_short_directory, path, mut short_workspace, report, published) =
+            baseline_installed_restart_fixture();
+        let events = report.recovery().root().join(EVENTS_DIRECTORY);
+        let event_count = fs::read_dir(&events).expect("events").count();
+        let mut one_short = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
+            max_entries: usage.entries - 1,
+            ..exact_limits
+        })
+        .expect("one-entry-short replay budget");
+
+        let error = short_workspace
+            .finalize_recovery_at(report.recovery(), &mut one_short)
+            .expect_err("one-entry-short replay must fail before execution");
+
+        assert!(matches!(error, RecoveryError::Budget { .. }));
+        assert_eq!(short_workspace.revision(), report.base_revision());
+        assert_eq!(fs::read(path).expect("published target"), published);
         assert_eq!(fs::read_dir(events).expect("events").count(), event_count);
     }
 
@@ -6412,6 +6511,33 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.kind(), JournalEventKind::Finalized))
         );
+    }
+
+    #[test]
+    fn rollback_rejects_same_bytes_replacement_before_abandoned() {
+        let (_directory, path, _reopened, report, _published) = journaled_restart_fixture();
+        let hook_path = path.clone();
+        super::super::test_set_publication_hook("before_recovery_rollback", move || {
+            replace_with_same_bytes(&hook_path);
+        });
+
+        let error = AssetWorkspace::abandon_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect_err("replacement before rollback must block recovery");
+
+        assert!(matches!(
+            error.blocked_reason(),
+            Some(RecoveryBlockedReason::UnexpectedEvidence { .. })
+        ));
+        assert_eq!(fs::read(&path).expect("replacement target"), YAML);
+        let journal = Journal::open(
+            test_layout_from_locator(report.recovery()).expect("journal layout"),
+            &mut AssetLoadBudget::default(),
+        )
+        .expect("open blocked rollback journal");
+        assert!(!journal.events().iter().any(|event| matches!(
+            event.kind(),
+            JournalEventKind::Abandoned | JournalEventKind::Finalized
+        )));
     }
 
     #[test]
@@ -6926,6 +7052,61 @@ mod tests {
         let mut payload = Vec::new();
         range.copy_to(&mut payload).expect("copy companion bytes");
         assert_eq!(payload, RESOURCE_PAYLOAD);
+    }
+
+    #[test]
+    fn finalized_receipt_completes_a_strict_partial_workspace_baseline() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(RESOURCE_ALIAS);
+        fs::write(&path, RESOURCE_YAML).expect("resource fixture");
+        let mut workspace = AssetWorkspace::new().expect("workspace");
+        workspace
+            .load_source(
+                SourceOpenRequest::new(&path, SourceAlias::new(RESOURCE_ALIAS).expect("alias"))
+                    .with_kind_hint(SourceKind::Yaml),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("load resource fixture");
+        let workspace_id = workspace.workspace_id();
+        let prepared = workspace
+            .prepare(
+                resource_plan(&workspace),
+                PrepareOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("prepare resource mutation");
+        let report = workspace
+            .commit(
+                prepared,
+                PublicationTarget::in_place(directory.path()).expect("publication target"),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("commit resource mutation");
+        drop(workspace);
+
+        let mut reopened =
+            AssetWorkspace::with_workspace_id(workspace_id, WorkspaceOptions::default())
+                .expect("reopened workspace");
+        reopened
+            .load_source(
+                SourceOpenRequest::new(&path, SourceAlias::new(RESOURCE_ALIAS).expect("alias"))
+                    .with_kind_hint(SourceKind::Yaml),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("load published YAML without its companion");
+        assert_ne!(reopened.revision(), report.base_revision());
+        assert_ne!(reopened.revision(), report.committed_revision());
+
+        let outcome = reopened
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("complete strict partial baseline");
+
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
+        );
+        assert_eq!(reopened.revision(), report.committed_revision());
+        assert_resource_payload(&reopened, &report);
     }
 
     #[test]

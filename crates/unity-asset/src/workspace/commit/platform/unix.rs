@@ -1982,6 +1982,8 @@ fn validate_opened_digest(
     changed_message: &'static str,
 ) -> io::Result<()> {
     file.seek(SeekFrom::Start(0))?;
+    #[cfg(test)]
+    super::super::test_record_verification_hash(length);
     let actual = DigestV1::hash_reader(&mut *file, length)?;
     if actual != expected {
         return Err(io::Error::new(io::ErrorKind::InvalidData, changed_message));

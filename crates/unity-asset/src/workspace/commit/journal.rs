@@ -36,6 +36,7 @@ use super::platform::{
 use super::platform::{
     atomic_replace_tracked, create_private_file_in_parent, open_readonly_regular_in_parent,
 };
+use super::publication_protocol::{PublicationAction, RecoveryDirection};
 use super::{CommitArtifactReport, CommitAtomicity, CommitReport, RecoveryLocator};
 
 mod preparation;
@@ -1688,87 +1689,80 @@ fn required_event_capacity(
     Ok(required.expect("validated event capacity"))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RecoveryDirection {
-    Forward,
-    Rollback,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub(crate) enum JournalEventKind {
     StagingVerified,
     Journaled,
-    BackupIntent { artifact: JournalPath },
-    BackupCaptured { artifact: JournalPath },
-    PromotionIntent { artifact: JournalPath },
-    Promoted { artifact: JournalPath },
+    BackupIntent {
+        artifact: JournalPath,
+    },
+    BackupCaptured {
+        artifact: JournalPath,
+    },
+    PromotionIntent {
+        artifact: JournalPath,
+    },
+    Promoted {
+        artifact: JournalPath,
+    },
     Published,
     BaselineInstalled,
     Finalized,
-    RecoveryDecision { direction: RecoveryDirection },
+    RecoveryDecision {
+        direction: RecoveryDirection,
+    },
     Abandoned,
-    RecoveryBlocked { reason: String },
-    Marker { name: String },
+    RecoveryBlocked {
+        reason: String,
+    },
+    /// Read-only compatibility record retained by journal version 3.
+    Marker {
+        name: String,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JournalEventKey {
-    StagingVerified,
-    Journaled,
-    BackupIntent(u32),
-    BackupCaptured(u32),
-    PromotionIntent(u32),
-    Promoted(u32),
-    Published,
-    BaselineInstalled,
-    Finalized,
-    RecoveryDecision(RecoveryDirection),
-    Abandoned,
-}
-
-impl JournalEventKey {
-    fn into_kind(
-        self,
-        manifest: &JournalManifest,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<JournalEventKind, JournalError> {
-        let target = |ordinal: u32, budget: &mut AssetLoadBudget| {
-            let index = usize::try_from(ordinal).map_err(|_| {
-                JournalError::InvalidEvent("artifact event ordinal overflowed".to_owned())
-            })?;
-            manifest
-                .artifacts()
-                .get(index)
-                .ok_or_else(|| {
-                    JournalError::InvalidEvent("artifact event ordinal is out of range".to_owned())
-                })?
-                .target()
-                .clone_budgeted(budget)
-        };
-        Ok(match self {
-            Self::StagingVerified => JournalEventKind::StagingVerified,
-            Self::Journaled => JournalEventKind::Journaled,
-            Self::BackupIntent(ordinal) => JournalEventKind::BackupIntent {
-                artifact: target(ordinal, budget)?,
-            },
-            Self::BackupCaptured(ordinal) => JournalEventKind::BackupCaptured {
-                artifact: target(ordinal, budget)?,
-            },
-            Self::PromotionIntent(ordinal) => JournalEventKind::PromotionIntent {
-                artifact: target(ordinal, budget)?,
-            },
-            Self::Promoted(ordinal) => JournalEventKind::Promoted {
-                artifact: target(ordinal, budget)?,
-            },
-            Self::Published => JournalEventKind::Published,
-            Self::BaselineInstalled => JournalEventKind::BaselineInstalled,
-            Self::Finalized => JournalEventKind::Finalized,
-            Self::RecoveryDecision(direction) => JournalEventKind::RecoveryDecision { direction },
-            Self::Abandoned => JournalEventKind::Abandoned,
-        })
-    }
+fn event_kind_for_action(
+    action: PublicationAction,
+    manifest: &JournalManifest,
+    budget: &mut AssetLoadBudget,
+) -> Result<JournalEventKind, JournalError> {
+    let target = |ordinal: u32, budget: &mut AssetLoadBudget| {
+        let index = usize::try_from(ordinal).map_err(|_| {
+            JournalError::InvalidEvent("artifact event ordinal overflowed".to_owned())
+        })?;
+        manifest
+            .artifacts()
+            .get(index)
+            .ok_or_else(|| {
+                JournalError::InvalidEvent("artifact event ordinal is out of range".to_owned())
+            })?
+            .target()
+            .clone_budgeted(budget)
+    };
+    Ok(match action {
+        PublicationAction::StagingVerified => JournalEventKind::StagingVerified,
+        PublicationAction::Journaled => JournalEventKind::Journaled,
+        PublicationAction::BackupIntent(ordinal) => JournalEventKind::BackupIntent {
+            artifact: target(ordinal, budget)?,
+        },
+        PublicationAction::BackupCaptured(ordinal) => JournalEventKind::BackupCaptured {
+            artifact: target(ordinal, budget)?,
+        },
+        PublicationAction::PromotionIntent(ordinal) => JournalEventKind::PromotionIntent {
+            artifact: target(ordinal, budget)?,
+        },
+        PublicationAction::Promoted(ordinal) => JournalEventKind::Promoted {
+            artifact: target(ordinal, budget)?,
+        },
+        PublicationAction::Published => JournalEventKind::Published,
+        PublicationAction::BaselineInstalled => JournalEventKind::BaselineInstalled,
+        PublicationAction::Finalized => JournalEventKind::Finalized,
+        PublicationAction::RecoveryDecision(direction) => {
+            JournalEventKind::RecoveryDecision { direction }
+        }
+        PublicationAction::Abandoned => JournalEventKind::Abandoned,
+    })
 }
 
 impl JournalEventKind {
@@ -2213,39 +2207,30 @@ struct OpenedJournalDirectories {
     baseline: JournalDirectory,
 }
 
-struct PreparedJournalEvent {
-    key: JournalEventKey,
+pub(crate) struct PlannedJournalEvent {
+    key: PublicationAction,
     event: JournalEvent,
     destination: PathBuf,
     temporary: PathBuf,
     encoded: Vec<u8>,
 }
 
-pub(crate) struct JournalEventPlan {
-    events: std::vec::IntoIter<PreparedJournalEvent>,
+impl PlannedJournalEvent {
+    #[must_use]
+    pub(crate) const fn action(&self) -> PublicationAction {
+        self.key
+    }
 }
 
-impl JournalEventPlan {
-    fn pop(&mut self, expected: JournalEventKey) -> Result<PreparedJournalEvent, JournalError> {
-        let event = self.events.next().ok_or_else(|| {
-            JournalError::InvalidEvent("event plan was exhausted before execution".to_owned())
-        })?;
-        if event.key != expected {
-            return Err(JournalError::InvalidEvent(
-                "event plan execution order changed after preflight".to_owned(),
-            ));
-        }
-        Ok(event)
-    }
+pub(crate) struct JournalEventPlan {
+    events: std::vec::IntoIter<PlannedJournalEvent>,
+}
 
-    pub(crate) fn finish(self) -> Result<(), JournalError> {
-        if self.events.len() == 0 {
-            Ok(())
-        } else {
-            Err(JournalError::InvalidEvent(
-                "event plan retained unexecuted records".to_owned(),
-            ))
-        }
+impl Iterator for JournalEventPlan {
+    type Item = PlannedJournalEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.events.next()
     }
 }
 
@@ -2343,7 +2328,7 @@ impl Journal {
     pub(crate) fn create_planned(
         layout: JournalLayout,
         manifest: JournalManifest,
-        event_keys: &[JournalEventKey],
+        event_keys: &[PublicationAction],
         budget: &mut AssetLoadBudget,
     ) -> Result<(Self, JournalEventPlan), JournalCreateError> {
         let root = super::platform::open_commit_root(layout.parent(), layout.root_identity())
@@ -2366,7 +2351,7 @@ impl Journal {
     pub(crate) fn create_planned_in_access(
         layout: JournalLayout,
         manifest: JournalManifest,
-        event_keys: &[JournalEventKey],
+        event_keys: &[PublicationAction],
         access: &JournalAccess<'_>,
         budget: &mut AssetLoadBudget,
     ) -> Result<(Self, JournalEventPlan), JournalCreateError> {
@@ -2596,7 +2581,7 @@ impl Journal {
 
     pub(crate) fn plan_events(
         &self,
-        keys: &[JournalEventKey],
+        keys: &[PublicationAction],
         budget: &mut AssetLoadBudget,
     ) -> Result<JournalEventPlan, JournalError> {
         Self::plan_events_for(
@@ -2614,7 +2599,7 @@ impl Journal {
         manifest: &JournalManifest,
         chain: &EventChain,
         next_temporary_attempt: u32,
-        keys: &[JournalEventKey],
+        keys: &[PublicationAction],
         budget: &mut AssetLoadBudget,
     ) -> Result<JournalEventPlan, JournalError> {
         let total = chain
@@ -2646,7 +2631,7 @@ impl Journal {
             .map_err(|_| JournalError::InvalidEvent("event sequence overflow".to_owned()))?;
         let mut previous = chain.events().last().map(JournalEvent::digest);
         for (offset, key) in keys.iter().copied().enumerate() {
-            let kind = key.into_kind(manifest, budget)?;
+            let kind = event_kind_for_action(key, manifest, budget)?;
             let event = JournalEvent::new(sequence, previous, kind, budget)?;
             let filename = budgeted_event_filename(&event, budget)?;
             let destination = budgeted_journal_join(
@@ -2672,7 +2657,7 @@ impl Journal {
             sequence = sequence
                 .checked_add(1)
                 .ok_or_else(|| JournalError::InvalidEvent("event sequence overflow".to_owned()))?;
-            events.push(PreparedJournalEvent {
+            events.push(PlannedJournalEvent {
                 key,
                 event,
                 destination,
@@ -2687,8 +2672,7 @@ impl Journal {
 
     pub(crate) fn append_planned(
         &mut self,
-        plan: &mut JournalEventPlan,
-        expected: JournalEventKey,
+        prepared: PlannedJournalEvent,
     ) -> Result<(), JournalError> {
         self.layout.verify_root_path_binding()?;
         if self.chain.events.len() >= self.chain.events.capacity() {
@@ -2696,7 +2680,6 @@ impl Journal {
                 "journal event chain capacity was exhausted before durable append".to_owned(),
             ));
         }
-        let prepared = plan.pop(expected)?;
         if prepared.event.sequence()
             != u64::try_from(self.chain.events.len())
                 .map_err(|_| JournalError::InvalidEvent("event sequence overflow".to_owned()))?
@@ -3815,6 +3798,85 @@ mod tests {
             EventChain::from_events(vec![first, broken], &mut budget),
             Err(JournalError::PreviousDigestMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn version_three_marker_remains_read_compatible() {
+        const LEGACY_MARKER_JSON: &[u8] = br#"{"version":3,"sequence":0,"previous":null,"kind":{"type":"marker","data":{"name":"legacy-diagnostic"}},"digest":"blake3-v1:f9442532a217d3bc5abeba6b5ab8fd531e2b64d619e206fafbbc0a7062c66879"}"#;
+        const LEGACY_MARKER_FILENAME: &str = "00000000000000000000-f9442532a217d3bc5abeba6b5ab8fd531e2b64d619e206fafbbc0a7062c66879.json";
+
+        let decoded: JournalEvent =
+            serde_json::from_slice(LEGACY_MARKER_JSON).expect("decode legacy marker");
+        decoded
+            .validate(&mut AssetLoadBudget::default())
+            .expect("validate legacy marker");
+        assert_eq!(
+            decoded.kind(),
+            &JournalEventKind::Marker {
+                name: "legacy-diagnostic".to_owned(),
+            }
+        );
+        assert_eq!(
+            budgeted_event_filename(&decoded, &mut AssetLoadBudget::default())
+                .expect("legacy marker filename"),
+            LEGACY_MARKER_FILENAME
+        );
+        assert_eq!(
+            serde_json::to_vec(&decoded).expect("re-encode legacy marker"),
+            LEGACY_MARKER_JSON
+        );
+    }
+
+    fn assert_legacy_event_chain(records: &[(&[u8], &str)]) {
+        let mut events = Vec::with_capacity(records.len());
+        for (json, filename) in records {
+            let event: JournalEvent = serde_json::from_slice(json).expect("decode legacy event");
+            event
+                .validate(&mut AssetLoadBudget::default())
+                .expect("validate legacy event");
+            assert_eq!(
+                budgeted_event_filename(&event, &mut AssetLoadBudget::default())
+                    .expect("legacy event filename"),
+                *filename
+            );
+            assert_eq!(
+                serde_json::to_vec(&event).expect("re-encode legacy event"),
+                *json
+            );
+            events.push(event);
+        }
+        EventChain::from_events(events, &mut AssetLoadBudget::default())
+            .expect("legacy event digest chain");
+    }
+
+    #[test]
+    fn version_three_action_chains_remain_read_compatible() {
+        // Captured from the pre-protocol v3 encoder at d6bef0b. Do not regenerate
+        // these bytes from the current encoder: they are a compatibility fixture.
+        const FORWARD: &[(&[u8], &str)] = &[
+            (br#"{"version":3,"sequence":0,"previous":null,"kind":{"type":"staging_verified"},"digest":"blake3-v1:c7a8dc3ee1d08bc8ec526cb35e2ba1f55233afad5e600b4f0dd47dcbc4135177"}"#, "00000000000000000000-c7a8dc3ee1d08bc8ec526cb35e2ba1f55233afad5e600b4f0dd47dcbc4135177.json"),
+            (br#"{"version":3,"sequence":1,"previous":"blake3-v1:c7a8dc3ee1d08bc8ec526cb35e2ba1f55233afad5e600b4f0dd47dcbc4135177","kind":{"type":"journaled"},"digest":"blake3-v1:79e8a849efeb26849075b7fd1867a0a99e8f5ab1dc5ce45709bad5d803de9d7b"}"#, "00000000000000000001-79e8a849efeb26849075b7fd1867a0a99e8f5ab1dc5ce45709bad5d803de9d7b.json"),
+            (br#"{"version":3,"sequence":2,"previous":"blake3-v1:79e8a849efeb26849075b7fd1867a0a99e8f5ab1dc5ce45709bad5d803de9d7b","kind":{"type":"recovery_decision","data":{"direction":"forward"}},"digest":"blake3-v1:5720436d11216f7422b1ec717323a4ebd759ec653d74908bd8dc67548bc79894"}"#, "00000000000000000002-5720436d11216f7422b1ec717323a4ebd759ec653d74908bd8dc67548bc79894.json"),
+            (br#"{"version":3,"sequence":3,"previous":"blake3-v1:5720436d11216f7422b1ec717323a4ebd759ec653d74908bd8dc67548bc79894","kind":{"type":"backup_intent","data":{"artifact":"existing.asset"}},"digest":"blake3-v1:ef90df5d38fc580e0db06c716153337793942e86a41e92d27d1c92957e870a96"}"#, "00000000000000000003-ef90df5d38fc580e0db06c716153337793942e86a41e92d27d1c92957e870a96.json"),
+            (br#"{"version":3,"sequence":4,"previous":"blake3-v1:ef90df5d38fc580e0db06c716153337793942e86a41e92d27d1c92957e870a96","kind":{"type":"backup_captured","data":{"artifact":"existing.asset"}},"digest":"blake3-v1:fbcc39a06b0d2dc4adde1137dec624d47f6ffa7f2996a4652d4806b7883dfac0"}"#, "00000000000000000004-fbcc39a06b0d2dc4adde1137dec624d47f6ffa7f2996a4652d4806b7883dfac0.json"),
+            (br#"{"version":3,"sequence":5,"previous":"blake3-v1:fbcc39a06b0d2dc4adde1137dec624d47f6ffa7f2996a4652d4806b7883dfac0","kind":{"type":"promotion_intent","data":{"artifact":"existing.asset"}},"digest":"blake3-v1:e43c7bfb34447cfb585747b8fd1fb630907bdab666d9ed085d954b095c6ecfd0"}"#, "00000000000000000005-e43c7bfb34447cfb585747b8fd1fb630907bdab666d9ed085d954b095c6ecfd0.json"),
+            (br#"{"version":3,"sequence":6,"previous":"blake3-v1:e43c7bfb34447cfb585747b8fd1fb630907bdab666d9ed085d954b095c6ecfd0","kind":{"type":"promoted","data":{"artifact":"existing.asset"}},"digest":"blake3-v1:5229fde61dfd9802c1c74af0d957f7fbf0fe2fca3133d9b747037cc6a4ccbb86"}"#, "00000000000000000006-5229fde61dfd9802c1c74af0d957f7fbf0fe2fca3133d9b747037cc6a4ccbb86.json"),
+            (br#"{"version":3,"sequence":7,"previous":"blake3-v1:5229fde61dfd9802c1c74af0d957f7fbf0fe2fca3133d9b747037cc6a4ccbb86","kind":{"type":"promotion_intent","data":{"artifact":"absent.asset"}},"digest":"blake3-v1:4bd917884e609b4f5fc71e2f2fa02bde6b88b3f71cf454aa374b6e7f8df80514"}"#, "00000000000000000007-4bd917884e609b4f5fc71e2f2fa02bde6b88b3f71cf454aa374b6e7f8df80514.json"),
+            (br#"{"version":3,"sequence":8,"previous":"blake3-v1:4bd917884e609b4f5fc71e2f2fa02bde6b88b3f71cf454aa374b6e7f8df80514","kind":{"type":"promoted","data":{"artifact":"absent.asset"}},"digest":"blake3-v1:89f5248047be01e2d14214cc0f1652c15f63e92374afe78d546476de5f57aa4e"}"#, "00000000000000000008-89f5248047be01e2d14214cc0f1652c15f63e92374afe78d546476de5f57aa4e.json"),
+            (br#"{"version":3,"sequence":9,"previous":"blake3-v1:89f5248047be01e2d14214cc0f1652c15f63e92374afe78d546476de5f57aa4e","kind":{"type":"published"},"digest":"blake3-v1:c563fb648d3f7f96cc30a72b292d0229da0fa47456961e004588b396c2505cf2"}"#, "00000000000000000009-c563fb648d3f7f96cc30a72b292d0229da0fa47456961e004588b396c2505cf2.json"),
+            (br#"{"version":3,"sequence":10,"previous":"blake3-v1:c563fb648d3f7f96cc30a72b292d0229da0fa47456961e004588b396c2505cf2","kind":{"type":"baseline_installed"},"digest":"blake3-v1:9f592f63a9f5f6789f344832609c753ce5143c71b4631e8c43e7397928c43f3b"}"#, "00000000000000000010-9f592f63a9f5f6789f344832609c753ce5143c71b4631e8c43e7397928c43f3b.json"),
+            (br#"{"version":3,"sequence":11,"previous":"blake3-v1:9f592f63a9f5f6789f344832609c753ce5143c71b4631e8c43e7397928c43f3b","kind":{"type":"finalized"},"digest":"blake3-v1:5d57cfe3f184d8e5edb1aee30e7455cfa6a467f6a0aa0ed6507c0660f0d7b3c6"}"#, "00000000000000000011-5d57cfe3f184d8e5edb1aee30e7455cfa6a467f6a0aa0ed6507c0660f0d7b3c6.json"),
+        ];
+        const ROLLBACK: &[(&[u8], &str)] = &[
+            (br#"{"version":3,"sequence":0,"previous":null,"kind":{"type":"staging_verified"},"digest":"blake3-v1:c7a8dc3ee1d08bc8ec526cb35e2ba1f55233afad5e600b4f0dd47dcbc4135177"}"#, "00000000000000000000-c7a8dc3ee1d08bc8ec526cb35e2ba1f55233afad5e600b4f0dd47dcbc4135177.json"),
+            (br#"{"version":3,"sequence":1,"previous":"blake3-v1:c7a8dc3ee1d08bc8ec526cb35e2ba1f55233afad5e600b4f0dd47dcbc4135177","kind":{"type":"journaled"},"digest":"blake3-v1:79e8a849efeb26849075b7fd1867a0a99e8f5ab1dc5ce45709bad5d803de9d7b"}"#, "00000000000000000001-79e8a849efeb26849075b7fd1867a0a99e8f5ab1dc5ce45709bad5d803de9d7b.json"),
+            (br#"{"version":3,"sequence":2,"previous":"blake3-v1:79e8a849efeb26849075b7fd1867a0a99e8f5ab1dc5ce45709bad5d803de9d7b","kind":{"type":"recovery_decision","data":{"direction":"rollback"}},"digest":"blake3-v1:b2cb8c45a068bd2cc7419b35b59e341f59f1db864ee134e822da1187949fcb1f"}"#, "00000000000000000002-b2cb8c45a068bd2cc7419b35b59e341f59f1db864ee134e822da1187949fcb1f.json"),
+            (br#"{"version":3,"sequence":3,"previous":"blake3-v1:b2cb8c45a068bd2cc7419b35b59e341f59f1db864ee134e822da1187949fcb1f","kind":{"type":"abandoned"},"digest":"blake3-v1:da8c96c24e6fa52c1c4851ac35db57f2dbd1a83aaabbb6c736cac281dda7682e"}"#, "00000000000000000003-da8c96c24e6fa52c1c4851ac35db57f2dbd1a83aaabbb6c736cac281dda7682e.json"),
+            (br#"{"version":3,"sequence":4,"previous":"blake3-v1:da8c96c24e6fa52c1c4851ac35db57f2dbd1a83aaabbb6c736cac281dda7682e","kind":{"type":"finalized"},"digest":"blake3-v1:9458ef26ff4b7b448778bbcfc250fa83e1b54c8d7ce91452246dadcf38913402"}"#, "00000000000000000004-9458ef26ff4b7b448778bbcfc250fa83e1b54c8d7ce91452246dadcf38913402.json"),
+        ];
+
+        assert_legacy_event_chain(FORWARD);
+        assert_legacy_event_chain(ROLLBACK);
     }
 
     #[test]

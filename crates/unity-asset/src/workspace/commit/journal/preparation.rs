@@ -424,12 +424,14 @@ impl JournalPreparation {
         Ok(())
     }
 
-    pub(crate) fn acknowledge_matching_rollback_in_access(
+    pub(crate) fn open_matching_rollback_in_access(
         layout: &JournalLayout,
         report: &CommitReport,
+        outputs: &[JournalPreparationOutput],
+        baseline: &JournalBaseline,
         access: &JournalAccess<'_>,
         budget: &mut AssetLoadBudget,
-    ) -> Result<(), JournalError> {
+    ) -> Result<OpenedJournalPreparation, JournalError> {
         let rollback = Self::open_rollback_in_access(layout, access, budget)?;
         let document = rollback.document();
         let report_matches = document.transaction == report.transaction()
@@ -440,6 +442,8 @@ impl JournalPreparation {
             && document.atomicity == report.atomicity()
             && document.containment_root_identity == *report.recovery().root_identity()
             && document.changes == *report.changes()
+            && document.outputs == outputs
+            && document.baseline == *baseline
             && document.outputs.len() == report.artifacts().len()
             && document
                 .outputs
@@ -456,6 +460,14 @@ impl JournalPreparation {
                 "terminal rollback does not match the retried commit report".to_owned(),
             ));
         }
+        Ok(rollback)
+    }
+
+    pub(crate) fn acknowledge_rollback_in_access(
+        layout: &JournalLayout,
+        access: &JournalAccess<'_>,
+        rollback: OpenedJournalPreparation,
+    ) -> Result<(), JournalError> {
         remove_journal_regular(access, layout.rollback_path(), rollback.identity())?;
         sync_journal_access(access).map_err(JournalError::Io)
     }

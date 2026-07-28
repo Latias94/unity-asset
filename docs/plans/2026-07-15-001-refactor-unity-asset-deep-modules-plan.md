@@ -253,7 +253,7 @@ stateDiagram-v2
   Publishing --> Prepared: retryable failure before journal
   Publishing --> RecoveryRequired: interrupted or blocked
   Publishing --> Snapshot: finalized new revision
-  RecoveryRequired --> Snapshot: reopen rolls forward or back
+  RecoveryRequired --> Snapshot: reopen follows the sticky publication protocol
   Rejected --> Snapshot
   Conflict --> Snapshot
 ```
@@ -294,7 +294,8 @@ stateDiagram-v2
   Capturing --> RecoveryRequired: interruption
   Promoting --> RecoveryRequired: interruption
   Published --> RecoveryRequired: interruption
-  RecoveryRequired --> Finalized: idempotent roll forward or rollback
+  RecoveryRequired --> Finalized: before Published choose sticky forward or rollback
+  RecoveryRequired --> BaselineInstalled: after Published only advance and redeliver
   RecoveryRequired --> RecoveryBlocked: unknown or externally changed bytes
 ```
 
@@ -812,9 +813,10 @@ Temporary bridges are implementation-only and must be crate-private. No public c
 
 **Files:**
 
-- Create crates/unity-asset/src/workspace/commit.rs
-- Create crates/unity-asset/src/workspace/journal.rs
-- Create crates/unity-asset/src/workspace/recovery.rs
+- Modify crates/unity-asset/src/workspace/commit.rs
+- Create crates/unity-asset/src/workspace/commit/publication_protocol.rs
+- Modify crates/unity-asset/src/workspace/commit/journal.rs
+- Modify crates/unity-asset/src/workspace/commit/recovery.rs
 - Create crates/unity-asset/src/workspace/commit/platform/mod.rs
 - Create crates/unity-asset/src/workspace/commit/platform/unix.rs
 - Create crates/unity-asset/src/workspace/commit/platform/windows.rs
@@ -830,7 +832,7 @@ Temporary bridges are implementation-only and must be crate-private. No public c
 - Delete crates/unity-asset-write/src/object/serialized_file_session.rs
 - Delete crates/unity-asset-write/tests/edit_session.rs
 
-**Approach:** Acquire an exclusive cross-process workspace/journal commit guard and revision CAS. Use target-specific rustix and windows-sys adapters for no-follow component opening, stable file identity, same-filesystem staging, atomic capture and promotion, file and directory flush, sharing/reparse diagnostics, and supported fallback classification. PublicationTarget contains a deterministic recovery root under the destination parent; AssetWorkspace::recover_at is the pre-open entry point for both out-of-place and in-place transactions. Bind both sources and existing destinations to fingerprints and path identities. Stream exact Prepared Artifact images once into same-filesystem staging while recomputing DigestV1. Before every irreversible action, durably record transaction ID, workspace and destination identities, atomicity, old/new digests, relative staging/backup identities, canonical CommitReport data, Change Set, identity remap, and promotion cursor; sync file and parent-directory state before advancing the journal. Treat the journal as untrusted: validate schema/version and transaction identity and re-establish no-follow root containment, file identity, and digest before every recovery action. Capture the old target atomically into the journaled backup and verify that captured digest before promotion, closing the final-check TOCTOU window where the platform permits it. Unknown or externally replaced bytes block publication or recovery and preserve private evidence. Journal, staging, and backup permissions never exceed the target and default to owner-only; preserve supported Unix ownership/mode and Windows ACL security metadata across promotion and rollback. On success, install reparsed published images, Change Set, identity remap, and revision through one CAS-protected baseline swap; recovery reconstructs and idempotently redelivers the same canonical result. U7 returns the result and never invokes a derived consumer.
+**Approach:** Extract a crate-private publication protocol from the existing nested commit implementation. The protocol uniquely owns durable logical state, per-artifact progress, legal event prefixes, sticky recovery direction, Published and Finalized boundaries, and the next durable action program. Journal remains the budgeted version-3 wire, hash-chain, pre-encoding, and atomic append adapter; commit and recovery execute protocol actions; platform modules retain no-follow, identity, rename, sync, ACL, and ownership operations. Acquire an exclusive cross-process workspace/journal commit guard and revision CAS. Use target-specific rustix and windows-sys adapters for no-follow component opening, stable file identity, same-filesystem staging, atomic capture and promotion, file and directory flush, sharing/reparse diagnostics, and supported fallback classification. PublicationTarget contains a deterministic recovery root under the destination parent; AssetWorkspace::recover_at is the pre-open entry point for both out-of-place and in-place transactions. Bind both sources and existing destinations to fingerprints and path identities. Stream exact Prepared Artifact images once into same-filesystem staging while recomputing DigestV1. Before the first durable recovery write or irreversible action, use the caller-owned AssetLoadBudget to preallocate paths, verification reservations, and every encoded event in the selected protocol program; the execution phase does not allocate, discover paths, or encode records. Before every irreversible action, durably record transaction ID, workspace and destination identities, atomicity, old/new digests, relative staging/backup identities, canonical CommitReport data, Change Set, identity remap, and promotion cursor; sync file and parent-directory state before advancing the journal. Treat the journal as untrusted: validate schema/version and transaction identity and re-establish no-follow root containment, file identity, and digest before every recovery action. Capture the old target atomically into the journaled backup and verify that captured digest before promotion, closing the final-check TOCTOU window where the platform permits it. Unknown or externally replaced bytes block publication or recovery and preserve private evidence. Journal, staging, and backup permissions never exceed the target and default to owner-only; preserve supported Unix ownership/mode and Windows ACL security metadata across promotion and rollback. Published is the irreversible logical publication boundary: recovery before it may select one sticky safe direction, while recovery after it can only install or redeliver the new baseline and canonical result. Freshly verify the complete target, backup, and staging set before recording Published and before every baseline CAS; a durable BaselineInstalled record never substitutes for re-establishing a newly opened process's in-memory baseline. On success, install reparsed published images, Change Set, identity remap, and revision through one CAS-protected baseline swap; recovery reconstructs and idempotently redelivers the same canonical result. U7 returns the result and never invokes a derived consumer.
 
 **Execution note:** Use failpoints and child-process recovery tests. Do not introduce a public filesystem trait; use tempfile and real platform behavior.
 
@@ -852,7 +854,7 @@ Temporary bridges are implementation-only and must be crate-private. No public c
 12. Return a committed Change Set without invoking derived consumers; simulate caller-side delivery failure and prove the baseline remains N+1 and the same idempotency key can be submitted later. U9 owns Search Generation failure and reconciliation coverage.
 13. Delete ChangeTracker, changed booleans, SerializedFileEditSession, EnvironmentEditSession, EnvironmentWriteState, and direct save/edit escape hatches after workspace callers migrate.
 14. Seed a syntactically valid malicious journal with absolute, parent-relative, cross-workspace, and reparse-point-swapped target/staging/backup entries; recover_at performs no external write and returns RecoveryBlocked.
-15. Crash after publication or baseline installation but before the caller receives a response; recover_at returns the byte-identical canonical CommitReport, Change Set, and identity remap exactly once per idempotency key.
+15. Crash after publication or baseline installation but before the caller receives a response; every retry for the same transaction or idempotency key returns the byte-identical canonical CommitReport, Change Set, and identity remap. Delivery is at least once and caller-deduplicable; publication, baseline installation, and revision advancement occur only once.
 16. Recover an out-of-place transaction using only its deterministic destination-parent locator, without an in-memory PreparedChange or CommitReport.
 17. Verify journal, staging, backup, promoted, rolled-back, Finalized, RecoveryBlocked, and explicit abandon states preserve or tighten Unix mode/owner and Windows ACLs, never log protected paths or bytes unexpectedly, and clean or retain private evidence according to policy.
 18. Run on a filesystem missing a required atomic, locking, identity, or directory-sync primitive and return the documented unsupported atomicity or PublishBlocked result instead of silently weakening guarantees.

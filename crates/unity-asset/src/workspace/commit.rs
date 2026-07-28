@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
+#[cfg(test)]
+use unity_asset_core::AssetLoadUsage;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ChangeSet, ContainmentKind, DigestV1, SourceFingerprint,
     SourceId, TransactionId, WorkspaceId, WorkspaceRevision,
@@ -24,10 +26,10 @@ use super::{AssetWorkspace, PreparedChange};
 use self::baseline::{MaterializedImages, PreparedBaseline};
 use self::journal::{
     Journal, JournalArtifact, JournalBaseline, JournalBaselineImage, JournalBaselineSource,
-    JournalCatalogAction, JournalDirectoryIdentities, JournalError, JournalEventKey,
-    JournalEventPlan, JournalExpectedDestination, JournalLayout, JournalManifest, JournalPath,
-    JournalPreparation, JournalPreparationOutput, JournalTransactionOutputSeed,
-    JournalTransactionSeed, OpenedJournalPreparation, transaction_id_from_seed,
+    JournalCatalogAction, JournalDirectoryIdentities, JournalError, JournalEventPlan,
+    JournalExpectedDestination, JournalLayout, JournalManifest, JournalPath, JournalPreparation,
+    JournalPreparationOutput, JournalTransactionOutputSeed, JournalTransactionSeed,
+    OpenedJournalPreparation, PlannedJournalEvent, transaction_id_from_seed,
 };
 use self::platform::{
     CommitGuard, CommitRoot, DirectoryIdentity, FileIdentity, JournalAccess, JournalDirectory,
@@ -43,20 +45,123 @@ use self::platform::{
     promote_journal_regular_to_external, reserve_security_metadata_copy, sync_journal_access,
     sync_journal_directory, sync_journal_namespace,
 };
+use self::publication_protocol::{PublicationAction, append_commit_program};
 
 mod baseline;
 mod journal;
 pub(crate) mod platform;
+mod publication_protocol;
 mod recovery;
 
 #[cfg(test)]
 const TEST_CRASH_POINT_ENV: &str = "UNITY_ASSET_TEST_CRASH_POINT";
 
 #[cfg(test)]
+type TestPublicationHook = (&'static str, Box<dyn FnOnce()>);
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_PUBLICATION_HOOK:
+        std::cell::RefCell<Option<TestPublicationHook>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_VERIFICATION_USAGE:
+        std::cell::RefCell<Option<VerificationCharge>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_LIVE_PRECHARGE:
+        std::cell::RefCell<Option<(AssetLoadUsage, VerificationCharge)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 fn test_crash_failpoint(point: &str) {
     if std::env::var(TEST_CRASH_POINT_ENV).is_ok_and(|configured| configured == point) {
         std::process::exit(86);
     }
+}
+
+#[cfg(test)]
+fn test_set_publication_hook(point: &'static str, callback: impl FnOnce() + 'static) {
+    TEST_PUBLICATION_HOOK.with(|slot| {
+        let previous = slot.borrow_mut().replace((point, Box::new(callback)));
+        assert!(
+            previous.is_none(),
+            "publication test hook already installed"
+        );
+    });
+}
+
+#[cfg(test)]
+fn test_run_publication_hook(point: &'static str) {
+    TEST_PUBLICATION_HOOK.with(|slot| {
+        let Some((expected, callback)) = slot.borrow_mut().take() else {
+            return;
+        };
+        if expected == point {
+            callback();
+        } else {
+            slot.borrow_mut().replace((expected, callback));
+        }
+    });
+}
+
+#[cfg(test)]
+fn test_begin_verification_measurement() {
+    TEST_VERIFICATION_USAGE.with(|slot| {
+        let previous = slot.borrow_mut().replace(VerificationCharge::default());
+        assert!(
+            previous.is_none(),
+            "verification measurement already active"
+        );
+    });
+}
+
+#[cfg(test)]
+fn test_record_verification_entry() {
+    TEST_VERIFICATION_USAGE.with(|slot| {
+        if let Some(usage) = slot.borrow_mut().as_mut() {
+            usage.entries = usage
+                .entries
+                .checked_add(1)
+                .expect("test verification entry count overflowed");
+        }
+    });
+}
+
+#[cfg(test)]
+fn test_record_verification_hash(bytes: u64) {
+    TEST_VERIFICATION_USAGE.with(|slot| {
+        if let Some(usage) = slot.borrow_mut().as_mut() {
+            usage.entries = usage
+                .entries
+                .checked_add(1)
+                .expect("test verification entry count overflowed");
+            usage.bytes = usage
+                .bytes
+                .checked_add(bytes)
+                .expect("test verification byte count overflowed");
+        }
+    });
+}
+
+#[cfg(test)]
+fn test_finish_verification_measurement() -> VerificationCharge {
+    TEST_VERIFICATION_USAGE.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .expect("verification measurement was not active")
+    })
+}
+
+#[cfg(test)]
+fn test_record_live_precharge(usage: AssetLoadUsage, charge: VerificationCharge) {
+    TEST_LIVE_PRECHARGE.with(|slot| {
+        slot.borrow_mut().replace((usage, charge));
+    });
+}
+
+#[cfg(test)]
+fn test_take_live_precharge() -> Option<(AssetLoadUsage, VerificationCharge)> {
+    TEST_LIVE_PRECHARGE.with(|slot| slot.borrow_mut().take())
 }
 
 #[cfg(test)]
@@ -534,6 +639,12 @@ struct PublicationExecution {
     stage: PathBuf,
     backup: Option<PathBuf>,
     security_metadata: Option<SecurityMetadataCopyReservation>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct VerificationCharge {
+    entries: u64,
+    bytes: u64,
 }
 
 struct CommitPreflight {
@@ -1169,16 +1280,22 @@ impl AssetWorkspace {
                 ));
             }
         }
-        match JournalPreparation::acknowledge_matching_rollback_in_access(
-            &layout, &report, &access, budget,
+        precharge_live_execution_verification(&publications, budget)
+            .map_err(map_preflight_error)?;
+        let preparation_outputs =
+            journal_preparation_outputs(&publications, budget).map_err(map_preflight_error)?;
+        let matching_rollback = match JournalPreparation::open_matching_rollback_in_access(
+            &layout,
+            &report,
+            &preparation_outputs,
+            &recovery_baseline,
+            &access,
+            budget,
         ) {
-            Ok(()) => {}
-            Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(rollback) => Some(rollback),
+            Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
             Err(JournalError::Budget(source)) => {
                 return Err(PreparePublicationError::Budget(source));
-            }
-            Err(JournalError::Io(error)) => {
-                return Err(map_prejournal_io("acknowledge terminal rollback", error));
             }
             Err(error) => {
                 return Err(PreparePublicationError::RecoveryRequired {
@@ -1186,9 +1303,7 @@ impl AssetWorkspace {
                     message: error.to_string(),
                 });
             }
-        }
-        let preparation_outputs =
-            journal_preparation_outputs(&publications, budget).map_err(map_preflight_error)?;
+        };
         recovery::cleanup_orphaned_preparation_attempts(&layout, &access, budget)
             .map_err(map_orphaned_preparation_cleanup_error)?;
         let preparation_temporary =
@@ -1213,6 +1328,18 @@ impl AssetWorkspace {
                 return Err(map_unpublished_journal_prepare_error(error.into_source()));
             }
         };
+        if let Some(rollback) = matching_rollback {
+            #[cfg(test)]
+            test_crash_failpoint("preparation_installed_before_rollback_ack");
+            JournalPreparation::acknowledge_rollback_in_access(&layout, &access, rollback).map_err(
+                |error| PreparePublicationError::RecoveryRequired {
+                    locator: locator.clone(),
+                    message: format!(
+                        "new preparation is durable but terminal rollback acknowledgement failed: {error}"
+                    ),
+                },
+            )?;
+        }
         #[cfg(test)]
         test_crash_failpoint("preparation_installed");
         let directories =
@@ -1390,7 +1517,7 @@ impl AssetWorkspace {
                 ));
             }
         };
-        let event_keys = match commit_event_keys(&publications, budget) {
+        let event_keys = match commit_event_program(&publications, budget) {
             Ok(keys) => keys,
             Err(error) => {
                 return Err(cleanup_prejournal_error(
@@ -1447,67 +1574,100 @@ impl AssetWorkspace {
             mut execution,
             baseline,
             mut journal,
-            mut event_plan,
+            event_plan,
             report,
         } = ready;
         let locator = report.recovery().clone();
         debug_assert_eq!(publications.len(), execution.len());
-        journal
-            .append_planned(&mut event_plan, JournalEventKey::StagingVerified)
-            .and_then(|_| journal.append_planned(&mut event_plan, JournalEventKey::Journaled))
-            .map_err(|error| CommitError::RecoveryRequired {
-                locator: locator.clone(),
-                message: error.to_string(),
-            })?;
-
-        for (publication, execution) in publications.iter().zip(&mut execution) {
-            debug_assert_eq!(publication.ordinal, execution.ordinal);
-            match publish_one(&mut journal, &mut event_plan, publication, execution) {
-                Ok(()) => {}
-                Err(PublishError::Message(message)) => {
-                    return Err(CommitError::RecoveryRequired {
-                        locator: locator.clone(),
-                        message,
-                    });
+        #[cfg(test)]
+        test_run_publication_hook("before_live_execution");
+        for planned in event_plan {
+            let action = planned.action();
+            let result = match action {
+                PublicationAction::StagingVerified | PublicationAction::Journaled => {
+                    append_live_event(&mut journal, planned)
                 }
+                PublicationAction::BackupIntent(_ordinal) => {
+                    let result = append_live_event(&mut journal, planned);
+                    #[cfg(test)]
+                    if result.is_ok() {
+                        test_crash_artifact_failpoint("backup_intent", _ordinal);
+                    }
+                    result
+                }
+                PublicationAction::BackupCaptured(ordinal) => {
+                    commit_backup_capture(&journal, &publications, &mut execution, ordinal)
+                        .and_then(|_| append_live_event(&mut journal, planned))
+                }
+                PublicationAction::PromotionIntent(ordinal) => {
+                    commit_verify_staging(&journal, &publications, &execution, ordinal).and_then(
+                        |_| {
+                            let result = append_live_event(&mut journal, planned);
+                            #[cfg(test)]
+                            if result.is_ok() {
+                                test_crash_artifact_failpoint("promotion_intent", ordinal);
+                            }
+                            result
+                        },
+                    )
+                }
+                PublicationAction::Promoted(ordinal) => {
+                    commit_promote(&journal, &publications, &execution, ordinal)
+                        .and_then(|_| append_live_event(&mut journal, planned))
+                }
+                PublicationAction::Published => {
+                    #[cfg(test)]
+                    test_run_publication_hook("before_live_published_verification");
+                    let result =
+                        verify_live_published_artifacts(&journal, &publications, &execution)
+                            .and_then(|()| append_live_event(&mut journal, planned));
+                    #[cfg(test)]
+                    if result.is_ok() {
+                        test_crash_failpoint("published");
+                    }
+                    result
+                }
+                PublicationAction::BaselineInstalled => {
+                    #[cfg(test)]
+                    test_run_publication_hook("before_live_baseline_verification");
+                    verify_live_published_artifacts(&journal, &publications, &execution)
+                        .and_then(|()| {
+                            if prepared_revision_changed(self, &baseline)
+                                || !self.install_state_if_current(
+                                    &baseline.expected,
+                                    Arc::clone(&baseline.next),
+                                )
+                            {
+                                Err(
+                                    "published bytes could not be installed over the expected workspace baseline"
+                                        .to_owned(),
+                                )
+                            } else {
+                                #[cfg(test)]
+                                test_crash_failpoint("baseline_cas_before_event");
+                                append_live_event(&mut journal, planned)
+                            }
+                        })
+                }
+                PublicationAction::Finalized => {
+                    let result = append_live_event(&mut journal, planned);
+                    #[cfg(test)]
+                    if result.is_ok() {
+                        test_crash_failpoint("finalized_before_response");
+                    }
+                    result
+                }
+                PublicationAction::RecoveryDecision(_) | PublicationAction::Abandoned => {
+                    Err("live commit program contains a recovery-only action".to_owned())
+                }
+            };
+            if let Err(message) = result {
+                return Err(CommitError::RecoveryRequired {
+                    locator: locator.clone(),
+                    message,
+                });
             }
         }
-        journal
-            .append_planned(&mut event_plan, JournalEventKey::Published)
-            .map_err(|error| CommitError::RecoveryRequired {
-                locator: locator.clone(),
-                message: error.to_string(),
-            })?;
-        #[cfg(test)]
-        test_crash_failpoint("published");
-
-        if prepared_revision_changed(self, &baseline)
-            || !self.install_state_if_current(&baseline.expected, baseline.next)
-        {
-            return Err(CommitError::RecoveryRequired {
-                locator,
-                message:
-                    "published bytes could not be installed over the expected workspace baseline"
-                        .to_owned(),
-            });
-        }
-        #[cfg(test)]
-        test_crash_failpoint("baseline_cas_before_event");
-        journal
-            .append_planned(&mut event_plan, JournalEventKey::BaselineInstalled)
-            .and_then(|_| journal.append_planned(&mut event_plan, JournalEventKey::Finalized))
-            .map_err(|error| CommitError::RecoveryRequired {
-                locator: locator.clone(),
-                message: error.to_string(),
-            })?;
-        #[cfg(test)]
-        test_crash_failpoint("finalized_before_response");
-        event_plan
-            .finish()
-            .map_err(|error| CommitError::RecoveryRequired {
-                locator: locator.clone(),
-                message: error.to_string(),
-            })?;
         Ok(report)
     }
 }
@@ -2207,10 +2367,10 @@ fn map_journal_preflight_error(error: JournalError) -> CommitPreflightError {
     }
 }
 
-fn commit_event_keys(
+fn commit_event_program(
     publications: &[PreparedPublication],
     budget: &mut AssetLoadBudget,
-) -> Result<Vec<JournalEventKey>, CommitPreflightError> {
+) -> Result<Vec<PublicationAction>, CommitPreflightError> {
     let artifact_events = publications
         .iter()
         .try_fold(0_usize, |count, publication| {
@@ -2229,136 +2389,230 @@ fn commit_event_keys(
             resource: "commit event plan",
         })?;
     let mut keys = budgeted_vec(capacity, "commit event plan", budget)?;
-    keys.push(JournalEventKey::StagingVerified);
-    keys.push(JournalEventKey::Journaled);
-    for publication in publications {
-        if publication.expected_identity.is_some() {
-            keys.push(JournalEventKey::BackupIntent(publication.ordinal));
-            keys.push(JournalEventKey::BackupCaptured(publication.ordinal));
-        }
-        keys.push(JournalEventKey::PromotionIntent(publication.ordinal));
-        keys.push(JournalEventKey::Promoted(publication.ordinal));
-    }
-    keys.push(JournalEventKey::Published);
-    keys.push(JournalEventKey::BaselineInstalled);
-    keys.push(JournalEventKey::Finalized);
+    append_commit_program(
+        publications.len(),
+        |index| {
+            (
+                publications[index].ordinal,
+                publications[index].expected_identity.is_some(),
+            )
+        },
+        &mut keys,
+    )
+    .map_err(|error| CommitPreflightError::Ownership(error.to_string()))?;
     Ok(keys)
 }
 
-#[derive(Debug)]
-enum PublishError {
-    Message(String),
+fn precharge_live_execution_verification(
+    publications: &[PreparedPublication],
+    budget: &mut AssetLoadBudget,
+) -> Result<(), CommitPreflightError> {
+    let charge = live_execution_verification_charge(publications)?;
+    #[cfg(test)]
+    test_record_live_precharge(budget.usage(), charge);
+    budget.check_entries(charge.entries)?;
+    budget.check_bytes(charge.bytes)?;
+    budget.consume_entries(charge.entries)?;
+    budget.consume_bytes(charge.bytes)?;
+    Ok(())
 }
 
-impl From<String> for PublishError {
-    fn from(message: String) -> Self {
-        Self::Message(message)
+fn live_execution_verification_charge(
+    publications: &[PreparedPublication],
+) -> Result<VerificationCharge, CommitPreflightError> {
+    let mut charge = VerificationCharge::default();
+    for publication in publications {
+        let (artifact_entries, artifact_bytes) = match publication.expected {
+            DestinationState::Existing(_) => {
+                let old_identity = publication.expected_identity.as_ref().ok_or_else(|| {
+                    CommitPreflightError::Ownership(
+                        "existing publication target has no captured identity".to_owned(),
+                    )
+                })?;
+                (
+                    14_u64,
+                    publication
+                        .bytes
+                        .checked_mul(7)
+                        .and_then(|new| {
+                            old_identity
+                                .length()
+                                .checked_mul(5)
+                                .and_then(|old| new.checked_add(old))
+                        })
+                        .ok_or(BudgetError::ArithmeticOverflow {
+                            resource: "live publication execution verification bytes",
+                        })?,
+                )
+            }
+            DestinationState::Absent => (
+                8_u64,
+                publication
+                    .bytes
+                    .checked_mul(6)
+                    .ok_or(BudgetError::ArithmeticOverflow {
+                        resource: "live publication execution verification bytes",
+                    })?,
+            ),
+            DestinationState::Directory
+            | DestinationState::SymbolicLink
+            | DestinationState::Other => {
+                return Err(CommitPreflightError::Ownership(
+                    "unsupported destination reached publication execution".to_owned(),
+                ));
+            }
+        };
+        charge.entries = charge.entries.checked_add(artifact_entries).ok_or(
+            BudgetError::ArithmeticOverflow {
+                resource: "live publication execution verification entries",
+            },
+        )?;
+        charge.bytes =
+            charge
+                .bytes
+                .checked_add(artifact_bytes)
+                .ok_or(BudgetError::ArithmeticOverflow {
+                    resource: "live publication execution verification bytes",
+                })?;
     }
+    Ok(charge)
 }
 
-fn publish_one(
-    journal: &mut Journal,
-    event_plan: &mut JournalEventPlan,
-    publication: &PreparedPublication,
-    execution: &mut PublicationExecution,
-) -> Result<(), PublishError> {
-    debug_assert_eq!(publication.ordinal, execution.ordinal);
+fn append_live_event(journal: &mut Journal, planned: PlannedJournalEvent) -> Result<(), String> {
+    journal
+        .append_planned(planned)
+        .map_err(|error| error.to_string())
+}
+
+fn live_artifact_index(
+    publications: &[PreparedPublication],
+    execution: &[PublicationExecution],
+    ordinal: u32,
+) -> Result<usize, String> {
+    let index = usize::try_from(ordinal)
+        .map_err(|_| "live commit artifact ordinal overflowed".to_owned())?;
+    let publication = publications
+        .get(index)
+        .ok_or_else(|| "live commit action names an unknown publication".to_owned())?;
+    let artifact = execution
+        .get(index)
+        .ok_or_else(|| "live commit action has no physical execution plan".to_owned())?;
+    if publication.ordinal != ordinal || artifact.ordinal != ordinal {
+        return Err("live commit artifact ordinals are not contiguous".to_owned());
+    }
+    Ok(index)
+}
+
+fn commit_backup_capture(
+    journal: &Journal,
+    publications: &[PreparedPublication],
+    execution: &mut [PublicationExecution],
+    ordinal: u32,
+) -> Result<(), String> {
+    let index = live_artifact_index(publications, execution, ordinal)?;
+    let publication = &publications[index];
+    let execution = &mut execution[index];
     let stage = &execution.stage;
+    let backup = execution
+        .backup
+        .as_ref()
+        .ok_or_else(|| "existing publication has no prepared backup path".to_owned())?;
+    let expected_identity = publication
+        .expected_identity
+        .as_ref()
+        .ok_or_else(|| "existing publication target has no captured identity".to_owned())?;
+    let staged_identity = publication
+        .staged_identity
+        .as_ref()
+        .ok_or_else(|| "staged artifact has no captured identity".to_owned())?;
+    let DestinationState::Existing(expected) = publication.expected else {
+        return Err("backup action names a publication without an existing target".to_owned());
+    };
+    verify_journal_file(
+        journal.stage_directory(),
+        stage,
+        publication.digest,
+        Some(publication.bytes),
+        Some(staged_identity),
+    )
+    .map_err(|error| error.to_string())?;
+    capture_external_regular_in_journal_directory(
+        &publication.target,
+        journal.backup_directory(),
+        backup,
+        expected_identity,
+        Some(expected.digest()),
+        &publication.destination_parent_identity,
+    )
+    .map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    test_crash_artifact_failpoint("backup_renamed", publication.ordinal);
+    verify_journal_file(
+        journal.backup_directory(),
+        backup,
+        expected.digest(),
+        None,
+        publication.expected_identity.as_ref(),
+    )
+    .map_err(|error| error.to_string())?;
+    copy_security_metadata_between_journal_directories(
+        journal.backup_directory(),
+        backup,
+        journal.stage_directory(),
+        stage,
+        expected_identity,
+        staged_identity,
+        execution
+            .security_metadata
+            .as_mut()
+            .ok_or_else(|| {
+                "existing publication has no reserved security metadata budget".to_owned()
+            })?
+            .budget_mut(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn commit_verify_staging(
+    journal: &Journal,
+    publications: &[PreparedPublication],
+    execution: &[PublicationExecution],
+    ordinal: u32,
+) -> Result<(), String> {
+    let index = live_artifact_index(publications, execution, ordinal)?;
+    let publication = &publications[index];
+    let execution = &execution[index];
     let staged_identity = publication
         .staged_identity
         .as_ref()
         .ok_or_else(|| "staged artifact has no captured identity".to_owned())?;
     verify_journal_file(
         journal.stage_directory(),
-        stage,
+        &execution.stage,
         publication.digest,
         Some(publication.bytes),
         Some(staged_identity),
     )
-    .map_err(|error| error.to_string())?;
-    if matches!(publication.expected, DestinationState::Existing(_)) {
-        let backup = execution
-            .backup
-            .as_ref()
-            .ok_or_else(|| "existing publication has no prepared backup path".to_owned())?;
-        journal
-            .append_planned(
-                event_plan,
-                JournalEventKey::BackupIntent(publication.ordinal),
-            )
-            .map_err(|error| error.to_string())?;
-        #[cfg(test)]
-        test_crash_artifact_failpoint("backup_intent", publication.ordinal);
-        let expected_identity = publication
-            .expected_identity
-            .as_ref()
-            .ok_or_else(|| "existing publication target has no captured identity".to_owned())?;
-        let DestinationState::Existing(expected) = publication.expected else {
-            unreachable!();
-        };
-        capture_external_regular_in_journal_directory(
-            &publication.target,
-            journal.backup_directory(),
-            backup,
-            expected_identity,
-            Some(expected.digest()),
-            &publication.destination_parent_identity,
-        )
-        .map_err(|error| error.to_string())?;
-        #[cfg(test)]
-        test_crash_artifact_failpoint("backup_renamed", publication.ordinal);
-        verify_journal_file(
-            journal.backup_directory(),
-            backup,
-            expected.digest(),
-            None,
-            publication.expected_identity.as_ref(),
-        )
-        .map_err(|error| error.to_string())?;
-        copy_security_metadata_between_journal_directories(
-            journal.backup_directory(),
-            backup,
-            journal.stage_directory(),
-            stage,
-            expected_identity,
-            staged_identity,
-            execution
-                .security_metadata
-                .as_mut()
-                .ok_or_else(|| {
-                    "existing publication has no reserved security metadata budget".to_owned()
-                })?
-                .budget_mut(),
-        )
-        .map_err(|error| error.to_string())?;
-        journal
-            .append_planned(
-                event_plan,
-                JournalEventKey::BackupCaptured(publication.ordinal),
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    // This is the publication linearization check. It immediately precedes the durable intent so
-    // already-visible stage corruption cannot mutate the target first.
-    verify_journal_file(
-        journal.stage_directory(),
-        stage,
-        publication.digest,
-        Some(publication.bytes),
-        Some(staged_identity),
-    )
-    .map_err(|error| error.to_string())?;
-    journal
-        .append_planned(
-            event_plan,
-            JournalEventKey::PromotionIntent(publication.ordinal),
-        )
-        .map_err(|error| error.to_string())?;
-    #[cfg(test)]
-    test_crash_artifact_failpoint("promotion_intent", publication.ordinal);
+    .map_err(|error| error.to_string())
+}
+
+fn commit_promote(
+    journal: &Journal,
+    publications: &[PreparedPublication],
+    execution: &[PublicationExecution],
+    ordinal: u32,
+) -> Result<(), String> {
+    let index = live_artifact_index(publications, execution, ordinal)?;
+    let publication = &publications[index];
+    let execution = &execution[index];
+    let staged_identity = publication
+        .staged_identity
+        .as_ref()
+        .ok_or_else(|| "staged artifact has no captured identity".to_owned())?;
     promote_journal_regular_to_external(
         journal.stage_directory(),
-        stage,
+        &execution.stage,
         &publication.target,
         staged_identity,
         Some(publication.digest),
@@ -2375,10 +2629,79 @@ fn publish_one(
         &publication.destination_parent_identity,
     )
     .map_err(|error| error.to_string())?;
-    journal
-        .append_planned(event_plan, JournalEventKey::Promoted(publication.ordinal))
-        .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn verify_live_published_artifacts(
+    journal: &Journal,
+    publications: &[PreparedPublication],
+    execution: &[PublicationExecution],
+) -> Result<(), String> {
+    if publications.len() != execution.len() {
+        return Err("published verification does not cover every artifact".to_owned());
+    }
+    for (publication, execution) in publications.iter().zip(execution) {
+        if publication.ordinal != execution.ordinal {
+            return Err("published verification artifact ordinals are not contiguous".to_owned());
+        }
+        let new_identity = publication
+            .staged_identity
+            .as_ref()
+            .ok_or_else(|| "published artifact has no captured staged identity".to_owned())?;
+        verify_file(
+            &publication.target,
+            publication.digest,
+            Some(publication.bytes),
+            Some(new_identity),
+            &publication.destination_parent_identity,
+        )
+        .map_err(|error| error.to_string())?;
+        match publication.expected {
+            DestinationState::Existing(expected) => {
+                let old_identity = publication.expected_identity.as_ref().ok_or_else(|| {
+                    "published replacement has no captured old identity".to_owned()
+                })?;
+                let backup = execution
+                    .backup
+                    .as_ref()
+                    .ok_or_else(|| "published replacement has no backup path".to_owned())?;
+                verify_journal_file(
+                    journal.backup_directory(),
+                    backup,
+                    expected.digest(),
+                    Some(old_identity.length()),
+                    Some(old_identity),
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            DestinationState::Absent => {
+                if execution.backup.is_some() {
+                    return Err("new publication unexpectedly retained a backup path".to_owned());
+                }
+            }
+            DestinationState::Directory
+            | DestinationState::SymbolicLink
+            | DestinationState::Other => {
+                return Err("unsupported destination reached published verification".to_owned());
+            }
+        }
+        verify_journal_absent(journal.stage_directory(), &execution.stage)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn verify_journal_absent(directory: &JournalDirectory, path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    test_record_verification_entry();
+    match open_journal_regular_in_directory(directory, path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "published artifact remains in staging",
+        )),
+    }
 }
 
 fn verify_file(
@@ -2403,6 +2726,8 @@ fn verify_file(
             "published artifact identity changed",
         ));
     }
+    #[cfg(test)]
+    test_record_verification_hash(length);
     let actual = DigestV1::hash_reader(&mut file, length)?;
     if actual != expected {
         return Err(io::Error::new(
@@ -2435,6 +2760,8 @@ fn verify_journal_file(
             "published artifact identity changed",
         ));
     }
+    #[cfg(test)]
+    test_record_verification_hash(length);
     let actual = DigestV1::hash_reader(&mut file, length)?;
     if actual != expected {
         return Err(io::Error::new(
