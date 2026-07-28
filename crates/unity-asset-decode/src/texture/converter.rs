@@ -250,14 +250,14 @@ impl Texture2DConverter {
                     let pos = reader.position();
 
                     // Attempt 1: `path (aligned string) -> offset (u64) -> size (u32)`
-                    if let Ok(path) = reader.read_aligned_string() {
-                        if is_plausible_stream_path(&path) {
-                            let offset = reader.read_u64().unwrap_or(0);
-                            let size = reader.read_u32().unwrap_or(0);
-                            let _ = reader.align();
-                            if !path.is_empty() && size > 0 {
-                                return Some((path, offset, size));
-                            }
+                    if let Ok(path) = reader.read_aligned_string()
+                        && is_plausible_stream_path(&path)
+                    {
+                        let offset = reader.read_u64().unwrap_or(0);
+                        let size = reader.read_u32().unwrap_or(0);
+                        let _ = reader.align();
+                        if !path.is_empty() && size > 0 {
+                            return Some((path, offset, size));
                         }
                     }
 
