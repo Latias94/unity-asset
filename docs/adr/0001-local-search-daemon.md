@@ -81,13 +81,13 @@ transient failed build.
 - Require a per-project token for mutation endpoints.
 - Reject unknown fields, methods, and contract versions.
 - Core endpoints:
-  - `GET /v2/health`
-  - `GET /v2/search`
-  - `GET /v2/suggest`
-  - `POST /v2/references` with a versioned `ReferenceRequest`
-  - `GET /v2/status`
-  - `POST /v2/reindex` with a versioned filesystem reindex intent
-  - `POST /v2/token/rotate`
+  - `GET /v3/health`
+  - `GET /v3/search`
+  - `GET /v3/suggest`
+  - `POST /v3/references` with a versioned `ReferenceRequest`
+  - `GET /v3/status`
+  - `POST /v3/reindex` with a versioned filesystem reindex intent
+  - `POST /v3/token/rotate`
 
 ### Implementation split (workspace crates)
 
@@ -136,6 +136,6 @@ would have to reject targets that the daemon cannot reproduce exactly from its c
 - Tier-1 YAML names, tags, script terms, hierarchy paths, and reference facts are implemented on a
   best-effort basis.
 - Binary PPtr facts and optional AssetBundle container paths can contribute to the index.
-- `/v2` request and response contracts, bearer-token reindexing, token rotation, and coordinator
+- `/v3` request and response contracts, bearer-token reindexing, token rotation, and coordinator
   status are implemented.
 - Richer binary field extraction and exact editor object navigation remain roadmap work.

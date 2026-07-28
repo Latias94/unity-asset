@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description = "A comprehensive Rust library for parsing Unity asset files (YAML and binary formats)"
@@ -23,11 +23,11 @@ exclude = [
 
 [dependencies]
 # Re-export sub-crates
-unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
-unity-asset-yaml = { path = "../unity-asset-yaml", version = "0.3.0" }
-unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
-unity-asset-write = { path = "../unity-asset-write", version = "0.3.0" }
-unity-asset-decode = { path = "../unity-asset-decode", version = "0.3.0", features = ["audio", "texture-advanced", "sprite"], optional = true }
+unity-asset-core = { workspace = true }
+unity-asset-yaml = { workspace = true }
+unity-asset-binary = { workspace = true }
+unity-asset-write = { workspace = true }
+unity-asset-decode = { workspace = true, features = ["audio", "texture-advanced", "sprite"], optional = true }
 zip = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -65,7 +65,7 @@ flate2 = { workspace = true }
 image = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
-unity-asset-decode = { path = "../unity-asset-decode", version = "0.3.0", features = ["audio"] }
+unity-asset-decode = { workspace = true, features = ["audio"] }
 
 [package.metadata.docs.rs]
 no-default-features = true

@@ -15,7 +15,7 @@ The following architecture is implemented:
   typed recovery outcomes;
 - one revision-bound `ReferenceGraph` for YAML and binary references;
 - typed extraction request, plan, manifest, and report contracts;
-- a local `/v2` search service with search, suggestions, reverse references, status, authenticated
+- a local `/v3` search service with search, suggestions, reverse references, status, authenticated
   reindex, and token rotation;
 - a machine-readable workspace capability catalog for agents and transport adapters.
 

@@ -185,7 +185,7 @@ Index AssetBundle container paths and ignore the project root's `.gitignore`:
 cargo run -p unity-asset-search-daemon -- --project-root D:\GameProject --watch --search-everything
 ```
 
-The versioned HTTP contract is `/v2`. Read endpoints are localhost-only; reindex and token
+The versioned HTTP contract is `/v3`. Read endpoints are localhost-only; reindex and token
 rotation require the persisted bearer token.
 
 ```powershell

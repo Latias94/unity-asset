@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Deserializer, Serialize};
 use unity_asset_core::{DigestV1, TransactionId, WorkspaceId, WorkspaceRevision};
 
-pub const SEARCH_GENERATION_CONTRACT_VERSION: u16 = 1;
+pub const SEARCH_GENERATION_CONTRACT_VERSION: u16 = 2;
+pub(crate) const SEARCH_GENERATION_STORAGE_CONTRACT_VERSION: u16 = 1;
 const GENERATION_DIRECTORY_PREFIX: &str = "generation-v1-";
 const GENERATION_ID_DOMAIN: &[u8] = b"unity-asset:search-generation:logical:v1\0";
 const MAX_APPLIED_TRANSACTIONS: usize = 4_096;
@@ -278,7 +279,7 @@ impl ArtifactTreeEvidence {
     #[must_use]
     pub const fn new(digest: DigestV1, files: u64, bytes: u64) -> Self {
         Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+            contract_version: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
             digest,
             files,
             bytes,
@@ -307,7 +308,10 @@ impl<'de> Deserialize<'de> for ArtifactTreeEvidence {
         D: Deserializer<'de>,
     {
         let wire = ArtifactTreeEvidenceWire::deserialize(deserializer)?;
-        validate_contract_version::<D::Error>("artifact tree evidence", wire.contract_version)?;
+        validate_storage_contract_version::<D::Error>(
+            "artifact tree evidence",
+            wire.contract_version,
+        )?;
         Ok(Self::new(wire.digest, wire.files, wire.bytes))
     }
 }
@@ -329,7 +333,7 @@ impl GenerationArtifactEvidence {
         source_state: ArtifactTreeEvidence,
     ) -> Self {
         Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+            contract_version: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
             search,
             references,
             source_state,
@@ -365,7 +369,7 @@ impl<'de> Deserialize<'de> for GenerationArtifactEvidence {
         D: Deserializer<'de>,
     {
         let wire = GenerationArtifactEvidenceWire::deserialize(deserializer)?;
-        validate_contract_version::<D::Error>(
+        validate_storage_contract_version::<D::Error>(
             "generation artifact evidence",
             wire.contract_version,
         )?;
@@ -426,7 +430,7 @@ impl GenerationProjectionSummary {
             });
         }
         Ok(Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+            contract_version: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
             assets,
             search_documents,
             reference_documents,
@@ -464,7 +468,7 @@ impl GenerationProjectionSummary {
 impl Default for GenerationProjectionSummary {
     fn default() -> Self {
         Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+            contract_version: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
             assets: 0,
             search_documents: 0,
             reference_documents: 0,
@@ -491,7 +495,7 @@ impl<'de> Deserialize<'de> for GenerationProjectionSummary {
         D: Deserializer<'de>,
     {
         let wire = GenerationProjectionSummaryWire::deserialize(deserializer)?;
-        validate_contract_version::<D::Error>(
+        validate_storage_contract_version::<D::Error>(
             "generation projection summary",
             wire.contract_version,
         )?;
@@ -579,7 +583,7 @@ impl SearchGenerationManifestV1 {
         artifacts: GenerationArtifactEvidence,
     ) -> Self {
         Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+            contract_version: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
             workspace: identity.workspace,
             revision: identity.revision,
             search_projection_digest: identity.projections.search,
@@ -692,7 +696,10 @@ impl<'de> Deserialize<'de> for SearchGenerationManifestV1 {
         D: Deserializer<'de>,
     {
         let wire = SearchGenerationManifestWire::deserialize(deserializer)?;
-        validate_contract_version::<D::Error>("search generation manifest", wire.contract_version)?;
+        validate_storage_contract_version::<D::Error>(
+            "search generation manifest",
+            wire.contract_version,
+        )?;
         ensure_canonical_transactions::<D::Error>(&wire.applied_transactions)?;
         let identity = SearchGenerationIdentityV1::new(
             wire.workspace,
@@ -734,15 +741,15 @@ where
     Ok(())
 }
 
-fn validate_contract_version<E>(contract: &'static str, actual: u16) -> Result<(), E>
+fn validate_storage_contract_version<E>(contract: &'static str, actual: u16) -> Result<(), E>
 where
     E: serde::de::Error,
 {
-    if actual != SEARCH_GENERATION_CONTRACT_VERSION {
+    if actual != SEARCH_GENERATION_STORAGE_CONTRACT_VERSION {
         return Err(E::custom(GenerationManifestError::UnsupportedVersion {
             contract,
             actual,
-            expected: SEARCH_GENERATION_CONTRACT_VERSION,
+            expected: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
         }));
     }
     Ok(())

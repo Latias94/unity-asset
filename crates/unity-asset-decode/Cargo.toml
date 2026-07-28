@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset-decode"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description = "Decode/export helpers for Unity assets (Texture/Audio/Sprite) built on unity-asset-binary"
@@ -13,8 +13,8 @@ categories = ["parsing", "game-development"]
 include = ["src/**", "assets/**", "examples/**", "tests/**", "Cargo.toml"]
 
 [dependencies]
-unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
-unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
+unity-asset-binary = { workspace = true }
+unity-asset-core = { workspace = true }
 serde = { workspace = true }
 image = { workspace = true, optional = true }
 symphonia = { version = "0.5", features = ["all"], optional = true }

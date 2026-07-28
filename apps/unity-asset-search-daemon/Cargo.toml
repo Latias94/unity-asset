@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset-search-daemon"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description = "Local HTTP daemon for Unity project search (used by UnityHero)"
@@ -26,9 +26,9 @@ mime.workspace = true
 subtle.workspace = true
 fs2.workspace = true
 url.workspace = true
-unity-asset-core = { path = "../../crates/unity-asset-core", version = "0.3.0" }
-unity-asset-search-index = { path = "../../crates/unity-asset-search-index", version = "0.3.0" }
-unity-asset-search-protocol = { path = "../../crates/unity-asset-search-protocol", version = "0.3.0" }
+unity-asset-core = { workspace = true }
+unity-asset-search-index = { workspace = true }
+unity-asset-search-protocol = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -44,7 +44,7 @@ fn search_response_json(contract_version: u16) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "contract_version": contract_version,
         "generation": {
-            "contract_version": 1,
+            "contract_version": 2,
             "generation": digest,
             "workspace": "workspace-v1:00000000000000000000000000000001",
             "actual_revision": digest,
@@ -73,7 +73,7 @@ fn search_response_json(contract_version: u16) -> Vec<u8> {
 
 #[test]
 fn daemon_api_error_is_emitted_as_its_original_json_envelope() {
-    let body = br#"{"contract_version":1,"code":"invalid_request","message":"fixture rejected","retryable":false,"details":{"field":"q"}}"#;
+    let body = br#"{"contract_version":2,"code":"invalid_request","message":"fixture rejected","retryable":false,"details":{"field":"q"}}"#;
     let (base_url, server) = serve_json_once("400 Bad Request", body.to_vec());
     let output = run_cli(&["--base-url", &base_url, "health"]);
     server.join().expect("finish HTTP fixture");
@@ -86,7 +86,7 @@ fn daemon_api_error_is_emitted_as_its_original_json_envelope() {
 
 #[test]
 fn successful_search_is_emitted_as_versioned_json() {
-    let (base_url, server) = serve_json_once("200 OK", search_response_json(1));
+    let (base_url, server) = serve_json_once("200 OK", search_response_json(2));
     let output = run_cli(&["--base-url", &base_url, "search", "fixture"]);
     server.join().expect("finish HTTP fixture");
 
@@ -98,31 +98,33 @@ fn successful_search_is_emitted_as_versioned_json() {
     assert!(output.stderr.is_empty(), "successful stderr must be empty");
     let response: SearchResponse =
         serde_json::from_slice(&output.stdout).expect("stdout must contain one SearchResponse");
-    assert_eq!(response.contract_version, 1);
-    assert_eq!(response.generation.contract_version, 1);
+    assert_eq!(response.contract_version, 2);
+    assert_eq!(response.generation.contract_version, 2);
     assert_eq!(response.query, "fixture");
     assert_eq!(response.returned_hits, 0);
 }
 
 #[test]
-fn unsupported_search_contract_version_is_a_structured_process_error() {
-    let (base_url, server) = serve_json_once("200 OK", search_response_json(2));
-    let output = run_cli(&["--base-url", &base_url, "search", "fixture"]);
-    server.join().expect("finish HTTP fixture");
+fn older_and_newer_search_contract_versions_are_structured_process_errors() {
+    for contract_version in [1, 3] {
+        let (base_url, server) = serve_json_once("200 OK", search_response_json(contract_version));
+        let output = run_cli(&["--base-url", &base_url, "search", "fixture"]);
+        server.join().expect("finish HTTP fixture");
 
-    let error = parse_stderr(&output);
-    assert_eq!(error.code, ApiErrorCode::Internal);
-    assert_eq!(
-        error.details.get("source"),
-        Some(&"unity_asset_search_cli".to_string())
-    );
-    assert!(
-        error
-            .message
-            .contains("validate response contract GET search"),
-        "unexpected version error: {}",
-        error.message
-    );
+        let error = parse_stderr(&output);
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert_eq!(
+            error.details.get("source"),
+            Some(&"unity_asset_search_cli".to_string())
+        );
+        assert!(
+            error
+                .message
+                .contains("validate response contract GET search"),
+            "unexpected version error for contract {contract_version}: {}",
+            error.message
+        );
+    }
 }
 
 #[test]

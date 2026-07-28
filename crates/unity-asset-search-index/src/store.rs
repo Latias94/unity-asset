@@ -24,7 +24,7 @@ use unity_asset_search_core::normalize_for_match;
 
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
-    SEARCH_GENERATION_CONTRACT_VERSION,
+    SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
 };
 use crate::projection::{GenerationProjection, ReferenceDocument, SearchDocument};
 use crate::reference_payload::{
@@ -968,7 +968,7 @@ struct SchemaMarker {
 impl SchemaMarker {
     fn new(schema_contract: &str, schema_version: u16) -> Self {
         Self {
-            generation_contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+            generation_contract_version: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
             schema_contract: schema_contract.to_owned(),
             schema_version,
         }
@@ -1154,7 +1154,7 @@ fn validate_schema_marker(
     let expected = SchemaMarker::new(contract, version);
     if contract == REFERENCE_SCHEMA_CONTRACT
         && version == REFERENCE_SCHEMA_VERSION
-        && actual.generation_contract_version == SEARCH_GENERATION_CONTRACT_VERSION
+        && actual.generation_contract_version == SEARCH_GENERATION_STORAGE_CONTRACT_VERSION
         && actual.schema_contract == contract
         && matches!(actual.schema_version, 1 | 2)
     {

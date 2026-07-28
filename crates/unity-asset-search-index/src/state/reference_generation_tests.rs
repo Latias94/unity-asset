@@ -7,6 +7,7 @@ use super::{
 };
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests, ReindexReceipt,
+    SEARCH_GENERATION_CONTRACT_VERSION, SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
     SearchGenerationId, SearchGenerationIdentityV1, SearchGenerationManifestV1,
 };
 use serde::Serialize;
@@ -466,6 +467,10 @@ fn manifest_deserialization_rejects_unknown_fields_and_versions() {
     )
     .unwrap();
     let manifest = SearchGenerationManifestV1::new(identity, evidence);
+    assert_eq!(
+        serde_json::to_value(&manifest).unwrap()["contract_version"],
+        SEARCH_GENERATION_STORAGE_CONTRACT_VERSION
+    );
 
     let mut unknown = serde_json::to_value(&manifest).unwrap();
     unknown
@@ -475,7 +480,8 @@ fn manifest_deserialization_rejects_unknown_fields_and_versions() {
     assert!(serde_json::from_value::<SearchGenerationManifestV1>(unknown).is_err());
 
     let mut unsupported = serde_json::to_value(&manifest).unwrap();
-    unsupported["contract_version"] = serde_json::json!(2);
+    unsupported["contract_version"] =
+        serde_json::json!(SEARCH_GENERATION_STORAGE_CONTRACT_VERSION + 1);
     assert!(serde_json::from_value::<SearchGenerationManifestV1>(unsupported).is_err());
 
     let mut invalid_summary = serde_json::to_value(&manifest).unwrap();
@@ -492,7 +498,7 @@ fn manifest_deserialization_rejects_unknown_fields_and_versions() {
 #[test]
 fn reindex_receipt_defaults_missing_execution_evidence() {
     let receipt = serde_json::from_value::<ReindexReceipt>(serde_json::json!({
-        "contract_version": 1,
+        "contract_version": SEARCH_GENERATION_CONTRACT_VERSION,
         "disposition": "queued"
     }))
     .unwrap();

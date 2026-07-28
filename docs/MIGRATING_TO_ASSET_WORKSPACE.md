@@ -387,12 +387,47 @@ session schema.
 
 ## Search Handoff
 
-Commit returns a transaction- and revision-bound `ChangeSet`. Deliver that structured value to the
-search coordinator. Do not call the indexer from inside the workspace transaction and do not roll
-back committed assets when derived indexing fails.
+Commit returns a transaction- and revision-bound `ChangeSet`. An authoritative in-process consumer
+passes that value and its matching `WorkspaceView` to `SearchIndex::reindex_workspace`. Do not call
+the indexer from inside the workspace transaction and do not roll back committed assets when
+derived indexing fails.
 
 The search consumer is idempotent by transaction identity and publishes a new complete generation
-through its generation barrier. Reconciliation can rebuild any missed handoff.
+through its generation barrier. The filesystem daemon does not accept a bare `ChangeSet`, because
+it cannot reconstruct the caller's historical `WorkspaceView` after files advance again. Startup,
+watcher, and periodic reconciliation repair missed cross-process delivery.
+
+### Search 0.4 contract migration
+
+Search 0.4 intentionally replaces the 0.3 `/v1` transport and the unreleased `/v2` development
+contract with `/v3`, and introduces Search Generation contract version 2. There is no compatibility
+route. Update the daemon and CLI together; old clients receive a route error instead of attempting
+to deserialize the new evidence fields as an older contract.
+
+Rust callers must make these source changes:
+
+| Previous surface | 0.4 replacement |
+|---|---|
+| Released 0.3 unversioned, flat index status | versioned protocol `StatusResponse` with revision and generation evidence |
+| Pre-release `/v2` `StatusResponse.progress` / `IndexProgress` | `indexing`, `GenerationStatus::building_revision`, and the active generation stamp |
+| Pre-release coordinator executor returning `ReindexReceipt` | return `ReindexExecution::new(receipt, terminal_status)` |
+| Released 0.3 `--no-auto-reindex` | `--no-startup-reindex` |
+| Released 0.3 `--watch-reconcile-interval-ms` | `--reconcile-interval-ms` |
+
+Periodic reconciliation now defaults to five minutes and runs independently of `--watch`. Set
+`--reconcile-interval-ms 0` only when another process owns reconciliation.
+
+The released 0.3 index used `tantivy-v2`, `refs-tantivy-v1`, and `state-v2.json`; 0.4 replaces that
+layout with immutable generations and durable generation heads. Stop the old daemon and delete its
+derived index root before the first 0.4 start. This also removes the obsolete 0.3 `token` file; 0.4
+creates a new owner-only `daemon.token`. The daemon rebuilds all projections from authoritative
+project files.
+
+Generation-head v2 is a one-way authority for 0.4 derived storage. Pre-release generation-head v1
+development indices can be opened and upgraded, but this is not a compatibility path for the
+released 0.3 layout. Before downgrading after 0.4 has written a head, delete the derived search index
+and let the target binary rebuild it. Asset sources and workspace publication journals are
+unaffected.
 
 ## No Compatibility Layer
 

@@ -16,6 +16,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
+version = "0.4.0"
 edition = "2024"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
 license = "MIT"
@@ -23,6 +24,17 @@ repository = "https://github.com/Latias94/unity-asset"
 homepage = "https://github.com/Latias94/unity-asset"
 
 [workspace.dependencies]
+# Workspace crates
+unity-asset = { path = "crates/unity-asset", version = "0.4.0", default-features = false }
+unity-asset-binary = { path = "crates/unity-asset-binary", version = "0.4.0" }
+unity-asset-core = { path = "crates/unity-asset-core", version = "0.4.0" }
+unity-asset-decode = { path = "crates/unity-asset-decode", version = "0.4.0" }
+unity-asset-search-core = { path = "crates/unity-asset-search-core", version = "0.4.0" }
+unity-asset-search-index = { path = "crates/unity-asset-search-index", version = "0.4.0" }
+unity-asset-search-protocol = { path = "crates/unity-asset-search-protocol", version = "0.4.0" }
+unity-asset-write = { path = "crates/unity-asset-write", version = "0.4.0" }
+unity-asset-yaml = { path = "crates/unity-asset-yaml", version = "0.4.0" }
+
 # Core dependencies
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

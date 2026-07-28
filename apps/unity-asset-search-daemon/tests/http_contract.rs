@@ -347,44 +347,48 @@ async fn malformed_and_versioned_requests_return_typed_api_errors() {
         ApiErrorCode::InvalidRequest,
     );
 
-    let unknown_version = SEARCH_GENERATION_CONTRACT_VERSION + 1;
-    let mut reference_version =
-        serde_json::to_value(&request).expect("reference request must serialize");
-    reference_version["contract_version"] = unknown_version.into();
-    let response = dispatch(
-        &fixture.router,
-        json_request(REFERENCES_ENDPOINT, &reference_version, None),
-    )
-    .await;
-    assert_api_error(
-        &response,
-        StatusCode::BAD_REQUEST,
-        ApiErrorCode::InvalidRequest,
-    );
+    for unsupported_version in [
+        SEARCH_GENERATION_CONTRACT_VERSION - 1,
+        SEARCH_GENERATION_CONTRACT_VERSION + 1,
+    ] {
+        let mut reference_version =
+            serde_json::to_value(&request).expect("reference request must serialize");
+        reference_version["contract_version"] = unsupported_version.into();
+        let response = dispatch(
+            &fixture.router,
+            json_request(REFERENCES_ENDPOINT, &reference_version, None),
+        )
+        .await;
+        assert_api_error(
+            &response,
+            StatusCode::BAD_REQUEST,
+            ApiErrorCode::InvalidRequest,
+        );
 
-    let mut intent = serde_json::to_value(FilesystemReindexIntent::reconcile())
-        .expect("reindex intent must serialize");
-    intent["contract_version"] = unknown_version.into();
-    let response = dispatch(
-        &fixture.router,
-        json_request(REINDEX_ENDPOINT, &intent, Some(&fixture.current_token)),
-    )
-    .await;
-    let error = assert_api_error(
-        &response,
-        StatusCode::BAD_REQUEST,
-        ApiErrorCode::InvalidRequest,
-    );
-    let actual_version = unknown_version.to_string();
-    let expected_version = SEARCH_GENERATION_CONTRACT_VERSION.to_string();
-    assert_eq!(
-        error.details.get("actual").map(String::as_str),
-        Some(actual_version.as_str())
-    );
-    assert_eq!(
-        error.details.get("expected").map(String::as_str),
-        Some(expected_version.as_str())
-    );
+        let mut intent = serde_json::to_value(FilesystemReindexIntent::reconcile())
+            .expect("reindex intent must serialize");
+        intent["contract_version"] = unsupported_version.into();
+        let response = dispatch(
+            &fixture.router,
+            json_request(REINDEX_ENDPOINT, &intent, Some(&fixture.current_token)),
+        )
+        .await;
+        let error = assert_api_error(
+            &response,
+            StatusCode::BAD_REQUEST,
+            ApiErrorCode::InvalidRequest,
+        );
+        let actual_version = unsupported_version.to_string();
+        let expected_version = SEARCH_GENERATION_CONTRACT_VERSION.to_string();
+        assert_eq!(
+            error.details.get("actual").map(String::as_str),
+            Some(actual_version.as_str())
+        );
+        assert_eq!(
+            error.details.get("expected").map(String::as_str),
+            Some(expected_version.as_str())
+        );
+    }
 
     let response = dispatch(
         &fixture.router,
@@ -795,7 +799,7 @@ async fn every_endpoint_returns_typed_method_errors_and_unknown_paths_return_typ
         );
     }
 
-    for unknown in ["/v2/unknown", "/v1/health"] {
+    for unknown in ["/v3/unknown", "/v2/health", "/v1/health"] {
         let response = dispatch(&fixture.router, empty_request(Method::GET, unknown, None)).await;
         let error = assert_api_error(
             &response,

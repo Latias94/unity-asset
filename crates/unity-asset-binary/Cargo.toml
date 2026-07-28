@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset-binary"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description = "Unity binary format parsing and canonical TypeTree wire execution"
@@ -22,7 +22,7 @@ exclude = [
 
 [dependencies]
 # Core dependencies
-unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
+unity-asset-core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 indexmap = { workspace = true }

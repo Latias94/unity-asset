@@ -37,13 +37,13 @@ Rationale:
 
 The Unity plugin uses:
 
-- `GET /v2/health`
-- `GET /v2/status`
-- `GET /v2/search?q=...&limit=...`
-- `GET /v2/suggest?prefix=...&limit=...`
-- `POST /v2/references` with a versioned JSON request
-- `POST /v2/reindex` with a versioned JSON intent and bearer token
-- `POST /v2/token/rotate` with a bearer token
+- `GET /v3/health`
+- `GET /v3/status`
+- `GET /v3/search?q=...&limit=...`
+- `GET /v3/suggest?prefix=...&limit=...`
+- `POST /v3/references` with a versioned JSON request
+- `POST /v3/reindex` with a versioned JSON intent and bearer token
+- `POST /v3/token/rotate` with a bearer token
 
 The daemon stays localhost-only by default. Authorization uses the bearer token stored in the
 index directory. The plugin validates response contract versions and does not infer behavior from

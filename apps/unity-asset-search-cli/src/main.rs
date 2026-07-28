@@ -942,7 +942,7 @@ mod tests {
         fetch_json, http_client, percentile, reference_request, reindex_intent, serialize_error,
     };
 
-    const VALID_HEALTH_JSON: &[u8] = br#"{"contract_version":2,"ok":true,"version":"fixture"}"#;
+    const VALID_HEALTH_JSON: &[u8] = br#"{"contract_version":3,"ok":true,"version":"fixture"}"#;
     const TEST_FETCH_TIMEOUTS: FetchTimeouts = FetchTimeouts {
         connect: Duration::from_millis(500),
         response_headers: Duration::from_millis(100),
@@ -1233,7 +1233,7 @@ mod tests {
 
     #[tokio::test]
     async fn preserves_typed_api_error_output() -> Result<()> {
-        let body = br#"{"contract_version":1,"code":"invalid_request","message":"fixture rejected","retryable":false,"details":{"field":"q"}}"#;
+        let body = br#"{"contract_version":2,"code":"invalid_request","message":"fixture rejected","retryable":false,"details":{"field":"q"}}"#;
         let error =
             fetch_health_from_fixture(fixed_http_response("400 Bad Request", body.len(), body))
                 .await
@@ -1249,7 +1249,7 @@ mod tests {
 
     #[tokio::test]
     async fn json_contract_failures_serialize_as_local_api_errors() -> Result<()> {
-        let body = br#"{"contract_version":2,"ok":true,"version":false}"#;
+        let body = br#"{"contract_version":3,"ok":true,"version":false}"#;
         let error = fetch_health_from_fixture(fixed_http_response("200 OK", body.len(), body))
             .await
             .expect_err("invalid health JSON must fail contract decoding");
@@ -1295,7 +1295,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_response_json_beyond_member_limit() -> Result<()> {
-        let mut body = String::from(r#"{"contract_version":2,"ok":true,"version":"fixture""#);
+        let mut body = String::from(r#"{"contract_version":3,"ok":true,"version":"fixture""#);
         for index in 0..HEALTH_RESPONSE_JSON.max_members {
             body.push_str(&format!(r#","extra_{index}":0"#));
         }
@@ -1357,7 +1357,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request)?,
             json!({
-                "contract_version": 1,
+                "contract_version": 2,
                 "direction": "incoming",
                 "selector": {
                     "kind": "guid",
@@ -1375,21 +1375,21 @@ mod tests {
         assert_eq!(
             serde_json::to_value(reindex_intent(true, false, &[])?)?,
             json!({
-                "contract_version": 1,
+                "contract_version": 2,
                 "scope": { "kind": "full" }
             })
         );
         assert_eq!(
             serde_json::to_value(reindex_intent(false, false, &[])?)?,
             json!({
-                "contract_version": 1,
+                "contract_version": 2,
                 "scope": { "kind": "reconcile" }
             })
         );
         assert_eq!(
             serde_json::to_value(reindex_intent(false, true, &[])?)?,
             json!({
-                "contract_version": 1,
+                "contract_version": 2,
                 "scope": { "kind": "reconcile" }
             })
         );
@@ -1401,7 +1401,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(reindex_intent(false, false, &paths)?)?,
             json!({
-                "contract_version": 1,
+                "contract_version": 2,
                 "scope": {
                     "kind": "changed_paths",
                     "paths": [

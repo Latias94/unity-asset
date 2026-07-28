@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added recoverable in-place publication with validated containment roots, durable journals, directory identity binding, `CommitReport`, recovery discovery, `RecoveryLocator`, `RecoveryOutcome`, and `RollbackReceipt` contracts.
 - Added one revision-bound `ReferenceGraph` with typed field paths, coverage, resolution states, incoming/outgoing/closure queries, caching, and deterministic JSON, JSON Lines, and DOT projections.
 - Added typed extraction request v1, plan v2, manifest v2, and report v2 contracts with bundle-container queries, deterministic artifact paths, collision policy, bounded execution, durable manifests, and verified resume.
-- Added a revision-bound, consumer-owned search pipeline with transaction-keyed `ChangeSet` handoff, coherent `SearchGeneration` state, strict `/v2` HTTP contracts, authenticated reindexing, and token rotation.
+- Added a revision-bound, consumer-owned search pipeline with transaction-keyed `ChangeSet` handoff, coherent `SearchGeneration` state, strict Search Generation v2 and `/v3` HTTP contracts, authenticated reindexing, and token rotation.
 - Added schema-aware mutation recipes that inspect exact YAML or binary provenance and lower guarded field, reference, schema, sequence, hierarchy, UnityEvent, material, transform, and streamed-audio changes into plan fragments.
 - Added deterministic performance contracts for unified TypeTree traversal and segmented prepared artifacts.
 
@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - **Breaking:** Replaced mutable high-level loading and editing with `AssetWorkspace`, immutable `WorkspaceView` values, guarded plans, prepare, preview, recoverable commit, and explicit recovery.
 - **Breaking:** Replaced broad text-oriented CLI inspection and export surfaces with typed `workspace`, `references`, `export`, and `split-yaml` commands that exchange versioned JSON contracts.
+- **Breaking:** Replaced the 0.3 search `/v1` transport and the unreleased `/v2` development contract with `/v3`, advanced the Search Generation contract to v2, removed `IndexProgress`, and changed daemon reindex executors to return one terminal receipt/status observation.
 - **Breaking:** Unified TypeTree read, skip, PPtr scan, validation, encoding, and byte-preserving rewrite on one compiled `TypeTreeSchema`; TypeTree write errors now use `TypeTreeWriteError`, and `unity_asset_write::Endian` was replaced by the shared `ByteOrder`.
 - Made JSON and TPK TypeTree ingestion caller-budgeted, deterministic, depth-bounded, and immutable; workspace loads retain only required schemas in frozen per-source registries.
 - Reworked source loading, archive/WebFile/bundle expansion, edits, serialization, and publication to stage complete candidate state before one authority-changing commit.

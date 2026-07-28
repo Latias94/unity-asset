@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset-search-core"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description = "Core fuzzy matching and query helpers for unity-asset search tooling"

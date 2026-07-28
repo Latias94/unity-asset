@@ -10,24 +10,24 @@ use unity_asset_search_index::{
 };
 
 /// Current HTTP envelope and route contract.
-pub const HTTP_CONTRACT_VERSION: u16 = 2;
+pub const HTTP_CONTRACT_VERSION: u16 = 3;
 /// Prefix for every endpoint in the current HTTP contract.
-pub const HTTP_API_PREFIX: &str = "/v2";
+pub const HTTP_API_PREFIX: &str = "/v3";
 
-/// `GET /v2/health`.
-pub const HEALTH_ENDPOINT: &str = "/v2/health";
-/// `GET /v2/status`.
-pub const STATUS_ENDPOINT: &str = "/v2/status";
-/// `GET /v2/search`.
-pub const SEARCH_ENDPOINT: &str = "/v2/search";
-/// `GET /v2/suggest`.
-pub const SUGGEST_ENDPOINT: &str = "/v2/suggest";
-/// `POST /v2/references`.
-pub const REFERENCES_ENDPOINT: &str = "/v2/references";
-/// `POST /v2/reindex`.
-pub const REINDEX_ENDPOINT: &str = "/v2/reindex";
-/// `POST /v2/token/rotate`.
-pub const TOKEN_ROTATE_ENDPOINT: &str = "/v2/token/rotate";
+/// `GET /v3/health`.
+pub const HEALTH_ENDPOINT: &str = "/v3/health";
+/// `GET /v3/status`.
+pub const STATUS_ENDPOINT: &str = "/v3/status";
+/// `GET /v3/search`.
+pub const SEARCH_ENDPOINT: &str = "/v3/search";
+/// `GET /v3/suggest`.
+pub const SUGGEST_ENDPOINT: &str = "/v3/suggest";
+/// `POST /v3/references`.
+pub const REFERENCES_ENDPOINT: &str = "/v3/references";
+/// `POST /v3/reindex`.
+pub const REINDEX_ENDPOINT: &str = "/v3/reindex";
+/// `POST /v3/token/rotate`.
+pub const TOKEN_ROTATE_ENDPOINT: &str = "/v3/token/rotate";
 
 /// Stable response envelope for the daemon health endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset-search-protocol"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description = "Versioned HTTP contracts for unity-asset search clients and daemons"
@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "game-development"]
 
 [dependencies]
 serde.workspace = true
-unity-asset-search-index = { path = "../unity-asset-search-index", version = "0.3.0" }
+unity-asset-search-index = { workspace = true }
 
 [dev-dependencies]
 serde_json.workspace = true

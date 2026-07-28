@@ -9,19 +9,13 @@ This repository uses a tag-driven release workflow.
 
 ## Release steps
 
-1. Decide the version (e.g. `0.2.1`).
-2. Update versions in all workspace crates:
-   - `crates/unity-asset-core/Cargo.toml`
-   - `crates/unity-asset-yaml/Cargo.toml`
-   - `crates/unity-asset-binary/Cargo.toml`
-   - `crates/unity-asset-decode/Cargo.toml`
-   - `crates/unity-asset/Cargo.toml` (published as `unity-asset`)
-   - `apps/unity-asset-cli/Cargo.toml`
-   - `crates/unity-asset-search-core/Cargo.toml`
-   - `crates/unity-asset-search-index/Cargo.toml`
-   - `apps/unity-asset-search-daemon/Cargo.toml`
-   - `apps/unity-asset-search-cli/Cargo.toml`
-3. Ensure path dependency versions match the same version (the release workflow validates this).
+1. Decide the version (e.g. `0.4.0`).
+2. In the root `Cargo.toml`, update `[workspace.package].version` and every internal
+   dependency version under `[workspace.dependencies]` to the same release version.
+   Member manifests inherit both values and must not declare independent package or path
+   dependency versions.
+3. Run `cargo metadata --no-deps --format-version 1`. The release workflow uses the same
+   metadata graph to validate the package set, versions, internal requirements, and publish order.
 4. Update `CHANGELOG.md`.
 5. Run locally:
    - `cargo fmt --all`
@@ -29,26 +23,29 @@ This repository uses a tag-driven release workflow.
    - `cargo nextest run --workspace`
 6. Commit changes.
 7. Create and push a tag:
-   - `git tag v0.2.1`
-   - `git push origin v0.2.1`
+   - `git tag v0.4.0`
+   - `git push origin v0.4.0`
 
 ## What CI does
 
 On tag push (`vMAJOR.MINOR.PATCH`), GitHub Actions:
 
-1. Validates that the tag version matches all crate versions and workspace path dependency versions.
+1. Uses Cargo metadata to validate that the tag matches the complete publishable workspace,
+   package versions, internal dependency requirements, and dependency-first publish topology.
 2. Runs formatting, clippy, and tests.
 3. Publishes crates to crates.io in dependency order:
    1) `unity-asset-core`
    2) `unity-asset-yaml`
    3) `unity-asset-binary`
-   4) `unity-asset-search-core`
-   5) `unity-asset-search-index`
-   6) `unity-asset-decode`
-   7) `unity-asset`
-   8) `unity-asset-cli`
-   9) `unity-asset-search-daemon`
-   10) `unity-asset-search-cli`
+   4) `unity-asset-write`
+   5) `unity-asset-decode`
+   6) `unity-asset`
+   7) `unity-asset-search-core`
+   8) `unity-asset-search-index`
+   9) `unity-asset-search-protocol`
+   10) `unity-asset-cli`
+   11) `unity-asset-search-daemon`
+   12) `unity-asset-search-cli`
 4. Builds and uploads multi-platform binaries using `cargo-dist`:
    - `unity-asset-search-daemon` (for the Unity Editor plugin)
    - `unity-asset-search-cli` (debug/ops utility)

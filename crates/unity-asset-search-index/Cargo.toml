@@ -1,6 +1,6 @@
 [package]
 name = "unity-asset-search-index"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description = "Local search index for Unity projects (Search Everything / Find References)"
@@ -22,9 +22,9 @@ tantivy.workspace = true
 ignore.workspace = true
 fs2.workspace = true
 same-file.workspace = true
-unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
-unity-asset = { path = "../unity-asset", version = "0.3.0", default-features = false }
-unity-asset-search-core = { path = "../unity-asset-search-core", version = "0.3.0" }
+unity-asset-core = { workspace = true }
+unity-asset = { workspace = true }
+unity-asset-search-core = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs"] }
