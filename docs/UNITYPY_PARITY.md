@@ -6,8 +6,8 @@ not API-shape parity.
 
 ## Comparison Baseline
 
-- UnityPy version: `1.24.2`
-- UnityPy commit: `14f2134c5996a21b15e5fb3ab649e0168e32267d`
+- UnityPy version: `1.25.2`
+- UnityPy commit: `5567c5eddc9dbeaef27b5113f5927226bee4f8ca`
 - UnityCN/Tuanjie observations: [UNITYCN_NOTES.md](UNITYCN_NOTES.md)
 
 Historical comparison results remain useful, but the current Rust authority is the checked-in
