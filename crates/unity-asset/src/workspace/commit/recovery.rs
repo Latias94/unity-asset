@@ -54,11 +54,13 @@ use super::platform::{
 };
 #[cfg(test)]
 use super::platform::{capture_existing, observe_file_identity};
+#[cfg(all(test, any(unix, windows)))]
+use super::platform::{test_security_metadata_matches, test_tamper_security_metadata};
 use super::publication_protocol::{
     ArtifactObservation, ArtifactProgress, BaselineObservation, EntryEvidence, PreparedTransition,
     ProtocolBlock, ProtocolError, ProtocolEvent, ProtocolPlanError, PublicationAction,
     PublicationState, RecoveryDecision, RecoveryDirection, RecoveryIntent, RecoveryRequest,
-    append_recovery_program, decide_recovery,
+    RecoveryStep, append_recovery_program, decide_recovery,
 };
 use super::{AssetWorkspace, CommitReport, PublicationTarget, RecoveryLocator, VerificationCharge};
 
@@ -1129,30 +1131,44 @@ struct RecoveryArtifactExecution {
     new_identity: FileIdentity,
 }
 
-fn recovery_event_program(
+struct RecoveryProgram {
+    steps: Vec<RecoveryStep>,
+    event_keys: Vec<PublicationAction>,
+}
+
+fn recovery_program(
     observation: &RecoveryObservation,
     direction: RecoveryDirection,
     finalize_workspace: bool,
     budget: &mut AssetLoadBudget,
-) -> Result<Vec<PublicationAction>, ObservationError> {
+) -> Result<RecoveryProgram, ObservationError> {
     let capacity = observation
         .artifacts
         .len()
         .checked_mul(4)
         .and_then(|events| events.checked_add(6))
         .ok_or(BudgetError::ArithmeticOverflow {
-            resource: "recovery event plan keys",
+            resource: "recovery execution steps",
         })?;
-    let mut actions = recovery_vec(capacity, "recovery event plan keys", budget)?;
+    let mut steps = recovery_vec(capacity, "recovery execution steps", budget)?;
     append_recovery_program(
         &observation.events.state,
         &observation.artifacts,
         direction,
         finalize_workspace,
-        &mut actions,
+        &mut steps,
     )
     .map_err(map_protocol_plan_error)?;
-    Ok(actions)
+    let event_count = steps.iter().filter(|step| step.records_event()).count();
+    let mut event_keys = recovery_vec(event_count, "recovery event plan keys", budget)?;
+    event_keys.extend(
+        steps
+            .iter()
+            .copied()
+            .filter(|step| step.records_event())
+            .map(RecoveryStep::action),
+    );
+    Ok(RecoveryProgram { steps, event_keys })
 }
 
 fn prebuild_recovery_baseline(
@@ -2481,7 +2497,7 @@ fn recover_open_journal(
             } else {
                 None
             };
-            let event_keys = recovery_event_program(
+            let program = recovery_program(
                 &observation,
                 RecoveryDirection::Forward,
                 finalize_workspace,
@@ -2489,13 +2505,13 @@ fn recover_open_journal(
             )
             .map_err(|error| map_observation_error(locator, error))?;
             let event_plan = journal
-                .plan_events(&event_keys, budget)
+                .plan_events(&program.event_keys, budget)
                 .map_err(|error| map_journal_mutation_error(locator, error))?;
             precharge_execution_verification(
                 journal,
                 &mut execution,
                 &observation.artifacts,
-                &event_keys,
+                &program.steps,
                 RecoveryDirection::Forward,
                 budget,
             )
@@ -2507,6 +2523,7 @@ fn recover_open_journal(
                 &mut observation.events,
                 &mut observation.artifacts,
                 &mut execution,
+                program.steps,
                 event_plan,
                 workspace.as_deref_mut(),
                 prebuilt_baseline,
@@ -2532,17 +2549,16 @@ fn recover_open_journal(
                     },
                 ));
             }
-            let event_keys =
-                recovery_event_program(&observation, RecoveryDirection::Rollback, true, budget)
-                    .map_err(|error| map_observation_error(locator, error))?;
+            let program = recovery_program(&observation, RecoveryDirection::Rollback, true, budget)
+                .map_err(|error| map_observation_error(locator, error))?;
             let event_plan = journal
-                .plan_events(&event_keys, budget)
+                .plan_events(&program.event_keys, budget)
                 .map_err(|error| map_journal_mutation_error(locator, error))?;
             precharge_execution_verification(
                 journal,
                 &mut execution,
                 &observation.artifacts,
-                &event_keys,
+                &program.steps,
                 RecoveryDirection::Rollback,
                 budget,
             )
@@ -2554,6 +2570,7 @@ fn recover_open_journal(
                 &mut observation.events,
                 &mut observation.artifacts,
                 &execution,
+                program.steps,
                 event_plan,
             )
             .map_err(|error| map_execution_error(locator, error))?;
@@ -3350,11 +3367,11 @@ fn precharge_execution_verification(
     journal: &Journal,
     execution: &mut RecoveryExecutionPlan,
     observations: &[ArtifactObservation],
-    actions: &[PublicationAction],
+    steps: &[RecoveryStep],
     direction: RecoveryDirection,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), ObservationError> {
-    let plan = execution_verification_charge(journal, execution, observations, actions, direction)?;
+    let plan = execution_verification_charge(journal, execution, observations, steps, direction)?;
     let security_bytes = u64::try_from(plan.security_metadata_copies)
         .map_err(|_| BudgetError::ArithmeticOverflow {
             resource: "recovery security metadata reservations",
@@ -3372,8 +3389,8 @@ fn precharge_execution_verification(
             })?;
     budget.check_entries(plan.charge.entries)?;
     budget.check_bytes(total_bytes)?;
-    for action in actions {
-        if let PublicationAction::BackupCaptured(ordinal) = *action {
+    for step in steps {
+        if let PublicationAction::BackupCaptured(ordinal) = step.action() {
             let index = verification_artifact_index(execution, observations, ordinal)?;
             execution.artifacts[index].security_metadata =
                 Some(reserve_security_metadata_copy(budget)?);
@@ -3394,7 +3411,7 @@ fn execution_verification_charge(
     journal: &Journal,
     execution: &RecoveryExecutionPlan,
     observations: &[ArtifactObservation],
-    actions: &[PublicationAction],
+    steps: &[RecoveryStep],
     direction: RecoveryDirection,
 ) -> Result<ExecutionVerificationPlan, ObservationError> {
     if observations.len() != journal.manifest().artifacts().len()
@@ -3407,8 +3424,8 @@ fn execution_verification_charge(
     }
     let mut charge = VerificationCharge::default();
     let mut security_metadata_copies = 0_usize;
-    for action in actions {
-        match *action {
+    for step in steps {
+        match step.action() {
             PublicationAction::BackupIntent(ordinal) => {
                 let index = verification_artifact_index(execution, observations, ordinal)?;
                 let artifact = &journal.manifest().artifacts()[index];
@@ -3820,7 +3837,8 @@ fn execute_forward_program(
     protocol: &mut ObservedProtocol,
     observations: &mut [ArtifactObservation],
     execution: &mut RecoveryExecutionPlan,
-    event_plan: JournalEventPlan,
+    steps: Vec<RecoveryStep>,
+    mut event_plan: JournalEventPlan,
     mut workspace: Option<&mut AssetWorkspace>,
     prebuilt_baseline: Option<super::baseline::PreparedBaseline>,
     committed_revision: WorkspaceRevision,
@@ -3833,12 +3851,9 @@ fn execute_forward_program(
         )));
     }
     let mut prebuilt_baseline = prebuilt_baseline;
-    for planned in event_plan {
-        let action = planned.action();
-        let transition = protocol
-            .state
-            .prepare(action)
-            .map_err(protocol_execution_error)?;
+    for step in steps {
+        let action = step.action();
+        let recorded = prepare_recovery_step(protocol, &mut event_plan, step)?;
         match action {
             PublicationAction::RecoveryDecision(RecoveryDirection::Forward)
             | PublicationAction::StagingVerified
@@ -3848,12 +3863,20 @@ fn execute_forward_program(
             }
             PublicationAction::BackupCaptured(ordinal) => {
                 execute_recovery_backup_capture(journal, observations, execution, ordinal)?;
+                #[cfg(test)]
+                if !step.records_event() {
+                    super::test_run_publication_hook("after_recovery_backup_replay");
+                }
             }
             PublicationAction::PromotionIntent(ordinal) => {
                 verify_recovery_promotion_intent(journal, observations, execution, ordinal)?;
             }
             PublicationAction::Promoted(ordinal) => {
                 execute_recovery_promotion(journal, observations, execution, ordinal)?;
+                #[cfg(test)]
+                if !step.records_event() {
+                    super::test_run_publication_hook("after_recovery_promotion_replay");
+                }
             }
             PublicationAction::Published => {
                 verify_published_artifacts(journal, observations, execution)?;
@@ -3892,9 +3915,11 @@ fn execute_forward_program(
                 )));
             }
         }
-        append_prepared_recovery_event(journal, protocol, planned, transition)?;
+        if let Some((planned, transition)) = recorded {
+            append_prepared_recovery_event(journal, protocol, planned, transition)?;
+        }
     }
-    Ok(())
+    ensure_recovery_event_plan_consumed(&mut event_plan)
 }
 
 fn execute_rollback_program(
@@ -3902,14 +3927,12 @@ fn execute_rollback_program(
     protocol: &mut ObservedProtocol,
     observations: &mut [ArtifactObservation],
     execution: &RecoveryExecutionPlan,
-    event_plan: JournalEventPlan,
+    steps: Vec<RecoveryStep>,
+    mut event_plan: JournalEventPlan,
 ) -> Result<(), ExecutionError> {
-    for planned in event_plan {
-        let action = planned.action();
-        let transition = protocol
-            .state
-            .prepare(action)
-            .map_err(protocol_execution_error)?;
+    for step in steps {
+        let action = step.action();
+        let recorded = prepare_recovery_step(protocol, &mut event_plan, step)?;
         match action {
             PublicationAction::RecoveryDecision(RecoveryDirection::Rollback)
             | PublicationAction::Finalized => {}
@@ -3932,9 +3955,61 @@ fn execute_rollback_program(
                 )));
             }
         }
+        let Some((planned, transition)) = recorded else {
+            return Err(ExecutionError::Blocked(invalid_event(
+                "rollback recovery program contains a physical replay",
+            )));
+        };
         append_prepared_recovery_event(journal, protocol, planned, transition)?;
     }
-    Ok(())
+    ensure_recovery_event_plan_consumed(&mut event_plan)
+}
+
+fn prepare_recovery_step(
+    protocol: &ObservedProtocol,
+    event_plan: &mut JournalEventPlan,
+    step: RecoveryStep,
+) -> Result<Option<(PlannedJournalEvent, PreparedTransition)>, ExecutionError> {
+    let action = step.action();
+    if !step.records_event() {
+        return if matches!(
+            action,
+            PublicationAction::BackupCaptured(_) | PublicationAction::Promoted(_)
+        ) {
+            Ok(None)
+        } else {
+            Err(ExecutionError::Blocked(invalid_event(
+                "only completed filesystem actions may be replayed",
+            )))
+        };
+    }
+    let planned = event_plan.next().ok_or_else(|| {
+        ExecutionError::Blocked(invalid_event(
+            "recovery execution is missing a pre-encoded journal event",
+        ))
+    })?;
+    if planned.action() != action {
+        return Err(ExecutionError::Blocked(invalid_event(
+            "recovery execution and journal event plans diverged",
+        )));
+    }
+    let transition = protocol
+        .state
+        .prepare(action)
+        .map_err(protocol_execution_error)?;
+    Ok(Some((planned, transition)))
+}
+
+fn ensure_recovery_event_plan_consumed(
+    event_plan: &mut JournalEventPlan,
+) -> Result<(), ExecutionError> {
+    if event_plan.next().is_some() {
+        Err(ExecutionError::Blocked(invalid_event(
+            "recovery journal plan contains an unexecuted event",
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn verify_and_install_recovery_baseline(
@@ -4897,7 +4972,7 @@ mod tests {
             artifacts,
             baseline,
         };
-        let actions = recovery_event_program(
+        let program = recovery_program(
             &observation,
             direction,
             finalize_workspace,
@@ -4908,7 +4983,7 @@ mod tests {
             &journal,
             &execution,
             &observation.artifacts,
-            &actions,
+            &program.steps,
             direction,
         )
         .expect("recovery verification charge")
@@ -6050,6 +6125,39 @@ mod tests {
         (directory, path, reopened, report, published)
     }
 
+    fn recorded_renames_moved_back_fixture(
+        retained: fn(&JournalEventKind) -> bool,
+    ) -> (
+        TempDir,
+        PathBuf,
+        AssetWorkspace,
+        CommitReport,
+        Vec<u8>,
+        JournalLayout,
+    ) {
+        let (directory, path, workspace, report) = committed_fixture();
+        let workspace_id = workspace.workspace_id();
+        let published = fs::read(&path).expect("published target");
+        let (layout, artifact) = truncate_events_after(&report, retained);
+        drop(workspace);
+
+        let staging = artifact.staging().join_root(layout.directory());
+        let backup = artifact
+            .backup()
+            .expect("existing target backup")
+            .join_root(layout.directory());
+        capture_existing(&path, &staging, artifact.new_identity())
+            .expect("move the promoted inode back to staging");
+        capture_existing(
+            &backup,
+            &path,
+            artifact.old_identity().expect("existing target identity"),
+        )
+        .expect("move the captured old inode back to the target");
+        let reopened = reopen_base_workspace(workspace_id, &path);
+        (directory, path, reopened, report, published, layout)
+    }
+
     fn read_name_at(workspace: &AssetWorkspace, address: &ObjectAddress) -> String {
         let snapshot = workspace.snapshot();
         let mut budget = AssetLoadBudget::default();
@@ -6444,6 +6552,91 @@ mod tests {
         let finalized = workspace
             .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
             .expect("attach exact preopen recovery");
+        assert_eq!(
+            finalized,
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
+        );
+        assert_eq!(workspace.revision(), report.committed_revision());
+    }
+
+    #[test]
+    fn replay_recovery_precharges_exact_and_one_short_budgets_before_mutation() {
+        let (
+            _measured_directory,
+            _measured_path,
+            _measured_workspace,
+            measured_report,
+            _published,
+            _measured_layout,
+        ) = recorded_renames_moved_back_fixture(|kind| {
+            matches!(kind, JournalEventKind::Promoted { .. })
+        });
+        let mut measured = AssetLoadBudget::default();
+        AssetWorkspace::recover_at(measured_report.recovery(), &mut measured)
+            .expect("measure physical replay recovery");
+        let usage = measured.usage();
+        let exact_limits = unity_asset_core::AssetLoadLimits {
+            max_entries: usage.entries,
+            max_bytes: usage.bytes,
+            max_depth: usage.max_observed_depth,
+            max_members: usage.members,
+            ..unity_asset_core::AssetLoadLimits::default()
+        };
+
+        let (_directory, path, mut workspace, report, published, layout) =
+            recorded_renames_moved_back_fixture(|kind| {
+                matches!(kind, JournalEventKind::Promoted { .. })
+            });
+        let journal = Journal::open(layout.clone(), &mut AssetLoadBudget::default())
+            .expect("open replay journal before one-short probe");
+        let artifact = journal.manifest().artifacts()[0].clone();
+        drop(journal);
+        let staging = artifact.staging().join_root(layout.directory());
+        let backup = artifact
+            .backup()
+            .expect("existing target backup")
+            .join_root(layout.directory());
+        let target_before = fs::read(&path).expect("target before replay");
+        let staging_before = fs::read(&staging).expect("staging before replay");
+        let event_count = fs::read_dir(layout.events_directory())
+            .expect("events before replay")
+            .count();
+        assert!(!backup.exists());
+        let mut one_short = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
+            max_bytes: usage.bytes - 1,
+            ..exact_limits
+        })
+        .expect("one-short replay budget");
+
+        let error = AssetWorkspace::recover_at(report.recovery(), &mut one_short)
+            .expect_err("one-short replay must fail before its sticky decision or rename");
+
+        assert!(matches!(error, RecoveryError::Budget { .. }));
+        assert_eq!(
+            fs::read(&path).expect("unchanged replay target"),
+            target_before
+        );
+        assert_eq!(
+            fs::read(&staging).expect("unchanged replay staging"),
+            staging_before
+        );
+        assert!(!backup.exists());
+        assert_eq!(
+            fs::read_dir(layout.events_directory())
+                .expect("unchanged replay events")
+                .count(),
+            event_count
+        );
+
+        let mut exact = AssetLoadBudget::new(exact_limits).expect("exact replay budget");
+        let recovered = AssetWorkspace::recover_at(report.recovery(), &mut exact)
+            .expect("exact physical replay recovery");
+        assert_eq!(exact.usage(), usage);
+        assert_eq!(fs::read(&path).expect("replayed target"), published);
+        assert!(recovered.requires_workspace_finalization());
+        let finalized = workspace
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("attach exact physical replay recovery");
         assert_eq!(
             finalized,
             RecoveryOutcome::Finalized(Box::new(report.clone()))
@@ -6953,6 +7146,90 @@ mod tests {
     }
 
     #[test]
+    fn recovery_replays_a_recorded_backup_capture_moved_back_to_the_target() {
+        let (_directory, path, mut reopened, report, published, layout) =
+            recorded_renames_moved_back_fixture(|kind| {
+                matches!(kind, JournalEventKind::BackupCaptured { .. })
+            });
+
+        let recovered =
+            AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
+                .expect("replay the recorded backup capture");
+        let outcome = reopened
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("attach replayed backup transaction");
+
+        assert!(recovered.requires_workspace_finalization());
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
+        );
+        assert_eq!(fs::read(&path).expect("recovered target"), published);
+        assert_eq!(reopened.revision(), report.committed_revision());
+        let journal =
+            Journal::open(layout, &mut AssetLoadBudget::default()).expect("open replayed journal");
+        assert_eq!(
+            journal
+                .events()
+                .iter()
+                .filter(|event| matches!(event.kind(), JournalEventKind::BackupCaptured { .. }))
+                .count(),
+            1,
+            "physical replay must not duplicate a durable completion event"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn recovery_restores_stage_security_metadata_after_recorded_backup_capture() {
+        let (_directory, path, mut reopened, report, published, layout) =
+            recorded_renames_moved_back_fixture(|kind| {
+                matches!(kind, JournalEventKind::BackupCaptured { .. })
+            });
+        let journal = Journal::open(layout.clone(), &mut AssetLoadBudget::default())
+            .expect("open recorded backup journal");
+        let artifact = journal.manifest().artifacts()[0].clone();
+        drop(journal);
+        let staging = artifact.staging().join_root(layout.directory());
+        let backup = artifact
+            .backup()
+            .expect("existing target backup")
+            .join_root(layout.directory());
+        capture_existing(
+            &path,
+            &backup,
+            artifact.old_identity().expect("existing target identity"),
+        )
+        .expect("restore the captured backup topology");
+        test_tamper_security_metadata(&staging).expect("tamper staged security metadata");
+        assert!(
+            !test_security_metadata_matches(&staging, &backup)
+                .expect("compare tampered security metadata"),
+            "the fixture must alter security metadata without changing the inode or bytes"
+        );
+
+        let recovered =
+            AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
+                .expect("restore metadata and publish the staged inode");
+        let outcome = reopened
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("attach metadata-restored transaction");
+
+        assert!(recovered.requires_workspace_finalization());
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
+        );
+        assert_eq!(fs::read(&path).expect("recovered target"), published);
+        assert!(
+            test_security_metadata_matches(&path, &backup)
+                .expect("compare recovered security metadata"),
+            "recovery must restore the captured target security metadata before promotion"
+        );
+        assert_eq!(reopened.revision(), report.committed_revision());
+    }
+
+    #[test]
     fn recovery_finishes_a_promotion_rename_missing_its_completion_event() {
         let (_directory, path, workspace, report) = committed_fixture();
         let workspace_id = workspace.workspace_id();
@@ -6981,6 +7258,141 @@ mod tests {
         assert_eq!(recovered.committed(), outcome.committed());
         assert_eq!(fs::read(&path).expect("recovered target"), published);
         assert_eq!(reopened.revision(), report.committed_revision());
+    }
+
+    #[test]
+    fn recovery_replays_recorded_renames_moved_back_to_the_previous_topology() {
+        let (_directory, path, mut reopened, report, published, layout) =
+            recorded_renames_moved_back_fixture(|kind| {
+                matches!(kind, JournalEventKind::Promoted { .. })
+            });
+
+        let recovered =
+            AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
+                .expect("replay both recorded renames");
+        let outcome = reopened
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("attach replayed promotion transaction");
+
+        assert!(recovered.requires_workspace_finalization());
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::Finalized(Box::new(report.clone()))
+        );
+        assert_eq!(fs::read(&path).expect("recovered target"), published);
+        assert_eq!(reopened.revision(), report.committed_revision());
+        let journal =
+            Journal::open(layout, &mut AssetLoadBudget::default()).expect("open replayed journal");
+        assert_eq!(
+            journal
+                .events()
+                .iter()
+                .filter(|event| matches!(event.kind(), JournalEventKind::BackupCaptured { .. }))
+                .count(),
+            1,
+            "backup replay must not duplicate its durable completion event"
+        );
+        assert_eq!(
+            journal
+                .events()
+                .iter()
+                .filter(|event| matches!(event.kind(), JournalEventKind::Promoted { .. }))
+                .count(),
+            1,
+            "promotion replay must not duplicate its durable completion event"
+        );
+    }
+
+    #[test]
+    fn replayed_renames_remain_retryable_after_each_physical_boundary() {
+        for crash_point in [
+            "after_recovery_backup_replay",
+            "after_recovery_promotion_replay",
+        ] {
+            let (_directory, path, mut reopened, report, published, layout) =
+                recorded_renames_moved_back_fixture(|kind| {
+                    matches!(kind, JournalEventKind::Promoted { .. })
+                });
+            super::super::test_set_publication_hook(crash_point, || {
+                panic!("injected replay interruption")
+            });
+
+            let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
+            }));
+            assert!(
+                interrupted.is_err(),
+                "{crash_point} must interrupt recovery"
+            );
+            let journal = Journal::open(layout.clone(), &mut AssetLoadBudget::default())
+                .expect("open interrupted replay journal");
+            assert_eq!(
+                journal
+                    .events()
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind(),
+                        JournalEventKind::RecoveryDecision {
+                            direction: RecoveryDirection::Forward
+                        }
+                    ))
+                    .count(),
+                1,
+                "the sticky decision must be durable exactly once"
+            );
+            assert_eq!(
+                journal
+                    .events()
+                    .iter()
+                    .filter(|event| matches!(event.kind(), JournalEventKind::BackupCaptured { .. }))
+                    .count(),
+                1,
+                "backup replay must not append its completed event"
+            );
+            assert_eq!(
+                journal
+                    .events()
+                    .iter()
+                    .filter(|event| matches!(event.kind(), JournalEventKind::Promoted { .. }))
+                    .count(),
+                1,
+                "promotion replay must not append its completed event"
+            );
+            drop(journal);
+
+            let recovered =
+                AssetWorkspace::recover_at(report.recovery(), &mut AssetLoadBudget::default())
+                    .expect("retry interrupted physical replay");
+            let outcome = reopened
+                .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+                .expect("attach retried physical replay");
+
+            assert!(recovered.requires_workspace_finalization());
+            assert_eq!(
+                outcome,
+                RecoveryOutcome::Finalized(Box::new(report.clone()))
+            );
+            assert_eq!(fs::read(&path).expect("retried replay target"), published);
+            assert_eq!(reopened.revision(), report.committed_revision());
+            let journal = Journal::open(layout, &mut AssetLoadBudget::default())
+                .expect("open finalized replay journal");
+            assert_eq!(
+                journal
+                    .events()
+                    .iter()
+                    .filter(|event| matches!(event.kind(), JournalEventKind::BackupCaptured { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                journal
+                    .events()
+                    .iter()
+                    .filter(|event| matches!(event.kind(), JournalEventKind::Promoted { .. }))
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]

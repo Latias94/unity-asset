@@ -1403,6 +1403,24 @@ pub(super) fn copy_security_metadata_external_to_journal_directory(
 }
 
 #[cfg(test)]
+pub(super) fn test_tamper_security_metadata(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
+}
+
+#[cfg(test)]
+pub(super) fn test_security_metadata_matches(left: &Path, right: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let left = std::fs::metadata(left)?;
+    let right = std::fs::metadata(right)?;
+    Ok(left.uid() == right.uid()
+        && left.gid() == right.gid()
+        && left.permissions().mode() == right.permissions().mode())
+}
+
+#[cfg(test)]
 pub(super) fn atomic_replace_tracked(
     source: &Path,
     destination: &Path,

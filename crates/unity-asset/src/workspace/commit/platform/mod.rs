@@ -1095,6 +1095,16 @@ pub(crate) fn copy_security_metadata_external_to_journal_directory(
     )
 }
 
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn test_tamper_security_metadata(path: &Path) -> io::Result<()> {
+    platform::test_tamper_security_metadata(path)
+}
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn test_security_metadata_matches(left: &Path, right: &Path) -> io::Result<bool> {
+    platform::test_security_metadata_matches(left, right)
+}
+
 /// Moves an external, identity-bound regular file into an already-opened
 /// private journal directory without re-resolving that directory by path.
 pub(crate) fn capture_external_regular_in_journal_directory(

@@ -2565,6 +2565,36 @@ impl PrivateSecurityDescriptor {
     }
 }
 
+#[cfg(test)]
+pub(super) fn test_tamper_security_metadata(path: &Path) -> io::Result<()> {
+    let file = open_regular(
+        path,
+        READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+        PINNED_FILE_SHARE,
+        "security metadata tamper target",
+    )?;
+    PrivateSecurityDescriptor::new(true)?.apply_and_verify(file.handle.raw())
+}
+
+#[cfg(test)]
+pub(super) fn test_security_metadata_matches(left: &Path, right: &Path) -> io::Result<bool> {
+    let left = open_regular(
+        left,
+        READ_CONTROL,
+        PINNED_FILE_SHARE,
+        "security metadata comparison source",
+    )?;
+    let right = open_regular(
+        right,
+        READ_CONTROL,
+        PINNED_FILE_SHARE,
+        "security metadata comparison target",
+    )?;
+    let left = SecuritySnapshot::capture(left.handle.raw())?;
+    let right = SecuritySnapshot::capture(right.handle.raw())?;
+    left.equivalent_to(&right)
+}
+
 fn open_effective_token() -> io::Result<OwnedHandle> {
     let mut handle = std::ptr::null_mut();
     let thread_opened =

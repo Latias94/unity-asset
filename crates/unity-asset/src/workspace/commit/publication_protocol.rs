@@ -47,6 +47,31 @@ impl PublicationAction {
     }
 }
 
+/// One recovery operation, separated from whether it advances durable state.
+///
+/// Completed filesystem actions remain safe to replay when their exact owned
+/// inode has moved back to an earlier topology or its security metadata must
+/// be restored. Replays never produce a second journal event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryStep {
+    Record(PublicationAction),
+    Replay(PublicationAction),
+}
+
+impl RecoveryStep {
+    #[must_use]
+    pub(crate) const fn action(self) -> PublicationAction {
+        match self {
+            Self::Record(action) | Self::Replay(action) => action,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn records_event(self) -> bool {
+        matches!(self, Self::Record(_))
+    }
+}
+
 /// Non-action records that still affect whether a journal prefix is legal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProtocolEvent {
@@ -836,13 +861,13 @@ pub(crate) fn append_commit_program(
     Ok(())
 }
 
-/// Appends every durable action that a selected recovery direction may execute.
+/// Appends the durable transitions and idempotent physical replays for recovery.
 pub(crate) fn append_recovery_program(
     state: &PublicationState,
     artifacts: &[ArtifactObservation],
     direction: RecoveryDirection,
     finalize_workspace: bool,
-    actions: &mut Vec<PublicationAction>,
+    steps: &mut Vec<RecoveryStep>,
 ) -> Result<(), ProtocolPlanError> {
     if state.artifacts().len() != artifacts.len() {
         return Err(ProtocolPlanError::InvalidState(
@@ -880,24 +905,26 @@ pub(crate) fn append_recovery_program(
             ));
         }
         Some(_) => {}
-        None => actions.push(PublicationAction::RecoveryDecision(direction)),
+        None => steps.push(RecoveryStep::Record(PublicationAction::RecoveryDecision(
+            direction,
+        ))),
     }
 
     if direction == RecoveryDirection::Rollback {
         if !state.abandoned() {
-            actions.push(PublicationAction::Abandoned);
+            steps.push(RecoveryStep::Record(PublicationAction::Abandoned));
         }
         if !state.finalized() {
-            actions.push(PublicationAction::Finalized);
+            steps.push(RecoveryStep::Record(PublicationAction::Finalized));
         }
         return Ok(());
     }
 
     if !state.staging_verified() {
-        actions.push(PublicationAction::StagingVerified);
+        steps.push(RecoveryStep::Record(PublicationAction::StagingVerified));
     }
     if !state.journaled() {
-        actions.push(PublicationAction::Journaled);
+        steps.push(RecoveryStep::Record(PublicationAction::Journaled));
     }
     for (index, (artifact, progress)) in artifacts.iter().zip(state.artifacts()).enumerate() {
         let ordinal =
@@ -920,7 +947,7 @@ pub(crate) fn append_recovery_program(
                 ));
             }
             if !progress.promoted() {
-                actions.push(PublicationAction::Promoted(ordinal));
+                steps.push(RecoveryStep::Record(PublicationAction::Promoted(ordinal)));
             }
             continue;
         }
@@ -929,10 +956,9 @@ pub(crate) fn append_recovery_program(
             match (artifact.target, artifact.staging, artifact.backup) {
                 (EntryEvidence::Old, EntryEvidence::New, EntryEvidence::Missing) => {
                     if !progress.backup_intent() {
-                        actions.push(PublicationAction::BackupIntent(ordinal));
-                    }
-                    if !progress.backup_captured() {
-                        actions.push(PublicationAction::BackupCaptured(ordinal));
+                        steps.push(RecoveryStep::Record(PublicationAction::BackupIntent(
+                            ordinal,
+                        )));
                     }
                 }
                 (EntryEvidence::Missing, EntryEvidence::New, EntryEvidence::Old) => {
@@ -941,14 +967,17 @@ pub(crate) fn append_recovery_program(
                             "captured backup has no durable intent",
                         ));
                     }
-                    if !progress.backup_captured() {
-                        actions.push(PublicationAction::BackupCaptured(ordinal));
-                    }
                 }
                 _ => {
                     return Err(ProtocolPlanError::UnexpectedEvidence { artifact: index });
                 }
             }
+            let backup_capture = PublicationAction::BackupCaptured(ordinal);
+            steps.push(if progress.backup_captured() {
+                RecoveryStep::Replay(backup_capture)
+            } else {
+                RecoveryStep::Record(backup_capture)
+            });
         } else if !matches!(
             (artifact.target, artifact.staging, artifact.backup),
             (
@@ -961,21 +990,26 @@ pub(crate) fn append_recovery_program(
         }
 
         if !progress.promotion_intent() {
-            actions.push(PublicationAction::PromotionIntent(ordinal));
+            steps.push(RecoveryStep::Record(PublicationAction::PromotionIntent(
+                ordinal,
+            )));
         }
-        if !progress.promoted() {
-            actions.push(PublicationAction::Promoted(ordinal));
-        }
+        let promotion = PublicationAction::Promoted(ordinal);
+        steps.push(if progress.promoted() {
+            RecoveryStep::Replay(promotion)
+        } else {
+            RecoveryStep::Record(promotion)
+        });
     }
     if !state.published() {
-        actions.push(PublicationAction::Published);
+        steps.push(RecoveryStep::Record(PublicationAction::Published));
     }
     if finalize_workspace {
         if !state.baseline_installed() {
-            actions.push(PublicationAction::BaselineInstalled);
+            steps.push(RecoveryStep::Record(PublicationAction::BaselineInstalled));
         }
         if !state.finalized() {
-            actions.push(PublicationAction::Finalized);
+            steps.push(RecoveryStep::Record(PublicationAction::Finalized));
         }
     }
     Ok(())
@@ -1011,6 +1045,19 @@ mod tests {
         )
         .unwrap();
         actions
+    }
+
+    fn recorded(actions: impl IntoIterator<Item = PublicationAction>) -> Vec<RecoveryStep> {
+        actions.into_iter().map(RecoveryStep::Record).collect()
+    }
+
+    fn recorded_actions(steps: &[RecoveryStep]) -> Vec<PublicationAction> {
+        steps
+            .iter()
+            .copied()
+            .filter(|step| step.records_event())
+            .map(RecoveryStep::action)
+            .collect()
     }
 
     fn existing(
@@ -1153,11 +1200,14 @@ mod tests {
                     expected
                 };
                 assert_eq!(
-                    recovery, expected,
+                    recorded_actions(&recovery),
+                    expected,
                     "topology {topology:?}, prefix {prefix_length}"
                 );
-                for action in recovery {
-                    state.apply(ProtocolEvent::Action(action)).unwrap();
+                for step in recovery {
+                    if step.records_event() {
+                        state.apply(ProtocolEvent::Action(step.action())).unwrap();
+                    }
                 }
                 assert!(state.finalized());
                 assert!(state.published());
@@ -1211,7 +1261,7 @@ mod tests {
                 RecoveryDirection::Forward,
             )];
             expected.extend_from_slice(&actions[prefix_length..]);
-            assert_eq!(recovery, expected);
+            assert_eq!(recovery, recorded(expected));
         }
     }
 
@@ -1645,7 +1695,7 @@ mod tests {
             RecoveryDirection::Forward,
         )];
         expected.extend(commit_program(&[true, false]));
-        assert_eq!(recovery, expected);
+        assert_eq!(recovery, recorded(expected.iter().copied()));
 
         let mut detached = Vec::new();
         append_recovery_program(
@@ -1660,7 +1710,7 @@ mod tests {
             .iter()
             .position(|action| *action == PublicationAction::Published)
             .unwrap();
-        assert_eq!(detached, expected[..=published]);
+        assert_eq!(detached, recorded(expected[..=published].iter().copied()));
     }
 
     #[test]
@@ -1693,9 +1743,11 @@ mod tests {
         assert_eq!(
             actions,
             [
-                PublicationAction::RecoveryDecision(RecoveryDirection::Forward),
-                PublicationAction::Promoted(0),
-                PublicationAction::Published,
+                RecoveryStep::Record(PublicationAction::RecoveryDecision(
+                    RecoveryDirection::Forward
+                )),
+                RecoveryStep::Record(PublicationAction::Promoted(0)),
+                RecoveryStep::Record(PublicationAction::Published),
             ]
         );
 
@@ -1723,6 +1775,89 @@ mod tests {
     }
 
     #[test]
+    fn recovery_replays_completed_filesystem_actions_without_new_events() {
+        let artifacts = vec![existing(
+            EntryEvidence::Old,
+            EntryEvidence::New,
+            EntryEvidence::Missing,
+        )];
+        let mut state = recovery_state(&artifacts);
+        for action in [
+            PublicationAction::StagingVerified,
+            PublicationAction::Journaled,
+            PublicationAction::BackupIntent(0),
+            PublicationAction::BackupCaptured(0),
+            PublicationAction::PromotionIntent(0),
+            PublicationAction::Promoted(0),
+        ] {
+            state.apply(ProtocolEvent::Action(action)).unwrap();
+        }
+
+        let mut steps = Vec::new();
+        append_recovery_program(
+            &state,
+            &artifacts,
+            RecoveryDirection::Forward,
+            false,
+            &mut steps,
+        )
+        .unwrap();
+
+        assert_eq!(
+            steps,
+            [
+                RecoveryStep::Record(PublicationAction::RecoveryDecision(
+                    RecoveryDirection::Forward
+                )),
+                RecoveryStep::Replay(PublicationAction::BackupCaptured(0)),
+                RecoveryStep::Replay(PublicationAction::Promoted(0)),
+                RecoveryStep::Record(PublicationAction::Published),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_reapplies_security_metadata_after_recorded_backup_capture() {
+        let artifacts = vec![existing(
+            EntryEvidence::Missing,
+            EntryEvidence::New,
+            EntryEvidence::Old,
+        )];
+        let mut state = recovery_state(&artifacts);
+        for action in [
+            PublicationAction::StagingVerified,
+            PublicationAction::Journaled,
+            PublicationAction::BackupIntent(0),
+            PublicationAction::BackupCaptured(0),
+        ] {
+            state.apply(ProtocolEvent::Action(action)).unwrap();
+        }
+
+        let mut steps = Vec::new();
+        append_recovery_program(
+            &state,
+            &artifacts,
+            RecoveryDirection::Forward,
+            false,
+            &mut steps,
+        )
+        .unwrap();
+
+        assert_eq!(
+            steps,
+            [
+                RecoveryStep::Record(PublicationAction::RecoveryDecision(
+                    RecoveryDirection::Forward
+                )),
+                RecoveryStep::Replay(PublicationAction::BackupCaptured(0)),
+                RecoveryStep::Record(PublicationAction::PromotionIntent(0)),
+                RecoveryStep::Record(PublicationAction::Promoted(0)),
+                RecoveryStep::Record(PublicationAction::Published),
+            ]
+        );
+    }
+
+    #[test]
     fn rollback_program_is_sticky_and_contains_no_forward_action() {
         let artifacts = vec![existing(
             EntryEvidence::Old,
@@ -1742,15 +1877,18 @@ mod tests {
         assert_eq!(
             actions,
             [
-                PublicationAction::RecoveryDecision(RecoveryDirection::Rollback),
-                PublicationAction::Abandoned,
-                PublicationAction::Finalized,
+                RecoveryStep::Record(PublicationAction::RecoveryDecision(
+                    RecoveryDirection::Rollback
+                )),
+                RecoveryStep::Record(PublicationAction::Abandoned),
+                RecoveryStep::Record(PublicationAction::Finalized),
             ]
         );
         assert!(
             !actions
                 .iter()
                 .copied()
+                .map(RecoveryStep::action)
                 .any(PublicationAction::is_forward_progress)
         );
     }
