@@ -6,6 +6,18 @@ wrapping the removed APIs.
 
 This is the only non-historical document that names removed public symbols and commands.
 
+`ExtractionPlan`, `ExtractionManifest`, and `ExtractionReport` are now version 2. Version 1 plans
+persisted an ignored Sprite Unity version, while version 1 manifests and reports did not declare
+the complete diagnostic vocabulary. Re-plan the request and create fresh resume evidence.
+
+`ExtractionExecutionLimits::new` now rejects `max_open_files` values below
+`ExtractionExecutionLimits::MIN_OPEN_FILES` (currently 5). The minimum covers the run lock,
+staging file, parent-directory handles, and digest verification required by safe publication.
+
+`ExtractionExecutionError`, `ExtractionModelError`, and `ExtractionDiagnosticCode` are now
+non-exhaustive. Downstream matches must retain a wildcard branch so future diagnostic additions do
+not require another source-breaking release.
+
 ## Migration Summary
 
 | Removed surface | Replacement |
@@ -26,6 +38,18 @@ This is the only non-historical document that names removed public symbols and c
 | Direct mutable class/document and `save*` APIs | `MutationPlan`, schema recipes, `prepare`, preview, and `commit` |
 | Legacy dependency/session graph types | `ReferenceGraph` |
 | Legacy export manifest and export sessions | `ExtractionRequest`, `ExtractionPlan`, `ExtractionManifest`, and `ExtractionReport` |
+| `ExtractionExecutor::execute_with_manifest` and separate resume/manifest arguments | Build one `ExtractionRunOptions` value with `with_resume` and/or `with_manifest_path`, then call `ExtractionExecutor::execute` |
+| `TextureExporter::export_*`, `export_auto`, `export_validated`, and texture `ExportOptions` | Open and buffer the destination in the application, then call the explicit `TextureExporter::write_png`, `write_jpeg`, `write_bmp`, or `write_tiff` encoder |
+| `AudioExporter::export_*`, `export_auto`, `export_validated`, `AudioFormat`, and audio `ExportOptions` | Open and buffer the destination in the application, then call `AudioExporter::write_wav`, `write_raw_pcm`, or `write_standard_source` |
+| `TextureExporter::supported_formats` / `is_format_supported` and `AudioExporter::supported_formats` / `is_format_supported` | The concrete `write_*` methods are the encoder capability surface; decoder support remains available from `TextureProcessor` and `AudioProcessor` |
+| `TextureExporter::create_filename` / `AudioExporter::create_filename` | Output naming belongs to the application, or to `ExtractionPlanner` when using the extraction pipeline |
+| `TextureExporter::validate_for_export` / `AudioExporter::validate_for_export` | Call the selected `write_*` method; each writer validates the exact dimensions, frame shape, container, and codec constraints it requires before publishing bytes |
+| `texture::export_image` / `audio::export_audio` | Call the corresponding explicit `TextureExporter::write_*` or `AudioExporter::write_*` encoder |
+| `TextureProcessor::process_and_export` / `AudioProcessor::process_and_export` | `process_and_write_png` / `process_and_write_wav` with a caller-owned writer |
+| `SpriteProcessor::extract_sprite_image` and `process_sprite_with_texture` | `render_sprite` for an `RgbaImage`, or `write_sprite_png` for a caller-owned writer |
+| `SpriteResult` | `SpriteProcessor::parse_sprite` and `SpriteParser::parse_from_unity_object` return `Sprite` directly |
+| `SpriteManager`, `SpriteConfig`, `SpriteAtlas`/`SpriteInfo`, `SpriteStats`, `create_*_manager`, `ProcessingOptions`, and Sprite feature/validation/statistics helpers | Use `SpriteParser` or `SpriteProcessor` directly; the library no longer advertises unimplemented atlas, transform, mesh, physics, caching, or parallel-processing capabilities |
+| `SpriteParser::new(version)` / `SpriteProcessor::new(version)` | Call `new()` without a version; the prior parameter was ignored and did not provide version-aware parsing |
 
 ## Loading Sources
 
@@ -277,9 +301,9 @@ The CLI now has typed command families rather than one command per internal pars
 | `deps` | `references graph` |
 | `project-graph` | `references graph --unity-project` |
 | `stats` / `stats-pathid` | `workspace inspect sources` |
-| `export` | `extract` |
-| `export-bundle` | `extract --request ...` or `extract --plan ...` |
-| `export-serialized` | `extract --request ...` or `extract --plan ...` |
+| `extract` | `export` |
+| `export-bundle` | `export --request ...` or `export --plan ...` |
+| `export-serialized` | `export --request ...` or `export --plan ...` |
 | `dump-typetree-registry` | No dump replacement; supply an immutable JSON/TPK registry with `--typetree-registry` |
 | Separate async command binary | Use the same typed commands; async is an implementation feature, not a second protocol |
 
@@ -344,13 +368,13 @@ Legacy export request JSON and manifests are not accepted. Build a current
 plan:
 
 ```bash
-unity-asset extract \
+unity-asset export \
   --input project \
   --output out \
   --request extraction-request.json \
   --dry-run > extraction-plan.json
 
-unity-asset extract \
+unity-asset export \
   --input project \
   --output out \
   --plan extraction-plan.json \

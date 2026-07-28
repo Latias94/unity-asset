@@ -107,38 +107,6 @@ impl Default for SpriteBorder {
     }
 }
 
-/// Comprehensive sprite information
-///
-/// Contains all the information needed to fully describe a sprite.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpriteInfo {
-    pub name: String,
-    pub rect: SpriteRect,
-    pub offset: SpriteOffset,
-    pub pivot: SpritePivot,
-    pub border: SpriteBorder,
-    pub pixels_to_units: f32,
-    pub is_polygon: bool,
-    pub texture_path_id: i64,
-    pub is_atlas_sprite: bool,
-}
-
-impl Default for SpriteInfo {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            rect: SpriteRect::default(),
-            offset: SpriteOffset::default(),
-            pivot: SpritePivot::default(),
-            border: SpriteBorder::default(),
-            pixels_to_units: 100.0,
-            is_polygon: false,
-            texture_path_id: 0,
-            is_atlas_sprite: false,
-        }
-    }
-}
-
 /// Sprite object representation
 ///
 /// Main sprite structure containing all sprite data and metadata.
@@ -193,84 +161,6 @@ impl Default for Sprite {
             sprite_atlas_path_id: None,
         }
     }
-}
-
-/// Sprite processing configuration
-#[derive(Debug, Clone)]
-pub struct SpriteConfig {
-    /// Whether to extract sprite images
-    pub extract_images: bool,
-    /// Whether to process atlas sprites
-    pub process_atlas: bool,
-    /// Maximum sprite size to process
-    pub max_sprite_size: Option<(u32, u32)>,
-    /// Whether to apply sprite transformations
-    pub apply_transformations: bool,
-}
-
-impl Default for SpriteConfig {
-    fn default() -> Self {
-        Self {
-            extract_images: true,
-            process_atlas: true,
-            max_sprite_size: None,
-            apply_transformations: true,
-        }
-    }
-}
-
-/// Sprite processing result
-#[derive(Debug, Clone)]
-pub struct SpriteResult {
-    pub sprite: Sprite,
-    pub image_data: Option<Vec<u8>>,
-    pub warnings: Vec<String>,
-    pub errors: Vec<String>,
-}
-
-impl SpriteResult {
-    pub fn new(sprite: Sprite) -> Self {
-        Self {
-            sprite,
-            image_data: None,
-            warnings: Vec::new(),
-            errors: Vec::new(),
-        }
-    }
-
-    pub fn with_image(mut self, image_data: Vec<u8>) -> Self {
-        self.image_data = Some(image_data);
-        self
-    }
-
-    pub fn add_warning(&mut self, warning: String) {
-        self.warnings.push(warning);
-    }
-
-    pub fn add_error(&mut self, error: String) {
-        self.errors.push(error);
-    }
-
-    pub fn has_warnings(&self) -> bool {
-        !self.warnings.is_empty()
-    }
-
-    pub fn has_errors(&self) -> bool {
-        !self.errors.is_empty()
-    }
-
-    pub fn has_image(&self) -> bool {
-        self.image_data.is_some()
-    }
-}
-
-/// Sprite atlas information
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SpriteAtlas {
-    pub name: String,
-    pub texture_path_id: i64,
-    pub sprites: Vec<SpriteInfo>,
-    pub packed_sprites: Vec<String>,
 }
 
 /// Helper functions for sprite types

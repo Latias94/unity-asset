@@ -2,19 +2,25 @@ use anyhow::{Context, Result};
 use unity_asset::AssetLoadBudget;
 use unity_asset::extraction::{
     ExtractionExecutionLimits, ExtractionExecutionOptions, ExtractionExecutor, ExtractionManifest,
-    ExtractionPath, ExtractionPlan, ExtractionPlanner, ExtractionRequest, ExtractionSelection,
+    ExtractionPath, ExtractionPlan, ExtractionPlanner, ExtractionRequest, ExtractionRunOptions,
+    ExtractionSelection,
 };
 use unity_asset::reference::ReferenceGraphBuildOptions;
 
 use super::write_stdout;
-use crate::cli::ExtractCommand;
+use crate::cli::ExportCommand;
+use crate::cli_error::{
+    ExportManifestPathErrorKind, mark_export_execution_error, mark_export_manifest_path_error,
+    mark_export_plan_error, mark_export_reference_graph_error, mark_export_shared_stdin_error,
+    mark_export_workspace_load_error,
+};
 use crate::json_io::with_contract_reader;
 use crate::shared::AppContext;
 use crate::workspace_loader::{
     load_full_workspace_excluding_output, load_full_workspace_with_workspace_id_excluding_output,
 };
 
-pub(crate) fn run(command: ExtractCommand, ctx: &AppContext) -> Result<()> {
+pub(crate) fn run(command: ExportCommand, ctx: &AppContext) -> Result<()> {
     let mut budget = AssetLoadBudget::default();
     reject_shared_stdin(&command)?;
     let manifest_path = command
@@ -48,11 +54,12 @@ pub(crate) fn run(command: ExtractCommand, ctx: &AppContext) -> Result<()> {
             workspace_id,
             ctx,
             &mut budget,
-        )?,
+        ),
         None => {
-            load_full_workspace_excluding_output(&command.input, &command.output, ctx, &mut budget)?
+            load_full_workspace_excluding_output(&command.input, &command.output, ctx, &mut budget)
         }
-    };
+    }
+    .map_err(|error| mark_export_workspace_load_error(error, &command.input))?;
     let snapshot = workspace.snapshot();
     let plan = match saved_plan {
         Some(plan) => plan,
@@ -65,6 +72,7 @@ pub(crate) fn run(command: ExtractCommand, ctx: &AppContext) -> Result<()> {
             .then(|| {
                 snapshot
                     .reference_graph(ReferenceGraphBuildOptions::unbounded(), &mut budget)
+                    .map_err(mark_export_reference_graph_error)
                     .context("Failed to build the extraction reference graph")
             })
             .transpose()?;
@@ -75,6 +83,7 @@ pub(crate) fn run(command: ExtractCommand, ctx: &AppContext) -> Result<()> {
             };
             planner
                 .plan(request, &mut budget)
+                .map_err(mark_export_plan_error)
                 .context("Failed to plan extraction")?
         }
     };
@@ -93,28 +102,20 @@ pub(crate) fn run(command: ExtractCommand, ctx: &AppContext) -> Result<()> {
         execution_limits(&command)?,
         command.existing_output.into_policy(),
         command.failure.into_policy(),
-    )?;
+    )
+    .map_err(mark_export_execution_error)?;
     let executor = ExtractionExecutor::new();
-    let report = match manifest_path.as_ref() {
-        Some(manifest_path) => executor.execute_with_manifest(
-            &snapshot,
-            &plan,
-            &command.output,
-            manifest_path,
-            &options,
-            resume.as_ref(),
-            &mut budget,
-        ),
-        None => executor.execute(
-            &snapshot,
-            &plan,
-            &command.output,
-            &options,
-            resume.as_ref(),
-            &mut budget,
-        ),
+    let mut run = ExtractionRunOptions::new(options);
+    if let Some(resume) = resume.as_ref() {
+        run = run.with_resume(resume);
     }
-    .context("Extraction execution failed")?;
+    if let Some(manifest_path) = manifest_path.as_ref() {
+        run = run.with_manifest_path(manifest_path);
+    }
+    let report = executor
+        .execute(&snapshot, &plan, &command.output, run, &mut budget)
+        .map_err(mark_export_execution_error)
+        .context("Extraction execution failed")?;
 
     write_stdout(
         |output| {
@@ -127,10 +128,16 @@ pub(crate) fn run(command: ExtractCommand, ctx: &AppContext) -> Result<()> {
 }
 
 fn parse_manifest_path(path: &std::path::Path) -> Result<ExtractionPath> {
-    let value = path
-        .to_str()
-        .context("--manifest must be a valid UTF-8 relative path")?;
-    ExtractionPath::new(value).context("Invalid --manifest path")
+    let value = path.to_str().ok_or_else(|| {
+        mark_export_manifest_path_error(
+            anyhow::anyhow!("--manifest must be a valid UTF-8 relative path"),
+            path,
+            ExportManifestPathErrorKind::NonUtf8,
+        )
+    })?;
+    ExtractionPath::new(value).map_err(|error| {
+        mark_export_manifest_path_error(error, path, ExportManifestPathErrorKind::Invalid)
+    })
 }
 
 fn read_manifest(
@@ -157,7 +164,7 @@ fn read_request(path: &std::path::Path, budget: &mut AssetLoadBudget) -> Result<
     })
 }
 
-fn execution_limits(command: &ExtractCommand) -> Result<ExtractionExecutionLimits> {
+fn execution_limits(command: &ExportCommand) -> Result<ExtractionExecutionLimits> {
     let defaults = ExtractionExecutionLimits::default();
     ExtractionExecutionLimits::new(
         command.workers.unwrap_or(defaults.workers()),
@@ -172,21 +179,21 @@ fn execution_limits(command: &ExtractCommand) -> Result<ExtractionExecutionLimit
             .max_report_bytes
             .unwrap_or(defaults.max_report_bytes()),
     )
+    .map_err(mark_export_execution_error)
     .context("Invalid extraction execution limits")
 }
 
-fn reject_shared_stdin(command: &ExtractCommand) -> Result<()> {
-    let stdin_count = [
-        command.plan.as_deref(),
-        command.request.as_deref(),
-        command.resume.as_deref(),
+fn reject_shared_stdin(command: &ExportCommand) -> Result<()> {
+    let inputs = [
+        ("--plan", command.plan.as_deref()),
+        ("--request", command.request.as_deref()),
+        ("--resume", command.resume.as_deref()),
     ]
     .into_iter()
-    .flatten()
-    .filter(|path| *path == std::path::Path::new("-"))
-    .count();
-    if stdin_count > 1 {
-        anyhow::bail!("Only one structured input may read from stdin in a command");
+    .filter_map(|(name, path)| (path == Some(std::path::Path::new("-"))).then_some(name))
+    .collect::<Vec<_>>();
+    if inputs.len() > 1 {
+        return Err(mark_export_shared_stdin_error(&inputs));
     }
     Ok(())
 }

@@ -38,6 +38,28 @@ pub(crate) trait ReferenceInput: sealed::Sealed {
     ) -> Result<ObjectAddress, ReferenceGraphError>;
 }
 
+pub(super) fn collect_object_sources<'source, I: ReferenceInput + ?Sized>(
+    input: &'source I,
+    mut sources: Vec<ReferenceSource<'source>>,
+) -> Result<Vec<ReferenceSource<'source>>, ReferenceGraphError> {
+    debug_assert!(sources.is_empty());
+    let expected = input.object_source_count();
+    for source in input.object_sources() {
+        if sources.len() == expected {
+            return Err(ReferenceGraphError::Invariant(
+                "reference input exposed more object sources than declared",
+            ));
+        }
+        sources.push(source?);
+    }
+    if sources.len() != expected {
+        return Err(ReferenceGraphError::Invariant(
+            "reference input exposed fewer object sources than declared",
+        ));
+    }
+    Ok(sources)
+}
+
 /// Sparse semantic and wire overlay used while scanning a prepared source.
 pub(crate) trait PreparedReferenceOverlay: std::fmt::Debug + Send + Sync {
     fn binary_replacement(&self, source: SourceId, path_id: i64) -> Option<&[u8]>;
@@ -216,6 +238,19 @@ impl<'source> ReferenceSource<'source> {
         match self.parse {
             ReferenceSourceParse::Serialized(file)
             | ReferenceSourceParse::PreparedSerialized { file, .. } => Some(file),
+            ReferenceSourceParse::Yaml(_) | ReferenceSourceParse::PreparedYaml { .. } => None,
+        }
+    }
+
+    #[cfg(feature = "decode")]
+    pub(crate) fn binary_external(self, index: usize) -> Option<&'source FileIdentifier> {
+        match self.parse {
+            ReferenceSourceParse::Serialized(file) => file.externals.get(index),
+            ReferenceSourceParse::PreparedSerialized {
+                source,
+                file,
+                overlay,
+            } => overlay.binary_external(source, file, index),
             ReferenceSourceParse::Yaml(_) | ReferenceSourceParse::PreparedYaml { .. } => None,
         }
     }

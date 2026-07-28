@@ -11,7 +11,7 @@ use crate::workspace::{
 
 use super::ReferenceGraphError;
 use super::fact::{RawReferenceTarget, ReferenceFormat};
-use super::input::ReferenceInput;
+use super::input::{ReferenceInput, collect_object_sources};
 use super::resolution::{ResolutionIdentityIndex, clone_string, reserve_vec};
 
 const DEFAULT_YAML_EXTERNAL_TYPE_ID: i64 = 3;
@@ -94,14 +94,12 @@ impl ReferenceDestinationEncoder {
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, ReferenceEncodingError> {
         let input = reference_view_parts(view);
-        let mut sources = reserve_vec(
+        let sources = reserve_vec(
             input.object_source_count(),
             "reference destination source inputs",
             budget,
         )?;
-        for source in input.object_sources() {
-            sources.push(source?);
-        }
+        let sources = collect_object_sources(&input, sources)?;
 
         let identity = ResolutionIdentityIndex::build(&sources, budget)?;
         let mut binary_external_encodings = reserve_vec(

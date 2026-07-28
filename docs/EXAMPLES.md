@@ -64,6 +64,9 @@ All successful machine-facing commands write one JSON document to stdout. Failur
 versioned `unity_asset.cli_error` contract to stderr. A JSON input path may be `-` when the command
 accepts stdin.
 
+The error version fixes the envelope and field meanings. Treat `code` and `details.kind` as
+non-exhaustive vocabularies: branch on values you understand and retain an unknown-value fallback.
+
 Discover the exact operation set and current wire versions:
 
 ```powershell
@@ -133,18 +136,18 @@ or open additional files while answering a query.
 ## Extraction
 
 An `ExtractionRequest` v1 selects objects and representation policy. A dry run emits the canonical
-`ExtractionPlan` v1 without writing artifacts:
+`ExtractionPlan` v2 without writing artifacts:
 
 ```powershell
-cargo run -p unity-asset-cli --bin unity-asset -- extract --input D:\GameProject --output D:\Exports --request extraction-request.json --dry-run
+cargo run -p unity-asset-cli --bin unity-asset -- export --input D:\GameProject --output D:\Exports --request extraction-request.json --dry-run
 ```
 
 Execute either a request or a previously captured plan. A durable manifest may be published below
 the output root, and a later process can verify and resume completed artifacts:
 
 ```powershell
-cargo run -p unity-asset-cli --bin unity-asset -- extract --input D:\GameProject --output D:\Exports --request extraction-request.json --manifest reports/manifest.json
-cargo run -p unity-asset-cli --bin unity-asset -- extract --input D:\GameProject --output D:\Exports --plan extraction-plan.json --resume D:\Exports\reports\manifest.json
+cargo run -p unity-asset-cli --bin unity-asset -- export --input D:\GameProject --output D:\Exports --request extraction-request.json --manifest reports/manifest.json
+cargo run -p unity-asset-cli --bin unity-asset -- export --input D:\GameProject --output D:\Exports --plan extraction-plan.json --resume D:\Exports\reports\manifest.json
 ```
 
 Output collision policy is `error`, `skip`, or `replace`. Failure policy is `collect-all` or

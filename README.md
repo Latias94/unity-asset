@@ -298,13 +298,13 @@ unity-asset references graph \
 Plan or execute deterministic extraction:
 
 ```bash
-unity-asset extract \
+unity-asset export \
   --input tests/samples \
   --output out \
   --request extraction-request.json \
   --dry-run
 
-unity-asset extract \
+unity-asset export \
   --input tests/samples \
   --output out \
   --plan extraction-plan.json \

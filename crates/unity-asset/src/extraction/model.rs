@@ -22,7 +22,7 @@ use super::manifest::{
 pub use super::manifest::{ExtractionDiagnostic, ExtractionDiagnosticCode};
 
 pub const EXTRACTION_REQUEST_VERSION: u8 = 1;
-pub const EXTRACTION_PLAN_VERSION: u8 = 1;
+pub const EXTRACTION_PLAN_VERSION: u8 = 2;
 pub const EXTRACTION_MANIFEST_VERSION: u8 = super::manifest::EXTRACTION_MANIFEST_VERSION;
 pub const EXTRACTION_REPORT_VERSION: u8 = super::manifest::EXTRACTION_REPORT_VERSION;
 pub const EXTRACTION_REQUEST_CONTRACT: &str = "unity_asset.extraction_request";
@@ -716,8 +716,6 @@ pub(crate) enum PlannedContent {
         stream: Option<ExtractionSourceRange>,
     },
     SpritePng {
-        #[serde(with = "unity_version_wire")]
-        version: UnityVersion,
         texture: ObjectAddress,
         texture_stream: Option<ExtractionSourceRange>,
     },
@@ -740,6 +738,14 @@ impl PlannedContent {
             validate_audio_extension(extension)?;
         }
         Ok(())
+    }
+
+    pub(super) const fn stream_range(&self) -> Option<&ExtractionSourceRange> {
+        match self {
+            Self::Audio { stream, .. } | Self::TexturePng { stream, .. } => stream.as_ref(),
+            Self::SpritePng { texture_stream, .. } => texture_stream.as_ref(),
+            Self::RawBinary | Self::Yaml | Self::TextAsset => None,
+        }
     }
 }
 
@@ -819,6 +825,15 @@ impl PlannedArtifact {
         let fallback = fallback
             .map(|(kind, path, content)| {
                 validate_content_kind(kind, &content)?;
+                if kind != ExtractionArtifactKind::BinaryRaw
+                    || !matches!(&content, PlannedContent::RawBinary)
+                    || matches!(
+                        preferred_kind,
+                        ExtractionArtifactKind::BinaryRaw | ExtractionArtifactKind::Yaml
+                    )
+                {
+                    return Err(ExtractionModelError::InvalidFallbackContent);
+                }
                 if preferred_path.portability_key() == path.portability_key() {
                     return Err(ExtractionModelError::FallbackPathCollision(
                         preferred_path.as_str().to_owned(),
@@ -831,6 +846,9 @@ impl PlannedArtifact {
                 })
             })
             .transpose()?;
+        if working_set_bytes == 0 {
+            return Err(ExtractionModelError::ZeroWorkingSet { ordinal });
+        }
         if diagnostics
             .iter()
             .any(|diagnostic| diagnostic.address() != Some(&address))
@@ -906,10 +924,10 @@ impl PlannedArtifact {
         self.fallback.as_ref().map(|fallback| &fallback.content)
     }
 
-    /// Conservative maximum transient bytes retained while encoding this artifact.
+    /// Planner-declared conservative maximum transient bytes for this artifact.
     ///
-    /// The bound includes staged output so the executor can limit concurrent batches before
-    /// creating temporary files.
+    /// The executor derives an authoritative bound from the exact workspace revision before it
+    /// creates output and rejects declarations below that proof.
     #[must_use]
     pub const fn working_set_bytes(&self) -> u64 {
         self.working_set_bytes
@@ -1287,26 +1305,13 @@ fn validate_content_sources(
     sources: &[ExtractionSourceExpectation],
     content: &PlannedContent,
 ) -> Result<(), ExtractionModelError> {
-    match content {
-        PlannedContent::RawBinary | PlannedContent::Yaml | PlannedContent::TextAsset => Ok(()),
-        PlannedContent::Audio { stream, .. } | PlannedContent::TexturePng { stream, .. } => {
-            if let Some(stream) = stream {
-                validate_source_exists(sources, stream.source())?;
-            }
-            Ok(())
-        }
-        PlannedContent::SpritePng {
-            texture,
-            texture_stream,
-            ..
-        } => {
-            validate_source_for_address(sources, texture)?;
-            if let Some(stream) = texture_stream {
-                validate_source_exists(sources, stream.source())?;
-            }
-            Ok(())
-        }
+    if let PlannedContent::SpritePng { texture, .. } = content {
+        validate_source_for_address(sources, texture)?;
     }
+    if let Some(stream) = content.stream_range() {
+        validate_source_exists(sources, stream.source())?;
+    }
+    Ok(())
 }
 
 fn validate_source_for_address(
@@ -1521,6 +1526,7 @@ mod unity_version_wire {
 }
 
 /// Validation failure for a persisted extraction request or plan.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ExtractionModelError {
     #[error("extraction contract {actual:?} is unsupported; expected {expected:?}")]
@@ -1553,6 +1559,10 @@ pub enum ExtractionModelError {
     },
     #[error("preferred and fallback outputs collide at {0:?}")]
     FallbackPathCollision(String),
+    #[error("decoded extraction fallbacks must be raw binary outputs")]
+    InvalidFallbackContent,
+    #[error("planned artifact {ordinal} declares a zero-byte working set")]
+    ZeroWorkingSet { ordinal: u32 },
     #[error("extraction request digest is {actual}, not declared digest {declared}")]
     RequestDigestMismatch {
         declared: DigestV1,

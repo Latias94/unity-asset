@@ -3,10 +3,12 @@ use std::path::Path;
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use unity_asset::extraction::{ExtractionExecutionError, ExtractionPlanError};
+use unity_asset::reference::ReferenceGraphError;
 use unity_asset::workspace::{
     CommitContractError, CommitDestinationState, CommitError, PrepareError, PublicationTargetError,
     RecoveryBlockedReason, RecoveryDiscoveryBlockedReason, RecoveryDiscoveryError, RecoveryError,
-    RecoveryLocator, WorkspaceLookup,
+    RecoveryLocator, WorkspaceError, WorkspaceLookup,
 };
 use unity_asset::{BudgetError, BudgetedJsonError};
 
@@ -36,6 +38,16 @@ pub(crate) enum CliErrorCode {
     RecoveryDiscoveryBusy,
     RecoveryDiscoveryBlocked,
     RecoveryDiscoveryBudgetExceeded,
+    ExportArgumentInvalid,
+    ExportPlanRejected,
+    ExportRepresentationUnavailable,
+    ExportWorkspaceMismatch,
+    ExportSourceChanged,
+    ExportBudgetExceeded,
+    ExportResourceLimit,
+    ExportResumeMismatch,
+    ExportOutputInvalid,
+    ExportExecutionFailed,
 }
 
 impl CliErrorCode {
@@ -67,6 +79,16 @@ impl CliErrorCode {
             Self::RecoveryDiscoveryBudgetExceeded => {
                 "CLI_WORKSPACE_RECOVERY_DISCOVERY_BUDGET_EXCEEDED"
             }
+            Self::ExportArgumentInvalid => "CLI_EXPORT_ARGUMENT_INVALID",
+            Self::ExportPlanRejected => "CLI_EXPORT_PLAN_REJECTED",
+            Self::ExportRepresentationUnavailable => "CLI_EXPORT_REPRESENTATION_UNAVAILABLE",
+            Self::ExportWorkspaceMismatch => "CLI_EXPORT_WORKSPACE_MISMATCH",
+            Self::ExportSourceChanged => "CLI_EXPORT_SOURCE_CHANGED",
+            Self::ExportBudgetExceeded => "CLI_EXPORT_BUDGET_EXCEEDED",
+            Self::ExportResourceLimit => "CLI_EXPORT_RESOURCE_LIMIT",
+            Self::ExportResumeMismatch => "CLI_EXPORT_RESUME_MISMATCH",
+            Self::ExportOutputInvalid => "CLI_EXPORT_OUTPUT_INVALID",
+            Self::ExportExecutionFailed => "CLI_EXPORT_EXECUTION_FAILED",
         }
     }
 
@@ -100,6 +122,33 @@ impl CliErrorCode {
             Self::RecoveryDiscoveryBudgetExceeded => {
                 "workspace recovery discovery exceeded its resource budget"
             }
+            Self::ExportArgumentInvalid => "export arguments are invalid",
+            Self::ExportPlanRejected => "export planning was rejected",
+            Self::ExportRepresentationUnavailable => {
+                "the requested export representation is unavailable"
+            }
+            Self::ExportWorkspaceMismatch => "export plan belongs to another workspace revision",
+            Self::ExportSourceChanged => "an export source changed or became unavailable",
+            Self::ExportBudgetExceeded => "export exceeded its caller-owned resource budget",
+            Self::ExportResourceLimit => "export exceeded an execution resource limit",
+            Self::ExportResumeMismatch => "resume evidence does not match the export plan",
+            Self::ExportOutputInvalid => "export output layout is invalid or unavailable",
+            Self::ExportExecutionFailed => "export execution failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExportManifestPathErrorKind {
+    NonUtf8,
+    Invalid,
+}
+
+impl ExportManifestPathErrorKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NonUtf8 => "manifest_path_non_utf8",
+            Self::Invalid => "manifest_path_invalid",
         }
     }
 }
@@ -327,6 +376,277 @@ pub(crate) fn mark_publication_target_error(error: PublicationTargetError) -> an
         }
     };
     mark(error, CliErrorCode::PublicationTargetInvalid, Some(details))
+}
+
+pub(crate) fn mark_export_shared_stdin_error(inputs: &[&str]) -> anyhow::Error {
+    mark(
+        anyhow::Error::msg("Only one structured export input may read from stdin"),
+        CliErrorCode::ExportArgumentInvalid,
+        Some(json!({
+            "kind": "structured_inputs_share_stdin",
+            "inputs": inputs,
+        })),
+    )
+}
+
+pub(crate) fn mark_export_manifest_path_error(
+    error: impl Into<anyhow::Error>,
+    path: &Path,
+    kind: ExportManifestPathErrorKind,
+) -> anyhow::Error {
+    mark(
+        error,
+        CliErrorCode::ExportOutputInvalid,
+        Some(json!({
+            "kind": kind.as_str(),
+            "path": path_details(path),
+        })),
+    )
+}
+
+pub(crate) fn mark_export_workspace_load_error(
+    error: anyhow::Error,
+    input: &Path,
+) -> anyhow::Error {
+    let budget = error
+        .downcast_ref::<BudgetError>()
+        .or_else(|| match error.downcast_ref::<WorkspaceError>() {
+            Some(WorkspaceError::Budget(source)) => Some(source),
+            _ => None,
+        })
+        .map(budget_details);
+    match budget {
+        Some(budget) => mark(
+            error,
+            CliErrorCode::ExportBudgetExceeded,
+            Some(json!({
+                "kind": "budget_exceeded",
+                "budget": budget,
+            })),
+        ),
+        None => mark(
+            error,
+            CliErrorCode::ExportSourceChanged,
+            Some(json!({
+                "kind": "workspace_load_failed",
+                "input": path_details(input),
+            })),
+        ),
+    }
+}
+
+pub(crate) fn mark_export_reference_graph_error(error: ReferenceGraphError) -> anyhow::Error {
+    let (code, details) = match &error {
+        ReferenceGraphError::Budget(source)
+        | ReferenceGraphError::Workspace(WorkspaceError::Budget(source)) => (
+            CliErrorCode::ExportBudgetExceeded,
+            json!({
+                "kind": "budget_exceeded",
+                "budget": budget_details(source),
+            }),
+        ),
+        ReferenceGraphError::Workspace(_) => (
+            CliErrorCode::ExportSourceChanged,
+            json!({ "kind": "reference_graph_source_failed" }),
+        ),
+        _ => (
+            CliErrorCode::ExportPlanRejected,
+            json!({ "kind": "reference_graph_rejected" }),
+        ),
+    };
+    mark(error, code, Some(details))
+}
+
+pub(crate) fn mark_export_plan_error(error: ExtractionPlanError) -> anyhow::Error {
+    let (code, details) = match &error {
+        ExtractionPlanError::Budget(source)
+        | ExtractionPlanError::Workspace(WorkspaceError::Budget(source)) => (
+            CliErrorCode::ExportBudgetExceeded,
+            json!({
+                "kind": "budget_exceeded",
+                "budget": budget_details(source),
+            }),
+        ),
+        ExtractionPlanError::RequiredDecodedUnavailable { address, reason } => (
+            CliErrorCode::ExportRepresentationUnavailable,
+            json!({
+                "kind": "representation_unavailable",
+                "address": address,
+                "diagnostic": reason,
+            }),
+        ),
+        ExtractionPlanError::ObjectUnloaded(address) => (
+            CliErrorCode::ExportPlanRejected,
+            json!({ "kind": "object_unloaded", "address": address }),
+        ),
+        ExtractionPlanError::ObjectMissing(address) => (
+            CliErrorCode::ExportPlanRejected,
+            json!({ "kind": "object_missing", "address": address }),
+        ),
+        ExtractionPlanError::ObjectAmbiguous {
+            address,
+            candidates,
+        } => (
+            CliErrorCode::ExportPlanRejected,
+            json!({
+                "kind": "object_ambiguous",
+                "address": address,
+                "candidate_count": candidates,
+            }),
+        ),
+        ExtractionPlanError::ObjectInvalid(address) => (
+            CliErrorCode::ExportPlanRejected,
+            json!({ "kind": "object_invalid", "address": address }),
+        ),
+        ExtractionPlanError::MissingStreamResource { owner, stream_path } => (
+            CliErrorCode::ExportPlanRejected,
+            json!({
+                "kind": "stream_resource_missing",
+                "owner": owner,
+                "stream_path": stream_path,
+            }),
+        ),
+        ExtractionPlanError::AmbiguousStreamResource { owner, stream_path } => (
+            CliErrorCode::ExportPlanRejected,
+            json!({
+                "kind": "stream_resource_ambiguous",
+                "owner": owner,
+                "stream_path": stream_path,
+            }),
+        ),
+        ExtractionPlanError::Workspace(WorkspaceError::RangeOutOfBounds {
+            source_id,
+            offset,
+            end,
+            source_len,
+        }) => (
+            CliErrorCode::ExportPlanRejected,
+            json!({
+                "kind": "stream_resource_out_of_range",
+                "source_id": source_id,
+                "offset": offset,
+                "end": end,
+                "source_length": source_len,
+            }),
+        ),
+        _ => (
+            CliErrorCode::ExportPlanRejected,
+            json!({ "kind": "plan_rejected" }),
+        ),
+    };
+    mark(error, code, Some(details))
+}
+
+pub(crate) fn mark_export_execution_error(error: ExtractionExecutionError) -> anyhow::Error {
+    let (code, details) = match &error {
+        ExtractionExecutionError::Budget(source)
+        | ExtractionExecutionError::Workspace(WorkspaceError::Budget(source)) => (
+            CliErrorCode::ExportBudgetExceeded,
+            json!({
+                "kind": "budget_exceeded",
+                "budget": budget_details(source),
+            }),
+        ),
+        ExtractionExecutionError::WorkspaceContextMismatch => (
+            CliErrorCode::ExportWorkspaceMismatch,
+            json!({ "kind": "workspace_revision_mismatch" }),
+        ),
+        ExtractionExecutionError::SourceChanged { locator } => (
+            CliErrorCode::ExportSourceChanged,
+            json!({ "kind": "source_changed", "locator": locator }),
+        ),
+        ExtractionExecutionError::StreamOutOfRange {
+            ordinal,
+            locator,
+            offset,
+            end,
+            source_len,
+        } => (
+            CliErrorCode::ExportSourceChanged,
+            json!({
+                "kind": "stream_resource_out_of_range",
+                "ordinal": ordinal,
+                "locator": locator,
+                "offset": offset,
+                "end": end,
+                "source_length": source_len,
+            }),
+        ),
+        ExtractionExecutionError::InvalidLimit { resource } => (
+            CliErrorCode::ExportResourceLimit,
+            json!({ "kind": "invalid_limit", "resource": resource }),
+        ),
+        ExtractionExecutionError::OpenFileLimitTooSmall { minimum, limit } => (
+            CliErrorCode::ExportResourceLimit,
+            json!({
+                "kind": "open_file_limit_too_small",
+                "minimum": minimum,
+                "limit": limit,
+            }),
+        ),
+        ExtractionExecutionError::WorkingSetExceedsLimit {
+            ordinal,
+            required,
+            limit,
+        } => (
+            CliErrorCode::ExportResourceLimit,
+            json!({
+                "kind": "working_set_exceeds_limit",
+                "ordinal": ordinal,
+                "required": required,
+                "limit": limit,
+            }),
+        ),
+        ExtractionExecutionError::WorkingSetUnderdeclared {
+            ordinal,
+            declared,
+            required,
+        } => (
+            CliErrorCode::ExportResourceLimit,
+            json!({
+                "kind": "working_set_underdeclared",
+                "ordinal": ordinal,
+                "declared": declared,
+                "required": required,
+            }),
+        ),
+        ExtractionExecutionError::WorkingSetProofFailed { ordinal } => (
+            CliErrorCode::ExportResourceLimit,
+            json!({
+                "kind": "working_set_proof_failed",
+                "ordinal": ordinal,
+            }),
+        ),
+        ExtractionExecutionError::ReportLimitExceeded { required, limit } => (
+            CliErrorCode::ExportResourceLimit,
+            json!({
+                "kind": "report_limit_exceeded",
+                "required": required,
+                "limit": limit,
+            }),
+        ),
+        ExtractionExecutionError::ManifestOutputLimitExceeded { required, limit } => (
+            CliErrorCode::ExportResourceLimit,
+            json!({
+                "kind": "manifest_output_limit_exceeded",
+                "required": required,
+                "limit": limit,
+            }),
+        ),
+        ExtractionExecutionError::ResumePlanMismatch => (
+            CliErrorCode::ExportResumeMismatch,
+            json!({ "kind": "resume_plan_mismatch" }),
+        ),
+        ExtractionExecutionError::OutputLayout { kind, .. } => (
+            CliErrorCode::ExportOutputInvalid,
+            json!({ "kind": kind.as_str() }),
+        ),
+        _ => (
+            CliErrorCode::ExportExecutionFailed,
+            json!({ "kind": "execution_failed" }),
+        ),
+    };
+    mark(error, code, Some(details))
 }
 
 pub(crate) fn resolve_lookup<T: Serialize>(lookup: WorkspaceLookup<T>) -> Result<T, anyhow::Error> {
@@ -580,6 +900,38 @@ fn recovery_blocked_reason_details(reason: &RecoveryBlockedReason) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_output_error_preserves_its_stable_stage() {
+        let error = mark_export_execution_error(ExtractionExecutionError::OutputLayout {
+            kind: unity_asset::extraction::ExtractionOutputErrorKind::LockRoot,
+            message: "fixture lock failure".to_owned(),
+        });
+        let (code, details) = report_parts(&error);
+
+        assert_eq!(code, "CLI_EXPORT_OUTPUT_INVALID");
+        assert_eq!(details.unwrap()["kind"], "lock_root");
+    }
+
+    #[test]
+    fn export_reference_graph_errors_preserve_machine_categories() {
+        let rejected = mark_export_reference_graph_error(ReferenceGraphError::Invariant(
+            "fixture reference invariant",
+        ));
+        let (code, details) = report_parts(&rejected);
+        assert_eq!(code, "CLI_EXPORT_PLAN_REJECTED");
+        assert_eq!(details.unwrap()["kind"], "reference_graph_rejected");
+
+        let budget =
+            mark_export_reference_graph_error(ReferenceGraphError::Budget(BudgetError::Exceeded {
+                resource: "entries",
+                limit: 4,
+                requested: 5,
+            }));
+        let (code, details) = report_parts(&budget);
+        assert_eq!(code, "CLI_EXPORT_BUDGET_EXCEEDED");
+        assert_eq!(details.unwrap()["kind"], "budget_exceeded");
+    }
 
     #[cfg(unix)]
     #[test]

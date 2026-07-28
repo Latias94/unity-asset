@@ -10,6 +10,7 @@ use unity_asset_core::{
     WorkspaceId, WorkspaceRevision,
 };
 
+use super::CheckedByteCounter;
 use super::json_contract::{large_contract_limits, read_json_bounded};
 use super::model::{
     ExtractionArtifactKind, ExtractionModelError, ExtractionPath, ExtractionPlan,
@@ -17,8 +18,8 @@ use super::model::{
     normalize_source_expectations, normalize_values,
 };
 
-pub const EXTRACTION_MANIFEST_VERSION: u8 = 1;
-pub const EXTRACTION_REPORT_VERSION: u8 = 1;
+pub const EXTRACTION_MANIFEST_VERSION: u8 = 2;
+pub const EXTRACTION_REPORT_VERSION: u8 = 2;
 pub const EXTRACTION_MANIFEST_CONTRACT: &str = "unity_asset.extraction_manifest";
 pub const EXTRACTION_REPORT_CONTRACT: &str = "unity_asset.extraction_report";
 
@@ -28,14 +29,18 @@ const EXTRACTION_REPORT_JSON_LIMITS: unity_asset_core::ContractJsonLimits =
     large_contract_limits(EXTRACTION_REPORT_CONTRACT);
 
 /// Stable, machine-actionable extraction diagnostic categories.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtractionDiagnosticCode {
     DecodedUnavailable,
+    FeatureUnavailable,
     UnsupportedClass,
     DecodeFailedRawFallback,
     MissingResource,
+    ResourceOutOfRange,
     UnresolvedDependency,
+    UnresolvedSpritePPtr,
     SourceChanged,
     OutputExists,
     OutputFailed,
@@ -578,12 +583,15 @@ impl Serialize for ExtractionReport {
     }
 }
 
-const MAXIMUM_DIAGNOSTIC_CODES: [ExtractionDiagnosticCode; 11] = [
+const MAXIMUM_DIAGNOSTIC_CODES: [ExtractionDiagnosticCode; 14] = [
     ExtractionDiagnosticCode::DecodedUnavailable,
+    ExtractionDiagnosticCode::FeatureUnavailable,
     ExtractionDiagnosticCode::UnsupportedClass,
     ExtractionDiagnosticCode::DecodeFailedRawFallback,
     ExtractionDiagnosticCode::MissingResource,
+    ExtractionDiagnosticCode::ResourceOutOfRange,
     ExtractionDiagnosticCode::UnresolvedDependency,
+    ExtractionDiagnosticCode::UnresolvedSpritePPtr,
     ExtractionDiagnosticCode::SourceChanged,
     ExtractionDiagnosticCode::OutputExists,
     ExtractionDiagnosticCode::OutputFailed,
@@ -621,14 +629,7 @@ impl Serialize for MaximumExtractionReport<'_> {
         let mut state = serializer.serialize_struct("ExtractionReport", 3)?;
         state.serialize_field("contract", EXTRACTION_REPORT_CONTRACT)?;
         state.serialize_field("version", &EXTRACTION_REPORT_VERSION)?;
-        state.serialize_field(
-            "manifest",
-            &MaximumExtractionManifest {
-                plan: self.plan,
-                plan_digest: self.plan_digest,
-                digest: self.digest,
-            },
-        )?;
+        state.serialize_field("manifest", &self.manifest())?;
         state.serialize_field(
             "counts",
             &ExtractionReportCounts {
@@ -642,7 +643,17 @@ impl Serialize for MaximumExtractionReport<'_> {
     }
 }
 
-struct MaximumExtractionManifest<'plan> {
+impl<'plan> MaximumExtractionReport<'plan> {
+    pub(crate) const fn manifest(&self) -> MaximumExtractionManifest<'plan> {
+        MaximumExtractionManifest {
+            plan: self.plan,
+            plan_digest: self.plan_digest,
+            digest: self.digest,
+        }
+    }
+}
+
+pub(crate) struct MaximumExtractionManifest<'plan> {
     plan: &'plan ExtractionPlan,
     plan_digest: DigestV1,
     digest: DigestV1,
@@ -912,32 +923,11 @@ pub(crate) fn write_canonical_json<T: Serialize>(
 pub(crate) fn canonical_digest<T: Serialize>(
     value: &T,
 ) -> Result<DigestV1, ExtractionCanonicalError> {
-    let mut counter = CountingWriter::default();
+    let mut counter = CheckedByteCounter::new("canonical extraction JSON length overflow");
     write_canonical_json(&mut counter, value)?;
-    let mut builder = DigestV1Builder::new(counter.bytes);
+    let mut builder = DigestV1Builder::new(counter.bytes());
     write_canonical_json(DigestWriter(&mut builder), value)?;
     builder.finalize().map_err(ExtractionCanonicalError::Digest)
-}
-
-#[derive(Default)]
-struct CountingWriter {
-    bytes: u64,
-}
-
-impl Write for CountingWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let amount = u64::try_from(buffer.len())
-            .map_err(|_| io::Error::other("canonical extraction JSON length overflow"))?;
-        self.bytes = self
-            .bytes
-            .checked_add(amount)
-            .ok_or_else(|| io::Error::other("canonical extraction JSON length overflow"))?;
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 struct DigestWriter<'builder>(&'builder mut DigestV1Builder);

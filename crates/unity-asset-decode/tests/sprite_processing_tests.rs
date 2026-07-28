@@ -9,18 +9,11 @@
 #![allow(clippy::bool_assert_comparison)]
 
 use indexmap::IndexMap;
-use std::fs;
-use std::path::Path;
 use unity_asset_core::UnityValue;
 use unity_asset_decode::asset::SerializedFile;
 use unity_asset_decode::bundle::AssetBundle;
-use unity_asset_decode::sprite::{Sprite, SpriteInfo, SpriteProcessor};
+use unity_asset_decode::sprite::{Sprite, SpriteProcessor};
 use unity_asset_decode::texture::{Texture2D, TextureFormat};
-use unity_asset_decode::unity_version::UnityVersion;
-
-fn test_version() -> UnityVersion {
-    UnityVersion::parse_version("2020.3.12f1").unwrap()
-}
 
 /// Test comprehensive sprite image extraction
 #[test]
@@ -81,32 +74,21 @@ fn test_sprite_comprehensive_extraction() {
             name, x, y, width, height
         );
 
-        // Extract sprite image using processor
-        let processor = SpriteProcessor::new(test_version());
-        match processor.extract_sprite_image(&sprite, &texture) {
-            Ok(sprite_image_data) => {
-                println!(
-                    "    ✓ Successfully extracted sprite image ({} bytes)",
-                    sprite_image_data.len()
-                );
-
-                // Verify we got some data
-                assert!(
-                    !sprite_image_data.is_empty(),
-                    "Sprite image data should not be empty"
-                );
-
-                // Basic PNG header check
-                if sprite_image_data.len() >= 8 {
-                    let png_header = &sprite_image_data[0..8];
-                    let expected_png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-                    assert_eq!(png_header, expected_png_header, "Should be valid PNG data");
-                }
-            }
-            Err(e) => {
-                panic!("Failed to extract sprite '{}': {}", name, e);
-            }
-        }
+        // Encode the sprite into a caller-owned buffer.
+        let processor = SpriteProcessor::new();
+        let mut sprite_image_data = Vec::new();
+        processor
+            .write_sprite_png(&sprite, &texture, &mut sprite_image_data)
+            .unwrap_or_else(|error| panic!("Failed to encode sprite '{name}': {error}"));
+        println!(
+            "    ✓ Successfully encoded sprite image ({} bytes)",
+            sprite_image_data.len()
+        );
+        assert_eq!(
+            &sprite_image_data[..8],
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+            "Should be valid PNG data"
+        );
     }
 
     println!("  ✓ All sprite extractions successful");
@@ -164,31 +146,18 @@ fn test_sprite_render_data_extraction() {
         sprite.render_data.texture_rect_height
     );
 
-    // Test extraction using processor
-    let processor = SpriteProcessor::new(test_version());
-    match processor.extract_sprite_image(&sprite, &texture) {
-        Ok(rect_image_data) => {
-            println!("    ✓ Rect extraction: {} bytes", rect_image_data.len());
-            assert!(!rect_image_data.is_empty());
-        }
-        Err(e) => {
-            panic!("Rect extraction failed: {}", e);
-        }
-    }
+    // Rendering and encoding are explicit, separate operations.
+    let processor = SpriteProcessor::new();
+    let image = processor
+        .render_sprite(&sprite, &texture)
+        .expect("sprite rendering should succeed");
+    assert_eq!(image.dimensions(), (4, 4));
 
-    // Test extraction using processor (same method)
-    match processor.extract_sprite_image(&sprite, &texture) {
-        Ok(render_image_data) => {
-            println!(
-                "    ✓ Render data extraction: {} bytes",
-                render_image_data.len()
-            );
-            assert!(!render_image_data.is_empty());
-        }
-        Err(e) => {
-            panic!("Render data extraction failed: {}", e);
-        }
-    }
+    let mut png_data = Vec::new();
+    processor
+        .write_sprite_png(&sprite, &texture, &mut png_data)
+        .expect("sprite PNG encoding should succeed");
+    assert!(png_data.starts_with(b"\x89PNG\r\n\x1a\n"));
 
     println!("  ✓ Both extraction methods working correctly");
 }
@@ -284,9 +253,9 @@ fn test_sprite_typetree_texture_pptr_uses_path_id() {
         ),
     );
 
-    let processor = SpriteProcessor::new(test_version());
-    let result = processor.parse_sprite(&obj).unwrap();
-    assert_eq!(result.sprite.render_data.texture_path_id, 123);
+    let processor = SpriteProcessor::new();
+    let sprite = processor.parse_sprite(&obj).unwrap();
+    assert_eq!(sprite.render_data.texture_path_id, 123);
 }
 
 /// Test sprite PNG export functionality
@@ -324,36 +293,14 @@ fn test_sprite_png_export() {
     sprite.rect_width = 4.0;
     sprite.rect_height = 4.0;
 
-    // Test PNG export
-    std::fs::create_dir_all("target").ok();
-    let png_path = "target/test_sprite_export.png";
-
-    // Use processor to extract image and save manually
-    let processor = SpriteProcessor::new(test_version());
-    match processor.extract_sprite_image(&sprite, &texture) {
-        Ok(png_data) => {
-            println!("    ✓ PNG extraction successful");
-
-            // Write to file
-            if let Ok(()) = fs::write(png_path, &png_data) {
-                println!("    ✓ PNG file written");
-
-                // Verify file exists
-                assert!(Path::new(png_path).exists(), "PNG file should exist");
-
-                // Check file size
-                let file_size = png_data.len();
-                println!("    ✓ PNG file size: {} bytes", file_size);
-                assert!(file_size > 50, "PNG file should have reasonable size");
-
-                // Clean up
-                fs::remove_file(png_path).ok();
-            }
-        }
-        Err(e) => {
-            panic!("PNG export failed: {}", e);
-        }
-    }
+    // Encode PNG into storage owned by the caller.
+    let processor = SpriteProcessor::new();
+    let mut png_data = Vec::new();
+    processor
+        .write_sprite_png(&sprite, &texture, &mut png_data)
+        .expect("PNG encoding should succeed");
+    assert!(png_data.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert!(png_data.len() > 50, "PNG should have reasonable size");
 
     println!("  ✓ Sprite PNG export functionality working correctly");
 }

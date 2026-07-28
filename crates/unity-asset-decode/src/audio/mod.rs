@@ -15,7 +15,8 @@
 //! # Examples
 //!
 //! ```rust,no_run
-//! use unity_asset_decode::audio::{AudioCompressionFormat, AudioClipConverter, AudioDecoder};
+//! use std::io::Cursor;
+//! use unity_asset_decode::audio::{AudioClipConverter, AudioDecoder, AudioExporter};
 //! use unity_asset_decode::unity_version::UnityVersion;
 //!
 //! // Create a converter for the version observed in the serialized source.
@@ -29,8 +30,9 @@
 //! let decoder = AudioDecoder::new();
 //! // let decoded_audio = decoder.decode(&audio_clip)?;
 //!
-//! // Export the audio
-//! // AudioExporter::export_wav(&decoded_audio, "output.wav")?;
+//! // Encode into a sink owned by the caller.
+//! // let mut output = Cursor::new(Vec::new());
+//! // AudioExporter::write_wav(&decoded_audio, &mut output)?;
 //! ```
 
 pub mod converter;
@@ -44,9 +46,7 @@ pub mod types;
 // Re-export main types for easy access
 pub use converter::{AudioClipConverter, AudioClipLayout};
 pub use decoder::AudioDecoder;
-pub use export::{
-    AudioExporter, AudioFormat, AudioSourceError, ExportOptions, PreparedAudioSource,
-};
+pub use export::{AudioExporter, AudioSourceError, PreparedAudioSource};
 pub use formats::{AudioCompressionFormat, AudioFormatInfo, FMODSoundType};
 pub use fsb5::MAX_VORBIS_SETUP_PACKET_BYTES;
 pub use types::{
@@ -85,15 +85,15 @@ impl AudioProcessor {
         self.decoder.decode(clip)
     }
 
-    /// Full pipeline: convert object -> decode -> export
-    pub fn process_and_export<P: AsRef<std::path::Path>>(
+    /// Convert and decode an object, then write WAV bytes to a caller-owned sink.
+    pub fn process_and_write_wav<W: std::io::Write + ?Sized>(
         &self,
         obj: &crate::object::UnityObject,
-        output_path: P,
+        writer: &mut W,
     ) -> crate::error::Result<()> {
         let audio_clip = self.convert_object(obj)?;
         let decoded_audio = self.decode_audio(&audio_clip)?;
-        AudioExporter::export_auto(&decoded_audio, output_path)
+        AudioExporter::write_wav(&decoded_audio, writer)
     }
 
     /// Check if a format can be processed
@@ -152,14 +152,6 @@ pub fn decode_audio_data(
 
     let decoder = AudioDecoder::new();
     decoder.decode(&audio_clip)
-}
-
-/// Quick function to export audio with automatic format detection
-pub fn export_audio<P: AsRef<std::path::Path>>(
-    audio: &DecodedAudio,
-    path: P,
-) -> crate::error::Result<()> {
-    AudioExporter::export_auto(audio, path)
 }
 
 #[cfg(test)]

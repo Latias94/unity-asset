@@ -10,15 +10,8 @@
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::bool_assert_comparison)]
 
-use std::fs;
-use std::path::Path;
 use unity_asset_decode::sprite::{Sprite, SpriteProcessor};
 use unity_asset_decode::texture::{Texture2D, TextureFormat};
-use unity_asset_decode::unity_version::UnityVersion;
-
-fn test_version() -> UnityVersion {
-    UnityVersion::parse_version("2020.3.12f1").unwrap()
-}
 
 /// Test sprite image extraction compatibility with UnityPy
 ///
@@ -78,31 +71,17 @@ fn test_sprite_image_extraction_unitypy_compat() {
         sprite.name, sprite.rect_x, sprite.rect_y, sprite.rect_width, sprite.rect_height
     );
 
-    // Use SpriteProcessor to extract sprite image
-    let sprite_processor = SpriteProcessor::new(test_version());
-    match sprite_processor.extract_sprite_image(&sprite, &texture) {
-        Ok(sprite_image_data) => {
-            println!(
-                "    ✓ Successfully extracted sprite image: {} bytes",
-                sprite_image_data.len()
-            );
-
-            // Verify we got PNG data
-            assert!(!sprite_image_data.is_empty());
-
-            // Basic PNG header check
-            if sprite_image_data.len() >= 8 {
-                let png_header = &sprite_image_data[0..8];
-                let expected_png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-                assert_eq!(png_header, expected_png_header, "Should be valid PNG data");
-            }
-
-            println!("    ✓ Sprite extraction compatible with UnityPy");
-        }
-        Err(e) => {
-            panic!("Sprite extraction failed: {}", e);
-        }
-    }
+    // Encode with SpriteProcessor into caller-owned storage.
+    let sprite_processor = SpriteProcessor::new();
+    let mut sprite_image_data = Vec::new();
+    sprite_processor
+        .write_sprite_png(&sprite, &texture, &mut sprite_image_data)
+        .expect("sprite PNG encoding should succeed");
+    assert!(sprite_image_data.starts_with(b"\x89PNG\r\n\x1a\n"));
+    println!(
+        "    ✓ Successfully encoded sprite image: {} bytes",
+        sprite_image_data.len()
+    );
 }
 
 /// Test sprite properties compatibility with UnityPy
@@ -217,20 +196,13 @@ fn test_sprite_atlas_unitypy_compat() {
             name, width, height, x, y
         );
 
-        // Test extraction using SpriteProcessor
-        let sprite_processor = SpriteProcessor::new(test_version());
-        match sprite_processor.extract_sprite_image(&sprite, &atlas_texture) {
-            Ok(sprite_image_data) => {
-                assert!(!sprite_image_data.is_empty());
-                println!(
-                    "      ✓ Extracted sprite image: {} bytes",
-                    sprite_image_data.len()
-                );
-            }
-            Err(e) => {
-                panic!("Failed to extract sprite '{}': {}", name, e);
-            }
-        }
+        // Encode each atlas sprite into caller-owned storage.
+        let sprite_processor = SpriteProcessor::new();
+        let mut sprite_image_data = Vec::new();
+        sprite_processor
+            .write_sprite_png(&sprite, &atlas_texture, &mut sprite_image_data)
+            .unwrap_or_else(|error| panic!("Failed to encode sprite '{name}': {error}"));
+        assert!(sprite_image_data.starts_with(b"\x89PNG\r\n\x1a\n"));
 
         // Test info extraction using sprite fields
         // Note: is_atlas_sprite and texture_path_id are not direct fields
@@ -273,68 +245,14 @@ fn test_sprite_export_unitypy_compat() {
     sprite.rect_width = 64.0;
     sprite.rect_height = 64.0;
 
-    // Test PNG export (like UnityPy's data.image.save())
-    std::fs::create_dir_all("target").ok();
-    let png_path = "target/unitypy_compat_sprite.png";
-
-    // Use SpriteProcessor to extract and save PNG
-    let sprite_processor = SpriteProcessor::new(test_version());
-    match sprite_processor.extract_sprite_image(&sprite, &texture) {
-        Ok(png_data) => {
-            match fs::write(png_path, &png_data) {
-                Ok(()) => {
-                    println!("    ✓ PNG export successful (like UnityPy's save method)");
-
-                    // Verify file exists and has reasonable size
-                    assert!(Path::new(png_path).exists(), "PNG file should exist");
-
-                    if let Ok(metadata) = fs::metadata(png_path) {
-                        let file_size = metadata.len();
-                        println!("    ✓ PNG file size: {} bytes", file_size);
-                        assert!(file_size > 100, "PNG should have reasonable size");
-                    }
-
-                    // Clean up
-                    fs::remove_file(png_path).ok();
-                }
-                Err(e) => {
-                    panic!("Failed to write PNG file: {}", e);
-                }
-            }
-        }
-        Err(e) => {
-            panic!("PNG export failed: {}", e);
-        }
-    }
+    // Encode PNG into storage owned by the caller.
+    let sprite_processor = SpriteProcessor::new();
+    let mut png_data = Vec::new();
+    sprite_processor
+        .write_sprite_png(&sprite, &texture, &mut png_data)
+        .expect("PNG encoding should succeed");
+    assert!(png_data.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert!(png_data.len() > 100, "PNG should have reasonable size");
 
     println!("    ✓ Sprite export fully compatible with UnityPy workflow");
-}
-
-/// Test sprite processor version compatibility
-#[test]
-fn test_sprite_processor_version_compat() {
-    println!("Testing sprite processor version compatibility...");
-
-    let test_versions = vec![
-        "5.0.0f1",
-        "5.6.0f1",
-        "2017.1.0f1",
-        "2018.4.0f1",
-        "2019.4.0f1",
-        "2020.3.0f1",
-        "2021.3.0f1",
-    ];
-
-    for version_str in test_versions {
-        let version = UnityVersion::parse_version(version_str).unwrap();
-        let processor = SpriteProcessor::new(version);
-
-        println!("  Testing version {}", version_str);
-
-        // The processor should be created successfully for all versions
-        // (Sprite format is relatively stable across Unity versions)
-        println!("    ✓ Processor created for version {}", version_str);
-    }
-
-    println!("    ✓ Sprite processor compatible with all Unity versions");
 }

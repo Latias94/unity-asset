@@ -3,7 +3,7 @@ use crate::shared::AppContext;
 use anyhow::{Context, Result};
 use std::io::Write;
 
-mod extract;
+mod export;
 mod list_bundle;
 mod references;
 mod split_yaml;
@@ -23,7 +23,7 @@ pub(crate) fn run(command: Commands, ctx: &AppContext) -> Result<()> {
     match command {
         Commands::Workspace(command) => workspace::run(command, ctx),
         Commands::References(command) => references::run(command, ctx),
-        Commands::Extract(command) => extract::run(*command, ctx),
+        Commands::Export(command) => export::run(*command, ctx),
         Commands::SplitYaml {
             input,
             output,

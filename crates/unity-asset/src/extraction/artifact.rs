@@ -19,8 +19,86 @@ use super::model::paths_conflict;
 const TEMPORARY_CREATE_ATTEMPTS: usize = 32;
 const EXECUTION_LOCK_NAME: &str = ".unity-asset-extraction.lock";
 
+/// Stable machine-readable stage for failures in extraction-owned output storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExtractionOutputErrorKind {
+    InvalidName,
+    PortableCollision,
+    MissingParent,
+    UnplannedPath,
+    ResolveCurrentDirectory,
+    ValidateRoot,
+    PrepareRoot,
+    LockRoot,
+    PrepareDirectory,
+    CreateTemporary,
+    InspectTemporary,
+    OpenExisting,
+    InspectExisting,
+    HashExisting,
+    FinalizeTemporary,
+    Publish,
+    DiscardTemporary,
+    TemporaryIdentityChanged,
+    ExistingHashLimitExceeded,
+}
+
+impl ExtractionOutputErrorKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidName => "invalid_name",
+            Self::PortableCollision => "portable_collision",
+            Self::MissingParent => "missing_parent",
+            Self::UnplannedPath => "unplanned_path",
+            Self::ResolveCurrentDirectory => "resolve_current_directory",
+            Self::ValidateRoot => "validate_root",
+            Self::PrepareRoot => "prepare_root",
+            Self::LockRoot => "lock_root",
+            Self::PrepareDirectory => "prepare_directory",
+            Self::CreateTemporary => "create_temporary",
+            Self::InspectTemporary => "inspect_temporary",
+            Self::OpenExisting => "open_existing",
+            Self::InspectExisting => "inspect_existing",
+            Self::HashExisting => "hash_existing",
+            Self::FinalizeTemporary => "finalize_temporary",
+            Self::Publish => "publish",
+            Self::DiscardTemporary => "discard_temporary",
+            Self::TemporaryIdentityChanged => "temporary_identity_changed",
+            Self::ExistingHashLimitExceeded => "existing_hash_limit_exceeded",
+        }
+    }
+}
+
+impl std::fmt::Display for ExtractionOutputErrorKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ResolveCurrentDirectory => "resolve current directory",
+            Self::ValidateRoot => "validate output root",
+            Self::PrepareRoot => "create output root",
+            Self::LockRoot => "lock output root",
+            Self::PrepareDirectory => "create output directory",
+            Self::CreateTemporary => "create temporary output",
+            Self::InspectTemporary => "inspect temporary output",
+            Self::OpenExisting => "open existing output",
+            Self::InspectExisting => "inspect existing output",
+            Self::HashExisting => "hash existing output",
+            Self::FinalizeTemporary => "finalize temporary output",
+            Self::Publish => "publish",
+            Self::DiscardTemporary => "remove temporary output",
+            Self::InvalidName => "validate output name",
+            Self::PortableCollision => "validate portable output names",
+            Self::MissingParent => "resolve output parent",
+            Self::UnplannedPath => "resolve planned output path",
+            Self::TemporaryIdentityChanged => "verify temporary output identity",
+            Self::ExistingHashLimitExceeded => "enforce existing-output hash limit",
+        })
+    }
+}
+
 #[derive(Debug, Error)]
-pub(crate) enum OutputArtifactError {
+pub(super) enum OutputArtifactError {
     #[error(transparent)]
     InvalidName(#[from] ArtifactNameError),
     #[error("output names {first:?} and {second:?} cannot coexist on portable filesystems")]
@@ -29,31 +107,51 @@ pub(crate) enum OutputArtifactError {
     MissingParent(PathBuf),
     #[error("output layout does not contain planned path {0:?}")]
     UnplannedPath(String),
-    #[error("failed to {operation} {path:?}: {source}")]
+    #[error("failed to {kind} {path:?}: {source}")]
     Io {
-        operation: &'static str,
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to publish {path:?}: {source}")]
-    Publish {
+        kind: ExtractionOutputErrorKind,
         path: PathBuf,
         #[source]
         source: io::Error,
     },
     #[error("temporary output identity changed before hashing: {0:?}")]
     TemporaryIdentityChanged(PathBuf),
+    #[error(
+        "existing output {path:?} requires hashing {length} bytes, exceeding the limit {limit}"
+    )]
+    ExistingHashLimitExceeded {
+        path: PathBuf,
+        length: u64,
+        limit: u64,
+    },
+}
+
+impl OutputArtifactError {
+    pub(super) const fn kind(&self) -> ExtractionOutputErrorKind {
+        match self {
+            Self::InvalidName(_) => ExtractionOutputErrorKind::InvalidName,
+            Self::PortableCollision { .. } => ExtractionOutputErrorKind::PortableCollision,
+            Self::MissingParent(_) => ExtractionOutputErrorKind::MissingParent,
+            Self::UnplannedPath(_) => ExtractionOutputErrorKind::UnplannedPath,
+            Self::Io { kind, .. } => *kind,
+            Self::TemporaryIdentityChanged(_) => {
+                ExtractionOutputErrorKind::TemporaryIdentityChanged
+            }
+            Self::ExistingHashLimitExceeded { .. } => {
+                ExtractionOutputErrorKind::ExistingHashLimitExceeded
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
-pub(crate) struct OutputLayout {
+pub(super) struct OutputLayout {
     paths: BTreeMap<String, PreparedOutputPath>,
     _execution_lock: File,
 }
 
 impl OutputLayout {
-    pub(crate) fn prepare<'path>(
+    pub(super) fn prepare<'path>(
         root: &Path,
         relative_paths: impl IntoIterator<Item = &'path str>,
     ) -> Result<Self, OutputArtifactError> {
@@ -97,7 +195,7 @@ impl OutputLayout {
         let root = absolute_path(root)?;
         let root_identity =
             ensure_directory_no_follow(&root).map_err(|source| OutputArtifactError::Io {
-                operation: "create output root",
+                kind: ExtractionOutputErrorKind::PrepareRoot,
                 path: root.clone(),
                 source,
             })?;
@@ -105,7 +203,7 @@ impl OutputLayout {
         let execution_lock =
             acquire_private_lock_in_parent(&lock_path, &root_identity).map_err(|source| {
                 OutputArtifactError::Io {
-                    operation: "lock output root",
+                    kind: ExtractionOutputErrorKind::LockRoot,
                     path: lock_path,
                     source,
                 }
@@ -120,7 +218,7 @@ impl OutputLayout {
                 .ok_or_else(|| OutputArtifactError::MissingParent(final_path.clone()))?;
             let parent_identity =
                 ensure_directory_no_follow(parent).map_err(|source| OutputArtifactError::Io {
-                    operation: "create output directory",
+                    kind: ExtractionOutputErrorKind::PrepareDirectory,
                     path: parent.to_path_buf(),
                     source,
                 })?;
@@ -139,7 +237,7 @@ impl OutputLayout {
         })
     }
 
-    pub(crate) fn path(&self, relative: &str) -> Result<&PreparedOutputPath, OutputArtifactError> {
+    pub(super) fn path(&self, relative: &str) -> Result<&PreparedOutputPath, OutputArtifactError> {
         self.paths
             .get(relative)
             .ok_or_else(|| OutputArtifactError::UnplannedPath(relative.to_owned()))
@@ -147,13 +245,13 @@ impl OutputLayout {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PreparedOutputPath {
+pub(super) struct PreparedOutputPath {
     final_path: PathBuf,
     parent_identity: DirectoryIdentity,
 }
 
 impl PreparedOutputPath {
-    pub(crate) fn create_staging(&self) -> Result<StagingOutput, OutputArtifactError> {
+    pub(super) fn create_staging(&self) -> Result<StagingOutput, OutputArtifactError> {
         let parent = self
             .final_path
             .parent()
@@ -165,7 +263,7 @@ impl PreparedOutputPath {
                 Ok(file) => {
                     let identity =
                         opened_file_identity(&file).map_err(|source| OutputArtifactError::Io {
-                            operation: "capture temporary output identity",
+                            kind: ExtractionOutputErrorKind::InspectTemporary,
                             path: temporary_path.clone(),
                             source,
                         })?;
@@ -180,7 +278,7 @@ impl PreparedOutputPath {
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(source) => {
                     return Err(OutputArtifactError::Io {
-                        operation: "create temporary output",
+                        kind: ExtractionOutputErrorKind::CreateTemporary,
                         path: temporary_path,
                         source,
                     });
@@ -188,7 +286,7 @@ impl PreparedOutputPath {
             }
         }
         Err(OutputArtifactError::Io {
-            operation: "create unique temporary output",
+            kind: ExtractionOutputErrorKind::CreateTemporary,
             path: parent.to_path_buf(),
             source: io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -197,33 +295,47 @@ impl PreparedOutputPath {
         })
     }
 
-    pub(crate) fn open_existing(&self) -> Result<Option<File>, OutputArtifactError> {
+    pub(super) fn open_existing(&self) -> Result<Option<File>, OutputArtifactError> {
         match open_readonly_regular_in_parent(&self.final_path, &self.parent_identity) {
             Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(source) => Err(OutputArtifactError::Io {
-                operation: "open existing output",
+                kind: ExtractionOutputErrorKind::OpenExisting,
                 path: self.final_path.clone(),
                 source,
             }),
         }
     }
 
-    pub(crate) fn hash_existing(&self) -> Result<Option<(u64, DigestV1)>, OutputArtifactError> {
+    pub(super) fn exists(&self) -> Result<bool, OutputArtifactError> {
+        self.open_existing().map(|file| file.is_some())
+    }
+
+    pub(super) fn hash_existing_bounded(
+        &self,
+        limit: u64,
+    ) -> Result<Option<(u64, DigestV1)>, OutputArtifactError> {
         let Some(mut file) = self.open_existing()? else {
             return Ok(None);
         };
         let length = file
             .metadata()
             .map_err(|source| OutputArtifactError::Io {
-                operation: "inspect existing output",
+                kind: ExtractionOutputErrorKind::InspectExisting,
                 path: self.final_path.clone(),
                 source,
             })?
             .len();
+        if length > limit {
+            return Err(OutputArtifactError::ExistingHashLimitExceeded {
+                path: self.final_path.clone(),
+                length,
+                limit,
+            });
+        }
         let digest =
             DigestV1::hash_reader(&mut file, length).map_err(|source| OutputArtifactError::Io {
-                operation: "hash existing output",
+                kind: ExtractionOutputErrorKind::HashExisting,
                 path: self.final_path.clone(),
                 source,
             })?;
@@ -231,7 +343,7 @@ impl PreparedOutputPath {
     }
 }
 
-pub(crate) struct StagingOutput {
+pub(super) struct StagingOutput {
     file: Option<File>,
     temporary_path: PathBuf,
     final_path: PathBuf,
@@ -240,24 +352,24 @@ pub(crate) struct StagingOutput {
 }
 
 impl StagingOutput {
-    pub(crate) fn writer(&mut self) -> &mut File {
+    pub(super) fn writer(&mut self) -> &mut File {
         self.file
             .as_mut()
             .expect("staging writer is only available before finish")
     }
 
-    pub(crate) fn finish(mut self) -> Result<StagedOutput, OutputArtifactError> {
+    pub(super) fn finish(mut self) -> Result<StagedOutput, OutputArtifactError> {
         let mut file = self
             .file
             .take()
             .expect("staging writer is only finished once");
         file.flush().map_err(|source| OutputArtifactError::Io {
-            operation: "flush temporary output",
+            kind: ExtractionOutputErrorKind::FinalizeTemporary,
             path: self.temporary_path.clone(),
             source,
         })?;
         file.sync_all().map_err(|source| OutputArtifactError::Io {
-            operation: "synchronize temporary output",
+            kind: ExtractionOutputErrorKind::FinalizeTemporary,
             path: self.temporary_path.clone(),
             source,
         })?;
@@ -265,7 +377,7 @@ impl StagingOutput {
 
         let observed = observe_file_identity(&self.temporary_path).map_err(|source| {
             OutputArtifactError::Io {
-                operation: "revalidate temporary output",
+                kind: ExtractionOutputErrorKind::FinalizeTemporary,
                 path: self.temporary_path.clone(),
                 source,
             }
@@ -278,7 +390,7 @@ impl StagingOutput {
         let mut reader =
             open_readonly_regular_in_parent(&self.temporary_path, &self.parent_identity).map_err(
                 |source| OutputArtifactError::Io {
-                    operation: "open temporary output for hashing",
+                    kind: ExtractionOutputErrorKind::FinalizeTemporary,
                     path: self.temporary_path.clone(),
                     source,
                 },
@@ -286,14 +398,14 @@ impl StagingOutput {
         let length = reader
             .metadata()
             .map_err(|source| OutputArtifactError::Io {
-                operation: "inspect temporary output",
+                kind: ExtractionOutputErrorKind::FinalizeTemporary,
                 path: self.temporary_path.clone(),
                 source,
             })?
             .len();
         let digest = DigestV1::hash_reader(&mut reader, length).map_err(|source| {
             OutputArtifactError::Io {
-                operation: "hash temporary output",
+                kind: ExtractionOutputErrorKind::FinalizeTemporary,
                 path: self.temporary_path.clone(),
                 source,
             }
@@ -331,7 +443,7 @@ impl Drop for StagingOutput {
 }
 
 #[derive(Debug)]
-pub(crate) struct StagedOutput {
+pub(super) struct StagedOutput {
     temporary_path: PathBuf,
     final_path: PathBuf,
     identity: FileIdentity,
@@ -342,15 +454,15 @@ pub(crate) struct StagedOutput {
 }
 
 impl StagedOutput {
-    pub(crate) const fn length(&self) -> u64 {
+    pub(super) const fn length(&self) -> u64 {
         self.length
     }
 
-    pub(crate) const fn digest(&self) -> DigestV1 {
+    pub(super) const fn digest(&self) -> DigestV1 {
         self.digest
     }
 
-    pub(crate) fn publish(mut self, replace_existing: bool) -> Result<(), OutputArtifactError> {
+    pub(super) fn publish(mut self, replace_existing: bool) -> Result<(), OutputArtifactError> {
         let result = atomic_replace_verified_tracked(
             &self.temporary_path,
             &self.final_path,
@@ -369,7 +481,8 @@ impl StagedOutput {
                 if error.moved_or_unknown_state() {
                     self.released = true;
                 }
-                Err(OutputArtifactError::Publish {
+                Err(OutputArtifactError::Io {
+                    kind: ExtractionOutputErrorKind::Publish,
                     path: self.final_path.clone(),
                     source: error.into_error(),
                 })
@@ -377,10 +490,10 @@ impl StagedOutput {
         }
     }
 
-    pub(crate) fn discard(mut self) -> Result<(), OutputArtifactError> {
+    pub(super) fn discard(mut self) -> Result<(), OutputArtifactError> {
         remove_owned_file_in_parent(&self.temporary_path, &self.identity, &self.parent_identity)
             .map_err(|source| OutputArtifactError::Io {
-                operation: "remove temporary output",
+                kind: ExtractionOutputErrorKind::DiscardTemporary,
                 path: self.temporary_path.clone(),
                 source,
             })?;
@@ -407,7 +520,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf, OutputArtifactError> {
     } else {
         std::env::current_dir()
             .map_err(|source| OutputArtifactError::Io {
-                operation: "resolve current directory",
+                kind: ExtractionOutputErrorKind::ResolveCurrentDirectory,
                 path: path.to_path_buf(),
                 source,
             })?
@@ -418,7 +531,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf, OutputArtifactError> {
         .any(|component| matches!(component, Component::ParentDir))
     {
         return Err(OutputArtifactError::Io {
-            operation: "validate output root",
+            kind: ExtractionOutputErrorKind::ValidateRoot,
             path,
             source: io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -445,6 +558,10 @@ mod tests {
         let error = OutputLayout::prepare(directory.path(), ["objects", "objects/item.bin"])
             .expect_err("a file cannot also be a directory ancestor");
 
+        assert_eq!(
+            error.kind(),
+            super::ExtractionOutputErrorKind::PortableCollision
+        );
         assert!(matches!(
             error,
             OutputArtifactError::PortableCollision { .. }
@@ -502,6 +619,7 @@ mod tests {
         let error = OutputLayout::prepare(directory.path(), ["objects/item.bin"])
             .expect_err("second executor must not race publication");
 
+        assert_eq!(error.kind(), super::ExtractionOutputErrorKind::LockRoot);
         assert!(matches!(error, OutputArtifactError::Io { .. }));
         drop(first);
     }

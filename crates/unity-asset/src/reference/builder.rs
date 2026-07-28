@@ -11,7 +11,7 @@ use crate::workspace::WorkspaceView;
 use super::cache::{FactCacheCandidate, LocalObjectId, LocalReferenceDiagnostic};
 use super::fact::{BinaryExternalReference, RawReferenceTarget, ReferenceFact, ReferenceGuid};
 use super::index::{ReferenceIndex, ReferenceIndexInput};
-use super::input::{ReferenceInput, ReferenceSource};
+use super::input::{ReferenceInput, ReferenceSource, collect_object_sources};
 use super::occurrence::{account_cached_source, scan_source_occurrences};
 use super::resolution::{ResolutionCatalog, diagnostic_with_severity};
 use super::{
@@ -67,20 +67,8 @@ pub(crate) fn build_graph_from_input<I: ReferenceInput + ?Sized>(
         })?;
 
     let object_source_count = reference_input.object_source_count();
-    let mut scan_inputs = reserve_vec(object_source_count, "reference source scan inputs", budget)?;
-    for source in reference_input.object_sources() {
-        if scan_inputs.len() == object_source_count {
-            return Err(ReferenceGraphError::Invariant(
-                "reference input exposed more object sources than declared",
-            ));
-        }
-        scan_inputs.push(source?);
-    }
-    if scan_inputs.len() != object_source_count {
-        return Err(ReferenceGraphError::Invariant(
-            "reference input exposed fewer object sources than declared",
-        ));
-    }
+    let scan_inputs = reserve_vec(object_source_count, "reference source scan inputs", budget)?;
+    let mut scan_inputs = collect_object_sources(reference_input, scan_inputs)?;
     scan_inputs.sort_unstable_by(|left, right| {
         left.fingerprint()
             .cmp(&right.fingerprint())

@@ -1,23 +1,22 @@
 #![cfg(all(feature = "audio", feature = "texture-advanced", feature = "sprite"))]
 
-use image::{ImageFormat, RgbaImage};
-use std::io::{self, Cursor, Write};
+use image::{GenericImageView, ImageFormat, RgbaImage};
+use std::io::{self, Cursor, Seek, SeekFrom, Write};
 use unity_asset_core::AssetLoadBudget;
 use unity_asset_decode::audio::{
     AudioClip, AudioCompressionFormat, AudioExporter, AudioSourceError, DecodedAudio,
     decode_audio_data,
 };
+use unity_asset_decode::error::BinaryError;
 use unity_asset_decode::sprite::{Sprite, SpriteProcessor};
 use unity_asset_decode::texture::{Texture2D, TextureDecoder, TextureExporter, TextureFormat};
-use unity_asset_decode::unity_version::UnityVersion;
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const SHORT_VORBIS: &[u8] = include_bytes!("fixtures/short_vorbis.fsb");
 
 #[test]
-fn audio_writer_matches_path_exports() -> Result<(), Box<dyn std::error::Error>> {
+fn audio_writers_encode_caller_owned_bytes() -> Result<(), Box<dyn std::error::Error>> {
     let audio = DecodedAudio::new(vec![-1.0, -0.25, 0.0, 0.5, 1.0, 0.125], 48_000, 2);
-    let temp = tempfile::tempdir()?;
 
     let mut wav_sink = Cursor::new(Vec::new());
     AudioExporter::write_wav(&audio, &mut wav_sink)?;
@@ -25,20 +24,28 @@ fn audio_writer_matches_path_exports() -> Result<(), Box<dyn std::error::Error>>
     assert_eq!(&wav_bytes[..4], b"RIFF");
     assert_eq!(&wav_bytes[8..12], b"WAVE");
 
-    let wav_path = temp.path().join("artifact.wav");
-    AudioExporter::export_wav(&audio, &wav_path)?;
-    assert_eq!(std::fs::read(wav_path)?, wav_bytes);
-
     for bit_depth in [16, 32] {
         let mut pcm_sink = Cursor::new(Vec::new());
         AudioExporter::write_raw_pcm(&audio, &mut pcm_sink, bit_depth)?;
-
-        let pcm_path = temp.path().join(format!("artifact-{bit_depth}.pcm"));
-        AudioExporter::export_raw_pcm(&audio, &pcm_path, bit_depth)?;
-        assert_eq!(std::fs::read(pcm_path)?, pcm_sink.into_inner());
+        let bytes_per_sample = usize::from(bit_depth) / 8;
+        assert_eq!(
+            pcm_sink.into_inner().len(),
+            audio.samples.len() * bytes_per_sample
+        );
     }
 
     Ok(())
+}
+
+#[test]
+fn wav_rejects_incomplete_channel_frames_before_writing() {
+    let audio = DecodedAudio::new(vec![0.25], 48_000, 2);
+    let mut sink = Vec::new();
+
+    let error = AudioExporter::write_wav(&audio, &mut sink).unwrap_err();
+
+    assert!(matches!(error, BinaryError::InvalidData(_)));
+    assert!(sink.is_empty());
 }
 
 #[test]
@@ -54,6 +61,137 @@ fn standard_audio_source_rejects_headerless_pcm_and_adpcm() {
         .expect("headerless PCM-like bytes must not be published as WAV");
         assert!(matches!(error, AudioSourceError::UnsupportedFormat(actual) if actual == format));
     }
+}
+
+#[test]
+fn standard_audio_source_rejects_header_only_containers() {
+    let cases = [
+        (
+            AudioCompressionFormat::PCM,
+            b"RIFF\x04\0\0\0WAVE".as_slice(),
+        ),
+        (
+            AudioCompressionFormat::MP3,
+            b"ID3\x04\0\0\0\0\0\0".as_slice(),
+        ),
+        (
+            AudioCompressionFormat::AAC,
+            b"\xff\xf1\x50\x80\0\xff\xfc".as_slice(),
+        ),
+    ];
+
+    for (format, bytes) in cases {
+        let clip = AudioClip::new("header-only".into(), format);
+        let Err(error) =
+            AudioExporter::prepare_standard_source(&clip, bytes, &mut AssetLoadBudget::default())
+        else {
+            panic!("a header without playable frames must be rejected");
+        };
+
+        assert!(match error {
+            AudioSourceError::InvalidData(_) => true,
+            AudioSourceError::UnsupportedFormat(actual) => actual == format,
+            _ => false,
+        });
+    }
+}
+
+#[test]
+fn standard_audio_source_rejects_reserved_adts_sample_rates() {
+    for sampling_frequency_index in [13_u8, 14] {
+        let bytes = [
+            0xFF,
+            0xF1,
+            0x40 | (sampling_frequency_index << 2),
+            0x80,
+            0x01,
+            0x1F,
+            0xFC,
+            0x00,
+        ];
+        let clip = AudioClip::new("reserved-adts-rate".into(), AudioCompressionFormat::AAC);
+
+        let result =
+            AudioExporter::prepare_standard_source(&clip, &bytes, &mut AssetLoadBudget::default());
+
+        assert!(matches!(
+            result,
+            Err(AudioSourceError::UnsupportedFormat(
+                AudioCompressionFormat::AAC
+            ))
+        ));
+    }
+}
+
+#[test]
+fn standard_audio_source_rejects_adpcm_without_codec_extension() {
+    let bytes = wave_fixture(0x11, 1, 8_000, 8_000, 4, 4, &[], &[0; 4]);
+    let clip = AudioClip::new("invalid-adpcm".into(), AudioCompressionFormat::ADPCM);
+
+    let result =
+        AudioExporter::prepare_standard_source(&clip, &bytes, &mut AssetLoadBudget::default());
+
+    assert!(matches!(
+        result,
+        Err(AudioSourceError::UnsupportedFormat(_))
+    ));
+}
+
+#[test]
+fn standard_audio_source_accepts_complete_minimal_containers() {
+    let mut wav = Vec::new();
+    AudioExporter::write_wav(&DecodedAudio::new(vec![0.0], 8_000, 1), &mut wav).unwrap();
+
+    let mut mp3 = vec![0_u8; 417];
+    mp3[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
+
+    let aac = vec![0xFF, 0xF1, 0x50, 0x80, 0x01, 0x1F, 0xFC, 0x00];
+    let ima_adpcm = wave_fixture(0x11, 1, 8_000, 7_111, 8, 4, &[2, 0, 9, 0], &[0; 8]);
+
+    for (format, bytes) in [
+        (AudioCompressionFormat::PCM, wav),
+        (AudioCompressionFormat::ADPCM, ima_adpcm),
+        (AudioCompressionFormat::MP3, mp3),
+        (AudioCompressionFormat::AAC, aac),
+    ] {
+        let clip = AudioClip::new("complete".into(), format);
+        let prepared =
+            AudioExporter::prepare_standard_source(&clip, &bytes, &mut AssetLoadBudget::default())
+                .unwrap();
+        let mut output = Vec::new();
+        prepared.write_to(&bytes, &mut output).unwrap();
+        assert_eq!(output, bytes);
+    }
+}
+
+fn wave_fixture(
+    format: u16,
+    channels: u16,
+    sample_rate: u32,
+    byte_rate: u32,
+    block_align: u16,
+    bits_per_sample: u16,
+    extra: &[u8],
+    data: &[u8],
+) -> Vec<u8> {
+    let fmt_size = 16_u32 + u32::try_from(extra.len()).unwrap();
+    let riff_size = 4_u32 + 8 + fmt_size + 8 + u32::try_from(data.len()).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&riff_size.to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&fmt_size.to_le_bytes());
+    bytes.extend_from_slice(&format.to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&byte_rate.to_le_bytes());
+    bytes.extend_from_slice(&block_align.to_le_bytes());
+    bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
+    bytes.extend_from_slice(extra);
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(data);
+    bytes
 }
 
 #[test]
@@ -169,8 +307,76 @@ impl Write for RejectingWriter {
     }
 }
 
+struct RejectingSeekWriter;
+
+impl Write for RejectingSeekWriter {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        Err(io::Error::other("fixture output failure"))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for RejectingSeekWriter {
+    fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
+        Ok(0)
+    }
+}
+
+struct ThrottledWriter {
+    bytes: Vec<u8>,
+    max_write: usize,
+    fail_after: Option<usize>,
+    write_calls: usize,
+}
+
+impl ThrottledWriter {
+    fn new(max_write: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_write,
+            fail_after: None,
+            write_calls: 0,
+        }
+    }
+
+    fn failing(max_write: usize, fail_after: usize) -> Self {
+        Self {
+            fail_after: Some(fail_after),
+            ..Self::new(max_write)
+        }
+    }
+}
+
+impl Write for ThrottledWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        self.write_calls += 1;
+        std::thread::yield_now();
+
+        let remaining = self
+            .fail_after
+            .map_or(usize::MAX, |limit| limit.saturating_sub(self.bytes.len()));
+        if remaining == 0 {
+            return Err(io::Error::other("fixture output capacity exhausted"));
+        }
+
+        let written = bytes.len().min(self.max_write).min(remaining);
+        self.bytes.extend_from_slice(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
-fn texture_png_writer_matches_path_export() -> Result<(), Box<dyn std::error::Error>> {
+fn texture_writers_encode_caller_owned_bytes() -> Result<(), Box<dyn std::error::Error>> {
     let image = RgbaImage::from_raw(
         2,
         2,
@@ -188,16 +394,91 @@ fn texture_png_writer_matches_path_export() -> Result<(), Box<dyn std::error::Er
     assert_eq!(decoded.dimensions(), image.dimensions());
     assert_eq!(decoded.as_raw(), image.as_raw());
 
-    let temp = tempfile::tempdir()?;
-    let png_path = temp.path().join("artifact.png");
-    TextureExporter::export_png(&image, &png_path)?;
-    assert_eq!(std::fs::read(png_path)?, png_bytes);
+    let mut jpeg_sink = Cursor::new(Vec::new());
+    TextureExporter::write_jpeg(&image, &mut jpeg_sink, 90)?;
+    let jpeg_bytes = jpeg_sink.into_inner();
+    assert!(jpeg_bytes.starts_with(&[0xff, 0xd8]));
+    assert_eq!(
+        image::load_from_memory_with_format(&jpeg_bytes, ImageFormat::Jpeg)?.dimensions(),
+        image.dimensions()
+    );
+
+    let mut bmp_sink = Cursor::new(Vec::new());
+    TextureExporter::write_bmp(&image, &mut bmp_sink)?;
+    let bmp_bytes = bmp_sink.into_inner();
+    assert!(bmp_bytes.starts_with(b"BM"));
+    assert_eq!(
+        image::load_from_memory_with_format(&bmp_bytes, ImageFormat::Bmp)?.dimensions(),
+        image.dimensions()
+    );
+
+    let mut tiff_sink = Cursor::new(Vec::new());
+    TextureExporter::write_tiff(&image, &mut tiff_sink)?;
+    let tiff_bytes = tiff_sink.into_inner();
+    assert!(tiff_bytes.starts_with(b"II") || tiff_bytes.starts_with(b"MM"));
+    assert_eq!(
+        image::load_from_memory_with_format(&tiff_bytes, ImageFormat::Tiff)?.dimensions(),
+        image.dimensions()
+    );
 
     Ok(())
 }
 
 #[test]
-fn sprite_vec_export_delegates_to_png_writer() -> Result<(), Box<dyn std::error::Error>> {
+fn texture_writers_reject_invalid_dimensions_before_writing() {
+    let empty = RgbaImage::new(0, 0);
+
+    for write in [
+        TextureExporter::write_png::<Vec<u8>>,
+        TextureExporter::write_bmp::<Vec<u8>>,
+    ] {
+        let mut sink = Vec::new();
+        assert!(matches!(
+            write(&empty, &mut sink),
+            Err(BinaryError::InvalidData(_))
+        ));
+        assert!(sink.is_empty());
+    }
+
+    let mut jpeg_sink = Vec::new();
+    assert!(matches!(
+        TextureExporter::write_jpeg(&empty, &mut jpeg_sink, 90),
+        Err(BinaryError::InvalidData(_))
+    ));
+    assert!(jpeg_sink.is_empty());
+
+    let mut tiff_sink = Cursor::new(Vec::new());
+    assert!(matches!(
+        TextureExporter::write_tiff(&empty, &mut tiff_sink),
+        Err(BinaryError::InvalidData(_))
+    ));
+    assert!(tiff_sink.into_inner().is_empty());
+
+    let too_wide = RgbaImage::new(u32::from(u16::MAX) + 1, 1);
+    let mut sink = Vec::new();
+    assert!(matches!(
+        TextureExporter::write_jpeg(&too_wide, &mut sink, 90),
+        Err(BinaryError::InvalidData(_))
+    ));
+    assert!(sink.is_empty());
+}
+
+#[test]
+fn texture_writers_preserve_caller_sink_errors() {
+    let image = RgbaImage::new(1, 1);
+
+    let error = TextureExporter::write_jpeg(&image, &mut RejectingWriter, 90).unwrap_err();
+    assert!(matches!(error, BinaryError::Io(source) if source.kind() == io::ErrorKind::Other));
+
+    let error = TextureExporter::write_bmp(&image, &mut RejectingWriter).unwrap_err();
+    assert!(matches!(error, BinaryError::Io(source) if source.kind() == io::ErrorKind::Other));
+
+    let error = TextureExporter::write_tiff(&image, &mut RejectingSeekWriter).unwrap_err();
+    assert!(matches!(error, BinaryError::Io(source) if source.kind() == io::ErrorKind::Other));
+}
+
+#[test]
+fn sprite_png_writer_encodes_caller_owned_bytes() -> Result<(), Box<dyn std::error::Error>> {
     let texture = Texture2D {
         width: 2,
         height: 2,
@@ -212,19 +493,66 @@ fn sprite_vec_export_delegates_to_png_writer() -> Result<(), Box<dyn std::error:
         rect_height: 1.0,
         ..Default::default()
     };
-    let version = UnityVersion::parse_version("2020.3.12f1")?;
-    let processor = SpriteProcessor::new(version);
+    let processor = SpriteProcessor::new();
 
-    let png_bytes = processor.extract_sprite_image(&sprite, &texture)?;
     let mut png_sink = Cursor::new(Vec::new());
     processor.write_sprite_png(&sprite, &texture, &mut png_sink)?;
+    let png_bytes = png_sink.into_inner();
 
     assert_eq!(&png_bytes[..PNG_SIGNATURE.len()], PNG_SIGNATURE);
-    assert_eq!(png_sink.into_inner(), png_bytes);
     let decoded = image::load_from_memory_with_format(&png_bytes, ImageFormat::Png)?.to_rgba8();
     assert_eq!(decoded.dimensions(), (2, 1));
     assert_eq!(decoded.as_raw(), &[0, 0, 255, 128, 255, 255, 255, 64]);
     Ok(())
+}
+
+#[test]
+fn codecs_bound_write_calls_and_propagate_partial_sink_failures() {
+    let samples = (0..16_384)
+        .map(|index| (index % 257) as f32 / 128.0 - 1.0)
+        .collect();
+    let audio = DecodedAudio::new(samples, 48_000, 2);
+
+    let mut wav_sink = ThrottledWriter::new(257);
+    AudioExporter::write_wav(&audio, &mut wav_sink).unwrap();
+    assert_eq!(wav_sink.bytes.len(), 44 + audio.samples.len() * 2);
+    assert_eq!(&wav_sink.bytes[..4], b"RIFF");
+    assert!(
+        wav_sink.write_calls > 100,
+        "fixture must exercise partial writes"
+    );
+
+    let mut pcm_sink = ThrottledWriter::new(usize::MAX);
+    AudioExporter::write_raw_pcm(&audio, &mut pcm_sink, 16).unwrap();
+    assert_eq!(pcm_sink.bytes.len(), audio.samples.len() * 2);
+    assert!(
+        pcm_sink.write_calls <= 16,
+        "PCM encoding must batch samples instead of writing each one"
+    );
+
+    let image = RgbaImage::from_fn(128, 128, |x, y| {
+        image::Rgba([
+            x.wrapping_mul(17) as u8,
+            y.wrapping_mul(29) as u8,
+            x.wrapping_mul(y) as u8,
+            255,
+        ])
+    });
+    let mut png_sink = ThrottledWriter::new(257);
+    TextureExporter::write_png(&image, &mut png_sink).unwrap();
+    assert!(png_sink.bytes.starts_with(PNG_SIGNATURE));
+    assert!(
+        png_sink.write_calls > 1,
+        "fixture must exercise partial writes"
+    );
+
+    let mut failing_audio = ThrottledWriter::failing(257, 1_024);
+    let error = AudioExporter::write_wav(&audio, &mut failing_audio).unwrap_err();
+    assert!(matches!(error, BinaryError::Io(source) if source.kind() == io::ErrorKind::Other));
+
+    let mut failing_texture = ThrottledWriter::failing(31, 64);
+    let error = TextureExporter::write_png(&image, &mut failing_texture).unwrap_err();
+    assert!(matches!(error, BinaryError::Io(source) if source.kind() == io::ErrorKind::Other));
 }
 
 #[test]

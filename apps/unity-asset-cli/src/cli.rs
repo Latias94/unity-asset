@@ -32,8 +32,8 @@ pub(crate) enum Commands {
     /// Query revision-bound reference facts through structured projections.
     References(ReferencesCommand),
 
-    /// Extract one deterministic, revision-bound artifact set.
-    Extract(Box<ExtractCommand>),
+    /// Export one deterministic, revision-bound artifact set.
+    Export(Box<ExportCommand>),
 
     /// Split Unity YAML documents through the safe artifact publisher.
     #[command(name = "split-yaml")]
@@ -260,7 +260,7 @@ pub(crate) enum ReferencesSubcommand {
 }
 
 #[derive(Args)]
-pub(crate) struct ExtractCommand {
+pub(crate) struct ExportCommand {
     #[arg(short, long)]
     pub(crate) input: PathBuf,
 
@@ -303,9 +303,11 @@ pub(crate) struct ExtractCommand {
     #[arg(long)]
     pub(crate) max_in_flight_bytes: Option<u64>,
 
+    /// Cap simultaneous open files; the safe publication minimum is 5.
     #[arg(long)]
     pub(crate) max_open_files: Option<usize>,
 
+    /// Cap both published bytes and existing-output bytes read for skip/resume evidence.
     #[arg(long)]
     pub(crate) max_output_bytes: Option<u64>,
 
@@ -349,7 +351,7 @@ mod tests {
         assert!(
             Cli::try_parse_from([
                 "unity-asset",
-                "extract",
+                "export",
                 "--input",
                 "game.ab",
                 "--output",
@@ -360,7 +362,7 @@ mod tests {
         assert!(
             Cli::try_parse_from([
                 "unity-asset",
-                "extract",
+                "export",
                 "--input",
                 "game.ab",
                 "--output",
@@ -375,7 +377,7 @@ mod tests {
         assert!(
             Cli::try_parse_from([
                 "unity-asset",
-                "extract",
+                "export",
                 "--input",
                 "game.ab",
                 "--output",
@@ -391,7 +393,7 @@ mod tests {
     #[test]
     fn superseded_commands_are_absent() {
         for command in [
-            "export",
+            "extract",
             "find-object",
             "inspect-object",
             "list-objects",

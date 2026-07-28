@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use unity_asset::extraction::{
     ExistingOutputPolicy, ExtractionExecutionLimits, ExtractionExecutionOptions,
     ExtractionExecutor, ExtractionFailurePolicy, ExtractionPlan, ExtractionPlanner,
-    ExtractionReport, ExtractionRepresentationPolicy, ExtractionRequest,
+    ExtractionReport, ExtractionRepresentationPolicy, ExtractionRequest, ExtractionRunOptions,
 };
 use unity_asset::schema::{AudioClipResourceRecipe, SchemaRecipePlanner};
 use unity_asset::workspace::{
@@ -65,7 +65,7 @@ fn value_at(view: &impl WorkspaceView, target: &ObjectAddress, path: &FieldPath)
 
 fn extraction_options() -> ExtractionExecutionOptions {
     ExtractionExecutionOptions::new(
-        ExtractionExecutionLimits::new(1, 8 * 1024 * 1024, 1, 16 * 1024 * 1024, 8 * 1024 * 1024)
+        ExtractionExecutionLimits::new(1, 8 * 1024 * 1024, 5, 16 * 1024 * 1024, 8 * 1024 * 1024)
             .unwrap(),
         ExistingOutputPolicy::Error,
         ExtractionFailurePolicy::CollectAll,
@@ -294,8 +294,7 @@ fn public_structured_workflow_spans_mutation_recovery_extraction_and_search() {
             &committed,
             &extraction_plan,
             &project_root.join("extracted"),
-            &extraction_options(),
-            None,
+            ExtractionRunOptions::new(extraction_options()),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();

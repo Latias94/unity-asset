@@ -9,12 +9,11 @@
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::identity_op)]
 
-use std::fs;
-use std::path::Path;
+use image::{GenericImageView, ImageFormat};
 use unity_asset_decode::asset::SerializedFile;
 use unity_asset_decode::bundle::AssetBundle;
 use unity_asset_decode::sprite::{Sprite, SpriteProcessor};
-use unity_asset_decode::texture::{Texture2D, Texture2DConverter, TextureFormat};
+use unity_asset_decode::texture::{Texture2D, Texture2DConverter, TextureExporter, TextureFormat};
 use unity_asset_decode::unity_version::UnityVersion;
 
 const SAMPLES_DIR: &str = "tests/samples";
@@ -205,62 +204,23 @@ fn test_texture_export_unitypy_compat() {
     }
     texture.image_data = data;
 
-    // Test PNG export (like UnityPy's data.image.save())
-    let png_path = "target/test_export.png";
-    std::fs::create_dir_all("target").ok();
-
-    // Use converter to decode and save as PNG
+    // Decode once, then encode into sinks owned by the caller.
     let converter = Texture2DConverter::new();
-    match converter.decode_to_image(&texture) {
-        Ok(image) => {
-            match image.save(png_path) {
-                Ok(()) => {
-                    // Verify file was created
-                    assert!(Path::new(png_path).exists(), "PNG file should be created");
+    let image = converter
+        .decode_to_image(&texture)
+        .expect("fixture texture should decode");
 
-                    // Clean up
-                    std::fs::remove_file(png_path).ok();
+    let mut png_data = Vec::new();
+    TextureExporter::write_png(&image, &mut png_data).expect("PNG encoding should succeed");
+    let decoded_png = image::load_from_memory_with_format(&png_data, ImageFormat::Png)
+        .expect("encoded PNG should decode");
+    assert_eq!(decoded_png.dimensions(), image.dimensions());
 
-                    println!("  ✓ PNG export successful (compatible with UnityPy)");
-                }
-                Err(e) => {
-                    panic!("PNG save failed: {}", e);
-                }
-            }
-        }
-        Err(e) => {
-            panic!("PNG export failed: {}", e);
-        }
-    }
-
-    // Test JPEG export (UnityPy can also export to JPEG)
-    let jpeg_path = "target/test_export.jpg";
-
-    // Use converter to decode and save as JPEG
-    let converter = Texture2DConverter::new();
-    match converter.decode_to_image(&texture) {
-        Ok(image) => {
-            // Convert to RGB for JPEG (no alpha channel)
-            let rgb_image = image::DynamicImage::ImageRgba8(image).to_rgb8();
-            match rgb_image.save(jpeg_path) {
-                Ok(()) => {
-                    // Verify file was created
-                    assert!(Path::new(jpeg_path).exists(), "JPEG file should be created");
-
-                    // Clean up
-                    std::fs::remove_file(jpeg_path).ok();
-
-                    println!("  ✓ JPEG export successful (compatible with UnityPy)");
-                }
-                Err(e) => {
-                    panic!("JPEG save failed: {}", e);
-                }
-            }
-        }
-        Err(e) => {
-            panic!("JPEG export failed: {}", e);
-        }
-    }
+    let mut jpeg_data = Vec::new();
+    TextureExporter::write_jpeg(&image, &mut jpeg_data, 90).expect("JPEG encoding should succeed");
+    let decoded_jpeg = image::load_from_memory_with_format(&jpeg_data, ImageFormat::Jpeg)
+        .expect("encoded JPEG should decode");
+    assert_eq!(decoded_jpeg.dimensions(), image.dimensions());
 }
 
 /// Test texture information extraction (like UnityPy's texture properties)
@@ -502,31 +462,12 @@ fn test_sprite_image_extraction() {
         sprite.name, sprite.rect_x, sprite.rect_y, sprite.rect_width, sprite.rect_height
     );
 
-    // Extract sprite image using processor
-    let sprite_processor = SpriteProcessor::new(test_version());
-    match sprite_processor.extract_sprite_image(&sprite, &texture) {
-        Ok(sprite_image_data) => {
-            println!(
-                "    ✓ Successfully extracted sprite image: {} bytes",
-                sprite_image_data.len()
-            );
-
-            // Verify we got PNG data
-            assert!(!sprite_image_data.is_empty());
-
-            // Basic PNG header check
-            if sprite_image_data.len() >= 8 {
-                let png_header = &sprite_image_data[0..8];
-                let expected_png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-                assert_eq!(png_header, expected_png_header, "Should be valid PNG data");
-            }
-
-            println!("    ✓ Sprite image extraction successful");
-        }
-        Err(e) => {
-            panic!("Sprite image extraction failed: {}", e);
-        }
-    }
+    // Render the sprite without implicitly allocating encoded output.
+    let sprite_processor = SpriteProcessor::new();
+    let sprite_image = sprite_processor
+        .render_sprite(&sprite, &texture)
+        .expect("sprite rendering should succeed");
+    assert_eq!(sprite_image.dimensions(), (2, 2));
 
     // Test sprite info extraction (using sprite fields directly)
     println!("  Testing sprite info extraction...");
@@ -544,36 +485,12 @@ fn test_sprite_image_extraction() {
 
     println!("    ✓ Sprite info extraction successful");
 
-    // Test PNG export
-    let png_path = "target/test_sprite.png";
-    std::fs::create_dir_all("target").ok();
-
-    // Use sprite processor to extract and save PNG
-    let sprite_processor = SpriteProcessor::new(test_version());
-    match sprite_processor.extract_sprite_image(&sprite, &texture) {
-        Ok(png_data) => {
-            match std::fs::write(png_path, &png_data) {
-                Ok(()) => {
-                    println!("    ✓ Sprite PNG export successful");
-
-                    // Verify file was created
-                    assert!(
-                        std::path::Path::new(png_path).exists(),
-                        "PNG file should be created"
-                    );
-
-                    // Clean up
-                    std::fs::remove_file(png_path).ok();
-                }
-                Err(e) => {
-                    println!("    ❌ Sprite PNG write failed: {}", e);
-                }
-            }
-        }
-        Err(e) => {
-            println!("    ❌ Sprite PNG export failed: {}", e);
-        }
-    }
+    // Encode PNG into storage owned by the caller.
+    let mut png_data = Vec::new();
+    sprite_processor
+        .write_sprite_png(&sprite, &texture, &mut png_data)
+        .expect("sprite PNG encoding should succeed");
+    assert!(png_data.starts_with(b"\x89PNG\r\n\x1a\n"));
 
     println!("Sprite Image Extraction Test Results:");
     println!("  ✓ Sprite image extraction working correctly");

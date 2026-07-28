@@ -11,7 +11,7 @@ use super::ReferenceGraphError;
 use super::fact::{
     BinaryExternalReference, RawReferenceTarget, ReferenceGuid, ReferenceResolution,
 };
-use super::input::{ReferenceInput, ReferenceSource};
+use super::input::{ReferenceInput, ReferenceSource, collect_object_sources};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PathClaim {
@@ -69,6 +69,44 @@ pub(super) struct ResolutionIdentityIndex {
     guids: Vec<GuidClaim>,
     source_guids: Vec<SourceGuidClaim>,
     source_parents: Vec<SourceParent>,
+}
+
+#[cfg(feature = "decode")]
+pub(super) fn binary_external_source_resolves_to<I: ReferenceInput + ?Sized>(
+    input: &I,
+    context: SourceId,
+    file_id: i32,
+    expected: SourceId,
+    budget: &mut AssetLoadBudget,
+) -> Result<bool, ReferenceGraphError> {
+    let Some(external_index) = file_id
+        .checked_sub(1)
+        .and_then(|index| usize::try_from(index).ok())
+    else {
+        return Ok(false);
+    };
+    let sources = reserve_vec(
+        input.object_source_count(),
+        "targeted binary reference source inputs",
+        budget,
+    )?;
+    let sources = collect_object_sources(input, sources)?;
+    let Some(external) = sources
+        .iter()
+        .copied()
+        .find(|source| source.source() == context)
+        .and_then(|source| source.binary_external(external_index))
+    else {
+        return Ok(false);
+    };
+    let raw_guid = (external.guid != [0; 16]).then_some(external.guid);
+    ResolutionIdentityIndex::build(&sources, budget)?.binary_external_resolves_to(
+        context,
+        raw_guid,
+        &external.path,
+        expected,
+        budget,
+    )
 }
 
 impl ResolutionIdentityIndex {

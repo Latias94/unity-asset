@@ -42,6 +42,18 @@ pub use query::{
 pub(crate) use cache::ReferenceStore;
 use index::ReferenceIndex;
 
+#[cfg(feature = "decode")]
+pub(crate) fn binary_external_source_resolves_to(
+    view: &dyn WorkspaceView,
+    context: SourceId,
+    file_id: i32,
+    expected: SourceId,
+    budget: &mut AssetLoadBudget,
+) -> Result<bool, ReferenceGraphError> {
+    let input = reference_view_parts(view);
+    resolution::binary_external_source_resolves_to(&input, context, file_id, expected, budget)
+}
+
 /// Deterministic soft limits applied after format-local facts are available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReferenceGraphBuildOptions {

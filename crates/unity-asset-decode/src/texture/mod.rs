@@ -15,7 +15,8 @@
 //! # Examples
 //!
 //! ```rust,no_run
-//! use unity_asset_decode::texture::{TextureFormat, Texture2DConverter, TextureDecoder};
+//! use std::io::Cursor;
+//! use unity_asset_decode::texture::{Texture2DConverter, TextureDecoder, TextureExporter};
 //!
 //! // Create a converter
 //! let converter = Texture2DConverter::new();
@@ -27,8 +28,9 @@
 //! let decoder = TextureDecoder::new();
 //! // let image = decoder.decode(&texture)?;
 //!
-//! // Export the image
-//! // TextureExporter::export_png(&image, "output.png")?;
+//! // Encode into a sink owned by the caller.
+//! // let mut output = Cursor::new(Vec::new());
+//! // TextureExporter::write_png(&image, &mut output)?;
 //! ```
 
 pub mod converter;
@@ -46,9 +48,6 @@ pub use types::{GLTextureSettings, StreamingInfo, Texture2D};
 
 // Re-export decoder types for advanced usage
 pub use decoders::{BasicDecoder, CompressedDecoder, CrunchDecoder, MobileDecoder};
-
-// Re-export export options
-pub use helpers::export::ExportOptions;
 
 /// Main texture processing facade
 ///
@@ -81,15 +80,15 @@ impl TextureProcessor {
         self.decoder.decode(texture)
     }
 
-    /// Full pipeline: convert object -> decode -> export
-    pub fn process_and_export<P: AsRef<std::path::Path>>(
+    /// Convert and decode an object, then write PNG bytes to a caller-owned sink.
+    pub fn process_and_write_png<W: std::io::Write + ?Sized>(
         &self,
         obj: &crate::object::UnityObject,
-        output_path: P,
+        writer: &mut W,
     ) -> crate::error::Result<()> {
         let texture = self.convert_object(obj)?;
         let image = self.decode_texture(&texture)?;
-        TextureExporter::export_auto(&image, output_path)
+        TextureExporter::write_png(&image, writer)
     }
 
     /// Check if a format can be processed
@@ -145,14 +144,6 @@ pub fn decode_texture_data(
 
     let decoder = TextureDecoder::new();
     decoder.decode(&texture)
-}
-
-/// Quick function to export image with automatic format detection
-pub fn export_image<P: AsRef<std::path::Path>>(
-    image: &image::RgbaImage,
-    path: P,
-) -> crate::error::Result<()> {
-    TextureExporter::export_auto(image, path)
 }
 
 #[cfg(test)]

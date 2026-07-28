@@ -1,23 +1,18 @@
 use std::fmt::Write as _;
-use std::io::{self, Write};
+#[cfg(feature = "decode")]
+use std::io;
 
 use thiserror::Error;
 use unity_asset_binary::asset::class_ids;
-#[cfg(feature = "decode")]
-use unity_asset_binary::object::UnityObject;
 #[cfg(feature = "decode")]
 use unity_asset_binary::unity_version::UnityVersion;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, ObjectAddress, ObjectKind, RevisionedObjectHandle,
     SourceFingerprint, SourceId, SourceLocator, UnityValue, vec_allocation_bytes,
 };
-use unity_asset_yaml::UnityYamlSerializer;
-
 #[cfg(feature = "decode")]
 use unity_asset_decode::{
-    audio::{AudioClipLayout, AudioCompressionFormat, MAX_VORBIS_SETUP_PACKET_BYTES},
-    sprite::SpriteTextureReference,
-    texture::Texture2DLayout,
+    audio::AudioClipLayout, sprite::SpriteTextureReference, texture::Texture2DLayout,
 };
 
 use super::container::{
@@ -32,7 +27,9 @@ use super::model::{
     ExtractionPath, ExtractionPlan, ExtractionRepresentationPolicy, ExtractionRequest,
     ExtractionSelection, ExtractionSourceExpectation, PlannedArtifact, PlannedContent,
 };
-use super::source_budget_error;
+use super::reservation::{ExtractionReservationError, raw_binary_working_set, yaml_working_set};
+#[cfg(feature = "decode")]
+use super::reservation::{audio_working_set, sprite_working_set_with_texture, texture_working_set};
 #[cfg(feature = "decode")]
 use crate::reference::{RawReferenceTarget, ReferenceResolution};
 use crate::reference::{ReferenceGraph, ReferenceGraphError, ReferenceTraversal};
@@ -314,14 +311,20 @@ impl<'view> ExtractionPlanner<'view> {
                 ExtractionArtifactKind::Text,
                 "txt",
                 PlannedContent::TextAsset,
-                usize_to_u64(binary.payload_len(), "text asset working set")?,
+                raw_binary_working_set(object).map_err(map_reservation_error)?,
                 policy.then_fallback(raw),
             ));
         }
 
         #[cfg(not(feature = "decode"))]
         {
-            unavailable_choice(address, policy, raw, budget)
+            unavailable_choice_with(
+                address,
+                policy,
+                raw,
+                ExtractionDiagnosticCode::FeatureUnavailable,
+                budget,
+            )
         }
 
         #[cfg(feature = "decode")]
@@ -373,35 +376,6 @@ impl<'view> ExtractionPlanner<'view> {
                         "audio output extension",
                         budget,
                     )?;
-                    let encoded_audio_bytes = match stream.as_ref() {
-                        Some(stream) => stream.size(),
-                        None => usize_to_u64(
-                            layout
-                                .payload()
-                                .embedded_byte_len()
-                                .expect("non-streamed layout is embedded"),
-                            "embedded audio size",
-                        )?,
-                    };
-                    let output_bound =
-                        if layout.compression_format() == AudioCompressionFormat::Vorbis {
-                            ogg_output_bound(encoded_audio_bytes)?
-                        } else {
-                            encoded_audio_bytes
-                        };
-                    let working_set = checked_sum(
-                        [
-                            usize_to_u64(binary.payload_len(), "audio working set")?,
-                            stream.as_ref().map_or(0, ExtractionSourceRange::size),
-                            if stream.is_none() {
-                                encoded_audio_bytes
-                            } else {
-                                0
-                            },
-                            output_bound,
-                        ],
-                        "audio working set",
-                    )?;
                     let mut expectations = budgeted_vec(
                         if stream.is_some() { 1 } else { 0 },
                         "audio source expectations",
@@ -411,6 +385,16 @@ impl<'view> ExtractionPlanner<'view> {
                         expectations.push(expectation);
                     }
                     let version = clone_unity_version(version, budget)?;
+                    let working_set = audio_working_set(
+                        self.view,
+                        object,
+                        &version,
+                        &extension,
+                        stream.as_ref(),
+                        Some(stream_resolver),
+                        budget,
+                    )
+                    .map_err(map_reservation_error)?;
                     Ok(ContentChoice::decoded_with_sources(
                         ExtractionArtifactKind::Audio,
                         layout.compression_format().extension(),
@@ -451,17 +435,6 @@ impl<'view> ExtractionPlanner<'view> {
                     } else {
                         (None, None)
                     };
-                    let image_bytes = u64::try_from(layout.width())
-                        .ok()
-                        .and_then(|width| {
-                            u64::try_from(layout.height())
-                                .ok()
-                                .and_then(|height| width.checked_mul(height))
-                        })
-                        .and_then(|pixels| pixels.checked_mul(4))
-                        .ok_or(ExtractionPlanError::ArithmeticOverflow {
-                            resource: "texture working set",
-                        })?;
                     let mut expectations = budgeted_vec(
                         if stream.is_some() { 1 } else { 0 },
                         "texture source expectations",
@@ -470,39 +443,30 @@ impl<'view> ExtractionPlanner<'view> {
                     if let Some(expectation) = stream_expectation {
                         expectations.push(expectation);
                     }
-                    let stream_bytes = stream.as_ref().map_or(0, ExtractionSourceRange::size);
-                    let embedded_bytes = layout
-                        .payload()
-                        .embedded_byte_len()
-                        .map(|size| usize_to_u64(size, "embedded texture size"))
-                        .transpose()?
-                        .unwrap_or(0);
                     let version = clone_unity_version(version, budget)?;
+                    let working_set = texture_working_set(
+                        self.view,
+                        object,
+                        stream.as_ref(),
+                        Some(stream_resolver),
+                        budget,
+                    )
+                    .map_err(map_reservation_error)?;
                     Ok(ContentChoice::decoded_with_sources(
                         ExtractionArtifactKind::TexturePng,
                         "png",
                         PlannedContent::TexturePng { version, stream },
-                        checked_sum(
-                            [
-                                image_bytes,
-                                png_output_bound(image_bytes)?,
-                                usize_to_u64(binary.payload_len(), "texture working set")?,
-                                stream_bytes,
-                                embedded_bytes,
-                            ],
-                            "texture working set",
-                        )?,
+                        working_set,
                         policy.then_fallback(raw),
                         expectations,
                     ))
                 }
                 class_ids::SPRITE => self.plan_sprite(
                     address,
-                    binary,
+                    object,
                     owner,
                     sources,
                     stream_resolver,
-                    version,
                     policy,
                     raw,
                     budget,
@@ -523,15 +487,17 @@ impl<'view> ExtractionPlanner<'view> {
     fn plan_sprite(
         &self,
         address: &ObjectAddress,
-        binary: &UnityObject,
+        object: &WorkspaceObject,
         owner: &WorkspaceSource,
         sources: &[WorkspaceSource],
         stream_resolver: &StreamedResourceResolver<'_, '_>,
-        version: &UnityVersion,
         policy: ExtractionRepresentationPolicy,
         raw: ContentChoice,
         budget: &mut AssetLoadBudget,
     ) -> Result<ContentChoice, ExtractionPlanError> {
+        let WorkspaceObjectValue::Binary(binary) = object.value() else {
+            unreachable!("sprite planning is only dispatched for binary objects");
+        };
         let texture_reference = match SpriteTextureReference::inspect(binary) {
             Ok(reference) => reference,
             Err(_) => return unavailable_choice(address, policy, raw, budget),
@@ -549,7 +515,7 @@ impl<'view> ExtractionPlanner<'view> {
                     address,
                     policy,
                     raw,
-                    ExtractionDiagnosticCode::UnresolvedDependency,
+                    ExtractionDiagnosticCode::UnresolvedSpritePPtr,
                     budget,
                 );
             };
@@ -561,7 +527,7 @@ impl<'view> ExtractionPlanner<'view> {
                     address,
                     policy,
                     raw,
-                    ExtractionDiagnosticCode::UnresolvedDependency,
+                    ExtractionDiagnosticCode::UnresolvedSpritePPtr,
                     budget,
                 );
             };
@@ -570,7 +536,7 @@ impl<'view> ExtractionPlanner<'view> {
         let texture_handle = match resolve_required_handle(self.view, &texture_address, budget) {
             Ok(handle) => handle,
             Err(error) => {
-                let Some(code) = decoded_resource_failure(&error) else {
+                let Some(code) = sprite_reference_failure(&error) else {
                     return Err(error);
                 };
                 return unavailable_choice_with(address, policy, raw, code, budget);
@@ -582,7 +548,7 @@ impl<'view> ExtractionPlanner<'view> {
                 address,
                 policy,
                 raw,
-                ExtractionDiagnosticCode::UnresolvedDependency,
+                ExtractionDiagnosticCode::UnresolvedSpritePPtr,
                 budget,
             );
         };
@@ -591,7 +557,7 @@ impl<'view> ExtractionPlanner<'view> {
                 address,
                 policy,
                 raw,
-                ExtractionDiagnosticCode::UnresolvedDependency,
+                ExtractionDiagnosticCode::UnresolvedSpritePPtr,
                 budget,
             );
         }
@@ -638,46 +604,23 @@ impl<'view> ExtractionPlanner<'view> {
         if let Some(expectation) = stream_expectation {
             expectations.push(expectation);
         }
-        let texture_stream_bytes = texture_stream
-            .as_ref()
-            .map_or(0, ExtractionSourceRange::size);
-        let embedded_texture_bytes = texture_layout
-            .payload()
-            .embedded_byte_len()
-            .map(|size| usize_to_u64(size, "embedded sprite texture size"))
-            .transpose()?
-            .unwrap_or(0);
-        let image_bytes = u64::try_from(texture_layout.width())
-            .ok()
-            .and_then(|width| {
-                u64::try_from(texture_layout.height())
-                    .ok()
-                    .and_then(|height| width.checked_mul(height))
-            })
-            .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or(ExtractionPlanError::ArithmeticOverflow {
-                resource: "sprite working set",
-            })?;
-        let version = clone_unity_version(version, budget)?;
+        let working_set = sprite_working_set_with_texture(
+            self.view,
+            object,
+            &texture_object,
+            texture_stream.as_ref(),
+            Some(stream_resolver),
+            budget,
+        )
+        .map_err(map_reservation_error)?;
         Ok(ContentChoice::decoded_with_sources(
             ExtractionArtifactKind::SpritePng,
             "png",
             PlannedContent::SpritePng {
-                version,
                 texture: texture_address,
                 texture_stream,
             },
-            checked_sum(
-                [
-                    image_bytes,
-                    png_output_bound(image_bytes)?,
-                    usize_to_u64(binary.payload_len(), "sprite working set")?,
-                    usize_to_u64(texture_binary.payload_len(), "sprite working set")?,
-                    texture_stream_bytes,
-                    embedded_texture_bytes,
-                ],
-                "sprite working set",
-            )?,
+            working_set,
             policy.then_fallback(raw),
             expectations,
         ))
@@ -815,36 +758,24 @@ fn raw_content(
     budget: &mut AssetLoadBudget,
 ) -> Result<ContentChoice, ExtractionPlanError> {
     match object.value() {
-        WorkspaceObjectValue::Binary(binary) => Ok(ContentChoice::decoded(
+        WorkspaceObjectValue::Binary(_) => Ok(ContentChoice::decoded(
             ExtractionArtifactKind::BinaryRaw,
             "bin",
             PlannedContent::RawBinary,
-            usize_to_u64(binary.payload_len(), "raw object length")?,
+            raw_binary_working_set(object).map_err(map_reservation_error)?,
             None,
         )),
-        WorkspaceObjectValue::Yaml(_) => {
-            let mut counter = PlanningByteCounter::default();
-            if let Err(error) = UnityYamlSerializer::new().serialize_to_writer_with_budget(
-                &mut counter,
-                std::iter::once(object.class()),
-                budget,
-            ) {
-                if let Some(error) = source_budget_error(&error) {
-                    return Err(error.clone().into());
-                }
-                return Err(ExtractionPlanError::YamlSizing(error.to_string()));
-            }
-            Ok(ContentChoice::decoded(
-                ExtractionArtifactKind::Yaml,
-                "yaml",
-                PlannedContent::Yaml,
-                counter.bytes,
-                None,
-            ))
-        }
+        WorkspaceObjectValue::Yaml(_) => Ok(ContentChoice::decoded(
+            ExtractionArtifactKind::Yaml,
+            "yaml",
+            PlannedContent::Yaml,
+            yaml_working_set(object, budget).map_err(map_reservation_error)?,
+            None,
+        )),
     }
 }
 
+#[cfg(feature = "decode")]
 fn unavailable_choice(
     address: &ObjectAddress,
     policy: ExtractionRepresentationPolicy,
@@ -899,9 +830,12 @@ fn decoded_resource_failure(error: &ExtractionPlanError) -> Option<ExtractionDia
         | ExtractionPlanError::ObjectUnloaded(_)
         | ExtractionPlanError::ObjectMissing(_)
         | ExtractionPlanError::SourceMissing(_)
-        | ExtractionPlanError::Workspace(
-            WorkspaceError::MissingSource(_) | WorkspaceError::RangeOutOfBounds { .. },
-        ) => Some(ExtractionDiagnosticCode::MissingResource),
+        | ExtractionPlanError::Workspace(WorkspaceError::MissingSource(_)) => {
+            Some(ExtractionDiagnosticCode::MissingResource)
+        }
+        ExtractionPlanError::Workspace(WorkspaceError::RangeOutOfBounds { .. }) => {
+            Some(ExtractionDiagnosticCode::ResourceOutOfRange)
+        }
         ExtractionPlanError::Workspace(WorkspaceError::SourceChanged { .. }) => {
             Some(ExtractionDiagnosticCode::SourceChanged)
         }
@@ -911,6 +845,42 @@ fn decoded_resource_failure(error: &ExtractionPlanError) -> Option<ExtractionDia
             Some(ExtractionDiagnosticCode::UnresolvedDependency)
         }
         _ => None,
+    }
+}
+
+#[cfg(feature = "decode")]
+fn sprite_reference_failure(error: &ExtractionPlanError) -> Option<ExtractionDiagnosticCode> {
+    match error {
+        ExtractionPlanError::ObjectUnloaded(_)
+        | ExtractionPlanError::ObjectMissing(_)
+        | ExtractionPlanError::ObjectAmbiguous { .. }
+        | ExtractionPlanError::ObjectInvalid(_) => {
+            Some(ExtractionDiagnosticCode::UnresolvedSpritePPtr)
+        }
+        _ => decoded_resource_failure(error),
+    }
+}
+
+fn map_reservation_error(error: ExtractionReservationError) -> ExtractionPlanError {
+    match error {
+        ExtractionReservationError::Workspace(error) => error.into(),
+        ExtractionReservationError::Budget(error) => error.into(),
+        #[cfg(feature = "decode")]
+        ExtractionReservationError::Reference(error) => error.into(),
+        ExtractionReservationError::ObjectUnavailable(address) => {
+            ExtractionPlanError::ObjectMissing(address)
+        }
+        ExtractionReservationError::ArithmeticOverflow { resource } => {
+            ExtractionPlanError::ArithmeticOverflow { resource }
+        }
+        ExtractionReservationError::YamlSizing(message) => ExtractionPlanError::YamlSizing(message),
+        error @ ExtractionReservationError::ContentMismatch(_) => {
+            ExtractionPlanError::Model(error.to_string())
+        }
+        #[cfg(feature = "decode")]
+        error @ ExtractionReservationError::StreamOutOfRange { .. } => {
+            ExtractionPlanError::Model(error.to_string())
+        }
     }
 }
 
@@ -1080,66 +1050,6 @@ fn push_budgeted<T>(
     budget.consume_bytes(retained_bytes)?;
     values.push(value);
     Ok(())
-}
-
-#[cfg(feature = "decode")]
-fn checked_sum(
-    values: impl IntoIterator<Item = u64>,
-    resource: &'static str,
-) -> Result<u64, ExtractionPlanError> {
-    values.into_iter().try_fold(0_u64, |total, value| {
-        total
-            .checked_add(value)
-            .ok_or(ExtractionPlanError::ArithmeticOverflow { resource })
-    })
-}
-
-#[cfg(feature = "decode")]
-fn png_output_bound(rgba_bytes: u64) -> Result<u64, ExtractionPlanError> {
-    rgba_bytes
-        .checked_mul(2)
-        .and_then(|bytes| bytes.checked_add(1024 * 1024))
-        .ok_or(ExtractionPlanError::ArithmeticOverflow {
-            resource: "PNG output bound",
-        })
-}
-
-#[cfg(feature = "decode")]
-fn ogg_output_bound(encoded_bytes: u64) -> Result<u64, ExtractionPlanError> {
-    // An FSB5 packet needs at least a two-byte length and one data byte. Even
-    // if every packet occupies its own Ogg page, sixteen times the input covers
-    // payload, lacing values, and page headers. The setup packet is independently
-    // capped by the decoder module and included as a fixed component.
-    encoded_bytes
-        .checked_mul(16)
-        .and_then(|bytes| {
-            MAX_VORBIS_SETUP_PACKET_BYTES
-                .checked_mul(2)
-                .and_then(|fixed| bytes.checked_add(fixed))
-        })
-        .and_then(|bytes| bytes.checked_add(64 * 1024))
-        .ok_or(ExtractionPlanError::ArithmeticOverflow {
-            resource: "Ogg output bound",
-        })
-}
-
-#[derive(Default)]
-struct PlanningByteCounter {
-    bytes: u64,
-}
-
-impl Write for PlanningByteCounter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.bytes = self
-            .bytes
-            .checked_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX))
-            .ok_or_else(|| io::Error::other("planned YAML output length overflow"))?;
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 fn selected_handles(
@@ -1723,7 +1633,7 @@ mod tests {
         );
         assert_eq!(
             decoded_resource_failure(&out_of_bounds),
-            Some(ExtractionDiagnosticCode::MissingResource)
+            Some(ExtractionDiagnosticCode::ResourceOutOfRange)
         );
         assert_eq!(
             decoded_resource_failure(&ambiguous_stream),
@@ -1732,6 +1642,10 @@ mod tests {
         assert_eq!(
             decoded_resource_failure(&unresolved),
             Some(ExtractionDiagnosticCode::UnresolvedDependency)
+        );
+        assert_eq!(
+            sprite_reference_failure(&unresolved),
+            Some(ExtractionDiagnosticCode::UnresolvedSpritePPtr)
         );
     }
 

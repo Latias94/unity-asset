@@ -6,11 +6,13 @@
 //! For broader format support, enable `texture-advanced` (or `full`):
 //! `cargo run -p unity-asset-decode --example export_textures --features texture-advanced -- <path> <out_dir>`
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use unity_asset_core::{AssetLoadBudget, constants::class_ids};
 use unity_asset_decode::file::load_unity_file_with_budget;
 use unity_asset_decode::object::ObjectHandle;
-use unity_asset_decode::texture::Texture2DConverter;
+use unity_asset_decode::texture::{Texture2DConverter, TextureExporter};
 
 fn main() -> unity_asset_decode::Result<()> {
     let path = std::env::args_os()
@@ -54,7 +56,20 @@ fn main() -> unity_asset_decode::Result<()> {
         let file_name = format!("{}_{}.png", stem, obj.path_id());
         let out_path = out_dir.join(file_name);
 
-        unity_asset_decode::texture::TextureExporter::export_png(&image, &out_path)?;
+        let output = File::create(&out_path).map_err(|error| {
+            unity_asset_decode::BinaryError::generic(format!(
+                "Failed to create {}: {error}",
+                out_path.display()
+            ))
+        })?;
+        let mut output = BufWriter::new(output);
+        TextureExporter::write_png(&image, &mut output)?;
+        output.flush().map_err(|error| {
+            unity_asset_decode::BinaryError::generic(format!(
+                "Failed to flush {}: {error}",
+                out_path.display()
+            ))
+        })?;
         exported += 1;
         Ok(())
     };

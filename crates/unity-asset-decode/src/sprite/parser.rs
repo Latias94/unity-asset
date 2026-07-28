@@ -6,8 +6,8 @@ use super::types::*;
 use crate::error::{BinaryError, Result};
 use crate::object::UnityObject;
 use crate::reader::BinaryReader;
-use crate::unity_version::UnityVersion;
 use indexmap::IndexMap;
+use std::mem::size_of;
 use unity_asset_core::UnityValue;
 
 /// The Texture2D PPtr selected by a Sprite without materializing the Sprite.
@@ -40,23 +40,19 @@ impl SpriteTextureReference {
 ///
 /// This struct provides methods for parsing Unity Sprite objects from
 /// various data sources including TypeTree and binary data.
-pub struct SpriteParser {
-    version: UnityVersion,
-}
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SpriteParser;
 
 impl SpriteParser {
     /// Create a new sprite parser
-    pub fn new(version: UnityVersion) -> Self {
-        Self { version }
+    pub const fn new() -> Self {
+        Self
     }
 
     /// Parse Sprite from UnityObject
-    pub fn parse_from_unity_object(&self, obj: &UnityObject) -> Result<SpriteResult> {
-        let sprite = self
-            .parse_from_typetree(obj.as_unity_class().properties())
-            .or_else(|_| self.parse_from_binary_data(obj.raw_data()))?;
-
-        Ok(SpriteResult::new(sprite))
+    pub fn parse_from_unity_object(&self, obj: &UnityObject) -> Result<Sprite> {
+        self.parse_from_typetree(obj.as_unity_class().properties())
+            .or_else(|_| self.parse_from_binary_data(obj.raw_data()))
     }
 
     /// Parse Sprite from TypeTree properties
@@ -306,8 +302,9 @@ impl SpriteParser {
     ) -> Result<()> {
         // This is a simplified implementation
         // The actual structure depends on the Unity version
-        if reader.remaining() >= 4 {
-            sprite.render_data.texture_path_id = reader.read_i64().unwrap_or(0);
+        if reader.remaining() >= size_of::<i32>() + size_of::<i64>() {
+            reader.read_i32()?;
+            sprite.render_data.texture_path_id = reader.read_i64()?;
         }
 
         if reader.remaining() >= 16 {
@@ -318,16 +315,6 @@ impl SpriteParser {
         }
 
         Ok(())
-    }
-
-    /// Get the Unity version
-    pub fn version(&self) -> &UnityVersion {
-        &self.version
-    }
-
-    /// Set the Unity version
-    pub fn set_version(&mut self, version: UnityVersion) {
-        self.version = version;
     }
 }
 
@@ -354,36 +341,23 @@ fn inspect_texture_reference_binary(data: &[u8]) -> Result<SpriteTextureReferenc
     reader.align_to(4)?;
     reader.read_bool()?;
     reader.align_to(4)?;
+    let file_id = reader.read_i32()?;
     let path_id = reader.read_i64()?;
     if path_id == 0 {
         return Err(BinaryError::invalid_data(
             "Sprite binary texture path ID is zero",
         ));
     }
-    Ok(SpriteTextureReference {
-        file_id: 0,
-        path_id,
-    })
+    Ok(SpriteTextureReference { file_id, path_id })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_version() -> UnityVersion {
-        UnityVersion::parse_version("2020.3.12f1").unwrap()
-    }
-
-    #[test]
-    fn test_parser_creation() {
-        let version = test_version();
-        let parser = SpriteParser::new(version.clone());
-        assert_eq!(parser.version(), &version);
-    }
-
     #[test]
     fn test_extract_rect() {
-        let parser = SpriteParser::new(test_version());
+        let parser = SpriteParser::new();
         let mut sprite = Sprite::default();
 
         let mut rect_obj = IndexMap::new();
@@ -437,5 +411,17 @@ mod tests {
 
         assert_eq!(reference.file_id(), 3);
         assert_eq!(reference.path_id(), 42);
+    }
+
+    #[test]
+    fn binary_texture_reference_preserves_external_file_and_signed_path_ids() {
+        let mut data = vec![0_u8; 4 + 13 * size_of::<f32>() + 4 + 4];
+        data.extend_from_slice(&7_i32.to_le_bytes());
+        data.extend_from_slice(&(-9_876_543_210_i64).to_le_bytes());
+
+        let reference = inspect_texture_reference_binary(&data).unwrap();
+
+        assert_eq!(reference.file_id(), 7);
+        assert_eq!(reference.path_id(), -9_876_543_210);
     }
 }

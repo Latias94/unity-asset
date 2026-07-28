@@ -7,12 +7,20 @@ use unity_asset::extraction::{
     BundleContainerQuery, BundleContainerResolution, ExistingOutputPolicy,
     ExtractionArtifactStatus, ExtractionDiagnosticCode, ExtractionExecutionError,
     ExtractionExecutionLimits, ExtractionExecutionOptions, ExtractionExecutor,
-    ExtractionFailurePolicy, ExtractionManifest, ExtractionPlanError, ExtractionPlanner,
-    ExtractionReport, ExtractionRepresentationPolicy, ExtractionRequest,
+    ExtractionFailurePolicy, ExtractionManifest, ExtractionPath, ExtractionPlan,
+    ExtractionPlanError, ExtractionPlanner, ExtractionReport, ExtractionRepresentationPolicy,
+    ExtractionRequest, ExtractionRunOptions,
 };
 use unity_asset::reference::{RawReferenceTarget, ReferenceGraphBuildOptions};
-use unity_asset::workspace::{AssetWorkspace, WorkspaceError, WorkspaceLookup, WorkspaceView};
-use unity_asset::{AssetLoadBudget, AssetLoadLimits, BudgetError, DigestV1};
+use unity_asset::schema::SchemaRecipePlanner;
+use unity_asset::workspace::{
+    AssetWorkspace, MutationPlanBuilder, MutationValue, PrepareOptions, WorkspaceError,
+    WorkspaceLookup, WorkspaceView,
+};
+use unity_asset::{
+    AssetLoadBudget, AssetLoadLimits, BudgetError, DigestV1, FieldPath, ObjectAddress,
+    SourceLocator,
+};
 use unity_asset_binary::asset::{SerializedFileParser, class_ids};
 use unity_asset_binary::bundle::BundleParser;
 
@@ -149,7 +157,7 @@ fn options_with_failure(
         ExtractionExecutionLimits::new(
             workers,
             8 * 1024 * 1024,
-            workers.max(1),
+            workers.saturating_mul(2).saturating_add(1).max(5),
             32 * 1024 * 1024,
             8 * 1024 * 1024,
         )
@@ -287,8 +295,7 @@ fn stop_in_plan_order_discards_every_later_staged_output() {
             &snapshot,
             &plan,
             &output,
-            &options(1, ExistingOutputPolicy::Error),
-            None,
+            ExtractionRunOptions::new(options(1, ExistingOutputPolicy::Error)),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -301,12 +308,11 @@ fn stop_in_plan_order_discards_every_later_staged_output() {
             &snapshot,
             &plan,
             &output,
-            &options_with_failure(
+            ExtractionRunOptions::new(options_with_failure(
                 2,
                 ExistingOutputPolicy::Error,
                 ExtractionFailurePolicy::StopInPlanOrder,
-            ),
-            None,
+            )),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -353,8 +359,7 @@ fn planning_is_write_free_and_worker_count_does_not_change_manifest() {
             &snapshot,
             &plan,
             &one_output,
-            &options(1, ExistingOutputPolicy::Error),
-            None,
+            ExtractionRunOptions::new(options(1, ExistingOutputPolicy::Error)),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -363,13 +368,12 @@ fn planning_is_write_free_and_worker_count_does_not_change_manifest() {
             &snapshot,
             &plan,
             &many_output,
-            &options(4, ExistingOutputPolicy::Error),
-            None,
+            ExtractionRunOptions::new(options(4, ExistingOutputPolicy::Error)),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
     let open_file_limited = ExtractionExecutionOptions::new(
-        ExtractionExecutionLimits::new(4, 8 * 1024 * 1024, 1, 32 * 1024 * 1024, 8 * 1024 * 1024)
+        ExtractionExecutionLimits::new(4, 8 * 1024 * 1024, 5, 32 * 1024 * 1024, 8 * 1024 * 1024)
             .unwrap(),
         ExistingOutputPolicy::Error,
         ExtractionFailurePolicy::CollectAll,
@@ -380,8 +384,7 @@ fn planning_is_write_free_and_worker_count_does_not_change_manifest() {
             &snapshot,
             &plan,
             &directory.path().join("open-file-limited"),
-            &open_file_limited,
-            None,
+            ExtractionRunOptions::new(open_file_limited),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -432,6 +435,98 @@ fn planning_is_write_free_and_worker_count_does_not_change_manifest() {
 }
 
 #[test]
+fn prepared_view_extraction_reads_the_uncommitted_candidate_revision() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("objects.prefab");
+    let output = directory.path().join("prepared-output");
+    fs::write(&source_path, FIRST_SOURCE).unwrap();
+
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(&source_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let base = workspace.snapshot();
+    let address =
+        ObjectAddress::yaml(SourceLocator::path("objects.prefab").unwrap(), "1001").unwrap();
+    let name_path = FieldPath::root().push_field("m_Name").unwrap();
+
+    let recipes = SchemaRecipePlanner::new(&base);
+    let observed = recipes
+        .inspect(&address, &mut AssetLoadBudget::default())
+        .unwrap();
+    let fragment = recipes
+        .lower_field_replace(
+            &observed,
+            name_path.clone(),
+            MutationValue::string("Prepared").unwrap(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let mut builder = MutationPlanBuilder::new(base.workspace_id(), base.revision());
+    builder.append(fragment).unwrap();
+    let prepared = workspace
+        .prepare(
+            builder.build().unwrap(),
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let view = prepared.view();
+
+    let plan = ExtractionPlanner::new(&view)
+        .plan(
+            ExtractionRequest::addresses(
+                [address.clone()],
+                ExtractionRepresentationPolicy::RawOnly,
+            )
+            .unwrap(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    assert_eq!(plan.revision(), view.revision());
+    assert_eq!(plan.artifacts().len(), 1);
+    assert_eq!(plan.artifacts()[0].object_name(), Some("Prepared"));
+
+    let report = ExtractionExecutor::new()
+        .execute(
+            &view,
+            &plan,
+            &output,
+            ExtractionRunOptions::new(options(1, ExistingOutputPolicy::Error)),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let artifact = report
+        .manifest()
+        .artifact_by_address(&address)
+        .expect("prepared object must have one extraction receipt");
+    assert_eq!(artifact.status(), ExtractionArtifactStatus::Written);
+    assert_eq!(report.manifest().revision(), view.revision());
+    let yaml = fs::read_to_string(output.join(artifact.path().as_str())).unwrap();
+    assert!(yaml.contains("m_Name: Prepared"));
+    assert!(!yaml.contains("m_Name: Alpha"));
+
+    assert_eq!(fs::read_to_string(&source_path).unwrap(), FIRST_SOURCE);
+    let WorkspaceLookup::Resolved(base_handle) = base
+        .resolve_object(&address, &mut AssetLoadBudget::default())
+        .unwrap()
+    else {
+        panic!("base object must remain resolvable");
+    };
+    let base_object = base
+        .read_object(&base_handle, &mut AssetLoadBudget::default())
+        .unwrap();
+    assert_eq!(
+        base_object
+            .class()
+            .value_at_path(&name_path)
+            .unwrap()
+            .as_str(),
+        Some("Alpha")
+    );
+}
+
+#[test]
 fn corrupted_resume_output_requires_explicit_replacement_authority() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("objects.prefab");
@@ -454,8 +549,7 @@ fn corrupted_resume_output_requires_explicit_replacement_authority() {
             &snapshot,
             &plan,
             &output,
-            &options(2, ExistingOutputPolicy::Error),
-            None,
+            ExtractionRunOptions::new(options(2, ExistingOutputPolicy::Error)),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -472,8 +566,8 @@ fn corrupted_resume_output_requires_explicit_replacement_authority() {
             &snapshot,
             &plan,
             &output,
-            &options(2, ExistingOutputPolicy::Error),
-            Some(first.manifest()),
+            ExtractionRunOptions::new(options(2, ExistingOutputPolicy::Error))
+                .with_resume(first.manifest()),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -486,8 +580,8 @@ fn corrupted_resume_output_requires_explicit_replacement_authority() {
             &snapshot,
             &plan,
             &output,
-            &options(2, ExistingOutputPolicy::Replace),
-            Some(first.manifest()),
+            ExtractionRunOptions::new(options(2, ExistingOutputPolicy::Replace))
+                .with_resume(first.manifest()),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -529,8 +623,7 @@ fn existing_output_policies_produce_stable_receipts_without_changing_files() {
             &snapshot,
             &plan,
             &output,
-            &options(1, ExistingOutputPolicy::Error),
-            None,
+            ExtractionRunOptions::new(options(1, ExistingOutputPolicy::Error)),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -546,8 +639,7 @@ fn existing_output_policies_produce_stable_receipts_without_changing_files() {
             &snapshot,
             &plan,
             &output,
-            &options(2, ExistingOutputPolicy::Skip),
-            None,
+            ExtractionRunOptions::new(options(2, ExistingOutputPolicy::Skip)),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -558,8 +650,7 @@ fn existing_output_policies_produce_stable_receipts_without_changing_files() {
             &snapshot,
             &plan,
             &output,
-            &options(2, ExistingOutputPolicy::Error),
-            None,
+            ExtractionRunOptions::new(options(2, ExistingOutputPolicy::Error)),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -580,8 +671,7 @@ fn existing_output_policies_produce_stable_receipts_without_changing_files() {
             &snapshot,
             &plan,
             &output,
-            &options(2, ExistingOutputPolicy::Replace),
-            None,
+            ExtractionRunOptions::new(options(2, ExistingOutputPolicy::Replace)),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -615,7 +705,7 @@ fn working_set_and_report_bounds_reject_before_creating_output() {
         .unwrap();
 
     let working_set_limited = ExtractionExecutionOptions::new(
-        ExtractionExecutionLimits::new(2, 1, 2, 32 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
+        ExtractionExecutionLimits::new(2, 1, 5, 32 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
         ExistingOutputPolicy::Error,
         ExtractionFailurePolicy::CollectAll,
     )
@@ -626,8 +716,7 @@ fn working_set_and_report_bounds_reject_before_creating_output() {
             &snapshot,
             &plan,
             &working_set_output,
-            &working_set_limited,
-            None,
+            ExtractionRunOptions::new(working_set_limited),
             &mut AssetLoadBudget::default(),
         )
         .unwrap_err();
@@ -638,7 +727,7 @@ fn working_set_and_report_bounds_reject_before_creating_output() {
     assert!(!working_set_output.exists());
 
     let report_limited = ExtractionExecutionOptions::new(
-        ExtractionExecutionLimits::new(2, 8 * 1024 * 1024, 2, 32 * 1024 * 1024, 1).unwrap(),
+        ExtractionExecutionLimits::new(2, 8 * 1024 * 1024, 5, 32 * 1024 * 1024, 1).unwrap(),
         ExistingOutputPolicy::Error,
         ExtractionFailurePolicy::CollectAll,
     )
@@ -649,8 +738,7 @@ fn working_set_and_report_bounds_reject_before_creating_output() {
             &snapshot,
             &plan,
             &report_output,
-            &report_limited,
-            None,
+            ExtractionRunOptions::new(report_limited),
             &mut AssetLoadBudget::default(),
         )
         .unwrap_err();
@@ -659,6 +747,67 @@ fn working_set_and_report_bounds_reject_before_creating_output() {
         ExtractionExecutionError::ReportLimitExceeded { .. }
     ));
     assert!(!report_output.exists());
+}
+
+#[test]
+fn persisted_plan_cannot_understate_its_authoritative_working_set() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("objects.prefab");
+    let output = directory.path().join("underdeclared");
+    fs::write(&source_path, FIRST_SOURCE).unwrap();
+
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(&source_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let plan = ExtractionPlanner::new(&snapshot)
+        .plan(
+            ExtractionRequest::all(ExtractionRepresentationPolicy::RawOnly),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let mut wire: serde_json::Value =
+        serde_json::from_slice(&plan.canonical_json().unwrap()).unwrap();
+    wire["artifacts"][0]["working_set_bytes"] = serde_json::Value::from(1);
+    let tampered = serde_json::to_vec(&wire).unwrap();
+    let plan =
+        ExtractionPlan::read_json(tampered.as_slice(), &mut AssetLoadBudget::default()).unwrap();
+
+    let error = ExtractionExecutor::new()
+        .execute(
+            &snapshot,
+            &plan,
+            &output,
+            ExtractionRunOptions::new(options(2, ExistingOutputPolicy::Error)),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ExtractionExecutionError::WorkingSetUnderdeclared {
+            ordinal: 0,
+            declared: 1,
+            ..
+        }
+    ));
+    assert!(!output.exists());
+}
+
+#[test]
+fn open_file_limit_reserves_lock_and_verified_publication_handles() {
+    let error =
+        ExtractionExecutionLimits::new(1, 8 * 1024 * 1024, 4, 32 * 1024 * 1024, 8 * 1024 * 1024)
+            .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ExtractionExecutionError::OpenFileLimitTooSmall {
+            minimum: 5,
+            limit: 4
+        }
+    ));
 }
 
 #[test]
@@ -682,13 +831,12 @@ fn durable_manifest_path_cannot_collide_with_a_planned_artifact() {
     let manifest_path = plan.artifacts()[0].preferred_path();
 
     let error = ExtractionExecutor::new()
-        .execute_with_manifest(
+        .execute(
             &snapshot,
             &plan,
             &output,
-            manifest_path,
-            &options(1, ExistingOutputPolicy::Error),
-            None,
+            ExtractionRunOptions::new(options(1, ExistingOutputPolicy::Error))
+                .with_manifest_path(manifest_path),
             &mut AssetLoadBudget::default(),
         )
         .unwrap_err();
@@ -696,6 +844,49 @@ fn durable_manifest_path_cannot_collide_with_a_planned_artifact() {
     assert!(matches!(
         error,
         ExtractionExecutionError::OutputLayout { .. }
+    ));
+    assert!(!output.exists());
+}
+
+#[test]
+fn manifest_output_reservation_fails_before_creating_the_output_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("objects.prefab");
+    let output = directory.path().join("output");
+    fs::write(&source_path, FIRST_SOURCE).unwrap();
+
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(&source_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let plan = ExtractionPlanner::new(&snapshot)
+        .plan(
+            ExtractionRequest::all(ExtractionRepresentationPolicy::RawOnly),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let limited = ExtractionExecutionOptions::new(
+        ExtractionExecutionLimits::new(1, 8 * 1024 * 1024, 5, 1, 8 * 1024 * 1024).unwrap(),
+        ExistingOutputPolicy::Error,
+        ExtractionFailurePolicy::CollectAll,
+    )
+    .unwrap();
+    let manifest_path = ExtractionPath::new("manifest.json").unwrap();
+
+    let error = ExtractionExecutor::new()
+        .execute(
+            &snapshot,
+            &plan,
+            &output,
+            ExtractionRunOptions::new(limited).with_manifest_path(&manifest_path),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ExtractionExecutionError::ManifestOutputLimitExceeded { limit: 1, .. }
     ));
     assert!(!output.exists());
 }
@@ -719,7 +910,7 @@ fn output_limit_rejects_artifacts_before_publication() {
         )
         .unwrap();
     let limited = ExtractionExecutionOptions::new(
-        ExtractionExecutionLimits::new(2, 8 * 1024 * 1024, 2, 1, 8 * 1024 * 1024).unwrap(),
+        ExtractionExecutionLimits::new(2, 8 * 1024 * 1024, 5, 1, 8 * 1024 * 1024).unwrap(),
         ExistingOutputPolicy::Error,
         ExtractionFailurePolicy::CollectAll,
     )
@@ -730,8 +921,7 @@ fn output_limit_rejects_artifacts_before_publication() {
             &snapshot,
             &plan,
             &output,
-            &limited,
-            None,
+            ExtractionRunOptions::new(limited),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -774,8 +964,7 @@ fn revision_mismatch_fails_before_creating_the_output_root() {
             &new_snapshot,
             &plan,
             &output,
-            &options(1, ExistingOutputPolicy::Error),
-            None,
+            ExtractionRunOptions::new(options(1, ExistingOutputPolicy::Error)),
             &mut AssetLoadBudget::default(),
         )
         .unwrap_err();
@@ -966,8 +1155,7 @@ fn bundle_container_and_explicit_handle_publish_identical_artifact_bytes() {
             &snapshot,
             &container_plan,
             &directory.path().join("container"),
-            &options(1, ExistingOutputPolicy::Error),
-            None,
+            ExtractionRunOptions::new(options(1, ExistingOutputPolicy::Error)),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -976,8 +1164,7 @@ fn bundle_container_and_explicit_handle_publish_identical_artifact_bytes() {
             &snapshot,
             &handle_plan,
             &directory.path().join("handle"),
-            &options(1, ExistingOutputPolicy::Error),
-            None,
+            ExtractionRunOptions::new(options(1, ExistingOutputPolicy::Error)),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -1059,8 +1246,7 @@ fn unsupported_binary_classes_are_reported_without_silent_raw_downgrade() {
             &snapshot,
             &preferred,
             output.path(),
-            &options(1, ExistingOutputPolicy::Error),
-            None,
+            ExtractionRunOptions::new(options(1, ExistingOutputPolicy::Error)),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();

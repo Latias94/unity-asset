@@ -8,7 +8,7 @@ use unity_asset::extraction::{
     ExistingOutputPolicy, ExtractionArtifactKind, ExtractionArtifactStatus,
     ExtractionExecutionLimits, ExtractionExecutionOptions, ExtractionExecutor,
     ExtractionFailurePolicy, ExtractionFilter, ExtractionPlanError, ExtractionPlanner,
-    ExtractionRepresentationPolicy, ExtractionRequest,
+    ExtractionRepresentationPolicy, ExtractionRequest, ExtractionRunOptions,
 };
 use unity_asset::workspace::{AssetWorkspace, WorkspaceError};
 use unity_asset::{AssetLoadBudget, AssetLoadLimits, BudgetError, DigestV1};
@@ -25,7 +25,7 @@ fn options() -> ExtractionExecutionOptions {
         ExtractionExecutionLimits::new(
             2,
             512 * 1024 * 1024,
-            4,
+            5,
             2 * 1024 * 1024 * 1024,
             16 * 1024 * 1024,
         )
@@ -125,8 +125,7 @@ fn banner_texture_exports_as_revision_bound_png() {
             &snapshot,
             &plan,
             directory.path(),
-            &options(),
-            None,
+            ExtractionRunOptions::new(options()),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -211,8 +210,7 @@ fn streamed_audio_is_resolved_by_the_plan_and_written_without_filesystem_probing
             &snapshot,
             &plan,
             directory.path(),
-            &options(),
-            None,
+            ExtractionRunOptions::new(options()),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
