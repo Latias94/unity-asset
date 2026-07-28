@@ -182,8 +182,10 @@ jobs:
               if cargo publish --locked -p "$package" --token "$CARGO_REGISTRY_TOKEN"; then
                 return 0
               fi
-              echo "$package publish failed (attempt $attempt), waiting for crates.io index..."
-              sleep 30
+              if (( attempt < 10 )); then
+                echo "$package publish failed (attempt $attempt), waiting for crates.io index..."
+                sleep 30
+              fi
             done
             return 1
           }
