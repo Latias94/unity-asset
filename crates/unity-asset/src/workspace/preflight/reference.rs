@@ -918,7 +918,7 @@ pub(super) enum ReferenceMutationCodecError {
     #[error(transparent)]
     Encoding(Box<ReferenceEncodingError>),
     #[error(transparent)]
-    Binary(#[from] SerializedObjectEncodeError),
+    Binary(Box<SerializedObjectEncodeError>),
     #[error(transparent)]
     BinarySchema(#[from] SerializedValueSchemaError),
     #[error(transparent)]
@@ -994,6 +994,12 @@ pub(super) enum ReferenceMutationCodecError {
 impl From<ReferenceEncodingError> for ReferenceMutationCodecError {
     fn from(source: ReferenceEncodingError) -> Self {
         Self::Encoding(Box::new(source))
+    }
+}
+
+impl From<SerializedObjectEncodeError> for ReferenceMutationCodecError {
+    fn from(source: SerializedObjectEncodeError) -> Self {
+        Self::Binary(Box::new(source))
     }
 }
 
@@ -1076,9 +1082,10 @@ mod tests {
         let field_path = FieldPath::root().push_field("m_Father").unwrap();
         let mut selected = None;
         for object in file.objects() {
-            let Ok(candidate) = SerializedObjectEncoder::new(&file, object.path_id())
-                .and_then(|encoder| encoder.begin_semantic(&mut AssetLoadBudget::default()))
-            else {
+            let Ok(encoder) = SerializedObjectEncoder::new(&file, object.path_id()) else {
+                continue;
+            };
+            let Ok(candidate) = encoder.begin_semantic(&mut AssetLoadBudget::default()) else {
                 continue;
             };
             let Ok(current) = candidate.value_at_path(&field_path) else {
