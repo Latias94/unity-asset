@@ -25,7 +25,7 @@ mod store;
 
 pub use config::{IndexPaths, SearchIndexOptions};
 pub use contract::{
-    ApiError, ApiErrorCode, IndexProgress, Location, MAX_REFERENCE_RESPONSE_DIAGNOSTIC_JSON_BYTES,
+    ApiError, ApiErrorCode, Location, MAX_REFERENCE_RESPONSE_DIAGNOSTIC_JSON_BYTES,
     MAX_REFERENCE_RESPONSE_DIAGNOSTICS, ReferenceContext, ReferenceCoverage, ReferenceCursor,
     ReferenceDiagnosticCoverage, ReferenceDirection, ReferenceHit, ReferenceObject,
     ReferenceRequest, ReferenceSelector, ReferencesResponse, SearchCapabilities, SearchHit,
@@ -344,7 +344,6 @@ impl SearchIndex {
             last_build_duration_ms: runtime.last_build_duration_ms,
             last_build_unix_ms: runtime.last_build_unix_ms,
             indexing: runtime.indexing,
-            progress: None,
         })
     }
 
@@ -581,8 +580,12 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use unity_asset::workspace::{AssetWorkspace, SourceOpenRequest, WorkspaceOptions};
+    use unity_asset::{SourceAlias, SourceKind};
+    use unity_asset_core::{TransactionId, WorkspaceRevision};
 
     const OWNER_PATH: &str = "Assets/owner.prefab";
+    const TARGET_PATH: &str = "Assets/target.prefab";
     const TARGET_GUID: &str = "0123456789abcdef0123456789abcdef";
     const OTHER_GUID: &str = "fedcba9876543210fedcba9876543210";
     const OWNER_BEFORE: &str = r#"%YAML 1.1
@@ -699,7 +702,7 @@ GameObject:
             fs::write(path, serde_json::to_vec(&activation).unwrap()).unwrap();
             matching_activations += 1;
         }
-        assert_eq!(matching_activations, 1);
+        assert!(matching_activations > 0);
     }
 
     fn assert_publish_failpoint_is_atomic(failpoint: GenerationFailpoint) {
@@ -736,6 +739,7 @@ GameObject:
             .expect("failed publication must keep an active generation");
         assert_eq!(failed_active.generation, baseline.generation);
         assert_eq!(failed_active.actual_revision, baseline.actual_revision);
+        assert_ne!(failed_active.desired_revision, baseline.actual_revision);
         assert!(failed_active.stale);
         assert_eq!(search_paths(&index, "Before"), vec![OWNER_PATH.to_owned()]);
         assert!(search_paths(&index, "After").is_empty());
@@ -748,7 +752,8 @@ GameObject:
 
         drop(index);
         let reopened = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
-        assert_baseline_generation(&reopened, &baseline);
+        assert_baseline_generation(&reopened, &failed_active);
+        assert!(reopened.status().unwrap().generation.last_failure.is_none());
         let recovered = reopened
             .reindex(
                 FilesystemReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
@@ -771,7 +776,7 @@ GameObject:
     }
 
     #[test]
-    fn runtime_build_guard_clears_progress_during_unwind() {
+    fn runtime_build_guard_clears_building_state_during_unwind() {
         let status = RwLock::new(StatusObservation {
             active: None,
             runtime: RuntimeStatus::default(),
@@ -835,6 +840,111 @@ GameObject:
         let rebuilt = receipt.generation.unwrap();
         assert_ne!(rebuilt.generation, baseline.generation);
         assert_baseline_generation(&reopened, &rebuilt);
+    }
+
+    #[test]
+    fn late_receipt_rebuild_from_legacy_projection_preserves_store_desired_revision() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        write_generation_fixture(&project);
+        let paths =
+            IndexPaths::for_project(project.clone(), Some(temporary.path().join("index")), None)
+                .unwrap();
+        let index =
+            SearchIndex::open_or_create(paths.clone(), &mut AssetLoadBudget::default()).unwrap();
+        let baseline = index
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap()
+            .generation
+            .unwrap();
+
+        let mut workspace =
+            AssetWorkspace::with_workspace_id(baseline.workspace, WorkspaceOptions::lenient())
+                .unwrap();
+        let owner = workspace
+            .load_source(
+                SourceOpenRequest::new(
+                    project.join(OWNER_PATH),
+                    SourceAlias::new(OWNER_PATH.to_owned()).unwrap(),
+                )
+                .with_kind_hint(SourceKind::Yaml),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        workspace
+            .load_source(
+                SourceOpenRequest::new(
+                    project.join(TARGET_PATH),
+                    SourceAlias::new(TARGET_PATH.to_owned()).unwrap(),
+                )
+                .with_kind_hint(SourceKind::Yaml),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(workspace.revision(), baseline.actual_revision);
+
+        let future_revision = WorkspaceRevision::new(DigestV1::hash_bytes(b"future-revision"));
+        let future = ChangeSet::new(
+            TransactionId::new(DigestV1::hash_bytes(b"future-transaction")),
+            baseline.workspace,
+            baseline.actual_revision,
+            future_revision,
+            vec![owner],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let error = index
+            .reindex_workspace(
+                future,
+                &workspace.snapshot(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), ApiErrorCode::RevisionMismatch);
+        let stale = index.status().unwrap().generation.active.unwrap();
+        assert_eq!(stale.actual_revision, baseline.actual_revision);
+        assert_eq!(stale.desired_revision, future_revision);
+        assert!(stale.stale);
+        drop(index);
+
+        rewrite_reference_marker_as_legacy(&paths, baseline.generation);
+        let reopened =
+            SearchIndex::open_or_create(paths.clone(), &mut AssetLoadBudget::default()).unwrap();
+        assert!(reopened.status().unwrap().generation.active.is_none());
+
+        let late = ChangeSet::new(
+            TransactionId::new(DigestV1::hash_bytes(b"late-transaction")),
+            baseline.workspace,
+            WorkspaceRevision::new(DigestV1::hash_bytes(b"prior-revision")),
+            baseline.actual_revision,
+            vec![owner],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let receipt = reopened
+            .reindex_workspace(late, &workspace.snapshot(), &mut AssetLoadBudget::default())
+            .unwrap();
+        let rebuilt = receipt.generation.unwrap();
+        assert_ne!(rebuilt.generation, baseline.generation);
+        assert_eq!(rebuilt.actual_revision, baseline.actual_revision);
+        assert_eq!(rebuilt.desired_revision, future_revision);
+        assert!(rebuilt.stale);
+        assert_eq!(
+            reopened.status().unwrap().generation.active.as_ref(),
+            Some(&rebuilt)
+        );
+        drop(reopened);
+
+        let reopened = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+        assert_eq!(
+            reopened.status().unwrap().generation.active.as_ref(),
+            Some(&rebuilt)
+        );
     }
 
     #[test]

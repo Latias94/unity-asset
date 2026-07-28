@@ -11,7 +11,9 @@ use super::ReferenceGraphError;
 use super::fact::{
     BinaryExternalReference, RawReferenceTarget, ReferenceGuid, ReferenceResolution,
 };
-use super::input::{ReferenceInput, ReferenceSource, collect_object_sources};
+#[cfg(feature = "decode")]
+use super::input::collect_object_sources;
+use super::input::{ReferenceInput, ReferenceSource};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PathClaim {

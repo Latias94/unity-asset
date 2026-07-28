@@ -41,13 +41,34 @@ The index is built in tiers to keep cold-start acceptable:
   - component types
   - key fields (tag/layer) and a small set of user-visible strings
   - reference edges (PPtr-like `{guid, fileID}` occurrences)
-- Tier-2 (on-demand): deep decoding
-  - best-effort enrichment (object name/type/field context) for a small set of results or "deep mode"
+- Tier-2 (future generation build): optional deep decoding
+  - best-effort enrichment (object name/type/field context) is projected before publication
+
+Queries never reopen Unity sources for enrichment. Every result is answered from one immutable
+Search Generation so its fields, references, and revision stamp cannot come from different source
+snapshots.
 
 Incremental indexing has two distinct ownership paths. The filesystem daemon admits only full,
 reconcile, and changed-path requests. Authoritative workspace consumers call the search-index
 library with revision-bound `ChangeSet` values after committing workspace state. A committed search
-generation records one coherent view of documents, reverse references, and status.
+generation records one coherent view of documents, reverse references, and status. Reindex receipts
+separate assets that were analyzed from assets considered during dependency discovery. Until the
+dependency projection has a persistent reverse index, changed-path and `ChangeSet` builds explicitly
+report a full cached dependency scan and its candidate count; unchanged source bytes remain closed.
+
+The append-only activation log is also the durable generation-head protocol. Once the index
+observes a target workspace revision, it appends a head that keeps the current immutable generation
+as `actual_revision` and records the target as `desired_revision`. A failed build therefore remains
+stale across process restart. Activating a complete replacement generation records
+`actual_revision == desired_revision` at the same commit point. Detailed failure text remains a
+bounded process-local diagnostic rather than a second persisted authority. The highest committed
+head is the sole freshness authority. If that head or its immutable generation is corrupt, opening
+fails closed instead of silently falling back to an older head and reporting stale data as fresh.
+Corrupt lower history does not prevent opening a valid latest head.
+
+The daemon performs startup reconciliation and an independent periodic reconciliation sweep. File
+watching only reduces update latency; it is not the recovery mechanism for missed events or a
+transient failed build.
 
 ### Storage location
 
@@ -82,7 +103,11 @@ metadata. The daemon owns only the derived search generation.
 
 The daemon does not expose a workspace transaction queue. Its HTTP and coordinator types cannot
 represent `ChangeSet`; clients that own an authoritative workspace snapshot use the
-`unity-asset-search-index` library boundary directly.
+`unity-asset-search-index` library boundary directly. A bare cross-process `ChangeSet` contains no
+source bytes, Source Catalog, or parse context, so it cannot prove an arbitrary historical target
+revision after the filesystem advances again. Reconciliation is the honest cross-process recovery
+path. A future remote transaction endpoint would require a content-addressed snapshot locator or
+would have to reject targets that the daemon cannot reproduce exactly from its current filesystem.
 
 ## Consequences
 

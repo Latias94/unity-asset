@@ -190,6 +190,8 @@ pub struct ReindexReceipt {
 pub struct ReindexEvidence {
     pub forced_full_scan: bool,
     pub forced_full_analysis: bool,
+    pub full_dependency_scan: bool,
+    pub dependency_candidate_assets: u64,
     pub dependency_closure_assets: u64,
     pub analysis: ReindexAnalysisEvidence,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -280,7 +280,7 @@ const SUGGEST_RESPONSE_JSON: ResponseJsonProfile = ResponseJsonProfile {
 };
 const STATUS_RESPONSE_JSON: ResponseJsonProfile = ResponseJsonProfile {
     contract: "search-cli.status.response",
-    // Status retains project paths, configured scan roots, and one bounded progress snapshot.
+    // Status retains project paths and configured scan roots.
     max_encoded_bytes: 4 * 1024 * 1024,
     max_depth: 16,
     max_entries: 32 * 1024,

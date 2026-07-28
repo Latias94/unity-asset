@@ -175,6 +175,10 @@ Start the local daemon and incrementally reconcile a Unity project:
 cargo run -p unity-asset-search-daemon -- --project-root D:\GameProject --watch
 ```
 
+Startup reconciliation and a five-minute integrity sweep are enabled by default. `--watch` adds
+low-latency changed-path admissions. Use `--reconcile-interval-ms 0` only when another process
+explicitly owns reconciliation.
+
 Index AssetBundle container paths and ignore the project root's `.gitignore`:
 
 ```powershell
@@ -195,4 +199,7 @@ cargo run -p unity-asset-search-cli -- --token $env:UNITY_ASSET_SEARCH_TOKEN rei
 
 The search index is a derived, consumer-owned `SearchGeneration`. Workspace commits hand off a
 revision-bound, transaction-keyed `ChangeSet`; the daemon never becomes authoritative for asset
-bytes.
+bytes. Reindex receipts report analysis and dependency work independently:
+`dependency_closure_assets` counts assets added to the changed set, while
+`full_dependency_scan` and `dependency_candidate_assets` disclose when dependency discovery still
+examined the complete cached asset set without reopening unchanged sources.

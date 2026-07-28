@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use unity_asset_search_daemon::app::router as daemon_router;
 use unity_asset_search_daemon::coordinator::{
-    ReindexCoordinator, ReindexCoordinatorConfig, ReindexSource,
+    ReindexCoordinator, ReindexCoordinatorConfig, ReindexExecution, ReindexSource,
 };
 use unity_asset_search_daemon::security::{TokenStore, validate_listen_addr};
 use unity_asset_search_index::{
@@ -18,6 +18,7 @@ use unity_asset_search_index::{
 };
 
 const WATCH_CHANNEL_CAPACITY: usize = 1_024;
+const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "unity-asset-search-daemon")]
@@ -41,8 +42,9 @@ struct Args {
     #[arg(long)]
     rotate_token: bool,
 
+    /// Skip the initial reconciliation performed before serving requests.
     #[arg(long)]
-    no_auto_reindex: bool,
+    no_startup_reindex: bool,
 
     #[arg(long)]
     watch: bool,
@@ -56,11 +58,11 @@ struct Args {
     #[arg(long, default_value_t = 5000)]
     watch_full_scan_threshold: usize,
 
-    /// Periodically reconcile the full project to recover from missed watcher events.
+    /// Periodically reconcile the project independently of filesystem watching.
     ///
-    /// Set to 0 to disable.
-    #[arg(long, default_value_t = 0)]
-    watch_reconcile_interval_ms: u64,
+    /// This repairs missed watcher events and transient build failures. Set to 0 to disable.
+    #[arg(long, default_value_t = DEFAULT_RECONCILE_INTERVAL_MS)]
+    reconcile_interval_ms: u64,
 
     /// Also index AssetBundle `m_Container` asset paths.
     #[arg(long)]
@@ -131,17 +133,21 @@ async fn main() -> anyhow::Result<()> {
     let coordinator = ReindexCoordinator::new(coordinator_config, move |intent| {
         let index = build_index.clone();
         async move {
-            let result = tokio::task::spawn_blocking(move || {
-                let mut budget = AssetLoadBudget::default();
-                index.reindex(intent, &mut budget)
-            })
+            let result = tokio::task::spawn_blocking(
+                move || -> Result<_, unity_asset_search_index::SearchIndexError> {
+                    let mut budget = AssetLoadBudget::default();
+                    let receipt = index.reindex(intent, &mut budget)?;
+                    let status = index.status()?;
+                    Ok(ReindexExecution::new(receipt, status))
+                },
+            )
             .await
             .map_err(|_| anyhow::anyhow!("reindex worker terminated unexpectedly"))?;
             result.map_err(anyhow::Error::new)
         }
     })?;
 
-    if !args.no_auto_reindex {
+    if !args.no_startup_reindex {
         coordinator
             .admit(ReindexSource::Startup, FilesystemReindexIntent::reconcile())
             .await?;
@@ -161,9 +167,8 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    if args.watch && args.watch_reconcile_interval_ms > 0 {
+    if let Some(interval) = reconciliation_interval(&args) {
         let timer_coordinator = coordinator.clone();
-        let interval = Duration::from_millis(args.watch_reconcile_interval_ms);
         let _reconcile_task = tokio::spawn(async move {
             reconcile_loop(timer_coordinator, interval).await;
         });
@@ -193,6 +198,10 @@ fn coordinator_config(args: &Args, project_root: &Path) -> ReindexCoordinatorCon
         .with_debounce(debounce)
         .with_max_debounce(max_debounce)
         .with_max_dirty_paths(maximum_dirty_paths)
+}
+
+fn reconciliation_interval(args: &Args) -> Option<Duration> {
+    (args.reconcile_interval_ms > 0).then(|| Duration::from_millis(args.reconcile_interval_ms))
 }
 
 #[derive(Debug)]
@@ -353,8 +362,13 @@ async fn reconcile_loop(coordinator: ReindexCoordinator, interval: Duration) {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::time::Duration;
 
-    use super::is_project_root_ignore_path;
+    use clap::Parser as _;
+
+    use super::{
+        Args, DEFAULT_RECONCILE_INTERVAL_MS, is_project_root_ignore_path, reconciliation_interval,
+    };
 
     #[test]
     fn only_project_root_ignore_files_trigger_policy_reconciliation() {
@@ -380,5 +394,26 @@ mod tests {
             root,
             Path::new("project/README.md")
         ));
+    }
+
+    #[test]
+    fn periodic_reconciliation_is_independent_of_watching_and_can_be_disabled() {
+        let defaults =
+            Args::try_parse_from(["unity-asset-search-daemon", "--project-root", "."]).unwrap();
+        assert!(!defaults.watch);
+        assert_eq!(
+            reconciliation_interval(&defaults),
+            Some(Duration::from_millis(DEFAULT_RECONCILE_INTERVAL_MS))
+        );
+
+        let disabled = Args::try_parse_from([
+            "unity-asset-search-daemon",
+            "--project-root",
+            ".",
+            "--reconcile-interval-ms",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(reconciliation_interval(&disabled), None);
     }
 }

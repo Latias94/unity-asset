@@ -3,7 +3,7 @@ use std::path::Path;
 
 use super::{
     GenerationBuild, GenerationFailpoint, GenerationPublishWarningKind, GenerationStore,
-    GenerationStoreError, GenerationStoreOptions,
+    GenerationStoreError, GenerationStoreOptions, activation_file_name,
 };
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests, ReindexReceipt,
@@ -194,6 +194,147 @@ fn writer_lease_rejects_a_second_store_until_the_first_drops() {
 }
 
 #[test]
+fn desired_revision_head_survives_reopen_and_new_generation_clears_stale_state() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let baseline = publish_generation(&mut store, "baseline", None);
+    let baseline_ordinal = store.active().unwrap().activation_ordinal();
+    let desired = revision("desired");
+
+    store
+        .record_desired_revision(desired, &mut AssetLoadBudget::default())
+        .unwrap();
+    let stale = store.active().unwrap();
+    assert_eq!(stale.generation(), baseline);
+    assert_eq!(stale.manifest().revision(), revision("baseline"));
+    assert_eq!(stale.desired_revision(), desired);
+    assert!(stale.activation_ordinal() > baseline_ordinal);
+
+    drop(store);
+    let mut reopened = open_store(temporary.path(), options).unwrap();
+    let recovered = reopened.active().unwrap();
+    assert_eq!(recovered.generation(), baseline);
+    assert_eq!(recovered.manifest().revision(), revision("baseline"));
+    assert_eq!(recovered.desired_revision(), desired);
+
+    let current = publish_generation(&mut reopened, "desired", Some(baseline));
+    let fresh = reopened.active().unwrap();
+    assert_eq!(fresh.generation(), current);
+    assert_eq!(fresh.manifest().revision(), desired);
+    assert_eq!(fresh.desired_revision(), desired);
+
+    drop(reopened);
+    let recovered = open_store(temporary.path(), options).unwrap();
+    let fresh = recovered.active().unwrap();
+    assert_eq!(fresh.generation(), current);
+    assert_eq!(fresh.manifest().revision(), desired);
+    assert_eq!(fresh.desired_revision(), desired);
+}
+
+#[test]
+fn corrupt_latest_desired_revision_head_fails_closed() {
+    let temporary = TempDir::new().unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    publish_generation(&mut store, "actual", None);
+    store
+        .record_desired_revision(revision("desired"), &mut AssetLoadBudget::default())
+        .unwrap();
+    let ordinal = store.active().unwrap().activation_ordinal();
+    let head = temporary
+        .path()
+        .join("activations")
+        .join(activation_file_name(ordinal));
+    drop(store);
+    fs::write(head, b"{").unwrap();
+
+    let error = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::ContractJson {
+            artifact: "activation record",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn corrupt_historical_head_does_not_hide_a_valid_latest_head() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions {
+        retain_previous_generations: 1,
+    };
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let first = publish_generation(&mut store, "first", None);
+    let first_ordinal = store.active().unwrap().activation_ordinal();
+    let second = publish_generation(&mut store, "second", Some(first));
+    let historical = temporary
+        .path()
+        .join("activations")
+        .join(activation_file_name(first_ordinal));
+    assert!(historical.is_file());
+    drop(store);
+    fs::write(historical, b"{").unwrap();
+
+    let reopened = open_store(temporary.path(), options).unwrap();
+    assert_eq!(reopened.active().unwrap().generation(), second);
+}
+
+#[test]
+fn legacy_activation_v1_defaults_desired_revision_to_actual_revision() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let generation = publish_generation(&mut store, "legacy", None);
+    let ordinal = store.active().unwrap().activation_ordinal();
+    let activation_path = temporary
+        .path()
+        .join("activations")
+        .join(activation_file_name(ordinal));
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&activation_path).unwrap()).unwrap();
+    value["contract_version"] = serde_json::json!(1);
+    value.as_object_mut().unwrap().remove("desired_revision");
+    fs::write(&activation_path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    drop(store);
+    let reopened = open_store(temporary.path(), options).unwrap();
+    let active = reopened.active().unwrap();
+    assert_eq!(active.generation(), generation);
+    assert_eq!(active.desired_revision(), active.manifest().revision());
+}
+
+#[test]
+fn desired_revision_head_budget_failure_is_precommit() {
+    let temporary = TempDir::new().unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let generation = publish_generation(&mut store, "baseline", None);
+    let actual_revision = store.active().unwrap().manifest().revision();
+    let activation_count = fs::read_dir(temporary.path().join("activations"))
+        .unwrap()
+        .count();
+    let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: 1,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+
+    let error = store
+        .record_desired_revision(revision("desired"), &mut budget)
+        .unwrap_err();
+    assert_byte_budget_error(error);
+    assert_eq!(
+        fs::read_dir(temporary.path().join("activations"))
+            .unwrap()
+            .count(),
+        activation_count
+    );
+    let active = store.active().unwrap();
+    assert_eq!(active.generation(), generation);
+    assert_eq!(active.desired_revision(), actual_revision);
+}
+
+#[test]
 fn dropped_builds_and_reopened_stores_recover_owned_staging() {
     let temporary = TempDir::new().unwrap();
     let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
@@ -364,33 +505,25 @@ fn reindex_receipt_defaults_missing_execution_evidence() {
 }
 
 #[test]
-fn reopen_ignores_incomplete_staging_and_malformed_activation() {
+fn reopen_ignores_incomplete_staging() {
     let temporary = TempDir::new().unwrap();
     let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     let generation = publish_generation(&mut store, "baseline", None);
 
     let incomplete = store.begin().unwrap();
     fs::write(incomplete.search_directory().join("partial"), b"partial").unwrap();
-    fs::write(
-        temporary
-            .path()
-            .join("activations")
-            .join("00000000000000000999.json"),
-        b"{",
-    )
-    .unwrap();
     drop(incomplete);
     drop(store);
 
     let mut reopened = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     assert_eq!(reopened.active().unwrap().generation(), generation);
     let next = publish_generation(&mut reopened, "after-gap", Some(generation));
-    assert_eq!(reopened.active().unwrap().activation_ordinal(), 1_000);
+    assert_eq!(reopened.active().unwrap().activation_ordinal(), 2);
     assert_eq!(reopened.active().unwrap().generation(), next);
 }
 
 #[test]
-fn reopen_budget_is_exact_and_corrupt_candidate_work_accumulates() {
+fn reopen_budget_is_exact_and_directory_discovery_accumulates() {
     let temporary = TempDir::new().unwrap();
     let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     let generation = publish_generation(&mut store, "baseline", None);
@@ -412,8 +545,8 @@ fn reopen_budget_is_exact_and_corrupt_candidate_work_accumulates() {
             temporary
                 .path()
                 .join("activations")
-                .join(format!("{ordinal:020}.json")),
-            b"{",
+                .join(format!("ignored-{ordinal:020}.json")),
+            b"ignored",
         )
         .unwrap();
     }
@@ -453,10 +586,10 @@ fn reopen_budget_is_exact_and_corrupt_candidate_work_accumulates() {
 }
 
 #[test]
-fn activation_contract_rejects_deep_wide_and_trailing_candidates() {
+fn latest_activation_contract_rejects_deep_wide_and_trailing_heads() {
     let temporary = TempDir::new().unwrap();
     let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
-    let baseline = publish_generation(&mut store, "baseline", None);
+    publish_generation(&mut store, "baseline", None);
     drop(store);
 
     let activations = temporary.path().join("activations");
@@ -473,79 +606,78 @@ fn activation_contract_rejects_deep_wide_and_trailing_candidates() {
     for _ in 0..4 {
         deep = serde_json::json!([deep]);
     }
-    fs::write(
-        activations.join("00000000000000000100.json"),
-        serde_json::to_vec(&deep).unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        activations.join("00000000000000000101.json"),
-        serde_json::to_vec(&vec![0_u8; 64]).unwrap(),
-    )
-    .unwrap();
     let mut trailing = valid_activation;
     trailing.extend_from_slice(b" null");
-    fs::write(activations.join("00000000000000000102.json"), trailing).unwrap();
-
-    let reopened = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
-    assert_eq!(reopened.active().unwrap().generation(), baseline);
+    let latest = activations.join("00000000000000000100.json");
+    for invalid in [
+        serde_json::to_vec(&deep).unwrap(),
+        serde_json::to_vec(&vec![0_u8; 64]).unwrap(),
+        trailing,
+    ] {
+        fs::write(&latest, invalid).unwrap();
+        let error = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap_err();
+        assert!(matches!(
+            error,
+            GenerationStoreError::ContractJson {
+                artifact: "activation record",
+                ..
+            }
+        ));
+    }
 }
 
 #[test]
-fn manifest_contract_rejects_deep_wide_and_trailing_candidates() {
-    let temporary = TempDir::new().unwrap();
-    let options = GenerationStoreOptions {
-        retain_previous_generations: 8,
-    };
-    let mut store = open_store(temporary.path(), options).unwrap();
-    let first = publish_generation(&mut store, "first", None);
-    let second = publish_generation(&mut store, "second", Some(first));
-    let second_directory = store.generation_directory(second);
-    let third = publish_generation(&mut store, "third", Some(second));
-    let third_directory = store.generation_directory(third);
-    let fourth = publish_generation(&mut store, "fourth", Some(third));
-    let fourth_directory = store.generation_directory(fourth);
-    drop(store);
-
+fn latest_manifest_contract_rejects_deep_wide_and_trailing_documents() {
     let mut deep = serde_json::json!(0);
     for _ in 0..10 {
         deep = serde_json::json!([deep]);
     }
-    fs::write(
-        second_directory.join("manifest.json"),
-        serde_json::to_vec(&deep).unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        third_directory.join("manifest.json"),
-        serde_json::to_vec(&vec![0_u8; 5_000]).unwrap(),
-    )
-    .unwrap();
-    let manifest_path = fourth_directory.join("manifest.json");
-    let mut trailing = fs::read(&manifest_path).unwrap();
-    trailing.extend_from_slice(b" null");
-    fs::write(manifest_path, trailing).unwrap();
+    for case in 0..3 {
+        let temporary = TempDir::new().unwrap();
+        let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+        let generation = publish_generation(&mut store, "latest", None);
+        let manifest_path = store.generation_directory(generation).join("manifest.json");
+        let invalid = match case {
+            0 => serde_json::to_vec(&deep).unwrap(),
+            1 => serde_json::to_vec(&vec![0_u8; 5_000]).unwrap(),
+            _ => {
+                let mut trailing = fs::read(&manifest_path).unwrap();
+                trailing.extend_from_slice(b" null");
+                trailing
+            }
+        };
+        drop(store);
+        fs::write(manifest_path, invalid).unwrap();
 
-    let reopened = open_store(temporary.path(), options).unwrap();
-    assert_eq!(reopened.active().unwrap().generation(), first);
+        let error = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap_err();
+        assert!(matches!(
+            error,
+            GenerationStoreError::ContractJson {
+                artifact: "generation manifest",
+                ..
+            }
+        ));
+    }
 }
 
 #[test]
-fn corrupted_latest_generation_falls_back_to_previous_activation() {
+fn corrupted_latest_generation_fails_closed_instead_of_rolling_back_freshness() {
     let temporary = TempDir::new().unwrap();
     let options = GenerationStoreOptions {
         retain_previous_generations: 1,
     };
     let mut store = open_store(temporary.path(), options).unwrap();
     let first = publish_generation(&mut store, "first", None);
-    let second = publish_generation(&mut store, "second", Some(first));
+    let _second = publish_generation(&mut store, "second", Some(first));
     let second_search = store.active().unwrap().search_directory().join("segments");
     fs::write(second_search, b"corrupt").unwrap();
     drop(store);
 
-    let reopened = open_store(temporary.path(), options).unwrap();
-    assert_eq!(reopened.active().unwrap().generation(), first);
-    assert_ne!(reopened.active().unwrap().generation(), second);
+    let error = open_store(temporary.path(), options).unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::ArtifactEvidenceMismatch { .. }
+    ));
 }
 
 #[test]
@@ -845,7 +977,9 @@ fn disk_estimate_accounts_for_old_and_new_generations() {
     let mut store = open_store(temporary.path(), options).unwrap();
     publish_generation(&mut store, "baseline", None);
 
-    let estimate = store.estimate_publish(4_096).unwrap();
+    let estimate = store
+        .estimate_publish(4_096, &mut AssetLoadBudget::default())
+        .unwrap();
     assert!(estimate.old_active_generation_bytes > 0);
     assert_eq!(
         estimate.publish_peak_bytes,

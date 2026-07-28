@@ -23,8 +23,8 @@ use crate::analysis::{
     WorkspaceObjectFact,
 };
 use crate::generation::{
-    ArtifactTreeEvidence, GenerationArtifactEvidence, ReindexDiskEstimate,
-    SEARCH_GENERATION_CONTRACT_VERSION, SearchGenerationId, SearchGenerationManifestV1,
+    ArtifactTreeEvidence, GenerationArtifactEvidence, ReindexDiskEstimate, SearchGenerationId,
+    SearchGenerationManifestV1,
 };
 
 pub(crate) mod secure_read;
@@ -41,6 +41,8 @@ const REFERENCE_ARTIFACT_DIRECTORY: &str = "references";
 const SOURCE_STATE_ARTIFACT_DIRECTORY: &str = "state";
 const SOURCE_STATE_FILE: &str = "source-state-v1.json";
 const MANIFEST_FILE: &str = "manifest.json";
+const LEGACY_ACTIVATION_CONTRACT_VERSION: u16 = 1;
+const GENERATION_HEAD_CONTRACT_VERSION: u16 = 2;
 const ACTIVATION_FILE_DIGITS: usize = 20;
 const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MANIFEST_BYTES_U64: u64 = 8 * 1024 * 1024;
@@ -558,6 +560,35 @@ impl SourceStateSnapshot {
         Ok(receipts)
     }
 
+    /// Extends the receipt window when filesystem reconciliation already observed the target.
+    ///
+    /// This is the only legal receipt-only transition: the source state must already represent
+    /// the Change Set's target revision, while the caller separately proves the matching
+    /// `WorkspaceView` revision before publication.
+    pub(crate) fn transaction_receipts_after_reconciled_target(
+        &self,
+        changes: &ChangeSet,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<TransactionReceiptWindow, SourceStateError> {
+        if self.workspace != changes.workspace() {
+            return Err(SourceStateError::TransactionReceiptWorkspaceMismatch {
+                expected: self.workspace,
+                actual: changes.workspace(),
+                transaction: changes.transaction(),
+            });
+        }
+        if self.revision != changes.to_revision() {
+            return Err(SourceStateError::TransactionReceiptRevisionBarrier {
+                indexed: self.revision,
+                change_from: changes.from_revision(),
+                change_to: changes.to_revision(),
+            });
+        }
+        let mut receipts = self.transaction_receipts.try_clone_with_budget(budget)?;
+        receipts.append(changes, budget)?;
+        Ok(receipts)
+    }
+
     #[must_use]
     pub(crate) fn scan_hints(&self) -> &[SourceScanHint] {
         &self.scan_hints
@@ -1005,8 +1036,11 @@ impl GenerationBuild {
         self.directory.join(SOURCE_STATE_ARTIFACT_DIRECTORY)
     }
 
-    pub fn abort(mut self) -> Result<(), GenerationStoreError> {
-        self.cleanup()
+    pub fn abort_with_budget(
+        mut self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<(), GenerationStoreError> {
+        self.cleanup_with_budget(budget)
     }
 
     pub(crate) fn write_source_state(
@@ -1051,11 +1085,19 @@ impl GenerationBuild {
     }
 
     fn cleanup(&mut self) -> Result<(), GenerationStoreError> {
+        let mut budget = AssetLoadBudget::default();
+        self.cleanup_with_budget(&mut budget)
+    }
+
+    fn cleanup_with_budget(
+        &mut self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<(), GenerationStoreError> {
         if !self.cleanup_on_drop {
             return Ok(());
         }
         if path_exists_no_follow(&self.directory)? {
-            remove_tree_no_follow(&self.directory)?;
+            remove_tree_no_follow(&self.directory, budget)?;
             sync_directory(
                 self.directory
                     .parent()
@@ -1082,7 +1124,9 @@ impl Drop for GenerationBuild {
 pub(crate) struct GenerationSnapshot {
     activation_ordinal: u64,
     generation: SearchGenerationId,
+    manifest_digest: DigestV1,
     manifest: SearchGenerationManifestV1,
+    desired_revision: WorkspaceRevision,
     directory: PathBuf,
 }
 
@@ -1095,6 +1139,11 @@ impl GenerationSnapshot {
     #[must_use]
     pub const fn generation(&self) -> SearchGenerationId {
         self.generation
+    }
+
+    #[must_use]
+    pub const fn desired_revision(&self) -> WorkspaceRevision {
+        self.desired_revision
     }
 
     #[must_use]
@@ -1688,7 +1737,7 @@ pub(crate) struct GenerationPublishWarning {
 }
 
 impl GenerationPublishWarning {
-    fn new(kind: GenerationPublishWarningKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: GenerationPublishWarningKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -1761,7 +1810,15 @@ impl PreparedGenerationPublish<'_> {
     /// Reader validation is intentionally absent here. Once the activation hard link is visible,
     /// later durability, cleanup, and retention failures are returned as typed warnings so a
     /// successful result always agrees with both in-memory and reopened active state.
+    #[cfg(test)]
     pub fn activate(self) -> Result<GenerationPublishReport, GenerationStoreError> {
+        self.activate_with_budget(&mut AssetLoadBudget::default())
+    }
+
+    pub fn activate_with_budget(
+        self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<GenerationPublishReport, GenerationStoreError> {
         let Self {
             store,
             snapshot,
@@ -1771,7 +1828,8 @@ impl PreparedGenerationPublish<'_> {
         } = self;
         match activation {
             PreparedActivation::AlreadyActive => {
-                let pruned_generations = match store.prune_retention() {
+                let mut maintenance_budget = AssetLoadBudget::default();
+                let pruned_generations = match store.prune_retention(&mut maintenance_budget) {
                     Ok(pruned) => pruned,
                     Err(error) => {
                         warnings.push(GenerationPublishWarning::new(
@@ -1789,7 +1847,7 @@ impl PreparedGenerationPublish<'_> {
             }
             PreparedActivation::Activate { manifest_digest } => {
                 inject_failure(failpoint, GenerationFailpoint::Activation)?;
-                store.activate_prepared(snapshot, manifest_digest, warnings, failpoint)
+                store.activate_prepared(snapshot, manifest_digest, warnings, failpoint, budget)
             }
         }
     }
@@ -1917,10 +1975,12 @@ pub(crate) struct GenerationStore {
 }
 
 impl GenerationStore {
-    /// Opens the durable store and selects the newest valid generation within `budget`.
+    /// Opens the durable store and selects the generation named by the latest committed head.
     ///
-    /// Directory discovery and every activation or manifest candidate share the caller's ledger;
-    /// corrupt candidates may be skipped, but their completed work remains charged.
+    /// The highest head is the sole authority for actual and desired revision state. Corruption in
+    /// that head or its immutable generation therefore fails closed instead of silently rolling
+    /// freshness back to an older activation. Directory discovery and validation share the
+    /// caller's ledger.
     pub fn open(
         root: impl AsRef<Path>,
         options: GenerationStoreOptions,
@@ -1966,6 +2026,36 @@ impl GenerationStore {
     #[must_use]
     pub const fn active(&self) -> Option<&GenerationSnapshot> {
         self.active.as_ref()
+    }
+
+    /// Appends a durable head for the current immutable generation before derived work starts.
+    ///
+    /// The hard-linked head is the commit point. A later generation activation records
+    /// `desired_revision == actual_revision`, so no mutable sidecar or cross-file clearing
+    /// protocol is required.
+    pub fn record_desired_revision(
+        &mut self,
+        desired_revision: WorkspaceRevision,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<GenerationPublishWarning>, GenerationStoreError> {
+        let Some(active) = self.active.clone() else {
+            return Ok(Vec::new());
+        };
+        if active.desired_revision == desired_revision {
+            return Ok(Vec::new());
+        }
+
+        let mut updated = active;
+        updated.activation_ordinal = self.allocate_activation_ordinal()?;
+        updated.desired_revision = desired_revision;
+        let report = self.activate_prepared(
+            updated.clone(),
+            updated.manifest_digest,
+            platform_durability_warnings(),
+            None,
+            budget,
+        )?;
+        Ok(report.warnings)
     }
 
     #[must_use]
@@ -2030,16 +2120,18 @@ impl GenerationStore {
         manifest: SearchGenerationManifestV1,
     ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
         let mut budget = AssetLoadBudget::default();
-        self.prepare_publish_with_budget(build, manifest, &mut budget)
+        let desired_revision = manifest.revision();
+        self.prepare_publish_inner(build, manifest, desired_revision, &mut budget, None)
     }
 
-    pub fn prepare_publish_with_budget(
+    pub(crate) fn prepare_publish_with_desired_revision_and_budget(
         &mut self,
         build: GenerationBuild,
         manifest: SearchGenerationManifestV1,
+        desired_revision: WorkspaceRevision,
         budget: &mut AssetLoadBudget,
     ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
-        self.prepare_publish_inner(build, manifest, budget, None)
+        self.prepare_publish_inner(build, manifest, desired_revision, budget, None)
     }
 
     #[cfg(test)]
@@ -2061,14 +2153,28 @@ impl GenerationStore {
         budget: &mut AssetLoadBudget,
         failpoint: GenerationFailpoint,
     ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
-        self.prepare_publish_inner(build, manifest, budget, Some(failpoint))
+        let desired_revision = manifest.revision();
+        self.prepare_publish_inner(build, manifest, desired_revision, budget, Some(failpoint))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_publish_with_desired_revision_failpoint_and_budget(
+        &mut self,
+        build: GenerationBuild,
+        manifest: SearchGenerationManifestV1,
+        desired_revision: WorkspaceRevision,
+        budget: &mut AssetLoadBudget,
+        failpoint: GenerationFailpoint,
+    ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
+        self.prepare_publish_inner(build, manifest, desired_revision, budget, Some(failpoint))
     }
 
     pub fn estimate_publish(
         &self,
         new_generation_bytes: u64,
+        budget: &mut AssetLoadBudget,
     ) -> Result<GenerationDiskEstimate, GenerationStoreError> {
-        let existing_generations = completed_generation_sizes(&self.generations)?;
+        let existing_generations = completed_generation_sizes(&self.generations, budget)?;
         let existing_generation_bytes = checked_sum(
             existing_generations.iter().map(|(_, bytes)| *bytes),
             "existing generation bytes",
@@ -2084,7 +2190,7 @@ impl GenerationStore {
             })
             .unwrap_or(0);
 
-        let historical = self.retained_historical_snapshots()?;
+        let historical = self.retained_historical_snapshots(budget)?;
         let mut retained_after_publish = Vec::new();
         if self.options.retain_previous_generations != 0 {
             if let Some(active) = &self.active {
@@ -2132,13 +2238,14 @@ impl GenerationStore {
     pub fn estimate_manifest_publish(
         &self,
         manifest: &SearchGenerationManifestV1,
+        budget: &mut AssetLoadBudget,
     ) -> Result<GenerationDiskEstimate, GenerationStoreError> {
-        let encoded_manifest =
-            serde_json::to_vec(manifest).map_err(|source| GenerationStoreError::Json {
-                artifact: "generation manifest",
-                path: self.staging.join(MANIFEST_FILE),
-                source,
-            })?;
+        let manifest_path = self.staging.join(MANIFEST_FILE);
+        let manifest_bytes = generation_manifest_json_length(manifest, &manifest_path)?;
+        budget
+            .check_bytes(manifest_bytes)
+            .and_then(|()| budget.consume_bytes(manifest_bytes))
+            .map_err(GenerationStoreError::Budget)?;
         let artifact_bytes =
             manifest
                 .artifacts()
@@ -2146,23 +2253,19 @@ impl GenerationStore {
                 .ok_or(GenerationStoreError::SizeOverflow {
                     resource: "incoming generation artifact bytes",
                 })?;
-        let manifest_bytes = u64::try_from(encoded_manifest.len()).map_err(|_| {
-            GenerationStoreError::SizeOverflow {
-                resource: "incoming generation manifest bytes",
-            }
-        })?;
         let new_generation_bytes = artifact_bytes.checked_add(manifest_bytes).ok_or(
             GenerationStoreError::SizeOverflow {
                 resource: "incoming generation bytes",
             },
         )?;
-        self.estimate_publish(new_generation_bytes)
+        self.estimate_publish(new_generation_bytes, budget)
     }
 
     fn prepare_publish_inner(
         &mut self,
         mut build: GenerationBuild,
         manifest: SearchGenerationManifestV1,
+        desired_revision: WorkspaceRevision,
         budget: &mut AssetLoadBudget,
         failpoint: Option<GenerationFailpoint>,
     ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
@@ -2184,8 +2287,23 @@ impl GenerationStore {
             .filter(|active| active.generation == generation)
             .cloned()
         {
-            inspect_completed_generation(&active.directory, generation, budget)?;
-            build.abort()?;
+            let completed = inspect_completed_generation(&active.directory, generation, budget)?;
+            build.abort_with_budget(budget)?;
+            if active.desired_revision != desired_revision {
+                let mut refreshed = active;
+                refreshed.activation_ordinal = self.allocate_activation_ordinal()?;
+                refreshed.manifest_digest = completed.manifest_digest;
+                refreshed.desired_revision = desired_revision;
+                return Ok(PreparedGenerationPublish {
+                    store: self,
+                    snapshot: refreshed,
+                    activation: PreparedActivation::Activate {
+                        manifest_digest: completed.manifest_digest,
+                    },
+                    warnings: platform_durability_warnings(),
+                    failpoint,
+                });
+            }
             return Ok(PreparedGenerationPublish {
                 store: self,
                 snapshot: active,
@@ -2200,11 +2318,13 @@ impl GenerationStore {
         let replace_invalid_completed = if path_exists_no_follow(&completed_directory)? {
             match inspect_completed_generation(&completed_directory, generation, budget) {
                 Ok(completed) => {
-                    build.abort()?;
+                    build.abort_with_budget(budget)?;
                     let activation_ordinal = self.allocate_activation_ordinal()?;
                     let snapshot = GenerationSnapshot {
                         activation_ordinal,
                         generation,
+                        manifest_digest: completed.manifest_digest,
+                        desired_revision,
                         manifest: completed.manifest,
                         directory: completed_directory,
                     };
@@ -2225,15 +2345,10 @@ impl GenerationStore {
             false
         };
 
-        let manifest_bytes =
-            serde_json::to_vec(&manifest).map_err(|source| GenerationStoreError::Json {
-                artifact: "generation manifest",
-                path: build.directory.join(MANIFEST_FILE),
-                source,
-            })?;
         let manifest_path = build.directory.join(MANIFEST_FILE);
+        let manifest_bytes = encode_generation_manifest_json(&manifest, &manifest_path, budget)?;
         write_new_file(&manifest_path, &manifest_bytes)?;
-        sync_tree_no_follow(&build.directory)?;
+        sync_tree_no_follow(&build.directory, budget)?;
         let durable_observed = measure_generation_artifacts(&build.directory, budget, None)?;
         if durable_observed != manifest.artifacts() {
             return Err(GenerationStoreError::ArtifactEvidenceMismatch {
@@ -2279,7 +2394,7 @@ impl GenerationStore {
 
         let mut warnings = Vec::new();
         if let Some(quarantine) = quarantine {
-            if let Err(error) = remove_tree_no_follow(&quarantine) {
+            if let Err(error) = remove_tree_no_follow(&quarantine, budget) {
                 warnings.push(GenerationPublishWarning::new(
                     GenerationPublishWarningKind::PreparationCleanup,
                     error.to_string(),
@@ -2297,6 +2412,8 @@ impl GenerationStore {
         let snapshot = GenerationSnapshot {
             activation_ordinal,
             generation,
+            manifest_digest,
+            desired_revision,
             manifest,
             directory: completed_directory,
         };
@@ -2315,23 +2432,26 @@ impl GenerationStore {
         manifest_digest: DigestV1,
         mut warnings: Vec<GenerationPublishWarning>,
         failpoint: Option<GenerationFailpoint>,
+        budget: &mut AssetLoadBudget,
     ) -> Result<GenerationPublishReport, GenerationStoreError> {
-        let record = ActivationRecordV1 {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+        let record = GenerationHeadRecord {
+            contract_version: GENERATION_HEAD_CONTRACT_VERSION,
             ordinal: snapshot.activation_ordinal,
             generation: snapshot.generation,
             manifest_digest,
             workspace: snapshot.manifest.workspace(),
             revision: snapshot.manifest.revision(),
+            desired_revision: Some(snapshot.desired_revision),
         };
-        warnings.extend(self.write_activation(&record, failpoint)?);
+        warnings.extend(self.write_activation(&record, failpoint, budget)?);
 
         self.active = Some(snapshot.clone());
 
         // Retention is post-commit maintenance. A security violation cannot turn this committed
         // activation into a failed publication; reopening rescans managed directories without
         // following links and fails closed if the unsafe entry remains.
-        let pruned_generations = match self.prune_retention() {
+        let mut maintenance_budget = AssetLoadBudget::default();
+        let pruned_generations = match self.prune_retention(&mut maintenance_budget) {
             Ok(pruned) => pruned,
             Err(error) => {
                 warnings.push(GenerationPublishWarning::new(
@@ -2401,18 +2521,15 @@ impl GenerationStore {
 
     fn write_activation(
         &self,
-        record: &ActivationRecordV1,
+        record: &GenerationHeadRecord,
         failpoint: Option<GenerationFailpoint>,
+        budget: &mut AssetLoadBudget,
     ) -> Result<Vec<GenerationPublishWarning>, GenerationStoreError> {
-        let bytes = serde_json::to_vec(record).map_err(|source| GenerationStoreError::Json {
-            artifact: "activation record",
-            path: self.activations.join(activation_file_name(record.ordinal)),
-            source,
-        })?;
         let temporary_path = self
             .staging
             .join(activation_staging_file_name(record.ordinal));
         let final_path = self.activations.join(activation_file_name(record.ordinal));
+        let bytes = encode_generation_head_json(record, &final_path, budget)?;
         write_new_file(&temporary_path, &bytes)?;
         // A hard link publishes the complete file atomically and never replaces an existing ordinal.
         fs::hard_link(&temporary_path, &final_path).map_err(|source| {
@@ -2458,6 +2575,7 @@ impl GenerationStore {
 
     fn retained_historical_snapshots(
         &self,
+        budget: &mut AssetLoadBudget,
     ) -> Result<Vec<GenerationSnapshot>, GenerationStoreError> {
         let Some(active) = &self.active else {
             return Ok(Vec::new());
@@ -2478,13 +2596,13 @@ impl GenerationStore {
                     source,
                 )
             })?;
-        let (mut candidates, _) = activation_candidates(&self.activations, &self.staging)?;
+        let (mut candidates, _) =
+            activation_candidates_for_open(&self.activations, &self.staging, budget)?;
         candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.ordinal));
 
         let mut seen = BTreeSet::new();
         seen.insert(active.generation);
         let mut retained = Vec::new();
-        let mut validation_budget = AssetLoadBudget::default();
         for candidate in candidates {
             if retained.len() >= self.options.retain_previous_generations {
                 break;
@@ -2494,7 +2612,7 @@ impl GenerationStore {
                 &candidate.path,
                 &candidate.file_name,
                 candidate.ordinal,
-                &mut validation_budget,
+                budget,
             ) {
                 Ok(record) => record,
                 Err(error) if error.is_candidate_scan_fatal() => {
@@ -2509,7 +2627,7 @@ impl GenerationStore {
                 &self.generations,
                 &opened_generations,
                 &record,
-                &mut validation_budget,
+                budget,
             ) {
                 Ok(generation) => generation,
                 Err(error) if error.is_candidate_scan_fatal() => {
@@ -2524,11 +2642,14 @@ impl GenerationStore {
         Ok(retained)
     }
 
-    fn prune_retention(&self) -> Result<Vec<SearchGenerationId>, GenerationStoreError> {
+    fn prune_retention(
+        &self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<SearchGenerationId>, GenerationStoreError> {
         let Some(active) = &self.active else {
             return Ok(Vec::new());
         };
-        let historical = self.retained_historical_snapshots()?;
+        let historical = self.retained_historical_snapshots(budget)?;
         let retained_directories = historical
             .iter()
             .map(GenerationSnapshot::generation)
@@ -2542,40 +2663,50 @@ impl GenerationStore {
             .collect::<BTreeSet<_>>();
 
         let mut pruned = Vec::new();
-        for entry in read_directory_entries(&self.generations)? {
-            let metadata = entry_metadata_no_follow(&entry)?;
+        visit_directory_entries_budgeted(&self.generations, budget, |entry, budget| {
+            let metadata = metadata_no_follow(&entry.path)?;
             if !metadata.is_dir() {
-                continue;
+                return Ok(());
             }
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
+            let Some(name) = entry.file_name.to_str() else {
+                return Ok(());
             };
-            let Some(generation) = SearchGenerationId::from_directory_name(&name) else {
-                continue;
+            let Some(generation) = SearchGenerationId::from_directory_name(name) else {
+                return Ok(());
             };
-            if retained_directories.contains(&name) {
-                continue;
+            if retained_directories.contains(name) {
+                return Ok(());
             }
-            remove_tree_no_follow(&entry.path())?;
+            remove_tree_no_follow(&entry.path, budget)?;
+            reserve_artifact_vec(&mut pruned, 1, "pruned generation IDs", budget)?;
             pruned.push(generation);
-        }
+            Ok(())
+        })?;
         if !pruned.is_empty() {
             sync_directory(&self.generations)?;
         }
-        prune_activation_history(&self.activations, &retained_activations)?;
+        prune_activation_history(&self.activations, &retained_activations, budget)?;
         Ok(pruned)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ActivationRecordV1 {
+struct GenerationHeadRecord {
     contract_version: u16,
     ordinal: u64,
     generation: SearchGenerationId,
     manifest_digest: DigestV1,
     workspace: WorkspaceId,
     revision: WorkspaceRevision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    desired_revision: Option<WorkspaceRevision>,
+}
+
+impl GenerationHeadRecord {
+    fn desired_revision(&self) -> WorkspaceRevision {
+        self.desired_revision.unwrap_or(self.revision)
+    }
 }
 
 #[derive(Debug)]
@@ -2739,7 +2870,7 @@ fn recover_owned_staging(
     budget: &mut AssetLoadBudget,
 ) -> Result<(), GenerationStoreError> {
     let mut changed = false;
-    visit_directory_entries_budgeted(staging, budget, |entry, _budget| {
+    visit_directory_entries_budgeted(staging, budget, |entry, budget| {
         let metadata = metadata_no_follow(&entry.path)?;
         let Some(name) = entry.file_name.to_str() else {
             return Ok(());
@@ -2748,7 +2879,7 @@ fn recover_owned_staging(
             if !metadata.is_dir() {
                 return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
             }
-            remove_tree_no_follow(&entry.path)?;
+            remove_tree_no_follow(&entry.path, budget)?;
             changed = true;
             return Ok(());
         }
@@ -2756,7 +2887,7 @@ fn recover_owned_staging(
             if !metadata.is_dir() {
                 return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
             }
-            remove_tree_no_follow(&entry.path)?;
+            remove_tree_no_follow(&entry.path, budget)?;
             changed = true;
             return Ok(());
         }
@@ -2844,46 +2975,6 @@ fn activation_candidates_for_open(
     Ok((candidates, next))
 }
 
-fn activation_candidates(
-    activations: &Path,
-    staging: &Path,
-) -> Result<(Vec<ActivationCandidate>, u64), GenerationStoreError> {
-    let mut candidates = Vec::new();
-    let mut maximum = 0_u64;
-    for entry in read_directory_entries(activations)? {
-        let _ = entry_metadata_no_follow(&entry)?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Some(ordinal) = parse_activation_file_name(&name) else {
-            continue;
-        };
-        maximum = maximum.max(ordinal);
-        push_activation_candidate(
-            &mut candidates,
-            ActivationCandidate {
-                ordinal,
-                path: entry.path(),
-                file_name: entry.file_name(),
-            },
-            None,
-        )?;
-    }
-    for entry in read_directory_entries(staging)? {
-        let _ = entry_metadata_no_follow(&entry)?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if let Some(ordinal) = parse_activation_staging_file_name(&name) {
-            maximum = maximum.max(ordinal);
-        }
-    }
-    let next = maximum
-        .checked_add(1)
-        .ok_or(GenerationStoreError::OrdinalOverflow)?;
-    Ok((candidates, next))
-}
-
 fn push_activation_candidate(
     candidates: &mut Vec<ActivationCandidate>,
     candidate: ActivationCandidate,
@@ -2947,19 +3038,20 @@ fn push_activation_candidate(
 fn prune_activation_history(
     activations: &Path,
     retained_ordinals: &BTreeSet<u64>,
+    budget: &mut AssetLoadBudget,
 ) -> Result<(), GenerationStoreError> {
     let mut changed = false;
-    for entry in read_directory_entries(activations)? {
-        let path = entry.path();
-        let metadata = entry_metadata_no_follow(&entry)?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
+    visit_directory_entries_budgeted(activations, budget, |entry, _budget| {
+        let path = entry.path;
+        let metadata = metadata_no_follow(&path)?;
+        let Some(name) = entry.file_name.to_str() else {
+            return Ok(());
         };
-        let Some(ordinal) = parse_activation_file_name(&name) else {
-            continue;
+        let Some(ordinal) = parse_activation_file_name(name) else {
+            return Ok(());
         };
         if retained_ordinals.contains(&ordinal) {
-            continue;
+            return Ok(());
         }
         if !metadata.is_file() {
             return Err(GenerationStoreError::UnsupportedFileType { path });
@@ -2968,7 +3060,8 @@ fn prune_activation_history(
             GenerationStoreError::io("prune generation activation record", path, source)
         })?;
         changed = true;
-    }
+        Ok(())
+    })?;
     if changed {
         sync_directory(activations)?;
     }
@@ -2982,25 +3075,17 @@ fn select_active_generation(
     candidates: &[ActivationCandidate],
     budget: &mut AssetLoadBudget,
 ) -> Result<Option<GenerationSnapshot>, GenerationStoreError> {
-    for candidate in candidates.iter().rev() {
-        let record = match read_activation_record(
-            opened_activations,
-            &candidate.path,
-            &candidate.file_name,
-            candidate.ordinal,
-            budget,
-        ) {
-            Ok(record) => record,
-            Err(error) if error.is_candidate_scan_fatal() => return Err(error),
-            Err(_) => continue,
-        };
-        match load_completed_generation(generations, opened_generations, &record, budget) {
-            Ok(generation) => return Ok(Some(generation)),
-            Err(error) if error.is_candidate_scan_fatal() => return Err(error),
-            Err(_) => continue,
-        }
-    }
-    Ok(None)
+    let Some(candidate) = candidates.last() else {
+        return Ok(None);
+    };
+    let record = read_activation_record(
+        opened_activations,
+        &candidate.path,
+        &candidate.file_name,
+        candidate.ordinal,
+        budget,
+    )?;
+    load_completed_generation(generations, opened_generations, &record, budget).map(Some)
 }
 
 fn read_activation_record(
@@ -3009,7 +3094,7 @@ fn read_activation_record(
     file_name: &OsStr,
     expected_ordinal: u64,
     budget: &mut AssetLoadBudget,
-) -> Result<ActivationRecordV1, GenerationStoreError> {
+) -> Result<GenerationHeadRecord, GenerationStoreError> {
     let mut file = open_contract_file(
         directory,
         file_name,
@@ -3018,7 +3103,7 @@ fn read_activation_record(
         "activation record",
     )?;
     let decoded =
-        read_contract_json::<ActivationRecordV1>(file.file_mut(), budget, ACTIVATION_JSON_LIMITS);
+        read_contract_json::<GenerationHeadRecord>(file.file_mut(), budget, ACTIVATION_JSON_LIMITS);
     file.ensure_unchanged().map_err(|source| {
         persisted_read_error("revalidate activation record", path.to_path_buf(), source)
     })?;
@@ -3027,12 +3112,28 @@ fn read_activation_record(
         path: path.to_path_buf(),
         source,
     })?;
-    if record.contract_version != SEARCH_GENERATION_CONTRACT_VERSION {
-        return Err(GenerationStoreError::UnsupportedVersion {
-            artifact: "activation record",
-            actual: record.contract_version,
-            expected: SEARCH_GENERATION_CONTRACT_VERSION,
-        });
+    match (record.contract_version, record.desired_revision) {
+        (LEGACY_ACTIVATION_CONTRACT_VERSION, None)
+        | (GENERATION_HEAD_CONTRACT_VERSION, Some(_)) => {}
+        (LEGACY_ACTIVATION_CONTRACT_VERSION, Some(_)) => {
+            return Err(GenerationStoreError::InvalidGenerationHead {
+                path: path.to_path_buf(),
+                message: "legacy activation record contains a desired revision",
+            });
+        }
+        (GENERATION_HEAD_CONTRACT_VERSION, None) => {
+            return Err(GenerationStoreError::InvalidGenerationHead {
+                path: path.to_path_buf(),
+                message: "generation head is missing its desired revision",
+            });
+        }
+        (actual, _) => {
+            return Err(GenerationStoreError::UnsupportedVersion {
+                artifact: "generation head",
+                actual,
+                expected: GENERATION_HEAD_CONTRACT_VERSION,
+            });
+        }
     }
     if record.ordinal != expected_ordinal {
         return Err(GenerationStoreError::ActivationOrdinalMismatch {
@@ -3047,7 +3148,7 @@ fn read_activation_record(
 fn load_completed_generation(
     generations: &Path,
     opened_generations: &SecureReadDirectory,
-    record: &ActivationRecordV1,
+    record: &GenerationHeadRecord,
     budget: &mut AssetLoadBudget,
 ) -> Result<GenerationSnapshot, GenerationStoreError> {
     let directory_name = record.generation.directory_name();
@@ -3080,6 +3181,8 @@ fn load_completed_generation(
     Ok(GenerationSnapshot {
         activation_ordinal: record.ordinal,
         generation: record.generation,
+        manifest_digest: completed.manifest_digest,
+        desired_revision: record.desired_revision(),
         manifest: completed.manifest,
         directory,
     })
@@ -3312,7 +3415,7 @@ fn measure_artifact_tree_with_budget(
                 .and_then(|()| budget.consume_members(1))
                 .map_err(GenerationStoreError::Budget)?;
             let path = entry.path();
-            let metadata = entry_metadata_no_follow(&entry)?;
+            let metadata = metadata_no_follow(&path)?;
             if metadata.is_dir() {
                 let next_depth =
                     depth
@@ -3881,68 +3984,188 @@ fn encode_artifact_tree(
 
 fn completed_generation_sizes(
     generations: &Path,
+    budget: &mut AssetLoadBudget,
 ) -> Result<Vec<(SearchGenerationId, u64)>, GenerationStoreError> {
     let mut sizes = Vec::new();
-    for entry in read_directory_entries(generations)? {
-        let metadata = entry_metadata_no_follow(&entry)?;
+    visit_directory_entries_budgeted(generations, budget, |entry, budget| {
+        let metadata = metadata_no_follow(&entry.path)?;
         if !metadata.is_dir() {
-            continue;
+            return Ok(());
         }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
+        let Some(name) = entry.file_name.to_str() else {
+            return Ok(());
         };
-        let Some(generation) = SearchGenerationId::from_directory_name(&name) else {
-            continue;
+        let Some(generation) = SearchGenerationId::from_directory_name(name) else {
+            return Ok(());
         };
-        sizes.push((generation, tree_size_no_follow(&entry.path())?));
-    }
+        let bytes = tree_size_no_follow(&entry.path, budget)?;
+        reserve_artifact_vec(&mut sizes, 1, "completed generation sizes", budget)?;
+        sizes.push((generation, bytes));
+        Ok(())
+    })?;
     Ok(sizes)
 }
 
-fn tree_size_no_follow(root: &Path) -> Result<u64, GenerationStoreError> {
-    ensure_existing_directory_no_follow(root)?;
-    let mut pending = vec![root.to_path_buf()];
-    let mut bytes = 0_u64;
-    while let Some(directory) = pending.pop() {
-        for entry in read_directory_entries(&directory)? {
-            let path = entry.path();
-            let metadata = entry_metadata_no_follow(&entry)?;
-            if metadata.is_dir() {
-                pending.push(path);
-            } else if metadata.is_file() {
-                bytes = bytes.checked_add(metadata.len()).ok_or(
-                    GenerationStoreError::SizeOverflow {
-                        resource: "generation tree bytes",
-                    },
-                )?;
-            } else {
-                return Err(GenerationStoreError::UnsupportedFileType { path });
-            }
-        }
-    }
-    Ok(bytes)
+fn generation_manifest_json_length(
+    manifest: &SearchGenerationManifestV1,
+    path: &Path,
+) -> Result<u64, GenerationStoreError> {
+    store_json_length(manifest, path, GENERATION_MANIFEST_JSON_PROFILE)
 }
 
-fn sync_tree_no_follow(root: &Path) -> Result<(), GenerationStoreError> {
-    ensure_existing_directory_no_follow(root)?;
-    let mut pending = vec![root.to_path_buf()];
-    let mut directories = Vec::new();
-    while let Some(directory) = pending.pop() {
-        directories.push(directory.clone());
-        for entry in read_directory_entries(&directory)? {
-            let path = entry.path();
-            let metadata = entry_metadata_no_follow(&entry)?;
-            if metadata.is_dir() {
-                pending.push(path);
-            } else if metadata.is_file() {
-                sync_regular_file(&path)?;
-            } else {
-                return Err(GenerationStoreError::UnsupportedFileType { path });
-            }
-        }
+#[derive(Clone, Copy)]
+struct StoreJsonProfile {
+    artifact: &'static str,
+    allocation_resource: &'static str,
+    byte_resource: &'static str,
+    changed_length_resource: &'static str,
+    maximum_bytes: u64,
+}
+
+const GENERATION_MANIFEST_JSON_PROFILE: StoreJsonProfile = StoreJsonProfile {
+    artifact: "generation manifest",
+    allocation_resource: "generation manifest",
+    byte_resource: "generation manifest bytes",
+    changed_length_resource: "generation manifest encoded length changed",
+    maximum_bytes: MAX_MANIFEST_BYTES_U64,
+};
+
+const GENERATION_HEAD_JSON_PROFILE: StoreJsonProfile = StoreJsonProfile {
+    artifact: "generation head",
+    allocation_resource: "generation head",
+    byte_resource: "generation head bytes",
+    changed_length_resource: "generation head encoded length changed",
+    maximum_bytes: MAX_ACTIVATION_BYTES_U64,
+};
+
+fn store_json_length(
+    value: &impl Serialize,
+    path: &Path,
+    profile: StoreJsonProfile,
+) -> Result<u64, GenerationStoreError> {
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, value).map_err(|source| GenerationStoreError::Json {
+        artifact: profile.artifact,
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if counter.bytes > profile.maximum_bytes {
+        return Err(GenerationStoreError::PersistedArtifactTooLarge {
+            artifact: profile.artifact,
+            actual: counter.bytes,
+            maximum: profile.maximum_bytes,
+        });
     }
-    directories.sort_unstable_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for directory in directories {
+    Ok(counter.bytes)
+}
+
+fn encode_generation_manifest_json(
+    manifest: &SearchGenerationManifestV1,
+    path: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<u8>, GenerationStoreError> {
+    encode_store_json(manifest, path, GENERATION_MANIFEST_JSON_PROFILE, budget)
+}
+
+fn encode_generation_head_json(
+    record: &GenerationHeadRecord,
+    path: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<u8>, GenerationStoreError> {
+    encode_store_json(record, path, GENERATION_HEAD_JSON_PROFILE, budget)
+}
+
+fn encode_store_json(
+    value: &impl Serialize,
+    path: &Path,
+    profile: StoreJsonProfile,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<u8>, GenerationStoreError> {
+    let encoded_length = store_json_length(value, path, profile)?;
+    budget
+        .check_bytes(encoded_length)
+        .map_err(GenerationStoreError::Budget)?;
+    let capacity =
+        usize::try_from(encoded_length).map_err(|_| GenerationStoreError::SizeOverflow {
+            resource: profile.byte_resource,
+        })?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(capacity)
+        .map_err(|_| GenerationStoreError::AllocationFailed {
+            resource: profile.allocation_resource,
+            requested: capacity,
+        })?;
+    budget
+        .consume_bytes(encoded_length)
+        .map_err(GenerationStoreError::Budget)?;
+    serde_json::to_writer(&mut encoded, value).map_err(|source| GenerationStoreError::Json {
+        artifact: profile.artifact,
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if encoded.len() != capacity {
+        return Err(GenerationStoreError::SizeOverflow {
+            resource: profile.changed_length_resource,
+        });
+    }
+    Ok(encoded)
+}
+
+fn tree_size_no_follow(
+    root: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<u64, GenerationStoreError> {
+    let mut pending = managed_tree_stack(root, budget)?;
+    let mut meter = ManagedTreeMeter::default();
+    while let Some((directory, depth)) = pending.pop() {
+        meter.observe_directory(depth, budget)?;
+        visit_directory_entries_budgeted(&directory, budget, |entry, budget| {
+            let metadata = metadata_no_follow(&entry.path)?;
+            if metadata.is_dir() {
+                push_managed_tree_directory(&mut pending, entry.path, depth, budget)?;
+            } else if metadata.is_file() {
+                meter.observe_file(metadata.len())?;
+            } else {
+                return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
+            }
+            Ok(())
+        })?;
+    }
+    Ok(meter.bytes)
+}
+
+fn sync_tree_no_follow(
+    root: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), GenerationStoreError> {
+    let mut pending = managed_tree_stack(root, budget)?;
+    let mut directories = Vec::new();
+    let mut meter = ManagedTreeMeter::default();
+    while let Some((directory, depth)) = pending.pop() {
+        meter.observe_directory(depth, budget)?;
+        visit_directory_entries_budgeted(&directory, budget, |entry, budget| {
+            let metadata = metadata_no_follow(&entry.path)?;
+            if metadata.is_dir() {
+                push_managed_tree_directory(&mut pending, entry.path, depth, budget)?;
+            } else if metadata.is_file() {
+                meter.observe_file(metadata.len())?;
+                sync_regular_file(&entry.path)?;
+            } else {
+                return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
+            }
+            Ok(())
+        })?;
+        reserve_artifact_vec(
+            &mut directories,
+            1,
+            "generation directories awaiting sync",
+            budget,
+        )?;
+        directories.push((directory, depth));
+    }
+    directories.sort_unstable_by_key(|(_, depth)| std::cmp::Reverse(*depth));
+    for (directory, _) in directories {
         sync_directory(&directory)?;
     }
     Ok(())
@@ -3971,8 +4194,11 @@ fn sync_regular_file(path: &Path) -> Result<(), GenerationStoreError> {
         })
 }
 
-fn remove_tree_no_follow(root: &Path) -> Result<(), GenerationStoreError> {
-    validate_tree_no_follow(root)?;
+fn remove_tree_no_follow(
+    root: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), GenerationStoreError> {
+    validate_tree_no_follow(root, budget)?;
     // The standard-library implementation uses handle-relative deletion on supported Unix and
     // Windows targets, preventing a directory-to-link replacement from escaping the managed tree.
     fs::remove_dir_all(root).map_err(|source| {
@@ -3980,42 +4206,135 @@ fn remove_tree_no_follow(root: &Path) -> Result<(), GenerationStoreError> {
     })
 }
 
-fn validate_tree_no_follow(root: &Path) -> Result<(), GenerationStoreError> {
-    ensure_existing_directory_no_follow(root)?;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
+fn validate_tree_no_follow(
+    root: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), GenerationStoreError> {
+    let mut pending = managed_tree_stack(root, budget)?;
+    let mut meter = ManagedTreeMeter::default();
+    while let Some((directory, depth)) = pending.pop() {
+        meter.observe_directory(depth, budget)?;
         ensure_existing_directory_no_follow(&directory)?;
-        for entry in read_directory_entries(&directory)? {
-            let path = entry.path();
-            let metadata = entry_metadata_no_follow(&entry)?;
+        visit_directory_entries_budgeted(&directory, budget, |entry, budget| {
+            let metadata = metadata_no_follow(&entry.path)?;
             if metadata.is_dir() {
-                pending.push(path);
+                push_managed_tree_directory(&mut pending, entry.path, depth, budget)?;
             } else if !metadata.is_file() {
-                return Err(GenerationStoreError::UnsupportedFileType { path });
+                return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
+            } else {
+                meter.observe_file(metadata.len())?;
             }
-        }
+            Ok(())
+        })?;
     }
     Ok(())
 }
 
-fn read_directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>, GenerationStoreError> {
-    fs::read_dir(path)
-        .map_err(|source| {
-            GenerationStoreError::io("read generation directory", path.to_path_buf(), source)
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| {
-            GenerationStoreError::io(
-                "read generation directory entry",
-                path.to_path_buf(),
-                source,
-            )
-        })
+#[derive(Default)]
+struct ManagedTreeMeter {
+    directories: u64,
+    files: u64,
+    bytes: u64,
 }
 
-fn entry_metadata_no_follow(entry: &fs::DirEntry) -> Result<fs::Metadata, GenerationStoreError> {
-    let path = entry.path();
-    metadata_no_follow(&path)
+impl ManagedTreeMeter {
+    fn observe_directory(
+        &mut self,
+        depth: u32,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<(), GenerationStoreError> {
+        self.directories =
+            self.directories
+                .checked_add(1)
+                .ok_or(GenerationStoreError::SizeOverflow {
+                    resource: "generation tree directories",
+                })?;
+        if self.directories > MAX_PERSISTED_ARTIFACT_TREE_DIRECTORIES {
+            return Err(GenerationStoreError::PersistedArtifactTooLarge {
+                artifact: "generation tree directories",
+                actual: self.directories,
+                maximum: MAX_PERSISTED_ARTIFACT_TREE_DIRECTORIES,
+            });
+        }
+        budget
+            .observe_depth(depth)
+            .map_err(GenerationStoreError::Budget)
+    }
+
+    fn observe_file(&mut self, bytes: u64) -> Result<(), GenerationStoreError> {
+        self.files = self
+            .files
+            .checked_add(1)
+            .ok_or(GenerationStoreError::SizeOverflow {
+                resource: "generation tree files",
+            })?;
+        if self.files > MAX_PERSISTED_ARTIFACT_TREE_FILES {
+            return Err(GenerationStoreError::PersistedArtifactTooLarge {
+                artifact: "generation tree files",
+                actual: self.files,
+                maximum: MAX_PERSISTED_ARTIFACT_TREE_FILES,
+            });
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(GenerationStoreError::SizeOverflow {
+                resource: "generation tree bytes",
+            })?;
+        if self.bytes > MAX_PERSISTED_ARTIFACT_TREE_BYTES {
+            return Err(GenerationStoreError::PersistedArtifactTooLarge {
+                artifact: "generation tree bytes",
+                actual: self.bytes,
+                maximum: MAX_PERSISTED_ARTIFACT_TREE_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn managed_tree_stack(
+    root: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<(PathBuf, u32)>, GenerationStoreError> {
+    ensure_existing_directory_no_follow(root)?;
+    let root_bytes =
+        u64::try_from(root.as_os_str().len()).map_err(|_| GenerationStoreError::SizeOverflow {
+            resource: "generation tree root path",
+        })?;
+    budget
+        .check_bytes(root_bytes)
+        .map_err(GenerationStoreError::Budget)?;
+    let mut pending = Vec::new();
+    reserve_artifact_vec(
+        &mut pending,
+        1,
+        "generation directory traversal stack",
+        budget,
+    )?;
+    budget
+        .consume_bytes(root_bytes)
+        .map_err(GenerationStoreError::Budget)?;
+    pending.push((root.to_path_buf(), 0));
+    Ok(pending)
+}
+
+fn push_managed_tree_directory(
+    pending: &mut Vec<(PathBuf, u32)>,
+    path: PathBuf,
+    parent_depth: u32,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), GenerationStoreError> {
+    let depth = parent_depth
+        .checked_add(1)
+        .ok_or(GenerationStoreError::SizeOverflow {
+            resource: "generation tree depth",
+        })?;
+    budget
+        .check_depth(depth)
+        .map_err(GenerationStoreError::Budget)?;
+    reserve_artifact_vec(pending, 1, "generation directory traversal stack", budget)?;
+    pending.push((path, depth));
+    Ok(())
 }
 
 fn metadata_no_follow(path: &Path) -> Result<fs::Metadata, GenerationStoreError> {
@@ -4583,6 +4902,10 @@ pub(crate) enum GenerationStoreError {
     ActivationContextMismatch {
         generation: SearchGenerationId,
     },
+    InvalidGenerationHead {
+        path: PathBuf,
+        message: &'static str,
+    },
     ManifestDigestMismatch {
         generation: SearchGenerationId,
         expected: DigestV1,
@@ -4801,6 +5124,11 @@ impl fmt::Display for GenerationStoreError {
             Self::ActivationContextMismatch { generation } => write!(
                 formatter,
                 "activation context does not match generation {generation}"
+            ),
+            Self::InvalidGenerationHead { path, message } => write!(
+                formatter,
+                "invalid generation head at {}: {message}",
+                path.display()
             ),
             Self::ManifestDigestMismatch {
                 generation,
@@ -5256,6 +5584,49 @@ mod source_state_tests {
         assert_eq!(receipts.as_slice()[0].to_revision, revision_1);
         assert_eq!(receipts.as_slice()[1].from_revision, revision_2);
         SourceStateSnapshot::new(workspace, revision_3, receipts, Vec::new(), Vec::new()).unwrap();
+    }
+
+    #[test]
+    fn source_state_records_reconciled_target_receipts_only_at_the_target_revision() {
+        let workspace = WorkspaceId::from_u128(0x551).unwrap();
+        let revision_0 = WorkspaceRevision::new(digest("reconciled revision 0"));
+        let revision_1 = WorkspaceRevision::new(digest("reconciled revision 1"));
+        let revision_2 = WorkspaceRevision::new(digest("reconciled revision 2"));
+        let changes = change_set(
+            workspace,
+            "reconciled transaction",
+            revision_0,
+            revision_1,
+            1,
+        );
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits::default()).unwrap();
+        let reconciled = SourceStateSnapshot::new(
+            workspace,
+            revision_1,
+            TransactionReceiptWindow::empty(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let receipts = reconciled
+            .transaction_receipts_after_reconciled_target(&changes, &mut budget)
+            .unwrap();
+        assert_eq!(receipts.as_slice().len(), 1);
+        assert_eq!(receipts.as_slice()[0].transaction(), changes.transaction());
+
+        let mismatched = SourceStateSnapshot::new(
+            workspace,
+            revision_2,
+            TransactionReceiptWindow::empty(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            mismatched.transaction_receipts_after_reconciled_target(&changes, &mut budget),
+            Err(SourceStateError::TransactionReceiptRevisionBarrier { .. })
+        ));
     }
 
     #[test]

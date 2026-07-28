@@ -449,7 +449,6 @@ fn published_stamp(index: &SearchIndex, receipt: &ReindexReceipt) -> GenerationS
     assert_eq!(status.generation.building_revision, None);
     assert!(status.generation.last_failure.is_none());
     assert!(!status.indexing);
-    assert!(status.progress.is_none());
     generation
 }
 
@@ -478,7 +477,6 @@ fn capture_references(
 fn capture_public_facts(index: &SearchIndex) -> PublicGenerationFacts {
     let status = index.status().unwrap();
     assert!(!status.indexing);
-    assert!(status.progress.is_none());
     assert!(status.generation.last_failure.is_none());
     let active = status
         .generation

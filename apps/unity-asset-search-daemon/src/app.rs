@@ -266,14 +266,13 @@ async fn reindex(
         .admit_and_wait(ReindexSource::Http, intent)
         .await
         .map_err(HttpError::from_coordinator)?;
-    let index = state.index.clone();
-    let actual_status = status_for_http(blocking_index(move || index.status()).await?);
+    let terminal_status = status_for_http(completion.status);
     Ok((
         StatusCode::OK,
         Json(ReindexResponse::waited(
             completion.admission,
             completion.terminal,
-            actual_status,
+            terminal_status,
         )),
     )
         .into_response())

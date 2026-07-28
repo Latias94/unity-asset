@@ -340,7 +340,6 @@ fn status() -> StatusResponse {
         last_build_duration_ms: None,
         last_build_unix_ms: None,
         indexing: false,
-        progress: None,
     }
 }
 

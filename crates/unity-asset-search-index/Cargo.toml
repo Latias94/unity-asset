@@ -24,9 +24,7 @@ fs2.workspace = true
 same-file.workspace = true
 unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
 unity-asset = { path = "../unity-asset", version = "0.3.0", default-features = false }
-unity-asset-yaml = { path = "../unity-asset-yaml", version = "0.3.0" }
 unity-asset-search-core = { path = "../unity-asset-search-core", version = "0.3.0" }
-unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs"] }

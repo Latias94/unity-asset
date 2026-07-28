@@ -6,11 +6,13 @@ use std::time::Duration;
 use tokio::sync::{Barrier, Mutex, Semaphore, mpsc};
 use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
 use unity_asset_search_daemon::coordinator::{
-    CoordinatorError, ReindexCoordinator, ReindexCoordinatorConfig, ReindexScopeKind, ReindexSource,
+    CoordinatorError, ReindexCoordinator, ReindexCoordinatorConfig, ReindexExecution,
+    ReindexScopeKind, ReindexSource,
 };
 use unity_asset_search_index::{
-    FilesystemReindexIntent, FilesystemReindexScope, GenerationStamp, ReindexDisposition,
-    ReindexReceipt, SEARCH_GENERATION_CONTRACT_VERSION, SearchGenerationId,
+    FilesystemReindexIntent, FilesystemReindexScope, GenerationStamp, GenerationStatus,
+    ReindexDisposition, ReindexReceipt, SEARCH_GENERATION_CONTRACT_VERSION, SearchCapabilities,
+    SearchGenerationId, StatusResponse,
 };
 
 fn project_root() -> PathBuf {
@@ -36,6 +38,39 @@ fn terminal_receipt(_intent: &FilesystemReindexIntent) -> ReindexReceipt {
         generation: None,
         evidence: Default::default(),
     }
+}
+
+fn status_for(receipt: &ReindexReceipt) -> StatusResponse {
+    StatusResponse {
+        contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+        generation: GenerationStatus {
+            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+            active: receipt.generation.clone(),
+            building_revision: None,
+            last_failure: None,
+        },
+        capabilities: SearchCapabilities::current(),
+        project_root: project_root(),
+        generation_root: project_root().join(".index"),
+        scan_roots: vec![project_root()],
+        indexed_assets: 0,
+        indexed_search_documents: 0,
+        indexed_reference_facts: 0,
+        incomplete_assets: 0,
+        projection_truncations: 0,
+        last_build_duration_ms: Some(1),
+        last_build_unix_ms: Some(1),
+        indexing: false,
+    }
+}
+
+fn execution_for(receipt: ReindexReceipt) -> ReindexExecution {
+    let status = status_for(&receipt);
+    ReindexExecution::new(receipt, status)
+}
+
+fn terminal_execution(intent: &FilesystemReindexIntent) -> ReindexExecution {
+    execution_for(terminal_receipt(intent))
 }
 
 fn changed(path: impl AsRef<Path>) -> FilesystemReindexIntent {
@@ -71,7 +106,7 @@ async fn wait_for_http_admissions(coordinator: &ReindexCoordinator, expected: u6
 fn unrepresentable_debounce_deadline_is_rejected_before_runner_start() {
     let result = ReindexCoordinator::new(
         ReindexCoordinatorConfig::new(project_root()).with_max_debounce(Duration::MAX),
-        |intent| async move { Ok(terminal_receipt(&intent)) },
+        |intent| async move { Ok(terminal_execution(&intent)) },
     );
     assert!(matches!(
         result,
@@ -103,7 +138,7 @@ async fn four_filesystem_entry_points_share_one_atomic_admission_and_one_build()
                 executed.lock().await.push(intent.clone());
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 active.fetch_sub(1, Ordering::SeqCst);
-                Ok(terminal_receipt(&intent))
+                Ok(terminal_execution(&intent))
             }
         }
     })
@@ -194,7 +229,7 @@ async fn full_scope_absorbs_pending_reconcile_and_changed_paths() {
             let executed = Arc::clone(&executed);
             async move {
                 executed.lock().await.push(intent.clone());
-                Ok(terminal_receipt(&intent))
+                Ok(terminal_execution(&intent))
             }
         }
     })
@@ -240,7 +275,7 @@ async fn dirty_path_limits_and_watcher_overflow_upgrade_to_full() {
             let threshold_executed = Arc::clone(&threshold_executed);
             async move {
                 threshold_executed.lock().await.push(intent.clone());
-                Ok(terminal_receipt(&intent))
+                Ok(terminal_execution(&intent))
             }
         }
     })
@@ -265,7 +300,7 @@ async fn dirty_path_limits_and_watcher_overflow_upgrade_to_full() {
             let overflow_executed = Arc::clone(&overflow_executed);
             async move {
                 overflow_executed.lock().await.push(intent.clone());
-                Ok(terminal_receipt(&intent))
+                Ok(terminal_execution(&intent))
             }
         }
     })
@@ -298,7 +333,7 @@ async fn paths_outside_the_project_are_rejected_before_execution() {
         let builds = Arc::clone(&builds);
         move |intent| {
             builds.fetch_add(1, Ordering::SeqCst);
-            async move { Ok(terminal_receipt(&intent)) }
+            async move { Ok(terminal_execution(&intent)) }
         }
     })
     .expect("coordinator must be constructible");
@@ -330,7 +365,7 @@ async fn continuous_events_cannot_postpone_build_past_max_debounce() {
             let started_tx = started_tx.clone();
             async move {
                 let _ignored = started_tx.send(());
-                Ok(terminal_receipt(&intent))
+                Ok(terminal_execution(&intent))
             }
         },
     )
@@ -372,7 +407,7 @@ async fn filesystem_failures_are_bounded_and_new_admissions_can_retry() {
                 if attempt < 3 {
                     anyhow::bail!("injected filesystem build failure {attempt}");
                 }
-                Ok(terminal_receipt(&intent))
+                Ok(terminal_execution(&intent))
             }
         }
     })
@@ -405,7 +440,7 @@ async fn synchronous_admission_returns_initial_and_terminal_receipts() {
     let coordinator =
         ReindexCoordinator::new(
             config(),
-            |intent| async move { Ok(terminal_receipt(&intent)) },
+            |intent| async move { Ok(terminal_execution(&intent)) },
         )
         .expect("coordinator must be constructible");
 
@@ -421,6 +456,10 @@ async fn synchronous_admission_returns_initial_and_terminal_receipts() {
     assert_eq!(
         completion.terminal,
         terminal_receipt(&FilesystemReindexIntent::reconcile())
+    );
+    assert_eq!(
+        completion.status.generation.active,
+        completion.terminal.generation
     );
 
     let unsupported = coordinator
@@ -459,14 +498,14 @@ async fn synchronous_admission_reports_executor_errors_and_invalid_receipts() {
     ));
 
     let invalid_receipt = ReindexCoordinator::new(config(), |_intent| async {
-        Ok(ReindexReceipt {
+        Ok(execution_for(ReindexReceipt {
             contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
             disposition: ReindexDisposition::Queued,
             transaction: None,
             target_revision: None,
             generation: None,
             evidence: Default::default(),
-        })
+        }))
     })
     .expect("receipt validation coordinator must be constructible");
     let error = invalid_receipt
@@ -489,7 +528,7 @@ async fn synchronous_admission_reports_executor_errors_and_invalid_receipts() {
         generation.contract_version += 1;
         let mut receipt = terminal_receipt(&intent);
         receipt.generation = Some(generation);
-        Ok(receipt)
+        Ok(execution_for(receipt))
     })
     .expect("nested version coordinator must be constructible");
     let error = invalid_generation_version
@@ -501,6 +540,29 @@ async fn synchronous_admission_reports_executor_errors_and_invalid_receipts() {
         CoordinatorError::ExecutionFailed { message, .. }
             if message.contains("reindex receipt generation contract version")
     ));
+
+    let mismatched_status = ReindexCoordinator::new(config(), |intent| async move {
+        let digest = DigestV1::hash_bytes(b"receipt and status generation mismatch");
+        let mut receipt = terminal_receipt(&intent);
+        receipt.generation = Some(GenerationStamp::current(
+            SearchGenerationId::new(digest),
+            WorkspaceId::from_u128(1).expect("nonzero workspace ID"),
+            WorkspaceRevision::new(digest),
+        ));
+        let mut status = status_for(&receipt);
+        status.generation.active = None;
+        Ok(ReindexExecution::new(receipt, status))
+    })
+    .expect("status validation coordinator must be constructible");
+    let error = mismatched_status
+        .admit_and_wait(ReindexSource::Http, FilesystemReindexIntent::full())
+        .await
+        .expect_err("a receipt/status generation mismatch must be rejected");
+    assert!(matches!(
+        error,
+        CoordinatorError::ExecutionFailed { message, .. }
+            if message.contains("different generations")
+    ));
 }
 
 #[tokio::test]
@@ -509,7 +571,7 @@ async fn synchronous_admission_reports_panics_and_cancelled_executor_tasks() {
         panic!("injected synchronous completion panic");
         #[allow(unreachable_code)]
         async {
-            Err::<ReindexReceipt, _>(anyhow::anyhow!("unreachable test future"))
+            Err::<ReindexExecution, _>(anyhow::anyhow!("unreachable test future"))
         }
     })
     .expect("synchronous panic coordinator must be constructible");
@@ -526,7 +588,7 @@ async fn synchronous_admission_reports_panics_and_cancelled_executor_tasks() {
     let asynchronous_panic = ReindexCoordinator::new(config(), |_intent| async move {
         panic!("injected asynchronous completion panic");
         #[allow(unreachable_code)]
-        Err::<ReindexReceipt, _>(anyhow::anyhow!("unreachable test future"))
+        Err::<ReindexExecution, _>(anyhow::anyhow!("unreachable test future"))
     })
     .expect("asynchronous panic coordinator must be constructible");
     let error = asynchronous_panic
@@ -543,7 +605,7 @@ async fn synchronous_admission_reports_panics_and_cancelled_executor_tasks() {
         let child = tokio::spawn(std::future::pending::<()>());
         child.abort();
         child.await.map_err(anyhow::Error::new)?;
-        Ok(terminal_receipt(&intent))
+        Ok(terminal_execution(&intent))
     })
     .expect("cancelled task coordinator must be constructible");
     let error = cancelled
@@ -566,7 +628,7 @@ async fn coalesced_synchronous_waiters_receive_the_same_terminal_receipt() {
             let builds = Arc::clone(&builds);
             async move {
                 builds.fetch_add(1, Ordering::SeqCst);
-                Ok(terminal_receipt(&intent))
+                Ok(terminal_execution(&intent))
             }
         }
     })
@@ -623,7 +685,7 @@ async fn cancelling_one_coalesced_waiter_does_not_affect_another() {
                         .await
                         .expect("test completion gate must remain open");
                     permit.forget();
-                    Ok(terminal_receipt(&intent))
+                    Ok(terminal_execution(&intent))
                 }
             }
         },
@@ -689,7 +751,7 @@ async fn synchronous_completion_waiters_are_bounded() {
                         .await
                         .expect("test completion gate must remain open");
                     permit.forget();
-                    Ok(terminal_receipt(&intent))
+                    Ok(terminal_execution(&intent))
                 }
             }
         },

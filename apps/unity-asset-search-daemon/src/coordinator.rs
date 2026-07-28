@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::time::Instant;
 use unity_asset_search_index::{
     FilesystemReindexIntent, FilesystemReindexScope, ReindexDisposition, ReindexReceipt,
-    SEARCH_GENERATION_CONTRACT_VERSION,
+    SEARCH_GENERATION_CONTRACT_VERSION, StatusResponse,
 };
 use unity_asset_search_protocol::ValidateContractVersion;
 
@@ -28,9 +28,9 @@ const DEFAULT_MAX_PENDING_EVENTS: usize = 32_768;
 const DEFAULT_MAX_FAILURE_HISTORY: usize = 64;
 const MAX_FAILURE_MESSAGE_BYTES: usize = 4_096;
 
-type BuildFuture = Pin<Box<dyn Future<Output = anyhow::Result<ReindexReceipt>> + Send + 'static>>;
+type BuildFuture = Pin<Box<dyn Future<Output = anyhow::Result<ReindexExecution>> + Send + 'static>>;
 type BuildExecutor = dyn Fn(FilesystemReindexIntent) -> BuildFuture + Send + Sync + 'static;
-type CompletionOutcome = Result<ReindexReceipt, ExecutionFailure>;
+type CompletionOutcome = Result<ReindexExecution, ExecutionFailure>;
 type CompletionSender = oneshot::Sender<CompletionOutcome>;
 
 /// The daemon boundary that admitted a reindex request.
@@ -207,13 +207,33 @@ impl ReindexCoordinatorSnapshot {
     }
 }
 
-/// Initial admission and the terminal receipt produced by its merged filesystem build.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One terminal build result observed before the coordinator may start another generation.
+#[derive(Debug, Clone)]
+pub struct ReindexExecution {
+    receipt: ReindexReceipt,
+    status: StatusResponse,
+}
+
+impl ReindexExecution {
+    #[must_use]
+    pub const fn new(receipt: ReindexReceipt, status: StatusResponse) -> Self {
+        Self { receipt, status }
+    }
+
+    fn into_parts(self) -> (ReindexReceipt, StatusResponse) {
+        (self.receipt, self.status)
+    }
+}
+
+/// Initial admission and the terminal observation produced by its merged filesystem build.
+#[derive(Debug, Clone)]
 pub struct ReindexCompletion {
     /// Receipt returned by atomic admission before execution.
     pub admission: ReindexReceipt,
     /// Terminal receipt returned by the concrete executor.
     pub terminal: ReindexReceipt,
+    /// Status captured after the terminal receipt and before another build may start.
+    pub status: StatusResponse,
 }
 
 /// Concrete daemon-owned coordinator.
@@ -241,7 +261,7 @@ impl ReindexCoordinator {
     ) -> Result<Self, CoordinatorError>
     where
         F: Fn(FilesystemReindexIntent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = anyhow::Result<ReindexReceipt>> + Send + 'static,
+        Fut: Future<Output = anyhow::Result<ReindexExecution>> + Send + 'static,
     {
         let config = config.validate()?;
         let executor: Arc<BuildExecutor> =
@@ -308,10 +328,14 @@ impl ReindexCoordinator {
             }
         };
         match completion {
-            Ok(terminal) => Ok(ReindexCompletion {
-                admission,
-                terminal,
-            }),
+            Ok(execution) => {
+                let (terminal, status) = execution.into_parts();
+                Ok(ReindexCompletion {
+                    admission,
+                    terminal,
+                    status,
+                })
+            }
             Err(failure) => Err(CoordinatorError::ExecutionFailed {
                 admission: Box::new(admission),
                 scope: failure.scope,
@@ -625,7 +649,7 @@ async fn execute(
         Ok(future) => {
             match tokio::spawn(async move {
                 match future.await {
-                    Ok(receipt) => validate_execution_receipt(receipt),
+                    Ok(execution) => validate_execution(execution),
                     Err(error) => Err(error.to_string()),
                 }
             })
@@ -640,7 +664,8 @@ async fn execute(
     outcome.map_err(|message| ExecutionFailure::new(intent, message))
 }
 
-fn validate_execution_receipt(receipt: ReindexReceipt) -> Result<ReindexReceipt, String> {
+fn validate_execution(execution: ReindexExecution) -> Result<ReindexExecution, String> {
+    let receipt = &execution.receipt;
     receipt
         .validate_contract_version()
         .map_err(|error| format!("executor returned an invalid receipt: {error}"))?;
@@ -659,7 +684,17 @@ fn validate_execution_receipt(receipt: ReindexReceipt) -> Result<ReindexReceipt,
             receipt.disposition
         ));
     }
-    Ok(receipt)
+    execution
+        .status
+        .validate_contract_version()
+        .map_err(|error| format!("executor returned an invalid status: {error}"))?;
+    if execution.status.indexing || execution.status.generation.building_revision.is_some() {
+        return Err("executor returned a non-terminal status snapshot".to_owned());
+    }
+    if execution.status.generation.active != receipt.generation {
+        return Err("executor receipt and status identify different generations".to_owned());
+    }
+    Ok(execution)
 }
 
 #[derive(Debug)]

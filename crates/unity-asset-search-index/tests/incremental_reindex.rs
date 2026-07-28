@@ -8,7 +8,7 @@ use unity_asset::workspace::{
 };
 use unity_asset::{
     AssetLoadBudget, ChangeSet, DigestV1, FieldPath, ObjectAddress, SourceAlias, SourceFingerprint,
-    SourceId, SourceKind, SourceLocator, TransactionId, UnityClass, UnityValue,
+    SourceId, SourceKind, SourceLocator, TransactionId, UnityClass, UnityValue, WorkspaceRevision,
 };
 use unity_asset_core::{semantic_value_digest, yaml_field_schema_digest};
 use unity_asset_search_index::{
@@ -205,7 +205,6 @@ fn commit_target_name(fixture: &mut Fixture, replacement: &str) -> ChangeSet {
 fn active_generation(index: &SearchIndex) -> GenerationStamp {
     let status = index.status().unwrap();
     assert!(!status.indexing);
-    assert!(status.progress.is_none());
     status
         .generation
         .active
@@ -223,7 +222,6 @@ fn assert_active_receipt(index: &SearchIndex, receipt: &ReindexReceipt) -> Gener
     assert!(!generation.stale);
     assert_eq!(status.generation.building_revision, None);
     assert!(!status.indexing);
-    assert!(status.progress.is_none());
     generation
 }
 
@@ -547,6 +545,193 @@ fn filesystem_reconciliation_preserves_lagging_change_set_receipts_across_reopen
 }
 
 #[test]
+fn late_change_set_after_filesystem_reconciliation_persists_its_receipt() {
+    let mut fixture = fixture();
+    let changes = commit_target_name(&mut fixture, "After");
+
+    let reconciled = fixture
+        .index
+        .reindex(
+            FilesystemReindexIntent::reconcile(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    assert_eq!(reconciled.disposition, ReindexDisposition::Applied);
+    let reconciled_generation = assert_active_receipt(&fixture.index, &reconciled);
+    assert_eq!(reconciled_generation.actual_revision, changes.to_revision());
+
+    let recorded = fixture
+        .index
+        .reindex_workspace(
+            changes.clone(),
+            &fixture.workspace.snapshot(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    assert_eq!(recorded.disposition, ReindexDisposition::Applied);
+    assert_eq!(recorded.transaction, Some(changes.transaction()));
+    assert_eq!(recorded.target_revision, Some(changes.to_revision()));
+    assert_eq!(recorded.evidence.analysis, Default::default());
+    let recorded_generation = assert_active_receipt(&fixture.index, &recorded);
+    assert_ne!(
+        recorded_generation.generation,
+        reconciled_generation.generation
+    );
+    assert_eq!(
+        recorded_generation.actual_revision,
+        reconciled_generation.actual_revision
+    );
+    assert_eq!(
+        search_paths_at_generation(&fixture.index, &recorded_generation, "After"),
+        vec![TARGET_ALIAS.to_owned()]
+    );
+
+    let conflicting = ChangeSet::new(
+        changes.transaction(),
+        changes.workspace(),
+        changes.from_revision(),
+        changes.to_revision(),
+        vec![fixture.owner_source],
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let paths = fixture.paths.clone();
+    drop(fixture.index);
+
+    let reopened = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+    let duplicate = reopened
+        .reindex_workspace(
+            changes.clone(),
+            &fixture.workspace.snapshot(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    assert_eq!(duplicate.disposition, ReindexDisposition::AlreadyApplied);
+    assert_eq!(duplicate.generation, Some(recorded_generation.clone()));
+
+    let conflict = reopened
+        .reindex_workspace(
+            conflicting,
+            &fixture.workspace.snapshot(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    assert_eq!(conflict.code(), ApiErrorCode::InvalidRequest);
+    assert_eq!(active_generation(&reopened), recorded_generation);
+}
+
+#[test]
+fn late_receipt_preserves_a_newer_durable_desired_revision() {
+    let mut fixture = fixture();
+    let obsolete_view = fixture.workspace.snapshot();
+    let late = commit_target_name(&mut fixture, "After");
+    let target_view = fixture.workspace.snapshot();
+
+    let reconciled = fixture
+        .index
+        .reindex(
+            FilesystemReindexIntent::reconcile(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let reconciled_generation = assert_active_receipt(&fixture.index, &reconciled);
+    assert_eq!(reconciled_generation.actual_revision, late.to_revision());
+
+    let future_revision = WorkspaceRevision::new(DigestV1::hash_bytes(b"future-revision"));
+    let future = ChangeSet::new(
+        TransactionId::new(DigestV1::hash_bytes(b"future-transaction")),
+        late.workspace(),
+        late.to_revision(),
+        future_revision,
+        vec![fixture.target_source],
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let error = fixture
+        .index
+        .reindex_workspace(future, &target_view, &mut AssetLoadBudget::default())
+        .unwrap_err();
+    assert_eq!(error.code(), ApiErrorCode::RevisionMismatch);
+    let stale = active_generation(&fixture.index);
+    assert_eq!(stale.actual_revision, late.to_revision());
+    assert_eq!(stale.desired_revision, future_revision);
+    assert!(stale.stale);
+
+    let error = fixture
+        .index
+        .reindex_workspace(
+            late.clone(),
+            &obsolete_view,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), ApiErrorCode::RevisionMismatch);
+    assert_eq!(active_generation(&fixture.index), stale);
+
+    let recorded = fixture
+        .index
+        .reindex_workspace(late.clone(), &target_view, &mut AssetLoadBudget::default())
+        .unwrap();
+    assert_eq!(recorded.disposition, ReindexDisposition::Applied);
+    assert_eq!(recorded.evidence.analysis, Default::default());
+    let recorded_generation = active_generation(&fixture.index);
+    assert_eq!(recorded.generation.as_ref(), Some(&recorded_generation));
+    assert_ne!(
+        recorded_generation.generation,
+        reconciled_generation.generation
+    );
+    assert_eq!(recorded_generation.actual_revision, late.to_revision());
+    assert_eq!(recorded_generation.desired_revision, future_revision);
+    assert!(recorded_generation.stale);
+
+    let paths = fixture.paths.clone();
+    drop(fixture.index);
+    let reopened = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+    assert_eq!(active_generation(&reopened), recorded_generation);
+    let duplicate = reopened
+        .reindex_workspace(late, &target_view, &mut AssetLoadBudget::default())
+        .unwrap();
+    assert_eq!(duplicate.disposition, ReindexDisposition::AlreadyApplied);
+    assert_eq!(active_generation(&reopened), recorded_generation);
+}
+
+#[test]
+fn obsolete_change_set_cannot_regress_the_durable_desired_revision() {
+    let mut fixture = fixture();
+    let obsolete = commit_target_name(&mut fixture, "After");
+    let obsolete_view = fixture.workspace.snapshot();
+    let target_path = fixture.project_root.join(TARGET_ALIAS);
+    let committed = fs::read_to_string(&target_path).unwrap();
+    let newest = committed.replacen("After", "Newest", 1);
+    assert_ne!(newest, committed);
+    fs::write(&target_path, newest).unwrap();
+
+    let reconciled = fixture
+        .index
+        .reindex(
+            FilesystemReindexIntent::reconcile(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let current = assert_active_receipt(&fixture.index, &reconciled);
+    assert_ne!(current.actual_revision, obsolete.to_revision());
+
+    let error = fixture
+        .index
+        .reindex_workspace(obsolete, &obsolete_view, &mut AssetLoadBudget::default())
+        .unwrap_err();
+    assert_eq!(error.code(), ApiErrorCode::RevisionMismatch);
+    assert_eq!(active_generation(&fixture.index), current);
+
+    let paths = fixture.paths.clone();
+    drop(fixture.index);
+    let reopened = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+    assert_eq!(active_generation(&reopened), current);
+}
+
+#[test]
 fn failed_delivery_keeps_the_stale_generation_queryable_until_reconciliation() {
     let mut fixture = fixture();
     let stale_view = fixture.workspace.snapshot();
@@ -576,6 +761,21 @@ fn failed_delivery_keeps_the_stale_generation_queryable_until_reconciliation() {
             .unwrap()
             .desired_revision,
         Some(target_revision)
+    );
+
+    drop(fixture.index);
+    fixture.index =
+        SearchIndex::open_or_create(fixture.paths.clone(), &mut AssetLoadBudget::default())
+            .unwrap();
+    let reopened_stale_status = fixture.index.status().unwrap();
+    assert_eq!(
+        reopened_stale_status.generation.active.as_ref(),
+        Some(&stale_generation),
+        "the durable generation head must retain the observed target revision"
+    );
+    assert!(
+        reopened_stale_status.generation.last_failure.is_none(),
+        "failure text is a process-local diagnostic rather than authoritative generation state"
     );
     let stale_search = search_response_at_generation(&fixture.index, &stale_generation, "Before");
     assert_eq!(
@@ -624,6 +824,16 @@ fn failed_delivery_keeps_the_stale_generation_queryable_until_reconciliation() {
             .generation
             .last_failure
             .is_none()
+    );
+
+    drop(fixture.index);
+    fixture.index =
+        SearchIndex::open_or_create(fixture.paths.clone(), &mut AssetLoadBudget::default())
+            .unwrap();
+    assert_eq!(
+        fixture.index.status().unwrap().generation.active.as_ref(),
+        Some(&reconciled_generation),
+        "the successful generation head must remain fresh after reopen"
     );
     assert_eq!(
         search_paths_at_generation(&fixture.index, &reconciled_generation, "Before"),
@@ -714,6 +924,11 @@ fn reported_target_change_reanalyzes_its_modified_dependency_owner_once() {
     assert_eq!(receipt.transaction, Some(changes.transaction()));
     assert_eq!(receipt.target_revision, Some(target_revision));
     assert!(!receipt.evidence.forced_full_analysis);
+    assert!(receipt.evidence.full_dependency_scan);
+    assert_eq!(
+        receipt.evidence.dependency_candidate_assets, 2,
+        "the current dependency implementation must report its full cached candidate scan"
+    );
     assert_eq!(
         receipt.evidence.dependency_closure_assets, 1,
         "only the owner should be added by dependency closure"

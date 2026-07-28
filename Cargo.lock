@@ -3611,10 +3611,8 @@ dependencies = [
  "tantivy",
  "tempfile",
  "unity-asset",
- "unity-asset-binary",
  "unity-asset-core",
  "unity-asset-search-core",
- "unity-asset-yaml",
  "windows-sys 0.61.2",
 ]
 

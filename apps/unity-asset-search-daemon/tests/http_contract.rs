@@ -1,6 +1,7 @@
 use std::fs;
 use std::future::Future;
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,12 +16,14 @@ use tower::ServiceExt as _;
 use tracing_subscriber::fmt::MakeWriter;
 
 use unity_asset_search_daemon::app::router as daemon_router;
-use unity_asset_search_daemon::coordinator::{ReindexCoordinator, ReindexCoordinatorConfig};
+use unity_asset_search_daemon::coordinator::{
+    ReindexCoordinator, ReindexCoordinatorConfig, ReindexExecution, ReindexSource,
+};
 use unity_asset_search_daemon::security::{DaemonToken, TokenStore};
 use unity_asset_search_index::{
     ApiError, ApiErrorCode, AssetLoadBudget, FilesystemReindexIntent, IndexPaths, ReferenceRequest,
-    ReferencesResponse, ReindexDisposition, ReindexReceipt, SEARCH_GENERATION_CONTRACT_VERSION,
-    SearchIndex, SearchResponse, StatusResponse, SuggestResponse,
+    ReferencesResponse, ReindexDisposition, SEARCH_GENERATION_CONTRACT_VERSION, SearchIndex,
+    SearchResponse, StatusResponse, SuggestResponse,
 };
 use unity_asset_search_protocol::{
     HEALTH_ENDPOINT, HTTP_CONTRACT_VERSION, HealthResponse, REFERENCES_ENDPOINT, REINDEX_ENDPOINT,
@@ -33,6 +36,7 @@ const REFERENCE_GUID: &str = "11112222333344445555666677778888";
 
 struct AppFixture {
     router: Router,
+    coordinator: ReindexCoordinator,
     token_store: TokenStore,
     current_token: DaemonToken,
     foreign_token: DaemonToken,
@@ -45,9 +49,13 @@ impl AppFixture {
             move |intent| {
                 let index = index.clone();
                 async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        index.reindex(intent, &mut AssetLoadBudget::default())
-                    })
+                    let result = tokio::task::spawn_blocking(
+                        move || -> Result<_, unity_asset_search_index::SearchIndexError> {
+                            let receipt = index.reindex(intent, &mut AssetLoadBudget::default())?;
+                            let status = index.status()?;
+                            Ok(ReindexExecution::new(receipt, status))
+                        },
+                    )
                     .await
                     .map_err(|_| anyhow::anyhow!("test reindex worker terminated"))?;
                     result.map_err(anyhow::Error::new)
@@ -60,7 +68,19 @@ impl AppFixture {
     where
         Factory: FnOnce(SearchIndex) -> Executor,
         Executor: Fn(FilesystemReindexIntent) -> BuildFuture + Send + Sync + 'static,
-        BuildFuture: Future<Output = anyhow::Result<ReindexReceipt>> + Send + 'static,
+        BuildFuture: Future<Output = anyhow::Result<ReindexExecution>> + Send + 'static,
+    {
+        Self::with_executor_and_debounce(factory, Duration::from_millis(1))
+    }
+
+    fn with_executor_and_debounce<Factory, Executor, BuildFuture>(
+        factory: Factory,
+        debounce: Duration,
+    ) -> Self
+    where
+        Factory: FnOnce(SearchIndex) -> Executor,
+        Executor: Fn(FilesystemReindexIntent) -> BuildFuture + Send + Sync + 'static,
+        BuildFuture: Future<Output = anyhow::Result<ReindexExecution>> + Send + 'static,
     {
         let temporary = TempDir::new().expect("temporary directory must be creatable");
         let project_root = temporary.path().join("project");
@@ -96,20 +116,21 @@ impl AppFixture {
 
         let coordinator = ReindexCoordinator::new(
             ReindexCoordinatorConfig::new(project_root)
-                .with_debounce(Duration::from_millis(1))
-                .with_max_debounce(Duration::from_millis(1)),
+                .with_debounce(debounce)
+                .with_max_debounce(debounce),
             factory(index.clone()),
         )
         .expect("test coordinator must be constructible");
         let router = daemon_router(
             index,
-            coordinator,
+            coordinator.clone(),
             token_store.clone(),
             current_token.clone(),
         );
 
         Self {
             router,
+            coordinator,
             token_store,
             current_token,
             foreign_token,
@@ -580,6 +601,90 @@ async fn reindex_wait_modes_report_admission_and_the_real_terminal_generation() 
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn startup_watcher_timer_and_http_share_one_real_admission_window() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let fixture = AppFixture::with_executor_and_debounce(
+        {
+            let runs = Arc::clone(&runs);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            move |index| {
+                move |intent| {
+                    let index = index.clone();
+                    let runs = Arc::clone(&runs);
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    async move {
+                        if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                            started.notify_one();
+                            release.notified().await;
+                        }
+                        let result = tokio::task::spawn_blocking(
+                            move || -> Result<_, unity_asset_search_index::SearchIndexError> {
+                                let receipt =
+                                    index.reindex(intent, &mut AssetLoadBudget::default())?;
+                                let status = index.status()?;
+                                Ok(ReindexExecution::new(receipt, status))
+                            },
+                        )
+                        .await
+                        .map_err(|_| anyhow::anyhow!("test reindex worker terminated"))?;
+                        result.map_err(anyhow::Error::new)
+                    }
+                }
+            }
+        },
+        Duration::from_millis(100),
+    );
+
+    let router = fixture.router.clone();
+    let token = fixture.current_token.clone();
+    let http = tokio::spawn(async move {
+        dispatch(
+            &router,
+            json_request(
+                REINDEX_ENDPOINT,
+                &FilesystemReindexIntent::reconcile(),
+                Some(&token),
+            ),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+
+    fixture
+        .coordinator
+        .admit(ReindexSource::Startup, FilesystemReindexIntent::reconcile())
+        .await
+        .unwrap();
+    fixture
+        .coordinator
+        .admit(ReindexSource::Watcher, FilesystemReindexIntent::reconcile())
+        .await
+        .unwrap();
+    fixture
+        .coordinator
+        .admit(ReindexSource::Timer, FilesystemReindexIntent::reconcile())
+        .await
+        .unwrap();
+
+    started.notified().await;
+    release.notify_one();
+    let response = http.await.unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+    fixture.coordinator.wait_for_idle().await;
+
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    let snapshot = fixture.coordinator.snapshot().await;
+    assert_eq!(snapshot.admissions.startup, 1);
+    assert_eq!(snapshot.admissions.watcher, 1);
+    assert_eq!(snapshot.admissions.timer, 1);
+    assert_eq!(snapshot.admissions.http, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn waited_reindex_maps_executor_errors_panics_and_cancellation_to_typed_failures() {
     let failed = AppFixture::with_executor(|_| {
         |_intent| async { Err(anyhow::anyhow!("injected executor failure")) }
@@ -607,7 +712,7 @@ async fn waited_reindex_maps_executor_errors_panics_and_cancellation_to_typed_fa
     );
 
     let panicked = AppFixture::with_executor(|_| {
-        |_intent| -> std::future::Ready<anyhow::Result<ReindexReceipt>> {
+        |_intent| -> std::future::Ready<anyhow::Result<ReindexExecution>> {
             panic!("injected synchronous executor panic")
         }
     });

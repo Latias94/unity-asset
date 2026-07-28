@@ -36,6 +36,7 @@ use crate::reference_payload::{
 use crate::store::{ReferenceProjectionFields, ReferenceProjectionReader};
 
 pub(crate) const MAX_REFERENCE_QUERY_LIMIT: usize = 500;
+const MAX_REFERENCE_CURSOR_STABLE_ID_BYTES: usize = 256;
 const MAX_REFERENCE_PAGE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REFERENCE_OBJECTS_PER_HIT: usize = 1024;
 const MAX_REFERENCE_HIT_JSON_BYTES: usize = 4 * 1024 * 1024;
@@ -623,10 +624,7 @@ impl ReferenceQueryEngine {
         let searcher = self.snapshot.reader.searcher();
         let query = TermQuery::new(Term::from_field_text(field, &key), IndexRecordOption::Basic);
         let fetch_limit = request.limit + 1;
-        let after_stable_id = request
-            .cursor
-            .as_ref()
-            .map(|cursor| Arc::<str>::from(cursor.after_stable_id.as_str()));
+        let after_stable_id = clone_cursor_stable_id(request.cursor.as_ref(), budget)?;
         let (total, mut documents) = searcher.search(
             &query,
             &(
@@ -758,6 +756,10 @@ pub(crate) enum ReferenceQueryError {
     EmptyGuid,
     InvalidGuid,
     EmptyCursor,
+    CursorStableIdTooLong {
+        actual: usize,
+        maximum: usize,
+    },
     CursorGenerationMismatch {
         cursor: crate::generation::SearchGenerationId,
         active: crate::generation::SearchGenerationId,
@@ -765,6 +767,7 @@ pub(crate) enum ReferenceQueryError {
     MissingCursorQueryBinding,
     InvalidCursorQueryBinding,
     CursorQueryMismatch,
+    Budget(BudgetError),
     Index(tantivy::TantivyError),
     CorruptDocument {
         stable_id: Option<String>,
@@ -802,11 +805,13 @@ impl ReferenceQueryError {
             | Self::EmptyGuid
             | Self::InvalidGuid => ApiErrorCode::InvalidRequest,
             Self::EmptyCursor
+            | Self::CursorStableIdTooLong { .. }
             | Self::CursorGenerationMismatch { .. }
             | Self::MissingCursorQueryBinding
             | Self::InvalidCursorQueryBinding
             | Self::CursorQueryMismatch => ApiErrorCode::InvalidCursor,
-            Self::Index(_)
+            Self::Budget(_)
+            | Self::Index(_)
             | Self::CorruptDocument { .. }
             | Self::Payload { .. }
             | Self::ResponseHitTooLarge { .. }
@@ -835,6 +840,10 @@ impl fmt::Display for ReferenceQueryError {
             Self::EmptyCursor => {
                 formatter.write_str("reference cursor stable ID must not be empty")
             }
+            Self::CursorStableIdTooLong { actual, maximum } => write!(
+                formatter,
+                "reference cursor stable ID is {actual} bytes, exceeding the {maximum}-byte limit"
+            ),
             Self::CursorGenerationMismatch { cursor, active } => write!(
                 formatter,
                 "reference cursor generation {cursor} does not match active generation {active}"
@@ -848,6 +857,7 @@ impl fmt::Display for ReferenceQueryError {
             Self::CursorQueryMismatch => formatter.write_str(
                 "reference cursor belongs to a different selector or reference direction",
             ),
+            Self::Budget(error) => fmt::Display::fmt(error, formatter),
             Self::Index(error) => write!(formatter, "reference index query failed: {error}"),
             Self::CorruptDocument { stable_id, reason } => {
                 if let Some(stable_id) = stable_id {
@@ -905,6 +915,7 @@ impl fmt::Display for ReferenceQueryError {
 impl Error for ReferenceQueryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Budget(error) => Some(error),
             Self::Index(error) => Some(error),
             Self::Payload { source, .. } => Some(source),
             _ => None,
@@ -915,6 +926,12 @@ impl Error for ReferenceQueryError {
 impl From<tantivy::TantivyError> for ReferenceQueryError {
     fn from(error: tantivy::TantivyError) -> Self {
         Self::Index(error)
+    }
+}
+
+impl From<BudgetError> for ReferenceQueryError {
+    fn from(error: BudgetError) -> Self {
+        Self::Budget(error)
     }
 }
 
@@ -937,6 +954,12 @@ fn validate_request(
     if let Some(cursor) = &request.cursor {
         if cursor.after_stable_id.is_empty() {
             return Err(ReferenceQueryError::EmptyCursor);
+        }
+        if cursor.after_stable_id.len() > MAX_REFERENCE_CURSOR_STABLE_ID_BYTES {
+            return Err(ReferenceQueryError::CursorStableIdTooLong {
+                actual: cursor.after_stable_id.len(),
+                maximum: MAX_REFERENCE_CURSOR_STABLE_ID_BYTES,
+            });
         }
         if cursor.generation != generation.generation {
             return Err(ReferenceQueryError::CursorGenerationMismatch {
@@ -965,6 +988,20 @@ fn validate_cursor_query_binding(
         return Err(ReferenceQueryError::CursorQueryMismatch);
     }
     Ok(())
+}
+
+fn clone_cursor_stable_id(
+    cursor: Option<&ReferenceCursor>,
+    budget: &mut AssetLoadBudget,
+) -> Result<Option<Arc<str>>, ReferenceQueryError> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let retained_bytes = arc_slice_allocation_bytes::<u8>(cursor.after_stable_id.len())
+        .map_err(|_| BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+    budget.check_bytes(retained_bytes)?;
+    budget.consume_bytes(retained_bytes)?;
+    Ok(Some(Arc::from(cursor.after_stable_id.as_str())))
 }
 
 fn reference_query_binding(direction: ReferenceDirection, normalized_selector_key: &str) -> String {
@@ -1003,14 +1040,20 @@ fn selector_key(
     let key = match selector {
         ReferenceSelector::Object { address } => reference_object_key(address),
         ReferenceSelector::Guid { guid, file_id } => {
-            let normalized = guid.trim().to_ascii_lowercase();
-            if normalized.is_empty() {
+            let trimmed = guid.trim();
+            if trimmed.is_empty() {
                 return Err(ReferenceQueryError::EmptyGuid);
             }
-            if normalized.len() != 32 || !normalized.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+            if trimmed.len() != 32 || !trimmed.as_bytes().iter().all(u8::is_ascii_hexdigit) {
                 return Err(ReferenceQueryError::InvalidGuid);
             }
-            *guid = normalized;
+            let trimmed_len = trimmed.len();
+            let start = trimmed.as_ptr() as usize - guid.as_ptr() as usize;
+            if start != 0 {
+                drop(guid.drain(..start));
+            }
+            guid.truncate(trimmed_len);
+            guid.make_ascii_lowercase();
             reference_guid_key(guid, *file_id)
         }
     };
@@ -2150,6 +2193,57 @@ mod tests {
 
         assert!(matches!(error, ReferenceQueryError::InvalidGuid));
         assert_eq!(error.api_code(), ApiErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn oversized_guid_is_rejected_without_consuming_query_budget() {
+        let stamp = generation(b"oversized-guid");
+        let (_directory, engine) = engine(Vec::new(), stamp);
+        let mut budget = AssetLoadBudget::default();
+
+        let error = engine
+            .references(
+                ReferenceRequest::incoming_guid("a".repeat(64 * 1024), None, 10),
+                &mut budget,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ReferenceQueryError::InvalidGuid));
+        assert_eq!(error.api_code(), ApiErrorCode::InvalidRequest);
+        assert_eq!(budget.usage(), AssetLoadUsage::default());
+    }
+
+    #[test]
+    fn oversized_cursor_is_rejected_before_query_execution() {
+        let stamp = generation(b"oversized-cursor");
+        let generation = stamp.generation;
+        let (_directory, engine) = engine(Vec::new(), stamp);
+        let binding = reference_query_binding(
+            ReferenceDirection::Incoming,
+            &reference_guid_key(GUID, None),
+        );
+        let mut budget = AssetLoadBudget::default();
+
+        let error = engine
+            .references(
+                ReferenceRequest::incoming_guid(GUID, None, 10).with_cursor(ReferenceCursor {
+                    generation,
+                    after_stable_id: "x".repeat(MAX_REFERENCE_CURSOR_STABLE_ID_BYTES + 1),
+                    query_binding: Some(binding),
+                }),
+                &mut budget,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            ReferenceQueryError::CursorStableIdTooLong {
+                actual,
+                maximum: MAX_REFERENCE_CURSOR_STABLE_ID_BYTES,
+            } if *actual == MAX_REFERENCE_CURSOR_STABLE_ID_BYTES + 1
+        ));
+        assert_eq!(error.api_code(), ApiErrorCode::InvalidCursor);
+        assert_eq!(budget.usage(), AssetLoadUsage::default());
     }
 
     #[test]

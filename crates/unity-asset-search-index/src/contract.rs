@@ -174,20 +174,6 @@ pub struct SuggestResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexProgress {
-    pub operation: String,
-    pub phase: String,
-    pub phase_index: u32,
-    pub phase_count: u32,
-    pub phases: Vec<String>,
-    pub processed: u64,
-    pub total: u64,
-    pub has_total: bool,
-    pub started_unix_ms: u64,
-    pub updated_unix_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub contract_version: u16,
     pub generation: GenerationStatus,
@@ -205,8 +191,6 @@ pub struct StatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_build_unix_ms: Option<u64>,
     pub indexing: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub progress: Option<IndexProgress>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
