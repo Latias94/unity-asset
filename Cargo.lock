@@ -3613,6 +3613,23 @@ dependencies = [
  "unity-asset",
  "unity-asset-core",
  "unity-asset-search-core",
+ "unity-asset-search-protocol",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "unity-asset-search-local"
+version = "0.4.0"
+dependencies = [
+ "hex",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.16",
+ "unity-asset-search-protocol",
  "windows-sys 0.61.2",
 ]
 
@@ -3620,9 +3637,13 @@ dependencies = [
 name = "unity-asset-search-protocol"
 version = "0.4.0"
 dependencies = [
+ "hex",
  "serde",
  "serde_json",
- "unity-asset-search-index",
+ "sha2",
+ "thiserror 2.0.16",
+ "unity-asset-core",
+ "unity-asset-search-core",
 ]
 
 [[package]]

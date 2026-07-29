@@ -3,15 +3,18 @@ use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 use unity_asset_core::{Diagnostic, WorkspaceId, WorkspaceRevision};
-use unity_asset_search_core::{
-    FuzzyWorkUsage, HighlightRange, MatchCount, MatchExplanation, MatchKind, RankingSignals,
-    SearchDiagnostic,
-};
+use unity_asset_search_core::MatchKind;
 use unity_asset_search_index::{
-    ApiErrorCode, AssetLoadBudget, FilesystemReindexIntent, GenerationStamp, IndexPaths, Location,
-    ReferenceContext, ReferenceCoverage, ReferenceHit, ReferenceObject, ReferenceRequest,
-    ReferencesResponse, ReindexDisposition, ReindexReceipt, SearchCapabilities, SearchHit,
-    SearchIndex, SearchIndexOptions, SearchRequest, SearchResponse, StatusResponse,
+    AssetLoadBudget, FilesystemReindexIntent, IndexPaths, SearchIndex, SearchIndexOptions,
+    SearchRequest,
+};
+use unity_asset_search_protocol::{
+    ApiErrorCode, DaemonInstanceId, FuzzyWorkUsageV1, GenerationStamp, HighlightRangeV1, Location,
+    MatchCountV1, MatchExplanationV1, ProjectId, QueryPolicyId, RankingSignalsV1, ReferenceContext,
+    ReferenceCoverage, ReferenceHit, ReferenceObject, ReferenceRequest, ReferencesResponse,
+    ReindexDisposition, ReindexReceipt, RequestEnvelope, RequestId, RequestOperation,
+    ResponseEnvelope, ResponseOperation, SearchCapabilities, SearchDiagnosticV1, SearchHit,
+    SearchRequest as ProtocolSearchRequest, SearchResponse, StatusResponse, SuggestRequest,
     SuggestResponse,
 };
 
@@ -150,7 +153,7 @@ struct LocationFact {
 impl From<Location> for LocationFact {
     fn from(location: Location) -> Self {
         Self {
-            path: location.path,
+            path: location.path.to_string(),
             guid: location.guid,
             file_id: location.file_id,
             class_id: location.class_id,
@@ -160,20 +163,20 @@ impl From<Location> for LocationFact {
 
 #[derive(Debug, PartialEq, Eq)]
 struct SearchHitFact {
-    rank: usize,
+    rank: u32,
     guid: Option<String>,
     path: String,
     name: String,
     kind: String,
     stable_id: String,
     location: LocationFact,
-    ranking_signals: RankingSignals,
+    ranking_signals: RankingSignalsV1,
     match_kind: MatchKind,
-    explanation: MatchExplanation,
+    explanation: MatchExplanationV1,
     matched_hierarchy_paths: Vec<String>,
     matched_script_symbols: Vec<String>,
-    highlight_path_ranges: Vec<HighlightRange>,
-    highlight_name_ranges: Vec<HighlightRange>,
+    highlight_path_ranges: Vec<HighlightRangeV1>,
+    highlight_name_ranges: Vec<HighlightRangeV1>,
     highlight_path: Option<String>,
     highlight_name: Option<String>,
 }
@@ -183,7 +186,7 @@ impl From<SearchHit> for SearchHitFact {
         Self {
             rank: hit.rank,
             guid: hit.guid,
-            path: hit.path,
+            path: hit.path.to_string(),
             name: hit.name,
             kind: hit.kind,
             stable_id: hit.stable_id,
@@ -203,21 +206,23 @@ impl From<SearchHit> for SearchHitFact {
 
 #[derive(Debug, PartialEq, Eq)]
 struct SearchResponseFact {
-    contract_version: u16,
+    protocol_revision: u16,
+    query_policy_id: QueryPolicyId,
     query: String,
-    match_count: MatchCount,
-    returned_hits: usize,
+    match_count: MatchCountV1,
+    returned_hits: u32,
     request_limit_truncated: bool,
-    fuzzy_work: FuzzyWorkUsage,
+    fuzzy_work: FuzzyWorkUsageV1,
     hits: Vec<SearchHitFact>,
-    diagnostics: Vec<SearchDiagnostic>,
+    diagnostics: Vec<SearchDiagnosticV1>,
     fallback_used: bool,
 }
 
 impl From<SearchResponse> for SearchResponseFact {
     fn from(response: SearchResponse) -> Self {
         Self {
-            contract_version: response.contract_version,
+            protocol_revision: response.protocol_revision,
+            query_policy_id: response.query_policy_id,
             query: response.query,
             match_count: response.match_count,
             returned_hits: response.returned_hits,
@@ -293,7 +298,7 @@ struct ReferenceHitFact {
 impl From<ReferenceHit> for ReferenceHitFact {
     fn from(hit: ReferenceHit) -> Self {
         Self {
-            source_path: hit.source_path,
+            source_path: hit.source_path.to_string(),
             source_kind: hit.source_kind,
             stable_id: hit.stable_id,
             location: hit.location.into(),
@@ -305,7 +310,8 @@ impl From<ReferenceHit> for ReferenceHitFact {
 
 #[derive(Debug, PartialEq, Eq)]
 struct ReferenceResponseFact {
-    contract_version: u16,
+    protocol_revision: u16,
+    query_policy_id: QueryPolicyId,
     request: ReferenceRequest,
     coverage: ReferenceCoverage,
     hits: Vec<ReferenceHitFact>,
@@ -315,7 +321,8 @@ struct ReferenceResponseFact {
 impl From<ReferencesResponse> for ReferenceResponseFact {
     fn from(response: ReferencesResponse) -> Self {
         Self {
-            contract_version: response.contract_version,
+            protocol_revision: response.protocol_revision,
+            query_policy_id: response.query_policy_id,
             request: response.request,
             coverage: response.coverage,
             hits: response.hits.into_iter().map(Into::into).collect(),
@@ -326,7 +333,8 @@ impl From<ReferencesResponse> for ReferenceResponseFact {
 
 #[derive(Debug, PartialEq, Eq)]
 struct SuggestionFact {
-    contract_version: u16,
+    protocol_revision: u16,
+    query_policy_id: QueryPolicyId,
     prefix: String,
     suggestions: Vec<String>,
 }
@@ -334,7 +342,8 @@ struct SuggestionFact {
 impl From<SuggestResponse> for SuggestionFact {
     fn from(response: SuggestResponse) -> Self {
         Self {
-            contract_version: response.contract_version,
+            protocol_revision: response.protocol_revision,
+            query_policy_id: response.query_policy_id,
             prefix: response.prefix,
             suggestions: response.suggestions,
         }
@@ -343,15 +352,16 @@ impl From<SuggestResponse> for SuggestionFact {
 
 #[derive(Debug, PartialEq, Eq)]
 struct StatusFact {
-    contract_version: u16,
+    protocol_revision: u16,
+    query_policy_id: QueryPolicyId,
     workspace: WorkspaceId,
     actual_revision: WorkspaceRevision,
     desired_revision: WorkspaceRevision,
     stale: bool,
     capabilities: SearchCapabilities,
-    project_root: PathBuf,
-    generation_root: PathBuf,
-    scan_roots: Vec<PathBuf>,
+    project_root: String,
+    generation_root: String,
+    scan_roots: Vec<String>,
     indexed_assets: u64,
     indexed_search_documents: u64,
     indexed_reference_facts: u64,
@@ -370,10 +380,11 @@ struct PublicGenerationFacts {
 
 #[derive(Debug, PartialEq, Eq)]
 struct PublicSemanticFacts<'facts> {
-    contract_version: u16,
+    protocol_revision: u16,
+    query_policy_id: QueryPolicyId,
     stale: bool,
     capabilities: &'facts SearchCapabilities,
-    project_root: &'facts Path,
+    project_root: &'facts str,
     indexed_assets: u64,
     indexed_search_documents: u64,
     indexed_reference_facts: u64,
@@ -388,7 +399,8 @@ struct PublicSemanticFacts<'facts> {
 impl PublicGenerationFacts {
     fn semantic(&self) -> PublicSemanticFacts<'_> {
         PublicSemanticFacts {
-            contract_version: self.status.contract_version,
+            protocol_revision: self.status.protocol_revision,
+            query_policy_id: self.status.query_policy_id,
             stale: self.status.stale,
             capabilities: &self.status.capabilities,
             project_root: &self.status.project_root,
@@ -486,7 +498,7 @@ fn capture_public_facts(index: &SearchIndex) -> PublicGenerationFacts {
 
     let hero_search = capture_search(index, &active, "FinalHero");
     let controller_search = capture_search(index, &active, "FinalController");
-    let references = [SCRIPT_GUID, INLINE_GUID, BLOCK_GUID]
+    let references: Vec<ReferenceResponseFact> = [SCRIPT_GUID, INLINE_GUID, BLOCK_GUID]
         .into_iter()
         .map(|guid| {
             capture_references(
@@ -498,17 +510,30 @@ fn capture_public_facts(index: &SearchIndex) -> PublicGenerationFacts {
         .collect();
     let suggestions = index.suggest("in:Assets/", 20).unwrap();
     assert_eq!(suggestions.generation, active);
+    assert_eq!(hero_search.query_policy_id, status.query_policy_id);
+    assert_eq!(controller_search.query_policy_id, status.query_policy_id);
+    assert!(
+        references
+            .iter()
+            .all(|response| response.query_policy_id == status.query_policy_id)
+    );
+    assert_eq!(suggestions.query_policy_id, status.query_policy_id);
 
     let status = StatusFact {
-        contract_version: status.contract_version,
+        protocol_revision: status.protocol_revision,
+        query_policy_id: status.query_policy_id,
         workspace: active.workspace,
         actual_revision: active.actual_revision,
         desired_revision: active.desired_revision,
         stale: active.stale,
         capabilities: status.capabilities,
-        project_root: status.project_root,
-        generation_root: status.generation_root,
-        scan_roots: status.scan_roots,
+        project_root: status.project_root.to_string(),
+        generation_root: status.generation_root.to_string(),
+        scan_roots: status
+            .scan_roots
+            .into_iter()
+            .map(|path| path.to_string())
+            .collect(),
         indexed_assets: status.indexed_assets,
         indexed_search_documents: status.indexed_search_documents,
         indexed_reference_facts: status.indexed_reference_facts,
@@ -659,6 +684,63 @@ fn full_reconcile_and_changed_paths_converge_on_public_generation_facts() {
 }
 
 #[test]
+fn search_and_suggest_echo_wire_input_while_executing_trimmed_values() {
+    let fixture = ProjectFixture::new(ProjectVersion::Final);
+    let index = open_index(&fixture);
+    let active = published_stamp(&index, &reindex(&index, FilesystemReindexIntent::full()));
+
+    let raw_query = "  FinalHero  ";
+    let search = index.search(SearchRequest::new(raw_query, 20)).unwrap();
+    assert_eq!(search.query, raw_query);
+    assert_eq!(search.hits.len(), 1);
+    assert_eq!(search.generation, active);
+    let search_request = RequestEnvelope::new(
+        1,
+        RequestId::from_bytes([1; 16]),
+        ProjectId::from_bytes([2; 32]),
+        DaemonInstanceId::from_bytes([3; 16]),
+        search.query_policy_id,
+        RequestOperation::Search(ProtocolSearchRequest {
+            query: raw_query.to_owned(),
+            limit: 20,
+        }),
+    )
+    .unwrap();
+    ResponseEnvelope::success(&search_request, ResponseOperation::Search(search))
+        .validate_for(&search_request)
+        .unwrap();
+
+    let whitespace_query = " \t ";
+    let empty = index
+        .search(SearchRequest::new(whitespace_query, 20))
+        .unwrap();
+    assert_eq!(empty.query, whitespace_query);
+    assert!(empty.hits.is_empty());
+    assert!(empty.diagnostics.contains(&SearchDiagnosticV1::EmptyQuery));
+
+    let raw_prefix = "  in:Assets/  ";
+    let suggest = index.suggest(raw_prefix, 20).unwrap();
+    assert_eq!(suggest.prefix, raw_prefix);
+    assert!(!suggest.suggestions.is_empty());
+    assert_eq!(suggest.generation, active);
+    let suggest_request = RequestEnvelope::new(
+        1,
+        RequestId::from_bytes([4; 16]),
+        ProjectId::from_bytes([2; 32]),
+        DaemonInstanceId::from_bytes([3; 16]),
+        suggest.query_policy_id,
+        RequestOperation::Suggest(SuggestRequest {
+            prefix: raw_prefix.to_owned(),
+            limit: 20,
+        }),
+    )
+    .unwrap();
+    ResponseEnvelope::success(&suggest_request, ResponseOperation::Suggest(suggest))
+        .validate_for(&suggest_request)
+        .unwrap();
+}
+
+#[test]
 fn unchanged_tier_zero_asset_is_reanalyzed_when_source_retention_increases() {
     let fixture = ProjectFixture::new(ProjectVersion::Draft);
     let paths = fixture.index_paths_with(
@@ -715,7 +797,7 @@ fn unchanged_tier_zero_asset_is_reanalyzed_when_source_retention_increases() {
             .unwrap()
             .hits
             .into_iter()
-            .map(|hit| hit.path)
+            .map(|hit| hit.path.to_string())
             .collect::<Vec<_>>(),
         vec![HERO_PATH.to_owned()]
     );
@@ -752,11 +834,19 @@ fn non_overlapping_scan_root_shards_match_a_single_project_scan_root() {
         sharded_status.generation_root
     );
     assert_eq!(
-        single_status.scan_roots,
+        single_status
+            .scan_roots
+            .iter()
+            .map(|path| path.to_path_buf())
+            .collect::<Vec<_>>(),
         vec![fixture.assets_directory().canonicalize().unwrap()]
     );
     assert_eq!(
-        sharded_status.scan_roots,
+        sharded_status
+            .scan_roots
+            .iter()
+            .map(|path| path.to_path_buf())
+            .collect::<Vec<_>>(),
         vec![
             fixture
                 .root()

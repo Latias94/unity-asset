@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use unity_asset_core::DigestV1;
+use unity_asset_search_protocol::{MAX_STATUS_SCAN_ROOTS, PortablePath, StatusResponse};
 
 use crate::scan::ScanReadLimits;
 
@@ -44,6 +45,7 @@ impl IndexPaths {
             _ => default_scan_roots(&project_root),
         };
         let scan_roots = normalize_scan_roots(&project_root, scan_roots)?;
+        validate_status_path_contract(&project_root, &index_root, &scan_roots)?;
 
         Ok(Self {
             project_root,
@@ -66,6 +68,30 @@ impl IndexPaths {
     pub fn scan_roots(&self) -> &[PathBuf] {
         &self.scan_roots
     }
+}
+
+fn validate_status_path_contract(
+    project_root: &Path,
+    generation_root: &Path,
+    scan_roots: &[PathBuf],
+) -> Result<()> {
+    let project_root = PortablePath::try_from(project_root)
+        .context("project root cannot be represented by the status protocol")?;
+    let generation_root = PortablePath::try_from(generation_root)
+        .context("generation root cannot be represented by the status protocol")?;
+    let scan_roots = scan_roots
+        .iter()
+        .map(|root| {
+            PortablePath::try_from(root.as_path()).with_context(|| {
+                format!(
+                    "scan root cannot be represented by the status protocol: {}",
+                    root.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    StatusResponse::validate_paths(&project_root, &generation_root, &scan_roots)
+        .context("configured paths exceed the status protocol response budget")
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -257,6 +283,11 @@ fn normalize_scan_roots(project_root: &Path, roots: Vec<PathBuf>) -> Result<Vec<
     }
     normalized.sort();
     normalized.dedup();
+    ensure!(
+        normalized.len() <= MAX_STATUS_SCAN_ROOTS,
+        "scan root count {} exceeds the protocol maximum of {MAX_STATUS_SCAN_ROOTS}",
+        normalized.len()
+    );
     Ok(normalized)
 }
 
@@ -291,6 +322,21 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("inside project root"));
+    }
+
+    #[test]
+    fn scan_root_count_cannot_exceed_the_status_contract() {
+        let project = tempfile::tempdir().unwrap();
+        let mut roots = Vec::new();
+        for ordinal in 0..=MAX_STATUS_SCAN_ROOTS {
+            let root = project.path().join(format!("root-{ordinal}"));
+            std::fs::create_dir_all(&root).unwrap();
+            roots.push(root);
+        }
+
+        let error =
+            IndexPaths::for_project(project.path().to_path_buf(), None, Some(roots)).unwrap_err();
+        assert!(error.to_string().contains("scan root count"));
     }
 
     #[test]

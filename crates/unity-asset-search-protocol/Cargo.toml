@@ -3,20 +3,22 @@ name = "unity-asset-search-protocol"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "Versioned HTTP contracts for unity-asset search clients and daemons"
+description = "Versioned local IPC contracts for unity-asset search clients and daemons"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/unity-asset-search-protocol"
-keywords = ["unity", "search", "protocol", "http"]
+keywords = ["unity", "search", "protocol", "ipc"]
 categories = ["command-line-utilities", "game-development"]
 
 [dependencies]
 serde.workspace = true
-unity-asset-search-index = { workspace = true }
-
-[dev-dependencies]
 serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+sha2.workspace = true
+unity-asset-core = { workspace = true }
+unity-asset-search-core = { workspace = true }
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

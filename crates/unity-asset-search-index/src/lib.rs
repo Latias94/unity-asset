@@ -3,6 +3,8 @@
 //! [`SearchIndex`] is the public concurrency boundary. Reindexing is serialized behind the
 //! internal generation pipeline, while every query pins an immutable active generation without
 //! waiting for a build.
+//! Public response and error payloads are owned by `unity-asset-search-protocol`; this crate only
+//! owns the in-process index inputs and persisted generation model.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -12,7 +14,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod analysis;
 mod analyzer;
 mod config;
-mod contract;
 mod generation;
 mod pipeline;
 mod projection;
@@ -22,34 +23,36 @@ mod reference_query;
 mod scan;
 mod state;
 mod store;
+mod wire;
 
 pub use config::{IndexPaths, SearchIndexOptions};
-pub use contract::{
-    ApiError, ApiErrorCode, Location, MAX_REFERENCE_RESPONSE_DIAGNOSTIC_JSON_BYTES,
-    MAX_REFERENCE_RESPONSE_DIAGNOSTICS, ReferenceContext, ReferenceCoverage, ReferenceCursor,
-    ReferenceDiagnosticCoverage, ReferenceDirection, ReferenceHit, ReferenceObject,
-    ReferenceRequest, ReferenceSelector, ReferencesResponse, SearchCapabilities, SearchHit,
-    SearchResponse, StatusResponse, SuggestResponse,
-};
-pub use generation::{
-    FilesystemReindexIntent, FilesystemReindexScope, GenerationFailure, GenerationStamp,
-    GenerationStatus, ReindexAnalysisEvidence, ReindexDiskEstimate, ReindexDisposition,
-    ReindexEvidence, ReindexReceipt, SEARCH_GENERATION_CONTRACT_VERSION, SearchGenerationId,
-};
+pub use generation::{FilesystemReindexIntent, FilesystemReindexScope};
 pub use unity_asset::workspace::WorkspaceView;
 pub use unity_asset_core::{AssetLoadBudget, ChangeSet, DigestV1, DigestV1Builder};
 pub use unity_asset_search_core::{SearchKind, SearchRequest};
+use unity_asset_search_protocol::{
+    ApiError, ApiErrorCode, GenerationFailure, GenerationStatus, ReferenceRequest,
+    ReferencesResponse, ReindexReceipt, SEARCH_PROTOCOL_REVISION, SearchCapabilities,
+    SearchResponse, StatusResponse, SuggestResponse, WireProjectionError,
+};
 
+use generation::GenerationStamp as InternalGenerationStamp;
 use pipeline::{ActiveGeneration, PipelineBuildOutput, PipelineError, SearchGenerationPipeline};
 use reference_query::ReferenceQueryError;
 #[cfg(test)]
 use state::GenerationFailpoint;
 
 /// Maximum UTF-8 byte length accepted by [`SearchIndex::suggest`].
-pub const MAX_SUGGEST_PREFIX_BYTES: usize = 4 * 1024;
+pub const MAX_SUGGEST_PREFIX_BYTES: usize = unity_asset_search_protocol::MAX_SUGGEST_PREFIX_BYTES;
 
 /// Maximum number of suggestions accepted by [`SearchIndex::suggest`].
-pub const MAX_SUGGEST_LIMIT: usize = 50;
+pub const MAX_SUGGEST_LIMIT: usize = unity_asset_search_protocol::MAX_SUGGEST_RESULTS as usize;
+
+/// Maximum UTF-8 byte length accepted by [`SearchIndex::search`].
+pub const MAX_SEARCH_QUERY_BYTES: usize = unity_asset_search_protocol::MAX_SEARCH_QUERY_BYTES;
+
+/// Maximum result limit accepted by [`SearchIndex::search`].
+pub const MAX_SEARCH_LIMIT: usize = unity_asset_search_protocol::MAX_SEARCH_RESULTS as usize;
 
 /// A cloneable handle to one project search index.
 ///
@@ -271,15 +274,11 @@ impl SearchIndex {
     }
 
     pub fn search(&self, request: SearchRequest) -> Result<SearchResponse, SearchIndexError> {
+        validate_search_request(&request)?;
         let active = self.active_generation()?;
-        active.search(request).map_err(|error| {
-            let message = error.to_string();
-            SearchIndexError::with_boxed_source(
-                ApiError::new(ApiErrorCode::Internal, message, false)
-                    .with_generation(active.stamp().clone()),
-                error.into_boxed_dyn_error(),
-            )
-        })
+        active
+            .search(request)
+            .map_err(|error| SearchIndexError::from_query(error, active.stamp()))
     }
 
     /// Returns type and path suggestions for a bounded prefix and result limit.
@@ -290,7 +289,9 @@ impl SearchIndex {
     pub fn suggest(&self, prefix: &str, limit: usize) -> Result<SuggestResponse, SearchIndexError> {
         validate_suggest_request(prefix, limit)?;
         let active = self.active_generation()?;
-        Ok(active.suggest(prefix, limit))
+        active
+            .suggest(prefix, limit)
+            .map_err(|error| SearchIndexError::from_query(error, active.stamp()))
     }
 
     /// Queries the active reference projection while charging every persisted
@@ -314,18 +315,39 @@ impl SearchIndex {
             .map_err(|_| SearchIndexError::internal("status observation lock is poisoned"))
             .map(|observation| (observation.active.clone(), observation.runtime.clone()))?;
 
+        let project_root = wire::portable_path(self.inner.paths.project_root())
+            .map_err(SearchIndexError::from_wire_projection)?;
+        let generation_root = wire::portable_path(self.inner.paths.index_root())
+            .map_err(SearchIndexError::from_wire_projection)?;
+        let scan_roots = self
+            .inner
+            .paths
+            .scan_roots()
+            .iter()
+            .map(|path| wire::portable_path(path))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SearchIndexError::from_wire_projection)?;
+        let last_build_duration_ms = runtime
+            .last_build_duration_ms
+            .map(|duration| wire::fixed_millis(duration, "status build duration"))
+            .transpose()
+            .map_err(SearchIndexError::from_wire_projection)?;
+
         Ok(StatusResponse {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+            protocol_revision: SEARCH_PROTOCOL_REVISION,
             generation: GenerationStatus {
-                contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-                active: active.as_ref().map(|generation| generation.stamp().clone()),
+                protocol_revision: SEARCH_PROTOCOL_REVISION,
+                active: active
+                    .as_ref()
+                    .map(|generation| wire::generation_stamp(generation.stamp())),
                 building_revision: runtime.building_revision,
                 last_failure: runtime.last_failure,
             },
+            query_policy_id: wire::query_policy_id(),
             capabilities: SearchCapabilities::current(),
-            project_root: self.inner.paths.project_root().to_path_buf(),
-            generation_root: self.inner.paths.index_root().to_path_buf(),
-            scan_roots: self.inner.paths.scan_roots().to_vec(),
+            project_root,
+            generation_root,
+            scan_roots,
             indexed_assets: active
                 .as_ref()
                 .map_or(0, |generation| generation.indexed_assets()),
@@ -341,7 +363,7 @@ impl SearchIndex {
             projection_truncations: active
                 .as_ref()
                 .map_or(0, |generation| generation.projection_truncations()),
-            last_build_duration_ms: runtime.last_build_duration_ms,
+            last_build_duration_ms,
             last_build_unix_ms: runtime.last_build_unix_ms,
             indexing: runtime.indexing,
         })
@@ -364,7 +386,7 @@ impl SearchIndex {
 
         let outcome = match result {
             Ok(output) => {
-                let receipt = output.receipt();
+                let receipt = wire::reindex_receipt(&output);
                 runtime.finish(
                     pipeline_active.clone(),
                     |status| {
@@ -388,7 +410,7 @@ impl SearchIndex {
                 );
                 let recorded = GenerationFailure {
                     code: api_error_code_name(failure.code()).to_owned(),
-                    message: failure.to_string(),
+                    message: failure.api_error().message.clone(),
                     retryable: failure.retryable(),
                     failed_unix_ms: unix_ms_now(),
                     desired_revision: target_revision,
@@ -419,6 +441,32 @@ impl SearchIndex {
             .clone()
             .ok_or_else(SearchIndexError::generation_unavailable)
     }
+}
+
+fn validate_search_request(request: &SearchRequest) -> Result<(), SearchIndexError> {
+    if request.query.len() > MAX_SEARCH_QUERY_BYTES {
+        return Err(SearchIndexError::invalid_request(
+            format!(
+                "search query is {} bytes, exceeding the {MAX_SEARCH_QUERY_BYTES}-byte limit",
+                request.query.len()
+            ),
+            "query_bytes",
+            request.query.len(),
+            MAX_SEARCH_QUERY_BYTES,
+        ));
+    }
+    if request.limit > MAX_SEARCH_LIMIT {
+        return Err(SearchIndexError::invalid_request(
+            format!(
+                "search limit {} exceeds the {MAX_SEARCH_LIMIT}-result limit",
+                request.limit
+            ),
+            "limit",
+            request.limit,
+            MAX_SEARCH_LIMIT,
+        ));
+    }
+    Ok(())
 }
 
 fn validate_suggest_request(prefix: &str, limit: usize) -> Result<(), SearchIndexError> {
@@ -472,36 +520,80 @@ impl SearchIndexError {
         *self.api
     }
 
-    fn from_pipeline(error: PipelineError, generation: Option<GenerationStamp>) -> Self {
-        let mut api = ApiError::new(error.api_code(), error.to_string(), error.retryable());
+    fn from_pipeline(error: PipelineError, generation: Option<InternalGenerationStamp>) -> Self {
+        let mut api = ApiError::new(
+            error.api_code(),
+            wire::bounded_error_message(error.to_string()),
+            error.retryable(),
+        )
+        .with_query_policy(wire::query_policy_id());
         if let Some(generation) = generation {
-            api = api.with_generation(generation);
+            api = api.with_generation(wire::generation_stamp(&generation));
         }
         Self::with_source(api, error)
     }
 
-    fn from_reference(error: ReferenceQueryError, generation: Option<GenerationStamp>) -> Self {
-        let mut api = ApiError::new(error.api_code(), error.to_string(), false);
+    fn from_reference(
+        error: ReferenceQueryError,
+        generation: Option<InternalGenerationStamp>,
+    ) -> Self {
+        let mut api = ApiError::new(
+            error.api_code(),
+            wire::bounded_error_message(error.to_string()),
+            false,
+        )
+        .with_query_policy(wire::query_policy_id());
         if let Some(generation) = generation {
-            api = api.with_generation(generation);
+            api = api.with_generation(wire::generation_stamp(&generation));
         }
+        Self::with_source(api, error)
+    }
+
+    fn from_query(error: anyhow::Error, generation: &InternalGenerationStamp) -> Self {
+        let api = ApiError::new(
+            ApiErrorCode::Internal,
+            wire::bounded_error_message(error.to_string()),
+            false,
+        )
+        .with_generation(wire::generation_stamp(generation))
+        .with_query_policy(wire::query_policy_id());
+        Self::with_boxed_source(api, error.into_boxed_dyn_error())
+    }
+
+    fn from_wire_projection(error: WireProjectionError) -> Self {
+        let api = ApiError::new(
+            ApiErrorCode::Internal,
+            wire::bounded_error_message(error.to_string()),
+            false,
+        )
+        .with_query_policy(wire::query_policy_id());
         Self::with_source(api, error)
     }
 
     fn generation_unavailable() -> Self {
         Self {
-            api: Box::new(ApiError::new(
-                ApiErrorCode::GenerationUnavailable,
-                "no complete search generation is active",
-                true,
-            )),
+            api: Box::new(
+                ApiError::new(
+                    ApiErrorCode::NotReady,
+                    "no complete search generation is active",
+                    true,
+                )
+                .with_query_policy(wire::query_policy_id()),
+            ),
             source: None,
         }
     }
 
     fn internal(message: impl Into<String>) -> Self {
         Self {
-            api: Box::new(ApiError::new(ApiErrorCode::Internal, message, false)),
+            api: Box::new(
+                ApiError::new(
+                    ApiErrorCode::Internal,
+                    wire::bounded_error_message(message.into()),
+                    false,
+                )
+                .with_query_policy(wire::query_policy_id()),
+            ),
             source: None,
         }
     }
@@ -514,10 +606,15 @@ impl SearchIndexError {
     ) -> Self {
         Self {
             api: Box::new(
-                ApiError::new(ApiErrorCode::InvalidRequest, message, false)
-                    .with_detail("field", field)
-                    .with_detail("actual", actual.to_string())
-                    .with_detail("maximum", maximum.to_string()),
+                ApiError::new(
+                    ApiErrorCode::InvalidRequest,
+                    wire::bounded_error_message(message.into()),
+                    false,
+                )
+                .with_query_policy(wire::query_policy_id())
+                .with_detail("field", field)
+                .with_detail("actual", actual.to_string())
+                .with_detail("maximum", maximum.to_string()),
             ),
             source: None,
         }
@@ -561,12 +658,14 @@ const fn api_error_code_name(code: ApiErrorCode) -> &'static str {
     match code {
         ApiErrorCode::InvalidRequest => "invalid_request",
         ApiErrorCode::InvalidCursor => "invalid_cursor",
-        ApiErrorCode::Unauthorized => "unauthorized",
-        ApiErrorCode::ForbiddenListener => "forbidden_listener",
+        ApiErrorCode::StaleCursor => "stale_cursor",
+        ApiErrorCode::IncompatibleProtocol => "incompatible_protocol",
+        ApiErrorCode::PeerRejected => "peer_rejected",
         ApiErrorCode::Busy => "busy",
-        ApiErrorCode::GenerationUnavailable => "generation_unavailable",
+        ApiErrorCode::NotReady => "not_ready",
         ApiErrorCode::RevisionMismatch => "revision_mismatch",
         ApiErrorCode::IndexBuildFailed => "index_build_failed",
+        ApiErrorCode::OperationNotFound => "operation_not_found",
         ApiErrorCode::Internal => "internal",
     }
 }
@@ -582,7 +681,12 @@ mod tests {
     use super::*;
     use unity_asset::workspace::{AssetWorkspace, SourceOpenRequest, WorkspaceOptions};
     use unity_asset::{SourceAlias, SourceKind};
-    use unity_asset_core::{TransactionId, WorkspaceRevision};
+    use unity_asset_core::{SourceId, TransactionId, WorkspaceId, WorkspaceRevision};
+    use unity_asset_search_protocol::{
+        GenerationIdV1, GenerationStamp, MAX_ERROR_MESSAGE_BYTES, ValidateContract,
+    };
+
+    use crate::generation::SearchGenerationId;
 
     const OWNER_PATH: &str = "Assets/owner.prefab";
     const TARGET_PATH: &str = "Assets/target.prefab";
@@ -632,7 +736,7 @@ GameObject:
             .unwrap()
             .hits
             .into_iter()
-            .map(|hit| hit.path)
+            .map(|hit| hit.path.to_string())
             .collect()
     }
 
@@ -645,7 +749,7 @@ GameObject:
             .unwrap()
             .hits
             .into_iter()
-            .map(|hit| hit.source_path)
+            .map(|hit| hit.source_path.to_string())
             .collect()
     }
 
@@ -663,11 +767,11 @@ GameObject:
         assert!(incoming_paths(index, OTHER_GUID).is_empty());
     }
 
-    fn rewrite_reference_marker_as_legacy(paths: &IndexPaths, generation: SearchGenerationId) {
+    fn rewrite_reference_marker_as_legacy(paths: &IndexPaths, generation: GenerationIdV1) {
         let generation_directory = paths
             .index_root()
             .join("generations")
-            .join(generation.directory_name());
+            .join(SearchGenerationId::new(generation.digest()).directory_name());
         let reference_directory = generation_directory.join("references");
         let marker_path = reference_directory.join("schema-contract.json");
         let mut marker: serde_json::Value =
@@ -993,6 +1097,80 @@ GameObject:
                 Some(&"limit".to_owned())
             );
         }
+    }
+
+    #[test]
+    fn public_search_validates_the_raw_query_and_limit_boundaries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        write_generation_fixture(&project);
+        let paths =
+            IndexPaths::for_project(project, Some(temporary.path().join("index")), None).unwrap();
+        let index = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+        index
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        let exact = "x".repeat(MAX_SEARCH_QUERY_BYTES);
+        assert_eq!(
+            index
+                .search(SearchRequest::new(exact.clone(), MAX_SEARCH_LIMIT))
+                .unwrap()
+                .query,
+            exact
+        );
+
+        let one_over = format!("{} ", "x".repeat(MAX_SEARCH_QUERY_BYTES));
+        let query_error = index.search(SearchRequest::new(one_over, 1)).unwrap_err();
+        assert_eq!(query_error.code(), ApiErrorCode::InvalidRequest);
+        assert_eq!(
+            query_error.api_error().details.get("field"),
+            Some(&"query_bytes".to_owned())
+        );
+
+        let limit_error = index
+            .search(SearchRequest::new("x", MAX_SEARCH_LIMIT + 1))
+            .unwrap_err();
+        assert_eq!(limit_error.code(), ApiErrorCode::InvalidRequest);
+        assert_eq!(
+            limit_error.api_error().details.get("field"),
+            Some(&"limit".to_owned())
+        );
+    }
+
+    #[test]
+    fn public_errors_and_recorded_failures_bound_long_utf8_sources() {
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let error = PipelineError::RelativePathCollision {
+            relative_path: "界".repeat(MAX_ERROR_MESSAGE_BYTES),
+            first: SourceId::new(workspace, SourceKind::Yaml, 1).unwrap(),
+            second: SourceId::new(workspace, SourceKind::Yaml, 2).unwrap(),
+        };
+        let source_message = error.to_string();
+        let wrapped = SearchIndexError::from_pipeline(error, None);
+
+        assert!(source_message.len() > MAX_ERROR_MESSAGE_BYTES);
+        assert!(wrapped.to_string().len() <= MAX_ERROR_MESSAGE_BYTES);
+        assert!(wrapped.to_string().ends_with("... [truncated]"));
+        wrapped.api_error().validate().unwrap();
+        assert_eq!(
+            wrapped.source().unwrap().to_string(),
+            source_message,
+            "the full diagnostic remains available through the source chain"
+        );
+
+        GenerationFailure {
+            code: "index_build_failed".to_owned(),
+            message: wrapped.to_string(),
+            retryable: false,
+            failed_unix_ms: 1,
+            desired_revision: None,
+        }
+        .validate()
+        .unwrap();
     }
 
     #[test]

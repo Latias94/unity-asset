@@ -23,6 +23,10 @@ use unity_asset::{
 };
 use unity_asset_core::{string_allocation_bytes, vec_allocation_bytes};
 use unity_asset_search_core::{SearchKind, SearchRequest};
+use unity_asset_search_protocol::{
+    ApiErrorCode, MAX_REINDEX_PUBLISH_WARNINGS, ReferenceRequest, ReferencesResponse,
+    ReindexEvidence, SearchResponse, SuggestResponse,
+};
 
 use crate::analysis::{
     AnalysisMetrics, AnalysisTruncation, AnalysisTruncationKind, AssetAnalysis, AssetAnalysisBatch,
@@ -30,12 +34,10 @@ use crate::analysis::{
 };
 use crate::analyzer::{AnalysisError, AnalyzerLimits, AssetAnalyzer, WorkspaceAnalysisContext};
 use crate::config::{IndexPaths, SearchIndexOptions};
-use crate::contract::{ApiErrorCode, ReferencesResponse, SearchResponse, SuggestResponse};
 use crate::generation::{
     FilesystemReindexIntent, FilesystemReindexScope, GenerationManifestError,
     GenerationProjectionDigests, GenerationProjectionSummary, GenerationStamp,
-    ReindexAnalysisEvidence, ReindexDisposition, ReindexEvidence, ReindexReceipt,
-    SEARCH_GENERATION_CONTRACT_VERSION, SearchGenerationIdentityV1, SearchGenerationManifestV1,
+    SearchGenerationIdentityV1, SearchGenerationManifestV1,
 };
 use crate::projection::{
     GenerationProjection, ProjectionCategory, ProjectionError, ProjectionLimits, ProjectionMetrics,
@@ -241,23 +243,23 @@ impl ActiveGeneration {
 
     pub(crate) fn search(&self, request: SearchRequest) -> anyhow::Result<SearchResponse> {
         let mut response = self.query.search(request)?;
-        response.generation = self.stamp.clone();
+        response.generation = crate::wire::generation_stamp(&self.stamp);
         Ok(response)
     }
 
-    pub(crate) fn suggest(&self, prefix: &str, limit: usize) -> SuggestResponse {
-        let mut response = self.query.suggest(prefix, limit);
-        response.generation = self.stamp.clone();
-        response
+    pub(crate) fn suggest(&self, prefix: &str, limit: usize) -> anyhow::Result<SuggestResponse> {
+        let mut response = self.query.suggest(prefix, limit)?;
+        response.generation = crate::wire::generation_stamp(&self.stamp);
+        Ok(response)
     }
 
     pub(crate) fn references(
         &self,
-        request: crate::contract::ReferenceRequest,
+        request: ReferenceRequest,
         budget: &mut AssetLoadBudget,
     ) -> Result<ReferencesResponse, ReferenceQueryError> {
         let mut response = self.references.references(request, budget)?;
-        response.generation = self.stamp.clone();
+        response.generation = crate::wire::generation_stamp(&self.stamp);
         Ok(response)
     }
 
@@ -278,53 +280,6 @@ pub(crate) struct PipelineBuildOutput {
     pub(crate) duration_ms: u128,
 }
 
-impl PipelineBuildOutput {
-    pub(crate) fn receipt(&self) -> ReindexReceipt {
-        ReindexReceipt {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-            disposition: match self.disposition {
-                PipelineBuildDisposition::AlreadyApplied => ReindexDisposition::AlreadyApplied,
-                PipelineBuildDisposition::Published | PipelineBuildDisposition::NoChange => {
-                    ReindexDisposition::Applied
-                }
-            },
-            transaction: self.transaction,
-            target_revision: self.target_revision,
-            generation: self.active.as_ref().map(|active| active.stamp.clone()),
-            evidence: ReindexEvidence {
-                forced_full_scan: self.metrics.forced_full_scan,
-                forced_full_analysis: self.metrics.forced_full_analysis,
-                full_dependency_scan: self.metrics.full_dependency_scan,
-                dependency_candidate_assets: self.metrics.dependency_candidate_assets,
-                dependency_closure_assets: self.metrics.dependency_closure_assets,
-                analysis: ReindexAnalysisEvidence::from(&self.metrics.analysis),
-                disk_estimate: self.disk_estimate.map(Into::into),
-                publish_warnings: self.warnings.clone(),
-            },
-        }
-    }
-}
-
-impl From<&AnalysisMetrics> for ReindexAnalysisEvidence {
-    fn from(metrics: &AnalysisMetrics) -> Self {
-        Self {
-            assets_visited: metrics.assets_visited,
-            assets_analyzed: metrics.assets_analyzed,
-            source_opens: metrics.source_opens,
-            source_bytes_read: metrics.source_bytes_read,
-            text_sources: metrics.text_sources,
-            text_bytes_scanned: metrics.text_bytes_scanned,
-            yaml_documents: metrics.yaml_documents,
-            binary_objects: metrics.binary_objects,
-            unity_values_visited: metrics.unity_values_visited,
-            references_emitted: metrics.references_emitted,
-            container_entries_emitted: metrics.container_entries_emitted,
-            truncations_emitted: metrics.truncations_emitted,
-            diagnostics_emitted: metrics.diagnostics_emitted,
-        }
-    }
-}
-
 pub(crate) struct SearchGenerationPipeline {
     paths: IndexPaths,
     options: SearchIndexOptions,
@@ -337,7 +292,8 @@ pub(crate) struct SearchGenerationPipeline {
     store: GenerationStore,
     source_state: Option<SourceStateSnapshot>,
     active: Option<Arc<ActiveGeneration>>,
-    pending_publish_warnings: Vec<GenerationPublishWarning>,
+    pending_publish_warnings: Vec<String>,
+    pending_publish_warnings_omitted: bool,
     #[cfg(test)]
     publish_failpoint: Option<GenerationFailpoint>,
 }
@@ -435,6 +391,7 @@ impl SearchGenerationPipeline {
             source_state,
             active,
             pending_publish_warnings: Vec::new(),
+            pending_publish_warnings_omitted: false,
             #[cfg(test)]
             publish_failpoint: None,
         })
@@ -454,7 +411,6 @@ impl SearchGenerationPipeline {
         intent: FilesystemReindexIntent,
         budget: &mut AssetLoadBudget,
     ) -> Result<PipelineBuildOutput, PipelineError> {
-        validate_intent_version(&intent)?;
         let started = Instant::now();
         let requested = match intent.scope {
             FilesystemReindexScope::Full => ScanIntent::Full,
@@ -1592,7 +1548,7 @@ impl SearchGenerationPipeline {
             budget,
         )?);
         let report = prepared.activate_with_budget(budget)?;
-        self.pending_publish_warnings.extend(report.warnings);
+        self.append_pending_publish_warnings(report.warnings);
         let warnings = self.take_pending_publish_warnings();
         self.source_state = Some(source_state);
         self.active = Some(Arc::clone(&active));
@@ -1839,7 +1795,7 @@ impl SearchGenerationPipeline {
         budget: &mut AssetLoadBudget,
     ) -> Result<(), PipelineError> {
         let warnings = self.store.record_desired_revision(desired, budget)?;
-        self.pending_publish_warnings.extend(warnings);
+        self.append_pending_publish_warnings(warnings);
         if let Some(active) = &mut self.active {
             Arc::make_mut(active).set_desired_revision(desired);
         }
@@ -1847,10 +1803,40 @@ impl SearchGenerationPipeline {
     }
 
     fn take_pending_publish_warnings(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.pending_publish_warnings)
-            .into_iter()
-            .map(|warning| warning.to_string())
-            .collect()
+        const OMITTED_WARNING: &str =
+            "additional publish warnings were omitted to satisfy the protocol budget";
+
+        let mut warnings = std::mem::take(&mut self.pending_publish_warnings);
+        let mut omitted = std::mem::take(&mut self.pending_publish_warnings_omitted);
+        while ReindexEvidence::validate_publish_warnings(&warnings).is_err() {
+            let _ = warnings.pop();
+            omitted = true;
+        }
+        if omitted {
+            loop {
+                warnings.push(OMITTED_WARNING.to_owned());
+                if ReindexEvidence::validate_publish_warnings(&warnings).is_ok() {
+                    break;
+                }
+                let _ = warnings.pop();
+                let _ = warnings.pop();
+            }
+        }
+        warnings
+    }
+
+    fn append_pending_publish_warnings(
+        &mut self,
+        warnings: impl IntoIterator<Item = GenerationPublishWarning>,
+    ) {
+        for warning in warnings {
+            if self.pending_publish_warnings.len() < MAX_REINDEX_PUBLISH_WARNINGS {
+                self.pending_publish_warnings
+                    .push(crate::wire::bounded_publish_warning(warning.to_string()));
+            } else {
+                self.pending_publish_warnings_omitted = true;
+            }
+        }
     }
 
     fn install_workspace(&mut self, prepared: Option<PreparedWorkspace>) {
@@ -2244,17 +2230,6 @@ fn canonical_transaction_ids(
     transactions.extend(receipts.ids());
     transactions.sort_unstable();
     Ok(transactions)
-}
-
-fn validate_intent_version(intent: &FilesystemReindexIntent) -> Result<(), PipelineError> {
-    if intent.contract_version == SEARCH_GENERATION_CONTRACT_VERSION {
-        Ok(())
-    } else {
-        Err(PipelineError::UnsupportedContractVersion {
-            actual: intent.contract_version,
-            expected: SEARCH_GENERATION_CONTRACT_VERSION,
-        })
-    }
 }
 
 fn validate_change_set_view(
@@ -3404,10 +3379,6 @@ fn saturating_usize_to_u64(value: usize) -> u64 {
 
 #[derive(Debug)]
 pub(crate) enum PipelineError {
-    UnsupportedContractVersion {
-        actual: u16,
-        expected: u16,
-    },
     WorkspaceMismatch {
         expected: WorkspaceId,
         actual: WorkspaceId,
@@ -3476,8 +3447,7 @@ pub(crate) enum PipelineError {
 impl PipelineError {
     pub(crate) fn api_code(&self) -> ApiErrorCode {
         match self {
-            Self::UnsupportedContractVersion { .. }
-            | Self::Configuration(_)
+            Self::Configuration(_)
             | Self::Contract(_)
             | Self::Diagnostic(_)
             | Self::NonPortableWorkspacePath(_)
@@ -3554,8 +3524,7 @@ impl PipelineError {
                         | GenerationStoreError::WriterLeaseUnavailable { .. }
                 )
             ),
-            Self::UnsupportedContractVersion { .. }
-            | Self::WorkspaceMismatch { .. }
+            Self::WorkspaceMismatch { .. }
             | Self::ViewRevisionMismatch { .. }
             | Self::RevisionBarrierMismatch { .. }
             | Self::TransactionConflict { .. }
@@ -3586,10 +3555,6 @@ impl PipelineError {
 impl fmt::Display for PipelineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedContractVersion { actual, expected } => write!(
-                formatter,
-                "reindex contract version {actual} is unsupported; expected {expected}"
-            ),
             Self::WorkspaceMismatch { expected, actual } => write!(
                 formatter,
                 "workspace {actual:?} does not match indexed workspace {expected:?}"
@@ -3713,8 +3678,7 @@ impl StdError for PipelineError {
             Self::Manifest(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Allocation { source, .. } => Some(source),
-            Self::UnsupportedContractVersion { .. }
-            | Self::WorkspaceMismatch { .. }
+            Self::WorkspaceMismatch { .. }
             | Self::ViewRevisionMismatch { .. }
             | Self::RevisionBarrierMismatch { .. }
             | Self::TransactionConflict { .. }
@@ -4090,12 +4054,10 @@ mod tests {
             .unwrap();
         assert_eq!(first.disposition, PipelineBuildDisposition::Published);
 
-        pipeline
-            .pending_publish_warnings
-            .push(GenerationPublishWarning::new(
-                GenerationPublishWarningKind::PostCommitDurability,
-                "committed head warning",
-            ));
+        pipeline.append_pending_publish_warnings([GenerationPublishWarning::new(
+            GenerationPublishWarningKind::PostCommitDurability,
+            "committed head warning",
+        )]);
         let unchanged = pipeline
             .reindex_filesystem(
                 FilesystemReindexIntent::reconcile(),
@@ -4106,5 +4068,44 @@ mod tests {
         assert_eq!(unchanged.disposition, PipelineBuildDisposition::NoChange);
         assert_eq!(unchanged.warnings, ["committed head warning"]);
         assert!(pipeline.pending_publish_warnings.is_empty());
+    }
+
+    #[test]
+    fn pending_publish_warnings_are_bounded_with_explicit_omission_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project_root = temporary.path().join("project");
+        std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(
+            project_root,
+            Some(temporary.path().join("index")),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let mut pipeline = SearchGenerationPipeline::open(
+            paths,
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        pipeline.append_pending_publish_warnings((0..MAX_REINDEX_PUBLISH_WARNINGS + 8).map(
+            |ordinal| {
+                GenerationPublishWarning::new(
+                    GenerationPublishWarningKind::PostCommitDurability,
+                    format!("warning-{ordinal}:{}", "x".repeat(4 * 1024)),
+                )
+            },
+        ));
+
+        assert!(pipeline.pending_publish_warnings.len() <= MAX_REINDEX_PUBLISH_WARNINGS);
+        let warnings = pipeline.take_pending_publish_warnings();
+
+        ReindexEvidence::validate_publish_warnings(&warnings).unwrap();
+        assert!(
+            warnings
+                .last()
+                .is_some_and(|warning| warning.contains("were omitted"))
+        );
+        assert!(pipeline.pending_publish_warnings.is_empty());
+        assert!(!pipeline.pending_publish_warnings_omitted);
     }
 }

@@ -25,6 +25,7 @@ same-file.workspace = true
 unity-asset-core = { workspace = true }
 unity-asset = { workspace = true }
 unity-asset-search-core = { workspace = true }
+unity-asset-search-protocol = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs"] }

@@ -19,29 +19,31 @@ use unity_asset_core::{
     FieldPathSegment, ObjectAddress, SourceLocator, arc_slice_allocation_bytes,
     string_allocation_bytes, vec_allocation_bytes,
 };
+use unity_asset_search_protocol::{
+    ApiErrorCode, GenerationIdV1, MAX_REFERENCE_RESULTS, QueryPolicyId, ReferenceContext,
+    ReferenceCoverage, ReferenceCursor, ReferenceDiagnosticCoverage, ReferenceDirection,
+    ReferenceHit, ReferenceObject, ReferenceRequest, ReferenceSelector, ReferencesResponse,
+    SEARCH_PROTOCOL_REVISION, WireProjectionError,
+};
 
 use crate::analysis::{GuidProjection, RawReferenceProjection, ReferenceResolutionProjection};
-use crate::contract::{
-    ApiErrorCode, Location, MAX_REFERENCE_RESPONSE_DIAGNOSTIC_JSON_BYTES,
-    MAX_REFERENCE_RESPONSE_DIAGNOSTICS, ReferenceContext, ReferenceCoverage, ReferenceCursor,
-    ReferenceDiagnosticCoverage, ReferenceDirection, ReferenceHit, ReferenceObject,
-    ReferenceRequest, ReferenceSelector, ReferencesResponse,
-};
-use crate::generation::{GenerationStamp, SEARCH_GENERATION_CONTRACT_VERSION};
+use crate::generation::GenerationStamp;
 use crate::projection::{reference_guid_key, reference_object_key};
 use crate::reference_payload::{
     MAX_REFERENCE_PAYLOAD_BYTES, ReferencePayload, ReferencePayloadReadError,
     ReferencePayloadReader,
 };
 use crate::store::{ReferenceProjectionFields, ReferenceProjectionReader};
+use crate::wire;
 
-pub(crate) const MAX_REFERENCE_QUERY_LIMIT: usize = 500;
+pub(crate) const MAX_REFERENCE_QUERY_LIMIT: usize = MAX_REFERENCE_RESULTS as usize;
 const MAX_REFERENCE_CURSOR_STABLE_ID_BYTES: usize = 256;
 const MAX_REFERENCE_PAGE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REFERENCE_OBJECTS_PER_HIT: usize = 1024;
 const MAX_REFERENCE_HIT_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REFERENCE_PAGE_HIT_JSON_BYTES: usize = 8 * 1024 * 1024;
-const REFERENCE_CURSOR_BINDING_DOMAIN: &[u8] = b"unity-asset:reference-query:cursor-binding:v1\0";
+const MAX_REFERENCE_RESPONSE_DIAGNOSTICS: usize = 128;
+const MAX_REFERENCE_RESPONSE_DIAGNOSTIC_JSON_BYTES: usize = 256 * 1024;
 const REFERENCE_CURSOR_BINDING_PREFIX: &str = "reference-query-v1:";
 
 #[derive(Debug, Clone, Copy)]
@@ -574,16 +576,28 @@ impl ResponseDiagnostics {
         Ok(())
     }
 
-    fn finish(self) -> (Vec<Diagnostic>, ReferenceDiagnosticCoverage) {
+    fn finish(self) -> Result<(Vec<Diagnostic>, ReferenceDiagnosticCoverage), ReferenceQueryError> {
         let coverage = ReferenceDiagnosticCoverage {
-            returned: self.values.len(),
+            returned: wire::fixed_u32(self.values.len(), "reference response diagnostic count")?,
             truncated: self.truncated,
-            total: self.total,
-            serialized_bytes: self.serialized_bytes,
-            max_count: self.max_count,
-            max_serialized_bytes: self.max_serialized_bytes,
+            total: self
+                .total
+                .map(|value| wire::fixed_u64(value, "reference response diagnostic total"))
+                .transpose()?,
+            serialized_bytes: wire::fixed_u64(
+                self.serialized_bytes,
+                "reference response diagnostic bytes",
+            )?,
+            max_count: wire::fixed_u32(
+                self.max_count,
+                "reference response diagnostic count limit",
+            )?,
+            max_serialized_bytes: wire::fixed_u64(
+                self.max_serialized_bytes,
+                "reference response diagnostic byte limit",
+            )?,
         };
-        (self.values, coverage)
+        Ok((self.values, coverage))
     }
 }
 
@@ -607,23 +621,31 @@ impl ReferenceQueryEngine {
 
     fn references_with_limits(
         &self,
-        mut request: ReferenceRequest,
+        request: ReferenceRequest,
         limits: ReferenceQueryLimits,
         budget: &mut AssetLoadBudget,
     ) -> Result<ReferencesResponse, ReferenceQueryError> {
         let started = Instant::now();
         validate_request(&request, &self.snapshot.generation)?;
-        let (field, key) = selector_key(
-            &mut request.selector,
-            request.direction,
-            self.snapshot.fields,
-        )?;
-        let query_binding = reference_query_binding(request.direction, &key);
+        let request_limit =
+            usize::try_from(request.limit).map_err(|_| WireProjectionError::NumericOverflow {
+                field: "reference request limit",
+            })?;
+        let (field, key) =
+            selector_key(&request.selector, request.direction, self.snapshot.fields)?;
+        let query_binding = request
+            .cursor_query_binding()
+            .map_err(|_| ReferenceQueryError::InvalidCursorQueryBinding)?;
         validate_cursor_query_binding(request.cursor.as_ref(), &query_binding)?;
 
         let searcher = self.snapshot.reader.searcher();
         let query = TermQuery::new(Term::from_field_text(field, &key), IndexRecordOption::Basic);
-        let fetch_limit = request.limit + 1;
+        let fetch_limit =
+            request_limit
+                .checked_add(1)
+                .ok_or(WireProjectionError::NumericOverflow {
+                    field: "reference fetch limit",
+                })?;
         let after_stable_id = clone_cursor_stable_id(request.cursor.as_ref(), budget)?;
         let (total, mut documents) = searcher.search(
             &query,
@@ -645,9 +667,9 @@ impl ReferenceQueryEngine {
             }
         }
 
-        let request_limit_has_more = documents.len() > request.limit;
+        let request_limit_has_more = documents.len() > request_limit;
         if request_limit_has_more {
-            documents.truncate(request.limit);
+            documents.truncate(request_limit);
         }
 
         let mut hits = Vec::with_capacity(documents.len());
@@ -714,26 +736,33 @@ impl ReferenceQueryEngine {
         let complete = self.snapshot.completeness.is_complete();
         let next_cursor = if has_more {
             last_returned_stable_id.map(|after_stable_id| ReferenceCursor {
-                generation: self.snapshot.generation.generation,
+                generation: wire::generation_id(self.snapshot.generation.generation),
+                query_policy_id: wire::query_policy_id(),
                 after_stable_id,
-                query_binding: Some(query_binding),
+                query_binding,
             })
         } else {
             None
         };
 
-        let (diagnostics, diagnostic_coverage) = diagnostics.finish();
+        let (diagnostics, diagnostic_coverage) = diagnostics.finish()?;
 
         Ok(ReferencesResponse {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-            generation: self.snapshot.generation.clone(),
+            protocol_revision: SEARCH_PROTOCOL_REVISION,
+            generation: wire::generation_stamp(&self.snapshot.generation),
+            query_policy_id: wire::query_policy_id(),
             request,
-            took_ms: started.elapsed().as_millis(),
+            took_ms: wire::fixed_millis(
+                started.elapsed().as_millis(),
+                "reference response duration",
+            )?,
             coverage: ReferenceCoverage {
                 complete,
                 truncated: has_more || !complete,
-                returned: hits.len(),
-                total: complete.then_some(total),
+                returned: wire::fixed_u32(hits.len(), "reference response hit count")?,
+                total: complete
+                    .then(|| wire::fixed_u64(total, "reference response total"))
+                    .transpose()?,
                 next_cursor,
             },
             hits,
@@ -745,10 +774,6 @@ impl ReferenceQueryEngine {
 
 #[derive(Debug)]
 pub(crate) enum ReferenceQueryError {
-    UnsupportedContractVersion {
-        actual: u16,
-        expected: u16,
-    },
     InvalidLimit {
         actual: usize,
         maximum: usize,
@@ -761,10 +786,13 @@ pub(crate) enum ReferenceQueryError {
         maximum: usize,
     },
     CursorGenerationMismatch {
-        cursor: crate::generation::SearchGenerationId,
-        active: crate::generation::SearchGenerationId,
+        cursor: GenerationIdV1,
+        active: GenerationIdV1,
     },
-    MissingCursorQueryBinding,
+    CursorQueryPolicyMismatch {
+        cursor: QueryPolicyId,
+        active: QueryPolicyId,
+    },
     InvalidCursorQueryBinding,
     CursorQueryMismatch,
     Budget(BudgetError),
@@ -795,19 +823,20 @@ pub(crate) enum ReferenceQueryError {
     ResponseDiagnostic {
         reason: String,
     },
+    WireProjection(WireProjectionError),
 }
 
 impl ReferenceQueryError {
     pub(crate) const fn api_code(&self) -> ApiErrorCode {
         match self {
-            Self::UnsupportedContractVersion { .. }
-            | Self::InvalidLimit { .. }
-            | Self::EmptyGuid
-            | Self::InvalidGuid => ApiErrorCode::InvalidRequest,
+            Self::InvalidLimit { .. } | Self::EmptyGuid | Self::InvalidGuid => {
+                ApiErrorCode::InvalidRequest
+            }
+            Self::CursorGenerationMismatch { .. } | Self::CursorQueryPolicyMismatch { .. } => {
+                ApiErrorCode::StaleCursor
+            }
             Self::EmptyCursor
             | Self::CursorStableIdTooLong { .. }
-            | Self::CursorGenerationMismatch { .. }
-            | Self::MissingCursorQueryBinding
             | Self::InvalidCursorQueryBinding
             | Self::CursorQueryMismatch => ApiErrorCode::InvalidCursor,
             Self::Budget(_)
@@ -817,7 +846,8 @@ impl ReferenceQueryError {
             | Self::ResponseHitTooLarge { .. }
             | Self::ResponseHitObjectLimitExceeded { .. }
             | Self::ResponsePageBudgetTooSmall { .. }
-            | Self::ResponseDiagnostic { .. } => ApiErrorCode::Internal,
+            | Self::ResponseDiagnostic { .. }
+            | Self::WireProjection(_) => ApiErrorCode::Internal,
         }
     }
 }
@@ -825,10 +855,6 @@ impl ReferenceQueryError {
 impl fmt::Display for ReferenceQueryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedContractVersion { actual, expected } => write!(
-                formatter,
-                "reference request contract version {actual} is unsupported; expected {expected}"
-            ),
             Self::InvalidLimit { actual, maximum } => write!(
                 formatter,
                 "reference query limit {actual} is outside 1..={maximum}"
@@ -848,9 +874,10 @@ impl fmt::Display for ReferenceQueryError {
                 formatter,
                 "reference cursor generation {cursor} does not match active generation {active}"
             ),
-            Self::MissingCursorQueryBinding => {
-                formatter.write_str("reference cursor is missing its query binding")
-            }
+            Self::CursorQueryPolicyMismatch { cursor, active } => write!(
+                formatter,
+                "reference cursor query policy {cursor} does not match active policy {active}"
+            ),
             Self::InvalidCursorQueryBinding => {
                 formatter.write_str("reference cursor query binding is malformed")
             }
@@ -908,6 +935,7 @@ impl fmt::Display for ReferenceQueryError {
                 formatter,
                 "reference response diagnostic cannot be serialized for response budgeting: {reason}"
             ),
+            Self::WireProjection(error) => fmt::Display::fmt(error, formatter),
         }
     }
 }
@@ -918,6 +946,7 @@ impl Error for ReferenceQueryError {
             Self::Budget(error) => Some(error),
             Self::Index(error) => Some(error),
             Self::Payload { source, .. } => Some(source),
+            Self::WireProjection(error) => Some(error),
             _ => None,
         }
     }
@@ -935,19 +964,23 @@ impl From<BudgetError> for ReferenceQueryError {
     }
 }
 
+impl From<WireProjectionError> for ReferenceQueryError {
+    fn from(error: WireProjectionError) -> Self {
+        Self::WireProjection(error)
+    }
+}
+
 fn validate_request(
     request: &ReferenceRequest,
     generation: &GenerationStamp,
 ) -> Result<(), ReferenceQueryError> {
-    if request.contract_version != SEARCH_GENERATION_CONTRACT_VERSION {
-        return Err(ReferenceQueryError::UnsupportedContractVersion {
-            actual: request.contract_version,
-            expected: SEARCH_GENERATION_CONTRACT_VERSION,
-        });
-    }
-    if !(1..=MAX_REFERENCE_QUERY_LIMIT).contains(&request.limit) {
+    let request_limit =
+        usize::try_from(request.limit).map_err(|_| WireProjectionError::NumericOverflow {
+            field: "reference request limit",
+        })?;
+    if !(1..=MAX_REFERENCE_QUERY_LIMIT).contains(&request_limit) {
         return Err(ReferenceQueryError::InvalidLimit {
-            actual: request.limit,
+            actual: request_limit,
             maximum: MAX_REFERENCE_QUERY_LIMIT,
         });
     }
@@ -961,10 +994,18 @@ fn validate_request(
                 maximum: MAX_REFERENCE_CURSOR_STABLE_ID_BYTES,
             });
         }
-        if cursor.generation != generation.generation {
+        let active_generation = wire::generation_id(generation.generation);
+        if cursor.generation != active_generation {
             return Err(ReferenceQueryError::CursorGenerationMismatch {
                 cursor: cursor.generation,
-                active: generation.generation,
+                active: active_generation,
+            });
+        }
+        let active_policy = wire::query_policy_id();
+        if cursor.query_policy_id != active_policy {
+            return Err(ReferenceQueryError::CursorQueryPolicyMismatch {
+                cursor: cursor.query_policy_id,
+                active: active_policy,
             });
         }
     }
@@ -978,9 +1019,7 @@ fn validate_cursor_query_binding(
     let Some(cursor) = cursor else {
         return Ok(());
     };
-    let Some(actual) = cursor.query_binding.as_deref() else {
-        return Err(ReferenceQueryError::MissingCursorQueryBinding);
-    };
+    let actual = cursor.query_binding.as_str();
     if !is_valid_cursor_query_binding(actual) {
         return Err(ReferenceQueryError::InvalidCursorQueryBinding);
     }
@@ -1004,19 +1043,6 @@ fn clone_cursor_stable_id(
     Ok(Some(Arc::from(cursor.after_stable_id.as_str())))
 }
 
-fn reference_query_binding(direction: ReferenceDirection, normalized_selector_key: &str) -> String {
-    let mut identity = Vec::from(REFERENCE_CURSOR_BINDING_DOMAIN);
-    identity.push(match direction {
-        ReferenceDirection::Incoming => 0,
-        ReferenceDirection::Outgoing => 1,
-    });
-    identity.extend_from_slice(normalized_selector_key.as_bytes());
-    format!(
-        "{REFERENCE_CURSOR_BINDING_PREFIX}{}",
-        hex::encode(DigestV1::hash_bytes(&identity).as_bytes())
-    )
-}
-
 fn is_valid_cursor_query_binding(value: &str) -> bool {
     value
         .strip_prefix(REFERENCE_CURSOR_BINDING_PREFIX)
@@ -1029,7 +1055,7 @@ fn is_valid_cursor_query_binding(value: &str) -> bool {
 }
 
 fn selector_key(
-    selector: &mut ReferenceSelector,
+    selector: &ReferenceSelector,
     direction: ReferenceDirection,
     fields: ReferenceProjectionFields,
 ) -> Result<(Field, String), ReferenceQueryError> {
@@ -1040,20 +1066,16 @@ fn selector_key(
     let key = match selector {
         ReferenceSelector::Object { address } => reference_object_key(address),
         ReferenceSelector::Guid { guid, file_id } => {
-            let trimmed = guid.trim();
-            if trimmed.is_empty() {
+            if guid.is_empty() {
                 return Err(ReferenceQueryError::EmptyGuid);
             }
-            if trimmed.len() != 32 || !trimmed.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+            if guid.len() != 32
+                || !guid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
                 return Err(ReferenceQueryError::InvalidGuid);
             }
-            let trimmed_len = trimmed.len();
-            let start = trimmed.as_ptr() as usize - guid.as_ptr() as usize;
-            if start != 0 {
-                drop(guid.drain(..start));
-            }
-            guid.truncate(trimmed_len);
-            guid.make_ascii_lowercase();
             reference_guid_key(guid, *file_id)
         }
     };
@@ -1445,15 +1467,15 @@ fn reference_hit(stored: ReferencePayload) -> Result<ReferenceHit, ReferenceQuer
     objects.extend(resolution_objects(&stored)?);
 
     Ok(ReferenceHit {
-        source_path: stored.source_path.clone(),
+        source_path: wire::portable_path_string(stored.source_path.clone())?,
         source_kind: stored.source_kind,
         stable_id: stored.stable_id,
-        location: Location {
-            path: stored.source_path,
-            guid: stored.source_guid,
-            file_id: stored.source_file_id,
-            class_id: stored.source_class_id,
-        },
+        location: wire::location(
+            stored.source_path,
+            stored.source_guid,
+            stored.source_file_id,
+            stored.source_class_id,
+        )?,
         contexts: vec![context],
         objects,
     })
@@ -1526,13 +1548,12 @@ fn raw_reference_object(stored: &ReferencePayload) -> Result<ReferenceObject, Re
                 doc_file_id: Some(*path_id),
                 doc_class_id: None,
                 stable_id,
-                location: Location {
+                location: wire::location(
                     path,
-                    guid: target_guid
-                        .or_else(|| target_address.as_ref().and(stored.source_guid.clone())),
-                    file_id: Some(*path_id),
-                    class_id: None,
-                },
+                    target_guid.or_else(|| target_address.as_ref().and(stored.source_guid.clone())),
+                    Some(*path_id),
+                    None,
+                )?,
                 object_name: None,
                 hierarchy_path: None,
                 field_hints,
@@ -1571,13 +1592,12 @@ fn raw_reference_object(stored: &ReferencePayload) -> Result<ReferenceObject, Re
                 doc_file_id: *file_id,
                 doc_class_id: None,
                 stable_id,
-                location: Location {
-                    path: stored.source_path.clone(),
-                    guid: target_guid
-                        .or_else(|| target_address.as_ref().and(stored.source_guid.clone())),
-                    file_id: *file_id,
-                    class_id: None,
-                },
+                location: wire::location(
+                    stored.source_path.clone(),
+                    target_guid.or_else(|| target_address.as_ref().and(stored.source_guid.clone())),
+                    *file_id,
+                    None,
+                )?,
                 object_name: None,
                 hierarchy_path: None,
                 field_hints,
@@ -1595,18 +1615,19 @@ fn resolution_objects(
         | ReferenceResolutionProjection::Missing { target: None }
         | ReferenceResolutionProjection::Invalid => {}
         ReferenceResolutionProjection::Resolved { target } => {
-            objects.push(address_object(target, "resolution.resolved"));
+            objects.push(address_object(target, "resolution.resolved")?);
         }
         ReferenceResolutionProjection::Missing {
             target: Some(target),
         } => {
-            objects.push(address_object(target, "resolution.missing"));
+            objects.push(address_object(target, "resolution.missing")?);
         }
         ReferenceResolutionProjection::Ambiguous { candidates } => {
             objects.extend(
                 candidates
                     .iter()
-                    .map(|target| address_object(target, "resolution.ambiguous")),
+                    .map(|target| address_object(target, "resolution.ambiguous"))
+                    .collect::<Result<Vec<_>, _>>()?,
             );
         }
         ReferenceResolutionProjection::Unloaded {
@@ -1617,12 +1638,7 @@ fn resolution_objects(
                 doc_file_id: None,
                 doc_class_id: None,
                 stable_id,
-                location: Location {
-                    path: locator_path(source),
-                    guid: None,
-                    file_id: None,
-                    class_id: None,
-                },
+                location: wire::locator_location(source, None, None, None)?,
                 object_name: None,
                 hierarchy_path: None,
                 field_hints: vec!["resolution.unloaded".to_owned()],
@@ -1633,42 +1649,24 @@ fn resolution_objects(
     Ok(objects)
 }
 
-fn address_object(address: &ObjectAddress, resolution: &str) -> ReferenceObject {
+fn address_object(
+    address: &ObjectAddress,
+    resolution: &str,
+) -> Result<ReferenceObject, ReferenceQueryError> {
     let file_id = address.binary_path_id().or_else(|| {
         address
             .yaml_anchor()
             .and_then(|anchor| anchor.parse::<i64>().ok())
     });
-    ReferenceObject {
+    Ok(ReferenceObject {
         doc_file_id: file_id,
         doc_class_id: None,
         stable_id: reference_object_key(address),
-        location: Location {
-            path: locator_path(address.source_locator()),
-            guid: None,
-            file_id,
-            class_id: None,
-        },
+        location: wire::locator_location(address.source_locator(), None, file_id, None)?,
         object_name: None,
         hierarchy_path: None,
         field_hints: vec![resolution.to_owned()],
-    }
-}
-
-fn locator_path(locator: &SourceLocator) -> String {
-    let mut path = locator.root_alias().as_str().to_owned();
-    for step in locator.members() {
-        path.push_str("::");
-        path.push_str(step.container().tag());
-        path.push(':');
-        path.push_str(step.member().name());
-        let occurrence = step.member().same_name_occurrence();
-        if occurrence != 0 {
-            path.push('@');
-            path.push_str(&occurrence.to_string());
-        }
-    }
-    path
+    })
 }
 
 fn raw_target_stable_id(target: &RawReferenceProjection) -> Result<String, ReferenceQueryError> {
@@ -1706,6 +1704,7 @@ mod tests {
         AssetLoadLimits, AssetLoadUsage, DiagnosticSeverity, FieldPath, WorkspaceId,
         WorkspaceRevision,
     };
+    use unity_asset_search_protocol::ValidateContract;
 
     use super::*;
     use crate::analysis::{
@@ -2102,13 +2101,13 @@ mod tests {
                 returned: 2,
                 truncated: false,
                 total: Some(2),
-                serialized_bytes: exact_bytes,
+                serialized_bytes: u64::try_from(exact_bytes).unwrap(),
                 max_count: 2,
-                max_serialized_bytes: exact_bytes,
+                max_serialized_bytes: u64::try_from(exact_bytes).unwrap(),
             }
         );
         assert_eq!(
-            serde_json::to_vec(&exact.diagnostics).unwrap().len(),
+            u64::try_from(serde_json::to_vec(&exact.diagnostics).unwrap().len()).unwrap(),
             exact.diagnostic_coverage.serialized_bytes
         );
         assert!(
@@ -2139,12 +2138,12 @@ mod tests {
     }
 
     #[test]
-    fn uppercase_guid_and_negative_ids_round_trip_without_source_io() {
+    fn negative_ids_round_trip_without_source_io() {
         let stamp = generation(b"one");
         let (_directory, engine) = engine(vec![projected_reference("reference-a", -7)], stamp);
         let response = engine
             .references(
-                ReferenceRequest::incoming_guid(GUID.to_ascii_uppercase(), Some(-99), 10),
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 10),
                 &mut AssetLoadBudget::default(),
             )
             .unwrap();
@@ -2177,6 +2176,21 @@ mod tests {
                 .iter()
                 .any(|hint| hint == "raw.binary.path_id=-99")
         );
+    }
+
+    #[test]
+    fn uppercase_guid_is_rejected_instead_of_silently_normalized() {
+        let stamp = generation(b"uppercase-guid");
+        let (_directory, engine) = engine(Vec::new(), stamp);
+        let error = engine
+            .references(
+                ReferenceRequest::incoming_guid(GUID.to_ascii_uppercase(), None, 10),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ReferenceQueryError::InvalidGuid));
+        assert_eq!(error.api_code(), ApiErrorCode::InvalidRequest);
     }
 
     #[test]
@@ -2218,18 +2232,18 @@ mod tests {
         let stamp = generation(b"oversized-cursor");
         let generation = stamp.generation;
         let (_directory, engine) = engine(Vec::new(), stamp);
-        let binding = reference_query_binding(
-            ReferenceDirection::Incoming,
-            &reference_guid_key(GUID, None),
-        );
+        let binding = ReferenceRequest::incoming_guid(GUID, None, 10)
+            .cursor_query_binding()
+            .unwrap();
         let mut budget = AssetLoadBudget::default();
 
         let error = engine
             .references(
                 ReferenceRequest::incoming_guid(GUID, None, 10).with_cursor(ReferenceCursor {
-                    generation,
+                    generation: wire::generation_id(generation),
+                    query_policy_id: wire::query_policy_id(),
                     after_stable_id: "x".repeat(MAX_REFERENCE_CURSOR_STABLE_ID_BYTES + 1),
-                    query_binding: Some(binding),
+                    query_binding: binding,
                 }),
                 &mut budget,
             )
@@ -2262,7 +2276,6 @@ mod tests {
         let outgoing = engine
             .references(
                 ReferenceRequest {
-                    contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
                     direction: ReferenceDirection::Outgoing,
                     selector: ReferenceSelector::Object { address: source },
                     limit: 10,
@@ -2289,25 +2302,24 @@ mod tests {
 
         let first = engine
             .references(
-                ReferenceRequest::incoming_guid(GUID.to_ascii_uppercase(), Some(-99), 1),
+                ReferenceRequest::incoming_guid(GUID, Some(-99), 1),
                 &mut AssetLoadBudget::default(),
             )
             .unwrap();
+        first.validate().unwrap();
         assert_eq!(first.hits[0].stable_id, "reference-a");
         assert_eq!(first.coverage.total, Some(3));
         assert!(first.coverage.truncated);
         let cursor = first.coverage.next_cursor.unwrap();
-        assert_eq!(cursor.generation, stamp.generation);
-        assert!(is_valid_cursor_query_binding(
-            cursor.query_binding.as_deref().unwrap()
-        ));
+        assert_eq!(cursor.generation, wire::generation_id(stamp.generation));
+        assert_eq!(cursor.query_policy_id, wire::query_policy_id());
+        assert!(is_valid_cursor_query_binding(&cursor.query_binding));
         let cursor: ReferenceCursor =
             serde_json::from_value(serde_json::to_value(cursor).unwrap()).unwrap();
 
         let second = engine
             .references(
                 ReferenceRequest {
-                    contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
                     direction: ReferenceDirection::Incoming,
                     selector: ReferenceSelector::Guid {
                         guid: GUID.to_owned(),
@@ -2329,7 +2341,6 @@ mod tests {
         let error = engine
             .references(
                 ReferenceRequest {
-                    contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
                     direction: ReferenceDirection::Incoming,
                     selector: ReferenceSelector::Guid {
                         guid: GUID.to_owned(),
@@ -2337,9 +2348,12 @@ mod tests {
                     },
                     limit: 10,
                     cursor: Some(ReferenceCursor {
-                        generation: generation(b"old").generation,
+                        generation: wire::generation_id(generation(b"old").generation),
+                        query_policy_id: wire::query_policy_id(),
                         after_stable_id: "reference-a".to_owned(),
-                        query_binding: None,
+                        query_binding: ReferenceRequest::incoming_guid(GUID, None, 10)
+                            .cursor_query_binding()
+                            .unwrap(),
                     }),
                 },
                 &mut AssetLoadBudget::default(),
@@ -2350,32 +2364,46 @@ mod tests {
             &error,
             ReferenceQueryError::CursorGenerationMismatch { .. }
         ));
-        assert_eq!(error.api_code(), ApiErrorCode::InvalidCursor);
+        assert_eq!(error.api_code(), ApiErrorCode::StaleCursor);
     }
 
     #[test]
-    fn legacy_cursor_without_query_binding_is_a_typed_error() {
-        let stamp = generation(b"legacy-cursor");
-        let legacy_cursor: ReferenceCursor = serde_json::from_value(serde_json::json!({
-            "generation": stamp.generation,
-            "after_stable_id": "reference-a",
-        }))
-        .unwrap();
-        assert_eq!(legacy_cursor.query_binding, None);
+    fn cursor_from_another_query_policy_is_a_typed_error() {
+        let stamp = generation(b"active-policy");
+        let active_generation = wire::generation_id(stamp.generation);
         let (_directory, engine) = engine(vec![projected_reference("reference-a", -7)], stamp);
+        let cursor = ReferenceCursor {
+            generation: active_generation,
+            query_policy_id: QueryPolicyId::from_bytes([0xa5; 32]),
+            after_stable_id: "reference-a".to_owned(),
+            query_binding: ReferenceRequest::incoming_guid(GUID, None, 10)
+                .cursor_query_binding()
+                .unwrap(),
+        };
 
         let error = engine
             .references(
-                ReferenceRequest::incoming_guid(GUID, None, 10).with_cursor(legacy_cursor),
+                ReferenceRequest::incoming_guid(GUID, None, 10).with_cursor(cursor),
                 &mut AssetLoadBudget::default(),
             )
             .unwrap_err();
 
         assert!(matches!(
             &error,
-            ReferenceQueryError::MissingCursorQueryBinding
+            ReferenceQueryError::CursorQueryPolicyMismatch { .. }
         ));
-        assert_eq!(error.api_code(), ApiErrorCode::InvalidCursor);
+        assert_eq!(error.api_code(), ApiErrorCode::StaleCursor);
+    }
+
+    #[test]
+    fn cursor_without_required_bindings_is_rejected_by_the_protocol() {
+        let stamp = generation(b"legacy-cursor");
+        let result = serde_json::from_value::<ReferenceCursor>(serde_json::json!({
+            "generation": wire::generation_id(stamp.generation),
+            "after_stable_id": "reference-a",
+        }));
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -2453,7 +2481,7 @@ mod tests {
             .coverage
             .next_cursor
             .unwrap();
-        cursor.query_binding = Some("reference-query-v1:not-a-digest".to_owned());
+        cursor.query_binding = "reference-query-v1:not-a-digest".to_owned();
 
         let error = engine
             .references(

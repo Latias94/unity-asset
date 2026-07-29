@@ -18,10 +18,12 @@ use tantivy::schema::{FAST, Field, INDEXED, STORED, STRING, Schema, TEXT};
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, TantivyError};
 use unity_asset_core::{
     AssetLoadBudget, ContractJsonLimits, ContractJsonResourceModel, DigestV1, DigestV1Builder,
-    read_contract_json,
+    ObjectAddress, SourceLocator, read_contract_json,
 };
 use unity_asset_search_core::normalize_for_match;
+use unity_asset_search_protocol::{MAX_PORTABLE_PATH_BYTES, PortablePath};
 
+use crate::analysis::{RawReferenceProjection, ReferenceResolutionProjection};
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
     SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
@@ -33,6 +35,7 @@ use crate::reference_payload::{
 };
 use crate::state::measure_artifact_tree;
 use crate::state::secure_read::{ReadDirectory as SecureReadDirectory, SecureReadError};
+use crate::wire;
 
 const SEARCH_ARTIFACT_DIRECTORY: &str = "search";
 const REFERENCE_ARTIFACT_DIRECTORY: &str = "references";
@@ -61,7 +64,7 @@ const MIN_WRITER_MEMORY_PER_THREAD: usize = 15_000_000;
 const MAX_WRITER_MEMORY_PER_THREAD: usize = u32::MAX as usize - 1_000_000;
 const MAX_WRITER_THREADS: usize = 8;
 // The path catalog exposes this bound before allocating an entry buffer.
-const MAX_PROJECTED_PATH_BYTES: usize = 64 * 1024;
+const MAX_PROJECTED_PATH_BYTES: usize = MAX_PORTABLE_PATH_BYTES;
 
 /// A completed projection whose on-disk layout is safe to discard and rebuild.
 ///
@@ -232,15 +235,87 @@ fn validate_projection(projection: &GenerationProjection) -> Result<()> {
         );
     }
     for document in &projection.search_documents {
-        ensure!(
-            !document.path.is_empty() && document.path.len() <= MAX_PROJECTED_PATH_BYTES,
-            "search projection path for `{}` has {} bytes and violates the non-empty path \
-             contract with a {MAX_PROJECTED_PATH_BYTES}-byte maximum",
-            document.stable_id,
-            document.path.len()
-        );
+        validate_projected_path(
+            "search projection path",
+            &document.stable_id,
+            &document.path,
+        )?;
+    }
+    for document in &projection.reference_documents {
+        validate_reference_paths(document)?;
     }
     Ok(())
+}
+
+fn validate_reference_paths(document: &ReferenceDocument) -> Result<()> {
+    validate_projected_path(
+        "reference projection source path",
+        &document.stable_id,
+        &document.source_path,
+    )?;
+    if let Some(source) = &document.source_object {
+        validate_address_path("reference source object", &document.stable_id, source)?;
+    }
+    if let Some(source) = &document.fact.source_object {
+        validate_address_path("reference fact source object", &document.stable_id, source)?;
+    }
+    match &document.fact.raw_target {
+        RawReferenceProjection::Binary {
+            external: Some(external),
+            ..
+        } if !external.path.is_empty() => {
+            validate_projected_path(
+                "reference binary external path",
+                &document.stable_id,
+                &external.path,
+            )?;
+        }
+        RawReferenceProjection::Binary { .. } | RawReferenceProjection::Yaml { .. } => {}
+    }
+
+    match &document.fact.resolution {
+        ReferenceResolutionProjection::Resolved { target }
+        | ReferenceResolutionProjection::Missing {
+            target: Some(target),
+        } => validate_address_path("reference resolution target", &document.stable_id, target)?,
+        ReferenceResolutionProjection::Unloaded {
+            source: Some(source),
+        } => validate_locator_path("reference unloaded source", &document.stable_id, source)?,
+        ReferenceResolutionProjection::Ambiguous { candidates } => {
+            for candidate in candidates {
+                validate_address_path(
+                    "reference ambiguous candidate",
+                    &document.stable_id,
+                    candidate,
+                )?;
+            }
+        }
+        ReferenceResolutionProjection::Null
+        | ReferenceResolutionProjection::Unloaded { source: None }
+        | ReferenceResolutionProjection::Missing { target: None }
+        | ReferenceResolutionProjection::Invalid => {}
+    }
+    Ok(())
+}
+
+fn validate_projected_path(kind: &str, stable_id: &str, path: &str) -> Result<()> {
+    PortablePath::validate(path).with_context(|| {
+        format!(
+            "{kind} for `{stable_id}` has {} bytes and violates the portable path contract with a \
+             {MAX_PROJECTED_PATH_BYTES}-byte maximum",
+            path.len()
+        )
+    })
+}
+
+fn validate_address_path(kind: &str, stable_id: &str, address: &ObjectAddress) -> Result<()> {
+    validate_locator_path(kind, stable_id, address.source_locator())
+}
+
+fn validate_locator_path(kind: &str, stable_id: &str, locator: &SourceLocator) -> Result<()> {
+    wire::portable_locator(locator)
+        .map(|_| ())
+        .with_context(|| format!("{kind} for `{stable_id}` violates the portable path contract"))
 }
 
 /// Read-only Tantivy directory rooted at an already-opened generation child directory.
@@ -1339,9 +1414,12 @@ mod tests {
     use tantivy::Term;
     use tantivy::merge_policy::NoMergePolicy;
     use tempfile::tempdir;
-    use unity_asset_core::{AssetLoadLimits, AssetLoadUsage, BudgetError, BudgetedJsonError};
+    use unity_asset_core::{
+        AssetLoadLimits, AssetLoadUsage, BudgetError, BudgetedJsonError, FieldPath,
+    };
 
     use super::*;
+    use crate::analysis::{BinaryExternalProjection, ReferenceProjectionFact};
     use crate::projection::ProjectionMetrics;
 
     fn empty_projection() -> GenerationProjection {
@@ -1368,6 +1446,42 @@ mod tests {
             hierarchy_paths: Vec::new(),
             script_symbols: Vec::new(),
             container_source_path: None,
+        }
+    }
+
+    fn projected_reference_document(stable_id: &str) -> ReferenceDocument {
+        let source =
+            ObjectAddress::binary_direct(SourceLocator::path("Assets/Source.asset").unwrap(), 1)
+                .unwrap();
+        ReferenceDocument {
+            stable_id: stable_id.to_owned(),
+            source_path: "Assets/Source.asset".to_owned(),
+            source_kind: "SerializedAsset".to_owned(),
+            source_guid: None,
+            source_object: Some(source.clone()),
+            source_file_id: Some(1),
+            source_class_id: Some(114),
+            fact: ReferenceProjectionFact {
+                source_object: Some(source),
+                source_file_id: Some(1),
+                source_class_id: Some(114),
+                field_path: FieldPath::root(),
+                raw_target: RawReferenceProjection::Binary {
+                    file_id: 0,
+                    path_id: 2,
+                    external: Some(BinaryExternalProjection {
+                        index: 0,
+                        guid: None,
+                        type_id: 0,
+                        path: "Assets/Target.asset".to_owned(),
+                    }),
+                },
+                resolution: ReferenceResolutionProjection::Invalid,
+                diagnostics: Vec::new(),
+                dependency_keys: Vec::new(),
+            },
+            incoming_keys: Vec::new(),
+            outgoing_keys: Vec::new(),
         }
     }
 
@@ -1617,7 +1731,7 @@ mod tests {
             validate_catalog_bytes(&zero)
                 .unwrap_err()
                 .to_string()
-                .contains("expected 1..=65536")
+                .contains(&format!("expected 1..={MAX_PROJECTED_PATH_BYTES}"))
         );
         assert!(
             validate_catalog_bytes(&invalid_utf8)
@@ -1767,7 +1881,11 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("expected 1..=65536"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("expected 1..={MAX_PROJECTED_PATH_BYTES}"))
+        );
     }
 
     #[test]
@@ -1784,7 +1902,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("violates the non-empty path contract")
+                .contains("violates the portable path contract")
         );
         assert!(!directory.path().join(SEARCH_ARTIFACT_DIRECTORY).exists());
         assert!(!directory.path().join(REFERENCE_ARTIFACT_DIRECTORY).exists());
@@ -1801,8 +1919,51 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("violates the non-empty path contract")
+                .contains("violates the portable path contract")
         );
+        assert!(!directory.path().join(SEARCH_ARTIFACT_DIRECTORY).exists());
+        assert!(!directory.path().join(REFERENCE_ARTIFACT_DIRECTORY).exists());
+    }
+
+    #[test]
+    fn projection_rejects_unrepresentable_nested_reference_paths_before_creating_artifacts() {
+        let directory = tempdir().unwrap();
+        let mut projection = empty_projection();
+        let mut external = projected_reference_document("external");
+        let RawReferenceProjection::Binary {
+            external: Some(target),
+            ..
+        } = &mut external.fact.raw_target
+        else {
+            unreachable!();
+        };
+        target.path = "x".repeat(MAX_PROJECTED_PATH_BYTES + 1);
+        projection.reference_documents = vec![external];
+
+        let error = ProjectionStore::build(directory.path(), &projection).unwrap_err();
+
+        assert!(error.to_string().contains("binary external path"));
+        assert!(!directory.path().join(SEARCH_ARTIFACT_DIRECTORY).exists());
+        assert!(!directory.path().join(REFERENCE_ARTIFACT_DIRECTORY).exists());
+    }
+
+    #[test]
+    fn projection_rejects_unrepresentable_resolution_locators_before_creating_artifacts() {
+        let directory = tempdir().unwrap();
+        let mut projection = empty_projection();
+        let mut reference = projected_reference_document("resolution");
+        reference.fact.resolution = ReferenceResolutionProjection::Resolved {
+            target: ObjectAddress::binary_direct(
+                SourceLocator::path("x".repeat(MAX_PROJECTED_PATH_BYTES + 1)).unwrap(),
+                2,
+            )
+            .unwrap(),
+        };
+        projection.reference_documents = vec![reference];
+
+        let error = ProjectionStore::build(directory.path(), &projection).unwrap_err();
+
+        assert!(error.to_string().contains("resolution target"));
         assert!(!directory.path().join(SEARCH_ARTIFACT_DIRECTORY).exists());
         assert!(!directory.path().join(REFERENCE_ARTIFACT_DIRECTORY).exists());
     }

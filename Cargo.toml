@@ -7,6 +7,7 @@ members = [
     "crates/unity-asset-write",
     "crates/unity-asset",
     "crates/unity-asset-search-core",
+    "crates/unity-asset-search-local",
     "crates/unity-asset-search-index",
     "crates/unity-asset-search-protocol",
     "apps/unity-asset-cli",
@@ -30,6 +31,7 @@ unity-asset-binary = { path = "crates/unity-asset-binary", version = "0.4.0" }
 unity-asset-core = { path = "crates/unity-asset-core", version = "0.4.0" }
 unity-asset-decode = { path = "crates/unity-asset-decode", version = "0.4.0" }
 unity-asset-search-core = { path = "crates/unity-asset-search-core", version = "0.4.0" }
+unity-asset-search-local = { path = "crates/unity-asset-search-local", version = "0.4.0" }
 unity-asset-search-index = { path = "crates/unity-asset-search-index", version = "0.4.0" }
 unity-asset-search-protocol = { path = "crates/unity-asset-search-protocol", version = "0.4.0" }
 unity-asset-write = { path = "crates/unity-asset-write", version = "0.4.0" }
@@ -44,6 +46,7 @@ indexmap = { version = "2", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
 blake3 = "1.8"
+sha2 = "0.10"
 
 # Binary parsing
 binrw = "0.15"

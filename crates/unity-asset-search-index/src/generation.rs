@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Deserializer, Serialize};
 use unity_asset_core::{DigestV1, TransactionId, WorkspaceId, WorkspaceRevision};
 
-pub const SEARCH_GENERATION_CONTRACT_VERSION: u16 = 2;
 pub(crate) const SEARCH_GENERATION_STORAGE_CONTRACT_VERSION: u16 = 1;
 const GENERATION_DIRECTORY_PREFIX: &str = "generation-v1-";
 const GENERATION_ID_DOMAIN: &[u8] = b"unity-asset:search-generation:logical:v1\0";
@@ -58,15 +57,13 @@ impl fmt::Display for SearchGenerationId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GenerationStamp {
-    pub contract_version: u16,
-    pub generation: SearchGenerationId,
-    pub workspace: WorkspaceId,
-    pub actual_revision: WorkspaceRevision,
-    pub desired_revision: WorkspaceRevision,
-    pub stale: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GenerationStamp {
+    pub(crate) generation: SearchGenerationId,
+    pub(crate) workspace: WorkspaceId,
+    pub(crate) actual_revision: WorkspaceRevision,
+    pub(crate) desired_revision: WorkspaceRevision,
+    pub(crate) stale: bool,
 }
 
 impl GenerationStamp {
@@ -77,7 +74,6 @@ impl GenerationStamp {
         revision: WorkspaceRevision,
     ) -> Self {
         Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
             generation,
             workspace,
             actual_revision: revision,
@@ -98,40 +94,16 @@ impl GenerationStamp {
 ///
 /// Authoritative workspace change sets are intentionally not representable here; they require
 /// [`crate::SearchIndex::reindex_workspace`] and its revision-bound [`unity_asset::workspace::WorkspaceView`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilesystemReindexScope {
     Full,
     Reconcile,
     ChangedPaths { paths: Vec<PathBuf> },
 }
 
-impl<'de> Deserialize<'de> for FilesystemReindexScope {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-        enum WireScope {
-            Full {},
-            Reconcile {},
-            ChangedPaths { paths: Vec<PathBuf> },
-        }
-
-        Ok(match WireScope::deserialize(deserializer)? {
-            WireScope::Full {} => Self::Full,
-            WireScope::Reconcile {} => Self::Reconcile,
-            WireScope::ChangedPaths { paths } => Self::ChangedPaths { paths },
-        })
-    }
-}
-
-/// Versioned request for one filesystem-backed search generation build.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// In-process request for one filesystem-backed search generation build.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilesystemReindexIntent {
-    pub contract_version: u16,
     pub scope: FilesystemReindexScope,
 }
 
@@ -139,7 +111,6 @@ impl FilesystemReindexIntent {
     #[must_use]
     pub const fn full() -> Self {
         Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
             scope: FilesystemReindexScope::Full,
         }
     }
@@ -147,7 +118,6 @@ impl FilesystemReindexIntent {
     #[must_use]
     pub const fn reconcile() -> Self {
         Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
             scope: FilesystemReindexScope::Reconcile,
         }
     }
@@ -155,113 +125,7 @@ impl FilesystemReindexIntent {
     #[must_use]
     pub fn changed_paths(paths: Vec<PathBuf>) -> Self {
         Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
             scope: FilesystemReindexScope::ChangedPaths { paths },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReindexDisposition {
-    Applied,
-    AlreadyApplied,
-    Coalesced,
-    Queued,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReindexReceipt {
-    pub contract_version: u16,
-    pub disposition: ReindexDisposition,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transaction: Option<TransactionId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_revision: Option<WorkspaceRevision>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub generation: Option<GenerationStamp>,
-    #[serde(default)]
-    pub evidence: ReindexEvidence,
-}
-
-/// Stable, public evidence explaining how a reindex request was executed.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ReindexEvidence {
-    pub forced_full_scan: bool,
-    pub forced_full_analysis: bool,
-    pub full_dependency_scan: bool,
-    pub dependency_candidate_assets: u64,
-    pub dependency_closure_assets: u64,
-    pub analysis: ReindexAnalysisEvidence,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disk_estimate: Option<ReindexDiskEstimate>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub publish_warnings: Vec<String>,
-}
-
-/// Stable counters describing the bounded analysis work performed by one reindex request.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ReindexAnalysisEvidence {
-    pub assets_visited: u64,
-    pub assets_analyzed: u64,
-    pub source_opens: u64,
-    pub source_bytes_read: u64,
-    pub text_sources: u64,
-    pub text_bytes_scanned: u64,
-    pub yaml_documents: u64,
-    pub binary_objects: u64,
-    pub unity_values_visited: u64,
-    pub references_emitted: u64,
-    pub container_entries_emitted: u64,
-    pub truncations_emitted: u64,
-    pub diagnostics_emitted: u64,
-}
-
-/// Serializable disk-space estimate exposed without coupling the API contract to the store module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReindexDiskEstimate {
-    pub existing_generation_bytes: u64,
-    pub old_active_generation_bytes: u64,
-    pub new_generation_bytes: u64,
-    pub publish_peak_bytes: u64,
-    pub retained_bytes_after_publish: u64,
-    pub reclaimable_bytes_after_publish: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GenerationFailure {
-    pub code: String,
-    pub message: String,
-    pub retryable: bool,
-    pub failed_unix_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub desired_revision: Option<WorkspaceRevision>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GenerationStatus {
-    pub contract_version: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active: Option<GenerationStamp>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub building_revision: Option<WorkspaceRevision>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_failure: Option<GenerationFailure>,
-}
-
-impl Default for GenerationStatus {
-    fn default() -> Self {
-        Self {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-            active: None,
-            building_revision: None,
-            last_failure: None,
         }
     }
 }

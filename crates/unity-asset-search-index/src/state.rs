@@ -16,6 +16,7 @@ use unity_asset_core::{
     DigestV1Builder, ObjectAddress, TransactionId, WorkspaceId, WorkspaceRevision,
     read_contract_json,
 };
+use unity_asset_search_protocol::MAX_PORTABLE_PATH_BYTES;
 
 use crate::analysis::{
     AnalysisTruncation, AssetAnalysis, AssetAnalysisBatch, ContainerEntryFact,
@@ -23,7 +24,7 @@ use crate::analysis::{
     WorkspaceObjectFact,
 };
 use crate::generation::{
-    ArtifactTreeEvidence, GenerationArtifactEvidence, ReindexDiskEstimate, SearchGenerationId,
+    ArtifactTreeEvidence, GenerationArtifactEvidence, SearchGenerationId,
     SearchGenerationManifestV1,
 };
 
@@ -96,7 +97,7 @@ const SOURCE_STATE_CONTRACT_VERSION: u16 = 1;
 const MAX_SOURCE_STATE_ASSETS: usize = 1_000_000;
 const MAX_SOURCE_STATE_SCAN_HINTS: usize = 1_000_000;
 const MAX_TRANSACTION_RECEIPTS: usize = 4_096;
-const MAX_SOURCE_STATE_RELATIVE_PATH_BYTES: usize = 64 * 1024;
+const MAX_SOURCE_STATE_RELATIVE_PATH_BYTES: usize = MAX_PORTABLE_PATH_BYTES;
 // Vec starts with at most eight slots for supported non-zero-sized element types, then grows
 // geometrically. Internally tagged Serde enums may temporarily buffer one Content sequence/map
 // while constructing the final typed Vec. Two independently grown buffers therefore require at
@@ -1868,19 +1869,6 @@ pub(crate) struct GenerationDiskEstimate {
     pub publish_peak_bytes: u64,
     pub retained_bytes_after_publish: u64,
     pub reclaimable_bytes_after_publish: u64,
-}
-
-impl From<GenerationDiskEstimate> for ReindexDiskEstimate {
-    fn from(estimate: GenerationDiskEstimate) -> Self {
-        Self {
-            existing_generation_bytes: estimate.existing_generation_bytes,
-            old_active_generation_bytes: estimate.old_active_generation_bytes,
-            new_generation_bytes: estimate.new_generation_bytes,
-            publish_peak_bytes: estimate.publish_peak_bytes,
-            retained_bytes_after_publish: estimate.retained_bytes_after_publish,
-            reclaimable_bytes_after_publish: estimate.reclaimable_bytes_after_publish,
-        }
-    }
 }
 
 /// Deterministic failure injection checkpoints used by state-machine tests.

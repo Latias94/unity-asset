@@ -6,9 +6,9 @@ use super::{
     GenerationStoreError, GenerationStoreOptions, activation_file_name,
 };
 use crate::generation::{
-    ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests, ReindexReceipt,
-    SEARCH_GENERATION_CONTRACT_VERSION, SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
-    SearchGenerationId, SearchGenerationIdentityV1, SearchGenerationManifestV1,
+    ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
+    SEARCH_GENERATION_STORAGE_CONTRACT_VERSION, SearchGenerationId, SearchGenerationIdentityV1,
+    SearchGenerationManifestV1,
 };
 use serde::Serialize;
 use tempfile::TempDir;
@@ -493,21 +493,6 @@ fn manifest_deserialization_rejects_unknown_fields_and_versions() {
     let different_summary =
         serde_json::from_value::<SearchGenerationManifestV1>(different_summary).unwrap();
     assert_ne!(different_summary.generation_id(), manifest.generation_id());
-}
-
-#[test]
-fn reindex_receipt_defaults_missing_execution_evidence() {
-    let receipt = serde_json::from_value::<ReindexReceipt>(serde_json::json!({
-        "contract_version": SEARCH_GENERATION_CONTRACT_VERSION,
-        "disposition": "queued"
-    }))
-    .unwrap();
-
-    assert!(!receipt.evidence.forced_full_scan);
-    assert!(!receipt.evidence.forced_full_analysis);
-    assert_eq!(receipt.evidence.dependency_closure_assets, 0);
-    assert!(receipt.evidence.disk_estimate.is_none());
-    assert!(receipt.evidence.publish_warnings.is_empty());
 }
 
 #[test]

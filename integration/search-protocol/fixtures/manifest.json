@@ -1,0 +1,40 @@
+{
+  "fixture_format": 1,
+  "protocol_revision": 1,
+  "binding": {
+    "project_id": "project-v1:2222222222222222222222222222222222222222222222222222222222222222",
+    "daemon_instance_id": "daemon-v1:33333333333333333333333333333333",
+    "query_policy_id": "query-policy-v1:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "valid": [
+    { "name": "bootstrap hello", "kind": "bootstrap_hello", "path": "bootstrap/hello-v1.json" },
+    { "name": "bootstrap accepted", "kind": "bootstrap_reply", "path": "bootstrap/accepted-v1.json" },
+    { "name": "bootstrap rejected", "kind": "bootstrap_reply", "path": "bootstrap/rejected-v1.json" },
+    { "name": "capabilities request", "kind": "request", "operation": "capabilities", "path": "requests/capabilities-v1.json" },
+    { "name": "status request", "kind": "request", "operation": "status", "path": "requests/status-v1.json" },
+    { "name": "search request", "kind": "request", "operation": "search", "path": "requests/search-v1.json" },
+    { "name": "suggest request", "kind": "request", "operation": "suggest", "path": "requests/suggest-v1.json" },
+    { "name": "references request", "kind": "request", "operation": "references", "path": "requests/references-v1.json" },
+    { "name": "reindex admit request", "kind": "request", "operation": "reindex_admit", "path": "requests/reindex-admit-v1.json" },
+    { "name": "reindex status request", "kind": "request", "operation": "reindex_status", "path": "requests/reindex-status-v1.json" },
+    { "name": "reindex wait request", "kind": "request", "operation": "reindex_wait", "path": "requests/reindex-wait-v1.json" },
+    { "name": "reindex cancel request", "kind": "request", "operation": "reindex_cancel", "path": "requests/reindex-cancel-v1.json" },
+    { "name": "shutdown request", "kind": "request", "operation": "shutdown", "path": "requests/shutdown-v1.json" },
+    { "name": "capabilities response", "kind": "response", "operation": "capabilities", "path": "responses/capabilities-v1.json", "request": "requests/capabilities-v1.json" },
+    { "name": "status response", "kind": "response", "operation": "status", "path": "responses/status-v1.json", "request": "requests/status-v1.json" },
+    { "name": "search response", "kind": "response", "operation": "search", "path": "responses/search-v1.json", "request": "requests/search-v1.json" },
+    { "name": "suggest response", "kind": "response", "operation": "suggest", "path": "responses/suggest-v1.json", "request": "requests/suggest-v1.json" },
+    { "name": "references response", "kind": "response", "operation": "references", "path": "responses/references-v1.json", "request": "requests/references-v1.json" },
+    { "name": "reindex admit response", "kind": "response", "operation": "reindex_admit", "path": "responses/reindex-admit-v1.json", "request": "requests/reindex-admit-v1.json" },
+    { "name": "reindex status response", "kind": "response", "operation": "reindex_status", "path": "responses/reindex-status-v1.json", "request": "requests/reindex-status-v1.json" },
+    { "name": "reindex wait response", "kind": "response", "operation": "reindex_wait", "path": "responses/reindex-wait-v1.json", "request": "requests/reindex-wait-v1.json" },
+    { "name": "reindex cancel response", "kind": "response", "operation": "reindex_cancel", "path": "responses/reindex-cancel-v1.json", "request": "requests/reindex-cancel-v1.json" },
+    { "name": "shutdown response", "kind": "response", "operation": "shutdown", "path": "responses/shutdown-v1.json", "request": "requests/shutdown-v1.json" },
+    { "name": "structured error response", "kind": "response", "operation": "search", "path": "responses/structured-error-v1.json", "request": "requests/search-v1.json" }
+  ],
+  "invalid": [
+    { "name": "request protocol revision mismatch", "kind": "request", "path": "invalid/request-version-mismatch-v1.json", "expected_error": "protocol revision" },
+    { "name": "request project mismatch", "kind": "request", "path": "invalid/request-project-mismatch-v1.json", "expected_error": "project" },
+    { "name": "request daemon instance mismatch", "kind": "request", "path": "invalid/request-instance-mismatch-v1.json", "expected_error": "daemon instance" }
+  ]
+}

@@ -16,9 +16,8 @@ use unity_asset::workspace::{
 use unity_asset::{
     AssetLoadBudget, FieldPath, ObjectAddress, SourceAlias, SourceKind, SourceLocator, UnityValue,
 };
-use unity_asset_search_index::{
-    IndexPaths, ReferenceRequest, ReindexDisposition, SearchIndex, SearchRequest,
-};
+use unity_asset_search_index::{IndexPaths, SearchIndex, SearchRequest};
+use unity_asset_search_protocol::{ReferenceRequest, ReindexDisposition};
 
 const SOURCE_ALIAS: &str = "Assets/agent-native.asset";
 const REPLACEMENT_PAYLOAD: &[u8] = b"OggS-agent-native-workflow";
@@ -251,7 +250,7 @@ fn public_structured_workflow_spans_mutation_recovery_extraction_and_search() {
         .iter()
         .find(|hit| hit.name == "After")
         .expect("search must expose the renamed source");
-    assert_eq!(renamed_hit.location.path, SOURCE_ALIAS);
+    assert_eq!(renamed_hit.location.path.as_str(), SOURCE_ALIAS);
     assert!(
         renamed_hit.location.file_id.is_none() && renamed_hit.location.class_id.is_none(),
         "search locations remain source-level; object identity comes from inspector and references"

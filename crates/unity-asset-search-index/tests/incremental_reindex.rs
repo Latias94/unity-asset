@@ -11,10 +11,10 @@ use unity_asset::{
     SourceId, SourceKind, SourceLocator, TransactionId, UnityClass, UnityValue, WorkspaceRevision,
 };
 use unity_asset_core::{semantic_value_digest, yaml_field_schema_digest};
-use unity_asset_search_index::{
-    ApiErrorCode, FilesystemReindexIntent, GenerationStamp, IndexPaths, ReferenceRequest,
-    ReferencesResponse, ReindexDisposition, ReindexReceipt, SearchIndex, SearchRequest,
-    SearchResponse,
+use unity_asset_search_index::{FilesystemReindexIntent, IndexPaths, SearchIndex, SearchRequest};
+use unity_asset_search_protocol::{
+    ApiErrorCode, GenerationStamp, ReferenceRequest, ReferencesResponse, ReindexDisposition,
+    ReindexReceipt, SearchResponse, ValidateContract,
 };
 
 const OWNER_ALIAS: &str = "Assets/owner.prefab";
@@ -249,7 +249,7 @@ fn search_paths_at_generation(
     search_response_at_generation(index, generation, query)
         .hits
         .into_iter()
-        .map(|hit| hit.path)
+        .map(|hit| hit.path.to_string())
         .collect()
 }
 
@@ -284,7 +284,7 @@ fn incoming_reference_paths_at_generation(
     reference_response_at_generation(index, generation, guid, file_id)
         .hits
         .into_iter()
-        .map(|hit| hit.source_path)
+        .map(|hit| hit.source_path.to_string())
         .collect()
 }
 
@@ -568,6 +568,7 @@ fn late_change_set_after_filesystem_reconciliation_persists_its_receipt() {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
+    recorded.validate().unwrap();
     assert_eq!(recorded.disposition, ReindexDisposition::Applied);
     assert_eq!(recorded.transaction, Some(changes.transaction()));
     assert_eq!(recorded.target_revision, Some(changes.to_revision()));
@@ -674,6 +675,7 @@ fn late_receipt_preserves_a_newer_durable_desired_revision() {
         .index
         .reindex_workspace(late.clone(), &target_view, &mut AssetLoadBudget::default())
         .unwrap();
+    recorded.validate().unwrap();
     assert_eq!(recorded.disposition, ReindexDisposition::Applied);
     assert_eq!(recorded.evidence.analysis, Default::default());
     let recorded_generation = active_generation(&fixture.index);
@@ -693,6 +695,7 @@ fn late_receipt_preserves_a_newer_durable_desired_revision() {
     let duplicate = reopened
         .reindex_workspace(late, &target_view, &mut AssetLoadBudget::default())
         .unwrap();
+    duplicate.validate().unwrap();
     assert_eq!(duplicate.disposition, ReindexDisposition::AlreadyApplied);
     assert_eq!(active_generation(&reopened), recorded_generation);
 }
@@ -762,6 +765,11 @@ fn failed_delivery_keeps_the_stale_generation_queryable_until_reconciliation() {
             .desired_revision,
         Some(target_revision)
     );
+
+    search_response_at_generation(&fixture.index, &stale_generation, "Before");
+    let stale_suggest = fixture.index.suggest("Be", 20).unwrap();
+    assert_eq!(stale_suggest.generation, stale_generation);
+    reference_response_at_generation(&fixture.index, &stale_generation, TARGET_GUID, 100);
 
     drop(fixture.index);
     fixture.index =

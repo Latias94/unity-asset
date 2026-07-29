@@ -19,12 +19,17 @@ use unity_asset_core::{
 };
 use unity_asset_search_core::{
     CandidateFacts, CandidateField, MatchField, MatchKind, QuerySpec, RetrievalEvidence,
-    RetrievalStage, RetrievalTerm, SearchDiagnostic, SearchDiagnosticSeverity, SearchKind,
-    SearchLimits, SearchPolicy, SearchRequest, normalize_for_match, to_terms, try_to_terms,
+    RetrievalStage, RetrievalTerm, SearchDiagnostic, SearchKind, SearchLimits, SearchPolicy,
+    SearchRequest, normalize_for_match, to_terms, try_to_terms,
+};
+use unity_asset_search_protocol::{
+    FuzzyWorkUsageV1, HighlightRangeV1, Location, MAX_SEARCH_HITS_JSON_BYTES, MatchCountV1,
+    SEARCH_PROTOCOL_REVISION, SearchDiagnosticV1, SearchHit, SearchResponse, SuggestResponse,
+    ValidateContract,
 };
 
-use crate::contract::{Location, SearchHit, SearchResponse, SuggestResponse};
-use crate::generation::{GenerationStamp, SEARCH_GENERATION_CONTRACT_VERSION};
+use crate::generation::GenerationStamp;
+use crate::wire;
 
 const MAX_MATCHED_HIERARCHY_PATHS: usize = 6;
 const MAX_MATCHED_SCRIPT_SYMBOLS: usize = 12;
@@ -33,9 +38,6 @@ const MAX_STORED_CANDIDATE_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 // contract at query time.
 const MAX_STORED_HIERARCHY_PATHS: usize = 100_000;
 const MAX_STORED_SCRIPT_SYMBOLS: usize = 4_096;
-const STORED_DOCUMENT_BYTE_LIMIT_DIAGNOSTIC: &str = "candidate_stored_document_byte_limit_exceeded";
-const STORED_PAGE_BYTE_LIMIT_DIAGNOSTIC: &str = "candidate_stored_page_byte_limit_exceeded";
-const STORED_VALUE_COUNT_LIMIT_DIAGNOSTIC: &str = "candidate_stored_value_count_limit_exceeded";
 /// Tantivy fields consumed by the generation-bound query engine.
 ///
 /// The generation writer owns the schema, while this type is the single validation boundary used
@@ -272,7 +274,8 @@ impl QueryEngine {
     pub(crate) fn search(&self, request: SearchRequest) -> Result<SearchResponse> {
         let start = Instant::now();
         let SearchRequest { query, limit } = request;
-        let query = trim_owned_query(query);
+        let response_query = query;
+        let query = trim_owned_query(response_query.clone());
         if query.len() > self.policy.limits.max_query_bytes {
             let mut outcome = self
                 .policy
@@ -285,17 +288,25 @@ impl QueryEngine {
                     actual: query.len(),
                     limit: self.policy.limits.max_query_bytes,
                 });
-            return Ok(SearchResponse {
-                contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-                generation: self.snapshot.generation.clone(),
-                query,
-                took_ms: start.elapsed().as_millis(),
-                match_count: outcome.match_count,
+            return validated_search_response(SearchResponse {
+                protocol_revision: SEARCH_PROTOCOL_REVISION,
+                generation: wire::generation_stamp(&self.snapshot.generation),
+                query_policy_id: wire::query_policy_id(),
+                query: response_query,
+                took_ms: wire::fixed_millis(
+                    start.elapsed().as_millis(),
+                    "search response duration",
+                )?,
+                match_count: MatchCountV1::try_from(outcome.match_count)?,
                 returned_hits: 0,
                 request_limit_truncated: false,
-                fuzzy_work: outcome.fuzzy_work,
+                fuzzy_work: FuzzyWorkUsageV1::try_from(outcome.fuzzy_work)?,
                 hits: Vec::new(),
-                diagnostics: outcome.diagnostics,
+                diagnostics: outcome
+                    .diagnostics
+                    .into_iter()
+                    .map(SearchDiagnosticV1::try_from)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
                 fallback_used: outcome.fallback_used,
             });
         }
@@ -307,17 +318,25 @@ impl QueryEngine {
         let fetch_limit = prepared.candidate_limit();
         if fetch_limit == 0 {
             let outcome = prepared.execute(Vec::new());
-            return Ok(SearchResponse {
-                contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-                generation: self.snapshot.generation.clone(),
-                query,
-                took_ms: start.elapsed().as_millis(),
-                match_count: outcome.match_count,
+            return validated_search_response(SearchResponse {
+                protocol_revision: SEARCH_PROTOCOL_REVISION,
+                generation: wire::generation_stamp(&self.snapshot.generation),
+                query_policy_id: wire::query_policy_id(),
+                query: response_query,
+                took_ms: wire::fixed_millis(
+                    start.elapsed().as_millis(),
+                    "search response duration",
+                )?,
+                match_count: MatchCountV1::try_from(outcome.match_count)?,
                 returned_hits: 0,
                 request_limit_truncated: false,
-                fuzzy_work: outcome.fuzzy_work,
+                fuzzy_work: FuzzyWorkUsageV1::try_from(outcome.fuzzy_work)?,
                 hits: Vec::new(),
-                diagnostics: outcome.diagnostics,
+                diagnostics: outcome
+                    .diagnostics
+                    .into_iter()
+                    .map(SearchDiagnosticV1::try_from)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
                 fallback_used: outcome.fallback_used,
             });
         }
@@ -394,50 +413,66 @@ impl QueryEngine {
         candidates_by_key.extend(fallback_candidates);
 
         let mut hits = Vec::with_capacity(outcome.matches.len());
+        let mut hits_json_bytes = 2_u64;
+        let mut request_limit_truncated = outcome.request_limit_truncated;
         for ranked in outcome.matches {
             let Some(candidate) = candidates_by_key.remove(&ranked.stable_key) else {
                 continue;
             };
-            hits.push(build_search_hit(candidate, ranked));
+            let hit = build_search_hit(candidate, ranked)?;
+            if !push_search_hit_within_json_budget(&mut hits, hit, &mut hits_json_bytes)? {
+                request_limit_truncated = true;
+                break;
+            }
         }
         let returned_hits = hits.len();
 
-        Ok(SearchResponse {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-            generation: self.snapshot.generation.clone(),
-            query,
-            took_ms: start.elapsed().as_millis(),
-            match_count: outcome.match_count,
-            returned_hits,
-            request_limit_truncated: outcome.request_limit_truncated,
-            fuzzy_work: outcome.fuzzy_work,
+        validated_search_response(SearchResponse {
+            protocol_revision: SEARCH_PROTOCOL_REVISION,
+            generation: wire::generation_stamp(&self.snapshot.generation),
+            query_policy_id: wire::query_policy_id(),
+            query: response_query,
+            took_ms: wire::fixed_millis(start.elapsed().as_millis(), "search response duration")?,
+            match_count: MatchCountV1::try_from(outcome.match_count)?,
+            returned_hits: wire::fixed_u32(returned_hits, "search response hit count")?,
+            request_limit_truncated,
+            fuzzy_work: FuzzyWorkUsageV1::try_from(outcome.fuzzy_work)?,
             hits,
-            diagnostics: outcome.diagnostics,
+            diagnostics: outcome
+                .diagnostics
+                .into_iter()
+                .map(SearchDiagnosticV1::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()?,
             fallback_used: outcome.fallback_used,
         })
     }
 
-    pub(crate) fn suggest(&self, prefix: &str, limit: usize) -> SuggestResponse {
+    pub(crate) fn suggest(&self, prefix: &str, limit: usize) -> Result<SuggestResponse> {
         let start = Instant::now();
-        let prefix = prefix.trim();
-        if prefix.is_empty() || limit == 0 {
-            return SuggestResponse {
-                contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-                generation: self.snapshot.generation.clone(),
-                prefix: prefix.to_owned(),
-                took_ms: start.elapsed().as_millis(),
+        let response_prefix = prefix;
+        let execution_prefix = prefix.trim();
+        if execution_prefix.is_empty() || limit == 0 {
+            return Ok(SuggestResponse {
+                protocol_revision: SEARCH_PROTOCOL_REVISION,
+                generation: wire::generation_stamp(&self.snapshot.generation),
+                query_policy_id: wire::query_policy_id(),
+                prefix: response_prefix.to_owned(),
+                took_ms: wire::fixed_millis(
+                    start.elapsed().as_millis(),
+                    "suggest response duration",
+                )?,
                 suggestions: Vec::new(),
-            };
+            });
         }
 
-        let (want_kind, want_path, rest) = if let Some(rest) = prefix.strip_prefix("t:") {
+        let (want_kind, want_path, rest) = if let Some(rest) = execution_prefix.strip_prefix("t:") {
             (true, false, rest)
-        } else if let Some(rest) = prefix.strip_prefix("type:") {
+        } else if let Some(rest) = execution_prefix.strip_prefix("type:") {
             (true, false, rest)
-        } else if let Some(rest) = prefix.strip_prefix("in:") {
+        } else if let Some(rest) = execution_prefix.strip_prefix("in:") {
             (false, true, rest)
         } else {
-            (true, true, prefix)
+            (true, true, execution_prefix)
         };
 
         let mut suggestions = Vec::new();
@@ -460,14 +495,23 @@ impl QueryEngine {
                     .suggest(rest, limit.saturating_sub(suggestions.len())),
             );
         }
+        retain_wire_suggestions(&mut suggestions);
 
-        SuggestResponse {
-            contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
-            generation: self.snapshot.generation.clone(),
-            prefix: prefix.to_owned(),
-            took_ms: start.elapsed().as_millis(),
+        Ok(SuggestResponse {
+            protocol_revision: SEARCH_PROTOCOL_REVISION,
+            generation: wire::generation_stamp(&self.snapshot.generation),
+            query_policy_id: wire::query_policy_id(),
+            prefix: response_prefix.to_owned(),
+            took_ms: wire::fixed_millis(start.elapsed().as_millis(), "suggest response duration")?,
             suggestions,
-        }
+        })
+    }
+}
+
+fn retain_wire_suggestions(suggestions: &mut Vec<String>) {
+    suggestions.retain(|suggestion| SuggestResponse::validate_suggestion(suggestion).is_ok());
+    while SuggestResponse::validate_suggestions(suggestions).is_err() {
+        suggestions.pop();
     }
 }
 
@@ -1012,32 +1056,26 @@ impl CandidateProjectionBudget {
 
     fn try_reserve_stored_document(&mut self, document_bytes: usize) -> bool {
         if document_bytes > MAX_STORED_CANDIDATE_DOCUMENT_BYTES {
-            self.reject(candidate_projection_limit_diagnostic(
-                STORED_DOCUMENT_BYTE_LIMIT_DIAGNOSTIC,
-                document_bytes,
-                MAX_STORED_CANDIDATE_DOCUMENT_BYTES,
-                None,
-            ));
+            self.reject(SearchDiagnostic::CandidateTotalByteLimitExceeded {
+                consumed: document_bytes,
+                limit: MAX_STORED_CANDIDATE_DOCUMENT_BYTES,
+            });
             return false;
         }
 
         let Some(next_total) = self.stored_document_bytes.checked_add(document_bytes) else {
-            self.reject(candidate_projection_limit_diagnostic(
-                STORED_PAGE_BYTE_LIMIT_DIAGNOSTIC,
-                usize::MAX,
-                self.limits.max_total_candidate_bytes,
-                None,
-            ));
+            self.reject(SearchDiagnostic::CandidateTotalByteLimitExceeded {
+                consumed: usize::MAX,
+                limit: self.limits.max_total_candidate_bytes,
+            });
             self.exhausted = true;
             return false;
         };
         if next_total > self.limits.max_total_candidate_bytes {
-            self.reject(candidate_projection_limit_diagnostic(
-                STORED_PAGE_BYTE_LIMIT_DIAGNOSTIC,
-                next_total,
-                self.limits.max_total_candidate_bytes,
-                None,
-            ));
+            self.reject(SearchDiagnostic::CandidateTotalByteLimitExceeded {
+                consumed: next_total,
+                limit: self.limits.max_total_candidate_bytes,
+            });
             self.exhausted = true;
             return false;
         }
@@ -1064,28 +1102,6 @@ impl CandidateProjectionBudget {
         }
         self.retained_bytes = next_total;
         true
-    }
-}
-
-fn candidate_projection_limit_diagnostic(
-    code: &'static str,
-    actual: usize,
-    limit: usize,
-    field: Option<&'static str>,
-) -> SearchDiagnostic {
-    let mut details = serde_json::json!({
-        "actual": actual,
-        "limit": limit,
-    });
-    if let Some(field) = field {
-        details["field"] = serde_json::Value::String(field.to_owned());
-    }
-    SearchDiagnostic::Unknown {
-        contract_version: SearchDiagnostic::WIRE_VERSION,
-        code: code.to_owned(),
-        severity: SearchDiagnosticSeverity::Warning,
-        blocks_execution: false,
-        details,
     }
 }
 
@@ -1275,17 +1291,12 @@ fn collect_stored_context(
 }
 
 fn validate_stored_value_count(
-    field_name: &'static str,
+    _field_name: &'static str,
     actual: usize,
     limit: usize,
 ) -> std::result::Result<(), SearchDiagnostic> {
     if actual > limit {
-        return Err(candidate_projection_limit_diagnostic(
-            STORED_VALUE_COUNT_LIMIT_DIAGNOSTIC,
-            actual,
-            limit,
-            Some(field_name),
-        ));
+        return Err(SearchDiagnostic::CandidateEvidenceLimitExceeded { actual, limit });
     }
     Ok(())
 }
@@ -1455,15 +1466,15 @@ fn collect_search_candidates(
             }
         }
 
-        let location = Location {
-            path: projection_fields
+        let location = wire::location(
+            projection_fields
                 .container_source_path
                 .unwrap_or(projection_fields.path)
                 .to_owned(),
-            guid: projection_fields.guid.map(str::to_owned),
-            file_id: None,
-            class_id: None,
-        };
+            projection_fields.guid.map(str::to_owned),
+            None,
+            None,
+        )?;
         candidates_by_key.insert(
             candidate_key.clone(),
             RetrievedCandidate {
@@ -1497,25 +1508,57 @@ fn collect_search_candidates(
 fn build_search_hit(
     candidate: RetrievedCandidate,
     ranked: unity_asset_search_core::RankedMatch,
-) -> SearchHit {
-    SearchHit {
-        rank: ranked.rank,
+) -> Result<SearchHit> {
+    Ok(SearchHit {
+        rank: wire::fixed_u32(ranked.rank, "search hit rank")?,
         guid: candidate.projection.guid,
-        path: candidate.facts.path,
+        path: wire::portable_path_string(candidate.facts.path)?,
         name: candidate.facts.name,
         kind: candidate.facts.kind,
         stable_id: candidate.projection.stable_id,
         location: candidate.projection.location,
-        ranking_signals: ranked.ranking_signals,
+        ranking_signals: ranked.ranking_signals.into(),
         match_kind: ranked.match_kind,
-        explanation: ranked.explanation,
+        explanation: ranked.explanation.into(),
         matched_hierarchy_paths: candidate.projection.matched_hierarchy_paths,
         matched_script_symbols: candidate.projection.matched_script_symbols,
-        highlight_path_ranges: ranked.highlight_path_ranges,
-        highlight_name_ranges: ranked.highlight_name_ranges,
+        highlight_path_ranges: ranked
+            .highlight_path_ranges
+            .into_iter()
+            .map(HighlightRangeV1::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        highlight_name_ranges: ranked
+            .highlight_name_ranges
+            .into_iter()
+            .map(HighlightRangeV1::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()?,
         highlight_path: ranked.highlight_path,
         highlight_name: ranked.highlight_name,
+    })
+}
+
+fn push_search_hit_within_json_budget(
+    hits: &mut Vec<SearchHit>,
+    hit: SearchHit,
+    encoded_bytes: &mut u64,
+) -> Result<bool> {
+    let hit_bytes = SearchResponse::canonical_hit_json_size(&hit)?;
+    let separator_bytes = u64::from(!hits.is_empty());
+    let next = encoded_bytes
+        .checked_add(separator_bytes)
+        .and_then(|bytes| bytes.checked_add(hit_bytes))
+        .ok_or_else(|| anyhow!("search hit JSON byte count overflow"))?;
+    if next > MAX_SEARCH_HITS_JSON_BYTES {
+        return Ok(false);
     }
+    hits.push(hit);
+    *encoded_bytes = next;
+    Ok(true)
+}
+
+fn validated_search_response(response: SearchResponse) -> Result<SearchResponse> {
+    response.validate()?;
+    Ok(response)
 }
 
 fn build_search_retrieval_query(
@@ -1622,6 +1665,10 @@ fn boosted_text_queries(
 mod tests {
     use super::*;
     use unity_asset_core::{AssetLoadLimits, AssetLoadUsage, BudgetError};
+    use unity_asset_search_protocol::{
+        RequestEnvelope, ResponseEnvelope, ResponseOperation, ResponseOutcome,
+        encode_response_frame,
+    };
 
     fn generous_asset_load_budget() -> AssetLoadBudget {
         AssetLoadBudget::new(AssetLoadLimits::default()).unwrap()
@@ -1639,6 +1686,63 @@ mod tests {
         assert_eq!(query, "Player Controller");
         assert_eq!(query.as_ptr(), pointer);
         assert_eq!(query.capacity(), capacity);
+    }
+
+    #[test]
+    fn suggestion_set_is_trimmed_to_the_wire_byte_contract() {
+        let mut suggestions = (0..8).map(|_| "x".repeat(30 * 1024)).collect::<Vec<_>>();
+        suggestions.insert(0, "x".repeat(32 * 1024 + 1));
+
+        retain_wire_suggestions(&mut suggestions);
+
+        assert!(!suggestions.is_empty());
+        assert!(suggestions.len() < 8);
+        SuggestResponse::validate_suggestions(&suggestions).unwrap();
+    }
+
+    #[test]
+    fn escaped_search_hits_keep_the_largest_frame_safe_prefix() {
+        let request_json =
+            include_str!("../../../integration/search-protocol/fixtures/requests/search-v1.json")
+                .replace("\"limit\":25", "\"limit\":200");
+        let request: RequestEnvelope = serde_json::from_str(&request_json).unwrap();
+        let fixture: ResponseEnvelope = serde_json::from_str(include_str!(
+            "../../../integration/search-protocol/fixtures/responses/search-v1.json"
+        ))
+        .unwrap();
+        let ResponseOutcome::Success(operation) = fixture.into_outcome() else {
+            panic!("search fixture must be successful");
+        };
+        let ResponseOperation::Search(mut response) = *operation else {
+            panic!("search fixture must contain a search response");
+        };
+        let template = response.hits[0].clone();
+        let name = "&".repeat(16 * 1024);
+        let highlighted_name = "&amp;".repeat(16 * 1024);
+        let mut hits = Vec::new();
+        let mut encoded_bytes = 2_u64;
+
+        for ordinal in 0..200_u32 {
+            let mut hit = template.clone();
+            hit.rank = ordinal + 1;
+            hit.name.clone_from(&name);
+            hit.highlight_name = Some(highlighted_name.clone());
+            if !push_search_hit_within_json_budget(&mut hits, hit, &mut encoded_bytes).unwrap() {
+                break;
+            }
+        }
+
+        assert!(!hits.is_empty());
+        assert!(hits.len() < 200);
+        response.returned_hits = u32::try_from(hits.len()).unwrap();
+        response.match_count.value = 200;
+        response.request_limit_truncated = true;
+        response.hits = hits;
+        response.validate().unwrap();
+
+        let envelope = ResponseEnvelope::success(&request, ResponseOperation::Search(response));
+        let frame = encode_response_frame(&envelope, &request).unwrap();
+        assert!(frame.len() <= 16 * 1024 * 1024 + std::mem::size_of::<u32>());
     }
 
     #[test]
@@ -1765,10 +1869,13 @@ mod tests {
         assert!(!budget.try_reserve_stored_document(MAX_STORED_CANDIDATE_DOCUMENT_BYTES + 1));
         assert_eq!(budget.stored_document_bytes, 0);
         assert!(!budget.exhausted);
-        assert_eq!(
-            budget.diagnostics[0].code(),
-            STORED_DOCUMENT_BYTE_LIMIT_DIAGNOSTIC
-        );
+        assert!(matches!(
+            &budget.diagnostics[0],
+            SearchDiagnostic::CandidateTotalByteLimitExceeded {
+                consumed,
+                limit: MAX_STORED_CANDIDATE_DOCUMENT_BYTES,
+            } if *consumed == MAX_STORED_CANDIDATE_DOCUMENT_BYTES + 1
+        ));
     }
 
     #[test]
@@ -1783,10 +1890,13 @@ mod tests {
         assert!(!budget.try_reserve_stored_document(41));
         assert_eq!(budget.stored_document_bytes, 60);
         assert!(budget.exhausted);
-        assert_eq!(
-            budget.diagnostics[0].code(),
-            STORED_PAGE_BYTE_LIMIT_DIAGNOSTIC
-        );
+        assert!(matches!(
+            &budget.diagnostics[0],
+            SearchDiagnostic::CandidateTotalByteLimitExceeded {
+                consumed: 101,
+                limit: 100,
+            }
+        ));
     }
 
     #[test]
@@ -1797,7 +1907,13 @@ mod tests {
         ] {
             let diagnostic = validate_stored_value_count(field_name, limit + 1, limit).unwrap_err();
 
-            assert_eq!(diagnostic.code(), STORED_VALUE_COUNT_LIMIT_DIAGNOSTIC);
+            assert!(matches!(
+                &diagnostic,
+                SearchDiagnostic::CandidateEvidenceLimitExceeded {
+                    actual,
+                    limit: actual_limit,
+                } if *actual == limit + 1 && *actual_limit == limit
+            ));
             assert!(diagnostic.may_hide_matches());
         }
     }
