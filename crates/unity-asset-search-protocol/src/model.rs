@@ -20,6 +20,7 @@ use crate::validation::{ContractValidationError, ValidateContract, ensure_versio
 use crate::{MAX_REFERENCE_RESULTS, QueryPolicyId};
 
 pub const SEARCH_PROTOCOL_REVISION: u16 = 1;
+pub const MAX_API_ERROR_JSON_BYTES: u64 = 224 * 1024;
 pub const MAX_ERROR_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_PORTABLE_PATH_BYTES: usize = 32 * 1024;
 pub const MAX_REINDEX_PUBLISH_WARNING_BYTES: usize = 4 * 1024;
@@ -591,15 +592,8 @@ impl ValidateContract for ReferenceRequest {
                 maximum: u64::from(MAX_REFERENCE_RESULTS),
             });
         }
-        if let ReferenceSelector::Guid { guid, .. } = &self.selector
-            && (guid.len() != 32
-                || !guid
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-        {
-            return Err(ContractValidationError::Inconsistent {
-                field: "references GUID",
-            });
+        if let ReferenceSelector::Guid { guid, .. } = &self.selector {
+            validate_guid("references GUID", guid)?;
         }
         if let Some(cursor) = &self.cursor {
             cursor.validate()?;
@@ -1356,7 +1350,7 @@ impl ValidateContract for ApiError {
         if let Some(generation) = &self.generation {
             generation.validate()?;
         }
-        Ok(())
+        validate_json_limit("API error JSON", self, MAX_API_ERROR_JSON_BYTES)
     }
 }
 
@@ -1409,6 +1403,12 @@ impl ValidateContract for SearchResponse {
                 return Err(ContractValidationError::Inconsistent {
                     field: "search response hit rank",
                 });
+            }
+            if let Some(guid) = &hit.guid {
+                validate_guid("search hit GUID", guid)?;
+            }
+            if let Some(guid) = &hit.location.guid {
+                validate_guid("search hit location GUID", guid)?;
             }
         }
         validate_json_limit(
@@ -1592,6 +1592,11 @@ impl ValidateContract for StatusResponse {
         )?;
         self.generation.validate()?;
         self.capabilities.validate()?;
+        if !self.indexing && self.generation.building_revision.is_some() {
+            return Err(ContractValidationError::Inconsistent {
+                field: "status response indexing state",
+            });
+        }
         Self::validate_paths(&self.project_root, &self.generation_root, &self.scan_roots)
     }
 }
@@ -1657,6 +1662,18 @@ fn ensure_byte_limit(
         })
     } else {
         Ok(())
+    }
+}
+
+fn validate_guid(field: &'static str, guid: &str) -> Result<(), ContractValidationError> {
+    if guid.len() == 32
+        && guid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(ContractValidationError::Inconsistent { field })
     }
 }
 

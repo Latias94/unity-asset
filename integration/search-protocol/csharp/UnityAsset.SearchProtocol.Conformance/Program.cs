@@ -128,6 +128,7 @@ internal static class ConformanceProgram
 
         AssertFramingRejectsLengthMismatch();
         AssertFixedIdsRejectNonCanonicalHex();
+        AssertJsonRequiresCanonicalEncoding(fixtureRoot, binding);
         AssertBootstrapRejectsBindingMismatches(fixtureRoot);
         AssertContractHardening(fixtureRoot, binding);
     }
@@ -175,6 +176,16 @@ internal static class ConformanceProgram
     {
         string uppercase = "project-v1:" + new string('A', 64);
         ExpectFailure(() => ProjectId.Parse(uppercase), "uppercase fixed ID");
+    }
+
+    private static void AssertJsonRequiresCanonicalEncoding(string fixtureRoot, ProtocolBinding binding)
+    {
+        string request = ReadFixtureText(fixtureRoot, "requests/search-v1.json");
+        ExpectFailure(
+            () => BusinessCodec.DecodeRequest(
+                Encoding.UTF8.GetBytes(request.Insert(1, " ")),
+                binding),
+            "non-canonical JSON whitespace");
     }
 
     private static void AssertBootstrapRejectsBindingMismatches(string fixtureRoot)
@@ -261,6 +272,7 @@ internal static class ConformanceProgram
         AssertCanonicalCoreValues(fixtureRoot, binding);
         AssertUnicodeScalarPathOrdering(binding);
         AssertStatusPathBudget(fixtureRoot);
+        AssertErrorFrameBudget(fixtureRoot, binding);
         AssertReindexPublishWarningBudget(fixtureRoot);
     }
 
@@ -328,6 +340,12 @@ internal static class ConformanceProgram
         ExpectFailure(
             () => BusinessCodec.DecodeResponse(SerializeNode(oversizedSearchHit)),
             "search hit JSON byte limit");
+
+        JsonObject invalidGuid = ParseObjectNode(searchResponseText);
+        invalidGuid["value"]!["response"]!["hits"]![0]!["guid"] = "not-a-guid";
+        ExpectFailure(
+            () => BusinessCodec.DecodeResponse(SerializeNode(invalidGuid)),
+            "search hit GUID");
     }
 
     private static void AssertStatusPathBudget(string fixtureRoot)
@@ -355,6 +373,38 @@ internal static class ConformanceProgram
         ExpectFailure(
             () => BusinessCodec.DecodeResponse(SerializeNode(oversizedFailure)),
             "generation failure message byte limit");
+
+        JsonObject idleBuilding = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v1.json"));
+        idleBuilding["value"]!["response"]!["generation"]!["building_revision"] =
+            "blake3-v1:" + new string('b', 64);
+        idleBuilding["value"]!["response"]!["indexing"] = false;
+        ExpectFailure(
+            () => BusinessCodec.DecodeResponse(SerializeNode(idleBuilding)),
+            "idle status building revision");
+    }
+
+    private static void AssertErrorFrameBudget(string fixtureRoot, ProtocolBinding binding)
+    {
+        RequestEnvelopeV1 shutdown = BusinessCodec.DecodeRequest(
+            Encoding.UTF8.GetBytes(ReadFixtureText(fixtureRoot, "requests/shutdown-v1.json")),
+            binding);
+        JsonObject errorNode = ParseObjectNode(
+            ReadFixtureText(fixtureRoot, "responses/structured-error-v1.json"));
+        errorNode["request_id"] = shutdown.RequestId.ToString();
+        errorNode["value"]!["message"] = new string('x', 16 * 1024);
+        ResponseEnvelopeV1 error = BusinessCodec.DecodeResponse(SerializeNode(errorNode));
+        FrameCodec.EncodeResponse(error, shutdown);
+
+        var details = new JsonObject();
+        for (int index = 0; index < 64; index++)
+        {
+            details["detail-" + index.ToString("D2")] = new string('\u0001', 4 * 1024);
+        }
+        errorNode["value"]!["message"] = "failure";
+        errorNode["value"]!["details"] = details;
+        ExpectFailure(
+            () => BusinessCodec.DecodeResponse(SerializeNode(errorNode)),
+            "API error aggregate JSON byte limit");
     }
 
     private static void AssertReindexPublishWarningBudget(string fixtureRoot)
@@ -497,15 +547,22 @@ internal static class ConformanceProgram
             "uppercase workspace ID");
 
         string reindex = ReadFixtureText(fixtureRoot, "requests/reindex-admit-v1.json");
+        BusinessCodec.DecodeRequest(
+            Encoding.UTF8.GetBytes(ReplaceExactly(
+                reindex,
+                "Assets/Prefabs/Player.prefab",
+                "1:/asset",
+                "portable path")),
+            binding);
         ExpectFailure(
             () => BusinessCodec.DecodeRequest(
                 Encoding.UTF8.GetBytes(ReplaceExactly(
                     reindex,
                     "Assets/Prefabs/Player.prefab",
-                    "1:/asset",
+                    "C:/asset",
                     "portable path")),
                 binding),
-            "non-letter drive-like path");
+            "ASCII-letter drive path");
     }
 
     private static void AssertUnicodeScalarPathOrdering(ProtocolBinding binding)

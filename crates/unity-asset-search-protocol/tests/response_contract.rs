@@ -1,14 +1,15 @@
 use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
 use unity_asset_search_protocol::{
     ApiError, ApiErrorCode, DaemonInstanceId, FilesystemReindexIntent, FuzzyWorkUsageV1,
-    GenerationIdV1, GenerationStamp, GenerationStatus, MAX_ERROR_MESSAGE_BYTES,
-    MAX_REINDEX_PUBLISH_WARNING_BYTES, MAX_REINDEX_PUBLISH_WARNINGS, MAX_SEARCH_HITS_JSON_BYTES,
-    MatchCountRelationV1, MatchCountV1, OperationId, PortablePath, ProjectId, QueryPolicyId,
-    ReferenceCoverage, ReferenceDiagnosticCoverage, ReferenceRequest, ReferencesResponse,
-    ReindexAdmitRequest, ReindexDisposition, ReindexEvidence, ReindexOperationState,
-    ReindexOperationStatus, ReindexReceipt, RequestEnvelope, RequestId, RequestOperation,
-    ResponseEnvelope, ResponseOperation, ResponseOutcome, SearchCapabilities, SearchRequest,
-    SearchResponse, StatusResponse, SuggestRequest, SuggestResponse, ValidateContract,
+    GenerationIdV1, GenerationStamp, GenerationStatus, MAX_API_ERROR_JSON_BYTES,
+    MAX_ERROR_MESSAGE_BYTES, MAX_REINDEX_PUBLISH_WARNING_BYTES, MAX_REINDEX_PUBLISH_WARNINGS,
+    MAX_SEARCH_HITS_JSON_BYTES, MatchCountRelationV1, MatchCountV1, OperationId, PortablePath,
+    ProjectId, QueryPolicyId, ReferenceCoverage, ReferenceDiagnosticCoverage, ReferenceRequest,
+    ReferencesResponse, ReindexAdmitRequest, ReindexDisposition, ReindexEvidence,
+    ReindexOperationState, ReindexOperationStatus, ReindexReceipt, RequestEnvelope, RequestId,
+    RequestOperation, ResponseEnvelope, ResponseOperation, ResponseOutcome, SearchCapabilities,
+    SearchRequest, SearchResponse, ShutdownRequest, StatusResponse, SuggestRequest,
+    SuggestResponse, ValidateContract, encode_response_frame,
 };
 
 const GUID: &str = "0123456789abcdef0123456789abcdef";
@@ -214,6 +215,17 @@ fn search_hits_are_bounded_by_their_canonical_json_representation() {
 }
 
 #[test]
+fn search_hit_guids_are_canonical_at_every_location() {
+    let mut response = fixture_search_response();
+    response.hits[0].guid = Some("not-a-guid".to_owned());
+    assert!(response.validate().is_err());
+
+    let mut response = fixture_search_response();
+    response.hits[0].location.guid = Some("A".repeat(32));
+    assert!(response.validate().is_err());
+}
+
+#[test]
 fn status_paths_are_collectively_frame_bounded() {
     let mut response = status(generation(5), query_policy(4));
     response.scan_roots = (0..8)
@@ -221,6 +233,15 @@ fn status_paths_are_collectively_frame_bounded() {
             PortablePath::new(format!("root-{ordinal}/{}", "x".repeat(30 * 1024))).unwrap()
         })
         .collect();
+
+    assert!(response.validate().is_err());
+}
+
+#[test]
+fn idle_status_cannot_claim_a_building_revision() {
+    let mut response = status(generation(5), query_policy(4));
+    response.generation.building_revision =
+        Some(response.generation.active.as_ref().unwrap().actual_revision);
 
     assert!(response.validate().is_err());
 }
@@ -442,6 +463,34 @@ fn structured_errors_validate_protocol_and_query_policy_binding() {
     error.query_policy_id = Some(query_policy(9));
     let response = ResponseEnvelope::error(&request, error);
     assert!(response.validate_for(&request).is_err());
+}
+
+#[test]
+fn maximum_error_message_fits_every_response_frame() {
+    let request = request(RequestOperation::Shutdown(ShutdownRequest {
+        drain_timeout_ms: 0,
+    }));
+    let error = ApiError::new(
+        ApiErrorCode::Internal,
+        "x".repeat(MAX_ERROR_MESSAGE_BYTES),
+        false,
+    );
+    let response = ResponseEnvelope::error(&request, error);
+
+    assert!(encode_response_frame(&response, &request).is_ok());
+}
+
+#[test]
+fn api_error_has_a_collective_json_budget() {
+    let mut error = ApiError::new(ApiErrorCode::Internal, "failure", false);
+    for ordinal in 0..64 {
+        error
+            .details
+            .insert(format!("detail-{ordinal:02}"), "\u{0001}".repeat(4 * 1024));
+    }
+
+    assert!(serde_json::to_vec(&error).unwrap().len() as u64 > MAX_API_ERROR_JSON_BYTES);
+    assert!(error.validate().is_err());
 }
 
 #[test]

@@ -10,6 +10,7 @@ namespace UnityAsset.SearchProtocol.Reference
     internal static class ContractValidator
     {
         private const int MaxErrorMessageBytes = 16 * 1024;
+        private const int MaxApiErrorJsonBytes = 224 * 1024;
         private const int MaxReindexPublishWarningBytes = 4 * 1024;
         private const int MaxReindexPublishWarnings = 64;
         private const int MaxReindexPublishWarningsJsonBytes = 224 * 1024;
@@ -463,7 +464,14 @@ namespace UnityAsset.SearchProtocol.Reference
             {
                 StrictJson.UInt64(timestamp, path + ".last_build_unix_ms");
             }
-            StrictJson.Boolean(StrictJson.Required(response, "indexing", path), path + ".indexing");
+            bool indexing = StrictJson.Boolean(
+                StrictJson.Required(response, "indexing", path),
+                path + ".indexing");
+            JsonElement generation = StrictJson.Required(response, "generation", path);
+            if (!indexing && StrictJson.Optional(generation, "building_revision", out _))
+            {
+                throw new ProtocolValidationException(path + " has a building revision while indexing is false");
+            }
         }
 
         private static void ValidateSearchResponse(JsonElement response, string path, QueryPolicyId envelopePolicy)
@@ -1243,6 +1251,7 @@ namespace UnityAsset.SearchProtocol.Reference
                 StrictJson.String(entry.Value, path + ".details." + entry.Name, 4 * 1024);
                 previous = entry.Name;
             }
+            RequireJsonByteLimit(error, path, MaxApiErrorJsonBytes);
         }
 
         private static void ValidateGenerationStamp(JsonElement generation, string path)

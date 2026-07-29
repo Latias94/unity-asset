@@ -42,10 +42,9 @@ namespace UnityAsset.SearchProtocol.Reference
                 case "capabilities":
                 case "status":
                 case "suggest":
-                    return 256 * 1024;
                 case "reindex_cancel":
                 case "shutdown":
-                    return 16 * 1024;
+                    return 256 * 1024;
                 default:
                     throw new ProtocolValidationException($"unknown response operation '{operationKind}'");
             }

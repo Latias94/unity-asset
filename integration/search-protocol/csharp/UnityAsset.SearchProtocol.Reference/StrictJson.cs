@@ -49,6 +49,11 @@ namespace UnityAsset.SearchProtocol.Reference
                 int collectionEntries = 0;
                 int objectMembers = 0;
                 ValidateStructuralLimits(root, path, ref collectionEntries, ref objectMembers);
+                byte[] canonical = BootstrapCodec.Write(writer => root.WriteTo(writer));
+                if (!utf8Json.AsSpan().SequenceEqual(canonical))
+                {
+                    throw new ProtocolValidationException($"{path} JSON is not canonically encoded");
+                }
                 return root.Clone();
             }
             catch (JsonException error)
@@ -265,7 +270,9 @@ namespace UnityAsset.SearchProtocol.Reference
             {
                 return;
             }
-            bool hasDrivePrefix = value.Length > 1 && value[1] == ':';
+            bool hasDrivePrefix = value.Length > 1
+                && value[1] == ':'
+                && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z'));
             if (value.StartsWith("/", StringComparison.Ordinal) || hasDrivePrefix)
             {
                 throw new ProtocolValidationException($"{path} must be relative");

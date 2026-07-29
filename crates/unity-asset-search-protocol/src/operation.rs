@@ -763,7 +763,10 @@ pub(crate) const fn response_encoded_limit(operation: OperationKind) -> usize {
         | OperationKind::ReindexAdmit
         | OperationKind::ReindexStatus
         | OperationKind::ReindexWait => 16 * 1024 * 1024,
-        OperationKind::Capabilities | OperationKind::Status | OperationKind::Suggest => 256 * 1024,
-        OperationKind::ReindexCancel | OperationKind::Shutdown => 16 * 1024,
+        OperationKind::Capabilities
+        | OperationKind::Status
+        | OperationKind::Suggest
+        | OperationKind::ReindexCancel
+        | OperationKind::Shutdown => 256 * 1024,
     }
 }
