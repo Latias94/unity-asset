@@ -1,6 +1,6 @@
 use unity_asset_search_local::{
-    EndpointDescriptorError, EndpointDescriptorV1, ExecutableFileIdentityV1,
-    ProcessStartIdentityV1, SecurityContextIdV1,
+    EndpointDescriptorError, EndpointDescriptorV1, ProcessIdentityV1, ProcessStartIdentityV1,
+    SecurityContextIdV1,
 };
 use unity_asset_search_protocol::{BOOTSTRAP_VERSION, DaemonInstanceId, ProjectId};
 
@@ -10,7 +10,6 @@ fn descriptor() -> EndpointDescriptorV1 {
         DaemonInstanceId::from_bytes([0x22; 16]),
         4242,
         ProcessStartIdentityV1::from_bytes([0x33; 32]).unwrap(),
-        ExecutableFileIdentityV1::from_bytes([0x44; 32]).unwrap(),
         SecurityContextIdV1::from_bytes([0x55; 32]).unwrap(),
     )
     .unwrap()
@@ -78,7 +77,6 @@ fn endpoint_descriptor_rejects_invalid_versions_and_zero_fields() {
             DaemonInstanceId::from_bytes([0; 16]),
             4242,
             ProcessStartIdentityV1::from_bytes([0x33; 32]).unwrap(),
-            ExecutableFileIdentityV1::from_bytes([0x44; 32]).unwrap(),
             SecurityContextIdV1::from_bytes([0x55; 32]).unwrap(),
         ),
         Err(EndpointDescriptorError::ZeroField {
@@ -92,7 +90,6 @@ fn endpoint_descriptor_rejects_invalid_versions_and_zero_fields() {
             DaemonInstanceId::from_bytes([0x22; 16]),
             4242,
             ProcessStartIdentityV1::from_bytes([0x33; 32]).unwrap(),
-            ExecutableFileIdentityV1::from_bytes([0x44; 32]).unwrap(),
             SecurityContextIdV1::from_bytes([0x55; 32]).unwrap(),
         ),
         Err(EndpointDescriptorError::ZeroField {
@@ -110,7 +107,7 @@ fn endpoint_descriptor_rejects_noncanonical_local_identities() {
         Err(EndpointDescriptorError::Json(_))
     ));
 
-    let zero = encoded.replace(&"44".repeat(32), &"00".repeat(32));
+    let zero = encoded.replace(&"55".repeat(32), &"00".repeat(32));
     assert!(matches!(
         EndpointDescriptorV1::decode_json(zero.as_bytes()),
         Err(EndpointDescriptorError::Json(_))
@@ -154,11 +151,41 @@ fn endpoint_descriptor_enforces_encoded_size_before_parsing() {
         unity_asset_search_local::MAX_ENDPOINT_DESCRIPTOR_BYTES,
         b' ',
     );
-    assert!(EndpointDescriptorV1::decode_json(&exact).is_ok());
+    assert!(matches!(
+        EndpointDescriptorV1::decode_json(&exact),
+        Err(EndpointDescriptorError::NonCanonicalJson)
+    ));
 
     let oversized = vec![b' '; unity_asset_search_local::MAX_ENDPOINT_DESCRIPTOR_BYTES + 1];
     assert!(matches!(
         EndpointDescriptorV1::decode_json(&oversized),
         Err(EndpointDescriptorError::EncodedSizeLimit { .. })
+    ));
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn endpoint_descriptor_binds_the_live_server_process() {
+    let descriptor = EndpointDescriptorV1::for_current_process(
+        ProjectId::from_bytes([0x11; 32]),
+        DaemonInstanceId::from_bytes([0x22; 16]),
+    )
+    .unwrap();
+    let process = ProcessIdentityV1::current().unwrap();
+
+    descriptor.validate_server_process(process).unwrap();
+    let wrong_pid = EndpointDescriptorV1::new(
+        descriptor.project_id(),
+        descriptor.daemon_instance_id(),
+        process.process_id().wrapping_add(1),
+        process.process_start_identity(),
+        process.security_context_id(),
+    )
+    .unwrap();
+    assert!(matches!(
+        wrong_pid.validate_server_process(process),
+        Err(EndpointDescriptorError::BindingMismatch {
+            field: "server_pid"
+        })
     ));
 }

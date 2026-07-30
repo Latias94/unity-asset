@@ -12,15 +12,18 @@ keywords = ["unity", "search", "cli"]
 categories = ["command-line-utilities", "game-development"]
 
 [dependencies]
-anyhow.workspace = true
 clap.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
-reqwest.workspace = true
 unity-asset-core = { workspace = true }
-unity-asset-search-index = { workspace = true }
+unity-asset-search-local = { workspace = true }
 unity-asset-search-protocol = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

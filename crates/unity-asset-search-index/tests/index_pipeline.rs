@@ -9,13 +9,13 @@ use unity_asset_search_index::{
     SearchRequest,
 };
 use unity_asset_search_protocol::{
-    ApiErrorCode, DaemonInstanceId, FuzzyWorkUsageV1, GenerationStamp, HighlightRangeV1, Location,
-    MatchCountV1, MatchExplanationV1, ProjectId, QueryPolicyId, RankingSignalsV1, ReferenceContext,
-    ReferenceCoverage, ReferenceHit, ReferenceObject, ReferenceRequest, ReferencesResponse,
-    ReindexDisposition, ReindexReceipt, RequestEnvelope, RequestId, RequestOperation,
-    ResponseEnvelope, ResponseOperation, SearchCapabilities, SearchDiagnosticV1, SearchHit,
-    SearchRequest as ProtocolSearchRequest, SearchResponse, StatusResponse, SuggestRequest,
-    SuggestResponse,
+    ApiErrorCode, BUSINESS_PROTOCOL_REVISION, DaemonInstanceId, FuzzyWorkUsageV1, GenerationStamp,
+    HighlightRangeV1, Location, MatchCountV1, MatchExplanationV1, ProjectId, QueryPolicyId,
+    RankingSignalsV1, ReferenceContext, ReferenceCoverage, ReferenceHit, ReferenceObject,
+    ReferenceRequest, ReferencesResponse, ReindexDisposition, ReindexReceipt, RequestEnvelope,
+    RequestId, RequestOperation, ResponseEnvelope, ResponseOperation, SearchCapabilities,
+    SearchDiagnosticV1, SearchHit, SearchRequest as ProtocolSearchRequest, SearchResponse,
+    StatusResponse, SuggestRequest, SuggestResponse,
 };
 
 const PREFAB_GUID: &str = "fedcba98765432100123456789abcdef";
@@ -695,7 +695,7 @@ fn search_and_suggest_echo_wire_input_while_executing_trimmed_values() {
     assert_eq!(search.hits.len(), 1);
     assert_eq!(search.generation, active);
     let search_request = RequestEnvelope::new(
-        1,
+        BUSINESS_PROTOCOL_REVISION,
         RequestId::from_bytes([1; 16]),
         ProjectId::from_bytes([2; 32]),
         DaemonInstanceId::from_bytes([3; 16]),
@@ -724,7 +724,7 @@ fn search_and_suggest_echo_wire_input_while_executing_trimmed_values() {
     assert!(!suggest.suggestions.is_empty());
     assert_eq!(suggest.generation, active);
     let suggest_request = RequestEnvelope::new(
-        1,
+        BUSINESS_PROTOCOL_REVISION,
         RequestId::from_bytes([4; 16]),
         ProjectId::from_bytes([2; 32]),
         DaemonInstanceId::from_bytes([3; 16]),

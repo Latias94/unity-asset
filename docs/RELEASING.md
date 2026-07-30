@@ -41,11 +41,12 @@ On tag push (`vMAJOR.MINOR.PATCH`), GitHub Actions:
    5) `unity-asset-decode`
    6) `unity-asset`
    7) `unity-asset-search-core`
-   8) `unity-asset-search-index`
-   9) `unity-asset-search-protocol`
-   10) `unity-asset-cli`
-   11) `unity-asset-search-daemon`
-   12) `unity-asset-search-cli`
+   8) `unity-asset-search-protocol`
+   9) `unity-asset-search-local`
+   10) `unity-asset-search-index`
+   11) `unity-asset-cli`
+   12) `unity-asset-search-daemon`
+   13) `unity-asset-search-cli`
 4. Builds and uploads multi-platform binaries using `cargo-dist`:
    - `unity-asset-search-daemon` (for the Unity Editor plugin)
    - `unity-asset-search-cli` (debug/ops utility)

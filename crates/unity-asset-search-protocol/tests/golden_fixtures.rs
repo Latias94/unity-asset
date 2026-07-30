@@ -1,21 +1,52 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use unity_asset_search_protocol::{
-    BootstrapHelloV1, BootstrapReplyV1, DaemonInstanceId, ProjectId, QueryPolicyId,
-    RequestEnvelope, ResponseEnvelope, ValidateContract,
+    BUSINESS_PROTOCOL_REVISION, BootstrapErrorCode, BootstrapHelloV2, BootstrapReplyV2,
+    DaemonInstanceId, ProjectId, QueryPolicyId, RequestEnvelope, ResponseEnvelope,
+    ValidateContract,
 };
+
+const FROZEN_BUSINESS_V1_INVENTORY_SHA256: &str =
+    "13cf5971f83e9a608c504582a36c442e79a982c9eb9dbad8d447a41c7694022a";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FixtureManifest {
     fixture_format: u16,
     protocol_revision: u16,
+    frozen_inventory: FrozenInventoryReference,
     binding: FixtureBinding,
     valid: Vec<FixtureEntry>,
     invalid: Vec<FixtureEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenInventoryReference {
+    business_revision: u16,
+    path: String,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenBusinessInventory {
+    inventory_format: u16,
+    business_revision: u16,
+    files: Vec<FrozenFixture>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenFixture {
+    path: String,
+    encoded_bytes: usize,
+    sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -45,10 +76,11 @@ fn rust_and_csharp_share_canonical_nonempty_protocol_fixtures() {
     let root = fixture_root();
     let manifest: FixtureManifest =
         serde_json::from_slice(&read_nonempty(&root.join("manifest.json"))).unwrap();
-    assert_eq!(manifest.fixture_format, 1);
-    assert_eq!(manifest.protocol_revision, 1);
+    assert_eq!(manifest.fixture_format, 2);
+    assert_eq!(manifest.protocol_revision, BUSINESS_PROTOCOL_REVISION);
     assert!(!manifest.valid.is_empty());
     assert!(!manifest.invalid.is_empty());
+    assert_frozen_business_v1(&root, &manifest.frozen_inventory);
 
     let project = ProjectId::from_str(&manifest.binding.project_id).unwrap();
     let instance = DaemonInstanceId::from_str(&manifest.binding.daemon_instance_id).unwrap();
@@ -58,13 +90,22 @@ fn rust_and_csharp_share_canonical_nonempty_protocol_fixtures() {
         let bytes = read_canonical(&root.join(&fixture.path));
         match fixture.kind.as_str() {
             "bootstrap_hello" => {
-                let value: BootstrapHelloV1 = serde_json::from_slice(&bytes).unwrap();
+                let value: BootstrapHelloV2 = serde_json::from_slice(&bytes).unwrap();
                 value.validate().unwrap();
                 assert_canonical(fixture, &bytes, &value);
             }
             "bootstrap_reply" => {
-                let value: BootstrapReplyV1 = serde_json::from_slice(&bytes).unwrap();
+                let value: BootstrapReplyV2 = serde_json::from_slice(&bytes).unwrap();
                 value.validate().unwrap();
+                if fixture.name == "bootstrap rejected" {
+                    assert!(matches!(
+                        &value,
+                        BootstrapReplyV2::Rejected {
+                            code: BootstrapErrorCode::NoCommonRevision,
+                            ..
+                        }
+                    ));
+                }
                 assert_canonical(fixture, &bytes, &value);
             }
             "request" => {
@@ -91,17 +132,109 @@ fn rust_and_csharp_share_canonical_nonempty_protocol_fixtures() {
     }
 
     for fixture in &manifest.invalid {
-        assert!(fixture.expected_error.is_some());
-        let request: RequestEnvelope =
-            serde_json::from_slice(&read_canonical(&root.join(&fixture.path))).unwrap();
+        let expected = fixture.expected_error.as_deref().unwrap();
+        let bytes = read_canonical(&root.join(&fixture.path));
+        let error = match fixture.kind.as_str() {
+            "bootstrap_hello" => serde_json::from_slice::<BootstrapHelloV2>(&bytes)
+                .and_then(|value| {
+                    value.validate().map_err(serde::de::Error::custom)?;
+                    Ok(value)
+                })
+                .unwrap_err()
+                .to_string(),
+            "bootstrap_reply" => match serde_json::from_slice::<BootstrapReplyV2>(&bytes) {
+                Ok(reply) => reply
+                    .validate_for(&fixture_hello(&root))
+                    .unwrap_err()
+                    .to_string(),
+                Err(error) => error.to_string(),
+            },
+            "request" => {
+                let request: RequestEnvelope = serde_json::from_slice(&bytes).unwrap();
+                request
+                    .validate_binding(project, instance, query_policy)
+                    .unwrap_err()
+                    .to_string()
+            }
+            other => panic!("unknown invalid fixture kind {other:?}"),
+        };
         assert!(
-            request
-                .validate_binding(project, instance, query_policy)
-                .is_err(),
-            "invalid fixture was accepted: {}",
+            error
+                .to_ascii_lowercase()
+                .contains(&expected.to_ascii_lowercase()),
+            "{}: rejection {error:?} did not identify {expected:?}",
             fixture.name
         );
     }
+}
+
+fn assert_frozen_business_v1(root: &Path, reference: &FrozenInventoryReference) {
+    assert_eq!(reference.business_revision, 1);
+    assert_eq!(reference.sha256, FROZEN_BUSINESS_V1_INVENTORY_SHA256);
+
+    let inventory_bytes = read_canonical(&root.join(&reference.path));
+    assert_eq!(
+        hex::encode(Sha256::digest(&inventory_bytes)),
+        FROZEN_BUSINESS_V1_INVENTORY_SHA256,
+        "frozen business v1 inventory changed"
+    );
+    let inventory: FrozenBusinessInventory = serde_json::from_slice(&inventory_bytes).unwrap();
+    assert_eq!(inventory.inventory_format, 1);
+    assert_eq!(inventory.business_revision, 1);
+    assert!(!inventory.files.is_empty());
+
+    let mut previous = None;
+    let mut inventoried = BTreeSet::new();
+    for fixture in &inventory.files {
+        if let Some(previous) = previous {
+            assert!(
+                previous < fixture.path.as_str(),
+                "frozen inventory is not sorted"
+            );
+        }
+        previous = Some(fixture.path.as_str());
+        assert!(
+            fixture.path.ends_with("-v1.json")
+                && (fixture.path.starts_with("requests/")
+                    || fixture.path.starts_with("responses/")
+                    || fixture.path.starts_with("invalid/request-")),
+            "unexpected frozen business fixture path: {}",
+            fixture.path
+        );
+        assert!(inventoried.insert(fixture.path.clone()));
+
+        let payload = read_canonical(&root.join(&fixture.path));
+        assert_eq!(payload.len(), fixture.encoded_bytes, "{}", fixture.path);
+        assert_eq!(
+            hex::encode(Sha256::digest(&payload)),
+            fixture.sha256,
+            "{} changed after business v1 was frozen",
+            fixture.path
+        );
+    }
+
+    assert_eq!(inventoried, archived_business_v1_paths(root));
+}
+
+fn archived_business_v1_paths(root: &Path) -> BTreeSet<String> {
+    ["requests", "responses", "invalid"]
+        .into_iter()
+        .flat_map(|directory| {
+            fs::read_dir(root.join(directory))
+                .unwrap()
+                .map(move |entry| (directory, entry.unwrap()))
+        })
+        .filter_map(|(directory, entry)| {
+            let name = entry.file_name().into_string().unwrap();
+            let is_business_v1 = name.ends_with("-v1.json")
+                && (directory != "invalid" || name.starts_with("request-"));
+            is_business_v1.then(|| format!("{directory}/{name}"))
+        })
+        .collect()
+}
+
+fn fixture_hello(root: &Path) -> BootstrapHelloV2 {
+    serde_json::from_slice(&read_canonical(&root.join("bootstrap/hello-v2.json"))).unwrap()
 }
 
 fn assert_canonical<T: serde::Serialize>(fixture: &FixtureEntry, bytes: &[u8], value: &T) {

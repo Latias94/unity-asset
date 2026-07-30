@@ -49,7 +49,7 @@ The intended result is not a generic agent command bus or a remote asset server.
 
 #### Local Protocol And Agent Surface
 
-- R1. Replace loopback TCP, unauthenticated read routes, bearer tokens, token rotation, and proxy-aware HTTP clients with execution-principal-scoped local IPC on Unix and Windows, bound to explicit project, daemon instance, and server process identities and verified in both directions before bootstrap data is disclosed.
+- R1. Replace loopback TCP, unauthenticated read routes, bearer tokens, token rotation, and proxy-aware HTTP clients with execution-principal-scoped local IPC on Unix and Windows, bound to explicit project, daemon instance, server process, and lease-owned endpoint-claim identities and verified in both directions before bootstrap data is disclosed. One private publication protocol owns fixed per-artifact staging and quarantine leaves, commit points, conditional withdrawal, and crash recovery for runtime bindings, rendezvous records, and descriptors; a replacement generation is never interpreted through stale discovery evidence.
 - R2. Make `unity-asset-search-protocol` own all versioned request, response, error, capability, status, generation, cursor, and framing contracts without depending on search-index or Tantivy.
 - R3. Use a finite typed operation enum, fixed-width wire values, portable UTF-8 path representations, and strict DTO validation. Reject unknown fields, contradictory terminal states, invalid limits, stale cursors, oversized frames, trailing JSON bytes within a frame, and unsupported contract versions before domain execution. A pipelined second request never enters domain dispatch and closes the connection when detected; the already validated first request may complete.
 - R4. Give the search CLI complete action and context parity: daemon start/attach/instance-bound stop, bootstrap/capabilities, status, search, suggest, incoming and outgoing references, object and GUID selectors, cursors, asynchronous reindex admission/status/wait/cancel, and bounded JSON request input from a path or stdin.
@@ -59,7 +59,7 @@ The intended result is not a generic agent command bus or a remote asset server.
 
 - R6. Version and digest analysis, projection, and query semantics independently from storage and wire versions. Bind analysis and projection identities to persisted source state, generation identity, manifests, status, and rebuild decisions. Bind query-policy identity to status, query responses, and cursors; a query-policy-only change does not rebuild persisted state unless it also changes a persisted projection or schema.
 - R7. Treat a semantics mismatch as a typed rebuild requirement that performs full re-analysis; never classify it as corruption or silently reuse prior analysis.
-- R8. Use one deterministic, execution-principal-private index root for a project regardless of whether `Library/` exists. Default and override roots must be owner-controlled, non-inheriting, no-follow directories; an explicit override that cannot prove those invariants is rejected.
+- R8. Use one deterministic private index root for a project regardless of whether `Library/` exists. Unix roots are effective-UID-private. Windows roots use a protected, non-inheriting logon-session DACL and retain the normal Windows privilege and integrity dominance model; exact `SecurityContextIdV1` equality is an IPC authorization boundary, not a filesystem claim. An explicit override that cannot prove the applicable owner, DACL/mode, and no-follow invariants is rejected.
 - R9. Expose daemon lifecycle, initial reconcile, watcher supervision, active/building generation, semantic compatibility, staleness, and last failure through one state model that distinguishes liveness, query availability, and readiness.
 - R10. Preserve single-writer immutable Search Generations and independent periodic reconcile. A watcher is a latency optimization, not the only recovery path.
 - R11. Replace the unpublished globset patch and `ignore` dependency with a caller-budgeted scanner and project-specific ignore policy whose behavior and allocation bounds are owned by this repository.
@@ -78,8 +78,8 @@ The intended result is not a generic agent command bus or a remote asset server.
 - R18. Use one tag-driven release path. Delete arbitrary-ref asset backfill and require source SHA, tag, crate versions, checksums, binaries, and provenance to describe the same commit.
 - R19. Delete obsolete HTTP/token code, root-level patching, vendored globset, YAML re-export adapters, duplicated media parsers, stale stress helpers, and tests that only preserve removed behavior.
 - R20. Split oversized implementation files only after their invariants move behind deep private modules; do not split cohesive modules or create forwarding-only files.
-- R21. Publish a cross-language IPC contract package with non-empty golden fixtures and a C# codec/reference adapter so the separate Unity plugin can perform a coordinated breaking migration without an HTTP compatibility window.
-- R22. Bound transport resources across connections, not only per frame: connection count, in-flight operations, header/body/idle/write deadlines, response materialization, and long-operation retention all have explicit limits and structured saturation behavior.
+- R21. Publish a cross-language IPC contract package with non-empty golden fixtures, shared positive and negative Bootstrap V2 fixtures, and a C# codec/reference adapter so the separate Unity plugin can perform a coordinated breaking migration without an HTTP compatibility window.
+- R22. Bound transport resources across connections, not only per frame: ordinary and control-reserved session capacity, in-flight operations, header/body/idle/write deadlines, response materialization, and long-operation retention all have explicit limits and structured saturation behavior. Exhausting persistent ordinary sessions must not starve bounded status or shutdown access.
 
 ### Key Flows
 
@@ -129,8 +129,8 @@ The intended result is not a generic agent command bus or a remote asset server.
 
 ### Acceptance Examples
 
-- AE1. Given a different Unix effective UID or a Windows peer with a different user SID, logon SID, integrity level, elevation type, restricted-token state, or AppContainer identity, either endpoint rejects the peer before project metadata is returned.
-- AE2. Given a malicious process that occupies the expected endpoint or replaces a server after descriptor publication, the daemon fails closed and the client rejects the server process identity before sending bootstrap project or instance data; neither side falls back to TCP or an alternate endpoint.
+- AE1. Given a different Unix effective UID or a Windows peer with a different user SID, logon SID, integrity level, elevation type, restricted-token state, or AppContainer identity, either endpoint rejects the peer before bootstrap or business data is returned. The endpoint descriptor is non-secret rendezvous metadata and contains no asset, path, query, result, or mutation content.
+- AE2. Given a malicious process that occupies the expected endpoint, a process crash during binding/descriptor publication, or a daemon replacement between discovery reads, the lease-owned endpoint claim either recovers a complete generation or fails closed. The client rejects the server process identity before sending bootstrap project or instance data and classifies a verified generation change as retryable `EndpointChanged`; neither side falls back to TCP or an alternate endpoint.
 - AE3. Given a declared frame length above the request limit, the daemon closes the connection with a bounded protocol error and allocates no declared-length buffer.
 - AE4. Given unknown JSON fields, trailing JSON bytes, an oversized frame, or an unsupported version, execution does not reach SearchIndex. Given a second request before the first response, the first validated request may complete, but the second never reaches SearchIndex and the connection closes when pipelining is detected.
 - AE5. Given a reindex response with only one terminal field, a still-building terminal status, or mismatched generation IDs, protocol validation rejects it and the CLI exits nonzero.
@@ -148,9 +148,9 @@ The intended result is not a generic agent command bus or a remote asset server.
 - AE17. Given a caller attempts to construct stale or contradictory hierarchy nodes, the public type no longer exists; the Workspace View based recipe either derives a valid plan or returns structured mismatch/cycle diagnostics.
 - AE18. Given a crates.io-style isolated consumer, every published crate resolves without repository patches and all release binaries report the same version and source commit as the release tag.
 - AE19. Given a descriptor for another project or a stale daemon instance, bootstrap and every business request reject the project/instance mismatch before query execution.
-- AE20. Given a reindex connection that drops after admission, the caller can retry its idempotency key, recover the same operation ID, and query queued, coalesced, running, succeeded, failed, expired, or lost status without duplicating the rebuild.
-- AE21. Given slow, partial, idle, or non-reading clients across the configured connection limit, the daemon enforces deadlines and global backpressure while status and already admitted reindex operations remain observable.
-- AE22. Given the published C# fixtures, a matching Unity adapter exchanges every non-empty operation and rejects unsupported protocol versions and mismatched project or daemon instance identities without falling back to HTTP.
+- AE20. Given a reindex connection that drops after admission, the caller can retry the same idempotency key and normalized intent, recover the same operation ID, and query queued, coalesced, running, succeeded, failed, expired, or lost status without duplicating the rebuild. Reusing that key for a different normalized intent returns a non-retryable structured idempotency conflict and admits no work.
+- AE21. Given slow, partial, idle, or non-reading clients across the configured connection limit, the daemon enforces deadlines and global backpressure while a bounded control-reserved lane keeps status and shutdown reachable and already admitted reindex operations observable.
+- AE22. Given the published Rust/C# fixtures, a matching Unity adapter exchanges every non-empty operation and rejects unsupported Bootstrap V2/business revisions, malformed policy identities, and mismatched project or daemon instance identities without falling back to HTTP.
 
 ### Success Criteria
 
@@ -159,7 +159,7 @@ The intended result is not a generic agent command bus or a remote asset server.
 - Every public wire DTO is strict, versioned, semantically validated, and covered by invalid-state tests.
 - Wire DTOs contain no platform-width integers, `u128`, native `PathBuf`, or implementation-only types.
 - Analysis and projection implementation changes have one explicit identity bump point and force a typed full rebuild.
-- A default project has exactly one deterministic private index location and one execution-principal-scoped local endpoint.
+- A default project has exactly one deterministic platform-private index location and one execution-principal-scoped local endpoint.
 - Search scanning is publishable, caller-budgeted, no-follow on supported platforms, and independent of the vendored globset patch.
 - Workspace source admission and baseline replacement install state through one private transaction.
 - Audio/texture inspection is strict and shared by capability, planning, and extraction execution.
@@ -183,6 +183,20 @@ The intended result is not a generic agent command bus or a remote asset server.
 - Long-lived multiplexed IPC, streaming result pages, subscriptions, or unsolicited daemon events.
 - General lossless Unity YAML syntax preservation beyond current workspace requirements.
 - New media families whose decoders do not yet exist.
+- A content-addressed private mapped Asset Source backing, including resident-memory baselines,
+  quota, crash GC, and Windows mapping lifetime. U8 must leave an opaque immutable backing seam
+  but does not implement this storage adapter.
+- Mesh-to-GLB and other new extraction representations. They require a versioned Unity corpus,
+  bounded dependency closure, coordinate-conversion evidence, and GLB reopen/digest gates.
+- ZIP/APK ancestor rebuild, including an explicit fidelity contract for compression method,
+  metadata, duplicate names, ZIP64, determinism, and APK signature invalidation.
+- Planner-owned complete Reference Graph acquisition and deletion of caller graph injection.
+- First-class Asset, Object, Script Symbol, and Container Search Entities, including the required
+  business-protocol revision and corpus-based entity/index/query limits.
+- Deeper traversal over the existing persisted reference projection. A second adjacency artifact
+  is allowed only if corpus benchmarks prove that the current projection cannot meet the target.
+- A fact-composed Capability Catalog after R14/R15 and representation/entity ownership stabilize,
+  and native TypeTree acquisition only after a managed/IL2CPP corpus gate succeeds.
 
 #### Outside This Product's Identity
 
@@ -198,11 +212,11 @@ The intended result is not a generic agent command bus or a remote asset server.
 ### Assumptions
 
 - The user explicitly authorizes breaking changes, deletion, and fearless refactoring; compatibility shims are unnecessary.
-- The local trust boundary is the effective UID on Unix and a matching `SecurityContextIdV1` on Windows. The Windows identity includes user SID, logon SID, integrity level, elevation type, restricted-token state, and AppContainer identity; same-user processes with different effective security contexts are not equivalent peers.
+- The IPC trust boundary is the effective UID on Unix and a matching `SecurityContextIdV1` on Windows. The Windows identity includes user SID, logon SID, integrity level, elevation type, restricted-token state, and AppContainer identity; same-user processes with different effective security contexts are not equivalent IPC peers. Windows storage is protected to the logon session and follows the operating system's ordinary integrity and privilege dominance rules; a higher-privilege process in the same logon session is inside that filesystem boundary.
 - Windows, Linux, and macOS are supported runtime targets. Other targets may compile, but filesystem scan and daemon transport must return typed unsupported-platform errors.
 - The CLI is the primary automation and AI-agent surface in this repository. The separate Unity plugin consumes the same wire fixtures after its own migration.
 - CLI and daemon commands take an explicit project root; the CLI may use the current directory only when it is itself a valid Unity project root and never probes parents. Unity integration passes its project root explicitly.
-- The in-repository C# reference package targets `netstandard2.0`, uses no Unity APIs, and ships source-level platform adapters where that profile lacks a managed IPC or peer-identity API. Actual Unity Editor version support remains an external plugin qualification, not a claim made by this repository.
+- The in-repository C# reference package targets `netstandard2.0`, uses no Unity APIs, and exposes one transport-neutral `Stream` adapter boundary. Platform endpoint discovery, IPC, peer identity, process lifecycle, and concrete Unity Editor support remain owned and qualified by the external plugin repository.
 - The search daemon remains a derived-read-model service. Workspace mutation and publication continue through `unity-asset` Rust APIs and `unity-asset-cli`, never through search IPC.
 - IPC v1 uses a persistent connection with one in-flight request at a time. It does not multiplex, compress, or push unsolicited events; clients use a small bounded connection pool only when parallel callers require it.
 - A valid stale Search Generation may remain queryable during rebuild, but readiness is false until current semantics and desired revision are active.
@@ -212,24 +226,24 @@ The intended result is not a generic agent command bus or a remote asset server.
 ### Key Technical Decisions
 
 - KTD1. **Break instead of layer.** `session-settled: user-directed`. Delete compatibility paths when their replacement lands. The rejected alternative is keeping HTTP, tokens, gitignore, and old public recipe state behind deprecated wrappers, which would preserve the same security and ownership defects.
-- KTD2. Replace local HTTP with execution-principal-scoped IPC plus explicit instance and process binding. The daemon acquires its project lease, creates a random instance ID, binds the platform endpoint, then atomically publishes `EndpointDescriptorV1` with project ID, instance ID, server PID, process start identity, executable file identity, security-context identity, and supported bootstrap version in a private runtime directory. Unix uses a short hashed socket name; client and server both validate endpoint ownership and peer effective UID. Windows uses a first-instance named pipe with remote clients rejected and a protected DACL; both sides compare `SecurityContextIdV1`, and the client verifies the named-pipe server PID plus descriptor process/executable identity before sending bootstrap data. Project and instance IDs bind every business request after bootstrap; no automatic fallback transport exists.
+- KTD2. Replace local HTTP with execution-principal-scoped IPC plus one lease-bound `EndpointClaim` that owns server preparation, crash-atomic binding/rendezvous/descriptor publication, stale recovery, conditional cleanup, and replacement generation checks. A crate-private publication module provides the only prepare, atomic replace, post-commit verification, conditional quarantine withdrawal, and recovery operations. Each artifact has deterministic current, staging, and quarantine names: recovery may remove staging or quarantine only after its authority is held, while an unexpected live staging name fails closed rather than being silently overwritten. Unix uses a short hashed socket name and claims or unlinks a verified leaf only while holding the project lease; client and server both validate endpoint ownership and peer effective UID. Windows publishes one random, single-use, first-instance pipe slot at a time through a crash-atomic volatile rendezvous, creates each pipe directly with the final protected client DACL, rejects remote clients, and rotates before returning an accepted stream; a Tokio/Mio pipe object is never recycled across sessions. Stable product/runtime/cache parents are scoped to the user SID with only create-child/traverse rights, while security-context children use protected non-inheriting logon-context DACLs. No client-visible handle receives pipe-instance creation or ACL/owner mutation rights. Endpoint acceptance and connection return only a `VerifiedLocalStreamV1`; raw OS streams remain transport-private so routing cannot omit peer verification. Both sides compare `SecurityContextIdV1`, and before Bootstrap V2 the client binds the OS-reported peer PID to a stable process-start identity from one verified process snapshot. A descriptor-self-declared executable file identity is intentionally excluded: it adds no authorization inside a same-principal namespace and is unstable when Windows or macOS atomically replaces the executable path. Project and instance IDs bind every business request; no automatic fallback transport exists.
 - KTD3. Use bounded framed JSON, not HTTP-over-IPC. A four-byte big-endian length prefixes each canonical JSON request or response; length is checked before allocation. After bootstrap, a persistent connection carries sequential exchanges with at most one in-flight request and closes after any framing error. Pipelining may be detected only after the first request was dispatched, so the first validated request may finish while the second is never dispatched. Envelopes use fixed-width integers and contain request, project, and instance IDs. The daemon enforces frame/JSON limits, deadlines, connection and in-flight semaphores, bounded response construction, and structured busy/retry evidence.
 - KTD4. Make the protocol crate the dependency floor. It may depend on `unity-asset-core` and the pure `unity-asset-search-core` vocabulary, but never on search-index. Search-index either returns protocol DTOs through a downward dependency or maps internal results at its public boundary. The daemon owns operation dispatch.
 - KTD5. Expose a closed typed operation enum, not a string command bus. Each variant has its own request type, resource model, and validation; responses use an explicit typed result envelope and a shared structured error. The enum includes an instance-bound graceful shutdown operation but cannot express Workspace mutation, PreparedChange, or naked ChangeSet. Adding an operation is a contract version decision.
 - KTD6. Give agents parity through the ordinary CLI. Convenience flags and `--request-json` lower into the same operation enum, receive the same generation and capability context, and emit one machine-readable result. There is no agent-only mutation or hidden workflow endpoint.
 - KTD7. Separate semantic identities by reason. Analyzer, search projection, and reference projection identities enter their cache keys, manifest, and logical generation content identity; query-policy identity is exposed in status and response evidence and binds every cursor or query binding. Storage and wire contract versions remain independent. Any stored semantic mismatch forces full re-analysis rather than selective optimistic reuse. Parent generation, event order, and applied transaction provenance remain activation evidence and do not perturb the logical content ID.
-- KTD8. Model daemon state as orthogonal evidence, not one boolean. Lifecycle, serving availability, generation freshness, reconcile, watcher, and periodic timer status are explicit. A valid stale generation remains queryable with actual/desired evidence; no active generation returns retryable not-ready. Watcher failure degrades observability and latency but periodic reconcile remains independent.
+- KTD8. Model daemon state as orthogonal evidence, not one boolean. Lifecycle, serving availability, generation freshness, reconcile, generation-staging maintenance, watcher, and periodic timer status are explicit. A successful publication may independently report `recovery_required` with bounded cleanup evidence until periodic reconcile removes abandoned staging; this is never rewritten as a generation build failure. A valid stale generation remains queryable with actual/desired evidence; no active generation returns retryable not-ready. Watcher failure degrades observability and latency but periodic reconcile remains independent.
 - KTD9. Replace `ignore` with a repository-owned `SearchIgnoreV1` matcher and a deterministic scanner. The matcher supports a deliberately documented bounded subset compiled into one shared multi-pattern automaton, preserves ordered exclude/re-include behavior, and rejects unsupported syntax. The rejected alternatives are an unpublished root patch, a privately published fork chain, or pretending per-rule regex state is caller-budgeted.
 - KTD10. Treat directory discovery as untrusted input and file handles as authority. The scanner uses a no-follow traversal policy and reopens every consumed file through one anchored root. Unix and Windows implementations share the same public failure semantics; the generic platform implementation refuses sensitive operations.
 - KTD11. Put SourceCatalog and SourceStore behind one in-process, non-serializable state transaction. It owns the expected state Arc, candidate cloning, register/remove/replace operations, joint validation, and preparation of a candidate state. AssetWorkspace installs it with pointer CAS only after any durable publication succeeds; a no-op retains the revision and a stale expected state returns a typed conflict. SourceAdmissionBatch remains the discovery value and does not become another transaction engine.
 - KTD12. Use strict prepared media descriptors. After applying an explicit, corpus-proven Unity-version precedence rule, a shared fallible classifier must produce exactly one valid non-empty effective embedded or streamed payload and records the rule as evidence. A dual payload without an applicable rule is `AmbiguousPayload`; other outcomes distinguish NotApplicable, TypeTreeUnavailable, and InvalidDescriptor. Only TypeTreeUnavailable may enter an explicitly versioned raw parser; malformed TypeTree evidence never falls back heuristically. Decode owns format/container/layout inspection and returns a closed descriptor plus an in-process prepared writer. Extraction serializes only the expected descriptor and re-prepares at execution; it never serializes opaque proof or resolves stream paths independently of Workspace Inspector.
 - KTD13. Move hierarchy derivation behind the recipe. A public typed intent names child, target parent, and placement. The recipe queries a revision-bound Workspace View, derives only the reachable facts needed for validation, detects cycles and bidirectional mismatches, and lowers generic mutations.
-- KTD14. Make release verification precede publication. A cross-platform verifier first creates and unpacks every internal `.crate` archive in dependency order without verification, rejects any packaged manifest that retains a path dependency, then builds temporary consumers in an isolated Cargo home whose consumer-level `[patch.crates-io]` points only to those unpacked internal archives while third-party dependencies resolve from the registry. It builds release binaries and records commit/version/toolchain evidence before `cargo publish`. Artifact attestations supplement checksums; they do not repair a non-reproducible source selection.
+- KTD14. Make release verification precede publication. A release can only start from the peeled signed-tag commit and every release Cargo invocation uses the locked dependency graph. A cross-platform verifier first creates and unpacks every internal `.crate` archive in dependency order without verification, rejects any packaged manifest that retains a path dependency or depends on a root-only patch, then builds temporary consumers in an isolated Cargo home whose consumer-level `[patch.crates-io]` points only to those unpacked internal archives while third-party dependencies resolve from the registry. It builds documented feature combinations and release binaries, then records tag/commit/version/lockfile/toolchain evidence before `cargo publish`. Artifact attestations supplement checksums; they do not repair a non-reproducible source selection.
 - KTD15. Split files around established ownership only. Protocol, transport, lifecycle, state transaction, media descriptor, and anchored filesystem modules are real seams. `source_catalog.rs`, format parsers, and publication persistence stay cohesive unless implementation reveals a second independent responsibility.
-- KTD16. Make reindex a connection-independent, process-lifetime observable operation. Admission returns an operation ID; an optional client idempotency key deduplicates retries within a bounded window; status/wait/cancel are separate typed operations; connection loss never cancels admitted work. Cancellation succeeds only for queued, unmerged work owned exclusively by that operation and never interrupts publication. Terminal records are retained by explicit count and time limits, and restart reports unmatched prior IDs as lost while generation/reconcile state remains authoritative.
-- KTD17. Perform a coordinated protocol break for Unity. Publish JSON schema, non-empty golden request/response fixtures, and a `netstandard2.0` C# bootstrap/framing/DTO reference package with no Unity API dependency. Source-level native adapters own Unix peer credentials and any managed-profile transport gaps. Matching plugin and daemon versions are bundled together; incompatible peers fail during bootstrap and never fall back to the deleted HTTP path. The external plugin repository alone claims and tests concrete Unity Editor versions.
+- KTD16. Make reindex a connection-independent, process-lifetime observable operation owned by the daemon lifecycle rather than the IPC dispatcher. Every startup, watcher, timer, semantic-upgrade, and client admission receives an operation ID. A prepared normalized intent has a domain-separated fixed-width fingerprint; the registry binds an optional client idempotency key to both operation ID and fingerprint, returns the existing ID only for the same intent, and reports a structured non-retryable conflict otherwise. Status/wait/cancel are separate typed operations and connection loss never cancels admitted work. Cancellation succeeds only for queued, unmerged work owned exclusively by that operation and never interrupts publication. Terminal records are retained by explicit count and time limits, and restart reports unmatched prior IDs as lost while generation/reconcile state remains authoritative.
+- KTD17. Perform a coordinated protocol break for Unity. Publish JSON schema, non-empty golden request/response fixtures, and a `netstandard2.0` C# bootstrap/framing/DTO reference package with no Unity API dependency. The reference package stops at a transport-neutral `Stream` interface; source-level native adapters in the external plugin own Unix peer credentials and any managed-profile transport gaps. Matching plugin and daemon versions are bundled together; incompatible peers fail during bootstrap and never fall back to the deleted HTTP path. The external plugin repository alone claims and tests concrete Unity Editor versions.
 - KTD18. Define project location and identity before transport discovery. `ProjectLocatorV1` accepts an explicit existing project root, opens it without following a root link, validates ordinary `Assets` and `ProjectSettings` directories, and derives domain-separated `ProjectIdentityV1` from the platform's stable directory file identity. A rename on the same filesystem preserves identity, a copy or cross-filesystem move receives a new identity, and targets without stable local file identity are unsupported for daemon mode. Linux uses a validated private XDG runtime/cache root with a short `/tmp` fallback, macOS uses a validated private per-user temporary root and `~/Library/Caches`, and Windows uses protected `%LOCALAPPDATA%` runtime/cache roots. Endpoint descriptors and default index roots are keyed by this identity.
-- KTD19. Freeze `BootstrapHelloV1` independently from business revisions. It uses the same bounded four-byte big-endian frame, a small fixed schema and size cap, strict project/instance binding, and a bounded sorted unique list of supported business revisions. The server selects exactly one highest common revision or returns a bootstrap-level incompatibility error; only then may either side parse a versioned business envelope. Rust and C# share bootstrap golden fixtures.
+- KTD19. Freeze `BootstrapHelloV2` independently from business revisions. It uses the same bounded four-byte big-endian frame, a small fixed schema and size cap, strict project/instance binding, a non-zero query-policy identity, and a bounded sorted unique list of supported business revisions. The server selects exactly one highest common revision or returns a bootstrap-level incompatibility error; only then may either side parse a versioned business envelope. Rust and C# share positive and negative bootstrap golden fixtures.
 
 ### High-Level Technical Design
 
@@ -277,7 +291,7 @@ sequenceDiagram
   C->>E: read project, instance, process, and security binding
   C->>T: connect
   T->>T: mutually verify OS identity before payload
-  C->>D: BootstrapHelloV1(project, instance, revisions)
+  C->>D: BootstrapHelloV2(project, instance, policy, revisions)
   D-->>C: selected revision and exact binding
   C->>D: next bounded frame(RequestEnvelope with binding)
   D->>D: validate version, variant, limits, invariants
@@ -365,9 +379,9 @@ flowchart LR
 1. **Contract and identity:** U1.
 2. **Transport and persisted search truth:** U2, U4.
 3. **Runtime lifecycle and agent surface:** U5, U3.
-4. **Scanner and release machinery:** U6, U7.
+4. **Scanner and release eligibility:** U6, then U7's no-publish package, external-consumer, and source-identity barrier. A tag may not enter artifact or crate publication until that barrier passes.
 5. **Workspace and domain depth:** U8, U9, U10.
-6. **Deletion, module boundaries, and conformance:** U11. U7 makes the release path valid, but this plan publishes nothing until U11 and the final Definition of Done pass.
+6. **Deletion, module boundaries, and conformance:** U11, then U7's tag-driven distribution gate. U7 makes the release path valid, but this plan publishes nothing until U11 and the final Definition of Done pass.
 
 ### Implementation Dependency Graph
 
@@ -466,7 +480,7 @@ flowchart LR
 **Approach:**
 
 - Implement `ProjectLocatorV1` and `ProjectIdentityV1` first, including explicit project-root validation, stable platform file identity, private platform runtime/cache roots, and `EndpointDescriptorV1` validation. Keep OS discovery and ACL dependencies out of the protocol crate.
-- Freeze `BootstrapHelloV1` framing and the reference compatibility matrix before defining business envelopes.
+- Freeze `BootstrapHelloV2` framing and the reference compatibility matrix before defining business envelopes.
 - Move wire-visible search, suggest, reference, status, capability, generation stamp, admission, completion, and error DTOs into protocol.
 - Keep pure ranking evidence types in search-core and stable asset identity/diagnostic types in core; protocol may depend downward on those crates.
 - Define fixed-width `ProjectId`, `DaemonInstanceId`, `RequestId`, `OperationId`, and portable path wire values. Remove `usize`, `u128`, and `PathBuf` from every DTO.
@@ -476,7 +490,7 @@ flowchart LR
 - Validate cross-field response invariants, especially reindex completion/status pairing and generation equality.
 - Introduce pure framing helpers that validate four-byte lengths and maximum encoded sizes without owning sockets.
 - Bind every cursor and query binding to `QueryPolicyId`; define a stable stale-cursor error distinct from malformed JSON.
-- Publish non-empty Rust/C# bootstrap, request, response, and structured-error fixtures. The reference project targets `netstandard2.0`, uses no Unity APIs, and keeps platform transport adapters behind explicit interfaces.
+- Publish non-empty Rust/C# bootstrap, request, response, and structured-error fixtures. The reference project targets `netstandard2.0`, uses no Unity APIs, and exposes a public transport-neutral framed session over `Stream`; it contains no platform transport, endpoint discovery, peer-identity, or process-lifecycle adapter.
 
 **Test scenarios:**
 
@@ -500,7 +514,7 @@ flowchart LR
 - Modify `apps/unity-asset-search-daemon/Cargo.toml` and `apps/unity-asset-search-cli/Cargo.toml`.
 - Create `apps/unity-asset-search-daemon/src/ipc/{mod.rs,dispatch.rs,unix.rs,windows.rs}`.
 - Create `apps/unity-asset-search-cli/src/client/{mod.rs,unix.rs,windows.rs}`.
-- Complete platform transport and peer-verification adapters in `crates/unity-asset-search-local/` and the C# reference project.
+- Complete Rust platform transport and peer-verification adapters in `crates/unity-asset-search-local/`; keep the C# reference project transport-neutral and fixture-conformant for the external plugin adapter.
 - Replace or delete `apps/unity-asset-search-daemon/src/app.rs`.
 - Delete `apps/unity-asset-search-daemon/src/security.rs` after pipe/socket security utilities migrate.
 - Modify `apps/unity-asset-search-daemon/src/main.rs` and the search CLI entry point.
@@ -509,23 +523,28 @@ flowchart LR
 
 **Approach:**
 
-- Resolve `ProjectLocatorV1`, acquire the daemon lease, bind the endpoint, then atomically publish a fully validated `EndpointDescriptorV1` in the private runtime root. Do not accept a network URL or silently choose another endpoint.
-- On Unix, create an owner-only endpoint directory and socket, reject symlinked endpoint components, verify socket owner/mode, and compare peer UID with the effective UID on both client and server before sending bootstrap bytes.
-- On Windows, create the first named-pipe instance with remote clients rejected and a protected DACL for the current security context. Server and client both compare `SecurityContextIdV1`; the client additionally obtains the pipe server PID and verifies descriptor PID, process start identity, executable file identity, and process token before sending bootstrap bytes. Reuse and simplify proven ACL construction code from the deleted token store.
+- Resolve `ProjectLocatorV1`, acquire the daemon lease, construct one `EndpointClaim`, and let that deep module own server preparation, stale retirement, crash-atomic `binding.v1`/rendezvous/descriptor publication, conditional cleanup, and replacement generation checks. Put the shared prepare/commit/recover/quarantine protocol in one crate-private module rather than repeating it in binding, descriptor, and rendezvous implementations. Its deterministic staging and quarantine names are recovered only under the binding or daemon authority; no random orphan name may accumulate after a crash. Do not accept a network URL or silently choose another endpoint.
+- Keep raw Unix sockets and Windows pipe objects private to transport adapters. Endpoint connection and acceptance expose only the already peer-verified `VerifiedLocalStreamV1`, so Bootstrap and business routing cannot accidentally run against an unverified local stream.
+- On Unix, create an owner-only endpoint directory and socket, reject symlinked endpoint components, verify socket owner/mode, and compare peer UID with the effective UID on both client and server before sending bootstrap bytes. The lease-owned claim validates and unlinks a stale socket leaf without an unbounded synchronous liveness probe.
+- On Windows, create one random single-use first-instance pipe slot with remote clients rejected and atomically publish only its fixed-width slot identifier. Create every slot directly with a protected final client DACL whose exact rights permit framed I/O but exclude `FILE_CREATE_PIPE_INSTANCE`, DACL/owner mutation, and deletion; rotate to the next slot before returning an accepted stream and never recycle a Tokio/Mio pipe object across sessions. Stable per-user parents grant only create-child/traverse rights to the user SID; per-security-context children retain exact protected logon-context DACLs. Server and client compare `SecurityContextIdV1`; before sending bootstrap bytes, the client binds the operating-system-reported server PID to a stable process-start identity and process-token snapshot and verifies unchanged publication evidence. Do not add a descriptor-self-declared executable identity.
 - Run the frozen bootstrap negotiation only after OS identity succeeds. Then process sequential bounded request/response frames with one in-flight operation until clean close, idle expiry, pipelining, or protocol error.
-- Bound accepted connections, in-flight query and reindex work, read-header/read-body/idle/write time, response construction, and slow-reader buffers. Return structured busy and retry evidence without materializing an oversized response.
+- Give the C# reference package one public transport-neutral session owner that consumes `IProtocolTransportAdapter`, performs Bootstrap V2, retains the accepted binding, and validates each sequential request/response exchange. Native endpoint discovery and peer verification remain exclusively in the external plugin adapter.
+- Bound accepted connections, in-flight query and reindex work, read-header/read-body/idle/write time, response construction, and slow-reader buffers. Reserve bounded short-lived session capacity for status and shutdown so ordinary persistent sessions cannot starve the control plane; non-control requests in that lane receive structured `Busy` and close.
 - Remove axum, reqwest, tower-http, mime, URL base selection, token generation/storage/rotation, authorization headers, and all token documentation.
 - Preserve single-writer daemon lease semantics independently from the removed token store.
 
 **Test scenarios:**
 
-- A same-principal Rust and C# test client completes bootstrap and stub dispatch on Windows and Unix; full business-operation coverage belongs to U3 after U5 supplies operation lifecycle.
+- A same-principal Rust test client completes Bootstrap V2 and stub dispatch on Windows and Unix. The transport-neutral C# reference client completes the same framing/bootstrap exchange over its fixture stream; shared negative fixtures cover project/instance mismatch, unsupported or malformed revision sets, and zero/invalid query-policy identity. Full business-operation coverage belongs to U3 after U5 supplies operation lifecycle, while native C# transport qualification remains an external plugin gate.
 - Oversized, truncated, malformed, idle, and incompatible-version connections terminate with bounded behavior before domain dispatch. A pipelined first request may finish, but the second is never dispatched.
-- Different UID, user SID, logon SID, integrity, elevation, restricted/AppContainer context, remote named-pipe access, and mismatched server process identity are rejected before bootstrap data is disclosed.
-- Wrong project, wrong instance, endpoint collision, stale Unix socket, hostile pipe-name occupation, descriptor/server replacement, symlink/reparse endpoint, permission mismatch, concurrent startup, and daemon crash/restart have deterministic outcomes.
+- Different UID, user SID, logon SID, integrity, elevation, restricted/AppContainer IPC context, remote named-pipe access, and mismatched server process identity are rejected before bootstrap data is disclosed. Additional first-instance creation and opening any slot with ACL mutation rights are denied.
+- Wrong project, wrong instance, endpoint collision, stale Unix socket, hostile pipe-slot occupation, descriptor/server replacement, symlink/reparse endpoint, permission mismatch, concurrent binding publication, daemon crash/restart, and Windows relogin have deterministic outcomes.
+- Fault injection before and after every `binding.v1`, descriptor, and Windows rendezvous commit proves readers never observe partial JSON. A restart under the appropriate binding or daemon authority removes each abandoned deterministic staging/quarantine record, preserves a newer current record, and reports an unexpected live staging record as a typed failure rather than deleting it.
+- Production-scale slow-client tests fill every ordinary session slot with idle, partial-frame, and non-reading clients while reserved status/shutdown sessions remain bounded and responsive.
+- The three-platform matrix runs the complete `unity-asset-search-local` suite, not only library tests, and separately records the controlled cross-principal rejection evidence available on each operating system.
 - No HTTP proxy environment variable changes local client routing.
 
-**Verification:** Daemon and CLI IPC nextest suites pass on Windows locally; Linux/macOS execution-principal and Windows cross-security-context scenarios are required CI gates.
+**Verification:** Daemon, CLI, and search-local IPC nextest suites pass on Windows locally; the platform CI matrix names only existing test targets and runs `transport_contract` plus CLI IPC contracts on Windows, Linux, and macOS. Linux/macOS execution-principal and Windows cross-security-context scenarios are required CI gates.
 
 ### U3. Complete The Agent-Native CLI Contract
 
@@ -546,6 +565,8 @@ flowchart LR
 - Add `--request-json <path|->` as a complete protocol request path. Bound file/stdin bytes before parsing and reject additional positional operation arguments.
 - Lower all convenience flags into protocol DTO constructors, then run the same validation used for JSON input.
 - Give CLI JSON an independent contract version rather than exposing raw transport envelopes. Emit one compact success document on stdout; emit one versioned structured error on stderr for local, transport, protocol, and domain failures. Preserve the daemon error code, retryability, operation ID, and generation evidence, and use stable nonzero exit categories without display-text parsing.
+- Preserve Clap's standard `--help` and `--version` behavior as successful display outcomes before project resolution or daemon discovery; only actual usage failures enter the structured-error contract.
+- Treat `--start-if-needed` as one bounded replacement-aware acquisition loop. Retry typed `EndpointChanged`, a concurrent lease loser, and a predecessor releasing its claim within the caller deadline; never retry identity-integrity or unsafe-endpoint failures, and always reap child processes.
 - Make capability and status output include protocol, semantic, availability, and readiness evidence needed by an agent to decide whether to query, wait, or reindex.
 - Bound benchmark query files and propagate read errors instead of silently using an empty set.
 
@@ -554,6 +575,8 @@ flowchart LR
 - Every operation succeeds through both convenience flags and JSON request input with byte-equivalent semantic requests.
 - Incoming/outgoing, ObjectAddress/GUID, file ID, cursor, idempotent reindex retry, operation status/wait, zero limit, and maximum limit behavior is covered.
 - Oversized stdin, invalid UTF-8 paths, malformed JSON, unknown fields, daemon unavailable, and invalid response invariants produce one structured error and nonzero exit.
+- `--help` and `--version` print their ordinary display output and exit zero without resolving a project or starting a daemon.
+- Real daemon subprocess tests cover concurrent start winner/loser, predecessor replacement, delayed lease release, deadline expiry, child reaping, and one-shot startup failure recovery.
 - A black-box agent flow discovers capabilities, starts reindex, waits for the matching generation, searches, and paginates references without parsing display text.
 - Exhaustive mapping tests require every protocol operation variant to have a daemon dispatch decision and a CLI/agent mapping; intentionally unsupported Unity operations appear in the compatibility matrix rather than disappearing silently.
 - Read commands attach only. Explicit `daemon start`, `daemon stop`, and `--start-if-needed` own lifecycle; stop sends the typed shutdown operation over an already verified project/instance connection. PID metadata is diagnostic only and never authorizes an OS signal to a possibly reused process.
@@ -607,14 +630,17 @@ flowchart LR
 
 **Approach:**
 
-- Centralize lifecycle state, initial reconcile, watcher status, retry schedule, last failure, active/building generation, and shutdown signal.
-- Add a bounded reindex operation registry that separates transport request IDs, client idempotency keys, and server operation IDs. Coalesced admissions retain their relationship, and status/wait survives connection loss within explicit count/time limits.
+- Introduce one `DaemonRuntime`/`LifecycleOwner` that owns the daemon claim and publication, listener, session set, search-index writer lease, coordinator, watcher, timer, operation registry, and every async or blocking task handle. No component may detach work whose lifetime can outlive that owner.
+- Keep session-task ownership outside the stack frame that serves IPC. A service-loop panic first closes admission and joins every owned session and blocking task before it can release endpoint or writer authority; if cleanup itself panics while work may still survive, retain authority until process termination rather than releasing a potentially shared writer lease.
+- Centralize lifecycle state, initial reconcile, watcher status, retry schedule, last failure, active/building generation, and shutdown signal behind one atomic admission gate shared by startup, watcher, timer, semantic-upgrade, and IPC callers.
+- Move the bounded reindex operation registry above IPC dispatch. It separates transport request IDs, client idempotency keys, and server operation IDs, stores the prepared normalized-intent fingerprint with each idempotency binding, rejects conflicting key reuse, and gives internal admissions the same operation lifecycle. Coalesced admissions retain their relationship, and status/wait survives connection loss within explicit count/time limits.
 - Begin serving IPC only after the secure endpoint and lifecycle owner exist. Allow status while booting; reject or serve queries according to explicit availability, never a constant healthy flag.
 - Supervise watcher construction and runtime failure with bounded exponential backoff and an injectable clock. Periodic reconcile remains independent and reports its next run and last outcome separately.
 - Treat an explicitly disabled watcher as configured state, not failure. If both watcher and periodic reconcile are disabled, expose `freshness_unmanaged` so clients never infer ongoing freshness maintenance.
 - Require explicit staging abort on every build error path. Keep Drop best-effort only as a last defense, and reconcile abandoned staging on startup and periodically.
-- Make the typed shutdown operation instance-bound and idempotent. Transition to draining, reject new work, finish or cancel only work allowed by the operation contract, close listeners, join owned tasks, and remove only the still-matching endpoint descriptor. Never authorize shutdown by signaling a PID from metadata.
-- Ensure task failures propagate into lifecycle state and orderly shutdown joins owned tasks.
+- Make the typed shutdown operation instance-bound and idempotent. Atomically close admission before entering draining; existing sessions may observe status and bounded operation state but cannot submit search, wait, cancel, or rebuild work. Repeated requests may only tighten the active absolute drain deadline.
+- Withdraw discovery and close listeners, stop watcher/timer admissions, drain or terminate sessions, complete or contractually cancel coordinator work, and join every owned async and blocking task before releasing the search-index writer lease and daemon claim. A non-cancellable blocking publication keeps its leases until it finishes and is never abandoned at timeout. Never authorize shutdown by signaling a PID from metadata.
+- Remove per-request detached dispatch tasks; task failures propagate into lifecycle state and orderly shutdown observes every owner-held handle.
 
 **Test scenarios:**
 
@@ -622,8 +648,12 @@ flowchart LR
 - Watcher initialization and runtime failures expose diagnostics, retry, and do not disable periodic reconcile.
 - Coordinator panic/task termination becomes degraded/unavailable rather than a healthy process.
 - Cleanup failure remains in structured status and abandoned staging is later removed without touching active generations.
-- Admission response loss, duplicate idempotency key, coalesced scopes, queued-exclusive cancellation, shared/running cancellation rejection, terminal expiry, and daemon restart produce deterministic operation states without duplicate work.
-- Shutdown over a verified IPC session rejects new work, completes or cancels bounded operations, joins tasks, and removes only the matching owned endpoint; repeated shutdown and stale PID metadata never signal an unrelated process.
+- Admission response loss, equivalent reordered/deduplicated intents under one idempotency key, conflicting key reuse, coalesced scopes, queued-exclusive cancellation, shared/running cancellation rejection, terminal expiry, and daemon restart produce deterministic operation states without duplicate work.
+- Two established sessions prove that one can initiate shutdown while the other is immediately rejected by the shared draining gate without increasing coordinator admission counts. Watcher and timer admissions obey the same gate.
+- Shutdown over a verified IPC session rejects new work, dynamically tightens repeated deadlines, completes or cancels bounded operations, joins all async and blocking tasks, and removes only the matching owned endpoint before releasing leases; stale PID metadata never signals an unrelated process.
+- Dropping the runtime handle and immediately destroying the caller's Tokio runtime cannot cancel lifecycle cleanup; daemon and index-writer leases remain held until non-cancellable blocking work finishes, including endpoint-publication failure paths.
+- A forced service-loop panic and a forced cleanup panic both retain endpoint and writer authority while an owned non-cancellable task is blocked; no second daemon can acquire either authority before the contract permits it.
+- A drain-deadline integration scenario keeps one real request blocked, aborts its session at deadline, and proves the runtime still joins the registered blocking work before releasing authority. A second established session may read status and operation status while draining, but search, wait, cancel, and every new admission fail before coordinator dispatch.
 
 **Verification:** Deterministic daemon lifecycle and search-index cleanup suites pass without wall-clock sleeps.
 
@@ -677,8 +707,11 @@ flowchart LR
 
 - Choose the lowest Rust version compatible with edition 2024 and actual dependencies, then make it an explicit workspace contract and CI lane.
 - Pin the release Rust toolchain, cargo-dist version and installer digest, and release-critical action revisions. Keep routine CI updates separately manageable.
-- In dependency order, run `cargo package --no-verify`, unpack every internal archive, and reject packaged manifests that retain path dependencies. Then build temporary consumers in an isolated Cargo home with consumer-local patches only for the unpacked internal archives; all third-party dependencies must resolve from the registry.
-- Validate tag, peeled commit, workspace versions, Cargo.lock, package manifests, and binary version/source evidence before any publish step.
+- Establish a no-publish release-eligibility gate immediately after U6 removes the root-only scanner patch: reject every packaged manifest that retains a path dependency, root-only patch assumption, omitted publishable crate, or dependency-order inversion before tag artifacts or credentials are touched.
+- In dependency order, run `cargo package --no-verify` against the locked graph, unpack every internal archive, and reject packaged manifests that retain path dependencies or unresolved local patch assumptions. Then build temporary consumers in an isolated Cargo home with consumer-local patches only for the unpacked internal archives; all third-party dependencies must resolve from the registry. Cover default and documented feature combinations for every published library surface.
+- Derive the publish list from all publishable workspace crates and validate a topological order. The search segment is `unity-asset-search-core`, `unity-asset-search-protocol`, `unity-asset-search-local`/`unity-asset-search-index`, then daemon and CLI consumers; omission or dependency inversion fails before credentials are used.
+- Run the external C# public-API consumer plus the C# conformance runner and the complete Rust local-transport/CLI contract targets in the Windows, Linux, and macOS matrices; workflow test names must be validated against existing Cargo test targets.
+- Validate tag, peeled commit, workspace versions, Cargo.lock, package manifests, and binary version/source evidence before any publish step. Delete arbitrary-ref backfill: rebuilding a prior release must check out that tag's peeled commit and prove its binary identity before upload.
 - Build all platform binaries from that exact commit, generate checksums and attestations, then publish and attach artifacts through one workflow.
 - Delete old backfill instructions; a rebuild of an old tag must check out and prove that tag's commit.
 
@@ -686,9 +719,12 @@ flowchart LR
 
 - MSRV builds all library targets and reports an actionable failure when a dependency exceeds it.
 - Package verification detects a root-only patch, packaged path dependency, missing unpacked internal package, accidental third-party patch, or version mismatch before any publish credential is used.
+- Package verification proves every publishable crate and documented feature consumer resolves from unpacked archives plus the registry, with no workspace checkout patch or source dependency left in the graph.
 - Release workflow rejects tag/SHA/version disagreement before credentials or publish are used.
 - Dist artifacts, checksums, attestations, and crate metadata carry the same tag and commit.
 - Matching and mismatched C# reference clients exercise bootstrap and every operation in CI; mismatches fail explicitly and no HTTP fallback exists.
+- The release topology rejects an omitted publishable crate or any crate ordered before an internal dependency, including search-local and search-protocol.
+- The release workflow rejects an arbitrary branch/ref backfill and any unpinned release toolchain, action, installer, or unlocked Cargo invocation before upload.
 
 **Verification:** Local package verifier passes sequentially; CI runs MSRV, stable Windows, Ubuntu, and macOS gates; release dry-run produces a complete evidence manifest.
 
@@ -706,6 +742,9 @@ flowchart LR
 **Approach:**
 
 - Give the private transaction exclusive mutable candidate access and explicit operations for register tree, remove subtree, rewrite physical domains, and replace verified content.
+- Make verified immutable content opaque to the transaction. Fingerprint, logical length,
+  ownership, and retained-cost evidence come from the backing owner; transaction APIs must not
+  expose `Arc<[u8]>`, pointer identity, or assume the full logical image is resident.
 - Validate catalog/store ownership, fingerprints, parent-child source topology, aliases, physical domains, and budgets once at commit.
 - Prepare one candidate WorkspaceState only after all operations succeed; install it with expected-state CAS after durable publication. A semantic no-op retains the existing state/revision. Invalidate or advance derived caches from the committed transition, not during candidate mutation.
 - Migrate SourceAdmissionBatch candidate application first, then commit/recovery baseline replacement.
@@ -716,7 +755,7 @@ flowchart LR
 
 - Late conflict, duplicate alias, invalid parent, store fingerprint mismatch, and budget exhaustion leave state and revision unchanged.
 - Multi-source admission and multi-source removal each advance exactly one revision.
-- Verified content replacement preserves source metadata while updating the owned bytes and fingerprint.
+- Verified content replacement preserves source metadata while updating immutable backing and fingerprint evidence.
 - Commit/recovery baseline and discovery admission enforce identical joint invariants.
 
 **Verification:** Workspace state, admission, commit, recovery, and reference-cache nextest suites pass.
@@ -729,6 +768,8 @@ flowchart LR
 
 - Refactor audio and texture converters under `crates/unity-asset-decode/src/` into strict inspect and prepared-write modules.
 - Create closed media descriptor types in decode and expose only validated constructors.
+- Create a private extraction representation module that owns the existing BinaryRaw, YAML,
+  TextAsset, Audio, TexturePng, and SpritePng contracts.
 - Modify `crates/unity-asset/src/workspace/inspection.rs` streamed-resource access where needed.
 - Modify extraction model, reservation, selection, and executor modules.
 - Modify schema resource recipe classification and planner code.
@@ -740,6 +781,11 @@ flowchart LR
 - Reject empty paths, zero or overflowing ranges, declared ranges beyond available bytes, and simultaneous embedded/streamed payloads unless a corpus-proven Unity version rule explicitly owns precedence and emits that evidence.
 - Keep streamed-resource path and byte-range resolution exclusively in Workspace Inspector. Decode receives a revision-bound range/reader and never probes filesystem paths.
 - Return a closed descriptor containing media family, container/encoding, canonical extension, MIME, and bounded output estimate with an in-process prepared writer.
+- Move eligibility, dependency closure, working-set accounting, prepared writer selection,
+  provenance, and diagnostics for the six existing representations behind that private module;
+  extraction retains orchestration, manifest construction, and publication only.
+- Remove decode parser compatibility re-exports after all in-repository callers and tests import
+  the owning binary module directly.
 - Persist only an expected descriptor in extraction plans. Re-prepare at execution and compare descriptor plus destination suffix before staging.
 - Share one pure AudioClip field-shape classifier between capability reporting and lowering, including primary/fallback field precedence and malformed values.
 
@@ -790,6 +836,7 @@ flowchart LR
 - Split oversized daemon, search state, workspace interface, and recovery files only along the ownership established in U1-U10.
 - Consolidate search daemon test helpers under one cross-platform harness; retain zsh only for Unix CI stress scenarios.
 - Remove obsolete imports, features, dependencies, examples, tests, and docs discovered by `rg` and package inspection.
+- Advance the changed business wire contract to a new revision, retain revision-1 fixture bytes as immutable evidence, and reject unsupported cross-revision exchanges during Bootstrap rather than mutating a frozen revision in place.
 - Update README, examples, ADRs, API docs, and architecture diagrams.
 - Add final black-box, package, platform, and fixture conformance suites.
 
@@ -803,8 +850,9 @@ flowchart LR
 
 **Test scenarios:**
 
-- One black-box flow starts the daemon, checks readiness, reindexes, searches, paginates both reference directions, handles stale cursor, and shuts down through structured IPC.
+- One black-box flow starts a real daemon child process, checks readiness, reindexes, searches, paginates both reference directions, handles stale cursor and replacement races, and shuts down through structured IPC. Stub servers remain protocol-unit fixtures and do not satisfy this gate.
 - One agent flow uses only capabilities and JSON requests.
+- One transport-neutral C# session completes Bootstrap and all business operations against the real Rust daemon; frozen revision-1 fixtures remain byte-identical and cross-revision requests fail before business dispatch.
 - One workspace flow admits sources, inspects, prepares media and hierarchy changes, commits, reopens, and observes the new revision/search generation.
 - Package consumers build with default and documented feature combinations on supported platforms.
 - Removed symbol and dependency assertions prevent accidental reintroduction.
@@ -819,8 +867,8 @@ flowchart LR
 - **CLI:** HTTP URL and token flags disappear. An explicit validated project locator selects private index and IPC roots. Reference and JSON request capabilities expand.
 - **Cross-language contract:** Wire counts, durations, IDs, and paths use explicit portable representations; the repository publishes C# reference fixtures for the external Unity consumer.
 - **Persistence:** Search storage contract and generation manifests change. Old valid generations become explicitly stale and rebuildable; corruption remains fail closed.
-- **Filesystem:** The index root moves to a deterministic, execution-principal-private platform cache root. `.gitignore` and `.ignore` no longer affect indexing; `.unity-asset-search-ignore` follows SearchIgnoreV1.
-- **Security:** Trust moves from possession of a bearer token on localhost to mutually verified Unix effective-UID or Windows security-context boundaries, with a private endpoint descriptor and index root. There is no network listener.
+- **Filesystem:** The index root moves to a deterministic platform-private cache root: effective-UID-private on Unix and protected to the Windows logon session under normal privilege/integrity dominance. `.gitignore` and `.ignore` no longer affect indexing; `.unity-asset-search-ignore` follows SearchIgnoreV1.
+- **Security:** IPC authorization moves from possession of a bearer token on localhost to mutually verified Unix effective UID or exact Windows `SecurityContextIdV1`, with a non-secret endpoint descriptor and private index root. There is no network listener. Windows filesystem ACLs are not represented as providing symmetric isolation between elevation or integrity contexts.
 - **Operations:** Readiness and watcher/build failures become structured state. Existing scripts and Unity integrations must migrate to IPC fixtures.
 - **Release:** All published packages are verified outside the workspace, and one tag/commit owns crates and binaries.
 - **Agent parity:** Agents receive the same domain actions, generation context, cursors, capabilities, budgets, and structured failures as human CLI users.
@@ -828,12 +876,12 @@ flowchart LR
 
 ## Risks And Dependencies
 
-- **Windows named-pipe identity correctness:** DACL construction, first-instance behavior, security-context comparison, server PID/start/executable verification, and process-token inspection are high risk. Mitigate with cross-integrity, restricted-token, AppContainer, replacement-server, remote-client, and Codex security review before deleting the token implementation.
+- **Windows named-pipe identity correctness:** Direct final-DACL creation, crash-atomic single-use slot rotation, security-context comparison, server PID/start binding, process-token inspection, and publication replacement detection are high risk. Mitigate with client-rights inspection, create-instance and `WRITE_DAC` denial, cross-integrity, restricted-token, AppContainer, replacement-server, remote-client, rotation/cancellation failure injection, capacity bounds, and Codex security review before completing U2.
 - **Unix credential portability:** Linux and macOS expose peer identity and private runtime roots differently. Hide them behind explicit target modules, verify both client and server, and require platform CI; other Unix targets return unsupported instead of inheriting an unproved `cfg(unix)` path.
 - **External Unity plugin break:** The plugin repository cannot be changed here. Publish the `netstandard2.0` reference source, versioned fixtures, and migration documentation before release, and bump the business protocol revision so old clients fail during the frozen bootstrap. Only the plugin repository claims concrete Editor versions.
-- **Endpoint identity and startup races:** A stale descriptor or competing daemon could target the wrong process. Publish descriptors only after lease and bind, authenticate the server process before bootstrap, bind project/instance on every envelope, and remove endpoints only when ownership still matches.
+- **Endpoint identity and startup races:** A stale descriptor, partial binding, or competing daemon could target the wrong process. Make the project lease a required `EndpointClaim` capability, publish descriptor last through crash-atomic primitives, authenticate the server process before bootstrap, re-read generation evidence across rendezvous discovery, bind project/instance on every envelope, and remove endpoints only when ownership still matches.
 - **Private index-root drift:** Overrides or inherited ACLs could expose or corrupt aggregated project metadata. Revalidate owner, mode/DACL protection, root file identity, and no-follow handles at create, reopen, and publication boundaries.
-- **Transport resource amplification:** Small per-frame limits do not bound many slow clients. Enforce global semaphores, deadlines, bounded response builders, and operation retention with exact-limit stress tests.
+- **Transport resource amplification:** Small per-frame limits do not bound many slow clients. Enforce ordinary plus control-reserved session capacity, short reserved-lane deadlines, global dispatch semaphores, bounded response builders, and operation retention with exact-limit stress tests.
 - **Ignore behavior break:** Projects using root gitignore rules will index different files. Make the new policy file and migration examples explicit; do not silently emulate partial Git semantics.
 - **Index rebuild cost:** Semantic mismatch intentionally forces a full rebuild. Preserve stale query availability, expose progress, and benchmark representative Unity projects.
 - **Scanner path races:** Discovery and open are separate. Treat discovery as a hint, authorize reads only through anchored handles, and revalidate snapshots before generation publication.

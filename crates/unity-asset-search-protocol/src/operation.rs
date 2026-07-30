@@ -728,7 +728,7 @@ fn ensure_protocol_revision(actual: u16) -> Result<(), ContractValidationError> 
     if actual == BUSINESS_PROTOCOL_REVISION {
         Ok(())
     } else {
-        Err(ContractValidationError::UnsupportedVersion {
+        Err(ContractValidationError::UnsupportedRevision {
             contract: "business protocol",
             actual,
             expected: BUSINESS_PROTOCOL_REVISION,

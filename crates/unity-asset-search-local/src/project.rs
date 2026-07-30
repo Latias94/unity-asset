@@ -252,8 +252,9 @@ mod platform {
     use sha2::Digest as _;
     use sha2::Sha256;
 
-    const DIRECTORY_FLAGS: OFlags =
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    fn directory_flags() -> OFlags {
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+    }
 
     pub(super) struct ReadDirectory {
         descriptor: OwnedFd,
@@ -270,7 +271,7 @@ mod platform {
                 ));
             };
             let mut descriptor =
-                openat(CWD, start, DIRECTORY_FLAGS, Mode::empty()).map_err(io::Error::from)?;
+                openat(CWD, start, directory_flags(), Mode::empty()).map_err(io::Error::from)?;
             for component in path.components() {
                 match component {
                     Component::RootDir => {}
@@ -317,7 +318,7 @@ mod platform {
     fn open_directory_at(parent: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
         validate_leaf(name)?;
         let descriptor =
-            openat(parent, name, DIRECTORY_FLAGS, Mode::empty()).map_err(io::Error::from)?;
+            openat(parent, name, directory_flags(), Mode::empty()).map_err(io::Error::from)?;
         let opened = fstat(&descriptor).map_err(io::Error::from)?;
         let opened_identity = directory_identity(&opened)?;
         let named = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;

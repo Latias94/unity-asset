@@ -12,6 +12,12 @@ pub enum ContractValidationError {
         actual: u16,
         expected: u16,
     },
+    #[error("unsupported {contract} revision {actual}; expected {expected}")]
+    UnsupportedRevision {
+        contract: &'static str,
+        actual: u16,
+        expected: u16,
+    },
     #[error("{field} must not be empty")]
     Empty { field: &'static str },
     #[error("{field} contains {actual} entries; maximum is {maximum}")]
@@ -47,6 +53,22 @@ pub(crate) fn ensure_version(
         Ok(())
     } else {
         Err(ContractValidationError::UnsupportedVersion {
+            contract,
+            actual,
+            expected,
+        })
+    }
+}
+
+pub(crate) fn ensure_revision(
+    contract: &'static str,
+    actual: u16,
+    expected: u16,
+) -> Result<(), ContractValidationError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ContractValidationError::UnsupportedRevision {
             contract,
             actual,
             expected,

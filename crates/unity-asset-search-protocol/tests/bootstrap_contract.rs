@@ -1,10 +1,10 @@
 use unity_asset_core::AssetLoadBudget;
 use unity_asset_search_protocol::{
-    ApiError, ApiErrorCode, BOOTSTRAP_VERSION, BootstrapHelloV1, BootstrapReplyV1,
-    DaemonInstanceId, FrameLimits, FramingError, ProjectId, QueryPolicyId, ReferenceRequest,
-    RequestEnvelope, RequestId, RequestOperation, ResponseEnvelope, SearchRequest, decode_frame,
-    decode_request_frame, decode_response_frame, encode_frame, encode_request_frame,
-    encode_response_frame,
+    ApiError, ApiErrorCode, BOOTSTRAP_VERSION, BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2,
+    BootstrapReplyV2, DaemonInstanceId, FrameLimits, FramingError, ProjectId, QueryPolicyId,
+    ReferenceRequest, RequestEnvelope, RequestId, RequestOperation, ResponseEnvelope,
+    SearchRequest, decode_frame, decode_request_frame, decode_response_frame, encode_frame,
+    encode_request_frame, encode_response_frame,
 };
 
 fn project_id() -> ProjectId {
@@ -15,63 +15,95 @@ fn instance_id() -> DaemonInstanceId {
     DaemonInstanceId::from_bytes([0x22; 16])
 }
 
+fn query_policy_id() -> QueryPolicyId {
+    QueryPolicyId::from_bytes([0x55; 32])
+}
+
 #[test]
 fn bootstrap_is_frozen_before_business_revision_negotiation() {
-    let hello = BootstrapHelloV1::new(project_id(), instance_id(), vec![1, 3, 7]).unwrap();
+    let hello = BootstrapHelloV2::new(
+        project_id(),
+        instance_id(),
+        vec![BUSINESS_PROTOCOL_REVISION],
+    )
+    .unwrap();
     let encoded = encode_frame(&hello, FrameLimits::bootstrap()).unwrap();
     let mut budget = AssetLoadBudget::default();
-    let decoded: BootstrapHelloV1 =
+    let decoded: BootstrapHelloV2 =
         decode_frame(&encoded, &mut budget, FrameLimits::bootstrap()).unwrap();
 
     assert_eq!(decoded, hello);
     assert_eq!(decoded.bootstrap_version(), BOOTSTRAP_VERSION);
-    assert_eq!(decoded.supported_revisions(), &[1, 3, 7]);
+    assert_eq!(decoded.supported_revisions(), &[BUSINESS_PROTOCOL_REVISION]);
 
-    let reply = BootstrapReplyV1::negotiate(&decoded, project_id(), instance_id(), &[2, 3, 4]);
-    assert_eq!(reply.selected_revision(), Some(3));
+    let reply = BootstrapReplyV2::negotiate(
+        &decoded,
+        project_id(),
+        instance_id(),
+        query_policy_id(),
+        &[BUSINESS_PROTOCOL_REVISION],
+    );
+    assert_eq!(reply.selected_revision(), Some(BUSINESS_PROTOCOL_REVISION));
+    assert_eq!(reply.query_policy_id(), Some(query_policy_id()));
     reply.validate_for(&decoded).unwrap();
 }
 
 #[test]
 fn bootstrap_rejects_unsorted_duplicate_and_unbound_inputs() {
-    assert!(BootstrapHelloV1::new(project_id(), instance_id(), vec![]).is_err());
-    assert!(BootstrapHelloV1::new(project_id(), instance_id(), vec![2, 1]).is_err());
-    assert!(BootstrapHelloV1::new(project_id(), instance_id(), vec![1, 1]).is_err());
+    assert!(BootstrapHelloV2::new(project_id(), instance_id(), vec![]).is_err());
+    assert!(BootstrapHelloV2::new(project_id(), instance_id(), vec![2, 1]).is_err());
+    assert!(BootstrapHelloV2::new(project_id(), instance_id(), vec![1, 1]).is_err());
 
-    let hello = BootstrapHelloV1::new(project_id(), instance_id(), vec![1]).unwrap();
+    let hello = BootstrapHelloV2::new(
+        project_id(),
+        instance_id(),
+        vec![BUSINESS_PROTOCOL_REVISION],
+    )
+    .unwrap();
     assert!(
-        BootstrapReplyV1::negotiate(
+        BootstrapReplyV2::negotiate(
             &hello,
             ProjectId::from_bytes([0x33; 32]),
             instance_id(),
-            &[1],
+            query_policy_id(),
+            &[BUSINESS_PROTOCOL_REVISION],
         )
         .selected_revision()
         .is_none()
+    );
+    assert!(
+        BootstrapReplyV2::negotiate(&hello, project_id(), instance_id(), query_policy_id(), &[1],)
+            .selected_revision()
+            .is_none()
     );
 }
 
 #[test]
 fn framed_json_is_exact_and_rejects_oversized_declared_lengths() {
-    let hello = BootstrapHelloV1::new(project_id(), instance_id(), vec![1]).unwrap();
+    let hello = BootstrapHelloV2::new(
+        project_id(),
+        instance_id(),
+        vec![BUSINESS_PROTOCOL_REVISION],
+    )
+    .unwrap();
     let limits = FrameLimits::bootstrap();
     let mut encoded = encode_frame(&hello, limits).unwrap();
     encoded.extend_from_slice(b"{}");
 
     let mut budget = AssetLoadBudget::default();
-    assert!(decode_frame::<BootstrapHelloV1>(&encoded, &mut budget, limits).is_err());
+    assert!(decode_frame::<BootstrapHelloV2>(&encoded, &mut budget, limits).is_err());
 
     let oversized = u32::try_from(limits.max_encoded_bytes() + 1)
         .unwrap()
         .to_be_bytes();
     let mut budget = AssetLoadBudget::default();
-    assert!(decode_frame::<BootstrapHelloV1>(&oversized, &mut budget, limits).is_err());
+    assert!(decode_frame::<BootstrapHelloV2>(&oversized, &mut budget, limits).is_err());
 }
 
 #[test]
 fn business_requests_bind_project_instance_and_query_policy() {
     let request = RequestEnvelope::new(
-        1,
+        2,
         RequestId::from_bytes([0x44; 16]),
         project_id(),
         instance_id(),
@@ -100,7 +132,7 @@ fn business_requests_bind_project_instance_and_query_policy() {
 #[test]
 fn validated_frame_decode_rejects_semantically_invalid_requests() {
     let request = RequestEnvelope::new(
-        1,
+        2,
         RequestId::from_bytes([0x44; 16]),
         project_id(),
         instance_id(),
@@ -125,7 +157,7 @@ fn validated_frame_decode_rejects_semantically_invalid_requests() {
 #[test]
 fn request_framing_validates_before_encoding_and_dispatch() {
     let request = RequestEnvelope::new(
-        1,
+        2,
         RequestId::from_bytes([0x44; 16]),
         project_id(),
         instance_id(),
@@ -157,7 +189,7 @@ fn frame_encoding_stops_at_the_exact_encoded_byte_limit() {
 #[test]
 fn business_frame_decode_rejects_noncanonical_json_spellings() {
     let request = RequestEnvelope::new(
-        1,
+        2,
         RequestId::from_bytes([0xaa; 16]),
         project_id(),
         instance_id(),
@@ -215,33 +247,54 @@ fn business_frame_decode_rejects_noncanonical_json_spellings() {
 fn bootstrap_reply_rejects_invalid_versions_and_revisions_during_decode() {
     let wrong_version = serde_json::json!({
         "result": "rejected",
-        "bootstrap_version": 2,
+        "bootstrap_version": 1,
         "code": "no_common_revision"
     });
-    assert!(serde_json::from_value::<BootstrapReplyV1>(wrong_version).is_err());
+    assert!(serde_json::from_value::<BootstrapReplyV2>(wrong_version).is_err());
 
     let zero_revision = serde_json::json!({
         "result": "accepted",
-        "bootstrap_version": 1,
+        "bootstrap_version": 2,
         "project_id": project_id(),
         "daemon_instance_id": instance_id(),
+        "query_policy_id": query_policy_id(),
         "selected_revision": 0
     });
-    assert!(serde_json::from_value::<BootstrapReplyV1>(zero_revision).is_err());
+    assert!(serde_json::from_value::<BootstrapReplyV2>(zero_revision).is_err());
 }
 
 #[test]
 fn bootstrap_reply_must_bind_the_original_project_and_instance() {
-    let hello = BootstrapHelloV1::new(project_id(), instance_id(), vec![1]).unwrap();
+    let hello = BootstrapHelloV2::new(
+        project_id(),
+        instance_id(),
+        vec![BUSINESS_PROTOCOL_REVISION],
+    )
+    .unwrap();
     let wrong_project = serde_json::json!({
         "result": "accepted",
-        "bootstrap_version": 1,
+        "bootstrap_version": 2,
         "project_id": ProjectId::from_bytes([0x33; 32]),
         "daemon_instance_id": instance_id(),
-        "selected_revision": 1
+        "query_policy_id": query_policy_id(),
+        "selected_revision": BUSINESS_PROTOCOL_REVISION
     });
-    let reply: BootstrapReplyV1 = serde_json::from_value(wrong_project).unwrap();
+    let reply: BootstrapReplyV2 = serde_json::from_value(wrong_project).unwrap();
     assert!(reply.validate_for(&hello).is_err());
+}
+
+#[test]
+fn bootstrap_reply_rejects_an_uninitialized_query_policy() {
+    let value = serde_json::json!({
+        "result": "accepted",
+        "bootstrap_version": 2,
+        "project_id": project_id(),
+        "daemon_instance_id": instance_id(),
+        "query_policy_id": QueryPolicyId::from_bytes([0; 32]),
+        "selected_revision": BUSINESS_PROTOCOL_REVISION
+    });
+
+    assert!(serde_json::from_value::<BootstrapReplyV2>(value).is_err());
 }
 
 #[test]

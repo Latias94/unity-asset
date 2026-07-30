@@ -6,8 +6,8 @@ namespace UnityAsset.SearchProtocol.Reference
 {
     public static class ProtocolConstants
     {
-        public const ushort BootstrapVersion = 1;
-        public const ushort BusinessProtocolRevision = 1;
+        public const ushort BootstrapVersion = 2;
+        public const ushort BusinessProtocolRevision = 2;
     }
 
     public sealed class ProtocolValidationException : Exception
@@ -51,9 +51,9 @@ namespace UnityAsset.SearchProtocol.Reference
         public QueryPolicyId QueryPolicyId { get; }
     }
 
-    public sealed class BootstrapHelloV1
+    public sealed class BootstrapHelloV2
     {
-        public BootstrapHelloV1(
+        public BootstrapHelloV2(
             ushort bootstrapVersion,
             ProjectId projectId,
             DaemonInstanceId daemonInstanceId,
@@ -74,9 +74,9 @@ namespace UnityAsset.SearchProtocol.Reference
         public IReadOnlyList<ushort> SupportedRevisions { get; }
     }
 
-    public abstract class BootstrapReplyV1
+    public abstract class BootstrapReplyV2
     {
-        protected BootstrapReplyV1(string result, ushort bootstrapVersion)
+        protected BootstrapReplyV2(string result, ushort bootstrapVersion)
         {
             Result = result;
             BootstrapVersion = bootstrapVersion;
@@ -87,17 +87,19 @@ namespace UnityAsset.SearchProtocol.Reference
         public ushort BootstrapVersion { get; }
     }
 
-    public sealed class BootstrapAcceptedV1 : BootstrapReplyV1
+    public sealed class BootstrapAcceptedV2 : BootstrapReplyV2
     {
-        public BootstrapAcceptedV1(
+        public BootstrapAcceptedV2(
             ushort bootstrapVersion,
             ProjectId projectId,
             DaemonInstanceId daemonInstanceId,
+            QueryPolicyId queryPolicyId,
             ushort selectedRevision)
             : base("accepted", bootstrapVersion)
         {
             ProjectId = projectId ?? throw new ArgumentNullException(nameof(projectId));
             DaemonInstanceId = daemonInstanceId ?? throw new ArgumentNullException(nameof(daemonInstanceId));
+            QueryPolicyId = queryPolicyId ?? throw new ArgumentNullException(nameof(queryPolicyId));
             SelectedRevision = selectedRevision;
         }
 
@@ -105,12 +107,14 @@ namespace UnityAsset.SearchProtocol.Reference
 
         public DaemonInstanceId DaemonInstanceId { get; }
 
+        public QueryPolicyId QueryPolicyId { get; }
+
         public ushort SelectedRevision { get; }
     }
 
-    public sealed class BootstrapRejectedV1 : BootstrapReplyV1
+    public sealed class BootstrapRejectedV2 : BootstrapReplyV2
     {
-        public BootstrapRejectedV1(ushort bootstrapVersion, string code)
+        public BootstrapRejectedV2(ushort bootstrapVersion, string code)
             : base("rejected", bootstrapVersion)
         {
             Code = code ?? throw new ArgumentNullException(nameof(code));
@@ -217,7 +221,10 @@ namespace UnityAsset.SearchProtocol.Reference
 
         public string? OperationKind { get; }
 
-        internal JsonElement Value { get; }
+        /// <summary>
+        /// Gets the schema-validated operation result or structured error payload.
+        /// </summary>
+        public JsonElement Value { get; }
 
         internal int EncodedLength { get; }
 

@@ -16,10 +16,10 @@ use unity_asset_search_core::{
     TermExplanation,
 };
 
-use crate::validation::{ContractValidationError, ValidateContract, ensure_version};
+use crate::validation::{ContractValidationError, ValidateContract, ensure_revision};
 use crate::{MAX_REFERENCE_RESULTS, QueryPolicyId};
 
-pub const SEARCH_PROTOCOL_REVISION: u16 = 1;
+pub const SEARCH_PROTOCOL_REVISION: u16 = 2;
 pub const MAX_API_ERROR_JSON_BYTES: u64 = 224 * 1024;
 pub const MAX_ERROR_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_PORTABLE_PATH_BYTES: usize = 32 * 1024;
@@ -258,7 +258,7 @@ impl GenerationStamp {
 
 impl ValidateContract for GenerationStamp {
     fn validate(&self) -> Result<(), ContractValidationError> {
-        ensure_version(
+        ensure_revision(
             "generation stamp",
             self.protocol_revision,
             SEARCH_PROTOCOL_REVISION,
@@ -315,7 +315,7 @@ impl FilesystemReindexIntent {
 
 impl ValidateContract for FilesystemReindexIntent {
     fn validate(&self) -> Result<(), ContractValidationError> {
-        ensure_version(
+        ensure_revision(
             "filesystem reindex intent",
             self.protocol_revision,
             SEARCH_PROTOCOL_REVISION,
@@ -656,6 +656,7 @@ pub enum ApiErrorCode {
     NotReady,
     RevisionMismatch,
     IndexBuildFailed,
+    IdempotencyConflict,
     OperationNotFound,
     Internal,
 }
@@ -1151,10 +1152,172 @@ pub struct SuggestResponse {
     pub suggestions: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonLifecycleState {
+    Booting,
+    Serving,
+    Draining,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingAvailability {
+    Unavailable,
+    Queryable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationFreshness {
+    Absent,
+    Stale,
+    Current,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessMaintenance {
+    Managed,
+    Unmanaged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileLifecycle {
+    Idle,
+    Queued,
+    Running,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationMaintenanceState {
+    Clean,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationMaintenanceStatus {
+    pub state: GenerationMaintenanceState,
+    pub last_recovered_entries: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_cleanup_failure: Option<String>,
+}
+
+impl GenerationMaintenanceStatus {
+    #[must_use]
+    pub const fn clean() -> Self {
+        Self {
+            state: GenerationMaintenanceState::Clean,
+            last_recovered_entries: 0,
+            last_cleanup_failure: None,
+        }
+    }
+}
+
+impl Default for GenerationMaintenanceStatus {
+    fn default() -> Self {
+        Self::clean()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatcherLifecycleState {
+    Disabled,
+    Starting,
+    Healthy,
+    Failed,
+    Retrying,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatcherStatus {
+    pub state: WatcherLifecycleState,
+    pub retry_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_in_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimerLifecycleState {
+    Disabled,
+    Scheduled,
+    Running,
+    Failed,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimerStatus {
+    pub state: TimerLifecycleState,
+    pub run_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run_in_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonLifecycleStatus {
+    pub lifecycle: DaemonLifecycleState,
+    pub serving: ServingAvailability,
+    pub freshness: GenerationFreshness,
+    pub freshness_maintenance: FreshnessMaintenance,
+    pub reconcile: ReconcileLifecycle,
+    pub generation_maintenance: GenerationMaintenanceStatus,
+    pub watcher: WatcherStatus,
+    pub timer: TimerStatus,
+}
+
+impl DaemonLifecycleStatus {
+    #[must_use]
+    pub fn unmanaged(generation: &GenerationStatus, indexing: bool) -> Self {
+        let (serving, freshness) = serving_and_freshness(generation);
+        Self {
+            lifecycle: DaemonLifecycleState::Serving,
+            serving,
+            freshness,
+            freshness_maintenance: FreshnessMaintenance::Unmanaged,
+            reconcile: if indexing {
+                ReconcileLifecycle::Running
+            } else if generation.last_failure.is_some() {
+                ReconcileLifecycle::Failed
+            } else {
+                ReconcileLifecycle::Idle
+            },
+            generation_maintenance: GenerationMaintenanceStatus::clean(),
+            watcher: WatcherStatus {
+                state: WatcherLifecycleState::Disabled,
+                retry_count: 0,
+                last_failure: None,
+                next_retry_in_ms: None,
+            },
+            timer: TimerStatus {
+                state: TimerLifecycleState::Disabled,
+                run_count: 0,
+                last_failure: None,
+                next_run_in_ms: None,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatusResponse {
     pub protocol_revision: u16,
+    pub daemon: DaemonLifecycleStatus,
     pub generation: GenerationStatus,
     pub query_policy_id: QueryPolicyId,
     pub capabilities: SearchCapabilities,
@@ -1175,7 +1338,7 @@ pub struct StatusResponse {
 
 impl ValidateContract for ReindexReceipt {
     fn validate(&self) -> Result<(), ContractValidationError> {
-        ensure_version(
+        ensure_revision(
             "reindex receipt",
             self.protocol_revision,
             SEARCH_PROTOCOL_REVISION,
@@ -1233,7 +1396,7 @@ impl ValidateContract for GenerationFailure {
 
 impl ValidateContract for GenerationStatus {
     fn validate(&self) -> Result<(), ContractValidationError> {
-        ensure_version(
+        ensure_revision(
             "generation status",
             self.protocol_revision,
             SEARCH_PROTOCOL_REVISION,
@@ -1328,7 +1491,7 @@ impl ValidateContract for ReferenceDiagnosticCoverage {
 
 impl ValidateContract for ApiError {
     fn validate(&self) -> Result<(), ContractValidationError> {
-        ensure_version(
+        ensure_revision(
             "API error",
             self.protocol_revision,
             SEARCH_PROTOCOL_REVISION,
@@ -1356,7 +1519,7 @@ impl ValidateContract for ApiError {
 
 impl ValidateContract for SearchCapabilities {
     fn validate(&self) -> Result<(), ContractValidationError> {
-        ensure_version(
+        ensure_revision(
             "search capabilities",
             self.protocol_revision,
             SEARCH_PROTOCOL_REVISION,
@@ -1366,7 +1529,7 @@ impl ValidateContract for SearchCapabilities {
 
 impl ValidateContract for SearchResponse {
     fn validate(&self) -> Result<(), ContractValidationError> {
-        ensure_version(
+        ensure_revision(
             "search response",
             self.protocol_revision,
             SEARCH_PROTOCOL_REVISION,
@@ -1436,7 +1599,7 @@ impl SearchResponse {
 
 impl ValidateContract for ReferencesResponse {
     fn validate(&self) -> Result<(), ContractValidationError> {
-        ensure_version(
+        ensure_revision(
             "references response",
             self.protocol_revision,
             SEARCH_PROTOCOL_REVISION,
@@ -1535,7 +1698,7 @@ fn canonical_json_size<T: Serialize + ?Sized>(value: &T) -> Result<u64, serde_js
 
 impl ValidateContract for SuggestResponse {
     fn validate(&self) -> Result<(), ContractValidationError> {
-        ensure_version(
+        ensure_revision(
             "suggest response",
             self.protocol_revision,
             SEARCH_PROTOCOL_REVISION,
@@ -1585,12 +1748,13 @@ impl SuggestResponse {
 
 impl ValidateContract for StatusResponse {
     fn validate(&self) -> Result<(), ContractValidationError> {
-        ensure_version(
+        ensure_revision(
             "status response",
             self.protocol_revision,
             SEARCH_PROTOCOL_REVISION,
         )?;
         self.generation.validate()?;
+        self.validate_daemon_status()?;
         self.capabilities.validate()?;
         if !self.indexing && self.generation.building_revision.is_some() {
             return Err(ContractValidationError::Inconsistent {
@@ -1602,6 +1766,99 @@ impl ValidateContract for StatusResponse {
 }
 
 impl StatusResponse {
+    fn validate_daemon_status(&self) -> Result<(), ContractValidationError> {
+        let (expected_serving, expected_freshness) = serving_and_freshness(&self.generation);
+        if self.daemon.serving != expected_serving {
+            return Err(ContractValidationError::Inconsistent {
+                field: "daemon serving availability",
+            });
+        }
+        if self.daemon.freshness != expected_freshness {
+            return Err(ContractValidationError::Inconsistent {
+                field: "daemon generation freshness",
+            });
+        }
+        if matches!(
+            self.daemon.generation_maintenance.state,
+            GenerationMaintenanceState::RecoveryRequired
+        ) != self
+            .daemon
+            .generation_maintenance
+            .last_cleanup_failure
+            .is_some()
+        {
+            return Err(ContractValidationError::Inconsistent {
+                field: "generation maintenance failure evidence",
+            });
+        }
+        if matches!(
+            self.daemon.watcher.state,
+            WatcherLifecycleState::Failed | WatcherLifecycleState::Retrying
+        ) && self.daemon.watcher.last_failure.is_none()
+        {
+            return Err(ContractValidationError::Inconsistent {
+                field: "watcher failure evidence",
+            });
+        }
+        if matches!(self.daemon.watcher.state, WatcherLifecycleState::Retrying)
+            != self.daemon.watcher.next_retry_in_ms.is_some()
+        {
+            return Err(ContractValidationError::Inconsistent {
+                field: "watcher retry deadline",
+            });
+        }
+        if matches!(self.daemon.timer.state, TimerLifecycleState::Failed)
+            && self.daemon.timer.last_failure.is_none()
+        {
+            return Err(ContractValidationError::Inconsistent {
+                field: "timer failure evidence",
+            });
+        }
+        if matches!(
+            self.daemon.timer.state,
+            TimerLifecycleState::Disabled | TimerLifecycleState::Stopped
+        ) && self.daemon.timer.next_run_in_ms.is_some()
+        {
+            return Err(ContractValidationError::Inconsistent {
+                field: "disabled timer next run",
+            });
+        }
+        if matches!(self.daemon.timer.state, TimerLifecycleState::Scheduled)
+            && self.daemon.timer.next_run_in_ms.is_none()
+        {
+            return Err(ContractValidationError::Inconsistent {
+                field: "scheduled timer next run",
+            });
+        }
+        let expected_maintenance =
+            if matches!(self.daemon.watcher.state, WatcherLifecycleState::Disabled)
+                && matches!(self.daemon.timer.state, TimerLifecycleState::Disabled)
+            {
+                FreshnessMaintenance::Unmanaged
+            } else {
+                FreshnessMaintenance::Managed
+            };
+        if self.daemon.freshness_maintenance != expected_maintenance {
+            return Err(ContractValidationError::Inconsistent {
+                field: "freshness maintenance",
+            });
+        }
+        for (field, failure) in [
+            (
+                "generation maintenance last cleanup failure",
+                &self.daemon.generation_maintenance.last_cleanup_failure,
+            ),
+            ("watcher last failure", &self.daemon.watcher.last_failure),
+            ("timer last failure", &self.daemon.timer.last_failure),
+        ] {
+            if let Some(failure) = failure {
+                ensure_nonempty(field, failure)?;
+                ensure_byte_limit(field, failure, MAX_ERROR_MESSAGE_BYTES)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_paths(
         project_root: &PortablePath,
         generation_root: &PortablePath,
@@ -1638,6 +1895,21 @@ impl StatusResponse {
             });
         }
         Ok(())
+    }
+}
+
+fn serving_and_freshness(
+    generation: &GenerationStatus,
+) -> (ServingAvailability, GenerationFreshness) {
+    match generation.active.as_ref() {
+        None => (
+            ServingAvailability::Unavailable,
+            GenerationFreshness::Absent,
+        ),
+        Some(active) if active.stale => {
+            (ServingAvailability::Queryable, GenerationFreshness::Stale)
+        }
+        Some(_) => (ServingAvailability::Queryable, GenerationFreshness::Current),
     }
 }
 

@@ -24,8 +24,9 @@ use unity_asset::{
 use unity_asset_core::{string_allocation_bytes, vec_allocation_bytes};
 use unity_asset_search_core::{SearchKind, SearchRequest};
 use unity_asset_search_protocol::{
-    ApiErrorCode, MAX_REINDEX_PUBLISH_WARNINGS, ReferenceRequest, ReferencesResponse,
-    ReindexEvidence, SearchResponse, SuggestResponse,
+    ApiErrorCode, GenerationMaintenanceState, GenerationMaintenanceStatus,
+    MAX_REINDEX_PUBLISH_WARNINGS, ReferenceRequest, ReferencesResponse, ReindexEvidence,
+    SearchResponse, SuggestResponse,
 };
 
 use crate::analysis::{
@@ -52,13 +53,14 @@ use crate::scan::{
     FileHint, PathRejection, ProjectScanner, ReadSource, ScanDiagnostic, ScanError, ScanIntent,
     ScanMetrics, ScanMode, SourceHints, SourcePart,
 };
-use crate::state::{
-    GenerationDiskEstimate, GenerationPublishWarning, GenerationSnapshot, GenerationStore,
-    GenerationStoreError, GenerationStoreOptions, SourceScanHint, SourceStateError,
-    SourceStateLimits, SourceStateSnapshot, TransactionReceiptMembership, TransactionReceiptWindow,
-};
 #[cfg(test)]
-use crate::state::{GenerationFailpoint, GenerationPublishWarningKind};
+use crate::state::GenerationFailpoint;
+use crate::state::{
+    GenerationBuild, GenerationDiskEstimate, GenerationPublishWarning,
+    GenerationPublishWarningKind, GenerationSnapshot, GenerationStore, GenerationStoreError,
+    GenerationStoreOptions, SourceScanHint, SourceStateError, SourceStateLimits,
+    SourceStateSnapshot, TransactionReceiptMembership, TransactionReceiptWindow,
+};
 use crate::store::{ProjectionReaders, ProjectionStore, is_rebuildable_projection_schema_version};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +294,7 @@ pub(crate) struct SearchGenerationPipeline {
     store: GenerationStore,
     source_state: Option<SourceStateSnapshot>,
     active: Option<Arc<ActiveGeneration>>,
+    generation_maintenance: GenerationMaintenanceStatus,
     pending_publish_warnings: Vec<String>,
     pending_publish_warnings_omitted: bool,
     #[cfg(test)]
@@ -390,6 +393,7 @@ impl SearchGenerationPipeline {
             store,
             source_state,
             active,
+            generation_maintenance: GenerationMaintenanceStatus::clean(),
             pending_publish_warnings: Vec::new(),
             pending_publish_warnings_omitted: false,
             #[cfg(test)]
@@ -406,17 +410,32 @@ impl SearchGenerationPipeline {
         self.active.clone()
     }
 
+    pub(crate) fn generation_maintenance(&self) -> GenerationMaintenanceStatus {
+        self.generation_maintenance.clone()
+    }
+
     pub(crate) fn reindex_filesystem(
         &mut self,
         intent: FilesystemReindexIntent,
         budget: &mut AssetLoadBudget,
     ) -> Result<PipelineBuildOutput, PipelineError> {
         let started = Instant::now();
+        let reconcile_staging = matches!(&intent.scope, FilesystemReindexScope::Reconcile);
         let requested = match intent.scope {
             FilesystemReindexScope::Full => ScanIntent::Full,
             FilesystemReindexScope::Reconcile => ScanIntent::Reconcile,
             FilesystemReindexScope::ChangedPaths { paths } => ScanIntent::ChangedPaths(paths),
         };
+        if reconcile_staging {
+            let mut cleanup_budget = AssetLoadBudget::default();
+            match self.store.reconcile_abandoned_staging(&mut cleanup_budget) {
+                Ok(report) => self.record_generation_recovery(report.removed_entries()),
+                Err(error) => {
+                    self.record_generation_cleanup_failure(error.to_string());
+                    return Err(PipelineError::Store(Box::new(error)));
+                }
+            }
+        }
         let force_full = !self.workspace_hydrated || !self.active_options_match;
         let scan_intent = if force_full {
             ScanIntent::Full
@@ -1450,91 +1469,103 @@ impl SearchGenerationPipeline {
         metrics.projection = projection.metrics;
         let source_state =
             SourceStateSnapshot::from_batch(batch, scan_hints, transaction_receipts)?;
-        let build = self.store.begin()?;
-        let projection_evidence = ProjectionStore::build(build.directory(), &projection)
-            .map_err(PipelineError::Projection)?;
-        build.write_source_state(&source_state, SourceStateLimits::default())?;
-
-        {
-            let readers = ProjectionReaders::open(build.directory(), budget)
+        let mut build = self.store.begin()?;
+        let staged = (|| -> Result<_, PipelineError> {
+            let projection_evidence = ProjectionStore::build(build.directory(), &projection)
                 .map_err(PipelineError::Projection)?;
-            SearchQueryFields::from_schema(&readers.search().index().schema())
-                .map_err(PipelineError::Query)?;
-        }
+            build.write_source_state(&source_state, SourceStateLimits::default())?;
 
-        let artifacts = self.store.measure_artifacts_with_budget(&build, budget)?;
-        let expected_artifacts = projection_evidence.generation_artifacts(artifacts.source_state());
-        if artifacts != expected_artifacts {
-            return Err(PipelineError::Invariant(
-                "projection evidence changed before generation publication",
-            ));
-        }
-        let parent = self.store.active().map(GenerationSnapshot::generation);
-        let projection_summary = GenerationProjectionSummary::new(
-            u64::try_from(source_state.assets().len())
-                .map_err(|_| PipelineError::ArithmeticOverflow("indexed asset count"))?,
-            projection.metrics.search_documents,
-            projection.metrics.reference_documents,
-            u64::try_from(projection.truncations.len())
-                .map_err(|_| PipelineError::ArithmeticOverflow("projection truncation count"))?,
-            u64::try_from(
-                source_state
-                    .assets()
-                    .iter()
-                    .filter(|analysis| !analysis.complete)
-                    .count(),
-            )
-            .map_err(|_| PipelineError::ArithmeticOverflow("incomplete asset count"))?,
-        )?;
-        let identity = SearchGenerationIdentityV1::new(
-            source_state.workspace(),
-            source_state.revision(),
-            GenerationProjectionDigests::new(
-                projection_evidence.logical_digests().search(),
-                projection_evidence.logical_digests().references(),
-            ),
-            projection_summary,
-            parent,
-            canonical_transaction_ids(source_state.transaction_receipts(), budget)?,
-            self.options_digest,
-            source_state.logical_digest(),
-        )?;
-        let manifest = SearchGenerationManifestV1::new(identity, artifacts);
-        let desired_revision = self
-            .store
-            .active()
-            .filter(|active| active.manifest().revision() == manifest.revision())
-            .map_or(manifest.revision(), GenerationSnapshot::desired_revision);
-        let disk_estimate = self.store.estimate_manifest_publish(&manifest, budget)?;
+            {
+                let readers = ProjectionReaders::open(build.directory(), budget)
+                    .map_err(PipelineError::Projection)?;
+                SearchQueryFields::from_schema(&readers.search().index().schema())
+                    .map_err(PipelineError::Query)?;
+            }
+
+            let artifacts = self.store.measure_artifacts_with_budget(&build, budget)?;
+            let expected_artifacts =
+                projection_evidence.generation_artifacts(artifacts.source_state());
+            if artifacts != expected_artifacts {
+                return Err(PipelineError::Invariant(
+                    "projection evidence changed before generation publication",
+                ));
+            }
+            let parent = self.store.active().map(GenerationSnapshot::generation);
+            let projection_summary = GenerationProjectionSummary::new(
+                u64::try_from(source_state.assets().len())
+                    .map_err(|_| PipelineError::ArithmeticOverflow("indexed asset count"))?,
+                projection.metrics.search_documents,
+                projection.metrics.reference_documents,
+                u64::try_from(projection.truncations.len()).map_err(|_| {
+                    PipelineError::ArithmeticOverflow("projection truncation count")
+                })?,
+                u64::try_from(
+                    source_state
+                        .assets()
+                        .iter()
+                        .filter(|analysis| !analysis.complete)
+                        .count(),
+                )
+                .map_err(|_| PipelineError::ArithmeticOverflow("incomplete asset count"))?,
+            )?;
+            let identity = SearchGenerationIdentityV1::new(
+                source_state.workspace(),
+                source_state.revision(),
+                GenerationProjectionDigests::new(
+                    projection_evidence.logical_digests().search(),
+                    projection_evidence.logical_digests().references(),
+                ),
+                projection_summary,
+                parent,
+                canonical_transaction_ids(source_state.transaction_receipts(), budget)?,
+                self.options_digest,
+                source_state.logical_digest(),
+            )?;
+            let manifest = SearchGenerationManifestV1::new(identity, artifacts);
+            let desired_revision = self
+                .store
+                .active()
+                .filter(|active| active.manifest().revision() == manifest.revision())
+                .map_or(manifest.revision(), GenerationSnapshot::desired_revision);
+            let disk_estimate = self.store.estimate_manifest_publish(&manifest, budget)?;
+            Ok((manifest, desired_revision, disk_estimate))
+        })();
+        let (manifest, desired_revision, disk_estimate) = match staged {
+            Ok(staged) => staged,
+            Err(primary) => return Err(self.abort_generation_build(&mut build, primary)),
+        };
         #[cfg(test)]
-        let prepared = match self.publish_failpoint.take() {
+        let prepared_result = match self.publish_failpoint.take() {
             Some(failpoint) => self
                 .store
                 .prepare_publish_with_desired_revision_failpoint_and_budget(
-                    build,
+                    &mut build,
                     manifest,
                     desired_revision,
                     budget,
                     failpoint,
-                )?,
-            None => self
-                .store
-                .prepare_publish_with_desired_revision_and_budget(
-                    build,
-                    manifest,
-                    desired_revision,
-                    budget,
-                )?,
-        };
-        #[cfg(not(test))]
-        let prepared = self
-            .store
-            .prepare_publish_with_desired_revision_and_budget(
-                build,
+                ),
+            None => self.store.prepare_publish_with_desired_revision_and_budget(
+                &mut build,
                 manifest,
                 desired_revision,
                 budget,
-            )?;
+            ),
+        };
+        #[cfg(not(test))]
+        let prepared_result = self.store.prepare_publish_with_desired_revision_and_budget(
+            &mut build,
+            manifest,
+            desired_revision,
+            budget,
+        );
+        let prepared = match prepared_result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let primary = PipelineError::Store(Box::new(error));
+                return Err(self.abort_generation_build(&mut build, primary));
+            }
+        };
         let candidate_snapshot = prepared.snapshot().clone();
         let readers = ProjectionReaders::open(candidate_snapshot.directory(), budget)
             .map_err(PipelineError::Projection)?;
@@ -1830,13 +1861,56 @@ impl SearchGenerationPipeline {
         warnings: impl IntoIterator<Item = GenerationPublishWarning>,
     ) {
         for warning in warnings {
+            let kind = warning.kind();
+            let message = warning.to_string();
+            if matches!(
+                kind,
+                GenerationPublishWarningKind::PreparationCleanup
+                    | GenerationPublishWarningKind::PostCommitCleanup
+            ) {
+                self.record_generation_cleanup_failure(message.clone());
+            }
             if self.pending_publish_warnings.len() < MAX_REINDEX_PUBLISH_WARNINGS {
                 self.pending_publish_warnings
-                    .push(crate::wire::bounded_publish_warning(warning.to_string()));
+                    .push(crate::wire::bounded_publish_warning(message));
             } else {
                 self.pending_publish_warnings_omitted = true;
             }
         }
+    }
+
+    fn abort_generation_build(
+        &mut self,
+        build: &mut GenerationBuild,
+        primary: PipelineError,
+    ) -> PipelineError {
+        let mut cleanup_budget = AssetLoadBudget::default();
+        match build.abort_with_budget(&mut cleanup_budget) {
+            Ok(()) => primary,
+            Err(cleanup) => {
+                self.record_generation_cleanup_failure(cleanup.to_string());
+                PipelineError::StagingAbortFailed {
+                    primary: Box::new(primary),
+                    cleanup: Box::new(cleanup),
+                }
+            }
+        }
+    }
+
+    fn record_generation_cleanup_failure(&mut self, message: String) {
+        self.generation_maintenance = GenerationMaintenanceStatus {
+            state: GenerationMaintenanceState::RecoveryRequired,
+            last_recovered_entries: self.generation_maintenance.last_recovered_entries,
+            last_cleanup_failure: Some(crate::wire::bounded_error_message(message)),
+        };
+    }
+
+    fn record_generation_recovery(&mut self, removed_entries: u64) {
+        self.generation_maintenance = GenerationMaintenanceStatus {
+            state: GenerationMaintenanceState::Clean,
+            last_recovered_entries: removed_entries,
+            last_cleanup_failure: None,
+        };
     }
 
     fn install_workspace(&mut self, prepared: Option<PreparedWorkspace>) {
@@ -3440,6 +3514,10 @@ pub(crate) enum PipelineError {
     Analysis(Box<AnalysisError>),
     SourceState(Box<SourceStateError>),
     Store(Box<GenerationStoreError>),
+    StagingAbortFailed {
+        primary: Box<PipelineError>,
+        cleanup: Box<GenerationStoreError>,
+    },
     Manifest(GenerationManifestError),
     Json(serde_json::Error),
 }
@@ -3447,6 +3525,7 @@ pub(crate) enum PipelineError {
 impl PipelineError {
     pub(crate) fn api_code(&self) -> ApiErrorCode {
         match self {
+            Self::StagingAbortFailed { primary, .. } => primary.api_code(),
             Self::Configuration(_)
             | Self::Contract(_)
             | Self::Diagnostic(_)
@@ -3500,6 +3579,9 @@ impl PipelineError {
 
     pub(crate) fn retryable(&self) -> bool {
         match self {
+            Self::StagingAbortFailed { primary, cleanup } => {
+                primary.retryable() || cleanup.is_retryable()
+            }
             Self::ScanPlanRejected { .. } | Self::SourceReadRejected { .. } | Self::Scan(_) => true,
             Self::SourceAdmission(error) => matches!(
                 error.category(),
@@ -3509,20 +3591,12 @@ impl PipelineError {
                 error.as_ref(),
                 WorkspaceError::Io { .. } | WorkspaceError::SourceChanged { .. }
             ),
-            Self::Store(error) => matches!(
-                error.as_ref(),
-                GenerationStoreError::Io { .. }
-                    | GenerationStoreError::WriterLeaseUnavailable { .. }
-            ),
+            Self::Store(error) => error.is_retryable(),
             Self::SourceState(error) => matches!(
                 error.as_ref(),
                 SourceStateError::Store(
                     store_error
-                ) if matches!(
-                    store_error.as_ref(),
-                    GenerationStoreError::Io { .. }
-                        | GenerationStoreError::WriterLeaseUnavailable { .. }
-                )
+                ) if store_error.is_retryable()
             ),
             Self::WorkspaceMismatch { .. }
             | Self::ViewRevisionMismatch { .. }
@@ -3653,6 +3727,10 @@ impl fmt::Display for PipelineError {
             Self::Analysis(error) => fmt::Display::fmt(error, formatter),
             Self::SourceState(error) => fmt::Display::fmt(error, formatter),
             Self::Store(error) => fmt::Display::fmt(error, formatter),
+            Self::StagingAbortFailed { primary, cleanup } => write!(
+                formatter,
+                "{primary}; generation staging cleanup also failed: {cleanup}"
+            ),
             Self::Manifest(error) => fmt::Display::fmt(error, formatter),
             Self::Json(error) => fmt::Display::fmt(error, formatter),
         }
@@ -3675,6 +3753,7 @@ impl StdError for PipelineError {
             Self::Analysis(error) => Some(error.as_ref()),
             Self::SourceState(error) => Some(error.as_ref()),
             Self::Store(error) => Some(error.as_ref()),
+            Self::StagingAbortFailed { primary, .. } => Some(primary.as_ref()),
             Self::Manifest(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Allocation { source, .. } => Some(source),
@@ -4107,5 +4186,24 @@ mod tests {
         );
         assert!(pipeline.pending_publish_warnings.is_empty());
         assert!(!pipeline.pending_publish_warnings_omitted);
+    }
+
+    #[test]
+    fn nested_generation_cleanup_io_remains_retryable() {
+        let error = PipelineError::Store(Box::new(
+            GenerationStoreError::ActivationPreCommitCleanupFailed {
+                primary: Box::new(GenerationStoreError::InjectedFailure {
+                    checkpoint: GenerationFailpoint::ActivationPreCommit,
+                }),
+                cleanup: Box::new(GenerationStoreError::Io {
+                    operation: "remove activation staging file",
+                    path: PathBuf::from("activation-staging"),
+                    source: io::Error::new(io::ErrorKind::PermissionDenied, "injected cleanup"),
+                }),
+            },
+        ));
+
+        assert_eq!(error.api_code(), ApiErrorCode::IndexBuildFailed);
+        assert!(error.retryable());
     }
 }

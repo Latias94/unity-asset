@@ -4,6 +4,7 @@ use std::path::Path;
 use super::{
     GenerationBuild, GenerationFailpoint, GenerationPublishWarningKind, GenerationStore,
     GenerationStoreError, GenerationStoreOptions, activation_file_name,
+    activation_staging_file_name, quarantine_directory_name, staging_directory_name,
 };
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
@@ -166,10 +167,10 @@ fn publish_generation(
     label: &str,
     parent: Option<SearchGenerationId>,
 ) -> SearchGenerationId {
-    let build = store.begin().unwrap();
+    let mut build = store.begin().unwrap();
     write_artifacts(&build, label);
     let manifest = manifest_for(store, &build, label, parent);
-    let prepared = store.prepare_publish(build, manifest).unwrap();
+    let prepared = store.prepare_publish(&mut build, manifest).unwrap();
     assert!(prepared.snapshot().directory().is_dir());
     prepared.activate().unwrap().active.generation()
 }
@@ -192,6 +193,60 @@ fn writer_lease_rejects_a_second_store_until_the_first_drops() {
     ));
     drop(build);
     open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+}
+
+#[test]
+fn store_allows_only_one_armed_build_and_releases_the_claim_on_abort() {
+    let temporary = TempDir::new().unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let mut first = store.begin().unwrap();
+    let first_path = first.directory().to_path_buf();
+
+    assert!(matches!(
+        store.begin(),
+        Err(GenerationStoreError::BuildAlreadyActive)
+    ));
+
+    first
+        .abort_with_budget(&mut AssetLoadBudget::default())
+        .unwrap();
+    assert!(!first_path.exists());
+
+    let second = store.begin().unwrap();
+    let second_path = second.directory().to_path_buf();
+    drop(second);
+    assert!(!second_path.exists());
+}
+
+#[test]
+fn failed_explicit_abort_relinquishes_the_claim_for_later_recovery() {
+    let temporary = TempDir::new().unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let mut first = store.begin().unwrap();
+    let first_path = first.directory().to_path_buf();
+    fs::write(first.search_directory().join("partial"), b"partial").unwrap();
+    let mut insufficient = AssetLoadBudget::new(AssetLoadLimits {
+        max_entries: 1,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+
+    assert!(matches!(
+        first.abort_with_budget(&mut insufficient),
+        Err(GenerationStoreError::Budget(BudgetError::Exceeded {
+            resource: "entries",
+            ..
+        }))
+    ));
+    assert!(first_path.exists());
+
+    let replacement = store.begin().unwrap();
+    drop(replacement);
+    let report = store
+        .reconcile_abandoned_staging(&mut AssetLoadBudget::default())
+        .unwrap();
+    assert_eq!(report.removed_entries(), 1);
+    assert!(!first_path.exists());
 }
 
 #[test]
@@ -358,6 +413,47 @@ fn dropped_builds_and_reopened_stores_recover_owned_staging() {
     let reopened = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     assert!(!abandoned.exists());
     drop(reopened);
+}
+
+#[test]
+fn reconciliation_removes_only_abandoned_staging_and_preserves_the_active_generation() {
+    let temporary = TempDir::new().unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let active = publish_generation(&mut store, "active", None);
+    let active_directory = store.generation_directory(active);
+    let active_activation = temporary
+        .path()
+        .join("activations")
+        .join(activation_file_name(
+            store.active().unwrap().activation_ordinal(),
+        ));
+    let staging = temporary.path().join(".staging");
+    let abandoned_build = staging.join(staging_directory_name(91));
+    let abandoned_quarantine = staging.join(quarantine_directory_name(92, active));
+    let abandoned_activation = staging.join(activation_staging_file_name(93));
+    fs::create_dir(&abandoned_build).unwrap();
+    fs::write(abandoned_build.join("partial"), b"partial").unwrap();
+    fs::create_dir(&abandoned_quarantine).unwrap();
+    fs::write(abandoned_quarantine.join("old"), b"old").unwrap();
+    fs::write(&abandoned_activation, b"partial activation").unwrap();
+
+    let live_build = store.begin().unwrap();
+    assert!(matches!(
+        store.reconcile_abandoned_staging(&mut AssetLoadBudget::default()),
+        Err(GenerationStoreError::BuildAlreadyActive)
+    ));
+    drop(live_build);
+
+    let report = store
+        .reconcile_abandoned_staging(&mut AssetLoadBudget::default())
+        .unwrap();
+    assert_eq!(report.removed_entries(), 3);
+    assert!(!abandoned_build.exists());
+    assert!(!abandoned_quarantine.exists());
+    assert!(!abandoned_activation.exists());
+    assert!(active_directory.is_dir());
+    assert!(active_activation.is_file());
+    assert_eq!(store.active().unwrap().generation(), active);
 }
 
 #[cfg(unix)]
@@ -690,11 +786,11 @@ fn pre_commit_publish_failures_never_change_the_active_generation() {
     .enumerate()
     {
         let label = format!("candidate-{index}");
-        let build = store.begin().unwrap();
+        let mut build = store.begin().unwrap();
         write_artifacts(&build, &label);
         let manifest = manifest_for(&store, &build, &label, Some(baseline));
         let error = store
-            .prepare_publish_with_failpoint(build, manifest, failpoint)
+            .prepare_publish_with_failpoint(&mut build, manifest, failpoint)
             .and_then(|prepared| prepared.activate())
             .unwrap_err();
         assert!(matches!(
@@ -702,29 +798,73 @@ fn pre_commit_publish_failures_never_change_the_active_generation() {
             GenerationStoreError::InjectedFailure { checkpoint }
                 if checkpoint == failpoint
         ));
+        build
+            .abort_with_budget(&mut AssetLoadBudget::default())
+            .unwrap();
         assert_eq!(store.active().unwrap().generation(), baseline);
 
+        drop(build);
         drop(store);
         store = open_store(temporary.path(), options).unwrap();
         assert_eq!(store.active().unwrap().generation(), baseline);
     }
 
-    let retry = store.begin().unwrap();
+    let mut retry = store.begin().unwrap();
     write_artifacts(&retry, "candidate-3");
     let retry_manifest = manifest_for(&store, &retry, "candidate-3", Some(baseline));
     let repaired = store
-        .prepare_publish(retry, retry_manifest)
+        .prepare_publish(&mut retry, retry_manifest)
         .unwrap()
         .activate()
         .unwrap();
     assert_ne!(repaired.active.generation(), baseline);
 
+    drop(retry);
     drop(store);
     let reopened = open_store(temporary.path(), options).unwrap();
     assert_eq!(
         reopened.active().unwrap().generation(),
         repaired.active.generation()
     );
+}
+
+#[test]
+fn activation_precommit_failure_cleans_staging_and_preserves_the_active_generation() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions {
+        retain_previous_generations: 2,
+    };
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let baseline = publish_generation(&mut store, "baseline", None);
+    let mut build = store.begin().unwrap();
+    write_artifacts(&build, "precommit-failure");
+    let manifest = manifest_for(&store, &build, "precommit-failure", Some(baseline));
+    let prepared = store
+        .prepare_publish_with_failpoint(
+            &mut build,
+            manifest,
+            GenerationFailpoint::ActivationPreCommit,
+        )
+        .unwrap();
+    let activation_ordinal = prepared.snapshot().activation_ordinal();
+    let staging_activation = temporary
+        .path()
+        .join(".staging")
+        .join(activation_staging_file_name(activation_ordinal));
+
+    assert!(matches!(
+        prepared.activate(),
+        Err(GenerationStoreError::InjectedFailure {
+            checkpoint: GenerationFailpoint::ActivationPreCommit
+        })
+    ));
+    assert!(!staging_activation.exists());
+    assert_eq!(store.active().unwrap().generation(), baseline);
+
+    drop(build);
+    drop(store);
+    let reopened = open_store(temporary.path(), options).unwrap();
+    assert_eq!(reopened.active().unwrap().generation(), baseline);
 }
 
 #[test]
@@ -735,14 +875,14 @@ fn activation_directory_sync_failure_returns_committed_generation_consistent_wit
     };
     let mut store = open_store(temporary.path(), options).unwrap();
     let baseline = publish_generation(&mut store, "baseline", None);
-    let build = store.begin().unwrap();
+    let mut build = store.begin().unwrap();
     write_artifacts(&build, "sync-warning");
     let manifest = manifest_for(&store, &build, "sync-warning", Some(baseline));
     let candidate = manifest.generation_id();
 
     let report = store
         .prepare_publish_with_failpoint(
-            build,
+            &mut build,
             manifest,
             GenerationFailpoint::ActivationDirectorySync,
         )
@@ -757,6 +897,7 @@ fn activation_directory_sync_failure_returns_committed_generation_consistent_wit
             && warning.message().contains("ActivationDirectorySync")
     }));
 
+    drop(build);
     drop(store);
     let reopened = open_store(temporary.path(), options).unwrap();
     assert_eq!(reopened.active().unwrap().generation(), candidate);
@@ -770,13 +911,17 @@ fn activation_cleanup_failure_returns_committed_generation_consistent_with_reope
     };
     let mut store = open_store(temporary.path(), options).unwrap();
     let baseline = publish_generation(&mut store, "baseline", None);
-    let build = store.begin().unwrap();
+    let mut build = store.begin().unwrap();
     write_artifacts(&build, "cleanup-warning");
     let manifest = manifest_for(&store, &build, "cleanup-warning", Some(baseline));
     let candidate = manifest.generation_id();
 
     let report = store
-        .prepare_publish_with_failpoint(build, manifest, GenerationFailpoint::ActivationCleanup)
+        .prepare_publish_with_failpoint(
+            &mut build,
+            manifest,
+            GenerationFailpoint::ActivationCleanup,
+        )
         .unwrap()
         .activate()
         .unwrap();
@@ -793,6 +938,7 @@ fn activation_cleanup_failure_returns_committed_generation_consistent_with_reope
             && warning.message().contains("ActivationCleanup")
     }));
 
+    drop(build);
     drop(store);
     let reopened = open_store(temporary.path(), options).unwrap();
     assert_eq!(reopened.active().unwrap().generation(), candidate);
@@ -804,12 +950,12 @@ fn prepared_generation_is_readable_before_activation_and_reusable_if_dropped() {
     let temporary = TempDir::new().unwrap();
     let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     let baseline = publish_generation(&mut store, "baseline", None);
-    let build = store.begin().unwrap();
+    let mut build = store.begin().unwrap();
     write_artifacts(&build, "candidate");
     let manifest = manifest_for(&store, &build, "candidate", Some(baseline));
     let candidate = manifest.generation_id();
 
-    let prepared = store.prepare_publish(build, manifest).unwrap();
+    let prepared = store.prepare_publish(&mut build, manifest).unwrap();
     assert_eq!(
         fs::read(prepared.snapshot().search_directory().join("segments")).unwrap(),
         b"search:candidate"
@@ -817,10 +963,10 @@ fn prepared_generation_is_readable_before_activation_and_reusable_if_dropped() {
     drop(prepared);
     assert_eq!(store.active().unwrap().generation(), baseline);
 
-    let retry = store.begin().unwrap();
+    let mut retry = store.begin().unwrap();
     write_artifacts(&retry, "candidate");
     let retry_manifest = manifest_for(&store, &retry, "candidate", Some(baseline));
-    let prepared = store.prepare_publish(retry, retry_manifest).unwrap();
+    let prepared = store.prepare_publish(&mut retry, retry_manifest).unwrap();
     assert_eq!(prepared.snapshot().generation(), candidate);
     let report = prepared.activate().unwrap();
     assert_eq!(report.active.generation(), candidate);
@@ -831,7 +977,7 @@ fn publish_rejects_source_state_that_does_not_match_the_manifest() {
     let temporary = TempDir::new().unwrap();
     let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
     let baseline = publish_generation(&mut store, "baseline", None);
-    let build = store.begin().unwrap();
+    let mut build = store.begin().unwrap();
     write_artifacts(&build, "candidate");
     let build_path = build.directory().to_path_buf();
     let evidence = store.measure_artifacts(&build).unwrap();
@@ -851,9 +997,15 @@ fn publish_rejects_source_state_that_does_not_match_the_manifest() {
     .unwrap();
 
     assert!(matches!(
-        store.prepare_publish(build, SearchGenerationManifestV1::new(identity, evidence)),
+        store.prepare_publish(
+            &mut build,
+            SearchGenerationManifestV1::new(identity, evidence),
+        ),
         Err(GenerationStoreError::InvalidSourceState { .. })
     ));
+    build
+        .abort_with_budget(&mut AssetLoadBudget::default())
+        .unwrap();
     assert_eq!(store.active().unwrap().generation(), baseline);
     assert!(!build_path.exists());
 }
@@ -867,18 +1019,21 @@ fn corrupt_completed_orphan_is_replaced_by_the_same_logical_generation() {
     let mut store = open_store(temporary.path(), options).unwrap();
     let baseline = publish_generation(&mut store, "baseline", None);
 
-    let build = store.begin().unwrap();
+    let mut build = store.begin().unwrap();
     write_artifacts(&build, "candidate");
     let manifest = manifest_for(&store, &build, "candidate", Some(baseline));
     let generation = manifest.generation_id();
     assert!(matches!(
         store
-            .prepare_publish_with_failpoint(build, manifest, GenerationFailpoint::Activation)
+            .prepare_publish_with_failpoint(&mut build, manifest, GenerationFailpoint::Activation,)
             .and_then(|prepared| prepared.activate()),
         Err(GenerationStoreError::InjectedFailure {
             checkpoint: GenerationFailpoint::Activation
         })
     ));
+    build
+        .abort_with_budget(&mut AssetLoadBudget::default())
+        .unwrap();
     fs::write(
         store
             .generation_directory(generation)
@@ -888,11 +1043,11 @@ fn corrupt_completed_orphan_is_replaced_by_the_same_logical_generation() {
     )
     .unwrap();
 
-    let retry = store.begin().unwrap();
+    let mut retry = store.begin().unwrap();
     write_artifacts(&retry, "candidate");
     let retry_manifest = manifest_for(&store, &retry, "candidate", Some(baseline));
     let report = store
-        .prepare_publish(retry, retry_manifest)
+        .prepare_publish(&mut retry, retry_manifest)
         .unwrap()
         .activate()
         .unwrap();
@@ -1013,7 +1168,7 @@ fn store_rejects_symbolic_links_in_managed_directories() {
 fn publish_syncs_read_only_artifacts_before_activation() {
     let temporary = TempDir::new().unwrap();
     let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
-    let build = store.begin().unwrap();
+    let mut build = store.begin().unwrap();
     write_artifacts(&build, "read-only");
     let artifact = build.search_directory().join("segments");
     let mut permissions = fs::metadata(&artifact).unwrap().permissions();
@@ -1022,7 +1177,7 @@ fn publish_syncs_read_only_artifacts_before_activation() {
     let manifest = manifest_for(&store, &build, "read-only", None);
 
     let report = store
-        .prepare_publish(build, manifest)
+        .prepare_publish(&mut build, manifest)
         .unwrap()
         .activate()
         .unwrap();

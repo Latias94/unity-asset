@@ -1,21 +1,21 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::validation::{ContractValidationError, ValidateContract, ensure_version};
-use crate::{DaemonInstanceId, ProjectId};
+use crate::{BUSINESS_PROTOCOL_REVISION, DaemonInstanceId, ProjectId, QueryPolicyId};
 
-pub const BOOTSTRAP_VERSION: u16 = 1;
+pub const BOOTSTRAP_VERSION: u16 = 2;
 pub const MAX_BOOTSTRAP_REVISIONS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct BootstrapHelloV1 {
+pub struct BootstrapHelloV2 {
     bootstrap_version: u16,
     project_id: ProjectId,
     daemon_instance_id: DaemonInstanceId,
     supported_revisions: Vec<u16>,
 }
 
-impl BootstrapHelloV1 {
+impl BootstrapHelloV2 {
     pub fn new(
         project_id: ProjectId,
         daemon_instance_id: DaemonInstanceId,
@@ -52,7 +52,7 @@ impl BootstrapHelloV1 {
     }
 }
 
-impl ValidateContract for BootstrapHelloV1 {
+impl ValidateContract for BootstrapHelloV2 {
     fn validate(&self) -> Result<(), ContractValidationError> {
         ensure_version("bootstrap", self.bootstrap_version, BOOTSTRAP_VERSION)?;
         if self.supported_revisions.is_empty() {
@@ -81,7 +81,7 @@ impl ValidateContract for BootstrapHelloV1 {
     }
 }
 
-impl<'de> Deserialize<'de> for BootstrapHelloV1 {
+impl<'de> Deserialize<'de> for BootstrapHelloV2 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -117,11 +117,12 @@ pub enum BootstrapErrorCode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
-pub enum BootstrapReplyV1 {
+pub enum BootstrapReplyV2 {
     Accepted {
         bootstrap_version: u16,
         project_id: ProjectId,
         daemon_instance_id: DaemonInstanceId,
+        query_policy_id: QueryPolicyId,
         selected_revision: u16,
     },
     Rejected {
@@ -130,12 +131,13 @@ pub enum BootstrapReplyV1 {
     },
 }
 
-impl BootstrapReplyV1 {
+impl BootstrapReplyV2 {
     #[must_use]
     pub fn negotiate(
-        hello: &BootstrapHelloV1,
+        hello: &BootstrapHelloV2,
         expected_project: ProjectId,
         expected_instance: DaemonInstanceId,
+        query_policy_id: QueryPolicyId,
         supported_revisions: &[u16],
     ) -> Self {
         if hello.project_id != expected_project {
@@ -144,17 +146,18 @@ impl BootstrapReplyV1 {
         if hello.daemon_instance_id != expected_instance {
             return Self::rejected(BootstrapErrorCode::InstanceMismatch);
         }
-        let selected = hello
-            .supported_revisions
-            .iter()
-            .rev()
-            .copied()
-            .find(|candidate| supported_revisions.contains(candidate));
+        let selected = (supported_revisions.contains(&BUSINESS_PROTOCOL_REVISION)
+            && hello
+                .supported_revisions
+                .binary_search(&BUSINESS_PROTOCOL_REVISION)
+                .is_ok())
+        .then_some(BUSINESS_PROTOCOL_REVISION);
         match selected {
             Some(selected_revision) => Self::Accepted {
                 bootstrap_version: BOOTSTRAP_VERSION,
                 project_id: expected_project,
                 daemon_instance_id: expected_instance,
+                query_policy_id,
                 selected_revision,
             },
             None => Self::rejected(BootstrapErrorCode::NoCommonRevision),
@@ -171,7 +174,17 @@ impl BootstrapReplyV1 {
         }
     }
 
-    pub fn validate_for(&self, hello: &BootstrapHelloV1) -> Result<(), ContractValidationError> {
+    #[must_use]
+    pub const fn query_policy_id(&self) -> Option<QueryPolicyId> {
+        match self {
+            Self::Accepted {
+                query_policy_id, ..
+            } => Some(*query_policy_id),
+            Self::Rejected { .. } => None,
+        }
+    }
+
+    pub fn validate_for(&self, hello: &BootstrapHelloV2) -> Result<(), ContractValidationError> {
         self.validate()?;
         if let Self::Accepted {
             project_id,
@@ -179,16 +192,31 @@ impl BootstrapReplyV1 {
             selected_revision,
             ..
         } = self
-            && (*project_id != hello.project_id
-                || *daemon_instance_id != hello.daemon_instance_id
-                || hello
-                    .supported_revisions
-                    .binary_search(selected_revision)
-                    .is_err())
         {
-            return Err(ContractValidationError::Inconsistent {
-                field: "bootstrap reply binding",
-            });
+            if *project_id != hello.project_id {
+                return Err(ContractValidationError::Inconsistent {
+                    field: "bootstrap reply project binding",
+                });
+            }
+            if *daemon_instance_id != hello.daemon_instance_id {
+                return Err(ContractValidationError::Inconsistent {
+                    field: "bootstrap reply daemon instance binding",
+                });
+            }
+            if hello
+                .supported_revisions
+                .binary_search(selected_revision)
+                .is_err()
+            {
+                return Err(ContractValidationError::Inconsistent {
+                    field: "bootstrap reply selected revision",
+                });
+            }
+            if *selected_revision != BUSINESS_PROTOCOL_REVISION {
+                return Err(ContractValidationError::Inconsistent {
+                    field: "bootstrap reply current business revision",
+                });
+            }
         }
         Ok(())
     }
@@ -201,17 +229,22 @@ impl BootstrapReplyV1 {
     }
 }
 
-impl ValidateContract for BootstrapReplyV1 {
+impl ValidateContract for BootstrapReplyV2 {
     fn validate(&self) -> Result<(), ContractValidationError> {
-        let (bootstrap_version, selected_revision) = match self {
+        let (bootstrap_version, selected_revision, query_policy_id) = match self {
             Self::Accepted {
                 bootstrap_version,
                 selected_revision,
+                query_policy_id,
                 ..
-            } => (*bootstrap_version, Some(*selected_revision)),
+            } => (
+                *bootstrap_version,
+                Some(*selected_revision),
+                Some(*query_policy_id),
+            ),
             Self::Rejected {
                 bootstrap_version, ..
-            } => (*bootstrap_version, None),
+            } => (*bootstrap_version, None, None),
         };
         ensure_version("bootstrap", bootstrap_version, BOOTSTRAP_VERSION)?;
         if selected_revision == Some(0) {
@@ -219,11 +252,25 @@ impl ValidateContract for BootstrapReplyV1 {
                 field: "selected_revision",
             });
         }
+        if let Some(actual) = selected_revision
+            && actual != BUSINESS_PROTOCOL_REVISION
+        {
+            return Err(ContractValidationError::UnsupportedRevision {
+                contract: "business protocol",
+                actual,
+                expected: BUSINESS_PROTOCOL_REVISION,
+            });
+        }
+        if query_policy_id.is_some_and(|value| value.as_bytes().iter().all(|byte| *byte == 0)) {
+            return Err(ContractValidationError::Empty {
+                field: "query_policy_id",
+            });
+        }
         Ok(())
     }
 }
 
-impl<'de> Deserialize<'de> for BootstrapReplyV1 {
+impl<'de> Deserialize<'de> for BootstrapReplyV2 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -235,6 +282,7 @@ impl<'de> Deserialize<'de> for BootstrapReplyV1 {
                 bootstrap_version: u16,
                 project_id: ProjectId,
                 daemon_instance_id: DaemonInstanceId,
+                query_policy_id: QueryPolicyId,
                 selected_revision: u16,
             },
             Rejected {
@@ -248,11 +296,13 @@ impl<'de> Deserialize<'de> for BootstrapReplyV1 {
                 bootstrap_version,
                 project_id,
                 daemon_instance_id,
+                query_policy_id,
                 selected_revision,
             } => Self::Accepted {
                 bootstrap_version,
                 project_id,
                 daemon_instance_id,
+                query_policy_id,
                 selected_revision,
             },
             Wire::Rejected {

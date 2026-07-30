@@ -3,7 +3,7 @@ name = "unity-asset-search-daemon"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "Local HTTP daemon for Unity project search (used by UnityHero)"
+description = "Principal-scoped local IPC daemon for Unity project search"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -13,40 +13,21 @@ categories = ["command-line-utilities", "game-development"]
 
 [dependencies]
 anyhow.workspace = true
-axum.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
+thiserror.workspace = true
 clap.workspace = true
-tower-http.workspace = true
+futures.workspace = true
 rand.workspace = true
-hex.workspace = true
 notify.workspace = true
-mime.workspace = true
-subtle.workspace = true
-fs2.workspace = true
-url.workspace = true
+sha2.workspace = true
 unity-asset-core = { workspace = true }
 unity-asset-search-index = { workspace = true }
+unity-asset-search-local = { workspace = true }
 unity-asset-search-protocol = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
-tower = { version = "0.5", features = ["util"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
-
-[target.'cfg(unix)'.dependencies]
-rustix = { workspace = true, features = ["fs", "process"] }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Storage_FileSystem",
-    "Win32_System_SystemServices",
-    "Win32_System_Threading",
-] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

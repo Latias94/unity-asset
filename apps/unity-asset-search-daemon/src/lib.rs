@@ -1,5 +1,6 @@
-//! Reusable daemon boundaries.
+//! Reusable local search daemon boundaries.
 
-pub mod app;
 pub mod coordinator;
-pub mod security;
+pub mod ipc;
+pub mod lifecycle;
+pub mod watcher;

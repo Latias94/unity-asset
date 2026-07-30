@@ -1,6 +1,6 @@
 //! Serial admission and execution for every daemon reindex trigger.
 //!
-//! Admission is intentionally centralized here. Filesystem events, timers, HTTP requests, and
+//! Admission is intentionally centralized here. Filesystem events, timers, IPC requests, and
 //! startup reconciliation must not grow independent scheduling rules around the index builder.
 
 use std::collections::{BTreeSet, VecDeque};
@@ -11,15 +11,17 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Notify, oneshot};
+use futures::FutureExt as _;
+use sha2::{Digest as _, Sha256};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::Instant;
-use unity_asset_search_index::{
-    FilesystemReindexIntent, FilesystemReindexScope, ReindexDisposition, ReindexReceipt,
-    SEARCH_GENERATION_CONTRACT_VERSION, StatusResponse,
+use unity_asset_search_index::{FilesystemReindexIntent, FilesystemReindexScope};
+use unity_asset_search_protocol::{
+    ReindexDisposition, ReindexReceipt, SEARCH_PROTOCOL_REVISION, StatusResponse, ValidateContract,
 };
-use unity_asset_search_protocol::ValidateContractVersion;
 
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(75);
 const DEFAULT_MAX_DEBOUNCE: Duration = Duration::from_millis(750);
@@ -27,11 +29,61 @@ const DEFAULT_MAX_DIRTY_PATHS: usize = 4_096;
 const DEFAULT_MAX_PENDING_EVENTS: usize = 32_768;
 const DEFAULT_MAX_FAILURE_HISTORY: usize = 64;
 const MAX_FAILURE_MESSAGE_BYTES: usize = 4_096;
+const REINDEX_INTENT_FINGERPRINT_DOMAIN: &[u8] = b"unity-asset:search-daemon:reindex-intent:v1\0";
 
 type BuildFuture = Pin<Box<dyn Future<Output = anyhow::Result<ReindexExecution>> + Send + 'static>>;
 type BuildExecutor = dyn Fn(FilesystemReindexIntent) -> BuildFuture + Send + Sync + 'static;
 type CompletionOutcome = Result<ReindexExecution, ExecutionFailure>;
-type CompletionSender = oneshot::Sender<CompletionOutcome>;
+const OBSERVATION_EVENT_CAPACITY: usize = 3;
+
+#[derive(Debug, Clone)]
+enum ObservationEvent {
+    Coalesced,
+    Running,
+    Completed(Arc<CompletionOutcome>),
+    Cancelled,
+}
+
+#[derive(Debug)]
+struct CompletionObserver {
+    id: u64,
+    events: mpsc::Sender<ObservationEvent>,
+    phase: Arc<AtomicU8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum ObservationPhase {
+    Queued = 0,
+    Coalesced = 1,
+    Running = 2,
+    Terminal = 3,
+}
+
+impl ObservationPhase {
+    fn load(phase: &AtomicU8) -> Self {
+        match phase.load(Ordering::Acquire) {
+            0 => Self::Queued,
+            1 => Self::Coalesced,
+            2 => Self::Running,
+            _ => Self::Terminal,
+        }
+    }
+}
+
+impl CompletionObserver {
+    fn notify(&self, event: ObservationEvent) {
+        let phase = match &event {
+            ObservationEvent::Coalesced => ObservationPhase::Coalesced,
+            ObservationEvent::Running => ObservationPhase::Running,
+            ObservationEvent::Completed(_) | ObservationEvent::Cancelled => {
+                ObservationPhase::Terminal
+            }
+        };
+        self.phase.store(phase as u8, Ordering::Release);
+        let _receiver_was_dropped = self.events.try_send(event);
+    }
+}
 
 /// The daemon boundary that admitted a reindex request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +91,7 @@ pub enum ReindexSource {
     Startup,
     Watcher,
     Timer,
-    Http,
+    Ipc,
 }
 
 impl ReindexSource {
@@ -48,7 +100,7 @@ impl ReindexSource {
             Self::Startup => 0,
             Self::Watcher => 1,
             Self::Timer => 2,
-            Self::Http => 3,
+            Self::Ipc => 3,
         }
     }
 }
@@ -174,7 +226,7 @@ pub struct ReindexAdmissionCounts {
     pub startup: u64,
     pub watcher: u64,
     pub timer: u64,
-    pub http: u64,
+    pub ipc: u64,
 }
 
 impl ReindexAdmissionCounts {
@@ -183,7 +235,7 @@ impl ReindexAdmissionCounts {
             startup: counts[0],
             watcher: counts[1],
             timer: counts[2],
-            http: counts[3],
+            ipc: counts[3],
         }
     }
 }
@@ -194,6 +246,7 @@ pub struct ReindexCoordinatorSnapshot {
     pub running: bool,
     pub in_flight: Option<ReindexScopeKind>,
     pub pending_general: Option<ReindexScopeKind>,
+    pub last_completion_failed: bool,
     pub failures: Vec<ReindexFailure>,
     pub full_escalations: u64,
     pub watcher_overflows: u64,
@@ -236,6 +289,112 @@ pub struct ReindexCompletion {
     pub status: StatusResponse,
 }
 
+/// One admitted reindex operation whose terminal result may outlive its requesting connection.
+pub struct ReindexObservation {
+    admission: ReindexReceipt,
+    events: mpsc::Receiver<ObservationEvent>,
+    cancellation: ReindexCancellation,
+}
+
+impl ReindexObservation {
+    #[must_use]
+    pub const fn admission(&self) -> &ReindexReceipt {
+        &self.admission
+    }
+
+    pub(crate) fn cancellation(&self) -> ReindexCancellation {
+        self.cancellation.clone()
+    }
+
+    pub(crate) async fn next_progress(&mut self) -> ReindexObservationProgress {
+        match self.events.recv().await {
+            Some(ObservationEvent::Coalesced) => ReindexObservationProgress::Coalesced,
+            Some(ObservationEvent::Running) => ReindexObservationProgress::Running,
+            Some(ObservationEvent::Cancelled) => ReindexObservationProgress::Cancelled,
+            Some(ObservationEvent::Completed(completion)) => {
+                ReindexObservationProgress::Terminal(Box::new(match completion.as_ref() {
+                    Ok(execution) => {
+                        let (terminal, status) = execution.clone().into_parts();
+                        Ok(ReindexCompletion {
+                            admission: self.admission.clone(),
+                            terminal,
+                            status,
+                        })
+                    }
+                    Err(failure) => Err(CoordinatorError::ExecutionFailed {
+                        admission: Box::new(self.admission.clone()),
+                        scope: failure.scope,
+                        message: failure.message.clone(),
+                    }),
+                }))
+            }
+            None => ReindexObservationProgress::Terminal(Box::new(Err(
+                CoordinatorError::CompletionChannelClosed {
+                    admission: Box::new(self.admission.clone()),
+                },
+            ))),
+        }
+    }
+
+    pub async fn wait(mut self) -> Result<ReindexCompletion, CoordinatorError> {
+        loop {
+            match self.next_progress().await {
+                ReindexObservationProgress::Coalesced | ReindexObservationProgress::Running => {}
+                ReindexObservationProgress::Cancelled => {
+                    return Err(CoordinatorError::Cancelled {
+                        admission: Box::new(self.admission),
+                    });
+                }
+                ReindexObservationProgress::Terminal(result) => return *result,
+            }
+        }
+    }
+}
+
+pub(crate) enum ReindexObservationProgress {
+    Coalesced,
+    Running,
+    Terminal(Box<Result<ReindexCompletion, CoordinatorError>>),
+    Cancelled,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReindexCancellation {
+    inner: Arc<CoordinatorInner>,
+    observation_id: u64,
+    phase: Arc<AtomicU8>,
+}
+
+impl ReindexCancellation {
+    pub(crate) async fn cancel(&self) -> ReindexCancellationOutcome {
+        let observer = {
+            let mut state = self.inner.state.lock().await;
+            state.cancel_exclusive(self.observation_id)
+        };
+        if let Some(observer) = observer {
+            observer.notify(ObservationEvent::Cancelled);
+            self.inner.changed.notify_waiters();
+            self.inner.wake.notify_one();
+            return ReindexCancellationOutcome::Cancelled;
+        }
+        match ObservationPhase::load(&self.phase) {
+            ObservationPhase::Coalesced => ReindexCancellationOutcome::Coalesced,
+            ObservationPhase::Running => ReindexCancellationOutcome::Running,
+            ObservationPhase::Queued | ObservationPhase::Terminal => {
+                ReindexCancellationOutcome::Finished
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReindexCancellationOutcome {
+    Cancelled,
+    Coalesced,
+    Running,
+    Finished,
+}
+
 /// Concrete daemon-owned coordinator.
 ///
 /// The executor is supplied once at construction but erased internally. Callers share this one
@@ -243,6 +402,13 @@ pub struct ReindexCompletion {
 #[derive(Clone)]
 pub struct ReindexCoordinator {
     inner: Arc<CoordinatorInner>,
+}
+
+/// Process-lifetime owner for the coordinator executor and its single persistent runner.
+#[must_use = "the coordinator runtime must be shut down and joined before daemon leases release"]
+pub struct ReindexCoordinatorRuntime {
+    coordinator: ReindexCoordinator,
+    runner: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl fmt::Debug for ReindexCoordinator {
@@ -254,8 +420,8 @@ impl fmt::Debug for ReindexCoordinator {
     }
 }
 
-impl ReindexCoordinator {
-    pub fn new<F, Fut>(
+impl ReindexCoordinatorRuntime {
+    pub fn start<F, Fut>(
         config: ReindexCoordinatorConfig,
         executor: F,
     ) -> Result<Self, CoordinatorError>
@@ -266,17 +432,63 @@ impl ReindexCoordinator {
         let config = config.validate()?;
         let executor: Arc<BuildExecutor> =
             Arc::new(move |intent| Box::pin(executor(intent)) as BuildFuture);
+        let inner = Arc::new(CoordinatorInner {
+            config,
+            state: Mutex::new(CoordinatorState::default()),
+            wake: Notify::new(),
+            changed: Notify::new(),
+            next_observation_id: AtomicU64::new(1),
+            shutting_down: AtomicBool::new(false),
+        });
+        let runner = tokio::spawn(run_coordinator(Arc::clone(&inner), executor));
         Ok(Self {
-            inner: Arc::new(CoordinatorInner {
-                config,
-                executor,
-                state: Mutex::new(CoordinatorState::default()),
-                wake: Notify::new(),
-                changed: Notify::new(),
-            }),
+            coordinator: ReindexCoordinator { inner },
+            runner: Some(runner),
         })
     }
 
+    #[must_use]
+    pub fn coordinator(&self) -> ReindexCoordinator {
+        self.coordinator.clone()
+    }
+
+    /// Closes admission, drains accepted builds, and joins the process-lifetime runner.
+    pub async fn shutdown(&mut self) -> Result<(), CoordinatorError> {
+        self.coordinator
+            .inner
+            .shutting_down
+            .store(true, Ordering::Release);
+        self.coordinator.inner.wake.notify_waiters();
+        let Some(runner) = self.runner.as_mut() else {
+            return Ok(());
+        };
+        let result = runner.await;
+        self.runner.take();
+        result.map_err(|error| CoordinatorError::RunnerTerminated {
+            message: truncate_message(error.to_string()),
+        })
+    }
+}
+
+impl Drop for ReindexCoordinatorRuntime {
+    fn drop(&mut self) {
+        if let Some(runner) = self.runner.take() {
+            runner.abort();
+        }
+    }
+}
+
+impl fmt::Debug for ReindexCoordinatorRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReindexCoordinatorRuntime")
+            .field("coordinator", &self.coordinator)
+            .field("running", &self.runner.is_some())
+            .finish()
+    }
+}
+
+impl ReindexCoordinator {
     /// Atomically admits, rejects, or coalesces one reindex request.
     pub async fn admit(
         &self,
@@ -292,24 +504,77 @@ impl ReindexCoordinator {
         source: ReindexSource,
         intent: FilesystemReindexIntent,
     ) -> Result<ReindexCompletion, CoordinatorError> {
-        if intent.contract_version != SEARCH_GENERATION_CONTRACT_VERSION {
-            return Err(CoordinatorError::UnsupportedContractVersion {
-                actual: intent.contract_version,
-                expected: SEARCH_GENERATION_CONTRACT_VERSION,
-            });
-        }
-        let normalized = normalize_general_scope(&intent, &self.inner.config)?;
-        let (completion_sender, completion_receiver) = oneshot::channel();
+        self.admit_observed(source, intent).await?.wait().await
+    }
+
+    /// Atomically admits one request and returns an independently awaitable completion handle.
+    pub async fn admit_observed(
+        &self,
+        source: ReindexSource,
+        intent: FilesystemReindexIntent,
+    ) -> Result<ReindexObservation, CoordinatorError> {
+        let prepared = self.prepare_intent(&intent)?;
+        self.admit_prepared_observed(source, prepared).await
+    }
+
+    pub(crate) fn prepare_intent(
+        &self,
+        intent: &FilesystemReindexIntent,
+    ) -> Result<PreparedReindexIntent, CoordinatorError> {
+        let normalized = normalize_general_scope(intent, &self.inner.config)?;
+        Ok(PreparedReindexIntent::new(normalized))
+    }
+
+    pub(crate) async fn admit_prepared_observed(
+        &self,
+        source: ReindexSource,
+        prepared: PreparedReindexIntent,
+    ) -> Result<ReindexObservation, CoordinatorError> {
+        self.admit_prepared_observed_with(source, prepared, false)
+            .await
+    }
+
+    pub(crate) async fn admit_watcher_overflow_observed(
+        &self,
+    ) -> Result<ReindexObservation, CoordinatorError> {
+        let prepared = PreparedReindexIntent::new(NormalizedGeneralScope {
+            scope: GeneralScope::Full,
+            escalated: true,
+        });
+        self.admit_prepared_observed_with(ReindexSource::Watcher, prepared, true)
+            .await
+    }
+
+    async fn admit_prepared_observed_with(
+        &self,
+        source: ReindexSource,
+        prepared: PreparedReindexIntent,
+        watcher_overflow: bool,
+    ) -> Result<ReindexObservation, CoordinatorError> {
+        let observation_id = self.next_observation_id();
+        let (event_sender, event_receiver) = mpsc::channel(OBSERVATION_EVENT_CAPACITY);
+        let phase = Arc::new(AtomicU8::new(ObservationPhase::Queued as u8));
+        let observer = CompletionObserver {
+            id: observation_id,
+            events: event_sender,
+            phase: Arc::clone(&phase),
+        };
         let (admission, should_start) = {
             let mut state = self.inner.state.lock().await;
+            if self.inner.shutting_down.load(Ordering::Acquire) {
+                return Err(CoordinatorError::ShuttingDown);
+            }
             state.admissions[source.index()] = state.admissions[source.index()].saturating_add(1);
-            let escalated = normalized.escalated;
+            if watcher_overflow {
+                state.watcher_overflows = state.watcher_overflows.saturating_add(1);
+            }
+            let escalated = prepared.escalated;
             let disposition = state.admit_general(
-                normalized.scope,
+                prepared.scope,
                 Instant::now(),
                 &self.inner.config,
                 escalated,
-                Some(completion_sender),
+                Some(observer),
             )?;
             if escalated {
                 state.full_escalations = state.full_escalations.saturating_add(1);
@@ -319,29 +584,15 @@ impl ReindexCoordinator {
         };
 
         self.signal_runner_after_admission(should_start);
-        let completion = match completion_receiver.await {
-            Ok(completion) => completion,
-            Err(_) => {
-                return Err(CoordinatorError::CompletionChannelClosed {
-                    admission: Box::new(admission),
-                });
-            }
-        };
-        match completion {
-            Ok(execution) => {
-                let (terminal, status) = execution.into_parts();
-                Ok(ReindexCompletion {
-                    admission,
-                    terminal,
-                    status,
-                })
-            }
-            Err(failure) => Err(CoordinatorError::ExecutionFailed {
-                admission: Box::new(admission),
-                scope: failure.scope,
-                message: failure.message,
-            }),
-        }
+        Ok(ReindexObservation {
+            admission,
+            events: event_receiver,
+            cancellation: ReindexCancellation {
+                inner: Arc::clone(&self.inner),
+                observation_id,
+                phase,
+            },
+        })
     }
 
     /// Records a lossy watcher overflow and upgrades pending filesystem work to a full scan.
@@ -379,13 +630,10 @@ impl ReindexCoordinator {
         intent: FilesystemReindexIntent,
         watcher_overflow: bool,
     ) -> Result<ReindexReceipt, CoordinatorError> {
-        if intent.contract_version != SEARCH_GENERATION_CONTRACT_VERSION {
-            return Err(CoordinatorError::UnsupportedContractVersion {
-                actual: intent.contract_version,
-                expected: SEARCH_GENERATION_CONTRACT_VERSION,
-            });
-        }
         let mut state = self.inner.state.lock().await;
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            return Err(CoordinatorError::ShuttingDown);
+        }
         state.admissions[source.index()] = state.admissions[source.index()].saturating_add(1);
 
         let disposition = if watcher_overflow {
@@ -399,15 +647,15 @@ impl ReindexCoordinator {
                 None,
             )?
         } else {
-            let scope = normalize_general_scope(&intent, &self.inner.config)?;
-            if scope.escalated {
+            let prepared = self.prepare_intent(&intent)?;
+            if prepared.escalated {
                 state.full_escalations = state.full_escalations.saturating_add(1);
             }
             state.admit_general(
-                scope.scope,
+                prepared.scope,
                 Instant::now(),
                 &self.inner.config,
-                scope.escalated,
+                prepared.escalated,
                 None,
             )?
         };
@@ -423,21 +671,29 @@ impl ReindexCoordinator {
     fn signal_runner_after_admission(&self, should_start: bool) {
         self.inner.changed.notify_waiters();
         self.inner.wake.notify_one();
-        if should_start {
-            let inner = Arc::clone(&self.inner);
-            let _runner = tokio::spawn(async move {
-                run_coordinator(inner).await;
-            });
+        let _runner_became_active = should_start;
+    }
+
+    fn next_observation_id(&self) -> u64 {
+        loop {
+            let candidate = self
+                .inner
+                .next_observation_id
+                .fetch_add(1, Ordering::Relaxed);
+            if candidate != 0 {
+                return candidate;
+            }
         }
     }
 }
 
 struct CoordinatorInner {
     config: ReindexCoordinatorConfig,
-    executor: Arc<BuildExecutor>,
     state: Mutex<CoordinatorState>,
     wake: Notify,
     changed: Notify,
+    next_observation_id: AtomicU64,
+    shutting_down: AtomicBool,
 }
 
 #[derive(Default)]
@@ -445,6 +701,7 @@ struct CoordinatorState {
     runner_running: bool,
     in_flight: Option<FilesystemReindexIntent>,
     pending_general: Option<PendingGeneral>,
+    last_completion_failed: bool,
     failures: VecDeque<ReindexFailure>,
     failure_sequence: u64,
     full_escalations: u64,
@@ -460,7 +717,7 @@ impl CoordinatorState {
         now: Instant,
         config: &ReindexCoordinatorConfig,
         force_immediate: bool,
-        completion_waiter: Option<CompletionSender>,
+        completion_waiter: Option<CompletionObserver>,
     ) -> Result<ReindexDisposition, CoordinatorError> {
         if completion_waiter.is_some() && self.completion_waiter_count >= config.max_pending_events
         {
@@ -479,12 +736,24 @@ impl CoordinatorState {
             return Ok(ReindexDisposition::Queued);
         };
 
-        if let Some(waiter) = completion_waiter {
-            pending.try_push_waiter(waiter)?;
+        let added_observer = completion_waiter.is_some();
+        if let Some(observer) = completion_waiter {
+            pending.try_push_waiter(observer)?;
             self.completion_waiter_count += 1;
         }
         pending.last_event = now;
         pending.event_count = pending.event_count.saturating_add(1);
+        pending.shared = true;
+        if !pending.coalesced_notified {
+            pending.notify_observers(ObservationEvent::Coalesced);
+            pending.coalesced_notified = true;
+        } else if added_observer {
+            pending
+                .waiters
+                .last()
+                .expect("the admitted observer was appended")
+                .notify(ObservationEvent::Coalesced);
+        }
         pending.force_immediate |= force_immediate;
         if pending.scope.merge(incoming, config.max_dirty_paths) {
             self.full_escalations = self.full_escalations.saturating_add(1);
@@ -516,6 +785,9 @@ impl CoordinatorState {
             .is_some_and(|pending| pending.ready_at(config) <= now);
         if general_is_ready && let Some(pending) = self.pending_general.take() {
             let PendingGeneral { scope, waiters, .. } = pending;
+            for observer in &waiters {
+                observer.notify(ObservationEvent::Running);
+            }
             let intent = scope.into_intent();
             self.in_flight = Some(intent.clone());
             return RunnerAction::Execute {
@@ -532,6 +804,16 @@ impl CoordinatorState {
         RunnerAction::Stop
     }
 
+    fn cancel_exclusive(&mut self, observation_id: u64) -> Option<CompletionObserver> {
+        let pending = self.pending_general.as_ref()?;
+        if pending.shared || pending.waiters.len() != 1 || pending.waiters[0].id != observation_id {
+            return None;
+        }
+        let mut pending = self.pending_general.take()?;
+        self.completion_waiter_count = self.completion_waiter_count.saturating_sub(1);
+        pending.waiters.pop()
+    }
+
     fn finish(
         &mut self,
         intent: &FilesystemReindexIntent,
@@ -540,6 +822,7 @@ impl CoordinatorState {
         config: &ReindexCoordinatorConfig,
     ) {
         self.in_flight = None;
+        self.last_completion_failed = outcome.is_err();
         self.completion_waiter_count = self
             .completion_waiter_count
             .saturating_sub(completed_waiters);
@@ -573,6 +856,7 @@ impl CoordinatorState {
                 .pending_general
                 .as_ref()
                 .map(|pending| pending.scope.kind()),
+            last_completion_failed: self.last_completion_failed,
             failures: self.failures.iter().cloned().collect(),
             full_escalations: self.full_escalations,
             watcher_overflows: self.watcher_overflows,
@@ -584,13 +868,13 @@ impl CoordinatorState {
 enum RunnerAction {
     Execute {
         intent: Box<FilesystemReindexIntent>,
-        waiters: Vec<CompletionSender>,
+        waiters: Vec<CompletionObserver>,
     },
     WaitUntil(Instant),
     Stop,
 }
 
-async fn run_coordinator(inner: Arc<CoordinatorInner>) {
+async fn run_coordinator(inner: Arc<CoordinatorInner>, executor: Arc<BuildExecutor>) {
     loop {
         let notified = inner.wake.notified();
         let action = {
@@ -601,12 +885,12 @@ async fn run_coordinator(inner: Arc<CoordinatorInner>) {
         match action {
             RunnerAction::Execute { intent, waiters } => {
                 inner.changed.notify_waiters();
-                let outcome = execute(&inner.executor, &intent).await;
+                let outcome = Arc::new(execute(&executor, &intent).await);
                 let mut state = inner.state.lock().await;
-                state.finish(&intent, &outcome, waiters.len(), &inner.config);
+                state.finish(&intent, outcome.as_ref(), waiters.len(), &inner.config);
                 drop(state);
-                for waiter in waiters {
-                    let _receiver_was_dropped = waiter.send(outcome.clone());
+                for observer in waiters {
+                    observer.notify(ObservationEvent::Completed(Arc::clone(&outcome)));
                 }
                 inner.changed.notify_waiters();
                 inner.wake.notify_one();
@@ -619,7 +903,10 @@ async fn run_coordinator(inner: Arc<CoordinatorInner>) {
             }
             RunnerAction::Stop => {
                 inner.changed.notify_waiters();
-                return;
+                if inner.shutting_down.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
             }
         }
     }
@@ -646,19 +933,11 @@ async fn execute(
 ) -> CompletionOutcome {
     let execution_intent = intent.clone();
     let outcome = match catch_unwind(AssertUnwindSafe(|| executor(execution_intent))) {
-        Ok(future) => {
-            match tokio::spawn(async move {
-                match future.await {
-                    Ok(execution) => validate_execution(execution),
-                    Err(error) => Err(error.to_string()),
-                }
-            })
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(join_error) => Err(format!("reindex build task failed: {join_error}")),
-            }
-        }
+        Ok(future) => match AssertUnwindSafe(future).catch_unwind().await {
+            Ok(Ok(execution)) => validate_execution(execution),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Err("reindex executor future panicked".to_owned()),
+        },
         Err(_) => Err("reindex executor panicked before returning its future".to_owned()),
     };
     outcome.map_err(|message| ExecutionFailure::new(intent, message))
@@ -667,7 +946,7 @@ async fn execute(
 fn validate_execution(execution: ReindexExecution) -> Result<ReindexExecution, String> {
     let receipt = &execution.receipt;
     receipt
-        .validate_contract_version()
+        .validate()
         .map_err(|error| format!("executor returned an invalid receipt: {error}"))?;
     if receipt.transaction.is_some() {
         return Err("executor returned a receipt for a different transaction".to_owned());
@@ -686,7 +965,7 @@ fn validate_execution(execution: ReindexExecution) -> Result<ReindexExecution, S
     }
     execution
         .status
-        .validate_contract_version()
+        .validate()
         .map_err(|error| format!("executor returned an invalid status: {error}"))?;
     if execution.status.indexing || execution.status.generation.building_revision.is_some() {
         return Err("executor returned a non-terminal status snapshot".to_owned());
@@ -701,6 +980,27 @@ fn validate_execution(execution: ReindexExecution) -> Result<ReindexExecution, S
 struct NormalizedGeneralScope {
     scope: GeneralScope,
     escalated: bool,
+}
+
+pub(crate) struct PreparedReindexIntent {
+    scope: GeneralScope,
+    escalated: bool,
+    fingerprint: [u8; 32],
+}
+
+impl PreparedReindexIntent {
+    fn new(normalized: NormalizedGeneralScope) -> Self {
+        let fingerprint = reindex_intent_fingerprint(&normalized.scope);
+        Self {
+            scope: normalized.scope,
+            escalated: normalized.escalated,
+            fingerprint,
+        }
+    }
+
+    pub(crate) const fn fingerprint(&self) -> [u8; 32] {
+        self.fingerprint
+    }
 }
 
 fn normalize_general_scope(
@@ -752,6 +1052,51 @@ enum GeneralScope {
     Full,
     Reconcile,
     ChangedPaths(BTreeSet<PathBuf>),
+}
+
+fn reindex_intent_fingerprint(scope: &GeneralScope) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(REINDEX_INTENT_FINGERPRINT_DOMAIN);
+    match scope {
+        GeneralScope::Full => hasher.update([0]),
+        GeneralScope::Reconcile => hasher.update([1]),
+        GeneralScope::ChangedPaths(paths) => {
+            hasher.update([2]);
+            hasher.update((paths.len() as u64).to_le_bytes());
+            for path in paths {
+                update_path_fingerprint(&mut hasher, path);
+            }
+        }
+    }
+    hasher.finalize().into()
+}
+
+#[cfg(unix)]
+fn update_path_fingerprint(hasher: &mut Sha256, path: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let encoded = path.as_os_str().as_bytes();
+    hasher.update((encoded.len() as u64).to_le_bytes());
+    hasher.update(encoded);
+}
+
+#[cfg(windows)]
+fn update_path_fingerprint(hasher: &mut Sha256, path: &Path) {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let encoded = path.as_os_str().encode_wide();
+    let length = encoded.clone().count() as u64;
+    hasher.update(length.to_le_bytes());
+    for unit in encoded {
+        hasher.update(unit.to_le_bytes());
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn update_path_fingerprint(hasher: &mut Sha256, path: &Path) {
+    let encoded = path.to_string_lossy();
+    hasher.update((encoded.len() as u64).to_le_bytes());
+    hasher.update(encoded.as_bytes());
 }
 
 impl GeneralScope {
@@ -810,8 +1155,10 @@ struct PendingGeneral {
     first_admitted: Instant,
     last_event: Instant,
     event_count: usize,
+    shared: bool,
+    coalesced_notified: bool,
     force_immediate: bool,
-    waiters: Vec<CompletionSender>,
+    waiters: Vec<CompletionObserver>,
 }
 
 impl PendingGeneral {
@@ -821,17 +1168,25 @@ impl PendingGeneral {
             first_admitted: now,
             last_event: now,
             event_count: 1,
+            shared: false,
+            coalesced_notified: false,
             force_immediate,
             waiters: Vec::new(),
         }
     }
 
-    fn try_push_waiter(&mut self, waiter: CompletionSender) -> Result<(), CoordinatorError> {
+    fn try_push_waiter(&mut self, waiter: CompletionObserver) -> Result<(), CoordinatorError> {
         self.waiters
             .try_reserve(1)
             .map_err(|_| CoordinatorError::CompletionWaiterAllocationFailed)?;
         self.waiters.push(waiter);
         Ok(())
+    }
+
+    fn notify_observers(&self, event: ObservationEvent) {
+        for observer in &self.waiters {
+            observer.notify(event.clone());
+        }
     }
 
     fn ready_at(&self, config: &ReindexCoordinatorConfig) -> Instant {
@@ -911,7 +1266,7 @@ fn normalize_changed_path(
 
 fn admission_receipt(disposition: ReindexDisposition) -> ReindexReceipt {
     ReindexReceipt {
-        contract_version: SEARCH_GENERATION_CONTRACT_VERSION,
+        protocol_revision: SEARCH_PROTOCOL_REVISION,
         disposition,
         transaction: None,
         target_revision: None,
@@ -937,9 +1292,9 @@ fn truncate_message(mut message: String) -> String {
 #[non_exhaustive]
 pub enum CoordinatorError {
     InvalidConfiguration(&'static str),
-    UnsupportedContractVersion {
-        actual: u16,
-        expected: u16,
+    ShuttingDown,
+    RunnerTerminated {
+        message: String,
     },
     CompletionWaiterLimit {
         maximum: usize,
@@ -951,6 +1306,9 @@ pub enum CoordinatorError {
         message: String,
     },
     CompletionChannelClosed {
+        admission: Box<ReindexReceipt>,
+    },
+    Cancelled {
         admission: Box<ReindexReceipt>,
     },
     PathOutsideProject {
@@ -968,10 +1326,13 @@ impl fmt::Display for CoordinatorError {
                     "invalid reindex coordinator configuration: {message}"
                 )
             }
-            Self::UnsupportedContractVersion { actual, expected } => write!(
-                formatter,
-                "reindex intent contract version {actual} is unsupported; expected {expected}"
-            ),
+            Self::ShuttingDown => formatter.write_str("reindex coordinator is shutting down"),
+            Self::RunnerTerminated { message } => {
+                write!(
+                    formatter,
+                    "reindex coordinator runner terminated: {message}"
+                )
+            }
             Self::CompletionWaiterLimit { maximum } => write!(
                 formatter,
                 "reindex completion waiter limit reached; maximum pending waiters is {maximum}"
@@ -985,6 +1346,7 @@ impl fmt::Display for CoordinatorError {
             Self::CompletionChannelClosed { .. } => {
                 formatter.write_str("reindex completion channel closed before reporting a result")
             }
+            Self::Cancelled { .. } => formatter.write_str("queued reindex operation was cancelled"),
             Self::PathOutsideProject { path, project_root } => write!(
                 formatter,
                 "changed path {} is outside project root {}",

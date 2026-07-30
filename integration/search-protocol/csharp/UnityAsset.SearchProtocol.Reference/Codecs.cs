@@ -15,7 +15,7 @@ namespace UnityAsset.SearchProtocol.Reference
             "no_common_revision",
         };
 
-        public static BootstrapHelloV1 DecodeHello(byte[] utf8Json)
+        public static BootstrapHelloV2 DecodeHello(byte[] utf8Json)
         {
             StrictJson.RequireEncodedLimit(utf8Json, FrameLimits.BootstrapMaxEncodedBytes, "bootstrap hello");
             JsonElement root = StrictJson.ParseObject(utf8Json, "bootstrap hello");
@@ -53,10 +53,10 @@ namespace UnityAsset.SearchProtocol.Reference
                 values[index] = revision;
                 previous = revision;
             }
-            return new BootstrapHelloV1(version, projectId, instanceId, values);
+            return new BootstrapHelloV2(version, projectId, instanceId, values);
         }
 
-        public static byte[] EncodeHello(BootstrapHelloV1 hello)
+        public static byte[] EncodeHello(BootstrapHelloV2 hello)
         {
             ValidateHello(hello);
             return Write(writer =>
@@ -76,7 +76,7 @@ namespace UnityAsset.SearchProtocol.Reference
             });
         }
 
-        public static BootstrapReplyV1 DecodeReply(byte[] utf8Json)
+        public static BootstrapReplyV2 DecodeReply(byte[] utf8Json)
         {
             StrictJson.RequireEncodedLimit(utf8Json, FrameLimits.BootstrapMaxEncodedBytes, "bootstrap reply");
             JsonElement root = StrictJson.ParseObject(utf8Json, "bootstrap reply");
@@ -93,18 +93,26 @@ namespace UnityAsset.SearchProtocol.Reference
                     "bootstrap_version",
                     "project_id",
                     "daemon_instance_id",
+                    "query_policy_id",
                     "selected_revision");
                 ushort version = StrictJson.UInt16(root.GetProperty("bootstrap_version"), "bootstrap reply.bootstrap_version");
                 RequireBootstrapVersion(version, "bootstrap reply.bootstrap_version");
                 ProjectId projectId = ProjectId.Parse(StrictJson.String(root.GetProperty("project_id"), "bootstrap reply.project_id"));
                 DaemonInstanceId instanceId = DaemonInstanceId.Parse(
                     StrictJson.String(root.GetProperty("daemon_instance_id"), "bootstrap reply.daemon_instance_id"));
+                QueryPolicyId queryPolicyId = QueryPolicyId.Parse(
+                    StrictJson.String(root.GetProperty("query_policy_id"), "bootstrap reply.query_policy_id"));
+                if (queryPolicyId.Value.EndsWith(new string('0', 64), StringComparison.Ordinal))
+                {
+                    throw new ProtocolValidationException("bootstrap reply.query_policy_id must not be zero");
+                }
                 ushort revision = StrictJson.UInt16(root.GetProperty("selected_revision"), "bootstrap reply.selected_revision");
                 if (revision == 0)
                 {
                     throw new ProtocolValidationException("bootstrap reply.selected_revision must not be zero");
                 }
-                return new BootstrapAcceptedV1(version, projectId, instanceId, revision);
+                RequireCurrentBusinessRevision(revision, "bootstrap reply.selected_revision");
+                return new BootstrapAcceptedV2(version, projectId, instanceId, queryPolicyId, revision);
             }
             if (result == "rejected")
             {
@@ -112,12 +120,12 @@ namespace UnityAsset.SearchProtocol.Reference
                 ushort version = StrictJson.UInt16(root.GetProperty("bootstrap_version"), "bootstrap reply.bootstrap_version");
                 RequireBootstrapVersion(version, "bootstrap reply.bootstrap_version");
                 string code = StrictJson.Enum(root.GetProperty("code"), "bootstrap reply.code", RejectionCodes);
-                return new BootstrapRejectedV1(version, code);
+                return new BootstrapRejectedV2(version, code);
             }
             throw new ProtocolValidationException($"bootstrap reply.result contains unsupported value '{result}'");
         }
 
-        public static byte[] EncodeReply(BootstrapReplyV1 reply)
+        public static byte[] EncodeReply(BootstrapReplyV2 reply)
         {
             if (reply == null)
             {
@@ -129,17 +137,25 @@ namespace UnityAsset.SearchProtocol.Reference
                 writer.WriteStartObject();
                 writer.WriteString("result", reply.Result);
                 writer.WriteNumber("bootstrap_version", reply.BootstrapVersion);
-                if (reply is BootstrapAcceptedV1 accepted)
+                if (reply is BootstrapAcceptedV2 accepted)
                 {
                     if (accepted.SelectedRevision == 0)
                     {
                         throw new ProtocolValidationException("bootstrap reply.selected_revision must not be zero");
                     }
+                    RequireCurrentBusinessRevision(
+                        accepted.SelectedRevision,
+                        "bootstrap reply.selected_revision");
                     writer.WriteString("project_id", accepted.ProjectId.Value);
                     writer.WriteString("daemon_instance_id", accepted.DaemonInstanceId.Value);
+                    if (accepted.QueryPolicyId.Value.EndsWith(new string('0', 64), StringComparison.Ordinal))
+                    {
+                        throw new ProtocolValidationException("bootstrap reply.query_policy_id must not be zero");
+                    }
+                    writer.WriteString("query_policy_id", accepted.QueryPolicyId.Value);
                     writer.WriteNumber("selected_revision", accepted.SelectedRevision);
                 }
-                else if (reply is BootstrapRejectedV1 rejected)
+                else if (reply is BootstrapRejectedV2 rejected)
                 {
                     if (!RejectionCodes.Contains(rejected.Code, StringComparer.Ordinal))
                     {
@@ -155,7 +171,7 @@ namespace UnityAsset.SearchProtocol.Reference
             });
         }
 
-        public static void ValidateReplyFor(BootstrapReplyV1 reply, BootstrapHelloV1 hello)
+        public static void ValidateReplyFor(BootstrapReplyV2 reply, BootstrapHelloV2 hello)
         {
             if (reply == null)
             {
@@ -171,7 +187,7 @@ namespace UnityAsset.SearchProtocol.Reference
             {
                 throw new ProtocolValidationException("bootstrap reply version does not match hello");
             }
-            if (reply is not BootstrapAcceptedV1 accepted)
+            if (reply is not BootstrapAcceptedV2 accepted)
             {
                 return;
             }
@@ -187,9 +203,12 @@ namespace UnityAsset.SearchProtocol.Reference
             {
                 throw new ProtocolValidationException("bootstrap selected revision was not offered by hello");
             }
+            RequireCurrentBusinessRevision(
+                accepted.SelectedRevision,
+                "bootstrap reply.selected_revision");
         }
 
-        private static void ValidateHello(BootstrapHelloV1 hello)
+        private static void ValidateHello(BootstrapHelloV2 hello)
         {
             if (hello == null)
             {
@@ -221,6 +240,15 @@ namespace UnityAsset.SearchProtocol.Reference
             }
         }
 
+        private static void RequireCurrentBusinessRevision(ushort revision, string path)
+        {
+            if (revision != ProtocolConstants.BusinessProtocolRevision)
+            {
+                throw new ProtocolValidationException(
+                    $"{path} mismatch: expected {ProtocolConstants.BusinessProtocolRevision}, got {revision}");
+            }
+        }
+
         internal static byte[] Write(Action<Utf8JsonWriter> write)
         {
             using var stream = new MemoryStream();
@@ -236,10 +264,11 @@ namespace UnityAsset.SearchProtocol.Reference
 
     public static class BootstrapNegotiator
     {
-        public static BootstrapReplyV1 Negotiate(
-            BootstrapHelloV1 hello,
+        public static BootstrapReplyV2 Negotiate(
+            BootstrapHelloV2 hello,
             ProjectId expectedProjectId,
             DaemonInstanceId expectedDaemonInstanceId,
+            QueryPolicyId queryPolicyId,
             IReadOnlyCollection<ushort> localRevisions)
         {
             if (hello == null)
@@ -254,6 +283,10 @@ namespace UnityAsset.SearchProtocol.Reference
             {
                 throw new ArgumentNullException(nameof(expectedDaemonInstanceId));
             }
+            if (queryPolicyId == null)
+            {
+                throw new ArgumentNullException(nameof(queryPolicyId));
+            }
             if (localRevisions == null)
             {
                 throw new ArgumentNullException(nameof(localRevisions));
@@ -262,31 +295,25 @@ namespace UnityAsset.SearchProtocol.Reference
             BootstrapCodec.DecodeHello(BootstrapCodec.EncodeHello(hello));
             if (!hello.ProjectId.Equals(expectedProjectId))
             {
-                return new BootstrapRejectedV1(ProtocolConstants.BootstrapVersion, "project_mismatch");
+                return new BootstrapRejectedV2(ProtocolConstants.BootstrapVersion, "project_mismatch");
             }
             if (!hello.DaemonInstanceId.Equals(expectedDaemonInstanceId))
             {
-                return new BootstrapRejectedV1(ProtocolConstants.BootstrapVersion, "instance_mismatch");
+                return new BootstrapRejectedV2(ProtocolConstants.BootstrapVersion, "instance_mismatch");
             }
 
-            ushort selected = 0;
-            var local = new HashSet<ushort>(localRevisions);
-            foreach (ushort revision in hello.SupportedRevisions)
+            bool selectsCurrent = localRevisions.Contains(ProtocolConstants.BusinessProtocolRevision)
+                && hello.SupportedRevisions.Contains(ProtocolConstants.BusinessProtocolRevision);
+            if (!selectsCurrent)
             {
-                if (local.Contains(revision) && revision > selected)
-                {
-                    selected = revision;
-                }
+                return new BootstrapRejectedV2(ProtocolConstants.BootstrapVersion, "no_common_revision");
             }
-            if (selected == 0)
-            {
-                return new BootstrapRejectedV1(ProtocolConstants.BootstrapVersion, "no_common_revision");
-            }
-            return new BootstrapAcceptedV1(
+            return new BootstrapAcceptedV2(
                 ProtocolConstants.BootstrapVersion,
                 hello.ProjectId,
                 hello.DaemonInstanceId,
-                selected);
+                queryPolicyId,
+                ProtocolConstants.BusinessProtocolRevision);
         }
     }
 

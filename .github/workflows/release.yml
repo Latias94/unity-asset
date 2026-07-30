@@ -19,8 +19,9 @@ env:
     unity-asset-decode
     unity-asset
     unity-asset-search-core
-    unity-asset-search-index
     unity-asset-search-protocol
+    unity-asset-search-local
+    unity-asset-search-index
     unity-asset-cli
     unity-asset-search-daemon
     unity-asset-search-cli

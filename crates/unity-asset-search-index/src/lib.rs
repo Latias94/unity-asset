@@ -30,10 +30,13 @@ pub use generation::{FilesystemReindexIntent, FilesystemReindexScope};
 pub use unity_asset::workspace::WorkspaceView;
 pub use unity_asset_core::{AssetLoadBudget, ChangeSet, DigestV1, DigestV1Builder};
 pub use unity_asset_search_core::{SearchKind, SearchRequest};
+#[cfg(test)]
+use unity_asset_search_protocol::GenerationMaintenanceState;
 use unity_asset_search_protocol::{
-    ApiError, ApiErrorCode, GenerationFailure, GenerationStatus, ReferenceRequest,
-    ReferencesResponse, ReindexReceipt, SEARCH_PROTOCOL_REVISION, SearchCapabilities,
-    SearchResponse, StatusResponse, SuggestResponse, WireProjectionError,
+    ApiError, ApiErrorCode, DaemonLifecycleStatus, GenerationFailure, GenerationMaintenanceStatus,
+    GenerationStatus, ReferenceRequest, ReferencesResponse, ReindexReceipt,
+    SEARCH_PROTOCOL_REVISION, SearchCapabilities, SearchResponse, StatusResponse, SuggestResponse,
+    WireProjectionError,
 };
 
 use generation::GenerationStamp as InternalGenerationStamp;
@@ -84,6 +87,7 @@ struct RuntimeStatus {
     indexing: bool,
     building_revision: Option<unity_asset_core::WorkspaceRevision>,
     last_failure: Option<GenerationFailure>,
+    generation_maintenance: GenerationMaintenanceStatus,
     last_build_duration_ms: Option<u128>,
     last_build_unix_ms: Option<u64>,
 }
@@ -196,6 +200,7 @@ impl SearchIndex {
         let pipeline = SearchGenerationPipeline::open(paths.clone(), options, budget)
             .map_err(|error| SearchIndexError::from_pipeline(error, None))?;
         let active = pipeline.active();
+        let generation_maintenance = pipeline.generation_maintenance();
         Ok(Self {
             inner: Arc::new(SearchIndexInner {
                 paths,
@@ -203,7 +208,10 @@ impl SearchIndex {
                 pipeline: Mutex::new(pipeline),
                 status: RwLock::new(StatusObservation {
                     active,
-                    runtime: RuntimeStatus::default(),
+                    runtime: RuntimeStatus {
+                        generation_maintenance,
+                        ..RuntimeStatus::default()
+                    },
                 }),
                 #[cfg(test)]
                 status_commit_hook: Mutex::new(None),
@@ -333,16 +341,20 @@ impl SearchIndex {
             .transpose()
             .map_err(SearchIndexError::from_wire_projection)?;
 
+        let generation = GenerationStatus {
+            protocol_revision: SEARCH_PROTOCOL_REVISION,
+            active: active
+                .as_ref()
+                .map(|generation| wire::generation_stamp(generation.stamp())),
+            building_revision: runtime.building_revision,
+            last_failure: runtime.last_failure,
+        };
+        let mut daemon = DaemonLifecycleStatus::unmanaged(&generation, runtime.indexing);
+        daemon.generation_maintenance = runtime.generation_maintenance;
         Ok(StatusResponse {
             protocol_revision: SEARCH_PROTOCOL_REVISION,
-            generation: GenerationStatus {
-                protocol_revision: SEARCH_PROTOCOL_REVISION,
-                active: active
-                    .as_ref()
-                    .map(|generation| wire::generation_stamp(generation.stamp())),
-                building_revision: runtime.building_revision,
-                last_failure: runtime.last_failure,
-            },
+            daemon,
+            generation,
             query_policy_id: wire::query_policy_id(),
             capabilities: SearchCapabilities::current(),
             project_root,
@@ -383,6 +395,7 @@ impl SearchIndex {
 
         let result = build(&mut pipeline);
         let pipeline_active = pipeline.active();
+        let generation_maintenance = pipeline.generation_maintenance();
 
         let outcome = match result {
             Ok(output) => {
@@ -391,6 +404,7 @@ impl SearchIndex {
                     pipeline_active.clone(),
                     |status| {
                         status.last_failure = None;
+                        status.generation_maintenance = generation_maintenance;
                         status.last_build_duration_ms = Some(output.duration_ms);
                         status.last_build_unix_ms = Some(unix_ms_now());
                     },
@@ -419,6 +433,7 @@ impl SearchIndex {
                     pipeline_active.clone(),
                     |status| {
                         status.last_failure = Some(recorded);
+                        status.generation_maintenance = generation_maintenance;
                     },
                     || {
                         #[cfg(test)]
@@ -665,6 +680,7 @@ const fn api_error_code_name(code: ApiErrorCode) -> &'static str {
         ApiErrorCode::NotReady => "not_ready",
         ApiErrorCode::RevisionMismatch => "revision_mismatch",
         ApiErrorCode::IndexBuildFailed => "index_build_failed",
+        ApiErrorCode::IdempotencyConflict => "idempotency_conflict",
         ApiErrorCode::OperationNotFound => "operation_not_found",
         ApiErrorCode::Internal => "internal",
     }
@@ -877,6 +893,67 @@ GameObject:
             vec![OWNER_PATH.to_owned()]
         );
         assert!(incoming_paths(&reopened, TARGET_GUID).is_empty());
+    }
+
+    #[test]
+    fn staging_cleanup_failure_is_distinct_and_reconcile_clears_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        write_generation_fixture(&project);
+        let paths =
+            IndexPaths::for_project(project, Some(temporary.path().join("index")), None).unwrap();
+        let index = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+        index
+            .inject_generation_failpoint(GenerationFailpoint::ActivationCleanup)
+            .unwrap();
+
+        let published = index
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert!(!published.evidence.publish_warnings.is_empty());
+        let status = index.status().unwrap();
+        assert!(status.generation.last_failure.is_none());
+        assert_eq!(
+            status.daemon.generation_maintenance.state,
+            GenerationMaintenanceState::RecoveryRequired
+        );
+        assert!(
+            status
+                .daemon
+                .generation_maintenance
+                .last_cleanup_failure
+                .is_some()
+        );
+
+        index
+            .reindex(
+                FilesystemReindexIntent::reconcile(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let recovered = index.status().unwrap();
+        assert_eq!(
+            recovered.daemon.generation_maintenance.state,
+            GenerationMaintenanceState::Clean
+        );
+        assert!(
+            recovered
+                .daemon
+                .generation_maintenance
+                .last_recovered_entries
+                >= 1
+        );
+        assert!(
+            recovered
+                .daemon
+                .generation_maintenance
+                .last_cleanup_failure
+                .is_none()
+        );
+        assert!(recovered.generation.last_failure.is_none());
     }
 
     #[test]

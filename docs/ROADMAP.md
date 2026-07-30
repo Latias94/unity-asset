@@ -15,8 +15,8 @@ The following architecture is implemented:
   typed recovery outcomes;
 - one revision-bound `ReferenceGraph` for YAML and binary references;
 - typed extraction request, plan, manifest, and report contracts;
-- a local `/v3` search service with search, suggestions, reverse references, status, authenticated
-  reindex, and token rotation;
+- a project-bound local IPC search service with search, suggestions, reverse references, status,
+  and observable reindex operations;
 - a machine-readable workspace capability catalog for agents and transport adapters.
 
 ## Priority 1: Agent-Native Workspace Tools

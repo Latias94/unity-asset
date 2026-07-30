@@ -6,7 +6,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::mem::size_of;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use fs2::FileExt;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1004,6 +1007,59 @@ fn validate_source_state_relative_path(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct LiveBuildClaim {
+    held: AtomicBool,
+}
+
+impl LiveBuildClaim {
+    fn acquire(self: &Arc<Self>) -> Result<LiveBuildToken, GenerationStoreError> {
+        self.held
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| GenerationStoreError::BuildAlreadyActive)?;
+        Ok(LiveBuildToken {
+            claim: Arc::clone(self),
+            held: true,
+        })
+    }
+
+    fn is_held(&self) -> bool {
+        self.held.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+struct LiveBuildToken {
+    claim: Arc<LiveBuildClaim>,
+    held: bool,
+}
+
+impl LiveBuildToken {
+    fn belongs_to(&self, claim: &Arc<LiveBuildClaim>) -> bool {
+        Arc::ptr_eq(&self.claim, claim)
+    }
+
+    fn release(&mut self) {
+        if self.held {
+            self.claim.held.store(false, Ordering::Release);
+            self.held = false;
+        }
+    }
+}
+
+impl Drop for LiveBuildToken {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationBuildState {
+    Armed,
+    Completed,
+    Relinquished,
+}
+
 /// A store-owned staging directory. All writable paths are derived from its ordinal.
 #[derive(Debug)]
 pub(crate) struct GenerationBuild {
@@ -1011,7 +1067,8 @@ pub(crate) struct GenerationBuild {
     ordinal: u64,
     directory: PathBuf,
     lease: Arc<WriterLease>,
-    cleanup_on_drop: bool,
+    claim: LiveBuildToken,
+    state: GenerationBuildState,
 }
 
 impl GenerationBuild {
@@ -1037,11 +1094,17 @@ impl GenerationBuild {
         self.directory.join(SOURCE_STATE_ARTIFACT_DIRECTORY)
     }
 
-    pub fn abort_with_budget(
-        mut self,
+    pub(crate) fn abort_with_budget(
+        &mut self,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), GenerationStoreError> {
-        self.cleanup_with_budget(budget)
+        if self.state != GenerationBuildState::Armed {
+            return Ok(());
+        }
+        let result = self.cleanup_directory_with_budget(budget);
+        self.state = GenerationBuildState::Relinquished;
+        self.claim.release();
+        result
     }
 
     pub(crate) fn write_source_state(
@@ -1085,18 +1148,10 @@ impl GenerationBuild {
         })
     }
 
-    fn cleanup(&mut self) -> Result<(), GenerationStoreError> {
-        let mut budget = AssetLoadBudget::default();
-        self.cleanup_with_budget(&mut budget)
-    }
-
-    fn cleanup_with_budget(
-        &mut self,
+    fn cleanup_directory_with_budget(
+        &self,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), GenerationStoreError> {
-        if !self.cleanup_on_drop {
-            return Ok(());
-        }
         if path_exists_no_follow(&self.directory)? {
             remove_tree_no_follow(&self.directory, budget)?;
             sync_directory(
@@ -1105,18 +1160,144 @@ impl GenerationBuild {
                     .ok_or(GenerationStoreError::ForeignBuild)?,
             )?;
         }
-        self.cleanup_on_drop = false;
         Ok(())
     }
 
     fn mark_completed(&mut self) {
-        self.cleanup_on_drop = false;
+        debug_assert_eq!(self.state, GenerationBuildState::Armed);
+        self.state = GenerationBuildState::Completed;
+        self.claim.release();
     }
 }
 
 impl Drop for GenerationBuild {
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        if self.state == GenerationBuildState::Armed {
+            let _ = self.cleanup_directory_with_budget(&mut AssetLoadBudget::default());
+            self.state = GenerationBuildState::Relinquished;
+        }
+        self.claim.release();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivationStagingState {
+    Armed,
+    Committed,
+    Relinquished,
+}
+
+/// Owns one activation staging file from creation through commit or explicit cleanup.
+#[derive(Debug)]
+struct ActivationStagingFile {
+    path: PathBuf,
+    parent: PathBuf,
+    state: ActivationStagingState,
+}
+
+impl ActivationStagingFile {
+    fn create(path: PathBuf, bytes: &[u8]) -> Result<Self, GenerationStoreError> {
+        let parent = path
+            .parent()
+            .ok_or(GenerationStoreError::ForeignBuild)?
+            .to_path_buf();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|source| {
+                GenerationStoreError::io("create activation staging file", path.clone(), source)
+            })?;
+        let mut staging = Self {
+            path,
+            parent,
+            state: ActivationStagingState::Armed,
+        };
+        let write_result = file
+            .write_all(bytes)
+            .map_err(|source| {
+                GenerationStoreError::io(
+                    "write activation staging file",
+                    staging.path.clone(),
+                    source,
+                )
+            })
+            .and_then(|()| {
+                file.sync_all().map_err(|source| {
+                    GenerationStoreError::io(
+                        "sync activation staging file",
+                        staging.path.clone(),
+                        source,
+                    )
+                })
+            });
+        drop(file);
+        match write_result {
+            Ok(()) => Ok(staging),
+            Err(primary) => Err(staging.precommit_failure(primary)),
+        }
+    }
+
+    fn publish(
+        &mut self,
+        final_path: &Path,
+        failpoint: Option<GenerationFailpoint>,
+    ) -> Result<(), GenerationStoreError> {
+        debug_assert_eq!(self.state, ActivationStagingState::Armed);
+        let publish_result = inject_failure(failpoint, GenerationFailpoint::ActivationPreCommit)
+            .and_then(|()| {
+                fs::hard_link(&self.path, final_path).map_err(|source| {
+                    GenerationStoreError::io(
+                        "activate generation",
+                        final_path.to_path_buf(),
+                        source,
+                    )
+                })
+            });
+        match publish_result {
+            Ok(()) => {
+                self.state = ActivationStagingState::Committed;
+                Ok(())
+            }
+            Err(primary) => Err(self.precommit_failure(primary)),
+        }
+    }
+
+    fn cleanup_after_commit(&mut self) -> Result<(), GenerationStoreError> {
+        debug_assert_eq!(self.state, ActivationStagingState::Committed);
+        self.cleanup_and_relinquish("remove committed activation staging file")
+    }
+
+    fn precommit_failure(&mut self, primary: GenerationStoreError) -> GenerationStoreError {
+        match self.cleanup_and_relinquish("remove uncommitted activation staging file") {
+            Ok(()) => primary,
+            Err(cleanup) => GenerationStoreError::ActivationPreCommitCleanupFailed {
+                primary: Box::new(primary),
+                cleanup: Box::new(cleanup),
+            },
+        }
+    }
+
+    fn cleanup_and_relinquish(
+        &mut self,
+        operation: &'static str,
+    ) -> Result<(), GenerationStoreError> {
+        if self.state == ActivationStagingState::Relinquished {
+            return Ok(());
+        }
+        let result = fs::remove_file(&self.path)
+            .map_err(|source| GenerationStoreError::io(operation, self.path.clone(), source))
+            .and_then(|()| sync_directory(&self.parent));
+        self.state = ActivationStagingState::Relinquished;
+        result
+    }
+}
+
+impl Drop for ActivationStagingFile {
+    fn drop(&mut self) {
+        if self.state != ActivationStagingState::Relinquished {
+            let _ = self.cleanup_and_relinquish("remove dropped activation staging file");
+        }
     }
 }
 
@@ -1745,15 +1926,14 @@ impl GenerationPublishWarning {
         }
     }
 
-    #[cfg(test)]
     #[must_use]
-    pub const fn kind(&self) -> GenerationPublishWarningKind {
+    pub(crate) const fn kind(&self) -> GenerationPublishWarningKind {
         self.kind
     }
 
     #[cfg(test)]
     #[must_use]
-    pub fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         &self.message
     }
 }
@@ -1879,6 +2059,7 @@ pub(crate) enum GenerationFailpoint {
     References,
     SourceState,
     Activation,
+    ActivationPreCommit,
     ActivationDirectorySync,
     ActivationCleanup,
 }
@@ -1949,6 +2130,19 @@ impl Drop for WriterLease {
     }
 }
 
+/// Bounded evidence produced by one abandoned-staging reconciliation pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GenerationStagingRecoveryReport {
+    removed_entries: u64,
+}
+
+impl GenerationStagingRecoveryReport {
+    #[must_use]
+    pub(crate) const fn removed_entries(self) -> u64 {
+        self.removed_entries
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct GenerationStore {
     root: PathBuf,
@@ -1960,6 +2154,7 @@ pub(crate) struct GenerationStore {
     next_staging_ordinal: u64,
     next_activation_ordinal: u64,
     lease: Arc<WriterLease>,
+    live_build: Arc<LiveBuildClaim>,
 }
 
 impl GenerationStore {
@@ -2008,12 +2203,27 @@ impl GenerationStore {
             next_staging_ordinal,
             next_activation_ordinal,
             lease,
+            live_build: Arc::new(LiveBuildClaim::default()),
         })
     }
 
     #[must_use]
     pub const fn active(&self) -> Option<&GenerationSnapshot> {
         self.active.as_ref()
+    }
+
+    /// Removes only store-owned abandoned entries from the private staging namespace.
+    ///
+    /// A live build is an exclusive capability. Recovery refuses to run while that capability is
+    /// armed, so it cannot mistake an in-flight build for crash residue.
+    pub(crate) fn reconcile_abandoned_staging(
+        &mut self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<GenerationStagingRecoveryReport, GenerationStoreError> {
+        if self.live_build.is_held() {
+            return Err(GenerationStoreError::BuildAlreadyActive);
+        }
+        recover_owned_staging(&self.staging, budget)
     }
 
     /// Appends a durable head for the current immutable generation before derived work starts.
@@ -2052,6 +2262,7 @@ impl GenerationStore {
     }
 
     pub fn begin(&mut self) -> Result<GenerationBuild, GenerationStoreError> {
+        let claim = self.live_build.acquire()?;
         loop {
             let ordinal = self.next_staging_ordinal;
             self.next_staging_ordinal = ordinal
@@ -2066,7 +2277,8 @@ impl GenerationStore {
                         ordinal,
                         directory,
                         lease: Arc::clone(&self.lease),
-                        cleanup_on_drop: true,
+                        claim,
+                        state: GenerationBuildState::Armed,
                     };
                     create_build_directories(&build.directory)?;
                     return Ok(build);
@@ -2104,7 +2316,7 @@ impl GenerationStore {
     #[cfg(test)]
     pub fn prepare_publish(
         &mut self,
-        build: GenerationBuild,
+        build: &mut GenerationBuild,
         manifest: SearchGenerationManifestV1,
     ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
         let mut budget = AssetLoadBudget::default();
@@ -2114,7 +2326,7 @@ impl GenerationStore {
 
     pub(crate) fn prepare_publish_with_desired_revision_and_budget(
         &mut self,
-        build: GenerationBuild,
+        build: &mut GenerationBuild,
         manifest: SearchGenerationManifestV1,
         desired_revision: WorkspaceRevision,
         budget: &mut AssetLoadBudget,
@@ -2125,7 +2337,7 @@ impl GenerationStore {
     #[cfg(test)]
     pub fn prepare_publish_with_failpoint(
         &mut self,
-        build: GenerationBuild,
+        build: &mut GenerationBuild,
         manifest: SearchGenerationManifestV1,
         failpoint: GenerationFailpoint,
     ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
@@ -2136,7 +2348,7 @@ impl GenerationStore {
     #[cfg(test)]
     pub fn prepare_publish_with_failpoint_and_budget(
         &mut self,
-        build: GenerationBuild,
+        build: &mut GenerationBuild,
         manifest: SearchGenerationManifestV1,
         budget: &mut AssetLoadBudget,
         failpoint: GenerationFailpoint,
@@ -2148,7 +2360,7 @@ impl GenerationStore {
     #[cfg(test)]
     pub(crate) fn prepare_publish_with_desired_revision_failpoint_and_budget(
         &mut self,
-        build: GenerationBuild,
+        build: &mut GenerationBuild,
         manifest: SearchGenerationManifestV1,
         desired_revision: WorkspaceRevision,
         budget: &mut AssetLoadBudget,
@@ -2251,13 +2463,13 @@ impl GenerationStore {
 
     fn prepare_publish_inner(
         &mut self,
-        mut build: GenerationBuild,
+        build: &mut GenerationBuild,
         manifest: SearchGenerationManifestV1,
         desired_revision: WorkspaceRevision,
         budget: &mut AssetLoadBudget,
         failpoint: Option<GenerationFailpoint>,
     ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
-        self.validate_build(&build)?;
+        self.validate_build(build)?;
 
         let observed = measure_generation_artifacts(&build.directory, budget, failpoint)?;
         if observed != manifest.artifacts() {
@@ -2359,23 +2571,26 @@ impl GenerationStore {
                     source,
                 )
             })?;
-            sync_directory(&self.generations)?;
-            sync_directory(&self.staging)?;
+            if let Err(primary) =
+                sync_directory(&self.generations).and_then(|()| sync_directory(&self.staging))
+            {
+                return Err(self.rollback_quarantine(&quarantine, &completed_directory, primary));
+            }
             Some(quarantine)
         } else {
             None
         };
 
         if let Err(source) = fs::rename(&build.directory, &completed_directory) {
-            if let Some(quarantine) = &quarantine {
-                let _ = fs::rename(quarantine, &completed_directory);
-                let _ = sync_directory(&self.generations);
-            }
-            return Err(GenerationStoreError::io(
+            let primary = GenerationStoreError::io(
                 "complete generation directory",
                 completed_directory.clone(),
                 source,
-            ));
+            );
+            if let Some(quarantine) = &quarantine {
+                return Err(self.rollback_quarantine(quarantine, &completed_directory, primary));
+            }
+            return Err(primary);
         }
         build.mark_completed();
         sync_directory(&self.generations)?;
@@ -2412,6 +2627,31 @@ impl GenerationStore {
             warnings,
             failpoint,
         })
+    }
+
+    fn rollback_quarantine(
+        &self,
+        quarantine: &Path,
+        completed_directory: &Path,
+        primary: GenerationStoreError,
+    ) -> GenerationStoreError {
+        let rollback = fs::rename(quarantine, completed_directory)
+            .map_err(|source| {
+                GenerationStoreError::io(
+                    "restore quarantined generation",
+                    completed_directory.to_path_buf(),
+                    source,
+                )
+            })
+            .and_then(|()| sync_directory(&self.generations))
+            .and_then(|()| sync_directory(&self.staging));
+        match rollback {
+            Ok(()) => primary,
+            Err(rollback) => GenerationStoreError::QuarantineRollbackFailed {
+                primary: Box::new(primary),
+                rollback: Box::new(rollback),
+            },
+        }
     }
 
     fn activate_prepared(
@@ -2459,6 +2699,8 @@ impl GenerationStore {
     fn validate_build(&self, build: &GenerationBuild) -> Result<(), GenerationStoreError> {
         if build.store_root != self.root
             || !Arc::ptr_eq(&build.lease, &self.lease)
+            || !build.claim.belongs_to(&self.live_build)
+            || build.state != GenerationBuildState::Armed
             || build.directory.parent() != Some(self.staging.as_path())
             || build.directory.file_name()
                 != Some(OsStr::new(&staging_directory_name(build.ordinal)))
@@ -2518,11 +2760,9 @@ impl GenerationStore {
             .join(activation_staging_file_name(record.ordinal));
         let final_path = self.activations.join(activation_file_name(record.ordinal));
         let bytes = encode_generation_head_json(record, &final_path, budget)?;
-        write_new_file(&temporary_path, &bytes)?;
+        let mut staging = ActivationStagingFile::create(temporary_path, &bytes)?;
         // A hard link publishes the complete file atomically and never replaces an existing ordinal.
-        fs::hard_link(&temporary_path, &final_path).map_err(|source| {
-            GenerationStoreError::io("activate generation", final_path.clone(), source)
-        })?;
+        staging.publish(&final_path, failpoint)?;
 
         // The final hard link is the commit point: reopen selects this highest valid activation
         // immediately after it becomes visible. Every later failure is reported as evidence rather
@@ -2538,21 +2778,9 @@ impl GenerationStore {
         }
 
         if let Err(error) = inject_failure(failpoint, GenerationFailpoint::ActivationCleanup)
-            .and_then(|()| {
-                fs::remove_file(&temporary_path).map_err(|source| {
-                    GenerationStoreError::io(
-                        "remove committed activation staging file",
-                        temporary_path.clone(),
-                        source,
-                    )
-                })
-            })
+            .and_then(|()| staging.cleanup_after_commit())
         {
-            warnings.push(GenerationPublishWarning::new(
-                GenerationPublishWarningKind::PostCommitCleanup,
-                error.to_string(),
-            ));
-        } else if let Err(error) = sync_directory(&self.staging) {
+            staging.state = ActivationStagingState::Relinquished;
             warnings.push(GenerationPublishWarning::new(
                 GenerationPublishWarningKind::PostCommitCleanup,
                 error.to_string(),
@@ -2856,8 +3084,9 @@ fn visit_directory_entries_budgeted(
 fn recover_owned_staging(
     staging: &Path,
     budget: &mut AssetLoadBudget,
-) -> Result<(), GenerationStoreError> {
+) -> Result<GenerationStagingRecoveryReport, GenerationStoreError> {
     let mut changed = false;
+    let mut removed_entries = 0_u64;
     visit_directory_entries_budgeted(staging, budget, |entry, budget| {
         let metadata = metadata_no_follow(&entry.path)?;
         let Some(name) = entry.file_name.to_str() else {
@@ -2869,6 +3098,12 @@ fn recover_owned_staging(
             }
             remove_tree_no_follow(&entry.path, budget)?;
             changed = true;
+            removed_entries =
+                removed_entries
+                    .checked_add(1)
+                    .ok_or(GenerationStoreError::SizeOverflow {
+                        resource: "recovered staging entries",
+                    })?;
             return Ok(());
         }
         if parse_quarantine_directory_name(name).is_some() {
@@ -2877,6 +3112,12 @@ fn recover_owned_staging(
             }
             remove_tree_no_follow(&entry.path, budget)?;
             changed = true;
+            removed_entries =
+                removed_entries
+                    .checked_add(1)
+                    .ok_or(GenerationStoreError::SizeOverflow {
+                        resource: "recovered staging entries",
+                    })?;
             return Ok(());
         }
         if parse_activation_staging_file_name(name).is_some() {
@@ -2891,13 +3132,19 @@ fn recover_owned_staging(
                 )
             })?;
             changed = true;
+            removed_entries =
+                removed_entries
+                    .checked_add(1)
+                    .ok_or(GenerationStoreError::SizeOverflow {
+                        resource: "recovered staging entries",
+                    })?;
         }
         Ok(())
     })?;
     if changed {
         sync_directory(staging)?;
     }
-    Ok(())
+    Ok(GenerationStagingRecoveryReport { removed_entries })
 }
 
 fn next_staging_ordinal(
@@ -4919,9 +5166,18 @@ pub(crate) enum GenerationStoreError {
         expected: SearchGenerationId,
         actual: Option<SearchGenerationId>,
     },
+    BuildAlreadyActive,
     ForeignBuild,
     QuarantineCollision {
         path: PathBuf,
+    },
+    QuarantineRollbackFailed {
+        primary: Box<GenerationStoreError>,
+        rollback: Box<GenerationStoreError>,
+    },
+    ActivationPreCommitCleanupFailed {
+        primary: Box<GenerationStoreError>,
+        cleanup: Box<GenerationStoreError>,
     },
     OrdinalOverflow,
     SizeOverflow {
@@ -4996,6 +5252,19 @@ impl GenerationStoreError {
             Self::Io { source, .. }
                 if source.kind() == io::ErrorKind::NotFound
         )
+    }
+
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::Io { .. } | Self::WriterLeaseUnavailable { .. } => true,
+            Self::QuarantineRollbackFailed { primary, rollback } => {
+                primary.is_retryable() || rollback.is_retryable()
+            }
+            Self::ActivationPreCommitCleanupFailed { primary, cleanup } => {
+                primary.is_retryable() || cleanup.is_retryable()
+            }
+            _ => false,
+        }
     }
 }
 
@@ -5147,6 +5416,9 @@ impl fmt::Display for GenerationStoreError {
                 formatter,
                 "generation parent mismatch: expected {expected}, got {actual:?}"
             ),
+            Self::BuildAlreadyActive => {
+                formatter.write_str("generation store already has an armed staging build")
+            }
             Self::ForeignBuild => formatter.write_str(
                 "generation build does not belong to this store or has an invalid ordinal path",
             ),
@@ -5154,6 +5426,14 @@ impl fmt::Display for GenerationStoreError {
                 formatter,
                 "generation quarantine path already exists: {}",
                 path.display()
+            ),
+            Self::QuarantineRollbackFailed { primary, rollback } => write!(
+                formatter,
+                "generation publication failed ({primary}); restoring the quarantined generation also failed ({rollback})"
+            ),
+            Self::ActivationPreCommitCleanupFailed { primary, cleanup } => write!(
+                formatter,
+                "activation publication failed before commit ({primary}); activation staging cleanup also failed ({cleanup})"
             ),
             Self::OrdinalOverflow => formatter.write_str("generation ordinal overflow"),
             Self::SizeOverflow { resource } => write!(formatter, "{resource} size overflow"),
@@ -5172,6 +5452,8 @@ impl Error for GenerationStoreError {
             Self::Json { source, .. } => Some(source),
             Self::ContractJson { source, .. } => Some(source),
             Self::Budget(source) => Some(source),
+            Self::QuarantineRollbackFailed { primary, .. }
+            | Self::ActivationPreCommitCleanupFailed { primary, .. } => Some(primary.as_ref()),
             _ => None,
         }
     }
@@ -5835,7 +6117,7 @@ mod source_state_tests {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-        let build = store.begin().unwrap();
+        let mut build = store.begin().unwrap();
         build
             .write_source_state(&snapshot, SourceStateLimits::default())
             .unwrap();
@@ -5852,7 +6134,10 @@ mod source_state_tests {
         )
         .unwrap();
         store
-            .prepare_publish(build, SearchGenerationManifestV1::new(identity, evidence))
+            .prepare_publish(
+                &mut build,
+                SearchGenerationManifestV1::new(identity, evidence),
+            )
             .unwrap()
             .activate()
             .unwrap();

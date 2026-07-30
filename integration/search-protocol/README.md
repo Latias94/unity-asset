@@ -1,6 +1,6 @@
 # Unity Asset Search Protocol Integration
 
-This directory is the language-neutral integration surface for `unity-asset-search-protocol` revision 1. It contains canonical JSON fixtures, a Unity-independent C# reference codec, and an executable conformance runner.
+This directory is the language-neutral integration surface for current `unity-asset-search-protocol` business revision 2. It contains canonical JSON fixtures, a Unity-independent C# reference codec, and an executable conformance runner. Business revision 1 is retained only as a byte-frozen archive and is not implemented by the current runtime.
 
 The Rust crate remains the source of truth for the protocol. These artifacts make the wire contract reviewable and testable by clients that cannot link Rust directly.
 
@@ -8,27 +8,29 @@ The Rust crate remains the source of truth for the protocol. These artifacts mak
 
 ```text
 fixtures/
-  manifest.json              Fixture inventory and expected peer binding
+  manifest.json              Current fixture inventory and expected peer binding
+  frozen-business-v1.json    Digests for the archived revision 1 byte set
   bootstrap/                 Hello, accepted, and rejected bootstrap messages
-  requests/                  One canonical request for every v1 operation
-  responses/                 One canonical response for every v1 operation and one API error
-  invalid/                   Binding/revision fixtures that must be rejected
+  requests/                  Archived v1 and current v2 requests
+  responses/                 Archived v1 and current v2 responses
+  invalid/                   Bootstrap, binding, and cross-revision rejection cases
 csharp/
   UnityAsset.SearchProtocol.Reference/    netstandard2.0 codec library
   UnityAsset.SearchProtocol.Conformance/  net8.0 fixture runner
+  UnityAsset.SearchProtocol.ExternalConsumer/  netstandard2.0 public API smoke consumer
 ```
 
 ## Wire Contract
 
 Every message is UTF-8 JSON preceded by a four-byte unsigned big-endian payload length. The length excludes the header. Decoders reject truncated headers, length mismatches, trailing frame bytes, and payloads that exceed the operation-specific limit.
 
-Bootstrap is revision-independent and uses `bootstrap_version: 1`. A client sends `BootstrapHelloV1` with a project ID, daemon instance ID, and a strictly increasing non-empty list of supported business revisions. The daemon returns either the highest common revision or one of these closed rejection codes:
+Bootstrap is revision-independent and uses `bootstrap_version: 2`. A current client sends `BootstrapHelloV2` with a project ID, daemon instance ID, and `supported_revisions: [2]`. The list is still structurally bounded, non-empty, unique, and strictly increasing so a future coordinated release can negotiate another revision without changing Bootstrap V2. An accepted reply supplies the nonzero query-policy identity required to construct the first business request. The daemon otherwise returns one of these closed rejection codes:
 
 - `project_mismatch`
 - `instance_mismatch`
 - `no_common_revision`
 
-Business revision 1 contains these operations:
+Business revision 2 contains these operations:
 
 - `capabilities`
 - `status`
@@ -42,6 +44,8 @@ Business revision 1 contains these operations:
 - `shutdown`
 
 Request and response envelopes bind every exchange to a protocol revision, request ID, project ID, daemon instance ID, and query-policy ID. A response is valid only in the context of its originating request.
+
+The current codec accepts and emits only business revision 2. It does not decode archived revision 1 fixtures, and peers that offer only revision 1 receive `no_common_revision` during Bootstrap V2. Revision 2 adds daemon lifecycle evidence to `status` and the closed `idempotency_conflict` API error code; changing either shape in place was the reason for the revision break.
 
 ## Canonical JSON
 
@@ -67,26 +71,29 @@ Aggregate limits are measured from canonical JSON, not from unescaped source str
 - bootstrap encode, decode, and negotiation;
 - business envelope encode, decode, construction, and request/response validation;
 - bounded frame encode/decode helpers;
-- `IProtocolTransportAdapter` as the platform connection boundary.
+- `IProtocolTransportAdapter` as the platform connection boundary;
+- `ProtocolSession` as the public Bootstrap V2 and sequential exchange owner.
 
 Domain operation payloads are retained as schema-validated JSON rather than duplicated as a second public object model. This keeps the reference implementation aligned with the Rust DTOs while still rejecting invalid nested data. Use `BusinessCodec.CreateRequest`, `CreateSuccessResponse`, or `CreateErrorResponse` to construct outbound envelopes from operation payload JSON.
 
-The asynchronous framed stream is deliberately internal. Public callers operate at the request/response exchange boundary, so they cannot pipeline unrelated messages or reuse a connection after cancellation, truncated I/O, or an invalid frame. Any such failure poisons and closes the connection.
+The C# `RequestEnvelopeV1` and `ResponseEnvelopeV1` class names are retained to avoid a mechanical source rename. Their wire revision always comes from `ProtocolConstants.BusinessProtocolRevision`, which is 2; the suffix does not imply revision 1 compatibility.
+
+The asynchronous framed stream is deliberately internal. `ProtocolSession.ConnectAsync` sends the current Bootstrap V2 hello, validates the accepted project and daemon instance, retains the negotiated `ProtocolBinding`, and reports a rejected handshake as `ProtocolBootstrapRejectedException` with its closed rejection code. A successful session exclusively owns the adapter's returned `Stream`; callers must not reuse that stream after passing it to the session. `ExchangeAsync` permits one sequential request/response exchange at a time and validates the response against its request. Once an exchange starts I/O, cancellation, truncated I/O, or an invalid frame permanently poisons and closes the connection; later exchanges fail without writing another request. `ResponseEnvelopeV1.Value` exposes the validated success payload or structured error payload as `JsonElement`.
 
 ```csharp
-var binding = new ProtocolBinding(
-    ProtocolConstants.BusinessProtocolRevision,
+using ProtocolSession session = await ProtocolSession.ConnectAsync(
+    new EditorTransportAdapter(),
     ProjectId.Parse(projectId),
     DaemonInstanceId.Parse(instanceId),
-    QueryPolicyId.Parse(queryPolicyId));
+    cancellationToken);
 
 RequestEnvelopeV1 request = BusinessCodec.CreateRequest(
-    binding,
+    session.Binding,
     RequestId.Parse(requestId),
     "search",
     Encoding.UTF8.GetBytes("{\"query\":\"player\",\"limit\":25}"));
 
-byte[] frame = FrameCodec.EncodeRequest(request);
+ResponseEnvelopeV1 response = await session.ExchangeAsync(request, cancellationToken);
 ```
 
 The external Unity plugin owns the platform transport implementation, endpoint discovery, process lifecycle, and editor-thread integration. Its adapter only needs to return a connected, readable, writable `Stream`:
@@ -102,24 +109,29 @@ public sealed class EditorTransportAdapter : IProtocolTransportAdapter
 }
 ```
 
-Do not treat a successfully parsed response as trusted until `ResponseEnvelopeV1.ValidateFor(request)` succeeds. The frame convenience methods perform that validation automatically.
+Low-level codec consumers must call `ResponseEnvelopeV1.ValidateFor(request)` before trusting a parsed response. `ProtocolSession.ExchangeAsync` performs this validation automatically.
 
 ## Conformance
 
 Run the focused suite from the repository root:
 
 ```text
+dotnet build integration/search-protocol/csharp/UnityAsset.SearchProtocol.ExternalConsumer/UnityAsset.SearchProtocol.ExternalConsumer.csproj --configuration Release
 dotnet run --project integration/search-protocol/csharp/UnityAsset.SearchProtocol.Conformance/UnityAsset.SearchProtocol.Conformance.csproj -- integration/search-protocol/fixtures
 ```
 
 The runner verifies that:
 
 - every listed fixture is non-empty and every JSON fixture is listed;
-- all ten request and response operations are covered;
+- all ten revision 2 request and response operations are covered;
 - bootstrap hello/accepted/rejected and a structured error are covered;
 - decode followed by canonical encode reproduces every valid fixture byte-for-byte;
 - every fixture survives bounded frame round-trip;
+- empty, duplicate, unsorted, incompatible, and wrong-version bootstrap inputs are rejected;
 - protocol revision, project, and daemon instance mismatches are rejected;
-- malformed frame lengths and non-canonical fixed IDs are rejected.
+- exact-limit frames succeed and one-byte-over frames fail;
+- the public transport-neutral session owns its stream, serializes concurrent exchanges, permanently poisons incomplete or invalid exchanges, exposes success/error payloads, and preserves structured rejection codes;
+- an external `netstandard2.0` consumer compiles against the public response payload surface without `InternalsVisibleTo` access;
+- every archived business revision 1 fixture still matches the frozen inventory digest and per-file SHA-256 value.
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for revision and runtime policy.

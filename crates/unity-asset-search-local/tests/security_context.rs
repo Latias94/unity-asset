@@ -13,6 +13,10 @@ fn current_security_context_is_stable_and_round_trips() {
         SecurityContextIdV1::from_str(&first.to_string()).unwrap(),
         first
     );
+    assert_eq!(
+        SecurityContextIdV1::for_process(std::process::id()).unwrap(),
+        first
+    );
 }
 
 #[test]
@@ -45,5 +49,13 @@ fn security_context_rejects_noncanonical_and_zero_values() {
     assert!(matches!(
         SecurityContextIdV1::from_str("security-context-v1:01"),
         Err(LocalIdentityParseError::InvalidLength { .. })
+    ));
+}
+
+#[test]
+fn security_context_rejects_zero_process_id() {
+    assert!(matches!(
+        SecurityContextIdV1::for_process(0),
+        Err(unity_asset_search_local::SecurityContextError::InvalidProcessId)
     ));
 }

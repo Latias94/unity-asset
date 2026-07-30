@@ -1,145 +1,152 @@
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::process::{Command, Output};
-use std::thread;
+use std::fs;
+use std::io::Write as _;
+use std::process::{Command, Output, Stdio};
 
-use unity_asset_search_index::{ApiError, ApiErrorCode, SearchResponse};
+use serde_json::Value;
+use tempfile::TempDir;
 
 fn run_cli(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_unity-asset-search-cli"))
         .args(arguments)
         .output()
-        .expect("run search CLI fixture")
+        .expect("run search CLI")
 }
 
-fn parse_stderr(output: &Output) -> ApiError {
-    assert!(!output.status.success(), "CLI unexpectedly succeeded");
-    assert!(
-        output.stdout.is_empty(),
-        "stdout must contain no error output"
+fn run_cli_with_stdin(arguments: &[&str], stdin: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_unity-asset-search-cli"))
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn search CLI");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(stdin)
+        .expect("write search CLI stdin");
+    child.wait_with_output().expect("wait for search CLI")
+}
+
+fn assert_failure(output: &Output, category: &str, exit_code: i32) -> Value {
+    assert_eq!(output.status.code(), Some(exit_code));
+    assert!(output.stdout.is_empty(), "errors must not write stdout");
+    let document: Value =
+        serde_json::from_slice(&output.stderr).expect("stderr must contain one JSON document");
+    assert_eq!(document["cli_contract_version"], 1);
+    assert_eq!(document["category"], category);
+    assert_eq!(
+        document["error"]["details"]["source"],
+        "unity_asset_search_cli"
     );
-    serde_json::from_slice(&output.stderr).expect("stderr must contain one ApiError JSON envelope")
-}
-
-fn serve_json_once(status: &'static str, body: Vec<u8>) -> (String, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP fixture");
-    let address = listener.local_addr().expect("read HTTP fixture address");
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept CLI request");
-        let mut request = [0_u8; 4096];
-        let _ = stream.read(&mut request).expect("read CLI request");
-        write!(
-            stream,
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .expect("write fixture headers");
-        stream.write_all(&body).expect("write fixture response");
-    });
-    (format!("http://{address}"), server)
-}
-
-fn search_response_json(contract_version: u16) -> Vec<u8> {
-    let digest = format!("blake3-v1:{}", "00".repeat(32));
-    serde_json::to_vec(&serde_json::json!({
-        "contract_version": contract_version,
-        "generation": {
-            "contract_version": 2,
-            "generation": digest,
-            "workspace": "workspace-v1:00000000000000000000000000000001",
-            "actual_revision": digest,
-            "desired_revision": digest,
-            "stale": false
-        },
-        "query": "fixture",
-        "took_ms": 1,
-        "match_count": {
-            "value": 0,
-            "relation": "exact"
-        },
-        "returned_hits": 0,
-        "request_limit_truncated": false,
-        "fuzzy_work": {
-            "consumed": 0,
-            "limit": 10,
-            "exhausted": false
-        },
-        "hits": [],
-        "diagnostics": [],
-        "fallback_used": false
-    }))
-    .expect("serialize search response fixture")
-}
-
-#[test]
-fn daemon_api_error_is_emitted_as_its_original_json_envelope() {
-    let body = br#"{"contract_version":2,"code":"invalid_request","message":"fixture rejected","retryable":false,"details":{"field":"q"}}"#;
-    let (base_url, server) = serve_json_once("400 Bad Request", body.to_vec());
-    let output = run_cli(&["--base-url", &base_url, "health"]);
-    server.join().expect("finish HTTP fixture");
-
-    let error = parse_stderr(&output);
-    assert_eq!(error.code, ApiErrorCode::InvalidRequest);
-    assert_eq!(error.message, "fixture rejected");
-    assert_eq!(error.details.get("field"), Some(&"q".to_string()));
-}
-
-#[test]
-fn successful_search_is_emitted_as_versioned_json() {
-    let (base_url, server) = serve_json_once("200 OK", search_response_json(2));
-    let output = run_cli(&["--base-url", &base_url, "search", "fixture"]);
-    server.join().expect("finish HTTP fixture");
-
-    assert!(
-        output.status.success(),
-        "search CLI failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+    assert_eq!(
+        output.stderr.iter().filter(|byte| **byte == b'\n').count(),
+        1,
+        "stderr must contain exactly one newline-terminated document"
     );
-    assert!(output.stderr.is_empty(), "successful stderr must be empty");
-    let response: SearchResponse =
-        serde_json::from_slice(&output.stdout).expect("stdout must contain one SearchResponse");
-    assert_eq!(response.contract_version, 2);
-    assert_eq!(response.generation.contract_version, 2);
-    assert_eq!(response.query, "fixture");
-    assert_eq!(response.returned_hits, 0);
+    document
+}
+
+fn unity_project() -> TempDir {
+    let root = tempfile::tempdir().expect("temporary Unity project");
+    fs::create_dir(root.path().join("Assets")).expect("Assets marker");
+    fs::create_dir(root.path().join("ProjectSettings")).expect("ProjectSettings marker");
+    root
 }
 
 #[test]
-fn older_and_newer_search_contract_versions_are_structured_process_errors() {
-    for contract_version in [1, 3] {
-        let (base_url, server) = serve_json_once("200 OK", search_response_json(contract_version));
-        let output = run_cli(&["--base-url", &base_url, "search", "fixture"]);
-        server.join().expect("finish HTTP fixture");
+fn help_and_version_use_standard_success_output() {
+    let help = run_cli(&["--help"]);
+    assert!(help.status.success());
+    assert!(help.stderr.is_empty());
+    assert!(
+        String::from_utf8(help.stdout)
+            .expect("help is UTF-8")
+            .contains("Usage:")
+    );
 
-        let error = parse_stderr(&output);
-        assert_eq!(error.code, ApiErrorCode::Internal);
-        assert_eq!(
-            error.details.get("source"),
-            Some(&"unity_asset_search_cli".to_string())
-        );
-        assert!(
-            error
-                .message
-                .contains("validate response contract GET search"),
-            "unexpected version error for contract {contract_version}: {}",
-            error.message
-        );
+    let version = run_cli(&["--version"]);
+    assert!(version.status.success());
+    assert!(version.stderr.is_empty());
+    assert!(
+        String::from_utf8(version.stdout)
+            .expect("version is UTF-8")
+            .contains(env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn invalid_project_root_is_a_structured_input_error() {
+    let root = tempfile::tempdir().expect("temporary non-project");
+    let output = run_cli(&[
+        "--project-root",
+        root.path().to_str().expect("UTF-8 test path"),
+        "capabilities",
+    ]);
+
+    let error = assert_failure(&output, "input", 3);
+    assert_eq!(error["error"]["code"], "invalid_request");
+}
+
+#[test]
+fn missing_daemon_is_a_retryable_structured_unavailable_error() {
+    let root = unity_project();
+    let output = run_cli(&[
+        "--project-root",
+        root.path().to_str().expect("UTF-8 test path"),
+        "capabilities",
+    ]);
+
+    let error = assert_failure(&output, "unavailable", 4);
+    assert_eq!(error["error"]["code"], "not_ready");
+    assert_eq!(error["error"]["retryable"], true);
+}
+
+#[test]
+fn malformed_and_unknown_request_json_are_structured_input_errors() {
+    let directory = tempfile::tempdir().expect("temporary input directory");
+    for (name, body) in [
+        ("malformed.json", "{"),
+        (
+            "unknown.json",
+            r#"{"cli_contract_version":1,"operation":{"kind":"status","request":{}},"unknown":true}"#,
+        ),
+    ] {
+        let path = directory.path().join(name);
+        fs::write(&path, body).expect("write request fixture");
+        let output = run_cli(&["--request-json", path.to_str().expect("UTF-8 test path")]);
+        assert_failure(&output, "input", 3);
     }
 }
 
 #[test]
-fn transport_failure_is_emitted_as_a_json_error_envelope() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve unused local port");
-    let address = listener.local_addr().expect("read reserved local port");
-    drop(listener);
-
-    let base_url = format!("http://{address}");
-    let output = run_cli(&["--base-url", &base_url, "health"]);
-    let error = parse_stderr(&output);
-
-    assert_eq!(error.code, ApiErrorCode::Internal);
-    assert_eq!(
-        error.details.get("source"),
-        Some(&"unity_asset_search_cli".to_string())
+fn oversized_stdin_is_rejected_before_protocol_or_project_work() {
+    let input = vec![b' '; 512 * 1024 + 1];
+    let output = run_cli_with_stdin(&["--request-json", "-"], &input);
+    let error = assert_failure(&output, "input", 3);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("encoded input exceeded its limit")
     );
+}
+
+#[test]
+fn request_json_and_subcommand_conflict_is_machine_readable() {
+    let directory = tempfile::tempdir().expect("temporary input directory");
+    let path = directory.path().join("request.json");
+    fs::write(
+        &path,
+        r#"{"cli_contract_version":1,"operation":{"kind":"status","request":{}}}"#,
+    )
+    .expect("write request fixture");
+    let output = run_cli(&[
+        "--request-json",
+        path.to_str().expect("UTF-8 test path"),
+        "status",
+    ]);
+
+    assert_failure(&output, "usage", 2);
 }

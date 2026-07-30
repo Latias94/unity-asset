@@ -8,7 +8,7 @@ mod operation;
 mod validation;
 
 pub use bootstrap::{
-    BOOTSTRAP_VERSION, BootstrapErrorCode, BootstrapHelloV1, BootstrapReplyV1,
+    BOOTSTRAP_VERSION, BootstrapErrorCode, BootstrapHelloV2, BootstrapReplyV2,
     MAX_BOOTSTRAP_REVISIONS,
 };
 pub use framing::{
@@ -19,21 +19,24 @@ pub use ids::{
     DaemonInstanceId, FixedIdParseError, OperationId, ProjectId, QueryPolicyId, RequestId,
 };
 pub use model::{
-    ApiError, ApiErrorCode, CandidateFieldV1, FilesystemReindexIntent, FilesystemReindexScope,
-    FuzzyWorkUsageV1, GenerationFailure, GenerationIdV1, GenerationStamp, GenerationStatus,
-    HighlightRangeV1, Location, MAX_API_ERROR_JSON_BYTES, MAX_ERROR_MESSAGE_BYTES,
-    MAX_PORTABLE_PATH_BYTES, MAX_REFERENCE_RESPONSE_DIAGNOSTIC_JSON_BYTES,
-    MAX_REFERENCE_RESPONSE_DIAGNOSTICS, MAX_REINDEX_PUBLISH_WARNING_BYTES,
-    MAX_REINDEX_PUBLISH_WARNINGS, MAX_REINDEX_PUBLISH_WARNINGS_JSON_BYTES,
-    MAX_SEARCH_DIAGNOSTICS_JSON_BYTES, MAX_SEARCH_HITS_JSON_BYTES, MAX_SEARCH_RESPONSE_DIAGNOSTICS,
-    MAX_SEARCH_RESPONSE_JSON_BYTES, MAX_STATUS_PATHS_JSON_BYTES, MAX_STATUS_SCAN_ROOTS,
-    MAX_SUGGESTION_BYTES, MAX_SUGGESTIONS_JSON_BYTES, MatchCountRelationV1, MatchCountV1,
-    MatchExplanationV1, PortablePath, PortablePathError, RankingSignalsV1, ReferenceContext,
+    ApiError, ApiErrorCode, CandidateFieldV1, DaemonLifecycleState, DaemonLifecycleStatus,
+    FilesystemReindexIntent, FilesystemReindexScope, FreshnessMaintenance, FuzzyWorkUsageV1,
+    GenerationFailure, GenerationFreshness, GenerationIdV1, GenerationMaintenanceState,
+    GenerationMaintenanceStatus, GenerationStamp, GenerationStatus, HighlightRangeV1, Location,
+    MAX_API_ERROR_JSON_BYTES, MAX_ERROR_MESSAGE_BYTES, MAX_PORTABLE_PATH_BYTES,
+    MAX_REFERENCE_RESPONSE_DIAGNOSTIC_JSON_BYTES, MAX_REFERENCE_RESPONSE_DIAGNOSTICS,
+    MAX_REINDEX_PUBLISH_WARNING_BYTES, MAX_REINDEX_PUBLISH_WARNINGS,
+    MAX_REINDEX_PUBLISH_WARNINGS_JSON_BYTES, MAX_SEARCH_DIAGNOSTICS_JSON_BYTES,
+    MAX_SEARCH_HITS_JSON_BYTES, MAX_SEARCH_RESPONSE_DIAGNOSTICS, MAX_SEARCH_RESPONSE_JSON_BYTES,
+    MAX_STATUS_PATHS_JSON_BYTES, MAX_STATUS_SCAN_ROOTS, MAX_SUGGESTION_BYTES,
+    MAX_SUGGESTIONS_JSON_BYTES, MatchCountRelationV1, MatchCountV1, MatchExplanationV1,
+    PortablePath, PortablePathError, RankingSignalsV1, ReconcileLifecycle, ReferenceContext,
     ReferenceCoverage, ReferenceCursor, ReferenceDiagnosticCoverage, ReferenceDirection,
     ReferenceHit, ReferenceObject, ReferenceRequest, ReferenceSelector, ReferencesResponse,
     ReindexAnalysisEvidence, ReindexDiskEstimate, ReindexDisposition, ReindexEvidence,
     ReindexReceipt, SEARCH_PROTOCOL_REVISION, SearchCapabilities, SearchDiagnosticV1, SearchHit,
-    SearchResponse, StatusResponse, SuggestResponse, TermExplanationV1, WireProjectionError,
+    SearchResponse, ServingAvailability, StatusResponse, SuggestResponse, TermExplanationV1,
+    TimerLifecycleState, TimerStatus, WatcherLifecycleState, WatcherStatus, WireProjectionError,
 };
 pub use operation::{
     BUSINESS_PROTOCOL_REVISION, CapabilitiesRequest, CapabilitiesResponse,

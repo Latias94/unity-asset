@@ -1,40 +1,43 @@
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io;
 use std::mem::{MaybeUninit, size_of};
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::{Component, Components, Path, PathBuf, Prefix};
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
+    FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileRenameInformation, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_INSUFFICIENT_BUFFER, GENERIC_ALL, GENERIC_WRITE, HANDLE,
     INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError,
     STATUS_REPARSE_POINT_ENCOUNTERED, STATUS_STOPPED_ON_SYMLINK,
 };
-#[cfg(test)]
-use windows_sys::Win32::Security::SetKernelObjectSecurity;
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACE_INHERITED_OBJECT_TYPE_PRESENT, ACE_OBJECT_TYPE_PRESENT,
-    ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    EqualSid, GetAce, GetKernelObjectSecurity, GetLengthSid, GetSecurityDescriptorControl,
-    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, INHERIT_ONLY_ACE, InitializeAcl,
-    InitializeSecurityDescriptor, IsValidAcl, IsValidSecurityDescriptor, IsValidSid,
-    IsWellKnownSid, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SID, SetSecurityDescriptorControl,
-    SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, WinBuiltinAdministratorsSid,
+    ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, CreateWellKnownSid,
+    DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetKernelObjectSecurity, GetLengthSid,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+    INHERIT_ONLY_ACE, InitializeAcl, InitializeSecurityDescriptor, IsValidAcl,
+    IsValidSecurityDescriptor, IsValidSid, IsWellKnownSid, OBJECT_INHERIT_ACE,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
+    SECURITY_MAX_SID_SIZE, SID, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+    SetSecurityDescriptorOwner, WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid,
     WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
-    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE, FileAttributeTagInfo, FileIdInfo,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_DELETE_CHILD, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FILE_TRAVERSE, FILE_WRITE_DATA, FileAttributeTagInfo, FileDispositionInfo, FileIdInfo,
     FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL,
-    SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+    SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -54,11 +57,15 @@ use super::{DiscoveredRoots, PRODUCT_DIRECTORY, PrivateRootsError};
 use crate::security_context::CurrentSecurityContextSnapshot;
 
 const DIRECTORY_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-const DIRECTORY_TRAVERSE_ACCESS: u32 =
-    FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+const DIRECTORY_TRAVERSE_ACCESS: u32 = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const DIRECTORY_CREATE_ACCESS: u32 =
-    DIRECTORY_TRAVERSE_ACCESS | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY;
+    DIRECTORY_TRAVERSE_ACCESS | FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY;
 const PRIVATE_DIRECTORY_ACCESS: u32 = DIRECTORY_CREATE_ACCESS | READ_CONTROL | WRITE_DAC;
+const STABLE_PARENT_DIRECTORY_ACCESS: u32 =
+    FILE_ADD_SUBDIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+const PRIVATE_OBJECT_ACCESS: u32 = FILE_ALL_ACCESS & !WRITE_OWNER;
+pub(crate) const WINDOWS_NAMED_PIPE_CLIENT_ACCESS: u32 =
+    FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const MAX_WINDOWS_ROOT_UTF16_UNITS: usize = 1_024;
 const MAX_WINDOWS_COMPONENT_UTF16_UNITS: usize = 255;
 const WINDOWS_ROOT_BUFFER_UTF16_UNITS: usize = MAX_WINDOWS_ROOT_UTF16_UNITS + 2;
@@ -81,29 +88,315 @@ pub(super) struct PrivateDirectory {
     identity: DirectoryIdentity,
 }
 
+struct StableParentDirectory {
+    handle: OwnedHandle,
+}
+
+impl StableParentDirectory {
+    fn create_stable_child(
+        &self,
+        name: &OsStr,
+        security: &PrivateSecurityDescriptor,
+    ) -> io::Result<Self> {
+        create_or_open_stable_parent_directory(self.handle.raw(), name, security)
+    }
+
+    fn create_private_child(
+        &self,
+        name: &OsStr,
+        security: &PrivateSecurityDescriptor,
+    ) -> io::Result<PrivateDirectory> {
+        create_or_open_private_directory(self.handle.raw(), name, security)
+    }
+}
+
 impl PrivateDirectory {
     pub(super) fn revalidate(
         &self,
         path: &Path,
         security_context: &CurrentSecurityContextSnapshot,
     ) -> io::Result<()> {
-        let security = PrivateSecurityDescriptor::new(security_context.windows_user_sid())?;
-        if validate_private_directory(self.handle.raw(), &security)? != self.identity {
+        let security = PrivateSecurityDescriptor::new(
+            security_context.windows_user_sid(),
+            security_context.windows_logon_sid(),
+        )?;
+        if validate_secured_directory(self.handle.raw(), &security)? != self.identity {
             return Err(io::Error::other(
                 "private directory identity changed during revalidation",
             ));
         }
         let reopened = open_directory_path(path, PRIVATE_DIRECTORY_ACCESS)?;
-        if validate_private_directory(reopened.raw(), &security)? != self.identity {
+        if validate_secured_directory(reopened.raw(), &security)? != self.identity {
             return Err(io::Error::other(
                 "private directory identity changed during revalidation",
             ));
         }
         Ok(())
     }
+
+    pub(super) fn create_private_child(
+        &self,
+        name: &OsStr,
+        security_context: &CurrentSecurityContextSnapshot,
+    ) -> io::Result<Self> {
+        let security = PrivateSecurityDescriptor::new(
+            security_context.windows_user_sid(),
+            security_context.windows_logon_sid(),
+        )?;
+        create_or_open_private_directory(self.handle.raw(), name, &security)
+    }
+
+    pub(super) fn create_private_file(
+        &self,
+        directory_path: &Path,
+        name: &OsStr,
+        security_context: &CurrentSecurityContextSnapshot,
+    ) -> io::Result<File> {
+        self.revalidate(directory_path, security_context)?;
+        validate_leaf_component(name)?;
+        let security = PrivateSecurityDescriptor::new(
+            security_context.windows_user_sid(),
+            security_context.windows_logon_sid(),
+        )?;
+        let (handle, information) = nt_create_file_at(
+            self.handle.raw(),
+            name,
+            PRIVATE_OBJECT_ACCESS,
+            FILE_CREATE,
+            Some(security.as_ptr()),
+        )?;
+        if information != FILE_CREATED_INFORMATION {
+            return Err(io::Error::other(
+                "Windows private file returned an unexpected create disposition",
+            ));
+        }
+        let file = handle.into_file();
+        validate_private_file(&file, &security)?;
+        self.revalidate(directory_path, security_context)?;
+        Ok(file)
+    }
+
+    pub(super) fn open_private_file(
+        &self,
+        directory_path: &Path,
+        name: &OsStr,
+        security_context: &CurrentSecurityContextSnapshot,
+        writable: bool,
+    ) -> io::Result<File> {
+        self.revalidate(directory_path, security_context)?;
+        validate_leaf_component(name)?;
+        let security = PrivateSecurityDescriptor::new(
+            security_context.windows_user_sid(),
+            security_context.windows_logon_sid(),
+        )?;
+        let access = FILE_READ_ATTRIBUTES
+            | windows_sys::Win32::Foundation::GENERIC_READ
+            | READ_CONTROL
+            | if writable {
+                windows_sys::Win32::Foundation::GENERIC_WRITE
+            } else {
+                0
+            };
+        let (handle, _) = nt_create_file_at(self.handle.raw(), name, access, FILE_OPEN, None)?;
+        let file = handle.into_file();
+        validate_private_file(&file, &security)?;
+        self.revalidate(directory_path, security_context)?;
+        Ok(file)
+    }
+
+    pub(super) fn rename_private_file(
+        &self,
+        directory_path: &Path,
+        source: &OsStr,
+        destination: &OsStr,
+        replace: bool,
+        security_context: &CurrentSecurityContextSnapshot,
+    ) -> io::Result<()> {
+        self.revalidate(directory_path, security_context)?;
+        validate_leaf_component(source)?;
+        validate_leaf_component(destination)?;
+        let security = PrivateSecurityDescriptor::new(
+            security_context.windows_user_sid(),
+            security_context.windows_logon_sid(),
+        )?;
+        let (source, _) = nt_create_file_at(
+            self.handle.raw(),
+            source,
+            DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_OPEN,
+            None,
+        )?;
+        let source = source.into_file();
+        validate_private_file(&source, &security)?;
+        rename_file_at(
+            &source,
+            self.handle.raw(),
+            destination,
+            if replace {
+                RenameBehavior::Replace
+            } else {
+                RenameBehavior::NoReplace
+            },
+        )?;
+        self.revalidate(directory_path, security_context)?;
+        Ok(())
+    }
+
+    pub(super) fn remove_private_file(
+        &self,
+        directory_path: &Path,
+        name: &OsStr,
+        security_context: &CurrentSecurityContextSnapshot,
+    ) -> io::Result<()> {
+        self.revalidate(directory_path, security_context)?;
+        validate_leaf_component(name)?;
+        let security = PrivateSecurityDescriptor::new(
+            security_context.windows_user_sid(),
+            security_context.windows_logon_sid(),
+        )?;
+        let (file, _) = nt_create_file_at(
+            self.handle.raw(),
+            name,
+            DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_OPEN,
+            None,
+        )?;
+        let file = file.into_file();
+        validate_private_file(&file, &security)?;
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: the live file handle has DELETE access and the input structure is exact.
+        if unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&raw const disposition).cast(),
+                structure_size::<FILE_DISPOSITION_INFO>()?,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        drop(file);
+        self.revalidate(directory_path, security_context)
+    }
+
+    pub(super) fn sync(&self) -> io::Result<()> {
+        // Windows directory handles do not provide a portable durability primitive. Descriptor
+        // publication uses write-through replacement; retaining this method keeps the commit
+        // boundary explicit across platforms.
+        Ok(())
+    }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+fn validate_leaf_component(name: &OsStr) -> io::Result<()> {
+    let mut encoded = [0_u16; MAX_WINDOWS_COMPONENT_UTF16_UNITS];
+    let _ = encode_leaf(name, &mut encoded)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum RenameBehavior {
+    Replace,
+    NoReplace,
+}
+
+fn rename_file_at(
+    source: &File,
+    destination_parent: HANDLE,
+    destination: &OsStr,
+    behavior: RenameBehavior,
+) -> io::Result<()> {
+    let mut encoded_name = [0_u16; MAX_WINDOWS_COMPONENT_UTF16_UNITS];
+    let name_length = encode_leaf(destination, &mut encoded_name)?;
+    let name_bytes = name_length
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(invalid_component)?;
+    let buffer_bytes = size_of::<FILE_RENAME_INFORMATION>()
+        .checked_add(name_bytes)
+        .ok_or_else(|| io::Error::other("Windows rename buffer size overflow"))?;
+    let mut buffer = AlignedStorage::zeroed(buffer_bytes, "Windows file rename information")?;
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: the aligned allocation is large enough for the fixed structure and complete name.
+    unsafe {
+        (*information).Anonymous.ReplaceIfExists = matches!(behavior, RenameBehavior::Replace);
+        (*information).RootDirectory = destination_parent;
+        (*information).FileNameLength = u32::try_from(name_bytes)
+            .map_err(|_| io::Error::other("Windows rename name is too large"))?;
+        std::ptr::copy_nonoverlapping(
+            encoded_name.as_ptr(),
+            (*information).FileName.as_mut_ptr(),
+            name_length,
+        );
+    }
+    let mut io_status = IO_STATUS_BLOCK::default();
+    // SAFETY: the source handle has DELETE access and the variable-sized input is initialized.
+    ntstatus_result(unsafe {
+        NtSetInformationFile(
+            source.as_raw_handle(),
+            &raw mut io_status,
+            information.cast(),
+            u32::try_from(buffer_bytes)
+                .map_err(|_| io::Error::other("Windows rename buffer is too large"))?,
+            FileRenameInformation,
+        )
+    })
+}
+
+fn validate_private_file(file: &File, security: &PrivateSecurityDescriptor) -> io::Result<()> {
+    let handle = file.as_raw_handle();
+    let mut attributes = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: the file handle is live and the output buffer is exact.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            (&raw mut attributes).cast(),
+            structure_size::<FILE_ATTRIBUTE_TAG_INFO>()?,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private namespace file is a reparse point",
+        ));
+    }
+    let mut standard = FILE_STANDARD_INFO::default();
+    // SAFETY: the file handle is live and the output buffer is exact.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileStandardInfo,
+            (&raw mut standard).cast(),
+            structure_size::<FILE_STANDARD_INFO>()?,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if standard.Directory {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private namespace entry is not a regular file",
+        ));
+    }
+    let identity = file_identity(handle)?;
+    if identity.volume_serial_number == 0 || identity.file_id.iter().all(|byte| *byte == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private namespace file has no stable identity",
+        ));
+    }
+    security.verify(handle)
+}
+
+fn file_identity(handle: HANDLE) -> io::Result<DirectoryIdentity> {
+    directory_identity(handle)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DirectoryIdentity {
     volume_serial_number: u64,
     file_id: [u8; 16],
@@ -119,24 +412,35 @@ pub(super) fn discover(
         path: PathBuf::from("<LocalAppData>"),
         source,
     })?;
-    let security =
-        PrivateSecurityDescriptor::new(security_context.windows_user_sid()).map_err(|source| {
+    let private_security = PrivateSecurityDescriptor::new(
+        security_context.windows_user_sid(),
+        security_context.windows_logon_sid(),
+    )
+    .map_err(|source| PrivateRootsError::Filesystem {
+        kind: super::PrivateRootKind::Runtime,
+        operation: "construct private Windows security descriptor",
+        path: base_path.clone(),
+        source,
+    })?;
+    let stable_parent_security = PrivateSecurityDescriptor::for_shared_parent(
+        security_context.windows_user_sid(),
+    )
+    .map_err(|source| PrivateRootsError::Filesystem {
+        kind: super::PrivateRootKind::Runtime,
+        operation: "construct stable Windows parent security descriptor",
+        path: base_path.clone(),
+        source,
+    })?;
+    let base =
+        open_directory_path(&base_path, STABLE_PARENT_DIRECTORY_ACCESS).map_err(|source| {
             PrivateRootsError::Filesystem {
                 kind: super::PrivateRootKind::Runtime,
-                operation: "construct private Windows security descriptor",
+                operation: "open LocalAppData",
                 path: base_path.clone(),
                 source,
             }
         })?;
-    let base = open_directory_path(&base_path, DIRECTORY_CREATE_ACCESS | READ_CONTROL).map_err(
-        |source| PrivateRootsError::Filesystem {
-            kind: super::PrivateRootKind::Runtime,
-            operation: "open LocalAppData",
-            path: base_path.clone(),
-            source,
-        },
-    )?;
-    security
+    stable_parent_security
         .verify_owner_controlled_parent(base.raw())
         .map_err(|source| PrivateRootsError::Filesystem {
             kind: super::PrivateRootKind::Runtime,
@@ -146,54 +450,57 @@ pub(super) fn discover(
         })?;
 
     let product_path = base_path.join(PRODUCT_DIRECTORY);
-    let product =
-        create_or_open_private_directory(base.raw(), OsStr::new(PRODUCT_DIRECTORY), &security)
-            .map_err(|source| PrivateRootsError::Filesystem {
-                kind: super::PrivateRootKind::Runtime,
-                operation: "create private product root",
-                path: product_path.clone(),
-                source,
-            })?;
+    let product = create_or_open_stable_parent_directory(
+        base.raw(),
+        OsStr::new(PRODUCT_DIRECTORY),
+        &stable_parent_security,
+    )
+    .map_err(|source| PrivateRootsError::Filesystem {
+        kind: super::PrivateRootKind::Runtime,
+        operation: "create stable product root",
+        path: product_path.clone(),
+        source,
+    })?;
 
     let runtime_parent_path = product_path.join("runtime");
-    let runtime_parent =
-        create_or_open_private_directory(product.handle.raw(), OsStr::new("runtime"), &security)
-            .map_err(|source| PrivateRootsError::Filesystem {
-                kind: super::PrivateRootKind::Runtime,
-                operation: "create runtime namespace",
-                path: runtime_parent_path.clone(),
-                source,
-            })?;
+    let runtime_parent = product
+        .create_stable_child(OsStr::new("runtime"), &stable_parent_security)
+        .map_err(|source| PrivateRootsError::Filesystem {
+            kind: super::PrivateRootKind::Runtime,
+            operation: "create stable runtime namespace",
+            path: runtime_parent_path.clone(),
+            source,
+        })?;
     let cache_parent_path = product_path.join("cache");
-    let cache_parent =
-        create_or_open_private_directory(product.handle.raw(), OsStr::new("cache"), &security)
-            .map_err(|source| PrivateRootsError::Filesystem {
-                kind: super::PrivateRootKind::Cache,
-                operation: "create cache namespace",
-                path: cache_parent_path.clone(),
-                source,
-            })?;
+    let cache_parent = product
+        .create_stable_child(OsStr::new("cache"), &stable_parent_security)
+        .map_err(|source| PrivateRootsError::Filesystem {
+            kind: super::PrivateRootKind::Cache,
+            operation: "create stable cache namespace",
+            path: cache_parent_path.clone(),
+            source,
+        })?;
 
     let context_component = security_context_id.path_component();
     let context_name = OsStr::new(&context_component);
     let runtime_path = runtime_parent_path.join(context_name);
-    let runtime =
-        create_or_open_private_directory(runtime_parent.handle.raw(), context_name, &security)
-            .map_err(|source| PrivateRootsError::Filesystem {
-                kind: super::PrivateRootKind::Runtime,
-                operation: "create security-context runtime root",
-                path: runtime_path.clone(),
-                source,
-            })?;
+    let runtime = runtime_parent
+        .create_private_child(context_name, &private_security)
+        .map_err(|source| PrivateRootsError::Filesystem {
+            kind: super::PrivateRootKind::Runtime,
+            operation: "create security-context runtime root",
+            path: runtime_path.clone(),
+            source,
+        })?;
     let cache_path = cache_parent_path.join(context_name);
-    let cache =
-        create_or_open_private_directory(cache_parent.handle.raw(), context_name, &security)
-            .map_err(|source| PrivateRootsError::Filesystem {
-                kind: super::PrivateRootKind::Cache,
-                operation: "create security-context cache root",
-                path: cache_path.clone(),
-                source,
-            })?;
+    let cache = cache_parent
+        .create_private_child(context_name, &private_security)
+        .map_err(|source| PrivateRootsError::Filesystem {
+            kind: super::PrivateRootKind::Cache,
+            operation: "create security-context cache root",
+            path: cache_path.clone(),
+            source,
+        })?;
 
     Ok(DiscoveredRoots {
         runtime_path,
@@ -274,20 +581,36 @@ fn create_or_open_private_directory(
     name: &OsStr,
     security: &PrivateSecurityDescriptor,
 ) -> io::Result<PrivateDirectory> {
-    let (handle, information) = nt_create_directory_at(
-        parent,
-        name,
-        PRIVATE_DIRECTORY_ACCESS,
-        FILE_OPEN_IF,
-        Some(security.as_ptr()),
-    )?;
+    let (handle, identity) =
+        create_or_open_secured_directory(parent, name, PRIVATE_DIRECTORY_ACCESS, security)?;
+    Ok(PrivateDirectory { handle, identity })
+}
+
+fn create_or_open_stable_parent_directory(
+    parent: HANDLE,
+    name: &OsStr,
+    security: &PrivateSecurityDescriptor,
+) -> io::Result<StableParentDirectory> {
+    let (handle, _) =
+        create_or_open_secured_directory(parent, name, STABLE_PARENT_DIRECTORY_ACCESS, security)?;
+    Ok(StableParentDirectory { handle })
+}
+
+fn create_or_open_secured_directory(
+    parent: HANDLE,
+    name: &OsStr,
+    access: u32,
+    security: &PrivateSecurityDescriptor,
+) -> io::Result<(OwnedHandle, DirectoryIdentity)> {
+    let (handle, information) =
+        nt_create_directory_at(parent, name, access, FILE_OPEN_IF, Some(security.as_ptr()))?;
     if information != FILE_CREATED_INFORMATION && information != FILE_OPENED_INFORMATION {
         return Err(io::Error::other(
-            "Windows private directory returned an unexpected create disposition",
+            "Windows secured directory returned an unexpected create disposition",
         ));
     }
-    let identity = validate_private_directory(handle.raw(), security)?;
-    Ok(PrivateDirectory { handle, identity })
+    let identity = validate_secured_directory(handle.raw(), security)?;
+    Ok((handle, identity))
 }
 
 fn open_directory_at(parent: HANDLE, name: &OsStr, access: u32) -> io::Result<OwnedHandle> {
@@ -355,6 +678,65 @@ fn nt_create_directory_at(
     Ok((handle, io_status.Information))
 }
 
+fn nt_create_file_at(
+    parent: HANDLE,
+    name: &OsStr,
+    access: u32,
+    disposition: u32,
+    security: Option<*const SECURITY_DESCRIPTOR>,
+) -> io::Result<(OwnedHandle, usize)> {
+    let mut encoded_name = [0_u16; MAX_WINDOWS_COMPONENT_UTF16_UNITS];
+    let name_length = encode_leaf(name, &mut encoded_name)?;
+    let name_bytes = name_length
+        .checked_mul(size_of::<u16>())
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .ok_or_else(invalid_component)?;
+    let unicode = windows_sys::Win32::Foundation::UNICODE_STRING {
+        Length: name_bytes,
+        MaximumLength: name_bytes,
+        Buffer: encoded_name.as_mut_ptr(),
+    };
+    let object_attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(size_of::<OBJECT_ATTRIBUTES>()).map_err(|_| invalid_component())?,
+        RootDirectory: parent,
+        ObjectName: &raw const unicode,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        SecurityDescriptor: security.unwrap_or(std::ptr::null()),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut handle = std::ptr::null_mut();
+    let mut io_status = IO_STATUS_BLOCK::default();
+    // SAFETY: all pointers reference initialized storage for the duration of the call.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut handle,
+            access | SYNCHRONIZE,
+            &raw const object_attributes,
+            &raw mut io_status,
+            std::ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            DIRECTORY_SHARE,
+            disposition,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if let Err(error) = ntstatus_result(status) {
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+            // SAFETY: a failed NtCreateFile may still return a handle requiring closure.
+            unsafe { CloseHandle(handle) };
+        }
+        return Err(error);
+    }
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::other(
+            "NtCreateFile succeeded without returning a file handle",
+        ));
+    }
+    Ok((OwnedHandle(handle), io_status.Information))
+}
+
 fn open_root(root: &OsStr) -> io::Result<OwnedHandle> {
     let mut path = [0_u16; WINDOWS_ROOT_BUFFER_UTF16_UNITS];
     encode_root(root, &mut path)?;
@@ -384,7 +766,7 @@ fn open_root(root: &OsStr) -> io::Result<OwnedHandle> {
     Ok(handle)
 }
 
-fn validate_private_directory(
+fn validate_secured_directory(
     handle: HANDLE,
     security: &PrivateSecurityDescriptor,
 ) -> io::Result<DirectoryIdentity> {
@@ -458,14 +840,51 @@ fn directory_identity(handle: HANDLE) -> io::Result<DirectoryIdentity> {
     })
 }
 
-struct PrivateSecurityDescriptor {
+pub(crate) struct PrivateSecurityDescriptor {
     owner: AlignedStorage,
-    acl: AlignedStorage,
+    _principal: AlignedStorage,
+    _owner_rights: AlignedStorage,
+    dacl: AlignedStorage,
     descriptor: SECURITY_DESCRIPTOR,
 }
 
+// SAFETY: every pointer embedded in `descriptor` targets an owned heap allocation retained by
+// this value. Construction completes before publication, the allocations do not move with the
+// struct, and all subsequent access is read-only through Windows security APIs.
+unsafe impl Send for PrivateSecurityDescriptor {}
+// SAFETY: the same immutable retained allocations may be read concurrently; no API exposes a
+// mutable pointer or mutates the descriptor after construction.
+unsafe impl Sync for PrivateSecurityDescriptor {}
+
 impl PrivateSecurityDescriptor {
-    fn new(owner_bytes: &[u8]) -> io::Result<Self> {
+    pub(crate) fn new(owner_bytes: &[u8], principal_bytes: &[u8]) -> io::Result<Self> {
+        Self::with_access(
+            owner_bytes,
+            principal_bytes,
+            PRIVATE_OBJECT_ACCESS,
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        )
+    }
+
+    pub(crate) fn for_named_pipe(owner_bytes: &[u8], principal_bytes: &[u8]) -> io::Result<Self> {
+        Self::with_access(
+            owner_bytes,
+            principal_bytes,
+            WINDOWS_NAMED_PIPE_CLIENT_ACCESS,
+            0,
+        )
+    }
+
+    pub(crate) fn for_shared_parent(user_bytes: &[u8]) -> io::Result<Self> {
+        Self::with_access(user_bytes, user_bytes, STABLE_PARENT_DIRECTORY_ACCESS, 0)
+    }
+
+    fn with_access(
+        owner_bytes: &[u8],
+        principal_bytes: &[u8],
+        principal_access: u32,
+        inheritance_flags: u32,
+    ) -> io::Result<Self> {
         let owner = AlignedStorage::from_bytes(owner_bytes, "Windows owner SID")?;
         let owner_sid = owner.as_ptr().cast_mut().cast();
         // SAFETY: the copied bytes came from a validated effective-token SID.
@@ -479,29 +898,94 @@ impl PrivateSecurityDescriptor {
                 "effective Windows user SID has an inconsistent length",
             ));
         }
-        let ace_bytes = size_of::<ACCESS_ALLOWED_ACE>()
-            .checked_sub(size_of::<u32>())
-            .and_then(|base| base.checked_add(sid_length))
-            .ok_or_else(|| io::Error::other("owner-only Windows ACL size overflow"))?;
-        let acl_bytes = size_of::<ACL>()
-            .checked_add(ace_bytes)
-            .ok_or_else(|| io::Error::other("owner-only Windows ACL size overflow"))?;
-        let mut acl = AlignedStorage::zeroed(acl_bytes, "owner-only Windows ACL")?;
-        let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
-        let acl_length = u32::try_from(acl_bytes)
-            .map_err(|_| io::Error::other("owner-only Windows ACL is too large"))?;
-        // SAFETY: `acl_ptr` is aligned and writable for `acl_length` bytes.
-        if unsafe { InitializeAcl(acl_ptr, acl_length, ACL_REVISION) } == 0 {
+        let principal = AlignedStorage::from_bytes(principal_bytes, "Windows principal SID")?;
+        let principal_sid = principal.as_ptr().cast_mut().cast();
+        // SAFETY: AlignedStorage retains all copied SID bytes.
+        if unsafe { IsValidSid(principal_sid) } == 0 {
+            return Err(io::Error::other("Windows principal SID is invalid"));
+        }
+        // SAFETY: IsValidSid succeeded.
+        let principal_length = unsafe { GetLengthSid(principal_sid) } as usize;
+        if principal_length != principal_bytes.len() {
+            return Err(io::Error::other(
+                "Windows principal SID has an inconsistent length",
+            ));
+        }
+
+        let mut owner_rights = AlignedStorage::zeroed(
+            usize::try_from(SECURITY_MAX_SID_SIZE)
+                .map_err(|_| io::Error::other("maximum Windows SID size does not fit usize"))?,
+            "Windows OWNER_RIGHTS SID",
+        )?;
+        let mut owner_rights_length = owner_rights.capacity_u32()?;
+        // SAFETY: the output allocation is writable for `owner_rights_length` bytes.
+        if unsafe {
+            CreateWellKnownSid(
+                WinCreatorOwnerRightsSid,
+                std::ptr::null_mut(),
+                owner_rights.as_mut_ptr().cast(),
+                &raw mut owner_rights_length,
+            )
+        } == 0
+        {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: the ACL allocation has room for one ACE containing the retained owner SID.
+        let owner_rights_sid = owner_rights.as_ptr().cast_mut().cast();
+        // SAFETY: CreateWellKnownSid initialized a valid SID on success.
+        if unsafe { IsValidSid(owner_rights_sid) } == 0
+            || unsafe { GetLengthSid(owner_rights_sid) } != owner_rights_length
+        {
+            return Err(io::Error::other(
+                "Windows OWNER_RIGHTS SID has an inconsistent length",
+            ));
+        }
+
+        let owner_rights_ace_bytes = size_of::<ACCESS_ALLOWED_ACE>()
+            .checked_sub(size_of::<u32>())
+            .and_then(|base| {
+                base.checked_add(usize::try_from(owner_rights_length).unwrap_or(usize::MAX))
+            })
+            .ok_or_else(|| io::Error::other("protected Windows DACL size overflow"))?;
+        let principal_ace_bytes = size_of::<ACCESS_ALLOWED_ACE>()
+            .checked_sub(size_of::<u32>())
+            .and_then(|base| base.checked_add(principal_length))
+            .ok_or_else(|| io::Error::other("protected Windows DACL size overflow"))?;
+        let dacl_bytes = size_of::<ACL>()
+            .checked_add(owner_rights_ace_bytes)
+            .and_then(|bytes| bytes.checked_add(principal_ace_bytes))
+            .ok_or_else(|| io::Error::other("protected Windows DACL size overflow"))?;
+        let mut dacl = AlignedStorage::zeroed(dacl_bytes, "protected Windows DACL")?;
+        let dacl_ptr = dacl.as_mut_ptr().cast::<ACL>();
+        let dacl_length = u32::try_from(dacl_bytes)
+            .map_err(|_| io::Error::other("protected Windows DACL is too large"))?;
+        // SAFETY: `dacl_ptr` is aligned and writable for `dacl_length` bytes.
+        if unsafe { InitializeAcl(dacl_ptr, dacl_length, ACL_REVISION) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Any OWNER_RIGHTS ACE suppresses the owner's implicit READ_CONTROL and WRITE_DAC. Grant
+        // only READ_CONTROL here; all other rights require the explicitly named principal.
+        // SAFETY: the DACL allocation includes the complete retained OWNER_RIGHTS SID.
         if unsafe {
             AddAccessAllowedAceEx(
-                acl_ptr,
+                dacl_ptr,
                 ACL_REVISION,
-                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-                FILE_ALL_ACCESS,
-                owner_sid,
+                inheritance_flags,
+                READ_CONTROL,
+                owner_rights_sid,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // A single explicit principal avoids accidentally OR-combining unrelated token SIDs.
+        // SAFETY: the DACL allocation was sized for the retained principal SID.
+        if unsafe {
+            AddAccessAllowedAceEx(
+                dacl_ptr,
+                ACL_REVISION,
+                inheritance_flags,
+                principal_access,
+                principal_sid,
             )
         } == 0
         {
@@ -516,9 +1000,9 @@ impl PrivateSecurityDescriptor {
         {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: the retained owner and ACL allocations outlive the descriptor.
+        // SAFETY: the retained owner and DACL allocations outlive the descriptor.
         if unsafe { SetSecurityDescriptorOwner(descriptor_ptr, owner_sid, 0) } == 0
-            || unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, acl_ptr, 0) } == 0
+            || unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, dacl_ptr, 0) } == 0
             || unsafe {
                 SetSecurityDescriptorControl(descriptor_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
             } == 0
@@ -528,18 +1012,24 @@ impl PrivateSecurityDescriptor {
         // SAFETY: all embedded pointers refer to retained initialized allocations.
         if unsafe { IsValidSecurityDescriptor(descriptor_ptr) } == 0 {
             return Err(io::Error::other(
-                "constructed owner-only Windows descriptor is invalid",
+                "constructed protected Windows descriptor is invalid",
             ));
         }
         Ok(Self {
             owner,
-            acl,
+            _principal: principal,
+            _owner_rights: owner_rights,
+            dacl,
             descriptor,
         })
     }
 
-    fn as_ptr(&self) -> *const SECURITY_DESCRIPTOR {
+    pub(crate) fn as_ptr(&self) -> *const SECURITY_DESCRIPTOR {
         &raw const self.descriptor
+    }
+
+    pub(crate) fn verify_handle(&self, handle: HANDLE) -> io::Result<()> {
+        self.verify(handle)
     }
 
     fn verify_owner_controlled_parent(&self, handle: HANDLE) -> io::Result<()> {
@@ -561,11 +1051,11 @@ impl PrivateSecurityDescriptor {
         // SAFETY: both owner SIDs were validated and remain retained.
         if unsafe { EqualSid(view.owner, self.owner_sid()) } == 0
             || !view.dacl_protected
-            || !acl_equal(view.dacl, self.acl.as_ptr().cast::<ACL>())?
+            || !acl_equal(view.dacl, self.dacl.as_ptr().cast::<ACL>())?
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "Windows private directory does not have the expected protected owner-only DACL",
+                "Windows object does not have the expected protected principal DACL",
             ));
         }
         Ok(())
@@ -770,9 +1260,13 @@ impl SecuritySnapshot {
         {
             return Err(io::Error::last_os_error());
         }
-        let returned_len = usize::try_from(returned)
-            .map_err(|_| io::Error::other("Windows descriptor length does not fit usize"))?;
-        if returned_len == 0 || returned_len > capacity as usize {
+        let returned_len = if returned == 0 {
+            required
+        } else {
+            usize::try_from(returned)
+                .map_err(|_| io::Error::other("Windows descriptor length does not fit usize"))?
+        };
+        if returned_len > capacity as usize {
             return Err(io::Error::other(
                 "Windows returned an invalid security descriptor length",
             ));
@@ -853,27 +1347,27 @@ impl SecuritySnapshot {
         if acl.is_null() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "Windows directory has no DACL",
+                "Windows object has no ACL",
             ));
         }
         let header = self
             .embedded_bytes(acl.cast(), size_of::<ACL>())
             .ok_or_else(|| {
-                io::Error::other("Windows directory DACL header is outside its descriptor")
+                io::Error::other("Windows object ACL header is outside its descriptor")
             })?;
         // SAFETY: the byte slice contains a complete ACL header and unaligned reads are allowed.
         let header = unsafe { header.as_ptr().cast::<ACL>().read_unaligned() };
         let acl_length = usize::from(header.AclSize);
         if acl_length < size_of::<ACL>() {
-            return Err(io::Error::other("Windows directory DACL is truncated"));
+            return Err(io::Error::other("Windows object ACL is truncated"));
         }
         self.embedded_bytes(acl.cast(), acl_length)
-            .ok_or_else(|| io::Error::other("Windows directory DACL is outside its descriptor"))?;
+            .ok_or_else(|| io::Error::other("Windows object ACL is outside its descriptor"))?;
         // SAFETY: the complete ACL length declared by its bounded header lies in retained storage.
         if unsafe { IsValidAcl(acl) } == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "Windows directory has no valid DACL",
+                "Windows object has no valid ACL",
             ));
         }
         Ok(acl_length)
@@ -1041,6 +1535,12 @@ unsafe impl Sync for OwnedHandle {}
 impl OwnedHandle {
     const fn raw(&self) -> HANDLE {
         self.0
+    }
+
+    fn into_file(mut self) -> File {
+        let handle = std::mem::replace(&mut self.0, std::ptr::null_mut());
+        // SAFETY: ownership of the live handle moves from this wrapper into `File` exactly once.
+        unsafe { File::from_raw_handle(handle) }
     }
 }
 
@@ -1259,11 +1759,80 @@ mod tests {
     }
 
     #[test]
+    fn stable_parent_grants_only_cross_session_directory_creation_rights() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = open_directory_path(temporary.path(), DIRECTORY_CREATE_ACCESS).unwrap();
+        let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+        let security =
+            PrivateSecurityDescriptor::for_shared_parent(security_context.windows_user_sid())
+                .unwrap();
+        let stable =
+            create_or_open_stable_parent_directory(base.raw(), OsStr::new("stable"), &security)
+                .unwrap();
+        let stable_path = temporary.path().join("stable");
+
+        security.verify_handle(stable.handle.raw()).unwrap();
+        open_directory_path(&stable_path, STABLE_PARENT_DIRECTORY_ACCESS).unwrap();
+        for forbidden in [
+            FILE_LIST_DIRECTORY,
+            FILE_ADD_FILE,
+            FILE_DELETE_CHILD,
+            DELETE,
+            WRITE_DAC,
+            WRITE_OWNER,
+        ] {
+            assert!(
+                open_directory_path(&stable_path, forbidden).is_err(),
+                "stable parent unexpectedly granted access mask {forbidden:#010x}"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_parent_creates_an_exact_logon_private_context_child() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = open_directory_path(temporary.path(), DIRECTORY_CREATE_ACCESS).unwrap();
+        let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+        let stable_security =
+            PrivateSecurityDescriptor::for_shared_parent(security_context.windows_user_sid())
+                .unwrap();
+        let private_security = PrivateSecurityDescriptor::new(
+            security_context.windows_user_sid(),
+            security_context.windows_logon_sid(),
+        )
+        .unwrap();
+        let stable = create_or_open_stable_parent_directory(
+            base.raw(),
+            OsStr::new("stable"),
+            &stable_security,
+        )
+        .unwrap();
+        let private = stable
+            .create_private_child(OsStr::new("context"), &private_security)
+            .unwrap();
+        let private_path = temporary.path().join("stable").join("context");
+
+        private_security
+            .verify_handle(private.handle.raw())
+            .unwrap();
+        assert!(stable_security.verify_handle(private.handle.raw()).is_err());
+        let reopened = open_directory_path(&private_path, PRIVATE_DIRECTORY_ACCESS).unwrap();
+        assert_eq!(
+            validate_secured_directory(reopened.raw(), &private_security).unwrap(),
+            private.identity
+        );
+    }
+
+    #[test]
     fn private_windows_child_revalidates_without_exposing_its_handle() {
         let temporary = tempfile::tempdir().unwrap();
         let base = open_directory_path(temporary.path(), DIRECTORY_CREATE_ACCESS).unwrap();
         let security_context = CurrentSecurityContextSnapshot::current().unwrap();
-        let security = PrivateSecurityDescriptor::new(security_context.windows_user_sid()).unwrap();
+        let security = PrivateSecurityDescriptor::new(
+            security_context.windows_user_sid(),
+            security_context.windows_logon_sid(),
+        )
+        .unwrap();
         let private =
             create_or_open_private_directory(base.raw(), OsStr::new("private"), &security).unwrap();
         private
@@ -1276,40 +1845,12 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let base = open_directory_path(temporary.path(), DIRECTORY_CREATE_ACCESS).unwrap();
         let security_context = CurrentSecurityContextSnapshot::current().unwrap();
-        let security = PrivateSecurityDescriptor::new(security_context.windows_user_sid()).unwrap();
-        let private =
-            create_or_open_private_directory(base.raw(), OsStr::new("private"), &security).unwrap();
-
-        let mut descriptor = SECURITY_DESCRIPTOR::default();
-        let descriptor_ptr = (&raw mut descriptor).cast();
-        // SAFETY: the descriptor is writable and a present null DACL is a valid, deliberately
-        // insecure descriptor used only inside this temporary test directory.
-        assert_ne!(
-            unsafe { InitializeSecurityDescriptor(descriptor_ptr, SECURITY_DESCRIPTOR_REVISION) },
-            0
-        );
-        // SAFETY: the initialized descriptor remains live for the kernel call below.
-        assert_ne!(
-            unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, std::ptr::null_mut(), 0) },
-            0
-        );
-        // SAFETY: the private handle was opened with WRITE_DAC and the descriptor is valid.
-        assert_ne!(
-            unsafe {
-                SetKernelObjectSecurity(
-                    private.handle.raw(),
-                    DACL_SECURITY_INFORMATION,
-                    descriptor_ptr,
-                )
-            },
-            0
-        );
-
-        assert!(
-            private
-                .revalidate(&temporary.path().join("private"), &security_context)
-                .is_err()
-        );
+        let security = PrivateSecurityDescriptor::new(
+            security_context.windows_user_sid(),
+            security_context.windows_logon_sid(),
+        )
+        .unwrap();
+        std::fs::create_dir(temporary.path().join("private")).unwrap();
         assert!(
             create_or_open_private_directory(base.raw(), OsStr::new("private"), &security).is_err()
         );

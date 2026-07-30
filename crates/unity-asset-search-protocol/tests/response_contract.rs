@@ -1,15 +1,17 @@
 use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
 use unity_asset_search_protocol::{
-    ApiError, ApiErrorCode, DaemonInstanceId, FilesystemReindexIntent, FuzzyWorkUsageV1,
-    GenerationIdV1, GenerationStamp, GenerationStatus, MAX_API_ERROR_JSON_BYTES,
-    MAX_ERROR_MESSAGE_BYTES, MAX_REINDEX_PUBLISH_WARNING_BYTES, MAX_REINDEX_PUBLISH_WARNINGS,
-    MAX_SEARCH_HITS_JSON_BYTES, MatchCountRelationV1, MatchCountV1, OperationId, PortablePath,
-    ProjectId, QueryPolicyId, ReferenceCoverage, ReferenceDiagnosticCoverage, ReferenceRequest,
-    ReferencesResponse, ReindexAdmitRequest, ReindexDisposition, ReindexEvidence,
-    ReindexOperationState, ReindexOperationStatus, ReindexReceipt, RequestEnvelope, RequestId,
-    RequestOperation, ResponseEnvelope, ResponseOperation, ResponseOutcome, SearchCapabilities,
-    SearchRequest, SearchResponse, ShutdownRequest, StatusResponse, SuggestRequest,
-    SuggestResponse, ValidateContract, encode_response_frame,
+    ApiError, ApiErrorCode, DaemonInstanceId, FilesystemReindexIntent, FreshnessMaintenance,
+    FuzzyWorkUsageV1, GenerationFreshness, GenerationIdV1, GenerationMaintenanceState,
+    GenerationStamp, GenerationStatus, MAX_API_ERROR_JSON_BYTES, MAX_ERROR_MESSAGE_BYTES,
+    MAX_REINDEX_PUBLISH_WARNING_BYTES, MAX_REINDEX_PUBLISH_WARNINGS, MAX_SEARCH_HITS_JSON_BYTES,
+    MatchCountRelationV1, MatchCountV1, OperationId, PortablePath, ProjectId, QueryPolicyId,
+    ReferenceCoverage, ReferenceDiagnosticCoverage, ReferenceRequest, ReferencesResponse,
+    ReindexAdmitRequest, ReindexDisposition, ReindexEvidence, ReindexOperationState,
+    ReindexOperationStatus, ReindexReceipt, RequestEnvelope, RequestId, RequestOperation,
+    ResponseEnvelope, ResponseOperation, ResponseOutcome, SearchCapabilities, SearchRequest,
+    SearchResponse, ServingAvailability, ShutdownRequest, StatusResponse, SuggestRequest,
+    SuggestResponse, TimerLifecycleState, ValidateContract, WatcherLifecycleState,
+    encode_response_frame,
 };
 
 const GUID: &str = "0123456789abcdef0123456789abcdef";
@@ -28,7 +30,7 @@ fn generation(seed: u8) -> GenerationStamp {
 
 fn request(operation: RequestOperation) -> RequestEnvelope {
     RequestEnvelope::new(
-        1,
+        2,
         RequestId::from_bytes([1; 16]),
         ProjectId::from_bytes([2; 32]),
         DaemonInstanceId::from_bytes([3; 16]),
@@ -40,7 +42,7 @@ fn request(operation: RequestOperation) -> RequestEnvelope {
 
 fn search_response() -> SearchResponse {
     SearchResponse {
-        protocol_revision: 1,
+        protocol_revision: 2,
         generation: generation(5),
         query_policy_id: query_policy(4),
         query: "player".to_owned(),
@@ -64,7 +66,7 @@ fn search_response() -> SearchResponse {
 
 fn fixture_search_response() -> SearchResponse {
     let envelope: ResponseEnvelope = serde_json::from_str(include_str!(
-        "../../../integration/search-protocol/fixtures/responses/search-v1.json"
+        "../../../integration/search-protocol/fixtures/responses/search-v2.json"
     ))
     .unwrap();
     let ResponseOutcome::Success(operation) = envelope.into_outcome() else {
@@ -79,7 +81,7 @@ fn fixture_search_response() -> SearchResponse {
 
 fn fixture_references_response() -> ReferencesResponse {
     let envelope: ResponseEnvelope = serde_json::from_str(include_str!(
-        "../../../integration/search-protocol/fixtures/responses/references-v1.json"
+        "../../../integration/search-protocol/fixtures/responses/references-v2.json"
     ))
     .unwrap();
     let ResponseOutcome::Success(operation) = envelope.into_outcome() else {
@@ -93,14 +95,16 @@ fn fixture_references_response() -> ReferencesResponse {
 }
 
 fn status(active: GenerationStamp, policy: QueryPolicyId) -> StatusResponse {
+    let generation = GenerationStatus {
+        protocol_revision: 2,
+        active: Some(active),
+        building_revision: None,
+        last_failure: None,
+    };
     StatusResponse {
-        protocol_revision: 1,
-        generation: GenerationStatus {
-            protocol_revision: 1,
-            active: Some(active),
-            building_revision: None,
-            last_failure: None,
-        },
+        protocol_revision: 2,
+        daemon: unity_asset_search_protocol::DaemonLifecycleStatus::unmanaged(&generation, false),
+        generation,
         query_policy_id: policy,
         capabilities: SearchCapabilities::current(),
         project_root: PortablePath::new("C:/projects/example").unwrap(),
@@ -169,7 +173,7 @@ fn successful_search_and_suggest_responses_are_bound_to_exact_requests() {
     );
 
     let suggest = SuggestResponse {
-        protocol_revision: 1,
+        protocol_revision: 2,
         generation: generation(5),
         query_policy_id: query_policy(4),
         prefix: "pla".to_owned(),
@@ -247,6 +251,39 @@ fn idle_status_cannot_claim_a_building_revision() {
 }
 
 #[test]
+fn daemon_status_must_match_generation_availability_and_freshness() {
+    let mut response = status(generation(5), query_policy(4));
+    response.daemon.serving = ServingAvailability::Unavailable;
+    assert!(response.validate().is_err());
+
+    let mut response = status(generation(5), query_policy(4));
+    response.daemon.freshness = GenerationFreshness::Stale;
+    assert!(response.validate().is_err());
+}
+
+#[test]
+fn daemon_status_requires_failure_evidence_and_consistent_maintenance() {
+    let mut response = status(generation(5), query_policy(4));
+    response.daemon.generation_maintenance.state = GenerationMaintenanceState::RecoveryRequired;
+    assert!(response.validate().is_err());
+
+    let mut response = status(generation(5), query_policy(4));
+    response.daemon.generation_maintenance.last_cleanup_failure =
+        Some("staging cleanup failed".to_owned());
+    assert!(response.validate().is_err());
+
+    let mut response = status(generation(5), query_policy(4));
+    response.daemon.watcher.state = WatcherLifecycleState::Retrying;
+    response.daemon.freshness_maintenance = FreshnessMaintenance::Managed;
+    assert!(response.validate().is_err());
+
+    let mut response = status(generation(5), query_policy(4));
+    response.daemon.timer.state = TimerLifecycleState::Disabled;
+    response.daemon.timer.next_run_in_ms = Some(1);
+    assert!(response.validate().is_err());
+}
+
+#[test]
 fn generation_failure_messages_share_the_api_error_bound() {
     let mut response = status(generation(5), query_policy(4));
     response.generation.last_failure = Some(unity_asset_search_protocol::GenerationFailure {
@@ -289,7 +326,7 @@ fn reference_response_cursor_is_bound_to_generation_and_query_policy() {
     let reference_request = ReferenceRequest::incoming_guid(GUID, None, 10);
     let request = request(RequestOperation::References(reference_request.clone()));
     let mut response = ReferencesResponse {
-        protocol_revision: 1,
+        protocol_revision: 2,
         generation: generation(5),
         query_policy_id: query_policy(4),
         request: reference_request,
@@ -385,7 +422,7 @@ fn succeeded_reindex_requires_matching_completion_and_status_generation() {
     }));
     let active = generation(5);
     let completion = ReindexReceipt {
-        protocol_revision: 1,
+        protocol_revision: 2,
         disposition: ReindexDisposition::Applied,
         transaction: None,
         target_revision: Some(active.actual_revision),
@@ -442,7 +479,7 @@ fn reindex_receipt_target_can_precede_the_global_desired_revision() {
     let target = generation(5);
     let later_desired = generation(9).actual_revision;
     ReindexReceipt {
-        protocol_revision: 1,
+        protocol_revision: 2,
         disposition: ReindexDisposition::AlreadyApplied,
         transaction: None,
         target_revision: Some(target.actual_revision),

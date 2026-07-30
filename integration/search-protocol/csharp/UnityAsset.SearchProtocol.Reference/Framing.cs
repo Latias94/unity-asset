@@ -104,22 +104,22 @@ namespace UnityAsset.SearchProtocol.Reference
             return payload;
         }
 
-        public static byte[] EncodeBootstrapHello(BootstrapHelloV1 hello)
+        public static byte[] EncodeBootstrapHello(BootstrapHelloV2 hello)
         {
             return Encode(BootstrapCodec.EncodeHello(hello), FrameLimits.BootstrapMaxEncodedBytes);
         }
 
-        public static BootstrapHelloV1 DecodeBootstrapHello(byte[] frame)
+        public static BootstrapHelloV2 DecodeBootstrapHello(byte[] frame)
         {
             return BootstrapCodec.DecodeHello(Decode(frame, FrameLimits.BootstrapMaxEncodedBytes));
         }
 
-        public static byte[] EncodeBootstrapReply(BootstrapReplyV1 reply)
+        public static byte[] EncodeBootstrapReply(BootstrapReplyV2 reply)
         {
             return Encode(BootstrapCodec.EncodeReply(reply), FrameLimits.BootstrapMaxEncodedBytes);
         }
 
-        public static BootstrapReplyV1 DecodeBootstrapReply(byte[] frame)
+        public static BootstrapReplyV2 DecodeBootstrapReply(byte[] frame)
         {
             return BootstrapCodec.DecodeReply(Decode(frame, FrameLimits.BootstrapMaxEncodedBytes));
         }

@@ -414,6 +414,7 @@ namespace UnityAsset.SearchProtocol.Reference
                 response,
                 path,
                 "protocol_revision",
+                "daemon",
                 "generation",
                 "query_policy_id",
                 "capabilities",
@@ -429,7 +430,12 @@ namespace UnityAsset.SearchProtocol.Reference
                 "last_build_unix_ms?",
                 "indexing");
             StrictJson.RequireRevision(StrictJson.Required(response, "protocol_revision", path), path + ".protocol_revision");
-            ValidateGenerationStatus(StrictJson.Required(response, "generation", path), path + ".generation");
+            JsonElement generation = StrictJson.Required(response, "generation", path);
+            ValidateGenerationStatus(generation, path + ".generation");
+            ValidateDaemonLifecycleStatus(
+                StrictJson.Required(response, "daemon", path),
+                generation,
+                path + ".daemon");
             ValidatePolicyBinding(response, path, envelopePolicy);
             ValidateCapabilities(StrictJson.Required(response, "capabilities", path), path + ".capabilities");
             JsonElement projectRoot = StrictJson.Required(response, "project_root", path);
@@ -467,10 +473,193 @@ namespace UnityAsset.SearchProtocol.Reference
             bool indexing = StrictJson.Boolean(
                 StrictJson.Required(response, "indexing", path),
                 path + ".indexing");
-            JsonElement generation = StrictJson.Required(response, "generation", path);
             if (!indexing && StrictJson.Optional(generation, "building_revision", out _))
             {
                 throw new ProtocolValidationException(path + " has a building revision while indexing is false");
+            }
+        }
+
+        private static void ValidateDaemonLifecycleStatus(
+            JsonElement daemon,
+            JsonElement generation,
+            string path)
+        {
+            StrictJson.Properties(
+                daemon,
+                path,
+                "lifecycle",
+                "serving",
+                "freshness",
+                "freshness_maintenance",
+                "reconcile",
+                "generation_maintenance",
+                "watcher",
+                "timer");
+            StrictJson.Enum(
+                StrictJson.Required(daemon, "lifecycle", path),
+                path + ".lifecycle",
+                "booting",
+                "serving",
+                "draining");
+            string serving = StrictJson.Enum(
+                StrictJson.Required(daemon, "serving", path),
+                path + ".serving",
+                "unavailable",
+                "queryable");
+            string freshness = StrictJson.Enum(
+                StrictJson.Required(daemon, "freshness", path),
+                path + ".freshness",
+                "absent",
+                "stale",
+                "current");
+            string maintenance = StrictJson.Enum(
+                StrictJson.Required(daemon, "freshness_maintenance", path),
+                path + ".freshness_maintenance",
+                "managed",
+                "unmanaged");
+            StrictJson.Enum(
+                StrictJson.Required(daemon, "reconcile", path),
+                path + ".reconcile",
+                "idle",
+                "queued",
+                "running",
+                "failed");
+
+            JsonElement generationMaintenance = StrictJson.Required(daemon, "generation_maintenance", path);
+            StrictJson.Properties(
+                generationMaintenance,
+                path + ".generation_maintenance",
+                "state",
+                "last_recovered_entries",
+                "last_cleanup_failure?");
+            string generationMaintenanceState = StrictJson.Enum(
+                StrictJson.Required(generationMaintenance, "state", path + ".generation_maintenance"),
+                path + ".generation_maintenance.state",
+                "clean",
+                "recovery_required");
+            StrictJson.UInt64(
+                StrictJson.Required(
+                    generationMaintenance,
+                    "last_recovered_entries",
+                    path + ".generation_maintenance"),
+                path + ".generation_maintenance.last_recovered_entries");
+            bool hasCleanupFailure = StrictJson.Optional(
+                generationMaintenance,
+                "last_cleanup_failure",
+                out JsonElement cleanupFailure);
+            if (hasCleanupFailure)
+            {
+                StrictJson.String(
+                    cleanupFailure,
+                    path + ".generation_maintenance.last_cleanup_failure",
+                    MaxErrorMessageBytes,
+                    allowEmpty: false);
+            }
+            if ((generationMaintenanceState == "recovery_required") != hasCleanupFailure)
+            {
+                throw new ProtocolValidationException(
+                    path + ".generation_maintenance cleanup failure evidence is inconsistent");
+            }
+
+            bool hasActive = StrictJson.Optional(generation, "active", out JsonElement active);
+            string expectedServing = hasActive ? "queryable" : "unavailable";
+            string expectedFreshness = !hasActive
+                ? "absent"
+                : StrictJson.Boolean(
+                    StrictJson.Required(active, "stale", path + ".generation.active"),
+                    path + ".generation.active.stale")
+                    ? "stale"
+                    : "current";
+            if (!string.Equals(serving, expectedServing, StringComparison.Ordinal)
+                || !string.Equals(freshness, expectedFreshness, StringComparison.Ordinal))
+            {
+                throw new ProtocolValidationException(path + " does not match generation availability and freshness");
+            }
+
+            JsonElement watcher = StrictJson.Required(daemon, "watcher", path);
+            StrictJson.Properties(
+                watcher,
+                path + ".watcher",
+                "state",
+                "retry_count",
+                "last_failure?",
+                "next_retry_in_ms?");
+            string watcherState = StrictJson.Enum(
+                StrictJson.Required(watcher, "state", path + ".watcher"),
+                path + ".watcher.state",
+                "disabled",
+                "starting",
+                "healthy",
+                "failed",
+                "retrying",
+                "stopped");
+            StrictJson.UInt64(
+                StrictJson.Required(watcher, "retry_count", path + ".watcher"),
+                path + ".watcher.retry_count");
+            bool watcherHasFailure = StrictJson.Optional(watcher, "last_failure", out JsonElement watcherFailure);
+            if (watcherHasFailure)
+            {
+                StrictJson.String(watcherFailure, path + ".watcher.last_failure", MaxErrorMessageBytes, allowEmpty: false);
+            }
+            if ((watcherState == "failed" || watcherState == "retrying") && !watcherHasFailure)
+            {
+                throw new ProtocolValidationException(path + ".watcher requires failure evidence");
+            }
+            bool watcherHasRetryDeadline = StrictJson.Optional(
+                watcher,
+                "next_retry_in_ms",
+                out JsonElement watcherRetryDeadline);
+            if (watcherHasRetryDeadline)
+            {
+                StrictJson.UInt64(watcherRetryDeadline, path + ".watcher.next_retry_in_ms");
+            }
+            if ((watcherState == "retrying") != watcherHasRetryDeadline)
+            {
+                throw new ProtocolValidationException(path + ".watcher retry deadline is inconsistent");
+            }
+
+            JsonElement timer = StrictJson.Required(daemon, "timer", path);
+            StrictJson.Properties(timer, path + ".timer", "state", "run_count", "last_failure?", "next_run_in_ms?");
+            string timerState = StrictJson.Enum(
+                StrictJson.Required(timer, "state", path + ".timer"),
+                path + ".timer.state",
+                "disabled",
+                "scheduled",
+                "running",
+                "failed",
+                "stopped");
+            StrictJson.UInt64(
+                StrictJson.Required(timer, "run_count", path + ".timer"),
+                path + ".timer.run_count");
+            bool timerHasFailure = StrictJson.Optional(timer, "last_failure", out JsonElement timerFailure);
+            if (timerHasFailure)
+            {
+                StrictJson.String(timerFailure, path + ".timer.last_failure", MaxErrorMessageBytes, allowEmpty: false);
+            }
+            bool timerHasNextRun = StrictJson.Optional(timer, "next_run_in_ms", out JsonElement nextRun);
+            if (timerHasNextRun)
+            {
+                StrictJson.UInt64(nextRun, path + ".timer.next_run_in_ms");
+            }
+            if (timerState == "failed" && !timerHasFailure)
+            {
+                throw new ProtocolValidationException(path + ".timer requires failure evidence");
+            }
+            if ((timerState == "disabled" || timerState == "stopped") && timerHasNextRun)
+            {
+                throw new ProtocolValidationException(path + ".timer cannot advertise a next run");
+            }
+            if (timerState == "scheduled" && !timerHasNextRun)
+            {
+                throw new ProtocolValidationException(path + ".timer must advertise its next run");
+            }
+
+            string expectedMaintenance = watcherState == "disabled" && timerState == "disabled"
+                ? "unmanaged"
+                : "managed";
+            if (!string.Equals(maintenance, expectedMaintenance, StringComparison.Ordinal))
+            {
+                throw new ProtocolValidationException(path + ".freshness_maintenance is inconsistent");
             }
         }
 
@@ -1208,6 +1397,7 @@ namespace UnityAsset.SearchProtocol.Reference
                 "not_ready",
                 "revision_mismatch",
                 "index_build_failed",
+                "idempotency_conflict",
                 "operation_not_found",
                 "internal");
             StrictJson.String(

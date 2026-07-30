@@ -147,7 +147,7 @@ fn reference_cursor_policy_must_match_the_request_envelope() {
 
     assert!(
         RequestEnvelope::new(
-            1,
+            2,
             RequestId::from_bytes([1; 16]),
             ProjectId::from_bytes([2; 32]),
             DaemonInstanceId::from_bytes([3; 16]),
@@ -184,7 +184,7 @@ fn changed_path_reindex_is_portable_and_nonempty() {
     assert_eq!(
         serde_json::to_value(intent).unwrap(),
         json!({
-            "protocol_revision": 1,
+            "protocol_revision": 2,
             "scope": {
                 "kind": "changed_paths",
                 "paths": ["Assets/Player.prefab"]

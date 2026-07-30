@@ -120,6 +120,11 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
 
+    - name: Install .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
 
@@ -141,6 +146,7 @@ jobs:
         -p unity-asset
         -p unity-asset-cli
         -p unity-asset-search-cli
+        -p unity-asset-search-local
         -p unity-asset-search-index
         -p unity-asset-search-daemon
         --test workspace_commit
@@ -151,10 +157,10 @@ jobs:
         --test workspace_commands
         --test workspace_json
         --test structured_errors
-        --test reference_generation
-        --test http_contract
+        --test ipc_commands
+        --test process_contract
+        --test transport_contract
         --test reindex_coordinator
-        --test security_contract
 
     - name: Run generation security unit contracts
       run: >-
@@ -162,6 +168,17 @@ jobs:
         --test-threads 2
         -p unity-asset-search-index
         --lib
+
+    - name: Run complete platform-local identity and filesystem security suite
+      run: >-
+        cargo nextest run
+        --test-threads 2
+        -p unity-asset-search-local
+
+    - name: Run cross-language search protocol conformance
+      run: |
+        dotnet build integration/search-protocol/csharp/UnityAsset.SearchProtocol.ExternalConsumer/UnityAsset.SearchProtocol.ExternalConsumer.csproj --configuration Release
+        dotnet run --project integration/search-protocol/csharp/UnityAsset.SearchProtocol.Conformance/UnityAsset.SearchProtocol.Conformance.csproj --configuration Release
 
     - name: Run Windows CLI and daemon unit contracts
       if: runner.os == 'Windows'

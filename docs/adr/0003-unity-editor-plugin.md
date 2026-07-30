@@ -1,125 +1,92 @@
-# ADR 0003: Unity Editor plugin integration and repository strategy
+# ADR 0003: Unity Editor Plugin Integration And Repository Strategy
 
-- Status: In Progress
-- Date: 2025-12-26
+- Status: Accepted
+- Date: 2026-07-30
 
 ## Context
 
-`unity-asset-search-daemon` provides a local "Search Everything" experience via an HTTP API. To make this useful for Unity users, the best UX is a Unity Editor plugin that:
+`unity-asset-search-daemon` provides a project-bound local search experience. Unity users need an
+Editor integration that can start the matching daemon, issue typed search and reference requests,
+observe indexing state, and navigate returned Unity identities without blocking the Editor thread.
 
-- starts/monitors the daemon for the current project,
-- queries it for search/references results,
-- navigates to assets (and later object-level locations) inside the Editor.
-
-The Rust workspace is currently optimized for Rust development. Unity plugin development has different constraints:
-
-- Unity projects generate many `.meta` files and platform-specific artifacts,
-- package distribution typically follows UPM (Unity Package Manager) conventions,
-- shipping native binaries for Windows/macOS/Linux requires release orchestration.
+Unity package development has different repository, CI, and release constraints from the Rust
+workspace: UPM requires `.meta` files, Editor-version qualification, and native binaries for every
+supported platform.
 
 ## Decision
 
-### 1) Keep the Unity plugin in a separate repository (template repo)
+### Keep The Plugin In A Separate Repository
 
-Create a dedicated repository, e.g.:
+Maintain the Unity integration as a UPM package in a dedicated repository, versioned independently
+but released against an explicit compatible daemon and business-protocol revision. This Rust
+repository owns the language-neutral contract, canonical fixtures, and Unity-independent C#
+reference codec; only the plugin repository claims concrete Unity Editor support.
 
-- `unity-asset-search-unity` (example)
+### Consume The Same Local IPC Contract
 
-This repository is a UPM package template and is versioned independently from the Rust workspace, while still tracking compatible daemon versions.
+The plugin uses the same frozen bootstrap, framed business protocol, typed operations, and response
+validation as the Rust CLI. It does not use HTTP, bearer tokens, ports, URLs, or compatibility
+fallbacks.
 
-Rationale:
+The in-repository `netstandard2.0` C# package owns framing, canonical DTO codecs, validation, and a
+transport-neutral `Stream` adapter interface. The plugin owns source-level platform transport and
+peer-verification adapters where its managed profile lacks the required APIs:
 
-- avoids polluting the Rust workspace with Unity-specific files and `.meta` churn,
-- allows Unity-specific CI (UPM packaging, editor tests, platform packaging),
-- supports Unity users who do not use Rust.
+- Unix-domain socket connection plus endpoint and effective-UID verification on Linux/macOS.
+- Named-pipe connection plus descriptor, server process, and `SecurityContextIdV1` verification on
+  Windows.
 
-### 2) Plugin communicates with the daemon over localhost HTTP
-
-The Unity plugin uses:
-
-- `GET /v3/health`
-- `GET /v3/status`
-- `GET /v3/search?q=...&limit=...`
-- `GET /v3/suggest?prefix=...&limit=...`
-- `POST /v3/references` with a versioned JSON request
-- `POST /v3/reindex` with a versioned JSON intent and bearer token
-- `POST /v3/token/rotate` with a bearer token
-
-The daemon stays localhost-only by default. Authorization uses the bearer token stored in the
-index directory. The plugin validates response contract versions and does not infer behavior from
+Project ID, daemon instance ID, and negotiated business revision are bound before any operation is
+sent. The plugin validates every response against its request rather than inferring behavior from
 display text.
 
-### 3) Process management inside Unity Editor
+### Own Process Lifecycle In The Editor Adapter
 
-The plugin owns a small "daemon manager" layer:
+The plugin derives the explicit Unity project root from the open project, resolves the deterministic
+private endpoint namespace, and starts a bundled matching daemon when no valid instance is
+available. It never probes parent directories and does not persist PID, port, or token files under
+`Library/`.
 
-- Determine `project_root` as Unity project directory.
-- Choose `index_dir`:
-  - default to `Library/unity-asset-search` (Unity's recommended cache location),
-  - allow override in plugin settings.
-- Start the daemon process if missing.
-- Keep a single instance per project:
-  - store pid/port/token info under `Library/unity-asset-search/`.
+The adapter handles startup races, attach, graceful instance-bound shutdown, crash detection, and
+Editor-domain reload without taking ownership of the search index. Readiness and failure state come
+from the protocol status model.
 
-UPM package identity (example):
+### Bundle Matching Native Binaries
 
-- package name: `com.frankorz.asset-hero`
-- display name: `Asset Hero`
+Production UPM releases include the matching daemon binary per supported platform under a package
+tool directory. Development may allow an explicitly configured local binary. Runtime downloading
+is outside the initial contract because it adds network availability, signature verification, and
+rollback requirements.
 
-### 4) Packaging strategy for daemon binaries
+### Navigation Scope
 
-MVP options (in increasing UX quality):
-
-1. Developer mode: require `cargo install unity-asset-search-daemon` and configure the executable path in Unity preferences.
-2. Recommended: ship prebuilt binaries inside the UPM package:
-   - `Tools/<platform>/unity-asset-search-daemon[.exe]`
-   - `Tools/<platform>/unity-asset-search-cli[.exe]` (optional; useful for debugging)
-3. Optional: on first run, download a matching binary from GitHub Releases (requires network and stronger security story).
-
-For reliability and offline use, option (2) is preferred for production.
-
-### 5) Navigation scope for MVP
-
-MVP navigation supports:
-
-- open/ping asset by `Location.path` (Unity `AssetDatabase` path),
-- open/ping references sources (same).
-
-Follow-up work can add object-level navigation:
-
-- prefabs/scenes: use `fileID` and extracted hierarchy paths to locate objects,
-- serialized files: pass a structured object address to workspace inspection.
+Initial navigation opens or pings assets using returned project-relative locations. Object-level
+navigation uses structured object addresses, file IDs, hierarchy paths, and script-symbol evidence
+only when the indexed entity provides them; the plugin does not reconstruct identities from display
+text.
 
 ## Consequences
 
-Pros:
+Benefits:
 
-- clear separation of concerns: Rust workspace (engine) vs Unity repo (product UX),
-- cleaner CI and release pipelines per ecosystem,
-- easier onboarding for Unity users.
+- Rust and Unity repositories keep focused build systems and release lifecycles.
+- CLI, Unity, and agent clients share one strict protocol and the same capability evidence.
+- Matching binaries and fixtures make breaking changes fail during bootstrap rather than at an
+  arbitrary operation.
+- Unity's main thread remains free of indexing and binary parsing work.
 
-Cons:
+Costs:
 
-- requires cross-repo version compatibility policy,
-- needs release automation to bundle daemon binaries into the Unity package.
+- Release automation must coordinate UPM packages, native binaries, protocol fixtures, and platform
+  tests.
+- The plugin requires platform-specific IPC and peer-verification code.
+- Cross-repository compatibility and supported Editor versions need explicit release metadata.
 
-## Alternatives considered
+## Alternatives Considered
 
-### A) Keep the Unity plugin inside this repository
-
-Pros: single repo, easier to coordinate changes.
-
-Cons:
-
-- Unity `.meta` churn and package assets increase noise and maintenance costs,
-- CI becomes more complex (Unity + Rust toolchains),
-- contributors without Unity installed have a worse experience.
-
-### B) Use a pure ripgrep-based Unity plugin (no daemon)
-
-Pros: extremely simple and fast for GUID reference search.
-
-Cons:
-
-- cannot provide object-level indexing, ranking, and richer queries,
-- becomes hard to extend into "Search Everything" beyond GUID text search.
+1. Keep the plugin in this repository: rejected because Unity metadata and Editor CI would obscure
+   the Rust engine's ownership and release graph.
+2. Retain localhost HTTP for Unity only: rejected because it would preserve a second security and
+   protocol surface after the Rust clients migrate.
+3. Use pure text scanning in the plugin: rejected because it cannot provide immutable generation
+   consistency, object-level reference identity, ranking, or bounded incremental indexing.

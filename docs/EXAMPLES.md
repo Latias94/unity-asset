@@ -185,16 +185,17 @@ Index AssetBundle container paths and ignore the project root's `.gitignore`:
 cargo run -p unity-asset-search-daemon -- --project-root D:\GameProject --watch --search-everything
 ```
 
-The versioned HTTP contract is `/v3`. Read endpoints are localhost-only; reindex and token
-rotation require the persisted bearer token.
+The CLI discovers the project-bound local IPC endpoint, verifies the daemon process and execution
+principal, and negotiates the versioned protocol before any business request. There is no TCP
+listener, URL, or bearer token.
 
 ```powershell
-cargo run -p unity-asset-search-cli -- health
-cargo run -p unity-asset-search-cli -- status
-cargo run -p unity-asset-search-cli -- search "type:Prefab in:Assets/UI start button" --limit 20
-cargo run -p unity-asset-search-cli -- suggest "t:pr" --limit 10
-cargo run -p unity-asset-search-cli -- references deadbeefdeadbeefdeadbeefdeadbeef --file-id -11500000 --limit 50
-cargo run -p unity-asset-search-cli -- --token $env:UNITY_ASSET_SEARCH_TOKEN reindex --path Assets\UI\StartButton.prefab
+cargo run -p unity-asset-search-cli -- --project-root D:\GameProject bootstrap
+cargo run -p unity-asset-search-cli -- --project-root D:\GameProject status
+cargo run -p unity-asset-search-cli -- --project-root D:\GameProject search "type:Prefab in:Assets/UI start button" --limit 20
+cargo run -p unity-asset-search-cli -- --project-root D:\GameProject suggest "t:pr" --limit 10
+cargo run -p unity-asset-search-cli -- --project-root D:\GameProject references --guid deadbeefdeadbeefdeadbeefdeadbeef --file-id -11500000 --limit 50
+cargo run -p unity-asset-search-cli -- --project-root D:\GameProject reindex admit --path Assets\UI\StartButton.prefab
 ```
 
 The search index is a derived, consumer-owned `SearchGeneration`. Workspace commits hand off a

@@ -399,10 +399,11 @@ watcher, and periodic reconciliation repair missed cross-process delivery.
 
 ### Search 0.4 contract migration
 
-Search 0.4 intentionally replaces the 0.3 `/v1` transport and the unreleased `/v2` development
-contract with `/v3`, and introduces Search Generation contract version 2. There is no compatibility
-route. Update the daemon and CLI together; old clients receive a route error instead of attempting
-to deserialize the new evidence fields as an older contract.
+The current search contract intentionally replaces the 0.3 `/v1` transport and the unreleased
+`/v2` and `/v3` HTTP development contracts with project-bound local IPC. There is no compatibility
+listener or route. Update the daemon and CLI together; old clients cannot connect, while a new
+client with an unsupported business revision receives a bootstrap incompatibility result before
+business DTOs are parsed.
 
 Rust callers must make these source changes:
 
@@ -413,15 +414,17 @@ Rust callers must make these source changes:
 | Pre-release coordinator executor returning `ReindexReceipt` | return `ReindexExecution::new(receipt, terminal_status)` |
 | Released 0.3 `--no-auto-reindex` | `--no-startup-reindex` |
 | Released 0.3 `--watch-reconcile-interval-ms` | `--reconcile-interval-ms` |
+| HTTP URL, port, and bearer-token options | explicit project root plus verified endpoint discovery |
+| synchronous `POST /reindex` completion | reindex admit, status, wait, and bounded cancel operations |
 
 Periodic reconciliation now defaults to five minutes and runs independently of `--watch`. Set
 `--reconcile-interval-ms 0` only when another process owns reconciliation.
 
 The released 0.3 index used `tantivy-v2`, `refs-tantivy-v1`, and `state-v2.json`; 0.4 replaces that
 layout with immutable generations and durable generation heads. Stop the old daemon and delete its
-derived index root before the first 0.4 start. This also removes the obsolete 0.3 `token` file; 0.4
-creates a new owner-only `daemon.token`. The daemon rebuilds all projections from authoritative
-project files.
+derived index root before the first 0.4 start. Remove any obsolete `token` or `daemon.token` file;
+the replacement daemon uses project-bound local IPC with operating-system peer verification and
+does not create bearer credentials. It rebuilds all projections from authoritative project files.
 
 Generation-head v2 is a one-way authority for 0.4 derived storage. Pre-release generation-head v1
 development indices can be opened and upgraded, but this is not a compatibility path for the
