@@ -2,6 +2,7 @@
 name = "unity-asset-search-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "CLI client for unity-asset-search-daemon (debug/ops utility)"
 license.workspace = true

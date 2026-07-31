@@ -64,6 +64,21 @@ jobs:
     - name: Verify packaged dependency isolation
       run: python scripts/verify_search_index_package.py
 
+  msrv:
+    name: MSRV / Rust 1.88.0
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust 1.88.0
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: 1.88.0
+
+    - name: Check all library targets against the declared MSRV
+      run: cargo check --workspace --lib --all-features --locked
+
   test:
     name: Test / Lint / Fmt
     runs-on: ubuntu-latest

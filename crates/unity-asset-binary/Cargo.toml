@@ -2,6 +2,7 @@
 name = "unity-asset-binary"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Unity binary format parsing and canonical TypeTree wire execution"
 license.workspace = true

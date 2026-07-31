@@ -2,6 +2,7 @@
 name = "unity-asset-search-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Core fuzzy matching and query helpers for unity-asset search tooling"
 license.workspace = true

@@ -2,6 +2,7 @@
 name = "unity-asset-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Command-line tools for Unity asset parsing and manipulation"
 license.workspace = true

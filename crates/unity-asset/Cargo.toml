@@ -2,6 +2,7 @@
 name = "unity-asset"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "A comprehensive Rust library for parsing Unity asset files (YAML and binary formats)"
 license.workspace = true

@@ -2,6 +2,7 @@
 name = "unity-asset-yaml"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "YAML format support for Unity asset parsing"
 license.workspace = true

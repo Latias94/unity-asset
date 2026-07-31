@@ -2,6 +2,7 @@
 name = "unity-asset-search-daemon"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Principal-scoped local IPC daemon for Unity project search"
 license.workspace = true

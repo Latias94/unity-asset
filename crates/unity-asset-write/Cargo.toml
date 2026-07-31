@@ -2,6 +2,7 @@
 name = "unity-asset-write"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Unity asset edit/write support (SerializedFile/Bundle/WebFile), targeting UnityPy parity"
 license.workspace = true

@@ -2,6 +2,7 @@
 name = "unity-asset-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Core data structures and traits for Unity asset parsing"
 license.workspace = true

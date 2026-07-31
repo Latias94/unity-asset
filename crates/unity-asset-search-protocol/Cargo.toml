@@ -2,6 +2,7 @@
 name = "unity-asset-search-protocol"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Versioned local IPC contracts for unity-asset search clients and daemons"
 license.workspace = true

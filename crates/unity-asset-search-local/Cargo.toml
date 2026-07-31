@@ -2,6 +2,7 @@
 name = "unity-asset-search-local"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Local project identity and endpoint discovery for unity-asset search"
 license.workspace = true

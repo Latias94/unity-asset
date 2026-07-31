@@ -2,6 +2,7 @@
 name = "unity-asset-decode"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Decode/export helpers for Unity assets (Texture/Audio/Sprite) built on unity-asset-binary"
 license.workspace = true
