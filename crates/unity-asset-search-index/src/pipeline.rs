@@ -40,6 +40,7 @@ use crate::generation::{
     GenerationProjectionDigests, GenerationProjectionSummary, GenerationStamp,
     SearchGenerationIdentityV1, SearchGenerationManifestV1,
 };
+use crate::path_semantics::compare_portable_paths;
 use crate::projection::{
     GenerationProjection, ProjectionCategory, ProjectionError, ProjectionLimits, ProjectionMetrics,
     project_batch,
@@ -51,7 +52,7 @@ use crate::reference_query::{
 };
 use crate::scan::{
     FileHint, PathRejection, ProjectScanner, ReadSource, ScanDiagnostic, ScanError, ScanIntent,
-    ScanMetrics, ScanMode, SourceHints, SourcePart,
+    ScanMetrics, ScanMode, ScanValidation, SourceHints, SourcePart,
 };
 #[cfg(test)]
 use crate::state::GenerationFailpoint;
@@ -282,6 +283,19 @@ pub(crate) struct PipelineBuildOutput {
     pub(crate) duration_ms: u128,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanValidationCheckpoint {
+    NoChangePreReturn,
+    ActivationPreCommit,
+}
+
+#[cfg(test)]
+struct ScanValidationHook {
+    checkpoint: ScanValidationCheckpoint,
+    action: Box<dyn FnOnce() + Send + 'static>,
+}
+
 pub(crate) struct SearchGenerationPipeline {
     paths: IndexPaths,
     options: SearchIndexOptions,
@@ -299,6 +313,8 @@ pub(crate) struct SearchGenerationPipeline {
     pending_publish_warnings_omitted: bool,
     #[cfg(test)]
     publish_failpoint: Option<GenerationFailpoint>,
+    #[cfg(test)]
+    scan_validation_hook: Option<ScanValidationHook>,
 }
 
 impl fmt::Debug for SearchGenerationPipeline {
@@ -330,13 +346,16 @@ impl SearchGenerationPipeline {
             .map_err(PipelineError::Configuration)?;
         let scanner = ProjectScanner::new(&paths, options, options.scan_limits())
             .map_err(PipelineError::Configuration)?;
-        let store = GenerationStore::open(
-            paths.index_root(),
+        let store = GenerationStore::open_private(
+            paths.private_index_root().clone(),
             GenerationStoreOptions {
                 retain_previous_generations: options.retain_previous_generations,
             },
             budget,
         )?;
+        scanner
+            .validate_project_root_binding()
+            .map_err(|error| PipelineError::Scan(error.into()))?;
         let recovered = store.active().cloned();
         let source_state = recovered
             .as_ref()
@@ -398,12 +417,42 @@ impl SearchGenerationPipeline {
             pending_publish_warnings_omitted: false,
             #[cfg(test)]
             publish_failpoint: None,
+            #[cfg(test)]
+            scan_validation_hook: None,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn inject_publish_failpoint(&mut self, failpoint: GenerationFailpoint) {
         self.publish_failpoint = Some(failpoint);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_scan_validation_hook(
+        &mut self,
+        checkpoint: ScanValidationCheckpoint,
+        action: impl FnOnce() + Send + 'static,
+    ) {
+        self.scan_validation_hook = Some(ScanValidationHook {
+            checkpoint,
+            action: Box::new(action),
+        });
+    }
+
+    #[cfg(test)]
+    fn run_scan_validation_hook(
+        hook: &mut Option<ScanValidationHook>,
+        checkpoint: ScanValidationCheckpoint,
+    ) {
+        let should_run = hook
+            .as_ref()
+            .is_some_and(|hook| hook.checkpoint == checkpoint);
+        if should_run {
+            let hook = hook
+                .take()
+                .expect("scan validation hook disappeared after matching its checkpoint");
+            (hook.action)();
+        }
     }
 
     pub(crate) fn active(&self) -> Option<Arc<ActiveGeneration>> {
@@ -443,17 +492,7 @@ impl SearchGenerationPipeline {
             requested
         };
         let prepared = self.prepare_filesystem_batch(scan_intent, force_full, budget)?;
-        self.publish_batch(
-            prepared.batch,
-            prepared.scan_hints,
-            prepared.metrics,
-            prepared.transaction_receipts,
-            prepared.workspace,
-            None,
-            None,
-            started,
-            budget,
-        )
+        self.publish_batch(prepared, None, None, started, budget)
     }
 
     pub(crate) fn reindex_workspace(
@@ -512,11 +551,7 @@ impl SearchGenerationPipeline {
                 validate_change_set_view(&changes, view)?;
                 let prepared = self.prepare_observed_transaction_batch(&changes, budget)?;
                 return self.publish_batch(
-                    prepared.batch,
-                    prepared.scan_hints,
-                    prepared.metrics,
-                    prepared.transaction_receipts,
-                    prepared.workspace,
+                    prepared,
                     Some(changes.transaction()),
                     Some(changes.to_revision()),
                     started,
@@ -531,11 +566,7 @@ impl SearchGenerationPipeline {
 
         let prepared = self.prepare_workspace_batch(&changes, view, budget)?;
         self.publish_batch(
-            prepared.batch,
-            prepared.scan_hints,
-            prepared.metrics,
-            prepared.transaction_receipts,
-            prepared.workspace,
+            prepared,
             Some(changes.transaction()),
             Some(changes.to_revision()),
             started,
@@ -596,6 +627,7 @@ impl SearchGenerationPipeline {
             },
             transaction_receipts,
             workspace: None,
+            filesystem_validation: None,
         })
     }
 
@@ -608,7 +640,7 @@ impl SearchGenerationPipeline {
         let mut cached = self.clone_previous_assets(budget)?;
         let mut workspace = self.workspace.fork_candidate();
         let known_paths = clone_known_paths(&cached, budget)?;
-        let plan =
+        let mut plan =
             self.scanner
                 .plan(intent, &known_paths, budget)
                 .map_err(|error| match error {
@@ -654,28 +686,35 @@ impl SearchGenerationPipeline {
         };
         let mut read_sources =
             reserve_retained_vec(plan.present.len(), "read source list", budget)?;
-        for candidate in &plan.present {
-            let previous_identity = cached
-                .get(&candidate.rel_path)
-                .map(|analysis| analysis.source.content_digest);
-            let outcome = self
-                .scanner
-                .read_source(candidate, previous_identity, budget);
+        for candidate_index in 0..plan.present.len() {
+            let outcome = {
+                let candidate = &plan.present[candidate_index];
+                let previous_identity = cached
+                    .get(&candidate.rel_path)
+                    .map(|analysis| analysis.source.content_digest);
+                self.scanner
+                    .read_source(candidate, previous_identity, budget)
+            };
             metrics.scan.merge(&outcome.metrics);
             metrics.scan_diagnostics = metrics
                 .scan_diagnostics
                 .saturating_add(saturating_usize_to_u64(outcome.diagnostics.len()));
-            let source = match outcome.source {
-                Some(source) => source,
+            let accepted = match outcome.accepted {
+                Some(accepted) => accepted,
                 None => {
                     return Err(PipelineError::SourceReadRejected {
-                        relative_path: candidate.rel_path.clone(),
+                        relative_path: plan.present[candidate_index].rel_path.clone(),
                         diagnostics: outcome.diagnostics,
                     });
                 }
             };
+            plan.record_source_proof(accepted.proof, budget)
+                .map_err(|error| match error {
+                    ScanError::Budget(error) => PipelineError::Budget(error),
+                    error => PipelineError::Scan(error.into()),
+                })?;
             read_sources.push(ScannedSource {
-                source,
+                source: accepted.source,
                 diagnostics: outcome.diagnostics,
             });
         }
@@ -1133,6 +1172,7 @@ impl SearchGenerationPipeline {
             assets,
             metrics.analysis,
         );
+        let filesystem_validation = plan.into_validation();
         Ok(PreparedBatch {
             batch,
             scan_hints,
@@ -1143,6 +1183,7 @@ impl SearchGenerationPipeline {
                 roots: workspace_roots,
                 hydrated: workspace_hydrated,
             }),
+            filesystem_validation: Some(filesystem_validation),
         })
     }
 
@@ -1414,27 +1455,42 @@ impl SearchGenerationPipeline {
                 roots: WorkspaceRoots::default(),
                 hydrated: false,
             }),
+            filesystem_validation: None,
         })
     }
 
     fn publish_batch(
         &mut self,
-        batch: AssetAnalysisBatch,
-        scan_hints: Vec<SourceScanHint>,
-        mut metrics: PipelineBuildMetrics,
-        transaction_receipts: TransactionReceiptWindow,
-        workspace: Option<PreparedWorkspace>,
+        prepared: PreparedBatch,
         transaction: Option<TransactionId>,
         target_revision: Option<WorkspaceRevision>,
         started: Instant,
         budget: &mut AssetLoadBudget,
     ) -> Result<PipelineBuildOutput, PipelineError> {
+        let PreparedBatch {
+            batch,
+            scan_hints,
+            mut metrics,
+            transaction_receipts,
+            workspace,
+            filesystem_validation,
+        } = prepared;
         if self.active_options_match
             && self
                 .source_state
                 .as_ref()
                 .is_some_and(|state| batch_matches_state(&batch, state))
         {
+            if let Some(validation) = filesystem_validation.as_ref() {
+                #[cfg(test)]
+                Self::run_scan_validation_hook(
+                    &mut self.scan_validation_hook,
+                    ScanValidationCheckpoint::NoChangePreReturn,
+                );
+                self.scanner
+                    .validate_scan(validation)
+                    .map_err(|error| PipelineError::Scan(error.into()))?;
+            }
             self.active_options_match = true;
             self.install_workspace(workspace);
             let warnings = self.take_pending_publish_warnings();
@@ -1578,6 +1634,16 @@ impl SearchGenerationPipeline {
             true,
             budget,
         )?);
+        if let Some(validation) = filesystem_validation.as_ref() {
+            #[cfg(test)]
+            Self::run_scan_validation_hook(
+                &mut self.scan_validation_hook,
+                ScanValidationCheckpoint::ActivationPreCommit,
+            );
+            self.scanner
+                .validate_scan(validation)
+                .map_err(|error| PipelineError::Scan(error.into()))?;
+        }
         let report = prepared.activate_with_budget(budget)?;
         self.append_pending_publish_warnings(report.warnings);
         let warnings = self.take_pending_publish_warnings();
@@ -1946,6 +2012,7 @@ struct PreparedBatch {
     metrics: PipelineBuildMetrics,
     transaction_receipts: TransactionReceiptWindow,
     workspace: Option<PreparedWorkspace>,
+    filesystem_validation: Option<ScanValidation>,
 }
 
 struct ScannedSource {
@@ -2824,6 +2891,15 @@ fn clone_known_paths(
     {
         return Err(PipelineError::Invariant(
             "cached source paths were not uniquely sorted",
+        ));
+    }
+    known_paths.sort_unstable_by(|left, right| compare_portable_paths(left, right));
+    if known_paths
+        .windows(2)
+        .any(|pair| compare_portable_paths(&pair[0], &pair[1]) == std::cmp::Ordering::Equal)
+    {
+        return Err(PipelineError::Invariant(
+            "cached source paths were not unique under platform path semantics",
         ));
     }
     Ok(known_paths)
@@ -4110,7 +4186,7 @@ mod tests {
 
     #[test]
     fn no_change_returns_pending_committed_head_warnings() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let project_root = temporary.path().join("project");
         std::fs::create_dir_all(project_root.join("Assets")).unwrap();
         let paths = IndexPaths::for_project(
@@ -4151,7 +4227,7 @@ mod tests {
 
     #[test]
     fn pending_publish_warnings_are_bounded_with_explicit_omission_evidence() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let project_root = temporary.path().join("project");
         std::fs::create_dir_all(project_root.join("Assets")).unwrap();
         let paths = IndexPaths::for_project(

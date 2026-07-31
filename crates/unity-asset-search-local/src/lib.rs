@@ -29,7 +29,8 @@ pub use ids::LocalIdentityParseError;
 pub use process::{ProcessIdentityError, ProcessIdentityV1};
 pub use project::{ProjectIdentityV1, ProjectLocatorError, ProjectLocatorV1};
 pub use roots::{
-    EndpointNamespaceV1, PrivateRootKind, PrivateRootV1, PrivateRootsError, PrivateRootsV1,
+    EndpointNamespaceV1, PrivateIndexRootV1, PrivateRootKind, PrivateRootV1, PrivateRootsError,
+    PrivateRootsV1,
 };
 pub use security_context::{SecurityContextError, SecurityContextIdV1};
 pub use transport::{EndpointTransportError, MAX_LOCAL_IPC_CONNECTIONS_V1, VerifiedLocalStreamV1};

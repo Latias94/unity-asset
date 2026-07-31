@@ -14,11 +14,11 @@ use std::sync::{
 use fs2::FileExt;
 use serde::{Deserialize, Deserializer, Serialize};
 use unity_asset_core::{
-    AssetLoadBudget, AssetLoadLimits, BudgetError, BudgetedJsonError, ChangeSet,
-    ContractJsonLimits, ContractJsonResourceModel, Diagnostic, DigestBuildError, DigestV1,
-    DigestV1Builder, ObjectAddress, TransactionId, WorkspaceId, WorkspaceRevision,
-    read_contract_json,
+    AssetLoadBudget, BudgetError, BudgetedJsonError, ChangeSet, ContractJsonLimits,
+    ContractJsonResourceModel, Diagnostic, DigestBuildError, DigestV1, DigestV1Builder,
+    ObjectAddress, TransactionId, WorkspaceId, WorkspaceRevision, read_contract_json,
 };
+use unity_asset_search_local::{PrivateIndexRootV1, PrivateRootsError};
 use unity_asset_search_protocol::MAX_PORTABLE_PATH_BYTES;
 
 use crate::analysis::{
@@ -31,10 +31,10 @@ use crate::generation::{
     SearchGenerationManifestV1,
 };
 
-pub(crate) mod secure_read;
-
-use secure_read::{
-    ReadDirectory as SecureReadDirectory, RegularFile as SecureRegularFile, SecureReadError,
+use crate::anchored_fs::{
+    AnchoredFsError as SecureReadError, EntryKindHint, OpenPolicy,
+    ReadDirectory as SecureReadDirectory, RegularFile as SecureRegularFile,
+    StableDirectoryIdentity,
 };
 
 const GENERATIONS_DIRECTORY: &str = "generations";
@@ -1355,29 +1355,119 @@ impl GenerationSnapshot {
         limits: SourceStateLimits,
     ) -> Result<SourceStateSnapshot, SourceStateError> {
         let directory = self.source_state_directory();
-        let actual = measure_artifact_tree(&directory).map_err(SourceStateError::store)?;
+        let generation = SecureReadDirectory::open(&self.directory, OpenPolicy::PersistedState)
+            .map_err(|source| {
+                SourceStateError::store(persisted_read_error(
+                    "open generation for source-state load",
+                    self.directory.clone(),
+                    source,
+                ))
+            })?;
+        let generation_identity = generation.stable_identity().map_err(|source| {
+            SourceStateError::store(persisted_read_error(
+                "capture generation identity for source-state load",
+                self.directory.clone(),
+                source,
+            ))
+        })?;
+        let measured_directory = generation
+            .open_directory(OsStr::new(SOURCE_STATE_ARTIFACT_DIRECTORY))
+            .map_err(|source| {
+                SourceStateError::store(persisted_read_error(
+                    "open source-state directory for evidence measurement",
+                    directory.clone(),
+                    source,
+                ))
+            })?;
+        let source_state_identity = measured_directory.stable_identity().map_err(|source| {
+            SourceStateError::store(persisted_read_error(
+                "capture source-state directory identity",
+                directory.clone(),
+                source,
+            ))
+        })?;
+        let actual = measure_anchored_artifact_tree(&directory, measured_directory, budget)
+            .map_err(SourceStateError::from_load_error)?;
         let expected = self.manifest.artifacts().source_state();
         if actual != expected {
             return Err(SourceStateError::PhysicalEvidenceMismatch { expected, actual });
         }
-        let snapshot = read_source_state_snapshot(&directory, budget, limits)?;
+        let opened_directory = generation
+            .open_directory(OsStr::new(SOURCE_STATE_ARTIFACT_DIRECTORY))
+            .map_err(|source| {
+                SourceStateError::store(persisted_read_error(
+                    "reopen source-state directory for parsing",
+                    directory.clone(),
+                    source,
+                ))
+            })?;
+        opened_directory
+            .ensure_identity(source_state_identity)
+            .map_err(|source| {
+                SourceStateError::store(persisted_read_error(
+                    "revalidate source-state directory before parsing",
+                    directory.clone(),
+                    source,
+                ))
+            })?;
+        let snapshot =
+            read_source_state_snapshot_in(&opened_directory, &directory, budget, limits)?;
+        opened_directory
+            .ensure_identity(source_state_identity)
+            .map_err(|source| {
+                SourceStateError::store(persisted_read_error(
+                    "revalidate source-state directory after parsing",
+                    directory.clone(),
+                    source,
+                ))
+            })?;
+        generation
+            .ensure_identity(generation_identity)
+            .map_err(|source| {
+                SourceStateError::store(persisted_read_error(
+                    "revalidate generation after source-state load",
+                    self.directory.clone(),
+                    source,
+                ))
+            })?;
+        let rebound_generation =
+            SecureReadDirectory::open(&self.directory, OpenPolicy::PersistedState).map_err(
+                |source| {
+                    SourceStateError::store(persisted_read_error(
+                        "reopen generation after source-state load",
+                        self.directory.clone(),
+                        source,
+                    ))
+                },
+            )?;
+        rebound_generation
+            .ensure_identity(generation_identity)
+            .map_err(|source| {
+                SourceStateError::store(persisted_read_error(
+                    "rebind generation after source-state load",
+                    self.directory.clone(),
+                    source,
+                ))
+            })?;
         validate_source_state_manifest(&snapshot, &self.manifest)?;
         Ok(snapshot)
     }
 }
 
+#[cfg(test)]
 fn read_source_state_snapshot(
     directory: &Path,
     budget: &mut AssetLoadBudget,
     limits: SourceStateLimits,
 ) -> Result<SourceStateSnapshot, SourceStateError> {
-    let opened_directory = SecureReadDirectory::open(directory).map_err(|source| {
-        SourceStateError::store(persisted_read_error(
-            "open source-state directory",
-            directory.to_path_buf(),
-            source,
-        ))
-    })?;
+    let opened_directory = SecureReadDirectory::open(directory, OpenPolicy::PersistedState)
+        .map_err(|source| {
+            SourceStateError::store(persisted_read_error(
+                "open source-state directory",
+                directory.to_path_buf(),
+                source,
+            ))
+        })?;
     read_source_state_snapshot_in(&opened_directory, directory, budget, limits)
 }
 
@@ -1528,21 +1618,25 @@ fn validate_source_state_manifest(
 fn validate_persisted_source_state(
     directory: &Path,
     manifest: &SearchGenerationManifestV1,
+    budget: &mut AssetLoadBudget,
 ) -> Result<(), GenerationStoreError> {
     let source_state_directory = directory.join(SOURCE_STATE_ARTIFACT_DIRECTORY);
     let opened_source_state =
-        SecureReadDirectory::open(&source_state_directory).map_err(|source| {
-            persisted_read_error(
-                "open completed source-state directory",
-                source_state_directory.clone(),
-                source,
-            )
-        })?;
+        SecureReadDirectory::open(&source_state_directory, OpenPolicy::PersistedState).map_err(
+            |source| {
+                persisted_read_error(
+                    "open completed source-state directory",
+                    source_state_directory.clone(),
+                    source,
+                )
+            },
+        )?;
     validate_persisted_source_state_in(
         directory,
         &source_state_directory,
         &opened_source_state,
         manifest,
+        budget,
     )
 }
 
@@ -1551,27 +1645,13 @@ fn validate_persisted_source_state_in(
     source_state_directory: &Path,
     opened_source_state: &SecureReadDirectory,
     manifest: &SearchGenerationManifestV1,
+    budget: &mut AssetLoadBudget,
 ) -> Result<(), GenerationStoreError> {
     let source_limits = SourceStateLimits::default();
-    let mut load_limits = AssetLoadLimits::default();
-    let validation_read_limit = source_limits.max_encoded_bytes.checked_add(1).ok_or(
-        GenerationStoreError::SizeOverflow {
-            resource: "source state validation read limit",
-        },
-    )?;
-    load_limits.max_entries = validation_read_limit;
-    load_limits.max_members = validation_read_limit;
-    load_limits.max_depth = 64;
-    let mut budget = AssetLoadBudget::new(load_limits).map_err(|source| {
-        invalid_source_state(
-            generation_directory,
-            SourceStateError::Budget(BudgetedJsonError::Budget(source)),
-        )
-    })?;
     let snapshot = read_source_state_snapshot_in(
         opened_source_state,
         source_state_directory,
-        &mut budget,
+        budget,
         source_limits,
     )
     .map_err(|error| classify_persisted_source_state_error(generation_directory, error))?;
@@ -1878,6 +1958,9 @@ fn classify_persisted_source_state_error(
 ) -> GenerationStoreError {
     match source {
         SourceStateError::Store(source) if source.is_security_violation() => *source,
+        SourceStateError::Budget(BudgetedJsonError::Budget(source)) => {
+            GenerationStoreError::Budget(source)
+        }
         SourceStateError::Budget(source) => GenerationStoreError::ContractJson {
             artifact: "source state",
             path: directory
@@ -2007,6 +2090,9 @@ impl PreparedGenerationPublish<'_> {
             mut warnings,
             failpoint,
         } = self;
+        store.revalidate_private_root(
+            "revalidate private index root before activation publication",
+        )?;
         match activation {
             PreparedActivation::AlreadyActive => {
                 let mut maintenance_budget = AssetLoadBudget::default();
@@ -2144,8 +2230,26 @@ impl GenerationStagingRecoveryReport {
 }
 
 #[derive(Debug)]
+enum GenerationStoreRootAuthority {
+    Private(PrivateIndexRootV1),
+    #[cfg(test)]
+    Fixture,
+}
+
+impl GenerationStoreRootAuthority {
+    fn revalidate(&self, operation: &'static str) -> Result<(), GenerationStoreError> {
+        match self {
+            Self::Private(private_root) => revalidate_private_index_root(private_root, operation),
+            #[cfg(test)]
+            Self::Fixture => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct GenerationStore {
     root: PathBuf,
+    root_authority: GenerationStoreRootAuthority,
     generations: PathBuf,
     staging: PathBuf,
     activations: PathBuf,
@@ -2164,37 +2268,86 @@ impl GenerationStore {
     /// that head or its immutable generation therefore fails closed instead of silently rolling
     /// freshness back to an older activation. Directory discovery and validation share the
     /// caller's ledger.
+    pub(crate) fn open_private(
+        private_root: PrivateIndexRootV1,
+        options: GenerationStoreOptions,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, GenerationStoreError> {
+        revalidate_private_index_root(
+            &private_root,
+            "revalidate private index root before reopening generation store",
+        )?;
+        let root = private_root.path().to_path_buf();
+        Self::open_at_root(
+            root,
+            GenerationStoreRootAuthority::Private(private_root),
+            options,
+            budget,
+        )
+    }
+
+    #[cfg(test)]
     pub fn open(
         root: impl AsRef<Path>,
         options: GenerationStoreOptions,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, GenerationStoreError> {
         let root = initialize_root(root.as_ref())?;
+        Self::open_at_root(root, GenerationStoreRootAuthority::Fixture, options, budget)
+    }
+
+    fn open_at_root(
+        root: PathBuf,
+        root_authority: GenerationStoreRootAuthority,
+        options: GenerationStoreOptions,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, GenerationStoreError> {
+        root_authority
+            .revalidate("revalidate private index root before opening generation store")?;
+        ensure_existing_directory_no_follow(&root)?;
         let lease = Arc::new(WriterLease::acquire(&root)?);
         let generations = ensure_managed_directory(&root, GENERATIONS_DIRECTORY)?;
         let staging = ensure_managed_directory(&root, STAGING_DIRECTORY)?;
         let activations = ensure_managed_directory(&root, ACTIVATIONS_DIRECTORY)?;
-        let opened_generations = SecureReadDirectory::open(&generations).map_err(|source| {
-            persisted_read_error("open generations directory", generations.clone(), source)
-        })?;
-        let opened_activations = SecureReadDirectory::open(&activations).map_err(|source| {
-            persisted_read_error("open activations directory", activations.clone(), source)
-        })?;
+        let opened_generations =
+            SecureReadDirectory::open(&generations, OpenPolicy::PersistedState).map_err(
+                |source| {
+                    persisted_read_error("open generations directory", generations.clone(), source)
+                },
+            )?;
+        let opened_activations =
+            SecureReadDirectory::open(&activations, OpenPolicy::PersistedState).map_err(
+                |source| {
+                    persisted_read_error("open activations directory", activations.clone(), source)
+                },
+            )?;
         recover_owned_staging(&staging, budget)?;
+        let opened_staging = SecureReadDirectory::open(&staging, OpenPolicy::PersistedState)
+            .map_err(|source| {
+                persisted_read_error("open staging directory", staging.clone(), source)
+            })?;
 
-        let next_staging_ordinal = next_staging_ordinal(&staging, budget)?;
-        let (activation_candidates, next_activation_ordinal) =
-            activation_candidates_for_open(&activations, &staging, budget)?;
+        let next_staging_ordinal = next_staging_ordinal(&staging, &opened_staging, budget)?;
+        let activation_snapshot = activation_candidates_for_open(
+            &activations,
+            &opened_activations,
+            &staging,
+            &opened_staging,
+            budget,
+        )?;
         let active = select_active_generation(
+            &activations,
             &generations,
             &opened_generations,
             &opened_activations,
-            &activation_candidates,
+            &activation_snapshot,
             budget,
         )?;
+        let next_activation_ordinal = activation_snapshot.next_ordinal;
 
-        Ok(Self {
+        let store = Self {
             root,
+            root_authority,
             generations,
             staging,
             activations,
@@ -2204,7 +2357,11 @@ impl GenerationStore {
             next_activation_ordinal,
             lease,
             live_build: Arc::new(LiveBuildClaim::default()),
-        })
+        };
+        store.revalidate_private_root(
+            "revalidate private index root after reopening generation store",
+        )?;
+        Ok(store)
     }
 
     #[must_use]
@@ -2262,6 +2419,7 @@ impl GenerationStore {
     }
 
     pub fn begin(&mut self) -> Result<GenerationBuild, GenerationStoreError> {
+        self.revalidate_private_root("revalidate private index root before creating generation")?;
         let claim = self.live_build.acquire()?;
         loop {
             let ordinal = self.next_staging_ordinal;
@@ -2478,7 +2636,7 @@ impl GenerationStore {
                 actual: Box::new(observed),
             });
         }
-        validate_persisted_source_state(&build.directory, &manifest)?;
+        validate_persisted_source_state(&build.directory, &manifest, budget)?;
 
         let generation = manifest.generation_id();
         if let Some(active) = self
@@ -2557,6 +2715,9 @@ impl GenerationStore {
             });
         }
 
+        self.revalidate_private_root(
+            "revalidate private index root before completing generation publication",
+        )?;
         let quarantine = if replace_invalid_completed {
             let quarantine = self
                 .staging
@@ -2671,6 +2832,7 @@ impl GenerationStore {
             revision: snapshot.manifest.revision(),
             desired_revision: Some(snapshot.desired_revision),
         };
+        self.revalidate_private_root("revalidate private index root before writing activation")?;
         warnings.extend(self.write_activation(&record, failpoint, budget)?);
 
         self.active = Some(snapshot.clone());
@@ -2696,7 +2858,14 @@ impl GenerationStore {
         })
     }
 
+    fn revalidate_private_root(&self, operation: &'static str) -> Result<(), GenerationStoreError> {
+        self.root_authority.revalidate(operation)
+    }
+
     fn validate_build(&self, build: &GenerationBuild) -> Result<(), GenerationStoreError> {
+        self.revalidate_private_root(
+            "revalidate private index root before generation publication",
+        )?;
         if build.store_root != self.root
             || !Arc::ptr_eq(&build.lease, &self.lease)
             || !build.claim.belongs_to(&self.live_build)
@@ -2797,65 +2966,84 @@ impl GenerationStore {
             return Ok(Vec::new());
         };
         let opened_activations =
-            SecureReadDirectory::open(&self.activations).map_err(|source| {
-                persisted_read_error(
-                    "open activations directory",
-                    self.activations.clone(),
-                    source,
-                )
-            })?;
+            SecureReadDirectory::open(&self.activations, OpenPolicy::PersistedState).map_err(
+                |source| {
+                    persisted_read_error(
+                        "open activations directory",
+                        self.activations.clone(),
+                        source,
+                    )
+                },
+            )?;
         let opened_generations =
-            SecureReadDirectory::open(&self.generations).map_err(|source| {
-                persisted_read_error(
-                    "open generations directory",
-                    self.generations.clone(),
-                    source,
-                )
-            })?;
-        let (mut candidates, _) =
-            activation_candidates_for_open(&self.activations, &self.staging, budget)?;
+            SecureReadDirectory::open(&self.generations, OpenPolicy::PersistedState).map_err(
+                |source| {
+                    persisted_read_error(
+                        "open generations directory",
+                        self.generations.clone(),
+                        source,
+                    )
+                },
+            )?;
+        let opened_staging = SecureReadDirectory::open(&self.staging, OpenPolicy::PersistedState)
+            .map_err(|source| {
+            persisted_read_error("open staging directory", self.staging.clone(), source)
+        })?;
+        let mut activation_snapshot = activation_candidates_for_open(
+            &self.activations,
+            &opened_activations,
+            &self.staging,
+            &opened_staging,
+            budget,
+        )?;
+        let mut candidates = std::mem::take(&mut activation_snapshot.candidates);
         candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.ordinal));
 
-        let mut seen = BTreeSet::new();
-        seen.insert(active.generation);
-        let mut retained = Vec::new();
-        for candidate in candidates {
-            if retained.len() >= self.options.retain_previous_generations {
-                break;
-            }
-            let record = match read_activation_record(
-                &opened_activations,
-                &candidate.path,
-                &candidate.file_name,
-                candidate.ordinal,
-                budget,
-            ) {
-                Ok(record) => record,
-                Err(error) if error.is_candidate_scan_fatal() => {
-                    return Err(error);
+        let retained = (|| {
+            let mut seen = BTreeSet::new();
+            seen.insert(active.generation);
+            let mut retained = Vec::new();
+            for candidate in candidates {
+                if retained.len() >= self.options.retain_previous_generations {
+                    break;
                 }
-                Err(_) => continue,
-            };
-            if seen.contains(&record.generation) {
-                continue;
-            }
-            let generation = match load_completed_generation(
-                &self.generations,
-                &opened_generations,
-                &record,
-                budget,
-            ) {
-                Ok(generation) => generation,
-                Err(error) if error.is_candidate_scan_fatal() => {
-                    return Err(error);
+                let record = match read_activation_record(
+                    &opened_activations,
+                    &candidate.display_path,
+                    &candidate.file_name,
+                    candidate.ordinal,
+                    budget,
+                ) {
+                    Ok(record) => record,
+                    Err(error) if error.is_candidate_scan_fatal() => return Err(error),
+                    Err(_) => continue,
+                };
+                if seen.contains(&record.generation) {
+                    continue;
                 }
-                Err(_) => continue,
-            };
-            if seen.insert(generation.generation) {
-                retained.push(generation);
+                let generation = match load_completed_generation(
+                    &self.generations,
+                    &opened_generations,
+                    &record,
+                    budget,
+                ) {
+                    Ok(generation) => generation,
+                    Err(error) if error.is_candidate_scan_fatal() => return Err(error),
+                    Err(_) => continue,
+                };
+                if seen.insert(generation.generation) {
+                    retained.push(generation);
+                }
             }
-        }
-        Ok(retained)
+            Ok(retained)
+        })();
+        revalidate_opened_directory_snapshot(
+            &self.activations,
+            &opened_activations,
+            activation_snapshot.directory_identity,
+            "revalidate activation directory after reading retained history",
+        )?;
+        retained
     }
 
     fn prune_retention(
@@ -2928,8 +3116,15 @@ impl GenerationHeadRecord {
 #[derive(Debug)]
 struct ActivationCandidate {
     ordinal: u64,
-    path: PathBuf,
+    display_path: PathBuf,
     file_name: OsString,
+}
+
+#[derive(Debug)]
+struct ActivationDirectorySnapshot {
+    candidates: Vec<ActivationCandidate>,
+    next_ordinal: u64,
+    directory_identity: StableDirectoryIdentity,
 }
 
 #[derive(Debug)]
@@ -2938,6 +3133,20 @@ struct CompletedGeneration {
     manifest_digest: DigestV1,
 }
 
+fn revalidate_private_index_root(
+    private_root: &PrivateIndexRootV1,
+    operation: &'static str,
+) -> Result<(), GenerationStoreError> {
+    private_root
+        .revalidate()
+        .map_err(|source| GenerationStoreError::PrivateIndexRoot {
+            operation,
+            path: private_root.path().to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(test)]
 fn initialize_root(root: &Path) -> Result<PathBuf, GenerationStoreError> {
     match fs::symlink_metadata(root) {
         Ok(metadata) => {
@@ -3034,6 +3243,46 @@ struct BudgetedDirectoryEntry {
     file_name: OsString,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenedDirectoryEntryKind {
+    Directory,
+    Regular,
+}
+
+struct OpenedBudgetedDirectoryEntry {
+    display_path: PathBuf,
+    file_name: OsString,
+    kind: OpenedDirectoryEntryKind,
+}
+
+fn charge_budgeted_directory_entry(
+    path: &Path,
+    file_name: &OsStr,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), GenerationStoreError> {
+    let fixed_bytes = size_of::<fs::DirEntry>()
+        .checked_add(size_of::<PathBuf>())
+        .and_then(|bytes| bytes.checked_add(size_of::<OsString>()))
+        .ok_or(GenerationStoreError::SizeOverflow {
+            resource: "generation directory entry",
+        })?;
+    let accounted_bytes = u64::try_from(fixed_bytes)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(u64::try_from(path.as_os_str().len()).ok()?))
+        .and_then(|bytes| bytes.checked_add(u64::try_from(file_name.len()).ok()?))
+        .ok_or(GenerationStoreError::SizeOverflow {
+            resource: "generation directory entry",
+        })?;
+    budget
+        .check_entries(1)
+        .and_then(|()| budget.check_bytes(accounted_bytes))
+        .map_err(GenerationStoreError::Budget)?;
+    budget
+        .consume_entries(1)
+        .and_then(|()| budget.consume_bytes(accounted_bytes))
+        .map_err(GenerationStoreError::Budget)
+}
+
 fn visit_directory_entries_budgeted(
     directory: &Path,
     budget: &mut AssetLoadBudget,
@@ -3055,30 +3304,99 @@ fn visit_directory_entries_budgeted(
         })?;
         let path = entry.path();
         let file_name = entry.file_name();
-        let fixed_bytes = size_of::<fs::DirEntry>()
-            .checked_add(size_of::<PathBuf>())
-            .and_then(|bytes| bytes.checked_add(size_of::<OsString>()))
-            .ok_or(GenerationStoreError::SizeOverflow {
-                resource: "generation directory entry",
-            })?;
-        let accounted_bytes = u64::try_from(fixed_bytes)
-            .ok()
-            .and_then(|bytes| bytes.checked_add(u64::try_from(path.as_os_str().len()).ok()?))
-            .and_then(|bytes| bytes.checked_add(u64::try_from(file_name.len()).ok()?))
-            .ok_or(GenerationStoreError::SizeOverflow {
-                resource: "generation directory entry",
-            })?;
-        budget
-            .check_entries(1)
-            .and_then(|()| budget.check_bytes(accounted_bytes))
-            .map_err(GenerationStoreError::Budget)?;
-        budget
-            .consume_entries(1)
-            .and_then(|()| budget.consume_bytes(accounted_bytes))
-            .map_err(GenerationStoreError::Budget)?;
+        charge_budgeted_directory_entry(&path, &file_name, budget)?;
         visitor(BudgetedDirectoryEntry { path, file_name }, budget)?;
     }
     Ok(())
+}
+
+fn visit_opened_directory_entries_budgeted(
+    display_directory: &Path,
+    opened_directory: &SecureReadDirectory,
+    budget: &mut AssetLoadBudget,
+    mut visitor: impl FnMut(
+        OpenedBudgetedDirectoryEntry,
+        &mut AssetLoadBudget,
+    ) -> Result<(), GenerationStoreError>,
+) -> Result<(), GenerationStoreError> {
+    let identity = opened_directory.stable_identity().map_err(|source| {
+        persisted_read_error(
+            "capture persisted directory identity",
+            display_directory.to_path_buf(),
+            source,
+        )
+    })?;
+    let entries = opened_directory.entries().map_err(|source| {
+        persisted_read_error(
+            "enumerate persisted directory",
+            display_directory.to_path_buf(),
+            source,
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            persisted_read_error(
+                "read persisted directory entry",
+                display_directory.to_path_buf(),
+                source,
+            )
+        })?;
+        let hint = entry.kind();
+        let file_name = entry.into_name();
+        let display_path = display_directory.join(&file_name);
+        charge_budgeted_directory_entry(&display_path, &file_name, budget)?;
+        let kind = match open_anchored_artifact_entry(
+            opened_directory,
+            &file_name,
+            hint,
+            &display_path,
+        )? {
+            OpenedArtifactEntry::Directory(_) => OpenedDirectoryEntryKind::Directory,
+            OpenedArtifactEntry::Regular(_) => OpenedDirectoryEntryKind::Regular,
+        };
+        visitor(
+            OpenedBudgetedDirectoryEntry {
+                display_path,
+                file_name,
+                kind,
+            },
+            budget,
+        )?;
+    }
+    revalidate_opened_directory_snapshot(
+        display_directory,
+        opened_directory,
+        identity,
+        "revalidate persisted directory after enumeration",
+    )
+}
+
+fn revalidate_opened_directory_snapshot(
+    display_directory: &Path,
+    opened_directory: &SecureReadDirectory,
+    identity: StableDirectoryIdentity,
+    operation: &'static str,
+) -> Result<(), GenerationStoreError> {
+    opened_directory
+        .ensure_identity(identity)
+        .map_err(|source| {
+            persisted_read_error(operation, display_directory.to_path_buf(), source)
+        })?;
+    let rebound = SecureReadDirectory::open(display_directory, OpenPolicy::PersistedState)
+        .map_err(|source| {
+            persisted_read_error(
+                "reopen persisted directory snapshot path",
+                display_directory.to_path_buf(),
+                source,
+            )
+        })?;
+    rebound.ensure_identity(identity).map_err(|source| {
+        persisted_read_error(
+            "revalidate persisted directory snapshot path binding",
+            display_directory.to_path_buf(),
+            source,
+        )
+    })
 }
 
 fn recover_owned_staging(
@@ -3149,15 +3467,20 @@ fn recover_owned_staging(
 
 fn next_staging_ordinal(
     staging: &Path,
+    opened_staging: &SecureReadDirectory,
     budget: &mut AssetLoadBudget,
 ) -> Result<u64, GenerationStoreError> {
     let mut maximum = 0_u64;
-    visit_directory_entries_budgeted(staging, budget, |entry, _budget| {
-        let _ = metadata_no_follow(&entry.path)?;
+    visit_opened_directory_entries_budgeted(staging, opened_staging, budget, |entry, _budget| {
         let Some(name) = entry.file_name.to_str() else {
             return Ok(());
         };
         if let Some(ordinal) = parse_staging_directory_name(name) {
+            if entry.kind != OpenedDirectoryEntryKind::Directory {
+                return Err(GenerationStoreError::UnsupportedFileType {
+                    path: entry.display_path,
+                });
+            }
             maximum = maximum.max(ordinal);
         }
         Ok(())
@@ -3169,36 +3492,58 @@ fn next_staging_ordinal(
 
 fn activation_candidates_for_open(
     activations: &Path,
+    opened_activations: &SecureReadDirectory,
     staging: &Path,
+    opened_staging: &SecureReadDirectory,
     budget: &mut AssetLoadBudget,
-) -> Result<(Vec<ActivationCandidate>, u64), GenerationStoreError> {
-    let mut candidates = Vec::new();
-    let mut maximum = 0_u64;
-    visit_directory_entries_budgeted(activations, budget, |entry, budget| {
-        let _ = metadata_no_follow(&entry.path)?;
-        let Some(name) = entry.file_name.to_str() else {
-            return Ok(());
-        };
-        let Some(ordinal) = parse_activation_file_name(name) else {
-            return Ok(());
-        };
-        maximum = maximum.max(ordinal);
-        push_activation_candidate(
-            &mut candidates,
-            ActivationCandidate {
-                ordinal,
-                path: entry.path,
-                file_name: entry.file_name,
-            },
-            Some(budget),
+) -> Result<ActivationDirectorySnapshot, GenerationStoreError> {
+    let directory_identity = opened_activations.stable_identity().map_err(|source| {
+        persisted_read_error(
+            "capture activation directory snapshot identity",
+            activations.to_path_buf(),
+            source,
         )
     })?;
-    visit_directory_entries_budgeted(staging, budget, |entry, _budget| {
-        let _ = metadata_no_follow(&entry.path)?;
+    let mut candidates = Vec::new();
+    let mut maximum = 0_u64;
+    visit_opened_directory_entries_budgeted(
+        activations,
+        opened_activations,
+        budget,
+        |entry, budget| {
+            let Some(name) = entry.file_name.to_str() else {
+                return Ok(());
+            };
+            let Some(ordinal) = parse_activation_file_name(name) else {
+                return Ok(());
+            };
+            if entry.kind != OpenedDirectoryEntryKind::Regular {
+                return Err(GenerationStoreError::UnsupportedFileType {
+                    path: entry.display_path,
+                });
+            }
+            maximum = maximum.max(ordinal);
+            push_activation_candidate(
+                &mut candidates,
+                ActivationCandidate {
+                    ordinal,
+                    display_path: entry.display_path,
+                    file_name: entry.file_name,
+                },
+                Some(budget),
+            )
+        },
+    )?;
+    visit_opened_directory_entries_budgeted(staging, opened_staging, budget, |entry, _budget| {
         let Some(name) = entry.file_name.to_str() else {
             return Ok(());
         };
         if let Some(ordinal) = parse_activation_staging_file_name(name) {
+            if entry.kind != OpenedDirectoryEntryKind::Regular {
+                return Err(GenerationStoreError::UnsupportedFileType {
+                    path: entry.display_path,
+                });
+            }
             maximum = maximum.max(ordinal);
         }
         Ok(())
@@ -3207,7 +3552,17 @@ fn activation_candidates_for_open(
     let next = maximum
         .checked_add(1)
         .ok_or(GenerationStoreError::OrdinalOverflow)?;
-    Ok((candidates, next))
+    revalidate_opened_directory_snapshot(
+        activations,
+        opened_activations,
+        directory_identity,
+        "revalidate activation directory after candidate enumeration",
+    )?;
+    Ok(ActivationDirectorySnapshot {
+        candidates,
+        next_ordinal: next,
+        directory_identity,
+    })
 }
 
 fn push_activation_candidate(
@@ -3304,23 +3659,34 @@ fn prune_activation_history(
 }
 
 fn select_active_generation(
+    activations: &Path,
     generations: &Path,
     opened_generations: &SecureReadDirectory,
     opened_activations: &SecureReadDirectory,
-    candidates: &[ActivationCandidate],
+    snapshot: &ActivationDirectorySnapshot,
     budget: &mut AssetLoadBudget,
 ) -> Result<Option<GenerationSnapshot>, GenerationStoreError> {
-    let Some(candidate) = candidates.last() else {
-        return Ok(None);
+    let selected = if let Some(candidate) = snapshot.candidates.last() {
+        let record = read_activation_record(
+            opened_activations,
+            &candidate.display_path,
+            &candidate.file_name,
+            candidate.ordinal,
+            budget,
+        );
+        record.and_then(|record| {
+            load_completed_generation(generations, opened_generations, &record, budget).map(Some)
+        })
+    } else {
+        Ok(None)
     };
-    let record = read_activation_record(
+    revalidate_opened_directory_snapshot(
+        activations,
         opened_activations,
-        &candidate.path,
-        &candidate.file_name,
-        candidate.ordinal,
-        budget,
+        snapshot.directory_identity,
+        "revalidate activation directory after selecting the active generation",
     )?;
-    load_completed_generation(generations, opened_generations, &record, budget).map(Some)
+    selected
 }
 
 fn read_activation_record(
@@ -3428,13 +3794,14 @@ fn inspect_completed_generation(
     expected_generation: SearchGenerationId,
     budget: &mut AssetLoadBudget,
 ) -> Result<CompletedGeneration, GenerationStoreError> {
-    let opened_directory = SecureReadDirectory::open(directory).map_err(|source| {
-        persisted_read_error(
-            "open completed generation directory",
-            directory.to_path_buf(),
-            source,
-        )
-    })?;
+    let opened_directory = SecureReadDirectory::open(directory, OpenPolicy::PersistedState)
+        .map_err(|source| {
+            persisted_read_error(
+                "open completed generation directory",
+                directory.to_path_buf(),
+                source,
+            )
+        })?;
     inspect_completed_generation_in(directory, &opened_directory, expected_generation, budget)
 }
 
@@ -3506,6 +3873,7 @@ fn inspect_completed_generation_in(
         &source_state_directory,
         &opened_source_state,
         &manifest,
+        budget,
     )?;
     Ok(CompletedGeneration {
         manifest,
@@ -3518,13 +3886,14 @@ fn measure_generation_artifacts(
     budget: &mut AssetLoadBudget,
     failpoint: Option<GenerationFailpoint>,
 ) -> Result<GenerationArtifactEvidence, GenerationStoreError> {
-    let opened = SecureReadDirectory::open(directory).map_err(|source| {
-        persisted_read_error(
-            "open generation artifact root",
-            directory.to_path_buf(),
-            source,
-        )
-    })?;
+    let opened =
+        SecureReadDirectory::open(directory, OpenPolicy::PersistedState).map_err(|source| {
+            persisted_read_error(
+                "open generation artifact root",
+                directory.to_path_buf(),
+                source,
+            )
+        })?;
     measure_generation_artifacts_in(directory, &opened, budget, failpoint)
 }
 
@@ -3755,22 +4124,69 @@ fn measure_artifact_tree_with_budget(
 }
 
 struct AnchoredArtifactDirectory {
-    directory: SecureReadDirectory,
     listing_path: PathBuf,
     relative_path: String,
     depth: u32,
+    identity: StableDirectoryIdentity,
+}
+
+enum OpenedArtifactEntry {
+    Directory(SecureReadDirectory),
+    Regular(SecureRegularFile),
+}
+
+fn open_anchored_artifact_entry(
+    directory: &SecureReadDirectory,
+    name: &OsStr,
+    hint: EntryKindHint,
+    display_path: &Path,
+) -> Result<OpenedArtifactEntry, GenerationStoreError> {
+    if hint == EntryKindHint::LinkOrReparse {
+        return Err(persisted_link_error(display_path.to_path_buf()));
+    }
+    if hint == EntryKindHint::Directory || hint == EntryKindHint::Unknown {
+        match directory.open_directory(name) {
+            Ok(opened) => return Ok(OpenedArtifactEntry::Directory(opened)),
+            Err(SecureReadError::NotDirectory) if hint == EntryKindHint::Unknown => {}
+            Err(source) => {
+                return Err(persisted_read_error(
+                    "open anchored artifact directory",
+                    display_path.to_path_buf(),
+                    source,
+                ));
+            }
+        }
+    }
+
+    directory
+        .open_regular(name)
+        .map(OpenedArtifactEntry::Regular)
+        .map_err(|source| {
+            persisted_read_error(
+                "open anchored artifact file",
+                display_path.to_path_buf(),
+                source,
+            )
+        })
 }
 
 /// Measures a completed artifact through already-opened directory handles.
 ///
-/// `read_dir` supplies names only. Each name is then re-opened relative to the retained
-/// descriptor before metadata, hashing, or recursion occurs, so a replacement of any pathname
-/// cannot redirect evidence collection outside the selected generation tree.
+/// Handle-relative enumeration supplies names and untrusted type hints only. Each name is then
+/// re-opened relative to the retained descriptor before hashing or recursion occurs, so a
+/// replacement of any pathname cannot redirect evidence collection outside the selected tree.
 fn measure_anchored_artifact_tree(
     root: &Path,
     opened_root: SecureReadDirectory,
     budget: &mut AssetLoadBudget,
 ) -> Result<ArtifactTreeEvidence, GenerationStoreError> {
+    let root_identity = opened_root.stable_identity().map_err(|source| {
+        persisted_read_error(
+            "capture anchored artifact root identity",
+            root.to_path_buf(),
+            source,
+        )
+    })?;
     let mut pending = Vec::new();
     reserve_artifact_vec(
         &mut pending,
@@ -3779,16 +4195,41 @@ fn measure_anchored_artifact_tree(
         budget,
     )?;
     pending.push(AnchoredArtifactDirectory {
-        directory: opened_root,
         listing_path: root.to_path_buf(),
         relative_path: String::new(),
         depth: 0,
+        identity: root_identity,
     });
     let mut entries = Vec::new();
     let mut directories = 0_u64;
     let mut total_bytes = 0_u64;
 
     while let Some(current) = pending.pop() {
+        let reopened = if current.relative_path.is_empty() {
+            None
+        } else {
+            Some(
+                opened_root
+                    .open_directory(Path::new(&current.relative_path))
+                    .map_err(|source| {
+                        persisted_read_error(
+                            "reopen anchored artifact directory",
+                            current.listing_path.clone(),
+                            source,
+                        )
+                    })?,
+            )
+        };
+        let directory = reopened.as_ref().unwrap_or(&opened_root);
+        directory
+            .ensure_identity(current.identity)
+            .map_err(|source| {
+                persisted_read_error(
+                    "revalidate anchored artifact directory before enumeration",
+                    current.listing_path.clone(),
+                    source,
+                )
+            })?;
         directories = directories
             .checked_add(1)
             .ok_or(GenerationStoreError::SizeOverflow {
@@ -3805,8 +4246,8 @@ fn measure_anchored_artifact_tree(
             .observe_depth(current.depth)
             .map_err(GenerationStoreError::Budget)?;
 
-        let directory_entries = fs::read_dir(&current.listing_path).map_err(|source| {
-            GenerationStoreError::io(
+        let directory_entries = directory.entries().map_err(|source| {
+            persisted_read_error(
                 "enumerate anchored artifact names",
                 current.listing_path.clone(),
                 source,
@@ -3818,7 +4259,7 @@ fn measure_anchored_artifact_tree(
                 .and_then(|()| budget.check_members(1))
                 .map_err(GenerationStoreError::Budget)?;
             let listing_entry = listing_entry.map_err(|source| {
-                GenerationStoreError::io(
+                persisted_read_error(
                     "read anchored artifact name",
                     current.listing_path.clone(),
                     source,
@@ -3829,57 +4270,47 @@ fn measure_anchored_artifact_tree(
                 .and_then(|()| budget.consume_members(1))
                 .map_err(GenerationStoreError::Budget)?;
 
-            let name = listing_entry.file_name();
+            let hint = listing_entry.kind();
+            let name = listing_entry.into_name();
             let display_path = current.listing_path.join(&name);
             let relative_path =
                 anchored_relative_path(&current.relative_path, &name, &display_path, budget)?;
-            let file_type = listing_entry.file_type().map_err(|source| {
-                GenerationStoreError::io(
-                    "inspect anchored artifact name type",
-                    display_path.clone(),
-                    source,
-                )
-            })?;
+            let opened = open_anchored_artifact_entry(directory, &name, hint, &display_path)?;
 
-            if file_type.is_symlink() {
-                return Err(persisted_link_error(display_path));
-            }
-            if file_type.is_dir() {
-                let directory = current.directory.open_directory(&name).map_err(|source| {
-                    persisted_read_error(
-                        "open anchored artifact directory",
-                        display_path.clone(),
-                        source,
-                    )
-                })?;
-                let depth =
-                    current
-                        .depth
-                        .checked_add(1)
-                        .ok_or(GenerationStoreError::SizeOverflow {
-                            resource: "anchored artifact tree depth",
+            let file =
+                match opened {
+                    OpenedArtifactEntry::Directory(child_directory) => {
+                        let depth = current.depth.checked_add(1).ok_or(
+                            GenerationStoreError::SizeOverflow {
+                                resource: "anchored artifact tree depth",
+                            },
+                        )?;
+                        budget
+                            .check_depth(depth)
+                            .map_err(GenerationStoreError::Budget)?;
+                        reserve_artifact_vec(
+                            &mut pending,
+                            1,
+                            "anchored artifact directory traversal stack",
+                            budget,
+                        )?;
+                        let identity = child_directory.stable_identity().map_err(|source| {
+                            persisted_read_error(
+                                "capture anchored artifact child identity",
+                                display_path.clone(),
+                                source,
+                            )
                         })?;
-                budget
-                    .check_depth(depth)
-                    .map_err(GenerationStoreError::Budget)?;
-                reserve_artifact_vec(
-                    &mut pending,
-                    1,
-                    "anchored artifact directory traversal stack",
-                    budget,
-                )?;
-                pending.push(AnchoredArtifactDirectory {
-                    directory,
-                    listing_path: display_path,
-                    relative_path,
-                    depth,
-                });
-                continue;
-            }
-
-            let file = current.directory.open_regular(&name).map_err(|source| {
-                persisted_read_error("open anchored artifact file", display_path.clone(), source)
-            })?;
+                        pending.push(AnchoredArtifactDirectory {
+                            listing_path: display_path,
+                            relative_path,
+                            depth,
+                            identity,
+                        });
+                        continue;
+                    }
+                    OpenedArtifactEntry::Regular(file) => file,
+                };
             let bytes = file.length();
             total_bytes =
                 total_bytes
@@ -3941,6 +4372,15 @@ fn measure_anchored_artifact_tree(
                 digest,
             });
         }
+        directory
+            .ensure_identity(current.identity)
+            .map_err(|source| {
+                persisted_read_error(
+                    "revalidate anchored artifact directory",
+                    current.listing_path.clone(),
+                    source,
+                )
+            })?;
     }
 
     entries.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -4606,6 +5046,9 @@ fn persisted_read_error(
 ) -> GenerationStoreError {
     match source {
         SecureReadError::Io(source) => GenerationStoreError::io(operation, path, source),
+        SecureReadError::UnsupportedPlatform => {
+            GenerationStoreError::UnsupportedPlatform { operation, path }
+        }
         SecureReadError::LinkOrReparse => persisted_link_error(path),
         SecureReadError::NotDirectory => GenerationStoreError::NotDirectory { path },
         SecureReadError::NotRegular => GenerationStoreError::UnsupportedFileType { path },
@@ -4921,6 +5364,13 @@ impl SourceStateError {
     fn store(error: GenerationStoreError) -> Self {
         Self::Store(Box::new(error))
     }
+
+    fn from_load_error(error: GenerationStoreError) -> Self {
+        match error {
+            GenerationStoreError::Budget(source) => Self::Budget(BudgetedJsonError::Budget(source)),
+            error => Self::store(error),
+        }
+    }
 }
 
 impl fmt::Display for SourceStateError {
@@ -5075,6 +5525,15 @@ pub(crate) enum GenerationStoreError {
         path: PathBuf,
         source: io::Error,
     },
+    PrivateIndexRoot {
+        operation: &'static str,
+        path: PathBuf,
+        source: PrivateRootsError,
+    },
+    UnsupportedPlatform {
+        operation: &'static str,
+        path: PathBuf,
+    },
     WriterLeaseUnavailable {
         path: PathBuf,
         source: io::Error,
@@ -5205,6 +5664,7 @@ impl GenerationStoreError {
                 | Self::NotDirectory { .. }
                 | Self::UnsupportedFileType { .. }
                 | Self::PersistedIdentityChanged { .. }
+                | Self::PrivateIndexRoot { .. }
         )
     }
 
@@ -5215,6 +5675,7 @@ impl GenerationStoreError {
                 Self::Budget(_)
                     | Self::AllocationFailed { .. }
                     | Self::ActivationCandidateLimitExceeded { .. }
+                    | Self::UnsupportedPlatform { .. }
             )
         {
             return true;
@@ -5278,6 +5739,20 @@ impl fmt::Display for GenerationStoreError {
             } => write!(
                 formatter,
                 "{operation} failed for {}: {source}",
+                path.display()
+            ),
+            Self::PrivateIndexRoot {
+                operation,
+                path,
+                source,
+            } => write!(
+                formatter,
+                "{operation} failed for {}: {source}",
+                path.display()
+            ),
+            Self::UnsupportedPlatform { operation, path } => write!(
+                formatter,
+                "{operation} is unsupported on this platform for {}",
                 path.display()
             ),
             Self::WriterLeaseUnavailable { path, source } => write!(
@@ -5448,6 +5923,7 @@ impl Error for GenerationStoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::PrivateIndexRoot { source, .. } => Some(source),
             Self::WriterLeaseUnavailable { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
             Self::ContractJson { source, .. } => Some(source),
@@ -5466,6 +5942,7 @@ mod reference_generation_tests;
 #[cfg(test)]
 mod generation_store_tests {
     use super::*;
+    use unity_asset_core::AssetLoadLimits;
 
     #[test]
     fn anchored_artifact_measurement_honors_the_exact_caller_budget() {
@@ -5477,7 +5954,7 @@ mod generation_store_tests {
         let mut measured = AssetLoadBudget::default();
         let evidence = measure_anchored_artifact_tree(
             temporary.path(),
-            SecureReadDirectory::open(temporary.path()).unwrap(),
+            SecureReadDirectory::open(temporary.path(), OpenPolicy::PersistedState).unwrap(),
             &mut measured,
         )
         .unwrap();
@@ -5494,7 +5971,7 @@ mod generation_store_tests {
         let mut exact = AssetLoadBudget::new(exact_limits).unwrap();
         let exact_evidence = measure_anchored_artifact_tree(
             temporary.path(),
-            SecureReadDirectory::open(temporary.path()).unwrap(),
+            SecureReadDirectory::open(temporary.path(), OpenPolicy::PersistedState).unwrap(),
             &mut exact,
         )
         .unwrap();
@@ -5508,7 +5985,7 @@ mod generation_store_tests {
         .unwrap();
         let error = measure_anchored_artifact_tree(
             temporary.path(),
-            SecureReadDirectory::open(temporary.path()).unwrap(),
+            SecureReadDirectory::open(temporary.path(), OpenPolicy::PersistedState).unwrap(),
             &mut one_byte_short,
         )
         .unwrap_err();
@@ -5522,11 +5999,31 @@ mod generation_store_tests {
     }
 
     #[test]
+    fn anchored_artifact_measurement_keeps_wide_tree_handles_bounded() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        for ordinal in 0..1_200 {
+            fs::create_dir(temporary.path().join(format!("child-{ordinal:04}"))).unwrap();
+        }
+
+        let mut budget = AssetLoadBudget::default();
+        let evidence = measure_anchored_artifact_tree(
+            temporary.path(),
+            SecureReadDirectory::open(temporary.path(), OpenPolicy::PersistedState).unwrap(),
+            &mut budget,
+        )
+        .unwrap();
+
+        assert_eq!(evidence.files(), 0);
+        assert_eq!(budget.usage().entries, 1_200);
+    }
+
+    #[test]
     fn activation_materialization_is_budgeted_before_typed_deserialization() {
         let temporary = tempfile::TempDir::new().unwrap();
         let path = temporary.path().join("activation.json");
         fs::write(&path, br#"{"contract_version":"invalid"}"#).unwrap();
-        let directory = SecureReadDirectory::open(temporary.path()).unwrap();
+        let directory =
+            SecureReadDirectory::open(temporary.path(), OpenPolicy::PersistedState).unwrap();
 
         let mut measured_budget = AssetLoadBudget::default();
         let error = read_activation_record(
@@ -5582,7 +6079,7 @@ mod generation_store_tests {
                 &mut candidates,
                 ActivationCandidate {
                     ordinal: u64::try_from(ordinal).unwrap(),
-                    path: PathBuf::new(),
+                    display_path: PathBuf::new(),
                     file_name: OsString::new(),
                 },
                 None,
@@ -5595,7 +6092,7 @@ mod generation_store_tests {
                 &mut candidates,
                 ActivationCandidate {
                     ordinal: u64::try_from(MAX_ACTIVATION_CANDIDATES).unwrap(),
-                    path: PathBuf::new(),
+                    display_path: PathBuf::new(),
                     file_name: OsString::new(),
                 },
                 None,
@@ -5603,6 +6100,191 @@ mod generation_store_tests {
             Err(GenerationStoreError::ActivationCandidateLimitExceeded {
                 maximum: MAX_ACTIVATION_CANDIDATES
             })
+        ));
+    }
+
+    #[test]
+    fn activation_snapshot_rejects_a_higher_head_or_candidate_replacement_before_selection() {
+        for replace_existing in [false, true] {
+            let temporary = tempfile::TempDir::new().unwrap();
+            let activations = temporary.path().join("activations");
+            let staging = temporary.path().join("staging");
+            let generations = temporary.path().join("generations");
+            fs::create_dir(&activations).unwrap();
+            fs::create_dir(&staging).unwrap();
+            fs::create_dir(&generations).unwrap();
+            let first = activations.join(activation_file_name(1));
+            if replace_existing {
+                fs::write(&first, b"{}").unwrap();
+            }
+            let opened_activations =
+                SecureReadDirectory::open(&activations, OpenPolicy::PersistedState).unwrap();
+            let opened_staging =
+                SecureReadDirectory::open(&staging, OpenPolicy::PersistedState).unwrap();
+            let opened_generations =
+                SecureReadDirectory::open(&generations, OpenPolicy::PersistedState).unwrap();
+            let mut budget = AssetLoadBudget::default();
+            let snapshot = activation_candidates_for_open(
+                &activations,
+                &opened_activations,
+                &staging,
+                &opened_staging,
+                &mut budget,
+            )
+            .unwrap();
+
+            if replace_existing {
+                fs::remove_file(&first).unwrap();
+                fs::write(&first, b"{\"ordinal\":1}").unwrap();
+            } else {
+                fs::write(activations.join(activation_file_name(2)), b"{}").unwrap();
+            }
+
+            let error = select_active_generation(
+                &activations,
+                &generations,
+                &opened_generations,
+                &opened_activations,
+                &snapshot,
+                &mut budget,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                GenerationStoreError::PersistedIdentityChanged { path } if path == activations
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_enumeration_rejects_display_path_rebinding() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let activations = temporary.path().join("activations");
+        let anchored_activations = temporary.path().join("anchored-activations");
+        let staging = temporary.path().join("staging");
+        fs::create_dir(&activations).unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::write(activations.join(activation_file_name(7)), b"{}").unwrap();
+        let opened_activations =
+            SecureReadDirectory::open(&activations, OpenPolicy::PersistedState).unwrap();
+        let opened_staging =
+            SecureReadDirectory::open(&staging, OpenPolicy::PersistedState).unwrap();
+        fs::rename(&activations, &anchored_activations).unwrap();
+        fs::create_dir(&activations).unwrap();
+
+        let error = activation_candidates_for_open(
+            &activations,
+            &opened_activations,
+            &staging,
+            &opened_staging,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GenerationStoreError::PersistedIdentityChanged { path } if path == activations
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_enumeration_rejects_unknown_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::TempDir::new().unwrap();
+        let activations = temporary.path().join("activations");
+        let staging = temporary.path().join("staging");
+        fs::create_dir(&activations).unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::write(temporary.path().join("outside.json"), b"{}").unwrap();
+        symlink("../outside.json", activations.join("unknown-link")).unwrap();
+        let opened_activations =
+            SecureReadDirectory::open(&activations, OpenPolicy::PersistedState).unwrap();
+        let opened_staging =
+            SecureReadDirectory::open(&staging, OpenPolicy::PersistedState).unwrap();
+
+        let error = activation_candidates_for_open(
+            &activations,
+            &opened_activations,
+            &staging,
+            &opened_staging,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, GenerationStoreError::Symlink { .. }));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn private_root_is_revalidated_on_reopen_and_before_generation_publication() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::generation::{GenerationProjectionDigests, SearchGenerationIdentityV1};
+
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root_path = temporary.path().join("index");
+        let project_identity =
+            unity_asset_search_local::ProjectIdentityV1::for_existing_root(temporary.path())
+                .unwrap();
+        let private_root =
+            PrivateIndexRootV1::open_or_create_for_project_override(project_identity, &root_path)
+                .unwrap();
+        let mut store = GenerationStore::open_private(
+            private_root.clone(),
+            GenerationStoreOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let mut build = store.begin().unwrap();
+        fs::write(build.search_directory().join("segments"), b"search").unwrap();
+        fs::write(build.reference_directory().join("segments"), b"references").unwrap();
+
+        let workspace = WorkspaceId::from_u128(0x7a).unwrap();
+        let revision = WorkspaceRevision::new(DigestV1::hash_bytes(b"revision"));
+        let source_state = SourceStateSnapshot::new(
+            workspace,
+            revision,
+            TransactionReceiptWindow::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        build
+            .write_source_state(&source_state, SourceStateLimits::default())
+            .unwrap();
+        let evidence = store.measure_artifacts(&build).unwrap();
+        let identity = SearchGenerationIdentityV1::new(
+            workspace,
+            revision,
+            GenerationProjectionDigests::new(
+                DigestV1::hash_bytes(b"search"),
+                DigestV1::hash_bytes(b"references"),
+            ),
+            Default::default(),
+            None,
+            Vec::new(),
+            DigestV1::hash_bytes(b"options"),
+            source_state.logical_digest(),
+        )
+        .unwrap();
+        let manifest = SearchGenerationManifestV1::new(identity, evidence);
+
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(
+            store.prepare_publish(&mut build, manifest),
+            Err(GenerationStoreError::PrivateIndexRoot { .. })
+        ));
+        assert!(matches!(
+            GenerationStore::open_private(
+                private_root,
+                GenerationStoreOptions::default(),
+                &mut AssetLoadBudget::default(),
+            ),
+            Err(GenerationStoreError::PrivateIndexRoot { .. })
         ));
     }
 }

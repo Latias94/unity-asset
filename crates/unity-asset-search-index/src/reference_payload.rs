@@ -14,8 +14,8 @@ use unity_asset_core::{
 };
 
 use crate::analysis::ReferenceProjectionFact;
+use crate::anchored_fs::{AnchoredFsError as SecureReadError, RegularFile, RegularFileRange};
 use crate::projection::ReferenceDocument;
-use crate::state::secure_read::{RegularFile, SecureReadError};
 
 pub(crate) const REFERENCE_PAYLOAD_FILE: &str = "reference-payload-v2.jsonl";
 pub(crate) const MAX_REFERENCE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
@@ -569,15 +569,12 @@ impl Write for MeasuringWriter<'_> {
 }
 
 struct DigestingReader<'reader> {
-    reader: crate::state::secure_read::RegularFileRange<'reader>,
+    reader: RegularFileRange<'reader>,
     digest: DigestV1Builder,
 }
 
 impl<'reader> DigestingReader<'reader> {
-    fn new(
-        reader: crate::state::secure_read::RegularFileRange<'reader>,
-        declared_length: u64,
-    ) -> Self {
+    fn new(reader: RegularFileRange<'reader>, declared_length: u64) -> Self {
         Self {
             reader,
             digest: DigestV1Builder::new(declared_length),
@@ -609,7 +606,7 @@ mod tests {
 
     use super::*;
     use crate::analysis::{RawReferenceProjection, ReferenceResolutionProjection};
-    use crate::state::secure_read::ReadDirectory;
+    use crate::anchored_fs::{OpenPolicy, ReadDirectory};
 
     fn projected_reference() -> ReferenceDocument {
         let source_object =
@@ -645,7 +642,7 @@ mod tests {
     fn open_reader(bytes: &[u8]) -> (TempDir, ReferencePayloadReader) {
         let directory = tempdir().unwrap();
         fs::write(directory.path().join(REFERENCE_PAYLOAD_FILE), bytes).unwrap();
-        let opened = ReadDirectory::open(directory.path()).unwrap();
+        let opened = ReadDirectory::open(directory.path(), OpenPolicy::PersistedState).unwrap();
         let file = opened
             .open_regular(OsStr::new(REFERENCE_PAYLOAD_FILE))
             .unwrap();
@@ -659,7 +656,7 @@ mod tests {
         let mut writer = ReferencePayloadWriter::create(directory.path()).unwrap();
         let location = writer.append(document, 1024 * 1024).unwrap();
         writer.finish().unwrap();
-        let opened = ReadDirectory::open(directory.path()).unwrap();
+        let opened = ReadDirectory::open(directory.path(), OpenPolicy::PersistedState).unwrap();
         let file = opened
             .open_regular(OsStr::new(REFERENCE_PAYLOAD_FILE))
             .unwrap();

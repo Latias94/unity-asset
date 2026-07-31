@@ -12,6 +12,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use unity_asset_search_protocol::ProjectId;
 
+use crate::project::ProjectIdentityV1;
 use crate::publication::{self, PublicationSlots};
 use crate::security_context::CurrentSecurityContextSnapshot;
 use crate::{SecurityContextError, SecurityContextIdV1};
@@ -24,6 +25,7 @@ const ENDPOINT_BINDING_LOCK_FILE: &str = ".binding-v1.lock";
 const ENDPOINT_BINDING_STAGING_FILE: &str = ".binding-v1.staging";
 const ENDPOINT_BINDING_VERSION: u16 = 1;
 const MAX_ENDPOINT_BINDING_BYTES: u64 = 512;
+const PRIVATE_INDEX_ROOT_PREFIX: &str = "index-v1-";
 const ENDPOINT_BINDING_PUBLICATION: PublicationSlots =
     PublicationSlots::new(ENDPOINT_BINDING_FILE, ENDPOINT_BINDING_STAGING_FILE, None);
 
@@ -46,7 +48,7 @@ pub struct PrivateRootV1 {
     kind: PrivateRootKind,
     path: PathBuf,
     security_context_id: SecurityContextIdV1,
-    authority: platform::PrivateDirectory,
+    authority: Arc<platform::PrivateDirectory>,
 }
 
 impl PrivateRootV1 {
@@ -80,9 +82,7 @@ impl PrivateRootV1 {
                 actual: self.kind,
             });
         }
-        if project_id.as_bytes().iter().all(|byte| *byte == 0) {
-            return Err(PrivateRootsError::ZeroProjectId);
-        }
+        require_nonzero_project_id(project_id)?;
         let current = CurrentSecurityContextSnapshot::current()?;
         self.revalidate_for_context(&current)?;
         let component = endpoint_namespace_component(project_id, current.id());
@@ -105,6 +105,43 @@ impl PrivateRootV1 {
         };
         namespace.bind(&current)?;
         Ok(namespace)
+    }
+
+    pub fn index_root(
+        &self,
+        project_identity: ProjectIdentityV1,
+    ) -> Result<PrivateIndexRootV1, PrivateRootsError> {
+        if self.kind != PrivateRootKind::Cache {
+            return Err(PrivateRootsError::WrongRootKind {
+                expected: PrivateRootKind::Cache,
+                actual: self.kind,
+            });
+        }
+        let project_id = project_identity.project_id();
+        require_nonzero_project_id(project_id)?;
+        let current = CurrentSecurityContextSnapshot::current()?;
+        self.revalidate_for_context(&current)?;
+        let component = private_index_root_component(project_id);
+        let path = self.path.join(&component);
+        let authority = self
+            .authority
+            .create_private_child(OsStr::new(&component), &current)
+            .map_err(|source| PrivateRootsError::Filesystem {
+                kind: self.kind,
+                operation: "create project private index root",
+                path: path.clone(),
+                source,
+            })?;
+        let root = PrivateIndexRootV1 {
+            path,
+            project_id,
+            security_context_id: self.security_context_id,
+            parent_path: self.path.clone(),
+            parent_authority: Arc::clone(&self.authority),
+            authority: Arc::new(authority),
+        };
+        root.revalidate_for_context(&current)?;
+        Ok(root)
     }
 
     fn revalidate_for_context(
@@ -439,6 +476,47 @@ fn endpoint_namespace_component(
     format!("p-{}", hex::encode(&digest[..ENDPOINT_NAMESPACE_KEY_BYTES]))
 }
 
+fn private_index_root_component(project_id: ProjectId) -> String {
+    format!(
+        "{PRIVATE_INDEX_ROOT_PREFIX}{}",
+        hex::encode(project_id.as_bytes())
+    )
+}
+
+fn require_nonzero_project_id(project_id: ProjectId) -> Result<(), PrivateRootsError> {
+    if project_id.as_bytes().iter().all(|byte| *byte == 0) {
+        Err(PrivateRootsError::ZeroProjectId)
+    } else {
+        Ok(())
+    }
+}
+
+fn current_private_security_context() -> Result<CurrentSecurityContextSnapshot, PrivateRootsError> {
+    CurrentSecurityContextSnapshot::current().map_err(|error| match error {
+        SecurityContextError::UnsupportedPlatform => PrivateRootsError::UnsupportedPlatform,
+        error => PrivateRootsError::SecurityContext(error),
+    })
+}
+
+fn absolute_private_path(path: &Path) -> Result<PathBuf, PrivateRootsError> {
+    if path.as_os_str().is_empty() {
+        return Err(PrivateRootsError::InvalidIndexRootOverride {
+            path: path.to_path_buf(),
+        });
+    }
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|current| current.join(path))
+        .map_err(|source| PrivateRootsError::Filesystem {
+            kind: PrivateRootKind::Cache,
+            operation: "resolve explicit private index root",
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
 impl fmt::Debug for PrivateRootV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -450,6 +528,196 @@ impl fmt::Debug for PrivateRootV1 {
     }
 }
 
+/// A verified, per-user root for one project's persisted search index.
+///
+/// The default constructor derives this root from a stable project identity under the platform
+/// private cache root. An explicit override is accepted only after the platform proves that the
+/// final directory is an ordinary private directory without following links or reparse points.
+/// On Windows, persistent storage is private from other user SIDs; processes running as the same
+/// persistent user SID are inside the storage trust boundary even when their logon contexts differ.
+#[derive(Clone)]
+pub struct PrivateIndexRootV1 {
+    path: PathBuf,
+    project_id: ProjectId,
+    security_context_id: SecurityContextIdV1,
+    parent_path: PathBuf,
+    parent_authority: Arc<platform::PrivateDirectory>,
+    authority: Arc<platform::PrivateDirectory>,
+}
+
+impl PrivateIndexRootV1 {
+    /// Creates or reopens the default private cache root for a stable project identity.
+    pub fn for_project(project_identity: ProjectIdentityV1) -> Result<Self, PrivateRootsError> {
+        PrivateRootsV1::discover_for_current_context()?.index_root(project_identity)
+    }
+
+    fn open_override_base(path: &Path) -> Result<PrivateIndexOverrideBase, PrivateRootsError> {
+        let path = absolute_private_path(path)?;
+        let security_context = current_private_security_context()?;
+        let security_context_id = security_context.id();
+        let authority =
+            platform::open_or_create_private_path(&path, &security_context).map_err(|source| {
+                PrivateRootsError::Filesystem {
+                    kind: PrivateRootKind::Cache,
+                    operation: "open or create explicit private index root",
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+        let path = authority.canonical_path(&path);
+        let base = PrivateIndexOverrideBase {
+            path,
+            security_context_id,
+            authority: Arc::new(authority),
+        };
+        base.revalidate_for_context(&security_context)?;
+        Ok(base)
+    }
+
+    /// Creates or reopens a project-specific root under an explicit private base directory.
+    ///
+    /// The base and derived child are created with the platform private-directory policy when
+    /// absent. Existing directories must already satisfy that policy; permissive directories,
+    /// links, and reparse points are rejected. Deriving a child from the project identity prevents
+    /// one override from exposing another project's generations.
+    pub fn open_or_create_for_project_override(
+        project_identity: ProjectIdentityV1,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, PrivateRootsError> {
+        let project_id = project_identity.project_id();
+        require_nonzero_project_id(project_id)?;
+        let base = Self::open_override_base(path.as_ref())?;
+        let current = CurrentSecurityContextSnapshot::current()?;
+        if current.id() != base.security_context_id {
+            return Err(PrivateRootsError::SecurityContextChanged);
+        }
+        let component = private_index_root_component(project_id);
+        let requested_path = base.path.join(&component);
+        let authority = base
+            .authority
+            .create_private_child(OsStr::new(&component), &current)
+            .map_err(|source| PrivateRootsError::Filesystem {
+                kind: PrivateRootKind::Cache,
+                operation: "create project child under explicit private index root",
+                path: requested_path.clone(),
+                source,
+            })?;
+        let path = authority.canonical_path(&requested_path);
+        let root = Self {
+            path,
+            project_id,
+            security_context_id: base.security_context_id,
+            parent_path: base.path,
+            parent_authority: base.authority,
+            authority: Arc::new(authority),
+        };
+        root.revalidate_for_context(&current)?;
+        Ok(root)
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the private namespace that contains all project-specific index roots.
+    ///
+    /// This path describes storage topology only. It may be an ancestor of a project and therefore
+    /// must not be used directly as a project source exclusion.
+    #[must_use]
+    pub fn namespace_path(&self) -> &Path {
+        &self.parent_path
+    }
+
+    #[must_use]
+    pub const fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+
+    #[must_use]
+    pub const fn security_context_id(&self) -> SecurityContextIdV1 {
+        self.security_context_id
+    }
+
+    pub fn revalidate(&self) -> Result<(), PrivateRootsError> {
+        let current = CurrentSecurityContextSnapshot::current()?;
+        self.revalidate_for_context(&current)
+    }
+
+    fn revalidate_for_context(
+        &self,
+        current: &CurrentSecurityContextSnapshot,
+    ) -> Result<(), PrivateRootsError> {
+        if current.id() != self.security_context_id {
+            return Err(PrivateRootsError::SecurityContextChanged);
+        }
+        self.parent_authority
+            .revalidate(&self.parent_path, current)
+            .map_err(|source| PrivateRootsError::Filesystem {
+                kind: PrivateRootKind::Cache,
+                operation: "revalidate private index parent root",
+                path: self.parent_path.clone(),
+                source,
+            })?;
+        self.authority
+            .revalidate(&self.path, current)
+            .map_err(|source| PrivateRootsError::Filesystem {
+                kind: PrivateRootKind::Cache,
+                operation: "revalidate project private index root",
+                path: self.path.clone(),
+                source,
+            })
+    }
+}
+
+impl PartialEq for PrivateIndexRootV1 {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.project_id == other.project_id
+            && self.security_context_id == other.security_context_id
+            && self.parent_path == other.parent_path
+    }
+}
+
+impl Eq for PrivateIndexRootV1 {}
+
+impl fmt::Debug for PrivateIndexRootV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateIndexRootV1")
+            .field("path", &self.path)
+            .field("parent_path", &self.parent_path)
+            .field("project_id", &self.project_id)
+            .field("security_context_id", &self.security_context_id)
+            .finish_non_exhaustive()
+    }
+}
+
+struct PrivateIndexOverrideBase {
+    path: PathBuf,
+    security_context_id: SecurityContextIdV1,
+    authority: Arc<platform::PrivateDirectory>,
+}
+
+impl PrivateIndexOverrideBase {
+    fn revalidate_for_context(
+        &self,
+        current: &CurrentSecurityContextSnapshot,
+    ) -> Result<(), PrivateRootsError> {
+        if current.id() != self.security_context_id {
+            return Err(PrivateRootsError::SecurityContextChanged);
+        }
+        self.authority
+            .revalidate(&self.path, current)
+            .map_err(|source| PrivateRootsError::Filesystem {
+                kind: PrivateRootKind::Cache,
+                operation: "revalidate explicit private index base",
+                path: self.path.clone(),
+                source,
+            })
+    }
+}
+
 pub struct PrivateRootsV1 {
     security_context_id: SecurityContextIdV1,
     runtime: PrivateRootV1,
@@ -458,11 +726,7 @@ pub struct PrivateRootsV1 {
 
 impl PrivateRootsV1 {
     pub fn discover_for_current_context() -> Result<Self, PrivateRootsError> {
-        let security_context =
-            CurrentSecurityContextSnapshot::current().map_err(|error| match error {
-                SecurityContextError::UnsupportedPlatform => PrivateRootsError::UnsupportedPlatform,
-                error => PrivateRootsError::SecurityContext(error),
-            })?;
+        let security_context = current_private_security_context()?;
         let security_context_id = security_context.id();
         let discovered = platform::discover(&security_context)?;
         Ok(Self {
@@ -471,13 +735,13 @@ impl PrivateRootsV1 {
                 kind: PrivateRootKind::Runtime,
                 path: discovered.runtime_path,
                 security_context_id,
-                authority: discovered.runtime,
+                authority: Arc::new(discovered.runtime),
             },
             cache: PrivateRootV1 {
                 kind: PrivateRootKind::Cache,
                 path: discovered.cache_path,
                 security_context_id,
-                authority: discovered.cache,
+                authority: Arc::new(discovered.cache),
             },
         })
     }
@@ -495,6 +759,13 @@ impl PrivateRootsV1 {
     #[must_use]
     pub const fn cache(&self) -> &PrivateRootV1 {
         &self.cache
+    }
+
+    pub fn index_root(
+        &self,
+        project_identity: ProjectIdentityV1,
+    ) -> Result<PrivateIndexRootV1, PrivateRootsError> {
+        self.cache.index_root(project_identity)
     }
 
     pub fn revalidate(&self) -> Result<(), PrivateRootsError> {
@@ -526,6 +797,8 @@ pub enum PrivateRootsError {
         variable: &'static str,
         reason: &'static str,
     },
+    #[error("private index root override is invalid: {path}")]
+    InvalidIndexRootOverride { path: PathBuf },
     #[error("the effective user has no usable home directory")]
     MissingHomeDirectory,
     #[error("project ID must not be zero")]
@@ -656,12 +929,23 @@ mod platform {
     }
     const PRIVATE_MODE: u32 = 0o700;
 
+    #[derive(Clone, Copy)]
+    enum AncestorPolicy {
+        Standard,
+        Strict,
+    }
+
     pub(super) struct PrivateDirectory {
         descriptor: OwnedFd,
         identity: DirectoryIdentity,
+        ancestor_policy: AncestorPolicy,
     }
 
     impl PrivateDirectory {
+        pub(super) fn canonical_path(&self, requested: &Path) -> PathBuf {
+            requested.to_path_buf()
+        }
+
         pub(super) fn revalidate(
             &self,
             path: &Path,
@@ -673,7 +957,10 @@ mod platform {
                     "private directory identity changed during revalidation",
                 ));
             }
-            let reopened = open_path(path)?;
+            let reopened = match self.ancestor_policy {
+                AncestorPolicy::Standard => open_path(path)?,
+                AncestorPolicy::Strict => open_strict_path(path, expected_uid)?,
+            };
             if validate_private_directory(&reopened, expected_uid)? != self.identity {
                 return Err(io::Error::other(
                     "private directory identity changed during revalidation",
@@ -687,7 +974,12 @@ mod platform {
             name: &OsStr,
             security_context: &CurrentSecurityContextSnapshot,
         ) -> io::Result<Self> {
-            create_or_open_private_child(&self.descriptor, name, security_context.effective_uid())
+            create_or_open_private_child_with_policy(
+                &self.descriptor,
+                name,
+                security_context.effective_uid(),
+                self.ancestor_policy,
+            )
         }
 
         pub(super) fn create_private_file(
@@ -776,6 +1068,24 @@ mod platform {
     struct DirectoryIdentity {
         device: u64,
         inode: u64,
+    }
+
+    pub(super) fn open_or_create_private_path(
+        path: &Path,
+        security_context: &CurrentSecurityContextSnapshot,
+    ) -> io::Result<PrivateDirectory> {
+        let parent_path = path.parent().ok_or_else(invalid_path)?;
+        let name = path.file_name().ok_or_else(invalid_path)?;
+        let expected_uid = security_context.effective_uid();
+        let parent = open_strict_path(parent_path, expected_uid)?;
+        let directory = create_or_open_private_child_with_policy(
+            &parent,
+            name,
+            expected_uid,
+            AncestorPolicy::Strict,
+        )?;
+        directory.revalidate(path, security_context)?;
+        Ok(directory)
     }
 
     pub(super) fn discover(
@@ -947,6 +1257,20 @@ mod platform {
         name: &OsStr,
         expected_uid: u32,
     ) -> io::Result<PrivateDirectory> {
+        create_or_open_private_child_with_policy(
+            parent,
+            name,
+            expected_uid,
+            AncestorPolicy::Standard,
+        )
+    }
+
+    fn create_or_open_private_child_with_policy(
+        parent: &OwnedFd,
+        name: &OsStr,
+        expected_uid: u32,
+        ancestor_policy: AncestorPolicy,
+    ) -> io::Result<PrivateDirectory> {
         validate_leaf(name)?;
         let created = match mkdirat(parent, name, Mode::RWXU) {
             Ok(()) => true,
@@ -961,6 +1285,7 @@ mod platform {
         Ok(PrivateDirectory {
             descriptor,
             identity,
+            ancestor_policy,
         })
     }
 
@@ -978,6 +1303,8 @@ mod platform {
                 "private namespace file must be owner-only",
             ));
         }
+        #[cfg(target_os = "macos")]
+        macos_acl::require_empty(descriptor)?;
         if metadata.st_dev == 0 || metadata.st_ino == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -997,6 +1324,28 @@ mod platform {
             match component {
                 Component::RootDir => {}
                 Component::Normal(name) => descriptor = open_named_directory(&descriptor, name)?,
+                Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                    return Err(invalid_path());
+                }
+            }
+        }
+        Ok(descriptor)
+    }
+
+    fn open_strict_path(path: &Path, expected_uid: u32) -> io::Result<OwnedFd> {
+        if !path.is_absolute() {
+            return Err(invalid_path());
+        }
+        let mut descriptor = openat(CWD, Path::new("/"), directory_flags(), Mode::empty())
+            .map_err(io::Error::from)?;
+        validate_trusted_ancestor(&descriptor, expected_uid)?;
+        for component in path.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(name) => {
+                    descriptor = open_named_directory(&descriptor, name)?;
+                    validate_trusted_ancestor(&descriptor, expected_uid)?;
+                }
                 Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
                     return Err(invalid_path());
                 }
@@ -1035,6 +1384,8 @@ mod platform {
                 "private directory must be owned by the effective user with mode 0700",
             ));
         }
+        #[cfg(target_os = "macos")]
+        macos_acl::require_empty(directory)?;
         Ok(identity)
     }
 
@@ -1051,7 +1402,176 @@ mod platform {
                 "cache base must be owned by the effective user and not group/other writable",
             ));
         }
+        #[cfg(target_os = "macos")]
+        macos_acl::reject_allow_entries(directory)?;
         Ok(())
+    }
+
+    fn validate_trusted_ancestor(directory: &OwnedFd, expected_uid: u32) -> io::Result<()> {
+        crate::local_filesystem::validate_local_directory(directory)?;
+        let metadata = fstat(directory.as_fd()).map_err(io::Error::from)?;
+        directory_identity(&metadata)?;
+        let owner_is_trusted = metadata.st_uid == expected_uid || metadata.st_uid == 0;
+        let mode = metadata.st_mode as u32;
+        let mutation_is_private = mode & 0o022 == 0;
+        let sticky_namespace = owner_is_trusted && mode & 0o1000 != 0;
+        if !owner_is_trusted || (!mutation_is_private && !sticky_namespace) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private override ancestor is writable by an untrusted principal",
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        macos_acl::reject_allow_entries(directory)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    mod macos_acl {
+        use std::ffi::c_void;
+        use std::io;
+        use std::os::fd::{AsRawFd as _, OwnedFd};
+        use std::ptr::NonNull;
+
+        const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+        const ACL_FIRST_ENTRY: libc::c_int = 0;
+        const ACL_NEXT_ENTRY: libc::c_int = -1;
+        const ACL_EXTENDED_ALLOW: libc::c_int = 1;
+        const ACL_EXTENDED_DENY: libc::c_int = 2;
+
+        type Acl = *mut c_void;
+        type AclEntry = *mut c_void;
+
+        unsafe extern "C" {
+            fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> Acl;
+            fn acl_get_entry(acl: Acl, entry_id: libc::c_int, entry: *mut AclEntry) -> libc::c_int;
+            fn acl_get_tag_type(entry: AclEntry, tag_type: *mut libc::c_int) -> libc::c_int;
+            fn acl_free(object: *mut c_void) -> libc::c_int;
+            fn acl_valid(acl: Acl) -> libc::c_int;
+        }
+
+        struct OwnedAcl(NonNull<c_void>);
+
+        impl OwnedAcl {
+            fn read(descriptor: &OwnedFd) -> io::Result<Option<Self>> {
+                clear_errno();
+                // SAFETY: the descriptor is live and the ACL type is the Darwin extended type.
+                let acl = unsafe { acl_get_fd_np(descriptor.as_raw_fd(), ACL_TYPE_EXTENDED) };
+                let Some(acl) = NonNull::new(acl) else {
+                    let errno = current_errno();
+                    return match errno {
+                        libc::ENOENT => Ok(None),
+                        0 => Err(io::Error::other(
+                            "macOS returned no extended ACL without reporting its absence",
+                        )),
+                        _ => Err(io::Error::from_raw_os_error(errno)),
+                    };
+                };
+                // SAFETY: `acl_get_fd_np` returned owned ACL working storage.
+                if unsafe { acl_valid(acl.as_ptr()) } != 0 {
+                    return Err(last_acl_error("macOS returned an invalid extended ACL"));
+                }
+                Ok(Some(Self(acl)))
+            }
+
+            fn next_entry(&self, entry_id: libc::c_int) -> io::Result<Option<AclEntry>> {
+                let mut entry = std::ptr::null_mut();
+                clear_errno();
+                // SAFETY: the ACL allocation is valid and `entry` is a writable output pointer.
+                let status = unsafe { acl_get_entry(self.0.as_ptr(), entry_id, &raw mut entry) };
+                if status == 0 {
+                    if entry.is_null() {
+                        return Err(io::Error::other("macOS returned a null extended ACL entry"));
+                    }
+                    return Ok(Some(entry));
+                }
+                let errno = current_errno();
+                if status == -1 && errno == libc::EINVAL {
+                    return Ok(None);
+                }
+                Err(last_acl_error("macOS could not enumerate an extended ACL"))
+            }
+
+            fn tag_type(&self, entry: AclEntry) -> io::Result<libc::c_int> {
+                let mut tag_type = 0;
+                clear_errno();
+                // SAFETY: `entry` was returned for this retained ACL allocation.
+                if unsafe { acl_get_tag_type(entry, &raw mut tag_type) } != 0 {
+                    return Err(last_acl_error(
+                        "macOS could not inspect an extended ACL entry",
+                    ));
+                }
+                Ok(tag_type)
+            }
+        }
+
+        impl Drop for OwnedAcl {
+            fn drop(&mut self) {
+                // SAFETY: this allocation came from `acl_get_fd_np` and is freed exactly once.
+                let _ = unsafe { acl_free(self.0.as_ptr()) };
+            }
+        }
+
+        pub(super) fn require_empty(descriptor: &OwnedFd) -> io::Result<()> {
+            let Some(acl) = OwnedAcl::read(descriptor)? else {
+                return Ok(());
+            };
+            if acl.next_entry(ACL_FIRST_ENTRY)?.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private macOS object must not have an extended ACL",
+                ));
+            }
+            Ok(())
+        }
+
+        pub(super) fn reject_allow_entries(descriptor: &OwnedFd) -> io::Result<()> {
+            let Some(acl) = OwnedAcl::read(descriptor)? else {
+                return Ok(());
+            };
+            let mut entry_id = ACL_FIRST_ENTRY;
+            while let Some(entry) = acl.next_entry(entry_id)? {
+                match acl.tag_type(entry)? {
+                    ACL_EXTENDED_DENY => {}
+                    ACL_EXTENDED_ALLOW => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "macOS ancestor extended ACL contains an allow entry",
+                        ));
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "macOS ancestor extended ACL contains an unsupported entry type",
+                        ));
+                    }
+                }
+                entry_id = ACL_NEXT_ENTRY;
+            }
+            Ok(())
+        }
+
+        fn clear_errno() {
+            // SAFETY: `__error` returns the calling thread's writable errno slot on Darwin.
+            unsafe { *libc::__error() = 0 };
+        }
+
+        fn current_errno() -> libc::c_int {
+            // SAFETY: `__error` returns the calling thread's readable errno slot on Darwin.
+            unsafe { *libc::__error() }
+        }
+
+        fn last_acl_error(context: &'static str) -> io::Error {
+            let errno = current_errno();
+            if errno == 0 {
+                io::Error::other(context)
+            } else {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("{context}: {}", io::Error::from_raw_os_error(errno)),
+                )
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1197,6 +1717,8 @@ mod platform {
     mod tests {
         use std::fs;
         use std::os::unix::fs::{PermissionsExt as _, symlink};
+        #[cfg(target_os = "macos")]
+        use std::process::Command;
 
         use super::*;
 
@@ -1240,6 +1762,44 @@ mod platform {
         }
 
         #[test]
+        fn strict_override_rejects_a_non_sticky_world_writable_ancestor() {
+            let temporary = tempfile::tempdir().unwrap();
+            let unsafe_parent = temporary.path().join("unsafe-parent");
+            fs::create_dir(&unsafe_parent).unwrap();
+            fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
+            let override_path = unsafe_parent.join("index-base");
+            let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+
+            let error = open_or_create_private_path(&override_path, &security_context)
+                .err()
+                .unwrap();
+
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(!override_path.exists());
+        }
+
+        #[test]
+        fn strict_override_revalidation_detects_ancestor_permission_widening() {
+            let temporary = tempfile::tempdir().unwrap();
+            let stable_parent = temporary.path().join("stable-parent");
+            fs::create_dir(&stable_parent).unwrap();
+            fs::set_permissions(&stable_parent, fs::Permissions::from_mode(0o700)).unwrap();
+            let override_path = stable_parent.join("index-base");
+            let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+            let private = open_or_create_private_path(&override_path, &security_context).unwrap();
+
+            fs::set_permissions(&stable_parent, fs::Permissions::from_mode(0o777)).unwrap();
+
+            assert_eq!(
+                private
+                    .revalidate(&override_path, &security_context)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+
+        #[test]
         fn existing_insecure_child_is_rejected_without_permission_repair() {
             let temporary = tempfile::tempdir().unwrap();
             fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1265,6 +1825,84 @@ mod platform {
                 fs::metadata(&child).unwrap().permissions().mode() & 0o777,
                 0o750
             );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn private_directory_rejects_an_extended_acl_even_with_mode_0700() {
+            let temporary = tempfile::tempdir().unwrap();
+            fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let base = open_path(temporary.path()).unwrap();
+            let path = temporary.path().join("private");
+            let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+            let private = create_or_open_private_child(
+                &base,
+                OsStr::new("private"),
+                security_context.effective_uid(),
+            )
+            .unwrap();
+            add_macos_acl(&path, "everyone allow list,search");
+
+            let error = private.revalidate(&path, &security_context).unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn strict_override_rejects_an_ancestor_allow_acl_before_creation() {
+            let temporary = tempfile::tempdir().unwrap();
+            fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let ancestor = temporary.path().join("acl-ancestor");
+            fs::create_dir(&ancestor).unwrap();
+            fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700)).unwrap();
+            add_macos_acl(
+                &ancestor,
+                "everyone allow add_file,add_subdirectory,delete_child,file_inherit,directory_inherit",
+            );
+            let override_path = ancestor.join("index-base");
+            let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+
+            let error = open_or_create_private_path(&override_path, &security_context)
+                .err()
+                .unwrap();
+
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(!override_path.exists());
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn strict_override_allows_a_deny_only_ancestor_acl() {
+            let temporary = tempfile::tempdir().unwrap();
+            fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let ancestor = temporary.path().join("acl-ancestor");
+            fs::create_dir(&ancestor).unwrap();
+            fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700)).unwrap();
+            add_macos_acl(&ancestor, "everyone deny delete");
+            let override_path = ancestor.join("index-base");
+            let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+
+            let private = open_or_create_private_path(&override_path, &security_context).unwrap();
+
+            private
+                .revalidate(&override_path, &security_context)
+                .unwrap();
+        }
+
+        #[cfg(target_os = "macos")]
+        fn add_macos_acl(path: &Path, entry: &str) {
+            let status = Command::new("chmod")
+                .arg("+a")
+                .arg(entry)
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to install test ACL: {entry}");
         }
 
         #[test]
@@ -1360,6 +1998,10 @@ mod platform {
     pub(super) struct PrivateDirectory;
 
     impl PrivateDirectory {
+        pub(super) fn canonical_path(&self, requested: &Path) -> PathBuf {
+            requested.to_path_buf()
+        }
+
         pub(super) fn revalidate(
             &self,
             _path: &Path,
@@ -1439,6 +2081,16 @@ mod platform {
                 "private local roots are unsupported on this platform",
             ))
         }
+    }
+
+    pub(super) fn open_or_create_private_path(
+        _path: &Path,
+        _security_context: &CurrentSecurityContextSnapshot,
+    ) -> io::Result<PrivateDirectory> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private local roots are unsupported on this platform",
+        ))
     }
 
     pub(super) fn discover(

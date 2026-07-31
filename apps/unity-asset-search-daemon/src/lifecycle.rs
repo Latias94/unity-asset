@@ -1130,7 +1130,7 @@ mod tests {
             daemon_instance_id: DaemonInstanceId,
             panic_stage: Option<SupervisorPanicStage>,
         ) -> Self {
-            let project = tempfile::tempdir().unwrap();
+            let project = crate::secure_test_tempdir();
             fs::create_dir(project.path().join("Assets")).unwrap();
             fs::create_dir(project.path().join("ProjectSettings")).unwrap();
             let locator = ProjectLocatorV1::open(project.path()).unwrap();

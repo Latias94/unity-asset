@@ -91,6 +91,29 @@ pub struct ProjectIdentityV1 {
 }
 
 impl ProjectIdentityV1 {
+    /// Derives a stable identity for an existing local directory without asserting that it is a
+    /// Unity project. This is intended for path-scoped local state; callers that need Unity
+    /// project validation must use [`ProjectLocatorV1::open`].
+    pub fn for_existing_root(root: impl AsRef<Path>) -> Result<Self, ProjectLocatorError> {
+        let root = absolute_path(root.as_ref())?;
+        let authority =
+            platform::ReadDirectory::open(&root).map_err(|source| map_root_error(&root, source))?;
+        let platform_identity = authority
+            .identity()
+            .map_err(|source| map_root_error(&root, source))?;
+        let reopened =
+            platform::ReadDirectory::open(&root).map_err(|source| map_root_error(&root, source))?;
+        let rebound = reopened
+            .identity()
+            .map_err(|source| map_root_error(&root, source))?;
+        if rebound != platform_identity {
+            return Err(ProjectLocatorError::IdentityChanged { path: root });
+        }
+        Ok(Self {
+            project_id: derive_project_id(platform_identity)?,
+        })
+    }
+
     #[must_use]
     pub const fn project_id(self) -> ProjectId {
         self.project_id
@@ -238,6 +261,33 @@ pub enum ProjectLocatorError {
         #[source]
         source: io::Error,
     },
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod tests {
+    use std::fs;
+
+    use super::ProjectIdentityV1;
+
+    #[test]
+    fn existing_root_identity_survives_rename_but_not_copy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("original");
+        let renamed = temporary.path().join("renamed");
+        let copied = temporary.path().join("copied");
+        fs::create_dir(&original).unwrap();
+        fs::write(original.join("asset.txt"), b"content").unwrap();
+
+        let first = ProjectIdentityV1::for_existing_root(&original).unwrap();
+        fs::rename(&original, &renamed).unwrap();
+        let after_rename = ProjectIdentityV1::for_existing_root(&renamed).unwrap();
+        fs::create_dir(&copied).unwrap();
+        fs::copy(renamed.join("asset.txt"), copied.join("asset.txt")).unwrap();
+        let after_copy = ProjectIdentityV1::for_existing_root(&copied).unwrap();
+
+        assert_eq!(first.project_id(), after_rename.project_id());
+        assert_ne!(first.project_id(), after_copy.project_id());
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

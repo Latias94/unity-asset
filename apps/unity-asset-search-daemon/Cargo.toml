@@ -29,6 +29,9 @@ unity-asset-search-protocol = { workspace = true }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
+
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
 

@@ -312,7 +312,7 @@ mod platform {
         start.extend_from_slice(&information.pbi_start_tvsec.to_le_bytes());
         start.extend_from_slice(&information.pbi_start_tvusec.to_le_bytes());
 
-        if (information.pbi_start_tvsec == 0 && information.pbi_start_tvusec == 0) {
+        if information.pbi_start_tvsec == 0 && information.pbi_start_tvusec == 0 {
             return Err(ProcessIdentityError::UnsupportedStableIdentity {
                 process_id,
                 resource: "macOS process start",

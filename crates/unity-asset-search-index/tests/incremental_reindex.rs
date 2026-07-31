@@ -17,6 +17,8 @@ use unity_asset_search_protocol::{
     ReindexReceipt, SearchResponse, ValidateContract,
 };
 
+mod common;
+
 const OWNER_ALIAS: &str = "Assets/owner.prefab";
 const TARGET_ALIAS: &str = "Assets/target.prefab";
 const TARGET_GUID: &str = "0123456789abcdef0123456789abcdef";
@@ -64,7 +66,7 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = common::secure_tempdir();
     let project_root = temporary.path().join("project");
     let assets = project_root.join("Assets");
     fs::create_dir_all(&assets).unwrap();

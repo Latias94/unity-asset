@@ -24,6 +24,10 @@ use unity_asset_search_core::normalize_for_match;
 use unity_asset_search_protocol::{MAX_PORTABLE_PATH_BYTES, PortablePath};
 
 use crate::analysis::{RawReferenceProjection, ReferenceResolutionProjection};
+use crate::anchored_fs::{
+    AnchoredFsError as SecureReadError, OpenPolicy, ReadDirectory as SecureReadDirectory,
+    RegularFile,
+};
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
     SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
@@ -34,7 +38,6 @@ use crate::reference_payload::{
     ReferencePayloadWriter,
 };
 use crate::state::measure_artifact_tree;
-use crate::state::secure_read::{ReadDirectory as SecureReadDirectory, SecureReadError};
 use crate::wire;
 
 const SEARCH_ARTIFACT_DIRECTORY: &str = "search";
@@ -455,7 +458,7 @@ impl Directory for AnchoredTantivyDirectory {
 
 #[derive(Debug)]
 struct AnchoredTantivyFile {
-    file: Arc<crate::state::secure_read::RegularFile>,
+    file: Arc<RegularFile>,
 }
 
 impl HasLen for AnchoredTantivyFile {
@@ -514,8 +517,11 @@ impl ProjectionReaders {
 
         let search_directory = complete_generation_dir.join(SEARCH_ARTIFACT_DIRECTORY);
         let reference_directory = complete_generation_dir.join(REFERENCE_ARTIFACT_DIRECTORY);
-        let generation = SecureReadDirectory::open(complete_generation_dir)
-            .context("open completed projection generation directory without following links")?;
+        let generation =
+            SecureReadDirectory::open(complete_generation_dir, OpenPolicy::PersistedState)
+                .context(
+                    "open completed projection generation directory without following links",
+                )?;
         let opened_search = Arc::new(
             generation
                 .open_directory(OsStr::new(SEARCH_ARTIFACT_DIRECTORY))
@@ -545,7 +551,7 @@ impl ProjectionReaders {
 pub(crate) struct SearchProjectionReader {
     index: Index,
     reader: IndexReader,
-    path_catalog: Arc<crate::state::secure_read::RegularFile>,
+    path_catalog: Arc<RegularFile>,
 }
 
 impl SearchProjectionReader {
@@ -1098,7 +1104,7 @@ fn write_path_catalog(directory: &Path, projection: &GenerationProjection) -> Re
 fn open_path_catalog(
     directory: &SecureReadDirectory,
     directory_path: &Path,
-) -> Result<(crate::state::secure_read::RegularFile, u64)> {
+) -> Result<(RegularFile, u64)> {
     let path = directory_path.join(PATH_CATALOG_FILE);
     let file = directory
         .open_regular(OsStr::new(PATH_CATALOG_FILE))
@@ -1504,7 +1510,8 @@ mod tests {
             SEARCH_SCHEMA_VERSION,
         )
         .unwrap();
-        let opened = SecureReadDirectory::open(directory.path()).unwrap();
+        let opened =
+            SecureReadDirectory::open(directory.path(), OpenPolicy::PersistedState).unwrap();
 
         let mut measured = AssetLoadBudget::default();
         validate_schema_marker(
@@ -1563,7 +1570,8 @@ mod tests {
             let directory = tempdir().unwrap();
             write_schema_marker(directory.path(), REFERENCE_SCHEMA_CONTRACT, schema_version)
                 .unwrap();
-            let opened = SecureReadDirectory::open(directory.path()).unwrap();
+            let opened =
+                SecureReadDirectory::open(directory.path(), OpenPolicy::PersistedState).unwrap();
             let error = validate_schema_marker(
                 directory.path(),
                 &opened,
@@ -1582,7 +1590,7 @@ mod tests {
             REFERENCE_SCHEMA_VERSION + 1,
         )
         .unwrap();
-        let opened = SecureReadDirectory::open(future.path()).unwrap();
+        let opened = SecureReadDirectory::open(future.path(), OpenPolicy::PersistedState).unwrap();
         let error = validate_schema_marker(
             future.path(),
             &opened,
@@ -1600,7 +1608,8 @@ mod tests {
             REFERENCE_SCHEMA_VERSION - 1,
         )
         .unwrap();
-        let opened = SecureReadDirectory::open(wrong_projection.path()).unwrap();
+        let opened =
+            SecureReadDirectory::open(wrong_projection.path(), OpenPolicy::PersistedState).unwrap();
         let error = validate_schema_marker(
             wrong_projection.path(),
             &opened,
@@ -1616,7 +1625,7 @@ mod tests {
     fn anchored_directory_reader_locks_do_not_enable_writes() {
         let directory = tempdir().unwrap();
         let anchored = AnchoredTantivyDirectory::new(Arc::new(
-            SecureReadDirectory::open(directory.path()).unwrap(),
+            SecureReadDirectory::open(directory.path(), OpenPolicy::PersistedState).unwrap(),
         ));
         let lock_path = PathBuf::from("reader.lock");
         let lock = Lock {
@@ -1635,7 +1644,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join(PATH_CATALOG_FILE);
         fs::write(&path, bytes).unwrap();
-        let opened = SecureReadDirectory::open(directory.path())
+        let opened = SecureReadDirectory::open(directory.path(), OpenPolicy::PersistedState)
             .map_err(|error| anyhow!("open catalog test directory: {error}"))?;
         let (file, document_count) = open_path_catalog(&opened, directory.path())?;
         let mut range = file.range(0, file.length())?;

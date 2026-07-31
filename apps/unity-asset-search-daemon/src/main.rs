@@ -19,7 +19,8 @@ struct Args {
     #[arg(long)]
     project_root: PathBuf,
 
-    #[arg(long)]
+    /// Private base directory under which a project-bound index directory is derived.
+    #[arg(long, value_name = "PRIVATE_BASE")]
     index_dir: Option<PathBuf>,
 
     #[arg(long, value_name = "PATH")]
@@ -54,24 +55,9 @@ struct Args {
     #[arg(long)]
     index_bundle_container_entries: bool,
 
-    /// Enable bundle-container indexing and ignore the project-root `.gitignore`.
-    #[arg(long, alias = "everything")]
-    search_everything: bool,
-
-    #[arg(long, hide = true)]
-    unityflow: bool,
-
     /// Cap indexed container entries per bundle.
     #[arg(long, default_value_t = 50_000)]
     max_bundle_container_entries_per_bundle: usize,
-
-    /// Do not apply project-root ignore files while scanning.
-    #[arg(long)]
-    no_ignore_files: bool,
-
-    /// Ignore the project-root `.gitignore` while honoring the two tool ignore files.
-    #[arg(long)]
-    no_gitignore: bool,
 }
 
 #[tokio::main]
@@ -87,7 +73,6 @@ async fn main() -> anyhow::Result<()> {
     }
     let daemon_instance_id = generate_daemon_instance_id()?;
 
-    let preset_everything = args.search_everything || args.unityflow;
     let scan_roots = if args.scan_all {
         Some(vec![PathBuf::from(".")])
     } else if args.scan_root.is_empty() {
@@ -101,10 +86,8 @@ async fn main() -> anyhow::Result<()> {
         scan_roots,
     )?;
     let options = SearchIndexOptions {
-        index_bundle_container_entries: preset_everything || args.index_bundle_container_entries,
+        index_bundle_container_entries: args.index_bundle_container_entries,
         max_bundle_container_entries_per_bundle: args.max_bundle_container_entries_per_bundle,
-        respect_project_root_ignore_files: !args.no_ignore_files,
-        respect_project_root_gitignore: !(preset_everything || args.no_gitignore),
         ..SearchIndexOptions::default()
     };
 
@@ -115,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
     let watcher = args.watch.then(|| WatcherConfig {
         scan_roots: paths.scan_roots().to_vec(),
         project_root: paths.project_root().to_path_buf(),
-        index_root: paths.index_root().to_path_buf(),
+        index_namespace_exclusion: paths.index_namespace_exclusion().map(PathBuf::from),
     });
     let reconcile_interval = reconciliation_interval(&args);
     let startup_reindex = (!args.no_startup_reindex).then(FilesystemReindexIntent::reconcile);

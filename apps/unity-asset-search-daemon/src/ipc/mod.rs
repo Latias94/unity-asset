@@ -1073,7 +1073,7 @@ mod tests {
     }
 
     async fn run_session_case(case: SessionCase) -> u64 {
-        let project = tempfile::tempdir().unwrap();
+        let project = crate::secure_test_tempdir();
         std::fs::create_dir(project.path().join("Assets")).unwrap();
         std::fs::create_dir(project.path().join("ProjectSettings")).unwrap();
         let index_root = project.path().join("index");
@@ -1304,7 +1304,7 @@ mod tests {
 
     #[tokio::test]
     async fn established_session_cannot_admit_work_after_peer_requests_shutdown() {
-        let project = tempfile::tempdir().unwrap();
+        let project = crate::secure_test_tempdir();
         std::fs::create_dir(project.path().join("Assets")).unwrap();
         std::fs::create_dir(project.path().join("ProjectSettings")).unwrap();
         let paths = IndexPaths::for_project(

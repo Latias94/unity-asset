@@ -40,25 +40,12 @@ fn main() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(50_000);
-    let respect_project_root_ignore_files =
-        std::env::var("UNITY_ASSET_RESPECT_PROJECT_ROOT_IGNORE_FILES")
-            .ok()
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
-    let respect_project_root_gitignore =
-        std::env::var("UNITY_ASSET_RESPECT_PROJECT_ROOT_GITIGNORE")
-            .ok()
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
-
     let mut budget = AssetLoadBudget::default();
     let index = SearchIndex::open_or_create_with_options(
         paths,
         SearchIndexOptions {
             index_bundle_container_entries,
             max_bundle_container_entries_per_bundle,
-            respect_project_root_ignore_files,
-            respect_project_root_gitignore,
             ..SearchIndexOptions::default()
         },
         &mut budget,

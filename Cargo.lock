@@ -365,16 +365,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bstr"
-version = "1.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63044e1ae8e69f3b5a92c736ca6269b8d12fa7efe39bf34ddb06d102cf0e2cab"
-dependencies = [
- "memchr",
- "serde",
-]
-
-[[package]]
 name = "built"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -983,17 +973,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "globset"
-version = "0.4.18"
-dependencies = [
- "aho-corasick",
- "bstr",
- "log",
- "regex-automata",
- "regex-syntax",
-]
-
-[[package]]
 name = "half"
 version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1085,22 +1064,6 @@ name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
-
-[[package]]
-name = "ignore"
-version = "0.4.25"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3d782a365a015e0f5c04902246139249abf769125006fbe7649e2ee88169b4a"
-dependencies = [
- "crossbeam-deque",
- "globset",
- "log",
- "memchr",
- "regex-automata",
- "same-file",
- "walkdir",
- "winapi-util",
-]
 
 [[package]]
 name = "image"
@@ -2920,6 +2883,7 @@ dependencies = [
  "unity-asset-search-index",
  "unity-asset-search-local",
  "unity-asset-search-protocol",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2930,10 +2894,9 @@ dependencies = [
  "async-trait",
  "fs2",
  "hex",
- "ignore",
  "regex",
+ "regex-automata",
  "rustix",
- "same-file",
  "serde",
  "serde_json",
  "tantivy",
@@ -2941,6 +2904,7 @@ dependencies = [
  "unity-asset",
  "unity-asset-core",
  "unity-asset-search-core",
+ "unity-asset-search-local",
  "unity-asset-search-protocol",
  "windows-sys 0.61.2",
 ]

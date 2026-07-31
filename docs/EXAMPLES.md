@@ -179,10 +179,10 @@ Startup reconciliation and a five-minute integrity sweep are enabled by default.
 low-latency changed-path admissions. Use `--reconcile-interval-ms 0` only when another process
 explicitly owns reconciliation.
 
-Index AssetBundle container paths and ignore the project root's `.gitignore`:
+Index AssetBundle container paths:
 
 ```powershell
-cargo run -p unity-asset-search-daemon -- --project-root D:\GameProject --watch --search-everything
+cargo run -p unity-asset-search-daemon -- --project-root D:\GameProject --watch --index-bundle-container-entries
 ```
 
 The CLI discovers the project-bound local IPC endpoint, verifies the daemon process and execution
@@ -204,3 +204,26 @@ bytes. Reindex receipts report analysis and dependency work independently:
 `dependency_closure_assets` counts assets added to the changed set, while
 `full_dependency_scan` and `dependency_candidate_assets` disclose when dependency discovery still
 examined the complete cached asset set without reopening unchanged sources.
+
+### SearchIgnoreV1
+
+Search reads only `.unity-asset-search-ignore` at the project root. `.gitignore`, `.ignore`, and
+nested policy files are intentionally inert because VCS inclusion is not asset identity. Rules are
+evaluated in file order and the last matching rule wins:
+
+```text
+# Literal file, literal subtree, and bounded wildcard forms
+exact:Assets/Generated/Drop.asset
+subtree:Assets/Generated/Cache
+glob:Assets/**/Generated*.asset
+
+# `!` re-includes a later file or subtree
+!exact:Assets/Generated/Cache/Keep.asset
+!glob:Assets/**/GeneratedKeep*.asset
+```
+
+Paths are project-relative. `/` and `\` separators are normalized. `exact:` and `subtree:` do not
+accept wildcards. `glob:` requires `*` within a segment or `**` as a complete segment; `?`, bracket
+classes, braces, absolute paths, empty segments, and `.` or `..` segments are rejected. File,
+line, rule, parser-work, automaton, and determinization limits are explicit in
+`SearchIgnoreV1Limits`; matching performs no caller-budget allocation.

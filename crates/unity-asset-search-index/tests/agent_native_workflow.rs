@@ -19,6 +19,8 @@ use unity_asset::{
 use unity_asset_search_index::{IndexPaths, SearchIndex, SearchRequest};
 use unity_asset_search_protocol::{ReferenceRequest, ReindexDisposition};
 
+mod common;
+
 const SOURCE_ALIAS: &str = "Assets/agent-native.asset";
 const REPLACEMENT_PAYLOAD: &[u8] = b"OggS-agent-native-workflow";
 const SOURCE: &str = r#"%YAML 1.1
@@ -74,7 +76,7 @@ fn extraction_options() -> ExtractionExecutionOptions {
 
 #[test]
 fn public_structured_workflow_spans_mutation_recovery_extraction_and_search() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = common::secure_tempdir();
     let project_root = temporary.path();
     let source_path = project_root.join(SOURCE_ALIAS);
     fs::create_dir_all(source_path.parent().unwrap()).unwrap();

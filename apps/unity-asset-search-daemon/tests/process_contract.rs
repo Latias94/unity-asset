@@ -25,9 +25,25 @@ GameObject:
   m_Name: AgentBeacon
 "#;
 
+fn secure_test_tempdir() -> tempfile::TempDir {
+    #[cfg(windows)]
+    {
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .expect("Windows tests require a LocalAppData directory");
+        tempfile::Builder::new()
+            .prefix("unity-asset-search-process-test-")
+            .tempdir_in(local_app_data)
+            .expect("create a process test directory below the private LocalAppData namespace")
+    }
+    #[cfg(not(windows))]
+    {
+        tempfile::tempdir().expect("create a private process test directory")
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_daemon_process_publishes_reindexes_searches_and_shuts_down() {
-    let project_directory = tempfile::tempdir().expect("temporary Unity project");
+    let project_directory = secure_test_tempdir();
     let assets = project_directory.path().join("Assets");
     fs::create_dir_all(&assets).expect("Assets marker");
     fs::create_dir(project_directory.path().join("ProjectSettings"))

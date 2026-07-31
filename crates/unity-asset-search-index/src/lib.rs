@@ -7,14 +7,17 @@
 //! owns the in-process index inputs and persisted generation model.
 
 use std::error::Error as StdError;
+use std::ffi::OsStr;
 use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod analysis;
 mod analyzer;
+mod anchored_fs;
 mod config;
 mod generation;
+mod path_semantics;
 mod pipeline;
 mod projection;
 mod query;
@@ -25,7 +28,7 @@ mod state;
 mod store;
 mod wire;
 
-pub use config::{IndexPaths, SearchIndexOptions};
+pub use config::{IndexPaths, ScanTraversalLimits, SearchIgnoreV1Limits, SearchIndexOptions};
 pub use generation::{FilesystemReindexIntent, FilesystemReindexScope};
 pub use unity_asset::workspace::WorkspaceView;
 pub use unity_asset_core::{AssetLoadBudget, ChangeSet, DigestV1, DigestV1Builder};
@@ -40,13 +43,55 @@ use unity_asset_search_protocol::{
 };
 
 use generation::GenerationStamp as InternalGenerationStamp;
+#[cfg(test)]
+use pipeline::ScanValidationCheckpoint;
 use pipeline::{ActiveGeneration, PipelineBuildOutput, PipelineError, SearchGenerationPipeline};
 use reference_query::ReferenceQueryError;
 #[cfg(test)]
 use state::GenerationFailpoint;
 
+#[cfg(test)]
+pub(crate) fn secure_test_tempdir() -> tempfile::TempDir {
+    #[cfg(windows)]
+    {
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .expect("Windows tests require a LocalAppData directory");
+        tempfile::Builder::new()
+            .prefix("unity-asset-search-test-")
+            .tempdir_in(local_app_data)
+            .expect("create a test directory below the private LocalAppData namespace")
+    }
+    #[cfg(not(windows))]
+    {
+        tempfile::tempdir().expect("create a private test directory")
+    }
+}
+
 /// Maximum UTF-8 byte length accepted by [`SearchIndex::suggest`].
 pub const MAX_SUGGEST_PREFIX_BYTES: usize = unity_asset_search_protocol::MAX_SUGGEST_PREFIX_BYTES;
+
+/// Project-root file name for the bounded SearchIgnoreV1 policy.
+pub const SEARCH_IGNORE_V1_FILE_NAME: &str = ".unity-asset-search-ignore";
+
+/// Returns whether a file name can denote the root SearchIgnoreV1 policy on this platform.
+///
+/// Windows and common macOS filesystems resolve ASCII case variants to the same file. macOS uses
+/// the conservative case-insensitive comparison even on a case-sensitive volume; the extra full
+/// rescan is safe, while missing an event on a case-insensitive volume is not.
+#[must_use]
+pub fn is_search_ignore_v1_file_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        name.eq_ignore_ascii_case(SEARCH_IGNORE_V1_FILE_NAME)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        name == SEARCH_IGNORE_V1_FILE_NAME
+    }
+}
 
 /// Maximum number of suggestions accepted by [`SearchIndex::suggest`].
 pub const MAX_SUGGEST_LIMIT: usize = unity_asset_search_protocol::MAX_SUGGEST_RESULTS as usize;
@@ -239,6 +284,20 @@ impl SearchIndex {
             .lock()
             .map_err(|_| SearchIndexError::internal("generation pipeline lock is poisoned"))?
             .inject_publish_failpoint(failpoint);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject_scan_validation_hook(
+        &self,
+        checkpoint: ScanValidationCheckpoint,
+        action: impl FnOnce() + Send + 'static,
+    ) -> Result<(), SearchIndexError> {
+        self.inner
+            .pipeline
+            .lock()
+            .map_err(|_| SearchIndexError::internal("generation pipeline lock is poisoned"))?
+            .inject_scan_validation_hook(checkpoint, action);
         Ok(())
     }
 
@@ -826,7 +885,7 @@ GameObject:
     }
 
     fn assert_publish_failpoint_is_atomic(failpoint: GenerationFailpoint) {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let project = temporary.path().join("project");
         write_generation_fixture(&project);
         let paths =
@@ -895,9 +954,176 @@ GameObject:
         assert!(incoming_paths(&reopened, TARGET_GUID).is_empty());
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum ScanValidationMutation {
+        RootPolicy,
+        AssetsDirectory,
+        AssetContents,
+        MetaContents,
+        MissingMeta,
+    }
+
+    fn assert_scan_validation_checkpoint_is_atomic(
+        checkpoint: ScanValidationCheckpoint,
+        mutation: ScanValidationMutation,
+    ) {
+        let temporary = crate::secure_test_tempdir();
+        let project = temporary.path().join("project");
+        write_generation_fixture(&project);
+        let paths =
+            IndexPaths::for_project(project.clone(), Some(temporary.path().join("index")), None)
+                .unwrap();
+        let index =
+            SearchIndex::open_or_create(paths.clone(), &mut AssetLoadBudget::default()).unwrap();
+        let baseline = index
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap()
+            .generation
+            .unwrap();
+        assert_baseline_generation(&index, &baseline);
+
+        fs::write(project.join(OWNER_PATH), OWNER_AFTER).unwrap();
+        if matches!(mutation, ScanValidationMutation::MissingMeta) {
+            fs::remove_file(project.join("Assets/owner.prefab.meta")).unwrap();
+        }
+        let mutation_project = project.clone();
+        let replacement_root = temporary.path().join("replacement");
+        index
+            .inject_scan_validation_hook(checkpoint, move || match mutation {
+                ScanValidationMutation::RootPolicy => {
+                    fs::write(
+                        mutation_project.join(".unity-asset-search-ignore"),
+                        "# changed after discovery\n",
+                    )
+                    .unwrap();
+                }
+                ScanValidationMutation::AssetsDirectory => {
+                    let assets = mutation_project.join("Assets");
+                    let replacement = replacement_root.join("Assets");
+                    let displaced = replacement_root.join("displaced-assets");
+                    fs::create_dir_all(&replacement).unwrap();
+                    for name in [
+                        "owner.prefab",
+                        "owner.prefab.meta",
+                        "target.prefab",
+                        "target.prefab.meta",
+                    ] {
+                        fs::copy(assets.join(name), replacement.join(name)).unwrap();
+                    }
+                    fs::rename(&assets, &displaced).unwrap();
+                    fs::rename(&replacement, &assets).unwrap();
+                }
+                ScanValidationMutation::AssetContents => {
+                    fs::write(
+                        mutation_project.join(OWNER_PATH),
+                        OWNER_AFTER.replace("type: 3", "type: 4"),
+                    )
+                    .unwrap();
+                }
+                ScanValidationMutation::MetaContents => {
+                    fs::write(
+                        mutation_project.join("Assets/owner.prefab.meta"),
+                        "fileFormatVersion: 2\nguid: 21111111111111111111111111111111\n",
+                    )
+                    .unwrap();
+                }
+                ScanValidationMutation::MissingMeta => {
+                    fs::write(
+                        mutation_project.join("Assets/owner.prefab.meta"),
+                        "fileFormatVersion: 2\nguid: 11111111111111111111111111111111\n",
+                    )
+                    .unwrap();
+                }
+            })
+            .unwrap();
+        let failure = index
+            .reindex(
+                FilesystemReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect_err("filesystem mutation must invalidate the prepared scan");
+        assert_eq!(
+            failure.code(),
+            ApiErrorCode::IndexBuildFailed,
+            "{checkpoint:?}"
+        );
+        assert!(failure.retryable(), "{checkpoint:?}: {failure}");
+        assert!(
+            failure.to_string().contains("changed during the scan"),
+            "{checkpoint:?}: {failure}"
+        );
+
+        let failed_active = index
+            .status()
+            .unwrap()
+            .generation
+            .active
+            .expect("failed publication must retain the previous active generation");
+        assert_eq!(
+            failed_active.generation, baseline.generation,
+            "{checkpoint:?}"
+        );
+        assert_eq!(
+            failed_active.actual_revision, baseline.actual_revision,
+            "{checkpoint:?}"
+        );
+        assert_eq!(search_paths(&index, "Before"), vec![OWNER_PATH.to_owned()]);
+        assert!(search_paths(&index, "After").is_empty());
+        assert_eq!(
+            incoming_paths(&index, TARGET_GUID),
+            vec![OWNER_PATH.to_owned()]
+        );
+        assert!(incoming_paths(&index, OTHER_GUID).is_empty());
+        let failed_status = index.status().unwrap();
+        assert!(
+            failed_status
+                .generation
+                .last_failure
+                .as_ref()
+                .is_some_and(|failure| failure.retryable),
+            "{checkpoint:?}"
+        );
+
+        drop(index);
+        let reopened = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+        assert_baseline_generation(&reopened, &failed_active);
+        let recovered = reopened
+            .reindex(
+                FilesystemReindexIntent::reconcile(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap()
+            .generation
+            .unwrap();
+        assert_ne!(recovered.generation, baseline.generation, "{checkpoint:?}");
+        assert_eq!(
+            search_paths(&reopened, "After"),
+            vec![OWNER_PATH.to_owned()]
+        );
+        assert!(search_paths(&reopened, "Before").is_empty());
+        assert_eq!(
+            incoming_paths(&reopened, OTHER_GUID),
+            vec![OWNER_PATH.to_owned()]
+        );
+        assert!(incoming_paths(&reopened, TARGET_GUID).is_empty());
+        assert_eq!(
+            reopened
+                .status()
+                .unwrap()
+                .daemon
+                .generation_maintenance
+                .state,
+            GenerationMaintenanceState::Clean,
+            "{checkpoint:?}"
+        );
+    }
+
     #[test]
     fn staging_cleanup_failure_is_distinct_and_reconcile_clears_it() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let project = temporary.path().join("project");
         write_generation_fixture(&project);
         let paths =
@@ -987,8 +1213,72 @@ GameObject:
     }
 
     #[test]
+    fn filesystem_scan_validation_is_atomic_at_every_publication_boundary() {
+        for mutation in [
+            ScanValidationMutation::RootPolicy,
+            ScanValidationMutation::AssetsDirectory,
+            ScanValidationMutation::AssetContents,
+            ScanValidationMutation::MetaContents,
+            ScanValidationMutation::MissingMeta,
+        ] {
+            assert_scan_validation_checkpoint_is_atomic(
+                ScanValidationCheckpoint::ActivationPreCommit,
+                mutation,
+            );
+        }
+    }
+
+    #[test]
+    fn no_change_result_revalidates_the_filesystem_before_returning() {
+        let temporary = crate::secure_test_tempdir();
+        let project = temporary.path().join("project");
+        write_generation_fixture(&project);
+        let paths =
+            IndexPaths::for_project(project.clone(), Some(temporary.path().join("index")), None)
+                .unwrap();
+        let index = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+        let baseline = index
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap()
+            .generation
+            .unwrap();
+        let mutation_project = project.clone();
+        index
+            .inject_scan_validation_hook(ScanValidationCheckpoint::NoChangePreReturn, move || {
+                fs::write(mutation_project.join(OWNER_PATH), OWNER_AFTER).unwrap();
+            })
+            .unwrap();
+
+        let failure = index
+            .reindex(
+                FilesystemReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect_err("a no-change result must not hide a post-scan filesystem mutation");
+
+        assert_eq!(failure.code(), ApiErrorCode::IndexBuildFailed);
+        assert!(failure.retryable());
+        assert!(failure.to_string().contains("changed during the scan"));
+        assert_eq!(
+            index
+                .status()
+                .unwrap()
+                .generation
+                .active
+                .unwrap()
+                .generation,
+            baseline.generation
+        );
+        assert_eq!(search_paths(&index, "Before"), vec![OWNER_PATH.to_owned()]);
+        assert!(search_paths(&index, "After").is_empty());
+    }
+
+    #[test]
     fn older_reference_projection_rebuilds_without_reusing_its_generation() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let project = temporary.path().join("project");
         write_generation_fixture(&project);
         let paths =
@@ -1025,7 +1315,7 @@ GameObject:
 
     #[test]
     fn late_receipt_rebuild_from_legacy_projection_preserves_store_desired_revision() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let project = temporary.path().join("project");
         write_generation_fixture(&project);
         let paths =
@@ -1130,7 +1420,7 @@ GameObject:
 
     #[test]
     fn public_suggest_validates_prefix_and_limit_boundaries() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let project = temporary.path().join("project");
         write_generation_fixture(&project);
         let paths =
@@ -1178,7 +1468,7 @@ GameObject:
 
     #[test]
     fn public_search_validates_the_raw_query_and_limit_boundaries() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let project = temporary.path().join("project");
         write_generation_fixture(&project);
         let paths =
@@ -1252,7 +1542,7 @@ GameObject:
 
     #[test]
     fn status_commit_is_an_atomic_observation_boundary() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let project = temporary.path().join("project");
         write_generation_fixture(&project);
         let paths =

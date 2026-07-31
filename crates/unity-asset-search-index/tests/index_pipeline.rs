@@ -18,6 +18,8 @@ use unity_asset_search_protocol::{
     StatusResponse, SuggestRequest, SuggestResponse,
 };
 
+mod common;
+
 const PREFAB_GUID: &str = "fedcba98765432100123456789abcdef";
 const SCRIPT_GUID: &str = "00112233445566778899aabbccddeeff";
 const INLINE_GUID: &str = "11112222333344445555666677778888";
@@ -86,7 +88,7 @@ struct ProjectFixture {
 
 impl ProjectFixture {
     fn new(version: ProjectVersion) -> Self {
-        let temporary = TempDir::new().unwrap();
+        let temporary = common::secure_tempdir();
         let hero_path = temporary.path().join(HERO_PATH);
         let script_path = temporary.path().join(SCRIPT_PATH);
         fs::create_dir_all(hero_path.parent().unwrap()).unwrap();
@@ -837,7 +839,7 @@ fn non_overlapping_scan_root_shards_match_a_single_project_scan_root() {
         single_status
             .scan_roots
             .iter()
-            .map(|path| path.to_path_buf())
+            .map(|path| path.to_path_buf().canonicalize().unwrap())
             .collect::<Vec<_>>(),
         vec![fixture.assets_directory().canonicalize().unwrap()]
     );
@@ -845,7 +847,7 @@ fn non_overlapping_scan_root_shards_match_a_single_project_scan_root() {
         sharded_status
             .scan_roots
             .iter()
-            .map(|path| path.to_path_buf())
+            .map(|path| path.to_path_buf().canonicalize().unwrap())
             .collect::<Vec<_>>(),
         vec![
             fixture
