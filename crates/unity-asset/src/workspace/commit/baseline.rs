@@ -6,28 +6,28 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, SourceFingerprint, SourceId, SourceKind, UnityDocument,
-    VerifiedSourceImage, arc_slice_allocation_bytes, arc_value_allocation_bytes,
-    vec_allocation_bytes,
+    AssetLoadBudget, BudgetError, BudgetedSourceBytes, BudgetedVerifiedSourceImage,
+    SourceFingerprint, SourceId, SourceKind, UnityDocument, vec_allocation_bytes,
 };
 use unity_asset_write::artifact::{
     ArtifactHandle, ArtifactStreamError, PreparedArtifactFormat, PreparedArtifactSet,
 };
+use unity_asset_yaml::parse_budgeted_yaml_source;
 
 use super::super::adapter::binary::{BinaryPayload, BinaryWorkspaceAdapter};
-use super::super::adapter::yaml::parse_yaml_source;
 use super::super::inspection::{
     AssetBundleSummary, SerializedFileSummary, WebFileSummary, WorkspaceSourceFormatInspection,
 };
 use super::super::interface::{
-    map_binary_adapter_error, map_yaml_adapter_error, promote_value_to_arc,
-    validate_yaml_identities,
+    map_binary_adapter_error, map_yaml_error, promote_value_to_arc, validate_yaml_identities,
 };
 use super::super::overlay::PreparedStateCore;
 use super::super::preflight::PreparedChange;
 use super::super::source_catalog::{CatalogError, PhysicalDomainChange, SourceDescriptor};
-use super::super::state::{WorkspaceState, WorkspaceStateError};
-use super::super::store::{FrozenSourceParse, SourceStoreError};
+use super::super::state::{
+    FrozenSourceParse, PreparedWorkspaceState, SourceStoreError, VerifiedSourceContent,
+    WorkspaceState, WorkspaceStateError, WorkspaceStateTransaction,
+};
 use super::super::view::WorkspaceError;
 use super::journal::{
     Journal, JournalBaselineImage, JournalBaselineSource, JournalCatalogAction, JournalError,
@@ -48,7 +48,7 @@ pub(crate) fn read_artifact_image(
     index: usize,
     location: RecoveryArtifactLocation,
     budget: &mut AssetLoadBudget,
-) -> Result<Arc<[u8]>, BaselineBuildError> {
+) -> Result<BudgetedVerifiedSourceImage, BaselineBuildError> {
     let artifact = journal.manifest().artifacts().get(index).ok_or_else(|| {
         BaselineBuildError::RecoveryBinding {
             message: "recovery artifact index is out of range".to_owned(),
@@ -91,13 +91,18 @@ pub(crate) fn read_artifact_image(
 
 /// Fully validated next baseline and the exact state it may replace.
 pub(crate) struct PreparedBaseline {
-    pub(crate) expected: Arc<WorkspaceState>,
-    pub(crate) next: Arc<WorkspaceState>,
+    state: PreparedWorkspaceState,
+}
+
+impl PreparedBaseline {
+    pub(crate) const fn state(&self) -> &PreparedWorkspaceState {
+        &self.state
+    }
 }
 
 /// Artifact images retained while the publication transaction builds its baseline.
 pub(crate) struct MaterializedImages {
-    images: Vec<Option<Arc<[u8]>>>,
+    images: Vec<Option<BudgetedSourceBytes>>,
 }
 
 impl MaterializedImages {
@@ -106,7 +111,7 @@ impl MaterializedImages {
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, BaselineBuildError> {
         let count = set.proof_image_count();
-        let planned = vec_allocation_bytes::<Option<Arc<[u8]>>>(count).map_err(|_| {
+        let planned = vec_allocation_bytes::<Option<BudgetedSourceBytes>>(count).map_err(|_| {
             BaselineBuildError::Budget(BudgetError::ArithmeticOverflow {
                 resource: "baseline materialized image table",
             })
@@ -120,8 +125,8 @@ impl MaterializedImages {
                 requested: count,
                 message: error.to_string(),
             })?;
-        let actual =
-            vec_allocation_bytes::<Option<Arc<[u8]>>>(images.capacity()).map_err(|_| {
+        let actual = vec_allocation_bytes::<Option<BudgetedSourceBytes>>(images.capacity())
+            .map_err(|_| {
                 BaselineBuildError::Budget(BudgetError::ArithmeticOverflow {
                     resource: "baseline materialized image table",
                 })
@@ -131,13 +136,13 @@ impl MaterializedImages {
         Ok(Self { images })
     }
 
-    pub(crate) fn insert(&mut self, handle: ArtifactHandle, image: Arc<[u8]>) {
+    pub(crate) fn insert(&mut self, handle: ArtifactHandle, image: BudgetedSourceBytes) {
         if let Some(slot) = self.images.get_mut(handle.ordinal()) {
             *slot = Some(image);
         }
     }
 
-    pub(crate) fn get(&self, handle: ArtifactHandle) -> Option<&Arc<[u8]>> {
+    pub(crate) fn get(&self, handle: ArtifactHandle) -> Option<&BudgetedSourceBytes> {
         self.images.get(handle.ordinal()).and_then(Option::as_ref)
     }
 
@@ -146,9 +151,9 @@ impl MaterializedImages {
         set: &PreparedArtifactSet,
         handle: ArtifactHandle,
         budget: &mut AssetLoadBudget,
-    ) -> Result<Arc<[u8]>, BaselineBuildError> {
+    ) -> Result<BudgetedSourceBytes, BaselineBuildError> {
         if let Some(image) = self.get(handle) {
-            return Ok(Arc::clone(image));
+            return Ok(image.clone());
         }
         self.stream_and_materialize(set, handle, &mut io::sink(), budget)
     }
@@ -159,7 +164,7 @@ impl MaterializedImages {
         handle: ArtifactHandle,
         sink: &mut impl Write,
         budget: &mut AssetLoadBudget,
-    ) -> Result<Arc<[u8]>, BaselineBuildError> {
+    ) -> Result<BudgetedSourceBytes, BaselineBuildError> {
         if self.get(handle).is_some() {
             return Err(BaselineBuildError::Artifact(
                 "publication artifact was already materialized before staging".to_owned(),
@@ -205,15 +210,8 @@ impl MaterializedImages {
             })
         })?;
         budget.consume_bytes(actual_capacity)?;
-        let arc_bytes = arc_slice_allocation_bytes::<u8>(bytes.len()).map_err(|_| {
-            BaselineBuildError::Budget(BudgetError::ArithmeticOverflow {
-                resource: "baseline artifact backing",
-            })
-        })?;
-        budget.check_bytes(arc_bytes)?;
-        let image: Arc<[u8]> = Arc::from(bytes);
-        budget.consume_bytes(arc_bytes)?;
-        self.insert(handle, Arc::clone(&image));
+        let image = BudgetedSourceBytes::from_vec(bytes, budget)?;
+        self.insert(handle, image.clone());
         Ok(image)
     }
 }
@@ -244,22 +242,19 @@ pub(crate) fn build(
 ) -> Result<PreparedBaseline, BaselineBuildError> {
     let state = prepared.state();
     let core: &PreparedStateCore = state.core().as_ref();
-    let base = core.base().state();
-    let catalog = core
-        .catalog()
-        .begin_transaction(budget)
-        .map_err(BaselineBuildError::catalog)?
-        .commit(budget)
-        .map_err(BaselineBuildError::catalog)?;
-    let mut store = base
-        .store()
-        .clone_for_update(budget)
-        .map_err(BaselineBuildError::Store)?;
+    let expected = Arc::clone(core.base().state());
+    let base = expected.as_ref();
+    let mut transaction = WorkspaceStateTransaction::begin_with_catalog(
+        Arc::clone(&expected),
+        core.catalog(),
+        budget,
+    )
+    .map_err(BaselineBuildError::state)?;
     let artifacts = core.artifacts();
 
     for binding in core.source_bindings() {
         let image = images.materialize(artifacts, binding.artifact(), budget)?;
-        let verified = VerifiedSourceImage::verify(binding.source().kind(), image);
+        let verified = image.verify(binding.source().kind());
         if verified.fingerprint() != binding.fingerprint() {
             return Err(BaselineBuildError::Fingerprint {
                 source_id: binding.source(),
@@ -267,10 +262,7 @@ pub(crate) fn build(
                 actual: verified.fingerprint(),
             });
         }
-        if store
-            .get(binding.source())
-            .is_some_and(|entry| entry.image().fingerprint() == verified.fingerprint())
-        {
+        if transaction.content_fingerprint(binding.source()) == Some(verified.fingerprint()) {
             continue;
         }
         let artifact = artifacts
@@ -278,42 +270,30 @@ pub(crate) fn build(
             .map_err(|error| BaselineBuildError::Artifact(error.to_string()))?;
         let parse = parse_source(
             binding.source(),
-            Arc::clone(verified.backing()),
+            verified.clone_backing(budget)?,
             base,
             binary,
             budget,
         )?;
         let format = format_from_artifact(binding.source(), artifact.format(), base, budget)?;
-        store
-            .insert_inspected(binding.source(), verified, parse, format, budget)
-            .map_err(BaselineBuildError::Store)?;
+        let content =
+            VerifiedSourceContent::from_budgeted(binding.source(), verified, parse, format);
+        transaction
+            .replace_verified_content(content, budget)
+            .map_err(BaselineBuildError::state)?;
     }
 
-    let next = WorkspaceState::new(
-        core.base().workspace_id(),
-        base.typetree_mode(),
-        catalog,
-        store,
-        budget,
-    )
-    .map_err(BaselineBuildError::state)?;
-    let retained = arc_value_allocation_bytes::<WorkspaceState>().map_err(|_| {
-        BudgetError::ArithmeticOverflow {
-            resource: "workspace baseline state",
-        }
-    })?;
-    budget.check_bytes(retained)?;
-    let next = Arc::new(next);
-    budget.consume_bytes(retained)?;
-    if next.revision() != core.revision() {
+    let prepared_state = transaction
+        .commit(budget)
+        .map_err(BaselineBuildError::state)?;
+    if prepared_state.revision() != core.revision() {
         return Err(BaselineBuildError::Revision {
             expected: core.revision(),
-            actual: next.revision(),
+            actual: prepared_state.revision(),
         });
     }
     Ok(PreparedBaseline {
-        expected: Arc::clone(core.base().state()),
-        next,
+        state: prepared_state,
     })
 }
 
@@ -321,7 +301,7 @@ pub(crate) fn build_from_journal_with_images(
     expected: Arc<WorkspaceState>,
     journal: &Journal,
     binary: &BinaryWorkspaceAdapter,
-    published_images: Option<&[Option<Arc<[u8]>>]>,
+    published_images: Option<&[Option<BudgetedVerifiedSourceImage>]>,
     budget: &mut AssetLoadBudget,
 ) -> Result<PreparedBaseline, BaselineBuildError> {
     let base = expected.as_ref();
@@ -334,10 +314,8 @@ pub(crate) fn build_from_journal_with_images(
 
     let sources = manifest.baseline().sources();
     let mut changes = reserve_recovery_vec::<PhysicalDomainChange>(sources.len(), budget)?;
-    let mut catalog = base
-        .catalog()
-        .begin_transaction(budget)
-        .map_err(BaselineBuildError::catalog)?;
+    let mut transaction = WorkspaceStateTransaction::begin(Arc::clone(&expected), budget)
+        .map_err(BaselineBuildError::state)?;
     for source in sources {
         match source.catalog() {
             JournalCatalogAction::Existing { base_fingerprint } => {
@@ -357,9 +335,9 @@ pub(crate) fn build_from_journal_with_images(
             JournalCatalogAction::AddCompanion { parent, member } => {
                 let descriptor = SourceDescriptor::companion(*parent, member.clone())
                     .map_err(BaselineBuildError::catalog)?;
-                let actual = catalog
-                    .register(descriptor, source.fingerprint(), budget)
-                    .map_err(BaselineBuildError::catalog)?;
+                let actual = transaction
+                    .register_descriptor(descriptor, source.fingerprint(), budget)
+                    .map_err(BaselineBuildError::state)?;
                 if actual != source.source() {
                     return Err(BaselineBuildError::RecoveryBinding {
                         message: format!(
@@ -373,9 +351,9 @@ pub(crate) fn build_from_journal_with_images(
             JournalCatalogAction::AddContainedSidecar { parent, member } => {
                 let descriptor = SourceDescriptor::sidecar(*parent, member.clone())
                     .map_err(BaselineBuildError::catalog)?;
-                let actual = catalog
-                    .register(descriptor, source.fingerprint(), budget)
-                    .map_err(BaselineBuildError::catalog)?;
+                let actual = transaction
+                    .register_descriptor(descriptor, source.fingerprint(), budget)
+                    .map_err(BaselineBuildError::state)?;
                 if actual != source.source() {
                     return Err(BaselineBuildError::RecoveryBinding {
                         message: format!(
@@ -402,21 +380,13 @@ pub(crate) fn build_from_journal_with_images(
         });
     }
 
-    catalog
+    transaction
         .rewrite_physical_domains_from_changes(&changes, budget)
-        .map_err(BaselineBuildError::catalog)?;
-    let catalog = catalog
-        .commit(budget)
-        .map_err(BaselineBuildError::catalog)?;
+        .map_err(BaselineBuildError::state)?;
 
-    let mut store = base
-        .store()
-        .clone_for_update(budget)
-        .map_err(BaselineBuildError::Store)?;
     for source in sources {
         validate_in_place_binding(base, journal, source, budget)?;
-        let image = recovery_image(journal, source, published_images, budget)?;
-        let verified = VerifiedSourceImage::verify(source.source().kind(), image);
+        let verified = recovery_image(journal, source, published_images, budget)?;
         if verified.fingerprint() != source.fingerprint() {
             return Err(BaselineBuildError::Fingerprint {
                 source_id: source.source(),
@@ -424,54 +394,43 @@ pub(crate) fn build_from_journal_with_images(
                 actual: verified.fingerprint(),
             });
         }
-        if store
-            .get(source.source())
-            .is_some_and(|entry| entry.image().fingerprint() == verified.fingerprint())
-        {
+        if transaction.content_fingerprint(source.source()) == Some(verified.fingerprint()) {
             continue;
         }
         let parse = parse_source(
             source.source(),
-            Arc::clone(verified.backing()),
+            verified.clone_backing(budget)?,
             base,
             binary,
             budget,
         )?;
         let format = inspect_recovered_source(
             source.source(),
-            verified.backing(),
+            verified.backing(budget)?,
             &parse,
             base,
             binary,
             budget,
         )?;
-        store
-            .insert_inspected(source.source(), verified, parse, format, budget)
-            .map_err(BaselineBuildError::Store)?;
+        let content =
+            VerifiedSourceContent::from_budgeted(source.source(), verified, parse, format);
+        transaction
+            .replace_verified_content(content, budget)
+            .map_err(BaselineBuildError::state)?;
     }
 
-    let next = WorkspaceState::new(
-        base.workspace(),
-        base.typetree_mode(),
-        catalog,
-        store,
-        budget,
-    )
-    .map_err(BaselineBuildError::state)?;
-    if next.revision() != manifest.committed_revision() {
+    let prepared_state = transaction
+        .commit(budget)
+        .map_err(BaselineBuildError::state)?;
+    if prepared_state.revision() != manifest.committed_revision() {
         return Err(BaselineBuildError::Revision {
             expected: manifest.committed_revision(),
-            actual: next.revision(),
+            actual: prepared_state.revision(),
         });
     }
-    let retained = arc_value_allocation_bytes::<WorkspaceState>().map_err(|_| {
-        BudgetError::ArithmeticOverflow {
-            resource: "recovery workspace state",
-        }
-    })?;
-    budget.consume_bytes(retained)?;
-    let next = Arc::new(next);
-    Ok(PreparedBaseline { expected, next })
+    Ok(PreparedBaseline {
+        state: prepared_state,
+    })
 }
 
 fn validate_in_place_binding(
@@ -529,9 +488,9 @@ fn validate_in_place_binding(
 fn recovery_image(
     journal: &Journal,
     source: &JournalBaselineSource,
-    published_images: Option<&[Option<Arc<[u8]>>]>,
+    published_images: Option<&[Option<BudgetedVerifiedSourceImage>]>,
     budget: &mut AssetLoadBudget,
-) -> Result<Arc<[u8]>, BaselineBuildError> {
+) -> Result<BudgetedVerifiedSourceImage, BaselineBuildError> {
     let (path, expected_bytes, parent_identity, expected_identity) = match source.image() {
         JournalBaselineImage::Published { artifact } => {
             let index =
@@ -547,7 +506,7 @@ fn recovery_image(
                 .and_then(|images| images.get(index))
                 .and_then(Option::as_ref)
             {
-                return Ok(Arc::clone(image));
+                return Ok(image.clone());
             }
             (
                 artifact
@@ -612,7 +571,7 @@ fn read_recovery_image(
     expected_bytes: u64,
     expected_identity: Option<&FileIdentity>,
     budget: &mut AssetLoadBudget,
-) -> Result<Arc<[u8]>, BaselineBuildError> {
+) -> Result<BudgetedVerifiedSourceImage, BaselineBuildError> {
     verify_recovery_parent(path, expected_parent, source)?;
     let mut file = open_readonly_regular_in_parent(path, expected_parent).map_err(|error| {
         BaselineBuildError::RecoveryImage {
@@ -700,23 +659,15 @@ fn read_recovery_image(
             message: format!("recovery image binding changed while source {source:?} was read"),
         });
     }
-    let arc_bytes = arc_slice_allocation_bytes::<u8>(length_usize).map_err(|_| {
-        BudgetError::ArithmeticOverflow {
-            resource: "recovery baseline image backing",
-        }
-    })?;
-    budget.check_bytes(arc_bytes)?;
-    let backing = Arc::<[u8]>::from(bytes);
-    budget.consume_bytes(arc_bytes)?;
-    let actual = SourceFingerprint::from_bytes(expected.kind(), &backing);
-    if actual != expected {
+    let verified = BudgetedSourceBytes::from_vec(bytes, budget)?.verify(expected.kind());
+    if verified.fingerprint() != expected {
         return Err(BaselineBuildError::Fingerprint {
             source_id: source,
             expected,
-            actual,
+            actual: verified.fingerprint(),
         });
     }
-    Ok(backing)
+    Ok(verified)
 }
 
 fn verify_recovery_parent(
@@ -799,8 +750,8 @@ fn parse_source(
             Ok(FrozenSourceParse::Serialized(file))
         }
         SourceKind::Yaml => {
-            let parsed = parse_yaml_source(image, budget)
-                .map_err(|error| map_yaml_adapter_error("baseline YAML parsing", error))
+            let parsed = parse_budgeted_yaml_source(image, budget)
+                .map_err(|error| map_yaml_error("baseline YAML parsing", error))
                 .map_err(map_workspace_parse_error)?;
             validate_yaml_identities(parsed.document(), budget)
                 .map_err(map_workspace_parse_error)?;
@@ -978,8 +929,6 @@ pub(crate) enum BaselineBuildError {
     },
     #[error("catalog baseline construction failed: {0}")]
     Catalog(#[source] Box<super::super::source_catalog::CatalogError>),
-    #[error("source store baseline construction failed: {0}")]
-    Store(#[source] SourceStoreError),
     #[error("workspace baseline validation failed: {0}")]
     State(#[source] Box<WorkspaceStateError>),
     #[error("baseline parse failed: {message}")]
@@ -1020,8 +969,8 @@ impl BaselineBuildError {
                 CatalogError::Budget(error) => Ok(error),
                 error => Err(Self::Catalog(Box::new(error))),
             },
-            Self::Store(SourceStoreError::Budget(error)) => Ok(error),
             Self::State(error) => match *error {
+                WorkspaceStateError::Budget(error) => Ok(error),
                 WorkspaceStateError::Catalog(error) => match *error {
                     CatalogError::Budget(error) => Ok(error),
                     error => Err(Self::state(WorkspaceStateError::Catalog(Box::new(error)))),
@@ -1050,7 +999,6 @@ impl BaselineBuildError {
             Self::Catalog(error) => {
                 matches!(error.as_ref(), CatalogError::AllocationFailed { .. })
             }
-            Self::Store(error) => matches!(error, SourceStoreError::AllocationFailed { .. }),
             Self::State(error) => match error.as_ref() {
                 WorkspaceStateError::Catalog(error) => {
                     matches!(error.as_ref(), CatalogError::AllocationFailed { .. })
@@ -1084,5 +1032,26 @@ impl From<io::Error> for BaselineBuildError {
         Self::Parse {
             message: error.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_workspace_state_budget_error_is_preserved() {
+        let error = BaselineBuildError::state(WorkspaceStateError::Budget(
+            BudgetError::ArithmeticOverflow {
+                resource: "workspace state",
+            },
+        ));
+
+        assert!(matches!(
+            error.into_budget(),
+            Ok(BudgetError::ArithmeticOverflow {
+                resource: "workspace state"
+            })
+        ));
     }
 }

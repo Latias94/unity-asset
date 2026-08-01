@@ -1632,20 +1632,17 @@ impl AssetWorkspace {
                     test_run_publication_hook("before_live_baseline_verification");
                     verify_live_published_artifacts(&journal, &publications, &execution)
                         .and_then(|()| {
-                            if prepared_revision_changed(self, &baseline)
-                                || !self.install_state_if_current(
-                                    &baseline.expected,
-                                    Arc::clone(&baseline.next),
-                                )
-                            {
-                                Err(
+                            match self.install_prepared_state(baseline.state()) {
+                                super::state::WorkspaceStateInstallOutcome::Installed => {
+                                    #[cfg(test)]
+                                    test_crash_failpoint("baseline_cas_before_event");
+                                    append_live_event(&mut journal, planned)
+                                }
+                                super::state::WorkspaceStateInstallOutcome::Unchanged
+                                | super::state::WorkspaceStateInstallOutcome::Stale => Err(
                                     "published bytes could not be installed over the expected workspace baseline"
                                         .to_owned(),
-                                )
-                            } else {
-                                #[cfg(test)]
-                                test_crash_failpoint("baseline_cas_before_event");
-                                append_live_event(&mut journal, planned)
+                                ),
                             }
                         })
                 }
@@ -2770,13 +2767,6 @@ fn verify_journal_file(
         ));
     }
     Ok(())
-}
-
-fn prepared_revision_changed(workspace: &AssetWorkspace, baseline: &PreparedBaseline) -> bool {
-    workspace.workspace_id() != baseline.expected.workspace()
-        || workspace.revision() != baseline.expected.revision()
-        || baseline.next.workspace() != baseline.expected.workspace()
-        || baseline.next.revision() == baseline.expected.revision()
 }
 
 #[derive(Debug, Error)]

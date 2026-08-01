@@ -1318,7 +1318,9 @@ mod tests {
     use unity_asset_yaml::YamlDocument;
 
     use super::*;
-    use crate::workspace::{AssetWorkspace, WorkspaceView, reference_view_parts};
+    use crate::workspace::{
+        AssetWorkspace, TestSourceBackingOwner, WorkspaceView, reference_view_parts,
+    };
 
     const TRANSFORM_BINARY: &[u8] = include_bytes!(
         "../../../unity-asset-write/tests/fixtures/serialized_file_wire/transform_hierarchy_v22.assets.bin"
@@ -1449,9 +1451,12 @@ mod tests {
         let target_id = SourceId::new(workspace, SourceKind::Yaml, 1).unwrap();
         let meta_id = SourceId::new(workspace, SourceKind::Yaml, 2).unwrap();
         let duplicate_basename_id = SourceId::new(workspace, SourceKind::Yaml, 3).unwrap();
-        let target_owner = Arc::<[u8]>::from(&b"target"[..]);
-        let meta_owner = Arc::<[u8]>::from(&b"meta"[..]);
-        let duplicate_owner = Arc::<[u8]>::from(&b"duplicate"[..]);
+        let target_owner =
+            TestSourceBackingOwner::new(SourceKind::Yaml, Arc::<[u8]>::from(&b"target"[..]));
+        let meta_owner =
+            TestSourceBackingOwner::new(SourceKind::Yaml, Arc::<[u8]>::from(&b"meta"[..]));
+        let duplicate_owner =
+            TestSourceBackingOwner::new(SourceKind::Yaml, Arc::<[u8]>::from(&b"duplicate"[..]));
         let target_locator = SourceLocator::path("folder/target.prefab").unwrap();
         let meta_locator = SourceLocator::path("folder/target.prefab.meta").unwrap();
         let duplicate_locator = SourceLocator::path("other/target.prefab").unwrap();
@@ -1467,8 +1472,8 @@ mod tests {
         let sources = [
             ReferenceSource::yaml(
                 target_id,
-                SourceFingerprint::from_bytes(SourceKind::Yaml, target_owner.as_ref()),
-                (&target_owner).into(),
+                SourceFingerprint::from_bytes(SourceKind::Yaml, b"target"),
+                target_owner.weak().into(),
                 &target_locator,
                 None,
                 &target_document,
@@ -1476,8 +1481,8 @@ mod tests {
             .unwrap(),
             ReferenceSource::yaml(
                 meta_id,
-                SourceFingerprint::from_bytes(SourceKind::Yaml, meta_owner.as_ref()),
-                (&meta_owner).into(),
+                SourceFingerprint::from_bytes(SourceKind::Yaml, b"meta"),
+                meta_owner.weak().into(),
                 &meta_locator,
                 None,
                 &meta_document,
@@ -1485,8 +1490,8 @@ mod tests {
             .unwrap(),
             ReferenceSource::yaml(
                 duplicate_basename_id,
-                SourceFingerprint::from_bytes(SourceKind::Yaml, duplicate_owner.as_ref()),
-                (&duplicate_owner).into(),
+                SourceFingerprint::from_bytes(SourceKind::Yaml, b"duplicate"),
+                duplicate_owner.weak().into(),
                 &duplicate_locator,
                 None,
                 &duplicate_document,

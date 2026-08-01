@@ -10,6 +10,7 @@ use unity_asset_write::artifact::PreparedArtifactSet;
 use unity_asset_yaml::YamlDocument;
 
 use super::{ReferenceGraphError, ReferenceStore};
+use crate::workspace::WeakSourceBackingOwner;
 
 pub(crate) mod sealed {
     pub trait Sealed {}
@@ -279,12 +280,12 @@ impl<'source> ReferenceSource<'source> {
 /// backing allocation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ReferenceSourceOwner<'owner> {
-    Committed(&'owner Arc<[u8]>),
+    Committed(&'owner WeakSourceBackingOwner),
     Prepared(&'owner Arc<PreparedArtifactSet>),
 }
 
-impl<'owner> From<&'owner Arc<[u8]>> for ReferenceSourceOwner<'owner> {
-    fn from(owner: &'owner Arc<[u8]>) -> Self {
+impl<'owner> From<&'owner WeakSourceBackingOwner> for ReferenceSourceOwner<'owner> {
+    fn from(owner: &'owner WeakSourceBackingOwner) -> Self {
         Self::Committed(owner)
     }
 }
@@ -297,14 +298,14 @@ impl<'owner> From<&'owner Arc<PreparedArtifactSet>> for ReferenceSourceOwner<'ow
 
 #[derive(Debug, Clone)]
 pub(crate) enum WeakReferenceSourceOwner {
-    Committed(std::sync::Weak<[u8]>),
+    Committed(WeakSourceBackingOwner),
     Prepared(std::sync::Weak<PreparedArtifactSet>),
 }
 
 impl ReferenceSourceOwner<'_> {
     pub(crate) fn downgrade(self) -> WeakReferenceSourceOwner {
         match self {
-            Self::Committed(owner) => WeakReferenceSourceOwner::Committed(Arc::downgrade(owner)),
+            Self::Committed(owner) => WeakReferenceSourceOwner::Committed(owner.clone()),
             Self::Prepared(owner) => WeakReferenceSourceOwner::Prepared(Arc::downgrade(owner)),
         }
     }
@@ -313,14 +314,14 @@ impl ReferenceSourceOwner<'_> {
 impl WeakReferenceSourceOwner {
     pub(crate) fn is_live(&self) -> bool {
         match self {
-            Self::Committed(owner) => owner.strong_count() != 0,
+            Self::Committed(owner) => owner.is_live(),
             Self::Prepared(owner) => owner.strong_count() != 0,
         }
     }
 
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Committed(left), Self::Committed(right)) => std::sync::Weak::ptr_eq(left, right),
+            (Self::Committed(left), Self::Committed(right)) => left.ptr_eq(right),
             (Self::Prepared(left), Self::Prepared(right)) => std::sync::Weak::ptr_eq(left, right),
             (Self::Committed(_), Self::Prepared(_)) | (Self::Prepared(_), Self::Committed(_)) => {
                 false
@@ -359,6 +360,7 @@ mod tests {
     use unity_asset_core::{SourceKind, WorkspaceId};
 
     use super::*;
+    use crate::workspace::TestSourceBackingOwner;
 
     fn source(kind: SourceKind) -> SourceId {
         SourceId::new(WorkspaceId::from_u128(1).unwrap(), kind, 1).unwrap()
@@ -366,14 +368,14 @@ mod tests {
 
     #[test]
     fn yaml_source_rejects_a_non_yaml_source_identity() {
-        let owner = Arc::<[u8]>::from([]);
+        let owner = TestSourceBackingOwner::new(SourceKind::Yaml, Arc::<[u8]>::from([]));
         let locator = SourceLocator::path("source.prefab").unwrap();
         let document = YamlDocument::from_entries(Vec::new());
         let source = source(SourceKind::SerializedFile);
         let error = ReferenceSource::yaml(
             source,
-            SourceFingerprint::from_bytes(SourceKind::Yaml, owner.as_ref()),
-            (&owner).into(),
+            SourceFingerprint::from_bytes(SourceKind::Yaml, &[]),
+            owner.weak().into(),
             &locator,
             None,
             &document,
@@ -393,14 +395,14 @@ mod tests {
 
     #[test]
     fn yaml_source_rejects_a_non_yaml_fingerprint() {
-        let owner = Arc::<[u8]>::from([]);
+        let owner = TestSourceBackingOwner::new(SourceKind::Yaml, Arc::<[u8]>::from([]));
         let locator = SourceLocator::path("source.prefab").unwrap();
         let document = YamlDocument::from_entries(Vec::new());
         let source = source(SourceKind::Yaml);
         let error = ReferenceSource::yaml(
             source,
-            SourceFingerprint::from_bytes(SourceKind::SerializedFile, owner.as_ref()),
-            (&owner).into(),
+            SourceFingerprint::from_bytes(SourceKind::SerializedFile, &[]),
+            owner.weak().into(),
             &locator,
             None,
             &document,

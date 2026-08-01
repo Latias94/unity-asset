@@ -1,25 +1,139 @@
 use std::collections::BTreeMap;
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use thiserror::Error;
 use unity_asset_binary::asset::SerializedFile;
 use unity_asset_binary::shared_bytes::SharedBytes;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, DigestV1, SourceId, SourceKind, VerifiedSourceImage,
-    VerifiedSourceRebinding, WorkspaceId, arc_value_allocation_bytes, vec_allocation_bytes,
+    VerifiedSourceRebinding, WorkspaceId, arc_slice_allocation_bytes, arc_value_allocation_bytes,
+    vec_allocation_bytes,
 };
 use unity_asset_yaml::YamlDocument;
 
-use super::inspection::WorkspaceSourceFormatInspection;
+use super::super::inspection::WorkspaceSourceFormatInspection;
 
 /// One immutable source entry and the parse state proven before publication.
 #[derive(Debug)]
 pub(crate) struct SourceEntry {
     source: SourceId,
     image: VerifiedSourceImage,
+    backing_owner: SourceBackingOwner,
+    weak_backing_owner: WeakSourceBackingOwner,
     parse: FrozenSourceParse,
     format: WorkspaceSourceFormatInspection,
+}
+
+/// Stable lifetime identity and retained-cost evidence for one canonical backing.
+#[derive(Debug, Clone)]
+struct SourceBackingOwner {
+    identity: Arc<SourceBackingIdentity>,
+}
+
+#[derive(Debug)]
+struct SourceBackingIdentity {
+    backing: Arc<[u8]>,
+    digest: DigestV1,
+    logical_len: u64,
+    retained_cost: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WeakSourceBackingOwner {
+    identity: Weak<SourceBackingIdentity>,
+}
+
+impl SourceBackingOwner {
+    fn from_image(image: &VerifiedSourceImage) -> Result<Self, SourceStoreError> {
+        let logical_len = usize_to_u64(image.as_bytes().len())?;
+        let retained_cost = arc_slice_allocation_bytes::<u8>(image.as_bytes().len())
+            .map_err(|_| SourceStoreError::RetainedSizeOverflow)?;
+        Ok(Self {
+            identity: Arc::new(SourceBackingIdentity {
+                backing: Arc::clone(image.backing()),
+                digest: image.fingerprint().digest(),
+                logical_len,
+                retained_cost,
+            }),
+        })
+    }
+
+    #[must_use]
+    fn downgrade(&self) -> WeakSourceBackingOwner {
+        WeakSourceBackingOwner {
+            identity: Arc::downgrade(&self.identity),
+        }
+    }
+
+    #[must_use]
+    fn backing(&self) -> &Arc<[u8]> {
+        &self.identity.backing
+    }
+
+    #[must_use]
+    fn digest(&self) -> DigestV1 {
+        self.identity.digest
+    }
+
+    #[must_use]
+    fn logical_len(&self) -> u64 {
+        self.identity.logical_len
+    }
+
+    #[must_use]
+    fn retained_cost(&self) -> u64 {
+        self.identity.retained_cost
+    }
+
+    #[must_use]
+    fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
+
+impl WeakSourceBackingOwner {
+    #[must_use]
+    pub(crate) fn is_live(&self) -> bool {
+        self.identity.strong_count() != 0
+    }
+
+    #[must_use]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.identity, &other.identity)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn strong_count(&self) -> usize {
+        self.identity.strong_count()
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestSourceBackingOwner {
+    owner: SourceBackingOwner,
+    weak: WeakSourceBackingOwner,
+}
+
+#[cfg(test)]
+impl TestSourceBackingOwner {
+    pub(crate) fn new(kind: SourceKind, bytes: Arc<[u8]>) -> Self {
+        let image = VerifiedSourceImage::verify(kind, bytes);
+        let owner = SourceBackingOwner::from_image(&image).expect("test backing metadata must fit");
+        let weak = owner.downgrade();
+        Self { owner, weak }
+    }
+
+    #[must_use]
+    pub(crate) const fn weak(&self) -> &WeakSourceBackingOwner {
+        &self.weak
+    }
+
+    #[must_use]
+    pub(crate) fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.owner.identity)
+    }
 }
 
 /// Parse state frozen before a source entry is published into a workspace snapshot.
@@ -72,7 +186,7 @@ impl FrozenSourceParse {
 }
 
 impl SourceEntry {
-    fn validate_parts(
+    pub(super) fn validate_parts(
         source: SourceId,
         image: &VerifiedSourceImage,
         parse: &FrozenSourceParse,
@@ -119,12 +233,16 @@ impl SourceEntry {
     fn new(
         source: SourceId,
         image: VerifiedSourceImage,
+        backing_owner: SourceBackingOwner,
         parse: FrozenSourceParse,
         format: WorkspaceSourceFormatInspection,
     ) -> Self {
+        let weak_backing_owner = backing_owner.downgrade();
         Self {
             source,
             image,
+            backing_owner,
+            weak_backing_owner,
             parse,
             format,
         }
@@ -138,6 +256,11 @@ impl SourceEntry {
     #[must_use]
     pub(crate) fn image(&self) -> &VerifiedSourceImage {
         &self.image
+    }
+
+    #[must_use]
+    pub(crate) const fn weak_backing_owner(&self) -> &WeakSourceBackingOwner {
+        &self.weak_backing_owner
     }
 
     #[must_use]
@@ -173,13 +296,13 @@ pub(crate) struct SourceStore {
 /// Canonical bytes and the exact number of source entries that reference them.
 #[derive(Debug, Clone)]
 struct ContentBacking {
-    bytes: Arc<[u8]>,
+    owner: SourceBackingOwner,
     source_count: usize,
 }
 
 impl SourceStore {
     #[must_use]
-    pub(crate) fn new(workspace: WorkspaceId) -> Self {
+    pub(super) fn new(workspace: WorkspaceId) -> Self {
         Self {
             workspace,
             by_id: BTreeMap::new(),
@@ -187,7 +310,7 @@ impl SourceStore {
         }
     }
 
-    pub(crate) fn insert_inspected(
+    pub(super) fn insert_proven(
         &mut self,
         source: SourceId,
         image: VerifiedSourceImage,
@@ -211,9 +334,9 @@ impl SourceStore {
         }
 
         let digest = image.fingerprint().digest();
-        let (image, next_source_count) = match self.by_digest.get(&digest) {
+        let (image, existing_owner, next_source_count) = match self.by_digest.get(&digest) {
             Some(existing) => {
-                let canonical = Arc::clone(&existing.bytes);
+                let canonical = Arc::clone(existing.owner.backing());
                 let needs_parse_rebind = !Arc::ptr_eq(image.backing(), &canonical);
                 let rebinding = image
                     .rebind_equivalent_with_proof(canonical)
@@ -227,23 +350,33 @@ impl SourceStore {
                     .source_count
                     .checked_add(1)
                     .ok_or(SourceStoreError::ContentReferenceCountOverflow { digest })?;
-                (image, next_source_count)
+                (image, Some(existing.owner.clone()), next_source_count)
             }
-            None => (image, 1),
+            None => (image, None, 1),
         };
         SourceEntry::validate_parts(source, &image, &parse, &format)?;
         let previous_digest = previous
             .map(|entry| self.validate_content_reference(source, entry))
             .transpose()?;
         let new_source = previous.is_none();
-        let new_digest = !self.by_digest.contains_key(&digest);
+        let new_digest = existing_owner.is_none();
         let retained_bytes = retained_insert_bytes(new_digest)?;
 
         if new_source {
             budget.check_entries(1)?;
         }
         budget.check_bytes(retained_bytes)?;
-        let entry = Arc::new(SourceEntry::new(source, image, parse, format));
+        let backing_owner = match existing_owner {
+            Some(owner) => owner,
+            None => SourceBackingOwner::from_image(&image)?,
+        };
+        let entry = Arc::new(SourceEntry::new(
+            source,
+            image,
+            backing_owner.clone(),
+            parse,
+            format,
+        ));
         if new_source {
             budget.consume_entries(1)?;
         }
@@ -258,7 +391,7 @@ impl SourceStore {
             self.by_digest.insert(
                 digest,
                 ContentBacking {
-                    bytes: Arc::clone(entry.image.backing()),
+                    owner: backing_owner,
                     source_count: next_source_count,
                 },
             );
@@ -268,7 +401,7 @@ impl SourceStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn insert(
+    pub(super) fn insert(
         &mut self,
         source: SourceId,
         image: VerifiedSourceImage,
@@ -276,10 +409,10 @@ impl SourceStore {
         budget: &mut AssetLoadBudget,
     ) -> Result<Arc<SourceEntry>, SourceStoreError> {
         let format = WorkspaceSourceFormatInspection::minimal_for_test(source.kind());
-        self.insert_inspected(source, image, parse, format, budget)
+        self.insert_proven(source, image, parse, format, budget)
     }
 
-    pub(crate) fn clone_for_update(
+    pub(super) fn clone_for_update(
         &self,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, SourceStoreError> {
@@ -329,41 +462,29 @@ impl SourceStore {
         Ok(removed)
     }
 
-    pub(crate) fn remove_all(
-        &mut self,
-        sources: &[SourceId],
-        budget: &mut AssetLoadBudget,
-    ) -> Result<(), SourceStoreError> {
-        let scratch_bytes = checked_vec_bytes::<(SourceId, DigestV1)>(sources.len())?;
-        budget.consume_bytes(scratch_bytes)?;
-        let mut removals = Vec::new();
-        removals.try_reserve_exact(sources.len()).map_err(|_| {
-            SourceStoreError::AllocationFailed {
-                resource: "source store removal validation",
-                requested: sources.len(),
+    pub(super) fn remove_sorted(&mut self, sources: &[SourceId]) -> Result<(), SourceStoreError> {
+        if let Some(pair) = sources.windows(2).find(|pair| pair[0] >= pair[1]) {
+            if pair[0] == pair[1] {
+                return Err(SourceStoreError::DuplicateRemovalSource(pair[0]));
             }
-        })?;
-
+            return Err(SourceStoreError::RemovalSourcesNotSorted {
+                previous: pair[0],
+                current: pair[1],
+            });
+        }
         for source in sources {
             self.ensure_workspace(*source)?;
             let entry = self
                 .by_id
                 .get(source)
                 .ok_or(SourceStoreError::UnknownSource(*source))?;
-            let digest = self.validate_content_reference(*source, entry)?;
-            removals.push((*source, digest));
-        }
-        removals.sort_unstable_by_key(|(source, _)| *source);
-        if let Some(source) = removals
-            .windows(2)
-            .find_map(|pair| (pair[0].0 == pair[1].0).then_some(pair[0].0))
-        {
-            return Err(SourceStoreError::DuplicateRemovalSource(source));
+            self.validate_content_reference(*source, entry)?;
         }
 
-        for (source, digest) in removals {
+        for source in sources {
+            let digest = self.by_id[source].image.fingerprint().digest();
             self.release_content_reference(digest);
-            let removed = self.by_id.remove(&source);
+            let removed = self.by_id.remove(source);
             debug_assert!(
                 removed.is_some(),
                 "prevalidated source disappeared during removal"
@@ -404,7 +525,7 @@ impl SourceStore {
         self.by_id.iter().map(|(source, entry)| (*source, entry))
     }
 
-    pub(crate) fn validate(&self, budget: &mut AssetLoadBudget) -> Result<(), SourceStoreError> {
+    pub(super) fn validate(&self, budget: &mut AssetLoadBudget) -> Result<(), SourceStoreError> {
         let scratch_bytes = checked_vec_bytes::<DigestV1>(self.by_id.len())?;
         budget.consume_bytes(scratch_bytes)?;
         let mut referenced_digests = Vec::new();
@@ -485,8 +606,22 @@ impl SourceStore {
                 source_id: source,
                 digest,
             })?;
-        if !Arc::ptr_eq(&indexed.bytes, entry.image.backing()) {
+        if !Arc::ptr_eq(indexed.owner.backing(), entry.image.backing()) {
             return Err(SourceStoreError::BackingNotCanonical {
+                source_id: source,
+                digest,
+            });
+        }
+        if !indexed.owner.ptr_eq(&entry.backing_owner)
+            || indexed.owner.digest() != digest
+            || indexed.owner.logical_len()
+                != u64::try_from(entry.image.as_bytes().len())
+                    .map_err(|_| SourceStoreError::RetainedSizeOverflow)?
+            || indexed.owner.retained_cost()
+                != arc_slice_allocation_bytes::<u8>(entry.image.as_bytes().len())
+                    .map_err(|_| SourceStoreError::RetainedSizeOverflow)?
+        {
+            return Err(SourceStoreError::BackingOwnerMismatch {
                 source_id: source,
                 digest,
             });
@@ -550,6 +685,11 @@ pub(crate) enum SourceStoreError {
     UnknownSource(SourceId),
     #[error("source removal batch contains duplicate source {0:?}")]
     DuplicateRemovalSource(SourceId),
+    #[error("source removal batch is not sorted: {previous:?} precedes {current:?}")]
+    RemovalSourcesNotSorted {
+        previous: SourceId,
+        current: SourceId,
+    },
     #[error("digest collision for distinct source bytes: {digest}")]
     DigestCollision { digest: DigestV1 },
     #[error("content reference count overflow for {digest}")]
@@ -575,6 +715,11 @@ pub(crate) enum SourceStoreError {
         source_id: SourceId,
         digest: DigestV1,
     },
+    #[error("source {source_id:?} has inconsistent backing-owner evidence for {digest}")]
+    BackingOwnerMismatch {
+        source_id: SourceId,
+        digest: DigestV1,
+    },
     #[error("content index {digest} has no source entry")]
     UnreferencedContentIndex { digest: DigestV1 },
     #[error("content index {digest} records {indexed} references, but {actual} sources use it")]
@@ -596,6 +741,10 @@ fn retained_insert_bytes(new_digest: bool) -> Result<u64, SourceStoreError> {
         bytes = checked_byte_add(
             bytes,
             checked_btree_entry_bytes::<DigestV1, ContentBacking>()?,
+        )?;
+        bytes = checked_byte_add(
+            bytes,
+            checked_arc_allocation_bytes::<SourceBackingIdentity>()?,
         )?;
     }
     Ok(bytes)
@@ -647,7 +796,7 @@ mod tests {
     use unity_asset_core::AssetLoadLimits;
 
     const V22_FIXTURE: &[u8] = include_bytes!(
-        "../../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin"
+        "../../../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin"
     );
 
     fn source(workspace: WorkspaceId, local: u128) -> SourceId {
@@ -987,6 +1136,28 @@ mod tests {
     }
 
     #[test]
+    fn raw_backing_does_not_keep_the_committed_owner_live_after_removal() {
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let source = source(workspace, 1);
+        let mut store = SourceStore::new(workspace);
+        let entry = insert(
+            &mut store,
+            source,
+            b"retained outside state",
+            &mut AssetLoadBudget::default(),
+        );
+        let raw_backing = Arc::clone(entry.image().backing());
+        let weak_owner = entry.weak_backing_owner().clone();
+        drop(entry);
+
+        drop(store.remove(source).expect("remove source"));
+
+        assert!(!weak_owner.is_live());
+        assert_eq!(raw_backing.as_ref(), b"retained outside state");
+        assert!(store.is_empty());
+    }
+
+    #[test]
     fn replacement_with_existing_digest_updates_both_reference_counts() {
         let workspace = WorkspaceId::from_u128(1).unwrap();
         let mut store = SourceStore::new(workspace);
@@ -1049,9 +1220,7 @@ mod tests {
         let sources = (1..=SOURCE_COUNT)
             .map(|local| source(workspace, local))
             .collect::<Vec<_>>();
-        store
-            .remove_all(&sources, &mut AssetLoadBudget::default())
-            .unwrap();
+        store.remove_sorted(&sources).unwrap();
         assert!(store.is_empty());
         assert!(store.by_digest.is_empty());
         validate(&store).unwrap();
@@ -1159,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_all_prevalidates_unknown_and_duplicate_sources_atomically() {
+    fn remove_sorted_prevalidates_invalid_sources_atomically() {
         let workspace = WorkspaceId::from_u128(1).unwrap();
         let mut store = SourceStore::new(workspace);
         let first = source(workspace, 1);
@@ -1170,9 +1339,8 @@ mod tests {
         insert(&mut store, second, b"shared", &mut load_budget);
         let digest = first_entry.image().fingerprint().digest();
 
-        let mut removal_budget = AssetLoadBudget::default();
         assert_eq!(
-            store.remove_all(&[first, unknown], &mut removal_budget),
+            store.remove_sorted(&[first, unknown]),
             Err(SourceStoreError::UnknownSource(unknown))
         );
         assert!(store.contains(first));
@@ -1180,8 +1348,15 @@ mod tests {
         assert_eq!(store.by_digest[&digest].source_count, 2);
 
         assert_eq!(
-            store.remove_all(&[first, first], &mut removal_budget),
+            store.remove_sorted(&[first, first]),
             Err(SourceStoreError::DuplicateRemovalSource(first))
+        );
+        assert_eq!(
+            store.remove_sorted(&[second, first]),
+            Err(SourceStoreError::RemovalSourcesNotSorted {
+                previous: second,
+                current: first,
+            })
         );
         assert!(store.contains(first));
         assert!(store.contains(second));

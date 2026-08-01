@@ -6,7 +6,19 @@ use unity_asset_core::{
 };
 
 use super::source_catalog::{CatalogError, SourceCatalog};
-use super::store::{SourceStore, SourceStoreError};
+
+mod store;
+mod transaction;
+
+#[cfg(test)]
+pub(crate) use store::TestSourceBackingOwner;
+pub(crate) use store::{
+    FrozenSourceParse, SourceEntry, SourceStore, SourceStoreError, WeakSourceBackingOwner,
+};
+pub(super) use transaction::{
+    PreparedSourceChild, PreparedSourceRelation, PreparedSourceTree, PreparedWorkspaceState,
+    VerifiedSourceContent, WorkspaceStateInstallOutcome, WorkspaceStateTransaction,
+};
 
 /// Fully validated immutable workspace baseline.
 #[derive(Debug)]
@@ -25,7 +37,7 @@ impl WorkspaceState {
         typetree_mode: TypeTreeParseMode,
     ) -> Result<Self, WorkspaceStateError> {
         let mut budget = AssetLoadBudget::default();
-        Self::new(
+        Self::from_candidates(
             workspace,
             typetree_mode,
             SourceCatalog::new(workspace),
@@ -34,7 +46,7 @@ impl WorkspaceState {
         )
     }
 
-    pub(crate) fn new(
+    fn from_candidates(
         workspace: WorkspaceId,
         typetree_mode: TypeTreeParseMode,
         catalog: SourceCatalog,
@@ -158,6 +170,20 @@ impl WorkspaceState {
         workspace_revision(catalog, self.parse_context)
     }
 
+    /// Compares every installed binding that is intentionally excluded from revision identity.
+    ///
+    /// Revision equality alone is insufficient: relocating an otherwise identical root keeps the
+    /// same logical revision but must install the new physical binding.
+    fn installation_equivalent(&self, other: &Self) -> bool {
+        if self.workspace != other.workspace
+            || self.typetree_mode != other.typetree_mode
+            || self.parse_context != other.parse_context
+        {
+            return false;
+        }
+        self.catalog.installation_equivalent(&other.catalog)
+    }
+
     #[must_use]
     pub(crate) fn catalog(&self) -> &SourceCatalog {
         &self.catalog
@@ -234,7 +260,7 @@ fn parse_context_digest(
 
 fn frozen_registry_digest(
     source: SourceId,
-    entry: &super::store::SourceEntry,
+    entry: &SourceEntry,
 ) -> Result<Option<DigestV1>, WorkspaceStateError> {
     let Some(serialized) = entry.cached_serialized() else {
         return Ok(None);
@@ -251,6 +277,8 @@ fn frozen_registry_digest(
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum WorkspaceStateError {
+    #[error(transparent)]
+    Budget(#[from] unity_asset_core::BudgetError),
     #[error(transparent)]
     Catalog(Box<CatalogError>),
     #[error(transparent)]
@@ -297,6 +325,8 @@ pub(crate) enum WorkspaceStateError {
     },
     #[error("source {source_id:?} retains a TypeTree registry without a stable semantic digest")]
     UnidentifiedTypeTreeRegistry { source_id: SourceId },
+    #[error("workspace state transaction is already aborted")]
+    TransactionAborted,
 }
 
 impl From<CatalogError> for WorkspaceStateError {
@@ -317,9 +347,9 @@ mod tests {
 
     use unity_asset_core::{AssetLoadBudget, SourceAlias};
 
+    use super::FrozenSourceParse;
     use super::*;
     use crate::workspace::source_catalog::{PhysicalOrigin, SourceDescriptor};
-    use crate::workspace::store::FrozenSourceParse;
     use unity_asset_core::VerifiedSourceImage;
 
     fn root_descriptor(kind: SourceKind, alias: &str, bytes: &[u8]) -> SourceDescriptor {
@@ -354,7 +384,7 @@ mod tests {
 
         let parse_context = parse_context_digest(&store, TypeTreeParseMode::Lenient).unwrap();
         let expected = workspace_revision(&catalog, parse_context).unwrap();
-        let state = WorkspaceState::new(
+        let state = WorkspaceState::from_candidates(
             workspace,
             TypeTreeParseMode::Lenient,
             catalog,
@@ -387,7 +417,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            WorkspaceState::new(
+            WorkspaceState::from_candidates(
                 workspace,
                 TypeTreeParseMode::Lenient,
                 catalog,
@@ -413,7 +443,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            WorkspaceState::new(
+            WorkspaceState::from_candidates(
                 workspace,
                 TypeTreeParseMode::Lenient,
                 SourceCatalog::new(workspace),

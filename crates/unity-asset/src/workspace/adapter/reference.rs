@@ -96,7 +96,7 @@ impl ReferenceInput for ReferenceViewParts<'_> {
                     };
                 }
 
-                let owner = ReferenceSourceOwner::from(entry.image().backing());
+                let owner = ReferenceSourceOwner::from(entry.weak_backing_owner());
                 match source.kind() {
                     SourceKind::SerializedFile => ReferenceSource::serialized(
                         source,

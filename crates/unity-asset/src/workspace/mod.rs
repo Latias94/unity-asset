@@ -13,7 +13,6 @@ mod snapshot;
 mod source_admission;
 mod source_catalog;
 mod state;
-mod store;
 mod view;
 
 pub use capabilities::{
@@ -72,7 +71,9 @@ pub use view::{
 };
 
 pub(crate) use inspection::StreamedResourceResolver;
-pub(crate) use state::WorkspaceState;
+#[cfg(test)]
+pub(crate) use state::TestSourceBackingOwner;
+pub(crate) use state::{WeakSourceBackingOwner, WorkspaceState};
 
 #[doc(hidden)]
 pub struct ReferenceViewParts<'a> {

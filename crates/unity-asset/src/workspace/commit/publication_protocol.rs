@@ -634,12 +634,14 @@ impl ArtifactObservation {
     }
 }
 
-/// Relationship between an attached workspace and the journal baseline.
+/// Relationship between an attached workspace and the journal base state.
+///
+/// A revision can intentionally exclude physical source bindings, so matching
+/// the committed revision does not prove that the committed state is installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BaselineObservation {
     Base,
-    Committed,
-    Other,
+    NotBase,
     Detached,
 }
 
@@ -1580,9 +1582,8 @@ mod tests {
         }
 
         for baseline in [
-            BaselineObservation::Committed,
             BaselineObservation::Base,
-            BaselineObservation::Other,
+            BaselineObservation::NotBase,
             BaselineObservation::Detached,
         ] {
             assert_eq!(
@@ -1636,7 +1637,7 @@ mod tests {
                 &state,
                 &forward,
                 RecoveryIntent::Abandon,
-                BaselineObservation::Other,
+                BaselineObservation::NotBase,
             ),
             RecoveryDecision::Blocked(ProtocolBlock::InvalidEventSequence(
                 "explicit abandon requires the workspace base revision",

@@ -14,11 +14,10 @@ use unity_asset_binary::typetree::{
 };
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, BudgetedSourceBytes, DigestBuildError, DigestV1, DigestV1Builder,
-    SourceAlias, SourceFingerprint, SourceId, SourceKind, SourceMemberId, UnityClass,
-    UnityDocument, WorkspaceId, WorkspaceRevision, YamlAnchor, arc_slice_allocation_bytes,
-    arc_value_allocation_bytes,
+    SourceAlias, SourceId, SourceKind, UnityClass, UnityDocument, WorkspaceId, WorkspaceRevision,
+    YamlAnchor, arc_slice_allocation_bytes, arc_value_allocation_bytes,
 };
-use unity_asset_yaml::YamlDocument;
+use unity_asset_yaml::{BudgetedYamlError, YamlDocument, parse_prebudgeted_yaml_source};
 
 use super::adapter::archive::{
     ArchiveLoadError, ArchiveMemberNameError, load_preflighted_zip_archive, preflight_zip_archive,
@@ -27,7 +26,6 @@ use super::adapter::binary::{
     BinaryAdapterAllocationUnit, BinaryAdapterError, BinaryContainerKind, BinaryMemberContent,
     BinaryPayload, BinaryWorkspaceAdapter,
 };
-use super::adapter::yaml::{YamlAdapterError, parse_prebudgeted_yaml_source};
 use super::inspection::{
     AssetBundleSummary, SerializedFileSummary, WebFileSummary, WorkspaceSourceFormatInspection,
 };
@@ -42,8 +40,11 @@ use super::source_catalog::{
     CatalogError, PhysicalOrigin, RootAdmissionDecision, SourceDescriptor, open_verified_file,
     physical_file_identity, physical_file_identity_from_path,
 };
-use super::state::WorkspaceState;
-use super::store::{FrozenSourceParse, SourceStore};
+use super::state::{
+    FrozenSourceParse, PreparedSourceChild, PreparedSourceRelation, PreparedSourceTree,
+    PreparedWorkspaceState, WorkspaceState, WorkspaceStateInstallOutcome,
+    WorkspaceStateTransaction,
+};
 use super::view::{
     WorkspaceAllocationUnit, WorkspaceError, WorkspaceSourceContainer,
     WorkspaceSourceIdentityError, WorkspaceSourceMemberIdentityError,
@@ -290,19 +291,11 @@ impl AssetWorkspace {
         &self.binary
     }
 
-    pub(crate) fn install_state_if_current(
+    pub(super) fn install_prepared_state(
         &mut self,
-        expected: &Arc<WorkspaceState>,
-        next: Arc<WorkspaceState>,
-    ) -> bool {
-        if !Arc::ptr_eq(&self.state, expected)
-            || expected.workspace() != next.workspace()
-            || expected.revision() == next.revision()
-        {
-            return false;
-        }
-        self.state = next;
-        true
+        prepared: &PreparedWorkspaceState,
+    ) -> WorkspaceStateInstallOutcome {
+        prepared.install_into(&mut self.state)
     }
 
     pub fn load_path(
@@ -642,21 +635,7 @@ impl AssetWorkspace {
                 outcomes,
             ));
         };
-        let mut catalog = self
-            .state
-            .catalog()
-            .begin_transaction(budget)
-            .map_err(WorkspaceError::from)
-            .map_err(|error| {
-                admission_batch_workspace_error(
-                    SourceAdmissionBatchPhase::CandidateApplication,
-                    error,
-                )
-            })?;
-        let mut store = self
-            .state
-            .store()
-            .clone_for_update(budget)
+        let mut transaction = WorkspaceStateTransaction::begin(Arc::clone(&self.state), budget)
             .map_err(WorkspaceError::from)
             .map_err(|error| {
                 admission_batch_workspace_error(
@@ -686,7 +665,7 @@ impl AssetWorkspace {
                             error.into(),
                         ));
                     }
-                    let is_root = catalog
+                    let is_root = transaction
                         .is_root(source)
                         .map_err(WorkspaceError::from)
                         .map_err(|error| {
@@ -703,18 +682,8 @@ impl AssetWorkspace {
                             WorkspaceError::NotRootSource(source),
                         ));
                     }
-                    let removed = catalog
+                    transaction
                         .remove_subtree(source, budget)
-                        .map_err(WorkspaceError::from)
-                        .map_err(|error| {
-                            admission_workspace_error_at(
-                                ordinal,
-                                SourceAdmissionOperationLocation::Source(source),
-                                error,
-                            )
-                        })?;
-                    store
-                        .remove_all(&removed, budget)
                         .map_err(WorkspaceError::from)
                         .map_err(|error| {
                             admission_workspace_error_at(
@@ -765,7 +734,7 @@ impl AssetWorkspace {
                         continue;
                     }
                     let fingerprint = source.fingerprint();
-                    let decision = catalog
+                    let decision = transaction
                         .root_admission_decision(&alias, &origin, fingerprint)
                         .map_err(WorkspaceError::from)
                         .map_err(|error| admission_workspace_error(ordinal, error))?;
@@ -866,15 +835,11 @@ impl AssetWorkspace {
                             ));
                         }
                     };
-                    let root_descriptor = SourceDescriptor::root(source.kind, alias, origin);
-                    let root = register_prepared(
-                        source,
-                        root_descriptor,
-                        &mut catalog,
-                        &mut store,
-                        budget,
-                    )
-                    .map_err(|error| admission_workspace_error(ordinal, error))?;
+                    let root_descriptor = SourceDescriptor::root(source.kind(), alias, origin);
+                    let root = transaction
+                        .register_tree(root_descriptor, source, budget)
+                        .map_err(WorkspaceError::from)
+                        .map_err(|error| admission_workspace_error(ordinal, error))?;
                     insert_admitted_source_index_keys(
                         &mut aliases,
                         &mut origins,
@@ -902,33 +867,28 @@ impl AssetWorkspace {
             ));
         }
 
-        let catalog = catalog
+        let prepared_state = transaction
             .commit(budget)
             .map_err(WorkspaceError::from)
             .map_err(|error| {
                 admission_batch_workspace_error(SourceAdmissionBatchPhase::Publication, error)
             })?;
-        let next = WorkspaceState::new(
-            self.workspace_id(),
-            self.config.typetree.mode,
-            catalog,
-            store,
-            budget,
-        )
-        .map_err(WorkspaceError::from)
-        .map_err(|error| {
-            admission_batch_workspace_error(SourceAdmissionBatchPhase::Publication, error)
-        })?;
-        let revision = next.revision();
-        let state_installed = revision != base_revision;
-        if state_installed {
-            consume_arc_allocation::<WorkspaceState>(budget, "workspace_state").map_err(
-                |error| {
-                    admission_batch_workspace_error(SourceAdmissionBatchPhase::Publication, error)
-                },
-            )?;
-            self.state = Arc::new(next);
-        }
+        let revision = prepared_state.revision();
+        let state_installed = match self.install_prepared_state(&prepared_state) {
+            WorkspaceStateInstallOutcome::Installed => true,
+            WorkspaceStateInstallOutcome::Unchanged => false,
+            WorkspaceStateInstallOutcome::Stale => {
+                return Err(admission_batch_workspace_error(
+                    SourceAdmissionBatchPhase::Publication,
+                    WorkspaceError::operation(
+                        "source admission state installation",
+                        std::io::Error::other(
+                            "workspace changed before the prepared state could be installed",
+                        ),
+                    ),
+                ));
+            }
+        };
         Ok(SourceAdmissionReport::new(
             policy,
             base_revision,
@@ -974,7 +934,7 @@ enum PreparedAdmission {
         ordinal: u64,
         alias: SourceAlias,
         origin: PhysicalOrigin,
-        source: PreparedSource,
+        source: PreparedSourceTree,
     },
     Unload {
         ordinal: u64,
@@ -992,21 +952,6 @@ impl PreparedAdmission {
             Self::Load { ordinal, .. } | Self::Unload { ordinal, .. } => Some(*ordinal),
             Self::Rejected { .. } => None,
         }
-    }
-}
-
-#[derive(Debug)]
-struct PreparedSource {
-    kind: SourceKind,
-    image: BudgetedSourceBytes,
-    parsed: PreparedParse,
-    format: WorkspaceSourceFormatInspection,
-    children: Vec<PreparedChild>,
-}
-
-impl PreparedSource {
-    fn fingerprint(&self) -> SourceFingerprint {
-        SourceFingerprint::from_bytes(self.kind, self.image.as_bytes())
     }
 }
 
@@ -1354,27 +1299,6 @@ fn clone_admission_origin(
     Ok(cloned)
 }
 
-#[derive(Debug)]
-enum PreparedParse {
-    None,
-    Serialized(Arc<SerializedFile>),
-    Yaml(Arc<YamlDocument>),
-}
-
-#[derive(Debug)]
-struct PreparedChild {
-    relation: ChildRelation,
-    identity: SourceMemberId,
-    source: PreparedSource,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ChildRelation {
-    Archive,
-    Bundle,
-    WebFile,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum FrozenRegistryKey {
     Class(i32),
@@ -1432,7 +1356,7 @@ fn prepare_root(
     binary: &BinaryWorkspaceAdapter,
     source_registry: Option<&Arc<dyn TypeTreeRegistry>>,
     budget: &mut AssetLoadBudget,
-) -> Result<PreparedSource, WorkspaceError> {
+) -> Result<PreparedSourceTree, WorkspaceError> {
     image.validate_budget(budget)?;
     observe_container_depth(0, budget)?;
     match kind_hint {
@@ -1475,10 +1399,10 @@ fn prepare_yaml(
     image: BudgetedSourceBytes,
     budget: &mut AssetLoadBudget,
     depth: u32,
-) -> Result<PreparedSource, WorkspaceError> {
+) -> Result<PreparedSourceTree, WorkspaceError> {
     let mut scoped = budget.enter_depth(depth)?;
     let parsed = parse_prebudgeted_yaml_source(image, &mut scoped)
-        .map_err(|error| map_yaml_adapter_error("YAML source parsing", error))?;
+        .map_err(|error| map_yaml_error("YAML source parsing", error))?;
     let (image, document) = parsed.into_budgeted_parts(&scoped)?;
     drop(scoped);
     finish_prepared_yaml(image, document, budget)
@@ -1488,16 +1412,16 @@ fn finish_prepared_yaml(
     image: BudgetedSourceBytes,
     document: Arc<YamlDocument>,
     budget: &mut AssetLoadBudget,
-) -> Result<PreparedSource, WorkspaceError> {
+) -> Result<PreparedSourceTree, WorkspaceError> {
     validate_yaml_identities(&document, budget)?;
     let document_count = usize_to_u64(document.entries().len(), "yaml_document_count")?;
-    Ok(PreparedSource {
-        kind: SourceKind::Yaml,
+    Ok(PreparedSourceTree::new(
+        SourceKind::Yaml,
         image,
-        parsed: PreparedParse::Yaml(document),
-        format: WorkspaceSourceFormatInspection::Yaml { document_count },
-        children: Vec::new(),
-    })
+        FrozenSourceParse::Yaml(document),
+        WorkspaceSourceFormatInspection::Yaml { document_count },
+        Vec::new(),
+    ))
 }
 
 fn prepare_binary_or_yaml(
@@ -1506,7 +1430,7 @@ fn prepare_binary_or_yaml(
     source_registry: Option<&Arc<dyn TypeTreeRegistry>>,
     budget: &mut AssetLoadBudget,
     depth: u32,
-) -> Result<PreparedSource, WorkspaceError> {
+) -> Result<PreparedSourceTree, WorkspaceError> {
     let binary_result = {
         let mut scoped = budget.enter_depth(depth)?;
         binary.parse_budgeted(&image, &mut scoped)
@@ -1526,7 +1450,7 @@ fn prepare_archive(
     source_registry: Option<&Arc<dyn TypeTreeRegistry>>,
     budget: &mut AssetLoadBudget,
     depth: u32,
-) -> Result<PreparedSource, WorkspaceError> {
+) -> Result<PreparedSourceTree, WorkspaceError> {
     image.validate_budget(budget)?;
     observe_container_depth(depth, budget)?;
     let plan = preflight_zip_archive(&image, budget)
@@ -1564,20 +1488,20 @@ fn prepare_archive(
             })?,
             false,
         )?;
-        children.push(PreparedChild {
-            relation: ChildRelation::Archive,
-            identity: member.member_id,
+        children.push(PreparedSourceChild::new(
+            PreparedSourceRelation::Archive,
+            member.member_id,
             source,
-        });
+        ));
     }
     let member_count = usize_to_u64(children.len(), "archive_member_count")?;
-    Ok(PreparedSource {
-        kind: SourceKind::Archive,
+    Ok(PreparedSourceTree::new(
+        SourceKind::Archive,
         image,
-        parsed: PreparedParse::None,
-        format: WorkspaceSourceFormatInspection::Archive { member_count },
+        FrozenSourceParse::None,
+        WorkspaceSourceFormatInspection::Archive { member_count },
         children,
-    })
+    ))
 }
 
 fn prepare_binary_payload(
@@ -1587,13 +1511,13 @@ fn prepare_binary_payload(
     source_registry: Option<&Arc<dyn TypeTreeRegistry>>,
     budget: &mut AssetLoadBudget,
     depth: u32,
-) -> Result<PreparedSource, WorkspaceError> {
+) -> Result<PreparedSourceTree, WorkspaceError> {
     image.validate_budget(budget)?;
     observe_container_depth(depth, budget)?;
     let kind = binary_payload_kind(&payload);
     let relation = match kind {
-        SourceKind::AssetBundle => Some(ChildRelation::Bundle),
-        SourceKind::WebFile => Some(ChildRelation::WebFile),
+        SourceKind::AssetBundle => Some(PreparedSourceRelation::Bundle),
+        SourceKind::WebFile => Some(PreparedSourceRelation::WebFile),
         SourceKind::SerializedFile
         | SourceKind::Yaml
         | SourceKind::Archive
@@ -1623,7 +1547,7 @@ fn prepare_binary_payload(
             let file = freeze_serialized_registry(*file, source_registry, budget, depth)?;
             let summary = SerializedFileSummary::from_file(&file, budget)?;
             (
-                PreparedParse::Serialized(promote_value_to_arc(
+                FrozenSourceParse::Serialized(promote_value_to_arc(
                     file,
                     budget,
                     "workspace_serialized_file",
@@ -1632,13 +1556,13 @@ fn prepare_binary_payload(
             )
         }
         BinaryPayload::AssetBundle(bundle) => (
-            PreparedParse::None,
+            FrozenSourceParse::None,
             WorkspaceSourceFormatInspection::AssetBundle(AssetBundleSummary::from_bundle(
                 &bundle, budget,
             )?),
         ),
         BinaryPayload::WebFile(web_file) => (
-            PreparedParse::None,
+            FrozenSourceParse::None,
             WorkspaceSourceFormatInspection::WebFile(WebFileSummary::from_webfile(
                 &web_file, budget,
             )?),
@@ -1682,19 +1606,11 @@ fn prepare_binary_payload(
                 std::io::Error::other("serialized files cannot own container members"),
             )
         })?;
-        children.push(PreparedChild {
-            relation,
-            identity,
-            source,
-        });
+        children.push(PreparedSourceChild::new(relation, identity, source));
     }
-    Ok(PreparedSource {
-        kind,
-        image,
-        parsed,
-        format,
-        children,
-    })
+    Ok(PreparedSourceTree::new(
+        kind, image, parsed, format, children,
+    ))
 }
 
 fn prepare_member(
@@ -1705,7 +1621,7 @@ fn prepare_member(
     budget: &mut AssetLoadBudget,
     depth: u32,
     binary_already_rejected: bool,
-) -> Result<PreparedSource, WorkspaceError> {
+) -> Result<PreparedSourceTree, WorkspaceError> {
     image.validate_budget(budget)?;
     observe_container_depth(depth, budget)?;
     let path = Path::new(name);
@@ -1739,14 +1655,14 @@ fn prepare_member(
     }
 }
 
-fn prepared_raw(image: BudgetedSourceBytes) -> PreparedSource {
-    PreparedSource {
-        kind: SourceKind::StreamedResource,
+fn prepared_raw(image: BudgetedSourceBytes) -> PreparedSourceTree {
+    PreparedSourceTree::new(
+        SourceKind::StreamedResource,
         image,
-        parsed: PreparedParse::None,
-        format: WorkspaceSourceFormatInspection::StreamedResource,
-        children: Vec::new(),
-    }
+        FrozenSourceParse::None,
+        WorkspaceSourceFormatInspection::StreamedResource,
+        Vec::new(),
+    )
 }
 
 fn binary_payload_kind(payload: &BinaryPayload) -> SourceKind {
@@ -2024,57 +1940,6 @@ fn is_plain_yaml_document(index: usize, class: &UnityClass) -> bool {
             == Some(index)
 }
 
-fn register_prepared(
-    prepared: PreparedSource,
-    descriptor: SourceDescriptor,
-    catalog: &mut super::source_catalog::SourceCatalogTransaction,
-    store: &mut SourceStore,
-    budget: &mut AssetLoadBudget,
-) -> Result<SourceId, WorkspaceError> {
-    let PreparedSource {
-        kind,
-        image,
-        parsed,
-        format,
-        children,
-    } = prepared;
-    let image = unity_asset_core::VerifiedSourceImage::verify(kind, image.into_backing(budget)?);
-    let fingerprint = image.fingerprint();
-    let source = catalog.register(descriptor, fingerprint, budget)?;
-    let parse = match parsed {
-        PreparedParse::None => FrozenSourceParse::None,
-        PreparedParse::Serialized(file) => FrozenSourceParse::Serialized(file),
-        PreparedParse::Yaml(document) => FrozenSourceParse::Yaml(document),
-    };
-    store
-        .insert_inspected(source, image, parse, format, budget)
-        .map_err(WorkspaceError::from)?;
-
-    for child in children {
-        let descriptor =
-            child_descriptor(source, child.relation, child.source.kind, child.identity)?;
-        register_prepared(child.source, descriptor, catalog, store, budget)?;
-    }
-    Ok(source)
-}
-
-fn child_descriptor(
-    parent: SourceId,
-    relation: ChildRelation,
-    kind: SourceKind,
-    identity: SourceMemberId,
-) -> Result<SourceDescriptor, WorkspaceError> {
-    if kind == SourceKind::StreamedResource {
-        return SourceDescriptor::sidecar(parent, identity).map_err(WorkspaceError::from);
-    }
-    match relation {
-        ChildRelation::Archive => SourceDescriptor::archive_member(parent, kind, identity),
-        ChildRelation::Bundle => SourceDescriptor::bundle_member(parent, kind, identity),
-        ChildRelation::WebFile => SourceDescriptor::webfile_member(parent, kind, identity),
-    }
-    .map_err(WorkspaceError::from)
-}
-
 fn observe_container_depth(depth: u32, budget: &mut AssetLoadBudget) -> Result<(), WorkspaceError> {
     if depth > MAX_CONTAINER_DEPTH {
         return Err(BudgetError::Exceeded {
@@ -2099,9 +1964,9 @@ fn next_container_depth(depth: u32, budget: &mut AssetLoadBudget) -> Result<u32,
 fn reserve_prepared_children(
     count: usize,
     budget: &mut AssetLoadBudget,
-) -> Result<Vec<PreparedChild>, WorkspaceError> {
+) -> Result<Vec<PreparedSourceChild>, WorkspaceError> {
     let bytes = count
-        .checked_mul(size_of::<PreparedChild>())
+        .checked_mul(size_of::<PreparedSourceChild>())
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or(BudgetError::ArithmeticOverflow {
             resource: "prepared_source_tree",
@@ -2120,13 +1985,10 @@ fn reserve_prepared_children(
     Ok(children)
 }
 
-pub(super) fn map_yaml_adapter_error(
-    operation: &'static str,
-    error: YamlAdapterError,
-) -> WorkspaceError {
+pub(super) fn map_yaml_error(operation: &'static str, error: BudgetedYamlError) -> WorkspaceError {
     match error {
-        YamlAdapterError::Budget(error) => WorkspaceError::Budget(error),
-        YamlAdapterError::AllocationFailed {
+        BudgetedYamlError::Budget(error) => WorkspaceError::Budget(error),
+        BudgetedYamlError::AllocationFailed {
             context,
             requested,
             source,
@@ -2136,7 +1998,7 @@ pub(super) fn map_yaml_adapter_error(
             unit: WorkspaceAllocationUnit::Bytes,
             message: source.to_string(),
         },
-        YamlAdapterError::IndexMapAllocationFailed {
+        BudgetedYamlError::IndexMapAllocationFailed {
             context,
             requested,
             source,
@@ -2146,7 +2008,7 @@ pub(super) fn map_yaml_adapter_error(
             unit: WorkspaceAllocationUnit::Bytes,
             message: source.to_string(),
         },
-        YamlAdapterError::DepthExceeded { actual, limit } => {
+        BudgetedYamlError::DepthExceeded { actual, limit } => {
             WorkspaceError::Budget(BudgetError::Exceeded {
                 resource: "yaml_depth",
                 limit: u64::from(limit),

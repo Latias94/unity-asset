@@ -1300,6 +1300,24 @@ impl SourceCatalog {
         budget: &mut AssetLoadBudget,
     ) -> Result<SourceCatalogTransaction, CatalogError> {
         self.validate()?;
+        self.clone_transaction_candidate(budget)
+    }
+
+    /// Clones a catalog already owned by validated workspace/prepared state.
+    ///
+    /// The workspace-state transaction performs the one authoritative candidate validation when
+    /// catalog and store are committed together.
+    pub(in crate::workspace) fn begin_state_transaction(
+        &self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SourceCatalogTransaction, CatalogError> {
+        self.clone_transaction_candidate(budget)
+    }
+
+    fn clone_transaction_candidate(
+        &self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SourceCatalogTransaction, CatalogError> {
         let retained_bytes = self.checked_transaction_clone_bytes()?;
         let entry_count =
             u64::try_from(self.by_id.len()).map_err(|_| CatalogError::AllocationSizeOverflow {
@@ -1629,6 +1647,20 @@ impl SourceCatalog {
         self.by_id
             .iter()
             .map(|(source, record)| (*source, &record.descriptor))
+    }
+
+    /// Compares source bindings that intentionally do not participate in logical revision identity.
+    pub(crate) fn installation_equivalent(&self, other: &Self) -> bool {
+        self.workspace == other.workspace
+            && self.by_id.len() == other.by_id.len()
+            && self.by_id.iter().zip(&other.by_id).all(
+                |((left_source, left), (right_source, right))| {
+                    left_source == right_source
+                        && left.descriptor == right.descriptor
+                        && left.fingerprint == right.fingerprint
+                        && left.physical_origin == right.physical_origin
+                },
+            )
     }
 
     #[must_use]
@@ -2781,6 +2813,17 @@ impl SourceCatalogTransaction {
             return Err(CatalogError::TransactionAborted);
         }
         self.candidate.validate()?;
+        Ok(self.candidate)
+    }
+
+    /// Transfers the candidate to the workspace-state transaction for joint validation.
+    ///
+    /// Callers that only own a catalog candidate must use [`Self::commit`]. The workspace-state
+    /// transaction validates catalog and source-store invariants together exactly once.
+    pub(in crate::workspace) fn into_state_candidate(self) -> Result<SourceCatalog, CatalogError> {
+        if self.failed {
+            return Err(CatalogError::TransactionAborted);
+        }
         Ok(self.candidate)
     }
 

@@ -22,8 +22,8 @@ use crate::schema::{BinarySchemaVersion, DeclaredUnityVersion, SchemaOrigin, Sch
 
 use super::interface::WorkspaceConfig;
 use super::source_catalog::{LocatorResolution, SourceCatalog};
+use super::state::SourceEntry;
 use super::state::WorkspaceState;
-use super::store::SourceEntry;
 use super::view::{
     self, WorkspaceAllocationUnit, WorkspaceByteRange, WorkspaceError, WorkspaceLookup,
     WorkspaceObject, WorkspaceObjectValue, WorkspaceSource, WorkspaceView, WorkspaceYamlObject,

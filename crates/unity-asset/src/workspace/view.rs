@@ -20,8 +20,8 @@ use unity_asset_write::artifact::{
 use unity_asset_yaml::YamlDocument;
 
 use super::source_catalog::{CatalogAllocationUnit, CatalogError, SourceLocationKind};
+use super::state::SourceStoreError;
 use super::state::WorkspaceStateError;
-use super::store::SourceStoreError;
 use crate::schema::SchemaProvenance;
 use crate::{BinaryError, BinaryObjectIdentityError};
 
@@ -1041,6 +1041,7 @@ impl From<SourceStoreError> for WorkspaceError {
 impl From<WorkspaceStateError> for WorkspaceError {
     fn from(error: WorkspaceStateError) -> Self {
         match error {
+            WorkspaceStateError::Budget(error) => Self::Budget(error),
             WorkspaceStateError::Catalog(error) => Self::from(*error),
             WorkspaceStateError::Store(error) => Self::from(*error),
             error => Self::operation("workspace state validation", error),

@@ -6,7 +6,7 @@ use unity_asset::workspace::{
     AssetWorkspace, SourceAdmissionBatch, SourceAdmissionBatchPhase, SourceAdmissionDisposition,
     SourceAdmissionErrorCategory, SourceAdmissionFailure, SourceAdmissionFailureSite,
     SourceAdmissionOperation, SourceAdmissionOperationLocation, SourceAdmissionPolicy,
-    SourceOpenRequest, WorkspaceView,
+    SourceOpenRequest, WorkspaceLookup, WorkspaceView,
 };
 use unity_asset::{AssetLoadBudget, AssetLoadLimits, SourceAlias, SourceId, SourceKind};
 
@@ -800,6 +800,99 @@ fn ordered_unload_then_reload_publishes_one_revision() {
         SourceAdmissionDisposition::Loaded { source_id } if *source_id == original
     ));
     assert_eq!(source_count(&workspace), 1);
+}
+
+#[test]
+fn same_content_relocation_installs_state_without_changing_revision() {
+    let directory = tempfile::tempdir().expect("create fixture directory");
+    let first_path = source_path(directory.path(), "first.resource", b"stable");
+    let second_path = source_path(directory.path(), "second.resource", b"stable");
+    let canonical_second = fs::canonicalize(&second_path).expect("canonical second path");
+    let alias = SourceAlias::new("stable.resource").expect("valid alias");
+    let mut workspace = AssetWorkspace::new().expect("create workspace");
+    let source = workspace
+        .load_source_bytes(
+            SourceOpenRequest::new(&first_path, alias.clone())
+                .with_kind_hint(SourceKind::StreamedResource),
+            Arc::from(b"stable".as_slice()),
+            &mut AssetLoadBudget::default(),
+        )
+        .expect("load original source");
+    let base_revision = workspace.revision();
+    let mut budget = AssetLoadBudget::default();
+    let batch = source_batch(
+        vec![
+            SourceAdmissionOperation::Unload(source),
+            raw_load(second_path, alias.as_str(), b"stable"),
+        ],
+        &mut budget,
+    );
+
+    let report = workspace
+        .admit_sources(batch, SourceAdmissionPolicy::Strict, &mut budget)
+        .expect("relocate source without changing logical identity");
+
+    assert!(report.state_installed());
+    assert_eq!(report.base_revision(), base_revision);
+    assert_eq!(report.revision(), base_revision);
+    assert_eq!(workspace.revision(), base_revision);
+    assert!(matches!(
+        report.outcomes()[1].disposition(),
+        SourceAdmissionDisposition::Loaded { source_id } if *source_id == source
+    ));
+    let resolved = workspace
+        .snapshot()
+        .source(source, &mut AssetLoadBudget::default())
+        .expect("resolve relocated source");
+    assert!(matches!(
+        resolved,
+        WorkspaceLookup::Resolved(source) if source.physical_origin() == Some(canonical_second.as_path())
+    ));
+}
+
+#[test]
+fn multi_root_removal_is_one_atomic_state_transition() {
+    let directory = tempfile::tempdir().expect("create fixture directory");
+    let first_path = source_path(directory.path(), "first.resource", b"first");
+    let second_path = source_path(directory.path(), "second.resource", b"second");
+    let mut workspace = AssetWorkspace::new().expect("create workspace");
+    let first = load_root(&mut workspace, &first_path, "first.resource", b"first");
+    let second = load_root(&mut workspace, &second_path, "second.resource", b"second");
+    let previous = workspace.snapshot();
+    let base_revision = workspace.revision();
+    let mut budget = AssetLoadBudget::default();
+    let batch = source_batch(
+        vec![
+            SourceAdmissionOperation::Unload(first),
+            SourceAdmissionOperation::Unload(second),
+        ],
+        &mut budget,
+    );
+
+    let report = workspace
+        .admit_sources(batch, SourceAdmissionPolicy::Strict, &mut budget)
+        .expect("remove both roots atomically");
+
+    assert!(report.state_installed());
+    assert_eq!(report.base_revision(), base_revision);
+    assert_eq!(report.revision(), workspace.revision());
+    assert_ne!(report.revision(), base_revision);
+    assert!(matches!(
+        report.outcomes()[0].disposition(),
+        SourceAdmissionDisposition::Unloaded { source_id } if *source_id == first
+    ));
+    assert!(matches!(
+        report.outcomes()[1].disposition(),
+        SourceAdmissionDisposition::Unloaded { source_id } if *source_id == second
+    ));
+    assert_eq!(source_count(&workspace), 0);
+    assert_eq!(
+        previous
+            .sources(&mut AssetLoadBudget::default())
+            .expect("old snapshot remains readable")
+            .len(),
+        2
+    );
 }
 
 #[test]

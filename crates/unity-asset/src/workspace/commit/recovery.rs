@@ -2292,18 +2292,8 @@ fn recover_finalized_journal(
         return Ok(historical_commit_receipt(report));
     };
     match baseline {
-        BaselineObservation::Committed => match observe_execution(journal, budget) {
-            Ok((_, artifacts)) if artifacts.iter().all(|artifact| artifact.is_published()) => {
-                Ok(commit_outcome(report, true))
-            }
-            Ok(_) | Err(ObservationError::Blocked(_)) => Ok(historical_commit_receipt(report)),
-            Err(ObservationError::Budget(source)) => Err(RecoveryError::Budget {
-                locator: Box::new(locator.clone()),
-                source,
-            }),
-        },
-        BaselineObservation::Base | BaselineObservation::Other => {
-            let may_be_partial = matches!(baseline, BaselineObservation::Other);
+        BaselineObservation::Base | BaselineObservation::NotBase => {
+            let may_be_partial = matches!(baseline, BaselineObservation::NotBase);
             // Installing a baseline changes in-memory state, so it remains a
             // stronger operation than receipt redelivery. Verify the current
             // publication image only in this branch before rebuilding it.
@@ -2343,7 +2333,7 @@ fn recover_finalized_journal(
                 &artifacts,
                 &execution,
                 workspace,
-                &mut Some(rebuilt),
+                Some(&rebuilt),
                 report.committed_revision(),
             )
             .map_err(|error| map_execution_error(locator, error))?;
@@ -2385,13 +2375,13 @@ fn recover_open_journal(
     let events = ObservedProtocol::from_journal(journal, budget)
         .map_err(|error| map_observation_error(locator, error))?;
     let baseline = match workspace.as_deref() {
-        Some(workspace) if workspace.revision() == report.committed_revision() => {
-            BaselineObservation::Committed
-        }
-        Some(workspace) if workspace.revision() == report.base_revision() => {
+        Some(workspace)
+            if report.base_revision() != report.committed_revision()
+                && workspace.revision() == report.base_revision() =>
+        {
             BaselineObservation::Base
         }
-        Some(_) => BaselineObservation::Other,
+        Some(_) => BaselineObservation::NotBase,
         None => BaselineObservation::Detached,
     };
     if events.state.finalized() {
@@ -2483,7 +2473,7 @@ fn recover_open_journal(
             let finalize_workspace = workspace.is_some();
             let prebuilt_baseline = if matches!(
                 observation.baseline,
-                BaselineObservation::Base | BaselineObservation::Other
+                BaselineObservation::Base | BaselineObservation::NotBase
             ) {
                 Some(prebuild_recovery_baseline(
                     workspace
@@ -3850,7 +3840,6 @@ fn execute_forward_program(
             "recovery execution plan does not cover every artifact",
         )));
     }
-    let mut prebuilt_baseline = prebuilt_baseline;
     for step in steps {
         let action = step.action();
         let recorded = prepare_recovery_step(protocol, &mut event_plan, step)?;
@@ -3892,7 +3881,7 @@ fn execute_forward_program(
                     observations,
                     execution,
                     workspace,
-                    &mut prebuilt_baseline,
+                    prebuilt_baseline.as_ref(),
                     committed_revision,
                 )?;
             }
@@ -3903,7 +3892,7 @@ fn execute_forward_program(
                         observations,
                         execution,
                         workspace,
-                        &mut prebuilt_baseline,
+                        prebuilt_baseline.as_ref(),
                         committed_revision,
                     )?;
                 }
@@ -4017,29 +4006,26 @@ fn verify_and_install_recovery_baseline(
     observations: &[ArtifactObservation],
     execution: &RecoveryExecutionPlan,
     workspace: &mut AssetWorkspace,
-    prebuilt_baseline: &mut Option<super::baseline::PreparedBaseline>,
+    prebuilt_baseline: Option<&super::baseline::PreparedBaseline>,
     committed_revision: WorkspaceRevision,
 ) -> Result<(), ExecutionError> {
     #[cfg(test)]
     super::test_run_publication_hook("before_recovery_baseline_install");
     verify_published_artifacts(journal, observations, execution)?;
-    if workspace.revision() == committed_revision {
-        return Ok(());
-    }
-    let baseline = prebuilt_baseline.take().ok_or_else(|| {
+    let baseline = prebuilt_baseline.ok_or_else(|| {
         ExecutionError::Blocked(invalid_event(
             "recovery baseline was not prepared before execution",
         ))
     })?;
-    if workspace.install_state_if_current(&baseline.expected, baseline.next) {
-        Ok(())
-    } else {
-        Err(ExecutionError::Blocked(
+    match workspace.install_prepared_state(baseline.state()) {
+        super::super::state::WorkspaceStateInstallOutcome::Installed
+        | super::super::state::WorkspaceStateInstallOutcome::Unchanged => Ok(()),
+        super::super::state::WorkspaceStateInstallOutcome::Stale => Err(ExecutionError::Blocked(
             RecoveryBlockedReason::BaselineUnavailable {
                 expected: committed_revision,
                 actual: workspace.revision(),
             },
-        ))
+        )),
     }
 }
 

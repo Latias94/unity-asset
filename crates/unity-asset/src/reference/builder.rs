@@ -575,7 +575,9 @@ mod tests {
     use super::*;
     use crate::reference::ReferenceStore;
     use crate::reference::input::sealed;
-    use crate::workspace::{AssetWorkspace, ReferenceViewParts, reference_view_parts};
+    use crate::workspace::{
+        AssetWorkspace, ReferenceViewParts, TestSourceBackingOwner, reference_view_parts,
+    };
 
     struct ChangingReferenceInput<'state> {
         inner: ReferenceViewParts<'state>,
@@ -715,12 +717,15 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("build A did not pause before publishing its fact-cache batch");
 
-        let competing_owner = Arc::<[u8]>::from(&b"competing reference owner"[..]);
+        let competing_owner = TestSourceBackingOwner::new(
+            unity_asset_core::SourceKind::Yaml,
+            Arc::<[u8]>::from(&b"competing reference owner"[..]),
+        );
         store
             .publish_facts_batch(
                 vec![FactCacheCandidate {
                     fingerprint,
-                    owner: (&competing_owner).into(),
+                    owner: competing_owner.weak().into(),
                     occurrences: Arc::clone(&retained),
                 }],
                 &mut AssetLoadBudget::default(),

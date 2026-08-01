@@ -572,7 +572,7 @@ fn reserve_cache_slot<T>(
 mod tests {
     use std::fs;
 
-    use crate::workspace::{AssetWorkspace, reference_view_parts};
+    use crate::workspace::{AssetWorkspace, TestSourceBackingOwner, reference_view_parts};
     use unity_asset_core::{AssetLoadLimits, SourceKind};
     use unity_asset_write::artifact::{
         ArtifactBatchDeclaration, ArtifactBudget, ArtifactLimits, PreparedArtifactSet,
@@ -581,8 +581,8 @@ mod tests {
     use super::*;
     use crate::reference::occurrence::account_cached_source;
 
-    fn source_owner() -> Arc<[u8]> {
-        Arc::from(&b"reference cache owner"[..])
+    fn source_owner() -> TestSourceBackingOwner {
+        TestSourceBackingOwner::new(SourceKind::Yaml, Arc::from(&b"reference cache owner"[..]))
     }
 
     fn prepared_owner() -> Arc<PreparedArtifactSet> {
@@ -615,7 +615,7 @@ mod tests {
         let mut candidates = vec![
             FactCacheCandidate {
                 fingerprint: fingerprint(1),
-                owner: (&committed).into(),
+                owner: committed.weak().into(),
                 occurrences: Arc::clone(&shared),
             },
             FactCacheCandidate {
@@ -630,7 +630,7 @@ mod tests {
             .publish_facts_batch(candidates, &mut AssetLoadBudget::default())
             .unwrap();
 
-        assert_eq!(Arc::strong_count(&committed), 1);
+        assert_eq!(committed.strong_count(), 1);
         assert_eq!(Arc::strong_count(&prepared), 1);
         drop(committed);
         drop(prepared);
@@ -656,7 +656,7 @@ mod tests {
             .publish_facts_batch(
                 vec![FactCacheCandidate {
                     fingerprint: key,
-                    owner: (&committed).into(),
+                    owner: committed.weak().into(),
                     occurrences: Arc::clone(&retained),
                 }],
                 &mut AssetLoadBudget::default(),
@@ -691,7 +691,7 @@ mod tests {
             .publish_facts_batch(
                 vec![FactCacheCandidate {
                     fingerprint: fingerprint(20),
-                    owner: (&first_sweep_owner).into(),
+                    owner: first_sweep_owner.weak().into(),
                     occurrences: occurrences(20),
                 }],
                 &mut AssetLoadBudget::default(),
@@ -713,7 +713,7 @@ mod tests {
             .publish_facts_batch(
                 vec![FactCacheCandidate {
                     fingerprint: fingerprint(30),
-                    owner: (&second_sweep_owner).into(),
+                    owner: second_sweep_owner.weak().into(),
                     occurrences: occurrences(30),
                 }],
                 &mut AssetLoadBudget::default(),
@@ -740,12 +740,12 @@ mod tests {
         let mut initial = vec![
             FactCacheCandidate {
                 fingerprint: key,
-                owner: (&committed).into(),
+                owner: committed.weak().into(),
                 occurrences: Arc::clone(&retained),
             },
             FactCacheCandidate {
                 fingerprint: fingerprint(16),
-                owner: (&committed).into(),
+                owner: committed.weak().into(),
                 occurrences: occurrences(1),
             },
         ];
@@ -881,7 +881,7 @@ mod tests {
             store.publish_facts_batch(
                 vec![FactCacheCandidate {
                     fingerprint,
-                    owner: (&owner).into(),
+                    owner: owner.weak().into(),
                     occurrences: candidate,
                 }],
                 &mut budget,
@@ -899,12 +899,21 @@ mod tests {
             .map(|index| {
                 (
                     fingerprint(u64::try_from(index).unwrap()),
-                    Arc::<[u8]>::from([u8::try_from(index).unwrap()]),
+                    TestSourceBackingOwner::new(
+                        SourceKind::Yaml,
+                        Arc::<[u8]>::from([u8::try_from(index).unwrap()]),
+                    ),
                 )
             })
             .collect::<Vec<_>>();
-        let next = (fingerprint(100), Arc::<[u8]>::from([100]));
-        let doomed = (fingerprint(101), Arc::<[u8]>::from([101]));
+        let next = (
+            fingerprint(100),
+            TestSourceBackingOwner::new(SourceKind::Yaml, Arc::<[u8]>::from([100])),
+        );
+        let doomed = (
+            fingerprint(101),
+            TestSourceBackingOwner::new(SourceKind::Yaml, Arc::<[u8]>::from([101])),
+        );
 
         let store = ReferenceStore::new();
         let candidate = Arc::new(SourceReferenceOccurrences {
@@ -917,13 +926,13 @@ mod tests {
             .iter()
             .map(|(fingerprint, owner)| FactCacheCandidate {
                 fingerprint: *fingerprint,
-                owner: owner.into(),
+                owner: owner.weak().into(),
                 occurrences: Arc::clone(&candidate),
             })
             .collect::<Vec<_>>();
         candidates.push(FactCacheCandidate {
             fingerprint: doomed.0,
-            owner: (&doomed.1).into(),
+            owner: doomed.1.weak().into(),
             occurrences: Arc::clone(&candidate),
         });
         candidates.sort_unstable_by_key(|candidate| candidate.fingerprint);
@@ -946,7 +955,7 @@ mod tests {
             store.publish_facts_batch(
                 vec![FactCacheCandidate {
                     fingerprint: next.0,
-                    owner: (&next.1).into(),
+                    owner: next.1.weak().into(),
                     occurrences: Arc::clone(&candidate),
                 }],
                 &mut tiny,
@@ -976,7 +985,7 @@ mod tests {
         let mut initial = (0..EXISTING)
             .map(|ordinal| FactCacheCandidate {
                 fingerprint: fingerprint(ordinal),
-                owner: (&owner).into(),
+                owner: owner.weak().into(),
                 occurrences: Arc::clone(&candidate),
             })
             .collect::<Vec<_>>();
@@ -995,7 +1004,7 @@ mod tests {
 
         let make_new = || FactCacheCandidate {
             fingerprint: fingerprint(99),
-            owner: (&owner).into(),
+            owner: owner.weak().into(),
             occurrences: Arc::clone(&candidate),
         };
         let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
@@ -1048,12 +1057,12 @@ mod tests {
                 vec![
                     FactCacheCandidate {
                         fingerprint: keys[0],
-                        owner: (&owner).into(),
+                        owner: owner.weak().into(),
                         occurrences: Arc::clone(&old_live),
                     },
                     FactCacheCandidate {
                         fingerprint: keys[1],
-                        owner: (&owner).into(),
+                        owner: owner.weak().into(),
                         occurrences: Arc::clone(&old_dead),
                     },
                 ],
@@ -1066,8 +1075,9 @@ mod tests {
                 .facts
                 .binary_search_by_key(&FactCacheKey::new(keys[1]), |entry| entry.key)
                 .unwrap();
-            let temporary = Arc::<[u8]>::from([]);
-            state.facts[dead].owners = vec![ReferenceSourceOwner::from(&temporary).downgrade()];
+            let temporary = TestSourceBackingOwner::new(SourceKind::Yaml, Arc::<[u8]>::from([]));
+            state.facts[dead].owners =
+                vec![ReferenceSourceOwner::from(temporary.weak()).downgrade()];
             drop(temporary);
         }
 
@@ -1079,17 +1089,17 @@ mod tests {
                 vec![
                     FactCacheCandidate {
                         fingerprint: keys[0],
-                        owner: (&owner).into(),
+                        owner: owner.weak().into(),
                         occurrences: replacement_live,
                     },
                     FactCacheCandidate {
                         fingerprint: keys[1],
-                        owner: (&owner).into(),
+                        owner: owner.weak().into(),
                         occurrences: Arc::clone(&replacement_dead),
                     },
                     FactCacheCandidate {
                         fingerprint: keys[2],
-                        owner: (&owner).into(),
+                        owner: owner.weak().into(),
                         occurrences: Arc::clone(&inserted),
                     },
                 ],
@@ -1127,7 +1137,7 @@ mod tests {
             .step_by(2)
             .map(|fingerprint| FactCacheCandidate {
                 fingerprint: *fingerprint,
-                owner: (&owner).into(),
+                owner: owner.weak().into(),
                 occurrences: Arc::clone(&shared),
             })
             .collect::<Vec<_>>();
@@ -1137,7 +1147,7 @@ mod tests {
             .step_by(2)
             .map(|fingerprint| FactCacheCandidate {
                 fingerprint: *fingerprint,
-                owner: (&owner).into(),
+                owner: owner.weak().into(),
                 occurrences: Arc::clone(&shared),
             })
             .collect::<Vec<_>>();

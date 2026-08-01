@@ -25,8 +25,7 @@ use crate::reference::input::PreparedReferenceOverlay;
 use crate::reference::{ReferenceGraph, ReferenceGraphBuildOptions, ReferenceGraphError};
 use crate::schema::SchemaProvenance;
 
-use super::adapter::yaml::parse_yaml_source;
-use super::interface::{map_yaml_adapter_error, validate_yaml_identities};
+use super::interface::{map_yaml_error, validate_yaml_identities};
 use super::preflight::PrepareStage;
 use super::snapshot::{
     WorkspaceSnapshot, consume_retained_bytes, consume_single_result, invalid_lookup,
@@ -37,6 +36,7 @@ use super::view::{
     self, WorkspaceByteRange, WorkspaceError, WorkspaceLookup, WorkspaceObject,
     WorkspaceObjectValue, WorkspaceSource, WorkspaceView, validate_prepared_artifact,
 };
+use unity_asset_yaml::parse_budgeted_yaml_source;
 
 /// Candidate artifact selected for one logical workspace source.
 ///
@@ -1192,8 +1192,8 @@ fn prove_yaml_source(
     budget: &mut AssetLoadBudget,
 ) -> Result<Arc<YamlDocument>, WorkspaceError> {
     let encoded = materialize_artifact(artifact, budget)?;
-    let parsed = parse_yaml_source(encoded, budget)
-        .map_err(|error| map_yaml_adapter_error("prepared YAML artifact parsing", error))?;
+    let parsed = parse_budgeted_yaml_source(encoded, budget)
+        .map_err(|error| map_yaml_error("prepared YAML artifact parsing", error))?;
     validate_yaml_identities(parsed.document(), budget)?;
     let exact = Arc::clone(parsed.document());
     let entry = base

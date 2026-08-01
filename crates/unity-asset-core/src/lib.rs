@@ -53,7 +53,8 @@ pub use semantic_digest::{
     yaml_field_schema_digest, yaml_schema_digest,
 };
 pub use source_image::{
-    BudgetedSourceBytes, VerifiedSourceImage, VerifiedSourceImageError, VerifiedSourceRebinding,
+    BudgetedSourceBytes, BudgetedVerifiedSourceImage, VerifiedSourceImage,
+    VerifiedSourceImageError, VerifiedSourceRebinding,
 };
 pub use unity_class::{UnityClass, UnityClassHeader};
 pub use unity_value::{UnityValue, UnityValueCloneError, UnityValueKind, ValuePathError};

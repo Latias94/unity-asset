@@ -72,6 +72,15 @@ impl BudgetedSourceBytes {
         }
         Ok(())
     }
+
+    /// Hashes the retained backing once while preserving its budget-domain proof.
+    #[must_use]
+    pub fn verify(self, kind: SourceKind) -> BudgetedVerifiedSourceImage {
+        BudgetedVerifiedSourceImage {
+            image: VerifiedSourceImage::verify(kind, self.bytes),
+            domain: self.domain,
+        }
+    }
 }
 
 impl PartialEq for BudgetedSourceBytes {
@@ -120,6 +129,68 @@ pub struct VerifiedSourceImage {
     kind: SourceKind,
     bytes: Arc<[u8]>,
     fingerprint: SourceFingerprint,
+}
+
+/// Verified immutable source bytes whose retained allocation belongs to one load-budget domain.
+#[derive(Clone)]
+pub struct BudgetedVerifiedSourceImage {
+    image: VerifiedSourceImage,
+    domain: Arc<AssetLoadBudgetDomain>,
+}
+
+impl BudgetedVerifiedSourceImage {
+    #[must_use]
+    pub const fn kind(&self) -> SourceKind {
+        self.image.kind()
+    }
+
+    #[must_use]
+    pub const fn fingerprint(&self) -> SourceFingerprint {
+        self.image.fingerprint()
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.image.as_bytes()
+    }
+
+    /// Borrows the verified backing after checking its budget domain.
+    pub fn backing(&self, budget: &AssetLoadBudget) -> Result<&Arc<[u8]>, BudgetError> {
+        self.validate_budget(budget)?;
+        Ok(self.image.backing())
+    }
+
+    /// Clones the verified backing after checking its budget domain.
+    pub fn clone_backing(&self, budget: &AssetLoadBudget) -> Result<Arc<[u8]>, BudgetError> {
+        self.backing(budget).map(Arc::clone)
+    }
+
+    /// Consumes the budget proof and returns the already-verified image without rehashing.
+    pub fn into_image(self, budget: &AssetLoadBudget) -> Result<VerifiedSourceImage, BudgetError> {
+        self.validate_budget(budget)?;
+        Ok(self.image)
+    }
+
+    /// Verifies that the retained allocation belongs to `budget`.
+    pub fn validate_budget(&self, budget: &AssetLoadBudget) -> Result<(), BudgetError> {
+        if !budget.belongs_to_domain(&self.domain) {
+            return Err(BudgetError::DomainMismatch {
+                resource: "verified source image",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for BudgetedVerifiedSourceImage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BudgetedVerifiedSourceImage")
+            .field("kind", &self.kind())
+            .field("bytes", &self.as_bytes().len())
+            .field("fingerprint", &self.fingerprint())
+            .finish()
+    }
 }
 
 /// Opaque proof that a verified source may move to an equivalent canonical allocation.
@@ -307,6 +378,31 @@ mod tests {
             })
         ));
         assert!(bytes.into_backing(&first).is_ok());
+    }
+
+    #[test]
+    fn budgeted_verification_preserves_the_domain_and_verified_backing() {
+        let mut first = AssetLoadBudget::default();
+        let image = BudgetedSourceBytes::from_vec(b"verified".to_vec(), &mut first)
+            .unwrap()
+            .verify(SourceKind::SerializedFile);
+        let second = AssetLoadBudget::default();
+
+        assert_eq!(image.kind(), SourceKind::SerializedFile);
+        assert_eq!(
+            image.fingerprint(),
+            SourceFingerprint::from_bytes(SourceKind::SerializedFile, b"verified")
+        );
+        assert!(matches!(
+            image.clone().into_image(&second),
+            Err(BudgetError::DomainMismatch {
+                resource: "verified source image"
+            })
+        ));
+
+        let backing = Arc::clone(image.backing(&first).unwrap());
+        let verified = image.into_image(&first).unwrap();
+        assert!(Arc::ptr_eq(verified.backing(), &backing));
     }
 
     #[test]
