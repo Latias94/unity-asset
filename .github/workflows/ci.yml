@@ -34,8 +34,11 @@ jobs:
           zsh -n "$script"
         done
 
-  search-index-package:
-    name: Isolated search-index package / ${{ matrix.os }}
+    - name: Validate GitHub workflow semantics
+      run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/*.yml
+
+  workspace-package:
+    name: Isolated workspace package / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
@@ -58,11 +61,11 @@ jobs:
       with:
         python-version: "3.12"
 
-    - name: Test package verifier rejection paths
-      run: python -m unittest discover -s scripts/tests -p "test_verify_search_index_package.py"
+    - name: Test package and release verifier rejection paths
+      run: python -m unittest discover -s scripts/tests -p "test_*.py"
 
     - name: Verify packaged dependency isolation
-      run: python scripts/verify_search_index_package.py
+      run: python scripts/verify_workspace_packages.py
 
   msrv:
     name: MSRV / Rust 1.88.0
@@ -77,7 +80,9 @@ jobs:
         toolchain: 1.88.0
 
     - name: Check all library targets against the declared MSRV
-      run: cargo check --workspace --lib --all-features --locked
+      run: |
+        rustc +1.88.0 --version | grep -F "rustc 1.88.0 "
+        cargo +1.88.0 check --workspace --lib --all-features --locked
 
   test:
     name: Test / Lint / Fmt
@@ -101,19 +106,19 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Clippy (workspace defaults)
-      run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::collapsible_if
+      run: cargo clippy --workspace --all-targets -- -D warnings
 
     - name: Clippy (async)
       run: |
-        cargo clippy -p unity-asset-core --all-targets --features async -- -D warnings -A clippy::collapsible_if
-        cargo clippy -p unity-asset-yaml --all-targets --features async -- -D warnings -A clippy::collapsible_if
-        cargo clippy -p unity-asset --all-targets --features async -- -D warnings -A clippy::collapsible_if
-        cargo clippy -p unity-asset-cli --all-targets --features async -- -D warnings -A clippy::collapsible_if
+        cargo clippy -p unity-asset-core --all-targets --features async -- -D warnings
+        cargo clippy -p unity-asset-yaml --all-targets --features async -- -D warnings
+        cargo clippy -p unity-asset --all-targets --features async -- -D warnings
+        cargo clippy -p unity-asset-cli --all-targets --features async -- -D warnings
 
     - name: Clippy (decode/export)
       run: |
-        cargo clippy -p unity-asset-decode --all-targets --features full -- -D warnings -A clippy::collapsible_if
-        cargo clippy -p unity-asset-cli --all-targets --features decode -- -D warnings -A clippy::collapsible_if
+        cargo clippy -p unity-asset-decode --all-targets --features full -- -D warnings
+        cargo clippy -p unity-asset-cli --all-targets --features decode -- -D warnings
 
     - name: Test CLI tools
       run: |

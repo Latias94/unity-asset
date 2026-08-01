@@ -1,230 +1,490 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated vMAJOR.MINOR.PATCH tag to verify or publish
+        required: true
+        type: string
+      mode:
+        description: Verify without writes, or enter the protected publication protocol
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - dry-run
+          - publish
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ inputs.mode }}-${{ inputs.tag }}
   cancel-in-progress: false
 
 env:
+  CARGO_BUILD_JOBS: 1
   CARGO_TERM_COLOR: always
-  PUBLISH_CRATES: >-
-    unity-asset-core
-    unity-asset-yaml
-    unity-asset-binary
-    unity-asset-write
-    unity-asset-decode
-    unity-asset
-    unity-asset-search-core
-    unity-asset-search-protocol
-    unity-asset-search-local
-    unity-asset-search-index
-    unity-asset-cli
-    unity-asset-search-daemon
-    unity-asset-search-cli
+  RELEASE_TAG: ${{ inputs.tag }}
 
 jobs:
   validate:
-    name: Validate tag/version
+    name: Verify immutable release source
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      version: ${{ steps.source.outputs.version }}
+      commit: ${{ steps.source.outputs.commit }}
+      tag_object: ${{ steps.source.outputs.tag_object }}
+      publish_crates: ${{ steps.source.outputs.publish_crates }}
+      evidence_sha256: ${{ steps.source.outputs.evidence_sha256 }}
+      msrv: ${{ steps.source.outputs.msrv }}
+      release_toolchain: ${{ steps.source.outputs.release_toolchain }}
+      dist_plan_sha256: ${{ steps.source.outputs.dist_plan_sha256 }}
+      protocol_sdk_artifact: ${{ steps.source.outputs.protocol_sdk_artifact }}
+      dist_matrix: ${{ steps.source.outputs.dist_matrix }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout selected tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Extract version from tag
-        id: version
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
 
-      - name: Ensure Cargo.toml versions match tag
+      - name: Install .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Read tracked release Rust toolchain
+        id: toolchain
+        shell: bash
         run: |
-          python3 - <<'PY'
-          import json
+          set -euo pipefail
+          python - <<'PY'
           import os
+          import pathlib
           import re
-          import subprocess
+          import tomllib
 
-          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
-          if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-              raise SystemExit(f"Invalid tag version: {version}")
-
-          metadata = json.loads(
-              subprocess.check_output(
-                  ["cargo", "metadata", "--no-deps", "--format-version", "1"],
-                  text=True,
-              )
-          )
-          workspace_members = set(metadata["workspace_members"])
-          workspace = {
-              package["name"]: package
-              for package in metadata["packages"]
-              if package["id"] in workspace_members
-          }
-          publish_order = os.environ["PUBLISH_CRATES"].split()
-          if len(publish_order) != len(set(publish_order)):
-              raise SystemExit(f"Duplicate package in PUBLISH_CRATES: {publish_order}")
-
-          publishable = {
-              name for name, package in workspace.items() if package.get("publish") != []
-          }
-          configured = set(publish_order)
-          if configured != publishable:
-              raise SystemExit(
-                  "PUBLISH_CRATES does not match publishable workspace packages: "
-                  f"missing={sorted(publishable - configured)}, "
-                  f"extra={sorted(configured - publishable)}"
-              )
-
-          bad_versions = {
-              name: package["version"]
-              for name, package in workspace.items()
-              if package["version"] != version
-          }
-          if bad_versions:
-              raise SystemExit(
-                  f"Tag v{version} does not match workspace package versions: {bad_versions}"
-              )
-
-          positions = {name: index for index, name in enumerate(publish_order)}
-          dependency_version = f"^{version}"
-          dependency_errors = []
-          for package_name, package in workspace.items():
-              for dependency in package["dependencies"]:
-                  dependency_name = dependency["name"]
-                  if dependency.get("path") is None or dependency_name not in workspace:
-                      continue
-                  if dependency["req"] != dependency_version:
-                      dependency_errors.append(
-                          f"{package_name} requires {dependency_name} {dependency['req']}"
-                      )
-                  if positions[dependency_name] >= positions[package_name]:
-                      dependency_errors.append(
-                          f"{package_name} is ordered before dependency {dependency_name}"
-                      )
-
-          if dependency_errors:
-              raise SystemExit(
-                  "Invalid workspace publish dependency contract: "
-                  + "; ".join(dependency_errors)
-              )
-
-          print(
-              f"OK: v{version} and publish topology cover "
-              f"{len(publish_order)} workspace packages"
-          )
+          document = tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text(encoding="utf-8"))
+          toolchain = document.get("toolchain")
+          channel = toolchain.get("channel") if isinstance(toolchain, dict) else None
+          if not isinstance(channel, str) or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", channel) is None:
+              raise SystemExit("rust-toolchain.toml must declare an exact stable patch channel")
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8", newline="\n") as stream:
+              stream.write(f"release_toolchain={channel}\n")
           PY
 
-  test:
-    name: Test before publish
+      - name: Install release Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: ${{ steps.toolchain.outputs.release_toolchain }}
+
+      - name: Run release contract tests
+        run: python -m unittest discover -s scripts/tests -p "test_*.py"
+
+      - name: Validate workflow semantics
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/ci.yml .github/workflows/release.yml
+
+      - name: Install verified cargo-dist
+        shell: bash
+        run: python scripts/install_cargo_dist.py --shell bash
+
+      - name: Generate the exact local distribution plan
+        shell: bash
+        run: >-
+          dist manifest --artifacts=local --output-format=json --no-local-paths
+          --tag "$RELEASE_TAG" > "$RUNNER_TEMP/release-dist-plan.json"
+
+      - name: Build the deterministic search protocol SDK bundle
+        run: >-
+          python scripts/build_protocol_sdk_bundle.py
+          --release-tag "$RELEASE_TAG"
+          --output-directory "$RUNNER_TEMP/protocol-sdk"
+          --extract-directory "$RUNNER_TEMP/protocol-sdk-extracted"
+
+      - name: Compile the exact generated search protocol SDK
+        run: >-
+          dotnet build
+          "$RUNNER_TEMP/protocol-sdk-extracted/unity-asset-search-protocol-sdk-$RELEASE_TAG/csharp/UnityAsset.SearchProtocol.Reference/UnityAsset.SearchProtocol.Reference.csproj"
+          --configuration Release
+
+      - name: Verify tag, source graph, distribution plan, and release evidence
+        id: source
+        run: >-
+           python scripts/verify_release_source.py
+           --tag "$RELEASE_TAG"
+           --dist-plan "$RUNNER_TEMP/release-dist-plan.json"
+           --protocol-sdk-bundle "$RUNNER_TEMP/protocol-sdk/unity-asset-search-protocol-sdk-$RELEASE_TAG.zip"
+           --release-title-output "$RUNNER_TEMP/release-title.txt"
+           --release-body-output "$RUNNER_TEMP/release-notes.md"
+           --evidence "$RUNNER_TEMP/release-evidence.json"
+           --github-output "$GITHUB_OUTPUT"
+      - name: Require GitHub-verified annotated tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          arguments=(
+            --tag "$RELEASE_TAG"
+            --expected-commit "${{ steps.source.outputs.commit }}"
+            --expected-tag-object "${{ steps.source.outputs.tag_object }}"
+            --github-repository "$GITHUB_REPOSITORY"
+          )
+          python scripts/verify_release_tag.py "${arguments[@]}"
+
+      - name: Stage immutable release proof inputs
+        shell: bash
+        run: |
+          mkdir release-proof
+          cp "$RUNNER_TEMP/release-evidence.json" release-proof/release-evidence.json
+          cp "$RUNNER_TEMP/release-dist-plan.json" release-proof/release-dist-plan.json
+          cp "$RUNNER_TEMP/release-title.txt" release-proof/release-title.txt
+          cp "$RUNNER_TEMP/release-notes.md" release-proof/release-notes.md
+          cp "$RUNNER_TEMP/protocol-sdk/${{ steps.source.outputs.protocol_sdk_artifact }}" release-proof/
+
+      - name: Upload release source evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-evidence-${{ github.run_id }}
+          path: release-proof/
+          if-no-files-found: error
+          overwrite: true
+
+  msrv:
+    name: MSRV library check
     runs-on: ubuntu-latest
     needs: validate
+    timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Checkout verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
         with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install declared MSRV
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: ${{ needs.validate.outputs.msrv }}
+
+      - name: Check every library against the locked graph
+        shell: bash
+        run: |
+          rustc +${{ needs.validate.outputs.msrv }} --version | grep -F "rustc ${{ needs.validate.outputs.msrv }} "
+          cargo +${{ needs.validate.outputs.msrv }} check --workspace --lib --all-features --locked
+
+  test:
+    name: Full Rust verification
+    runs-on: ubuntu-latest
+    needs: validate
+    timeout-minutes: 60
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install release Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: ${{ needs.validate.outputs.release_toolchain }}
           components: rustfmt, clippy
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@314b6e93a9b2f40a64f401a23fed55603083dc69 # nextest
 
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2.8.1
+        with:
+          shared-key: release-rust-${{ needs.validate.outputs.commit }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Clippy (workspace defaults)
-        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::collapsible_if
+      - name: Run strict Clippy
+        run: >-
+          cargo clippy --workspace --all-targets --locked
+          -- -D warnings
 
-      - name: Test (workspace defaults)
-        run: cargo nextest run --workspace
+      - name: Run default workspace tests
+        run: cargo nextest run --workspace --locked --test-threads 2
 
-      - name: Cargo package (unity-asset-core)
-        run: cargo package -p unity-asset-core
-      # NOTE: We intentionally do not run `cargo package` for crates that depend on
-      # other workspace crates that haven't been published for this tag yet.
-
-  publish:
-    name: Publish to crates.io
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Publish workspace crates in dependency order
-        shell: bash
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Run async and decode feature tests
         run: |
-          publish_with_retry() {
-            local package="$1"
-            local version="${GITHUB_REF_NAME#v}"
-            for attempt in 1 2 3 4 5 6 7 8 9 10; do
-              if cargo info "${package}@${version}" --registry crates-io >/dev/null 2>&1; then
-                echo "${package} ${version} is already published"
-                return 0
-              fi
-              if cargo publish --locked -p "$package" --token "$CARGO_REGISTRY_TOKEN"; then
-                return 0
-              fi
-              if (( attempt < 10 )); then
-                echo "$package publish failed (attempt $attempt), waiting for crates.io index..."
-                sleep 30
-              fi
-            done
-            return 1
-          }
+          cargo nextest run -p unity-asset --features async --locked --test-threads 2
+          cargo nextest run -p unity-asset-cli --features async --locked --test-threads 2 --no-tests=pass
+          cargo nextest run -p unity-asset-decode --features full --locked --test-threads 2
+          cargo nextest run -p unity-asset --features decode --locked --test extraction_decode --test-threads 2
+          cargo nextest run -p unity-asset-cli --features decode --locked --test-threads 2
 
-          for package in $PUBLISH_CRATES; do
-            publish_with_retry "$package"
-          done
+      - name: Run binary loader feature contracts
+        run: |
+          cargo nextest run -p unity-asset-binary --no-default-features --locked --test-threads 2
+          cargo nextest run -p unity-asset-binary --no-default-features --features mmap --locked --test-threads 2
 
-  dist:
-    name: Build release binaries (cargo-dist)
-    needs: test
+  package:
+    name: Verify every publishable package outside the workspace
+    runs-on: ubuntu-latest
+    needs: validate
+    timeout-minutes: 45
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: ${{ needs.validate.outputs.release_toolchain }}
+
+      - name: Package and build isolated archive consumers before credentials exist
+        run: python scripts/verify_workspace_packages.py
+
+  platform-contracts:
+    name: Local transport and protocol contracts / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    needs: validate
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            targets: x86_64-unknown-linux-musl
-          - os: windows-latest
-            targets: x86_64-pc-windows-msvc
-          - os: macos-latest
-            targets: aarch64-apple-darwin,x86_64-apple-darwin
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install release Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: ${{ needs.validate.outputs.release_toolchain }}
+
+      - name: Install .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@314b6e93a9b2f40a64f401a23fed55603083dc69 # nextest
 
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2.8.1
+        with:
+          shared-key: release-platform-${{ matrix.os }}-${{ needs.validate.outputs.commit }}
 
-      - name: Install cargo-dist
-        shell: bash
+      - name: Run platform publication, recovery, and extraction contracts
+        run: >-
+          cargo nextest run -p unity-asset --locked --test-threads 2
+          -E 'test(/^workspace::commit::/) | test(/^extraction::artifact::tests::/)'
+
+      - name: Run local IPC and workspace black-box contracts
+        run: >-
+          cargo nextest run --locked --test-threads 2
+          -p unity-asset
+          -p unity-asset-cli
+          -p unity-asset-search-cli
+          -p unity-asset-search-local
+          -p unity-asset-search-index
+          -p unity-asset-search-daemon
+          --test workspace_commit
+          --test workspace_recovery
+          --test public_workflows
+          --test agent_native_workflows
+          --test agent_native_workflow
+          --test workspace_commands
+          --test workspace_json
+          --test structured_errors
+          --test ipc_commands
+          --test process_contract
+          --test transport_contract
+          --test reindex_coordinator
+
+      - name: Run search generation, daemon lifecycle, and local identity contracts
         run: |
-          curl --proto '=https' --tlsv1.2 -LsSf \
-            https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh \
-            | sh
+          cargo nextest run -p unity-asset-search-index --lib --locked --test-threads 2
+          cargo nextest run -p unity-asset-search-daemon --lib --locked --test-threads 2
+          cargo nextest run -p unity-asset-search-local --locked --test-threads 2
+
+      - name: Run cross-language search protocol conformance
+        run: |
+          dotnet build integration/search-protocol/csharp/UnityAsset.SearchProtocol.ExternalConsumer/UnityAsset.SearchProtocol.ExternalConsumer.csproj --configuration Release
+          dotnet run --project integration/search-protocol/csharp/UnityAsset.SearchProtocol.Conformance/UnityAsset.SearchProtocol.Conformance.csproj --configuration Release
+
+      - name: Run Windows CLI unit contracts
+        if: runner.os == 'Windows'
+        run: >-
+          cargo nextest run -p unity-asset-cli --bin unity-asset
+          --locked --test-threads 2
+
+  source-recheck:
+    name: Recheck signed source before production approval
+    runs-on: ubuntu-latest
+    needs: [validate, release-assets, attest]
+    if: inputs.mode == 'publish'
+    timeout-minutes: 15
+    steps:
+      - name: Checkout verified commit with tags
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Revalidate the current signed tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_tag.py
+          --refresh-tag
+          --tag "$RELEASE_TAG"
+          --expected-commit "${{ needs.validate.outputs.commit }}"
+          --expected-tag-object "${{ needs.validate.outputs.tag_object }}"
+          --github-repository "$GITHUB_REPOSITORY"
+
+  publish:
+    name: Publish crates.io packages
+    runs-on: ubuntu-latest
+    needs: [validate, release-assets, source-recheck, github-draft]
+    if: inputs.mode == 'publish'
+    timeout-minutes: 90
+    environment:
+      name: crates-io-production
+    steps:
+      - name: Checkout verified commit with tags
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: ${{ needs.validate.outputs.release_toolchain }}
+
+      - name: Revalidate the signed tag after production approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_tag.py
+          --refresh-tag
+          --tag "$RELEASE_TAG"
+          --expected-commit "${{ needs.validate.outputs.commit }}"
+          --expected-tag-object "${{ needs.validate.outputs.tag_object }}"
+          --github-repository "$GITHUB_REPOSITORY"
+
+      - name: Download attested release assets after production approval
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-${{ github.run_id }}
+          path: release-assets
+
+      - name: Download verified release metadata after production approval
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-evidence-${{ github.run_id }}
+          path: release-proof
+
+      - name: Reverify staged GitHub Release after production approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_github_release_assets.py
+          --github-repository "$GITHUB_REPOSITORY"
+          --tag "$RELEASE_TAG"
+          --commit "${{ needs.validate.outputs.commit }}"
+          --assets release-assets
+          --expected-title "$RELEASE_TAG"
+          --expected-body-file release-proof/release-notes.md
+          --evidence release-proof/release-evidence.json
+          --expected-evidence-sha256 "${{ needs.validate.outputs.evidence_sha256 }}"
+          --phase staged
+          --expected-release-id "${{ needs.github-draft.outputs.release_id }}"
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2.8.1
+        with:
+          shared-key: release-publish-${{ needs.validate.outputs.commit }}
+
+      - name: Publish verified workspace packages in dependency order
+        shell: bash
+        env:
+          UNITY_ASSET_RELEASE_CARGO_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN_PRODUCTION }}
+        run: |
+          set -euo pipefail
+          git diff --exit-code -- Cargo.lock
+          python scripts/publish_workspace_packages.py \
+            --version "${{ needs.validate.outputs.version }}" \
+            --packages ${{ needs.validate.outputs.publish_crates }}
+          git diff --exit-code -- Cargo.lock
+
+  dist:
+    name: Build verified release binaries / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: [validate, msrv, test, package, platform-contracts]
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.validate.outputs.dist_matrix) }}
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: ${{ needs.validate.outputs.release_toolchain }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2.8.1
+        with:
+          shared-key: release-dist-${{ matrix.os }}-${{ needs.validate.outputs.commit }}
+
+      - name: Install verified cargo-dist
+        shell: bash
+        run: python scripts/install_cargo_dist.py --shell bash
 
       - name: Install Linux musl tools
         if: runner.os == 'Linux'
@@ -235,49 +495,296 @@ jobs:
 
       - name: Install macOS targets
         if: runner.os == 'macOS'
-        run: |
-          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      - name: Build archives
+      - name: Build archives from the locked source graph
         shell: bash
         run: |
-          IFS=',' read -ra TARGETS <<< "${{ matrix.targets }}"
-          for t in "${TARGETS[@]}"; do
-            cargo dist build --artifacts=local --tag "${{ github.ref_name }}" --target "$t"
+          set -euo pipefail
+          git diff --exit-code -- Cargo.lock
+          IFS=',' read -r -a targets <<< "${{ matrix.targets }}"
+          for target in "${targets[@]}"; do
+            dist build --artifacts=local --tag "$RELEASE_TAG" --target "$target"
           done
+          git diff --exit-code -- Cargo.lock
 
       - name: Upload dist artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: dist-${{ matrix.os }}
-          path: target/distrib/
+          name: dist-${{ github.run_id }}-${{ matrix.os }}
+          path: |
+            target/distrib/*.tar.xz
+            target/distrib/*.tar.xz.sha256
+            target/distrib/*.zip
+            target/distrib/*.zip.sha256
+          if-no-files-found: error
+          overwrite: true
 
-  github-release:
-    name: Create GitHub release
+  release-assets:
+    name: Assemble verified release assets
     runs-on: ubuntu-latest
-    needs: [publish, dist]
+    needs: [validate, dist]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Download source evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-evidence-${{ github.run_id }}
+          path: release-evidence
+
+      - name: Download dist artifacts without merging names
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dist-${{ github.run_id }}-*
+          path: dist-artifacts
+
+      - name: Assemble collision-free release assets
+        run: >-
+          python scripts/assemble_release_assets.py
+          --dist-root dist-artifacts
+          --evidence release-evidence/release-evidence.json
+          --expected-evidence-sha256 "${{ needs.validate.outputs.evidence_sha256 }}"
+          --dist-plan release-evidence/release-dist-plan.json
+          --expected-dist-plan-sha256 "${{ needs.validate.outputs.dist_plan_sha256 }}"
+          --protocol-sdk-bundle "release-evidence/${{ needs.validate.outputs.protocol_sdk_artifact }}"
+          --output release-assets
+
+      - name: Upload assembled release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets-${{ github.run_id }}
+          path: release-assets/
+          if-no-files-found: error
+          overwrite: true
+
+  attest:
+    name: Attest verified publication assets
+    runs-on: ubuntu-latest
+    needs: [validate, release-assets]
+    if: inputs.mode == 'publish'
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Download complete verified release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-${{ github.run_id }}
+          path: release-assets
+
+      - name: Attest release artifacts before publication
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2.3.0
+        with:
+          subject-path: release-assets/**
+
+  dry-run:
+    name: Verify complete no-publish release bundle
+    runs-on: ubuntu-latest
+    needs: [validate, msrv, test, package, platform-contracts, dist, release-assets]
+    if: inputs.mode == 'dry-run'
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Download complete release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-${{ github.run_id }}
+          path: release-assets
+
+      - name: Download canonical release proof
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-evidence-${{ github.run_id }}
+          path: release-proof
+
+      - name: Verify release evidence, inventory, SDK, and checksums
+        run: >-
+          python scripts/verify_release_bundle.py
+          --assets release-assets
+          --tag "$RELEASE_TAG"
+          --expected-evidence-sha256 "${{ needs.validate.outputs.evidence_sha256 }}"
+          --release-title release-proof/release-title.txt
+          --release-body release-proof/release-notes.md
+
+  github-draft:
+    name: Stage and verify GitHub Release assets
+    runs-on: ubuntu-latest
+    needs: [validate, release-assets, source-recheck]
+    if: inputs.mode == 'publish'
+    timeout-minutes: 30
+    outputs:
+      release_id: ${{ steps.staged.outputs.release_id }}
     permissions:
       contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Extract release notes
-        id: notes
-        uses: ffurrer2/extract-release-notes@v2
-
-      - name: Download dist artifacts
-        uses: actions/download-artifact@v4
+      - name: Checkout verified commit with tags
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
         with:
-          pattern: dist-*
-          path: dist-artifacts
-          merge-multiple: true
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          body: ${{ steps.notes.outputs.release_notes }}
-          files: |
-            dist-artifacts/**
+          python-version: "3.12"
+
+      - name: Revalidate the signed tag before draft publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_tag.py
+          --refresh-tag
+          --tag "$RELEASE_TAG"
+          --expected-commit "${{ needs.validate.outputs.commit }}"
+          --expected-tag-object "${{ needs.validate.outputs.tag_object }}"
+          --github-repository "$GITHUB_REPOSITORY"
+
+      - name: Download attested release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-${{ github.run_id }}
+          path: release-assets
+
+      - name: Download verified release metadata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-evidence-${{ github.run_id }}
+          path: release-proof
+
+      - name: Reject a pre-existing non-identical release
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_github_release_assets.py
+          --github-repository "$GITHUB_REPOSITORY"
+          --tag "$RELEASE_TAG"
+          --commit "${{ needs.validate.outputs.commit }}"
+          --assets release-assets
+          --expected-title "$RELEASE_TAG"
+          --expected-body-file release-proof/release-notes.md
+          --evidence release-proof/release-evidence.json
+          --expected-evidence-sha256 "${{ needs.validate.outputs.evidence_sha256 }}"
+          --phase preflight
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Create or update the verified draft release
+        if: steps.preflight.outputs.needs_upload == 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.3.2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ needs.validate.outputs.commit }}
+          name: ${{ env.RELEASE_TAG }}
+          body_path: release-proof/release-notes.md
+          draft: true
+          prerelease: false
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: release-assets/**
+
+      - name: Read back the complete staged asset set
+        id: staged
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_github_release_assets.py
+          --github-repository "$GITHUB_REPOSITORY"
+          --tag "$RELEASE_TAG"
+          --commit "${{ needs.validate.outputs.commit }}"
+          --assets release-assets
+          --expected-title "$RELEASE_TAG"
+          --expected-body-file release-proof/release-notes.md
+          --evidence release-proof/release-evidence.json
+          --expected-evidence-sha256 "${{ needs.validate.outputs.evidence_sha256 }}"
+          --phase staged
+          --github-output "$GITHUB_OUTPUT"
+
+  github-release:
+    name: Publish the verified GitHub Release
+    runs-on: ubuntu-latest
+    needs: [validate, publish, github-draft, release-assets]
+    if: inputs.mode == 'publish'
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout verified commit with tags
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Revalidate the signed tag before final publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_tag.py
+          --refresh-tag
+          --tag "$RELEASE_TAG"
+          --expected-commit "${{ needs.validate.outputs.commit }}"
+          --expected-tag-object "${{ needs.validate.outputs.tag_object }}"
+          --github-repository "$GITHUB_REPOSITORY"
+
+      - name: Download attested release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-${{ github.run_id }}
+          path: release-assets
+
+      - name: Download verified release metadata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-evidence-${{ github.run_id }}
+          path: release-proof
+
+      - name: Publish only the verified draft and read it back
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_github_release_assets.py
+          --github-repository "$GITHUB_REPOSITORY"
+          --tag "$RELEASE_TAG"
+          --commit "${{ needs.validate.outputs.commit }}"
+          --assets release-assets
+          --expected-title "$RELEASE_TAG"
+          --expected-body-file release-proof/release-notes.md
+          --evidence release-proof/release-evidence.json
+          --expected-evidence-sha256 "${{ needs.validate.outputs.evidence_sha256 }}"
+          --phase publish
+          --expected-release-id "${{ needs.github-draft.outputs.release_id }}"

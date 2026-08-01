@@ -1,69 +1,162 @@
 # Releasing
 
-This repository uses a tag-driven release workflow.
+This repository releases only from an immutable `vMAJOR.MINOR.PATCH` tag through
+an explicit `Release` workflow dispatch. Pushing a tag never starts publication.
+The selected mode is either `dry-run` or `publish`; both check out the tag's
+peeled commit, prove that its `HEAD`, package versions, dependency graph,
+lockfile, and generated evidence agree, and use that commit for every subsequent
+step.
 
 ## Prerequisites
 
-- GitHub Actions `release.yml` enabled.
-- `CARGO_REGISTRY_TOKEN` secret configured in the GitHub repo.
+- The GitHub Actions `release.yml` workflow is enabled.
+- A protected GitHub Environment named `crates-io-production` has required
+  reviewers, disallows self-approval and administrator bypass, and exposes the
+  `CARGO_REGISTRY_TOKEN_PRODUCTION` environment secret. Delete any repository-
+  scoped crates.io token; the workflow intentionally fails closed when this
+  environment secret is unavailable.
+- A repository ruleset protects `v*` release tags from creation, update, and
+  deletion by ordinary write-capable identities. Only the release maintainers or
+  release automation may create an immutable signed release tag.
+- GitHub Releases are immutable after publication, or the repository limits
+  Release write permission to the release automation identity. A release
+  workflow proves the asset bytes it uploads, but cannot prevent a different
+  identity from mutating a completed Release after the workflow exits.
+- The release commit is clean and already passes the normal branch CI.
+- The exact stable Rust channel tracked by `rust-toolchain.toml` is available
+  for the release build. The workspace `rust-version` remains the declared MSRV
+  and has its own release gate.
 
-## Release steps
+## Preparing a release
 
-1. Decide the version (e.g. `0.4.0`).
-2. In the root `Cargo.toml`, update `[workspace.package].version` and every internal
-   dependency version under `[workspace.dependencies]` to the same release version.
-   Member manifests inherit both values and must not declare independent package or path
-   dependency versions.
-3. Run `cargo metadata --no-deps --format-version 1`. The release workflow uses the same
-   metadata graph to validate the package set, versions, internal requirements, and publish order.
-4. Update `CHANGELOG.md`.
-5. Run locally:
-   - `cargo fmt --all`
-   - `cargo clippy --workspace --all-targets -- -D warnings -A clippy::collapsible_if`
-   - `cargo nextest run --workspace`
-6. Commit changes.
-7. Create and push a tag:
-   - `git tag v0.4.0`
-   - `git push origin v0.4.0`
+1. Choose the version, for example `0.4.0`.
+2. Update `[workspace.package].version` and every internal requirement in root
+   `Cargo.toml` to that version. Member manifests inherit the workspace values;
+   they must not declare independent versions or internal path-version pairs.
+3. Replace the unreleased notes with exactly one `## [<version>] - YYYY-MM-DD`
+   section in `CHANGELOG.md`. The release title and body are generated from
+   this tracked section and bound into release evidence.
+4. Run the release eligibility checks sequentially:
 
-## What CI does
+   ```text
+   cargo fmt --all -- --check
+   cargo clippy --workspace --all-targets --locked -- -D warnings
+   cargo nextest run --workspace --locked
+   python scripts/verify_workspace_packages.py
+   ```
 
-On tag push (`vMAJOR.MINOR.PATCH`), GitHub Actions:
+   The package verifier intentionally takes longer than an ordinary build: it
+   packages every publishable crate, unpacks the archives, and builds isolated
+   consumers for default, all-feature, and explicitly documented feature
+   profiles that may use only those archives and crates.io dependencies.
+5. Commit the release source. Do not modify the commit after tagging it.
+6. Create and push the signed tag. The tag push is deliberately inert and
+   cannot publish crates or a GitHub Release:
 
-1. Uses Cargo metadata to validate that the tag matches the complete publishable workspace,
-   package versions, internal dependency requirements, and dependency-first publish topology.
-2. Runs formatting, clippy, and tests.
-3. Publishes crates to crates.io in dependency order:
-   1) `unity-asset-core`
-   2) `unity-asset-yaml`
-   3) `unity-asset-binary`
-   4) `unity-asset-write`
-   5) `unity-asset-decode`
-   6) `unity-asset`
-   7) `unity-asset-search-core`
-   8) `unity-asset-search-protocol`
-   9) `unity-asset-search-local`
-   10) `unity-asset-search-index`
-   11) `unity-asset-cli`
-   12) `unity-asset-search-daemon`
-   13) `unity-asset-search-cli`
-4. Builds and uploads multi-platform binaries using `cargo-dist`:
-   - `unity-asset-search-daemon` (for the Unity Editor plugin)
-   - `unity-asset-search-cli` (debug/ops utility)
-5. Creates a GitHub Release using release notes extracted from `CHANGELOG.md` and attaches the built binaries.
+   ```text
+   git tag -s v0.4.0 -m "v0.4.0"
+   git push origin v0.4.0
+   ```
 
-## Backfill missing dist assets (existing tag)
+7. Run the `Release` workflow manually with the existing tag as its `tag` input
+   and `mode` set to `dry-run`. This read-only mode executes the release tests,
+   package isolation, platform matrix, cargo-dist build, exact asset assembly,
+   protocol SDK generation, and final evidence plus title/body verification. It
+   receives no attestation, Release-write, or crates.io publication authority.
+8. After the dry-run succeeds, dispatch the `Release` workflow again with the
+   same tag and `mode` set to `publish`. A signed annotated tag is mandatory.
+   The source verifier rejects lightweight tags, and the workflow requires
+   GitHub to report the tag signature as verified. It never trusts a branch
+   name or arbitrary ref as a release source.
 
-If a tag already exists and the GitHub Release was created without dist assets (e.g. early release workflow),
-use the manual workflow:
+## What the explicit release workflow proves
 
-- GitHub Actions → `Upload cargo-dist assets to an existing tag`
+Before credentials are made available, the workflow:
 
-Inputs:
+1. Checks out `refs/tags/<tag>` with full tag history and requires the checked
+   out `HEAD` to equal the tag's peeled commit. GitHub must verify the annotated
+   tag signature.
+2. Writes canonical `release-evidence.json` containing the tag, tag object,
+   commit, workspace version, `Cargo.lock` SHA-256, MSRV, release toolchain,
+   dependency-first publish order, package manifests, the SHA-256 of the
+   cargo-dist local-artifact plan, that plan's exact artifact inventory, the
+   deterministic C# protocol SDK/fixture bundle identity, and the normalized
+   GitHub Release title/body digests.
+3. Builds every library target with Rust `1.88.0` against the locked graph.
+4. Runs formatting, strict Clippy, default/async/decode/binary Rust tests, and
+   the Windows, Linux, and macOS local-transport plus C# conformance matrix.
+5. Packages every publishable crate and proves isolated archive consumers work
+   without a repository path dependency, root patch, missing internal archive,
+   or untrusted registry source.
 
-- `tag`: the existing tag (e.g. `v0.2.0`)
-- `ref`: the git ref to build from
-  - use `main` to backfill old tags (note: this trades exact reproducibility for a practical repair)
+Only after those gates pass does the workflow build `dist` binaries from the
+same verified commit, check the pinned cargo-dist installer SHA-256 and
+installed version, and require the produced file set to equal the precomputed
+cargo-dist local plan. It creates one complete checksum inventory. In `publish`
+mode a separate least-privilege job adds build provenance attestations before
+the workflow creates or updates a GitHub **Draft** Release. Dry-run mode stops
+after re-reading the complete bundle and the separately stored canonical title
+and body proof.
+Every pre-existing asset must already be byte-identical; after upload the
+workflow reads the GitHub API back and verifies the exact name set and
+SHA-256 of every asset.
+
+Only after that draft has passed read-back verification does the protected
+`crates-io-production` job obtain its environment secret. It rechecks the
+signed tag after approval and publishes the reviewed package set in
+dependency order. Every package is built and every existing remote version is
+byte-verified before the first irreversible crates.io write. Only after that
+complete preflight succeeds are missing crates published in dependency order.
+The final job revalidates the signed tag and changes only the same verified
+Draft Release to published, then reads its metadata and complete asset set back
+again. If the publish PATCH succeeded but the client missed the response, a
+rerun accepts only the same Release ID with byte-identical metadata and assets.
+
+The workflow pins its release-critical actions, reads the exact Rust toolchain
+from the verified tag's `rust-toolchain.toml` before any Cargo command, and pins
+the cargo-dist version and installer digest. Cargo commands that resolve the
+workspace use `--locked`; the cargo-dist stage additionally proves that
+`Cargo.lock` did not change.
+
+## Retrying or rebuilding a release
+
+There is deliberately no automatic tag-push publication or arbitrary-ref asset
+upload workflow. The only entry point is an explicit dispatch that checks out
+`refs/tags/<tag>` and selects exactly one mode. `dry-run` has no publication
+jobs or write permissions. `publish` enters the attestation, Draft Release,
+protected crates.io, and final Release state machine. Never build an existing
+tag from `main`, a branch, or another user-provided ref.
+
+If a publish dispatch fails before the production approval, rerun `publish` for
+the same tag. Runs for a tag and mode never cancel one another. The rerun resolves
+the same peeled commit and either recreates the Draft Release or accepts only
+its already byte-identical assets. If a transient
+failure occurs after one or more crates are published, the publish step
+downloads each existing `.crate` and requires it to be byte-identical to the
+locally packaged archive before treating the operation as idempotent. A
+mismatch, missing expected asset, or extra Release asset fails closed. Do not
+move or recreate a release tag to repair assets; investigate the evidence and
+rerun the explicit `publish` dispatch for the same tag.
+
+## Release evidence
+
+A completed GitHub Release contains:
+
+- `release-evidence.json`: canonical source identity and package topology.
+- `release-dist-plan.json`: the exact cargo-dist local-artifact inventory
+  bound into the source evidence.
+- `unity-asset-search-protocol-sdk-v<version>.zip`: the public C# reference
+  codec and all golden protocol fixtures with an internal manifest.
+- `SHA256SUMS`: checksums for every attached binary, protocol SDK, and
+  provenance file.
+
+The release is also accompanied by GitHub build provenance attestations for the
+binaries, checksums, and source evidence. Those attestations live in GitHub's
+attestation service rather than as ordinary Release attachments.
+
+These files establish which tag, commit, lockfile, toolchain, and crate graph
+produced the release. Provenance and checksums complement source verification;
+they do not permit a different ref to stand in for the tag commit.
 
 ## Unity Editor plugin packaging (scheme B)
 
@@ -73,7 +166,10 @@ The Unity Editor UPM plugin vendors the daemon binaries into:
 
 The Unity plugin release workflow should:
 
-1. Download `unity-asset-search-daemon` archives from this repo's GitHub Release.
-2. Extract and place them into `Tools/win-x64/`, `Tools/linux-x64/`, and `Tools/mac-universal/`.
-3. For macOS, merge `x86_64` + `aarch64` into a universal binary (e.g. `lipo -create`).
-4. Ensure macOS/Linux binaries are executable (`chmod +x`).
+1. Download `unity-asset-search-daemon` archives from this repository's GitHub
+   Release.
+2. Extract and place them into `Tools/win-x64/`, `Tools/linux-x64/`, and
+   `Tools/mac-universal/`.
+3. For macOS, merge `x86_64` and `aarch64` binaries into a universal binary,
+   for example with `lipo -create`.
+4. Ensure macOS and Linux binaries are executable with `chmod +x`.

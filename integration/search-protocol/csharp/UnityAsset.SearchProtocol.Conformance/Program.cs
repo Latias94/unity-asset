@@ -798,12 +798,24 @@ internal static class ConformanceProgram
             accepted.DaemonInstanceId,
             new[] { ProtocolConstants.BusinessProtocolRevision });
         byte[] acceptedFrame = FrameCodec.EncodeBootstrapReply(accepted);
-        byte[] responsePayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "status-v2.json")));
-        byte[] responseFrame = FrameCodec.Encode(
-            responsePayload,
-            FrameLimits.ForResponse("status"));
-        var exchangeStream = new ScriptedDuplexStream(acceptedFrame.Concat(responseFrame).ToArray());
+        var exchangeFixtures = OperationNames.Select(operation =>
+        {
+            string fixtureName = operation.Replace('_', '-');
+            return (
+                Operation: operation,
+                RequestPayload: TrimTerminalNewline(
+                    ReadNonEmpty(Path.Combine(fixtureRoot, "requests", $"{fixtureName}-v2.json"))),
+                ResponsePayload: TrimTerminalNewline(
+                    ReadNonEmpty(Path.Combine(fixtureRoot, "responses", $"{fixtureName}-v2.json"))));
+        }).ToArray();
+        var incomingBytes = new List<byte>(acceptedFrame);
+        foreach (var fixture in exchangeFixtures)
+        {
+            incomingBytes.AddRange(FrameCodec.Encode(
+                fixture.ResponsePayload,
+                FrameLimits.ForResponse(fixture.Operation)));
+        }
+        var exchangeStream = new ScriptedDuplexStream(incomingBytes.ToArray());
         var adapter = new SingleStreamTransportAdapter(exchangeStream);
 
         using (ProtocolSession session = await ProtocolSession.ConnectAsync(
@@ -823,23 +835,48 @@ internal static class ConformanceProgram
                 session.Binding.QueryPolicyId.Equals(accepted.QueryPolicyId),
                 "Public session lost query policy binding.");
 
-            byte[] requestPayload = TrimTerminalNewline(
-                ReadNonEmpty(Path.Combine(fixtureRoot, "requests", "status-v2.json")));
-            RequestEnvelopeV1 request = BusinessCodec.DecodeRequest(requestPayload, session.Binding);
-            ResponseEnvelopeV1 response = await session.ExchangeAsync(
-                request,
-                CancellationToken.None).ConfigureAwait(false);
-            Require(!response.IsError && response.OperationKind == "status", "Public session decoded the wrong response.");
-            Require(
-                response.Value.GetProperty("kind").GetString() == "status",
-                "Public session did not expose the successful response value.");
+            var expectedWrites = new List<byte>(FrameCodec.EncodeBootstrapHello(hello));
+            var sentOperations = new List<string>();
+            var receivedOperations = new List<string>();
+            foreach (var fixture in exchangeFixtures)
+            {
+                RequestEnvelopeV1 request = BusinessCodec.DecodeRequest(
+                    fixture.RequestPayload,
+                    session.Binding);
+                Require(
+                    string.Equals(request.OperationKind, fixture.Operation, StringComparison.Ordinal),
+                    $"Public session request fixture decoded as {request.OperationKind}, expected {fixture.Operation}.");
 
-            byte[] expectedWrites = FrameCodec.EncodeBootstrapHello(hello)
-                .Concat(FrameCodec.Encode(requestPayload, FrameLimits.ForRequest("status")))
-                .ToArray();
+                ResponseEnvelopeV1 response = await session.ExchangeAsync(
+                    request,
+                    CancellationToken.None).ConfigureAwait(false);
+                Require(!response.IsError, $"Public session decoded {fixture.Operation} as an error response.");
+                Require(
+                    string.Equals(response.OperationKind, fixture.Operation, StringComparison.Ordinal),
+                    $"Public session decoded the wrong response operation for {fixture.Operation}.");
+                Require(
+                    string.Equals(
+                        response.Value.GetProperty("kind").GetString(),
+                        fixture.Operation,
+                        StringComparison.Ordinal),
+                    $"Public session did not expose the {fixture.Operation} response value.");
+
+                sentOperations.Add(request.OperationKind);
+                receivedOperations.Add(response.OperationKind!);
+                expectedWrites.AddRange(FrameCodec.Encode(
+                    fixture.RequestPayload,
+                    FrameLimits.ForRequest(fixture.Operation)));
+            }
+
             Require(
-                exchangeStream.WrittenBytes.AsSpan().SequenceEqual(expectedWrites),
-                "Public session did not emit the canonical Bootstrap and request frames.");
+                sentOperations.SequenceEqual(OperationNames, StringComparer.Ordinal),
+                "Public session did not send every operation in canonical fixture order.");
+            Require(
+                receivedOperations.SequenceEqual(OperationNames, StringComparer.Ordinal),
+                "Public session did not receive every operation in canonical fixture order.");
+            Require(
+                exchangeStream.WrittenBytes.AsSpan().SequenceEqual(expectedWrites.ToArray()),
+                "Public session did not emit the canonical Bootstrap and complete request frame sequence.");
         }
         Require(exchangeStream.WasDisposed, "Public session did not own and dispose its transport stream.");
 
