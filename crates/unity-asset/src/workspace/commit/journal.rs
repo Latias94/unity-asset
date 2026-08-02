@@ -25,6 +25,7 @@ use unity_asset_core::{
     WorkspaceRevision, read_contract_json, vec_allocation_bytes,
 };
 
+use super::super::WorkspaceInstallationDigest;
 use super::platform::{
     DIRECTORY_VISIT_ENTRY_BYTES, DIRECTORY_VISIT_SETUP_BYTES, DirectoryEntryName,
     DirectoryIdentity, DirectoryVisitError, FileIdentity, JournalAccess, JournalDirectory,
@@ -37,7 +38,9 @@ use super::platform::{
     atomic_replace_tracked, create_private_file_in_parent, open_readonly_regular_in_parent,
 };
 use super::publication_protocol::{PublicationAction, RecoveryDirection};
-use super::{CommitArtifactReport, CommitAtomicity, CommitReport, RecoveryLocator};
+use super::{
+    CommitArtifactReport, CommitAtomicity, CommitReport, CommitReportFields, RecoveryLocator,
+};
 
 mod preparation;
 
@@ -45,7 +48,8 @@ pub(crate) use preparation::{
     JournalPreparation, JournalPreparationOutput, OpenedJournalPreparation,
 };
 
-pub(crate) const JOURNAL_VERSION: u8 = 3;
+pub(crate) const JOURNAL_VERSION: u8 = 4;
+const LEGACY_EVENT_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +78,8 @@ pub(crate) struct JournalTransactionSeed<'a> {
     pub(crate) workspace: WorkspaceId,
     pub(crate) base_revision: WorkspaceRevision,
     pub(crate) committed_revision: WorkspaceRevision,
+    pub(crate) base_installation: WorkspaceInstallationDigest,
+    pub(crate) committed_installation: WorkspaceInstallationDigest,
     pub(crate) plan_digest: DigestV1,
     pub(crate) atomicity: CommitAtomicity,
     pub(crate) containment_root: &'a str,
@@ -966,6 +972,8 @@ pub(crate) struct JournalResult {
     workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     committed_revision: WorkspaceRevision,
+    base_installation: WorkspaceInstallationDigest,
+    committed_installation: WorkspaceInstallationDigest,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
     artifacts: Vec<CommitArtifactReport>,
@@ -980,6 +988,8 @@ struct JournalResultWire {
     workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     committed_revision: WorkspaceRevision,
+    base_installation: WorkspaceInstallationDigest,
+    committed_installation: WorkspaceInstallationDigest,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
     artifacts: BoundedSequence<CommitArtifactReport, MAX_ARTIFACT_COUNT>,
@@ -998,6 +1008,8 @@ impl<'de> Deserialize<'de> for JournalResult {
             workspace_id: wire.workspace_id,
             base_revision: wire.base_revision,
             committed_revision: wire.committed_revision,
+            base_installation: wire.base_installation,
+            committed_installation: wire.committed_installation,
             plan_digest: wire.plan_digest,
             atomicity: wire.atomicity,
             artifacts: wire.artifacts.0,
@@ -1017,6 +1029,8 @@ impl JournalResult {
             workspace_id: report.workspace_id(),
             base_revision: report.base_revision(),
             committed_revision: report.committed_revision(),
+            base_installation: report.base_installation(),
+            committed_installation: report.committed_installation(),
             plan_digest: report.plan_digest(),
             atomicity: report.atomicity(),
             artifacts: clone_artifact_reports(report.artifacts(), budget)?,
@@ -1029,17 +1043,19 @@ impl JournalResult {
         root: PathBuf,
         root_identity: DirectoryIdentity,
     ) -> Result<CommitReport, JournalError> {
-        let report = CommitReport::new(
-            self.transaction,
-            self.workspace_id,
-            self.base_revision,
-            self.committed_revision,
-            self.plan_digest,
-            self.atomicity,
-            self.artifacts,
-            self.changes,
-            RecoveryLocator::new(root, self.transaction, root_identity),
-        );
+        let report = CommitReport::new(CommitReportFields {
+            transaction: self.transaction,
+            workspace_id: self.workspace_id,
+            base_revision: self.base_revision,
+            committed_revision: self.committed_revision,
+            base_installation: self.base_installation,
+            committed_installation: self.committed_installation,
+            plan_digest: self.plan_digest,
+            atomicity: self.atomicity,
+            artifacts: self.artifacts,
+            changes: self.changes,
+            recovery: RecoveryLocator::new(root, self.transaction, root_identity),
+        });
         report
             .validate()
             .map_err(|error| JournalError::InvalidManifest(error.to_string()))?;
@@ -1079,6 +1095,8 @@ pub(crate) struct JournalManifest {
     workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     committed_revision: WorkspaceRevision,
+    base_installation: WorkspaceInstallationDigest,
+    committed_installation: WorkspaceInstallationDigest,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
     containment_root_identity: DirectoryIdentity,
@@ -1096,6 +1114,8 @@ struct JournalManifestWire {
     workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     committed_revision: WorkspaceRevision,
+    base_installation: WorkspaceInstallationDigest,
+    committed_installation: WorkspaceInstallationDigest,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
     containment_root_identity: DirectoryIdentity,
@@ -1117,6 +1137,8 @@ impl<'de> Deserialize<'de> for JournalManifest {
             workspace_id: wire.workspace_id,
             base_revision: wire.base_revision,
             committed_revision: wire.committed_revision,
+            base_installation: wire.base_installation,
+            committed_installation: wire.committed_installation,
             plan_digest: wire.plan_digest,
             atomicity: wire.atomicity,
             containment_root_identity: wire.containment_root_identity,
@@ -1149,6 +1171,8 @@ impl JournalManifest {
             workspace_id: report.workspace_id(),
             base_revision: report.base_revision(),
             committed_revision: report.committed_revision(),
+            base_installation: report.base_installation(),
+            committed_installation: report.committed_installation(),
             plan_digest: report.plan_digest(),
             atomicity: report.atomicity(),
             containment_root_identity,
@@ -1192,6 +1216,8 @@ impl JournalManifest {
             || self.result.workspace_id != self.workspace_id
             || self.result.base_revision != self.base_revision
             || self.result.committed_revision != self.committed_revision
+            || self.result.base_installation != self.base_installation
+            || self.result.committed_installation != self.committed_installation
             || self.result.plan_digest != self.plan_digest
             || self.result.atomicity != self.atomicity
         {
@@ -1299,6 +1325,8 @@ impl JournalManifest {
                 workspace: self.workspace_id,
                 base_revision: self.base_revision,
                 committed_revision: self.committed_revision,
+                base_installation: self.base_installation,
+                committed_installation: self.committed_installation,
                 plan_digest: self.plan_digest,
                 atomicity: self.atomicity,
                 containment_root,
@@ -1333,6 +1361,16 @@ impl JournalManifest {
     #[must_use]
     pub(crate) const fn committed_revision(&self) -> WorkspaceRevision {
         self.committed_revision
+    }
+
+    #[must_use]
+    pub(crate) const fn base_installation(&self) -> WorkspaceInstallationDigest {
+        self.base_installation
+    }
+
+    #[must_use]
+    pub(crate) const fn committed_installation(&self) -> WorkspaceInstallationDigest {
+        self.committed_installation
     }
 
     #[must_use]
@@ -1376,6 +1414,8 @@ impl JournalManifest {
             workspace_id: self.result.workspace_id,
             base_revision: self.result.base_revision,
             committed_revision: self.result.committed_revision,
+            base_installation: self.result.base_installation,
+            committed_installation: self.result.committed_installation,
             plan_digest: self.result.plan_digest,
             atomicity: self.result.atomicity,
             artifacts: clone_artifact_reports(&self.result.artifacts, budget)?,
@@ -1829,7 +1869,7 @@ impl JournalEvent {
     }
 
     pub(crate) fn validate(&self, budget: &mut AssetLoadBudget) -> Result<(), JournalError> {
-        if self.version != JOURNAL_VERSION {
+        if self.version != JOURNAL_VERSION && self.version != LEGACY_EVENT_VERSION {
             return Err(JournalError::UnsupportedVersion(self.version));
         }
         self.kind.validate()?;
@@ -3405,6 +3445,10 @@ mod tests {
         let source = SourceId::new(workspace, SourceKind::Yaml, 1).expect("source id");
         let from = WorkspaceRevision::new(DigestV1::hash_bytes(b"from"));
         let to = WorkspaceRevision::new(DigestV1::hash_bytes(b"to"));
+        let base_installation =
+            WorkspaceInstallationDigest::new(DigestV1::hash_bytes(b"base installation"));
+        let committed_installation =
+            WorkspaceInstallationDigest::new(DigestV1::hash_bytes(b"committed installation"));
         let plan_digest = DigestV1::hash_bytes(b"plan");
         let report_artifact =
             CommitArtifactReport::new("root".to_owned(), source, DigestV1::hash_bytes(b"bytes"), 5);
@@ -3439,6 +3483,8 @@ mod tests {
                 workspace,
                 base_revision: from,
                 committed_revision: to,
+                base_installation,
+                committed_installation,
                 plan_digest,
                 atomicity: CommitAtomicity::PerArtifactRecoverable,
                 containment_root: parent.to_str().expect("UTF-8 fixture path"),
@@ -3469,21 +3515,23 @@ mod tests {
         std::fs::create_dir(layout.baseline_directory()).expect("baseline directory");
         let directories =
             JournalDirectoryIdentities::observe(&layout).expect("journal directory identities");
-        let report = CommitReport::new(
+        let report = CommitReport::new(CommitReportFields {
             transaction,
-            workspace,
-            from,
-            to,
+            workspace_id: workspace,
+            base_revision: from,
+            committed_revision: to,
+            base_installation,
+            committed_installation,
             plan_digest,
-            CommitAtomicity::PerArtifactRecoverable,
-            vec![report_artifact],
+            atomicity: CommitAtomicity::PerArtifactRecoverable,
+            artifacts: vec![report_artifact],
             changes,
-            RecoveryLocator::new(
+            recovery: RecoveryLocator::new(
                 layout.directory().to_path_buf(),
                 transaction,
                 layout.root_identity().clone(),
             ),
-        );
+        });
         let artifact = JournalArtifact::new(
             &report.artifacts()[0],
             JournalPath::new("target").unwrap(),

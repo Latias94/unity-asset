@@ -21,7 +21,7 @@ use super::portable_path::{PortablePathError, slash_key};
 use super::preflight::destination::{DestinationProofError, DestinationState};
 use super::preflight::source_proof::PhysicalDependencyProofError;
 use super::source_catalog::CatalogError;
-use super::{AssetWorkspace, PreparedChange};
+use super::{AssetWorkspace, PreparedChange, WorkspaceInstallationDigest};
 
 use self::baseline::{MaterializedImages, PreparedBaseline};
 use self::journal::{
@@ -180,7 +180,7 @@ pub use recovery::{
 };
 
 /// Current canonical commit-report wire version.
-pub const COMMIT_REPORT_VERSION: u8 = 1;
+pub const COMMIT_REPORT_VERSION: u8 = 2;
 
 /// Current canonical recovery-locator wire version.
 pub const RECOVERY_LOCATOR_VERSION: u8 = 1;
@@ -460,6 +460,8 @@ pub struct CommitReport {
     workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     committed_revision: WorkspaceRevision,
+    base_installation: WorkspaceInstallationDigest,
+    committed_installation: WorkspaceInstallationDigest,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
     artifacts: Vec<CommitArtifactReport>,
@@ -475,6 +477,22 @@ struct CommitReportWire {
     workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     committed_revision: WorkspaceRevision,
+    base_installation: WorkspaceInstallationDigest,
+    committed_installation: WorkspaceInstallationDigest,
+    plan_digest: DigestV1,
+    atomicity: CommitAtomicity,
+    artifacts: Vec<CommitArtifactReport>,
+    changes: ChangeSet,
+    recovery: RecoveryLocator,
+}
+
+struct CommitReportFields {
+    transaction: TransactionId,
+    workspace_id: WorkspaceId,
+    base_revision: WorkspaceRevision,
+    committed_revision: WorkspaceRevision,
+    base_installation: WorkspaceInstallationDigest,
+    committed_installation: WorkspaceInstallationDigest,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
     artifacts: Vec<CommitArtifactReport>,
@@ -494,6 +512,8 @@ impl<'de> Deserialize<'de> for CommitReport {
             workspace_id: wire.workspace_id,
             base_revision: wire.base_revision,
             committed_revision: wire.committed_revision,
+            base_installation: wire.base_installation,
+            committed_installation: wire.committed_installation,
             plan_digest: wire.plan_digest,
             atomicity: wire.atomicity,
             artifacts: wire.artifacts,
@@ -506,24 +526,28 @@ impl<'de> Deserialize<'de> for CommitReport {
 }
 
 impl CommitReport {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        transaction: TransactionId,
-        workspace_id: WorkspaceId,
-        base_revision: WorkspaceRevision,
-        committed_revision: WorkspaceRevision,
-        plan_digest: DigestV1,
-        atomicity: CommitAtomicity,
-        artifacts: Vec<CommitArtifactReport>,
-        changes: ChangeSet,
-        recovery: RecoveryLocator,
-    ) -> Self {
+    fn new(fields: CommitReportFields) -> Self {
+        let CommitReportFields {
+            transaction,
+            workspace_id,
+            base_revision,
+            committed_revision,
+            base_installation,
+            committed_installation,
+            plan_digest,
+            atomicity,
+            artifacts,
+            changes,
+            recovery,
+        } = fields;
         Self {
             version: COMMIT_REPORT_VERSION,
             transaction,
             workspace_id,
             base_revision,
             committed_revision,
+            base_installation,
+            committed_installation,
             plan_digest,
             atomicity,
             artifacts,
@@ -555,6 +579,16 @@ impl CommitReport {
     #[must_use]
     pub const fn committed_revision(&self) -> WorkspaceRevision {
         self.committed_revision
+    }
+
+    #[must_use]
+    pub const fn base_installation(&self) -> WorkspaceInstallationDigest {
+        self.base_installation
+    }
+
+    #[must_use]
+    pub const fn committed_installation(&self) -> WorkspaceInstallationDigest {
+        self.committed_installation
     }
 
     #[must_use]
@@ -651,6 +685,8 @@ struct CommitPreflight {
     publications: Vec<PreparedPublication>,
     atomicity: CommitAtomicity,
     transaction: TransactionId,
+    base_installation: WorkspaceInstallationDigest,
+    committed_installation: WorkspaceInstallationDigest,
     changes: ChangeSet,
     artifacts: Vec<CommitArtifactReport>,
     recovery_baseline: JournalBaseline,
@@ -667,6 +703,12 @@ fn preflight_commit(
     }
 
     let core = prepared.state().core();
+    let base_installation = core.base().state().installation();
+    let committed_installation = core
+        .base()
+        .state()
+        .installation_for_catalog(core.catalog())
+        .map_err(|error| CommitPreflightError::Ownership(error.to_string()))?;
     let publication_root_count = core
         .source_bindings()
         .iter()
@@ -843,6 +885,8 @@ fn preflight_commit(
         workspace: report.workspace_id(),
         base_revision: report.base_revision(),
         committed_revision: report.prepared_revision(),
+        base_installation,
+        committed_installation,
         plan_digest: report.plan_digest(),
         atomicity: CommitAtomicity::PerArtifactRecoverable,
         containment_root: root,
@@ -884,6 +928,8 @@ fn preflight_commit(
         publications,
         atomicity: CommitAtomicity::PerArtifactRecoverable,
         transaction,
+        base_installation,
+        committed_installation,
         changes,
         artifacts,
         recovery_baseline,
@@ -1195,6 +1241,8 @@ impl AssetWorkspace {
             mut publications,
             atomicity,
             transaction,
+            base_installation,
+            committed_installation,
             changes,
             artifacts,
             recovery_baseline,
@@ -1217,17 +1265,19 @@ impl AssetWorkspace {
         let mut execution = publication_execution_plan(&layout, &publications, budget)
             .map_err(map_preflight_error)?;
         let prepare_report = prepared.report();
-        let report = CommitReport::new(
+        let report = CommitReport::new(CommitReportFields {
             transaction,
-            prepare_report.workspace_id(),
-            prepare_report.base_revision(),
-            prepare_report.prepared_revision(),
-            prepare_report.plan_digest(),
+            workspace_id: prepare_report.workspace_id(),
+            base_revision: prepare_report.base_revision(),
+            committed_revision: prepare_report.prepared_revision(),
+            base_installation,
+            committed_installation,
+            plan_digest: prepare_report.plan_digest(),
             atomicity,
             artifacts,
             changes,
-            locator.clone(),
-        );
+            recovery: locator.clone(),
+        });
         report
             .validate()
             .map_err(|error| PreparePublicationError::PublishBlocked(error.to_string()))?;
@@ -1417,8 +1467,14 @@ impl AssetWorkspace {
                 #[cfg(test)]
                 test_crash_artifact_failpoint("staged_artifact_synced", publication.ordinal);
             }
-            let baseline = baseline::build(prepared, self.binary_adapter(), &mut images, budget)
-                .map_err(map_baseline_prepare_error)?;
+            let baseline = baseline::build(
+                prepared,
+                self.binary_adapter(),
+                report.committed_installation(),
+                &mut images,
+                budget,
+            )
+            .map_err(map_baseline_prepare_error)?;
             write_recovery_baseline(
                 prepared,
                 &recovery_baseline,
@@ -3239,6 +3295,10 @@ mod tests {
         let base_revision = WorkspaceRevision::new(DigestV1::hash_bytes(b"base revision"));
         let committed_revision =
             WorkspaceRevision::new(DigestV1::hash_bytes(b"committed revision"));
+        let base_installation =
+            WorkspaceInstallationDigest::new(DigestV1::hash_bytes(b"base installation"));
+        let committed_installation =
+            WorkspaceInstallationDigest::new(DigestV1::hash_bytes(b"committed installation"));
         let changes = ChangeSet::new(
             transaction,
             workspace,
@@ -3249,14 +3309,16 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        CommitReport::new(
+        CommitReport::new(CommitReportFields {
             transaction,
-            workspace,
+            workspace_id: workspace,
             base_revision,
             committed_revision,
-            DigestV1::hash_bytes(b"commit report plan"),
-            CommitAtomicity::PerArtifactRecoverable,
-            vec![
+            base_installation,
+            committed_installation,
+            plan_digest: DigestV1::hash_bytes(b"commit report plan"),
+            atomicity: CommitAtomicity::PerArtifactRecoverable,
+            artifacts: vec![
                 CommitArtifactReport::new(
                     "root-00000000".to_owned(),
                     source,
@@ -3271,8 +3333,8 @@ mod tests {
                 ),
             ],
             changes,
-            target.recovery_locator(transaction),
-        )
+            recovery: target.recovery_locator(transaction),
+        })
     }
 
     #[test]
@@ -3289,6 +3351,8 @@ mod tests {
             "workspace_id",
             "base_revision",
             "committed_revision",
+            "base_installation",
+            "committed_installation",
             "plan_digest",
             "atomicity",
             "artifacts",

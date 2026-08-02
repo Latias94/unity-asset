@@ -29,6 +29,7 @@ use unity_asset_core::{
 
 use super::super::portable_path::{PortablePathError, slash_key};
 
+use super::super::WorkspaceInstallationDigest;
 use super::journal::{
     BACKUP_DIRECTORY, BASELINE_DIRECTORY, EVENTS_DIRECTORY, Journal, JournalArtifact,
     JournalBaselineImage, JournalError, JournalEvent, JournalEventKind, JournalEventPlan,
@@ -65,7 +66,7 @@ use super::publication_protocol::{
 use super::{AssetWorkspace, CommitReport, PublicationTarget, RecoveryLocator, VerificationCharge};
 
 /// Version of the rollback-receipt response contract.
-pub const ROLLBACK_RECEIPT_VERSION: u8 = 1;
+pub const ROLLBACK_RECEIPT_VERSION: u8 = 2;
 
 /// Stable receipt for a transaction whose pre-publication state was restored.
 ///
@@ -77,6 +78,7 @@ pub struct RollbackReceipt {
     version: u8,
     workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
+    base_installation: WorkspaceInstallationDigest,
     recovery: RecoveryLocator,
 }
 
@@ -86,6 +88,7 @@ struct RollbackReceiptWire {
     version: u8,
     workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
+    base_installation: WorkspaceInstallationDigest,
     recovery: RecoveryLocator,
 }
 
@@ -99,6 +102,7 @@ impl<'de> Deserialize<'de> for RollbackReceipt {
             version: wire.version,
             workspace_id: wire.workspace_id,
             base_revision: wire.base_revision,
+            base_installation: wire.base_installation,
             recovery: wire.recovery,
         };
         receipt.validate().map_err(serde::de::Error::custom)?;
@@ -110,12 +114,14 @@ impl RollbackReceipt {
     const fn new(
         workspace_id: WorkspaceId,
         base_revision: WorkspaceRevision,
+        base_installation: WorkspaceInstallationDigest,
         recovery: RecoveryLocator,
     ) -> Self {
         Self {
             version: ROLLBACK_RECEIPT_VERSION,
             workspace_id,
             base_revision,
+            base_installation,
             recovery,
         }
     }
@@ -136,6 +142,11 @@ impl RollbackReceipt {
     }
 
     #[must_use]
+    pub const fn base_installation(&self) -> WorkspaceInstallationDigest {
+        self.base_installation
+    }
+
+    #[must_use]
     pub const fn recovery(&self) -> &RecoveryLocator {
         &self.recovery
     }
@@ -149,7 +160,7 @@ impl RollbackReceipt {
 }
 
 /// Version of the terminal recovery-outcome response contract.
-pub const RECOVERY_OUTCOME_VERSION: u8 = 1;
+pub const RECOVERY_OUTCOME_VERSION: u8 = 2;
 
 /// Terminal result of recovering one transaction.
 ///
@@ -531,6 +542,14 @@ pub enum RecoveryBlockedReason {
     BaselineUnavailable {
         expected: WorkspaceRevision,
         actual: WorkspaceRevision,
+    },
+    #[error(
+        "recovery workspace installation {actual:?} does not match the journal installation required by its current revision; base {base:?}, committed {committed:?}"
+    )]
+    InstallationUnavailable {
+        base: WorkspaceInstallationDigest,
+        committed: WorkspaceInstallationDigest,
+        actual: WorkspaceInstallationDigest,
     },
     #[error("the published workspace baseline could not be rebuilt: {message}")]
     BaselineRebuild { message: String },
@@ -1400,20 +1419,13 @@ fn recover_prepared_transaction(
         }
         Err(error) => return Err(map_journal_open_error(locator, error)),
     };
-    if let Some(workspace) = workspace
-        && preparation.document().workspace_id() != workspace.workspace_id()
-    {
-        return Err(blocked(
-            locator,
-            RecoveryBlockedReason::WorkspaceMismatch {
-                expected: preparation.document().workspace_id(),
-                actual: workspace.workspace_id(),
-            },
-        ));
+    if let Some(workspace) = workspace {
+        validate_preparation_workspace(preparation.document(), workspace, locator)?;
     }
     let receipt = RollbackReceipt::new(
         preparation.document().workspace_id(),
         preparation.document().base_revision(),
+        preparation.document().base_installation(),
         locator.clone(),
     );
     let plan = observe_premanifest_cleanup(layout, access, preparation, budget)
@@ -1460,24 +1472,7 @@ fn recover_premanifest_rollback(
     ensure_premanifest_rollback_absence(access, layout, duplicate_preparation.is_none())
         .map_err(|reason| blocked(locator, reason))?;
     if let Some(workspace) = workspace {
-        if rollback.document().workspace_id() != workspace.workspace_id() {
-            return Err(blocked(
-                locator,
-                RecoveryBlockedReason::WorkspaceMismatch {
-                    expected: rollback.document().workspace_id(),
-                    actual: workspace.workspace_id(),
-                },
-            ));
-        }
-        if rollback.document().base_revision() != workspace.revision() {
-            return Err(blocked(
-                locator,
-                RecoveryBlockedReason::BaselineUnavailable {
-                    expected: rollback.document().base_revision(),
-                    actual: workspace.revision(),
-                },
-            ));
-        }
+        validate_preparation_workspace(rollback.document(), workspace, locator)?;
     }
     if let Some(preparation) = duplicate_preparation {
         let current = JournalPreparation::open_in_access(layout, access, budget)
@@ -1520,8 +1515,45 @@ fn recover_premanifest_rollback(
     Ok(RecoveryOutcome::RolledBack(RollbackReceipt::new(
         rollback.document().workspace_id(),
         rollback.document().base_revision(),
+        rollback.document().base_installation(),
         locator.clone(),
     )))
+}
+
+fn validate_preparation_workspace(
+    preparation: &JournalPreparation,
+    workspace: &AssetWorkspace,
+    locator: &RecoveryLocator,
+) -> Result<(), RecoveryError> {
+    if preparation.workspace_id() != workspace.workspace_id() {
+        return Err(blocked(
+            locator,
+            RecoveryBlockedReason::WorkspaceMismatch {
+                expected: preparation.workspace_id(),
+                actual: workspace.workspace_id(),
+            },
+        ));
+    }
+    if preparation.base_revision() != workspace.revision() {
+        return Err(blocked(
+            locator,
+            RecoveryBlockedReason::BaselineUnavailable {
+                expected: preparation.base_revision(),
+                actual: workspace.revision(),
+            },
+        ));
+    }
+    if preparation.base_installation() != workspace.installation_digest() {
+        return Err(blocked(
+            locator,
+            RecoveryBlockedReason::InstallationUnavailable {
+                base: preparation.base_installation(),
+                committed: preparation.committed_installation(),
+                actual: workspace.installation_digest(),
+            },
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_premanifest_rollback_absence(
@@ -1605,10 +1637,7 @@ fn map_premanifest_cleanup_error(
     error: PremanifestCleanupError,
 ) -> RecoveryError {
     match error {
-        PremanifestCleanupError::Budget(source) => RecoveryError::Budget {
-            locator: Box::new(locator.clone()),
-            source,
-        },
+        PremanifestCleanupError::Budget(source) => recovery_budget_error(locator, source),
         PremanifestCleanupError::Blocked(reason) => blocked(locator, reason),
         PremanifestCleanupError::Preparation(error) => map_journal_open_error(locator, error),
         PremanifestCleanupError::Io(error) => blocked(
@@ -2266,7 +2295,7 @@ fn recover_finalized_journal(
     intent: RecoveryIntent,
     report: CommitReport,
     events: &ObservedProtocol,
-    baseline: BaselineObservation,
+    relation: WorkspaceBaselineRelation,
     budget: &mut AssetLoadBudget,
 ) -> Result<RecoveryOutcome, RecoveryError> {
     if events.state.abandoned() {
@@ -2289,8 +2318,12 @@ fn recover_finalized_journal(
         // intentionally does not compare current targets with a historical
         // digest because a later legitimate transaction may have superseded
         // every target since this receipt was finalized.
-        return Ok(historical_commit_receipt(report));
+        return historical_commit_outcome(report, locator, budget);
     };
+    if relation == WorkspaceBaselineRelation::Diverged {
+        return historical_commit_outcome(report, locator, budget);
+    }
+    let baseline = relation.protocol_observation();
     match baseline {
         BaselineObservation::Base | BaselineObservation::NotBase => {
             let may_be_partial = matches!(baseline, BaselineObservation::NotBase);
@@ -2300,13 +2333,13 @@ fn recover_finalized_journal(
             let (execution, artifacts) = match observe_execution(journal, budget) {
                 Ok(observation) => observation,
                 Err(ObservationError::Blocked(_)) if may_be_partial => {
-                    return Ok(historical_commit_receipt(report));
+                    return historical_commit_outcome(report, locator, budget);
                 }
                 Err(error) => return Err(map_observation_error(locator, error)),
             };
             if artifacts.iter().any(|artifact| !artifact.is_published()) {
                 if may_be_partial {
-                    return Ok(historical_commit_receipt(report));
+                    return historical_commit_outcome(report, locator, budget);
                 }
                 return Err(blocked(
                     locator,
@@ -2324,17 +2357,18 @@ fn recover_finalized_journal(
                         return Err(RecoveryError::Budget { locator, source });
                     }
                     Err(_) if may_be_partial => {
-                        return Ok(historical_commit_receipt(report));
+                        return historical_commit_outcome(report, locator, budget);
                     }
                     Err(error) => return Err(error),
                 };
+            let report = budgeted_commit_report(report, locator, budget)?;
             verify_and_install_recovery_baseline(
                 journal,
                 &artifacts,
                 &execution,
                 workspace,
                 Some(&rebuilt),
-                report.committed_revision(),
+                RecoveryBaselineExpectation::from_report(report.as_ref()),
             )
             .map_err(|error| map_execution_error(locator, error))?;
             Ok(commit_outcome(report, true))
@@ -2343,7 +2377,72 @@ fn recover_finalized_journal(
             // The same workspace can legitimately have advanced through a
             // successor transaction. Redeliver the immutable receipt without
             // replacing its newer state.
-            Ok(historical_commit_receipt(report))
+            historical_commit_outcome(report, locator, budget)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceBaselineRelation {
+    Base,
+    Committed,
+    Partial,
+    Diverged,
+    Detached,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecoveryBaselineExpectation {
+    committed_revision: WorkspaceRevision,
+    base_installation: WorkspaceInstallationDigest,
+    committed_installation: WorkspaceInstallationDigest,
+}
+
+impl RecoveryBaselineExpectation {
+    const fn from_report(report: &CommitReport) -> Self {
+        Self {
+            committed_revision: report.committed_revision(),
+            base_installation: report.base_installation(),
+            committed_installation: report.committed_installation(),
+        }
+    }
+}
+
+impl WorkspaceBaselineRelation {
+    fn observe(report: &CommitReport, workspace: Option<&AssetWorkspace>) -> Self {
+        let Some(workspace) = workspace else {
+            return Self::Detached;
+        };
+        let revision = workspace.revision();
+        let installation = workspace.installation_digest();
+        if revision == report.base_revision() && installation == report.base_installation() {
+            Self::Base
+        } else if revision == report.committed_revision()
+            && installation == report.committed_installation()
+        {
+            Self::Committed
+        } else if revision == report.base_revision() || revision == report.committed_revision() {
+            // A known logical state with a different physical installation must never be
+            // reconstructed from this journal. This is the same-revision relocation case that
+            // the installation digest exists to distinguish.
+            Self::Diverged
+        } else if installation == report.base_installation()
+            || installation == report.committed_installation()
+        {
+            // Publication may leave a reopened workspace with a strict subset of the eventual
+            // logical baseline while its complete physical topology still matches one journal
+            // endpoint. Recovery may rebuild that partial logical view after filesystem proof.
+            Self::Partial
+        } else {
+            Self::Detached
+        }
+    }
+
+    const fn protocol_observation(self) -> BaselineObservation {
+        match self {
+            Self::Base => BaselineObservation::Base,
+            Self::Committed | Self::Partial | Self::Diverged => BaselineObservation::NotBase,
+            Self::Detached => BaselineObservation::Detached,
         }
     }
 }
@@ -2374,16 +2473,8 @@ fn recover_open_journal(
 
     let events = ObservedProtocol::from_journal(journal, budget)
         .map_err(|error| map_observation_error(locator, error))?;
-    let baseline = match workspace.as_deref() {
-        Some(workspace)
-            if report.base_revision() != report.committed_revision()
-                && workspace.revision() == report.base_revision() =>
-        {
-            BaselineObservation::Base
-        }
-        Some(_) => BaselineObservation::NotBase,
-        None => BaselineObservation::Detached,
-    };
+    let relation = WorkspaceBaselineRelation::observe(&report, workspace.as_deref());
+    let baseline = relation.protocol_observation();
     if events.state.finalized() {
         validate_manifest_paths(journal, budget)
             .map_err(|error| map_observation_error(locator, error))?;
@@ -2394,9 +2485,32 @@ fn recover_open_journal(
             intent,
             report,
             &events,
-            baseline,
+            relation,
             budget,
         );
+    }
+    if relation == WorkspaceBaselineRelation::Diverged {
+        let workspace = workspace
+            .as_deref()
+            .expect("diverged recovery relation requires an attached workspace");
+        return Err(blocked(
+            locator,
+            RecoveryBlockedReason::InstallationUnavailable {
+                base: report.base_installation(),
+                committed: report.committed_installation(),
+                actual: workspace.installation_digest(),
+            },
+        ));
+    }
+    if relation == WorkspaceBaselineRelation::Committed && !events.state.published() {
+        return Err(blocked(
+            locator,
+            RecoveryBlockedReason::InvalidEventSequence {
+                message:
+                    "the committed workspace installation predates the journal publication boundary"
+                        .to_owned(),
+            },
+        ));
     }
     let (mut execution, artifacts) = observe_execution(journal, budget)
         .map_err(|error| map_observation_error(locator, error))?;
@@ -2415,6 +2529,17 @@ fn recover_open_journal(
         return Err(blocked(
             locator,
             RecoveryBlockedReason::FilesystemRecoveryRequired,
+        ));
+    }
+    if relation == WorkspaceBaselineRelation::Detached
+        && let Some(workspace) = workspace.as_deref()
+    {
+        return Err(blocked(
+            locator,
+            RecoveryBlockedReason::BaselineUnavailable {
+                expected: report.committed_revision(),
+                actual: workspace.revision(),
+            },
         ));
     }
     let plan = decide_recovery(RecoveryRequest {
@@ -2506,6 +2631,7 @@ fn recover_open_journal(
                 budget,
             )
             .map_err(|error| map_observation_error(locator, error))?;
+            let report = budgeted_commit_report(report, locator, budget)?;
             #[cfg(test)]
             super::test_run_publication_hook("before_recovery_execution");
             execute_forward_program(
@@ -2517,7 +2643,7 @@ fn recover_open_journal(
                 event_plan,
                 workspace.as_deref_mut(),
                 prebuilt_baseline,
-                report.committed_revision(),
+                RecoveryBaselineExpectation::from_report(report.as_ref()),
             )
             .map_err(|error| map_execution_error(locator, error))?;
             Ok(commit_outcome(report, workspace_attached))
@@ -2573,26 +2699,56 @@ fn rollback_outcome(report: &CommitReport) -> RecoveryOutcome {
     RecoveryOutcome::RolledBack(RollbackReceipt::new(
         report.workspace_id(),
         report.base_revision(),
+        report.base_installation(),
         report.recovery().clone(),
     ))
 }
 
-fn commit_outcome(report: CommitReport, workspace_attached: bool) -> RecoveryOutcome {
+fn budgeted_commit_report(
+    report: CommitReport,
+    locator: &RecoveryLocator,
+    budget: &mut AssetLoadBudget,
+) -> Result<Box<CommitReport>, RecoveryError> {
+    let retained = u64::try_from(size_of::<CommitReport>()).map_err(|_| {
+        recovery_budget_error(
+            locator,
+            BudgetError::ArithmeticOverflow {
+                resource: "recovery commit report",
+            },
+        )
+    })?;
+    budget
+        .check_bytes(retained)
+        .map_err(|source| recovery_budget_error(locator, source))?;
+    budget
+        .consume_bytes(retained)
+        .map_err(|source| recovery_budget_error(locator, source))?;
+    Ok(Box::new(report))
+}
+
+fn commit_outcome(report: Box<CommitReport>, workspace_attached: bool) -> RecoveryOutcome {
     if workspace_attached {
-        RecoveryOutcome::Finalized(Box::new(report))
+        RecoveryOutcome::Finalized(report)
     } else {
-        RecoveryOutcome::FilesystemRecovered(Box::new(report))
+        RecoveryOutcome::FilesystemRecovered(report)
     }
 }
 
-fn historical_commit_receipt(report: CommitReport) -> RecoveryOutcome {
-    RecoveryOutcome::HistoricalCommitReceipt(Box::new(report))
+fn historical_commit_outcome(
+    report: CommitReport,
+    locator: &RecoveryLocator,
+    budget: &mut AssetLoadBudget,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    Ok(RecoveryOutcome::HistoricalCommitReceipt(
+        budgeted_commit_report(report, locator, budget)?,
+    ))
 }
 
 fn historical_rollback_receipt(report: &CommitReport) -> RecoveryOutcome {
     RecoveryOutcome::HistoricalRollbackReceipt(RollbackReceipt::new(
         report.workspace_id(),
         report.base_revision(),
+        report.base_installation(),
         report.recovery().clone(),
     ))
 }
@@ -2851,10 +3007,7 @@ fn layout_from_locator(
 
 fn map_layout_error(locator: &RecoveryLocator, error: JournalError) -> RecoveryError {
     match error {
-        JournalError::Budget(source) => RecoveryError::Budget {
-            locator: Box::new(locator.clone()),
-            source,
-        },
+        JournalError::Budget(source) => recovery_budget_error(locator, source),
         JournalError::Allocation { message, .. } => {
             blocked(locator, RecoveryBlockedReason::Io { message })
         }
@@ -3831,7 +3984,7 @@ fn execute_forward_program(
     mut event_plan: JournalEventPlan,
     mut workspace: Option<&mut AssetWorkspace>,
     prebuilt_baseline: Option<super::baseline::PreparedBaseline>,
-    committed_revision: WorkspaceRevision,
+    expected: RecoveryBaselineExpectation,
 ) -> Result<(), ExecutionError> {
     if protocol.state.artifacts().len() != execution.artifacts.len()
         || observations.len() != execution.artifacts.len()
@@ -3882,7 +4035,7 @@ fn execute_forward_program(
                     execution,
                     workspace,
                     prebuilt_baseline.as_ref(),
-                    committed_revision,
+                    expected,
                 )?;
             }
             PublicationAction::Finalized => {
@@ -3893,7 +4046,7 @@ fn execute_forward_program(
                         execution,
                         workspace,
                         prebuilt_baseline.as_ref(),
-                        committed_revision,
+                        expected,
                     )?;
                 }
             }
@@ -4007,7 +4160,7 @@ fn verify_and_install_recovery_baseline(
     execution: &RecoveryExecutionPlan,
     workspace: &mut AssetWorkspace,
     prebuilt_baseline: Option<&super::baseline::PreparedBaseline>,
-    committed_revision: WorkspaceRevision,
+    expected: RecoveryBaselineExpectation,
 ) -> Result<(), ExecutionError> {
     #[cfg(test)]
     super::test_run_publication_hook("before_recovery_baseline_install");
@@ -4019,10 +4172,29 @@ fn verify_and_install_recovery_baseline(
     })?;
     match workspace.install_prepared_state(baseline.state()) {
         super::super::state::WorkspaceStateInstallOutcome::Installed
-        | super::super::state::WorkspaceStateInstallOutcome::Unchanged => Ok(()),
+        | super::super::state::WorkspaceStateInstallOutcome::Unchanged => {
+            if workspace.revision() != expected.committed_revision {
+                return Err(ExecutionError::Blocked(
+                    RecoveryBlockedReason::BaselineUnavailable {
+                        expected: expected.committed_revision,
+                        actual: workspace.revision(),
+                    },
+                ));
+            }
+            if workspace.installation_digest() != expected.committed_installation {
+                return Err(ExecutionError::Blocked(
+                    RecoveryBlockedReason::InstallationUnavailable {
+                        base: expected.base_installation,
+                        committed: expected.committed_installation,
+                        actual: workspace.installation_digest(),
+                    },
+                ));
+            }
+            Ok(())
+        }
         super::super::state::WorkspaceStateInstallOutcome::Stale => Err(ExecutionError::Blocked(
             RecoveryBlockedReason::BaselineUnavailable {
-                expected: committed_revision,
+                expected: expected.committed_revision,
                 actual: workspace.revision(),
             },
         )),
@@ -4670,6 +4842,13 @@ fn blocked(locator: &RecoveryLocator, reason: RecoveryBlockedReason) -> Recovery
     }
 }
 
+fn recovery_budget_error(locator: &RecoveryLocator, source: BudgetError) -> RecoveryError {
+    RecoveryError::Budget {
+        locator: Box::new(locator.clone()),
+        source,
+    }
+}
+
 fn map_commit_guard_error(locator: &RecoveryLocator, error: io::Error) -> RecoveryError {
     if error.kind() == io::ErrorKind::WouldBlock {
         RecoveryError::Busy {
@@ -4687,10 +4866,7 @@ fn invalid_journal(message: String) -> RecoveryBlockedReason {
 
 fn map_journal_open_error(locator: &RecoveryLocator, error: JournalError) -> RecoveryError {
     match error {
-        JournalError::Budget(source) => RecoveryError::Budget {
-            locator: Box::new(locator.clone()),
-            source,
-        },
+        JournalError::Budget(source) => recovery_budget_error(locator, source),
         JournalError::Io(error) => blocked(locator, io_reason(error)),
         error => blocked(locator, invalid_journal(error.to_string())),
     }
@@ -4698,10 +4874,7 @@ fn map_journal_open_error(locator: &RecoveryLocator, error: JournalError) -> Rec
 
 fn map_journal_mutation_error(locator: &RecoveryLocator, error: JournalError) -> RecoveryError {
     match error {
-        JournalError::Budget(source) => RecoveryError::Budget {
-            locator: Box::new(locator.clone()),
-            source,
-        },
+        JournalError::Budget(source) => recovery_budget_error(locator, source),
         JournalError::Io(error) => blocked(locator, io_reason(error)),
         error => blocked(locator, invalid_journal(error.to_string())),
     }
@@ -4712,10 +4885,7 @@ fn map_baseline_error(
     error: super::baseline::BaselineBuildError,
 ) -> RecoveryError {
     match error.into_budget() {
-        Ok(source) => RecoveryError::Budget {
-            locator: Box::new(locator.clone()),
-            source,
-        },
+        Ok(source) => recovery_budget_error(locator, source),
         Err(super::baseline::BaselineBuildError::Revision { expected, actual }) => blocked(
             locator,
             RecoveryBlockedReason::BaselineUnavailable { expected, actual },
@@ -4731,20 +4901,14 @@ fn map_baseline_error(
 
 fn map_observation_error(locator: &RecoveryLocator, error: ObservationError) -> RecoveryError {
     match error {
-        ObservationError::Budget(source) => RecoveryError::Budget {
-            locator: Box::new(locator.clone()),
-            source,
-        },
+        ObservationError::Budget(source) => recovery_budget_error(locator, source),
         ObservationError::Blocked(reason) => blocked(locator, reason),
     }
 }
 
 fn map_execution_error(locator: &RecoveryLocator, error: ExecutionError) -> RecoveryError {
     match error {
-        ExecutionError::Budget(source) => RecoveryError::Budget {
-            locator: Box::new(locator.clone()),
-            source,
-        },
+        ExecutionError::Budget(source) => recovery_budget_error(locator, source),
         ExecutionError::Blocked(reason) => blocked(locator, reason),
         ExecutionError::Journal(error) => map_journal_mutation_error(locator, error),
         ExecutionError::Io(error) => blocked(
@@ -4774,12 +4938,13 @@ mod tests {
 
     use crate::workspace::{
         AssetWorkspace, CommitError, FieldGuard, GenericMutation, MutationPlan, MutationValue,
-        PlanPayload, PrepareOptions, PublicationTarget, SourceExpectation, SourceOpenRequest,
+        PlanPayload, PrepareOptions, PublicationTarget, SourceAdmissionBatch,
+        SourceAdmissionOperation, SourceAdmissionPolicy, SourceExpectation, SourceOpenRequest,
         WorkspaceLookup, WorkspaceOptions, WorkspaceView,
     };
     use crate::{
-        AssetLoadBudget, FieldPath, ObjectAddress, SourceAlias, SourceFingerprint, SourceKind,
-        SourceLocator, UnityClass, UnityValue,
+        AssetLoadBudget, FieldPath, ObjectAddress, SourceAlias, SourceFingerprint, SourceId,
+        SourceKind, SourceLocator, UnityClass, UnityValue,
     };
 
     use super::super::RECOVERY_LOCATOR_VERSION;
@@ -4913,6 +5078,8 @@ mod tests {
                 &mut AssetLoadBudget::default(),
             )
             .expect("load fixture");
+        let shared_reference_store = Arc::clone(workspace.snapshot().reference_store());
+        let shared_cache_before = shared_reference_store.local_entry_counts();
         let prepared = workspace
             .prepare(
                 mutation_plan(&workspace, "Before", "After"),
@@ -4920,6 +5087,14 @@ mod tests {
                 &mut AssetLoadBudget::default(),
             )
             .expect("prepare mutation");
+        assert_eq!(
+            shared_reference_store.local_entry_counts(),
+            shared_cache_before,
+            "preparing a candidate must not publish into the committed reference cache"
+        );
+        let candidate_cache = prepared.view().local_reference_cache_counts();
+        assert!(candidate_cache.0 >= 1);
+        assert_eq!(candidate_cache.1, 1);
         let report = workspace
             .commit(
                 prepared,
@@ -4936,6 +5111,43 @@ mod tests {
         fs::write(&replacement, bytes).expect("replacement file");
         fs::remove_file(path).expect("remove replaced target");
         fs::rename(replacement, path).expect("install replacement target");
+    }
+
+    fn relocate_streamed_source(
+        workspace: &mut AssetWorkspace,
+        source: SourceId,
+        alias: &str,
+        path: &Path,
+        bytes: &[u8],
+    ) {
+        let mut budget = AssetLoadBudget::default();
+        let mut relocation = SourceAdmissionBatch::with_capacity(2, &mut budget)
+            .expect("reserve physical relocation batch");
+        relocation
+            .try_push(SourceAdmissionOperation::Unload(source), &mut budget)
+            .expect("append previous physical binding removal");
+        relocation
+            .try_push(
+                SourceAdmissionOperation::LoadBytes {
+                    request: SourceOpenRequest::new(
+                        path,
+                        SourceAlias::new(alias).expect("streamed alias"),
+                    )
+                    .with_kind_hint(SourceKind::StreamedResource),
+                    image: Arc::from(bytes),
+                },
+                &mut budget,
+            )
+            .expect("append replacement physical binding");
+        let report = workspace
+            .admit_sources(relocation, SourceAdmissionPolicy::Strict, &mut budget)
+            .expect("relocate streamed source atomically");
+        assert_eq!(report.outcomes()[0].disposition().source_id(), Some(source));
+        assert_eq!(
+            report.outcomes()[1].disposition().source_id(),
+            Some(source),
+            "relocation must preserve deterministic source identity"
+        );
     }
 
     fn planned_recovery_verification_charge(
@@ -6395,7 +6607,20 @@ mod tests {
         let error = short_workspace
             .finalize_recovery_at(short_report.recovery(), &mut one_short)
             .expect_err("one-short recovery must fail");
-        assert!(matches!(error, RecoveryError::Budget { .. }));
+        assert!(matches!(
+            error,
+            RecoveryError::Budget {
+                source: BudgetError::Exceeded {
+                    resource: "bytes",
+                    limit,
+                    requested,
+                },
+                ..
+            } if limit == usage.bytes - 1 && requested == usage.bytes
+        ));
+        let report_box_bytes =
+            u64::try_from(size_of::<CommitReport>()).expect("commit report allocation size");
+        assert_eq!(one_short.usage().bytes, usage.bytes - report_box_bytes);
         assert_eq!(short_workspace.revision(), short_report.base_revision());
         assert_eq!(fs::read(short_path).expect("published target"), published);
         assert_eq!(fs::read_dir(events).expect("events").count(), event_count);
@@ -7572,11 +7797,206 @@ mod tests {
     }
 
     #[test]
+    fn finalized_receipt_does_not_rebuild_over_same_revision_physical_relocation() {
+        const STABLE_ALIAS: &str = "stable.resS";
+        const STABLE_BYTES: &[u8] = b"stable physical binding";
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(SOURCE_ALIAS);
+        let first_binding = directory.path().join("stable-first.resS");
+        let second_binding = directory.path().join("stable-second.resS");
+        fs::write(&path, YAML).expect("fixture bytes");
+        fs::write(&first_binding, STABLE_BYTES).expect("first stable binding");
+        fs::write(&second_binding, STABLE_BYTES).expect("second stable binding");
+
+        let mut workspace = AssetWorkspace::new().expect("workspace");
+        workspace
+            .load_source(
+                SourceOpenRequest::new(&path, SourceAlias::new(SOURCE_ALIAS).expect("alias"))
+                    .with_kind_hint(SourceKind::Yaml),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("load mutation source");
+        let stable = workspace
+            .load_source(
+                SourceOpenRequest::new(
+                    &first_binding,
+                    SourceAlias::new(STABLE_ALIAS).expect("stable alias"),
+                )
+                .with_kind_hint(SourceKind::StreamedResource),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("load stable source");
+
+        let prepared = workspace
+            .prepare(
+                mutation_plan(&workspace, "Before", "After"),
+                PrepareOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("prepare mutation");
+        let report = workspace
+            .commit(
+                prepared,
+                PublicationTarget::in_place(directory.path()).expect("publication target"),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("commit mutation");
+        assert_eq!(
+            workspace.installation_digest(),
+            report.committed_installation()
+        );
+
+        relocate_streamed_source(
+            &mut workspace,
+            stable,
+            STABLE_ALIAS,
+            &second_binding,
+            STABLE_BYTES,
+        );
+        assert_eq!(workspace.revision(), report.committed_revision());
+        assert_ne!(
+            workspace.installation_digest(),
+            report.committed_installation()
+        );
+        let relocated_installation = workspace.installation_digest();
+
+        let outcome = workspace
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect("redeliver finalized receipt after physical relocation");
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::HistoricalCommitReceipt(Box::new(report))
+        );
+        assert_eq!(workspace.installation_digest(), relocated_installation);
+        assert_eq!(
+            workspace
+                .state()
+                .catalog()
+                .physical_origin(stable)
+                .expect("relocated physical origin")
+                .path(),
+            fs::canonicalize(&second_binding)
+                .expect("canonical second binding")
+                .as_path()
+        );
+    }
+
+    #[test]
+    fn unfinished_recovery_blocks_same_revision_physical_relocation_before_mutation() {
+        const STABLE_ALIAS: &str = "stable.resS";
+        const STABLE_BYTES: &[u8] = b"stable physical binding";
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(SOURCE_ALIAS);
+        let first_binding = directory.path().join("stable-first.resS");
+        let second_binding = directory.path().join("stable-second.resS");
+        fs::write(&path, YAML).expect("fixture bytes");
+        fs::write(&first_binding, STABLE_BYTES).expect("first stable binding");
+        fs::write(&second_binding, STABLE_BYTES).expect("second stable binding");
+
+        let mut workspace = AssetWorkspace::new().expect("workspace");
+        workspace
+            .load_source(
+                SourceOpenRequest::new(&path, SourceAlias::new(SOURCE_ALIAS).expect("alias"))
+                    .with_kind_hint(SourceKind::Yaml),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("load mutation source");
+        workspace
+            .load_source(
+                SourceOpenRequest::new(
+                    &first_binding,
+                    SourceAlias::new(STABLE_ALIAS).expect("stable alias"),
+                )
+                .with_kind_hint(SourceKind::StreamedResource),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("load stable source");
+        let prepared = workspace
+            .prepare(
+                mutation_plan(&workspace, "Before", "After"),
+                PrepareOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("prepare mutation");
+        let report = workspace
+            .commit(
+                prepared,
+                PublicationTarget::in_place(directory.path()).expect("publication target"),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("commit mutation");
+        let workspace_id = workspace.workspace_id();
+        let (layout, artifact) =
+            truncate_events_after(&report, |kind| matches!(kind, JournalEventKind::Journaled));
+        drop(workspace);
+
+        let staging = artifact.staging().join_root(layout.directory());
+        let backup = artifact
+            .backup()
+            .expect("existing target backup")
+            .join_root(layout.directory());
+        capture_existing(&path, &staging, artifact.new_identity())
+            .expect("restore staged image identity");
+        capture_existing(
+            &backup,
+            &path,
+            artifact.old_identity().expect("existing target identity"),
+        )
+        .expect("restore old target identity");
+
+        let mut reopened =
+            AssetWorkspace::with_workspace_id(workspace_id, WorkspaceOptions::default())
+                .expect("reopened workspace");
+        reopened
+            .load_source(
+                SourceOpenRequest::new(&path, SourceAlias::new(SOURCE_ALIAS).expect("alias"))
+                    .with_kind_hint(SourceKind::Yaml),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("load base mutation source");
+        let stable = reopened
+            .load_source(
+                SourceOpenRequest::new(
+                    &first_binding,
+                    SourceAlias::new(STABLE_ALIAS).expect("stable alias"),
+                )
+                .with_kind_hint(SourceKind::StreamedResource),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect("load base stable source");
+        assert_eq!(reopened.revision(), report.base_revision());
+        assert_eq!(reopened.installation_digest(), report.base_installation());
+        relocate_streamed_source(
+            &mut reopened,
+            stable,
+            STABLE_ALIAS,
+            &second_binding,
+            STABLE_BYTES,
+        );
+        assert_eq!(reopened.revision(), report.base_revision());
+        assert_ne!(reopened.installation_digest(), report.base_installation());
+        let target_before = fs::read(&path).expect("base target before blocked recovery");
+
+        let error = reopened
+            .finalize_recovery_at(report.recovery(), &mut AssetLoadBudget::default())
+            .expect_err("unfinished recovery must reject unrelated physical relocation");
+        assert!(matches!(
+            error.blocked_reason(),
+            Some(RecoveryBlockedReason::InstallationUnavailable { .. })
+        ));
+        assert_target_unchanged(&path, &target_before);
+        assert!(staging.is_file());
+    }
+
+    #[test]
     fn rollback_receipt_wire_is_versioned_strict_and_round_trippable() {
         let (_directory, _path, _workspace, report) = committed_fixture();
         let receipt = RollbackReceipt::new(
             report.workspace_id(),
             report.base_revision(),
+            report.base_installation(),
             report.recovery().clone(),
         );
         let encoded = serde_json::to_value(&receipt).expect("serialize rollback receipt");
@@ -7586,6 +8006,7 @@ mod tests {
                 "version": ROLLBACK_RECEIPT_VERSION,
                 "workspace_id": report.workspace_id(),
                 "base_revision": report.base_revision(),
+                "base_installation": report.base_installation(),
                 "recovery": report.recovery(),
             })
         );
@@ -7627,7 +8048,7 @@ mod tests {
         let encoded_text = serde_json::to_string(&live).expect("serialize live recovery outcome");
         assert!(
             encoded_text
-                .starts_with("{\"version\":1,\"outcome\":{\"status\":\"finalized\",\"report\":")
+                .starts_with("{\"version\":2,\"outcome\":{\"status\":\"finalized\",\"report\":")
         );
         let encoded =
             serde_json::from_str::<serde_json::Value>(&encoded_text).expect("outcome JSON");
@@ -7660,6 +8081,7 @@ mod tests {
         let receipt = RollbackReceipt::new(
             report.workspace_id(),
             report.base_revision(),
+            report.base_installation(),
             report.recovery().clone(),
         );
         let live = RecoveryOutcome::RolledBack(receipt.clone());
@@ -7753,6 +8175,7 @@ mod tests {
         let receipt = RollbackReceipt::new(
             report.workspace_id(),
             report.base_revision(),
+            report.base_installation(),
             report.recovery().clone(),
         );
         let rollback = RecoveryOutcome::HistoricalRollbackReceipt(receipt);

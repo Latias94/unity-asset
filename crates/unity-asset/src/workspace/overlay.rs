@@ -22,7 +22,9 @@ use unity_asset_write::artifact::{
 use unity_asset_yaml::YamlDocument;
 
 use crate::reference::input::PreparedReferenceOverlay;
-use crate::reference::{ReferenceGraph, ReferenceGraphBuildOptions, ReferenceGraphError};
+use crate::reference::{
+    ReferenceGraph, ReferenceGraphBuildOptions, ReferenceGraphError, ReferenceStore,
+};
 use crate::schema::SchemaProvenance;
 
 use super::interface::{map_yaml_error, validate_yaml_identities};
@@ -559,6 +561,7 @@ impl fmt::Debug for PreparedStateCore {
 pub(crate) struct PreparedState {
     core: Arc<PreparedStateCore>,
     reference_graph: ReferenceGraph,
+    reference_store: Arc<ReferenceStore>,
 }
 
 #[derive(Debug, Error)]
@@ -594,6 +597,7 @@ impl PreparedState {
         budget
             .check_bytes(state_bytes)
             .map_err(WorkspaceError::from)?;
+        let reference_store = ReferenceStore::candidate(base.reference_store(), budget)?;
         let core = PreparedStateCore::prove(
             base,
             catalog,
@@ -604,6 +608,7 @@ impl PreparedState {
         )?;
         let build_view = PreparedGraphView {
             core: Arc::clone(&core),
+            reference_store: Arc::clone(&reference_store),
         };
         let reference_graph =
             ReferenceGraph::build(&build_view, ReferenceGraphBuildOptions::unbounded(), budget)?;
@@ -622,6 +627,7 @@ impl PreparedState {
         Ok(Arc::new(Self {
             core,
             reference_graph,
+            reference_store,
         }))
     }
 
@@ -652,6 +658,7 @@ impl fmt::Debug for PreparedState {
 #[derive(Clone)]
 struct PreparedGraphView {
     core: Arc<PreparedStateCore>,
+    reference_store: Arc<ReferenceStore>,
 }
 
 /// Read-your-writes view over one fully proven prepare result.
@@ -694,6 +701,11 @@ impl PreparedView {
     }
 
     #[cfg(test)]
+    pub(crate) fn local_reference_cache_counts(&self) -> (usize, usize) {
+        self.state.reference_store.local_entry_counts()
+    }
+
+    #[cfg(test)]
     pub(crate) const fn state(&self) -> &Arc<PreparedState> {
         &self.state
     }
@@ -715,7 +727,7 @@ impl view::sealed::Sealed for PreparedView {
     fn reference_view_parts(&self) -> super::ReferenceViewParts<'_> {
         super::ReferenceViewParts::prepared(
             self.state.core.as_ref(),
-            self.state.core.base.reference_store(),
+            &self.state.reference_store,
             self.state.core.base.config().typetree,
         )
     }
@@ -725,7 +737,7 @@ impl view::sealed::Sealed for PreparedGraphView {
     fn reference_view_parts(&self) -> super::ReferenceViewParts<'_> {
         super::ReferenceViewParts::prepared(
             self.core.as_ref(),
-            self.core.base.reference_store(),
+            &self.reference_store,
             self.core.base.config().typetree,
         )
     }

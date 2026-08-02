@@ -20,11 +20,39 @@ pub(super) use transaction::{
     VerifiedSourceContent, WorkspaceStateInstallOutcome, WorkspaceStateTransaction,
 };
 
+/// Digest of every runtime source-to-physical-origin binding in one workspace state.
+///
+/// This identity complements [`WorkspaceRevision`]: the revision describes logical content and
+/// object identity, while this digest proves the complete physical installation used by durable
+/// commit and recovery.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct WorkspaceInstallationDigest(DigestV1);
+
+impl WorkspaceInstallationDigest {
+    #[must_use]
+    pub const fn new(digest: DigestV1) -> Self {
+        Self(digest)
+    }
+
+    #[must_use]
+    pub const fn digest(self) -> DigestV1 {
+        self.0
+    }
+
+    fn from_catalog(catalog: &SourceCatalog) -> Result<Self, WorkspaceStateError> {
+        catalog.installation_digest().map(Self).map_err(Into::into)
+    }
+}
+
 /// Fully validated immutable workspace baseline.
 #[derive(Debug)]
 pub(crate) struct WorkspaceState {
     workspace: WorkspaceId,
     revision: WorkspaceRevision,
+    installation: WorkspaceInstallationDigest,
     parse_context: DigestV1,
     typetree_mode: TypeTreeParseMode,
     catalog: SourceCatalog,
@@ -53,12 +81,7 @@ impl WorkspaceState {
         store: SourceStore,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, WorkspaceStateError> {
-        if catalog.workspace() != workspace {
-            return Err(WorkspaceStateError::CatalogWorkspaceMismatch {
-                expected: workspace,
-                actual: catalog.workspace(),
-            });
-        }
+        ensure_catalog_workspace(workspace, &catalog)?;
         if store.workspace() != workspace {
             return Err(WorkspaceStateError::StoreWorkspaceMismatch {
                 expected: workspace,
@@ -132,9 +155,11 @@ impl WorkspaceState {
 
         let parse_context = parse_context_digest(&store, typetree_mode)?;
         let revision = workspace_revision(&catalog, parse_context)?;
+        let installation = WorkspaceInstallationDigest::from_catalog(&catalog)?;
         Ok(Self {
             workspace,
             revision,
+            installation,
             parse_context,
             typetree_mode,
             catalog,
@@ -153,6 +178,11 @@ impl WorkspaceState {
     }
 
     #[must_use]
+    pub(crate) const fn installation(&self) -> WorkspaceInstallationDigest {
+        self.installation
+    }
+
+    #[must_use]
     pub(crate) const fn typetree_mode(&self) -> TypeTreeParseMode {
         self.typetree_mode
     }
@@ -161,13 +191,16 @@ impl WorkspaceState {
         &self,
         catalog: &SourceCatalog,
     ) -> Result<WorkspaceRevision, WorkspaceStateError> {
-        if catalog.workspace() != self.workspace {
-            return Err(WorkspaceStateError::CatalogWorkspaceMismatch {
-                expected: self.workspace,
-                actual: catalog.workspace(),
-            });
-        }
+        ensure_catalog_workspace(self.workspace, catalog)?;
         workspace_revision(catalog, self.parse_context)
+    }
+
+    pub(crate) fn installation_for_catalog(
+        &self,
+        catalog: &SourceCatalog,
+    ) -> Result<WorkspaceInstallationDigest, WorkspaceStateError> {
+        ensure_catalog_workspace(self.workspace, catalog)?;
+        WorkspaceInstallationDigest::from_catalog(catalog)
     }
 
     /// Compares every installed binding that is intentionally excluded from revision identity.
@@ -175,13 +208,7 @@ impl WorkspaceState {
     /// Revision equality alone is insufficient: relocating an otherwise identical root keeps the
     /// same logical revision but must install the new physical binding.
     fn installation_equivalent(&self, other: &Self) -> bool {
-        if self.workspace != other.workspace
-            || self.typetree_mode != other.typetree_mode
-            || self.parse_context != other.parse_context
-        {
-            return false;
-        }
-        self.catalog.installation_equivalent(&other.catalog)
+        self.installation == other.installation
     }
 
     #[must_use]
@@ -193,6 +220,19 @@ impl WorkspaceState {
     pub(crate) fn store(&self) -> &SourceStore {
         &self.store
     }
+}
+
+fn ensure_catalog_workspace(
+    expected: WorkspaceId,
+    catalog: &SourceCatalog,
+) -> Result<(), WorkspaceStateError> {
+    if catalog.workspace() != expected {
+        return Err(WorkspaceStateError::CatalogWorkspaceMismatch {
+            expected,
+            actual: catalog.workspace(),
+        });
+    }
+    Ok(())
 }
 
 fn workspace_revision(

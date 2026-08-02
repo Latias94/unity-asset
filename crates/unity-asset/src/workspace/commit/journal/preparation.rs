@@ -24,6 +24,7 @@ use super::{
     read_json_bounded_from_file, transaction_id_from_seed, validate_event_capacity,
     write_encoded_atomic_in_journal_access_tracked,
 };
+use crate::workspace::WorkspaceInstallationDigest;
 use crate::workspace::commit::{CommitAtomicity, CommitReport};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +117,8 @@ pub(crate) struct JournalPreparation {
     workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     committed_revision: WorkspaceRevision,
+    base_installation: WorkspaceInstallationDigest,
+    committed_installation: WorkspaceInstallationDigest,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
     containment_root_identity: DirectoryIdentity,
@@ -132,6 +135,8 @@ struct JournalPreparationWire {
     workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     committed_revision: WorkspaceRevision,
+    base_installation: WorkspaceInstallationDigest,
+    committed_installation: WorkspaceInstallationDigest,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
     containment_root_identity: DirectoryIdentity,
@@ -152,6 +157,8 @@ impl<'de> Deserialize<'de> for JournalPreparation {
             workspace_id: wire.workspace_id,
             base_revision: wire.base_revision,
             committed_revision: wire.committed_revision,
+            base_installation: wire.base_installation,
+            committed_installation: wire.committed_installation,
             plan_digest: wire.plan_digest,
             atomicity: wire.atomicity,
             containment_root_identity: wire.containment_root_identity,
@@ -170,12 +177,57 @@ struct JournalPreparationRef<'a> {
     workspace_id: WorkspaceId,
     base_revision: WorkspaceRevision,
     committed_revision: WorkspaceRevision,
+    base_installation: WorkspaceInstallationDigest,
+    committed_installation: WorkspaceInstallationDigest,
     plan_digest: DigestV1,
     atomicity: CommitAtomicity,
     containment_root_identity: &'a DirectoryIdentity,
     outputs: &'a [JournalPreparationOutput],
     baseline: &'a JournalBaseline,
     changes: &'a ChangeSet,
+}
+
+fn encode_preparation(
+    layout: &JournalLayout,
+    report: &CommitReport,
+    outputs: &[JournalPreparationOutput],
+    baseline: &JournalBaseline,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<u8>, JournalError> {
+    if report.recovery().root_identity() != layout.root_identity() {
+        return Err(JournalError::InvalidManifest(
+            "commit report recovery locator does not match the preparation containment root"
+                .to_owned(),
+        ));
+    }
+    let preparation = JournalPreparationRef {
+        version: JOURNAL_VERSION,
+        transaction: report.transaction(),
+        workspace_id: report.workspace_id(),
+        base_revision: report.base_revision(),
+        committed_revision: report.committed_revision(),
+        base_installation: report.base_installation(),
+        committed_installation: report.committed_installation(),
+        plan_digest: report.plan_digest(),
+        atomicity: report.atomicity(),
+        containment_root_identity: layout.root_identity(),
+        outputs,
+        baseline,
+        changes: report.changes(),
+    };
+    validate_parts(preparation, layout.parent(), layout.root_identity(), budget)?;
+    if preparation.transaction != layout.transaction() {
+        return Err(JournalError::TransactionMismatch {
+            expected: layout.transaction(),
+            actual: preparation.transaction,
+        });
+    }
+    encode_json_bounded(
+        layout.preparation_path(),
+        &preparation,
+        MAX_MANIFEST_BYTES,
+        budget,
+    )
 }
 
 impl JournalPreparation {
@@ -190,34 +242,8 @@ impl JournalPreparation {
     ) -> Result<OpenedJournalPreparation, JournalPreparationInstallError> {
         let mut preparation_installed = false;
         let result = (|| {
-            if report.recovery().root_identity() != layout.root_identity() {
-                return Err(JournalError::InvalidManifest(
-                    "commit report recovery locator does not match the preparation containment root"
-                        .to_owned(),
-                ));
-            }
-            let preparation = JournalPreparationRef {
-                version: JOURNAL_VERSION,
-                transaction: report.transaction(),
-                workspace_id: report.workspace_id(),
-                base_revision: report.base_revision(),
-                committed_revision: report.committed_revision(),
-                plan_digest: report.plan_digest(),
-                atomicity: report.atomicity(),
-                containment_root_identity: layout.root_identity(),
-                outputs,
-                baseline,
-                changes: report.changes(),
-            };
-            validate_parts(preparation, layout.parent(), layout.root_identity(), budget)?;
-            if preparation.transaction != layout.transaction() {
-                return Err(JournalError::TransactionMismatch {
-                    expected: layout.transaction(),
-                    actual: preparation.transaction,
-                });
-            }
             let path = layout.preparation_path();
-            let bytes = encode_json_bounded(path, &preparation, MAX_MANIFEST_BYTES, budget)?;
+            let bytes = encode_preparation(layout, report, outputs, baseline, budget)?;
             write_encoded_atomic_in_journal_access_tracked(
                 access,
                 path,
@@ -247,34 +273,8 @@ impl JournalPreparation {
         let mut preparation_installed = false;
         let result = (|| {
             layout.verify_root_path_binding()?;
-            if report.recovery().root_identity() != layout.root_identity() {
-                return Err(JournalError::InvalidManifest(
-                    "commit report recovery locator does not match the preparation containment root"
-                        .to_owned(),
-                ));
-            }
-            let preparation = JournalPreparationRef {
-                version: JOURNAL_VERSION,
-                transaction: report.transaction(),
-                workspace_id: report.workspace_id(),
-                base_revision: report.base_revision(),
-                committed_revision: report.committed_revision(),
-                plan_digest: report.plan_digest(),
-                atomicity: report.atomicity(),
-                containment_root_identity: layout.root_identity(),
-                outputs,
-                baseline,
-                changes: report.changes(),
-            };
-            validate_parts(preparation, layout.parent(), layout.root_identity(), budget)?;
-            if preparation.transaction != layout.transaction() {
-                return Err(JournalError::TransactionMismatch {
-                    expected: layout.transaction(),
-                    actual: preparation.transaction,
-                });
-            }
             let path = layout.preparation_path();
-            let bytes = encode_json_bounded(path, &preparation, MAX_MANIFEST_BYTES, budget)?;
+            let bytes = encode_preparation(layout, report, outputs, baseline, budget)?;
             write_encoded_atomic_with_temporary_path_tracked(
                 path,
                 &bytes,
@@ -384,6 +384,8 @@ impl JournalPreparation {
                 workspace_id: self.workspace_id,
                 base_revision: self.base_revision,
                 committed_revision: self.committed_revision,
+                base_installation: self.base_installation,
+                committed_installation: self.committed_installation,
                 plan_digest: self.plan_digest,
                 atomicity: self.atomicity,
                 containment_root_identity: &self.containment_root_identity,
@@ -402,6 +404,8 @@ impl JournalPreparation {
             || self.workspace_id != manifest.workspace_id
             || self.base_revision != manifest.base_revision
             || self.committed_revision != manifest.committed_revision
+            || self.base_installation != manifest.base_installation
+            || self.committed_installation != manifest.committed_installation
             || self.plan_digest != manifest.plan_digest
             || self.atomicity != manifest.atomicity
             || self.containment_root_identity != manifest.containment_root_identity
@@ -438,6 +442,8 @@ impl JournalPreparation {
             && document.workspace_id == report.workspace_id()
             && document.base_revision == report.base_revision()
             && document.committed_revision == report.committed_revision()
+            && document.base_installation == report.base_installation()
+            && document.committed_installation == report.committed_installation()
             && document.plan_digest == report.plan_digest()
             && document.atomicity == report.atomicity()
             && document.containment_root_identity == *report.recovery().root_identity()
@@ -480,6 +486,16 @@ impl JournalPreparation {
     #[must_use]
     pub(crate) const fn base_revision(&self) -> WorkspaceRevision {
         self.base_revision
+    }
+
+    #[must_use]
+    pub(crate) const fn base_installation(&self) -> WorkspaceInstallationDigest {
+        self.base_installation
+    }
+
+    #[must_use]
+    pub(crate) const fn committed_installation(&self) -> WorkspaceInstallationDigest {
+        self.committed_installation
     }
 
     #[must_use]
@@ -529,6 +545,8 @@ fn validate_parts(
         workspace_id,
         base_revision,
         committed_revision,
+        base_installation,
+        committed_installation,
         plan_digest,
         atomicity,
         containment_root_identity: preparation_root_identity,
@@ -603,6 +621,8 @@ fn validate_parts(
             workspace: workspace_id,
             base_revision,
             committed_revision,
+            base_installation,
+            committed_installation,
             plan_digest,
             atomicity,
             containment_root,

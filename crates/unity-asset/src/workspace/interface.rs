@@ -272,6 +272,12 @@ impl AssetWorkspace {
         self.state.revision()
     }
 
+    /// Returns the complete runtime source-to-physical-origin installation identity.
+    #[must_use]
+    pub fn installation_digest(&self) -> super::WorkspaceInstallationDigest {
+        self.state.installation()
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> WorkspaceSnapshot {
         WorkspaceSnapshot::new(

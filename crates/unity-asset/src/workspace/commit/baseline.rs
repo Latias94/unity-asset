@@ -14,6 +14,7 @@ use unity_asset_write::artifact::{
 };
 use unity_asset_yaml::parse_budgeted_yaml_source;
 
+use super::super::WorkspaceInstallationDigest;
 use super::super::adapter::binary::{BinaryPayload, BinaryWorkspaceAdapter};
 use super::super::inspection::{
     AssetBundleSummary, SerializedFileSummary, WebFileSummary, WorkspaceSourceFormatInspection,
@@ -237,6 +238,7 @@ impl<A: Write, B: Write> Write for TeeWriter<'_, A, B> {
 pub(crate) fn build(
     prepared: &PreparedChange,
     binary: &BinaryWorkspaceAdapter,
+    expected_installation: WorkspaceInstallationDigest,
     images: &mut MaterializedImages,
     budget: &mut AssetLoadBudget,
 ) -> Result<PreparedBaseline, BaselineBuildError> {
@@ -292,6 +294,12 @@ pub(crate) fn build(
             actual: prepared_state.revision(),
         });
     }
+    if prepared_state.installation() != expected_installation {
+        return Err(BaselineBuildError::Installation {
+            expected: expected_installation,
+            actual: prepared_state.installation(),
+        });
+    }
     Ok(PreparedBaseline {
         state: prepared_state,
     })
@@ -309,6 +317,14 @@ pub(crate) fn build_from_journal_with_images(
     if base.workspace() != manifest.workspace_id() {
         return Err(BaselineBuildError::RecoveryBinding {
             message: "recovery baseline does not match the loaded workspace identity".to_owned(),
+        });
+    }
+    if base.installation() != manifest.base_installation()
+        && base.installation() != manifest.committed_installation()
+    {
+        return Err(BaselineBuildError::RecoveryBinding {
+            message: "recovery baseline does not match the journal base or committed installation"
+                .to_owned(),
         });
     }
 
@@ -426,6 +442,12 @@ pub(crate) fn build_from_journal_with_images(
         return Err(BaselineBuildError::Revision {
             expected: manifest.committed_revision(),
             actual: prepared_state.revision(),
+        });
+    }
+    if prepared_state.installation() != manifest.committed_installation() {
+        return Err(BaselineBuildError::Installation {
+            expected: manifest.committed_installation(),
+            actual: prepared_state.installation(),
         });
     }
     Ok(PreparedBaseline {
@@ -950,6 +972,11 @@ pub(crate) enum BaselineBuildError {
     Revision {
         expected: unity_asset_core::WorkspaceRevision,
         actual: unity_asset_core::WorkspaceRevision,
+    },
+    #[error("prepared baseline installation changed from {expected:?} to {actual:?}")]
+    Installation {
+        expected: super::super::WorkspaceInstallationDigest,
+        actual: super::super::WorkspaceInstallationDigest,
     },
 }
 

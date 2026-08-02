@@ -122,6 +122,11 @@ impl PreparedWorkspaceState {
     }
 
     #[must_use]
+    pub(crate) fn installation(&self) -> super::WorkspaceInstallationDigest {
+        self.next.installation()
+    }
+
+    #[must_use]
     #[cfg(test)]
     pub(crate) fn changed(&self) -> bool {
         !Arc::ptr_eq(&self.expected, &self.next)
@@ -411,7 +416,9 @@ mod tests {
     use std::fs;
 
     use unity_asset_binary::typetree::TypeTreeParseMode;
-    use unity_asset_core::{BudgetError, SourceAlias, WorkspaceId};
+    use unity_asset_core::{
+        AssetLoadLimits, BudgetError, SourceAlias, SourceMemberId, WorkspaceId,
+    };
 
     use super::*;
     use crate::workspace::inspection::WorkspaceSourceFormatInspection;
@@ -548,6 +555,235 @@ mod tests {
     }
 
     #[test]
+    fn unknown_parent_aborts_the_complete_transaction() {
+        let expected = empty_state();
+        let missing_parent = SourceId::new(expected.workspace(), SourceKind::Archive, 99)
+            .expect("valid missing parent identity");
+        let descriptor = SourceDescriptor::archive_member(
+            missing_parent,
+            SourceKind::Yaml,
+            SourceMemberId::new("missing.yaml").expect("valid member identity"),
+        )
+        .expect("valid child descriptor shape");
+        let mut budget = AssetLoadBudget::default();
+        let mut transaction = WorkspaceStateTransaction::begin(Arc::clone(&expected), &mut budget)
+            .expect("begin transaction");
+
+        assert!(matches!(
+            transaction.register_descriptor(
+                descriptor,
+                SourceFingerprint::from_bytes(SourceKind::Yaml, b"child"),
+                &mut budget,
+            ),
+            Err(WorkspaceStateError::Catalog(error))
+                if matches!(*error, crate::workspace::source_catalog::CatalogError::UnknownSource(source)
+                    if source == missing_parent)
+        ));
+        assert!(matches!(
+            transaction.commit(&mut budget),
+            Err(WorkspaceStateError::TransactionAborted)
+        ));
+        assert!(expected.catalog().is_empty());
+        assert!(expected.store().is_empty());
+    }
+
+    #[test]
+    fn stale_pointer_cas_never_replaces_a_newer_state() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let first_path = directory.path().join("first.resource");
+        let second_path = directory.path().join("second.resource");
+        fs::write(&first_path, b"first").expect("write first fixture");
+        fs::write(&second_path, b"second").expect("write second fixture");
+        let expected = empty_state();
+        let mut budget = AssetLoadBudget::default();
+
+        let mut first = WorkspaceStateTransaction::begin(Arc::clone(&expected), &mut budget)
+            .expect("begin first transaction");
+        first
+            .register_tree(
+                root_descriptor(&first_path, "first.resource"),
+                prepared_stream(b"first", &mut budget),
+                &mut budget,
+            )
+            .expect("register first candidate");
+        let first = first.commit(&mut budget).expect("prepare first state");
+
+        let mut stale = WorkspaceStateTransaction::begin(Arc::clone(&expected), &mut budget)
+            .expect("begin stale transaction");
+        stale
+            .register_tree(
+                root_descriptor(&second_path, "second.resource"),
+                prepared_stream(b"second", &mut budget),
+                &mut budget,
+            )
+            .expect("register stale candidate");
+        let stale = stale.commit(&mut budget).expect("prepare stale state");
+
+        let mut current = Arc::clone(&expected);
+        assert_eq!(
+            first.install_into(&mut current),
+            WorkspaceStateInstallOutcome::Installed
+        );
+        let installed_revision = current.revision();
+        let installed_installation = current.installation();
+        assert_eq!(
+            stale.install_into(&mut current),
+            WorkspaceStateInstallOutcome::Stale
+        );
+        assert_eq!(current.revision(), installed_revision);
+        assert_eq!(current.installation(), installed_installation);
+        assert!(Arc::ptr_eq(&current, &first.next));
+    }
+
+    #[test]
+    fn one_short_budget_fails_at_the_final_workspace_state_arc() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("final-state.resource");
+        fs::write(&path, b"final state").expect("write fixture");
+        let prepare = |budget: &mut AssetLoadBudget| {
+            let expected = empty_state();
+            let mut transaction =
+                WorkspaceStateTransaction::begin(expected, budget).expect("begin transaction");
+            let tree = prepared_stream(b"final state", budget);
+            transaction
+                .register_tree(root_descriptor(&path, "final-state.resource"), tree, budget)
+                .expect("register candidate");
+            transaction.commit(budget)
+        };
+
+        let mut measured = AssetLoadBudget::default();
+        prepare(&mut measured).expect("measure final state publication");
+        let measured_bytes = measured.usage().bytes;
+        let final_arc_bytes = arc_value_allocation_bytes::<WorkspaceState>()
+            .expect("workspace state Arc allocation must fit");
+        assert!(measured_bytes > final_arc_bytes);
+
+        let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: measured_bytes,
+            ..AssetLoadLimits::default()
+        })
+        .expect("valid exact budget");
+        prepare(&mut exact).expect("exact final state budget");
+        assert_eq!(exact.usage().bytes, measured_bytes);
+
+        let limit = measured_bytes - 1;
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: limit,
+            ..AssetLoadLimits::default()
+        })
+        .expect("valid one-short budget");
+        let error = prepare(&mut one_short).expect_err("final Arc allocation must be rejected");
+
+        assert!(matches!(
+            error,
+            WorkspaceStateError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit: actual_limit,
+                requested,
+            }) if actual_limit == limit && requested == measured_bytes
+        ));
+        assert_eq!(one_short.usage().bytes, measured_bytes - final_arc_bytes);
+        assert_eq!(one_short.remaining_bytes(), final_arc_bytes - 1);
+    }
+
+    #[test]
+    fn verified_replacement_preserves_metadata_and_updates_backing_evidence() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("replace.resource");
+        fs::write(&path, b"before").expect("write original fixture");
+        let expected = empty_state();
+        let mut budget = AssetLoadBudget::default();
+        let mut initial = WorkspaceStateTransaction::begin(Arc::clone(&expected), &mut budget)
+            .expect("begin initial transaction");
+        let source = initial
+            .register_tree(
+                root_descriptor(&path, "replace.resource"),
+                prepared_stream(b"before", &mut budget),
+                &mut budget,
+            )
+            .expect("register original source");
+        let initial = initial.commit(&mut budget).expect("prepare original state");
+        let mut current = Arc::clone(&expected);
+        assert_eq!(
+            initial.install_into(&mut current),
+            WorkspaceStateInstallOutcome::Installed
+        );
+        let original_locator = current
+            .catalog()
+            .source_locator(source)
+            .expect("original source locator")
+            .clone();
+        let original_origin = current
+            .catalog()
+            .physical_origin(source)
+            .expect("original physical origin")
+            .path()
+            .to_path_buf();
+        let original_entry =
+            Arc::clone(current.store().get(source).expect("original source entry"));
+        let original_revision = current.revision();
+
+        fs::write(&path, b"after").expect("write replacement fixture");
+        let replacement = BudgetedSourceBytes::from_arc(Arc::from(&b"after"[..]), &mut budget)
+            .expect("budgeted replacement")
+            .verify(SourceKind::StreamedResource);
+        let replacement_fingerprint = replacement.fingerprint();
+        let replacement_content = VerifiedSourceContent::from_budgeted(
+            source,
+            replacement,
+            FrozenSourceParse::None,
+            WorkspaceSourceFormatInspection::StreamedResource,
+        );
+        let mut transaction = WorkspaceStateTransaction::begin(Arc::clone(&current), &mut budget)
+            .expect("begin replacement transaction");
+        transaction
+            .rewrite_physical_domains_from_changes(
+                &[PhysicalDomainChange::new(source, replacement_fingerprint)],
+                &mut budget,
+            )
+            .expect("rewrite catalog fingerprint evidence");
+        transaction
+            .replace_verified_content(replacement_content, &mut budget)
+            .expect("replace verified content");
+        let replacement = transaction
+            .commit(&mut budget)
+            .expect("prepare replacement state");
+
+        assert_eq!(
+            replacement.next.catalog().source_locator(source),
+            Ok(&original_locator)
+        );
+        assert_eq!(
+            replacement
+                .next
+                .catalog()
+                .physical_origin(source)
+                .expect("replacement physical origin")
+                .path(),
+            original_origin.as_path()
+        );
+        assert_eq!(
+            replacement.next.catalog().fingerprint(source),
+            Ok(replacement_fingerprint)
+        );
+        let replacement_entry = replacement
+            .next
+            .store()
+            .get(source)
+            .expect("replacement source entry");
+        assert_eq!(replacement_entry.image().as_bytes(), b"after");
+        assert_eq!(
+            replacement_entry.image().fingerprint(),
+            replacement_fingerprint
+        );
+        assert!(!Arc::ptr_eq(
+            original_entry.image().backing(),
+            replacement_entry.image().backing()
+        ));
+        assert_ne!(replacement.revision(), original_revision);
+    }
+
+    #[test]
     fn physical_relocation_installs_even_when_revision_is_unchanged() {
         let directory = tempfile::tempdir().expect("fixture directory");
         let first_path = directory.path().join("first.resource");
@@ -573,6 +809,7 @@ mod tests {
             WorkspaceStateInstallOutcome::Installed
         );
         let logical_revision = current.revision();
+        let first_installation = current.installation();
 
         let mut relocation = WorkspaceStateTransaction::begin(Arc::clone(&current), &mut budget)
             .expect("begin relocation");
@@ -605,6 +842,7 @@ mod tests {
             WorkspaceStateInstallOutcome::Unchanged
         );
         assert_eq!(current.revision(), logical_revision);
+        assert_ne!(current.installation(), first_installation);
         assert_eq!(
             current
                 .catalog()

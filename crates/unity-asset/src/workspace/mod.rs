@@ -73,6 +73,7 @@ pub use view::{
 pub(crate) use inspection::StreamedResourceResolver;
 #[cfg(test)]
 pub(crate) use state::TestSourceBackingOwner;
+pub use state::WorkspaceInstallationDigest;
 pub(crate) use state::{WeakSourceBackingOwner, WorkspaceState};
 
 #[doc(hidden)]

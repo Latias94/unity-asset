@@ -1627,6 +1627,51 @@ impl SourceCatalog {
         Ok(WorkspaceRevision::new(digest.finalize()?))
     }
 
+    /// Hashes the complete runtime installation without changing logical workspace identity.
+    ///
+    /// A logical revision deliberately excludes physical paths so relocating an otherwise
+    /// identical project does not invalidate object addresses. Durable recovery needs the
+    /// complementary proof: every source must still be attached to the same physical origin as
+    /// the journal's base or committed state. The source identity plus optional canonical origin
+    /// captures the complete physical-domain membership because contained sources inherit their
+    /// domain owner's origin in the validated catalog.
+    pub(crate) fn installation_digest(&self) -> Result<DigestV1, CatalogError> {
+        const PREFIX: &[u8] = b"unity-asset:workspace-installation:v1\0";
+
+        let mut logical_length = checked_len(PREFIX.len())?;
+        logical_length = checked_add(logical_length, 16)?;
+        for (source, record) in &self.by_id {
+            logical_length = checked_add(logical_length, 16)?;
+            logical_length = checked_add(
+                logical_length,
+                DigestV1Builder::framed_len(source.kind().tag().as_bytes())?,
+            )?;
+            logical_length = checked_add(logical_length, 1)?;
+            if let Some(origin) = &record.physical_origin {
+                logical_length = checked_add(
+                    logical_length,
+                    DigestV1Builder::framed_len(origin.path().as_os_str().as_encoded_bytes())?,
+                )?;
+            }
+        }
+
+        let mut digest = DigestV1Builder::new(logical_length);
+        digest.update(PREFIX)?;
+        digest.update(&self.workspace.get().to_le_bytes())?;
+        for (source, record) in &self.by_id {
+            digest.update(&source.local().to_le_bytes())?;
+            digest.update_framed(source.kind().tag().as_bytes())?;
+            match &record.physical_origin {
+                Some(origin) => {
+                    digest.update(&[1])?;
+                    digest.update_framed(origin.path().as_os_str().as_encoded_bytes())?;
+                }
+                None => digest.update(&[0])?,
+            }
+        }
+        digest.finalize().map_err(Into::into)
+    }
+
     #[must_use]
     pub(crate) const fn workspace(&self) -> WorkspaceId {
         self.workspace
@@ -1647,20 +1692,6 @@ impl SourceCatalog {
         self.by_id
             .iter()
             .map(|(source, record)| (*source, &record.descriptor))
-    }
-
-    /// Compares source bindings that intentionally do not participate in logical revision identity.
-    pub(crate) fn installation_equivalent(&self, other: &Self) -> bool {
-        self.workspace == other.workspace
-            && self.by_id.len() == other.by_id.len()
-            && self.by_id.iter().zip(&other.by_id).all(
-                |((left_source, left), (right_source, right))| {
-                    left_source == right_source
-                        && left.descriptor == right.descriptor
-                        && left.fingerprint == right.fingerprint
-                        && left.physical_origin == right.physical_origin
-                },
-            )
     }
 
     #[must_use]

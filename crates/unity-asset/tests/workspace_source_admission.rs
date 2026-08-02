@@ -499,6 +499,39 @@ fn duplicate_alias_and_physical_origin_are_typed_ordered_rejections() {
 }
 
 #[test]
+fn strict_duplicate_alias_rolls_back_the_complete_batch() {
+    let directory = tempfile::tempdir().expect("create fixture directory");
+    let first_path = source_path(directory.path(), "first.resource", b"first");
+    let second_path = source_path(directory.path(), "second.resource", b"second");
+    let mut workspace = AssetWorkspace::new().expect("create workspace");
+    let base_revision = workspace.revision();
+    let mut budget = AssetLoadBudget::default();
+    let batch = source_batch(
+        vec![
+            raw_load(first_path, "same.resource", b"first"),
+            raw_load(second_path, "same.resource", b"second"),
+        ],
+        &mut budget,
+    );
+
+    let error = workspace
+        .admit_sources(batch, SourceAdmissionPolicy::Strict, &mut budget)
+        .expect_err("strict duplicate alias must reject the complete batch");
+
+    assert_eq!(error.operation_ordinal(), Some(1));
+    assert_eq!(
+        error.category(),
+        SourceAdmissionErrorCategory::DuplicateAlias
+    );
+    assert!(matches!(
+        error.operation_location(),
+        Some(SourceAdmissionOperationLocation::Alias(alias)) if alias.as_str() == "same.resource"
+    ));
+    assert_eq!(workspace.revision(), base_revision);
+    assert_eq!(source_count(&workspace), 0);
+}
+
+#[test]
 fn tolerant_existing_root_identity_conflicts_are_ordered_rejections() {
     let directory = tempfile::tempdir().expect("create fixture directory");
     let existing_path = source_path(directory.path(), "existing.resource", b"existing");

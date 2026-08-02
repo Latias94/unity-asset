@@ -6,7 +6,7 @@ use std::sync::mpsc::{Receiver, SyncSender};
 
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, DiagnosticSeverity, FieldPath, SourceFingerprint,
-    WorkspaceRevision, YamlDocumentSelector,
+    WorkspaceRevision, YamlDocumentSelector, arc_value_allocation_bytes,
 };
 
 use super::fact::RawReferenceTarget;
@@ -156,6 +156,9 @@ impl ReferenceStoreState {
 #[derive(Debug, Default)]
 pub(crate) struct ReferenceStore {
     state: Mutex<ReferenceStoreState>,
+    // Candidate stores read through the committed store but publish only to their local state.
+    // The committed store never points back to a candidate, so this ownership cannot cycle.
+    base: Option<Arc<ReferenceStore>>,
     #[cfg(test)]
     fact_publish_pause: Mutex<Option<FactPublishPause>>,
 }
@@ -172,22 +175,47 @@ impl ReferenceStore {
         Self::default()
     }
 
+    /// Creates an isolated candidate cache with read-through access to committed entries.
+    pub(crate) fn candidate(
+        base: &Arc<Self>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Arc<Self>, ReferenceGraphError> {
+        let retained =
+            arc_value_allocation_bytes::<Self>().map_err(|_| BudgetError::ArithmeticOverflow {
+                resource: "candidate reference store",
+            })?;
+        budget.check_bytes(retained)?;
+        let candidate = Arc::new(Self {
+            base: Some(Arc::clone(base)),
+            ..Self::default()
+        });
+        budget.consume_bytes(retained)?;
+        Ok(candidate)
+    }
+
     pub(crate) fn fact_hit(
         &self,
         fingerprint: SourceFingerprint,
     ) -> Result<Option<Arc<SourceReferenceOccurrences>>, ReferenceGraphError> {
-        let hit = {
+        let local = {
             let state = self
                 .state
                 .lock()
                 .map_err(|_| ReferenceGraphError::CachePoisoned)?;
             let key = FactCacheKey::new(fingerprint);
-            let Ok(position) = state.facts.binary_search_by_key(&key, |entry| entry.key) else {
-                return Ok(None);
-            };
-            Arc::clone(&state.facts[position].occurrences)
+            state
+                .facts
+                .binary_search_by_key(&key, |entry| entry.key)
+                .ok()
+                .map(|position| Arc::clone(&state.facts[position].occurrences))
         };
-        Ok(Some(hit))
+        if local.is_some() {
+            return Ok(local);
+        }
+        match &self.base {
+            Some(base) => base.fact_hit(fingerprint),
+            None => Ok(None),
+        }
     }
 
     #[cfg(test)]
@@ -263,15 +291,31 @@ impl ReferenceStore {
         revision: WorkspaceRevision,
         options: ReferenceGraphBuildOptions,
     ) -> Result<Option<Arc<ReferenceIndex>>, ReferenceGraphError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| ReferenceGraphError::CachePoisoned)?;
-        let key = GraphCacheKey { revision, options };
-        let Ok(position) = state.graphs.binary_search_by_key(&key, |entry| entry.key) else {
-            return Ok(None);
+        let local = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| ReferenceGraphError::CachePoisoned)?;
+            let key = GraphCacheKey { revision, options };
+            state
+                .graphs
+                .binary_search_by_key(&key, |entry| entry.key)
+                .ok()
+                .and_then(|position| state.graphs[position].graph.upgrade())
         };
-        Ok(state.graphs[position].graph.upgrade())
+        if local.is_some() {
+            return Ok(local);
+        }
+        match &self.base {
+            Some(base) => base.graph(revision, options),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_entry_counts(&self) -> (usize, usize) {
+        let state = self.state.lock().expect("reference cache lock");
+        (state.facts.len(), state.graphs.len())
     }
 
     pub(crate) fn publish_graph(
@@ -604,6 +648,48 @@ mod tests {
             object_count,
             complete: true,
         })
+    }
+
+    #[test]
+    fn candidate_cache_reads_committed_facts_without_publishing_its_delta() {
+        let committed_owner = source_owner();
+        let candidate_owner = source_owner();
+        let committed_key = fingerprint(1);
+        let candidate_key = fingerprint(2);
+        let committed_occurrences = occurrences(1);
+        let candidate_occurrences = occurrences(2);
+        let committed = Arc::new(ReferenceStore::new());
+        committed
+            .publish_facts_batch(
+                vec![FactCacheCandidate {
+                    fingerprint: committed_key,
+                    owner: committed_owner.weak().into(),
+                    occurrences: Arc::clone(&committed_occurrences),
+                }],
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        let candidate =
+            ReferenceStore::candidate(&committed, &mut AssetLoadBudget::default()).unwrap();
+        let inherited = candidate.fact_hit(committed_key).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&inherited, &committed_occurrences));
+        candidate
+            .publish_facts_batch(
+                vec![FactCacheCandidate {
+                    fingerprint: candidate_key,
+                    owner: candidate_owner.weak().into(),
+                    occurrences: Arc::clone(&candidate_occurrences),
+                }],
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        assert!(committed.fact_hit(candidate_key).unwrap().is_none());
+        let local = candidate.fact_hit(candidate_key).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&local, &candidate_occurrences));
+        assert_eq!(committed.local_entry_counts(), (1, 0));
+        assert_eq!(candidate.local_entry_counts(), (1, 0));
     }
 
     #[test]
