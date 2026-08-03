@@ -195,6 +195,7 @@ impl DaemonRuntime {
         }
     }
 
+    #[cfg(test)]
     pub fn begin_shutdown(&self, drain_timeout: Duration) {
         let deadline = Instant::now()
             .checked_add(drain_timeout)

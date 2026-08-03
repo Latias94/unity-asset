@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Semaphore};
-use unity_asset_search_daemon::coordinator::{
-    CoordinatorError, ReindexCoordinator, ReindexCoordinatorConfig, ReindexCoordinatorRuntime,
-    ReindexExecution, ReindexScopeKind, ReindexSource,
+use super::{
+    CoordinatorError, ReindexCompletion, ReindexCoordinator, ReindexCoordinatorConfig,
+    ReindexCoordinatorRuntime, ReindexExecution, ReindexObservation, ReindexObservationProgress,
+    ReindexScopeKind, ReindexSource,
 };
+use tokio::sync::{Mutex, Semaphore};
 use unity_asset_search_index::{FilesystemReindexIntent, FilesystemReindexScope};
 use unity_asset_search_protocol::{
     GenerationStatus, PortablePath, QueryPolicyId, ReindexDisposition, ReindexReceipt,
@@ -81,6 +82,20 @@ async fn wait_for_idle(coordinator: &ReindexCoordinator) {
     tokio::time::timeout(Duration::from_secs(5), coordinator.wait_for_idle())
         .await
         .expect("coordinator must become idle before the deadline");
+}
+
+async fn wait_for_completion(
+    mut observation: ReindexObservation,
+) -> Result<ReindexCompletion, CoordinatorError> {
+    loop {
+        match observation.next_progress().await {
+            ReindexObservationProgress::Coalesced | ReindexObservationProgress::Running => {}
+            ReindexObservationProgress::Cancelled => {
+                panic!("test observation was unexpectedly cancelled")
+            }
+            ReindexObservationProgress::Terminal(result) => return *result,
+        }
+    }
 }
 
 #[test]
@@ -227,7 +242,7 @@ async fn observed_admission_survives_the_requesting_connection() {
         observation.admission().disposition,
         ReindexDisposition::Queued | ReindexDisposition::Coalesced
     ));
-    let completed = observation.wait().await.unwrap();
+    let completed = wait_for_completion(observation).await.unwrap();
     assert_eq!(completed.terminal.disposition, ReindexDisposition::Applied);
     assert!(!completed.status.indexing);
 }
@@ -324,7 +339,7 @@ async fn completion_waiters_are_explicitly_bounded() {
         Err(CoordinatorError::CompletionWaiterLimit { maximum: 1 })
     ));
     gate.add_permits(1);
-    first.wait().await.unwrap();
+    wait_for_completion(first).await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]

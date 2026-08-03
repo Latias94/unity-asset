@@ -320,12 +320,11 @@ jobs:
           --test ipc_commands
           --test process_contract
           --test transport_contract
-          --test reindex_coordinator
 
       - name: Run search generation, daemon lifecycle, and local identity contracts
         run: |
           cargo nextest run -p unity-asset-search-index --lib --locked --test-threads 2
-          cargo nextest run -p unity-asset-search-daemon --lib --locked --test-threads 2
+          cargo nextest run -p unity-asset-search-daemon --bin unity-asset-search-daemon --locked --test-threads 2
           cargo nextest run -p unity-asset-search-local --locked --test-threads 2
 
       - name: Run cross-language search protocol conformance

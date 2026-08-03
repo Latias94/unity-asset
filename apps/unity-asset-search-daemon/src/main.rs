@@ -3,15 +3,38 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use unity_asset_search_daemon::coordinator::ReindexCoordinatorConfig;
-use unity_asset_search_daemon::lifecycle::{DaemonRuntime, DaemonRuntimeConfig};
-use unity_asset_search_daemon::watcher::WatcherConfig;
 use unity_asset_search_index::{
     AssetLoadBudget, FilesystemReindexIntent, IndexPaths, SearchIndex, SearchIndexOptions,
 };
 use unity_asset_search_local::{PrivateRootsV1, ProjectLocatorV1, generate_daemon_instance_id};
 
+mod coordinator;
+mod ipc;
+mod lifecycle;
+mod watcher;
+
+use crate::coordinator::ReindexCoordinatorConfig;
+use crate::lifecycle::{DaemonRuntime, DaemonRuntimeConfig};
+use crate::watcher::WatcherConfig;
+
 const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 5 * 60 * 1_000;
+
+#[cfg(test)]
+fn secure_test_tempdir() -> tempfile::TempDir {
+    #[cfg(windows)]
+    {
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .expect("Windows tests require a LocalAppData directory");
+        tempfile::Builder::new()
+            .prefix("unity-asset-search-daemon-test-")
+            .tempdir_in(local_app_data)
+            .expect("create a daemon test directory below the private LocalAppData namespace")
+    }
+    #[cfg(not(windows))]
+    {
+        tempfile::tempdir().expect("create a private daemon test directory")
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "unity-asset-search-daemon")]

@@ -33,7 +33,6 @@ pub enum WatcherLifecycle {
     Disabled,
     Starting,
     Healthy,
-    Failed,
     Retrying,
     Stopped,
 }
@@ -43,7 +42,6 @@ pub enum TimerLifecycle {
     Disabled,
     Scheduled,
     Running,
-    Failed,
     Stopped,
 }
 

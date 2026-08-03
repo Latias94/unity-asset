@@ -307,7 +307,6 @@ const fn watcher_lifecycle_state(state: InternalWatcherLifecycle) -> WatcherLife
         InternalWatcherLifecycle::Disabled => WatcherLifecycleState::Disabled,
         InternalWatcherLifecycle::Starting => WatcherLifecycleState::Starting,
         InternalWatcherLifecycle::Healthy => WatcherLifecycleState::Healthy,
-        InternalWatcherLifecycle::Failed => WatcherLifecycleState::Failed,
         InternalWatcherLifecycle::Retrying => WatcherLifecycleState::Retrying,
         InternalWatcherLifecycle::Stopped => WatcherLifecycleState::Stopped,
     }
@@ -318,7 +317,6 @@ const fn timer_lifecycle_state(state: InternalTimerLifecycle) -> TimerLifecycleS
         InternalTimerLifecycle::Disabled => TimerLifecycleState::Disabled,
         InternalTimerLifecycle::Scheduled => TimerLifecycleState::Scheduled,
         InternalTimerLifecycle::Running => TimerLifecycleState::Running,
-        InternalTimerLifecycle::Failed => TimerLifecycleState::Failed,
         InternalTimerLifecycle::Stopped => TimerLifecycleState::Stopped,
     }
 }
@@ -987,8 +985,7 @@ fn coordinator_admission(
 ) -> Option<unity_asset_search_protocol::ReindexReceipt> {
     match error {
         CoordinatorError::ExecutionFailed { admission, .. }
-        | CoordinatorError::CompletionChannelClosed { admission }
-        | CoordinatorError::Cancelled { admission } => Some((**admission).clone()),
+        | CoordinatorError::CompletionChannelClosed { admission } => Some((**admission).clone()),
         _ => None,
     }
 }
@@ -1034,11 +1031,6 @@ fn coordinator_error(error: CoordinatorError, query_policy: QueryPolicyId) -> Ap
             ApiErrorCode::Internal,
             "reindex completion channel closed unexpectedly",
             true,
-        ),
-        CoordinatorError::Cancelled { .. } => ApiError::new(
-            ApiErrorCode::Internal,
-            "queued reindex operation was cancelled outside the operation registry",
-            false,
         ),
         CoordinatorError::PathOutsideProject { .. } => ApiError::new(
             ApiErrorCode::InvalidRequest,

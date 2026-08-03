@@ -148,12 +148,14 @@ impl ReindexCoordinatorConfig {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn with_max_pending_events(mut self, maximum: usize) -> Self {
         self.max_pending_events = maximum;
         self
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn with_max_failure_history(mut self, maximum: usize) -> Self {
         self.max_failure_history = maximum;
         self
@@ -255,6 +257,7 @@ pub struct ReindexCoordinatorSnapshot {
 
 impl ReindexCoordinatorSnapshot {
     #[must_use]
+    #[cfg(test)]
     pub const fn is_idle(&self) -> bool {
         !self.running && self.in_flight.is_none() && self.pending_general.is_none()
     }
@@ -333,20 +336,6 @@ impl ReindexObservation {
                     admission: Box::new(self.admission.clone()),
                 },
             ))),
-        }
-    }
-
-    pub async fn wait(mut self) -> Result<ReindexCompletion, CoordinatorError> {
-        loop {
-            match self.next_progress().await {
-                ReindexObservationProgress::Coalesced | ReindexObservationProgress::Running => {}
-                ReindexObservationProgress::Cancelled => {
-                    return Err(CoordinatorError::Cancelled {
-                        admission: Box::new(self.admission),
-                    });
-                }
-                ReindexObservationProgress::Terminal(result) => return *result,
-            }
         }
     }
 }
@@ -490,6 +479,7 @@ impl fmt::Debug for ReindexCoordinatorRuntime {
 
 impl ReindexCoordinator {
     /// Atomically admits, rejects, or coalesces one reindex request.
+    #[cfg(test)]
     pub async fn admit(
         &self,
         source: ReindexSource,
@@ -498,16 +488,8 @@ impl ReindexCoordinator {
         self.admit_inner(source, intent, false).await
     }
 
-    /// Atomically admits one filesystem-backed request and waits for its merged build result.
-    pub async fn admit_and_wait(
-        &self,
-        source: ReindexSource,
-        intent: FilesystemReindexIntent,
-    ) -> Result<ReindexCompletion, CoordinatorError> {
-        self.admit_observed(source, intent).await?.wait().await
-    }
-
     /// Atomically admits one request and returns an independently awaitable completion handle.
+    #[cfg(test)]
     pub async fn admit_observed(
         &self,
         source: ReindexSource,
@@ -596,6 +578,7 @@ impl ReindexCoordinator {
     }
 
     /// Records a lossy watcher overflow and upgrades pending filesystem work to a full scan.
+    #[cfg(test)]
     pub async fn watcher_overflow(&self) -> Result<ReindexReceipt, CoordinatorError> {
         self.admit_inner(
             ReindexSource::Watcher,
@@ -606,6 +589,7 @@ impl ReindexCoordinator {
     }
 
     /// Waits until the runner has drained every admitted request.
+    #[cfg(test)]
     pub async fn wait_for_idle(&self) {
         loop {
             let changed = self.inner.changed.notified();
@@ -624,6 +608,7 @@ impl ReindexCoordinator {
         state.snapshot()
     }
 
+    #[cfg(test)]
     async fn admit_inner(
         &self,
         source: ReindexSource,
@@ -1308,9 +1293,6 @@ pub enum CoordinatorError {
     CompletionChannelClosed {
         admission: Box<ReindexReceipt>,
     },
-    Cancelled {
-        admission: Box<ReindexReceipt>,
-    },
     PathOutsideProject {
         path: PathBuf,
         project_root: PathBuf,
@@ -1346,7 +1328,6 @@ impl fmt::Display for CoordinatorError {
             Self::CompletionChannelClosed { .. } => {
                 formatter.write_str("reindex completion channel closed before reporting a result")
             }
-            Self::Cancelled { .. } => formatter.write_str("queued reindex operation was cancelled"),
             Self::PathOutsideProject { path, project_root } => write!(
                 formatter,
                 "changed path {} is outside project root {}",
@@ -1358,3 +1339,6 @@ impl fmt::Display for CoordinatorError {
 }
 
 impl Error for CoordinatorError {}
+
+#[cfg(test)]
+mod tests;

@@ -210,7 +210,6 @@ jobs:
         --test ipc_commands
         --test process_contract
         --test transport_contract
-        --test reindex_coordinator
 
     - name: Run generation security unit contracts
       run: >-
@@ -224,7 +223,7 @@ jobs:
         cargo nextest run
         --test-threads 2
         -p unity-asset-search-daemon
-        --lib
+        --bin unity-asset-search-daemon
 
     - name: Run complete platform-local identity and filesystem security suite
       run: >-
