@@ -5,23 +5,58 @@ use std::time::{Duration, Instant};
 
 use unity_asset_core::AssetLoadBudget;
 use unity_asset_search_local::{
-    EndpointNamespaceV1, EndpointStoreError, FrameReadTimeoutsV1, PrivateRootsV1, ProjectLocatorV1,
-    VerifiedFramedTransportV1,
+    EndpointNamespaceV1, EndpointStoreError, EndpointTransportError, FrameReadTimeoutsV1,
+    PrivateRootsV1, ProjectLocatorV1, VerifiedFramedTransportV1,
 };
 use unity_asset_search_protocol::{
-    BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2, FilesystemReindexIntent,
-    FrameLimits, QueryPolicyId, ReindexAdmitRequest, ReindexOperationState, ReindexWaitRequest,
-    RequestEnvelope, RequestId, RequestOperation, ResponseOperation, ResponseOutcome,
-    SearchRequest, ShutdownRequest, StatusRequest, decode_response_frame, decode_validated_frame,
-    encode_frame, encode_request_frame,
+    ApiErrorCode, BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2,
+    CapabilitiesRequest, DaemonLifecycleState, FilesystemReindexIntent, FrameLimits, QueryPolicyId,
+    ReferenceRequest, ReindexAdmitRequest, ReindexCancelRequest, ReindexOperationState,
+    ReindexStatusRequest, ReindexWaitRequest, RequestEnvelope, RequestId, RequestOperation,
+    ResponseOperation, ResponseOutcome, SearchCapabilities, SearchRequest, ShutdownRequest,
+    StatusRequest, SuggestRequest, decode_response_frame, decode_validated_frame, encode_frame,
+    encode_request_frame,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
-const PREFAB: &str = r#"%YAML 1.1
+const OWNER_ONE_GUID: &str = "11111111111111111111111111111111";
+const OWNER_TWO_GUID: &str = "22222222222222222222222222222222";
+const TARGET_GUID: &str = "0123456789abcdef0123456789abcdef";
+const TARGET_TWO_GUID: &str = "fedcba9876543210fedcba9876543210";
+const OWNER_ONE: &str = r#"%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
 --- !u!1 &1
 GameObject:
   m_Name: AgentBeacon
+  m_Target: {fileID: 100, guid: 0123456789abcdef0123456789abcdef, type: 3}
+  m_SecondaryTarget: {fileID: 200, guid: fedcba9876543210fedcba9876543210, type: 3}
+"#;
+const OWNER_ONE_UPDATED: &str = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &1
+GameObject:
+  m_Name: AgentBeaconUpdated
+  m_Target: {fileID: 100, guid: 0123456789abcdef0123456789abcdef, type: 3}
+  m_SecondaryTarget: {fileID: 200, guid: fedcba9876543210fedcba9876543210, type: 3}
+"#;
+const OWNER_TWO: &str = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &2
+GameObject:
+  m_Name: AgentBeaconSibling
+  m_Target: {fileID: 100, guid: 0123456789abcdef0123456789abcdef, type: 3}
+"#;
+const TARGET: &str = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100
+GameObject:
+  m_Name: TargetBeacon
+"#;
+const TARGET_TWO: &str = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &200
+GameObject:
+  m_Name: SecondaryTargetBeacon
 "#;
 
 fn secure_test_tempdir() -> tempfile::TempDir {
@@ -41,18 +76,16 @@ fn secure_test_tempdir() -> tempfile::TempDir {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_daemon_process_publishes_reindexes_searches_and_shuts_down() {
+async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state() {
     let project_directory = secure_test_tempdir();
     let assets = project_directory.path().join("Assets");
     fs::create_dir_all(&assets).expect("Assets marker");
     fs::create_dir(project_directory.path().join("ProjectSettings"))
         .expect("ProjectSettings marker");
-    fs::write(assets.join("AgentBeacon.prefab"), PREFAB).expect("write prefab");
-    fs::write(
-        assets.join("AgentBeacon.prefab.meta"),
-        "fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n",
-    )
-    .expect("write prefab metadata");
+    write_asset(&assets, "OwnerOne.prefab", OWNER_ONE, OWNER_ONE_GUID);
+    write_asset(&assets, "OwnerTwo.prefab", OWNER_TWO, OWNER_TWO_GUID);
+    write_asset(&assets, "Target.prefab", TARGET, TARGET_GUID);
+    write_asset(&assets, "TargetTwo.prefab", TARGET_TWO, TARGET_TWO_GUID);
 
     let project = ProjectLocatorV1::open(project_directory.path()).expect("locate project");
     let roots = PrivateRootsV1::discover_for_current_context().expect("private local roots");
@@ -63,6 +96,7 @@ async fn real_daemon_process_publishes_reindexes_searches_and_shuts_down() {
     let index_directory = project_directory.path().join(".process-contract-index");
     let mut daemon = DaemonChild::spawn(project_directory.path(), &index_directory);
     let discovered = wait_for_endpoint(&namespace, &mut daemon).await;
+    let stale_discovered = discovered;
     let descriptor = discovered.descriptor();
     let stream = discovered
         .connect_verified(&namespace, Instant::now() + TEST_TIMEOUT)
@@ -75,23 +109,240 @@ async fn real_daemon_process_publishes_reindexes_searches_and_shuts_down() {
     )
     .await;
 
+    let capabilities = client
+        .exchange(RequestOperation::Capabilities(
+            CapabilitiesRequest::default(),
+        ))
+        .await;
+    let ResponseOperation::Capabilities(capabilities) = capabilities else {
+        panic!("real daemon returned a non-capabilities response");
+    };
+    assert_eq!(capabilities.capabilities, SearchCapabilities::current());
+
     let initial = client
         .exchange(RequestOperation::Status(StatusRequest::default()))
         .await;
     let ResponseOperation::Status(initial) = initial else {
         panic!("real daemon returned a non-status response");
     };
+    assert_eq!(initial.daemon.lifecycle, DaemonLifecycleState::Serving);
     assert!(!initial.indexing);
 
+    complete_reindex(&mut client, "process-contract-v1").await;
+
+    let search = client
+        .exchange(RequestOperation::Search(SearchRequest {
+            query: "AgentBeacon".to_owned(),
+            limit: 10,
+        }))
+        .await;
+    let ResponseOperation::Search(search) = search else {
+        panic!("real daemon returned a non-search response");
+    };
+    assert!(
+        search.hits.iter().any(|hit| {
+            hit.name == "AgentBeacon" && hit.path.as_str() == "Assets/OwnerOne.prefab"
+        }),
+        "real daemon search did not return the indexed prefab: {:?}",
+        search.hits
+    );
+
+    let suggest = client
+        .exchange(RequestOperation::Suggest(SuggestRequest {
+            prefix: "in:Assets/".to_owned(),
+            limit: 10,
+        }))
+        .await;
+    let ResponseOperation::Suggest(suggest) = suggest else {
+        panic!("real daemon returned a non-suggest response");
+    };
+    assert_eq!(suggest.suggestions, ["in:Assets/"]);
+
+    let incoming = ReferenceRequest::incoming_guid(TARGET_GUID, Some(100), 1);
+    let first_page = client
+        .exchange(RequestOperation::References(incoming.clone()))
+        .await;
+    let ResponseOperation::References(first_page) = first_page else {
+        panic!("real daemon returned a non-reference response");
+    };
+    assert_eq!(first_page.coverage.returned, 1);
+    assert_eq!(first_page.coverage.total, Some(2));
+    assert!(first_page.coverage.truncated);
+    let stale_cursor = first_page
+        .coverage
+        .next_cursor
+        .clone()
+        .expect("first reference page has a continuation cursor");
+
+    let second_page = client
+        .exchange(RequestOperation::References(
+            incoming.clone().with_cursor(stale_cursor.clone()),
+        ))
+        .await;
+    let ResponseOperation::References(second_page) = second_page else {
+        panic!("real daemon returned a non-reference response");
+    };
+    assert_eq!(second_page.coverage.returned, 1);
+    assert!(!second_page.coverage.truncated);
+    assert!(second_page.coverage.next_cursor.is_none());
+    let mut incoming_sources = first_page
+        .hits
+        .iter()
+        .chain(&second_page.hits)
+        .map(|hit| hit.source_path.as_str())
+        .collect::<Vec<_>>();
+    incoming_sources.sort_unstable();
+    assert_eq!(
+        incoming_sources,
+        ["Assets/OwnerOne.prefab", "Assets/OwnerTwo.prefab"]
+    );
+
+    let outgoing = ReferenceRequest::outgoing_guid(OWNER_ONE_GUID, Some(1), 1);
+    let first_outgoing_page = client
+        .exchange(RequestOperation::References(outgoing.clone()))
+        .await;
+    let ResponseOperation::References(first_outgoing_page) = first_outgoing_page else {
+        panic!("real daemon returned a non-reference response");
+    };
+    assert_eq!(first_outgoing_page.coverage.returned, 1);
+    assert_eq!(first_outgoing_page.coverage.total, Some(2));
+    assert!(first_outgoing_page.coverage.truncated);
+    let outgoing_cursor = first_outgoing_page
+        .coverage
+        .next_cursor
+        .clone()
+        .expect("first outgoing reference page has a continuation cursor");
+    let second_outgoing_page = client
+        .exchange(RequestOperation::References(
+            outgoing.with_cursor(outgoing_cursor),
+        ))
+        .await;
+    let ResponseOperation::References(second_outgoing_page) = second_outgoing_page else {
+        panic!("real daemon returned a non-reference response");
+    };
+    assert_eq!(second_outgoing_page.coverage.returned, 1);
+    assert!(!second_outgoing_page.coverage.truncated);
+    assert!(second_outgoing_page.coverage.next_cursor.is_none());
+    let mut outgoing_targets = first_outgoing_page
+        .hits
+        .iter()
+        .chain(&second_outgoing_page.hits)
+        .filter_map(|hit| {
+            assert_eq!(hit.source_path.as_str(), "Assets/OwnerOne.prefab");
+            hit.objects
+                .iter()
+                .find(|object| {
+                    object
+                        .field_hints
+                        .iter()
+                        .any(|hint| hint.starts_with("raw.yaml.file_id="))
+                })
+                .and_then(|object| object.location.guid.as_deref().zip(object.location.file_id))
+        })
+        .collect::<Vec<_>>();
+    outgoing_targets.sort_unstable();
+    assert_eq!(
+        outgoing_targets,
+        [(TARGET_GUID, 100), (TARGET_TWO_GUID, 200)]
+    );
+
+    fs::write(assets.join("OwnerOne.prefab"), OWNER_ONE_UPDATED).expect("update owner prefab");
+    complete_reindex(&mut client, "process-contract-v2").await;
+    let stale = client
+        .exchange_outcome(RequestOperation::References(
+            incoming.with_cursor(stale_cursor),
+        ))
+        .await;
+    let ResponseOutcome::Error(stale) = stale else {
+        panic!("old reference cursor was accepted after generation replacement");
+    };
+    assert_eq!(stale.code, ApiErrorCode::StaleCursor);
+
+    shutdown(&mut client).await;
+    drop(client);
+
+    let status = daemon.wait_for_exit().await;
+    assert!(
+        status.success(),
+        "real daemon exited unsuccessfully: {status}; stderr: {}",
+        daemon.stderr()
+    );
+    assert!(matches!(
+        namespace.discover_endpoint(),
+        Err(EndpointStoreError::DescriptorMissing)
+    ));
+
+    let mut replacement = DaemonChild::spawn(project_directory.path(), &index_directory);
+    let replacement_discovered = wait_for_endpoint(&namespace, &mut replacement).await;
+    assert_ne!(
+        replacement_discovered.descriptor().daemon_instance_id(),
+        descriptor.daemon_instance_id()
+    );
+    assert!(matches!(
+        stale_discovered
+            .connect_verified(&namespace, Instant::now() + TEST_TIMEOUT)
+            .await,
+        Err(EndpointTransportError::Store(
+            EndpointStoreError::EndpointChanged
+        ))
+    ));
+    let replacement_descriptor = replacement_discovered.descriptor();
+    let replacement_stream = replacement_discovered
+        .connect_verified(&namespace, Instant::now() + TEST_TIMEOUT)
+        .await
+        .expect("connect to replacement daemon");
+    let mut replacement_client = ProcessClient::bootstrap(
+        replacement_stream,
+        project.project_id(),
+        replacement_descriptor.daemon_instance_id(),
+    )
+    .await;
+    shutdown(&mut replacement_client).await;
+    drop(replacement_client);
+    assert!(replacement.wait_for_exit().await.success());
+    assert!(matches!(
+        namespace.discover_endpoint(),
+        Err(EndpointStoreError::DescriptorMissing)
+    ));
+}
+
+fn write_asset(assets: &std::path::Path, name: &str, contents: &str, guid: &str) {
+    fs::write(assets.join(name), contents).expect("write process-contract asset");
+    fs::write(
+        assets.join(format!("{name}.meta")),
+        format!("fileFormatVersion: 2\nguid: {guid}\n"),
+    )
+    .expect("write process-contract asset metadata");
+}
+
+async fn complete_reindex(client: &mut ProcessClient, idempotency_key: &str) {
     let admitted = client
         .exchange(RequestOperation::ReindexAdmit(ReindexAdmitRequest {
             intent: FilesystemReindexIntent::full(),
-            idempotency_key: Some("process-contract-v1".to_owned()),
+            idempotency_key: Some(idempotency_key.to_owned()),
         }))
         .await;
     let ResponseOperation::ReindexAdmit(admitted) = admitted else {
         panic!("real daemon returned a non-reindex-admission response");
     };
+    let status = client
+        .exchange(RequestOperation::ReindexStatus(ReindexStatusRequest {
+            operation_id: admitted.operation_id,
+        }))
+        .await;
+    let ResponseOperation::ReindexStatus(status) = status else {
+        panic!("real daemon returned a non-reindex-status response");
+    };
+    assert_eq!(status.operation_id, admitted.operation_id);
+    assert!(matches!(
+        status.state,
+        ReindexOperationState::Queued
+            | ReindexOperationState::Coalesced
+            | ReindexOperationState::Running
+            | ReindexOperationState::Succeeded
+    ));
+    assert!(status.admission.is_some());
+
     let completed = client
         .exchange(RequestOperation::ReindexWait(ReindexWaitRequest {
             operation_id: admitted.operation_id,
@@ -105,23 +356,19 @@ async fn real_daemon_process_publishes_reindexes_searches_and_shuts_down() {
     assert!(completed.completion.is_some());
     assert!(completed.status.is_some());
 
-    let search = client
-        .exchange(RequestOperation::Search(SearchRequest {
-            query: "AgentBeacon".to_owned(),
-            limit: 10,
+    let cancelled = client
+        .exchange(RequestOperation::ReindexCancel(ReindexCancelRequest {
+            operation_id: admitted.operation_id,
         }))
         .await;
-    let ResponseOperation::Search(search) = search else {
-        panic!("real daemon returned a non-search response");
+    let ResponseOperation::ReindexCancel(cancelled) = cancelled else {
+        panic!("real daemon returned a non-reindex-cancel response");
     };
-    assert!(
-        search.hits.iter().any(|hit| {
-            hit.name == "AgentBeacon" && hit.path.as_str() == "Assets/AgentBeacon.prefab"
-        }),
-        "real daemon search did not return the indexed prefab: {:?}",
-        search.hits
-    );
+    assert_eq!(cancelled.state, ReindexOperationState::Succeeded);
+    assert!(!cancelled.cancelled);
+}
 
+async fn shutdown(client: &mut ProcessClient) {
     let shutdown = client
         .exchange(RequestOperation::Shutdown(ShutdownRequest {
             drain_timeout_ms: 5_000,
@@ -131,18 +378,6 @@ async fn real_daemon_process_publishes_reindexes_searches_and_shuts_down() {
         panic!("real daemon returned a non-shutdown response");
     };
     assert!(shutdown.accepted);
-    drop(client);
-
-    let status = daemon.wait_for_exit().await;
-    assert!(
-        status.success(),
-        "real daemon exited unsuccessfully: {status}; stderr: {}",
-        daemon.stderr()
-    );
-    assert!(matches!(
-        namespace.discover_endpoint(),
-        Err(EndpointStoreError::DescriptorMissing)
-    ));
 }
 
 struct ProcessClient {
@@ -189,6 +424,13 @@ impl ProcessClient {
     }
 
     async fn exchange(&mut self, operation: RequestOperation) -> ResponseOperation {
+        match self.exchange_outcome(operation).await {
+            ResponseOutcome::Success(operation) => *operation,
+            ResponseOutcome::Error(error) => panic!("real daemon returned an API error: {error:?}"),
+        }
+    }
+
+    async fn exchange_outcome(&mut self, operation: RequestOperation) -> ResponseOutcome {
         let request_id = RequestId::from_bytes([self.next_request_id; 16]);
         self.next_request_id = self
             .next_request_id
@@ -218,10 +460,7 @@ impl ProcessClient {
         let mut budget = AssetLoadBudget::default();
         let response = decode_response_frame(&response_frame, &mut budget, &request)
             .expect("decode business response");
-        match response.into_outcome() {
-            ResponseOutcome::Success(operation) => *operation,
-            ResponseOutcome::Error(error) => panic!("real daemon returned an API error: {error:?}"),
-        }
+        response.into_outcome()
     }
 }
 
