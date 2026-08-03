@@ -785,6 +785,9 @@ impl StreamedResourceRequest {
         size: u64,
     ) -> Result<(), StreamedResourceRequestError> {
         validate_stream_path(stream_path)?;
+        if size == 0 {
+            return Err(StreamedResourceRequestError::ZeroSize);
+        }
         offset
             .checked_add(size)
             .ok_or(StreamedResourceRequestError::RangeOverflow { offset, size })?;
@@ -1089,6 +1092,8 @@ pub enum StreamedResourceRequestError {
     ControlCharacter,
     #[error("stream path has no safe final component")]
     InvalidBasename,
+    #[error("stream range size must be non-zero")]
+    ZeroSize,
     #[error("stream range overflows: offset={offset}, size={size}")]
     RangeOverflow { offset: u64, size: u64 },
 }
@@ -1257,6 +1262,35 @@ impl<'view, 'source> StreamedResourceResolver<'view, 'source> {
         })
     }
 
+    pub(crate) fn resolve_request(
+        &self,
+        request: &StreamedResourceRequest,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<StreamedResourceResolution, WorkspaceError> {
+        let owner = match self.view.resolve_source(request.owner(), budget)? {
+            WorkspaceLookup::Resolved(source) => source,
+            WorkspaceLookup::Unloaded => return Ok(StreamedResourceResolution::OwnerUnloaded),
+            WorkspaceLookup::Missing => return Ok(StreamedResourceResolution::OwnerMissing),
+            WorkspaceLookup::Ambiguous { .. } => {
+                return invalid_stream_resolution(
+                    "WORKSPACE_STREAM_OWNER_AMBIGUOUS",
+                    "stream owner resolves to multiple loaded sources",
+                    budget,
+                );
+            }
+            WorkspaceLookup::Invalid { diagnostic } => {
+                return Ok(StreamedResourceResolution::Invalid { diagnostic });
+            }
+        };
+        self.resolve(
+            &owner,
+            request.stream_path(),
+            request.offset(),
+            request.size(),
+            budget,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn reset_test_build_count() {
         STREAMED_RESOURCE_INDEX_BUILDS.with(|builds| builds.set(0));
@@ -1355,44 +1389,9 @@ impl<'view> WorkspaceInspector<'view> {
         budget: &mut AssetLoadBudget,
     ) -> Result<StreamedResourceQueryResult, WorkspaceError> {
         let request_copy = request.try_clone_with_budget(budget)?;
-        let owner = match self.view.resolve_source(request.owner(), budget)? {
-            WorkspaceLookup::Resolved(source) => source,
-            WorkspaceLookup::Unloaded => {
-                return Ok(
-                    self.stream_result(request_copy, StreamedResourceResolution::OwnerUnloaded)
-                );
-            }
-            WorkspaceLookup::Missing => {
-                return Ok(
-                    self.stream_result(request_copy, StreamedResourceResolution::OwnerMissing)
-                );
-            }
-            WorkspaceLookup::Ambiguous { .. } => {
-                return Ok(self.stream_result(
-                    request_copy,
-                    invalid_stream_resolution(
-                        "WORKSPACE_STREAM_OWNER_AMBIGUOUS",
-                        "stream owner resolves to multiple loaded sources",
-                        budget,
-                    )?,
-                ));
-            }
-            WorkspaceLookup::Invalid { diagnostic } => {
-                return Ok(self.stream_result(
-                    request_copy,
-                    StreamedResourceResolution::Invalid { diagnostic },
-                ));
-            }
-        };
         let sources = self.view.sources(budget)?;
         let resolver = StreamedResourceResolver::new(self.view, &sources, budget)?;
-        let resolution = resolver.resolve(
-            &owner,
-            request.stream_path(),
-            request.offset(),
-            request.size(),
-            budget,
-        )?;
+        let resolution = resolver.resolve_request(request, budget)?;
         Ok(self.stream_result(request_copy, resolution))
     }
 
@@ -1669,7 +1668,7 @@ fn usize_to_u64(value: usize, resource: &'static str) -> Result<u64, WorkspaceEr
 }
 
 fn validate_stream_path(path: &str) -> Result<(), StreamedResourceRequestError> {
-    if path.is_empty() {
+    if path.trim().is_empty() {
         return Err(StreamedResourceRequestError::EmptyPath);
     }
     if path.len() > MAX_STREAM_PATH_BYTES {
@@ -1684,8 +1683,11 @@ fn validate_stream_path(path: &str) -> Result<(), StreamedResourceRequestError> 
     {
         return Err(StreamedResourceRequestError::ControlCharacter);
     }
+    if path.ends_with(['/', '\\']) {
+        return Err(StreamedResourceRequestError::InvalidBasename);
+    }
     stream_basename(path)
-        .filter(|basename| !matches!(*basename, "." | ".."))
+        .filter(|basename| !basename.trim().is_empty() && !matches!(*basename, "." | ".."))
         .ok_or(StreamedResourceRequestError::InvalidBasename)?;
     Ok(())
 }

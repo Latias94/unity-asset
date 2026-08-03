@@ -3,6 +3,10 @@ use std::path::Path;
 
 use serde::Serialize;
 use serde_json::{Value, json};
+#[cfg(test)]
+use unity_asset::extraction::ExtractionAllocationUnit;
+#[cfg(feature = "decode")]
+use unity_asset::extraction::MediaInspectionError;
 use unity_asset::extraction::{ExtractionExecutionError, ExtractionPlanError};
 use unity_asset::reference::ReferenceGraphError;
 use unity_asset::workspace::{
@@ -467,6 +471,55 @@ pub(crate) fn mark_export_plan_error(error: ExtractionPlanError) -> anyhow::Erro
                 "budget": budget_details(source),
             }),
         ),
+        ExtractionPlanError::Allocation {
+            resource,
+            requested,
+            unit,
+            ..
+        } => (
+            CliErrorCode::ExportResourceLimit,
+            json!({
+                "kind": "allocation_failed",
+                "resource": resource,
+                "requested": requested,
+                "unit": unit.as_str(),
+            }),
+        ),
+        ExtractionPlanError::MediaAllocation {
+            resource,
+            requested,
+        } => (
+            CliErrorCode::ExportResourceLimit,
+            json!({
+                "kind": "allocation_failed",
+                "resource": resource,
+                "requested": requested,
+                "unit": "bytes",
+            }),
+        ),
+        #[cfg(feature = "decode")]
+        ExtractionPlanError::InvalidMediaDescriptor { address, source } => (
+            CliErrorCode::ExportPlanRejected,
+            json!({
+                "kind": "invalid_media_descriptor",
+                "address": address,
+                "inspection": media_inspection_error_details(source),
+            }),
+        ),
+        ExtractionPlanError::MediaPreparation { address } => (
+            CliErrorCode::ExportPlanRejected,
+            json!({
+                "kind": "media_preparation_failed",
+                "address": address,
+            }),
+        ),
+        ExtractionPlanError::MediaPayloadChanged { resource } => (
+            CliErrorCode::ExportSourceChanged,
+            json!({
+                "kind": "media_payload_changed",
+                "resource": resource,
+            }),
+        ),
         ExtractionPlanError::RequiredDecodedUnavailable { address, reason } => (
             CliErrorCode::ExportRepresentationUnavailable,
             json!({
@@ -497,6 +550,21 @@ pub(crate) fn mark_export_plan_error(error: ExtractionPlanError) -> anyhow::Erro
         ExtractionPlanError::ObjectInvalid(address) => (
             CliErrorCode::ExportPlanRejected,
             json!({ "kind": "object_invalid", "address": address }),
+        ),
+        ExtractionPlanError::InvalidStreamPath(stream_path) => (
+            CliErrorCode::ExportPlanRejected,
+            json!({
+                "kind": "invalid_stream_resource_path",
+                "stream_path": stream_path,
+            }),
+        ),
+        ExtractionPlanError::InvalidStreamRange { offset, size } => (
+            CliErrorCode::ExportPlanRejected,
+            json!({
+                "kind": "invalid_stream_resource_range",
+                "offset": offset,
+                "size": size,
+            }),
         ),
         ExtractionPlanError::MissingStreamResource { owner, stream_path } => (
             CliErrorCode::ExportPlanRejected,
@@ -537,6 +605,46 @@ pub(crate) fn mark_export_plan_error(error: ExtractionPlanError) -> anyhow::Erro
     mark(error, code, Some(details))
 }
 
+#[cfg(feature = "decode")]
+fn media_inspection_error_details(error: &MediaInspectionError) -> Value {
+    match error {
+        MediaInspectionError::NotApplicable { expected, actual } => json!({
+            "kind": "wrong_class",
+            "expected_class_id": expected,
+            "actual_class_id": actual,
+        }),
+        MediaInspectionError::TypeTreeUnavailable => {
+            json!({ "kind": "typetree_unavailable" })
+        }
+        MediaInspectionError::InvalidDescriptor { field, reason } => json!({
+            "kind": "invalid_descriptor_field",
+            "field": field,
+            "reason": reason,
+        }),
+        MediaInspectionError::UnsupportedEncoding { family, value } => json!({
+            "kind": "unsupported_encoding",
+            "family": family,
+            "value": value,
+        }),
+        MediaInspectionError::UnsupportedLayout { family, layout } => json!({
+            "kind": "unsupported_layout",
+            "family": family,
+            "layout": layout,
+        }),
+        MediaInspectionError::MissingPayload => json!({ "kind": "missing_payload" }),
+        MediaInspectionError::AmbiguousPayload => json!({ "kind": "ambiguous_payload" }),
+        MediaInspectionError::StreamRangeOverflow { offset, size } => json!({
+            "kind": "stream_range_overflow",
+            "offset": offset,
+            "size": size,
+        }),
+        MediaInspectionError::UnsupportedRawLayout { layout } => json!({
+            "kind": "unsupported_raw_layout",
+            "layout": layout,
+        }),
+    }
+}
+
 pub(crate) fn mark_export_execution_error(error: ExtractionExecutionError) -> anyhow::Error {
     let (code, details) = match &error {
         ExtractionExecutionError::Budget(source)
@@ -547,6 +655,19 @@ pub(crate) fn mark_export_execution_error(error: ExtractionExecutionError) -> an
                 "budget": budget_details(source),
             }),
         ),
+        ExtractionExecutionError::Allocation {
+            resource,
+            requested,
+            unit,
+        } => (
+            CliErrorCode::ExportResourceLimit,
+            json!({
+                "kind": "allocation_failed",
+                "resource": resource,
+                "requested": requested,
+                "unit": unit.as_str(),
+            }),
+        ),
         ExtractionExecutionError::WorkspaceContextMismatch => (
             CliErrorCode::ExportWorkspaceMismatch,
             json!({ "kind": "workspace_revision_mismatch" }),
@@ -554,23 +675,6 @@ pub(crate) fn mark_export_execution_error(error: ExtractionExecutionError) -> an
         ExtractionExecutionError::SourceChanged { locator } => (
             CliErrorCode::ExportSourceChanged,
             json!({ "kind": "source_changed", "locator": locator }),
-        ),
-        ExtractionExecutionError::StreamOutOfRange {
-            ordinal,
-            locator,
-            offset,
-            end,
-            source_len,
-        } => (
-            CliErrorCode::ExportSourceChanged,
-            json!({
-                "kind": "stream_resource_out_of_range",
-                "ordinal": ordinal,
-                "locator": locator,
-                "offset": offset,
-                "end": end,
-                "source_length": source_len,
-            }),
         ),
         ExtractionExecutionError::InvalidLimit { resource } => (
             CliErrorCode::ExportResourceLimit,
@@ -614,6 +718,20 @@ pub(crate) fn mark_export_execution_error(error: ExtractionExecutionError) -> an
             CliErrorCode::ExportResourceLimit,
             json!({
                 "kind": "working_set_proof_failed",
+                "ordinal": ordinal,
+            }),
+        ),
+        ExtractionExecutionError::MediaDescriptorChanged { ordinal } => (
+            CliErrorCode::ExportExecutionFailed,
+            json!({
+                "kind": "media_descriptor_changed",
+                "ordinal": ordinal,
+            }),
+        ),
+        ExtractionExecutionError::MediaPreparationFailed { ordinal } => (
+            CliErrorCode::ExportExecutionFailed,
+            json!({
+                "kind": "media_preparation_failed",
                 "ordinal": ordinal,
             }),
         ),
@@ -888,6 +1006,18 @@ fn recovery_blocked_reason_details(reason: &RecoveryBlockedReason) -> Value {
                 "actual_revision": actual,
             })
         }
+        RecoveryBlockedReason::InstallationUnavailable {
+            base,
+            committed,
+            actual,
+        } => {
+            json!({
+                "kind": "installation_unavailable",
+                "base_installation": base,
+                "committed_installation": committed,
+                "actual_installation": actual,
+            })
+        }
         RecoveryBlockedReason::BaselineRebuild { message } => {
             json!({ "kind": "baseline_rebuild", "reason": message })
         }
@@ -911,6 +1041,165 @@ mod tests {
 
         assert_eq!(code, "CLI_EXPORT_OUTPUT_INVALID");
         assert_eq!(details.unwrap()["kind"], "lock_root");
+    }
+
+    #[test]
+    fn media_execution_failures_preserve_the_artifact_and_failure_kind() {
+        for (error, expected_kind) in [
+            (
+                ExtractionExecutionError::MediaDescriptorChanged { ordinal: 7 },
+                "media_descriptor_changed",
+            ),
+            (
+                ExtractionExecutionError::MediaPreparationFailed { ordinal: 7 },
+                "media_preparation_failed",
+            ),
+        ] {
+            let error = mark_export_execution_error(error);
+            let (code, details) = report_parts(&error);
+            let details = details.expect("typed media execution details");
+
+            assert_eq!(code, "CLI_EXPORT_EXECUTION_FAILED");
+            assert_eq!(details["kind"], expected_kind);
+            assert_eq!(details["ordinal"], 7);
+        }
+    }
+
+    #[cfg(feature = "decode")]
+    #[test]
+    fn invalid_media_descriptor_preserves_structured_inspection_evidence() {
+        let address = unity_asset::ObjectAddress::binary_direct(
+            unity_asset::SourceLocator::path("content.assets").unwrap(),
+            41,
+        )
+        .unwrap();
+        let error = mark_export_plan_error(ExtractionPlanError::InvalidMediaDescriptor {
+            address,
+            source: MediaInspectionError::InvalidDescriptor {
+                field: "stream.size",
+                reason: "must be non-zero",
+            },
+        });
+        let (code, details) = report_parts(&error);
+        let details = details.expect("typed media inspection details");
+
+        assert_eq!(code, "CLI_EXPORT_PLAN_REJECTED");
+        assert_eq!(details["kind"], "invalid_media_descriptor");
+        assert_eq!(details["inspection"]["kind"], "invalid_descriptor_field");
+        assert_eq!(details["inspection"]["field"], "stream.size");
+        assert_eq!(details["inspection"]["reason"], "must be non-zero");
+    }
+
+    #[test]
+    fn media_plan_failures_preserve_remediation_category() {
+        let address = unity_asset::ObjectAddress::binary_direct(
+            unity_asset::SourceLocator::path("content.assets").unwrap(),
+            41,
+        )
+        .unwrap();
+        let preparation = mark_export_plan_error(ExtractionPlanError::MediaPreparation { address });
+        let (code, details) = report_parts(&preparation);
+        let details = details.expect("typed media preparation details");
+        assert_eq!(code, "CLI_EXPORT_PLAN_REJECTED");
+        assert_eq!(details["kind"], "media_preparation_failed");
+
+        let changed = mark_export_plan_error(ExtractionPlanError::MediaPayloadChanged {
+            resource: "planned embedded texture",
+        });
+        let (code, details) = report_parts(&changed);
+        let details = details.expect("typed media source details");
+        assert_eq!(code, "CLI_EXPORT_SOURCE_CHANGED");
+        assert_eq!(details["kind"], "media_payload_changed");
+        assert_eq!(details["resource"], "planned embedded texture");
+
+        let invalid_path =
+            mark_export_plan_error(ExtractionPlanError::InvalidStreamPath(".".to_owned()));
+        let (code, details) = report_parts(&invalid_path);
+        let details = details.expect("typed streamed-resource path details");
+        assert_eq!(code, "CLI_EXPORT_PLAN_REJECTED");
+        assert_eq!(details["kind"], "invalid_stream_resource_path");
+        assert_eq!(details["stream_path"], ".");
+
+        let invalid_range = mark_export_plan_error(ExtractionPlanError::InvalidStreamRange {
+            offset: u64::MAX,
+            size: 1,
+        });
+        let (code, details) = report_parts(&invalid_range);
+        let details = details.expect("typed streamed-resource range details");
+        assert_eq!(code, "CLI_EXPORT_PLAN_REJECTED");
+        assert_eq!(details["kind"], "invalid_stream_resource_range");
+        assert_eq!(details["offset"], u64::MAX);
+        assert_eq!(details["size"], 1);
+    }
+
+    #[test]
+    fn export_allocation_failures_are_resource_limits() {
+        let mut impossible = Vec::<u8>::new();
+        let source = impossible
+            .try_reserve(usize::MAX)
+            .expect_err("impossible capacity must fail");
+        let generic = mark_export_plan_error(ExtractionPlanError::Allocation {
+            resource: "planned artifacts",
+            requested: usize::MAX,
+            unit: ExtractionAllocationUnit::CapacityUnits,
+            source,
+        });
+        let (code, details) = report_parts(&generic);
+        let details = details.expect("typed generic allocation details");
+        assert_eq!(code, "CLI_EXPORT_RESOURCE_LIMIT");
+        assert_eq!(details["kind"], "allocation_failed");
+        assert_eq!(details["resource"], "planned artifacts");
+        assert_eq!(details["unit"], "capacity_units");
+
+        let plan_error = mark_export_plan_error(ExtractionPlanError::MediaAllocation {
+            resource: "decoded texture",
+            requested: 4_096,
+        });
+        let (code, details) = report_parts(&plan_error);
+        let details = details.expect("typed planning allocation details");
+        assert_eq!(code, "CLI_EXPORT_RESOURCE_LIMIT");
+        assert_eq!(details["kind"], "allocation_failed");
+        assert_eq!(details["resource"], "decoded texture");
+        assert_eq!(details["requested"], 4_096);
+        assert_eq!(details["unit"], "bytes");
+
+        let execution_error = mark_export_execution_error(ExtractionExecutionError::Allocation {
+            resource: "extraction outcomes",
+            requested: 32,
+            unit: ExtractionAllocationUnit::Bytes,
+        });
+        let (code, details) = report_parts(&execution_error);
+        let details = details.expect("typed execution allocation details");
+        assert_eq!(code, "CLI_EXPORT_RESOURCE_LIMIT");
+        assert_eq!(details["kind"], "allocation_failed");
+        assert_eq!(details["resource"], "extraction outcomes");
+        assert_eq!(details["requested"], 32);
+        assert_eq!(details["unit"], "bytes");
+    }
+
+    #[test]
+    fn recovery_installation_mismatch_preserves_all_digest_evidence() {
+        let base = unity_asset::workspace::WorkspaceInstallationDigest::new(
+            unity_asset::DigestV1::hash_bytes(b"base"),
+        );
+        let committed = unity_asset::workspace::WorkspaceInstallationDigest::new(
+            unity_asset::DigestV1::hash_bytes(b"committed"),
+        );
+        let actual = unity_asset::workspace::WorkspaceInstallationDigest::new(
+            unity_asset::DigestV1::hash_bytes(b"actual"),
+        );
+
+        let details =
+            recovery_blocked_reason_details(&RecoveryBlockedReason::InstallationUnavailable {
+                base,
+                committed,
+                actual,
+            });
+
+        assert_eq!(details["kind"], "installation_unavailable");
+        assert_eq!(details["base_installation"], json!(base));
+        assert_eq!(details["committed_installation"], json!(committed));
+        assert_eq!(details["actual_installation"], json!(actual));
     }
 
     #[test]

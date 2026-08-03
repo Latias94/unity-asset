@@ -1,10 +1,13 @@
-use unity_asset_core::{AssetLoadBudget, UnityValue, class_ids, class_names};
+use unity_asset_core::{AssetLoadBudget, class_ids, class_names};
+use unity_asset_decode::media::{
+    AudioClipResourceField, classify_audio_clip_resource as classify_audio_clip_resource_fields,
+};
 
 use crate::workspace::{GenericMutation, PlanPayload};
 
 use super::recipe::{
     RecipeError, RecipeId, RecipeLowering, RecipeObject, RecipeOutputBuilder, SchemaRecipePlanner,
-    SchemaVariantId, validate_recipe_provenance, value_kind,
+    SchemaVariantId, validate_recipe_provenance,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -26,30 +29,9 @@ impl AudioClipResourceRecipe {
             });
         }
 
-        let resource = classify_resource_field(
-            audio_clip,
-            "m_Resource",
-            ResourceShape::Resource,
-            &mut output,
-        )?;
-        let stream_data = classify_resource_field(
-            audio_clip,
-            "m_StreamData",
-            ResourceShape::StreamData,
-            &mut output,
-        )?;
-        let (field_name, schema_variant) = match (resource, stream_data) {
-            (Candidate::Valid, _) => ("m_Resource", SchemaVariantId::AudioClipResource),
-            (Candidate::Absent, Candidate::Valid) => (
-                "m_StreamData",
-                SchemaVariantId::AudioClipStreamDataCompatibility,
-            ),
-            (Candidate::Absent, Candidate::Absent) => {
-                return Err(RecipeError::UnsupportedSchema {
-                    variant: "AudioClip without m_Resource or compatibility m_StreamData",
-                });
-            }
-        };
+        let selection = classify_audio_clip_resource(audio_clip)?;
+        let field_name = selection.field_name();
+        let schema_variant = selection.schema_variant();
         if schema_variant == SchemaVariantId::AudioClipStreamDataCompatibility
             && payload.bytes().len() > u32::MAX as usize
         {
@@ -79,16 +61,36 @@ impl AudioClipResourceRecipe {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ResourceShape {
-    Resource,
-    StreamData,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AudioClipResourceSelection {
+    field: AudioClipResourceField,
 }
 
-#[derive(Clone, Copy)]
-enum Candidate {
-    Absent,
-    Valid,
+impl AudioClipResourceSelection {
+    pub(crate) const fn field_name(self) -> &'static str {
+        self.field.field_name()
+    }
+
+    pub(crate) const fn schema_variant(self) -> SchemaVariantId {
+        match self.field {
+            AudioClipResourceField::Resource => SchemaVariantId::AudioClipResource,
+            AudioClipResourceField::StreamData => SchemaVariantId::AudioClipStreamDataCompatibility,
+        }
+    }
+}
+
+pub(crate) fn classify_audio_clip_resource(
+    audio_clip: &RecipeObject,
+) -> Result<AudioClipResourceSelection, RecipeError> {
+    match classify_audio_clip_resource_fields(audio_clip.class().properties()) {
+        Ok(Some(selection)) => Ok(AudioClipResourceSelection {
+            field: selection.field(),
+        }),
+        Ok(None) => Err(RecipeError::UnsupportedSchema {
+            variant: "AudioClip without m_Resource or compatibility m_StreamData",
+        }),
+        Err(source) => Err(RecipeError::InvalidMediaDescriptor { source }),
+    }
 }
 
 fn validate_audio_clip(
@@ -105,44 +107,4 @@ fn validate_audio_clip(
         });
     }
     validate_recipe_provenance(audio_clip)
-}
-
-fn classify_resource_field(
-    audio_clip: &RecipeObject,
-    field_name: &'static str,
-    shape: ResourceShape,
-    output: &mut RecipeOutputBuilder<'_>,
-) -> Result<Candidate, RecipeError> {
-    let path = output.field_path(&[field_name])?;
-    let Some(value) = audio_clip.field(&path) else {
-        return Ok(Candidate::Absent);
-    };
-    let Some(fields) = value.as_object() else {
-        return Err(RecipeError::WrongFieldShape {
-            path,
-            expected: "a streamed-resource object",
-            actual: value_kind(value),
-        });
-    };
-    let (source_name, offset_name, size_name) = match shape {
-        ResourceShape::Resource => ("m_Source", "m_Offset", "m_Size"),
-        ResourceShape::StreamData => ("path", "offset", "size"),
-    };
-    let source_valid = matches!(fields.get(source_name), Some(UnityValue::String(_)));
-    let offset_valid = fields
-        .get(offset_name)
-        .and_then(UnityValue::as_u64)
-        .is_some();
-    let size_valid = fields.get(size_name).and_then(UnityValue::as_u64).is_some();
-    if !source_valid || !offset_valid || !size_valid {
-        return Err(RecipeError::WrongFieldShape {
-            path,
-            expected: match shape {
-                ResourceShape::Resource => "m_Source:string, m_Offset:unsigned, m_Size:unsigned",
-                ResourceShape::StreamData => "path:string, offset:unsigned, size:unsigned",
-            },
-            actual: value_kind(value),
-        });
-    }
-    Ok(Candidate::Valid)
 }

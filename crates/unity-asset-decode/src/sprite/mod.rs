@@ -1,14 +1,12 @@
-//! Unity Sprite parsing, rendering, and caller-owned encoding.
-//!
-//! `SpriteParser` reads Sprite metadata. `SpriteProcessor` adds explicit
-//! texture decoding, atlas processing, and PNG writing without taking
-//! ownership of filesystem paths.
+//! Strict Unity Sprite inspection, rendering, and caller-owned encoding.
 
-pub mod parser;
+mod inspection;
+mod prepared;
 pub mod processor;
 pub mod types;
 
-pub use parser::{SpriteParser, SpriteTextureReference};
+pub use inspection::{SpriteLayout, SpritePixelRect, SpriteTextureReference};
+pub use prepared::{PreparedSpritePng, SpritePreparationError};
 pub use processor::{DecodedSpriteTexture, SpriteProcessor};
 pub use types::{
     Sprite, SpriteBorder, SpriteOffset, SpritePivot, SpriteRect, SpriteRenderData, SpriteSettings,

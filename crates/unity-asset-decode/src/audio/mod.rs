@@ -17,7 +17,7 @@
 //! ```rust,no_run
 //! use std::io::Cursor;
 //! use unity_asset_decode::audio::{AudioClipConverter, AudioDecoder, AudioExporter};
-//! use unity_asset_decode::unity_version::UnityVersion;
+//! use unity_asset_binary::unity_version::UnityVersion;
 //!
 //! // Create a converter for the version observed in the serialized source.
 //! let version = UnityVersion::parse_version("2020.3.12f1")?;
@@ -40,15 +40,17 @@ pub mod decoder;
 pub mod export;
 pub mod formats;
 mod fsb5;
+mod inspection;
 mod ogg;
 pub mod types;
 
 // Re-export main types for easy access
-pub use converter::{AudioClipConverter, AudioClipLayout};
+pub use converter::AudioClipConverter;
 pub use decoder::AudioDecoder;
 pub use export::{AudioExporter, AudioSourceError, PreparedAudioSource};
 pub use formats::{AudioCompressionFormat, AudioFormatInfo, FMODSoundType};
 pub use fsb5::MAX_VORBIS_SETUP_PACKET_BYTES;
+pub use inspection::AudioClipLayout;
 pub use types::{
     AudioAnalysis, AudioClip, AudioClipMeta, AudioInfo, AudioProperties, DecodedAudio,
     StreamingInfo,
@@ -65,7 +67,7 @@ pub struct AudioProcessor {
 
 impl AudioProcessor {
     /// Create a new audio processor
-    pub fn new(version: crate::unity_version::UnityVersion) -> Self {
+    pub fn new(version: unity_asset_binary::unity_version::UnityVersion) -> Self {
         Self {
             converter: AudioClipConverter::new(version),
             decoder: AudioDecoder::new(),
@@ -75,22 +77,22 @@ impl AudioProcessor {
     /// Process Unity object to AudioClip
     pub fn convert_object(
         &self,
-        obj: &crate::object::UnityObject,
-    ) -> crate::error::Result<AudioClip> {
+        obj: &unity_asset_binary::object::UnityObject,
+    ) -> unity_asset_binary::Result<AudioClip> {
         self.converter.from_unity_object(obj)
     }
 
     /// Decode audio clip to PCM data
-    pub fn decode_audio(&self, clip: &AudioClip) -> crate::error::Result<DecodedAudio> {
+    pub fn decode_audio(&self, clip: &AudioClip) -> unity_asset_binary::Result<DecodedAudio> {
         self.decoder.decode(clip)
     }
 
     /// Convert and decode an object, then write WAV bytes to a caller-owned sink.
     pub fn process_and_write_wav<W: std::io::Write + ?Sized>(
         &self,
-        obj: &crate::object::UnityObject,
+        obj: &unity_asset_binary::object::UnityObject,
         writer: &mut W,
-    ) -> crate::error::Result<()> {
+    ) -> unity_asset_binary::Result<()> {
         let audio_clip = self.convert_object(obj)?;
         let decoded_audio = self.decode_audio(&audio_clip)?;
         AudioExporter::write_wav(&decoded_audio, writer)
@@ -130,7 +132,7 @@ pub fn get_supported_formats() -> Vec<AudioCompressionFormat> {
 pub fn decode_audio_data(
     format: AudioCompressionFormat,
     data: Vec<u8>,
-) -> crate::error::Result<DecodedAudio> {
+) -> unity_asset_binary::Result<DecodedAudio> {
     let audio_clip = AudioClip {
         name: "decoded_audio".to_string(),
         meta: types::AudioClipMeta::Modern {
@@ -167,7 +169,8 @@ mod tests {
 
     #[test]
     fn test_processor_creation() {
-        let version = crate::unity_version::UnityVersion::parse_version("2020.3.12f1").unwrap();
+        let version =
+            unity_asset_binary::unity_version::UnityVersion::parse_version("2020.3.12f1").unwrap();
         let processor = AudioProcessor::new(version);
         // Basic test - processor should be created successfully
         assert!(

@@ -729,3 +729,21 @@ fn streamed_resource_request_json_rejects_trailing_document() {
         Err(BudgetedJsonError::Json(_))
     ));
 }
+
+#[test]
+fn streamed_resource_request_rejects_empty_identity_and_zero_ranges() {
+    let owner = SourceLocator::path("scene.assets").unwrap();
+
+    assert_eq!(
+        StreamedResourceRequest::new(owner.clone(), "   ", 0, 1),
+        Err(unity_asset::workspace::StreamedResourceRequestError::EmptyPath)
+    );
+    assert_eq!(
+        StreamedResourceRequest::new(owner.clone(), "archive:/", 0, 1),
+        Err(unity_asset::workspace::StreamedResourceRequestError::InvalidBasename)
+    );
+    assert_eq!(
+        StreamedResourceRequest::new(owner, "scene.resS", 0, 0),
+        Err(unity_asset::workspace::StreamedResourceRequestError::ZeroSize)
+    );
+}

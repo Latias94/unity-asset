@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::descriptor::UnityTextureEncoding;
+
 /// Unity texture formats
 ///
 /// This enum represents all texture formats supported by Unity.
@@ -256,6 +258,30 @@ impl TextureFormat {
                 has_alpha: true,
                 supported: true,
             },
+            TextureFormat::BC4 => TextureFormatInfo {
+                name: "BC4".to_string(),
+                bits_per_pixel: 4,
+                block_size: (4, 4),
+                compressed: true,
+                has_alpha: false,
+                supported: cfg!(feature = "texture-advanced"),
+            },
+            TextureFormat::BC5 => TextureFormatInfo {
+                name: "BC5".to_string(),
+                bits_per_pixel: 8,
+                block_size: (4, 4),
+                compressed: true,
+                has_alpha: false,
+                supported: cfg!(feature = "texture-advanced"),
+            },
+            TextureFormat::BC7 => TextureFormatInfo {
+                name: "BC7".to_string(),
+                bits_per_pixel: 8,
+                block_size: (4, 4),
+                compressed: true,
+                has_alpha: true,
+                supported: cfg!(feature = "texture-advanced"),
+            },
             TextureFormat::ETC2_RGB => TextureFormatInfo {
                 name: "ETC2_RGB".to_string(),
                 bits_per_pixel: 4,
@@ -305,27 +331,65 @@ impl TextureFormat {
         self.info().supported
     }
 
-    /// Get expected data size for given dimensions
+    /// Get expected base-level data size for given dimensions.
     pub fn calculate_data_size(&self, width: u32, height: u32) -> u32 {
-        let info = self.info();
-        if info.compressed {
-            let blocks_x = width.div_ceil(info.block_size.0);
-            let blocks_y = height.div_ceil(info.block_size.1);
-            // For compressed formats, calculate bytes per block
-            let bytes_per_block = match self {
-                TextureFormat::DXT1 => 8,
-                TextureFormat::DXT5 => 16,
-                TextureFormat::BC7 => 16,
-                TextureFormat::ETC2_RGB => 8,
-                TextureFormat::ETC2_RGBA8 => 16,
-                TextureFormat::ASTC_RGBA_4x4
-                | TextureFormat::ASTC_RGBA_6x6
-                | TextureFormat::ASTC_RGBA_8x8 => 16,
-                _ => info.bits_per_pixel / 8,
-            };
-            blocks_x * blocks_y * bytes_per_block
-        } else {
-            width * height * (info.bits_per_pixel / 8)
+        self.checked_data_size(width, height)
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .unwrap_or(0)
+    }
+
+    /// Returns the exact base-level payload size for formats with a strict decoder.
+    pub fn checked_data_size(&self, width: u32, height: u32) -> Option<u64> {
+        let (block_width, block_height, bytes_per_block) = match self {
+            Self::Alpha8 => (1, 1, 1),
+            Self::RGB24 => (1, 1, 3),
+            Self::RGBA32 | Self::ARGB32 | Self::BGRA32 => (1, 1, 4),
+            Self::RGBA4444 | Self::ARGB4444 | Self::RGB565 => (1, 1, 2),
+            Self::DXT1 | Self::BC4 | Self::ETC2_RGB => (4, 4, 8),
+            Self::DXT5 | Self::BC5 | Self::BC7 | Self::ETC2_RGBA8 => (4, 4, 16),
+            Self::ASTC_RGBA_4x4 => (4, 4, 16),
+            Self::ASTC_RGBA_6x6 => (6, 6, 16),
+            Self::ASTC_RGBA_8x8 => (8, 8, 16),
+            _ => return None,
+        };
+        let blocks_x = u64::from(width.div_ceil(block_width));
+        let blocks_y = u64::from(height.div_ceil(block_height));
+        blocks_x.checked_mul(blocks_y)?.checked_mul(bytes_per_block)
+    }
+
+    /// Maps formats with a strict decoder into the stable media descriptor domain.
+    #[must_use]
+    pub const fn descriptor_encoding(self) -> Option<UnityTextureEncoding> {
+        match self {
+            Self::Alpha8 => Some(UnityTextureEncoding::Alpha8),
+            Self::ARGB4444 => Some(UnityTextureEncoding::Argb4444),
+            Self::RGB24 => Some(UnityTextureEncoding::Rgb24),
+            Self::RGBA32 => Some(UnityTextureEncoding::Rgba32),
+            Self::ARGB32 => Some(UnityTextureEncoding::Argb32),
+            Self::RGB565 => Some(UnityTextureEncoding::Rgb565),
+            #[cfg(feature = "texture-advanced")]
+            Self::DXT1 => Some(UnityTextureEncoding::Dxt1),
+            #[cfg(feature = "texture-advanced")]
+            Self::DXT5 => Some(UnityTextureEncoding::Dxt5),
+            Self::RGBA4444 => Some(UnityTextureEncoding::Rgba4444),
+            Self::BGRA32 => Some(UnityTextureEncoding::Bgra32),
+            #[cfg(feature = "texture-advanced")]
+            Self::BC4 => Some(UnityTextureEncoding::Bc4),
+            #[cfg(feature = "texture-advanced")]
+            Self::BC5 => Some(UnityTextureEncoding::Bc5),
+            #[cfg(feature = "texture-advanced")]
+            Self::BC7 => Some(UnityTextureEncoding::Bc7),
+            #[cfg(feature = "texture-advanced")]
+            Self::ETC2_RGB => Some(UnityTextureEncoding::Etc2Rgb),
+            #[cfg(feature = "texture-advanced")]
+            Self::ETC2_RGBA8 => Some(UnityTextureEncoding::Etc2Rgba8),
+            #[cfg(feature = "texture-advanced")]
+            Self::ASTC_RGBA_4x4 => Some(UnityTextureEncoding::AstcRgba4x4),
+            #[cfg(feature = "texture-advanced")]
+            Self::ASTC_RGBA_6x6 => Some(UnityTextureEncoding::AstcRgba6x6),
+            #[cfg(feature = "texture-advanced")]
+            Self::ASTC_RGBA_8x8 => Some(UnityTextureEncoding::AstcRgba8x8),
+            _ => None,
         }
     }
 

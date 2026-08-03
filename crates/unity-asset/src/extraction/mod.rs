@@ -6,11 +6,13 @@ use unity_asset_core::BudgetError;
 
 mod artifact;
 mod container;
+mod contract;
 mod executor;
 mod json_contract;
 mod manifest;
 mod model;
-mod reservation;
+mod planning_contract;
+mod representation;
 mod selection;
 #[cfg(all(test, feature = "decode"))]
 mod test_probe;
@@ -70,6 +72,11 @@ pub use container::{
     BundleContainerContractError, BundleContainerOccurrence, BundleContainerQuery,
     BundleContainerRawTarget, BundleContainerResolution, BundleContainerResult,
 };
+pub use contract::{
+    ExtractionAllocationUnit, ExtractionArtifactKind, ExtractionDiagnostic,
+    ExtractionDiagnosticCode, ExtractionPath, ExtractionRepresentationPolicy,
+    ExtractionSourceExpectation,
+};
 pub use executor::{
     ExistingOutputPolicy, ExtractionExecutionError, ExtractionExecutionLimits,
     ExtractionExecutionOptions, ExtractionExecutor, ExtractionFailurePolicy, ExtractionRunOptions,
@@ -82,12 +89,13 @@ pub use manifest::{
 pub use model::{
     EXTRACTION_MANIFEST_VERSION, EXTRACTION_PLAN_CONTRACT, EXTRACTION_PLAN_VERSION,
     EXTRACTION_REPORT_VERSION, EXTRACTION_REQUEST_CONTRACT, EXTRACTION_REQUEST_VERSION,
-    ExtractionArtifactKind, ExtractionDiagnostic, ExtractionDiagnosticCode, ExtractionFilter,
-    ExtractionModelError, ExtractionPath, ExtractionPlan, ExtractionRepresentationPolicy,
-    ExtractionRequest, ExtractionSelection, ExtractionSourceExpectation, ExtractionSourceRange,
+    ExtractionFilter, ExtractionModelError, ExtractionPlan, ExtractionRequest, ExtractionSelection,
     PlannedArtifact,
 };
-pub use selection::{ExtractionPlanError, ExtractionPlanner};
+pub use planning_contract::ExtractionPlanError;
+pub use selection::ExtractionPlanner;
+#[cfg(feature = "decode")]
+pub use unity_asset_decode::media::MediaInspectionError;
 pub use yaml_split::{
     YAML_SPLIT_REPORT_CONTRACT, YAML_SPLIT_REPORT_VERSION, YamlSplitArtifact, YamlSplitError,
     YamlSplitExecutor, YamlSplitPlan, YamlSplitPlanner, YamlSplitReport,

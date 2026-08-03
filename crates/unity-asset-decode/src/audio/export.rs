@@ -4,49 +4,55 @@
 
 use super::formats::AudioCompressionFormat;
 use super::fsb5::{self, Fsb5Error, PreparedVorbisOgg};
-use super::ogg::is_ogg_vorbis;
+use super::inspection::AudioClipLayout;
+use super::ogg::final_ogg_granule;
 use super::types::{AudioClip, DecodedAudio};
-use crate::error::{BinaryError, Result};
+use crate::descriptor::{
+    MediaDescriptor, MediaDescriptorError, MediaOutputEstimate, PreparedAudioSourceKind,
+};
+use crate::media::BudgetedMediaBytes;
+use std::collections::TryReserveError;
 use std::io::{self, Write};
 use std::mem::size_of;
 use thiserror::Error;
-use unity_asset_core::{AssetLoadBudget, BudgetError, DigestV1};
+use unity_asset_binary::{BinaryError, Result};
+use unity_asset_core::{AssetLoadBudget, BudgetError};
 
-/// A validated standard audio artifact tied to the exact source bytes used at
-/// preparation time.
+/// A validated standard audio artifact that owns its exact output bytes.
 pub struct PreparedAudioSource {
-    source_length: u64,
-    source_digest: DigestV1,
-    encoding: PreparedAudioEncoding,
+    output: PreparedAudioOutput,
+    descriptor: MediaDescriptor,
 }
 
-enum PreparedAudioEncoding {
-    Passthrough,
-    Fsb5Vorbis(PreparedVorbisOgg),
+enum PreparedAudioOutput {
+    Source(BudgetedMediaBytes),
+    RebuiltOgg(PreparedVorbisOgg),
+}
+
+impl PreparedAudioOutput {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Source(source) => source.as_bytes(),
+            Self::RebuiltOgg(output) => output.as_bytes(),
+        }
+    }
 }
 
 impl PreparedAudioSource {
+    #[must_use]
+    pub const fn descriptor(&self) -> &MediaDescriptor {
+        &self.descriptor
+    }
+
     /// Write the prepared artifact without reparsing or allocating from
     /// attacker-controlled source metadata.
     pub fn write_to<W: Write + ?Sized>(
         &self,
-        bytes: &[u8],
         writer: &mut W,
     ) -> std::result::Result<(), AudioSourceError> {
-        let source_length = u64::try_from(bytes.len())
-            .map_err(|_| AudioSourceError::InvalidData("audio source length exceeds u64".into()))?;
-        if source_length != self.source_length || DigestV1::hash_bytes(bytes) != self.source_digest
-        {
-            return Err(AudioSourceError::SourceChanged);
-        }
-        match &self.encoding {
-            PreparedAudioEncoding::Passthrough => {
-                writer.write_all(bytes).map_err(AudioSourceError::Output)
-            }
-            PreparedAudioEncoding::Fsb5Vorbis(prepared) => prepared
-                .write_to(bytes, writer)
-                .map_err(AudioSourceError::from_fsb5),
-        }
+        writer
+            .write_all(self.output.as_bytes())
+            .map_err(AudioSourceError::Output)
     }
 }
 
@@ -57,10 +63,24 @@ pub enum AudioSourceError {
     InvalidData(String),
     #[error("audio compression format {0:?} has no validated standard-container export")]
     UnsupportedFormat(AudioCompressionFormat),
-    #[error("audio source bytes changed after preparation")]
-    SourceChanged,
+    #[error(
+        "{format:?} source container {container} has no caller-budgeted strict validation path"
+    )]
+    UnsupportedContainer {
+        format: AudioCompressionFormat,
+        container: &'static str,
+    },
     #[error(transparent)]
     Budget(#[from] BudgetError),
+    #[error(transparent)]
+    Descriptor(#[from] MediaDescriptorError),
+    #[error("failed to allocate {resource} ({requested} bytes): {source}")]
+    Allocation {
+        resource: &'static str,
+        requested: usize,
+        #[source]
+        source: TryReserveError,
+    },
     #[error("failed to write audio output: {0}")]
     Output(#[source] io::Error),
 }
@@ -70,6 +90,15 @@ impl AudioSourceError {
         match error {
             Fsb5Error::Budget(error) => Self::Budget(error),
             Fsb5Error::Output(error) => Self::Output(error),
+            Fsb5Error::Allocation {
+                resource,
+                requested,
+                source,
+            } => Self::Allocation {
+                resource,
+                requested,
+                source,
+            },
             error => Self::InvalidData(error.to_string()),
         }
     }
@@ -81,13 +110,56 @@ impl AudioSourceError {
 pub struct AudioExporter;
 
 impl AudioExporter {
+    /// Whether this build has a strict standard-container path for the encoding.
+    #[must_use]
+    pub const fn supports_standard_source(format: AudioCompressionFormat) -> bool {
+        matches!(
+            format,
+            AudioCompressionFormat::PCM
+                | AudioCompressionFormat::Vorbis
+                | AudioCompressionFormat::ADPCM
+                | AudioCompressionFormat::MP3
+                | AudioCompressionFormat::AAC
+        )
+    }
+
+    /// Prepares a strict TypeTree-backed AudioClip layout without materializing
+    /// the legacy owned AudioClip adapter.
+    pub fn prepare_layout(
+        layout: AudioClipLayout<'_>,
+        bytes: BudgetedMediaBytes,
+        budget: &mut AssetLoadBudget,
+    ) -> std::result::Result<PreparedAudioSource, AudioSourceError> {
+        Self::prepare_source(
+            layout.compression_format(),
+            layout.subsound_index(),
+            bytes,
+            budget,
+        )
+    }
+
     /// Validate a Unity audio payload and prepare a deterministic standard
     /// container export under the caller's load budget.
     pub fn prepare_standard_source(
         clip: &AudioClip,
-        bytes: &[u8],
+        bytes: BudgetedMediaBytes,
         budget: &mut AssetLoadBudget,
     ) -> std::result::Result<PreparedAudioSource, AudioSourceError> {
+        Self::prepare_source(
+            clip.compression_format(),
+            clip.subsound_index(),
+            bytes,
+            budget,
+        )
+    }
+
+    fn prepare_source(
+        compression_format: AudioCompressionFormat,
+        subsound_index: i32,
+        bytes: BudgetedMediaBytes,
+        budget: &mut AssetLoadBudget,
+    ) -> std::result::Result<PreparedAudioSource, AudioSourceError> {
+        bytes.validate_budget(budget)?;
         if bytes.is_empty() {
             return Err(AudioSourceError::InvalidData(
                 "audio source data is empty".into(),
@@ -95,21 +167,33 @@ impl AudioExporter {
         }
         let source_length = u64::try_from(bytes.len())
             .map_err(|_| AudioSourceError::InvalidData("audio source length exceeds u64".into()))?;
-        budget.consume_bytes(source_length)?;
+        let source = bytes.as_bytes();
 
-        let encoding = match clip.compression_format() {
-            AudioCompressionFormat::Vorbis if is_ogg_vorbis(bytes) => {
-                PreparedAudioEncoding::Passthrough
+        let (source_kind, rebuilt_ogg) = match compression_format {
+            AudioCompressionFormat::Vorbis if source.starts_with(b"OggS") => {
+                if final_ogg_granule(source).is_none() {
+                    return Err(AudioSourceError::InvalidData(
+                        "Ogg source has invalid framing, continuation, sequence, checksum, or EOS"
+                            .into(),
+                    ));
+                }
+                return Err(AudioSourceError::UnsupportedContainer {
+                    format: AudioCompressionFormat::Vorbis,
+                    container: "Ogg Vorbis",
+                });
             }
-            AudioCompressionFormat::Vorbis if fsb5::is_fsb5(bytes) => {
-                let subsound_index = usize::try_from(clip.subsound_index()).map_err(|_| {
+            AudioCompressionFormat::Vorbis if fsb5::is_fsb5(source) => {
+                let subsound_index = usize::try_from(subsound_index).map_err(|_| {
                     AudioSourceError::InvalidData(
                         "AudioClip subsound index cannot be negative".into(),
                     )
                 })?;
-                PreparedAudioEncoding::Fsb5Vorbis(
-                    PreparedVorbisOgg::prepare(bytes, subsound_index, budget)
-                        .map_err(AudioSourceError::from_fsb5)?,
+                (
+                    PreparedAudioSourceKind::Fsb5Vorbis,
+                    Some(
+                        PreparedVorbisOgg::prepare(source, subsound_index, budget)
+                            .map_err(AudioSourceError::from_fsb5)?,
+                    ),
                 )
             }
             AudioCompressionFormat::Vorbis => {
@@ -118,20 +202,47 @@ impl AudioExporter {
                 ));
             }
             format @ (AudioCompressionFormat::PCM | AudioCompressionFormat::ADPCM)
-                if is_wave(bytes, format) =>
+                if is_wave(source, format) =>
             {
-                PreparedAudioEncoding::Passthrough
+                (
+                    if format == AudioCompressionFormat::PCM {
+                        PreparedAudioSourceKind::WavePcm
+                    } else {
+                        PreparedAudioSourceKind::WaveAdpcm
+                    },
+                    None,
+                )
             }
-            AudioCompressionFormat::MP3 if is_mp3(bytes) => PreparedAudioEncoding::Passthrough,
-            AudioCompressionFormat::AAC if is_adts_aac(bytes) => PreparedAudioEncoding::Passthrough,
+            AudioCompressionFormat::MP3 if is_mp3(source) => (PreparedAudioSourceKind::Mp3, None),
+            AudioCompressionFormat::AAC if is_adts_aac(source) => {
+                (PreparedAudioSourceKind::AdtsAac, None)
+            }
+            format if Self::supports_standard_source(format) => {
+                return Err(AudioSourceError::InvalidData(
+                    "audio bytes do not match the container declared by the AudioClip encoding"
+                        .into(),
+                ));
+            }
             format => return Err(AudioSourceError::UnsupportedFormat(format)),
         };
 
-        Ok(PreparedAudioSource {
+        let output_length = match &rebuilt_ogg {
+            Some(output) => u64::try_from(output.as_bytes().len()).map_err(|_| {
+                AudioSourceError::InvalidData("rebuilt Ogg length exceeds u64".into())
+            })?,
+            None => source_length,
+        };
+        let descriptor = MediaDescriptor::audio(
+            source_kind,
             source_length,
-            source_digest: DigestV1::hash_bytes(bytes),
-            encoding,
-        })
+            MediaOutputEstimate::exact(output_length)?,
+        )?;
+
+        let output = rebuilt_ogg.map_or_else(
+            || PreparedAudioOutput::Source(bytes),
+            PreparedAudioOutput::RebuiltOgg,
+        );
+        Ok(PreparedAudioSource { output, descriptor })
     }
 
     /// Write a standard playable container from an AudioClip payload.
@@ -142,11 +253,11 @@ impl AudioExporter {
     /// `.ogg` extension.
     pub fn write_standard_source<W: Write + ?Sized>(
         clip: &AudioClip,
-        bytes: &[u8],
+        bytes: BudgetedMediaBytes,
         writer: &mut W,
         budget: &mut AssetLoadBudget,
     ) -> std::result::Result<(), AudioSourceError> {
-        Self::prepare_standard_source(clip, bytes, budget)?.write_to(bytes, writer)
+        Self::prepare_standard_source(clip, bytes, budget)?.write_to(writer)
     }
 
     /// Write WAV bytes to a caller-owned sink.
@@ -647,4 +758,138 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
         bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unity_asset_core::AssetLoadLimits;
+
+    const SHORT_VORBIS: &[u8] = include_bytes!("../../tests/fixtures/short_vorbis.fsb");
+
+    fn minimal_mp3() -> Vec<u8> {
+        let mut bytes = vec![0_u8; 417];
+        bytes[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
+        bytes
+    }
+
+    fn prepare_short_vorbis(
+        budget: &mut AssetLoadBudget,
+    ) -> std::result::Result<PreparedAudioSource, AudioSourceError> {
+        let clip = AudioClip::new("short".to_owned(), AudioCompressionFormat::Vorbis);
+        let source =
+            BudgetedMediaBytes::from_vec(SHORT_VORBIS.to_vec(), "test FSB5 source", budget)?;
+        AudioExporter::prepare_standard_source(&clip, source, budget)
+    }
+
+    #[test]
+    fn audio_preparation_reuses_the_budgeted_source_allocation() {
+        let clip = AudioClip::new("budgeted".to_owned(), AudioCompressionFormat::MP3);
+        let mut budget = AssetLoadBudget::default();
+        let source =
+            BudgetedMediaBytes::from_vec(minimal_mp3(), "test audio source", &mut budget).unwrap();
+        let source_charge = budget.usage().bytes;
+
+        let prepared = AudioExporter::prepare_standard_source(&clip, source, &mut budget).unwrap();
+
+        assert_eq!(budget.usage().bytes, source_charge);
+        let mut output = Vec::new();
+        prepared.write_to(&mut output).unwrap();
+        assert_eq!(output.len(), 417);
+    }
+
+    #[test]
+    fn audio_preparation_rejects_a_different_budget_domain() {
+        let clip = AudioClip::new("budgeted".to_owned(), AudioCompressionFormat::MP3);
+        let mut owner = AssetLoadBudget::default();
+        let source =
+            BudgetedMediaBytes::from_vec(minimal_mp3(), "test audio source", &mut owner).unwrap();
+        let mut other = AssetLoadBudget::default();
+
+        let Err(error) = AudioExporter::prepare_standard_source(&clip, source, &mut other) else {
+            panic!("a different budget domain must not consume media bytes");
+        };
+        assert!(matches!(
+            error,
+            AudioSourceError::Budget(BudgetError::DomainMismatch {
+                resource: "test audio source"
+            })
+        ));
+    }
+
+    #[test]
+    fn fsb5_preparation_obeys_exact_caller_budget() {
+        let mut measured = AssetLoadBudget::default();
+        let prepared = prepare_short_vorbis(&mut measured).unwrap();
+        let exact_bytes = measured.usage().bytes;
+        assert!(exact_bytes > u64::try_from(SHORT_VORBIS.len()).unwrap());
+        assert!(prepared.output.as_bytes().starts_with(b"OggS"));
+
+        let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: exact_bytes,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(prepare_short_vorbis(&mut exact).is_ok());
+        assert_eq!(exact.usage().bytes, exact_bytes);
+
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: exact_bytes - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            prepare_short_vorbis(&mut one_short),
+            Err(AudioSourceError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn prepared_multi_page_fsb5_output_is_immutable_across_writes() {
+        #[derive(Default)]
+        struct CountingWriter {
+            calls: usize,
+            bytes: usize,
+        }
+
+        impl Write for CountingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                self.bytes = self
+                    .bytes
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| io::Error::other("test byte count overflow"))?;
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut budget = AssetLoadBudget::default();
+        let prepared = prepare_short_vorbis(&mut budget).unwrap();
+        let output = prepared.output.as_bytes();
+        let output_pointer = output.as_ptr();
+        let output_len = output.len();
+        let page_count = output
+            .windows(4)
+            .filter(|window| *window == b"OggS")
+            .count();
+        assert!(
+            page_count > 1,
+            "fixture must exercise multi-page Ogg output"
+        );
+
+        let mut writer = CountingWriter::default();
+        prepared.write_to(&mut writer).unwrap();
+        prepared.write_to(&mut writer).unwrap();
+
+        assert_eq!(writer.calls, 2);
+        assert_eq!(writer.bytes, output_len * 2);
+        assert_eq!(prepared.output.as_bytes().as_ptr(), output_pointer);
+    }
 }

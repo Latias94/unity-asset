@@ -11,10 +11,13 @@ use unity_asset_core::{
 };
 
 use super::CheckedByteCounter;
+use super::contract::{
+    ExtractionArtifactKind, ExtractionDiagnostic, ExtractionDiagnosticCode, ExtractionPath,
+    ExtractionSourceExpectation,
+};
 use super::json_contract::{large_contract_limits, read_json_bounded};
 use super::model::{
-    ExtractionArtifactKind, ExtractionModelError, ExtractionPath, ExtractionPlan,
-    ExtractionRequest, ExtractionSourceExpectation, PlannedArtifact, first_path_conflict,
+    ExtractionModelError, ExtractionPlan, ExtractionRequest, PlannedArtifact, first_path_conflict,
     normalize_source_expectations, normalize_values,
 };
 
@@ -27,52 +30,6 @@ const EXTRACTION_MANIFEST_JSON_LIMITS: unity_asset_core::ContractJsonLimits =
     large_contract_limits(EXTRACTION_MANIFEST_CONTRACT);
 const EXTRACTION_REPORT_JSON_LIMITS: unity_asset_core::ContractJsonLimits =
     large_contract_limits(EXTRACTION_REPORT_CONTRACT);
-
-/// Stable, machine-actionable extraction diagnostic categories.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExtractionDiagnosticCode {
-    DecodedUnavailable,
-    FeatureUnavailable,
-    UnsupportedClass,
-    DecodeFailedRawFallback,
-    MissingResource,
-    ResourceOutOfRange,
-    UnresolvedDependency,
-    UnresolvedSpritePPtr,
-    SourceChanged,
-    OutputExists,
-    OutputFailed,
-    OutputLimitExceeded,
-    ResumeMismatch,
-    StoppedAfterFailure,
-}
-
-/// A deterministic diagnostic that never persists operating-system error text.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExtractionDiagnostic {
-    code: ExtractionDiagnosticCode,
-    address: Option<ObjectAddress>,
-}
-
-impl ExtractionDiagnostic {
-    #[must_use]
-    pub const fn new(code: ExtractionDiagnosticCode, address: Option<ObjectAddress>) -> Self {
-        Self { code, address }
-    }
-
-    #[must_use]
-    pub const fn code(&self) -> ExtractionDiagnosticCode {
-        self.code
-    }
-
-    #[must_use]
-    pub const fn address(&self) -> Option<&ObjectAddress> {
-        self.address.as_ref()
-    }
-}
 
 /// Stable outcome of one planned output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -583,13 +540,14 @@ impl Serialize for ExtractionReport {
     }
 }
 
-const MAXIMUM_DIAGNOSTIC_CODES: [ExtractionDiagnosticCode; 14] = [
+const MAXIMUM_DIAGNOSTIC_CODES: &[ExtractionDiagnosticCode] = &[
     ExtractionDiagnosticCode::DecodedUnavailable,
     ExtractionDiagnosticCode::FeatureUnavailable,
     ExtractionDiagnosticCode::UnsupportedClass,
+    ExtractionDiagnosticCode::UnsupportedMediaEncoding,
+    ExtractionDiagnosticCode::UnsupportedMediaLayout,
     ExtractionDiagnosticCode::DecodeFailedRawFallback,
     ExtractionDiagnosticCode::MissingResource,
-    ExtractionDiagnosticCode::ResourceOutOfRange,
     ExtractionDiagnosticCode::UnresolvedDependency,
     ExtractionDiagnosticCode::UnresolvedSpritePPtr,
     ExtractionDiagnosticCode::SourceChanged,
@@ -781,7 +739,7 @@ impl Serialize for MaximumManifestDiagnostics<'_> {
         }
         for code in MAXIMUM_DIAGNOSTIC_CODES {
             sequence.serialize_element(&MaximumManifestDiagnostic {
-                code,
+                code: *code,
                 address: Some(self.address),
             })?;
         }

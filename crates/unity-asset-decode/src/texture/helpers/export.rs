@@ -2,9 +2,9 @@
 //!
 //! Every encoder writes to storage owned and managed by the caller.
 
-use crate::error::{BinaryError, Result};
 use image::{ExtendedColorType, ImageEncoder, ImageError, RgbaImage};
 use std::io::{Seek, Write};
+use unity_asset_binary::{BinaryError, Result};
 
 /// Texture encoder utility
 ///

@@ -9,9 +9,10 @@ use unity_asset_core::{
     ObjectAddress, SourceLocator, UnityValue, WorkspaceId, WorkspaceRevision,
 };
 
+use super::contract::ExtractionAllocationUnit;
 use super::json_contract::{large_contract_limits, read_json_bounded, small_contract_limits};
 use super::manifest::{ExtractionCanonicalError, canonical_json, write_canonical_json};
-use super::selection::ExtractionPlanError;
+use super::planning_contract::ExtractionPlanError;
 use crate::reference::{RawReferenceTarget, ReferenceFact, ReferenceGraph, ReferenceResolution};
 use crate::workspace::{WorkspaceObject, WorkspaceObjectValue, WorkspaceView};
 
@@ -675,10 +676,13 @@ fn clone_string(
         .map_err(|source| ExtractionPlanError::Allocation {
             resource,
             requested: value.len(),
+            unit: ExtractionAllocationUnit::Bytes,
             source,
         })?;
+    let retained = usize_to_u64(cloned.capacity(), resource)?;
+    budget.check_bytes(retained)?;
     cloned.push_str(value);
-    budget.consume_bytes(bytes)?;
+    budget.consume_bytes(retained)?;
     Ok(cloned)
 }
 
@@ -698,9 +702,16 @@ fn reserve_vec<T>(
         .map_err(|source| ExtractionPlanError::Allocation {
             resource,
             requested: capacity,
+            unit: ExtractionAllocationUnit::CapacityUnits,
             source,
         })?;
-    budget.consume_bytes(bytes)?;
+    let retained = values
+        .capacity()
+        .checked_mul(size_of::<T>())
+        .ok_or(BudgetError::ArithmeticOverflow { resource })?;
+    let retained = usize_to_u64(retained, resource)?;
+    budget.check_bytes(retained)?;
+    budget.consume_bytes(retained)?;
     Ok(values)
 }
 
@@ -716,6 +727,7 @@ fn push_value<T>(
     budget: &mut AssetLoadBudget,
 ) -> Result<(), ExtractionPlanError> {
     if values.len() == values.capacity() {
+        let previous_capacity = values.capacity();
         let additional = values.capacity().max(1);
         let bytes = additional
             .checked_mul(size_of::<T>())
@@ -727,9 +739,19 @@ fn push_value<T>(
             .map_err(|source| ExtractionPlanError::Allocation {
                 resource,
                 requested: additional,
+                unit: ExtractionAllocationUnit::CapacityUnits,
                 source,
             })?;
-        budget.consume_bytes(bytes)?;
+        let retained_capacity = values
+            .capacity()
+            .checked_sub(previous_capacity)
+            .ok_or(BudgetError::ArithmeticOverflow { resource })?;
+        let retained = retained_capacity
+            .checked_mul(size_of::<T>())
+            .ok_or(BudgetError::ArithmeticOverflow { resource })?;
+        let retained = usize_to_u64(retained, resource)?;
+        budget.check_bytes(retained)?;
+        budget.consume_bytes(retained)?;
     }
     values.push(value);
     Ok(())

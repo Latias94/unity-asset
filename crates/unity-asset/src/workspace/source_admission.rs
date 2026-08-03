@@ -733,7 +733,9 @@ fn classify_binary_error(error: &BinaryError) -> SourceAdmissionErrorCategory {
     match error {
         BinaryError::Budget(_) => SourceAdmissionErrorCategory::Budget,
         BinaryError::Io(_) | BinaryError::Timeout(_) => SourceAdmissionErrorCategory::Io,
-        BinaryError::MemoryError(_) => SourceAdmissionErrorCategory::Allocation,
+        BinaryError::MemoryError(_) | BinaryError::Allocation { .. } => {
+            SourceAdmissionErrorCategory::Allocation
+        }
         BinaryError::ResourceLimitExceeded(_) => SourceAdmissionErrorCategory::ResourceLimit,
         BinaryError::UnsupportedVersion(_)
         | BinaryError::UnsupportedCompression(_)

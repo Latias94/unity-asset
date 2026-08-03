@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::path::Path;
-#[cfg(feature = "decode")]
+#[cfg(all(test, feature = "decode"))]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -9,41 +9,28 @@ use std::thread;
 use serde::Serialize;
 use thiserror::Error;
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, DigestV1, ObjectAddress, SourceLocator, UnityValue,
-    vec_allocation_bytes,
-};
-use unity_asset_yaml::UnityYamlSerializer;
-
-#[cfg(feature = "decode")]
-use unity_asset_decode::{
-    audio::{AudioClipConverter, AudioExporter, AudioSourceError, PreparedAudioSource},
-    sprite::{DecodedSpriteTexture, SpriteProcessor},
-    texture::{TextureExporter, TextureProcessor},
+    AssetLoadBudget, BudgetError, DigestV1, SourceLocator, vec_allocation_bytes,
 };
 
 use super::CheckedByteCounter;
 use super::artifact::{ExtractionOutputErrorKind, OutputArtifactError, OutputLayout, StagedOutput};
+use super::contract::{
+    ExtractionAllocationUnit, ExtractionArtifactKind, ExtractionDiagnostic,
+    ExtractionDiagnosticCode, ExtractionPath,
+};
 use super::manifest::{
-    ExtractionArtifactStatus, ExtractionCanonicalError, ExtractionDiagnostic,
-    ExtractionDiagnosticCode, ExtractionManifest, ExtractionManifestArtifact,
-    ExtractionManifestError, ExtractionReport, maximum_extraction_report,
+    ExtractionArtifactStatus, ExtractionCanonicalError, ExtractionManifest,
+    ExtractionManifestArtifact, ExtractionManifestError, ExtractionReport,
+    maximum_extraction_report,
+};
+use super::model::{ExtractionPlan, PlannedArtifact};
+use super::representation::{
+    ExtractionReservationError, PreparedRepresentation, RepresentationPreparationError,
+    RepresentationRuntime, RepresentationRuntimeContext, RepresentationWriteError,
 };
 #[cfg(feature = "decode")]
-use super::model::ExtractionSourceRange;
-use super::model::{
-    ExtractionArtifactKind, ExtractionPath, ExtractionPlan, PlannedArtifact, PlannedContent,
-};
-#[cfg(feature = "decode")]
-use super::reservation::requires_stream_resolution;
-use super::reservation::{ExtractionReservationError, trusted_working_set};
-use super::source_budget_error;
-#[cfg(feature = "decode")]
-use crate::reference::ReferenceGraphError;
-#[cfg(feature = "decode")]
-use crate::workspace::StreamedResourceResolver;
-use crate::workspace::{
-    WorkspaceError, WorkspaceLookup, WorkspaceObject, WorkspaceObjectValue, WorkspaceView,
-};
+use crate::reference::{ReferenceAllocationUnit, ReferenceGraphError};
+use crate::workspace::{WorkspaceError, WorkspaceLookup, WorkspaceView};
 
 /// Policy applied when a non-resumable output already occupies a planned path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,7 +371,14 @@ impl ExtractionExecutor {
         validate_context(view, plan)?;
         validate_sources(view, plan, budget)?;
         validate_resume(plan, resume)?;
-        let working_sets = prove_working_sets(view, plan, options.limits, budget)?;
+        let runtime_context = RepresentationRuntimeContext::load(
+            view,
+            plan.artifacts().iter().map(PlannedArtifact::representation),
+            budget,
+        )?;
+        let representation_runtime = runtime_context.bind(view, budget)?;
+        let working_sets =
+            prove_working_sets(&representation_runtime, plan, options.limits, budget)?;
         let manifest_output_reservation =
             validate_contract_bounds(plan, options.limits, manifest_path.is_some())?;
         let artifact_output_limit = options
@@ -482,11 +476,11 @@ impl ExtractionExecutor {
             debug_assert!(batch.open_files <= options.limits.max_open_files);
             let remaining_output = publication.remaining_output();
             let results = execute_pending_batch(
-                view,
                 plan,
                 &layout,
                 options,
                 budget,
+                &representation_runtime,
                 &pending[pending_cursor..batch_end],
                 remaining_output,
                 &self.observer,
@@ -565,16 +559,10 @@ pub enum ExtractionExecutionError {
     },
     #[error("artifact {ordinal} no longer matches its persisted working-set proof")]
     WorkingSetProofFailed { ordinal: u32 },
-    #[error(
-        "artifact {ordinal} streamed range {offset}..{end} exceeds source {locator:?} length {source_len}"
-    )]
-    StreamOutOfRange {
-        ordinal: u32,
-        locator: SourceLocator,
-        offset: u64,
-        end: u64,
-        source_len: u64,
-    },
+    #[error("artifact {ordinal} prepared media descriptor no longer matches its extraction plan")]
+    MediaDescriptorChanged { ordinal: u32 },
+    #[error("artifact {ordinal} media can no longer be prepared from its validated source")]
+    MediaPreparationFailed { ordinal: u32 },
     #[error("canonical extraction report requires at most {required} bytes, limit is {limit}")]
     ReportLimitExceeded { required: u64, limit: u64 },
     #[error(
@@ -588,10 +576,11 @@ pub enum ExtractionExecutionError {
     },
     #[error("resume manifest does not describe this exact extraction plan")]
     ResumePlanMismatch,
-    #[error("failed to reserve {requested} bytes for {resource}")]
+    #[error("failed to reserve {requested} {unit} for {resource}")]
     Allocation {
         resource: &'static str,
         requested: usize,
+        unit: ExtractionAllocationUnit,
     },
     #[error("an extraction worker panicked while processing ordinal {ordinal}")]
     WorkerPanicked { ordinal: u32 },
@@ -665,59 +654,6 @@ enum PreparedTarget {
     Encode { replace: bool },
     Existing { length: u64, digest: DigestV1 },
     Failed(ExtractionDiagnosticCode),
-}
-
-#[cfg(feature = "decode")]
-struct BatchCache<Key, Value> {
-    entries: Mutex<Vec<(Key, Option<Arc<Value>>)>>,
-}
-
-#[cfg(feature = "decode")]
-impl<Key, Value> Default for BatchCache<Key, Value> {
-    fn default() -> Self {
-        Self {
-            entries: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-#[cfg(feature = "decode")]
-impl<Key: Eq, Value> BatchCache<Key, Value> {
-    fn get_or_try_insert_with(
-        &self,
-        key: Key,
-        prepare: impl FnOnce() -> Result<Option<Value>, ExtractionExecutionError>,
-    ) -> Result<Option<Arc<Value>>, ExtractionExecutionError> {
-        let mut entries = lock_recover(&self.entries);
-        if let Some((_, value)) = entries.iter().find(|(candidate, _)| candidate == &key) {
-            return Ok(value.clone());
-        }
-        let value = prepare()?.map(Arc::new);
-        entries
-            .try_reserve(1)
-            .map_err(|_| ExtractionExecutionError::Allocation {
-                resource: "sprite texture cache",
-                requested: std::mem::size_of::<(Key, Option<Arc<Value>>)>(),
-            })?;
-        entries.push((key, value.clone()));
-        Ok(value)
-    }
-}
-
-#[cfg(feature = "decode")]
-#[derive(Clone, PartialEq, Eq)]
-struct SpriteTextureKey {
-    address: ObjectAddress,
-    stream: Option<ExtractionSourceRange>,
-}
-
-#[cfg(feature = "decode")]
-type SpriteTextureCache = BatchCache<SpriteTextureKey, DecodedSpriteTexture>;
-
-#[cfg(not(feature = "decode"))]
-#[derive(Default)]
-struct SpriteTextureCache {
-    _private: (),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -808,23 +744,11 @@ fn validate_resume(
 }
 
 fn prove_working_sets(
-    view: &dyn WorkspaceView,
+    runtime: &RepresentationRuntime<'_, '_>,
     plan: &ExtractionPlan,
     limits: ExtractionExecutionLimits,
     budget: &mut AssetLoadBudget,
 ) -> Result<Vec<u64>, ExtractionExecutionError> {
-    #[cfg(feature = "decode")]
-    let stream_sources = plan
-        .artifacts()
-        .iter()
-        .any(requires_stream_resolution)
-        .then(|| view.sources(budget))
-        .transpose()?;
-    #[cfg(feature = "decode")]
-    let stream_resolver = stream_sources
-        .as_ref()
-        .map(|sources| StreamedResourceResolver::new(view, sources, budget))
-        .transpose()?;
     let count = plan.artifacts().len();
     let entries = u64::try_from(count).map_err(|_| BudgetError::ArithmeticOverflow {
         resource: "trusted extraction working sets",
@@ -842,6 +766,7 @@ fn prove_working_sets(
         .map_err(|_| ExtractionExecutionError::Allocation {
             resource: "trusted extraction working sets",
             requested: count,
+            unit: ExtractionAllocationUnit::CapacityUnits,
         })?;
     let retained_bytes = vec_allocation_bytes::<u64>(working_sets.capacity()).map_err(|_| {
         BudgetError::ArithmeticOverflow {
@@ -852,10 +777,8 @@ fn prove_working_sets(
     budget.consume_entries(entries)?;
     budget.consume_bytes(retained_bytes)?;
     for artifact in plan.artifacts() {
-        #[cfg(feature = "decode")]
-        let required = trusted_working_set(view, artifact, stream_resolver.as_ref(), budget);
-        #[cfg(not(feature = "decode"))]
-        let required = trusted_working_set(view, artifact, budget);
+        let required =
+            runtime.trusted_working_set(artifact.address(), artifact.representation(), budget);
         let required =
             required.map_err(|error| map_reservation_error(artifact.ordinal(), error))?;
         if artifact.working_set_bytes() < required {
@@ -886,10 +809,15 @@ fn map_reference_graph_error(ordinal: u32, error: ReferenceGraphError) -> Extrac
         ReferenceGraphError::Allocation {
             resource,
             requested,
+            unit,
             ..
         } => ExtractionExecutionError::Allocation {
             resource,
             requested,
+            unit: match unit {
+                ReferenceAllocationUnit::Bytes => ExtractionAllocationUnit::Bytes,
+                ReferenceAllocationUnit::Elements => ExtractionAllocationUnit::CapacityUnits,
+            },
         },
         ReferenceGraphError::Contract(_)
         | ReferenceGraphError::Binary(_)
@@ -916,19 +844,6 @@ fn map_reservation_error(
         ExtractionReservationError::Budget(error) => error.into(),
         #[cfg(feature = "decode")]
         ExtractionReservationError::Reference(error) => map_reference_graph_error(ordinal, error),
-        #[cfg(feature = "decode")]
-        ExtractionReservationError::StreamOutOfRange {
-            locator,
-            offset,
-            end,
-            source_len,
-        } => ExtractionExecutionError::StreamOutOfRange {
-            ordinal,
-            locator,
-            offset,
-            end,
-            source_len,
-        },
         ExtractionReservationError::ArithmeticOverflow { .. } => {
             ExtractionExecutionError::OutputLengthOverflow
         }
@@ -1201,11 +1116,11 @@ fn prepared_target_outcome(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pending_batch(
-    view: &dyn WorkspaceView,
     plan: &ExtractionPlan,
     layout: &OutputLayout,
     options: &ExtractionExecutionOptions,
     budget: &mut AssetLoadBudget,
+    representation_runtime: &RepresentationRuntime<'_, '_>,
     pending: &[PendingWork],
     output_limit: u64,
     observer: &ExecutionObserver,
@@ -1219,7 +1134,6 @@ fn execute_pending_batch(
     );
     let budget = Mutex::new(budget);
     let preparation = PreparationOrder::default();
-    let sprite_textures = SpriteTextureCache::default();
 
     thread::scope(|scope| {
         let mut workers = Vec::with_capacity(worker_count);
@@ -1233,14 +1147,13 @@ fn execute_pending_batch(
                     let artifact = &plan.artifacts()[work.artifact_index];
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         process_artifact(
-                            view,
                             artifact,
                             work,
                             layout,
                             pending_index,
                             &budget,
                             &preparation,
-                            &sprite_textures,
+                            representation_runtime,
                             output_limit,
                             observer,
                         )
@@ -1276,14 +1189,13 @@ fn execute_pending_batch(
 
 #[allow(clippy::too_many_arguments)]
 fn process_artifact(
-    view: &dyn WorkspaceView,
     artifact: &PlannedArtifact,
     work: &PendingWork,
     layout: &OutputLayout,
     pending_index: usize,
     budget: &Mutex<&mut AssetLoadBudget>,
     preparation: &PreparationOrder,
-    sprite_textures: &SpriteTextureCache,
+    representation_runtime: &RepresentationRuntime<'_, '_>,
     output_limit: u64,
     observer: &ExecutionObserver,
 ) -> WorkOutcome {
@@ -1291,8 +1203,10 @@ fn process_artifact(
     let _active_work = observer.enter_work(artifact.ordinal(), work.working_set_bytes);
     let prepared = preparation.run(pending_index, || {
         let mut budget = lock_recover(budget);
-        let input = prepare_input(view, artifact, &mut budget, sprite_textures)?;
-        if matches!(artifact.preferred_content(), PlannedContent::Yaml) {
+        let input = representation_runtime
+            .prepare(artifact.address(), artifact.representation(), &mut budget)
+            .map_err(|error| map_representation_preparation_error(artifact.ordinal(), error))?;
+        if artifact.preferred_requires_write_budget() {
             return Ok(PreparedWork::Complete(encode_artifact(
                 artifact,
                 work,
@@ -1321,201 +1235,44 @@ fn process_artifact(
 }
 
 enum PreparedWork {
-    Input(PreparedInput),
+    Input(PreparedRepresentation),
     Complete(WorkOutcome),
 }
 
-struct PreparedInput {
-    object: WorkspaceObject,
-    #[cfg(feature = "decode")]
-    stream: Option<Vec<u8>>,
-    #[cfg(feature = "decode")]
-    sprite_texture: Option<Arc<DecodedSpriteTexture>>,
-    #[cfg(feature = "decode")]
-    audio: Option<PreparedAudioSource>,
-    #[cfg(feature = "decode")]
-    embedded_audio: Option<Vec<u8>>,
-}
-
-fn prepare_input(
-    view: &dyn WorkspaceView,
-    artifact: &PlannedArtifact,
-    budget: &mut AssetLoadBudget,
-    _sprite_textures: &SpriteTextureCache,
-) -> Result<PreparedInput, ExtractionExecutionError> {
-    let object = read_object(view, artifact.address(), budget)?;
-    let input = PreparedInput {
-        object,
+fn map_representation_preparation_error(
+    ordinal: u32,
+    error: RepresentationPreparationError,
+) -> ExtractionExecutionError {
+    match error {
+        RepresentationPreparationError::Workspace(error) => error.into(),
+        RepresentationPreparationError::Budget(error) => error.into(),
         #[cfg(feature = "decode")]
-        stream: None,
+        RepresentationPreparationError::Allocation {
+            resource,
+            requested,
+        } => ExtractionExecutionError::Allocation {
+            resource,
+            requested,
+            unit: ExtractionAllocationUnit::Bytes,
+        },
         #[cfg(feature = "decode")]
-        sprite_texture: None,
+        RepresentationPreparationError::SourceChanged(locator) => {
+            ExtractionExecutionError::SourceChanged { locator }
+        }
         #[cfg(feature = "decode")]
-        audio: None,
-        #[cfg(feature = "decode")]
-        embedded_audio: None,
-    };
-    #[cfg(feature = "decode")]
-    let input = {
-        let mut input = input;
-        match artifact.preferred_content() {
-            PlannedContent::Audio {
-                version, stream, ..
-            } => {
-                input.stream = stream
-                    .as_ref()
-                    .map(|range| read_range(view, range, budget))
-                    .transpose()?;
-                let WorkspaceObjectValue::Binary(object) = input.object.value() else {
-                    return Ok(input);
-                };
-                let clip = match AudioClipConverter::new(version.clone()).from_unity_object(object)
-                {
-                    Ok(clip) => clip,
-                    Err(_) => return Ok(input),
-                };
-                let bytes = if stream.is_some() {
-                    match input.stream.as_deref() {
-                        Some(bytes) => bytes,
-                        None => return Ok(input),
-                    }
-                } else {
-                    clip.data.as_slice()
-                };
-                let prepared = match AudioExporter::prepare_standard_source(&clip, bytes, budget) {
-                    Ok(prepared) => Some(prepared),
-                    Err(AudioSourceError::Budget(error)) => return Err(error.into()),
-                    Err(
-                        AudioSourceError::InvalidData(_)
-                        | AudioSourceError::UnsupportedFormat(_)
-                        | AudioSourceError::SourceChanged
-                        | AudioSourceError::Output(_),
-                    ) => None,
-                };
-                if prepared.is_some() && stream.is_none() {
-                    input.embedded_audio = Some(clip.data);
-                }
-                input.audio = prepared;
-            }
-            PlannedContent::TexturePng { stream, .. } => {
-                input.stream = stream
-                    .as_ref()
-                    .map(|range| read_range(view, range, budget))
-                    .transpose()?;
-            }
-            PlannedContent::SpritePng {
-                texture,
-                texture_stream,
-            } => {
-                input.sprite_texture = prepare_sprite_texture(
-                    view,
-                    texture,
-                    texture_stream,
-                    budget,
-                    _sprite_textures,
-                )?;
-            }
-            PlannedContent::RawBinary | PlannedContent::Yaml | PlannedContent::TextAsset => {}
+        RepresentationPreparationError::DescriptorChanged => {
+            ExtractionExecutionError::MediaDescriptorChanged { ordinal }
         }
-        input
-    };
-    Ok(input)
-}
-
-#[cfg(feature = "decode")]
-fn prepare_sprite_texture(
-    view: &dyn WorkspaceView,
-    address: &ObjectAddress,
-    stream: &Option<ExtractionSourceRange>,
-    budget: &mut AssetLoadBudget,
-    cache: &SpriteTextureCache,
-) -> Result<Option<Arc<DecodedSpriteTexture>>, ExtractionExecutionError> {
-    let key = SpriteTextureKey {
-        address: address.clone(),
-        stream: stream.clone(),
-    };
-    cache.get_or_try_insert_with(key, || {
-        let texture_object = read_object(view, address, budget)?;
-        let WorkspaceObjectValue::Binary(texture_object) = texture_object.value() else {
-            return Ok(None);
-        };
-        let processor = TextureProcessor::new();
-        let Ok(mut texture) = processor.convert_object(texture_object) else {
-            return Ok(None);
-        };
-        if let Some(stream) = stream {
-            let bytes = read_range(view, stream, budget)?;
-            let Ok(data_size) = i32::try_from(bytes.len()) else {
-                return Ok(None);
-            };
-            texture.image_data = bytes;
-            texture.data_size = data_size;
+        RepresentationPreparationError::InvalidContent => {
+            ExtractionExecutionError::MediaPreparationFailed { ordinal }
         }
-        Ok(SpriteProcessor::new().decode_sprite_texture(&texture).ok())
-    })
-}
-
-fn read_object(
-    view: &dyn WorkspaceView,
-    address: &ObjectAddress,
-    budget: &mut AssetLoadBudget,
-) -> Result<WorkspaceObject, ExtractionExecutionError> {
-    let handle = match view.resolve_object(address, budget)? {
-        WorkspaceLookup::Resolved(handle) => handle,
-        WorkspaceLookup::Unloaded
-        | WorkspaceLookup::Missing
-        | WorkspaceLookup::Ambiguous { .. }
-        | WorkspaceLookup::Invalid { .. } => {
-            return Err(WorkspaceError::MissingObject(Box::new(address.clone())).into());
-        }
-    };
-    Ok(view.read_object(&handle, budget)?)
-}
-
-#[cfg(feature = "decode")]
-fn read_range(
-    view: &dyn WorkspaceView,
-    range: &ExtractionSourceRange,
-    budget: &mut AssetLoadBudget,
-) -> Result<Vec<u8>, ExtractionExecutionError> {
-    let source = match view.resolve_source(range.source(), budget)? {
-        WorkspaceLookup::Resolved(source) => source,
-        WorkspaceLookup::Unloaded
-        | WorkspaceLookup::Missing
-        | WorkspaceLookup::Ambiguous { .. }
-        | WorkspaceLookup::Invalid { .. } => {
-            return Err(ExtractionExecutionError::SourceChanged {
-                locator: range.source().clone(),
-            });
-        }
-    };
-    budget.consume_bytes(range.size())?;
-    let size = usize::try_from(range.size()).map_err(|_| ExtractionExecutionError::Allocation {
-        resource: "extraction streamed resource",
-        requested: usize::MAX,
-    })?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(size)
-        .map_err(|_| ExtractionExecutionError::Allocation {
-            resource: "extraction streamed resource",
-            requested: size,
-        })?;
-    bytes.resize(size, 0);
-    let source_range = view.read_source_range(source.id(), range.offset(), range.size(), budget)?;
-    let mut reader = source_range.reader();
-    io::Read::read_exact(&mut reader, &mut bytes).map_err(|_| {
-        ExtractionExecutionError::SourceChanged {
-            locator: range.source().clone(),
-        }
-    })?;
-    Ok(bytes)
+    }
 }
 
 fn encode_artifact(
     artifact: &PlannedArtifact,
     work: &PendingWork,
-    mut input: PreparedInput,
+    input: PreparedRepresentation,
     layout: &OutputLayout,
     output_limit: u64,
     budget: Option<&mut AssetLoadBudget>,
@@ -1538,8 +1295,8 @@ fn encode_artifact(
     let preferred = stage_content(
         layout,
         artifact.preferred_path(),
-        artifact.preferred_content(),
-        &mut input,
+        false,
+        &input,
         artifact.ordinal(),
         output_limit,
         budget,
@@ -1554,11 +1311,8 @@ fn encode_artifact(
             diagnostics: planned_diagnostics,
         },
         Err(AttemptError::Decode) => {
-            let (Some(kind), Some(path), Some(content)) = (
-                artifact.fallback_kind(),
-                artifact.fallback_path(),
-                artifact.fallback_content(),
-            ) else {
+            let (Some(kind), Some(path)) = (artifact.fallback_kind(), artifact.fallback_path())
+            else {
                 return failed_outcome(artifact, ExtractionDiagnosticCode::DecodedUnavailable);
             };
             let diagnostics = artifact_diagnostics_with(
@@ -1578,8 +1332,8 @@ fn encode_artifact(
             match stage_content(
                 layout,
                 path,
-                content,
-                &mut input,
+                true,
+                &input,
                 artifact.ordinal(),
                 output_limit,
                 None,
@@ -1614,8 +1368,8 @@ fn encode_artifact(
 fn stage_content(
     layout: &OutputLayout,
     path: &ExtractionPath,
-    content: &PlannedContent,
-    input: &mut PreparedInput,
+    fallback: bool,
+    input: &PreparedRepresentation,
     _ordinal: u32,
     output_limit: u64,
     budget: Option<&mut AssetLoadBudget>,
@@ -1632,10 +1386,20 @@ fn stage_content(
         #[cfg(all(test, feature = "decode"))]
         let result = {
             let mut writer = _observer.observe_writer(_ordinal, &mut writer);
-            write_content(&mut writer, content, input, budget)
+            if fallback {
+                input.write_fallback(&mut writer)
+            } else {
+                input.write_preferred(&mut writer, budget)
+            }
+            .map_err(map_representation_write_error)
         };
         #[cfg(not(all(test, feature = "decode")))]
-        let result = write_content(&mut writer, content, input, budget);
+        let result = if fallback {
+            input.write_fallback(&mut writer)
+        } else {
+            input.write_preferred(&mut writer, budget)
+        }
+        .map_err(map_representation_write_error);
         (result, writer.exceeded())
     };
     if exceeded {
@@ -1645,168 +1409,21 @@ fn stage_content(
     staging.finish().map_err(|_| AttemptError::Output)
 }
 
-fn write_content(
-    writer: &mut dyn Write,
-    content: &PlannedContent,
-    input: &mut PreparedInput,
-    budget: Option<&mut AssetLoadBudget>,
-) -> Result<(), AttemptError> {
-    match content {
-        PlannedContent::RawBinary => {
-            let WorkspaceObjectValue::Binary(object) = input.object.value() else {
-                return Err(AttemptError::Decode);
-            };
-            writer
-                .write_all(object.raw_data())
-                .map_err(|_| AttemptError::Output)
-        }
-        PlannedContent::Yaml => {
-            let budget = budget.ok_or(AttemptError::Decode)?;
-            let result = UnityYamlSerializer::new().serialize_to_writer_with_budget(
-                writer,
-                std::iter::once(input.object.class()),
-                budget,
-            );
-            match result {
-                Ok(()) => Ok(()),
-                Err(error) => match source_budget_error(&error) {
-                    Some(error) => Err(AttemptError::Fatal(Box::new(error.clone().into()))),
-                    None => Err(AttemptError::Output),
-                },
-            }
-        }
-        PlannedContent::TextAsset => write_text_asset(writer, &input.object),
+fn map_representation_write_error(error: RepresentationWriteError) -> AttemptError {
+    match error {
+        RepresentationWriteError::InvalidContent => AttemptError::Decode,
+        RepresentationWriteError::Output => AttemptError::Output,
+        RepresentationWriteError::Budget(error) => AttemptError::Fatal(Box::new(error.into())),
         #[cfg(feature = "decode")]
-        PlannedContent::Audio {
-            version: _,
-            extension: _,
-            stream,
-        } => write_audio(writer, stream, input),
-        #[cfg(feature = "decode")]
-        PlannedContent::TexturePng { version: _, stream } => write_texture(writer, stream, input),
-        #[cfg(feature = "decode")]
-        PlannedContent::SpritePng { .. } => write_sprite(writer, input),
-        #[cfg(not(feature = "decode"))]
-        PlannedContent::Audio { .. }
-        | PlannedContent::TexturePng { .. }
-        | PlannedContent::SpritePng { .. } => Err(AttemptError::Decode),
+        RepresentationWriteError::Allocation {
+            resource,
+            requested,
+        } => AttemptError::Fatal(Box::new(ExtractionExecutionError::Allocation {
+            resource,
+            requested,
+            unit: ExtractionAllocationUnit::Bytes,
+        })),
     }
-}
-
-fn write_text_asset(writer: &mut dyn Write, object: &WorkspaceObject) -> Result<(), AttemptError> {
-    let WorkspaceObjectValue::Binary(object) = object.value() else {
-        return Err(AttemptError::Decode);
-    };
-    for key in ["m_Script", "m_Text", "m_Bytes", "m_Data"] {
-        let Some(value) = object.get(key) else {
-            continue;
-        };
-        return match value {
-            UnityValue::String(value) => writer
-                .write_all(value.as_bytes())
-                .map_err(|_| AttemptError::Output),
-            UnityValue::Bytes(value) => writer.write_all(value).map_err(|_| AttemptError::Output),
-            UnityValue::Array(values) => write_byte_array(writer, values),
-            _ => Err(AttemptError::Decode),
-        };
-    }
-    Err(AttemptError::Decode)
-}
-
-fn write_byte_array(writer: &mut dyn Write, values: &[UnityValue]) -> Result<(), AttemptError> {
-    let mut buffer = [0_u8; 8192];
-    for chunk in values.chunks(buffer.len()) {
-        for (output, value) in buffer.iter_mut().zip(chunk) {
-            *output = value
-                .as_u64()
-                .and_then(|value| u8::try_from(value).ok())
-                .ok_or(AttemptError::Decode)?;
-        }
-        writer
-            .write_all(&buffer[..chunk.len()])
-            .map_err(|_| AttemptError::Output)?;
-    }
-    Ok(())
-}
-
-#[cfg(feature = "decode")]
-fn write_audio(
-    writer: &mut dyn Write,
-    stream: &Option<ExtractionSourceRange>,
-    input: &PreparedInput,
-) -> Result<(), AttemptError> {
-    let prepared = input.audio.as_ref().ok_or(AttemptError::Decode)?;
-    let bytes = if stream.is_some() {
-        input.stream.as_deref().ok_or(AttemptError::Decode)?
-    } else {
-        input
-            .embedded_audio
-            .as_deref()
-            .ok_or(AttemptError::Decode)?
-    };
-    prepared
-        .write_to(bytes, writer)
-        .map_err(|error| match error {
-            AudioSourceError::Output(_) => AttemptError::Output,
-            AudioSourceError::Budget(error) => AttemptError::Fatal(Box::new(error.into())),
-            AudioSourceError::InvalidData(_)
-            | AudioSourceError::UnsupportedFormat(_)
-            | AudioSourceError::SourceChanged => AttemptError::Decode,
-        })
-}
-
-#[cfg(feature = "decode")]
-fn write_texture(
-    writer: &mut dyn Write,
-    stream: &Option<ExtractionSourceRange>,
-    input: &mut PreparedInput,
-) -> Result<(), AttemptError> {
-    let WorkspaceObjectValue::Binary(object) = input.object.value() else {
-        return Err(AttemptError::Decode);
-    };
-    let processor = TextureProcessor::new();
-    let mut texture = processor
-        .convert_object(object)
-        .map_err(|_| AttemptError::Decode)?;
-    if stream.is_some() {
-        texture.image_data = input.stream.take().ok_or(AttemptError::Decode)?;
-        texture.data_size =
-            i32::try_from(texture.image_data.len()).map_err(|_| AttemptError::Decode)?;
-    }
-    let image = processor
-        .decode_texture(&texture)
-        .map_err(|_| AttemptError::Decode)?;
-    png_output_result(TextureExporter::write_png(&image, writer))
-}
-
-#[cfg(feature = "decode")]
-fn write_sprite(writer: &mut dyn Write, input: &mut PreparedInput) -> Result<(), AttemptError> {
-    let WorkspaceObjectValue::Binary(sprite_object) = input.object.value() else {
-        return Err(AttemptError::Decode);
-    };
-    let texture = input
-        .sprite_texture
-        .as_deref()
-        .ok_or(AttemptError::Decode)?;
-    let sprite_processor = SpriteProcessor::new();
-    let sprite = sprite_processor
-        .parse_sprite(sprite_object)
-        .map_err(|_| AttemptError::Decode)?;
-    let image = sprite_processor
-        .render_sprite_from_texture(&sprite, texture)
-        .map_err(|_| AttemptError::Decode)?;
-    png_output_result(TextureExporter::write_png(&image, writer))
-}
-
-#[cfg(feature = "decode")]
-fn png_output_result<T>(result: unity_asset_decode::Result<T>) -> Result<T, AttemptError> {
-    result.map_err(|error| match error {
-        unity_asset_decode::BinaryError::Io(_) => AttemptError::Output,
-        unity_asset_decode::BinaryError::Budget(error) => {
-            AttemptError::Fatal(Box::new(error.into()))
-        }
-        _ => AttemptError::Decode,
-    })
 }
 
 enum AttemptError {
@@ -2206,7 +1823,6 @@ mod resource_tests {
 
 #[cfg(all(test, feature = "decode"))]
 mod tests {
-    use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -2216,78 +1832,13 @@ mod tests {
         ExtractionFilter, ExtractionPlanner, ExtractionRepresentationPolicy, ExtractionRequest,
     };
     use crate::reference::ReferenceGraphBuildOptions;
-    use crate::workspace::{AssetWorkspace, WorkspaceSnapshot};
+    use crate::schema::SchemaRecipePlanner;
+    use crate::workspace::{
+        AssetWorkspace, MutationPlanBuilder, MutationValue, PrepareOptions, PreparedView,
+        WorkspaceSnapshot, WorkspaceView,
+    };
     use unity_asset_binary::asset::class_ids;
-
-    struct FailingWriter;
-
-    impl Write for FailingWriter {
-        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-            Err(io::Error::other("injected PNG sink failure"))
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn png_sink_errors_are_output_errors() {
-        let image = image::RgbaImage::new(1, 1);
-        let result = png_output_result(TextureExporter::write_png(&image, &mut FailingWriter));
-
-        assert!(matches!(result, Err(AttemptError::Output)));
-    }
-
-    #[test]
-    fn png_codec_errors_are_decode_errors() {
-        let result = png_output_result::<()>(Err(unity_asset_decode::BinaryError::InvalidData(
-            "invalid dimensions".to_owned(),
-        )));
-
-        assert!(matches!(result, Err(AttemptError::Decode)));
-    }
-
-    #[test]
-    fn batch_cache_prepares_each_key_once_including_failures() {
-        let cache = BatchCache::<u8, String>::default();
-        let calls = Cell::new(0_u8);
-        let first = cache
-            .get_or_try_insert_with(1, || {
-                calls.set(calls.get() + 1);
-                Ok(Some("atlas".to_owned()))
-            })
-            .unwrap()
-            .unwrap();
-        let second = cache
-            .get_or_try_insert_with(1, || {
-                calls.set(calls.get() + 1);
-                Ok(Some("duplicate".to_owned()))
-            })
-            .unwrap()
-            .unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
-
-        assert!(
-            cache
-                .get_or_try_insert_with(2, || {
-                    calls.set(calls.get() + 1);
-                    Ok(None)
-                })
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            cache
-                .get_or_try_insert_with(2, || {
-                    calls.set(calls.get() + 1);
-                    Ok(Some("unexpected".to_owned()))
-                })
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(calls.get(), 2);
-    }
+    use unity_asset_core::FieldPath;
 
     #[test]
     fn executor_rejects_tampered_stream_ranges_before_creating_output() {
@@ -2358,6 +1909,41 @@ mod tests {
             &directory.path().join("tampered-texture"),
             ordinal,
         );
+    }
+
+    #[test]
+    fn sprite_working_set_has_an_exact_execution_boundary() {
+        let (view, plan, sprite_index) = sprite_plan();
+        assert_eq!(sprite_index, 0);
+        let artifact = &plan.artifacts()[sprite_index];
+        let declared = artifact.working_set_bytes();
+        assert!(declared > 1);
+
+        let mut budget = AssetLoadBudget::default();
+        let context = RepresentationRuntimeContext::load(
+            &view,
+            plan.artifacts().iter().map(PlannedArtifact::representation),
+            &mut budget,
+        )
+        .unwrap();
+        let runtime = context.bind(&view, &mut budget).unwrap();
+        let exact_limits =
+            ExtractionExecutionLimits::new(1, declared, 5, u64::MAX, u64::MAX).unwrap();
+        let proven = prove_working_sets(&runtime, &plan, exact_limits, &mut budget).unwrap();
+        assert_eq!(proven, [declared]);
+
+        let one_short =
+            ExtractionExecutionLimits::new(1, declared - 1, 5, u64::MAX, u64::MAX).unwrap();
+        let error = prove_working_sets(&runtime, &plan, one_short, &mut AssetLoadBudget::default())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::WorkingSetExceedsLimit {
+                ordinal: 0,
+                required,
+                limit,
+            } if required == declared && limit == declared - 1
+        ));
     }
 
     #[test]
@@ -2735,7 +2321,7 @@ mod tests {
         (snapshot, plan)
     }
 
-    fn sprite_plan() -> (WorkspaceSnapshot, ExtractionPlan, usize) {
+    fn sprite_plan() -> (PreparedView, ExtractionPlan, usize) {
         let mut workspace = AssetWorkspace::new().unwrap();
         for name in [
             "atlas_test",
@@ -2755,17 +2341,101 @@ mod tests {
             )
             .unwrap();
         let request = ExtractionRequest::all(ExtractionRepresentationPolicy::PreferDecoded)
-            .with_filter(ExtractionFilter::new([class_ids::SPRITE], None, None, None).unwrap());
-        let plan = ExtractionPlanner::new(&snapshot)
+            .with_filter(
+                ExtractionFilter::new([class_ids::SPRITE], None, Some("banner_1".to_owned()), None)
+                    .unwrap(),
+            );
+        let raw_plan = ExtractionPlanner::new(&snapshot)
             .with_reference_graph(&graph)
             .plan(request, &mut AssetLoadBudget::default())
             .unwrap();
-        let sprite_index = plan
+        let address = raw_plan
             .artifacts()
             .iter()
-            .position(|artifact| artifact.preferred_kind() == ExtractionArtifactKind::SpritePng)
-            .expect("fixture must contain at least one resolvable Sprite texture");
-        (snapshot, plan, sprite_index)
+            .find(|artifact| {
+                artifact.diagnostics().iter().any(|diagnostic| {
+                    diagnostic.code() == ExtractionDiagnosticCode::UnsupportedMediaLayout
+                })
+            })
+            .expect("fixture must contain a packed Sprite")
+            .address()
+            .clone();
+
+        let recipe_planner = SchemaRecipePlanner::new(&snapshot);
+        let sprite = recipe_planner
+            .inspect(&address, &mut AssetLoadBudget::default())
+            .unwrap();
+        let mut builder = MutationPlanBuilder::new(snapshot.workspace_id(), snapshot.revision());
+        for (path, replacement) in [
+            (
+                field_path(&["m_RD", "settingsRaw"]),
+                MutationValue::unsigned(0),
+            ),
+            (
+                field_path(&["m_AtlasTags"]),
+                MutationValue::array(Vec::new()).unwrap(),
+            ),
+            (
+                field_path(&["m_RD", "downscaleMultiplier"]),
+                MutationValue::float64(1.0),
+            ),
+            (
+                field_path(&["m_RD", "textureRect", "x"]),
+                MutationValue::float64(0.0),
+            ),
+            (
+                field_path(&["m_RD", "textureRect", "y"]),
+                MutationValue::float64(0.0),
+            ),
+            (
+                field_path(&["m_RD", "textureRect", "width"]),
+                MutationValue::float64(1.0),
+            ),
+            (
+                field_path(&["m_RD", "textureRect", "height"]),
+                MutationValue::float64(1.0),
+            ),
+        ] {
+            if sprite.field(&path).is_none() {
+                continue;
+            }
+            let fragment = recipe_planner
+                .lower_field_replace(&sprite, path, replacement, &mut AssetLoadBudget::default())
+                .unwrap();
+            builder.append(fragment).unwrap();
+        }
+        let prepared = workspace
+            .prepare(
+                builder.build().unwrap(),
+                PrepareOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let view = prepared.view();
+        let request =
+            ExtractionRequest::addresses([address], ExtractionRepresentationPolicy::PreferDecoded)
+                .unwrap();
+        let plan = ExtractionPlanner::new(&view)
+            .with_reference_graph(view.reference_graph())
+            .plan(request, &mut AssetLoadBudget::default())
+            .unwrap();
+        assert_eq!(plan.artifacts().len(), 1);
+        let sprite_index = 0;
+        assert_eq!(
+            plan.artifacts()[sprite_index].preferred_kind(),
+            ExtractionArtifactKind::SpritePng
+        );
+        assert_eq!(
+            plan.artifacts()[sprite_index].fallback_kind(),
+            Some(ExtractionArtifactKind::BinaryRaw)
+        );
+        (view, plan, sprite_index)
+    }
+
+    fn field_path(fields: &[&str]) -> FieldPath {
+        fields.iter().fold(FieldPath::root(), |path, field| {
+            path.push_field(*field).unwrap()
+        })
     }
 
     fn texture_plan() -> (WorkspaceSnapshot, ExtractionPlan) {
@@ -2784,7 +2454,7 @@ mod tests {
     }
 
     fn assert_working_set_proof_rejected(
-        snapshot: &WorkspaceSnapshot,
+        snapshot: &impl WorkspaceView,
         plan: &ExtractionPlan,
         output: &Path,
         ordinal: u32,

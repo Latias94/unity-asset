@@ -2825,6 +2825,7 @@ name = "unity-asset-decode"
 version = "0.4.0"
 dependencies = [
  "base64",
+ "crc32fast",
  "hex",
  "hound",
  "image",

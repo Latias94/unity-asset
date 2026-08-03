@@ -287,7 +287,9 @@ fn yaml_output_path(
             resource: "yaml_split_relative_path",
         }
     })?)?;
-    ExtractionPath::new(path).map_err(YamlSplitError::from)
+    ExtractionPath::new(path)
+        .map_err(ExtractionModelError::from)
+        .map_err(YamlSplitError::from)
 }
 
 #[derive(Debug, Error)]

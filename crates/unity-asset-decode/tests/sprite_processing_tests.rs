@@ -8,10 +8,8 @@
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::bool_assert_comparison)]
 
-use indexmap::IndexMap;
-use unity_asset_core::UnityValue;
-use unity_asset_decode::asset::SerializedFile;
-use unity_asset_decode::bundle::AssetBundle;
+use unity_asset_binary::asset::SerializedFile;
+use unity_asset_binary::bundle::AssetBundle;
 use unity_asset_decode::sprite::{Sprite, SpriteProcessor};
 use unity_asset_decode::texture::{Texture2D, TextureFormat};
 
@@ -228,34 +226,6 @@ fn test_sprite_info_extraction() {
     assert_eq!(sprite.is_atlas_sprite(), true);
 
     println!("  ✓ All sprite information correctly extracted");
-}
-
-#[test]
-fn test_sprite_typetree_texture_pptr_uses_path_id() {
-    let mut props: IndexMap<String, UnityValue> = IndexMap::new();
-    props.insert("m_Name".to_string(), UnityValue::String("Test".to_string()));
-
-    let mut rd: IndexMap<String, UnityValue> = IndexMap::new();
-    let mut texture_pptr: IndexMap<String, UnityValue> = IndexMap::new();
-    texture_pptr.insert("m_FileID".to_string(), UnityValue::Integer(0));
-    texture_pptr.insert("m_PathID".to_string(), UnityValue::Integer(123));
-    rd.insert("texture".to_string(), UnityValue::Object(texture_pptr));
-    props.insert("m_RD".to_string(), UnityValue::Object(rd));
-
-    let obj = unity_asset_decode::object::UnityObject::from_info_and_class(
-        unity_asset_decode::asset::ObjectInfo::for_standalone_class(1, 0, 0, 213)
-            .expect("valid standalone sprite object"),
-        unity_asset_core::UnityClass::with_properties(
-            213,
-            "Sprite".to_string(),
-            "1".to_string(),
-            props,
-        ),
-    );
-
-    let processor = SpriteProcessor::new();
-    let sprite = processor.parse_sprite(&obj).unwrap();
-    assert_eq!(sprite.render_data.texture_path_id, 123);
 }
 
 /// Test sprite PNG export functionality

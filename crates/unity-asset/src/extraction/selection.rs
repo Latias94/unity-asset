@@ -1,47 +1,30 @@
 use std::fmt::Write as _;
-#[cfg(feature = "decode")]
-use std::io;
 
-use thiserror::Error;
+#[cfg(test)]
 use unity_asset_binary::asset::class_ids;
-#[cfg(feature = "decode")]
-use unity_asset_binary::unity_version::UnityVersion;
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, ContractError, ObjectAddress, ObjectKind, RevisionedObjectHandle,
-    SourceFingerprint, SourceId, SourceLocator, UnityValue, vec_allocation_bytes,
-};
-#[cfg(feature = "decode")]
-use unity_asset_decode::{
-    audio::AudioClipLayout, sprite::SpriteTextureReference, texture::Texture2DLayout,
+    AssetLoadBudget, ObjectAddress, ObjectKind, RevisionedObjectHandle, SourceLocator, UnityValue,
 };
 
 use super::container::{
     BundleContainerQuery, BundleContainerResult, query_bundle_container_occurrences,
     resolved_addresses,
 };
+use super::contract::ExtractionAllocationUnit;
 use super::manifest::canonical_digest;
-#[cfg(feature = "decode")]
-use super::model::ExtractionSourceRange;
 use super::model::{
-    ExtractionArtifactKind, ExtractionDiagnostic, ExtractionDiagnosticCode, ExtractionModelError,
-    ExtractionPath, ExtractionPlan, ExtractionRepresentationPolicy, ExtractionRequest,
-    ExtractionSelection, ExtractionSourceExpectation, PlannedArtifact, PlannedContent,
+    ExtractionModelError, ExtractionPath, ExtractionPlan, ExtractionRepresentationPolicy,
+    ExtractionRequest, ExtractionSelection, PlannedArtifact,
 };
-use super::reservation::{ExtractionReservationError, raw_binary_working_set, yaml_working_set};
-#[cfg(feature = "decode")]
-use super::reservation::{audio_working_set, sprite_working_set_with_texture, texture_working_set};
-#[cfg(feature = "decode")]
-use crate::reference::{RawReferenceTarget, ReferenceResolution};
-use crate::reference::{ReferenceGraph, ReferenceGraphError, ReferenceTraversal};
-#[cfg(feature = "decode")]
-use crate::workspace::{
-    ResolvedStreamedResource, StreamedResourceRequest, StreamedResourceRequestError,
-    StreamedResourceResolution,
+use super::planning_contract::{
+    ExtractionPlanError, budgeted_vec, clone_string, resolve_required_handle, source_for_id,
+    usize_to_u64,
 };
-use crate::workspace::{
-    StreamedResourceResolver, WorkspaceError, WorkspaceLookup, WorkspaceObject,
-    WorkspaceObjectValue, WorkspaceSource, WorkspaceView,
-};
+use super::representation::RepresentationPlanner;
+use crate::reference::{ReferenceGraph, ReferenceTraversal};
+#[cfg(test)]
+use crate::workspace::StreamedResourceResolver;
+use crate::workspace::{WorkspaceObject, WorkspaceSource, WorkspaceView};
 
 /// Plans deterministic extraction artifacts against one immutable workspace view.
 pub struct ExtractionPlanner<'view> {
@@ -72,13 +55,12 @@ impl<'view> ExtractionPlanner<'view> {
         self.validate_reference_context()?;
 
         let sources = self.view.sources(budget)?;
-        let stream_resolver = if cfg!(feature = "decode")
-            && request.representation() != ExtractionRepresentationPolicy::RawOnly
-        {
-            Some(StreamedResourceResolver::new(self.view, &sources, budget)?)
-        } else {
-            None
-        };
+        let mut representation_planner = RepresentationPlanner::new(
+            self.view,
+            self.references,
+            &sources,
+            request.representation(),
+        );
         let handles = selected_handles(self.view, &request, &sources, budget)?;
         let mut candidates = budgeted_vec(handles.len(), "extraction candidate addresses", budget)?;
         for handle in handles {
@@ -110,42 +92,19 @@ impl<'view> ExtractionPlanner<'view> {
             }
 
             let owner = source_for_id(handle.object().source(), &sources)?;
-            insert_source_expectation(
-                &mut source_expectations,
-                SourceExpectationOwned::from_source(owner, budget)?,
-            )?;
-            let choice = self.plan_content(
-                &address,
-                &object,
-                owner,
-                &sources,
-                stream_resolver.as_ref(),
-                request.representation(),
-                budget,
-            )?;
-            for expectation in choice.source_expectations {
-                insert_source_expectation(&mut source_expectations, expectation)?;
-            }
-
             let ordinal = u32::try_from(artifacts.len()).map_err(|_| {
                 ExtractionPlanError::ArithmeticOverflow {
                     resource: "extraction artifact ordinal",
                 }
             })?;
-            let preferred_path = allocate_path(
-                request.prefix(),
+            let choice = representation_planner.select(&address, &object, owner, budget)?;
+            let representation = choice.finalize(
+                ordinal,
                 &address,
-                owner.locator(),
-                object.class().class_id(),
-                object.class().class_name(),
-                object_name.as_deref(),
-                choice.preferred_extension,
-                false,
+                &mut source_expectations,
+                owner,
                 budget,
-            )?;
-            let fallback = match choice.fallback {
-                Some((kind, content)) => Some((
-                    kind,
+                |extension, fallback, budget| {
                     allocate_path(
                         request.prefix(),
                         &address,
@@ -153,14 +112,12 @@ impl<'view> ExtractionPlanner<'view> {
                         object.class().class_id(),
                         object.class().class_name(),
                         object_name.as_deref(),
-                        "bin",
-                        true,
+                        extension,
+                        fallback,
                         budget,
-                    )?,
-                    content,
-                )),
-                None => None,
-            };
+                    )
+                },
+            )?;
             let class_name = clone_string(
                 object.class().class_name(),
                 "extraction artifact class name",
@@ -173,12 +130,7 @@ impl<'view> ExtractionPlanner<'view> {
                     object.class().class_id(),
                     class_name,
                     object_name,
-                    choice.preferred_kind,
-                    preferred_path,
-                    choice.preferred_content,
-                    fallback,
-                    choice.working_set_bytes,
-                    choice.diagnostics,
+                    representation,
                 )
                 .map_err(map_model_error)?,
             );
@@ -207,8 +159,8 @@ impl<'view> ExtractionPlanner<'view> {
             handle.validate_context(self.view.workspace_id(), self.view.revision())?;
             addresses.push(self.view.object_address(handle, budget)?);
         }
-        let request = ExtractionRequest::addresses(addresses, representation)
-            .map_err(|error| ExtractionPlanError::Model(error.to_string()))?;
+        let request =
+            ExtractionRequest::addresses(addresses, representation).map_err(map_model_error)?;
         self.plan(request, budget)
     }
 
@@ -232,8 +184,8 @@ impl<'view> ExtractionPlanner<'view> {
             handle.validate_context(self.view.workspace_id(), self.view.revision())?;
             addresses.push(self.view.object_address(handle, budget)?);
         }
-        let request = ExtractionRequest::addresses(addresses, representation)
-            .map_err(|error| ExtractionPlanError::Model(error.to_string()))?;
+        let request =
+            ExtractionRequest::addresses(addresses, representation).map_err(map_model_error)?;
         self.plan(request, budget)
     }
 
@@ -257,7 +209,7 @@ impl<'view> ExtractionPlanner<'view> {
         )?;
         let request =
             ExtractionRequest::bundle_container(request_pattern, addresses, representation)
-                .map_err(|error| ExtractionPlanError::Model(error.to_string()))?;
+                .map_err(map_model_error)?;
         self.plan(request, budget)
     }
 
@@ -283,678 +235,6 @@ impl<'view> ExtractionPlanner<'view> {
         }
         Ok(())
     }
-
-    fn plan_content(
-        &self,
-        address: &ObjectAddress,
-        object: &WorkspaceObject,
-        _owner: &WorkspaceSource,
-        _sources: &[WorkspaceSource],
-        _stream_resolver: Option<&StreamedResourceResolver<'_, '_>>,
-        policy: ExtractionRepresentationPolicy,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<ContentChoice, ExtractionPlanError> {
-        #[cfg(feature = "decode")]
-        let (owner, sources, stream_resolver) = (_owner, _sources, _stream_resolver);
-        let raw = raw_content(object, budget)?;
-        if policy == ExtractionRepresentationPolicy::RawOnly
-            || matches!(object.value(), WorkspaceObjectValue::Yaml(_))
-        {
-            return Ok(raw);
-        }
-
-        let WorkspaceObjectValue::Binary(binary) = object.value() else {
-            return Ok(raw);
-        };
-        if binary.class_id() == class_ids::TEXT_ASSET {
-            return Ok(ContentChoice::decoded(
-                ExtractionArtifactKind::Text,
-                "txt",
-                PlannedContent::TextAsset,
-                raw_binary_working_set(object).map_err(map_reservation_error)?,
-                policy.then_fallback(raw),
-            ));
-        }
-
-        #[cfg(not(feature = "decode"))]
-        {
-            unavailable_choice_with(
-                address,
-                policy,
-                raw,
-                ExtractionDiagnosticCode::FeatureUnavailable,
-                budget,
-            )
-        }
-
-        #[cfg(feature = "decode")]
-        {
-            let stream_resolver = stream_resolver.ok_or_else(|| {
-                WorkspaceError::operation(
-                    "extraction streamed-resource resolver",
-                    io::Error::other("decoded extraction requires a streamed-resource index"),
-                )
-            })?;
-            let Some(version) = object
-                .schema_provenance()
-                .binary_version()
-                .and_then(|version| version.unity())
-            else {
-                return unavailable_choice(address, policy, raw, budget);
-            };
-
-            match binary.class_id() {
-                class_ids::AUDIO_CLIP => {
-                    let layout = match AudioClipLayout::inspect(binary, version) {
-                        Ok(layout) => layout,
-                        Err(_) => return unavailable_choice(address, policy, raw, budget),
-                    };
-                    let (stream, stream_expectation) = if let Some(stream) =
-                        layout.payload().stream()
-                    {
-                        match resolve_extraction_stream(
-                            owner,
-                            stream_resolver,
-                            stream.path(),
-                            stream.offset(),
-                            u64::from(stream.size()),
-                            budget,
-                        ) {
-                            Ok(resolved) => (Some(resolved.range), Some(resolved.expectation)),
-                            Err(error) => {
-                                let Some(code) = decoded_resource_failure(&error) else {
-                                    return Err(error);
-                                };
-                                return unavailable_choice_with(address, policy, raw, code, budget);
-                            }
-                        }
-                    } else {
-                        (None, None)
-                    };
-                    let extension = clone_string(
-                        layout.compression_format().extension(),
-                        "audio output extension",
-                        budget,
-                    )?;
-                    let mut expectations = budgeted_vec(
-                        if stream.is_some() { 1 } else { 0 },
-                        "audio source expectations",
-                        budget,
-                    )?;
-                    if let Some(expectation) = stream_expectation {
-                        expectations.push(expectation);
-                    }
-                    let version = clone_unity_version(version, budget)?;
-                    let working_set = audio_working_set(
-                        self.view,
-                        object,
-                        &version,
-                        &extension,
-                        stream.as_ref(),
-                        Some(stream_resolver),
-                        budget,
-                    )
-                    .map_err(map_reservation_error)?;
-                    Ok(ContentChoice::decoded_with_sources(
-                        ExtractionArtifactKind::Audio,
-                        layout.compression_format().extension(),
-                        PlannedContent::Audio {
-                            version,
-                            extension,
-                            stream,
-                        },
-                        working_set,
-                        policy.then_fallback(raw),
-                        expectations,
-                    ))
-                }
-                class_ids::TEXTURE_2D => {
-                    let layout = match Texture2DLayout::inspect(binary) {
-                        Ok(layout) => layout,
-                        Err(_) => return unavailable_choice(address, policy, raw, budget),
-                    };
-                    let (stream, stream_expectation) = if let Some(stream) =
-                        layout.payload().stream()
-                    {
-                        match resolve_extraction_stream(
-                            owner,
-                            stream_resolver,
-                            stream.path(),
-                            stream.offset(),
-                            u64::from(stream.size()),
-                            budget,
-                        ) {
-                            Ok(resolved) => (Some(resolved.range), Some(resolved.expectation)),
-                            Err(error) => {
-                                let Some(code) = decoded_resource_failure(&error) else {
-                                    return Err(error);
-                                };
-                                return unavailable_choice_with(address, policy, raw, code, budget);
-                            }
-                        }
-                    } else {
-                        (None, None)
-                    };
-                    let mut expectations = budgeted_vec(
-                        if stream.is_some() { 1 } else { 0 },
-                        "texture source expectations",
-                        budget,
-                    )?;
-                    if let Some(expectation) = stream_expectation {
-                        expectations.push(expectation);
-                    }
-                    let version = clone_unity_version(version, budget)?;
-                    let working_set = texture_working_set(
-                        self.view,
-                        object,
-                        stream.as_ref(),
-                        Some(stream_resolver),
-                        budget,
-                    )
-                    .map_err(map_reservation_error)?;
-                    Ok(ContentChoice::decoded_with_sources(
-                        ExtractionArtifactKind::TexturePng,
-                        "png",
-                        PlannedContent::TexturePng { version, stream },
-                        working_set,
-                        policy.then_fallback(raw),
-                        expectations,
-                    ))
-                }
-                class_ids::SPRITE => self.plan_sprite(
-                    address,
-                    object,
-                    owner,
-                    sources,
-                    stream_resolver,
-                    policy,
-                    raw,
-                    budget,
-                ),
-                _ => unavailable_choice_with(
-                    address,
-                    policy,
-                    raw,
-                    ExtractionDiagnosticCode::UnsupportedClass,
-                    budget,
-                ),
-            }
-        }
-    }
-
-    #[cfg(feature = "decode")]
-    #[allow(clippy::too_many_arguments)]
-    fn plan_sprite(
-        &self,
-        address: &ObjectAddress,
-        object: &WorkspaceObject,
-        owner: &WorkspaceSource,
-        sources: &[WorkspaceSource],
-        stream_resolver: &StreamedResourceResolver<'_, '_>,
-        policy: ExtractionRepresentationPolicy,
-        raw: ContentChoice,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<ContentChoice, ExtractionPlanError> {
-        let WorkspaceObjectValue::Binary(binary) = object.value() else {
-            unreachable!("sprite planning is only dispatched for binary objects");
-        };
-        let texture_reference = match SpriteTextureReference::inspect(binary) {
-            Ok(reference) => reference,
-            Err(_) => return unavailable_choice(address, policy, raw, budget),
-        };
-        let file_id = texture_reference.file_id();
-        let path_id = texture_reference.path_id();
-        let texture_address = if file_id == 0 {
-            ObjectAddress::binary_at(
-                clone_source_locator(owner.locator(), "sprite texture source locator", budget)?,
-                path_id,
-            )?
-        } else {
-            let Some(references) = self.references else {
-                return unavailable_choice_with(
-                    address,
-                    policy,
-                    raw,
-                    ExtractionDiagnosticCode::UnresolvedSpritePPtr,
-                    budget,
-                );
-            };
-            let owner_handle = resolve_required_handle(self.view, address, budget)?;
-            let Some(texture) =
-                resolve_reference_address(references, &owner_handle, file_id, path_id, budget)?
-            else {
-                return unavailable_choice_with(
-                    address,
-                    policy,
-                    raw,
-                    ExtractionDiagnosticCode::UnresolvedSpritePPtr,
-                    budget,
-                );
-            };
-            texture
-        };
-        let texture_handle = match resolve_required_handle(self.view, &texture_address, budget) {
-            Ok(handle) => handle,
-            Err(error) => {
-                let Some(code) = sprite_reference_failure(&error) else {
-                    return Err(error);
-                };
-                return unavailable_choice_with(address, policy, raw, code, budget);
-            }
-        };
-        let texture_object = self.view.read_object(&texture_handle, budget)?;
-        let WorkspaceObjectValue::Binary(texture_binary) = texture_object.value() else {
-            return unavailable_choice_with(
-                address,
-                policy,
-                raw,
-                ExtractionDiagnosticCode::UnresolvedSpritePPtr,
-                budget,
-            );
-        };
-        if texture_binary.class_id() != class_ids::TEXTURE_2D {
-            return unavailable_choice_with(
-                address,
-                policy,
-                raw,
-                ExtractionDiagnosticCode::UnresolvedSpritePPtr,
-                budget,
-            );
-        }
-        let texture_owner = match source_for_id(texture_handle.object().source(), sources) {
-            Ok(owner) => owner,
-            Err(error) => {
-                let Some(code) = decoded_resource_failure(&error) else {
-                    return Err(error);
-                };
-                return unavailable_choice_with(address, policy, raw, code, budget);
-            }
-        };
-        let texture_layout = match Texture2DLayout::inspect(texture_binary) {
-            Ok(layout) => layout,
-            Err(_) => return unavailable_choice(address, policy, raw, budget),
-        };
-        let (texture_stream, stream_expectation) =
-            if let Some(stream) = texture_layout.payload().stream() {
-                match resolve_extraction_stream(
-                    texture_owner,
-                    stream_resolver,
-                    stream.path(),
-                    stream.offset(),
-                    u64::from(stream.size()),
-                    budget,
-                ) {
-                    Ok(resolved) => (Some(resolved.range), Some(resolved.expectation)),
-                    Err(error) => {
-                        let Some(code) = decoded_resource_failure(&error) else {
-                            return Err(error);
-                        };
-                        return unavailable_choice_with(address, policy, raw, code, budget);
-                    }
-                }
-            } else {
-                (None, None)
-            };
-        let mut expectations = budgeted_vec(
-            if texture_stream.is_some() { 2 } else { 1 },
-            "sprite source expectations",
-            budget,
-        )?;
-        expectations.push(SourceExpectationOwned::from_source(texture_owner, budget)?);
-        if let Some(expectation) = stream_expectation {
-            expectations.push(expectation);
-        }
-        let working_set = sprite_working_set_with_texture(
-            self.view,
-            object,
-            &texture_object,
-            texture_stream.as_ref(),
-            Some(stream_resolver),
-            budget,
-        )
-        .map_err(map_reservation_error)?;
-        Ok(ContentChoice::decoded_with_sources(
-            ExtractionArtifactKind::SpritePng,
-            "png",
-            PlannedContent::SpritePng {
-                texture: texture_address,
-                texture_stream,
-            },
-            working_set,
-            policy.then_fallback(raw),
-            expectations,
-        ))
-    }
-}
-
-#[derive(Debug)]
-struct ContentChoice {
-    preferred_kind: ExtractionArtifactKind,
-    preferred_extension: &'static str,
-    preferred_content: PlannedContent,
-    fallback: Option<(ExtractionArtifactKind, PlannedContent)>,
-    working_set_bytes: u64,
-    diagnostics: Vec<ExtractionDiagnostic>,
-    source_expectations: Vec<SourceExpectationOwned>,
-}
-
-impl ContentChoice {
-    fn decoded(
-        kind: ExtractionArtifactKind,
-        extension: &'static str,
-        content: PlannedContent,
-        working_set_bytes: u64,
-        fallback: Option<(ExtractionArtifactKind, PlannedContent)>,
-    ) -> Self {
-        Self::decoded_with_sources(
-            kind,
-            extension,
-            content,
-            working_set_bytes,
-            fallback,
-            Vec::new(),
-        )
-    }
-
-    fn decoded_with_sources(
-        kind: ExtractionArtifactKind,
-        extension: &'static str,
-        content: PlannedContent,
-        working_set_bytes: u64,
-        fallback: Option<(ExtractionArtifactKind, PlannedContent)>,
-        source_expectations: Vec<SourceExpectationOwned>,
-    ) -> Self {
-        Self {
-            preferred_kind: kind,
-            preferred_extension: extension,
-            preferred_content: content,
-            fallback,
-            working_set_bytes: working_set_bytes.max(1),
-            diagnostics: Vec::new(),
-            source_expectations,
-        }
-    }
-}
-
-trait RepresentationPolicyExt {
-    fn then_fallback(self, raw: ContentChoice) -> Option<(ExtractionArtifactKind, PlannedContent)>;
-}
-
-impl RepresentationPolicyExt for ExtractionRepresentationPolicy {
-    fn then_fallback(self, raw: ContentChoice) -> Option<(ExtractionArtifactKind, PlannedContent)> {
-        (self == Self::PreferDecoded).then_some((raw.preferred_kind, raw.preferred_content))
-    }
-}
-
-#[derive(Debug)]
-struct SourceExpectationOwned {
-    locator: SourceLocator,
-    fingerprint: unity_asset_core::SourceFingerprint,
-}
-
-impl SourceExpectationOwned {
-    fn from_source(
-        source: &WorkspaceSource,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<Self, ExtractionPlanError> {
-        Ok(Self {
-            locator: clone_source_locator(
-                source.locator(),
-                "extraction source expectation locator",
-                budget,
-            )?,
-            fingerprint: source.fingerprint(),
-        })
-    }
-
-    #[cfg(feature = "decode")]
-    fn from_streamed_resource(
-        resource: &ResolvedStreamedResource,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<Self, ExtractionPlanError> {
-        Ok(Self {
-            locator: clone_source_locator(
-                resource.source().locator(),
-                "streamed extraction source expectation locator",
-                budget,
-            )?,
-            fingerprint: resource.source().fingerprint(),
-        })
-    }
-}
-
-#[cfg(feature = "decode")]
-struct ResolvedExtractionStream {
-    range: ExtractionSourceRange,
-    expectation: SourceExpectationOwned,
-}
-
-fn insert_source_expectation(
-    expectations: &mut Vec<ExtractionSourceExpectation>,
-    candidate: SourceExpectationOwned,
-) -> Result<(), ExtractionPlanError> {
-    if let Some(existing) = expectations
-        .iter()
-        .find(|expectation| expectation.locator() == &candidate.locator)
-    {
-        if existing.fingerprint() != candidate.fingerprint {
-            return Err(ExtractionPlanError::SourceFingerprintConflict {
-                locator: candidate.locator,
-                first: existing.fingerprint(),
-                second: candidate.fingerprint,
-            });
-        }
-        return Ok(());
-    }
-    expectations.push(ExtractionSourceExpectation::new(
-        candidate.locator,
-        candidate.fingerprint,
-    ));
-    Ok(())
-}
-
-fn raw_content(
-    object: &WorkspaceObject,
-    budget: &mut AssetLoadBudget,
-) -> Result<ContentChoice, ExtractionPlanError> {
-    match object.value() {
-        WorkspaceObjectValue::Binary(_) => Ok(ContentChoice::decoded(
-            ExtractionArtifactKind::BinaryRaw,
-            "bin",
-            PlannedContent::RawBinary,
-            raw_binary_working_set(object).map_err(map_reservation_error)?,
-            None,
-        )),
-        WorkspaceObjectValue::Yaml(_) => Ok(ContentChoice::decoded(
-            ExtractionArtifactKind::Yaml,
-            "yaml",
-            PlannedContent::Yaml,
-            yaml_working_set(object, budget).map_err(map_reservation_error)?,
-            None,
-        )),
-    }
-}
-
-#[cfg(feature = "decode")]
-fn unavailable_choice(
-    address: &ObjectAddress,
-    policy: ExtractionRepresentationPolicy,
-    raw: ContentChoice,
-    budget: &mut AssetLoadBudget,
-) -> Result<ContentChoice, ExtractionPlanError> {
-    unavailable_choice_with(
-        address,
-        policy,
-        raw,
-        ExtractionDiagnosticCode::DecodedUnavailable,
-        budget,
-    )
-}
-
-fn unavailable_choice_with(
-    address: &ObjectAddress,
-    policy: ExtractionRepresentationPolicy,
-    mut raw: ContentChoice,
-    code: ExtractionDiagnosticCode,
-    budget: &mut AssetLoadBudget,
-) -> Result<ContentChoice, ExtractionPlanError> {
-    if policy == ExtractionRepresentationPolicy::RequireDecoded {
-        return Err(ExtractionPlanError::RequiredDecodedUnavailable {
-            address: clone_object_address(address, "required decoded unavailable address", budget)?,
-            reason: code,
-        });
-    }
-    let diagnostic = ExtractionDiagnostic::new(
-        code,
-        Some(clone_object_address(
-            address,
-            "extraction diagnostic address",
-            budget,
-        )?),
-    );
-    push_budgeted(
-        &mut raw.diagnostics,
-        diagnostic,
-        "extraction diagnostics",
-        budget,
-    )?;
-    Ok(raw)
-}
-
-#[cfg(feature = "decode")]
-fn decoded_resource_failure(error: &ExtractionPlanError) -> Option<ExtractionDiagnosticCode> {
-    match error {
-        ExtractionPlanError::InvalidStreamPath(_)
-        | ExtractionPlanError::MissingStreamResource { .. }
-        | ExtractionPlanError::StreamSourceMissing(_)
-        | ExtractionPlanError::ObjectUnloaded(_)
-        | ExtractionPlanError::ObjectMissing(_)
-        | ExtractionPlanError::SourceMissing(_)
-        | ExtractionPlanError::Workspace(WorkspaceError::MissingSource(_)) => {
-            Some(ExtractionDiagnosticCode::MissingResource)
-        }
-        ExtractionPlanError::Workspace(WorkspaceError::RangeOutOfBounds { .. }) => {
-            Some(ExtractionDiagnosticCode::ResourceOutOfRange)
-        }
-        ExtractionPlanError::Workspace(WorkspaceError::SourceChanged { .. }) => {
-            Some(ExtractionDiagnosticCode::SourceChanged)
-        }
-        ExtractionPlanError::AmbiguousStreamResource { .. }
-        | ExtractionPlanError::ObjectAmbiguous { .. }
-        | ExtractionPlanError::ObjectInvalid(_) => {
-            Some(ExtractionDiagnosticCode::UnresolvedDependency)
-        }
-        _ => None,
-    }
-}
-
-#[cfg(feature = "decode")]
-fn sprite_reference_failure(error: &ExtractionPlanError) -> Option<ExtractionDiagnosticCode> {
-    match error {
-        ExtractionPlanError::ObjectUnloaded(_)
-        | ExtractionPlanError::ObjectMissing(_)
-        | ExtractionPlanError::ObjectAmbiguous { .. }
-        | ExtractionPlanError::ObjectInvalid(_) => {
-            Some(ExtractionDiagnosticCode::UnresolvedSpritePPtr)
-        }
-        _ => decoded_resource_failure(error),
-    }
-}
-
-fn map_reservation_error(error: ExtractionReservationError) -> ExtractionPlanError {
-    match error {
-        ExtractionReservationError::Workspace(error) => error.into(),
-        ExtractionReservationError::Budget(error) => error.into(),
-        #[cfg(feature = "decode")]
-        ExtractionReservationError::Reference(error) => error.into(),
-        ExtractionReservationError::ObjectUnavailable(address) => {
-            ExtractionPlanError::ObjectMissing(address)
-        }
-        ExtractionReservationError::ArithmeticOverflow { resource } => {
-            ExtractionPlanError::ArithmeticOverflow { resource }
-        }
-        ExtractionReservationError::YamlSizing(message) => ExtractionPlanError::YamlSizing(message),
-        error @ ExtractionReservationError::ContentMismatch(_) => {
-            ExtractionPlanError::Model(error.to_string())
-        }
-        #[cfg(feature = "decode")]
-        error @ ExtractionReservationError::StreamOutOfRange { .. } => {
-            ExtractionPlanError::Model(error.to_string())
-        }
-    }
-}
-
-fn usize_to_u64(value: usize, resource: &'static str) -> Result<u64, ExtractionPlanError> {
-    u64::try_from(value).map_err(|_| ExtractionPlanError::ArithmeticOverflow { resource })
-}
-
-fn clone_string(
-    value: &str,
-    resource: &'static str,
-    budget: &mut AssetLoadBudget,
-) -> Result<String, ExtractionPlanError> {
-    let bytes = usize_to_u64(value.len(), resource)?;
-    budget.check_bytes(bytes)?;
-    let mut cloned = String::new();
-    cloned
-        .try_reserve_exact(value.len())
-        .map_err(|source| ExtractionPlanError::Allocation {
-            resource,
-            requested: value.len(),
-            source,
-        })?;
-    cloned.push_str(value);
-    budget.consume_bytes(bytes)?;
-    Ok(cloned)
-}
-
-fn clone_source_locator(
-    value: &SourceLocator,
-    resource: &'static str,
-    budget: &mut AssetLoadBudget,
-) -> Result<SourceLocator, ExtractionPlanError> {
-    let bytes = value
-        .retained_clone_bytes()
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or(BudgetError::ArithmeticOverflow { resource })?;
-    budget.check_bytes(bytes)?;
-    let cloned = value.clone();
-    budget.consume_bytes(bytes)?;
-    Ok(cloned)
-}
-
-fn clone_object_address(
-    value: &ObjectAddress,
-    resource: &'static str,
-    budget: &mut AssetLoadBudget,
-) -> Result<ObjectAddress, ExtractionPlanError> {
-    let bytes = value
-        .retained_clone_bytes()
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or(BudgetError::ArithmeticOverflow { resource })?;
-    budget.check_bytes(bytes)?;
-    let cloned = value.clone();
-    budget.consume_bytes(bytes)?;
-    Ok(cloned)
-}
-
-#[cfg(feature = "decode")]
-fn clone_unity_version(
-    value: &UnityVersion,
-    budget: &mut AssetLoadBudget,
-) -> Result<UnityVersion, ExtractionPlanError> {
-    Ok(UnityVersion {
-        major: value.major,
-        minor: value.minor,
-        build: value.build,
-        version_type: value.version_type,
-        type_number: value.type_number,
-        type_str: value
-            .type_str
-            .as_deref()
-            .map(|channel| clone_string(channel, "planned Unity version channel", budget))
-            .transpose()?,
-    })
 }
 
 fn map_model_error(error: ExtractionModelError) -> ExtractionPlanError {
@@ -972,6 +252,7 @@ fn map_model_error(error: ExtractionModelError) -> ExtractionPlanError {
         ) => ExtractionPlanError::Allocation {
             resource,
             requested,
+            unit: ExtractionAllocationUnit::Bytes,
             source,
         },
         ExtractionModelError::Allocation {
@@ -981,75 +262,11 @@ fn map_model_error(error: ExtractionModelError) -> ExtractionPlanError {
         } => ExtractionPlanError::Allocation {
             resource,
             requested,
+            unit: ExtractionAllocationUnit::CapacityUnits,
             source,
         },
-        other => ExtractionPlanError::Model(other.to_string()),
+        other => ExtractionPlanError::ModelValidation(other),
     }
-}
-
-fn budgeted_vec<T>(
-    count: usize,
-    resource: &'static str,
-    budget: &mut AssetLoadBudget,
-) -> Result<Vec<T>, ExtractionPlanError> {
-    let entries = u64::try_from(count).map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
-    let minimum_bytes = vec_allocation_bytes::<T>(count)
-        .map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
-    budget.check_entries(entries)?;
-    budget.check_bytes(minimum_bytes)?;
-
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(count)
-        .map_err(|source| ExtractionPlanError::Allocation {
-            resource,
-            requested: count,
-            source,
-        })?;
-    let retained_bytes = vec_allocation_bytes::<T>(values.capacity())
-        .map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
-    budget.check_bytes(retained_bytes)?;
-    budget.consume_entries(entries)?;
-    budget.consume_bytes(retained_bytes)?;
-    Ok(values)
-}
-
-fn push_budgeted<T>(
-    values: &mut Vec<T>,
-    value: T,
-    resource: &'static str,
-    budget: &mut AssetLoadBudget,
-) -> Result<(), ExtractionPlanError> {
-    budget.check_entries(1)?;
-    let previous_bytes = vec_allocation_bytes::<T>(values.capacity())
-        .map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
-    if values.len() == values.capacity() {
-        let planned_capacity = values
-            .capacity()
-            .checked_add(1)
-            .ok_or(BudgetError::ArithmeticOverflow { resource })?;
-        let planned_bytes = vec_allocation_bytes::<T>(planned_capacity)
-            .map_err(|_| BudgetError::ArithmeticOverflow { resource })?
-            .checked_sub(previous_bytes)
-            .ok_or(BudgetError::ArithmeticOverflow { resource })?;
-        budget.check_bytes(planned_bytes)?;
-        values
-            .try_reserve_exact(1)
-            .map_err(|source| ExtractionPlanError::Allocation {
-                resource,
-                requested: 1,
-                source,
-            })?;
-    }
-    let retained_bytes = vec_allocation_bytes::<T>(values.capacity())
-        .map_err(|_| BudgetError::ArithmeticOverflow { resource })?
-        .checked_sub(previous_bytes)
-        .ok_or(BudgetError::ArithmeticOverflow { resource })?;
-    budget.check_bytes(retained_bytes)?;
-    budget.consume_entries(1)?;
-    budget.consume_bytes(retained_bytes)?;
-    values.push(value);
-    Ok(())
 }
 
 fn selected_handles(
@@ -1078,41 +295,6 @@ fn selected_handles(
             Ok(handles)
         }
     }
-}
-
-fn resolve_required_handle(
-    view: &dyn WorkspaceView,
-    address: &ObjectAddress,
-    budget: &mut AssetLoadBudget,
-) -> Result<RevisionedObjectHandle, ExtractionPlanError> {
-    match view.resolve_object(address, budget)? {
-        WorkspaceLookup::Resolved(handle) => Ok(handle),
-        WorkspaceLookup::Unloaded => Err(ExtractionPlanError::ObjectUnloaded(
-            clone_object_address(address, "unloaded object address", budget)?,
-        )),
-        WorkspaceLookup::Missing => Err(ExtractionPlanError::ObjectMissing(clone_object_address(
-            address,
-            "missing object address",
-            budget,
-        )?)),
-        WorkspaceLookup::Ambiguous { candidates } => Err(ExtractionPlanError::ObjectAmbiguous {
-            address: clone_object_address(address, "ambiguous object address", budget)?,
-            candidates: candidates.len(),
-        }),
-        WorkspaceLookup::Invalid { .. } => Err(ExtractionPlanError::ObjectInvalid(
-            clone_object_address(address, "invalid object address", budget)?,
-        )),
-    }
-}
-
-fn source_for_id(
-    id: SourceId,
-    sources: &[WorkspaceSource],
-) -> Result<&WorkspaceSource, ExtractionPlanError> {
-    sources
-        .iter()
-        .find(|source| source.id() == id)
-        .ok_or(ExtractionPlanError::SourceMissing(id))
 }
 
 fn object_name(
@@ -1185,6 +367,7 @@ fn allocate_path(
         .map_err(|source| ExtractionPlanError::Allocation {
             resource: "extraction relative path",
             requested,
+            unit: ExtractionAllocationUnit::Bytes,
             source,
         })?;
     if let Some(prefix) = prefix {
@@ -1205,7 +388,9 @@ fn allocate_path(
     relative.push('.');
     relative.push_str(extension);
 
-    ExtractionPath::from_string_with_budget(relative, budget).map_err(map_model_error)
+    ExtractionPath::from_string_with_budget(relative, budget)
+        .map_err(ExtractionModelError::from)
+        .map_err(map_model_error)
 }
 
 const fn slug_capacity_bound(value: &str, maximum: usize) -> usize {
@@ -1259,201 +444,6 @@ fn push_digest_hex(output: &mut String, digest: unity_asset_core::DigestV1) {
         output.push(char::from(HEX[usize::from(byte >> 4)]));
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
-}
-
-#[cfg(feature = "decode")]
-fn resolve_extraction_stream(
-    owner: &WorkspaceSource,
-    resolver: &StreamedResourceResolver<'_, '_>,
-    stream_path: &str,
-    offset: u64,
-    size: u64,
-    budget: &mut AssetLoadBudget,
-) -> Result<ResolvedExtractionStream, ExtractionPlanError> {
-    if let Err(error) = StreamedResourceRequest::validate_parts(stream_path, offset, size) {
-        return match error {
-            StreamedResourceRequestError::RangeOverflow { offset, size } => {
-                Err(WorkspaceError::RangeOverflow { offset, size }.into())
-            }
-            StreamedResourceRequestError::EmptyPath
-            | StreamedResourceRequestError::PathTooLong { .. }
-            | StreamedResourceRequestError::ControlCharacter
-            | StreamedResourceRequestError::InvalidBasename => {
-                Err(ExtractionPlanError::InvalidStreamPath(clone_string(
-                    stream_path,
-                    "invalid stream path",
-                    budget,
-                )?))
-            }
-        };
-    }
-    let resource = match resolver.resolve(owner, stream_path, offset, size, budget)? {
-        StreamedResourceResolution::Resolved { resource } => resource,
-        StreamedResourceResolution::Missing => {
-            return Err(ExtractionPlanError::MissingStreamResource {
-                owner: clone_source_locator(
-                    owner.locator(),
-                    "missing stream resource owner",
-                    budget,
-                )?,
-                stream_path: clone_string(stream_path, "missing stream resource path", budget)?,
-            });
-        }
-        StreamedResourceResolution::Ambiguous { .. } => {
-            return Err(ExtractionPlanError::AmbiguousStreamResource {
-                owner: clone_source_locator(
-                    owner.locator(),
-                    "ambiguous stream resource owner",
-                    budget,
-                )?,
-                stream_path: clone_string(stream_path, "ambiguous stream resource path", budget)?,
-            });
-        }
-        StreamedResourceResolution::OwnerUnloaded | StreamedResourceResolution::OwnerMissing => {
-            return Err(ExtractionPlanError::StreamSourceMissing(
-                clone_source_locator(
-                    owner.locator(),
-                    "missing streamed-resource owner locator",
-                    budget,
-                )?,
-            ));
-        }
-        StreamedResourceResolution::Invalid { .. } => {
-            return Err(ExtractionPlanError::InvalidStreamPath(clone_string(
-                stream_path,
-                "invalid stream path",
-                budget,
-            )?));
-        }
-    };
-    let expectation = SourceExpectationOwned::from_streamed_resource(&resource, budget)?;
-    let range = ExtractionSourceRange::new(
-        clone_source_locator(
-            resource.source().locator(),
-            "decoded stream source range locator",
-            budget,
-        )?,
-        offset,
-        size,
-    )
-    .map_err(map_model_error)?;
-    Ok(ResolvedExtractionStream { range, expectation })
-}
-
-#[cfg(feature = "decode")]
-fn resolve_reference_address(
-    graph: &ReferenceGraph,
-    owner: &RevisionedObjectHandle,
-    file_id: i32,
-    path_id: i64,
-    budget: &mut AssetLoadBudget,
-) -> Result<Option<ObjectAddress>, ExtractionPlanError> {
-    for fact in graph.outgoing(owner)? {
-        let RawReferenceTarget::Binary {
-            file_id: candidate_file,
-            path_id: candidate_path,
-            ..
-        } = fact.raw_target()
-        else {
-            continue;
-        };
-        if *candidate_file != file_id || *candidate_path != path_id {
-            continue;
-        }
-        if let ReferenceResolution::Resolved(target) = fact.resolution() {
-            return Ok(Some(clone_object_address(
-                graph.address(target)?,
-                "resolved sprite texture address",
-                budget,
-            )?));
-        }
-    }
-    Ok(None)
-}
-
-#[derive(Debug, Error)]
-pub enum ExtractionPlanError {
-    #[error(transparent)]
-    Workspace(#[from] WorkspaceError),
-    #[error(transparent)]
-    Contract(#[from] ContractError),
-    #[error(transparent)]
-    Budget(#[from] BudgetError),
-    #[error(transparent)]
-    Reference(#[from] ReferenceGraphError),
-    #[error(transparent)]
-    ContainerContract(#[from] super::container::BundleContainerContractError),
-    #[error(transparent)]
-    Diagnostic(#[from] unity_asset_core::DiagnosticError),
-    #[error(transparent)]
-    FieldPath(#[from] unity_asset_core::FieldPathError),
-    #[error("failed to reserve {requested} capacity units for {resource}: {source}")]
-    Allocation {
-        resource: &'static str,
-        requested: usize,
-        #[source]
-        source: std::collections::TryReserveError,
-    },
-    #[error("extraction model rejected the plan: {0}")]
-    Model(String),
-    #[error("reference graph violated an extraction invariant: {0}")]
-    ReferenceInvariant(&'static str),
-    #[error("reference graph does not describe the extraction workspace revision")]
-    ReferenceContextMismatch,
-    #[error("bundle-container selection requires a caller-supplied ReferenceGraph")]
-    ReferenceGraphRequired,
-    #[error("an incomplete reference graph cannot drive bundle-container extraction")]
-    IncompleteReferenceGraph,
-    #[error("an incomplete reference traversal cannot be used as an extraction selection")]
-    IncompleteReferenceTraversal,
-    #[error("required decoded representation is unavailable for {address:?}: {reason:?}")]
-    RequiredDecodedUnavailable {
-        address: ObjectAddress,
-        reason: ExtractionDiagnosticCode,
-    },
-    #[error("object is not loaded: {0:?}")]
-    ObjectUnloaded(ObjectAddress),
-    #[error("object does not exist: {0:?}")]
-    ObjectMissing(ObjectAddress),
-    #[error("object address {address:?} is ambiguous across {candidates} candidates")]
-    ObjectAmbiguous {
-        address: ObjectAddress,
-        candidates: usize,
-    },
-    #[error("object address is invalid: {0:?}")]
-    ObjectInvalid(ObjectAddress),
-    #[error("workspace source is missing: {0:?}")]
-    SourceMissing(SourceId),
-    #[error("source {locator:?} has conflicting fingerprints {first} and {second}")]
-    SourceFingerprintConflict {
-        locator: SourceLocator,
-        first: SourceFingerprint,
-        second: SourceFingerprint,
-    },
-    #[error("stream source is missing: {0:?}")]
-    StreamSourceMissing(SourceLocator),
-    #[error("object identity cannot be represented as an ObjectAddress")]
-    InvalidObjectIdentity,
-    #[error("invalid streamed resource path: {0:?}")]
-    InvalidStreamPath(String),
-    #[error("streamed resource {stream_path:?} is missing for {owner:?}")]
-    MissingStreamResource {
-        owner: SourceLocator,
-        stream_path: String,
-    },
-    #[error("streamed resource {stream_path:?} is ambiguous for {owner:?}")]
-    AmbiguousStreamResource {
-        owner: SourceLocator,
-        stream_path: String,
-    },
-    #[error("failed to encode canonical object address: {0}")]
-    CanonicalAddress(String),
-    #[error("failed to format extraction output path")]
-    PathFormatting,
-    #[error("failed to measure canonical YAML output: {0}")]
-    YamlSizing(String),
-    #[error("arithmetic overflow while planning {resource}")]
-    ArithmeticOverflow { resource: &'static str },
 }
 
 #[cfg(test)]
@@ -1531,122 +521,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(budget.usage().bytes, path.retained_bytes().unwrap());
-    }
-
-    #[test]
-    fn unavailable_decoding_preserves_the_machine_actionable_reason() {
-        let address =
-            ObjectAddress::binary_direct(SourceLocator::path("media.assets").unwrap(), 41).unwrap();
-        let raw = ContentChoice::decoded(
-            ExtractionArtifactKind::BinaryRaw,
-            "bin",
-            PlannedContent::RawBinary,
-            1,
-            None,
-        );
-
-        let mut budget = AssetLoadBudget::default();
-        let fallback = unavailable_choice_with(
-            &address,
-            ExtractionRepresentationPolicy::PreferDecoded,
-            raw,
-            ExtractionDiagnosticCode::MissingResource,
-            &mut budget,
-        )
-        .unwrap();
-        assert_eq!(
-            fallback.diagnostics[0].code(),
-            ExtractionDiagnosticCode::MissingResource
-        );
-        let expected_bytes = u64::try_from(address.retained_clone_bytes().unwrap()).unwrap()
-            + vec_allocation_bytes::<ExtractionDiagnostic>(fallback.diagnostics.capacity())
-                .unwrap();
-        assert_eq!(budget.usage().entries, 1);
-        assert_eq!(budget.usage().bytes, expected_bytes);
-
-        let required = unavailable_choice_with(
-            &address,
-            ExtractionRepresentationPolicy::RequireDecoded,
-            ContentChoice::decoded(
-                ExtractionArtifactKind::BinaryRaw,
-                "bin",
-                PlannedContent::RawBinary,
-                1,
-                None,
-            ),
-            ExtractionDiagnosticCode::UnresolvedDependency,
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            required,
-            ExtractionPlanError::RequiredDecodedUnavailable {
-                reason: ExtractionDiagnosticCode::UnresolvedDependency,
-                ..
-            }
-        ));
-    }
-
-    #[cfg(feature = "decode")]
-    #[test]
-    fn decoded_resource_failures_keep_missing_and_unresolved_categories_distinct() {
-        let owner = SourceLocator::path("media.assets").unwrap();
-        let missing = ExtractionPlanError::MissingStreamResource {
-            owner: owner.clone(),
-            stream_path: "missing.resS".to_owned(),
-        };
-        let invalid = ExtractionPlanError::InvalidStreamPath(".".to_owned());
-        let owner_missing = ExtractionPlanError::StreamSourceMissing(owner.clone());
-        let ambiguous_stream = ExtractionPlanError::AmbiguousStreamResource {
-            owner: owner.clone(),
-            stream_path: "shared.resS".to_owned(),
-        };
-        let resource_source = SourceId::new(
-            unity_asset_core::WorkspaceId::from_u128(1).unwrap(),
-            unity_asset_core::SourceKind::StreamedResource,
-            1,
-        )
-        .unwrap();
-        let out_of_bounds = ExtractionPlanError::Workspace(WorkspaceError::RangeOutOfBounds {
-            source_id: resource_source,
-            offset: 2,
-            end: 5,
-            source_len: 4,
-        });
-        let address = ObjectAddress::binary_direct(owner, 41).unwrap();
-        let unresolved = ExtractionPlanError::ObjectAmbiguous {
-            address,
-            candidates: 2,
-        };
-
-        assert_eq!(
-            decoded_resource_failure(&missing),
-            Some(ExtractionDiagnosticCode::MissingResource)
-        );
-        assert_eq!(
-            decoded_resource_failure(&invalid),
-            Some(ExtractionDiagnosticCode::MissingResource)
-        );
-        assert_eq!(
-            decoded_resource_failure(&owner_missing),
-            Some(ExtractionDiagnosticCode::MissingResource)
-        );
-        assert_eq!(
-            decoded_resource_failure(&out_of_bounds),
-            Some(ExtractionDiagnosticCode::ResourceOutOfRange)
-        );
-        assert_eq!(
-            decoded_resource_failure(&ambiguous_stream),
-            Some(ExtractionDiagnosticCode::UnresolvedDependency)
-        );
-        assert_eq!(
-            decoded_resource_failure(&unresolved),
-            Some(ExtractionDiagnosticCode::UnresolvedDependency)
-        );
-        assert_eq!(
-            sprite_reference_failure(&unresolved),
-            Some(ExtractionDiagnosticCode::UnresolvedSpritePPtr)
-        );
     }
 
     #[cfg(feature = "decode")]

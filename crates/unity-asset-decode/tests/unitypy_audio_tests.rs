@@ -6,8 +6,8 @@
 #![cfg(feature = "audio")]
 #![allow(clippy::field_reassign_with_default)]
 
+use unity_asset_binary::unity_version::UnityVersion;
 use unity_asset_decode::audio::{AudioClip, AudioClipMeta, AudioCompressionFormat, AudioProcessor};
-use unity_asset_decode::unity_version::UnityVersion;
 
 fn test_version() -> UnityVersion {
     UnityVersion::parse_version("2020.3.12f1").unwrap()

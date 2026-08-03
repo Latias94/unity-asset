@@ -10,6 +10,7 @@ use super::contract::{
     SchemaVariantId,
 };
 use super::output::RecipeOutputBuilder;
+use crate::schema::resource::classify_audio_clip_resource;
 use crate::workspace::{
     FieldGuard, GenericMutation, MutationPlanError, MutationPlanFragment, MutationValue,
     PlanPayload, SourceExpectation, WorkspaceLookup, WorkspaceObject, WorkspaceSource,
@@ -220,7 +221,7 @@ impl<'view> SchemaRecipePlanner<'view> {
             material_applicability(object, budget)?,
             event_applicability(object, budget)?,
             hierarchy_applicability(object),
-            resource_applicability(object),
+            resource_applicability(object)?,
         ])
     }
 
@@ -721,31 +722,28 @@ fn hierarchy_applicability(object: &RecipeObject) -> RecipeApplicability {
     }
 }
 
-fn resource_applicability(object: &RecipeObject) -> RecipeApplicability {
+fn resource_applicability(object: &RecipeObject) -> Result<RecipeApplicability, RecipeError> {
     let class = object.class();
     if class.class_id() != unity_asset_core::class_ids::AUDIO_CLIP
         || class.class_name() != class_names::AUDIO_CLIP
     {
-        return RecipeApplicability::rejected(
+        return Ok(RecipeApplicability::rejected(
             RecipeId::AudioClipStreamedResourceV1,
             RecipeRejectionCode::WrongClass,
-        );
+        ));
     }
-    if matches!(class.get("m_Resource"), Some(UnityValue::Object(_))) {
-        RecipeApplicability::applicable(
+    match classify_audio_clip_resource(object) {
+        Ok(selection) => Ok(RecipeApplicability::applicable(
             RecipeId::AudioClipStreamedResourceV1,
-            SchemaVariantId::AudioClipResource,
-        )
-    } else if matches!(class.get("m_StreamData"), Some(UnityValue::Object(_))) {
-        RecipeApplicability::applicable(
-            RecipeId::AudioClipStreamedResourceV1,
-            SchemaVariantId::AudioClipStreamDataCompatibility,
-        )
-    } else {
-        RecipeApplicability::rejected(
-            RecipeId::AudioClipStreamedResourceV1,
-            RecipeRejectionCode::UnsupportedSchema,
-        )
+            selection.schema_variant(),
+        )),
+        Err(error) => match error.code() {
+            Some(rejection) => Ok(RecipeApplicability::rejected(
+                RecipeId::AudioClipStreamedResourceV1,
+                rejection,
+            )),
+            None => Err(error),
+        },
     }
 }
 

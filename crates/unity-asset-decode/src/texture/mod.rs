@@ -34,20 +34,21 @@
 //! ```
 
 pub mod converter;
-pub mod decoders;
+mod decoders;
 pub mod formats;
 pub mod helpers;
+mod inspection;
+pub(crate) mod prepared;
 pub mod types;
 
 // Re-export main types for easy access
-pub use converter::{Texture2DConverter, Texture2DLayout};
-pub use decoders::{Decoder, TextureDecoder};
+pub use converter::Texture2DConverter;
+pub use decoders::TextureDecoder;
 pub use formats::{TextureFormat, TextureFormatInfo};
 pub use helpers::{TextureExporter, TextureSwizzler};
+pub use inspection::Texture2DLayout;
+pub use prepared::{PreparedTexturePng, TexturePreparationError};
 pub use types::{GLTextureSettings, StreamingInfo, Texture2D};
-
-// Re-export decoder types for advanced usage
-pub use decoders::{BasicDecoder, CompressedDecoder, CrunchDecoder, MobileDecoder};
 
 /// Main texture processing facade
 ///
@@ -70,22 +71,25 @@ impl TextureProcessor {
     /// Process Unity object to Texture2D
     pub fn convert_object(
         &self,
-        obj: &crate::object::UnityObject,
-    ) -> crate::error::Result<Texture2D> {
+        obj: &unity_asset_binary::object::UnityObject,
+    ) -> unity_asset_binary::Result<Texture2D> {
         self.converter.from_unity_object(obj)
     }
 
     /// Decode texture to RGBA image
-    pub fn decode_texture(&self, texture: &Texture2D) -> crate::error::Result<image::RgbaImage> {
+    pub fn decode_texture(
+        &self,
+        texture: &Texture2D,
+    ) -> unity_asset_binary::Result<image::RgbaImage> {
         self.decoder.decode(texture)
     }
 
     /// Convert and decode an object, then write PNG bytes to a caller-owned sink.
     pub fn process_and_write_png<W: std::io::Write + ?Sized>(
         &self,
-        obj: &crate::object::UnityObject,
+        obj: &unity_asset_binary::object::UnityObject,
         writer: &mut W,
-    ) -> crate::error::Result<()> {
+    ) -> unity_asset_binary::Result<()> {
         let texture = self.convert_object(obj)?;
         let image = self.decode_texture(&texture)?;
         TextureExporter::write_png(&image, writer)
@@ -132,7 +136,7 @@ pub fn decode_texture_data(
     width: u32,
     height: u32,
     data: Vec<u8>,
-) -> crate::error::Result<image::RgbaImage> {
+) -> unity_asset_binary::Result<image::RgbaImage> {
     let texture = Texture2D {
         name: "decoded_texture".to_string(),
         width: width as i32,

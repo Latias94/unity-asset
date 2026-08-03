@@ -9,23 +9,24 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use unity_asset_binary::file::{UnityFile, load_unity_file_with_budget};
+use unity_asset_binary::object::ObjectHandle;
+use unity_asset_binary::{BinaryError, Result};
 use unity_asset_core::{AssetLoadBudget, constants::class_ids};
-use unity_asset_decode::file::load_unity_file_with_budget;
-use unity_asset_decode::object::ObjectHandle;
 use unity_asset_decode::texture::{Texture2DConverter, TextureExporter};
 
-fn main() -> unity_asset_decode::Result<()> {
+fn main() -> Result<()> {
     let path = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .ok_or_else(|| unity_asset_decode::BinaryError::invalid_format("missing <path>"))?;
+        .ok_or_else(|| BinaryError::invalid_format("missing <path>"))?;
     let out_dir = std::env::args_os()
         .nth(2)
         .map(PathBuf::from)
-        .ok_or_else(|| unity_asset_decode::BinaryError::invalid_format("missing <out_dir>"))?;
+        .ok_or_else(|| BinaryError::invalid_format("missing <out_dir>"))?;
 
     std::fs::create_dir_all(&out_dir).map_err(|e| {
-        unity_asset_decode::BinaryError::generic(format!(
+        BinaryError::generic(format!(
             "Failed to create output dir {}: {}",
             out_dir.display(),
             e
@@ -40,7 +41,7 @@ fn main() -> unity_asset_decode::Result<()> {
     let mut exported = 0usize;
     let mut seen = 0usize;
 
-    let mut process = |handle: ObjectHandle<'_>| -> unity_asset_decode::Result<()> {
+    let mut process = |handle: ObjectHandle<'_>| -> Result<()> {
         if handle.class_id() != class_ids::TEXTURE_2D {
             return Ok(());
         }
@@ -57,38 +58,32 @@ fn main() -> unity_asset_decode::Result<()> {
         let out_path = out_dir.join(file_name);
 
         let output = File::create(&out_path).map_err(|error| {
-            unity_asset_decode::BinaryError::generic(format!(
-                "Failed to create {}: {error}",
-                out_path.display()
-            ))
+            BinaryError::generic(format!("Failed to create {}: {error}", out_path.display()))
         })?;
         let mut output = BufWriter::new(output);
         TextureExporter::write_png(&image, &mut output)?;
         output.flush().map_err(|error| {
-            unity_asset_decode::BinaryError::generic(format!(
-                "Failed to flush {}: {error}",
-                out_path.display()
-            ))
+            BinaryError::generic(format!("Failed to flush {}: {error}", out_path.display()))
         })?;
         exported += 1;
         Ok(())
     };
 
     match file {
-        unity_asset_decode::file::UnityFile::SerializedFile(sf) => {
+        UnityFile::SerializedFile(sf) => {
             for h in sf.object_handles() {
                 process(h)?;
             }
         }
-        unity_asset_decode::file::UnityFile::AssetBundle(bundle) => {
+        UnityFile::AssetBundle(bundle) => {
             for sf in &bundle.assets {
                 for h in sf.object_handles() {
                     process(h)?;
                 }
             }
         }
-        unity_asset_decode::file::UnityFile::WebFile(_) => {
-            return Err(unity_asset_decode::BinaryError::invalid_format(
+        UnityFile::WebFile(_) => {
+            return Err(BinaryError::invalid_format(
                 "WebFile container: inspect entries through AssetWorkspace or the typed CLI",
             ));
         }

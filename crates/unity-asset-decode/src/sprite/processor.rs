@@ -1,21 +1,17 @@
 //! Sprite processing implementation
 //!
-//! This module provides high-level sprite parsing, rendering, and caller-owned
-//! PNG encoding.
+//! This module provides sprite rendering and caller-owned PNG encoding.
 
-use super::parser::SpriteParser;
 use super::types::*;
-use crate::error::{BinaryError, Result};
-use crate::object::UnityObject;
 use crate::texture::Texture2D;
 use crate::texture::helpers::export::write_rgba_png;
 use image::{RgbaImage, imageops};
 use std::io::Write;
+use unity_asset_binary::{BinaryError, Result};
 
 /// Sprite processor
 ///
-/// This struct provides high-level methods for processing Unity Sprite objects,
-/// including parsing and caller-owned image encoding.
+/// This struct provides high-level methods for rendering inspected Sprite data.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SpriteProcessor;
 
@@ -29,11 +25,6 @@ impl SpriteProcessor {
     /// Create a new Sprite processor
     pub const fn new() -> Self {
         Self
-    }
-
-    /// Parse Sprite from Unity object
-    pub fn parse_sprite(&self, object: &UnityObject) -> Result<Sprite> {
-        SpriteParser::new().parse_from_unity_object(object)
     }
 
     /// Extract and encode a sprite as PNG into a caller-owned sink.

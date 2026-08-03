@@ -591,7 +591,7 @@ mod tests {
             r#""streamed_resource_query":1,"prepare_report":1,"commit_report":2,"#,
             r#""recovery_locator":1,"recovery_discovery":1,"recovery_outcome":2,"#,
             r#""rollback_receipt":2,"bundle_container_query":1,"bundle_container_result":1,"#,
-            r#""reference_graph_projection":1,"extraction_request":1,"extraction_plan":2,"#,
+            r#""reference_graph_projection":1,"extraction_request":1,"extraction_plan":3,"#,
             r#""extraction_manifest":2,"#,
             r#""extraction_report":2,"yaml_split_report":1},"#,
             r#""source_inspection":{"source_kinds":["yaml","serialized_file","asset_bundle","#,

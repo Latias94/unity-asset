@@ -14,11 +14,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use unity_asset_binary::asset::SerializedFileParser;
+use unity_asset_binary::bundle::BundleParser;
+use unity_asset_binary::object::UnityObject;
+use unity_asset_binary::unity_version::UnityVersion;
 use unity_asset_core::AssetLoadBudget;
-use unity_asset_decode::asset::SerializedFileParser;
-use unity_asset_decode::bundle::BundleParser;
-use unity_asset_decode::object::UnityObject;
-use unity_asset_decode::unity_version::UnityVersion;
 use unity_asset_decode::{
     audio::AudioProcessor, sprite::SpriteProcessor, texture::TextureProcessor,
 };

@@ -1,5 +1,7 @@
 //! Error types for Unity binary parsing
 
+use std::collections::TryReserveError;
+
 use thiserror::Error;
 use unity_asset_core::BudgetError;
 
@@ -107,6 +109,15 @@ pub enum BinaryError {
     #[error("Memory allocation error: {0}")]
     MemoryError(String),
 
+    /// Fallible capacity reservation failed without allocating an error message.
+    #[error("failed to allocate {requested} bytes for {resource}: {source}")]
+    Allocation {
+        resource: &'static str,
+        requested: usize,
+        #[source]
+        source: TryReserveError,
+    },
+
     /// Timeout error
     #[error("Operation timed out: {0}")]
     Timeout(String),
@@ -200,7 +211,10 @@ impl BinaryError {
     pub fn is_resource_error(&self) -> bool {
         matches!(
             self,
-            Self::Budget(_) | Self::MemoryError(_) | Self::ResourceLimitExceeded(_)
+            Self::Budget(_)
+                | Self::MemoryError(_)
+                | Self::Allocation { .. }
+                | Self::ResourceLimitExceeded(_)
         )
     }
 }
@@ -249,6 +263,15 @@ impl BinaryError {
         BinaryError::MemoryError(msg.into())
     }
 
+    /// Preserve one failed capacity reservation without allocating diagnostics.
+    pub fn allocation(resource: &'static str, requested: usize, source: TryReserveError) -> Self {
+        Self::Allocation {
+            resource,
+            requested,
+            source,
+        }
+    }
+
     /// Create a timeout error
     pub fn timeout(msg: impl Into<String>) -> Self {
         BinaryError::Timeout(msg.into())
@@ -275,6 +298,7 @@ impl BinaryError {
             BinaryError::InvalidSignature { .. } => false,
             BinaryError::Unsupported(_) => true, // Might skip unsupported feature
             BinaryError::MemoryError(_) => false,
+            BinaryError::Allocation { .. } => false,
             BinaryError::Timeout(_) => true, // Might retry
             BinaryError::ResourceLimitExceeded(_) => true, // Might reduce limits
             BinaryError::Budget(_) => true,  // Might retry with a larger load budget
@@ -299,6 +323,7 @@ impl BinaryError {
             BinaryError::InvalidSignature { .. } => ErrorSeverity::High,
             BinaryError::Unsupported(_) => ErrorSeverity::Low,
             BinaryError::MemoryError(_) => ErrorSeverity::Critical,
+            BinaryError::Allocation { .. } => ErrorSeverity::Critical,
             BinaryError::Timeout(_) => ErrorSeverity::Medium,
             BinaryError::ResourceLimitExceeded(_) => ErrorSeverity::Medium,
             BinaryError::Budget(_) => ErrorSeverity::Medium,
@@ -318,6 +343,7 @@ impl BinaryError {
             BinaryError::Timeout(_) => Some("Retry with longer timeout"),
             BinaryError::ResourceLimitExceeded(_) => Some("Reduce processing limits"),
             BinaryError::Budget(_) => Some("Increase load limits or reduce the input scope"),
+            BinaryError::Allocation { .. } => Some("Reduce the input scope or free memory"),
             BinaryError::CorruptedData(_) => Some("Skip corrupted section"),
             BinaryError::ObjectIdentity(_) => Some("Skip malformed SerializedFile"),
             BinaryError::ObjectReplacement(_) => Some("Reject the invalid object replacement"),

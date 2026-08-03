@@ -28,7 +28,7 @@ unity-asset-core = { workspace = true }
 unity-asset-yaml = { workspace = true }
 unity-asset-binary = { workspace = true }
 unity-asset-write = { workspace = true }
-unity-asset-decode = { workspace = true, features = ["audio", "texture-advanced", "sprite"], optional = true }
+unity-asset-decode = { workspace = true }
 zip = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -59,7 +59,11 @@ libc = "0.2"
 default = ["mmap"]
 async = ["unity-asset-core/async", "unity-asset-yaml/async"]
 mmap = ["unity-asset-binary/mmap"]
-decode = ["dep:unity-asset-decode"]
+decode = [
+    "unity-asset-decode/audio",
+    "unity-asset-decode/sprite",
+    "unity-asset-decode/texture-advanced",
+]
 
 [dev-dependencies]
 flate2 = { workspace = true }

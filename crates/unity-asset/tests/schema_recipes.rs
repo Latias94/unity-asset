@@ -243,6 +243,15 @@ AudioClip:
 --- !u!83 &8300008
 AudioClip:
   m_StreamData: {path: archive:/CAB-a/CAB-a.resS, offset: 0, size: 4.5}
+--- !u!83 &8300009
+AudioClip:
+  m_Resource: {m_Source: archive:/CAB-a/CAB-a.resS, m_Offset: 0, m_Size: 0}
+--- !u!83 &8300010
+AudioClip:
+  m_Resource: {m_Source: archive:/CAB-a/CAB-a.resS, m_Offset: 18446744073709551615, m_Size: 1}
+--- !u!83 &8300011
+AudioClip:
+  m_Resource: {m_Source: "", m_Offset: 0, m_Size: 4}
 "#;
 
 struct Fixture {
@@ -1334,13 +1343,37 @@ fn audio_clip_recipe_classifies_all_candidate_combinations_without_allocating_ca
     let snapshot = fixture.workspace.snapshot();
     let planner = SchemaRecipePlanner::new(&snapshot);
 
-    for (anchor, expected_path) in [
-        ("8300000", "$.m_Resource"),
-        ("8300001", "$.m_StreamData"),
-        ("8300002", "$.m_Resource"),
+    for (anchor, expected_path, expected_variant) in [
+        (
+            "8300000",
+            "$.m_Resource",
+            SchemaVariantId::AudioClipResource,
+        ),
+        (
+            "8300001",
+            "$.m_StreamData",
+            SchemaVariantId::AudioClipStreamDataCompatibility,
+        ),
+        (
+            "8300002",
+            "$.m_Resource",
+            SchemaVariantId::AudioClipResource,
+        ),
+        (
+            "8300006",
+            "$.m_Resource",
+            SchemaVariantId::AudioClipResource,
+        ),
     ] {
         let object = planner
             .inspect(&fixture.address(anchor), &mut AssetLoadBudget::default())
+            .unwrap();
+        let applicability = planner
+            .capabilities_for(&object, &mut AssetLoadBudget::default())
+            .unwrap();
+        let resource = applicability
+            .iter()
+            .find(|entry| entry.recipe() == RecipeId::AudioClipStreamedResourceV1)
             .unwrap();
         let fragment = changed(
             AudioClipResourceRecipe::lower(
@@ -1357,18 +1390,30 @@ fn audio_clip_recipe_classifies_all_candidate_combinations_without_allocating_ca
             unreachable!();
         };
         assert_eq!(path.to_string(), expected_path);
+        assert_eq!(resource.status(), RecipeApplicabilityStatus::Applicable);
+        assert_eq!(resource.variant(), Some(expected_variant));
+        assert!(resource.rejection().is_none());
     }
 
     for (anchor, code) in [
         ("8300003", RecipeRejectionCode::UnsupportedSchema),
         ("8300004", RecipeRejectionCode::WrongFieldShape),
         ("8300005", RecipeRejectionCode::WrongClass),
-        ("8300006", RecipeRejectionCode::WrongFieldShape),
         ("8300007", RecipeRejectionCode::WrongFieldShape),
         ("8300008", RecipeRejectionCode::WrongFieldShape),
+        ("8300009", RecipeRejectionCode::WrongFieldShape),
+        ("8300010", RecipeRejectionCode::WrongFieldShape),
+        ("8300011", RecipeRejectionCode::WrongFieldShape),
     ] {
         let object = planner
             .inspect(&fixture.address(anchor), &mut AssetLoadBudget::default())
+            .unwrap();
+        let applicability = planner
+            .capabilities_for(&object, &mut AssetLoadBudget::default())
+            .unwrap();
+        let resource = applicability
+            .iter()
+            .find(|entry| entry.recipe() == RecipeId::AudioClipStreamedResourceV1)
             .unwrap();
         let error = AudioClipResourceRecipe::lower(
             &planner,
@@ -1378,7 +1423,28 @@ fn audio_clip_recipe_classifies_all_candidate_combinations_without_allocating_ca
         )
         .unwrap_err();
         assert_eq!(error.code(), Some(code));
+        assert_eq!(resource.status(), RecipeApplicabilityStatus::Rejected);
+        assert_eq!(resource.rejection(), Some(code));
+        assert!(resource.variant().is_none());
     }
+
+    let malformed = planner
+        .inspect(&fixture.address("8300007"), &mut AssetLoadBudget::default())
+        .unwrap();
+    assert!(matches!(
+        AudioClipResourceRecipe::lower(
+            &planner,
+            &malformed,
+            PlanPayload::new(b"OggS".to_vec()),
+            &mut AssetLoadBudget::default(),
+        ),
+        Err(RecipeError::InvalidMediaDescriptor {
+            source: unity_asset_decode::media::MediaInspectionError::InvalidDescriptor {
+                field: "m_Offset",
+                reason: "field must be an unsigned integer",
+            },
+        })
+    ));
 
     let object = planner
         .inspect(&fixture.address("8300000"), &mut AssetLoadBudget::default())

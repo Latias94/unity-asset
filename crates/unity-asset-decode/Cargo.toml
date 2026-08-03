@@ -18,6 +18,7 @@ unity-asset-binary = { workspace = true }
 unity-asset-core = { workspace = true }
 serde = { workspace = true }
 image = { workspace = true, optional = true }
+crc32fast = { version = "1.5", optional = true }
 symphonia = { version = "0.5", features = ["all"], optional = true }
 hound = { version = "3.5", optional = true }
 texture2ddecoder = { version = "0.1", optional = true }
@@ -30,7 +31,7 @@ thiserror = { workspace = true }
 [features]
 default = []
 
-texture = ["dep:image"]
+texture = ["dep:crc32fast", "dep:image"]
 texture-advanced = ["texture", "dep:texture2ddecoder"]
 audio = [
     "dep:base64",
@@ -46,6 +47,7 @@ full = ["texture", "texture-advanced", "audio", "sprite"]
 [dev-dependencies]
 tempfile = { workspace = true }
 hex = "0.4"
+serde_json = { workspace = true }
 
 [[example]]
 name = "debug_texture_formats"

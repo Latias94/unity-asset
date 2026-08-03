@@ -9,9 +9,9 @@
 
 use std::fs;
 use std::path::Path;
+use unity_asset_binary::bundle::BundleParser;
+use unity_asset_binary::object::UnityObject;
 use unity_asset_core::AssetLoadBudget;
-use unity_asset_decode::bundle::BundleParser;
-use unity_asset_decode::object::UnityObject;
 use unity_asset_decode::texture::TextureProcessor;
 
 const SAMPLES_DIR: &str = "tests/samples";

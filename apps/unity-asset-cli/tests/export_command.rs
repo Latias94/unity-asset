@@ -50,7 +50,7 @@ fn export_dry_run_is_side_effect_free_and_execution_uses_manifest_paths() {
     assert_success(&dry_run);
     let plan: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
     assert_eq!(plan["contract"], "unity_asset.extraction_plan");
-    assert_eq!(plan["version"], 2);
+    assert_eq!(plan["version"], 3);
     assert_eq!(plan["artifacts"].as_array().unwrap().len(), 1);
     assert!(!output_root.exists());
 

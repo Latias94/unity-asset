@@ -5,6 +5,7 @@ use unity_asset_core::{
     BudgetError, DigestBuildError, DigestV1, FieldPath, FieldPathError, ObjectAddress, ObjectKind,
     SemanticDigestError, ValuePathError,
 };
+use unity_asset_decode::media::MediaInspectionError;
 
 use crate::workspace::{MutationPlanError, MutationPlanFragment, WorkspaceError};
 
@@ -563,6 +564,11 @@ pub enum RecipeError {
         expected: &'static str,
         actual: RecipeValueKind,
     },
+    #[error("media descriptor is invalid: {source}")]
+    InvalidMediaDescriptor {
+        #[source]
+        source: MediaInspectionError,
+    },
     #[error("field variant is ambiguous between {first} and {second}")]
     AmbiguousFieldVariant {
         first: &'static str,
@@ -697,7 +703,9 @@ impl RecipeError {
             Self::ProtectedSemanticField { .. } => {
                 Some(RecipeRejectionCode::ProtectedSemanticField)
             }
-            Self::WrongFieldShape { .. } => Some(RecipeRejectionCode::WrongFieldShape),
+            Self::WrongFieldShape { .. } | Self::InvalidMediaDescriptor { .. } => {
+                Some(RecipeRejectionCode::WrongFieldShape)
+            }
             Self::AmbiguousFieldVariant { .. } => Some(RecipeRejectionCode::AmbiguousFieldVariant),
             Self::PropertyNotFound { .. } => Some(RecipeRejectionCode::PropertyNotFound),
             Self::DuplicateProperty { .. } => Some(RecipeRejectionCode::DuplicateProperty),

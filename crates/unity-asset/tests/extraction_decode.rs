@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use image::ImageFormat;
 use unity_asset::extraction::{
     ExistingOutputPolicy, ExtractionArtifactKind, ExtractionArtifactStatus,
-    ExtractionExecutionLimits, ExtractionExecutionOptions, ExtractionExecutor,
-    ExtractionFailurePolicy, ExtractionFilter, ExtractionPlanError, ExtractionPlanner,
-    ExtractionRepresentationPolicy, ExtractionRequest, ExtractionRunOptions,
+    ExtractionDiagnosticCode, ExtractionExecutionError, ExtractionExecutionLimits,
+    ExtractionExecutionOptions, ExtractionExecutor, ExtractionFailurePolicy, ExtractionFilter,
+    ExtractionPlan, ExtractionPlanError, ExtractionPlanner, ExtractionRepresentationPolicy,
+    ExtractionRequest, ExtractionRunOptions,
 };
 use unity_asset::workspace::{AssetWorkspace, WorkspaceError};
 use unity_asset::{AssetLoadBudget, AssetLoadLimits, BudgetError, DigestV1};
@@ -21,15 +22,13 @@ fn sample(name: &str) -> PathBuf {
 }
 
 fn options() -> ExtractionExecutionOptions {
+    options_with_output_limit(2 * 1024 * 1024 * 1024)
+}
+
+fn options_with_output_limit(max_output_bytes: u64) -> ExtractionExecutionOptions {
     ExtractionExecutionOptions::new(
-        ExtractionExecutionLimits::new(
-            2,
-            512 * 1024 * 1024,
-            5,
-            2 * 1024 * 1024 * 1024,
-            16 * 1024 * 1024,
-        )
-        .unwrap(),
+        ExtractionExecutionLimits::new(2, 512 * 1024 * 1024, 5, max_output_bytes, 16 * 1024 * 1024)
+            .unwrap(),
         ExistingOutputPolicy::Error,
         ExtractionFailurePolicy::CollectAll,
     )
@@ -73,7 +72,7 @@ fn banner_texture_exports_as_revision_bound_png() {
     let snapshot = workspace.snapshot();
     let planner = ExtractionPlanner::new(&snapshot);
     let request = || {
-        ExtractionRequest::all(ExtractionRepresentationPolicy::RequireDecoded)
+        ExtractionRequest::all(ExtractionRepresentationPolicy::PreferDecoded)
             .with_filter(ExtractionFilter::new([28], None, None, None).unwrap())
     };
     let cold_plan = planner
@@ -86,6 +85,10 @@ fn banner_texture_exports_as_revision_bound_png() {
     assert_eq!(
         plan.artifacts()[0].preferred_kind(),
         ExtractionArtifactKind::TexturePng
+    );
+    assert_eq!(
+        plan.artifacts()[0].fallback_kind(),
+        Some(ExtractionArtifactKind::BinaryRaw)
     );
     let usage = measured.usage();
     assert!(usage.bytes > 1);
@@ -144,7 +147,50 @@ fn banner_texture_exports_as_revision_bound_png() {
     assert_eq!(image.dimensions(), (492, 180));
     assert!(image.pixels().any(|pixel| pixel[3] != 0));
     assert_eq!(artifact.digest(), Some(DigestV1::hash_bytes(&bytes)));
-    assert_eq!(artifact.length(), Some(u64::try_from(bytes.len()).unwrap()));
+    let output_length = u64::try_from(bytes.len()).unwrap();
+    assert_eq!(artifact.length(), Some(output_length));
+
+    let strict_plan = planner
+        .plan(
+            ExtractionRequest::all(ExtractionRepresentationPolicy::RequireDecoded)
+                .with_filter(ExtractionFilter::new([28], None, None, None).unwrap()),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let exact_directory = tempfile::tempdir().unwrap();
+    let exact = ExtractionExecutor::new()
+        .execute(
+            &snapshot,
+            &strict_plan,
+            exact_directory.path(),
+            ExtractionRunOptions::new(options_with_output_limit(output_length)),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    assert_eq!(exact.counts().written(), 1);
+
+    let one_short_directory = tempfile::tempdir().unwrap();
+    let one_short = ExtractionExecutor::new()
+        .execute(
+            &snapshot,
+            &strict_plan,
+            one_short_directory.path(),
+            ExtractionRunOptions::new(options_with_output_limit(output_length - 1)),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    assert_eq!(one_short.counts().failed(), 1);
+    let failed = &one_short.manifest().artifacts()[0];
+    assert_eq!(
+        failed.diagnostics()[0].code(),
+        ExtractionDiagnosticCode::OutputLimitExceeded
+    );
+    assert!(
+        !one_short_directory
+            .path()
+            .join(failed.path().as_str())
+            .exists()
+    );
 }
 
 #[test]
@@ -156,7 +202,7 @@ fn streamed_audio_is_resolved_by_the_plan_and_written_without_filesystem_probing
     let snapshot = workspace.snapshot();
     let planner = ExtractionPlanner::new(&snapshot);
     let request = || {
-        ExtractionRequest::all(ExtractionRepresentationPolicy::RequireDecoded)
+        ExtractionRequest::all(ExtractionRepresentationPolicy::PreferDecoded)
             .with_filter(ExtractionFilter::new([83], None, None, None).unwrap())
     };
     let cold_plan = planner
@@ -170,6 +216,11 @@ fn streamed_audio_is_resolved_by_the_plan_and_written_without_filesystem_probing
         plan.artifacts()
             .iter()
             .all(|artifact| artifact.preferred_kind() == ExtractionArtifactKind::Audio)
+    );
+    assert!(
+        plan.artifacts().iter().all(|artifact| {
+            artifact.fallback_kind() == Some(ExtractionArtifactKind::BinaryRaw)
+        })
     );
     let usage = measured.usage();
     assert!(usage.bytes > 1);
@@ -233,4 +284,77 @@ fn streamed_audio_is_resolved_by_the_plan_and_written_without_filesystem_probing
         );
         assert_eq!(artifact.digest(), Some(DigestV1::hash_bytes(&bytes)));
     }
+}
+
+#[test]
+fn media_plan_rejects_a_destination_suffix_that_disagrees_with_its_descriptor() {
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(sample("banner_1"), &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let plan = ExtractionPlanner::new(&snapshot)
+        .plan(
+            ExtractionRequest::all(ExtractionRepresentationPolicy::RequireDecoded)
+                .with_filter(ExtractionFilter::new([28], None, None, None).unwrap()),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let mut encoded = serde_json::to_value(plan).unwrap();
+    assert_eq!(encoded["version"], serde_json::json!(3));
+    let path = encoded["artifacts"][0]["preferred_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    encoded["artifacts"][0]["preferred_path"] =
+        serde_json::Value::String(path.strip_suffix(".png").unwrap().to_owned() + ".bin");
+
+    let error = serde_json::from_value::<ExtractionPlan>(encoded).unwrap_err();
+
+    assert!(
+        error.to_string().contains("canonical .png suffix"),
+        "{error}"
+    );
+}
+
+#[test]
+fn execution_reprepares_media_and_rejects_descriptor_drift_before_staging() {
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(sample("banner_1"), &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let plan = ExtractionPlanner::new(&snapshot)
+        .plan(
+            ExtractionRequest::all(ExtractionRepresentationPolicy::RequireDecoded)
+                .with_filter(ExtractionFilter::new([28], None, None, None).unwrap()),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let mut encoded = serde_json::to_value(plan).unwrap();
+    let output_bound =
+        encoded["artifacts"][0]["preferred_content"]["descriptor"]["output"]["upper_bound"]
+            .as_u64()
+            .unwrap();
+    encoded["artifacts"][0]["preferred_content"]["descriptor"]["output"]["upper_bound"] =
+        serde_json::Value::from(output_bound + 1);
+    let plan = serde_json::from_value::<ExtractionPlan>(encoded).unwrap();
+    let destination = plan.artifacts()[0].preferred_path().as_str().to_owned();
+    let directory = tempfile::tempdir().unwrap();
+
+    let error = ExtractionExecutor::new()
+        .execute(
+            &snapshot,
+            &plan,
+            directory.path(),
+            ExtractionRunOptions::new(options()),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ExtractionExecutionError::MediaDescriptorChanged { ordinal: 0 }
+    ));
+    assert!(!directory.path().join(destination).exists());
 }

@@ -1,28 +1,34 @@
 //! Versioned, deterministic extraction requests and inert plans.
 
-use std::cmp::Ordering;
 use std::collections::TryReserveError;
 use std::io::{Read, Write};
 use std::num::NonZeroU64;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
-use unity_asset_binary::unity_version::{UnityVersion, UnityVersionType};
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, BudgetedJsonError, DigestV1, ObjectAddress, ObjectKind,
     SourceFingerprint, SourceKind, SourceLocator, WorkspaceId, WorkspaceRevision,
     vec_allocation_bytes,
 };
-use unity_asset_write::artifact::{ArtifactNameError, LogicalArtifactName};
+use unity_asset_decode::descriptor::MediaFamily;
+use unity_asset_write::artifact::ArtifactNameError;
 
+pub use super::contract::{
+    ExtractionArtifactKind, ExtractionDiagnostic, ExtractionPath, ExtractionRepresentationPolicy,
+    ExtractionSourceExpectation,
+};
 use super::json_contract::{large_contract_limits, read_json_bounded, small_contract_limits};
 use super::manifest::{
     ExtractionCanonicalError, canonical_digest, canonical_json, write_canonical_json,
 };
-pub use super::manifest::{ExtractionDiagnostic, ExtractionDiagnosticCode};
+use super::representation::{
+    PlannedContent, PlannedFallback, RepresentationContract, RepresentationContractError,
+    RepresentationContractParts,
+};
 
 pub const EXTRACTION_REQUEST_VERSION: u8 = 1;
-pub const EXTRACTION_PLAN_VERSION: u8 = 2;
+pub const EXTRACTION_PLAN_VERSION: u8 = 3;
 pub const EXTRACTION_MANIFEST_VERSION: u8 = super::manifest::EXTRACTION_MANIFEST_VERSION;
 pub const EXTRACTION_REPORT_VERSION: u8 = super::manifest::EXTRACTION_REPORT_VERSION;
 pub const EXTRACTION_REQUEST_CONTRACT: &str = "unity_asset.extraction_request";
@@ -36,90 +42,6 @@ const EXTRACTION_PLAN_JSON_LIMITS: unity_asset_core::ContractJsonLimits =
 const MAX_SELECTION_PATTERN_BYTES: usize = 4_096;
 const MAX_FILTER_TEXT_BYTES: usize = 4_096;
 const MAX_METADATA_TEXT_BYTES: usize = 64 * 1_024;
-const MAX_AUDIO_EXTENSION_BYTES: usize = 16;
-
-/// A validated relative output path that has portable filesystem semantics.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExtractionPath {
-    name: LogicalArtifactName,
-}
-
-impl ExtractionPath {
-    pub fn new(value: impl AsRef<str>) -> Result<Self, ExtractionModelError> {
-        Ok(Self {
-            name: LogicalArtifactName::new(value)?,
-        })
-    }
-
-    pub(crate) fn from_string_with_budget(
-        value: String,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<Self, ExtractionModelError> {
-        Ok(Self {
-            name: LogicalArtifactName::from_string_with_budget(value, budget)?,
-        })
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        self.name.as_str()
-    }
-
-    pub(crate) fn portability_key(&self) -> &str {
-        self.name.portability_key()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retained_bytes(&self) -> Result<u64, ExtractionModelError> {
-        self.name.retained_bytes().map_err(Into::into)
-    }
-}
-
-impl PartialOrd for ExtractionPath {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ExtractionPath {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.as_str().cmp(other.as_str())
-    }
-}
-
-impl AsRef<str> for ExtractionPath {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl Serialize for ExtractionPath {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ExtractionPath {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-/// The requested logical representation of extracted objects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExtractionRepresentationPolicy {
-    RawOnly,
-    PreferDecoded,
-    RequireDecoded,
-}
 
 /// A portable, normalized object selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,286 +510,37 @@ impl<'de> Deserialize<'de> for ExtractionRequest {
     }
 }
 
-/// One source byte range required by a decoded representation.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ExtractionSourceRange {
-    source: SourceLocator,
-    offset: u64,
-    size: u64,
-}
-
-impl ExtractionSourceRange {
-    pub fn new(
-        source: SourceLocator,
-        offset: u64,
-        size: u64,
-    ) -> Result<Self, ExtractionModelError> {
-        offset
-            .checked_add(size)
-            .ok_or(ExtractionModelError::SourceRangeOverflow { offset, size })?;
-        Ok(Self {
-            source,
-            offset,
-            size,
-        })
-    }
-
-    #[must_use]
-    pub const fn source(&self) -> &SourceLocator {
-        &self.source
-    }
-
-    #[must_use]
-    pub const fn offset(&self) -> u64 {
-        self.offset
-    }
-
-    #[must_use]
-    pub const fn size(&self) -> u64 {
-        self.size
-    }
-
-    #[must_use]
-    pub fn end(&self) -> u64 {
-        self.offset + self.size
-    }
-}
-
-#[derive(Serialize)]
-struct ExtractionSourceRangeRef<'value> {
-    source: &'value SourceLocator,
-    offset: u64,
-    size: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ExtractionSourceRangeWire {
-    source: SourceLocator,
-    offset: u64,
-    size: u64,
-}
-
-impl Serialize for ExtractionSourceRange {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        ExtractionSourceRangeRef {
-            source: &self.source,
-            offset: self.offset,
-            size: self.size,
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for ExtractionSourceRange {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = ExtractionSourceRangeWire::deserialize(deserializer)?;
-        Self::new(wire.source, wire.offset, wire.size).map_err(serde::de::Error::custom)
-    }
-}
-
-/// The stable semantic kind of one output artifact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExtractionArtifactKind {
-    BinaryRaw,
-    Yaml,
-    Text,
-    Audio,
-    TexturePng,
-    SpritePng,
-}
-
-impl ExtractionArtifactKind {
-    #[must_use]
-    pub const fn extension(self) -> &'static str {
-        match self {
-            Self::BinaryRaw => "bin",
-            Self::Yaml => "yaml",
-            Self::Text => "txt",
-            Self::Audio => "audio",
-            Self::TexturePng | Self::SpritePng => "png",
-        }
-    }
-}
-
-/// Inert execution data selected during planning.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum PlannedContent {
-    RawBinary,
-    Yaml,
-    TextAsset,
-    Audio {
-        #[serde(with = "unity_version_wire")]
-        version: UnityVersion,
-        extension: String,
-        stream: Option<ExtractionSourceRange>,
-    },
-    TexturePng {
-        #[serde(with = "unity_version_wire")]
-        version: UnityVersion,
-        stream: Option<ExtractionSourceRange>,
-    },
-    SpritePng {
-        texture: ObjectAddress,
-        texture_stream: Option<ExtractionSourceRange>,
-    },
-}
-
-impl PlannedContent {
-    fn artifact_kind(&self) -> ExtractionArtifactKind {
-        match self {
-            Self::RawBinary => ExtractionArtifactKind::BinaryRaw,
-            Self::Yaml => ExtractionArtifactKind::Yaml,
-            Self::TextAsset => ExtractionArtifactKind::Text,
-            Self::Audio { .. } => ExtractionArtifactKind::Audio,
-            Self::TexturePng { .. } => ExtractionArtifactKind::TexturePng,
-            Self::SpritePng { .. } => ExtractionArtifactKind::SpritePng,
-        }
-    }
-
-    fn validate(&self) -> Result<(), ExtractionModelError> {
-        if let Self::Audio { extension, .. } = self {
-            validate_audio_extension(extension)?;
-        }
-        Ok(())
-    }
-
-    pub(super) const fn stream_range(&self) -> Option<&ExtractionSourceRange> {
-        match self {
-            Self::Audio { stream, .. } | Self::TexturePng { stream, .. } => stream.as_ref(),
-            Self::SpritePng { texture_stream, .. } => texture_stream.as_ref(),
-            Self::RawBinary | Self::Yaml | Self::TextAsset => None,
-        }
-    }
-}
-
-/// Expected identity of one source read by an extraction plan.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExtractionSourceExpectation {
-    locator: SourceLocator,
-    fingerprint: SourceFingerprint,
-}
-
-impl ExtractionSourceExpectation {
-    #[must_use]
-    pub const fn new(locator: SourceLocator, fingerprint: SourceFingerprint) -> Self {
-        Self {
-            locator,
-            fingerprint,
-        }
-    }
-
-    #[must_use]
-    pub const fn locator(&self) -> &SourceLocator {
-        &self.locator
-    }
-
-    #[must_use]
-    pub const fn fingerprint(&self) -> SourceFingerprint {
-        self.fingerprint
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PlannedFallback {
-    kind: ExtractionArtifactKind,
-    path: ExtractionPath,
-    content: PlannedContent,
-}
-
 /// One ordered artifact in an immutable extraction plan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedArtifact {
     ordinal: u32,
     address: ObjectAddress,
     class_id: i32,
     class_name: String,
     object_name: Option<String>,
-    preferred_kind: ExtractionArtifactKind,
-    preferred_path: ExtractionPath,
-    preferred_content: PlannedContent,
-    fallback: Option<PlannedFallback>,
-    working_set_bytes: u64,
-    diagnostics: Box<[ExtractionDiagnostic]>,
+    representation: RepresentationContract,
 }
 
 impl PlannedArtifact {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub(super) fn new(
         ordinal: u32,
         address: ObjectAddress,
         class_id: i32,
         class_name: String,
         object_name: Option<String>,
-        preferred_kind: ExtractionArtifactKind,
-        preferred_path: ExtractionPath,
-        preferred_content: PlannedContent,
-        fallback: Option<(ExtractionArtifactKind, ExtractionPath, PlannedContent)>,
-        working_set_bytes: u64,
-        diagnostics: Vec<ExtractionDiagnostic>,
+        representation: RepresentationContract,
     ) -> Result<Self, ExtractionModelError> {
         validate_metadata("class_name", &class_name, false)?;
         if let Some(object_name) = object_name.as_deref() {
             validate_metadata("object_name", object_name, true)?;
         }
-        validate_content_kind(preferred_kind, &preferred_content)?;
-        let fallback = fallback
-            .map(|(kind, path, content)| {
-                validate_content_kind(kind, &content)?;
-                if kind != ExtractionArtifactKind::BinaryRaw
-                    || !matches!(&content, PlannedContent::RawBinary)
-                    || matches!(
-                        preferred_kind,
-                        ExtractionArtifactKind::BinaryRaw | ExtractionArtifactKind::Yaml
-                    )
-                {
-                    return Err(ExtractionModelError::InvalidFallbackContent);
-                }
-                if preferred_path.portability_key() == path.portability_key() {
-                    return Err(ExtractionModelError::FallbackPathCollision(
-                        preferred_path.as_str().to_owned(),
-                    ));
-                }
-                Ok(PlannedFallback {
-                    kind,
-                    path,
-                    content,
-                })
-            })
-            .transpose()?;
-        if working_set_bytes == 0 {
-            return Err(ExtractionModelError::ZeroWorkingSet { ordinal });
-        }
-        if diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.address() != Some(&address))
-        {
-            return Err(ExtractionModelError::InvalidDiagnosticAddress { ordinal });
-        }
-        let diagnostics = normalize_values(diagnostics).into_boxed_slice();
         Ok(Self {
             ordinal,
             address,
             class_id,
             class_name,
             object_name,
-            preferred_kind,
-            preferred_path,
-            preferred_content,
-            fallback,
-            working_set_bytes,
-            diagnostics,
+            representation,
         })
     }
 
@@ -898,30 +571,30 @@ impl PlannedArtifact {
 
     #[must_use]
     pub const fn preferred_kind(&self) -> ExtractionArtifactKind {
-        self.preferred_kind
+        self.representation.preferred_kind()
     }
 
     #[must_use]
     pub const fn preferred_path(&self) -> &ExtractionPath {
-        &self.preferred_path
+        self.representation.preferred_path()
     }
 
-    pub(crate) const fn preferred_content(&self) -> &PlannedContent {
-        &self.preferred_content
+    pub(super) const fn preferred_content(&self) -> &PlannedContent {
+        self.representation.preferred_content()
+    }
+
+    pub(super) const fn preferred_requires_write_budget(&self) -> bool {
+        self.representation.preferred_requires_write_budget()
     }
 
     #[must_use]
     pub fn fallback_kind(&self) -> Option<ExtractionArtifactKind> {
-        self.fallback.as_ref().map(|fallback| fallback.kind)
+        self.representation.fallback_kind()
     }
 
     #[must_use]
     pub fn fallback_path(&self) -> Option<&ExtractionPath> {
-        self.fallback.as_ref().map(|fallback| &fallback.path)
-    }
-
-    pub(crate) fn fallback_content(&self) -> Option<&PlannedContent> {
-        self.fallback.as_ref().map(|fallback| &fallback.content)
+        self.representation.fallback_path()
     }
 
     /// Planner-declared conservative maximum transient bytes for this artifact.
@@ -930,12 +603,12 @@ impl PlannedArtifact {
     /// creates output and rejects declarations below that proof.
     #[must_use]
     pub const fn working_set_bytes(&self) -> u64 {
-        self.working_set_bytes
+        self.representation.working_set_bytes()
     }
 
     #[must_use]
     pub const fn diagnostics(&self) -> &[ExtractionDiagnostic] {
-        &self.diagnostics
+        self.representation.diagnostics()
     }
 
     pub(crate) fn matches_output(
@@ -943,11 +616,79 @@ impl PlannedArtifact {
         kind: ExtractionArtifactKind,
         path: &ExtractionPath,
     ) -> bool {
-        (self.preferred_kind == kind && &self.preferred_path == path)
-            || self
-                .fallback
-                .as_ref()
-                .is_some_and(|fallback| fallback.kind == kind && &fallback.path == path)
+        self.representation.matches_output(kind, path)
+    }
+
+    pub(super) const fn representation(&self) -> &RepresentationContract {
+        &self.representation
+    }
+}
+
+#[derive(Serialize)]
+struct PlannedFallbackRef<'artifact> {
+    kind: ExtractionArtifactKind,
+    path: &'artifact ExtractionPath,
+    content: &'artifact PlannedContent,
+}
+
+impl<'artifact> From<&'artifact PlannedFallback> for PlannedFallbackRef<'artifact> {
+    fn from(fallback: &'artifact PlannedFallback) -> Self {
+        Self {
+            kind: fallback.kind(),
+            path: fallback.path(),
+            content: fallback.content(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PlannedArtifactRef<'artifact> {
+    ordinal: u32,
+    address: &'artifact ObjectAddress,
+    class_id: i32,
+    class_name: &'artifact str,
+    object_name: Option<&'artifact str>,
+    preferred_kind: ExtractionArtifactKind,
+    preferred_path: &'artifact ExtractionPath,
+    preferred_content: &'artifact PlannedContent,
+    fallback: Option<PlannedFallbackRef<'artifact>>,
+    working_set_bytes: u64,
+    diagnostics: &'artifact [ExtractionDiagnostic],
+}
+
+impl Serialize for PlannedArtifact {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        PlannedArtifactRef {
+            ordinal: self.ordinal,
+            address: &self.address,
+            class_id: self.class_id,
+            class_name: &self.class_name,
+            object_name: self.object_name.as_deref(),
+            preferred_kind: self.preferred_kind(),
+            preferred_path: self.preferred_path(),
+            preferred_content: self.preferred_content(),
+            fallback: self.representation.fallback().map(PlannedFallbackRef::from),
+            working_set_bytes: self.working_set_bytes(),
+            diagnostics: self.diagnostics(),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlannedFallbackWire {
+    kind: ExtractionArtifactKind,
+    path: ExtractionPath,
+    content: PlannedContent,
+}
+
+impl PlannedFallbackWire {
+    fn into_fallback(self) -> Result<PlannedFallback, ExtractionModelError> {
+        PlannedFallback::from_declared_parts(self.kind, self.path, self.content).map_err(Into::into)
     }
 }
 
@@ -962,26 +703,48 @@ struct PlannedArtifactWire {
     preferred_kind: ExtractionArtifactKind,
     preferred_path: ExtractionPath,
     preferred_content: PlannedContent,
-    fallback: Option<PlannedFallback>,
+    fallback: Option<PlannedFallbackWire>,
     working_set_bytes: u64,
     diagnostics: Vec<ExtractionDiagnostic>,
 }
 
 impl PlannedArtifactWire {
     fn into_artifact(self) -> Result<PlannedArtifact, ExtractionModelError> {
+        let Self {
+            ordinal,
+            address,
+            class_id,
+            class_name,
+            object_name,
+            preferred_kind,
+            preferred_path,
+            preferred_content,
+            fallback,
+            working_set_bytes,
+            diagnostics,
+        } = self;
+        preferred_content.validate_declared_kind(preferred_kind)?;
+        let fallback = fallback
+            .map(PlannedFallbackWire::into_fallback)
+            .transpose()?;
+        let representation = RepresentationContract::from_parts(
+            ordinal,
+            &address,
+            RepresentationContractParts {
+                preferred_path,
+                preferred_content,
+                fallback,
+                working_set_bytes,
+                diagnostics,
+            },
+        )?;
         PlannedArtifact::new(
-            self.ordinal,
-            self.address,
-            self.class_id,
-            self.class_name,
-            self.object_name,
-            self.preferred_kind,
-            self.preferred_path,
-            self.preferred_content,
-            self.fallback
-                .map(|fallback| (fallback.kind, fallback.path, fallback.content)),
-            self.working_set_bytes,
-            self.diagnostics,
+            ordinal,
+            address,
+            class_id,
+            class_name,
+            object_name,
+            representation,
         )
     }
 }
@@ -1181,17 +944,17 @@ impl<'de> Deserialize<'de> for ExtractionPlan {
 pub(crate) fn normalize_source_expectations(
     mut sources: Vec<ExtractionSourceExpectation>,
 ) -> Result<Vec<ExtractionSourceExpectation>, ExtractionModelError> {
-    sources.sort_unstable_by(|left, right| left.locator.cmp(&right.locator));
+    sources.sort_unstable_by(|left, right| left.locator().cmp(right.locator()));
     if let Some(pair) = sources.windows(2).find(|pair| {
-        pair[0].locator == pair[1].locator && pair[0].fingerprint != pair[1].fingerprint
+        pair[0].locator() == pair[1].locator() && pair[0].fingerprint() != pair[1].fingerprint()
     }) {
         return Err(ExtractionModelError::ConflictingSourceExpectation {
-            locator: pair[1].locator.clone(),
-            first: pair[0].fingerprint,
-            second: pair[1].fingerprint,
+            locator: pair[1].locator().clone(),
+            first: pair[0].fingerprint(),
+            second: pair[1].fingerprint(),
         });
     }
-    sources.dedup_by(|right, left| right.locator == left.locator);
+    sources.dedup_by(|right, left| right.locator() == left.locator());
     Ok(sources)
 }
 
@@ -1243,11 +1006,10 @@ fn validate_planned_artifacts_with_budget(
             });
         }
         validate_source_for_address(sources, &artifact.address)?;
-        validate_content_sources(sources, &artifact.preferred_content)?;
-        paths.push(&artifact.preferred_path);
-        if let Some(fallback) = artifact.fallback.as_ref() {
-            validate_content_sources(sources, &fallback.content)?;
-            paths.push(&fallback.path);
+        artifact.representation.validate_sources(sources)?;
+        paths.push(artifact.preferred_path());
+        if let Some(path) = artifact.fallback_path() {
+            paths.push(path);
         }
         addresses.push(&artifact.address);
     }
@@ -1301,19 +1063,6 @@ fn validation_vec<T>(
     Ok(values)
 }
 
-fn validate_content_sources(
-    sources: &[ExtractionSourceExpectation],
-    content: &PlannedContent,
-) -> Result<(), ExtractionModelError> {
-    if let PlannedContent::SpritePng { texture, .. } = content {
-        validate_source_for_address(sources, texture)?;
-    }
-    if let Some(stream) = content.stream_range() {
-        validate_source_exists(sources, stream.source())?;
-    }
-    Ok(())
-}
-
 fn validate_source_for_address(
     sources: &[ExtractionSourceExpectation],
     address: &ObjectAddress,
@@ -1323,10 +1072,10 @@ fn validate_source_for_address(
         ObjectKind::Binary => SourceKind::SerializedFile,
         ObjectKind::Yaml => SourceKind::Yaml,
     };
-    let actual = source.fingerprint.kind();
+    let actual = source.fingerprint().kind();
     if actual != expected {
         return Err(ExtractionModelError::SourceKindMismatch {
-            locator: source.locator.clone(),
+            locator: source.locator().clone(),
             expected,
             actual,
         });
@@ -1334,19 +1083,12 @@ fn validate_source_for_address(
     Ok(())
 }
 
-fn validate_source_exists(
-    sources: &[ExtractionSourceExpectation],
-    locator: &SourceLocator,
-) -> Result<(), ExtractionModelError> {
-    expectation_for(sources, locator).map(|_| ())
-}
-
 fn expectation_for<'source>(
     sources: &'source [ExtractionSourceExpectation],
     locator: &SourceLocator,
 ) -> Result<&'source ExtractionSourceExpectation, ExtractionModelError> {
     sources
-        .binary_search_by(|source| source.locator.cmp(locator))
+        .binary_search_by(|source| source.locator().cmp(locator))
         .map(|index| &sources[index])
         .map_err(|_| ExtractionModelError::MissingSourceExpectation(locator.clone()))
 }
@@ -1388,33 +1130,6 @@ fn validate_unique_paths(mut paths: Vec<&ExtractionPath>) -> Result<(), Extracti
             first: first.as_str().to_owned(),
             second: second.as_str().to_owned(),
         });
-    }
-    Ok(())
-}
-
-fn validate_content_kind(
-    kind: ExtractionArtifactKind,
-    content: &PlannedContent,
-) -> Result<(), ExtractionModelError> {
-    content.validate()?;
-    let actual = content.artifact_kind();
-    if kind != actual {
-        return Err(ExtractionModelError::ArtifactKindMismatch {
-            declared: kind,
-            actual,
-        });
-    }
-    Ok(())
-}
-
-fn validate_audio_extension(extension: &str) -> Result<(), ExtractionModelError> {
-    if extension.is_empty()
-        || extension.len() > MAX_AUDIO_EXTENSION_BYTES
-        || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
-    {
-        return Err(ExtractionModelError::InvalidAudioExtension(
-            extension.to_owned(),
-        ));
     }
     Ok(())
 }
@@ -1480,51 +1195,6 @@ fn lowercase_contains(value: &str, needle: &str) -> bool {
     })
 }
 
-mod unity_version_wire {
-    use super::*;
-
-    #[derive(Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct UnityVersionWire {
-        major: u16,
-        minor: u16,
-        build: u16,
-        version_type: UnityVersionType,
-        type_number: u8,
-        type_str: Option<String>,
-    }
-
-    pub(super) fn serialize<S>(value: &UnityVersion, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        UnityVersionWire {
-            major: value.major,
-            minor: value.minor,
-            build: value.build,
-            version_type: value.version_type,
-            type_number: value.type_number,
-            type_str: value.type_str.clone(),
-        }
-        .serialize(serializer)
-    }
-
-    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<UnityVersion, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = UnityVersionWire::deserialize(deserializer)?;
-        Ok(UnityVersion {
-            major: wire.major,
-            minor: wire.minor,
-            build: wire.build,
-            version_type: wire.version_type,
-            type_number: wire.type_number,
-            type_str: wire.type_str,
-        })
-    }
-}
-
 /// Validation failure for a persisted extraction request or plan.
 #[non_exhaustive]
 #[derive(Debug, Error)]
@@ -1546,10 +1216,16 @@ pub enum ExtractionModelError {
     InvalidFilterText { field: &'static str, value: String },
     #[error("extraction filter limit must be nonzero")]
     ZeroExtractionLimit,
-    #[error("source byte range {offset}+{size} overflows u64")]
-    SourceRangeOverflow { offset: u64, size: u64 },
-    #[error("audio extension must contain 1 to 16 ASCII alphanumeric bytes: {0:?}")]
-    InvalidAudioExtension(String),
+    #[error("media descriptor family is {actual:?}; representation requires {expected:?}")]
+    MediaDescriptorFamilyMismatch {
+        expected: MediaFamily,
+        actual: MediaFamily,
+    },
+    #[error("artifact path {path:?} must end in the canonical .{expected} suffix")]
+    ArtifactExtensionMismatch {
+        path: String,
+        expected: &'static str,
+    },
     #[error("artifact metadata {field} is invalid: {value:?}")]
     InvalidMetadata { field: &'static str, value: String },
     #[error("artifact declares kind {declared:?}, but content requires {actual:?}")]
@@ -1611,4 +1287,132 @@ pub enum ExtractionModelError {
     Budget(#[from] BudgetError),
     #[error(transparent)]
     Canonical(#[from] ExtractionCanonicalError),
+}
+
+impl From<RepresentationContractError> for ExtractionModelError {
+    fn from(error: RepresentationContractError) -> Self {
+        match error {
+            RepresentationContractError::MediaDescriptorFamilyMismatch { expected, actual } => {
+                Self::MediaDescriptorFamilyMismatch { expected, actual }
+            }
+            RepresentationContractError::ArtifactExtensionMismatch { path, expected } => {
+                Self::ArtifactExtensionMismatch { path, expected }
+            }
+            RepresentationContractError::ArtifactKindMismatch { declared, actual } => {
+                Self::ArtifactKindMismatch { declared, actual }
+            }
+            RepresentationContractError::FallbackPathCollision(path) => {
+                Self::FallbackPathCollision(path)
+            }
+            RepresentationContractError::InvalidFallbackContent => Self::InvalidFallbackContent,
+            RepresentationContractError::ZeroWorkingSet { ordinal } => {
+                Self::ZeroWorkingSet { ordinal }
+            }
+            RepresentationContractError::InvalidDiagnosticAddress { ordinal } => {
+                Self::InvalidDiagnosticAddress { ordinal }
+            }
+            RepresentationContractError::MissingSourceExpectation(locator) => {
+                Self::MissingSourceExpectation(locator)
+            }
+            RepresentationContractError::SourceKindMismatch {
+                locator,
+                expected,
+                actual,
+            } => Self::SourceKindMismatch {
+                locator,
+                expected,
+                actual,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn planned_text_artifact() -> PlannedArtifact {
+        let address =
+            ObjectAddress::binary_direct(SourceLocator::path("content.assets").unwrap(), 41)
+                .unwrap();
+        let fallback = PlannedFallback::new(
+            ExtractionPath::new("object.raw.bin").unwrap(),
+            PlannedContent::RawBinary,
+        )
+        .unwrap();
+        let representation = RepresentationContract::from_parts(
+            0,
+            &address,
+            RepresentationContractParts {
+                preferred_path: ExtractionPath::new("object.txt").unwrap(),
+                preferred_content: PlannedContent::TextAsset,
+                fallback: Some(fallback),
+                working_set_bytes: 1,
+                diagnostics: Vec::new(),
+            },
+        )
+        .unwrap();
+        PlannedArtifact::new(
+            0,
+            address,
+            49,
+            "TextAsset".to_owned(),
+            Some("object".to_owned()),
+            representation,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn plan_v3_artifact_serializes_derived_kinds_in_the_existing_wire_shape() {
+        let artifact = planned_text_artifact();
+        let encoded = serde_json::to_value(&artifact).unwrap();
+
+        assert_eq!(encoded["preferred_kind"], serde_json::json!("text"));
+        assert_eq!(
+            encoded["preferred_content"]["kind"],
+            serde_json::json!("text_asset")
+        );
+        assert_eq!(encoded["fallback"]["kind"], serde_json::json!("binary_raw"));
+        assert_eq!(
+            encoded["fallback"]["content"]["kind"],
+            serde_json::json!("raw_binary")
+        );
+
+        let wire: PlannedArtifactWire = serde_json::from_value(encoded).unwrap();
+        assert_eq!(wire.into_artifact().unwrap(), artifact);
+    }
+
+    #[test]
+    fn plan_v3_artifact_rejects_tampered_preferred_and_fallback_kinds() {
+        let encoded = serde_json::to_value(planned_text_artifact()).unwrap();
+
+        let mut preferred = encoded.clone();
+        preferred["preferred_kind"] = serde_json::json!("yaml");
+        let error = serde_json::from_value::<PlannedArtifactWire>(preferred)
+            .unwrap()
+            .into_artifact()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionModelError::ArtifactKindMismatch {
+                declared: ExtractionArtifactKind::Yaml,
+                actual: ExtractionArtifactKind::Text,
+            }
+        ));
+
+        let mut fallback = encoded;
+        fallback["fallback"]["kind"] = serde_json::json!("text");
+        let error = serde_json::from_value::<PlannedArtifactWire>(fallback)
+            .unwrap()
+            .into_artifact()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionModelError::ArtifactKindMismatch {
+                declared: ExtractionArtifactKind::Text,
+                actual: ExtractionArtifactKind::BinaryRaw,
+            }
+        ));
+    }
 }

@@ -2,17 +2,27 @@
 
 use image::{GenericImageView, ImageFormat, RgbaImage};
 use std::io::{self, Cursor, Seek, SeekFrom, Write};
+use unity_asset_binary::BinaryError;
 use unity_asset_core::AssetLoadBudget;
 use unity_asset_decode::audio::{
     AudioClip, AudioCompressionFormat, AudioExporter, AudioSourceError, DecodedAudio,
-    decode_audio_data,
+    PreparedAudioSource, decode_audio_data,
 };
-use unity_asset_decode::error::BinaryError;
+use unity_asset_decode::media::BudgetedMediaBytes;
 use unity_asset_decode::sprite::{Sprite, SpriteProcessor};
 use unity_asset_decode::texture::{Texture2D, TextureDecoder, TextureExporter, TextureFormat};
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const SHORT_VORBIS: &[u8] = include_bytes!("fixtures/short_vorbis.fsb");
+
+fn prepare_standard_source(
+    clip: &AudioClip,
+    bytes: Vec<u8>,
+) -> Result<PreparedAudioSource, AudioSourceError> {
+    let mut budget = AssetLoadBudget::default();
+    let source = BudgetedMediaBytes::from_vec(bytes, "test audio source", &mut budget)?;
+    AudioExporter::prepare_standard_source(clip, source, &mut budget)
+}
 
 #[test]
 fn audio_writers_encode_caller_owned_bytes() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,14 +62,10 @@ fn wav_rejects_incomplete_channel_frames_before_writing() {
 fn standard_audio_source_rejects_headerless_pcm_and_adpcm() {
     for format in [AudioCompressionFormat::PCM, AudioCompressionFormat::ADPCM] {
         let clip = AudioClip::new("not-a-wave".into(), format);
-        let error = AudioExporter::prepare_standard_source(
-            &clip,
-            &[1, 2, 3, 4],
-            &mut AssetLoadBudget::default(),
-        )
-        .err()
-        .expect("headerless PCM-like bytes must not be published as WAV");
-        assert!(matches!(error, AudioSourceError::UnsupportedFormat(actual) if actual == format));
+        let error = prepare_standard_source(&clip, vec![1, 2, 3, 4])
+            .err()
+            .expect("headerless PCM-like bytes must not be published as WAV");
+        assert!(matches!(error, AudioSourceError::InvalidData(_)));
     }
 }
 
@@ -82,9 +88,7 @@ fn standard_audio_source_rejects_header_only_containers() {
 
     for (format, bytes) in cases {
         let clip = AudioClip::new("header-only".into(), format);
-        let Err(error) =
-            AudioExporter::prepare_standard_source(&clip, bytes, &mut AssetLoadBudget::default())
-        else {
+        let Err(error) = prepare_standard_source(&clip, bytes.to_vec()) else {
             panic!("a header without playable frames must be rejected");
         };
 
@@ -111,15 +115,9 @@ fn standard_audio_source_rejects_reserved_adts_sample_rates() {
         ];
         let clip = AudioClip::new("reserved-adts-rate".into(), AudioCompressionFormat::AAC);
 
-        let result =
-            AudioExporter::prepare_standard_source(&clip, &bytes, &mut AssetLoadBudget::default());
+        let result = prepare_standard_source(&clip, bytes.to_vec());
 
-        assert!(matches!(
-            result,
-            Err(AudioSourceError::UnsupportedFormat(
-                AudioCompressionFormat::AAC
-            ))
-        ));
+        assert!(matches!(result, Err(AudioSourceError::InvalidData(_))));
     }
 }
 
@@ -128,13 +126,9 @@ fn standard_audio_source_rejects_adpcm_without_codec_extension() {
     let bytes = wave_fixture(0x11, 1, 8_000, 8_000, 4, 4, &[], &[0; 4]);
     let clip = AudioClip::new("invalid-adpcm".into(), AudioCompressionFormat::ADPCM);
 
-    let result =
-        AudioExporter::prepare_standard_source(&clip, &bytes, &mut AssetLoadBudget::default());
+    let result = prepare_standard_source(&clip, bytes.to_vec());
 
-    assert!(matches!(
-        result,
-        Err(AudioSourceError::UnsupportedFormat(_))
-    ));
+    assert!(matches!(result, Err(AudioSourceError::InvalidData(_))));
 }
 
 #[test]
@@ -155,12 +149,11 @@ fn standard_audio_source_accepts_complete_minimal_containers() {
         (AudioCompressionFormat::AAC, aac),
     ] {
         let clip = AudioClip::new("complete".into(), format);
-        let prepared =
-            AudioExporter::prepare_standard_source(&clip, &bytes, &mut AssetLoadBudget::default())
-                .unwrap();
+        let expected = bytes.clone();
+        let prepared = prepare_standard_source(&clip, bytes).unwrap();
         let mut output = Vec::new();
-        prepared.write_to(&bytes, &mut output).unwrap();
-        assert_eq!(output, bytes);
+        prepared.write_to(&mut output).unwrap();
+        assert_eq!(output, expected);
     }
 }
 
@@ -195,31 +188,27 @@ fn wave_fixture(
 }
 
 #[test]
-fn prepared_ogg_passthrough_is_exact_and_preserves_output_errors() {
+fn direct_ogg_requires_a_budgeted_setup_validator_before_passthrough() {
     let clip = AudioClip::new("direct".into(), AudioCompressionFormat::Vorbis);
     let source = rebuilt_playable_ogg();
     assert!(
         decode_audio_data(AudioCompressionFormat::Vorbis, source.clone()).is_ok(),
         "the direct Ogg fixture must be playable Vorbis"
     );
-    let prepared =
-        AudioExporter::prepare_standard_source(&clip, &source, &mut AssetLoadBudget::default())
-            .unwrap();
-
-    let mut output = Vec::new();
-    prepared.write_to(&source, &mut output).unwrap();
-    assert_eq!(output, source);
-
-    let error = prepared
-        .write_to(&source, &mut RejectingWriter)
-        .unwrap_err();
-    assert!(matches!(error, AudioSourceError::Output(_)));
+    let Err(error) = prepare_standard_source(&clip, source.clone()) else {
+        panic!("direct Ogg passthrough must remain disabled without setup validation");
+    };
+    assert!(matches!(
+        error,
+        AudioSourceError::UnsupportedContainer {
+            format: AudioCompressionFormat::Vorbis,
+            container: "Ogg Vorbis",
+        }
+    ));
 
     let mut corrupt = source;
     corrupt[22] ^= 0xff;
-    let Err(error) =
-        AudioExporter::prepare_standard_source(&clip, &corrupt, &mut AssetLoadBudget::default())
-    else {
+    let Err(error) = prepare_standard_source(&clip, corrupt) else {
         panic!("a corrupt Ogg checksum must not be published as a direct audio source");
     };
     assert!(matches!(error, AudioSourceError::InvalidData(_)));
@@ -229,40 +218,86 @@ fn prepared_ogg_passthrough_is_exact_and_preserves_output_errors() {
 fn standard_audio_source_rejects_crc_correct_non_vorbis_ogg() {
     let clip = AudioClip::new("not-vorbis".into(), AudioCompressionFormat::Vorbis);
     let source = crc_correct_non_vorbis_ogg();
-    let Err(error) =
-        AudioExporter::prepare_standard_source(&clip, &source, &mut AssetLoadBudget::default())
-    else {
+    let Err(error) = prepare_standard_source(&clip, source) else {
         panic!("a non-Vorbis Ogg container must not be accepted as direct audio");
     };
-    assert!(matches!(error, AudioSourceError::InvalidData(_)));
+    assert!(matches!(
+        error,
+        AudioSourceError::UnsupportedContainer {
+            format: AudioCompressionFormat::Vorbis,
+            container: "Ogg Vorbis",
+        }
+    ));
 }
 
 #[test]
 fn rebuilt_fsb5_vorbis_decodes_to_its_declared_frame_count() {
     let clip = AudioClip::new("short".into(), AudioCompressionFormat::Vorbis);
-    let prepared = AudioExporter::prepare_standard_source(
-        &clip,
-        SHORT_VORBIS,
-        &mut AssetLoadBudget::default(),
-    )
-    .unwrap();
+    let prepared = prepare_standard_source(&clip, SHORT_VORBIS.to_vec()).unwrap();
     let mut output = Vec::new();
-    prepared.write_to(SHORT_VORBIS, &mut output).unwrap();
+    prepared.write_to(&mut output).unwrap();
 
     let decoded = decode_audio_data(AudioCompressionFormat::Vorbis, output).unwrap();
     assert_eq!(decoded.frame_count(), 24_806);
 }
 
+#[test]
+fn strict_fsb5_prepare_rejects_truncated_sections_and_damaged_lengths() {
+    const HEADER_LEN: usize = 0x3C;
+    const SAMPLE_HEADERS_LEN_OFFSET: usize = 12;
+    const NAMES_LEN_OFFSET: usize = 16;
+    const DATA_LEN_OFFSET: usize = 20;
+
+    fn declared_len(bytes: &[u8], offset: usize) -> usize {
+        usize::try_from(u32::from_le_bytes(
+            bytes[offset..offset + 4].try_into().unwrap(),
+        ))
+        .unwrap()
+    }
+
+    fn increment_declared_len(bytes: &mut [u8], offset: usize) {
+        let length = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        bytes[offset..offset + 4].copy_from_slice(&length.checked_add(1).unwrap().to_le_bytes());
+    }
+
+    let sample_headers_end = HEADER_LEN + declared_len(SHORT_VORBIS, SAMPLE_HEADERS_LEN_OFFSET);
+    let data_start = sample_headers_end + declared_len(SHORT_VORBIS, NAMES_LEN_OFFSET);
+    let data_end = data_start + declared_len(SHORT_VORBIS, DATA_LEN_OFFSET);
+    assert_eq!(data_end, SHORT_VORBIS.len());
+
+    let mut oversized_sample_headers = SHORT_VORBIS.to_vec();
+    increment_declared_len(&mut oversized_sample_headers, SAMPLE_HEADERS_LEN_OFFSET);
+    let mut oversized_data = SHORT_VORBIS.to_vec();
+    increment_declared_len(&mut oversized_data, DATA_LEN_OFFSET);
+
+    let cases = [
+        ("header", SHORT_VORBIS[..HEADER_LEN - 1].to_vec()),
+        (
+            "sample header directory",
+            SHORT_VORBIS[..sample_headers_end - 1].to_vec(),
+        ),
+        ("sample payload", SHORT_VORBIS[..data_end - 1].to_vec()),
+        ("declared sample header length", oversized_sample_headers),
+        ("declared sample payload length", oversized_data),
+    ];
+
+    let clip = AudioClip::new("invalid-fsb5".into(), AudioCompressionFormat::Vorbis);
+    for (case, bytes) in cases {
+        let Err(error) = prepare_standard_source(&clip, bytes) else {
+            panic!("{case} must fail strict FSB5 preparation");
+        };
+        assert!(
+            matches!(&error, AudioSourceError::InvalidData(_)),
+            "{case} produced an unrelated error: {error}"
+        );
+    }
+}
+
 fn rebuilt_playable_ogg() -> Vec<u8> {
     let clip = AudioClip::new("short".into(), AudioCompressionFormat::Vorbis);
-    let prepared = AudioExporter::prepare_standard_source(
-        &clip,
-        SHORT_VORBIS,
-        &mut AssetLoadBudget::default(),
-    )
-    .unwrap();
+    let prepared = prepare_standard_source(&clip, SHORT_VORBIS.to_vec()).unwrap();
     let mut output = Vec::new();
-    prepared.write_to(SHORT_VORBIS, &mut output).unwrap();
+    prepared.write_to(&mut output).unwrap();
     output
 }
 

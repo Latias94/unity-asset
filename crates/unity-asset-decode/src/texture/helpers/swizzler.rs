@@ -3,8 +3,8 @@
 //! This module provides functionality for texture data manipulation and channel swizzling.
 //! Inspired by UnityPy's TextureSwizzler.
 
-use crate::error::{BinaryError, Result};
 use image::RgbaImage;
+use unity_asset_binary::{BinaryError, Result};
 
 /// Texture swizzling utility
 ///

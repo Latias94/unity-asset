@@ -6,7 +6,7 @@
 use super::formats::AudioCompressionFormat;
 use super::ogg::final_ogg_granule;
 use super::types::{AudioClip, DecodedAudio};
-use crate::error::{BinaryError, Result};
+use unity_asset_binary::{BinaryError, Result};
 
 /// Main audio decoder
 ///

@@ -47,9 +47,9 @@ not require another source-breaking release.
 | `texture::export_image` / `audio::export_audio` | Call the corresponding explicit `TextureExporter::write_*` or `AudioExporter::write_*` encoder |
 | `TextureProcessor::process_and_export` / `AudioProcessor::process_and_export` | `process_and_write_png` / `process_and_write_wav` with a caller-owned writer |
 | `SpriteProcessor::extract_sprite_image` and `process_sprite_with_texture` | `render_sprite` for an `RgbaImage`, or `write_sprite_png` for a caller-owned writer |
-| `SpriteResult` | `SpriteProcessor::parse_sprite` and `SpriteParser::parse_from_unity_object` return `Sprite` directly |
-| `SpriteManager`, `SpriteConfig`, `SpriteAtlas`/`SpriteInfo`, `SpriteStats`, `create_*_manager`, `ProcessingOptions`, and Sprite feature/validation/statistics helpers | Use `SpriteParser` or `SpriteProcessor` directly; the library no longer advertises unimplemented atlas, transform, mesh, physics, caching, or parallel-processing capabilities |
-| `SpriteParser::new(version)` / `SpriteProcessor::new(version)` | Call `new()` without a version; the prior parameter was ignored and did not provide version-aware parsing |
+| `SpriteResult`, `SpriteParser`, and `SpriteProcessor::parse_sprite` | Use strict `SpriteLayout::inspect` for extraction metadata; the unversioned raw fallback parser was removed |
+| `SpriteManager`, `SpriteConfig`, `SpriteAtlas`/`SpriteInfo`, `SpriteStats`, `create_*_manager`, `ProcessingOptions`, and Sprite feature/validation/statistics helpers | Use `SpriteLayout` for inspection or `SpriteProcessor` for rendering caller-owned `Sprite` data; the library no longer advertises unimplemented atlas, transform, mesh, physics, caching, or parallel-processing capabilities |
+| `SpriteProcessor::new(version)` | Call `new()` without a version; the prior parameter was ignored and did not provide version-aware parsing |
 
 ## Loading Sources
 

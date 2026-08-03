@@ -8,7 +8,7 @@
 //! The setup-header database was imported from Fmod5Sharp under the MIT
 //! license. See `assets/FMOD5SHARP-NOTICE` and `assets/FMOD5SHARP-LICENSE`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, TryReserveError};
 use std::io::{self, Write};
 use std::mem::size_of;
 use std::ops::Range;
@@ -29,6 +29,7 @@ const FSB5_FREQUENCY_CHUNK: u32 = 2;
 const FSB5_CHANNELS_CHUNK: u32 = 1;
 const OGG_SERIAL: u32 = 1;
 const MAX_VORBIS_PACKETS: usize = 1_000_000;
+const OGG_OUTPUT_RESOURCE: &str = "FSB5 rebuilt Ogg output";
 // `ogg` retains at most one 255-segment page of borrowed packet descriptors,
 // lacing values, and a fixed page header. This ceiling includes allocator and
 // map overhead with substantial headroom.
@@ -48,19 +49,40 @@ pub(crate) fn is_fsb5(bytes: &[u8]) -> bool {
     bytes.starts_with(FSB5_MAGIC)
 }
 
-/// Validated, budgeted instructions for rebuilding one FSB5 Vorbis subsound.
+/// A validated Ogg/Vorbis artifact whose output allocation is caller-budgeted.
 pub(crate) struct PreparedVorbisOgg {
+    bytes: Vec<u8>,
+}
+
+impl PreparedVorbisOgg {
+    pub(crate) fn prepare(
+        bytes: &[u8],
+        subsound_index: usize,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, Fsb5Error> {
+        let plan = VorbisOggPlan::prepare(bytes, subsound_index, budget)?;
+        let bytes = plan.rebuild(bytes, budget)?;
+        Ok(Self { bytes })
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Validated instructions retained only while preparing the final Ogg bytes.
+struct VorbisOggPlan {
     sample_range: Range<usize>,
     channels: u8,
     frequency: u32,
     sample_frames: u64,
     setup_crc: u32,
-    block_flags: Vec<bool>,
+    block_flags: Vec<u8>,
     packet_ranges: Vec<Range<usize>>,
 }
 
-impl PreparedVorbisOgg {
-    pub(crate) fn prepare(
+impl VorbisOggPlan {
+    fn prepare(
         bytes: &[u8],
         subsound_index: usize,
         budget: &mut AssetLoadBudget,
@@ -84,7 +106,6 @@ impl PreparedVorbisOgg {
             .get(sample_range.clone())
             .ok_or(Fsb5Error::Truncated("FSB5 selected sample"))?;
         let packet_ranges = parse_packet_ranges(sample_bytes, budget)?;
-        budget.consume_bytes(OGG_WRITER_SCRATCH_BYTES)?;
 
         Ok(Self {
             sample_range,
@@ -97,63 +118,159 @@ impl PreparedVorbisOgg {
         })
     }
 
-    pub(crate) fn write_to<W: Write + ?Sized>(
-        &self,
-        bytes: &[u8],
-        writer: &mut W,
-    ) -> Result<(), Fsb5Error> {
+    fn rebuild(&self, bytes: &[u8], budget: &mut AssetLoadBudget) -> Result<Vec<u8>, Fsb5Error> {
         let sample = bytes
             .get(self.sample_range.clone())
             .ok_or(Fsb5Error::Truncated("FSB5 selected sample"))?;
         let setup = vorbis_setup(self.setup_crc)?;
         let info = build_info_packet(self.channels, self.frequency)?;
         let comment = build_comment_packet();
-        let mut ogg = PacketWriter::new(writer);
-        ogg.write_packet(&info[..], OGG_SERIAL, PacketWriteEndInfo::EndPage, 0)
-            .map_err(Fsb5Error::Output)?;
-        ogg.write_packet(
-            &comment[..],
-            OGG_SERIAL,
-            PacketWriteEndInfo::NormalPacket,
-            0,
-        )
-        .map_err(Fsb5Error::Output)?;
-        ogg.write_packet(
-            setup.header_bytes.as_slice(),
-            OGG_SERIAL,
-            PacketWriteEndInfo::EndPage,
-            0,
-        )
-        .map_err(Fsb5Error::Output)?;
+        budget.consume_bytes(OGG_WRITER_SCRATCH_BYTES)?;
+        let mut output = BudgetedOggOutput::new(budget);
 
-        let mut granule_position = 0_u64;
-        let mut previous_block_size = 0_u64;
-        for (index, range) in self.packet_ranges.iter().enumerate() {
-            let packet = sample
-                .get(range.clone())
-                .ok_or(Fsb5Error::Truncated("FSB5 prepared Vorbis packet"))?;
-            let block_size = packet_block_size(packet, &self.block_flags)?;
-            let previous_granule = granule_position;
-            if previous_block_size != 0 {
-                granule_position = granule_position
-                    .checked_add((block_size + previous_block_size) / 4)
-                    .ok_or(Fsb5Error::Invalid("Vorbis granule position overflow"))?;
-            }
-            previous_block_size = block_size;
-            let is_last = index + 1 == self.packet_ranges.len();
-            let output_granule = if is_last {
-                exact_end_granule(self.sample_frames, previous_granule, granule_position)?
-            } else {
-                granule_position
-            };
-            let end = if is_last {
-                PacketWriteEndInfo::EndStream
-            } else {
-                PacketWriteEndInfo::NormalPacket
-            };
-            ogg.write_packet(packet, OGG_SERIAL, end, output_granule)
+        let write_result = {
+            let mut ogg = PacketWriter::new(&mut output);
+            let result: Result<(), Fsb5Error> = (|| {
+                ogg.write_packet(&info[..], OGG_SERIAL, PacketWriteEndInfo::EndPage, 0)
+                    .map_err(Fsb5Error::Output)?;
+                ogg.write_packet(
+                    &comment[..],
+                    OGG_SERIAL,
+                    PacketWriteEndInfo::NormalPacket,
+                    0,
+                )
                 .map_err(Fsb5Error::Output)?;
+                ogg.write_packet(
+                    setup.header_bytes.as_slice(),
+                    OGG_SERIAL,
+                    PacketWriteEndInfo::EndPage,
+                    0,
+                )
+                .map_err(Fsb5Error::Output)?;
+
+                let mut granule_position = 0_u64;
+                let mut previous_block_size = 0_u64;
+                for (index, range) in self.packet_ranges.iter().enumerate() {
+                    let packet = sample
+                        .get(range.clone())
+                        .ok_or(Fsb5Error::Truncated("FSB5 prepared Vorbis packet"))?;
+                    let block_size = packet_block_size(packet, &self.block_flags)?;
+                    let previous_granule = granule_position;
+                    if previous_block_size != 0 {
+                        granule_position = granule_position
+                            .checked_add((block_size + previous_block_size) / 4)
+                            .ok_or(Fsb5Error::Invalid("Vorbis granule position overflow"))?;
+                    }
+                    previous_block_size = block_size;
+                    let is_last = index + 1 == self.packet_ranges.len();
+                    let output_granule = if is_last {
+                        exact_end_granule(self.sample_frames, previous_granule, granule_position)?
+                    } else {
+                        granule_position
+                    };
+                    let end = if is_last {
+                        PacketWriteEndInfo::EndStream
+                    } else {
+                        PacketWriteEndInfo::NormalPacket
+                    };
+                    ogg.write_packet(packet, OGG_SERIAL, end, output_granule)
+                        .map_err(Fsb5Error::Output)?;
+                }
+                Ok(())
+            })();
+            result
+        };
+
+        if let Some(error) = output.take_failure() {
+            return Err(error);
         }
+        write_result?;
+        Ok(output.into_bytes())
+    }
+}
+
+struct BudgetedOggOutput<'budget> {
+    bytes: Vec<u8>,
+    budget: &'budget mut AssetLoadBudget,
+    failure: Option<Fsb5Error>,
+}
+
+impl<'budget> BudgetedOggOutput<'budget> {
+    fn new(budget: &'budget mut AssetLoadBudget) -> Self {
+        Self {
+            bytes: Vec::new(),
+            budget,
+            failure: None,
+        }
+    }
+
+    fn reserve_for(&mut self, additional: usize) -> Result<(), Fsb5Error> {
+        let required_len =
+            self.bytes
+                .len()
+                .checked_add(additional)
+                .ok_or(BudgetError::ArithmeticOverflow {
+                    resource: OGG_OUTPUT_RESOURCE,
+                })?;
+        let old_capacity = self.bytes.capacity();
+        if required_len <= old_capacity {
+            return Ok(());
+        }
+
+        let minimum_growth = required_len - old_capacity;
+        let minimum_growth =
+            u64::try_from(minimum_growth).map_err(|_| BudgetError::ArithmeticOverflow {
+                resource: OGG_OUTPUT_RESOURCE,
+            })?;
+        self.budget.check_bytes(minimum_growth)?;
+        self.bytes
+            .try_reserve_exact(additional)
+            .map_err(|source| Fsb5Error::Allocation {
+                resource: OGG_OUTPUT_RESOURCE,
+                requested: required_len,
+                source,
+            })?;
+        let capacity_growth = self.bytes.capacity().checked_sub(old_capacity).ok_or(
+            BudgetError::ArithmeticOverflow {
+                resource: OGG_OUTPUT_RESOURCE,
+            },
+        )?;
+        let capacity_growth =
+            u64::try_from(capacity_growth).map_err(|_| BudgetError::ArithmeticOverflow {
+                resource: OGG_OUTPUT_RESOURCE,
+            })?;
+        self.budget.consume_bytes(capacity_growth)?;
+        Ok(())
+    }
+
+    fn take_failure(&mut self) -> Option<Fsb5Error> {
+        self.failure.take()
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for BudgetedOggOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.failure.is_some() {
+            return Err(io::Error::other("FSB5 Ogg output is already failed"));
+        }
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if let Err(error) = self.reserve_for(bytes.len()) {
+            self.failure = Some(error);
+            return Err(io::Error::other(
+                "failed to reserve caller-budgeted FSB5 Ogg output",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
@@ -197,13 +314,32 @@ fn build_comment_packet() -> [u8; 27] {
     packet
 }
 
-fn charge_vec<T>(budget: &mut AssetLoadBudget, capacity: usize) -> Result<(), Fsb5Error> {
-    let bytes = capacity
+fn reserve_vec<T>(
+    capacity: usize,
+    resource: &'static str,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<T>, Fsb5Error> {
+    let minimum_bytes = capacity
         .checked_mul(size_of::<T>())
         .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
-    budget.consume_bytes(bytes)?;
-    Ok(())
+        .ok_or(BudgetError::ArithmeticOverflow { resource })?;
+    budget.check_bytes(minimum_bytes)?;
+
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|source| Fsb5Error::Allocation {
+            resource,
+            requested: capacity.saturating_mul(size_of::<T>()),
+            source,
+        })?;
+    let allocated_bytes = values
+        .capacity()
+        .checked_mul(size_of::<T>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(BudgetError::ArithmeticOverflow { resource })?;
+    budget.consume_bytes(allocated_bytes)?;
+    Ok(values)
 }
 
 /*
@@ -275,7 +411,7 @@ struct VorbisSetup {
 }
 
 impl VorbisSetup {
-    fn block_flags(&self, budget: &mut AssetLoadBudget) -> Result<Vec<bool>, Fsb5Error> {
+    fn block_flags(&self, budget: &mut AssetLoadBudget) -> Result<Vec<u8>, Fsb5Error> {
         let mut reader = LsbBitReader::new(&self.header_bytes);
         if reader.read_bits(8)? != 5 || !reader.read_bytes(6)?.eq(b"vorbis") {
             return Err(Fsb5Error::Invalid("invalid FSB5 Vorbis setup packet"));
@@ -288,20 +424,16 @@ impl VorbisSetup {
                 resource: "entries",
             }
         })?)?;
-        charge_vec::<bool>(budget, mode_count)?;
-        let mut flags = Vec::new();
-        flags
-            .try_reserve_exact(mode_count)
-            .map_err(|_| Fsb5Error::Allocation("Vorbis mode flags"))?;
+        let mut flags = reserve_vec(mode_count, "Vorbis mode flags", budget)?;
         for _ in 0..mode_count {
-            flags.push(reader.read_bits(1)? != 0);
+            flags.push(u8::from(reader.read_bits(1)? != 0));
             reader.skip(16 + 16 + 8)?;
         }
         Ok(flags)
     }
 }
 
-fn packet_block_size(packet: &[u8], block_flags: &[bool]) -> Result<u64, Fsb5Error> {
+fn packet_block_size(packet: &[u8], block_flags: &[u8]) -> Result<u64, Fsb5Error> {
     let mut reader = LsbBitReader::new(packet);
     if reader.read_bits(1)? != 0 {
         return Ok(0);
@@ -311,7 +443,7 @@ fn packet_block_size(packet: &[u8], block_flags: &[bool]) -> Result<u64, Fsb5Err
         .map_err(|_| Fsb5Error::Invalid("Vorbis mode index does not fit usize"))?;
     let long_block = *block_flags.get(mode).ok_or(Fsb5Error::Invalid(
         "Vorbis packet references an unknown mode",
-    ))?;
+    ))? != 0;
     Ok(if long_block { 2_048 } else { 256 })
 }
 
@@ -344,11 +476,7 @@ fn parse_packet_ranges(
         return Err(Fsb5Error::Invalid("FSB5 Vorbis sample has no packets"));
     }
 
-    charge_vec::<Range<usize>>(budget, packet_count)?;
-    let mut packets = Vec::new();
-    packets
-        .try_reserve_exact(packet_count)
-        .map_err(|_| Fsb5Error::Allocation("FSB5 Vorbis packet ranges"))?;
+    let mut packets = reserve_vec(packet_count, "FSB5 Vorbis packet ranges", budget)?;
     let mut cursor = PacketCursor::new(bytes);
     while let Some(range) = cursor.next_range()? {
         packets.push(range);
@@ -469,14 +597,8 @@ impl Fsb5Bank {
                 resource: "entries",
             }
         })?)?;
-        charge_vec::<SampleMetadata>(budget, sample_count)?;
-        charge_vec::<Fsb5Sample>(budget, sample_count)?;
-
         let mut cursor = header_len;
-        let mut metadata_entries = Vec::new();
-        metadata_entries
-            .try_reserve_exact(sample_count)
-            .map_err(|_| Fsb5Error::Allocation("FSB5 sample metadata"))?;
+        let mut metadata_entries = reserve_vec(sample_count, "FSB5 sample metadata", budget)?;
         for _ in 0..sample_count {
             metadata_entries.push(parse_sample_metadata(
                 bytes,
@@ -486,10 +608,7 @@ impl Fsb5Bank {
             )?);
         }
 
-        let mut samples = Vec::new();
-        samples
-            .try_reserve_exact(metadata_entries.len())
-            .map_err(|_| Fsb5Error::Allocation("FSB5 samples"))?;
+        let mut samples = reserve_vec(metadata_entries.len(), "FSB5 samples", budget)?;
         for (index, metadata) in metadata_entries.iter().enumerate() {
             let end_offset = metadata
                 .next_offset(&metadata_entries, index, data_len)
@@ -794,8 +913,13 @@ pub(crate) enum Fsb5Error {
     Truncated(&'static str),
     #[error("invalid {0}")]
     Invalid(&'static str),
-    #[error("failed to allocate {0}")]
-    Allocation(&'static str),
+    #[error("failed to allocate {resource} ({requested} bytes): {source}")]
+    Allocation {
+        resource: &'static str,
+        requested: usize,
+        #[source]
+        source: TryReserveError,
+    },
     #[error("unsupported FSB5 codec mode {mode}")]
     UnsupportedCodec { mode: u32 },
     #[error("FSB5 subsound index {requested} is outside the {available} available samples")]
@@ -894,15 +1018,45 @@ mod tests {
     }
 
     #[test]
+    fn vector_reservation_charges_the_allocator_capacity() {
+        let mut measured = AssetLoadBudget::default();
+        let values = reserve_vec::<Range<usize>>(3, "fixture ranges", &mut measured).unwrap();
+        let actual_bytes = u64::try_from(values.capacity() * size_of::<Range<usize>>()).unwrap();
+        assert_eq!(measured.usage().bytes, actual_bytes);
+
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: actual_bytes - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            reserve_vec::<Range<usize>>(3, "fixture ranges", &mut one_short),
+            Err(Fsb5Error::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn rebuilt_output_charges_its_actual_retained_capacity() {
+        let mut measured = AssetLoadBudget::default();
+        let mut output = BudgetedOggOutput::new(&mut measured);
+        output.write_all(&[1; 31]).unwrap();
+        output.write_all(&[2; 257]).unwrap();
+        let capacity = u64::try_from(output.bytes.capacity()).unwrap();
+        let bytes = output.into_bytes();
+
+        assert_eq!(measured.usage().bytes, capacity);
+        assert_eq!(bytes.len(), 288);
+    }
+
+    #[test]
     fn real_fsb5_rebuild_uses_the_declared_eos_granule() {
         let prepared =
             PreparedVorbisOgg::prepare(SHORT_VORBIS, 0, &mut AssetLoadBudget::default()).unwrap();
-        assert_eq!(prepared.sample_frames, 24_806);
 
-        let mut output = Vec::new();
-        prepared.write_to(SHORT_VORBIS, &mut output).unwrap();
-
-        assert_eq!(last_ogg_granule(&output), Some(24_806));
+        assert_eq!(last_ogg_granule(prepared.as_bytes()), Some(24_806));
     }
 
     #[test]

@@ -70,6 +70,7 @@ pub use view::{
     WorkspaceView, WorkspaceYamlObject,
 };
 
+#[cfg(any(feature = "decode", test))]
 pub(crate) use inspection::StreamedResourceResolver;
 #[cfg(test)]
 pub(crate) use state::TestSourceBackingOwner;
