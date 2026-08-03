@@ -50,6 +50,8 @@ enum PreparedSource {
     RawBinary,
     Yaml,
     TextAsset,
+    #[cfg(not(feature = "decode"))]
+    DecodedUnavailable,
 }
 
 #[cfg(feature = "decode")]
@@ -165,7 +167,15 @@ impl PreparedRepresentation {
             PlannedContent::Audio { .. }
             | PlannedContent::TexturePng { .. }
             | PlannedContent::SpritePng { .. } => {
-                Err(RepresentationPreparationError::InvalidContent)
+                if raw_fallback {
+                    Ok(Self::source(
+                        object,
+                        PreparedSource::DecodedUnavailable,
+                        true,
+                    ))
+                } else {
+                    Err(RepresentationPreparationError::InvalidContent)
+                }
             }
         }
     }
@@ -223,6 +233,11 @@ impl PreparedRepresentation {
                 preferred: PreparedSource::TextAsset,
                 ..
             } => write_text_asset(writer, object),
+            #[cfg(not(feature = "decode"))]
+            PreparedState::Source {
+                preferred: PreparedSource::DecodedUnavailable,
+                ..
+            } => Err(RepresentationWriteError::InvalidContent),
             #[cfg(feature = "decode")]
             PreparedState::Media { preferred, .. } => write_media(writer, preferred),
         }
