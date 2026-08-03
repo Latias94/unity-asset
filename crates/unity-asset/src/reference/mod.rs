@@ -10,6 +10,7 @@ mod occurrence;
 mod projection;
 mod query;
 mod resolution;
+pub(crate) mod yaml_value;
 
 use std::collections::TryReserveError;
 use std::fmt;

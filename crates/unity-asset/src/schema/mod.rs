@@ -11,7 +11,7 @@ pub use event::{
     UnityEventRecipe,
 };
 pub use hierarchy::{
-    ChildPlacement, HierarchyNode, HierarchyRecipe, HierarchyState, Quaternion,
+    HierarchyDestinationV1, HierarchyIntentV1, HierarchyPlacementV1, HierarchyRecipe, Quaternion,
     RectTransformChange, TransformChange, TransformRecipe, Vector2, Vector3,
 };
 pub use material::{MaterialRecipe, MaterialTextureChange};

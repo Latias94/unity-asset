@@ -32,6 +32,9 @@ not require another source-breaking release.
 | `UnityClassRegistry` | Direct immutable class values and schema provenance; no constructor registry |
 | `PythonLikeUnityDocument` / `PythonLikeUnityClass` | Typed `YamlDocument`, `UnityClass`, `UnityValue`, and Workspace inspection |
 | `DynamicAccess` / `DynamicValue` | `UnityClass` and `UnityValue` typed accessors |
+| `unity_asset_binary::unity_objects::{GameObject, Transform, ObjectRef, Vector3, Quaternion}` | Inspect `UnityObject::class_id`, `class_name`, and `as_unity_class`; project required fields from `UnityValue` or use a workspace schema recipe. The shallow structs with silent defaults have no replacement. |
+| `UnityObject::{as_gameobject, as_transform, is_gameobject, is_transform}` | Match the authoritative class ID/name and read fields through `UnityObject::as_unity_class`; use `HierarchyRecipe` for validated hierarchy mutation. |
+| `HierarchyNode`, `HierarchyState`, `ChildPlacement`, and `HierarchyRecipe::reparent` | `HierarchyIntentV1::for_view`, `HierarchyDestinationV1`, `HierarchyPlacementV1`, and `HierarchyRecipe::lower`; current hierarchy facts are derived from the supplied immutable view. |
 | `UnityAssetError::TypeTreeShape` | `TypeTreeWriteError::Shape`; object mutations report `SerializedObjectEncodeError::ReplacementShape` |
 | `SerializedObjectEncodeError::{ReplacementValue, Rewrite}` with `UnityAssetError` sources | The same variants with `TypeTreeWriteError` sources |
 | `unity_asset_write::Endian` | `unity_asset_write::ByteOrder`, re-exported from `unity-asset-binary` |
@@ -185,6 +188,15 @@ fn inspect(workspace: &AssetWorkspace) -> Result<(), Box<dyn std::error::Error>>
 Inspection values are owned, versioned, serialize-only projections. They do not expose mutable
 parser maps or require reparsing source bytes.
 
+### Low-level binary object access
+
+The removed `unity_objects` structs copied a few fields into shallow projections and supplied
+defaults when the observed TypeTree did not match their assumptions. They did not preserve enough
+schema or source evidence for mutation. Low-level readers should instead check both class ID and
+class name, then read the required fields from `UnityObject::as_unity_class`. Code that changes a
+Transform hierarchy should use the hierarchy recipe below so parent/child invariants and field
+guards are derived from one revision-bound view.
+
 ### Bundle container discovery
 
 Replace `bundle_container_entries`, `find_bundle_container_entries`,
@@ -245,6 +257,37 @@ Use `MutationPlanBuilder` to combine validated generic operations or use
 - continuous operation ordinals;
 - schema/value guards;
 - content-addressed payloads.
+
+### Hierarchy mutation
+
+Callers no longer construct a second, potentially stale `HierarchyState`. Express only the desired
+result and let the recipe inspect YAML, binary, or prepared-overlay objects from the supplied view:
+
+```rust,no_run
+use unity_asset::schema::{
+    HierarchyDestinationV1, HierarchyIntentV1, HierarchyPlacementV1, HierarchyRecipe,
+    RecipeError, RecipeLowering, SchemaRecipePlanner,
+};
+use unity_asset::workspace::WorkspaceView;
+use unity_asset::{AssetLoadBudget, ObjectAddress};
+
+fn lower_reparent(
+    view: &dyn WorkspaceView,
+    child: ObjectAddress,
+    parent: Option<ObjectAddress>,
+    budget: &mut AssetLoadBudget,
+) -> Result<RecipeLowering, RecipeError> {
+    let destination = match parent {
+        Some(parent) => HierarchyDestinationV1::parent(parent, HierarchyPlacementV1::Last),
+        None => HierarchyDestinationV1::root(),
+    };
+    let intent = HierarchyIntentV1::for_view(view, child, destination);
+    HierarchyRecipe::lower(&SchemaRecipePlanner::new(view), &intent, budget)
+}
+```
+
+The intent is bound to the view's workspace and revision. Recreate it after advancing the
+workspace; do not persist runtime hierarchy observations or reuse an intent against another view.
 
 `PreparedChange` is deliberately not serializable, cloneable, or reconstructible from
 `PrepareReport`. In a Rust process, keep it alive and pass it directly to `commit`. Across a

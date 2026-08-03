@@ -20,19 +20,17 @@ use crate::reference::encoding::{
     ReferenceDestination, ReferenceDestinationEncoder, ReferenceEncodingError,
     ReferenceEncodingHint,
 };
+use crate::reference::yaml_value::{
+    YAML_FILE_ID, YAML_GUID, YAML_TYPE, YamlReferenceValue as YamlPPtr,
+};
+#[cfg(test)]
+use crate::reference::yaml_value::{YAML_MEMBER_FILE_ID, YAML_MEMBER_GUID, YAML_MEMBER_TYPE};
 
 use super::super::plan::MutationValueOwned;
 use super::super::{
     FieldGuard, MutationField, MutationValue, MutationValueRef, ReferenceTarget, WorkspaceView,
 };
 use super::yaml::{YamlCandidateError, YamlObjectCandidate, YamlSemanticOperation};
-
-const YAML_FILE_ID: &str = "fileID";
-const YAML_GUID: &str = "guid";
-const YAML_TYPE: &str = "type";
-const YAML_MEMBER_FILE_ID: &str = "m_FileID";
-const YAML_MEMBER_GUID: &str = "m_GUID";
-const YAML_MEMBER_TYPE: &str = "m_Type";
 
 /// Revision-bound codec shared by every operation in one prepare run.
 pub(super) struct StagedReferenceMutationCodec<'view> {
@@ -128,7 +126,7 @@ impl<'view> StagedReferenceMutationCodec<'view> {
     ) -> Result<(), ReferenceMutationCodecError> {
         self.validate_yaml_owner(owner, candidate)?;
         let current = candidate.class().value_at_path(path)?;
-        let raw = YamlPPtr::read(current)?;
+        let raw = read_yaml_pptr(current)?;
         let actual_schema = yaml_field_schema_digest(candidate.class(), path, current, budget)?;
         if actual_schema != schema_digest {
             return Err(ReferenceMutationCodecError::FieldSchemaMismatch {
@@ -137,18 +135,18 @@ impl<'view> StagedReferenceMutationCodec<'view> {
             });
         }
 
-        let hint = ReferenceEncodingHint::yaml(raw.type_id);
+        let hint = ReferenceEncodingHint::yaml(raw.type_id());
         if !self.destinations.yaml_current_matches(
             self.view,
             owner,
             expected,
-            raw.file_id,
-            raw.guid,
+            raw.file_id(),
+            raw.guid(),
             budget,
         )? {
             return Err(ReferenceMutationCodecError::ExpectedReferenceMismatch {
-                actual_file_id: yaml_file_id_for_diagnostic(raw.file_id),
-                actual_path_id: raw.file_id,
+                actual_file_id: yaml_file_id_for_diagnostic(raw.file_id()),
+                actual_path_id: raw.file_id(),
             });
         }
 
@@ -335,8 +333,8 @@ impl<'view> StagedReferenceMutationCodec<'view> {
                 UnityValue::Bytes(retain_bytes(value.into_vec(), budget)?)
             }
             MutationValueOwned::Reference(target) => {
-                let template = current.and_then(|value| YamlPPtr::read(value).ok());
-                let hint = ReferenceEncodingHint::yaml(template.and_then(|value| value.type_id));
+                let template = current.and_then(|value| read_yaml_pptr(value).ok());
+                let hint = ReferenceEncodingHint::yaml(template.and_then(YamlPPtr::type_id));
                 let destination = self
                     .destinations
                     .encode(self.view, owner, &target, hint, budget)?;
@@ -632,85 +630,13 @@ fn binary_integer(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct YamlPPtr<'value> {
-    file_field: &'value str,
-    guid_field: Option<&'value str>,
-    type_field: Option<&'value str>,
-    file_id: i64,
-    guid: Option<[u8; 16]>,
-    type_id: Option<i64>,
-}
-
-impl<'value> YamlPPtr<'value> {
-    fn read(value: &'value UnityValue) -> Result<Self, ReferenceMutationCodecError> {
-        let UnityValue::Object(fields) = value else {
-            return Err(ReferenceMutationCodecError::ReferenceValueKind {
-                actual: value.kind(),
-            });
-        };
-        let mut file = None;
-        let mut guid = None;
-        let mut type_id = None;
-        for (name, value) in fields {
-            match name.as_str() {
-                YAML_FILE_ID | YAML_MEMBER_FILE_ID if file.is_none() => {
-                    file = Some((name.as_str(), value));
-                }
-                YAML_GUID | YAML_MEMBER_GUID if guid.is_none() => {
-                    guid = Some((name.as_str(), value));
-                }
-                YAML_TYPE | YAML_MEMBER_TYPE if type_id.is_none() => {
-                    type_id = Some((name.as_str(), value));
-                }
-                _ => return Err(ReferenceMutationCodecError::InvalidYamlReferenceShape),
-            }
-        }
-        let (file_field, file_value) =
-            file.ok_or(ReferenceMutationCodecError::InvalidYamlReferenceShape)?;
-        let file_id = file_value
-            .as_i64()
-            .ok_or(ReferenceMutationCodecError::InvalidYamlReferenceShape)?;
-        let (guid_field, guid) = match guid {
-            Some((field, value)) => {
-                let value = value
-                    .as_str()
-                    .ok_or(ReferenceMutationCodecError::InvalidYamlReferenceShape)?;
-                (Some(field), Some(parse_guid(value)?))
-            }
-            None => (None, None),
-        };
-        let (type_field, type_id) = match type_id {
-            Some((field, value)) => (
-                Some(field),
-                Some(
-                    value
-                        .as_i64()
-                        .ok_or(ReferenceMutationCodecError::InvalidYamlReferenceShape)?,
-                ),
-            ),
-            None => (None, None),
-        };
-        if guid.is_some() != type_id.is_some() {
-            return Err(ReferenceMutationCodecError::InvalidYamlReferenceShape);
-        }
-        Ok(Self {
-            file_field,
-            guid_field,
-            type_field,
-            file_id,
-            guid,
-            type_id,
-        })
+fn read_yaml_pptr(value: &UnityValue) -> Result<YamlPPtr<'_>, ReferenceMutationCodecError> {
+    if !matches!(value, UnityValue::Object(_)) {
+        return Err(ReferenceMutationCodecError::ReferenceValueKind {
+            actual: value.kind(),
+        });
     }
-
-    fn external_field_names(self) -> (&'value str, &'value str) {
-        match (self.guid_field, self.type_field) {
-            (Some(guid), Some(type_id)) => (guid, type_id),
-            _ if self.file_field == YAML_MEMBER_FILE_ID => (YAML_MEMBER_GUID, YAML_MEMBER_TYPE),
-            _ => (YAML_GUID, YAML_TYPE),
-        }
-    }
+    YamlPPtr::read(value).map_err(|_| ReferenceMutationCodecError::InvalidYamlReferenceShape)
 }
 
 fn yaml_pptr_value(
@@ -718,7 +644,7 @@ fn yaml_pptr_value(
     template: Option<YamlPPtr<'_>>,
     budget: &mut AssetLoadBudget,
 ) -> Result<UnityValue, ReferenceMutationCodecError> {
-    let file_field = template.map_or(YAML_FILE_ID, |value| value.file_field);
+    let file_field = template.map_or(YAML_FILE_ID, YamlPPtr::file_field);
     let (file_id, external) = match destination {
         ReferenceDestination::Null => (0, None),
         ReferenceDestination::YamlLocal { file_id } => (file_id, None),
@@ -751,30 +677,6 @@ fn yaml_pptr_value(
         );
     }
     Ok(UnityValue::Object(fields))
-}
-
-fn parse_guid(value: &str) -> Result<[u8; 16], ReferenceMutationCodecError> {
-    if value.len() != 32 {
-        return Err(ReferenceMutationCodecError::InvalidYamlReferenceShape);
-    }
-    let mut guid = [0_u8; 16];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high =
-            hex_value(pair[0]).ok_or(ReferenceMutationCodecError::InvalidYamlReferenceShape)?;
-        let low =
-            hex_value(pair[1]).ok_or(ReferenceMutationCodecError::InvalidYamlReferenceShape)?;
-        guid[index] = (high << 4) | low;
-    }
-    Ok(guid)
-}
-
-const fn hex_value(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn format_guid(

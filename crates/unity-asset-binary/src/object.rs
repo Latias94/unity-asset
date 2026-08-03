@@ -9,7 +9,6 @@ use crate::typetree::{
     PPtrScanResult, TypeTree, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput,
     TypeTreeParseWarning, TypeTreeSchema, TypeTreeTraversalStats,
 };
-use crate::unity_objects::{GameObject, Transform};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::sync::Arc;
@@ -806,34 +805,6 @@ impl UnityObject {
         &self.class
     }
 
-    pub fn as_gameobject(&self) -> Result<GameObject> {
-        if self.class_id() != 1 {
-            return Err(BinaryError::invalid_data(format!(
-                "Object is not a GameObject (class_id: {})",
-                self.class_id()
-            )));
-        }
-        GameObject::from_typetree(self.class.properties())
-    }
-
-    pub fn as_transform(&self) -> Result<Transform> {
-        if self.class_id() != 4 {
-            return Err(BinaryError::invalid_data(format!(
-                "Object is not a Transform (class_id: {})",
-                self.class_id()
-            )));
-        }
-        Transform::from_typetree(self.class.properties())
-    }
-
-    pub fn is_gameobject(&self) -> bool {
-        self.class_id() == 1
-    }
-
-    pub fn is_transform(&self) -> bool {
-        self.class_id() == 4
-    }
-
     pub fn describe(&self) -> String {
         let name = self.name().unwrap_or_else(|| "<unnamed>".to_string());
         format!(
@@ -1609,6 +1580,27 @@ mod tests {
         );
         assert!(object.as_unity_class().properties().is_empty());
         assert_eq!(object.typetree_stats(), TypeTreeTraversalStats::default());
+    }
+
+    #[test]
+    fn describes_named_and_unnamed_objects_without_class_wrappers() {
+        let info = ObjectInfo::for_standalone_class(12_345, 0, 0, 1).unwrap();
+        let class = UnityClass::new(1, "GameObject".to_owned(), "12345".to_owned());
+        let (header, mut properties) = class.into_parts();
+        properties.insert("m_Name".to_owned(), UnityValue::String("Player".to_owned()));
+        let named =
+            UnityObject::from_info_and_class(info, UnityClass::from_parts(header, properties));
+        assert_eq!(named.describe(), "GameObject 'Player' (ID:1, PathID:12345)");
+
+        let info = ObjectInfo::for_standalone_class(67_890, 0, 0, 4).unwrap();
+        let unnamed = UnityObject::from_info_and_class(
+            info,
+            UnityClass::new(4, "Transform".to_owned(), "67890".to_owned()),
+        );
+        assert_eq!(
+            unnamed.describe(),
+            "Transform '<unnamed>' (ID:4, PathID:67890)"
+        );
     }
 
     #[test]

@@ -54,7 +54,6 @@ pub mod reader;
 pub mod reference;
 pub mod shared_bytes;
 pub mod typetree;
-pub mod unity_objects;
 pub mod unity_version;
 pub mod webfile;
 

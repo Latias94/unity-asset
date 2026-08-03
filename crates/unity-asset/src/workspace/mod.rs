@@ -63,6 +63,7 @@ pub use source_admission::{
     SourceAdmissionOutcome, SourceAdmissionPolicy, SourceAdmissionRejection, SourceAdmissionReport,
 };
 pub use source_catalog::SourceLocationKind;
+pub(crate) use view::SourceObjectDescriptor;
 pub use view::{
     WorkspaceAllocationUnit, WorkspaceByteRange, WorkspaceByteRangeReader, WorkspaceError,
     WorkspaceLookup, WorkspaceObject, WorkspaceObjectValue, WorkspaceSource,
@@ -118,4 +119,29 @@ impl<'a> ReferenceViewParts<'a> {
 
 pub(crate) fn reference_view_parts(view: &dyn WorkspaceView) -> ReferenceViewParts<'_> {
     view::sealed::Sealed::reference_view_parts(view)
+}
+
+pub(crate) fn object_count_in_source(
+    view: &dyn WorkspaceView,
+    source: unity_asset_core::SourceId,
+    budget: &mut unity_asset_core::AssetLoadBudget,
+) -> Result<usize, WorkspaceError> {
+    view::sealed::Sealed::object_count_in_source(view, source, budget)
+}
+
+pub(crate) fn object_descriptor_at_in_source(
+    view: &dyn WorkspaceView,
+    source: unity_asset_core::SourceId,
+    index: usize,
+    budget: &mut unity_asset_core::AssetLoadBudget,
+) -> Result<view::SourceObjectDescriptor, WorkspaceError> {
+    view::sealed::Sealed::object_descriptor_at_in_source(view, source, index, budget)
+}
+
+pub(crate) fn read_object_at_in_source(
+    view: &dyn WorkspaceView,
+    descriptor: &view::SourceObjectDescriptor,
+    budget: &mut unity_asset_core::AssetLoadBudget,
+) -> Result<WorkspaceObject, WorkspaceError> {
+    view::sealed::Sealed::read_object_at_in_source(view, descriptor, budget)
 }

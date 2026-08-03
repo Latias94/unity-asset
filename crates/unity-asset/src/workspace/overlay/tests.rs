@@ -696,6 +696,134 @@ fn prepared_binary_objects_are_derived_from_the_exact_serialized_artifact() {
         ObjectPayloadProvenance::TypedReplacement | ObjectPayloadProvenance::RawReplacement
     ));
 
+    let prepared_descriptor = crate::workspace::object_descriptor_at_in_source(
+        &view,
+        source,
+        0,
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap();
+    let baseline_descriptor = crate::workspace::object_descriptor_at_in_source(
+        &snapshot,
+        source,
+        0,
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap();
+    let mut exact_measurement = AssetLoadBudget::default();
+    crate::workspace::read_object_at_in_source(&view, &prepared_descriptor, &mut exact_measurement)
+        .unwrap();
+    let exact_usage = exact_measurement.usage();
+    let mut baseline_measurement = AssetLoadBudget::default();
+    crate::workspace::read_object_at_in_source(
+        &snapshot,
+        &baseline_descriptor,
+        &mut baseline_measurement,
+    )
+    .unwrap();
+    assert!(exact_usage.bytes < baseline_measurement.usage().bytes);
+
+    let tight_limits = AssetLoadLimits {
+        max_entries: exact_usage.entries.max(1),
+        max_bytes: exact_usage.bytes.max(1),
+        ..AssetLoadLimits::default()
+    };
+    crate::workspace::read_object_at_in_source(
+        &view,
+        &prepared_descriptor,
+        &mut AssetLoadBudget::new(tight_limits).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        crate::workspace::read_object_at_in_source(
+            &snapshot,
+            &baseline_descriptor,
+            &mut AssetLoadBudget::new(tight_limits).unwrap(),
+        ),
+        Err(WorkspaceError::Budget(_))
+    ));
+
+    let passthrough_descriptor = crate::workspace::object_descriptor_at_in_source(
+        &view,
+        source,
+        1,
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap();
+    let baseline_passthrough_descriptor = crate::workspace::object_descriptor_at_in_source(
+        &snapshot,
+        source,
+        1,
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap();
+    let mut passthrough_measurement = AssetLoadBudget::default();
+    let passthrough = crate::workspace::read_object_at_in_source(
+        &view,
+        &passthrough_descriptor,
+        &mut passthrough_measurement,
+    )
+    .unwrap();
+    let WorkspaceObjectValue::Binary(passthrough) = passthrough.value() else {
+        panic!("SerializedFile passthrough object must remain binary");
+    };
+    assert_eq!(
+        passthrough.raw_data(),
+        file.object_handles().nth(1).unwrap().raw_data().unwrap()
+    );
+    let passthrough_usage = passthrough_measurement.usage();
+    assert!(passthrough_usage.entries > 1 && passthrough_usage.bytes > 1);
+    let mut baseline_passthrough_measurement = AssetLoadBudget::default();
+    crate::workspace::read_object_at_in_source(
+        &snapshot,
+        &baseline_passthrough_descriptor,
+        &mut baseline_passthrough_measurement,
+    )
+    .unwrap();
+    assert_eq!(
+        passthrough_usage,
+        baseline_passthrough_measurement.usage(),
+        "passthrough must not charge an unsuccessful Exact projection"
+    );
+
+    let passthrough_limits = AssetLoadLimits {
+        max_entries: passthrough_usage.entries,
+        max_bytes: passthrough_usage.bytes,
+        ..AssetLoadLimits::default()
+    };
+    crate::workspace::read_object_at_in_source(
+        &view,
+        &passthrough_descriptor,
+        &mut AssetLoadBudget::new(passthrough_limits).unwrap(),
+    )
+    .unwrap();
+    for (dimension, limits) in [
+        (
+            "entries",
+            AssetLoadLimits {
+                max_entries: passthrough_usage.entries - 1,
+                ..passthrough_limits
+            },
+        ),
+        (
+            "bytes",
+            AssetLoadLimits {
+                max_bytes: passthrough_usage.bytes - 1,
+                ..passthrough_limits
+            },
+        ),
+    ] {
+        let result = crate::workspace::read_object_at_in_source(
+            &view,
+            &passthrough_descriptor,
+            &mut AssetLoadBudget::new(limits).unwrap(),
+        );
+        assert!(
+            matches!(result, Err(WorkspaceError::Budget(_))),
+            "passthrough {dimension} one-short boundary unexpectedly succeeded: usage={passthrough_usage:?}, result={result:?}"
+        );
+    }
+
     let baseline_handle = handle.clone().with_revision(snapshot.revision());
     let baseline =
         WorkspaceView::read_object(&snapshot, &baseline_handle, &mut AssetLoadBudget::default())

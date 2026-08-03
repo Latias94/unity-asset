@@ -180,12 +180,25 @@ impl PreparedObjectBinding {
         }
     }
 
-    fn project_exact(&self, handle: RevisionedObjectHandle) -> Option<WorkspaceObject> {
+    fn project_exact(
+        &self,
+        handle: &RevisionedObjectHandle,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Option<WorkspaceObject>, WorkspaceError> {
         match &self.projection {
-            PreparedObjectProjection::Exact { value, schema } => Some(
-                WorkspaceObject::from_shared(handle, value.clone(), Arc::clone(schema)),
-            ),
-            PreparedObjectProjection::BinaryPassthrough { .. } => None,
+            PreparedObjectProjection::Exact { value, schema } => {
+                consume_single_result(
+                    handle.retained_clone_bytes(),
+                    "prepared workspace object projection",
+                    budget,
+                )?;
+                Ok(Some(WorkspaceObject::from_shared(
+                    handle.clone(),
+                    value.clone(),
+                    Arc::clone(schema),
+                )))
+            }
+            PreparedObjectProjection::BinaryPassthrough { .. } => Ok(None),
         }
     }
 
@@ -731,6 +744,31 @@ impl view::sealed::Sealed for PreparedView {
             self.state.core.base.config().typetree,
         )
     }
+
+    fn object_count_in_source(
+        &self,
+        source: SourceId,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<usize, WorkspaceError> {
+        prepared_object_count_in_source(self.state.core.as_ref(), source, budget)
+    }
+
+    fn object_descriptor_at_in_source(
+        &self,
+        source: SourceId,
+        index: usize,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<view::SourceObjectDescriptor, WorkspaceError> {
+        prepared_object_descriptor_at_in_source(self.state.core.as_ref(), source, index, budget)
+    }
+
+    fn read_object_at_in_source(
+        &self,
+        descriptor: &view::SourceObjectDescriptor,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<WorkspaceObject, WorkspaceError> {
+        prepared_read_object_at_in_source(self.state.core.as_ref(), descriptor, budget)
+    }
 }
 
 impl view::sealed::Sealed for PreparedGraphView {
@@ -740,6 +778,31 @@ impl view::sealed::Sealed for PreparedGraphView {
             &self.reference_store,
             self.core.base.config().typetree,
         )
+    }
+
+    fn object_count_in_source(
+        &self,
+        source: SourceId,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<usize, WorkspaceError> {
+        prepared_object_count_in_source(self.core.as_ref(), source, budget)
+    }
+
+    fn object_descriptor_at_in_source(
+        &self,
+        source: SourceId,
+        index: usize,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<view::SourceObjectDescriptor, WorkspaceError> {
+        prepared_object_descriptor_at_in_source(self.core.as_ref(), source, index, budget)
+    }
+
+    fn read_object_at_in_source(
+        &self,
+        descriptor: &view::SourceObjectDescriptor,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<WorkspaceObject, WorkspaceError> {
+        prepared_read_object_at_in_source(self.core.as_ref(), descriptor, budget)
     }
 }
 
@@ -915,6 +978,65 @@ fn prepared_objects(
     Ok(objects)
 }
 
+fn prepared_object_count_in_source(
+    state: &PreparedStateCore,
+    source: SourceId,
+    budget: &mut AssetLoadBudget,
+) -> Result<usize, WorkspaceError> {
+    if !state.catalog.contains(source) {
+        return Err(WorkspaceError::MissingSource(source));
+    }
+    super::object_count_in_source(&state.base, source, budget)
+}
+
+fn prepared_object_descriptor_at_in_source(
+    state: &PreparedStateCore,
+    source: SourceId,
+    index: usize,
+    budget: &mut AssetLoadBudget,
+) -> Result<view::SourceObjectDescriptor, WorkspaceError> {
+    if !state.catalog.contains(source) {
+        return Err(WorkspaceError::MissingSource(source));
+    }
+    Ok(
+        super::object_descriptor_at_in_source(&state.base, source, index, budget)?
+            .with_revision(state.revision),
+    )
+}
+
+fn prepared_read_object_at_in_source(
+    state: &PreparedStateCore,
+    descriptor: &view::SourceObjectDescriptor,
+    budget: &mut AssetLoadBudget,
+) -> Result<WorkspaceObject, WorkspaceError> {
+    let handle = descriptor.handle();
+    handle.validate_context(state.base.workspace_id(), state.revision)?;
+    if !state.catalog.contains(handle.object().source()) {
+        return Err(WorkspaceError::MissingSource(handle.object().source()));
+    }
+    if let Some(binding) = state.object_binding(handle.object())
+        && let Some(object) = binding.project_exact(handle, budget)?
+    {
+        return Ok(object);
+    }
+
+    consume_retained_bytes(
+        handle.retained_clone_bytes(),
+        "prepared baseline object handle",
+        budget,
+    )?;
+    let base_descriptor = descriptor.clone().with_revision(state.base.revision());
+    let object = super::read_object_at_in_source(&state.base, &base_descriptor, budget)?;
+    let object = match state
+        .object_binding(handle.object())
+        .and_then(PreparedObjectBinding::exact_info)
+    {
+        Some(info) => object.with_exact_binary_info(info.clone())?,
+        None => object,
+    };
+    Ok(object.with_revision(state.revision))
+}
+
 fn prepared_resolve_object(
     state: &PreparedStateCore,
     address: &ObjectAddress,
@@ -961,15 +1083,10 @@ fn prepared_read_object(
     if !state.catalog.contains(handle.object().source()) {
         return Err(WorkspaceError::MissingSource(handle.object().source()));
     }
-    if let Some(binding) = state.object_binding(handle.object()) {
-        consume_single_result(
-            handle.retained_clone_bytes(),
-            "prepared workspace object projection",
-            budget,
-        )?;
-        if let Some(object) = binding.project_exact(handle.clone()) {
-            return Ok(object);
-        }
+    if let Some(binding) = state.object_binding(handle.object())
+        && let Some(object) = binding.project_exact(handle, budget)?
+    {
+        return Ok(object);
     }
 
     consume_retained_bytes(

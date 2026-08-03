@@ -26,10 +26,67 @@ use crate::schema::SchemaProvenance;
 use crate::{BinaryError, BinaryObjectIdentityError};
 
 pub(crate) mod sealed {
+    use unity_asset_core::{AssetLoadBudget, SourceId};
+
     use super::super::ReferenceViewParts;
+    use super::{SourceObjectDescriptor, WorkspaceError, WorkspaceObject};
 
     pub trait Sealed {
         fn reference_view_parts(&self) -> ReferenceViewParts<'_>;
+
+        fn object_count_in_source(
+            &self,
+            source: SourceId,
+            budget: &mut AssetLoadBudget,
+        ) -> Result<usize, WorkspaceError>;
+
+        fn object_descriptor_at_in_source(
+            &self,
+            source: SourceId,
+            index: usize,
+            budget: &mut AssetLoadBudget,
+        ) -> Result<SourceObjectDescriptor, WorkspaceError>;
+
+        fn read_object_at_in_source(
+            &self,
+            descriptor: &SourceObjectDescriptor,
+            budget: &mut AssetLoadBudget,
+        ) -> Result<WorkspaceObject, WorkspaceError>;
+    }
+}
+
+/// Metadata-only object-table projection used by private source-local algorithms.
+#[derive(Debug, Clone)]
+pub struct SourceObjectDescriptor {
+    handle: RevisionedObjectHandle,
+    class_id: i32,
+    ordinal: usize,
+}
+
+impl SourceObjectDescriptor {
+    pub(crate) const fn new(handle: RevisionedObjectHandle, class_id: i32, ordinal: usize) -> Self {
+        Self {
+            handle,
+            class_id,
+            ordinal,
+        }
+    }
+
+    pub(crate) const fn handle(&self) -> &RevisionedObjectHandle {
+        &self.handle
+    }
+
+    pub(crate) const fn class_id(&self) -> i32 {
+        self.class_id
+    }
+
+    pub(crate) const fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    pub(super) fn with_revision(mut self, revision: WorkspaceRevision) -> Self {
+        self.handle = self.handle.with_revision(revision);
+        self
     }
 }
 

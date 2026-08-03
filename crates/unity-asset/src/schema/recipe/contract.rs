@@ -3,7 +3,7 @@ use thiserror::Error;
 use unity_asset_binary::{typetree::TypeTreeSemanticDigestError, unity_version::UnityVersion};
 use unity_asset_core::{
     BudgetError, DigestBuildError, DigestV1, FieldPath, FieldPathError, ObjectAddress, ObjectKind,
-    SemanticDigestError, ValuePathError,
+    SemanticDigestError, ValuePathError, WorkspaceId, WorkspaceRevision,
 };
 use unity_asset_decode::media::MediaInspectionError;
 
@@ -504,13 +504,14 @@ pub enum RecipeRejectionCode {
     UnresolvedReference,
     CallIndexOutOfBounds,
     ListenerArgumentMismatch,
+    HierarchyWorkspaceMismatch,
+    HierarchyRevisionMismatch,
     CrossSourceHierarchy,
     SelfParent,
     HierarchyCycle,
     MissingParent,
     MissingChild,
     ParentChildMismatch,
-    DuplicateHierarchyNode,
     DuplicateChildMembership,
     MultipleParents,
     ChildPlacementOutOfBounds,
@@ -586,6 +587,16 @@ pub enum RecipeError {
     CallIndexOutOfBounds { index: usize, len: usize },
     #[error("persistent call snapshot does not match the observed event field")]
     ListenerArgumentMismatch,
+    #[error("hierarchy intent belongs to workspace {expected:?}, not {actual:?}")]
+    HierarchyWorkspaceMismatch {
+        expected: WorkspaceId,
+        actual: WorkspaceId,
+    },
+    #[error("hierarchy intent belongs to revision {expected:?}, not {actual:?}")]
+    HierarchyRevisionMismatch {
+        expected: WorkspaceRevision,
+        actual: WorkspaceRevision,
+    },
     #[error("hierarchy nodes do not share one source and object format")]
     CrossSourceHierarchy,
     #[error("a hierarchy node cannot parent itself: {child:?}")]
@@ -594,18 +605,16 @@ pub enum RecipeError {
     HierarchyCycle { at: ObjectAddress },
     #[error("hierarchy parent is missing: {parent:?}")]
     MissingParent { parent: ObjectAddress },
-    #[error("hierarchy child is missing from the supplied topology: {child:?}")]
+    #[error("hierarchy child is missing from the workspace view: {child:?}")]
     MissingChild { child: ObjectAddress },
     #[error("hierarchy parent/child edges disagree for {child:?}")]
     ParentChildMismatch { child: ObjectAddress },
-    #[error("hierarchy contains duplicate node {node:?}")]
-    DuplicateHierarchyNode { node: ObjectAddress },
     #[error("hierarchy parent contains child {child:?} more than once")]
     DuplicateChildMembership { child: ObjectAddress },
     #[error("hierarchy child {child:?} belongs to more than one parent")]
     MultipleParents { child: ObjectAddress },
     #[error("child placement index {index} exceeds maximum {maximum}")]
-    ChildPlacementOutOfBounds { index: usize, maximum: usize },
+    ChildPlacementOutOfBounds { index: u32, maximum: u32 },
     #[error("non-finite values are not accepted by this recipe")]
     NonFiniteValue,
     #[error("invalid recipe payload: {reason}")]
@@ -713,15 +722,18 @@ impl RecipeError {
             Self::UnresolvedReference { .. } => Some(RecipeRejectionCode::UnresolvedReference),
             Self::CallIndexOutOfBounds { .. } => Some(RecipeRejectionCode::CallIndexOutOfBounds),
             Self::ListenerArgumentMismatch => Some(RecipeRejectionCode::ListenerArgumentMismatch),
+            Self::HierarchyWorkspaceMismatch { .. } => {
+                Some(RecipeRejectionCode::HierarchyWorkspaceMismatch)
+            }
+            Self::HierarchyRevisionMismatch { .. } => {
+                Some(RecipeRejectionCode::HierarchyRevisionMismatch)
+            }
             Self::CrossSourceHierarchy => Some(RecipeRejectionCode::CrossSourceHierarchy),
             Self::SelfParent { .. } => Some(RecipeRejectionCode::SelfParent),
             Self::HierarchyCycle { .. } => Some(RecipeRejectionCode::HierarchyCycle),
             Self::MissingParent { .. } => Some(RecipeRejectionCode::MissingParent),
             Self::MissingChild { .. } => Some(RecipeRejectionCode::MissingChild),
             Self::ParentChildMismatch { .. } => Some(RecipeRejectionCode::ParentChildMismatch),
-            Self::DuplicateHierarchyNode { .. } => {
-                Some(RecipeRejectionCode::DuplicateHierarchyNode)
-            }
             Self::DuplicateChildMembership { .. } => {
                 Some(RecipeRejectionCode::DuplicateChildMembership)
             }

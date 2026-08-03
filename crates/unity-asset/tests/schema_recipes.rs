@@ -2,12 +2,12 @@ use std::fs;
 use std::path::PathBuf;
 
 use unity_asset::schema::{
-    AudioClipResourceRecipe, ChildPlacement, DeclaredUnityVersion, HierarchyNode, HierarchyRecipe,
-    HierarchyState, MaterialRecipe, MaterialTextureChange, PersistentArgument, PersistentCall,
-    PersistentCallShape, PersistentCallState, RecipeApplicabilityStatus, RecipeError, RecipeId,
-    RecipeLowering, RecipeRejectionCode, RectTransformChange, SchemaOrigin, SchemaRecipePlanner,
-    SchemaVariantId, TransformChange, TransformRecipe, UnityEventEdit, UnityEventRecipe, Vector2,
-    Vector3, recipe_capabilities,
+    AudioClipResourceRecipe, DeclaredUnityVersion, HierarchyDestinationV1, HierarchyIntentV1,
+    HierarchyPlacementV1, HierarchyRecipe, MaterialRecipe, MaterialTextureChange,
+    PersistentArgument, PersistentCall, PersistentCallShape, PersistentCallState,
+    RecipeApplicabilityStatus, RecipeError, RecipeId, RecipeLowering, RecipeRejectionCode,
+    RectTransformChange, SchemaOrigin, SchemaRecipePlanner, SchemaVariantId, TransformChange,
+    TransformRecipe, UnityEventEdit, UnityEventRecipe, Vector2, Vector3, recipe_capabilities,
 };
 use unity_asset::workspace::{
     AssetWorkspace, FieldGuard, GenericMutation, MutationPlan, MutationPlanBuilder,
@@ -289,6 +289,36 @@ fn changed(lowering: RecipeLowering) -> unity_asset::workspace::MutationPlanFrag
         .expect("recipe should produce a changed fragment")
 }
 
+fn assert_detach_to_root_semantics(
+    fragment: &MutationPlanFragment,
+    child: &ObjectAddress,
+    parent: &ObjectAddress,
+) {
+    assert_eq!(fragment.actions().len(), 2);
+    assert!(matches!(
+        &fragment.actions()[0],
+        GenericMutation::ReferenceReplace {
+            target,
+            path,
+            expected,
+            replacement,
+            ..
+        } if target == child
+            && path.to_string() == "$.m_Father"
+            && expected == &ReferenceTarget::object(parent.clone())
+            && replacement == &ReferenceTarget::null()
+    ));
+    assert!(matches!(
+        &fragment.actions()[1],
+        GenericMutation::SequenceEdit {
+            target,
+            path,
+            edit: SequenceMutation::Remove { index: 0 },
+            ..
+        } if target == parent && path.to_string() == "$.m_Children"
+    ));
+}
+
 fn field_names(value: &unity_asset::workspace::MutationValue) -> Vec<&str> {
     let MutationValueRef::Object(fields) = value.view() else {
         panic!("expected object value");
@@ -506,29 +536,126 @@ fn hierarchy_applicability_matches_the_lowering_variant_for_transform_kinds() {
             Some(SchemaVariantId::HierarchyLocalReferences)
         );
 
-        let nodes = if anchor == "1" {
-            let child_address = fixture.address("2");
-            let child = planner
-                .inspect(&child_address, &mut AssetLoadBudget::default())
-                .unwrap();
-            vec![
-                HierarchyNode::new(object, None, vec![child_address]),
-                HierarchyNode::new(child, Some(fixture.address(anchor)), Vec::new()),
-            ]
-        } else {
-            vec![HierarchyNode::new(object, None, Vec::new())]
-        };
-        let state = HierarchyState::new(nodes, &mut AssetLoadBudget::default()).unwrap();
-        let lowering = HierarchyRecipe::reparent(
+        let intent = hierarchy_intent(
             &planner,
-            &state,
-            &fixture.address(anchor),
-            None,
-            ChildPlacement::Append,
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
+            fixture.address(anchor),
+            HierarchyDestinationV1::root(),
+        );
+        let lowering =
+            HierarchyRecipe::lower(&planner, &intent, &mut AssetLoadBudget::default()).unwrap();
         assert_eq!(lowering.report().variant(), hierarchy.variant().unwrap());
+    }
+
+    let dual_rect_yaml = HIERARCHY_YAML.replacen(
+        "  m_AnchoredPosition: {x: 0, y: 0}\n",
+        "  m_AnchoredPosition: {x: 0, y: 0}\n  m_Position: {x: 0, y: 0}\n",
+        1,
+    );
+    let dual_rect = Fixture::open("dual-rect.prefab", &dual_rect_yaml);
+    let dual_snapshot = dual_rect.workspace.snapshot();
+    let dual_planner = SchemaRecipePlanner::new(&dual_snapshot);
+    let object = dual_planner
+        .inspect(&dual_rect.address("4"), &mut AssetLoadBudget::default())
+        .unwrap();
+    let applicability = dual_planner
+        .capabilities_for(&object, &mut AssetLoadBudget::default())
+        .unwrap();
+    let transform = applicability
+        .iter()
+        .find(|entry| entry.recipe() == RecipeId::TransformV1)
+        .unwrap();
+    let hierarchy = applicability
+        .iter()
+        .find(|entry| entry.recipe() == RecipeId::HierarchyReparentV1)
+        .unwrap();
+    assert_eq!(transform.status(), RecipeApplicabilityStatus::Rejected);
+    assert_eq!(hierarchy.status(), RecipeApplicabilityStatus::Applicable);
+    let intent = hierarchy_intent(
+        &dual_planner,
+        dual_rect.address("4"),
+        HierarchyDestinationV1::root(),
+    );
+    assert!(
+        HierarchyRecipe::lower(&dual_planner, &intent, &mut AssetLoadBudget::default())
+            .unwrap()
+            .fragment()
+            .is_none()
+    );
+}
+
+#[test]
+fn hierarchy_yaml_reference_shape_matches_prepare_and_null_semantics() {
+    let null_with_external_identity = HIERARCHY_YAML.replacen(
+        "  m_Father: {fileID: 0}",
+        "  m_Father: {fileID: 0, guid: 0123456789abcdef0123456789abcdef, type: 2}",
+        1,
+    );
+    let fixture = Fixture::open(
+        "null-external-hierarchy.prefab",
+        &null_with_external_identity,
+    );
+    let snapshot = fixture.workspace.snapshot();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+    let target = planner
+        .inspect(&fixture.address("1"), &mut AssetLoadBudget::default())
+        .unwrap();
+    let capability = planner
+        .capabilities_for(&target, &mut AssetLoadBudget::default())
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.recipe() == RecipeId::HierarchyReparentV1)
+        .unwrap();
+    assert_eq!(capability.status(), RecipeApplicabilityStatus::Applicable);
+    let intent = hierarchy_intent(
+        &planner,
+        fixture.address("1"),
+        HierarchyDestinationV1::root(),
+    );
+    assert!(
+        HierarchyRecipe::lower(&planner, &intent, &mut AssetLoadBudget::default())
+            .unwrap()
+            .fragment()
+            .is_none()
+    );
+
+    for (name, father) in [
+        ("type-without-guid", "{fileID: 0, type: 2}"),
+        (
+            "guid-without-type",
+            "{fileID: 0, guid: 0123456789abcdef0123456789abcdef}",
+        ),
+        ("extra-field", "{fileID: 0, unexpected: 2}"),
+    ] {
+        let yaml = HIERARCHY_YAML.replacen(
+            "  m_Father: {fileID: 0}",
+            &format!("  m_Father: {father}"),
+            1,
+        );
+        let fixture = Fixture::open(&format!("{name}.prefab"), &yaml);
+        let snapshot = fixture.workspace.snapshot();
+        let planner = SchemaRecipePlanner::new(&snapshot);
+        let target = planner
+            .inspect(&fixture.address("1"), &mut AssetLoadBudget::default())
+            .unwrap();
+        let capability = planner
+            .capabilities_for(&target, &mut AssetLoadBudget::default())
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.recipe() == RecipeId::HierarchyReparentV1)
+            .unwrap();
+        assert_eq!(
+            capability.rejection(),
+            Some(RecipeRejectionCode::InvalidReference),
+            "{name} capability"
+        );
+        let intent = hierarchy_intent(
+            &planner,
+            fixture.address("1"),
+            HierarchyDestinationV1::root(),
+        );
+        let error =
+            HierarchyRecipe::lower(&planner, &intent, &mut AssetLoadBudget::default()).unwrap_err();
+        assert_eq!(error.code(), capability.rejection(), "{name} lowering");
     }
 }
 
@@ -929,29 +1056,159 @@ fn transform_recipe_selects_modern_and_legacy_rect_fields_and_rejects_wrong_clas
     assert_eq!(error.code(), Some(RecipeRejectionCode::WrongClass));
 }
 
-fn hierarchy_nodes(fixture: &Fixture, planner: &SchemaRecipePlanner<'_>) -> Vec<HierarchyNode> {
-    let one = planner
-        .inspect(&fixture.address("1"), &mut AssetLoadBudget::default())
-        .unwrap();
-    let two = planner
-        .inspect(&fixture.address("2"), &mut AssetLoadBudget::default())
-        .unwrap();
-    let three = planner
-        .inspect(&fixture.address("3"), &mut AssetLoadBudget::default())
-        .unwrap();
-    vec![
-        HierarchyNode::new(one, None, vec![fixture.address("2")]),
-        HierarchyNode::new(two, Some(fixture.address("1")), Vec::new()),
-        HierarchyNode::new(three, None, Vec::new()),
-    ]
+fn hierarchy_intent(
+    planner: &SchemaRecipePlanner<'_>,
+    child: ObjectAddress,
+    destination: HierarchyDestinationV1,
+) -> HierarchyIntentV1 {
+    HierarchyIntentV1::new(
+        planner.workspace_id(),
+        planner.revision(),
+        child,
+        destination,
+    )
 }
 
-fn hierarchy_state(fixture: &Fixture, planner: &SchemaRecipePlanner<'_>) -> HierarchyState {
-    HierarchyState::new(
-        hierarchy_nodes(fixture, planner),
-        &mut AssetLoadBudget::default(),
-    )
-    .unwrap()
+const MINIMAL_REPARENT_HIERARCHY_YAML: &str = r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!4 &1
+Transform:
+  m_Father: {fileID: 0}
+  m_Children:
+  - {fileID: 2}
+--- !u!4 &2
+Transform:
+  m_Father: {fileID: 1}
+  m_Children: []
+--- !u!4 &3
+Transform:
+  m_Father: {fileID: 0}
+  m_Children: []
+"#;
+
+fn hierarchy_with_unrelated_transforms(unrelated: usize) -> String {
+    let mut yaml = String::from(MINIMAL_REPARENT_HIERARCHY_YAML);
+    for index in 0..unrelated {
+        let anchor = 10_000 + index;
+        yaml.push_str(&format!(
+            "--- !u!4 &{anchor}\nTransform:\n  m_Father: {{fileID: 0}}\n  m_Children: []\n"
+        ));
+    }
+    yaml
+}
+
+fn hierarchy_with_unrelated_gameobjects(unrelated: usize) -> String {
+    let mut yaml = String::from(MINIMAL_REPARENT_HIERARCHY_YAML);
+    for index in 0..unrelated {
+        let anchor = 10_000 + index;
+        yaml.push_str(&format!(
+            "--- !u!1 &{anchor}\nGameObject:\n  m_Name: Unrelated\n"
+        ));
+    }
+    yaml
+}
+
+fn deep_hierarchy(depth: usize) -> String {
+    let mut yaml = String::from("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n");
+    for index in 1..=depth {
+        let parent = index.saturating_sub(1);
+        let children = if index == depth {
+            "[]".to_owned()
+        } else {
+            format!("\n  - {{fileID: {}}}", index + 1)
+        };
+        yaml.push_str(&format!(
+            "--- !u!4 &{index}\nTransform:\n  m_Father: {{fileID: {parent}}}\n  m_Children: {children}\n"
+        ));
+    }
+    yaml
+}
+
+fn wide_hierarchy(width: usize) -> String {
+    let mut yaml = String::from(
+        "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!4 &1\nTransform:\n  m_Father: {fileID: 0}\n  m_Children:\n",
+    );
+    for index in 2..=width + 1 {
+        yaml.push_str(&format!("  - {{fileID: {index}}}\n"));
+    }
+    for index in 2..=width + 1 {
+        yaml.push_str(&format!(
+            "--- !u!4 &{index}\nTransform:\n  m_Father: {{fileID: 1}}\n  m_Children: []\n"
+        ));
+    }
+    yaml
+}
+
+fn hierarchy_usage(
+    yaml: &str,
+    child_anchor: &str,
+    parent_anchor: Option<&str>,
+) -> unity_asset::AssetLoadUsage {
+    let fixture = Fixture::open("large-hierarchy.prefab", yaml);
+    let snapshot = fixture.workspace.snapshot();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+    let destination = match parent_anchor {
+        Some(parent) => {
+            HierarchyDestinationV1::parent(fixture.address(parent), HierarchyPlacementV1::Last)
+        }
+        None => HierarchyDestinationV1::root(),
+    };
+    let intent = hierarchy_intent(&planner, fixture.address(child_anchor), destination);
+    let mut budget = AssetLoadBudget::default();
+    HierarchyRecipe::lower(&planner, &intent, &mut budget).unwrap();
+    budget.usage()
+}
+
+fn assert_linear_entry_growth(samples: [unity_asset::AssetLoadUsage; 3]) {
+    let first = samples[1].entries - samples[0].entries;
+    let second = samples[2].entries - samples[1].entries;
+    assert!(first > 0);
+    assert!(second > first);
+    assert!(
+        second.saturating_mul(100) <= first.saturating_mul(205),
+        "doubling input should at most double marginal work: {samples:?}"
+    );
+}
+
+#[test]
+fn hierarchy_projection_work_is_linear_for_sparse_deep_and_wide_sources() {
+    assert_linear_entry_growth([64, 128, 256].map(|count| {
+        hierarchy_usage(&hierarchy_with_unrelated_gameobjects(count), "2", Some("3"))
+    }));
+    assert_linear_entry_growth(
+        [64, 128, 256].map(|count| {
+            hierarchy_usage(&hierarchy_with_unrelated_transforms(count), "2", Some("3"))
+        }),
+    );
+    assert_linear_entry_growth(
+        [32, 64, 128]
+            .map(|depth| hierarchy_usage(&deep_hierarchy(depth), &depth.to_string(), None)),
+    );
+    assert_linear_entry_growth(
+        [32, 64, 128].map(|width| hierarchy_usage(&wide_hierarchy(width), "2", None)),
+    );
+}
+
+#[test]
+fn sparse_hierarchy_projection_retains_only_transform_nodes() {
+    let small_count = 128_usize;
+    let large_count = 256_usize;
+    let small = hierarchy_usage(
+        &hierarchy_with_unrelated_gameobjects(small_count),
+        "2",
+        Some("3"),
+    );
+    let large = hierarchy_usage(
+        &hierarchy_with_unrelated_gameobjects(large_count),
+        "2",
+        Some("3"),
+    );
+    let marginal_bytes = large.bytes - small.bytes;
+    let maximum_descriptor_bytes = u64::try_from(large_count - small_count).unwrap() * 32;
+    assert!(
+        marginal_bytes <= maximum_descriptor_bytes,
+        "unrelated objects must not reserve hierarchy nodes: small={small:?}, large={large:?}"
+    );
 }
 
 #[test]
@@ -959,72 +1216,37 @@ fn hierarchy_validation_and_output_have_exact_budget_boundaries() {
     let fixture = Fixture::open("hierarchy.prefab", HIERARCHY_YAML);
     let snapshot = fixture.workspace.snapshot();
     let planner = SchemaRecipePlanner::new(&snapshot);
-
-    let mut measured = AssetLoadBudget::default();
-    HierarchyState::new(hierarchy_nodes(&fixture, &planner), &mut measured).unwrap();
-    let state_usage = measured.usage();
-    assert!(state_usage.entries > 1 && state_usage.bytes > 1);
-    let mut exact = AssetLoadBudget::new(AssetLoadLimits {
-        max_entries: state_usage.entries,
-        max_bytes: state_usage.bytes,
-        ..AssetLoadLimits::default()
-    })
-    .unwrap();
-    HierarchyState::new(hierarchy_nodes(&fixture, &planner), &mut exact).unwrap();
-    assert_eq!(exact.usage(), state_usage);
-    for limits in [
-        AssetLoadLimits {
-            max_entries: state_usage.entries - 1,
-            max_bytes: state_usage.bytes,
-            ..AssetLoadLimits::default()
-        },
-        AssetLoadLimits {
-            max_entries: state_usage.entries,
-            max_bytes: state_usage.bytes - 1,
-            ..AssetLoadLimits::default()
-        },
-    ] {
-        let mut one_short = AssetLoadBudget::new(limits).unwrap();
-        assert!(matches!(
-            HierarchyState::new(hierarchy_nodes(&fixture, &planner), &mut one_short),
-            Err(RecipeError::Budget(_))
-        ));
-    }
-
-    let state = hierarchy_state(&fixture, &planner);
+    let intent = hierarchy_intent(
+        &planner,
+        fixture.address("2"),
+        HierarchyDestinationV1::parent(fixture.address("3"), HierarchyPlacementV1::Last),
+    );
     let run = |budget: &mut AssetLoadBudget| {
-        HierarchyRecipe::reparent(
-            &planner,
-            &state,
-            &fixture.address("2"),
-            Some(&fixture.address("3")),
-            ChildPlacement::Append,
-            budget,
-        )
-        .map(|_| ())
-        .map_err(|error| matches!(error, RecipeError::Budget(_)))
+        HierarchyRecipe::lower(&planner, &intent, budget)
+            .map(|_| ())
+            .map_err(|error| matches!(error, RecipeError::Budget(_)))
     };
     let mut measured = AssetLoadBudget::default();
     run(&mut measured).unwrap();
-    let output_usage = measured.usage();
-    assert!(output_usage.entries > 1 && output_usage.bytes > 1);
+    let usage = measured.usage();
+    assert!(usage.entries > 1 && usage.bytes > 1);
     let mut exact = AssetLoadBudget::new(AssetLoadLimits {
-        max_entries: output_usage.entries,
-        max_bytes: output_usage.bytes,
+        max_entries: usage.entries,
+        max_bytes: usage.bytes,
         ..AssetLoadLimits::default()
     })
     .unwrap();
     run(&mut exact).unwrap();
-    assert_eq!(exact.usage(), output_usage);
+    assert_eq!(exact.usage(), usage);
     for limits in [
         AssetLoadLimits {
-            max_entries: output_usage.entries - 1,
-            max_bytes: output_usage.bytes,
+            max_entries: usage.entries - 1,
+            max_bytes: usage.bytes,
             ..AssetLoadLimits::default()
         },
         AssetLoadLimits {
-            max_entries: output_usage.entries,
-            max_bytes: output_usage.bytes - 1,
+            max_entries: usage.entries,
+            max_bytes: usage.bytes - 1,
             ..AssetLoadLimits::default()
         },
     ] {
@@ -1038,18 +1260,16 @@ fn hierarchy_recipe_emits_complete_ordered_reparent_fragment() {
     let fixture = Fixture::open("hierarchy.prefab", HIERARCHY_YAML);
     let snapshot = fixture.workspace.snapshot();
     let planner = SchemaRecipePlanner::new(&snapshot);
-    let state = hierarchy_state(&fixture, &planner);
-    let fragment = changed(
-        HierarchyRecipe::reparent(
-            &planner,
-            &state,
-            &fixture.address("2"),
-            Some(&fixture.address("3")),
-            ChildPlacement::Append,
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap(),
+    let intent = hierarchy_intent(
+        &planner,
+        fixture.address("2"),
+        HierarchyDestinationV1::parent(fixture.address("3"), HierarchyPlacementV1::Last),
     );
+    let lower = || {
+        changed(HierarchyRecipe::lower(&planner, &intent, &mut AssetLoadBudget::default()).unwrap())
+    };
+    let fragment = lower();
+    assert_eq!(fragment, lower());
     assert_eq!(fragment.actions().len(), 3);
     assert!(matches!(
         &fragment.actions()[0],
@@ -1068,42 +1288,61 @@ fn hierarchy_recipe_emits_complete_ordered_reparent_fragment() {
 }
 
 #[test]
-fn hierarchy_move_indices_name_final_sequence_positions() {
+fn hierarchy_root_and_existing_position_no_ops_do_not_emit_fragments() {
+    let fixture = Fixture::open("hierarchy.prefab", HIERARCHY_YAML);
+    let snapshot = fixture.workspace.snapshot();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+
+    let root_intent = hierarchy_intent(
+        &planner,
+        fixture.address("2"),
+        HierarchyDestinationV1::root(),
+    );
+    let root_fragment = changed(
+        HierarchyRecipe::lower(&planner, &root_intent, &mut AssetLoadBudget::default()).unwrap(),
+    );
+    assert_eq!(root_fragment.actions().len(), 2);
+    assert!(matches!(
+        &root_fragment.actions()[0],
+        GenericMutation::ReferenceReplace { replacement, .. } if replacement == &ReferenceTarget::null()
+    ));
+
+    for intent in [
+        hierarchy_intent(
+            &planner,
+            fixture.address("1"),
+            HierarchyDestinationV1::root(),
+        ),
+        hierarchy_intent(
+            &planner,
+            fixture.address("2"),
+            HierarchyDestinationV1::parent(fixture.address("1"), HierarchyPlacementV1::First),
+        ),
+    ] {
+        let lowering =
+            HierarchyRecipe::lower(&planner, &intent, &mut AssetLoadBudget::default()).unwrap();
+        assert!(lowering.fragment().is_none());
+    }
+}
+
+#[test]
+fn hierarchy_move_indices_name_first_last_and_index_final_positions() {
     let fixture = Fixture::open("ordered-hierarchy.prefab", ORDERED_HIERARCHY_YAML);
     let snapshot = fixture.workspace.snapshot();
     let planner = SchemaRecipePlanner::new(&snapshot);
-    let mut nodes = Vec::new();
-    for anchor in ["1", "2", "3", "4"] {
-        let object = planner
-            .inspect(&fixture.address(anchor), &mut AssetLoadBudget::default())
-            .unwrap();
-        let parent = (anchor != "1").then(|| fixture.address("1"));
-        let children = if anchor == "1" {
-            ["2", "3", "4"]
-                .into_iter()
-                .map(|child| fixture.address(child))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        nodes.push(HierarchyNode::new(object, parent, children));
-    }
-    let state = HierarchyState::new(nodes, &mut AssetLoadBudget::default()).unwrap();
 
     for (child, placement, expected_from, expected_to) in [
-        ("2", ChildPlacement::At(2), 0, 2),
-        ("4", ChildPlacement::At(0), 2, 0),
+        ("4", HierarchyPlacementV1::First, 2, 0),
+        ("2", HierarchyPlacementV1::Last, 0, 2),
+        ("2", HierarchyPlacementV1::Index { index: 1 }, 0, 1),
     ] {
+        let intent = hierarchy_intent(
+            &planner,
+            fixture.address(child),
+            HierarchyDestinationV1::parent(fixture.address("1"), placement),
+        );
         let fragment = changed(
-            HierarchyRecipe::reparent(
-                &planner,
-                &state,
-                &fixture.address(child),
-                Some(&fixture.address("1")),
-                placement,
-                &mut AssetLoadBudget::default(),
-            )
-            .unwrap(),
+            HierarchyRecipe::lower(&planner, &intent, &mut AssetLoadBudget::default()).unwrap(),
         );
         assert!(matches!(
             &fragment.actions()[0],
@@ -1116,7 +1355,7 @@ fn hierarchy_move_indices_name_final_sequence_positions() {
 }
 
 #[test]
-fn binary_hierarchy_recipe_uses_the_same_guarded_sequence_contract() {
+fn binary_and_yaml_hierarchy_detach_have_equivalent_semantics() {
     let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
         "../unity-asset-write/tests/fixtures/serialized_file_wire/transform_hierarchy_v22.assets.bin",
     );
@@ -1179,21 +1418,439 @@ fn binary_hierarchy_recipe_uses_the_same_guarded_sequence_contract() {
         Some(Vec::new())
     );
 
-    let state = HierarchyState::new(
-        vec![
-            HierarchyNode::new(parent, None, vec![child_address.clone()]),
-            HierarchyNode::new(child, Some(parent_address), Vec::new()),
-        ],
+    let intent = hierarchy_intent(
+        &planner,
+        child_address.clone(),
+        HierarchyDestinationV1::root(),
+    );
+    let binary_fragment = changed(
+        HierarchyRecipe::lower(&planner, &intent, &mut AssetLoadBudget::default()).unwrap(),
+    );
+    assert_detach_to_root_semantics(&binary_fragment, &child_address, &parent_address);
+    let mut builder = MutationPlanBuilder::new(planner.workspace_id(), planner.revision());
+    builder.append(binary_fragment).unwrap();
+    let prepared = workspace
+        .prepare(
+            builder.build().unwrap(),
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let prepared_view = prepared.view();
+    let prepared_planner = SchemaRecipePlanner::new(&prepared_view);
+    let prepared_intent = hierarchy_intent(
+        &prepared_planner,
+        child_address.clone(),
+        HierarchyDestinationV1::root(),
+    );
+    assert!(
+        HierarchyRecipe::lower(
+            &prepared_planner,
+            &prepared_intent,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap()
+        .fragment()
+        .is_none()
+    );
+
+    let yaml = Fixture::open("hierarchy-equivalence.prefab", HIERARCHY_YAML);
+    let yaml_snapshot = yaml.workspace.snapshot();
+    let yaml_planner = SchemaRecipePlanner::new(&yaml_snapshot);
+    let yaml_child = yaml.address("2");
+    let yaml_parent = yaml.address("1");
+    let yaml_intent = hierarchy_intent(
+        &yaml_planner,
+        yaml_child.clone(),
+        HierarchyDestinationV1::root(),
+    );
+    let yaml_fragment = changed(
+        HierarchyRecipe::lower(&yaml_planner, &yaml_intent, &mut AssetLoadBudget::default())
+            .unwrap(),
+    );
+    assert_detach_to_root_semantics(&yaml_fragment, &yaml_child, &yaml_parent);
+}
+
+#[test]
+fn hierarchy_recipe_rejects_stale_or_foreign_intents_before_inspection() {
+    let fixture = Fixture::open("hierarchy.prefab", HIERARCHY_YAML);
+    let snapshot = fixture.workspace.snapshot();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+    let other = Fixture::open("other.prefab", HIERARCHY_YAML);
+    let other_snapshot = other.workspace.snapshot();
+
+    let foreign = HierarchyIntentV1::for_view(
+        &other_snapshot,
+        fixture.address("2"),
+        HierarchyDestinationV1::root(),
+    );
+    let error =
+        HierarchyRecipe::lower(&planner, &foreign, &mut AssetLoadBudget::default()).unwrap_err();
+    assert_eq!(
+        error.code(),
+        Some(RecipeRejectionCode::HierarchyWorkspaceMismatch)
+    );
+
+    let stale = HierarchyIntentV1::new(
+        planner.workspace_id(),
+        WorkspaceRevision::new(unity_asset::DigestV1::hash_bytes(
+            b"stale hierarchy revision",
+        )),
+        fixture.address("2"),
+        HierarchyDestinationV1::root(),
+    );
+    let error =
+        HierarchyRecipe::lower(&planner, &stale, &mut AssetLoadBudget::default()).unwrap_err();
+    assert_eq!(
+        error.code(),
+        Some(RecipeRejectionCode::HierarchyRevisionMismatch)
+    );
+
+    let mut unloaded = Fixture::open("unloaded.prefab", HIERARCHY_YAML);
+    let unloaded_address = unloaded.address("2");
+    unloaded
+        .workspace
+        .unload_source(unloaded.source, &mut AssetLoadBudget::default())
+        .unwrap();
+    let unloaded_snapshot = unloaded.workspace.snapshot();
+    let unloaded_planner = SchemaRecipePlanner::new(&unloaded_snapshot);
+    let intent = HierarchyIntentV1::for_view(
+        &unloaded_snapshot,
+        unloaded_address,
+        HierarchyDestinationV1::root(),
+    );
+    let error = HierarchyRecipe::lower(&unloaded_planner, &intent, &mut AssetLoadBudget::default())
+        .unwrap_err();
+    assert_eq!(error.code(), Some(RecipeRejectionCode::TargetUnloaded));
+}
+
+#[test]
+fn hierarchy_recipe_rejects_self_cycles_missing_and_out_of_bounds_destinations() {
+    let fixture = Fixture::open("hierarchy.prefab", HIERARCHY_YAML);
+    let snapshot = fixture.workspace.snapshot();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+
+    let self_parent = hierarchy_intent(
+        &planner,
+        fixture.address("2"),
+        HierarchyDestinationV1::parent(fixture.address("2"), HierarchyPlacementV1::Last),
+    );
+    assert!(matches!(
+        HierarchyRecipe::lower(&planner, &self_parent, &mut AssetLoadBudget::default()),
+        Err(RecipeError::SelfParent { .. })
+    ));
+
+    let cycle = hierarchy_intent(
+        &planner,
+        fixture.address("1"),
+        HierarchyDestinationV1::parent(fixture.address("2"), HierarchyPlacementV1::Last),
+    );
+    assert!(matches!(
+        HierarchyRecipe::lower(&planner, &cycle, &mut AssetLoadBudget::default()),
+        Err(RecipeError::HierarchyCycle { .. })
+    ));
+
+    let missing = hierarchy_intent(
+        &planner,
+        fixture.address("2"),
+        HierarchyDestinationV1::parent(fixture.address("99"), HierarchyPlacementV1::Last),
+    );
+    assert!(matches!(
+        HierarchyRecipe::lower(&planner, &missing, &mut AssetLoadBudget::default()),
+        Err(RecipeError::MissingParent { .. })
+    ));
+
+    let out_of_bounds = hierarchy_intent(
+        &planner,
+        fixture.address("2"),
+        HierarchyDestinationV1::parent(
+            fixture.address("1"),
+            HierarchyPlacementV1::Index { index: 2 },
+        ),
+    );
+    assert!(matches!(
+        HierarchyRecipe::lower(&planner, &out_of_bounds, &mut AssetLoadBudget::default()),
+        Err(RecipeError::ChildPlacementOutOfBounds {
+            index: 2,
+            maximum: 0,
+        })
+    ));
+}
+
+#[test]
+fn hierarchy_projection_rejects_dangling_external_asymmetric_and_duplicate_edges() {
+    let fixture = Fixture::open("hierarchy.prefab", HIERARCHY_YAML);
+    let snapshot = fixture.workspace.snapshot();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+
+    let dangling = hierarchy_intent(
+        &planner,
+        fixture.address("6"),
+        HierarchyDestinationV1::root(),
+    );
+    assert!(matches!(
+        HierarchyRecipe::lower(&planner, &dangling, &mut AssetLoadBudget::default()),
+        Err(RecipeError::MissingChild { .. })
+    ));
+
+    let external = hierarchy_intent(
+        &planner,
+        fixture.address("7"),
+        HierarchyDestinationV1::root(),
+    );
+    assert!(matches!(
+        HierarchyRecipe::lower(&planner, &external, &mut AssetLoadBudget::default()),
+        Err(RecipeError::UnresolvedReference { .. })
+    ));
+
+    let asymmetric_yaml =
+        HIERARCHY_YAML.replacen("  m_Father: {fileID: 1}", "  m_Father: {fileID: 0}", 1);
+    let asymmetric = Fixture::open("asymmetric.prefab", &asymmetric_yaml);
+    let asymmetric_snapshot = asymmetric.workspace.snapshot();
+    let asymmetric_planner = SchemaRecipePlanner::new(&asymmetric_snapshot);
+    let asymmetric_object = asymmetric_planner
+        .inspect(&asymmetric.address("1"), &mut AssetLoadBudget::default())
+        .unwrap();
+    let hierarchy_capability = asymmetric_planner
+        .capabilities_for(&asymmetric_object, &mut AssetLoadBudget::default())
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.recipe() == RecipeId::HierarchyReparentV1)
+        .unwrap();
+    assert_eq!(
+        hierarchy_capability.rejection(),
+        Some(RecipeRejectionCode::ParentChildMismatch)
+    );
+    let intent = hierarchy_intent(
+        &asymmetric_planner,
+        asymmetric.address("1"),
+        HierarchyDestinationV1::root(),
+    );
+    assert!(matches!(
+        HierarchyRecipe::lower(
+            &asymmetric_planner,
+            &intent,
+            &mut AssetLoadBudget::default()
+        ),
+        Err(RecipeError::ParentChildMismatch { .. })
+    ));
+
+    let duplicate_yaml = HIERARCHY_YAML.replacen(
+        "  m_Children:\n  - {fileID: 2}\n  m_LocalPosition",
+        "  m_Children:\n  - {fileID: 2}\n  - {fileID: 2}\n  m_LocalPosition",
+        1,
+    );
+    let duplicate = Fixture::open("duplicate.prefab", &duplicate_yaml);
+    let duplicate_snapshot = duplicate.workspace.snapshot();
+    let duplicate_planner = SchemaRecipePlanner::new(&duplicate_snapshot);
+    let intent = hierarchy_intent(
+        &duplicate_planner,
+        duplicate.address("1"),
+        HierarchyDestinationV1::root(),
+    );
+    assert!(matches!(
+        HierarchyRecipe::lower(&duplicate_planner, &intent, &mut AssetLoadBudget::default()),
+        Err(RecipeError::DuplicateChildMembership { .. })
+    ));
+
+    let multiple_parent_yaml = format!(
+        "{HIERARCHY_YAML}\n--- !u!4 &9\nTransform:\n  m_Father: {{fileID: 0}}\n  m_Children:\n  - {{fileID: 2}}\n"
+    );
+    let multiple_parent = Fixture::open("multiple-parent.prefab", &multiple_parent_yaml);
+    let multiple_parent_snapshot = multiple_parent.workspace.snapshot();
+    let multiple_parent_planner = SchemaRecipePlanner::new(&multiple_parent_snapshot);
+    let intent = hierarchy_intent(
+        &multiple_parent_planner,
+        multiple_parent.address("2"),
+        HierarchyDestinationV1::root(),
+    );
+    assert!(matches!(
+        HierarchyRecipe::lower(
+            &multiple_parent_planner,
+            &intent,
+            &mut AssetLoadBudget::default()
+        ),
+        Err(RecipeError::MultipleParents { .. })
+    ));
+
+    let mismatched_tag_yaml =
+        format!("{HIERARCHY_YAML}\n--- !u!4 &9\nNotTransform:\n  m_Children:\n  - {{fileID: 2}}\n");
+    let mismatched_tag = Fixture::open("mismatched-tag.prefab", &mismatched_tag_yaml);
+    let mismatched_tag_snapshot = mismatched_tag.workspace.snapshot();
+    let mismatched_tag_planner = SchemaRecipePlanner::new(&mismatched_tag_snapshot);
+    let intent = hierarchy_intent(
+        &mismatched_tag_planner,
+        mismatched_tag.address("2"),
+        HierarchyDestinationV1::root(),
+    );
+    assert!(
+        HierarchyRecipe::lower(
+            &mismatched_tag_planner,
+            &intent,
+            &mut AssetLoadBudget::default()
+        )
+        .is_ok()
+    );
+
+    let observed_sibling_yaml = HIERARCHY_YAML.replacen(
+        "  m_Children:\n  - {fileID: 2}\n  m_LocalPosition",
+        "  m_Children:\n  - {fileID: 2}\n  - {fileID: 9}\n  m_LocalPosition",
+        1,
+    ) + "\n--- !u!4 &9\nTransform:\n  m_Father: {fileID: 1}\n  m_Children:\n  - {fileID: 2}\n";
+    let observed_sibling = Fixture::open("observed-sibling.prefab", &observed_sibling_yaml);
+    let observed_sibling_snapshot = observed_sibling.workspace.snapshot();
+    let observed_sibling_planner = SchemaRecipePlanner::new(&observed_sibling_snapshot);
+    let intent = hierarchy_intent(
+        &observed_sibling_planner,
+        observed_sibling.address("2"),
+        HierarchyDestinationV1::root(),
+    );
+    assert!(matches!(
+        HierarchyRecipe::lower(
+            &observed_sibling_planner,
+            &intent,
+            &mut AssetLoadBudget::default()
+        ),
+        Err(RecipeError::MultipleParents { .. })
+    ));
+
+    let adopted_direct_child_yaml = HIERARCHY_YAML.replacen(
+        "  m_Children:\n  - {fileID: 2}\n  m_LocalPosition",
+        "  m_Children:\n  - {fileID: 2}\n  - {fileID: 9}\n  m_LocalPosition",
+        1,
+    ) + "\n--- !u!4 &9\nTransform:\n  m_Father: {fileID: 1}\n  m_Children: []\n--- !u!4 &10\nTransform:\n  m_Father: {fileID: 0}\n  m_Children:\n  - {fileID: 9}\n";
+    let adopted_direct_child =
+        Fixture::open("adopted-direct-child.prefab", &adopted_direct_child_yaml);
+    let adopted_direct_child_snapshot = adopted_direct_child.workspace.snapshot();
+    let adopted_direct_child_planner = SchemaRecipePlanner::new(&adopted_direct_child_snapshot);
+    let intent = hierarchy_intent(
+        &adopted_direct_child_planner,
+        adopted_direct_child.address("2"),
+        HierarchyDestinationV1::root(),
+    );
+    assert!(matches!(
+        HierarchyRecipe::lower(
+            &adopted_direct_child_planner,
+            &intent,
+            &mut AssetLoadBudget::default()
+        ),
+        Err(RecipeError::MultipleParents { .. })
+    ));
+}
+
+#[test]
+fn hierarchy_projection_rejects_cross_source_wrong_class_and_wrong_shape() {
+    let mut fixture = Fixture::open("hierarchy.prefab", HIERARCHY_YAML);
+    let other_path = fixture._directory.path().join("other.prefab");
+    fs::write(&other_path, HIERARCHY_YAML).unwrap();
+    fixture
+        .workspace
+        .load_path(&other_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = fixture.workspace.snapshot();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+    let other_parent =
+        ObjectAddress::yaml(SourceLocator::path("other.prefab").unwrap(), "3").unwrap();
+    let cross_source = hierarchy_intent(
+        &planner,
+        fixture.address("2"),
+        HierarchyDestinationV1::parent(other_parent, HierarchyPlacementV1::Last),
+    );
+    assert!(matches!(
+        HierarchyRecipe::lower(&planner, &cross_source, &mut AssetLoadBudget::default()),
+        Err(RecipeError::CrossSourceHierarchy)
+    ));
+
+    let wrong_class_yaml =
+        format!("{HIERARCHY_YAML}\n--- !u!1 &8\nGameObject:\n  m_Name: NotATransform\n");
+    let wrong_class = Fixture::open("wrong-class.prefab", &wrong_class_yaml);
+    let wrong_class_snapshot = wrong_class.workspace.snapshot();
+    let wrong_class_planner = SchemaRecipePlanner::new(&wrong_class_snapshot);
+    let intent = hierarchy_intent(
+        &wrong_class_planner,
+        wrong_class.address("8"),
+        HierarchyDestinationV1::root(),
+    );
+    assert!(matches!(
+        HierarchyRecipe::lower(
+            &wrong_class_planner,
+            &intent,
+            &mut AssetLoadBudget::default()
+        ),
+        Err(RecipeError::WrongClass { .. })
+    ));
+
+    let wrong_shape_yaml = HIERARCHY_YAML.replacen(
+        "  m_Children:\n  - {fileID: 99}\n  m_LocalPosition",
+        "  m_Children: not-an-array\n  m_LocalPosition",
+        1,
+    );
+    let wrong_shape = Fixture::open("wrong-shape.prefab", &wrong_shape_yaml);
+    let wrong_shape_snapshot = wrong_shape.workspace.snapshot();
+    let wrong_shape_planner = SchemaRecipePlanner::new(&wrong_shape_snapshot);
+    let wrong_shape_object = wrong_shape_planner
+        .inspect(&wrong_shape.address("6"), &mut AssetLoadBudget::default())
+        .unwrap();
+    let applicability = wrong_shape_planner
+        .capabilities_for(&wrong_shape_object, &mut AssetLoadBudget::default())
+        .unwrap();
+    let hierarchy = applicability
+        .iter()
+        .find(|entry| entry.recipe() == RecipeId::HierarchyReparentV1)
+        .unwrap();
+    assert_eq!(hierarchy.status(), RecipeApplicabilityStatus::Rejected);
+    assert_eq!(
+        hierarchy.rejection(),
+        Some(RecipeRejectionCode::WrongFieldShape)
+    );
+    let intent = hierarchy_intent(
+        &wrong_shape_planner,
+        wrong_shape.address("6"),
+        HierarchyDestinationV1::root(),
+    );
+    let error = HierarchyRecipe::lower(
+        &wrong_shape_planner,
+        &intent,
         &mut AssetLoadBudget::default(),
     )
-    .unwrap();
+    .unwrap_err();
+    assert_eq!(error.code(), hierarchy.rejection());
+}
+
+#[test]
+fn hierarchy_lowering_reads_prepared_view_mutations() {
+    let fixture = Fixture::open("prepared-hierarchy.prefab", HIERARCHY_YAML);
+    let snapshot = fixture.workspace.snapshot();
+    let planner = SchemaRecipePlanner::new(&snapshot);
+    let first_intent = hierarchy_intent(
+        &planner,
+        fixture.address("2"),
+        HierarchyDestinationV1::parent(fixture.address("3"), HierarchyPlacementV1::Last),
+    );
+    let first = changed(
+        HierarchyRecipe::lower(&planner, &first_intent, &mut AssetLoadBudget::default()).unwrap(),
+    );
+    let mut builder = MutationPlanBuilder::new(planner.workspace_id(), planner.revision());
+    builder.append(first).unwrap();
+    let prepared = fixture
+        .workspace
+        .prepare(
+            builder.build().unwrap(),
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let view = prepared.view();
+    let prepared_planner = SchemaRecipePlanner::new(&view);
+    let root_intent = hierarchy_intent(
+        &prepared_planner,
+        fixture.address("2"),
+        HierarchyDestinationV1::root(),
+    );
     let fragment = changed(
-        HierarchyRecipe::reparent(
-            &planner,
-            &state,
-            &child_address,
-            None,
-            ChildPlacement::Append,
+        HierarchyRecipe::lower(
+            &prepared_planner,
+            &root_intent,
             &mut AssetLoadBudget::default(),
         )
         .unwrap(),
@@ -1201,139 +1858,9 @@ fn binary_hierarchy_recipe_uses_the_same_guarded_sequence_contract() {
     assert_eq!(fragment.actions().len(), 2);
     assert!(matches!(
         &fragment.actions()[0],
-        GenericMutation::ReferenceReplace { .. }
-    ));
-    assert!(matches!(
-        &fragment.actions()[1],
-        GenericMutation::SequenceEdit {
-            edit: SequenceMutation::Remove { .. },
-            ..
-        }
-    ));
-}
-
-#[test]
-fn hierarchy_recipe_rejects_self_cycles_missing_and_inconsistent_membership() {
-    let fixture = Fixture::open("hierarchy.prefab", HIERARCHY_YAML);
-    let snapshot = fixture.workspace.snapshot();
-    let planner = SchemaRecipePlanner::new(&snapshot);
-    let state = hierarchy_state(&fixture, &planner);
-
-    assert!(matches!(
-        HierarchyRecipe::reparent(
-            &planner,
-            &state,
-            &fixture.address("2"),
-            Some(&fixture.address("2")),
-            ChildPlacement::Append,
-            &mut AssetLoadBudget::default(),
-        ),
-        Err(RecipeError::SelfParent { .. })
-    ));
-    assert!(matches!(
-        HierarchyRecipe::reparent(
-            &planner,
-            &state,
-            &fixture.address("1"),
-            Some(&fixture.address("2")),
-            ChildPlacement::Append,
-            &mut AssetLoadBudget::default(),
-        ),
-        Err(RecipeError::HierarchyCycle { .. })
-    ));
-    assert!(matches!(
-        HierarchyRecipe::reparent(
-            &planner,
-            &state,
-            &fixture.address("2"),
-            Some(&fixture.address("99")),
-            ChildPlacement::Append,
-            &mut AssetLoadBudget::default(),
-        ),
-        Err(RecipeError::MissingParent { .. })
-    ));
-
-    let one = planner
-        .inspect(&fixture.address("1"), &mut AssetLoadBudget::default())
-        .unwrap();
-    let two = planner
-        .inspect(&fixture.address("2"), &mut AssetLoadBudget::default())
-        .unwrap();
-    assert!(matches!(
-        HierarchyState::new(
-            vec![
-                HierarchyNode::new(one, None, Vec::new()),
-                HierarchyNode::new(two, Some(fixture.address("1")), Vec::new()),
-            ],
-            &mut AssetLoadBudget::default(),
-        ),
-        Err(RecipeError::ParentChildMismatch { .. })
-    ));
-
-    let one = planner
-        .inspect(&fixture.address("1"), &mut AssetLoadBudget::default())
-        .unwrap();
-    let two = planner
-        .inspect(&fixture.address("2"), &mut AssetLoadBudget::default())
-        .unwrap();
-    let three = planner
-        .inspect(&fixture.address("3"), &mut AssetLoadBudget::default())
-        .unwrap();
-    assert!(matches!(
-        HierarchyState::new(
-            vec![
-                HierarchyNode::new(one, None, vec![fixture.address("3")]),
-                HierarchyNode::new(two, Some(fixture.address("1")), Vec::new()),
-                HierarchyNode::new(three, None, Vec::new()),
-            ],
-            &mut AssetLoadBudget::default(),
-        ),
-        Err(RecipeError::ParentChildMismatch { .. })
-    ));
-
-    let dangling = planner
-        .inspect(&fixture.address("6"), &mut AssetLoadBudget::default())
-        .unwrap();
-    assert!(matches!(
-        HierarchyState::new(
-            vec![HierarchyNode::new(
-                dangling,
-                None,
-                vec![fixture.address("99")],
-            )],
-            &mut AssetLoadBudget::default(),
-        ),
-        Err(RecipeError::MissingChild { .. })
-    ));
-
-    let external = planner
-        .inspect(&fixture.address("7"), &mut AssetLoadBudget::default())
-        .unwrap();
-    assert!(matches!(
-        HierarchyState::new(
-            vec![HierarchyNode::new(
-                external,
-                None,
-                vec![fixture.address("8")],
-            )],
-            &mut AssetLoadBudget::default(),
-        ),
-        Err(RecipeError::UnresolvedReference { .. })
-    ));
-
-    assert!(matches!(
-        HierarchyRecipe::reparent(
-            &planner,
-            &state,
-            &fixture.address("2"),
-            Some(&fixture.address("1")),
-            ChildPlacement::At(2),
-            &mut AssetLoadBudget::default(),
-        ),
-        Err(RecipeError::ChildPlacementOutOfBounds {
-            index: 2,
-            maximum: 0,
-        })
+        GenericMutation::ReferenceReplace { expected, replacement, .. }
+            if expected == &ReferenceTarget::object(fixture.address("3"))
+                && replacement == &ReferenceTarget::null()
     ));
 }
 
@@ -1967,17 +2494,13 @@ fn every_retained_recipe_matches_its_direct_primitive_prepare_result() {
         let fixture = Fixture::open("hierarchy-equivalence.prefab", HIERARCHY_YAML);
         let snapshot = fixture.workspace.snapshot();
         let planner = SchemaRecipePlanner::new(&snapshot);
-        let state = hierarchy_state(&fixture, &planner);
+        let intent = hierarchy_intent(
+            &planner,
+            fixture.address("2"),
+            HierarchyDestinationV1::parent(fixture.address("3"), HierarchyPlacementV1::Last),
+        );
         let fragment = changed(
-            HierarchyRecipe::reparent(
-                &planner,
-                &state,
-                &fixture.address("2"),
-                Some(&fixture.address("3")),
-                ChildPlacement::Append,
-                &mut AssetLoadBudget::default(),
-            )
-            .unwrap(),
+            HierarchyRecipe::lower(&planner, &intent, &mut AssetLoadBudget::default()).unwrap(),
         );
         assert_prepare_equivalent(&fixture, fragment);
         covered.push(RecipeId::HierarchyReparentV1);

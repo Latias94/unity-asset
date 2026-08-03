@@ -1,26 +1,28 @@
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, Diagnostic, FieldPath, FieldPathSegment, ObjectAddress,
-    ObjectKind, UnityClass, UnityValue, ValuePathError, WorkspaceRevision, class_ids, class_names,
-    field_schema_digest, observe_semantic_value, semantic_value_digest, yaml_field_schema_digest,
+    ObjectKind, SourceId, UnityClass, UnityValue, ValuePathError, WorkspaceRevision, class_ids,
+    class_names, field_schema_digest, observe_semantic_value, semantic_value_digest,
+    yaml_field_schema_digest,
 };
 
 use super::contract::{
-    CAPABILITIES, RecipeApplicability, RecipeApplicabilityStatus, RecipeError, RecipeId,
-    RecipeLowering, RecipeRejectionCode, RecipeValueKind, SchemaOrigin, SchemaProvenance,
-    SchemaVariantId,
+    CAPABILITIES, RecipeApplicability, RecipeError, RecipeId, RecipeLowering, RecipeRejectionCode,
+    RecipeValueKind, SchemaOrigin, SchemaProvenance, SchemaVariantId,
 };
 use super::output::RecipeOutputBuilder;
+use crate::reference::yaml_value::YamlReferenceValue;
 use crate::schema::resource::classify_audio_clip_resource;
 use crate::workspace::{
     FieldGuard, GenericMutation, MutationPlanError, MutationPlanFragment, MutationValue,
-    PlanPayload, SourceExpectation, WorkspaceLookup, WorkspaceObject, WorkspaceSource,
-    WorkspaceView,
+    PlanPayload, SourceExpectation, SourceObjectDescriptor, WorkspaceLookup, WorkspaceObject,
+    WorkspaceSource, WorkspaceView,
 };
 
 /// Trusted immutable observation used by every built-in recipe.
 #[derive(Debug)]
 pub struct RecipeObject {
     address: ObjectAddress,
+    source_id: SourceId,
     source: SourceExpectation,
     object: WorkspaceObject,
 }
@@ -36,6 +38,10 @@ impl RecipeObject {
         &self.source
     }
 
+    pub(crate) const fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
     #[must_use]
     pub fn class(&self) -> &UnityClass {
         self.object.class()
@@ -44,14 +50,6 @@ impl RecipeObject {
     #[must_use]
     pub fn provenance(&self) -> &SchemaProvenance {
         self.object.schema_provenance()
-    }
-
-    pub(crate) const fn revision(&self) -> WorkspaceRevision {
-        self.object.handle().revision()
-    }
-
-    pub(crate) const fn workspace_id(&self) -> unity_asset_core::WorkspaceId {
-        self.object.handle().workspace()
     }
 
     pub(crate) fn field<'value>(&'value self, path: &FieldPath) -> Option<&'value UnityValue> {
@@ -165,6 +163,29 @@ impl<'view> SchemaRecipePlanner<'view> {
                 });
             }
         };
+        self.inspect_handle(address, &handle, budget)
+    }
+
+    fn inspect_handle(
+        &self,
+        address: &ObjectAddress,
+        handle: &unity_asset_core::RevisionedObjectHandle,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<RecipeObject, RecipeError> {
+        handle
+            .validate_context(self.view.workspace_id(), self.view.revision())
+            .map_err(|_| RecipeError::InspectionContractMismatch)?;
+        let object = self.view.read_object(handle, budget)?;
+        self.finish_inspection(address, handle, object, budget)
+    }
+
+    fn finish_inspection(
+        &self,
+        address: &ObjectAddress,
+        handle: &unity_asset_core::RevisionedObjectHandle,
+        object: WorkspaceObject,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<RecipeObject, RecipeError> {
         let source = match self.view.source(handle.object().source(), budget)? {
             WorkspaceLookup::Resolved(source) => source,
             WorkspaceLookup::Unloaded => return Err(RecipeError::TargetUnloaded),
@@ -180,14 +201,57 @@ impl<'view> SchemaRecipePlanner<'view> {
                 });
             }
         };
-        let object = self.view.read_object(&handle, budget)?;
-        validate_inspection(address, &handle, &source, &object)?;
+        validate_inspection(address, handle, &source, &object)?;
         let mut output = RecipeOutputBuilder::new(budget);
         Ok(RecipeObject {
             address: output.address(address)?,
+            source_id: source.id(),
             source: SourceExpectation::new(output.locator(source.locator())?, source.fingerprint()),
             object,
         })
+    }
+
+    pub(crate) fn object_count_in_source(
+        &self,
+        source: SourceId,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<usize, RecipeError> {
+        crate::workspace::object_count_in_source(self.view, source, budget)
+            .map_err(RecipeError::from)
+    }
+
+    pub(crate) fn source_object_descriptor(
+        &self,
+        source_id: SourceId,
+        index: usize,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SourceObjectDescriptor, RecipeError> {
+        crate::workspace::object_descriptor_at_in_source(self.view, source_id, index, budget)
+            .map_err(RecipeError::from)
+    }
+
+    pub(crate) fn source_object_address(
+        &self,
+        descriptor: &SourceObjectDescriptor,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<ObjectAddress, RecipeError> {
+        self.view
+            .object_address(descriptor.handle(), budget)
+            .map_err(RecipeError::from)
+    }
+
+    pub(crate) fn inspect_source_object(
+        &self,
+        descriptor: &SourceObjectDescriptor,
+        address: &ObjectAddress,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<RecipeObject, RecipeError> {
+        descriptor
+            .handle()
+            .validate_context(self.view.workspace_id(), self.view.revision())
+            .map_err(|_| RecipeError::InspectionContractMismatch)?;
+        let object = crate::workspace::read_object_at_in_source(self.view, descriptor, budget)?;
+        self.finish_inspection(address, descriptor.handle(), object, budget)
     }
 
     /// Reports target-specific recipe applicability without lowering or mutating state.
@@ -212,6 +276,7 @@ impl<'view> SchemaRecipePlanner<'view> {
                 resource: "recipe_capabilities",
             }
         })?)?;
+        let hierarchy = hierarchy_applicability(self, object, budget)?;
         Ok([
             RecipeApplicability::applicable(
                 RecipeId::ReferenceRetargetV1,
@@ -220,7 +285,7 @@ impl<'view> SchemaRecipePlanner<'view> {
             transform_applicability(object),
             material_applicability(object, budget)?,
             event_applicability(object, budget)?,
-            hierarchy_applicability(object),
+            hierarchy,
             resource_applicability(object)?,
         ])
     }
@@ -406,7 +471,7 @@ fn is_reference_value(value: &UnityValue, kind: ObjectKind) -> bool {
         return false;
     };
     match kind {
-        ObjectKind::Yaml => fields.get("fileID").and_then(UnityValue::as_i64).is_some(),
+        ObjectKind::Yaml => YamlReferenceValue::read(value).is_ok(),
         ObjectKind::Binary => {
             aliased_reference_integer(fields, "m_FileID", "fileID").is_some()
                 && aliased_reference_integer(fields, "m_PathID", "pathID").is_some()
@@ -459,7 +524,7 @@ pub(crate) fn validate_reference_shape<'value>(
         });
     };
     let valid = match object.address.kind() {
-        ObjectKind::Yaml => fields.get("fileID").and_then(UnityValue::as_i64).is_some(),
+        ObjectKind::Yaml => YamlReferenceValue::read(value).is_ok(),
         ObjectKind::Binary => {
             let file = aliased_reference_integer(fields, "m_FileID", "fileID");
             let path_id = aliased_reference_integer(fields, "m_PathID", "pathID");
@@ -474,40 +539,42 @@ pub(crate) fn validate_reference_shape<'value>(
     Ok(fields)
 }
 
-pub(crate) fn local_reference_matches(
+pub(crate) fn decode_local_reference(
     object: &RecipeObject,
     path: &FieldPath,
-    expected: Option<&ObjectAddress>,
     output: &mut RecipeOutputBuilder<'_>,
-) -> Result<bool, RecipeError> {
+) -> Result<Option<ObjectAddress>, RecipeError> {
     let fields = validate_reference_shape(object, path, output)?;
     match object.address().kind() {
         ObjectKind::Yaml => {
-            if fields
-                .get("guid")
-                .is_some_and(|guid| !matches!(guid, UnityValue::String(value) if value.is_empty()))
-            {
+            let value = object.resolve_field(path, output)?;
+            let raw = match YamlReferenceValue::read(value) {
+                Ok(raw) => raw,
+                Err(_) => {
+                    return Err(RecipeError::InvalidReference {
+                        path: output.path(path)?,
+                    });
+                }
+            };
+            let file_id = raw.file_id();
+            if file_id == 0 {
+                return Ok(None);
+            }
+            if raw.guid().is_some() {
                 return Err(RecipeError::UnresolvedReference {
                     path: output.path(path)?,
                 });
             }
-            let Some(file_id) = fields.get("fileID").and_then(UnityValue::as_i64) else {
-                return Err(RecipeError::InvalidReference {
+            let mut buffer = [0_u8; 20];
+            let anchor = decimal_i64(file_id, &mut buffer);
+            let anchor = output.string(anchor, "hierarchy YAML anchor")?;
+            let locator = output.locator(object.address().source_locator())?;
+            match ObjectAddress::yaml(locator, anchor) {
+                Ok(address) => Ok(Some(address)),
+                Err(_) => Err(RecipeError::InvalidReference {
                     path: output.path(path)?,
-                });
-            };
-            Ok(if file_id == 0 {
-                expected.is_none()
-            } else {
-                expected.is_some_and(|address| {
-                    address.kind() == ObjectKind::Yaml
-                        && address.source_locator() == object.address().source_locator()
-                        && address
-                            .yaml_anchor()
-                            .and_then(|anchor| anchor.parse::<i64>().ok())
-                            == Some(file_id)
-                })
-            })
+                }),
+            }
         }
         ObjectKind::Binary => {
             let Some(file_id) = aliased_reference_integer(fields, "m_FileID", "fileID") else {
@@ -520,22 +587,41 @@ pub(crate) fn local_reference_matches(
                     path: output.path(path)?,
                 });
             };
+            if path_id == 0 {
+                return Ok(None);
+            }
             if file_id != 0 {
                 return Err(RecipeError::UnresolvedReference {
                     path: output.path(path)?,
                 });
             }
-            Ok(if path_id == 0 {
-                expected.is_none()
-            } else {
-                expected.is_some_and(|address| {
-                    address.kind() == ObjectKind::Binary
-                        && address.source_locator() == object.address().source_locator()
-                        && address.binary_path_id() == Some(path_id)
-                })
-            })
+            let locator = output.locator(object.address().source_locator())?;
+            match ObjectAddress::binary_at(locator, path_id) {
+                Ok(address) => Ok(Some(address)),
+                Err(_) => Err(RecipeError::InvalidReference {
+                    path: output.path(path)?,
+                }),
+            }
         }
     }
+}
+
+fn decimal_i64(value: i64, buffer: &mut [u8; 20]) -> &str {
+    let mut cursor = buffer.len();
+    let mut magnitude = value.unsigned_abs();
+    loop {
+        cursor -= 1;
+        buffer[cursor] = b'0' + u8::try_from(magnitude % 10).expect("one decimal digit");
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if value.is_negative() {
+        cursor -= 1;
+        buffer[cursor] = b'-';
+    }
+    std::str::from_utf8(&buffer[cursor..]).expect("decimal digits are valid UTF-8")
 }
 
 fn aliased_reference_integer(
@@ -700,25 +786,23 @@ fn event_applicability(
     }
 }
 
-fn hierarchy_applicability(object: &RecipeObject) -> RecipeApplicability {
-    let transform = transform_applicability(object);
-    if transform.status() == RecipeApplicabilityStatus::Applicable
-        && object.class().has_property("m_Father")
-        && matches!(object.class().get("m_Children"), Some(UnityValue::Array(_)))
-    {
-        RecipeApplicability::applicable(
+fn hierarchy_applicability(
+    planner: &SchemaRecipePlanner<'_>,
+    object: &RecipeObject,
+    budget: &mut AssetLoadBudget,
+) -> Result<RecipeApplicability, RecipeError> {
+    match crate::schema::hierarchy::validate_hierarchy_target(planner, object, budget) {
+        Ok(()) => Ok(RecipeApplicability::applicable(
             RecipeId::HierarchyReparentV1,
             SchemaVariantId::HierarchyLocalReferences,
-        )
-    } else {
-        RecipeApplicability::rejected(
-            RecipeId::HierarchyReparentV1,
-            if transform.status() == RecipeApplicabilityStatus::Rejected {
-                RecipeRejectionCode::WrongClass
-            } else {
-                RecipeRejectionCode::UnsupportedSchema
-            },
-        )
+        )),
+        Err(error) => match error.code() {
+            Some(rejection) => Ok(RecipeApplicability::rejected(
+                RecipeId::HierarchyReparentV1,
+                rejection,
+            )),
+            None => Err(error),
+        },
     }
 }
 
@@ -770,6 +854,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_yaml_reference_formatting_preserves_the_full_signed_range() {
+        for (value, expected) in [
+            (0_i64, "0"),
+            (1_i64, "1"),
+            (-1_i64, "-1"),
+            (i64::MAX, "9223372036854775807"),
+            (i64::MIN, "-9223372036854775808"),
+        ] {
+            let mut buffer = [0_u8; 20];
+            assert_eq!(decimal_i64(value, &mut buffer), expected);
+        }
+    }
+
+    #[test]
     fn reference_lowering_rejects_each_conflicting_binary_alias_before_building_a_fragment() {
         let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
             "../unity-asset-write/tests/fixtures/serialized_file_wire/transform_hierarchy_v22.assets.bin",
@@ -790,6 +888,7 @@ mod tests {
                 .unwrap();
             let RecipeObject {
                 address,
+                source_id,
                 source,
                 object,
             } = inspected;
@@ -816,6 +915,7 @@ mod tests {
             let class = UnityClass::from_parts(header, properties);
             let object = RecipeObject {
                 address,
+                source_id,
                 source,
                 object: WorkspaceObject::new(
                     handle,
@@ -847,5 +947,62 @@ mod tests {
                 "{case} alias conflict must be rejected as an invalid reference"
             );
         }
+    }
+
+    #[test]
+    fn binary_zero_path_id_is_null_before_external_source_classification() {
+        let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../unity-asset-write/tests/fixtures/serialized_file_wire/transform_hierarchy_v22.assets.bin",
+        );
+        let mut workspace = AssetWorkspace::new().unwrap();
+        workspace
+            .load_path(&sample, &mut AssetLoadBudget::default())
+            .unwrap();
+        let snapshot = workspace.snapshot();
+        let planner = SchemaRecipePlanner::new(&snapshot);
+        let locator = SourceLocator::path("transform_hierarchy_v22.assets.bin").unwrap();
+        let address = ObjectAddress::binary_direct(locator, 1).unwrap();
+        let inspected = planner
+            .inspect(&address, &mut AssetLoadBudget::default())
+            .unwrap();
+        let RecipeObject {
+            address,
+            source_id,
+            source,
+            object,
+        } = inspected;
+        let handle = object.handle().clone();
+        let provenance = object.schema_provenance().clone();
+        let WorkspaceObjectValue::Binary(binary) = object.into_value() else {
+            panic!("expected the binary fixture to yield a binary object");
+        };
+        let binary = (*binary).clone();
+        let (header, mut properties) = binary.as_unity_class().clone().into_parts();
+        let Some(UnityValue::Object(fields)) = properties.get_mut("m_Father") else {
+            panic!("expected the Transform fixture to contain m_Father");
+        };
+        fields.insert("m_FileID".to_owned(), UnityValue::Integer(1));
+        fields.insert("m_PathID".to_owned(), UnityValue::Integer(0));
+        let object = RecipeObject {
+            address,
+            source_id,
+            source,
+            object: WorkspaceObject::new(
+                handle,
+                WorkspaceObjectValue::Binary(Arc::new(UnityObject::from_info_and_class(
+                    binary.info,
+                    UnityClass::from_parts(header, properties),
+                ))),
+                provenance,
+            ),
+        };
+        let path = FieldPath::root().push_field("m_Father").unwrap();
+        let mut budget = AssetLoadBudget::default();
+        let mut output = RecipeOutputBuilder::new(&mut budget);
+
+        assert!(matches!(
+            decode_local_reference(&object, &path, &mut output),
+            Ok(None)
+        ));
     }
 }
