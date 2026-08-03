@@ -33,4 +33,7 @@ pub use roots::{
     PrivateRootsV1,
 };
 pub use security_context::{SecurityContextError, SecurityContextIdV1};
-pub use transport::{EndpointTransportError, MAX_LOCAL_IPC_CONNECTIONS_V1, VerifiedLocalStreamV1};
+pub use transport::{
+    EndpointTransportError, FrameReadTimeoutsV1, FramedPeerStateV1, MAX_LOCAL_IPC_CONNECTIONS_V1,
+    VerifiedFramedTransportV1,
+};

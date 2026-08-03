@@ -4,11 +4,10 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use rand::TryRngCore as _;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use unity_asset_core::AssetLoadBudget;
 use unity_asset_search_local::{
-    EndpointDescriptorError, EndpointStoreError, EndpointTransportError, PrivateRootsV1,
-    ProjectLocatorV1, VerifiedLocalStreamV1,
+    EndpointDescriptorError, EndpointStoreError, EndpointTransportError, FrameReadTimeoutsV1,
+    PrivateRootsV1, ProjectLocatorV1, VerifiedFramedTransportV1,
 };
 use unity_asset_search_protocol::{
     BUSINESS_PROTOCOL_REVISION, BootstrapErrorCode, BootstrapHelloV2, BootstrapReplyV2,
@@ -54,10 +53,9 @@ pub struct SessionBinding {
 }
 
 pub struct ClientSession {
-    stream: VerifiedLocalStreamV1,
+    stream: VerifiedFramedTransportV1,
     binding: SessionBinding,
     server_pid: u32,
-    expected_security_context: unity_asset_search_local::SecurityContextIdV1,
     request_timeout: Duration,
 }
 
@@ -83,18 +81,21 @@ impl ClientSession {
         .map_err(|error| CliFailure::input(format!("invalid request: {error}")))?;
         let frame = encode_request_frame(&request)
             .map_err(|error| CliFailure::protocol(format!("encode request frame: {error}")))?;
-        write_frame(&mut self.stream, &frame, self.request_timeout).await?;
+        write_frame(
+            &mut self.stream,
+            &frame,
+            FrameLimits::request_envelope(),
+            self.request_timeout,
+        )
+        .await?;
         let limits = FrameLimits::response(request.operation().kind());
         let response_frame = read_required_frame(
             &mut self.stream,
-            limits.max_encoded_bytes(),
+            limits,
             response_timeout,
             "business response",
         )
         .await?;
-        self.stream
-            .verify_received_message_principal(self.expected_security_context)
-            .map_err(map_transport)?;
         let mut budget = AssetLoadBudget::default();
         let response = decode_response_frame(&response_frame, &mut budget, &request)
             .map_err(|error| CliFailure::protocol(format!("decode response frame: {error}")))?;
@@ -221,7 +222,6 @@ async fn connect_once(
     let discovered = namespace.discover_endpoint().map_err(ConnectError::Store)?;
     let descriptor = discovered.descriptor();
     let daemon_instance_id = descriptor.daemon_instance_id();
-    let expected_security_context = namespace.security_context_id();
     let mut stream = discovered
         .connect_verified(&namespace, deadline)
         .await
@@ -234,24 +234,22 @@ async fn connect_once(
     )
     .map_err(ConnectError::Contract)?;
     let frame = encode_frame(&hello, FrameLimits::bootstrap()).map_err(ConnectError::Framing)?;
-    write_frame_raw(
+    write_frame(
         &mut stream,
         &frame,
+        FrameLimits::bootstrap(),
         remaining_timeout(deadline, options.request_timeout)?,
     )
     .await
     .map_err(ConnectError::Failure)?;
-    let reply_frame = read_required_frame_raw(
+    let reply_frame = read_required_frame(
         &mut stream,
-        FrameLimits::bootstrap().max_encoded_bytes(),
+        FrameLimits::bootstrap(),
         remaining_timeout(deadline, options.request_timeout)?,
         "bootstrap reply",
     )
     .await
     .map_err(ConnectError::Failure)?;
-    stream
-        .verify_received_message_principal(expected_security_context)
-        .map_err(ConnectError::Transport)?;
     let mut budget = AssetLoadBudget::default();
     let reply: BootstrapReplyV2 =
         decode_validated_frame(&reply_frame, &mut budget, FrameLimits::bootstrap())
@@ -276,7 +274,6 @@ async fn connect_once(
             protocol_revision: selected_revision,
         },
         server_pid: descriptor.server_pid(),
-        expected_security_context,
         request_timeout: options.request_timeout,
     })
 }
@@ -419,81 +416,51 @@ fn random_request_id() -> Result<RequestId, CliFailure> {
 }
 
 async fn write_frame(
-    stream: &mut VerifiedLocalStreamV1,
+    stream: &mut VerifiedFramedTransportV1,
     frame: &[u8],
+    limits: FrameLimits,
     timeout: Duration,
 ) -> Result<(), CliFailure> {
-    write_frame_raw(stream, frame, timeout).await
-}
-
-async fn write_frame_raw(
-    stream: &mut VerifiedLocalStreamV1,
-    frame: &[u8],
-    timeout: Duration,
-) -> Result<(), CliFailure> {
-    tokio::time::timeout(timeout, async {
-        stream.write_all(frame).await?;
-        stream.flush().await
-    })
-    .await
-    .map_err(|_| CliFailure::transport("local IPC write deadline elapsed", true))?
-    .map_err(|error| CliFailure::transport(format!("write local IPC frame: {error}"), true))
+    stream
+        .write_frame(frame, limits, timeout)
+        .await
+        .map_err(map_transport)
 }
 
 async fn read_required_frame(
-    stream: &mut VerifiedLocalStreamV1,
-    maximum: usize,
+    stream: &mut VerifiedFramedTransportV1,
+    limits: FrameLimits,
     timeout: Duration,
     label: &'static str,
 ) -> Result<Vec<u8>, CliFailure> {
-    read_required_frame_raw(stream, maximum, timeout, label).await
-}
-
-async fn read_required_frame_raw(
-    stream: &mut VerifiedLocalStreamV1,
-    maximum: usize,
-    timeout: Duration,
-    label: &'static str,
-) -> Result<Vec<u8>, CliFailure> {
-    tokio::time::timeout(timeout, read_frame_body(stream, maximum, label))
-        .await
-        .map_err(|_| CliFailure::transport(format!("{label} deadline elapsed"), true))?
-}
-
-async fn read_frame_body(
-    stream: &mut VerifiedLocalStreamV1,
-    maximum: usize,
-    label: &'static str,
-) -> Result<Vec<u8>, CliFailure> {
-    let mut header = [0_u8; 4];
-    stream
-        .read_exact(&mut header)
-        .await
-        .map_err(|error| CliFailure::transport(format!("read {label} header: {error}"), true))?;
-    let declared = u32::from_be_bytes(header) as usize;
-    if declared > maximum {
-        return Err(CliFailure::protocol(format!(
-            "{label} declares {declared} bytes; maximum is {maximum}"
-        )));
-    }
-    let total = declared
-        .checked_add(header.len())
-        .ok_or_else(|| CliFailure::protocol(format!("{label} length overflow")))?;
-    let mut frame = Vec::new();
-    frame.try_reserve_exact(total).map_err(|_| {
-        CliFailure::internal(format!("could not allocate {total} bytes for {label}"))
-    })?;
-    frame.extend_from_slice(&header);
-    frame.resize(total, 0);
-    stream
-        .read_exact(&mut frame[4..])
-        .await
-        .map_err(|error| CliFailure::transport(format!("read {label} body: {error}"), true))?;
-    Ok(frame)
+    tokio::time::timeout(
+        timeout,
+        stream.read_frame(limits, FrameReadTimeoutsV1::uniform(timeout)),
+    )
+    .await
+    .map_err(|_| CliFailure::transport(format!("{label} deadline elapsed"), true))?
+    .map_err(map_transport)?
+    .ok_or_else(|| CliFailure::transport(format!("peer closed before {label}"), true))
 }
 
 fn map_transport(error: EndpointTransportError) -> CliFailure {
-    CliFailure::transport(format!("verify local IPC peer: {error}"), false)
+    let message = format!("local IPC transport: {error}");
+    match error {
+        EndpointTransportError::FrameTooLarge { .. }
+        | EndpointTransportError::FrameLengthOverflow
+        | EndpointTransportError::InvalidEncodedFrame { .. } => CliFailure::protocol(message),
+        EndpointTransportError::FrameAllocationFailed { .. }
+        | EndpointTransportError::FrameDeadlineOverflow => CliFailure::internal(message),
+        EndpointTransportError::DeadlineElapsed
+        | EndpointTransportError::FrameReadDeadlineElapsed
+        | EndpointTransportError::FrameWriteDeadlineElapsed
+        | EndpointTransportError::EndpointUnavailable
+        | EndpointTransportError::Io { .. }
+        | EndpointTransportError::Store(
+            EndpointStoreError::DescriptorMissing | EndpointStoreError::EndpointChanged,
+        ) => CliFailure::transport(message, true),
+        _ => CliFailure::transport(message, false),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -591,18 +558,17 @@ mod tests {
     use std::fs;
     use std::time::{Duration, Instant};
 
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use unity_asset_core::AssetLoadBudget;
     use unity_asset_search_local::{
         EndpointCleanupV1, EndpointDescriptorError, EndpointStoreError, EndpointTransportError,
-        PrivateRootsV1, ProjectLocatorV1, generate_daemon_instance_id,
+        FrameReadTimeoutsV1, PrivateRootsV1, ProjectLocatorV1, generate_daemon_instance_id,
     };
     use unity_asset_search_protocol::{
         BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2, FrameLimits, QueryPolicyId,
         decode_validated_frame, encode_frame,
     };
 
-    use super::{ConnectError, ConnectionOptions, connect_once, read_frame_body};
+    use super::{ConnectError, ConnectionOptions, connect_once};
 
     #[tokio::test]
     async fn bootstrap_cannot_commit_a_session_after_endpoint_withdrawal() {
@@ -617,7 +583,6 @@ mod tests {
             .endpoint_namespace(project.project_id())
             .expect("endpoint namespace");
         let cleanup_path = namespace.path().to_path_buf();
-        let expected_security_context = namespace.security_context_id();
         let mut claim = namespace
             .claim_daemon_endpoint()
             .expect("claim daemon endpoint");
@@ -635,16 +600,14 @@ mod tests {
             connect_once(&options, Instant::now() + options.connect_timeout).await
         });
         let mut server = endpoint.accept_verified().await.expect("accept client");
-        let hello_frame = read_frame_body(
-            &mut server,
-            FrameLimits::bootstrap().max_encoded_bytes(),
-            "bootstrap hello",
-        )
-        .await
-        .expect("read bootstrap hello");
-        server
-            .verify_received_message_principal(expected_security_context)
-            .expect("verify client principal");
+        let hello_frame = server
+            .read_frame(
+                FrameLimits::bootstrap(),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(10)),
+            )
+            .await
+            .expect("read bootstrap hello")
+            .expect("client sent bootstrap hello");
         let mut budget = AssetLoadBudget::default();
         let hello: BootstrapHelloV2 =
             decode_validated_frame(&hello_frame, &mut budget, FrameLimits::bootstrap())
@@ -658,39 +621,31 @@ mod tests {
         );
         let reply_frame =
             encode_frame(&reply, FrameLimits::bootstrap()).expect("encode bootstrap reply");
-        let final_byte = reply_frame
-            .len()
-            .checked_sub(1)
-            .expect("framed reply is non-empty");
-        server
-            .write_all(&reply_frame[..final_byte])
-            .await
-            .expect("write partial bootstrap reply");
-        server.flush().await.expect("flush partial bootstrap reply");
-
         assert_eq!(
             endpoint.withdraw().expect("withdraw endpoint publication"),
             EndpointCleanupV1::Removed
         );
         server
-            .write_all(&reply_frame[final_byte..])
+            .write_frame(
+                &reply_frame,
+                FrameLimits::bootstrap(),
+                Duration::from_secs(10),
+            )
             .await
-            .expect("finish bootstrap reply");
-        server.flush().await.expect("flush bootstrap reply");
+            .expect("write bootstrap reply");
 
         assert!(matches!(
             client.await.expect("join client"),
             Err(ConnectError::Store(EndpointStoreError::EndpointChanged))
         ));
-        let mut post_bootstrap = Vec::new();
-        server
-            .read_to_end(&mut post_bootstrap)
+        let post_bootstrap = server
+            .read_frame(
+                FrameLimits::request_envelope(),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(1)),
+            )
             .await
             .expect("observe client disconnect");
-        assert!(
-            post_bootstrap.is_empty(),
-            "the replaced endpoint received business request bytes"
-        );
+        assert!(post_bootstrap.is_none());
 
         drop(server);
         drop(endpoint);

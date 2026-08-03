@@ -266,7 +266,7 @@ impl ClaimedEndpointV1 {
 
     pub async fn accept_verified(
         &mut self,
-    ) -> Result<crate::VerifiedLocalStreamV1, EndpointTransportError> {
+    ) -> Result<crate::VerifiedFramedTransportV1, EndpointTransportError> {
         let server = self
             .server
             .as_mut()

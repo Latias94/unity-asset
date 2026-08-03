@@ -552,9 +552,9 @@ mod tests {
     use std::io;
     use std::time::{Duration, Instant};
 
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::AsyncReadExt as _;
     use tokio::net::windows::named_pipe::ServerOptions;
-    use unity_asset_search_protocol::ProjectId;
+    use unity_asset_search_protocol::{FrameLimits, ProjectId};
     use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
     use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 
@@ -650,15 +650,25 @@ mod tests {
         .unwrap();
         let (first_server, _) = first_server.unwrap();
         let mut first_client = first_client.unwrap();
-        first_client.write_all(b"stale").await.unwrap();
+        let mut stale_frame = 5_u32.to_be_bytes().to_vec();
+        stale_frame.extend_from_slice(b"stale");
+        first_client
+            .write_frame(
+                &stale_frame,
+                FrameLimits::bootstrap(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
         tokio::task::yield_now().await;
         drop(first_server);
-        let mut disconnected = [0_u8; 1];
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), first_client.read(&mut disconnected))
-                .await
-                .expect("server drop must disconnect a non-reading client");
-        assert!(result.is_err() || result.is_ok_and(|read| read == 0));
+        let result = first_client
+            .read_frame(
+                FrameLimits::bootstrap(),
+                crate::FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+            )
+            .await;
+        assert!(result.is_err() || result.is_ok_and(|frame| frame.is_none()));
         drop(first_client);
 
         let rotated = discover(&namespace, descriptor).unwrap();
@@ -678,9 +688,18 @@ mod tests {
         .unwrap();
         let (mut second_server, _) = second_server.unwrap();
         let mut second_client = second_client.unwrap();
-        second_client.write_all(b"fresh").await.unwrap();
+        let mut fresh_frame = 5_u32.to_be_bytes().to_vec();
+        fresh_frame.extend_from_slice(b"fresh");
+        second_client
+            .write_frame(
+                &fresh_frame,
+                FrameLimits::bootstrap(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
 
-        let mut observed = [0_u8; 5];
+        let mut observed = [0_u8; 9];
         tokio::time::timeout(
             Duration::from_secs(5),
             second_server.read_exact(&mut observed),
@@ -688,7 +707,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(&observed, b"fresh");
+        assert_eq!(&observed, fresh_frame.as_slice());
         assert_eq!(server.pending.len(), 1);
 
         let current = discover(&namespace, descriptor).unwrap();

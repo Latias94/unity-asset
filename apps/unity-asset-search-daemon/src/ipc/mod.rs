@@ -1,18 +1,16 @@
 mod dispatch;
 
 use std::future::Future;
-use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use unity_asset_core::AssetLoadBudget;
 use unity_asset_search_local::{
-    ClaimedEndpointV1, EndpointCleanupV1, EndpointTransportError, MAX_LOCAL_IPC_CONNECTIONS_V1,
-    VerifiedLocalStreamV1,
+    ClaimedEndpointV1, EndpointCleanupV1, EndpointTransportError, FrameReadTimeoutsV1,
+    FramedPeerStateV1, MAX_LOCAL_IPC_CONNECTIONS_V1, VerifiedFramedTransportV1,
 };
 use unity_asset_search_protocol::{
     ApiError, ApiErrorCode, BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2,
@@ -469,7 +467,7 @@ impl PeerRejectionLog {
 async fn accept_when_capacity(
     endpoint: &mut ClaimedEndpointV1,
     connections: &ConnectionCapacity,
-) -> Result<(VerifiedLocalStreamV1, SessionLease), EndpointTransportError> {
+) -> Result<(VerifiedFramedTransportV1, SessionLease), EndpointTransportError> {
     let lease = connections.acquire().await;
     // The platform listener remains armed while capacity is unavailable. The Windows transport
     // retains exactly one single-use pending slot until ownership transfers into this future.
@@ -478,7 +476,7 @@ async fn accept_when_capacity(
 }
 
 async fn session(
-    mut stream: VerifiedLocalStreamV1,
+    mut stream: VerifiedFramedTransportV1,
     dispatcher: Dispatcher,
     dispatch_capacity: DispatchCapacity,
     connection: SessionLease,
@@ -487,19 +485,19 @@ async fn session(
 ) -> Result<(), SessionError> {
     let lane = connection.lane();
     let _connection = connection;
-    let expected_context = stream.peer_identity().security_context_id();
-    let bootstrap_frame = match read_frame(
-        &mut stream,
-        FrameLimits::bootstrap().max_encoded_bytes(),
-        lane.bootstrap_timeout(),
-    )
-    .await
+    let bootstrap_frame = match stream
+        .read_frame(
+            FrameLimits::bootstrap(),
+            FrameReadTimeoutsV1::new(lane.bootstrap_timeout(), BODY_TIMEOUT),
+        )
+        .await
     {
-        Err(SessionError::ReadTimeout) if lane.single_request() => return Ok(()),
+        Err(EndpointTransportError::FrameReadDeadlineElapsed) if lane.single_request() => {
+            return Ok(());
+        }
         result => result?,
     }
     .ok_or(SessionError::ClosedDuringBootstrap)?;
-    stream.verify_received_message_principal(expected_context)?;
     let mut budget = AssetLoadBudget::default();
     let hello: BootstrapHelloV2 =
         decode_validated_frame(&bootstrap_frame, &mut budget, FrameLimits::bootstrap())?;
@@ -511,35 +509,41 @@ async fn session(
         &[BUSINESS_PROTOCOL_REVISION],
     );
     let reply_frame = encode_frame(&reply, FrameLimits::bootstrap())?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    match write_frame_monitoring_pipeline(&mut reader, &mut writer, &reply_frame, PeerState::Open)
+    match stream
+        .write_frame_monitoring_inbound(
+            &reply_frame,
+            FrameLimits::bootstrap(),
+            WRITE_TIMEOUT,
+            FramedPeerStateV1::Open,
+        )
         .await?
     {
-        PeerState::Open => stream = reader.unsplit(writer),
-        PeerState::Closed => return Ok(()),
-        PeerState::Pipelined => return Err(SessionError::PipelinedRequest),
+        FramedPeerStateV1::Open => {}
+        FramedPeerStateV1::Closed => return Ok(()),
+        FramedPeerStateV1::Pipelined => return Err(SessionError::PipelinedRequest),
     }
     if reply.selected_revision().is_none() {
         return Ok(());
     }
 
     loop {
-        let frame = match read_frame(
-            &mut stream,
-            FrameLimits::request_envelope().max_encoded_bytes(),
-            lane.request_timeout(),
-        )
-        .await
+        let frame = match stream
+            .read_frame(
+                FrameLimits::request_envelope(),
+                FrameReadTimeoutsV1::new(lane.request_timeout(), BODY_TIMEOUT),
+            )
+            .await
         {
-            Err(SessionError::ReadTimeout) if lane.single_request() => return Ok(()),
+            Err(EndpointTransportError::FrameReadDeadlineElapsed) if lane.single_request() => {
+                return Ok(());
+            }
             result => result?,
         };
         let Some(frame) = frame else { return Ok(()) };
-        stream.verify_received_message_principal(expected_context)?;
         let mut budget = AssetLoadBudget::default();
         let request = decode_request_frame(&frame, &mut budget)?;
         request.validate_binding(project_id, daemon_instance_id, dispatcher.query_policy_id())?;
-        let (mut reader, mut writer) = tokio::io::split(stream);
+        let response_limits = FrameLimits::response(request.operation().kind());
         let operation = request.operation().clone();
         let dispatch_class = DispatchClass::for_operation(operation.kind());
         let request_dispatcher = dispatcher.clone();
@@ -574,17 +578,8 @@ async fn session(
                 },
             }
         };
-        tokio::pin!(dispatch);
-        let mut pipeline_byte = [0_u8; 1];
-        let (dispatched, peer_state) = tokio::select! {
-            biased;
-            read = reader.read(&mut pipeline_byte) => {
-                let peer_state = PeerState::from_read(read).unwrap_or(PeerState::Closed);
-                (dispatch.await, peer_state)
-            }
-            dispatched = &mut dispatch => (dispatched, PeerState::Open),
-        };
-        if peer_state == PeerState::Closed {
+        let (dispatched, peer_state) = stream.monitor_inbound_while(dispatch).await;
+        if peer_state == FramedPeerStateV1::Closed {
             if let Some(deadline) = dispatched.shutdown_after_response {
                 dispatcher.begin_shutdown_at(deadline);
             }
@@ -596,15 +591,22 @@ async fn session(
         };
         let write_result = async {
             let response_frame = encode_response_frame(&response, &request)?;
-            write_frame_monitoring_pipeline(&mut reader, &mut writer, &response_frame, peer_state)
+            stream
+                .write_frame_monitoring_inbound(
+                    &response_frame,
+                    response_limits,
+                    WRITE_TIMEOUT,
+                    peer_state,
+                )
                 .await
+                .map_err(SessionError::from)
         }
         .await;
         if let Some(deadline) = dispatched.shutdown_after_response {
             dispatcher.begin_shutdown_at(deadline);
         }
         let peer_state = write_result?;
-        if peer_state == PeerState::Pipelined {
+        if peer_state == FramedPeerStateV1::Pipelined {
             return Err(SessionError::PipelinedRequest);
         }
         if dispatched.shutdown_after_response.is_some() {
@@ -613,147 +615,6 @@ async fn session(
         if lane.single_request() {
             return Ok(());
         }
-        stream = reader.unsplit(writer);
-    }
-}
-
-async fn read_frame(
-    stream: &mut VerifiedLocalStreamV1,
-    maximum: usize,
-    header_timeout: Duration,
-) -> Result<Option<Vec<u8>>, SessionError> {
-    let mut header = [0_u8; 4];
-    let first = tokio::time::timeout(header_timeout, stream.read(&mut header[..1]))
-        .await
-        .map_err(|_| SessionError::ReadTimeout)??;
-    if first == 0 {
-        return Ok(None);
-    }
-    tokio::time::timeout(BODY_TIMEOUT, stream.read_exact(&mut header[1..]))
-        .await
-        .map_err(|_| SessionError::ReadTimeout)??;
-    let declared = u32::from_be_bytes(header) as usize;
-    if declared > maximum {
-        return Err(SessionError::FrameTooLarge {
-            requested: declared,
-            maximum,
-        });
-    }
-    let total = declared
-        .checked_add(header.len())
-        .ok_or(SessionError::FrameLengthOverflow)?;
-    let mut frame = Vec::new();
-    frame
-        .try_reserve_exact(total)
-        .map_err(|_| SessionError::AllocationFailed { requested: total })?;
-    frame.extend_from_slice(&header);
-    frame.resize(total, 0);
-    tokio::time::timeout(BODY_TIMEOUT, stream.read_exact(&mut frame[4..]))
-        .await
-        .map_err(|_| SessionError::ReadTimeout)??;
-    Ok(Some(frame))
-}
-
-async fn write_frame_monitoring_pipeline<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    frame: &[u8],
-    mut peer_state: PeerState,
-) -> Result<PeerState, SessionError>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let deadline = tokio::time::Instant::now() + WRITE_TIMEOUT;
-    let mut offset = 0;
-    let mut pipeline_byte = [0_u8; 1];
-    while offset < frame.len() {
-        if peer_state == PeerState::Closed {
-            return Ok(peer_state);
-        }
-        if peer_state == PeerState::Open {
-            if let Some(observed) = probe_peer_state(reader, &mut pipeline_byte).await? {
-                peer_state = observed;
-                continue;
-            }
-            tokio::select! {
-                biased;
-                written = tokio::time::timeout_at(deadline, writer.write(&frame[offset..])) => {
-                    offset = advance_write(offset, written)?;
-                }
-                read = reader.read(&mut pipeline_byte) => {
-                    peer_state = PeerState::from_read(read)?;
-                }
-            }
-        } else {
-            offset = advance_write(
-                offset,
-                tokio::time::timeout_at(deadline, writer.write(&frame[offset..])).await,
-            )?;
-        }
-    }
-    if peer_state == PeerState::Closed {
-        return Ok(peer_state);
-    }
-    // Once the final frame byte has been accepted by the OS, a following request belongs to the
-    // next sequential exchange. Monitoring reads while flush races would misclassify a client that
-    // consumed the complete response and immediately sent its next request.
-    tokio::time::timeout_at(deadline, writer.flush())
-        .await
-        .map_err(|_| SessionError::WriteTimeout)??;
-    Ok(peer_state)
-}
-
-async fn probe_peer_state<R>(
-    reader: &mut R,
-    byte: &mut [u8; 1],
-) -> Result<Option<PeerState>, SessionError>
-where
-    R: AsyncRead + Unpin,
-{
-    std::future::poll_fn(|context| {
-        let mut buffer = tokio::io::ReadBuf::new(byte);
-        match std::pin::Pin::new(&mut *reader).poll_read(context, &mut buffer) {
-            std::task::Poll::Pending => std::task::Poll::Ready(Ok(None)),
-            std::task::Poll::Ready(Ok(())) => {
-                std::task::Poll::Ready(PeerState::from_read(Ok(buffer.filled().len())).map(Some))
-            }
-            std::task::Poll::Ready(Err(source)) => {
-                std::task::Poll::Ready(Err(SessionError::Io(source)))
-            }
-        }
-    })
-    .await
-}
-
-fn advance_write(
-    offset: usize,
-    result: Result<io::Result<usize>, tokio::time::error::Elapsed>,
-) -> Result<usize, SessionError> {
-    let written = result.map_err(|_| SessionError::WriteTimeout)??;
-    if written == 0 {
-        return Err(SessionError::Io(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "local IPC response write returned zero bytes",
-        )));
-    }
-    Ok(offset + written)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerState {
-    Open,
-    Closed,
-    Pipelined,
-}
-
-impl PeerState {
-    fn from_read(result: io::Result<usize>) -> Result<Self, SessionError> {
-        match result {
-            Ok(0) => Ok(Self::Closed),
-            Ok(_) => Ok(Self::Pipelined),
-            Err(source) => Err(SessionError::Io(source)),
-        }
     }
 }
 
@@ -761,16 +622,6 @@ impl PeerState {
 enum SessionError {
     #[error("peer closed during bootstrap")]
     ClosedDuringBootstrap,
-    #[error("read deadline elapsed")]
-    ReadTimeout,
-    #[error("write deadline elapsed")]
-    WriteTimeout,
-    #[error("frame declared {requested} bytes; maximum is {maximum}")]
-    FrameTooLarge { requested: usize, maximum: usize },
-    #[error("frame length overflow")]
-    FrameLengthOverflow,
-    #[error("could not allocate {requested} frame bytes")]
-    AllocationFailed { requested: usize },
     #[error("client pipelined a second request")]
     PipelinedRequest,
     #[error(transparent)]
@@ -779,21 +630,19 @@ enum SessionError {
     Framing(#[from] unity_asset_search_protocol::FramingError),
     #[error(transparent)]
     Contract(#[from] unity_asset_search_protocol::ContractValidationError),
-    #[error(transparent)]
-    Io(#[from] io::Error),
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant as StdInstant};
 
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::watch;
     use tokio::time::Instant;
     use unity_asset_core::AssetLoadBudget;
     use unity_asset_search_index::{IndexPaths, SearchIndex, SearchIndexOptions};
     use unity_asset_search_local::{
-        EndpointCleanupV1, PrivateRootsV1, VerifiedLocalStreamV1, generate_daemon_instance_id,
+        EndpointCleanupV1, FrameReadTimeoutsV1, PrivateRootsV1, VerifiedFramedTransportV1,
+        generate_daemon_instance_id,
     };
     use unity_asset_search_protocol::{
         ApiErrorCode, BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2,
@@ -806,72 +655,12 @@ mod tests {
 
     use super::{
         CONTROL_RESERVED_CONNECTIONS, ConnectionCapacity, DispatchCapacity, DispatchClass,
-        Dispatcher, MAX_LOCAL_IPC_CONNECTIONS_V1, ORDINARY_CONNECTIONS, PeerState, ServeEvent,
-        SessionError, SessionLane, drain_sessions, next_serve_event, read_frame, session,
-        write_frame_monitoring_pipeline,
+        Dispatcher, MAX_LOCAL_IPC_CONNECTIONS_V1, ORDINARY_CONNECTIONS, ServeEvent, SessionError,
+        SessionLane, drain_sessions, next_serve_event, session,
     };
     use crate::coordinator::{ReindexCoordinatorConfig, ReindexCoordinatorRuntime};
     use crate::lifecycle::{AdmissionGate, BlockingTaskOwner};
     use crate::watcher::MaintenanceRuntime;
-
-    #[tokio::test]
-    async fn sequential_response_completes_without_pipeline_evidence() {
-        let (server, mut client) = tokio::io::duplex(128);
-        let (mut reader, mut writer) = tokio::io::split(server);
-        let response = b"first-response";
-
-        let state =
-            write_frame_monitoring_pipeline(&mut reader, &mut writer, response, PeerState::Open)
-                .await
-                .expect("write response");
-
-        assert_eq!(state, PeerState::Open);
-        let mut received = vec![0_u8; response.len()];
-        client
-            .read_exact(&mut received)
-            .await
-            .expect("read response");
-        assert_eq!(received, response);
-    }
-
-    #[tokio::test]
-    async fn buffered_second_request_is_detected_while_first_response_completes() {
-        let (server, mut client) = tokio::io::duplex(128);
-        let (mut reader, mut writer) = tokio::io::split(server);
-        let response = b"first-response";
-        client.write_all(&[0x00]).await.expect("pipeline one byte");
-
-        let state =
-            write_frame_monitoring_pipeline(&mut reader, &mut writer, response, PeerState::Open)
-                .await
-                .expect("write first response");
-
-        assert_eq!(state, PeerState::Pipelined);
-        let mut received = vec![0_u8; response.len()];
-        client
-            .read_exact(&mut received)
-            .await
-            .expect("read first response");
-        assert_eq!(received, response);
-    }
-
-    #[tokio::test]
-    async fn closed_peer_stops_response_materialization_without_write_error() {
-        let (server, client) = tokio::io::duplex(128);
-        let (mut reader, mut writer) = tokio::io::split(server);
-        drop(client);
-
-        let state = write_frame_monitoring_pipeline(
-            &mut reader,
-            &mut writer,
-            b"unused-response",
-            PeerState::Open,
-        )
-        .await
-        .expect("observe closed peer");
-
-        assert_eq!(state, PeerState::Closed);
-    }
 
     #[tokio::test]
     async fn saturated_long_polls_preserve_control_and_work_capacity() {
@@ -1018,7 +807,7 @@ mod tests {
         assert!(Instant::now() < initial);
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Debug, Clone, Copy)]
     enum SessionCase {
         Bootstrap,
         PipelinedBusiness,
@@ -1027,7 +816,7 @@ mod tests {
     }
 
     async fn bootstrap_client(
-        client: &mut VerifiedLocalStreamV1,
+        client: &mut VerifiedFramedTransportV1,
         project_id: ProjectId,
         instance_id: DaemonInstanceId,
     ) {
@@ -1035,17 +824,21 @@ mod tests {
             BootstrapHelloV2::new(project_id, instance_id, vec![BUSINESS_PROTOCOL_REVISION])
                 .unwrap();
         client
-            .write_all(&encode_frame(&hello, FrameLimits::bootstrap()).unwrap())
+            .write_frame(
+                &encode_frame(&hello, FrameLimits::bootstrap()).unwrap(),
+                FrameLimits::bootstrap(),
+                Duration::from_secs(5),
+            )
             .await
             .unwrap();
-        let reply_frame = read_frame(
-            client,
-            FrameLimits::bootstrap().max_encoded_bytes(),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let reply_frame = client
+            .read_frame(
+                FrameLimits::bootstrap(),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         let mut budget = AssetLoadBudget::default();
         let reply: BootstrapReplyV2 =
             decode_validated_frame(&reply_frame, &mut budget, FrameLimits::bootstrap()).unwrap();
@@ -1053,21 +846,26 @@ mod tests {
     }
 
     async fn exchange_request(
-        client: &mut VerifiedLocalStreamV1,
+        client: &mut VerifiedFramedTransportV1,
         request: &RequestEnvelope,
     ) -> ResponseEnvelope {
+        let request_frame = encode_request_frame(request).unwrap();
         client
-            .write_all(&encode_request_frame(request).unwrap())
+            .write_frame(
+                &request_frame,
+                FrameLimits::request_envelope(),
+                Duration::from_secs(5),
+            )
             .await
             .unwrap();
-        let response_frame = read_frame(
-            client,
-            FrameLimits::response(request.operation().kind()).max_encoded_bytes(),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let response_frame = client
+            .read_frame(
+                FrameLimits::response(request.operation().kind()),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         let mut budget = AssetLoadBudget::default();
         decode_response_frame(&response_frame, &mut budget, request).unwrap()
     }
@@ -1133,14 +931,6 @@ mod tests {
             ConnectionCapacity::new(usize::from(!matches!(case, SessionCase::ReservedWork)), 1)
                 .acquire()
                 .await;
-        let server_session = tokio::spawn(session(
-            accepted,
-            dispatcher.clone(),
-            DispatchCapacity::new(1, 1, 1),
-            connection,
-            project_id,
-            instance_id,
-        ));
 
         let hello =
             BootstrapHelloV2::new(project_id, instance_id, vec![BUSINESS_PROTOCOL_REVISION])
@@ -1160,23 +950,41 @@ mod tests {
         .unwrap();
         let first_frame = encode_request_frame(&first_request).unwrap();
 
+        connected
+            .write_frame(
+                &hello_frame,
+                FrameLimits::bootstrap(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
         if matches!(case, SessionCase::Bootstrap) {
-            let mut pipelined = hello_frame;
-            pipelined.try_reserve(first_frame.len()).unwrap();
-            pipelined.extend_from_slice(&first_frame);
-            connected.write_all(&pipelined).await.unwrap();
-        } else {
-            connected.write_all(&hello_frame).await.unwrap();
+            connected
+                .write_frame(
+                    &first_frame,
+                    FrameLimits::request_envelope(),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
         }
+        let server_session = tokio::spawn(session(
+            accepted,
+            dispatcher.clone(),
+            DispatchCapacity::new(1, 1, 1),
+            connection,
+            project_id,
+            instance_id,
+        ));
 
-        let reply_frame = read_frame(
-            &mut connected,
-            FrameLimits::bootstrap().max_encoded_bytes(),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let reply_frame = connected
+            .read_frame(
+                FrameLimits::bootstrap(),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         let mut reply_budget = AssetLoadBudget::default();
         let reply: BootstrapReplyV2 =
             decode_validated_frame(&reply_frame, &mut reply_budget, FrameLimits::bootstrap())
@@ -1198,30 +1006,49 @@ mod tests {
             .unwrap();
             let second_frame = encode_request_frame(&second_request).unwrap();
             if matches!(case, SessionCase::PipelinedBusiness) {
-                let mut pipelined = first_frame;
-                pipelined.try_reserve(second_frame.len()).unwrap();
-                pipelined.extend_from_slice(&second_frame);
-                connected.write_all(&pipelined).await.unwrap();
-                assert!(
-                    read_frame(
-                        &mut connected,
-                        FrameLimits::response(OperationKind::ReindexAdmit).max_encoded_bytes(),
+                connected
+                    .write_frame(
+                        &first_frame,
+                        FrameLimits::request_envelope(),
                         Duration::from_secs(5),
                     )
                     .await
-                    .unwrap()
-                    .is_some()
+                    .unwrap();
+                connected
+                    .write_frame(
+                        &second_frame,
+                        FrameLimits::request_envelope(),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    connected
+                        .read_frame(
+                            FrameLimits::response(OperationKind::ReindexAdmit),
+                            FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+                        )
+                        .await
+                        .unwrap()
+                        .is_some()
                 );
             } else {
-                connected.write_all(&first_frame).await.unwrap();
-                let response_frame = read_frame(
-                    &mut connected,
-                    FrameLimits::response(OperationKind::ReindexAdmit).max_encoded_bytes(),
-                    Duration::from_secs(5),
-                )
-                .await
-                .unwrap()
-                .unwrap();
+                connected
+                    .write_frame(
+                        &first_frame,
+                        FrameLimits::request_envelope(),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .unwrap();
+                let response_frame = connected
+                    .read_frame(
+                        FrameLimits::response(OperationKind::ReindexAdmit),
+                        FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
                 if matches!(case, SessionCase::ReservedWork) {
                     let mut budget = AssetLoadBudget::default();
                     let response =
@@ -1236,36 +1063,42 @@ mod tests {
                         Some("control_reserved")
                     );
                 } else {
-                    connected.write_all(&second_frame).await.unwrap();
-                    assert!(
-                        read_frame(
-                            &mut connected,
-                            FrameLimits::response(OperationKind::ReindexAdmit).max_encoded_bytes(),
+                    connected
+                        .write_frame(
+                            &second_frame,
+                            FrameLimits::request_envelope(),
                             Duration::from_secs(5),
                         )
                         .await
-                        .unwrap()
-                        .is_some()
+                        .unwrap();
+                    assert!(
+                        connected
+                            .read_frame(
+                                FrameLimits::response(OperationKind::ReindexAdmit),
+                                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+                            )
+                            .await
+                            .unwrap()
+                            .is_some()
                     );
-                    connected.shutdown().await.unwrap();
                 }
             }
         }
 
         drop(connected);
         let session_result = server_session.await.unwrap();
+        let admissions = coordinator.snapshot().await.admissions.ipc;
         if matches!(
             case,
             SessionCase::SequentialBusiness | SessionCase::ReservedWork
         ) {
             assert!(session_result.is_ok());
         } else {
-            assert!(matches!(
-                session_result,
-                Err(SessionError::PipelinedRequest)
-            ));
+            assert!(
+                matches!(session_result, Err(SessionError::PipelinedRequest)),
+                "unexpected session result for {case:?}: {session_result:?}; admissions={admissions}"
+            );
         }
-        let admissions = coordinator.snapshot().await.admissions.ipc;
 
         assert_eq!(endpoint.withdraw().unwrap(), EndpointCleanupV1::Removed);
         drop(endpoint);
@@ -1512,8 +1345,6 @@ mod tests {
             admissions_before
         );
 
-        shutdown_client.shutdown().await.unwrap();
-        work_client.shutdown().await.unwrap();
         drop(shutdown_client);
         drop(work_client);
         let (serve_result, endpoint) = server.await.unwrap();

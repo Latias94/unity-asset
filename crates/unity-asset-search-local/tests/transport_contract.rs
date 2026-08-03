@@ -5,9 +5,9 @@ use std::{sync::Arc, sync::Barrier, thread};
 
 use unity_asset_search_local::{
     EndpointClaimError, EndpointCleanupV1, EndpointStoreError, EndpointTransportError,
-    PrivateRootsV1, generate_daemon_instance_id,
+    FrameReadTimeoutsV1, PrivateRootsV1, generate_daemon_instance_id,
 };
-use unity_asset_search_protocol::{DaemonInstanceId, ProjectId};
+use unity_asset_search_protocol::{DaemonInstanceId, FrameLimits, ProjectId};
 
 const BINDING_STAGING_FILE: &str = ".binding-v1.staging";
 const BINDING_LOCK_FILE: &str = ".binding-v1.lock";
@@ -36,10 +36,52 @@ async fn same_principal_connects_to_the_published_process() {
         endpoint.accept_verified(),
         discovered.connect_verified(&namespace, Instant::now() + Duration::from_secs(5))
     );
-    let accepted = accepted.unwrap();
-    let connected = connected.unwrap();
+    let mut accepted = accepted.unwrap();
+    let mut connected = connected.unwrap();
     assert_eq!(accepted.peer_identity().process_id(), std::process::id());
     assert_eq!(connected.peer_identity().process_id(), std::process::id());
+
+    let client_frame = [0, 0, 0, 4, b'p', b'i', b'n', b'g'];
+    connected
+        .write_frame(
+            &client_frame,
+            FrameLimits::bootstrap(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted
+            .read_frame(
+                FrameLimits::bootstrap(),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        client_frame
+    );
+
+    let server_frame = [0, 0, 0, 4, b'p', b'o', b'n', b'g'];
+    accepted
+        .write_frame(
+            &server_frame,
+            FrameLimits::bootstrap(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        connected
+            .read_frame(
+                FrameLimits::bootstrap(),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        server_frame
+    );
 
     drop(accepted);
     drop(connected);

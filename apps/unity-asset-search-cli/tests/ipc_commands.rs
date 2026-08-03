@@ -3,11 +3,10 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use unity_asset_core::AssetLoadBudget;
 use unity_asset_search_local::{
-    ClaimedEndpointV1, PrivateRootsV1, ProjectLocatorV1, VerifiedLocalStreamV1,
-    generate_daemon_instance_id,
+    ClaimedEndpointV1, FrameReadTimeoutsV1, PrivateRootsV1, ProjectLocatorV1,
+    VerifiedFramedTransportV1, generate_daemon_instance_id,
 };
 use unity_asset_search_protocol::{
     BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2, CapabilitiesResponse,
@@ -42,19 +41,10 @@ async fn convenience_and_json_requests_share_the_verified_ipc_path() {
     let instance = generate_daemon_instance_id().expect("daemon instance");
     let endpoint = claim.publish(instance).expect("publish endpoint");
     let query_policy = QueryPolicyId::from_bytes([0x44; 32]);
-    let expected_context = namespace.security_context_id();
     let project_id = project.project_id();
 
     let server_task = tokio::spawn(async move {
-        serve_capabilities(
-            endpoint,
-            project_id,
-            instance,
-            query_policy,
-            expected_context,
-            2,
-        )
-        .await
+        serve_capabilities(endpoint, project_id, instance, query_policy, 2).await
     });
 
     let project_root = root.path().to_str().expect("UTF-8 test path");
@@ -109,7 +99,6 @@ async fn serve_capabilities(
     project_id: unity_asset_search_protocol::ProjectId,
     instance: unity_asset_search_protocol::DaemonInstanceId,
     query_policy: QueryPolicyId,
-    expected_context: unity_asset_search_local::SecurityContextIdV1,
     exchanges: usize,
 ) -> Result<Vec<RequestOperation>, String> {
     let mut observed = Vec::with_capacity(exchanges);
@@ -118,11 +107,7 @@ async fn serve_capabilities(
             .await
             .map_err(|_| "accept timeout".to_owned())?
             .map_err(|error| error.to_string())?;
-        let hello_frame =
-            read_frame(&mut stream, FrameLimits::bootstrap().max_encoded_bytes()).await?;
-        stream
-            .verify_received_message_principal(expected_context)
-            .map_err(|error| error.to_string())?;
+        let hello_frame = read_frame(&mut stream, FrameLimits::bootstrap()).await?;
         let mut budget = AssetLoadBudget::default();
         let hello: BootstrapHelloV2 =
             decode_validated_frame(&hello_frame, &mut budget, FrameLimits::bootstrap())
@@ -137,17 +122,11 @@ async fn serve_capabilities(
         write_frame(
             &mut stream,
             &encode_frame(&reply, FrameLimits::bootstrap()).map_err(|error| error.to_string())?,
+            FrameLimits::bootstrap(),
         )
         .await?;
 
-        let request_frame = read_frame(
-            &mut stream,
-            FrameLimits::request_envelope().max_encoded_bytes(),
-        )
-        .await?;
-        stream
-            .verify_received_message_principal(expected_context)
-            .map_err(|error| error.to_string())?;
+        let request_frame = read_frame(&mut stream, FrameLimits::request_envelope()).await?;
         let mut budget = AssetLoadBudget::default();
         let request =
             decode_request_frame(&request_frame, &mut budget).map_err(|error| error.to_string())?;
@@ -164,39 +143,34 @@ async fn serve_capabilities(
         );
         let response_frame =
             encode_response_frame(&response, &request).map_err(|error| error.to_string())?;
-        write_frame(&mut stream, &response_frame).await?;
+        write_frame(
+            &mut stream,
+            &response_frame,
+            FrameLimits::response(request.operation().kind()),
+        )
+        .await?;
     }
     Ok(observed)
 }
 
-async fn read_frame(stream: &mut VerifiedLocalStreamV1, maximum: usize) -> Result<Vec<u8>, String> {
-    tokio::time::timeout(TEST_TIMEOUT, async {
-        let mut header = [0_u8; 4];
-        stream.read_exact(&mut header).await?;
-        let declared = u32::from_be_bytes(header) as usize;
-        if declared > maximum {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "frame exceeds fixture limit",
-            ));
-        }
-        let mut frame = Vec::with_capacity(4 + declared);
-        frame.extend_from_slice(&header);
-        frame.resize(4 + declared, 0);
-        stream.read_exact(&mut frame[4..]).await?;
-        Ok::<_, std::io::Error>(frame)
-    })
-    .await
-    .map_err(|_| "read timeout".to_owned())?
-    .map_err(|error| error.to_string())
+async fn read_frame(
+    stream: &mut VerifiedFramedTransportV1,
+    limits: FrameLimits,
+) -> Result<Vec<u8>, String> {
+    stream
+        .read_frame(limits, FrameReadTimeoutsV1::uniform(TEST_TIMEOUT))
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "peer closed before returning a frame".to_owned())
 }
 
-async fn write_frame(stream: &mut VerifiedLocalStreamV1, frame: &[u8]) -> Result<(), String> {
-    tokio::time::timeout(TEST_TIMEOUT, async {
-        stream.write_all(frame).await?;
-        stream.flush().await
-    })
-    .await
-    .map_err(|_| "write timeout".to_owned())?
-    .map_err(|error| error.to_string())
+async fn write_frame(
+    stream: &mut VerifiedFramedTransportV1,
+    frame: &[u8],
+    limits: FrameLimits,
+) -> Result<(), String> {
+    stream
+        .write_frame(frame, limits, TEST_TIMEOUT)
+        .await
+        .map_err(|error| error.to_string())
 }

@@ -768,12 +768,12 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::oneshot;
     use unity_asset_search_index::{AssetLoadBudget, IndexPaths, SearchIndex};
     use unity_asset_search_local::{
-        EndpointClaimV1, EndpointNamespaceV1, EndpointStoreError, PrivateRootsV1, ProjectLocatorV1,
-        VerifiedLocalStreamV1, generate_daemon_instance_id,
+        EndpointClaimV1, EndpointNamespaceV1, EndpointStoreError, EndpointTransportError,
+        FrameReadTimeoutsV1, PrivateRootsV1, ProjectLocatorV1, VerifiedFramedTransportV1,
+        generate_daemon_instance_id,
     };
     use unity_asset_search_protocol::{
         BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2, DaemonInstanceId,
@@ -820,7 +820,7 @@ mod tests {
     }
 
     async fn bootstrap_fixture_client(
-        client: &mut VerifiedLocalStreamV1,
+        client: &mut VerifiedFramedTransportV1,
         descriptor: unity_asset_search_local::EndpointDescriptorV1,
     ) {
         let hello = BootstrapHelloV2::new(
@@ -829,22 +829,19 @@ mod tests {
             vec![BUSINESS_PROTOCOL_REVISION],
         )
         .unwrap();
+        let frame = encode_frame(&hello, FrameLimits::bootstrap()).unwrap();
         client
-            .write_all(&encode_frame(&hello, FrameLimits::bootstrap()).unwrap())
+            .write_frame(&frame, FrameLimits::bootstrap(), Duration::from_secs(5))
             .await
             .unwrap();
-
-        let mut header = [0_u8; 4];
-        client.read_exact(&mut header).await.unwrap();
-        let length = u32::from_be_bytes(header) as usize;
-        assert!(length <= FrameLimits::bootstrap().max_encoded_bytes());
-        let mut frame = Vec::with_capacity(4 + length);
-        frame.extend_from_slice(&header);
-        frame.resize(4 + length, 0);
-        client.read_exact(&mut frame[4..]).await.unwrap();
-        client
-            .verify_received_message_principal(descriptor.security_context_id())
-            .unwrap();
+        let frame = client
+            .read_frame(
+                FrameLimits::bootstrap(),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap()
+            .expect("daemon returned a bootstrap reply");
         let mut budget = AssetLoadBudget::default();
         let reply: BootstrapReplyV2 =
             decode_validated_frame(&frame, &mut budget, FrameLimits::bootstrap()).unwrap();
@@ -913,7 +910,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn drain_deadline_aborts_a_real_session_before_blocking_work_releases_authority() {
+    async fn drain_deadline_aborts_an_idle_session_before_blocking_work_releases_authority() {
         let mut fixture = RuntimeFixture::new(generate_daemon_instance_id().unwrap());
         fixture.wait_for_publication().await;
         let descriptor = fixture.namespace().discover_endpoint().unwrap();
@@ -922,26 +919,25 @@ mod tests {
             .await
             .unwrap();
         bootstrap_fixture_client(&mut client, descriptor.descriptor()).await;
-        client.write_all(&32_u32.to_be_bytes()).await.unwrap();
-        client.write_all(b"{").await.unwrap();
-        client.flush().await.unwrap();
 
         fixture.runtime().begin_shutdown(Duration::ZERO);
-        let mut trailing = [0_u8; 1];
-        let closed = tokio::time::timeout(Duration::from_secs(5), client.read(&mut trailing))
-            .await
-            .expect("drain deadline closes the partial-frame session");
+        let closed = client
+            .read_frame(
+                FrameLimits::response(unity_asset_search_protocol::OperationKind::Status),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+            )
+            .await;
         match closed {
-            Ok(0) => {}
-            Err(error)
+            Ok(None) => {}
+            Err(EndpointTransportError::Io { source, .. })
                 if matches!(
-                    error.kind(),
+                    source.kind(),
                     std::io::ErrorKind::BrokenPipe
                         | std::io::ErrorKind::ConnectionAborted
                         | std::io::ErrorKind::ConnectionReset
                         | std::io::ErrorKind::NotConnected
-                ) || error.raw_os_error() == Some(233) => {}
-            Ok(_) => panic!("draining session returned unexpected response bytes"),
+                ) || source.raw_os_error() == Some(233) => {}
+            Ok(Some(_)) => panic!("draining session returned unexpected response bytes"),
             Err(error) => panic!("draining session failed unexpectedly: {error}"),
         }
         assert!(

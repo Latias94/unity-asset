@@ -3,11 +3,10 @@ use std::io::Read as _;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use unity_asset_core::AssetLoadBudget;
 use unity_asset_search_local::{
-    EndpointNamespaceV1, EndpointStoreError, PrivateRootsV1, ProjectLocatorV1,
-    VerifiedLocalStreamV1,
+    EndpointNamespaceV1, EndpointStoreError, FrameReadTimeoutsV1, PrivateRootsV1, ProjectLocatorV1,
+    VerifiedFramedTransportV1,
 };
 use unity_asset_search_protocol::{
     BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2, FilesystemReindexIntent,
@@ -65,7 +64,6 @@ async fn real_daemon_process_publishes_reindexes_searches_and_shuts_down() {
     let mut daemon = DaemonChild::spawn(project_directory.path(), &index_directory);
     let discovered = wait_for_endpoint(&namespace, &mut daemon).await;
     let descriptor = discovered.descriptor();
-    let expected_security_context = namespace.security_context_id();
     let stream = discovered
         .connect_verified(&namespace, Instant::now() + TEST_TIMEOUT)
         .await
@@ -74,7 +72,6 @@ async fn real_daemon_process_publishes_reindexes_searches_and_shuts_down() {
         stream,
         project.project_id(),
         descriptor.daemon_instance_id(),
-        expected_security_context,
     )
     .await;
 
@@ -149,20 +146,18 @@ async fn real_daemon_process_publishes_reindexes_searches_and_shuts_down() {
 }
 
 struct ProcessClient {
-    stream: VerifiedLocalStreamV1,
+    stream: VerifiedFramedTransportV1,
     project_id: unity_asset_search_protocol::ProjectId,
     daemon_instance_id: unity_asset_search_protocol::DaemonInstanceId,
     query_policy_id: QueryPolicyId,
-    expected_security_context: unity_asset_search_local::SecurityContextIdV1,
     next_request_id: u8,
 }
 
 impl ProcessClient {
     async fn bootstrap(
-        mut stream: VerifiedLocalStreamV1,
+        mut stream: VerifiedFramedTransportV1,
         project_id: unity_asset_search_protocol::ProjectId,
         daemon_instance_id: unity_asset_search_protocol::DaemonInstanceId,
-        expected_security_context: unity_asset_search_local::SecurityContextIdV1,
     ) -> Self {
         let hello = BootstrapHelloV2::new(
             project_id,
@@ -171,12 +166,8 @@ impl ProcessClient {
         )
         .expect("valid bootstrap hello");
         let hello_frame = encode_frame(&hello, FrameLimits::bootstrap()).expect("encode hello");
-        write_frame(&mut stream, &hello_frame).await;
-        let reply_frame =
-            read_frame(&mut stream, FrameLimits::bootstrap().max_encoded_bytes()).await;
-        stream
-            .verify_received_message_principal(expected_security_context)
-            .expect("verify daemon principal for bootstrap reply");
+        write_frame(&mut stream, &hello_frame, FrameLimits::bootstrap()).await;
+        let reply_frame = read_frame(&mut stream, FrameLimits::bootstrap()).await;
         let mut budget = AssetLoadBudget::default();
         let reply: BootstrapReplyV2 =
             decode_validated_frame(&reply_frame, &mut budget, FrameLimits::bootstrap())
@@ -193,7 +184,6 @@ impl ProcessClient {
             project_id,
             daemon_instance_id,
             query_policy_id,
-            expected_security_context,
             next_request_id: 1,
         }
     }
@@ -214,15 +204,17 @@ impl ProcessClient {
         )
         .expect("valid process-contract request");
         let request_frame = encode_request_frame(&request).expect("encode business request");
-        write_frame(&mut self.stream, &request_frame).await;
-        let response_frame = read_frame(
+        write_frame(
             &mut self.stream,
-            FrameLimits::response(request.operation().kind()).max_encoded_bytes(),
+            &request_frame,
+            FrameLimits::request_envelope(),
         )
         .await;
-        self.stream
-            .verify_received_message_principal(self.expected_security_context)
-            .expect("verify daemon principal for business response");
+        let response_frame = read_frame(
+            &mut self.stream,
+            FrameLimits::response(request.operation().kind()),
+        )
+        .await;
         let mut budget = AssetLoadBudget::default();
         let response = decode_response_frame(&response_frame, &mut budget, &request)
             .expect("decode business response");
@@ -316,34 +308,17 @@ async fn wait_for_endpoint(
     }
 }
 
-async fn read_frame(stream: &mut VerifiedLocalStreamV1, maximum: usize) -> Vec<u8> {
-    tokio::time::timeout(TEST_TIMEOUT, async {
-        let mut header = [0_u8; 4];
-        stream.read_exact(&mut header).await?;
-        let declared = u32::from_be_bytes(header) as usize;
-        if declared > maximum {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "real daemon frame exceeds the operation limit",
-            ));
-        }
-        let mut frame = Vec::with_capacity(4 + declared);
-        frame.extend_from_slice(&header);
-        frame.resize(4 + declared, 0);
-        stream.read_exact(&mut frame[4..]).await?;
-        Ok::<_, std::io::Error>(frame)
-    })
-    .await
-    .expect("real daemon read deadline")
-    .expect("read real daemon frame")
+async fn read_frame(stream: &mut VerifiedFramedTransportV1, limits: FrameLimits) -> Vec<u8> {
+    stream
+        .read_frame(limits, FrameReadTimeoutsV1::uniform(TEST_TIMEOUT))
+        .await
+        .expect("read real daemon frame")
+        .expect("real daemon closed before returning a frame")
 }
 
-async fn write_frame(stream: &mut VerifiedLocalStreamV1, frame: &[u8]) {
-    tokio::time::timeout(TEST_TIMEOUT, async {
-        stream.write_all(frame).await?;
-        stream.flush().await
-    })
-    .await
-    .expect("real daemon write deadline")
-    .expect("write real daemon frame");
+async fn write_frame(stream: &mut VerifiedFramedTransportV1, frame: &[u8], limits: FrameLimits) {
+    stream
+        .write_frame(frame, limits, TEST_TIMEOUT)
+        .await
+        .expect("write real daemon frame");
 }
