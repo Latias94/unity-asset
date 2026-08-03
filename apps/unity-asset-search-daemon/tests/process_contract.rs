@@ -1,12 +1,12 @@
-use std::fs;
-use std::io::Read as _;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+mod support;
 
+use std::fs;
+use std::time::Instant;
+
+use support::{SearchDaemonFixture, TEST_TIMEOUT};
 use unity_asset_core::AssetLoadBudget;
 use unity_asset_search_local::{
-    EndpointNamespaceV1, EndpointStoreError, EndpointTransportError, FrameReadTimeoutsV1,
-    PrivateRootsV1, ProjectLocatorV1, VerifiedFramedTransportV1,
+    EndpointStoreError, EndpointTransportError, FrameReadTimeoutsV1, VerifiedFramedTransportV1,
 };
 use unity_asset_search_protocol::{
     ApiErrorCode, BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2,
@@ -18,7 +18,6 @@ use unity_asset_search_protocol::{
     encode_request_frame,
 };
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const OWNER_ONE_GUID: &str = "11111111111111111111111111111111";
 const OWNER_TWO_GUID: &str = "22222222222222222222222222222222";
 const TARGET_GUID: &str = "0123456789abcdef0123456789abcdef";
@@ -59,47 +58,22 @@ GameObject:
   m_Name: SecondaryTargetBeacon
 "#;
 
-fn secure_test_tempdir() -> tempfile::TempDir {
-    #[cfg(windows)]
-    {
-        let local_app_data = std::env::var_os("LOCALAPPDATA")
-            .expect("Windows tests require a LocalAppData directory");
-        tempfile::Builder::new()
-            .prefix("unity-asset-search-process-test-")
-            .tempdir_in(local_app_data)
-            .expect("create a process test directory below the private LocalAppData namespace")
-    }
-    #[cfg(not(windows))]
-    {
-        tempfile::tempdir().expect("create a private process test directory")
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state() {
-    let project_directory = secure_test_tempdir();
-    let assets = project_directory.path().join("Assets");
-    fs::create_dir_all(&assets).expect("Assets marker");
-    fs::create_dir(project_directory.path().join("ProjectSettings"))
-        .expect("ProjectSettings marker");
-    write_asset(&assets, "OwnerOne.prefab", OWNER_ONE, OWNER_ONE_GUID);
-    write_asset(&assets, "OwnerTwo.prefab", OWNER_TWO, OWNER_TWO_GUID);
-    write_asset(&assets, "Target.prefab", TARGET, TARGET_GUID);
-    write_asset(&assets, "TargetTwo.prefab", TARGET_TWO, TARGET_TWO_GUID);
+    let fixture = SearchDaemonFixture::new();
+    fixture.write_asset("OwnerOne.prefab", OWNER_ONE, OWNER_ONE_GUID);
+    fixture.write_asset("OwnerTwo.prefab", OWNER_TWO, OWNER_TWO_GUID);
+    fixture.write_asset("Target.prefab", TARGET, TARGET_GUID);
+    fixture.write_asset("TargetTwo.prefab", TARGET_TWO, TARGET_TWO_GUID);
 
-    let project = ProjectLocatorV1::open(project_directory.path()).expect("locate project");
-    let roots = PrivateRootsV1::discover_for_current_context().expect("private local roots");
-    let namespace = roots
-        .runtime()
-        .endpoint_namespace(project.project_id())
-        .expect("endpoint namespace");
-    let index_directory = project_directory.path().join(".process-contract-index");
-    let mut daemon = DaemonChild::spawn(project_directory.path(), &index_directory);
-    let discovered = wait_for_endpoint(&namespace, &mut daemon).await;
+    let project = fixture.project();
+    let namespace = fixture.namespace();
+    let mut daemon = fixture.spawn_daemon();
+    let discovered = fixture.wait_for_endpoint(&mut daemon).await;
     let stale_discovered = discovered;
     let descriptor = discovered.descriptor();
     let stream = discovered
-        .connect_verified(&namespace, Instant::now() + TEST_TIMEOUT)
+        .connect_verified(namespace, Instant::now() + TEST_TIMEOUT)
         .await
         .expect("connect to real daemon");
     let mut client = ProcessClient::bootstrap(
@@ -246,7 +220,8 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
         [(TARGET_GUID, 100), (TARGET_TWO_GUID, 200)]
     );
 
-    fs::write(assets.join("OwnerOne.prefab"), OWNER_ONE_UPDATED).expect("update owner prefab");
+    fs::write(fixture.assets().join("OwnerOne.prefab"), OWNER_ONE_UPDATED)
+        .expect("update owner prefab");
     complete_reindex(&mut client, "process-contract-v2").await;
     let stale = client
         .exchange_outcome(RequestOperation::References(
@@ -272,15 +247,15 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
         Err(EndpointStoreError::DescriptorMissing)
     ));
 
-    let mut replacement = DaemonChild::spawn(project_directory.path(), &index_directory);
-    let replacement_discovered = wait_for_endpoint(&namespace, &mut replacement).await;
+    let mut replacement = fixture.spawn_daemon();
+    let replacement_discovered = fixture.wait_for_endpoint(&mut replacement).await;
     assert_ne!(
         replacement_discovered.descriptor().daemon_instance_id(),
         descriptor.daemon_instance_id()
     );
     assert!(matches!(
         stale_discovered
-            .connect_verified(&namespace, Instant::now() + TEST_TIMEOUT)
+            .connect_verified(namespace, Instant::now() + TEST_TIMEOUT)
             .await,
         Err(EndpointTransportError::Store(
             EndpointStoreError::EndpointChanged
@@ -288,7 +263,7 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
     ));
     let replacement_descriptor = replacement_discovered.descriptor();
     let replacement_stream = replacement_discovered
-        .connect_verified(&namespace, Instant::now() + TEST_TIMEOUT)
+        .connect_verified(namespace, Instant::now() + TEST_TIMEOUT)
         .await
         .expect("connect to replacement daemon");
     let mut replacement_client = ProcessClient::bootstrap(
@@ -304,15 +279,6 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
         namespace.discover_endpoint(),
         Err(EndpointStoreError::DescriptorMissing)
     ));
-}
-
-fn write_asset(assets: &std::path::Path, name: &str, contents: &str, guid: &str) {
-    fs::write(assets.join(name), contents).expect("write process-contract asset");
-    fs::write(
-        assets.join(format!("{name}.meta")),
-        format!("fileFormatVersion: 2\nguid: {guid}\n"),
-    )
-    .expect("write process-contract asset metadata");
 }
 
 async fn complete_reindex(client: &mut ProcessClient, idempotency_key: &str) {
@@ -461,89 +427,6 @@ impl ProcessClient {
         let response = decode_response_frame(&response_frame, &mut budget, &request)
             .expect("decode business response");
         response.into_outcome()
-    }
-}
-
-struct DaemonChild {
-    child: Child,
-}
-
-impl DaemonChild {
-    fn spawn(project_root: &std::path::Path, index_directory: &std::path::Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_unity-asset-search-daemon"))
-            .arg("--project-root")
-            .arg(project_root)
-            .arg("--index-dir")
-            .arg(index_directory)
-            .arg("--no-startup-reindex")
-            .arg("--reconcile-interval-ms")
-            .arg("0")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn real search daemon");
-        Self { child }
-    }
-
-    fn assert_running(&mut self) {
-        if let Some(status) = self.child.try_wait().expect("poll daemon process") {
-            panic!(
-                "real daemon exited before endpoint publication: {status}; stderr: {}",
-                self.stderr()
-            );
-        }
-    }
-
-    async fn wait_for_exit(&mut self) -> ExitStatus {
-        let deadline = Instant::now() + TEST_TIMEOUT;
-        loop {
-            if let Some(status) = self.child.try_wait().expect("poll daemon exit") {
-                return status;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "real daemon did not exit after structured shutdown"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-
-    fn stderr(&mut self) -> String {
-        let mut output = String::new();
-        if let Some(stderr) = self.child.stderr.as_mut() {
-            let _ = stderr.read_to_string(&mut output);
-        }
-        output
-    }
-}
-
-impl Drop for DaemonChild {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-async fn wait_for_endpoint(
-    namespace: &EndpointNamespaceV1,
-    daemon: &mut DaemonChild,
-) -> unity_asset_search_local::DiscoveredEndpointV1 {
-    let deadline = Instant::now() + TEST_TIMEOUT;
-    loop {
-        daemon.assert_running();
-        match namespace.discover_endpoint() {
-            Ok(discovered) => return discovered,
-            Err(EndpointStoreError::DescriptorMissing | EndpointStoreError::EndpointChanged) => {}
-            Err(error) => panic!("discover real daemon endpoint: {error}"),
-        }
-        assert!(
-            Instant::now() < deadline,
-            "real daemon did not publish its endpoint"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 

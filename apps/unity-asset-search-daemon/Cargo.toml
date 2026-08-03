@@ -11,6 +11,7 @@ homepage.workspace = true
 documentation = "https://github.com/Latias94/unity-asset"
 keywords = ["unity", "search", "daemon", "references"]
 categories = ["command-line-utilities", "game-development"]
+exclude = ["tests/csharp_protocol_session.rs"]
 
 [dependencies]
 anyhow.workspace = true

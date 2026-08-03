@@ -236,6 +236,7 @@ jobs:
       run: |
         dotnet build integration/search-protocol/csharp/UnityAsset.SearchProtocol.ExternalConsumer/UnityAsset.SearchProtocol.ExternalConsumer.csproj --configuration Release
         dotnet run --project integration/search-protocol/csharp/UnityAsset.SearchProtocol.Conformance/UnityAsset.SearchProtocol.Conformance.csproj --configuration Release
+        cargo nextest run -p unity-asset-search-daemon --test csharp_protocol_session --run-ignored ignored-only --test-threads 1
 
     - name: Run Windows CLI unit contracts
       if: runner.os == 'Windows'

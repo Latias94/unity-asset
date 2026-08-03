@@ -32,6 +32,13 @@ internal static class ConformanceProgram
     {
         try
         {
+            if (args.Length > 0 && string.Equals(args[0], "--real-daemon-relay", StringComparison.Ordinal))
+            {
+                await LiveDaemonConformance.RunAsync(args[1..]).ConfigureAwait(false);
+                Console.WriteLine("PASS: public C# session reached every real daemon operation");
+                return 0;
+            }
+
             string fixtureRoot = ResolveFixtureRoot(args);
             Run(fixtureRoot);
             await AssertPublicProtocolSessionAsync(fixtureRoot).ConfigureAwait(false);
