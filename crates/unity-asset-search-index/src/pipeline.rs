@@ -40,6 +40,14 @@ use crate::generation::{
     GenerationProjectionDigests, GenerationProjectionSummary, GenerationStamp,
     SearchGenerationIdentityV1, SearchGenerationManifestV1,
 };
+#[cfg(test)]
+use crate::generation_store::GenerationFailpoint;
+use crate::generation_store::{
+    GenerationBuild, GenerationDiskEstimate, GenerationPublishWarning,
+    GenerationPublishWarningKind, GenerationSnapshot, GenerationStore, GenerationStoreError,
+    GenerationStoreOptions, SourceScanHint, SourceStateError, SourceStateLimits,
+    SourceStateSnapshot, TransactionReceiptMembership, TransactionReceiptWindow,
+};
 use crate::path_semantics::compare_portable_paths;
 use crate::projection::{
     GenerationProjection, ProjectionCategory, ProjectionError, ProjectionLimits, ProjectionMetrics,
@@ -53,14 +61,6 @@ use crate::reference_query::{
 use crate::scan::{
     FileHint, PathRejection, ProjectScanner, ReadSource, ScanDiagnostic, ScanError, ScanIntent,
     ScanMetrics, ScanMode, ScanValidation, SourceHints, SourcePart,
-};
-#[cfg(test)]
-use crate::state::GenerationFailpoint;
-use crate::state::{
-    GenerationBuild, GenerationDiskEstimate, GenerationPublishWarning,
-    GenerationPublishWarningKind, GenerationSnapshot, GenerationStore, GenerationStoreError,
-    GenerationStoreOptions, SourceScanHint, SourceStateError, SourceStateLimits,
-    SourceStateSnapshot, TransactionReceiptMembership, TransactionReceiptWindow,
 };
 use crate::store::{ProjectionReaders, ProjectionStore, is_rebuildable_projection_schema_version};
 
@@ -533,12 +533,12 @@ impl SearchGenerationPipeline {
                         duration_ms: started.elapsed().as_millis(),
                     });
                 }
-                TransactionReceiptMembership::Conflict { .. } => {
+                TransactionReceiptMembership::Conflict => {
                     return Err(PipelineError::TransactionConflict {
                         transaction: changes.transaction(),
                     });
                 }
-                TransactionReceiptMembership::Absent { .. } => {}
+                TransactionReceiptMembership::Absent => {}
             }
             if revision != changes.from_revision() && revision != changes.to_revision() {
                 return Err(PipelineError::RevisionBarrierMismatch {

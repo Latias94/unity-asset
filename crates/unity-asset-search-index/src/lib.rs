@@ -17,6 +17,7 @@ mod analyzer;
 mod anchored_fs;
 mod config;
 mod generation;
+mod generation_store;
 mod path_semantics;
 mod pipeline;
 mod projection;
@@ -24,7 +25,6 @@ mod query;
 mod reference_payload;
 mod reference_query;
 mod scan;
-mod state;
 mod store;
 mod wire;
 
@@ -44,11 +44,11 @@ use unity_asset_search_protocol::{
 
 use generation::GenerationStamp as InternalGenerationStamp;
 #[cfg(test)]
+use generation_store::GenerationFailpoint;
+#[cfg(test)]
 use pipeline::ScanValidationCheckpoint;
 use pipeline::{ActiveGeneration, PipelineBuildOutput, PipelineError, SearchGenerationPipeline};
 use reference_query::ReferenceQueryError;
-#[cfg(test)]
-use state::GenerationFailpoint;
 
 #[cfg(test)]
 pub(crate) fn secure_test_tempdir() -> tempfile::TempDir {
@@ -858,7 +858,7 @@ GameObject:
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         manifest["artifacts"]["references"] = serde_json::to_value(
-            crate::state::measure_artifact_tree(&reference_directory).unwrap(),
+            crate::generation_store::measure_artifact_tree(&reference_directory).unwrap(),
         )
         .unwrap();
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();

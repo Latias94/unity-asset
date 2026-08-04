@@ -107,44 +107,43 @@ fn public_structured_workflow_spans_mutation_recovery_extraction_and_search() {
     assert_eq!(inspected.object().class().class_id(), 1);
 
     let planner = SchemaRecipePlanner::new(&base);
-    let renamed = planner
+    let rename_target = planner
         .inspect(&address("1"), &mut AssetLoadBudget::default())
-        .and_then(|object| {
-            planner.lower_field_replace(
-                &object,
-                field("m_Name"),
-                MutationValue::string("After").unwrap(),
-                &mut AssetLoadBudget::default(),
-            )
-        })
+        .unwrap();
+    let renamed = planner
+        .lower_field_replace(
+            &rename_target,
+            field("m_Name"),
+            MutationValue::string("After").unwrap(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let reference_target = planner
+        .inspect(&address("2"), &mut AssetLoadBudget::default())
         .unwrap();
     let retargeted = planner
-        .inspect(&address("2"), &mut AssetLoadBudget::default())
-        .and_then(|object| {
-            planner.lower_reference(
-                &object,
-                field("m_Texture"),
-                ReferenceTarget::null(),
-                ReferenceTarget::object(address("3")),
-                &mut AssetLoadBudget::default(),
-            )
-        })
+        .lower_reference(
+            &reference_target,
+            field("m_Texture"),
+            ReferenceTarget::null(),
+            ReferenceTarget::object(address("3")),
+            &mut AssetLoadBudget::default(),
+        )
         .unwrap()
         .into_fragment()
         .expect("reference retarget must change the object");
-    let resource = planner
+    let resource_target = planner
         .inspect(&address("4"), &mut AssetLoadBudget::default())
-        .and_then(|object| {
-            AudioClipResourceRecipe::lower(
-                &planner,
-                &object,
-                PlanPayload::new(REPLACEMENT_PAYLOAD.to_vec()),
-                &mut AssetLoadBudget::default(),
-            )
-        })
-        .unwrap()
-        .into_fragment()
-        .expect("resource replacement must change the object");
+        .unwrap();
+    let resource = AudioClipResourceRecipe::lower(
+        &planner,
+        &resource_target,
+        PlanPayload::new(REPLACEMENT_PAYLOAD.to_vec()),
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap()
+    .into_fragment()
+    .expect("resource replacement must change the object");
 
     let mut builder = MutationPlanBuilder::new(base.workspace_id(), base.revision());
     builder.append(renamed).unwrap();

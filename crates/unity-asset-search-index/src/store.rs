@@ -32,12 +32,12 @@ use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
     SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
 };
+use crate::generation_store::measure_artifact_tree;
 use crate::projection::{GenerationProjection, ReferenceDocument, SearchDocument};
 use crate::reference_payload::{
     REFERENCE_PAYLOAD_FILE, ReferencePayloadLocation, ReferencePayloadReader,
     ReferencePayloadWriter,
 };
-use crate::state::measure_artifact_tree;
 use crate::wire;
 
 const SEARCH_ARTIFACT_DIRECTORY: &str = "search";
