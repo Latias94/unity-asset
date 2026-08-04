@@ -1001,7 +1001,7 @@ fn publish_rejects_source_state_that_does_not_match_the_manifest() {
             &mut build,
             SearchGenerationManifestV1::new(identity, evidence),
         ),
-        Err(GenerationStoreError::InvalidSourceState { .. })
+        Err(GenerationStoreError::SourceState { .. })
     ));
     build
         .abort_with_budget(&mut AssetLoadBudget::default())

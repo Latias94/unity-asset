@@ -220,42 +220,43 @@ impl GenerationBuild {
     pub(crate) fn write_source_state(
         &self,
         snapshot: &SourceStateSnapshot,
-        limits: SourceStateLimits,
-    ) -> Result<(), SourceStateError> {
-        snapshot.validate_limits(limits)?;
+    ) -> Result<(), GenerationStoreError> {
+        let limits = SourceStateLimits::default();
+        snapshot
+            .validate_limits(limits)
+            .map_err(|source| invalid_source_state(&self.directory, source))?;
         let directory = self.source_state_directory();
-        ensure_existing_directory_no_follow(&directory).map_err(SourceStateError::store)?;
+        ensure_existing_directory_no_follow(&directory)?;
         let path = directory.join(SOURCE_STATE_FILE);
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .map_err(|source| {
-                SourceStateError::store(GenerationStoreError::io(
-                    "create source state",
-                    path.clone(),
-                    source,
-                ))
+                GenerationStoreError::io("create source state", path.clone(), source)
             })?;
         let mut writer = SizeLimitedWriter::new(BufWriter::new(file), limits.max_encoded_bytes);
         let encoded = serde_json::to_writer(&mut writer, snapshot);
         if let Some(actual) = writer.rejected_bytes() {
-            return Err(SourceStateError::EncodedTooLarge {
-                actual,
-                maximum: limits.max_encoded_bytes,
-            });
+            return Err(invalid_source_state(
+                &self.directory,
+                SourceStateError::EncodedTooLarge {
+                    actual,
+                    maximum: limits.max_encoded_bytes,
+                },
+            ));
         }
-        encoded.map_err(SourceStateError::Json)?;
-        writer.flush().map_err(|source| {
-            SourceStateError::store(GenerationStoreError::io(
-                "flush source state",
-                path.clone(),
-                source,
-            ))
+        encoded.map_err(|source| {
+            invalid_source_state(&self.directory, SourceStateError::Json(source))
         })?;
-        writer.inner().get_ref().sync_all().map_err(|source| {
-            SourceStateError::store(GenerationStoreError::io("sync source state", path, source))
-        })
+        writer.flush().map_err(|source| {
+            GenerationStoreError::io("flush source state", path.clone(), source)
+        })?;
+        writer
+            .inner()
+            .get_ref()
+            .sync_all()
+            .map_err(|source| GenerationStoreError::io("sync source state", path, source))
     }
 
     fn cleanup_directory_with_budget(
@@ -462,104 +463,114 @@ impl GenerationSnapshot {
     pub(crate) fn load_source_state(
         &self,
         budget: &mut AssetLoadBudget,
+    ) -> Result<SourceStateSnapshot, GenerationStoreError> {
+        self.load_source_state_with_limits(budget, SourceStateLimits::default())
+    }
+
+    fn load_source_state_with_limits(
+        &self,
+        budget: &mut AssetLoadBudget,
         limits: SourceStateLimits,
-    ) -> Result<SourceStateSnapshot, SourceStateError> {
+    ) -> Result<SourceStateSnapshot, GenerationStoreError> {
         let directory = self.source_state_directory();
         let generation = SecureReadDirectory::open(&self.directory, OpenPolicy::PersistedState)
             .map_err(|source| {
-                SourceStateError::store(persisted_read_error(
+                persisted_read_error(
                     "open generation for source-state load",
                     self.directory.clone(),
                     source,
-                ))
+                )
             })?;
         let generation_identity = generation.stable_identity().map_err(|source| {
-            SourceStateError::store(persisted_read_error(
+            persisted_read_error(
                 "capture generation identity for source-state load",
                 self.directory.clone(),
                 source,
-            ))
+            )
         })?;
         let measured_directory = generation
             .open_directory(OsStr::new(SOURCE_STATE_ARTIFACT_DIRECTORY))
             .map_err(|source| {
-                SourceStateError::store(persisted_read_error(
+                persisted_read_error(
                     "open source-state directory for evidence measurement",
                     directory.clone(),
                     source,
-                ))
+                )
             })?;
         let source_state_identity = measured_directory.stable_identity().map_err(|source| {
-            SourceStateError::store(persisted_read_error(
+            persisted_read_error(
                 "capture source-state directory identity",
                 directory.clone(),
                 source,
-            ))
+            )
         })?;
-        let actual = measure_anchored_artifact_tree(&directory, measured_directory, budget)
-            .map_err(SourceStateError::from_load_error)?;
+        let actual = measure_anchored_artifact_tree(&directory, measured_directory, budget)?;
         let expected = self.manifest.artifacts().source_state();
         if actual != expected {
-            return Err(SourceStateError::PhysicalEvidenceMismatch { expected, actual });
+            return Err(invalid_source_state(
+                &self.directory,
+                SourceStateError::PhysicalEvidenceMismatch { expected, actual },
+            ));
         }
         let opened_directory = generation
             .open_directory(OsStr::new(SOURCE_STATE_ARTIFACT_DIRECTORY))
             .map_err(|source| {
-                SourceStateError::store(persisted_read_error(
+                persisted_read_error(
                     "reopen source-state directory for parsing",
                     directory.clone(),
                     source,
-                ))
+                )
             })?;
         opened_directory
             .ensure_identity(source_state_identity)
             .map_err(|source| {
-                SourceStateError::store(persisted_read_error(
+                persisted_read_error(
                     "revalidate source-state directory before parsing",
                     directory.clone(),
                     source,
-                ))
+                )
             })?;
         let snapshot =
             read_source_state_snapshot_in(&opened_directory, &directory, budget, limits)?;
         opened_directory
             .ensure_identity(source_state_identity)
             .map_err(|source| {
-                SourceStateError::store(persisted_read_error(
+                persisted_read_error(
                     "revalidate source-state directory after parsing",
                     directory.clone(),
                     source,
-                ))
+                )
             })?;
         generation
             .ensure_identity(generation_identity)
             .map_err(|source| {
-                SourceStateError::store(persisted_read_error(
+                persisted_read_error(
                     "revalidate generation after source-state load",
                     self.directory.clone(),
                     source,
-                ))
+                )
             })?;
         let rebound_generation =
             SecureReadDirectory::open(&self.directory, OpenPolicy::PersistedState).map_err(
                 |source| {
-                    SourceStateError::store(persisted_read_error(
+                    persisted_read_error(
                         "reopen generation after source-state load",
                         self.directory.clone(),
                         source,
-                    ))
+                    )
                 },
             )?;
         rebound_generation
             .ensure_identity(generation_identity)
             .map_err(|source| {
-                SourceStateError::store(persisted_read_error(
+                persisted_read_error(
                     "rebind generation after source-state load",
                     self.directory.clone(),
                     source,
-                ))
+                )
             })?;
-        validate_source_state_manifest(&snapshot, &self.manifest)?;
+        validate_source_state_manifest(&snapshot, &self.manifest)
+            .map_err(|source| invalid_source_state(&self.directory, source))?;
         Ok(snapshot)
     }
 }
@@ -569,14 +580,14 @@ fn read_source_state_snapshot(
     directory: &Path,
     budget: &mut AssetLoadBudget,
     limits: SourceStateLimits,
-) -> Result<SourceStateSnapshot, SourceStateError> {
+) -> Result<SourceStateSnapshot, GenerationStoreError> {
     let opened_directory = SecureReadDirectory::open(directory, OpenPolicy::PersistedState)
         .map_err(|source| {
-            SourceStateError::store(persisted_read_error(
+            persisted_read_error(
                 "open source-state directory",
                 directory.to_path_buf(),
                 source,
-            ))
+            )
         })?;
     read_source_state_snapshot_in(&opened_directory, directory, budget, limits)
 }
@@ -586,114 +597,120 @@ fn read_source_state_snapshot_in(
     directory_path: &Path,
     budget: &mut AssetLoadBudget,
     limits: SourceStateLimits,
-) -> Result<SourceStateSnapshot, SourceStateError> {
+) -> Result<SourceStateSnapshot, GenerationStoreError> {
     let path = directory_path.join(SOURCE_STATE_FILE);
     let mut file = directory
         .open_regular(OsStr::new(SOURCE_STATE_FILE))
-        .map_err(|source| {
-            SourceStateError::store(persisted_read_error(
-                "open source state",
-                path.clone(),
-                source,
-            ))
-        })?;
+        .map_err(|source| persisted_read_error("open source state", path.clone(), source))?;
     let encoded_length = file.length();
     if encoded_length > limits.max_encoded_bytes {
-        return Err(SourceStateError::EncodedTooLarge {
-            actual: encoded_length,
-            maximum: limits.max_encoded_bytes,
-        });
+        return Err(classify_source_state_file_error(
+            &path,
+            SourceStateError::EncodedTooLarge {
+                actual: encoded_length,
+                maximum: limits.max_encoded_bytes,
+            },
+        ));
     }
 
     let read_limit = encoded_length
         .checked_add(1)
         .ok_or(SourceStateError::SizeOverflow {
             resource: "source state read limit",
-        })?;
+        })
+        .map_err(|source| classify_source_state_file_error(&path, source))?;
     budget
         .check_bytes(read_limit)
-        .map_err(|source| SourceStateError::Budget(BudgetedJsonError::Budget(source)))?;
+        .map_err(GenerationStoreError::Budget)?;
     budget
         .consume_bytes(read_limit)
-        .map_err(|source| SourceStateError::Budget(BudgetedJsonError::Budget(source)))?;
-    let capacity = usize::try_from(read_limit).map_err(|_| SourceStateError::SizeOverflow {
-        resource: "source state read buffer",
-    })?;
+        .map_err(GenerationStoreError::Budget)?;
+    let capacity = usize::try_from(read_limit)
+        .map_err(|_| SourceStateError::SizeOverflow {
+            resource: "source state read buffer",
+        })
+        .map_err(|source| classify_source_state_file_error(&path, source))?;
     let mut encoded = Vec::new();
     encoded
         .try_reserve_exact(capacity)
-        .map_err(|error| SourceStateError::AllocationFailed {
+        .map_err(|_| GenerationStoreError::AllocationFailed {
+            resource: "source state encoded bytes",
             requested: capacity,
-            message: error.to_string(),
         })?;
     Read::by_ref(file.file_mut())
         .take(read_limit)
         .read_to_end(&mut encoded)
-        .map_err(|source| {
-            SourceStateError::store(GenerationStoreError::io(
-                "read source state",
-                path.clone(),
-                source,
-            ))
-        })?;
-    file.ensure_unchanged().map_err(|source| {
-        SourceStateError::store(persisted_read_error(
-            "revalidate source state",
-            path.clone(),
-            source,
-        ))
-    })?;
-    let actual = u64::try_from(encoded.len()).map_err(|_| SourceStateError::SizeOverflow {
-        resource: "source state encoded length",
-    })?;
+        .map_err(|source| GenerationStoreError::io("read source state", path.clone(), source))?;
+    file.ensure_unchanged()
+        .map_err(|source| persisted_read_error("revalidate source state", path.clone(), source))?;
+    let actual = u64::try_from(encoded.len())
+        .map_err(|_| SourceStateError::SizeOverflow {
+            resource: "source state encoded length",
+        })
+        .map_err(|source| classify_source_state_file_error(&path, source))?;
     if actual > limits.max_encoded_bytes {
-        return Err(SourceStateError::EncodedTooLarge {
-            actual,
-            maximum: limits.max_encoded_bytes,
-        });
+        return Err(classify_source_state_file_error(
+            &path,
+            SourceStateError::EncodedTooLarge {
+                actual,
+                maximum: limits.max_encoded_bytes,
+            },
+        ));
     }
     if actual != encoded_length {
-        return Err(SourceStateError::EncodedLengthChanged {
-            expected: encoded_length,
-            actual,
-        });
+        return Err(classify_source_state_file_error(
+            &path,
+            SourceStateError::EncodedLengthChanged {
+                expected: encoded_length,
+                actual,
+            },
+        ));
     }
 
-    let structure = scan_json_structure(&encoded)?;
-    let owned_allocation = source_state_owned_allocation_bound(structure)?;
+    let structure = scan_json_structure(&encoded)
+        .map_err(|source| classify_source_state_file_error(&path, source))?;
+    let owned_allocation = source_state_owned_allocation_bound(structure)
+        .map_err(|source| classify_source_state_file_error(&path, source))?;
     budget
         .check_entries(structure.array_entries)
-        .map_err(|source| SourceStateError::Budget(BudgetedJsonError::Budget(source)))?;
+        .map_err(GenerationStoreError::Budget)?;
     budget
         .check_members(structure.object_members)
-        .map_err(|source| SourceStateError::Budget(BudgetedJsonError::Budget(source)))?;
+        .map_err(GenerationStoreError::Budget)?;
     budget
         .check_depth(structure.max_depth)
-        .map_err(|source| SourceStateError::Budget(BudgetedJsonError::Budget(source)))?;
+        .map_err(GenerationStoreError::Budget)?;
     budget
         .check_bytes(owned_allocation)
-        .map_err(|source| SourceStateError::Budget(BudgetedJsonError::Budget(source)))?;
+        .map_err(GenerationStoreError::Budget)?;
     budget
         .consume_entries(structure.array_entries)
-        .map_err(|source| SourceStateError::Budget(BudgetedJsonError::Budget(source)))?;
+        .map_err(GenerationStoreError::Budget)?;
     budget
         .consume_members(structure.object_members)
-        .map_err(|source| SourceStateError::Budget(BudgetedJsonError::Budget(source)))?;
+        .map_err(GenerationStoreError::Budget)?;
     budget
         .observe_depth(structure.max_depth)
-        .map_err(|source| SourceStateError::Budget(BudgetedJsonError::Budget(source)))?;
+        .map_err(GenerationStoreError::Budget)?;
     budget
         .consume_bytes(owned_allocation)
-        .map_err(|source| SourceStateError::Budget(BudgetedJsonError::Budget(source)))?;
-    let snapshot: SourceStateSnapshot =
-        serde_json::from_slice(&encoded).map_err(SourceStateError::Json)?;
-    snapshot.validate_limits(limits)?;
-    let semantic_entries = source_state_entry_count(&snapshot)?;
+        .map_err(GenerationStoreError::Budget)?;
+    let snapshot: SourceStateSnapshot = serde_json::from_slice(&encoded)
+        .map_err(SourceStateError::Json)
+        .map_err(|source| classify_source_state_file_error(&path, source))?;
+    snapshot
+        .validate_limits(limits)
+        .map_err(|source| classify_source_state_file_error(&path, source))?;
+    let semantic_entries = source_state_entry_count(&snapshot)
+        .map_err(|source| classify_source_state_file_error(&path, source))?;
     if semantic_entries > structure.array_entries {
-        return Err(SourceStateError::StructuralEntryUnderestimate {
-            structural: structure.array_entries,
-            semantic: semantic_entries,
-        });
+        return Err(classify_source_state_file_error(
+            &path,
+            SourceStateError::StructuralEntryUnderestimate {
+                structural: structure.array_entries,
+                semantic: semantic_entries,
+            },
+        ));
     }
     Ok(snapshot)
 }
@@ -736,35 +753,28 @@ fn validate_persisted_source_state_in(
         source_state_directory,
         budget,
         source_limits,
-    )
-    .map_err(|error| classify_persisted_source_state_error(generation_directory, error))?;
+    )?;
     validate_source_state_manifest(&snapshot, manifest)
         .map_err(|error| classify_persisted_source_state_error(generation_directory, error))
 }
 
 fn invalid_source_state(directory: &Path, source: SourceStateError) -> GenerationStoreError {
-    GenerationStoreError::InvalidSourceState {
+    GenerationStoreError::SourceState {
         path: directory
             .join(SOURCE_STATE_ARTIFACT_DIRECTORY)
             .join(SOURCE_STATE_FILE),
-        message: source.to_string(),
+        source: Box::new(source),
     }
 }
 
-fn classify_persisted_source_state_error(
-    directory: &Path,
-    source: SourceStateError,
-) -> GenerationStoreError {
+fn classify_source_state_file_error(path: &Path, source: SourceStateError) -> GenerationStoreError {
     match source {
-        SourceStateError::Store(source) if source.is_security_violation() => *source,
         SourceStateError::Budget(BudgetedJsonError::Budget(source)) => {
             GenerationStoreError::Budget(source)
         }
         SourceStateError::Budget(source) => GenerationStoreError::ContractJson {
             artifact: "source state",
-            path: directory
-                .join(SOURCE_STATE_ARTIFACT_DIRECTORY)
-                .join(SOURCE_STATE_FILE),
+            path: path.to_path_buf(),
             source,
         },
         SourceStateError::AllocationFailed { requested, .. } => {
@@ -776,8 +786,23 @@ fn classify_persisted_source_state_error(
         SourceStateError::SizeOverflow { resource } => {
             GenerationStoreError::SizeOverflow { resource }
         }
-        source => invalid_source_state(directory, source),
+        source => GenerationStoreError::SourceState {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        },
     }
+}
+
+fn classify_persisted_source_state_error(
+    directory: &Path,
+    source: SourceStateError,
+) -> GenerationStoreError {
+    classify_source_state_file_error(
+        &directory
+            .join(SOURCE_STATE_ARTIFACT_DIRECTORY)
+            .join(SOURCE_STATE_FILE),
+        source,
+    )
 }
 
 /// Classifies non-fatal work that could not be completed around generation publication.
@@ -4137,9 +4162,9 @@ pub(crate) enum GenerationStoreError {
         expected: Box<GenerationArtifactEvidence>,
         actual: Box<GenerationArtifactEvidence>,
     },
-    InvalidSourceState {
+    SourceState {
         path: PathBuf,
-        message: String,
+        source: Box<SourceStateError>,
     },
     WorkspaceMismatch {
         expected: WorkspaceId,
@@ -4231,7 +4256,7 @@ impl GenerationStoreError {
                 | Self::PersistedArtifactTooLarge { .. }
                 | Self::ManifestGenerationMismatch { .. }
                 | Self::ArtifactEvidenceMismatch { .. }
-                | Self::InvalidSourceState { .. }
+                | Self::SourceState { .. }
         ) || matches!(
             self,
             Self::Io { source, .. }
@@ -4402,9 +4427,9 @@ impl fmt::Display for GenerationStoreError {
                 formatter,
                 "generation artifact evidence mismatch: expected {expected:?}, got {actual:?}"
             ),
-            Self::InvalidSourceState { path, message } => write!(
+            Self::SourceState { path, source } => write!(
                 formatter,
-                "invalid generation source state at {}: {message}",
+                "invalid generation source state at {}: {source}",
                 path.display()
             ),
             Self::WorkspaceMismatch { expected, actual } => write!(
@@ -4452,6 +4477,7 @@ impl Error for GenerationStoreError {
             Self::Json { source, .. } => Some(source),
             Self::ContractJson { source, .. } => Some(source),
             Self::Budget(source) => Some(source),
+            Self::SourceState { source, .. } => Some(source.as_ref()),
             Self::QuarantineRollbackFailed { primary, .. }
             | Self::ActivationPreCommitCleanupFailed { primary, .. } => Some(primary.as_ref()),
             _ => None,
@@ -4776,9 +4802,7 @@ mod generation_store_tests {
             Vec::new(),
         )
         .unwrap();
-        build
-            .write_source_state(&source_state, SourceStateLimits::default())
-            .unwrap();
+        build.write_source_state(&source_state).unwrap();
         let evidence = store.measure_artifacts(&build).unwrap();
         let identity = SearchGenerationIdentityV1::new(
             workspace,

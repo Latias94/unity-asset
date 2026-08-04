@@ -18,8 +18,6 @@ use crate::analysis::{
 };
 use crate::generation::{ArtifactTreeEvidence, SearchGenerationManifestV1};
 
-use super::GenerationStoreError;
-
 const SOURCE_STATE_CONTRACT_VERSION: u16 = 1;
 const MAX_SOURCE_STATE_ASSETS: usize = 1_000_000;
 const MAX_SOURCE_STATE_SCAN_HINTS: usize = 1_000_000;
@@ -1255,7 +1253,6 @@ pub(super) fn source_state_owned_allocation_bound(
 
 #[derive(Debug)]
 pub(crate) enum SourceStateError {
-    Store(Box<GenerationStoreError>),
     Budget(BudgetedJsonError),
     Json(serde_json::Error),
     Digest(DigestBuildError),
@@ -1355,23 +1352,9 @@ pub(crate) enum SourceStateError {
     },
 }
 
-impl SourceStateError {
-    pub(super) fn store(error: GenerationStoreError) -> Self {
-        Self::Store(Box::new(error))
-    }
-
-    pub(super) fn from_load_error(error: GenerationStoreError) -> Self {
-        match error {
-            GenerationStoreError::Budget(source) => Self::Budget(BudgetedJsonError::Budget(source)),
-            error => Self::store(error),
-        }
-    }
-}
-
 impl fmt::Display for SourceStateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Store(error) => fmt::Display::fmt(error, formatter),
             Self::Budget(error) => fmt::Display::fmt(error, formatter),
             Self::Json(error) => write!(formatter, "invalid source state JSON: {error}"),
             Self::Digest(error) => write!(formatter, "failed to digest source state: {error}"),
@@ -1504,7 +1487,6 @@ impl fmt::Display for SourceStateError {
 impl Error for SourceStateError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Store(error) => Some(error.as_ref()),
             Self::Budget(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Digest(error) => Some(error),
@@ -1933,7 +1915,7 @@ mod source_state_tests {
 
         assert!(matches!(
             read_source_state_snapshot(temporary.path(), &mut budget, limits),
-            Err(SourceStateError::Budget(BudgetedJsonError::Budget(_)))
+            Err(GenerationStoreError::Budget(_))
         ));
     }
 
@@ -1968,7 +1950,7 @@ mod source_state_tests {
 
         assert!(matches!(
             read_source_state_snapshot(temporary.path(), &mut budget, limits),
-            Err(SourceStateError::Budget(BudgetedJsonError::Budget(_)))
+            Err(GenerationStoreError::Budget(_))
         ));
     }
 
@@ -1998,7 +1980,7 @@ mod source_state_tests {
         };
         assert!(matches!(
             read_source_state_snapshot(temporary.path(), &mut budget, limits),
-            Err(SourceStateError::Budget(BudgetedJsonError::Budget(_)))
+            Err(GenerationStoreError::Budget(_))
         ));
 
         let sufficient_limits = AssetLoadLimits {
@@ -2008,7 +1990,8 @@ mod source_state_tests {
         let mut sufficient_budget = AssetLoadBudget::new(sufficient_limits).unwrap();
         assert!(matches!(
             read_source_state_snapshot(temporary.path(), &mut sufficient_budget, limits),
-            Err(SourceStateError::Json(_))
+            Err(GenerationStoreError::SourceState { source, .. })
+                if matches!(source.as_ref(), SourceStateError::Json(_))
         ));
     }
 
@@ -2025,9 +2008,7 @@ mod source_state_tests {
         )
         .unwrap();
         let mut build = store.begin().unwrap();
-        build
-            .write_source_state(&snapshot, SourceStateLimits::default())
-            .unwrap();
+        build.write_source_state(&snapshot).unwrap();
         let evidence = store.measure_artifacts(&build).unwrap();
         let identity = SearchGenerationIdentityV1::new(
             workspace,
@@ -2053,7 +2034,7 @@ mod source_state_tests {
         let reopened = store
             .active()
             .unwrap()
-            .load_source_state(&mut budget, SourceStateLimits::default())
+            .load_source_state(&mut budget)
             .unwrap();
         assert_eq!(reopened, snapshot);
 
@@ -2063,11 +2044,8 @@ mod source_state_tests {
         };
         let mut low_budget = AssetLoadBudget::new(low_limits).unwrap();
         assert!(matches!(
-            store
-                .active()
-                .unwrap()
-                .load_source_state(&mut low_budget, SourceStateLimits::default()),
-            Err(SourceStateError::Budget(BudgetedJsonError::Budget(_)))
+            store.active().unwrap().load_source_state(&mut low_budget),
+            Err(GenerationStoreError::Budget(_))
         ));
 
         let low_entry_limits = AssetLoadLimits {
@@ -2079,8 +2057,8 @@ mod source_state_tests {
             store
                 .active()
                 .unwrap()
-                .load_source_state(&mut low_entry_budget, SourceStateLimits::default()),
-            Err(SourceStateError::Budget(BudgetedJsonError::Budget(_)))
+                .load_source_state(&mut low_entry_budget),
+            Err(GenerationStoreError::Budget(_))
         ));
 
         let low_member_limits = AssetLoadLimits {
@@ -2092,8 +2070,8 @@ mod source_state_tests {
             store
                 .active()
                 .unwrap()
-                .load_source_state(&mut low_member_budget, SourceStateLimits::default()),
-            Err(SourceStateError::Budget(BudgetedJsonError::Budget(_)))
+                .load_source_state(&mut low_member_budget),
+            Err(GenerationStoreError::Budget(_))
         ));
 
         let mut entry_budget = AssetLoadBudget::new(AssetLoadLimits::default()).unwrap();
@@ -2105,11 +2083,15 @@ mod source_state_tests {
             store
                 .active()
                 .unwrap()
-                .load_source_state(&mut entry_budget, entry_limits),
-            Err(SourceStateError::CollectionTooLarge {
-                collection: "assets",
-                ..
-            })
+                .load_source_state_with_limits(&mut entry_budget, entry_limits),
+            Err(GenerationStoreError::SourceState { source, .. })
+                if matches!(
+                    source.as_ref(),
+                    SourceStateError::CollectionTooLarge {
+                        collection: "assets",
+                        ..
+                    }
+                )
         ));
 
         fs::write(
@@ -2126,8 +2108,9 @@ mod source_state_tests {
             store
                 .active()
                 .unwrap()
-                .load_source_state(&mut tamper_budget, SourceStateLimits::default()),
-            Err(SourceStateError::PhysicalEvidenceMismatch { .. })
+                .load_source_state(&mut tamper_budget),
+            Err(GenerationStoreError::SourceState { source, .. })
+                if matches!(source.as_ref(), SourceStateError::PhysicalEvidenceMismatch { .. })
         ));
     }
 }

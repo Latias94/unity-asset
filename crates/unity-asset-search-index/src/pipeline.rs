@@ -45,8 +45,8 @@ use crate::generation_store::GenerationFailpoint;
 use crate::generation_store::{
     GenerationBuild, GenerationDiskEstimate, GenerationPublishWarning,
     GenerationPublishWarningKind, GenerationSnapshot, GenerationStore, GenerationStoreError,
-    GenerationStoreOptions, SourceScanHint, SourceStateError, SourceStateLimits,
-    SourceStateSnapshot, TransactionReceiptMembership, TransactionReceiptWindow,
+    GenerationStoreOptions, SourceScanHint, SourceStateError, SourceStateSnapshot,
+    TransactionReceiptMembership, TransactionReceiptWindow,
 };
 use crate::path_semantics::compare_portable_paths;
 use crate::projection::{
@@ -359,7 +359,7 @@ impl SearchGenerationPipeline {
         let recovered = store.active().cloned();
         let source_state = recovered
             .as_ref()
-            .map(|snapshot| snapshot.load_source_state(budget, SourceStateLimits::default()))
+            .map(|snapshot| snapshot.load_source_state(budget))
             .transpose()?;
         let workspace = match source_state.as_ref() {
             Some(state) => {
@@ -1529,7 +1529,7 @@ impl SearchGenerationPipeline {
         let staged = (|| -> Result<_, PipelineError> {
             let projection_evidence = ProjectionStore::build(build.directory(), &projection)
                 .map_err(PipelineError::Projection)?;
-            build.write_source_state(&source_state, SourceStateLimits::default())?;
+            build.write_source_state(&source_state)?;
 
             {
                 let readers = ProjectionReaders::open(build.directory(), budget)
@@ -3620,15 +3620,6 @@ impl PipelineError {
             {
                 ApiErrorCode::Busy
             }
-            Self::SourceState(error)
-                if matches!(
-                    error.as_ref(),
-                    SourceStateError::Store(store_error)
-                        if matches!(store_error.as_ref(), GenerationStoreError::WriterLeaseUnavailable { .. })
-                ) =>
-            {
-                ApiErrorCode::Busy
-            }
             Self::SourceHierarchyCycle(_)
             | Self::UnknownWorkspaceSource(_)
             | Self::CachedWorkspaceSourceUnavailable(_)
@@ -3668,12 +3659,6 @@ impl PipelineError {
                 WorkspaceError::Io { .. } | WorkspaceError::SourceChanged { .. }
             ),
             Self::Store(error) => error.is_retryable(),
-            Self::SourceState(error) => matches!(
-                error.as_ref(),
-                SourceStateError::Store(
-                    store_error
-                ) if store_error.is_retryable()
-            ),
             Self::WorkspaceMismatch { .. }
             | Self::ViewRevisionMismatch { .. }
             | Self::RevisionBarrierMismatch { .. }
@@ -3696,6 +3681,7 @@ impl PipelineError {
             | Self::Diagnostic(_)
             | Self::ReferenceGraph(_)
             | Self::Analysis(_)
+            | Self::SourceState(_)
             | Self::Manifest(_)
             | Self::Json(_) => false,
         }
