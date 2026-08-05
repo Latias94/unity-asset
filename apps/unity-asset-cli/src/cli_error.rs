@@ -51,6 +51,7 @@ pub(crate) enum CliErrorCode {
     ExportResourceLimit,
     ExportResumeMismatch,
     ExportOutputInvalid,
+    ExportRecoveryRequired,
     ExportExecutionFailed,
 }
 
@@ -92,6 +93,7 @@ impl CliErrorCode {
             Self::ExportResourceLimit => "CLI_EXPORT_RESOURCE_LIMIT",
             Self::ExportResumeMismatch => "CLI_EXPORT_RESUME_MISMATCH",
             Self::ExportOutputInvalid => "CLI_EXPORT_OUTPUT_INVALID",
+            Self::ExportRecoveryRequired => "CLI_EXPORT_RECOVERY_REQUIRED",
             Self::ExportExecutionFailed => "CLI_EXPORT_EXECUTION_FAILED",
         }
     }
@@ -137,6 +139,7 @@ impl CliErrorCode {
             Self::ExportResourceLimit => "export exceeded an execution resource limit",
             Self::ExportResumeMismatch => "resume evidence does not match the export plan",
             Self::ExportOutputInvalid => "export output layout is invalid or unavailable",
+            Self::ExportRecoveryRequired => "export publication requires recovery",
             Self::ExportExecutionFailed => "export execution failed",
         }
     }
@@ -439,30 +442,13 @@ pub(crate) fn mark_export_workspace_load_error(
     }
 }
 
-pub(crate) fn mark_export_reference_graph_error(error: ReferenceGraphError) -> anyhow::Error {
-    let (code, details) = match &error {
-        ReferenceGraphError::Budget(source)
-        | ReferenceGraphError::Workspace(WorkspaceError::Budget(source)) => (
-            CliErrorCode::ExportBudgetExceeded,
-            json!({
-                "kind": "budget_exceeded",
-                "budget": budget_details(source),
-            }),
-        ),
-        ReferenceGraphError::Workspace(_) => (
-            CliErrorCode::ExportSourceChanged,
-            json!({ "kind": "reference_graph_source_failed" }),
-        ),
-        _ => (
-            CliErrorCode::ExportPlanRejected,
-            json!({ "kind": "reference_graph_rejected" }),
-        ),
-    };
+pub(crate) fn mark_export_plan_error(error: ExtractionPlanError) -> anyhow::Error {
+    let (code, details) = export_plan_error_metadata(&error);
     mark(error, code, Some(details))
 }
 
-pub(crate) fn mark_export_plan_error(error: ExtractionPlanError) -> anyhow::Error {
-    let (code, details) = match &error {
+fn export_plan_error_metadata(error: &ExtractionPlanError) -> (CliErrorCode, Value) {
+    match error {
         ExtractionPlanError::Budget(source)
         | ExtractionPlanError::Workspace(WorkspaceError::Budget(source)) => (
             CliErrorCode::ExportBudgetExceeded,
@@ -526,6 +512,17 @@ pub(crate) fn mark_export_plan_error(error: ExtractionPlanError) -> anyhow::Erro
                 "kind": "representation_unavailable",
                 "address": address,
                 "diagnostic": reason,
+            }),
+        ),
+        ExtractionPlanError::ExecutionCapabilityUnavailable {
+            ordinal,
+            capability,
+        } => (
+            CliErrorCode::ExportRepresentationUnavailable,
+            json!({
+                "kind": "execution_capability_unavailable",
+                "ordinal": ordinal,
+                "capability": capability,
             }),
         ),
         ExtractionPlanError::ObjectUnloaded(address) => (
@@ -597,12 +594,44 @@ pub(crate) fn mark_export_plan_error(error: ExtractionPlanError) -> anyhow::Erro
                 "source_length": source_len,
             }),
         ),
+        ExtractionPlanError::Reference(source) => reference_plan_error_metadata(source),
+        ExtractionPlanError::PlanDerivationMismatch { kind } => (
+            CliErrorCode::ExportPlanRejected,
+            json!({
+                "kind": "plan_derivation_mismatch",
+                "mismatch": kind.to_string(),
+            }),
+        ),
+        ExtractionPlanError::Model(_) | ExtractionPlanError::ModelValidation(_) => (
+            CliErrorCode::ExportPlanRejected,
+            json!({ "kind": "plan_rejected" }),
+        ),
         _ => (
             CliErrorCode::ExportPlanRejected,
             json!({ "kind": "plan_rejected" }),
         ),
-    };
-    mark(error, code, Some(details))
+    }
+}
+
+fn reference_plan_error_metadata(error: &ReferenceGraphError) -> (CliErrorCode, Value) {
+    match error {
+        ReferenceGraphError::Budget(source)
+        | ReferenceGraphError::Workspace(WorkspaceError::Budget(source)) => (
+            CliErrorCode::ExportBudgetExceeded,
+            json!({
+                "kind": "budget_exceeded",
+                "budget": budget_details(source),
+            }),
+        ),
+        ReferenceGraphError::Workspace(_) => (
+            CliErrorCode::ExportSourceChanged,
+            json!({ "kind": "reference_graph_source_failed" }),
+        ),
+        _ => (
+            CliErrorCode::ExportPlanRejected,
+            json!({ "kind": "reference_graph_rejected" }),
+        ),
+    }
 }
 
 #[cfg(feature = "decode")]
@@ -655,6 +684,7 @@ pub(crate) fn mark_export_execution_error(error: ExtractionExecutionError) -> an
                 "budget": budget_details(source),
             }),
         ),
+        ExtractionExecutionError::PlanVerification(source) => export_plan_error_metadata(source),
         ExtractionExecutionError::Allocation {
             resource,
             requested,
@@ -758,6 +788,43 @@ pub(crate) fn mark_export_execution_error(error: ExtractionExecutionError) -> an
         ExtractionExecutionError::OutputLayout { kind, .. } => (
             CliErrorCode::ExportOutputInvalid,
             json!({ "kind": kind.as_str() }),
+        ),
+        ExtractionExecutionError::PublicationJournalInvalid { .. } => (
+            CliErrorCode::ExportRecoveryRequired,
+            json!({ "kind": "publication_journal_invalid" }),
+        ),
+        ExtractionExecutionError::PublicationJournalLimitExceeded { required, limit } => (
+            CliErrorCode::ExportResourceLimit,
+            json!({
+                "kind": "publication_journal_limit_exceeded",
+                "required": required,
+                "limit": limit,
+            }),
+        ),
+        ExtractionExecutionError::EvidenceVerificationLimitExceeded {
+            required,
+            remaining,
+        } => (
+            CliErrorCode::ExportResourceLimit,
+            json!({
+                "kind": "evidence_verification_limit_exceeded",
+                "required": required,
+                "remaining": remaining,
+            }),
+        ),
+        ExtractionExecutionError::PublicationJournalConflict { reason } => (
+            CliErrorCode::ExportRecoveryRequired,
+            json!({
+                "kind": "publication_journal_conflict",
+                "reason": reason,
+            }),
+        ),
+        ExtractionExecutionError::PublicationRecoveryRequired { stage } => (
+            CliErrorCode::ExportRecoveryRequired,
+            json!({
+                "kind": "publication_recovery_required",
+                "stage": stage,
+            }),
         ),
         _ => (
             CliErrorCode::ExportExecutionFailed,
@@ -1044,6 +1111,76 @@ mod tests {
     }
 
     #[test]
+    fn reference_graph_budgets_remain_budget_errors_during_plan_verification() {
+        for nested_workspace in [false, true] {
+            let make_plan_error = || {
+                let source = BudgetError::Exceeded {
+                    resource: "reference nodes",
+                    limit: 4,
+                    requested: 5,
+                };
+                if nested_workspace {
+                    ExtractionPlanError::Reference(Box::new(ReferenceGraphError::Workspace(
+                        WorkspaceError::Budget(source),
+                    )))
+                } else {
+                    ExtractionPlanError::Reference(Box::new(ReferenceGraphError::Budget(source)))
+                }
+            };
+
+            for error in [
+                mark_export_plan_error(make_plan_error()),
+                mark_export_execution_error(ExtractionExecutionError::PlanVerification(Box::new(
+                    make_plan_error(),
+                ))),
+            ] {
+                let (code, details) = report_parts(&error);
+                let details = details.expect("typed nested budget details");
+
+                assert_eq!(code, "CLI_EXPORT_BUDGET_EXCEEDED");
+                assert_eq!(details["kind"], "budget_exceeded");
+                assert_eq!(details["budget"]["kind"], "exceeded");
+                assert_eq!(details["budget"]["resource"], "reference nodes");
+            }
+        }
+    }
+
+    #[test]
+    fn plan_verification_preserves_plan_rejection_categories() {
+        let mismatch = mark_export_execution_error(ExtractionExecutionError::PlanVerification(
+            Box::new(ExtractionPlanError::PlanDerivationMismatch {
+                kind: unity_asset::extraction::ExtractionPlanMismatchKind::Artifacts,
+            }),
+        ));
+        let (code, details) = report_parts(&mismatch);
+        let details = details.expect("typed derivation mismatch details");
+        assert_eq!(code, "CLI_EXPORT_PLAN_REJECTED");
+        assert_eq!(details["kind"], "plan_derivation_mismatch");
+        assert_eq!(details["mismatch"], "artifact contracts");
+
+        let model =
+            mark_export_execution_error(ExtractionExecutionError::PlanVerification(Box::new(
+                ExtractionPlanError::Model("fixture model rejection".to_owned()),
+            )));
+        let (code, details) = report_parts(&model);
+        assert_eq!(code, "CLI_EXPORT_PLAN_REJECTED");
+        assert_eq!(details.unwrap()["kind"], "plan_rejected");
+
+        let unavailable = mark_export_execution_error(ExtractionExecutionError::PlanVerification(
+            Box::new(ExtractionPlanError::ExecutionCapabilityUnavailable {
+                ordinal: 3,
+                capability: "media decode",
+            }),
+        ));
+        let (code, details) = report_parts(&unavailable);
+        let details = details.expect("typed execution capability details");
+        assert_eq!(code, "CLI_EXPORT_REPRESENTATION_UNAVAILABLE");
+        assert_eq!(details["kind"], "execution_capability_unavailable");
+        assert_eq!(details["ordinal"], 3);
+        assert_eq!(details["capability"], "media decode");
+    }
+
+    #[test]
     fn media_execution_failures_preserve_the_artifact_and_failure_kind() {
         for (error, expected_kind) in [
             (
@@ -1063,6 +1200,23 @@ mod tests {
             assert_eq!(details["kind"], expected_kind);
             assert_eq!(details["ordinal"], 7);
         }
+    }
+
+    #[test]
+    fn evidence_verification_limit_remains_a_resource_error() {
+        let error = mark_export_execution_error(
+            ExtractionExecutionError::EvidenceVerificationLimitExceeded {
+                required: 8,
+                remaining: 7,
+            },
+        );
+        let (code, details) = report_parts(&error);
+        let details = details.expect("typed physical verification details");
+
+        assert_eq!(code, "CLI_EXPORT_RESOURCE_LIMIT");
+        assert_eq!(details["kind"], "evidence_verification_limit_exceeded");
+        assert_eq!(details["required"], 8);
+        assert_eq!(details["remaining"], 7);
     }
 
     #[cfg(feature = "decode")]
@@ -1200,26 +1354,6 @@ mod tests {
         assert_eq!(details["base_installation"], json!(base));
         assert_eq!(details["committed_installation"], json!(committed));
         assert_eq!(details["actual_installation"], json!(actual));
-    }
-
-    #[test]
-    fn export_reference_graph_errors_preserve_machine_categories() {
-        let rejected = mark_export_reference_graph_error(ReferenceGraphError::Invariant(
-            "fixture reference invariant",
-        ));
-        let (code, details) = report_parts(&rejected);
-        assert_eq!(code, "CLI_EXPORT_PLAN_REJECTED");
-        assert_eq!(details.unwrap()["kind"], "reference_graph_rejected");
-
-        let budget =
-            mark_export_reference_graph_error(ReferenceGraphError::Budget(BudgetError::Exceeded {
-                resource: "entries",
-                limit: 4,
-                requested: 5,
-            }));
-        let (code, details) = report_parts(&budget);
-        assert_eq!(code, "CLI_EXPORT_BUDGET_EXCEEDED");
-        assert_eq!(details.unwrap()["kind"], "budget_exceeded");
     }
 
     #[cfg(unix)]

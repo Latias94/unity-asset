@@ -94,7 +94,7 @@ fn request_json_rejects_structure_beyond_its_contract_profile() {
 #[test]
 fn request_json_rejects_unknown_versions_and_fields() {
     let encoded = String::from_utf8(request().canonical_json().unwrap()).unwrap();
-    let unknown_version = encoded.replacen("\"version\":1", "\"version\":2", 1);
+    let unknown_version = encoded.replacen("\"version\":2", "\"version\":3", 1);
     assert!(
         ExtractionRequest::read_json(unknown_version.as_bytes(), &mut AssetLoadBudget::default(),)
             .is_err()

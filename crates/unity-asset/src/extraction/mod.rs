@@ -12,6 +12,7 @@ mod json_contract;
 mod manifest;
 mod model;
 mod planning_contract;
+mod publication;
 mod representation;
 mod selection;
 #[cfg(all(test, feature = "decode"))]
@@ -89,10 +90,11 @@ pub use manifest::{
 pub use model::{
     EXTRACTION_MANIFEST_VERSION, EXTRACTION_PLAN_CONTRACT, EXTRACTION_PLAN_VERSION,
     EXTRACTION_REPORT_VERSION, EXTRACTION_REQUEST_CONTRACT, EXTRACTION_REQUEST_VERSION,
-    ExtractionFilter, ExtractionModelError, ExtractionPlan, ExtractionRequest, ExtractionSelection,
-    PlannedArtifact,
+    ExtractionFilter, ExtractionModelError, ExtractionPlan, ExtractionReferenceDirection,
+    ExtractionReferenceTraversalLimits, ExtractionRequest, ExtractionSelection,
+    ExtractionSelectionWitness, PlannedArtifact,
 };
-pub use planning_contract::ExtractionPlanError;
+pub use planning_contract::{ExtractionPlanError, ExtractionPlanMismatchKind};
 pub use selection::ExtractionPlanner;
 #[cfg(feature = "decode")]
 pub use unity_asset_decode::media::MediaInspectionError;

@@ -25,6 +25,8 @@ use super::super::planning_contract::{
 use super::super::planning_contract::{
     budgeted_vec, clone_string, resolve_required_handle, source_for_id,
 };
+#[cfg(feature = "decode")]
+use super::contract::PlannedStreamSource;
 use super::contract::{
     PlannedContent, PlannedFallback, RepresentationContract, RepresentationContractParts,
 };
@@ -34,6 +36,8 @@ use super::reservation::{ExtractionReservationError, raw_binary_working_set, yam
 #[cfg(feature = "decode")]
 use super::reservation::{audio_working_set, sprite_working_set_with_texture, texture_working_set};
 use crate::reference::ReferenceGraph;
+#[cfg(feature = "decode")]
+use crate::reference::ReferenceGraphBuildOptions;
 #[cfg(feature = "decode")]
 use crate::reference::{RawReferenceTarget, ReferenceResolution};
 #[cfg(feature = "decode")]
@@ -51,7 +55,7 @@ pub(in crate::extraction) struct RepresentationPlanner<'view, 'source> {
     #[cfg(feature = "decode")]
     view: &'view dyn WorkspaceView,
     #[cfg(feature = "decode")]
-    references: Option<&'view ReferenceGraph>,
+    references: Option<ReferenceGraph>,
     #[cfg(feature = "decode")]
     sources: &'source [WorkspaceSource],
     #[cfg(feature = "decode")]
@@ -63,7 +67,7 @@ pub(in crate::extraction) struct RepresentationPlanner<'view, 'source> {
 impl<'view, 'source> RepresentationPlanner<'view, 'source> {
     pub(in crate::extraction) fn new(
         view: &'view dyn WorkspaceView,
-        references: Option<&'view ReferenceGraph>,
+        references: Option<ReferenceGraph>,
         sources: &'source [WorkspaceSource],
         policy: ExtractionRepresentationPolicy,
     ) -> Self {
@@ -115,13 +119,25 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
         #[cfg(not(feature = "decode"))]
         {
             let _ = owner;
-            unavailable_choice_with(
-                address,
-                self.policy,
-                raw,
-                ExtractionDiagnosticCode::FeatureUnavailable,
-                budget,
-            )
+            if matches!(
+                binary.class_id(),
+                class_ids::AUDIO_CLIP | class_ids::TEXTURE_2D | class_ids::SPRITE
+            ) && self.policy == ExtractionRepresentationPolicy::PreferDecoded
+            {
+                return Err(ExtractionPlanError::PlanningCapabilityUnavailable {
+                    class_id: binary.class_id(),
+                    capability: "media decode",
+                });
+            }
+            let reason = if matches!(
+                binary.class_id(),
+                class_ids::AUDIO_CLIP | class_ids::TEXTURE_2D | class_ids::SPRITE
+            ) {
+                ExtractionDiagnosticCode::FeatureUnavailable
+            } else {
+                ExtractionDiagnosticCode::UnsupportedClass
+            };
+            unavailable_choice_with(address, self.policy, raw, reason, budget)
         }
 
         #[cfg(feature = "decode")]
@@ -169,14 +185,10 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
                 budget,
             );
         }
-        let (stream, stream_expectation, bytes) = if let Some(stream) = layout.payload().stream() {
+        let (stream, bytes) = if let Some(stream) = layout.payload().stream() {
             match self.resolve_stream(owner, stream.path(), stream.offset(), stream.size(), budget)
             {
-                Ok(resolved) => (
-                    Some(resolved.request),
-                    Some(resolved.expectation),
-                    resolved.bytes,
-                ),
+                Ok(resolved) => (Some(resolved.source), resolved.bytes),
                 Err(error) => {
                     let Some(code) = decoded_resource_failure(&error) else {
                         return Err(error);
@@ -186,7 +198,6 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
             }
         } else {
             (
-                None,
                 None,
                 materialize_embedded(
                     layout.payload().embedded(),
@@ -219,14 +230,6 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
             ) => return media_preparation_error(address, budget),
         };
         let descriptor = prepared.descriptor().clone();
-        let mut expectations = budgeted_vec(
-            usize::from(stream_expectation.is_some()),
-            "audio source expectations",
-            budget,
-        )?;
-        if let Some(expectation) = stream_expectation {
-            expectations.push(expectation);
-        }
         let working_set = audio_working_set(
             self.view,
             object,
@@ -236,11 +239,10 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
             budget,
         )
         .map_err(map_reservation_error)?;
-        Ok(RepresentationChoice::decoded_with_sources(
+        Ok(RepresentationChoice::decoded(
             PlannedContent::Audio { stream, descriptor },
             working_set,
             self.policy.raw_fallback(),
-            expectations,
         ))
     }
 
@@ -263,14 +265,10 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
                     return unavailable_choice_with(address, self.policy, raw, reason, budget);
                 }
             };
-        let (stream, stream_expectation, bytes) = if let Some(stream) = layout.payload().stream() {
+        let (stream, bytes) = if let Some(stream) = layout.payload().stream() {
             match self.resolve_stream(owner, stream.path(), stream.offset(), stream.size(), budget)
             {
-                Ok(resolved) => (
-                    Some(resolved.request),
-                    Some(resolved.expectation),
-                    resolved.bytes,
-                ),
+                Ok(resolved) => (Some(resolved.source), resolved.bytes),
                 Err(error) => {
                     let Some(code) = decoded_resource_failure(&error) else {
                         return Err(error);
@@ -280,7 +278,6 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
             }
         } else {
             (
-                None,
                 None,
                 materialize_embedded(
                     layout.payload().embedded(),
@@ -320,14 +317,6 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
             ) => return media_preparation_error(address, budget),
         };
         let descriptor = prepared.descriptor().clone();
-        let mut expectations = budgeted_vec(
-            usize::from(stream_expectation.is_some()),
-            "texture source expectations",
-            budget,
-        )?;
-        if let Some(expectation) = stream_expectation {
-            expectations.push(expectation);
-        }
         let working_set = texture_working_set(
             self.view,
             object,
@@ -337,11 +326,10 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
             budget,
         )
         .map_err(map_reservation_error)?;
-        Ok(RepresentationChoice::decoded_with_sources(
+        Ok(RepresentationChoice::decoded(
             PlannedContent::TexturePng { stream, descriptor },
             working_set,
             self.policy.raw_fallback(),
-            expectations,
         ))
     }
 
@@ -373,15 +361,21 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
                 path_id,
             )?
         } else {
-            let Some(references) = self.references else {
-                return unavailable_choice_with(
-                    address,
-                    self.policy,
-                    raw,
-                    ExtractionDiagnosticCode::UnresolvedSpritePPtr,
+            if self.references.is_none() {
+                let references = ReferenceGraph::build(
+                    self.view,
+                    ReferenceGraphBuildOptions::unbounded(),
                     budget,
-                );
-            };
+                )?;
+                if !references.is_complete() {
+                    return Err(ExtractionPlanError::IncompleteReferenceGraph);
+                }
+                self.references = Some(references);
+            }
+            let references = self
+                .references
+                .as_ref()
+                .expect("reference graph was initialized above");
             let owner_handle = resolve_required_handle(self.view, address, budget)?;
             let Some(texture) =
                 resolve_reference_address(references, &owner_handle, file_id, path_id, budget)?
@@ -443,7 +437,7 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
                 return unavailable_choice_with(address, self.policy, raw, reason, budget);
             }
         };
-        let (texture_stream, stream_expectation, texture_bytes) =
+        let (texture_stream, texture_bytes) =
             if let Some(stream) = texture_layout.payload().stream() {
                 match self.resolve_stream(
                     texture_owner,
@@ -452,11 +446,7 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
                     stream.size(),
                     budget,
                 ) {
-                    Ok(resolved) => (
-                        Some(resolved.request),
-                        Some(resolved.expectation),
-                        resolved.bytes,
-                    ),
+                    Ok(resolved) => (Some(resolved.source), resolved.bytes),
                     Err(error) => {
                         let Some(code) = decoded_resource_failure(&error) else {
                             return Err(error);
@@ -466,7 +456,6 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
                 }
             } else {
                 (
-                    None,
                     None,
                     materialize_embedded(
                         texture_layout.payload().embedded(),
@@ -519,15 +508,8 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
             ) => return media_preparation_error(address, budget),
         };
         let descriptor = prepared.descriptor().clone();
-        let mut expectations = budgeted_vec(
-            1 + usize::from(stream_expectation.is_some()),
-            "sprite source expectations",
-            budget,
-        )?;
+        let mut expectations = budgeted_vec(1, "sprite source expectations", budget)?;
         expectations.push(source_expectation(texture_owner, budget)?);
-        if let Some(expectation) = stream_expectation {
-            expectations.push(expectation);
-        }
         let working_set = sprite_working_set_with_texture(
             self.view,
             object,
@@ -625,11 +607,28 @@ impl RepresentationChoice {
             &mut AssetLoadBudget,
         ) -> Result<ExtractionPath, ExtractionPlanError>,
     {
+        if let Some(stream) = self.preferred_content.stream_source() {
+            let source = stream.source();
+            let expectation = ExtractionSourceExpectation::new(
+                clone_source_locator(
+                    source.locator(),
+                    "streamed extraction source precondition locator",
+                    budget,
+                )?,
+                source.fingerprint(),
+            );
+            push_budgeted(
+                &mut self.source_expectations,
+                expectation,
+                "representation source expectations",
+                budget,
+            )?;
+        }
         let owner = source_expectation(owner, budget)?;
         if let Some(first) = conflicting_fingerprint(expectations, &owner) {
             let (locator, second) = owner.into_parts();
             return Err(ExtractionPlanError::SourceFingerprintConflict {
-                locator,
+                locator: Box::new(locator),
                 first,
                 second,
             });
@@ -647,7 +646,7 @@ impl RepresentationChoice {
                 let candidate = self.source_expectations.swap_remove(index);
                 let (locator, second) = candidate.into_parts();
                 return Err(ExtractionPlanError::SourceFingerprintConflict {
-                    locator,
+                    locator: Box::new(locator),
                     first,
                     second,
                 });
@@ -665,7 +664,7 @@ impl RepresentationChoice {
                 let content = PlannedContent::RawBinary;
                 let path = allocate_path(content.canonical_extension(), true, budget)?;
                 PlannedFallback::new(path, content)
-                    .map_err(|error| ExtractionPlanError::ModelValidation(error.into()))
+                    .map_err(|error| ExtractionPlanError::ModelValidation(Box::new(error.into())))
             })
             .transpose()?;
         RepresentationContract::from_parts(
@@ -679,7 +678,7 @@ impl RepresentationChoice {
                 diagnostics: self.diagnostics,
             },
         )
-        .map_err(|error| ExtractionPlanError::ModelValidation(error.into()))
+        .map_err(|error| ExtractionPlanError::ModelValidation(Box::new(error.into())))
     }
 }
 
@@ -733,7 +732,7 @@ fn insert_source_expectation(
         if existing.fingerprint() != candidate.fingerprint() {
             let (locator, fingerprint) = candidate.into_parts();
             return Err(ExtractionPlanError::SourceFingerprintConflict {
-                locator,
+                locator: Box::new(locator),
                 first: existing.fingerprint(),
                 second: fingerprint,
             });
@@ -765,8 +764,7 @@ fn conflicting_owned_fingerprint(
 
 #[cfg(feature = "decode")]
 struct ResolvedExtractionStream {
-    request: StreamedResourceRequest,
-    expectation: ExtractionSourceExpectation,
+    source: PlannedStreamSource,
     bytes: BudgetedMediaBytes,
 }
 
@@ -1022,14 +1020,12 @@ fn resolve_extraction_stream(
         }
     };
     let expectation = streamed_source_expectation(&resource, budget)?;
+    let source = PlannedStreamSource::new(request, expectation)
+        .map_err(|error| ExtractionPlanError::ModelValidation(Box::new(error.into())))?;
     let range = resource.open(view, budget)?;
     let bytes = copy_workspace_range(&range, "planned streamed media", budget)
         .map_err(map_workspace_payload_error)?;
-    Ok(ResolvedExtractionStream {
-        request,
-        expectation,
-        bytes,
-    })
+    Ok(ResolvedExtractionStream { source, bytes })
 }
 
 #[cfg(feature = "decode")]

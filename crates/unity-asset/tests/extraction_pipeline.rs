@@ -8,8 +8,8 @@ use unity_asset::extraction::{
     ExtractionArtifactStatus, ExtractionDiagnosticCode, ExtractionExecutionError,
     ExtractionExecutionLimits, ExtractionExecutionOptions, ExtractionExecutor,
     ExtractionFailurePolicy, ExtractionManifest, ExtractionPath, ExtractionPlan,
-    ExtractionPlanError, ExtractionPlanner, ExtractionReport, ExtractionRepresentationPolicy,
-    ExtractionRequest, ExtractionRunOptions,
+    ExtractionPlanError, ExtractionPlanMismatchKind, ExtractionPlanner, ExtractionReport,
+    ExtractionRepresentationPolicy, ExtractionRequest, ExtractionRunOptions,
 };
 use unity_asset::reference::{RawReferenceTarget, ReferenceGraphBuildOptions};
 use unity_asset::schema::SchemaRecipePlanner;
@@ -18,8 +18,8 @@ use unity_asset::workspace::{
     WorkspaceLookup, WorkspaceView,
 };
 use unity_asset::{
-    AssetLoadBudget, AssetLoadLimits, BudgetError, DigestV1, FieldPath, ObjectAddress,
-    SourceLocator,
+    AssetLoadBudget, AssetLoadLimits, BudgetError, BudgetedJsonError, DigestV1, FieldPath,
+    ObjectAddress, SourceLocator,
 };
 use unity_asset_binary::asset::{SerializedFileParser, class_ids};
 use unity_asset_binary::bundle::BundleParser;
@@ -159,6 +159,7 @@ fn options_with_failure(
             8 * 1024 * 1024,
             workers.saturating_mul(2).saturating_add(1).max(5),
             32 * 1024 * 1024,
+            u64::MAX,
             8 * 1024 * 1024,
         )
         .unwrap(),
@@ -373,8 +374,15 @@ fn planning_is_write_free_and_worker_count_does_not_change_manifest() {
         )
         .unwrap();
     let open_file_limited = ExtractionExecutionOptions::new(
-        ExtractionExecutionLimits::new(4, 8 * 1024 * 1024, 5, 32 * 1024 * 1024, 8 * 1024 * 1024)
-            .unwrap(),
+        ExtractionExecutionLimits::new(
+            4,
+            8 * 1024 * 1024,
+            5,
+            32 * 1024 * 1024,
+            u64::MAX,
+            8 * 1024 * 1024,
+        )
+        .unwrap(),
         ExistingOutputPolicy::Error,
         ExtractionFailurePolicy::CollectAll,
     )
@@ -411,6 +419,18 @@ fn planning_is_write_free_and_worker_count_does_not_change_manifest() {
     let decoded =
         ExtractionManifest::read_json(encoded.as_slice(), &mut AssetLoadBudget::default()).unwrap();
     assert_eq!(&decoded, one.manifest());
+    let mut legacy_manifest: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    legacy_manifest["version"] = serde_json::Value::from(2);
+    let error = ExtractionManifest::read_json(
+        serde_json::to_vec(&legacy_manifest).unwrap().as_slice(),
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        BudgetedJsonError::Json(source)
+            if source.to_string().contains("manifest version 2 is unsupported")
+    ));
 
     let report_encoded = one.canonical_json().unwrap();
     let report_decoded =
@@ -418,6 +438,18 @@ fn planning_is_write_free_and_worker_count_does_not_change_manifest() {
             .unwrap();
     assert_eq!(report_decoded, one);
     assert_eq!(one.digest().unwrap(), DigestV1::hash_bytes(&report_encoded));
+    let mut legacy_report: serde_json::Value = serde_json::from_slice(&report_encoded).unwrap();
+    legacy_report["version"] = serde_json::Value::from(2);
+    let error = ExtractionReport::read_json(
+        serde_json::to_vec(&legacy_report).unwrap().as_slice(),
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        BudgetedJsonError::Json(source)
+            if source.to_string().contains("report version 2 is unsupported")
+    ));
 
     let canonical_report: serde_json::Value = serde_json::from_slice(&report_encoded).unwrap();
     for field in ["written", "resumed", "skipped_existing", "failed"] {
@@ -705,7 +737,8 @@ fn working_set_and_report_bounds_reject_before_creating_output() {
         .unwrap();
 
     let working_set_limited = ExtractionExecutionOptions::new(
-        ExtractionExecutionLimits::new(2, 1, 5, 32 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
+        ExtractionExecutionLimits::new(2, 1, 5, 32 * 1024 * 1024, u64::MAX, 8 * 1024 * 1024)
+            .unwrap(),
         ExistingOutputPolicy::Error,
         ExtractionFailurePolicy::CollectAll,
     )
@@ -727,7 +760,8 @@ fn working_set_and_report_bounds_reject_before_creating_output() {
     assert!(!working_set_output.exists());
 
     let report_limited = ExtractionExecutionOptions::new(
-        ExtractionExecutionLimits::new(2, 8 * 1024 * 1024, 5, 32 * 1024 * 1024, 1).unwrap(),
+        ExtractionExecutionLimits::new(2, 8 * 1024 * 1024, 5, 32 * 1024 * 1024, u64::MAX, 1)
+            .unwrap(),
         ExistingOutputPolicy::Error,
         ExtractionFailurePolicy::CollectAll,
     )
@@ -786,20 +820,135 @@ fn persisted_plan_cannot_understate_its_authoritative_working_set() {
 
     assert!(matches!(
         error,
-        ExtractionExecutionError::WorkingSetUnderdeclared {
-            ordinal: 0,
-            declared: 1,
-            ..
-        }
+        ExtractionExecutionError::PlanVerification(source)
+            if matches!(
+                source.as_ref(),
+                ExtractionPlanError::PlanDerivationMismatch {
+                    kind: ExtractionPlanMismatchKind::Representations,
+                }
+            )
+    ));
+    assert!(!output.exists());
+}
+
+#[test]
+fn persisted_plan_request_must_rederive_the_exact_artifact_set() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("objects.prefab");
+    let output = directory.path().join("request-mismatch");
+    fs::write(&source_path, FIRST_SOURCE).unwrap();
+
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(&source_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let plan = ExtractionPlanner::new(&snapshot)
+        .plan(
+            ExtractionRequest::all(ExtractionRepresentationPolicy::RawOnly),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    assert_eq!(plan.artifacts().len(), 2);
+
+    let mut wire: serde_json::Value =
+        serde_json::from_slice(&plan.canonical_json().unwrap()).unwrap();
+    let mut prefix_wire = wire.clone();
+    prefix_wire["request"]["prefix"] = serde_json::json!("relocated");
+    let prefix_request: ExtractionRequest =
+        serde_json::from_value(prefix_wire["request"].clone()).unwrap();
+    prefix_wire["request_digest"] = serde_json::to_value(prefix_request.digest().unwrap()).unwrap();
+    let error = ExtractionPlan::read_json(
+        serde_json::to_vec(&prefix_wire).unwrap().as_slice(),
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("outside the extraction request prefix")
+    );
+
+    let mut nested_prefix_wire = wire.clone();
+    nested_prefix_wire["request"]["prefix"] = serde_json::json!("sources");
+    let nested_prefix_request: ExtractionRequest =
+        serde_json::from_value(nested_prefix_wire["request"].clone()).unwrap();
+    nested_prefix_wire["request_digest"] =
+        serde_json::to_value(nested_prefix_request.digest().unwrap()).unwrap();
+    let nested_prefix_plan = ExtractionPlan::read_json(
+        serde_json::to_vec(&nested_prefix_wire).unwrap().as_slice(),
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap();
+    let error = ExtractionExecutor::new()
+        .execute(
+            &snapshot,
+            &nested_prefix_plan,
+            &output,
+            ExtractionRunOptions::new(options(2, ExistingOutputPolicy::Error)),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ExtractionExecutionError::PlanVerification(source)
+            if matches!(
+                source.as_ref(),
+                ExtractionPlanError::PlanDerivationMismatch {
+                    kind: ExtractionPlanMismatchKind::ArtifactPaths,
+                }
+            )
+    ));
+    assert!(!output.exists());
+
+    let mut legacy = wire.clone();
+    legacy["version"] = serde_json::Value::from(3);
+    let legacy = serde_json::to_vec(&legacy).unwrap();
+    let error =
+        ExtractionPlan::read_json(legacy.as_slice(), &mut AssetLoadBudget::default()).unwrap_err();
+    assert!(error.to_string().contains("version 3 is unsupported"));
+
+    wire["request"]["filter"]["limit"] = serde_json::Value::from(1);
+    let request: ExtractionRequest = serde_json::from_value(wire["request"].clone()).unwrap();
+    wire["request_digest"] = serde_json::to_value(request.digest().unwrap()).unwrap();
+    let tampered = serde_json::to_vec(&wire).unwrap();
+    let plan =
+        ExtractionPlan::read_json(tampered.as_slice(), &mut AssetLoadBudget::default()).unwrap();
+
+    let error = ExtractionExecutor::new()
+        .execute(
+            &snapshot,
+            &plan,
+            &output,
+            ExtractionRunOptions::new(options(2, ExistingOutputPolicy::Error)),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ExtractionExecutionError::PlanVerification(source)
+            if matches!(
+                source.as_ref(),
+                ExtractionPlanError::PlanDerivationMismatch {
+                    kind: ExtractionPlanMismatchKind::Artifacts,
+                }
+            )
     ));
     assert!(!output.exists());
 }
 
 #[test]
 fn open_file_limit_reserves_lock_and_verified_publication_handles() {
-    let error =
-        ExtractionExecutionLimits::new(1, 8 * 1024 * 1024, 4, 32 * 1024 * 1024, 8 * 1024 * 1024)
-            .unwrap_err();
+    let error = ExtractionExecutionLimits::new(
+        1,
+        8 * 1024 * 1024,
+        4,
+        32 * 1024 * 1024,
+        u64::MAX,
+        8 * 1024 * 1024,
+    )
+    .unwrap_err();
 
     assert!(matches!(
         error,
@@ -867,7 +1016,8 @@ fn manifest_output_reservation_fails_before_creating_the_output_root() {
         )
         .unwrap();
     let limited = ExtractionExecutionOptions::new(
-        ExtractionExecutionLimits::new(1, 8 * 1024 * 1024, 5, 1, 8 * 1024 * 1024).unwrap(),
+        ExtractionExecutionLimits::new(1, 8 * 1024 * 1024, 5, 1, u64::MAX, 8 * 1024 * 1024)
+            .unwrap(),
         ExistingOutputPolicy::Error,
         ExtractionFailurePolicy::CollectAll,
     )
@@ -910,7 +1060,8 @@ fn output_limit_rejects_artifacts_before_publication() {
         )
         .unwrap();
     let limited = ExtractionExecutionOptions::new(
-        ExtractionExecutionLimits::new(2, 8 * 1024 * 1024, 5, 1, 8 * 1024 * 1024).unwrap(),
+        ExtractionExecutionLimits::new(2, 8 * 1024 * 1024, 5, 1, u64::MAX, 8 * 1024 * 1024)
+            .unwrap(),
         ExistingOutputPolicy::Error,
         ExtractionFailurePolicy::CollectAll,
     )
@@ -983,23 +1134,18 @@ fn bundle_container_query_preserves_same_target_occurrences_and_exact_budget() {
     let (image, asset_paths) = serialized_file_with_duplicate_container_target();
     fs::write(&source_path, image).unwrap();
 
-    let mut workspace = AssetWorkspace::new().unwrap();
-    workspace
-        .load_path(&source_path, &mut AssetLoadBudget::default())
-        .unwrap();
-    let snapshot = workspace.snapshot();
-    let graph = snapshot
-        .reference_graph(
-            ReferenceGraphBuildOptions::unbounded(),
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
-    let planner = ExtractionPlanner::new(&snapshot).with_reference_graph(&graph);
+    let query = |budget: &mut AssetLoadBudget| {
+        let mut workspace = AssetWorkspace::new().unwrap();
+        workspace
+            .load_path(&source_path, &mut AssetLoadBudget::default())
+            .unwrap();
+        let snapshot = workspace.snapshot();
+        ExtractionPlanner::new(&snapshot)
+            .bundle_container_occurrences(BundleContainerQuery::new("*").unwrap(), budget)
+    };
 
     let mut measured = AssetLoadBudget::default();
-    let result = planner
-        .bundle_container_occurrences(BundleContainerQuery::new("*").unwrap(), &mut measured)
-        .unwrap();
+    let result = query(&mut measured).unwrap();
     let (first_index, first) = result
         .occurrences()
         .iter()
@@ -1032,10 +1178,10 @@ fn bundle_container_query_preserves_same_target_occurrences_and_exact_budget() {
         ..AssetLoadLimits::default()
     };
     let mut exact = AssetLoadBudget::new(exact_limits).unwrap();
-    let exact_result = planner
-        .bundle_container_occurrences(BundleContainerQuery::new("*").unwrap(), &mut exact)
-        .unwrap();
-    assert_eq!(exact_result, result);
+    let exact_result = query(&mut exact).unwrap();
+    assert_eq!(exact_result.query(), result.query());
+    assert_eq!(exact_result.is_complete(), result.is_complete());
+    assert_eq!(exact_result.occurrences(), result.occurrences());
     assert_eq!(exact.usage(), usage);
 
     let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
@@ -1043,9 +1189,7 @@ fn bundle_container_query_preserves_same_target_occurrences_and_exact_budget() {
         ..exact_limits
     })
     .unwrap();
-    let error = planner
-        .bundle_container_occurrences(BundleContainerQuery::new("*").unwrap(), &mut one_short)
-        .unwrap_err();
+    let error = query(&mut one_short).unwrap_err();
     assert!(matches!(
         error,
         ExtractionPlanError::Budget(BudgetError::Exceeded {
@@ -1071,7 +1215,7 @@ fn bundle_container_and_explicit_handle_publish_identical_artifact_bytes() {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-    let planner = ExtractionPlanner::new(&snapshot).with_reference_graph(&graph);
+    let planner = ExtractionPlanner::new(&snapshot);
     let occurrences = planner
         .bundle_container_occurrences(
             BundleContainerQuery::new("*").unwrap(),
@@ -1113,11 +1257,15 @@ fn bundle_container_and_explicit_handle_publish_identical_artifact_bytes() {
     )
     .unwrap();
     assert_eq!(decoded, occurrences);
-    let address = occurrences
+    let (container_pattern, address) = occurrences
         .occurrences()
         .iter()
-        .find_map(|occurrence| occurrence.resolution().resolved())
-        .cloned()
+        .find_map(|occurrence| {
+            occurrence
+                .resolution()
+                .resolved()
+                .map(|address| (occurrence.asset_path().to_owned(), address.clone()))
+        })
         .expect("the fixture AssetBundle must expose at least one container entry");
     let WorkspaceLookup::Resolved(handle) = snapshot
         .resolve_object(&address, &mut AssetLoadBudget::default())
@@ -1129,8 +1277,7 @@ fn bundle_container_and_explicit_handle_publish_identical_artifact_bytes() {
     let container_plan = planner
         .plan(
             ExtractionRequest::bundle_container(
-                "*".to_owned(),
-                vec![address.clone()],
+                container_pattern,
                 ExtractionRepresentationPolicy::RawOnly,
             )
             .unwrap(),
@@ -1178,6 +1325,185 @@ fn bundle_container_and_explicit_handle_publish_identical_artifact_bytes() {
     assert_eq!(handle_artifact.status(), ExtractionArtifactStatus::Written);
     assert_eq!(container_artifact.length(), handle_artifact.length());
     assert_eq!(container_artifact.digest(), handle_artifact.digest());
+}
+
+#[cfg(feature = "decode")]
+#[test]
+fn execution_rejects_a_serialized_raw_downgrade_of_decodable_media() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(sample("xinzexi_2_n_tex"), &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let request = ExtractionRequest::all(ExtractionRepresentationPolicy::PreferDecoded)
+        .with_filter(
+            unity_asset::extraction::ExtractionFilter::new(
+                [class_ids::TEXTURE_2D],
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+    let plan = ExtractionPlanner::new(&snapshot)
+        .plan(request, &mut AssetLoadBudget::default())
+        .unwrap();
+    assert_eq!(plan.artifacts().len(), 1);
+
+    let mut wire: serde_json::Value =
+        serde_json::from_slice(&plan.canonical_json().unwrap()).unwrap();
+    let owner_locator =
+        serde_json::to_value(plan.artifacts()[0].address().source_locator()).unwrap();
+    let decoded_path = wire["artifacts"][0]["preferred_path"].as_str().unwrap();
+    let raw_path = format!(
+        "{}.bin",
+        decoded_path
+            .strip_suffix(".png")
+            .expect("texture plan uses the canonical PNG suffix")
+    );
+    let address = wire["artifacts"][0]["address"].clone();
+    wire["artifacts"][0]["preferred_kind"] = serde_json::json!("binary_raw");
+    wire["artifacts"][0]["preferred_path"] = serde_json::json!(raw_path);
+    wire["artifacts"][0]["preferred_content"] = serde_json::json!({
+        "kind": "raw_binary",
+    });
+    wire["artifacts"][0]["fallback"] = serde_json::Value::Null;
+    wire["artifacts"][0]["diagnostics"] = serde_json::json!([{
+        "code": "feature_unavailable",
+        "address": address,
+    }]);
+    wire["sources"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|source| source["locator"] == owner_locator);
+    let tampered = ExtractionPlan::read_json(
+        serde_json::to_vec(&wire).unwrap().as_slice(),
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap();
+
+    let output = directory.path().join("raw-downgrade-output");
+    let error = ExtractionExecutor::new()
+        .execute(
+            &snapshot,
+            &tampered,
+            &output,
+            ExtractionRunOptions::new(options(1, ExistingOutputPolicy::Error)),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ExtractionExecutionError::PlanVerification(source)
+            if matches!(
+                source.as_ref(),
+                ExtractionPlanError::PlanDerivationMismatch {
+                    kind: ExtractionPlanMismatchKind::SourceExpectations,
+                }
+            )
+    ));
+    assert!(!output.exists());
+}
+
+#[cfg(feature = "decode")]
+#[test]
+fn streamed_media_execution_rejects_another_loaded_sidecar() {
+    let directory = tempfile::tempdir().unwrap();
+    let alternate_path = directory.path().join("unrelated.resS");
+    fs::write(&alternate_path, b"another loaded sidecar").unwrap();
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(sample("char_118_yuki.ab"), &mut AssetLoadBudget::default())
+        .unwrap();
+    let alternate_id = workspace
+        .load_path(&alternate_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let WorkspaceLookup::Resolved(alternate) = snapshot
+        .source(alternate_id, &mut AssetLoadBudget::default())
+        .unwrap()
+    else {
+        panic!("alternate sidecar must remain loaded");
+    };
+    let request = ExtractionRequest::all(ExtractionRepresentationPolicy::RequireDecoded)
+        .with_filter(
+            unity_asset::extraction::ExtractionFilter::new(
+                [class_ids::AUDIO_CLIP],
+                None,
+                None,
+                Some(1),
+            )
+            .unwrap(),
+        );
+    let plan = ExtractionPlanner::new(&snapshot)
+        .plan(request, &mut AssetLoadBudget::default())
+        .unwrap();
+    let mut wire: serde_json::Value =
+        serde_json::from_slice(&plan.canonical_json().unwrap()).unwrap();
+    let streamed_index = wire["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|artifact| artifact["preferred_content"]["stream"].is_object())
+        .expect("fixture must contain a streamed AudioClip");
+    let planned_source =
+        wire["artifacts"][streamed_index]["preferred_content"]["stream"]["source"].clone();
+    let source_index = wire["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|source| source == &planned_source)
+        .expect("streamed sidecar must be a global plan precondition");
+    let mut missing_precondition = wire.clone();
+    missing_precondition["sources"]
+        .as_array_mut()
+        .unwrap()
+        .remove(source_index);
+    let error = ExtractionPlan::read_json(
+        serde_json::to_vec(&missing_precondition)
+            .unwrap()
+            .as_slice(),
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("has no expected fingerprint"));
+
+    wire["artifacts"][streamed_index]["preferred_content"]["stream"]["source"]["locator"] =
+        serde_json::to_value(alternate.locator()).unwrap();
+    wire["artifacts"][streamed_index]["preferred_content"]["stream"]["source"]["fingerprint"] =
+        serde_json::to_value(alternate.fingerprint()).unwrap();
+    wire["sources"][source_index]["locator"] = serde_json::to_value(alternate.locator()).unwrap();
+    wire["sources"][source_index]["fingerprint"] =
+        serde_json::to_value(alternate.fingerprint()).unwrap();
+    let plan = ExtractionPlan::read_json(
+        serde_json::to_vec(&wire).unwrap().as_slice(),
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap();
+
+    let output = directory.path().join("wrong-sidecar-output");
+    let error = ExtractionExecutor::new()
+        .execute(
+            &snapshot,
+            &plan,
+            &output,
+            ExtractionRunOptions::new(options(1, ExistingOutputPolicy::Error)),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ExtractionExecutionError::PlanVerification(source)
+            if matches!(
+                source.as_ref(),
+                ExtractionPlanError::PlanDerivationMismatch {
+                    kind: ExtractionPlanMismatchKind::SourceExpectations,
+                }
+            )
+    ));
+    assert!(!output.exists());
 }
 
 #[cfg(feature = "decode")]
@@ -1240,6 +1566,25 @@ fn unsupported_binary_classes_are_reported_without_silent_raw_downgrade() {
         artifact.preferred_kind(),
         unity_asset::extraction::ExtractionArtifactKind::BinaryRaw
     );
+    let artifact_index = preferred
+        .artifacts()
+        .iter()
+        .position(|candidate| candidate.address() == artifact.address())
+        .unwrap();
+    let mut diagnostic_wire: serde_json::Value =
+        serde_json::from_slice(&preferred.canonical_json().unwrap()).unwrap();
+    diagnostic_wire["artifacts"][artifact_index]["diagnostics"] = serde_json::json!([]);
+    let error = ExtractionPlan::read_json(
+        serde_json::to_vec(&diagnostic_wire).unwrap().as_slice(),
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("requires a deterministic planning diagnostic")
+    );
+
     let output = tempfile::tempdir().unwrap();
     let report = ExtractionExecutor::new()
         .execute(

@@ -6,13 +6,23 @@ wrapping the removed APIs.
 
 This is the only non-historical document that names removed public symbols and commands.
 
-`ExtractionPlan`, `ExtractionManifest`, and `ExtractionReport` are now version 2. Version 1 plans
-persisted an ignored Sprite Unity version, while version 1 manifests and reports did not declare
-the complete diagnostic vocabulary. Re-plan the request and create fresh resume evidence.
+`ExtractionRequest` is now version 2 and `ExtractionPlan` is now version 4. Requests persist the
+bundle-container query or reference-traversal intent rather than a caller-expanded object list.
+Plans bind that intent to a deterministic selection witness and persist the exact sidecar source
+and byte range selected for streamed media. Version 1 requests and version 3 plans are rejected;
+re-plan them against the intended workspace revision. `ExtractionManifest` and `ExtractionReport`
+are now version 3 and bind the current request, plan, diagnostics, source proof, and publication
+semantics. Historical version 2 manifests and reports are rejected. Create fresh resume evidence
+from a current request and plan; current evidence still requires an exact plan digest.
 
-`ExtractionExecutionLimits::new` now rejects `max_open_files` values below
-`ExtractionExecutionLimits::MIN_OPEN_FILES` (currently 5). The minimum covers the run lock,
-staging file, parent-directory handles, and digest verification required by safe publication.
+`ExtractionExecutionLimits::new` now accepts a cumulative `max_evidence_verification_bytes` limit
+between `max_output_bytes` and `max_report_bytes`, and rejects `max_open_files` values below
+`ExtractionExecutionLimits::MIN_OPEN_FILES` (currently 5). The evidence limit covers final-path
+reads used to prove skip, resume, recovery, artifact, and manifest evidence in one execution. It is
+a retry budget and may be raised while recovering an unfinished publication. Staging and atomic
+publication integrity passes are instead bounded by `max_output_bytes`. The open-file minimum
+covers the run lock, staging file, parent-directory handles, and digest verification required by
+safe publication.
 
 `ExtractionExecutionError`, `ExtractionModelError`, and `ExtractionDiagnosticCode` are now
 non-exhaustive. Downstream matches must retain a wildcard branch so future diagnostic additions do
@@ -202,9 +212,12 @@ guards are derived from one revision-bound view.
 Replace `bundle_container_entries`, `find_bundle_container_entries`,
 `find_binary_object_keys_in_bundle_container`, and local `m_Container` fallback parsers with:
 
-1. one `ReferenceGraph`;
-2. `ExtractionPlanner::bundle_container_occurrences`;
-3. a versioned `BundleContainerQuery`.
+1. `ExtractionPlanner::bundle_container_occurrences`;
+2. a versioned `BundleContainerQuery`.
+
+The planner builds and owns the revision-bound `ReferenceGraph` required by this query. Extraction
+callers do not construct or pass a graph. Build a graph explicitly only for the independent
+reference-query APIs described below.
 
 The result preserves source order, owner address, field path, raw `{fileID, pathID}`, structured
 resolution, and diagnostics. It does not discard unresolved occurrences.
@@ -407,8 +420,9 @@ accept a serialized prepared session.
 ### Extraction
 
 Legacy export request JSON and manifests are not accepted. Build a current
-`ExtractionRequest`, use `--dry-run` to obtain its canonical `ExtractionPlan`, then execute that
-plan:
+`ExtractionRequest` version 2, use `--dry-run` to obtain its canonical `ExtractionPlan` version 4,
+then execute that plan. The planner derives any required reference graph from its workspace view;
+the caller supplies only the persisted selection intent and limits:
 
 ```bash
 unity-asset export \
@@ -423,6 +437,10 @@ unity-asset export \
   --plan extraction-plan.json \
   --manifest manifest.json
 ```
+
+`ExtractionRequest` version 1, `ExtractionPlan` version 3, and `ExtractionManifest` /
+`ExtractionReport` version 2 are rejected rather than upgraded. Re-run the dry run and extraction
+to create current plan and resume evidence.
 
 The current manifest records normalized intent, workspace revision, source and plan identities,
 relative artifact paths, statuses, diagnostics, and content digests. It does not use the legacy

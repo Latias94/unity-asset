@@ -8,7 +8,7 @@ pub(crate) struct ProbeSnapshot {
     pub(crate) peak_working_set_bytes: u64,
     pub(crate) active_open_files: usize,
     pub(crate) peak_open_files: usize,
-    pub(crate) existing_hash_bytes: u64,
+    pub(crate) preflight_hash_bytes: u64,
     pub(crate) started_ordinals: Vec<u32>,
     pub(crate) waiting_ordinals: Vec<u32>,
     pub(crate) failed_ordinals: Vec<u32>,
@@ -28,12 +28,15 @@ struct ProbeState {
     peak_working_set_bytes: u64,
     active_open_files: usize,
     peak_open_files: usize,
-    existing_hash_bytes: u64,
+    preflight_hash_bytes: u64,
     started_ordinals: Vec<u32>,
     first_write_ordinals: Vec<u32>,
     waiting_ordinals: Vec<u32>,
     failed_ordinals: Vec<u32>,
     writes_released: bool,
+    block_publication_commit: bool,
+    publication_commit_waiting: bool,
+    publication_commit_released: bool,
 }
 
 impl ExecutionProbe {
@@ -67,6 +70,23 @@ impl ExecutionProbe {
         self.changed.notify_all();
     }
 
+    pub(crate) fn block_publication_commit(&self) {
+        let mut state = lock_recover(&self.state);
+        state.block_publication_commit = true;
+    }
+
+    pub(crate) fn wait_for_publication_commit(&self) {
+        self.wait_until("publication commit", |state| {
+            state.publication_commit_waiting
+        });
+    }
+
+    pub(crate) fn release_publication_commit(&self) {
+        let mut state = lock_recover(&self.state);
+        state.publication_commit_released = true;
+        self.changed.notify_all();
+    }
+
     pub(crate) fn release_on_drop(self: &Arc<Self>) -> ProbeReleaseGuard {
         ProbeReleaseGuard {
             probe: Arc::clone(self),
@@ -80,7 +100,7 @@ impl ExecutionProbe {
             peak_working_set_bytes: state.peak_working_set_bytes,
             active_open_files: state.active_open_files,
             peak_open_files: state.peak_open_files,
-            existing_hash_bytes: state.existing_hash_bytes,
+            preflight_hash_bytes: state.preflight_hash_bytes,
             started_ordinals: state.started_ordinals.clone(),
             waiting_ordinals: state.waiting_ordinals.clone(),
             failed_ordinals: state.failed_ordinals.clone(),
@@ -137,10 +157,10 @@ impl ExecutionProbe {
         }
     }
 
-    fn record_existing_hash(&self, bytes: u64) {
+    fn record_preflight_hash(&self, bytes: u64) {
         let mut state = lock_recover(&self.state);
-        state.existing_hash_bytes = state
-            .existing_hash_bytes
+        state.preflight_hash_bytes = state
+            .preflight_hash_bytes
             .checked_add(bytes)
             .expect("test existing-output hash accounting must not overflow");
         self.changed.notify_all();
@@ -168,6 +188,21 @@ impl ExecutionProbe {
             }
         }
         Ok(())
+    }
+
+    fn before_publication_commit(&self) {
+        let mut state = lock_recover(&self.state);
+        if !state.block_publication_commit {
+            return;
+        }
+        state.publication_commit_waiting = true;
+        self.changed.notify_all();
+        while !state.publication_commit_released {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
     }
 }
 
@@ -246,9 +281,15 @@ pub(crate) fn reserve_open_files(
     )
 }
 
-pub(crate) fn record_existing_hash(probe: Option<&Arc<ExecutionProbe>>, bytes: u64) {
+pub(crate) fn record_preflight_hash(probe: Option<&Arc<ExecutionProbe>>, bytes: u64) {
     if let Some(probe) = probe {
-        probe.record_existing_hash(bytes);
+        probe.record_preflight_hash(bytes);
+    }
+}
+
+pub(crate) fn before_publication_commit(probe: Option<&Arc<ExecutionProbe>>) {
+    if let Some(probe) = probe {
+        probe.before_publication_commit();
     }
 }
 

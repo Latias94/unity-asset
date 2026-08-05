@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use unity_asset::AssetLoadBudget;
 use unity_asset::extraction::{
     ExistingOutputPolicy, ExtractionArtifactKind, ExtractionArtifactStatus,
-    ExtractionExecutionError, ExtractionExecutionLimits, ExtractionExecutionOptions,
-    ExtractionExecutor, ExtractionFailurePolicy, ExtractionFilter, ExtractionPlan,
-    ExtractionPlanner, ExtractionRepresentationPolicy, ExtractionRequest, ExtractionRunOptions,
+    ExtractionDiagnosticCode, ExtractionExecutionError, ExtractionExecutionLimits,
+    ExtractionExecutionOptions, ExtractionExecutor, ExtractionFailurePolicy, ExtractionFilter,
+    ExtractionPlan, ExtractionPlanner, ExtractionRepresentationPolicy, ExtractionRequest,
+    ExtractionRunOptions,
 };
 use unity_asset::workspace::{
     AssetWorkspace, WorkspaceLookup, WorkspaceObjectValue, WorkspaceView,
@@ -24,9 +25,20 @@ fn sample(name: &str) -> PathBuf {
 }
 
 fn execution_options() -> ExtractionExecutionOptions {
+    execution_options_with_in_flight(64 * 1024 * 1024)
+}
+
+fn execution_options_with_in_flight(max_in_flight_bytes: u64) -> ExtractionExecutionOptions {
     ExtractionExecutionOptions::new(
-        ExtractionExecutionLimits::new(1, 64 * 1024 * 1024, 5, 64 * 1024 * 1024, 16 * 1024 * 1024)
-            .unwrap(),
+        ExtractionExecutionLimits::new(
+            1,
+            max_in_flight_bytes,
+            5,
+            64 * 1024 * 1024,
+            u64::MAX,
+            16 * 1024 * 1024,
+        )
+        .unwrap(),
         ExistingOutputPolicy::Error,
         ExtractionFailurePolicy::CollectAll,
     )
@@ -53,6 +65,12 @@ fn default_build_executes_a_persisted_decoded_plan_through_its_raw_fallback() {
     let raw_path = artifact.preferred_path().as_str().to_owned();
     let preferred_path = format!(
         "{}.png",
+        raw_path
+            .strip_suffix(".bin")
+            .expect("raw plan uses the canonical binary suffix")
+    );
+    let fallback_path = format!(
+        "{}.raw.bin",
         raw_path
             .strip_suffix(".bin")
             .expect("raw plan uses the canonical binary suffix")
@@ -93,9 +111,48 @@ fn default_build_executes_a_persisted_decoded_plan_through_its_raw_fallback() {
     });
     persisted["artifacts"][0]["fallback"] = serde_json::json!({
         "kind": "binary_raw",
-        "path": raw_path,
+        "path": fallback_path.clone(),
         "content": { "kind": "raw_binary" },
     });
+    let raw_working_set = u64::try_from(expected.len()).unwrap().max(1);
+    persisted["artifacts"][0]["working_set_bytes"] = serde_json::Value::from(raw_working_set + 1);
+    let mut downgraded = persisted.clone();
+    downgraded["artifacts"][0]["preferred_kind"] = serde_json::json!("binary_raw");
+    downgraded["artifacts"][0]["preferred_path"] = serde_json::json!(raw_path.clone());
+    downgraded["artifacts"][0]["preferred_content"] = serde_json::json!({
+        "kind": "raw_binary",
+    });
+    downgraded["artifacts"][0]["fallback"] = serde_json::Value::Null;
+    let downgraded_address = downgraded["artifacts"][0]["address"].clone();
+    downgraded["artifacts"][0]["diagnostics"] = serde_json::json!([{
+        "code": "feature_unavailable",
+        "address": downgraded_address,
+    }]);
+    let downgraded_json = serde_json::to_vec(&downgraded).unwrap();
+    let downgraded_plan =
+        ExtractionPlan::read_json(downgraded_json.as_slice(), &mut AssetLoadBudget::default())
+            .unwrap();
+    let downgraded_output = tempfile::tempdir().unwrap();
+    let error = ExtractionExecutor::new()
+        .execute(
+            &snapshot,
+            &downgraded_plan,
+            downgraded_output.path(),
+            ExtractionRunOptions::new(execution_options()),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ExtractionExecutionError::PlanVerification(source)
+            if matches!(
+                source.as_ref(),
+                unity_asset::extraction::ExtractionPlanError::PlanDerivationMismatch {
+                    kind: unity_asset::extraction::ExtractionPlanMismatchKind::Representations,
+                }
+            )
+    ));
+
     let persisted_json = serde_json::to_vec(&persisted).unwrap();
     let plan =
         ExtractionPlan::read_json(persisted_json.as_slice(), &mut AssetLoadBudget::default())
@@ -107,7 +164,7 @@ fn default_build_executes_a_persisted_decoded_plan_through_its_raw_fallback() {
             &snapshot,
             &plan,
             output.path(),
-            ExtractionRunOptions::new(execution_options()),
+            ExtractionRunOptions::new(execution_options_with_in_flight(raw_working_set)),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -116,6 +173,15 @@ fn default_build_executes_a_persisted_decoded_plan_through_its_raw_fallback() {
     let artifact = &report.manifest().artifacts()[0];
     assert_eq!(artifact.kind(), ExtractionArtifactKind::BinaryRaw);
     assert_eq!(artifact.status(), ExtractionArtifactStatus::Written);
+    assert!(
+        artifact
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == ExtractionDiagnosticCode::FeatureUnavailable)
+    );
+    assert!(artifact.diagnostics().iter().all(|diagnostic| {
+        diagnostic.code() != ExtractionDiagnosticCode::DecodeFailedRawFallback
+    }));
     assert_eq!(
         fs::read(output.path().join(artifact.path().as_str())).unwrap(),
         expected
@@ -143,7 +209,14 @@ fn default_build_executes_a_persisted_decoded_plan_through_its_raw_fallback() {
         .unwrap_err();
     assert!(matches!(
         error,
-        ExtractionExecutionError::MediaPreparationFailed { ordinal: 0 }
+        ExtractionExecutionError::PlanVerification(source)
+            if matches!(
+                source.as_ref(),
+                unity_asset::extraction::ExtractionPlanError::ExecutionCapabilityUnavailable {
+                    ordinal: 0,
+                    capability: "media decode",
+                }
+            )
     ));
     assert!(!required_output.path().join(preferred_path).exists());
 }

@@ -16,13 +16,13 @@ use unity_asset_decode::{
 };
 
 use super::super::{CheckedByteCounter, source_budget_error};
+#[cfg(feature = "decode")]
+use super::contract::PlannedStreamSource;
 use super::contract::{PlannedContent, RepresentationContract};
 #[cfg(feature = "decode")]
 use crate::reference::{ReferenceGraphError, binary_external_source_resolves_to};
 #[cfg(feature = "decode")]
-use crate::workspace::{
-    StreamedResourceRequest, StreamedResourceResolution, StreamedResourceResolver,
-};
+use crate::workspace::{StreamedResourceResolution, StreamedResourceResolver};
 use crate::workspace::{
     WorkspaceError, WorkspaceLookup, WorkspaceObject, WorkspaceObjectValue, WorkspaceView,
 };
@@ -161,7 +161,7 @@ pub(in crate::extraction) fn audio_working_set(
     view: &dyn WorkspaceView,
     object: &WorkspaceObject,
     descriptor: &MediaDescriptor,
-    stream: Option<&StreamedResourceRequest>,
+    stream: Option<&PlannedStreamSource>,
     stream_resolver: Option<&StreamedResourceResolver<'_, '_>>,
     budget: &mut AssetLoadBudget,
 ) -> Result<u64, ExtractionReservationError> {
@@ -192,7 +192,7 @@ pub(in crate::extraction) fn audio_working_set(
                 ))
                 .and_then(|length| usize_to_u64(length, "embedded audio size"))
         },
-        |range| Ok(range.size()),
+        |source| Ok(source.request().size()),
     )?;
     if descriptor.input_bytes() != encoded_bytes {
         return Err(ExtractionReservationError::ContentMismatch(
@@ -207,7 +207,7 @@ pub(in crate::extraction) fn audio_working_set(
     checked_sum(
         [
             usize_to_u64(binary.payload_len(), "audio working set")?,
-            stream.map_or(0, StreamedResourceRequest::size),
+            stream.map_or(0, |source| source.request().size()),
             if stream.is_none() { encoded_bytes } else { 0 },
             output_bound,
         ],
@@ -220,7 +220,7 @@ pub(in crate::extraction) fn texture_working_set(
     view: &dyn WorkspaceView,
     object: &WorkspaceObject,
     descriptor: &MediaDescriptor,
-    stream: Option<&StreamedResourceRequest>,
+    stream: Option<&PlannedStreamSource>,
     stream_resolver: Option<&StreamedResourceResolver<'_, '_>>,
     budget: &mut AssetLoadBudget,
 ) -> Result<u64, ExtractionReservationError> {
@@ -250,7 +250,7 @@ struct SpriteExecutionProof {
 #[derive(Debug, Clone, Copy)]
 struct PlannedSpriteExecution<'plan> {
     texture: &'plan ObjectAddress,
-    texture_stream: Option<&'plan StreamedResourceRequest>,
+    texture_stream: Option<&'plan PlannedStreamSource>,
     descriptor: &'plan MediaDescriptor,
 }
 
@@ -342,7 +342,7 @@ pub(in crate::extraction) fn sprite_working_set_with_texture(
     object: &WorkspaceObject,
     texture_object: &WorkspaceObject,
     descriptor: &MediaDescriptor,
-    texture_stream: Option<&StreamedResourceRequest>,
+    texture_stream: Option<&PlannedStreamSource>,
     stream_resolver: Option<&StreamedResourceResolver<'_, '_>>,
     budget: &mut AssetLoadBudget,
 ) -> Result<u64, ExtractionReservationError> {
@@ -397,7 +397,7 @@ pub(in crate::extraction) fn sprite_working_set_with_texture(
 fn image_working_set(
     binary_bytes: usize,
     layout: Texture2DLayout<'_>,
-    stream: Option<&StreamedResourceRequest>,
+    stream: Option<&PlannedStreamSource>,
 ) -> Result<u64, ExtractionReservationError> {
     let image_bytes = u64::from(layout.width())
         .checked_mul(u64::from(layout.height()))
@@ -416,7 +416,7 @@ fn image_working_set(
             image_bytes,
             png_output_bound(image_bytes)?,
             usize_to_u64(binary_bytes, "texture binary working set")?,
-            stream.map_or(0, StreamedResourceRequest::size),
+            stream.map_or(0, |source| source.request().size()),
             embedded_bytes,
         ],
         "texture working set",
@@ -445,18 +445,18 @@ fn validate_payload_request(
     view: &dyn WorkspaceView,
     owner_object: &WorkspaceObject,
     expected: Option<StreamDataRef<'_>>,
-    planned: Option<&StreamedResourceRequest>,
+    planned: Option<&PlannedStreamSource>,
     stream_resolver: Option<&StreamedResourceResolver<'_, '_>>,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), ExtractionReservationError> {
     match (expected, planned) {
         (None, None) => Ok(()),
-        (Some(expected), Some(request))
-            if expected.path() == request.stream_path()
-                && expected.offset() == request.offset()
-                && expected.size() == request.size() =>
+        (Some(expected), Some(source))
+            if expected.path() == source.request().stream_path()
+                && expected.offset() == source.request().offset()
+                && expected.size() == source.request().size() =>
         {
-            validate_resolved_stream(view, owner_object, request, stream_resolver, budget)
+            validate_resolved_stream(view, owner_object, source, stream_resolver, budget)
         }
         _ => Err(ExtractionReservationError::ContentMismatch(
             "streamed payload range does not match inspected media metadata",
@@ -468,13 +468,11 @@ fn validate_payload_request(
 fn validate_resolved_stream(
     view: &dyn WorkspaceView,
     owner_object: &WorkspaceObject,
-    request: &StreamedResourceRequest,
+    planned: &PlannedStreamSource,
     stream_resolver: Option<&StreamedResourceResolver<'_, '_>>,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), ExtractionReservationError> {
-    let stream_resolver = stream_resolver.ok_or(ExtractionReservationError::ContentMismatch(
-        "streamed payload resolver is unavailable",
-    ))?;
+    let request = planned.request();
     let owner_id = owner_object.handle().object().source();
     let owner = match view.source(owner_id, budget)? {
         WorkspaceLookup::Resolved(source) => source,
@@ -492,18 +490,22 @@ fn validate_resolved_stream(
             "streamed payload owner no longer matches the planned request",
         ));
     }
-    let resolution = stream_resolver.resolve_request(request, budget)?;
-    let StreamedResourceResolution::Resolved { resource } = resolution else {
+    let stream_resolver = stream_resolver.ok_or(ExtractionReservationError::ContentMismatch(
+        "streamed payload resolver is unavailable",
+    ))?;
+    let StreamedResourceResolution::Resolved { resource } =
+        stream_resolver.resolve_request(request, budget)?
+    else {
         return Err(ExtractionReservationError::ContentMismatch(
             "streamed payload no longer resolves uniquely",
         ));
     };
-    if resource.offset() != request.offset() || resource.size() != request.size() {
+    if !planned.matches_resolution(&resource) {
         return Err(ExtractionReservationError::ContentMismatch(
-            "streamed payload source does not match inspected media metadata",
+            "planned streamed source is not the canonical request resolution",
         ));
     }
-    resource.open(view, budget)?;
+    planned.open(view, budget)?;
     Ok(())
 }
 

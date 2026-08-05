@@ -3,16 +3,13 @@ use unity_asset::AssetLoadBudget;
 use unity_asset::extraction::{
     ExtractionExecutionLimits, ExtractionExecutionOptions, ExtractionExecutor, ExtractionManifest,
     ExtractionPath, ExtractionPlan, ExtractionPlanner, ExtractionRequest, ExtractionRunOptions,
-    ExtractionSelection,
 };
-use unity_asset::reference::ReferenceGraphBuildOptions;
 
 use super::write_stdout;
 use crate::cli::ExportCommand;
 use crate::cli_error::{
     ExportManifestPathErrorKind, mark_export_execution_error, mark_export_manifest_path_error,
-    mark_export_plan_error, mark_export_reference_graph_error, mark_export_shared_stdin_error,
-    mark_export_workspace_load_error,
+    mark_export_plan_error, mark_export_shared_stdin_error, mark_export_workspace_load_error,
 };
 use crate::json_io::with_contract_reader;
 use crate::shared::AppContext;
@@ -43,10 +40,16 @@ pub(crate) fn run(command: ExportCommand, ctx: &AppContext) -> Result<()> {
         .as_deref()
         .map(|path| read_request(path, &mut budget))
         .transpose()?;
-    let workspace_id = saved_plan
+    let persisted_workspace_id = saved_plan
         .as_ref()
         .map(ExtractionPlan::workspace_id)
         .or_else(|| resume.as_ref().map(ExtractionManifest::workspace_id));
+    let workspace_id = match persisted_workspace_id {
+        Some(workspace_id) => Some(workspace_id),
+        None => ExtractionExecutor::publication_workspace_id(&command.output, &mut budget)
+            .map_err(mark_export_execution_error)
+            .context("Failed to inspect extraction publication recovery")?,
+    };
     let workspace = match workspace_id {
         Some(workspace_id) => load_full_workspace_with_workspace_id_excluding_output(
             &command.input,
@@ -65,23 +68,7 @@ pub(crate) fn run(command: ExportCommand, ctx: &AppContext) -> Result<()> {
         Some(plan) => plan,
         None => {
             let request = request.context("ExtractionRequest is required when --plan is absent")?;
-            let references = matches!(
-                request.selection(),
-                ExtractionSelection::ReferenceTraversal { .. }
-            )
-            .then(|| {
-                snapshot
-                    .reference_graph(ReferenceGraphBuildOptions::unbounded(), &mut budget)
-                    .map_err(mark_export_reference_graph_error)
-                    .context("Failed to build the extraction reference graph")
-            })
-            .transpose()?;
-            let planner = ExtractionPlanner::new(&snapshot);
-            let planner = match references.as_ref() {
-                Some(references) => planner.with_reference_graph(references),
-                None => planner,
-            };
-            planner
+            ExtractionPlanner::new(&snapshot)
                 .plan(request, &mut budget)
                 .map_err(mark_export_plan_error)
                 .context("Failed to plan extraction")?
@@ -175,6 +162,9 @@ fn execution_limits(command: &ExportCommand) -> Result<ExtractionExecutionLimits
         command
             .max_output_bytes
             .unwrap_or(defaults.max_output_bytes()),
+        command
+            .max_evidence_verification_bytes
+            .unwrap_or(defaults.max_evidence_verification_bytes()),
         command
             .max_report_bytes
             .unwrap_or(defaults.max_report_bytes()),

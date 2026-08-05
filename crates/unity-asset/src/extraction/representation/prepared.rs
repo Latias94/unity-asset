@@ -17,13 +17,11 @@ use unity_asset_decode::{
 };
 
 use super::super::source_budget_error;
+#[cfg(feature = "decode")]
+use super::contract::PlannedStreamSource;
 use super::contract::{PlannedContent, RepresentationContract};
 #[cfg(feature = "decode")]
 use super::payload::{WorkspacePayloadError, copy_workspace_range};
-#[cfg(feature = "decode")]
-use crate::workspace::{
-    StreamedResourceRequest, StreamedResourceResolution, StreamedResourceResolver,
-};
 use crate::workspace::{
     WorkspaceError, WorkspaceLookup, WorkspaceObject, WorkspaceObjectValue, WorkspaceView,
 };
@@ -66,7 +64,6 @@ impl PreparedRepresentation {
         view: &dyn WorkspaceView,
         address: &ObjectAddress,
         contract: &RepresentationContract,
-        #[cfg(feature = "decode")] stream_resolver: Option<&StreamedResourceResolver<'_, '_>>,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, RepresentationPreparationError> {
         let object = read_object(view, address, budget)?;
@@ -90,13 +87,7 @@ impl PreparedRepresentation {
                 };
                 let layout = AudioClipLayout::inspect(binary)
                     .map_err(|_| RepresentationPreparationError::InvalidContent)?;
-                let source = media_source_bytes(
-                    view,
-                    layout.payload(),
-                    stream.as_ref(),
-                    stream_resolver,
-                    budget,
-                )?;
+                let source = media_source_bytes(view, layout.payload(), stream.as_ref(), budget)?;
                 let media = AudioExporter::prepare_layout(layout, source, budget)
                     .map_err(map_audio_preparation_error)?;
                 validate_descriptor(descriptor, media.descriptor())?;
@@ -113,13 +104,7 @@ impl PreparedRepresentation {
                 };
                 let layout = Texture2DLayout::inspect(binary)
                     .map_err(|_| RepresentationPreparationError::InvalidContent)?;
-                let source = media_source_bytes(
-                    view,
-                    layout.payload(),
-                    stream.as_ref(),
-                    stream_resolver,
-                    budget,
-                )?;
+                let source = media_source_bytes(view, layout.payload(), stream.as_ref(), budget)?;
                 let media = PreparedTexturePng::prepare(layout, source, budget)
                     .map_err(map_texture_preparation_error)?;
                 validate_descriptor(descriptor, media.descriptor())?;
@@ -150,7 +135,6 @@ impl PreparedRepresentation {
                     view,
                     texture_layout.payload(),
                     texture_stream.as_ref(),
-                    stream_resolver,
                     budget,
                 )?;
                 let media =
@@ -237,7 +221,9 @@ impl PreparedRepresentation {
             PreparedState::Source {
                 preferred: PreparedSource::DecodedUnavailable,
                 ..
-            } => Err(RepresentationWriteError::InvalidContent),
+            } => Err(RepresentationWriteError::CapabilityUnavailable {
+                capability: "media decode",
+            }),
             #[cfg(feature = "decode")]
             PreparedState::Media { preferred, .. } => write_media(writer, preferred),
         }
@@ -309,6 +295,9 @@ pub(in crate::extraction) enum RepresentationPreparationError {
 pub(in crate::extraction) enum RepresentationWriteError {
     #[error("prepared representation no longer matches the requested content")]
     InvalidContent,
+    #[cfg(not(feature = "decode"))]
+    #[error("prepared representation requires unavailable capability {capability}")]
+    CapabilityUnavailable { capability: &'static str },
     #[error("representation output failed")]
     Output,
     #[error(transparent)]
@@ -342,12 +331,11 @@ fn read_object(
 fn media_source_bytes(
     view: &dyn WorkspaceView,
     payload: MediaPayloadRef<'_>,
-    stream: Option<&StreamedResourceRequest>,
-    stream_resolver: Option<&StreamedResourceResolver<'_, '_>>,
+    stream: Option<&PlannedStreamSource>,
     budget: &mut AssetLoadBudget,
 ) -> Result<BudgetedMediaBytes, RepresentationPreparationError> {
     match (payload.embedded(), stream) {
-        (None, Some(request)) => read_streamed_payload(view, request, stream_resolver, budget),
+        (None, Some(source)) => read_streamed_payload(view, source, budget),
         (Some(embedded), None) => embedded
             .materialize("embedded media payload", budget)
             .map_err(map_embedded_media_error),
@@ -358,21 +346,12 @@ fn media_source_bytes(
 #[cfg(feature = "decode")]
 fn read_streamed_payload(
     view: &dyn WorkspaceView,
-    request: &StreamedResourceRequest,
-    resolver: Option<&StreamedResourceResolver<'_, '_>>,
+    source: &PlannedStreamSource,
     budget: &mut AssetLoadBudget,
 ) -> Result<BudgetedMediaBytes, RepresentationPreparationError> {
-    let resolver = resolver
-        .ok_or_else(|| RepresentationPreparationError::SourceChanged(request.owner().clone()))?;
-    let resolution = resolver.resolve_request(request, budget)?;
-    let StreamedResourceResolution::Resolved { resource } = resolution else {
-        return Err(RepresentationPreparationError::SourceChanged(
-            request.owner().clone(),
-        ));
-    };
-    let range = resource.open(view, budget)?;
+    let range = source.open(view, budget)?;
     copy_workspace_range(&range, "extraction streamed resource", budget)
-        .map_err(|error| map_workspace_payload_error(error, request.owner()))
+        .map_err(|error| map_workspace_payload_error(error, source.request().owner()))
 }
 
 #[cfg(feature = "decode")]

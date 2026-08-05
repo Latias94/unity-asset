@@ -9,7 +9,7 @@ use unity_asset_core::{
 };
 use unity_asset_yaml::UnityYamlSerializer;
 
-use super::artifact::{OutputArtifactError, OutputLayout};
+use super::artifact::{OutputArtifactError, OutputLayout, StagedPublishError};
 use super::executor::ExistingOutputPolicy;
 use super::model::{ExtractionModelError, ExtractionPath};
 use crate::workspace::{WorkspaceError, WorkspaceObjectValue, WorkspaceSource, WorkspaceView};
@@ -230,11 +230,10 @@ impl YamlSplitExecutor {
                     budget,
                 )
                 .map_err(|error| YamlSplitError::Serialization(error.to_string()))?;
-            staging
-                .finish()
-                .map_err(YamlSplitError::output)?
+            let staged = staging.finish().map_err(YamlSplitError::output)?;
+            staged
                 .publish(existing_output == ExistingOutputPolicy::Replace)
-                .map_err(YamlSplitError::output)?;
+                .map_err(map_staged_publish_error)?;
             written = written
                 .checked_add(1)
                 .ok_or(BudgetError::ArithmeticOverflow {
@@ -248,6 +247,15 @@ impl YamlSplitExecutor {
             written,
             skipped_existing,
         })
+    }
+}
+
+fn map_staged_publish_error(error: StagedPublishError) -> YamlSplitError {
+    match error {
+        StagedPublishError::NotPublished(error) => YamlSplitError::output(error),
+        StagedPublishError::Uncertain(error) => {
+            YamlSplitError::PublicationUncertain(error.to_string())
+        }
     }
 }
 
@@ -327,6 +335,8 @@ pub enum YamlSplitError {
     Serialization(String),
     #[error("safe YAML split publication failed: {0}")]
     Output(String),
+    #[error("YAML split publication may already have committed: {0}")]
+    PublicationUncertain(String),
 }
 
 impl YamlSplitError {
@@ -393,5 +403,19 @@ mod tests {
                 .is_file()
         );
         assert!(!output.join("extraction-manifest.json").exists());
+    }
+
+    #[test]
+    fn split_publication_preserves_uncertain_move_state() {
+        let output_error = || OutputArtifactError::UnplannedPath("fixture.yaml".to_owned());
+
+        assert!(matches!(
+            map_staged_publish_error(StagedPublishError::NotPublished(output_error())),
+            YamlSplitError::Output(_)
+        ));
+        assert!(matches!(
+            map_staged_publish_error(StagedPublishError::Uncertain(output_error())),
+            YamlSplitError::PublicationUncertain(_)
+        ));
     }
 }

@@ -6,10 +6,12 @@ use super::contract::RepresentationContract;
 use super::prepared::{PreparedRepresentation, RepresentationPreparationError};
 use super::reservation::{ExtractionReservationError, trusted_working_set};
 #[cfg(feature = "decode")]
-use crate::workspace::{StreamedResourceResolver, WorkspaceSource};
+use crate::workspace::StreamedResourceResolver;
+#[cfg(feature = "decode")]
+use crate::workspace::WorkspaceSource;
 use crate::workspace::{WorkspaceError, WorkspaceView};
 
-/// Owned inputs that must outlive a bound representation runtime.
+/// Owns the source snapshot required to prove streamed representation inputs.
 pub(in crate::extraction) struct RepresentationRuntimeContext {
     #[cfg(feature = "decode")]
     stream_sources: Option<Vec<WorkspaceSource>>,
@@ -32,7 +34,7 @@ impl RepresentationRuntimeContext {
         }
         #[cfg(not(feature = "decode"))]
         {
-            let _ = (view, contracts.into_iter(), budget);
+            let _ = (view, contracts, budget);
             Ok(Self {})
         }
     }
@@ -55,18 +57,18 @@ impl RepresentationRuntimeContext {
             #[cfg(feature = "decode")]
             stream_resolver,
             #[cfg(not(feature = "decode"))]
-            source: std::marker::PhantomData,
+            marker: std::marker::PhantomData,
         })
     }
 }
 
 /// Opaque execution owner for representation proof and preparation.
-pub(in crate::extraction) struct RepresentationRuntime<'view, 'source> {
+pub(in crate::extraction) struct RepresentationRuntime<'view, 'context> {
     view: &'view dyn WorkspaceView,
     #[cfg(feature = "decode")]
-    stream_resolver: Option<StreamedResourceResolver<'view, 'source>>,
+    stream_resolver: Option<StreamedResourceResolver<'view, 'context>>,
     #[cfg(not(feature = "decode"))]
-    source: std::marker::PhantomData<&'source ()>,
+    marker: std::marker::PhantomData<&'context ()>,
 }
 
 impl RepresentationRuntime<'_, '_> {
@@ -92,13 +94,6 @@ impl RepresentationRuntime<'_, '_> {
         contract: &RepresentationContract,
         budget: &mut AssetLoadBudget,
     ) -> Result<PreparedRepresentation, RepresentationPreparationError> {
-        PreparedRepresentation::prepare(
-            self.view,
-            address,
-            contract,
-            #[cfg(feature = "decode")]
-            self.stream_resolver.as_ref(),
-            budget,
-        )
+        PreparedRepresentation::prepare(self.view, address, contract, budget)
     }
 }

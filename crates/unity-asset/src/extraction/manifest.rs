@@ -21,8 +21,8 @@ use super::model::{
     normalize_source_expectations, normalize_values,
 };
 
-pub const EXTRACTION_MANIFEST_VERSION: u8 = 2;
-pub const EXTRACTION_REPORT_VERSION: u8 = 2;
+pub const EXTRACTION_MANIFEST_VERSION: u8 = 3;
+pub const EXTRACTION_REPORT_VERSION: u8 = 3;
 pub const EXTRACTION_MANIFEST_CONTRACT: &str = "unity_asset.extraction_manifest";
 pub const EXTRACTION_REPORT_CONTRACT: &str = "unity_asset.extraction_report";
 
@@ -53,6 +53,17 @@ pub struct ExtractionManifestArtifact {
     length: Option<u64>,
     digest: Option<DigestV1>,
     diagnostics: Box<[ExtractionDiagnostic]>,
+}
+
+impl<'de> Deserialize<'de> for ExtractionManifestArtifact {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        ExtractionManifestArtifactWire::deserialize(deserializer)?
+            .into_artifact()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Public name for one persisted artifact receipt.

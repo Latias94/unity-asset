@@ -8,8 +8,8 @@ use unity_asset::extraction::{
     ExistingOutputPolicy, ExtractionArtifactKind, ExtractionArtifactStatus,
     ExtractionDiagnosticCode, ExtractionExecutionError, ExtractionExecutionLimits,
     ExtractionExecutionOptions, ExtractionExecutor, ExtractionFailurePolicy, ExtractionFilter,
-    ExtractionPlan, ExtractionPlanError, ExtractionPlanner, ExtractionRepresentationPolicy,
-    ExtractionRequest, ExtractionRunOptions,
+    ExtractionPlan, ExtractionPlanError, ExtractionPlanMismatchKind, ExtractionPlanner,
+    ExtractionRepresentationPolicy, ExtractionRequest, ExtractionRunOptions,
 };
 use unity_asset::workspace::{AssetWorkspace, WorkspaceError};
 use unity_asset::{AssetLoadBudget, AssetLoadLimits, BudgetError, DigestV1};
@@ -27,8 +27,15 @@ fn options() -> ExtractionExecutionOptions {
 
 fn options_with_output_limit(max_output_bytes: u64) -> ExtractionExecutionOptions {
     ExtractionExecutionOptions::new(
-        ExtractionExecutionLimits::new(2, 512 * 1024 * 1024, 5, max_output_bytes, 16 * 1024 * 1024)
-            .unwrap(),
+        ExtractionExecutionLimits::new(
+            2,
+            512 * 1024 * 1024,
+            5,
+            max_output_bytes,
+            u64::MAX,
+            16 * 1024 * 1024,
+        )
+        .unwrap(),
         ExistingOutputPolicy::Error,
         ExtractionFailurePolicy::CollectAll,
     )
@@ -301,7 +308,7 @@ fn media_plan_rejects_a_destination_suffix_that_disagrees_with_its_descriptor() 
         )
         .unwrap();
     let mut encoded = serde_json::to_value(plan).unwrap();
-    assert_eq!(encoded["version"], serde_json::json!(3));
+    assert_eq!(encoded["version"], serde_json::json!(4));
     let path = encoded["artifacts"][0]["preferred_path"]
         .as_str()
         .unwrap()
@@ -354,7 +361,13 @@ fn execution_reprepares_media_and_rejects_descriptor_drift_before_staging() {
 
     assert!(matches!(
         error,
-        ExtractionExecutionError::MediaDescriptorChanged { ordinal: 0 }
+        ExtractionExecutionError::PlanVerification(source)
+            if matches!(
+                source.as_ref(),
+                ExtractionPlanError::PlanDerivationMismatch {
+                    kind: ExtractionPlanMismatchKind::Representations,
+                }
+            )
     ));
     assert!(!directory.path().join(destination).exists());
 }

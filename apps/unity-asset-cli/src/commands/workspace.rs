@@ -2,7 +2,6 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use unity_asset::extraction::{BundleContainerQuery, ExtractionPlanner};
-use unity_asset::reference::ReferenceGraphBuildOptions;
 use unity_asset::workspace::{
     AssetWorkspace, MutationPlan, PrepareOptions, PublicationTarget, RecoveryLocator,
     WorkspaceInspector, WorkspaceLookup, workspace_capabilities,
@@ -121,11 +120,7 @@ fn inspect_bundle_containers(input: &Path, query_json: &Path, context: &AppConte
     })?;
     let workspace = load_full_workspace(input, context, &mut budget)?;
     let snapshot = workspace.snapshot();
-    let references = snapshot
-        .reference_graph(ReferenceGraphBuildOptions::unbounded(), &mut budget)
-        .context("Failed to build the revision-bound reference graph")?;
     let result = ExtractionPlanner::new(&snapshot)
-        .with_reference_graph(&references)
         .bundle_container_occurrences(query, &mut budget)
         .context("Failed to inspect AssetBundle container occurrences")?;
     write_canonical(|output| {

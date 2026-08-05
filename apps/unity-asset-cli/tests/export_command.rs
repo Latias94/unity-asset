@@ -50,7 +50,7 @@ fn export_dry_run_is_side_effect_free_and_execution_uses_manifest_paths() {
     assert_success(&dry_run);
     let plan: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
     assert_eq!(plan["contract"], "unity_asset.extraction_plan");
-    assert_eq!(plan["version"], 3);
+    assert_eq!(plan["version"], 4);
     assert_eq!(plan["artifacts"].as_array().unwrap().len(), 1);
     assert!(!output_root.exists());
 
@@ -58,7 +58,7 @@ fn export_dry_run_is_side_effect_free_and_execution_uses_manifest_paths() {
     assert_success(&execution);
     let report = extraction_report(&execution);
     assert_eq!(report["contract"], "unity_asset.extraction_report");
-    assert_eq!(report["version"], 2);
+    assert_eq!(report["version"], 3);
     assert_eq!(report["counts"]["written"], 1);
     let artifacts = report["manifest"]["artifacts"].as_array().unwrap();
     assert_eq!(artifacts.len(), 1);
@@ -212,6 +212,48 @@ fn export_resume_reuses_verified_outputs_across_independent_processes() {
 }
 
 #[test]
+fn export_can_raise_the_evidence_verification_limit_to_recover() {
+    let temp = tempfile::tempdir().unwrap();
+    let output_root = temp.path().join("artifacts");
+    let input = sample("banner_1");
+    let request = write_request(temp.path());
+
+    let first = export_artifacts(&input, &output_root, &request, false);
+    assert_success(&first);
+    let report = extraction_report(&first);
+    let artifact_path = report["manifest"]["artifacts"][0]["path"].as_str().unwrap();
+    let artifact_length = fs::metadata(output_root.join(artifact_path)).unwrap().len();
+    assert!(artifact_length > 1);
+
+    let rejected = export_with_evidence_verification_limit(
+        &input,
+        &output_root,
+        &request,
+        artifact_length - 1,
+    );
+    let error = assert_cli_error(&rejected, "CLI_EXPORT_RESOURCE_LIMIT");
+    assert_eq!(
+        error["details"]["kind"],
+        "evidence_verification_limit_exceeded"
+    );
+    assert_eq!(error["details"]["required"], artifact_length);
+    assert_eq!(error["details"]["remaining"], artifact_length - 1);
+
+    let recovered = export_with_evidence_verification_limit(
+        &input,
+        &output_root,
+        &request,
+        artifact_length.checked_mul(2).unwrap(),
+    );
+    assert_success(&recovered);
+    let report = extraction_report(&recovered);
+    assert_eq!(
+        report["manifest"]["artifacts"][0]["status"],
+        "skipped_existing"
+    );
+}
+
+#[test]
 fn export_atomically_publishes_a_durable_resume_manifest() {
     let temp = tempfile::tempdir().unwrap();
     let output_root = temp.path().join("artifacts");
@@ -348,7 +390,7 @@ fn extraction_report_reader_rejects_version_one() {
 }
 
 #[test]
-fn export_rejects_underdeclared_plan_with_stable_machine_details() {
+fn export_rejects_tampered_working_set_as_a_plan_mismatch() {
     let temp = tempfile::tempdir().unwrap();
     let output_root = temp.path().join("artifacts");
     let plan_path = temp.path().join("plan.json");
@@ -367,10 +409,9 @@ fn export_rejects_underdeclared_plan_with_stable_machine_details() {
     assert!(rejected.stdout.is_empty());
     let error: serde_json::Value = serde_json::from_slice(&rejected.stderr).unwrap();
     assert_eq!(error["contract"], "unity_asset.cli_error");
-    assert_eq!(error["code"], "CLI_EXPORT_RESOURCE_LIMIT");
-    assert_eq!(error["details"]["kind"], "working_set_underdeclared");
-    assert_eq!(error["details"]["ordinal"], 0);
-    assert_eq!(error["details"]["declared"], 1);
+    assert_eq!(error["code"], "CLI_EXPORT_PLAN_REJECTED");
+    assert_eq!(error["details"]["kind"], "plan_derivation_mismatch");
+    assert_eq!(error["details"]["mismatch"], "representations");
     assert!(!output_root.exists());
 }
 
@@ -559,6 +600,28 @@ fn export_with_plan(input: &Path, output: &Path, plan: &Path, resume: Option<&Pa
     export_with_inputs(input, output, false, None, resume, Some(plan), None)
 }
 
+fn export_with_evidence_verification_limit(
+    input: &Path,
+    output: &Path,
+    request: &Path,
+    limit: u64,
+) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_unity-asset"))
+        .arg("export")
+        .arg("--input")
+        .arg(input)
+        .arg("--output")
+        .arg(output)
+        .arg("--request")
+        .arg(request)
+        .arg("--existing-output")
+        .arg("skip")
+        .arg("--max-evidence-verification-bytes")
+        .arg(limit.to_string())
+        .output()
+        .expect("the export command must start")
+}
+
 fn export_with_manifest(
     input: &Path,
     output: &Path,
@@ -647,12 +710,12 @@ fn extraction_report(output: &Output) -> serde_json::Value {
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("extraction report must be JSON");
     assert_eq!(report["contract"], "unity_asset.extraction_report");
-    assert_eq!(report["version"], 2);
+    assert_eq!(report["version"], 3);
     assert_eq!(
         report["manifest"]["contract"],
         "unity_asset.extraction_manifest"
     );
-    assert_eq!(report["manifest"]["version"], 2);
+    assert_eq!(report["manifest"]["version"], 3);
     report
 }
 

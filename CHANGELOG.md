@@ -14,7 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added zero-write prepare with independently reparsed segmented artifacts, read-your-writes inspection, deterministic proof manifests, and an opaque single-use `PreparedChange`.
 - Added recoverable in-place publication with validated containment roots, durable journals, directory identity binding, `CommitReport`, recovery discovery, `RecoveryLocator`, `RecoveryOutcome`, and `RollbackReceipt` contracts.
 - Added one revision-bound `ReferenceGraph` with typed field paths, coverage, resolution states, incoming/outgoing/closure queries, caching, and deterministic JSON, JSON Lines, and DOT projections.
-- Added typed extraction request v1, plan v2, manifest v2, and report v2 contracts with bundle-container queries, deterministic artifact paths, collision policy, bounded execution, durable manifests, and verified resume.
+- Added typed extraction request v2, plan v4, manifest v3, and report v3 contracts with bundle-container and reference-traversal queries, deterministic artifact paths, caller-budgeted execution, recoverable publication, and verified resume.
 - Added a revision-bound, consumer-owned search pipeline with transaction-keyed `ChangeSet` handoff, coherent `SearchGeneration` state, project-bound local IPC Bootstrap V2, and bounded idempotent reindex operations.
 - Added deterministic tag-release evidence, exact cargo-dist artifact-plan validation, isolated archive-consumer verification, real MSRV validation, pinned release inputs, checksums, GitHub Draft Release byte read-back, and build provenance attestations.
 - Added schema-aware mutation recipes that inspect exact YAML or binary provenance and lower guarded field, reference, schema, sequence, hierarchy, UnityEvent, material, transform, and streamed-audio changes into plan fragments.
@@ -32,6 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Bound source fingerprints, object identities, prepared artifacts, journals, extraction manifests, changes, and search generations to the versioned BLAKE3 `DigestV1` contract.
 - Made binary reference changes allocate external-file IDs deterministically and preserve exact PPtr shape, directory occurrence order, and source ownership.
 - Moved optional decode representations behind extraction policies while keeping authoritative selection, identity, planning, and manifest semantics in the high-level workspace.
+- Bound extraction final-path evidence reads to one cumulative, recovery-adjustable verification limit.
 
 ### Fixed
 

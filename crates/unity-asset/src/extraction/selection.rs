@@ -1,6 +1,9 @@
 use std::fmt::Write as _;
+use std::ops::Deref;
 
-#[cfg(test)]
+use serde::ser::SerializeSeq;
+use serde::{Serialize, Serializer};
+#[cfg(any(test, not(feature = "decode")))]
 use unity_asset_binary::asset::class_ids;
 use unity_asset_core::{
     AssetLoadBudget, ObjectAddress, ObjectKind, RevisionedObjectHandle, SourceLocator, UnityValue,
@@ -11,17 +14,21 @@ use super::container::{
     resolved_addresses,
 };
 use super::contract::ExtractionAllocationUnit;
+#[cfg(not(feature = "decode"))]
+use super::contract::{ExtractionArtifactKind, ExtractionDiagnosticCode};
 use super::manifest::canonical_digest;
 use super::model::{
     ExtractionModelError, ExtractionPath, ExtractionPlan, ExtractionRepresentationPolicy,
-    ExtractionRequest, ExtractionSelection, PlannedArtifact,
+    ExtractionRequest, ExtractionSelection, ExtractionSelectionWitness, PlannedArtifact,
 };
 use super::planning_contract::{
-    ExtractionPlanError, budgeted_vec, clone_string, resolve_required_handle, source_for_id,
-    usize_to_u64,
+    ExtractionPlanError, ExtractionPlanMismatchKind, budgeted_vec, clone_string,
+    resolve_required_handle, source_for_id, usize_to_u64,
 };
+#[cfg(not(feature = "decode"))]
+use super::representation::PlannedContent;
 use super::representation::RepresentationPlanner;
-use crate::reference::{ReferenceGraph, ReferenceTraversal};
+use crate::reference::{ReferenceGraph, ReferenceGraphBuildOptions};
 #[cfg(test)]
 use crate::workspace::StreamedResourceResolver;
 use crate::workspace::{WorkspaceObject, WorkspaceSource, WorkspaceView};
@@ -29,22 +36,25 @@ use crate::workspace::{WorkspaceObject, WorkspaceSource, WorkspaceView};
 /// Plans deterministic extraction artifacts against one immutable workspace view.
 pub struct ExtractionPlanner<'view> {
     view: &'view dyn WorkspaceView,
-    references: Option<&'view ReferenceGraph>,
+}
+
+/// Non-serializable evidence that one persisted plan matches this workspace.
+pub(in crate::extraction) struct VerifiedExecutionPlan<'plan> {
+    plan: &'plan ExtractionPlan,
+}
+
+impl Deref for VerifiedExecutionPlan<'_> {
+    type Target = ExtractionPlan;
+
+    fn deref(&self) -> &Self::Target {
+        self.plan
+    }
 }
 
 impl<'view> ExtractionPlanner<'view> {
     #[must_use]
     pub const fn new(view: &'view dyn WorkspaceView) -> Self {
-        Self {
-            view,
-            references: None,
-        }
-    }
-
-    #[must_use]
-    pub const fn with_reference_graph(mut self, references: &'view ReferenceGraph) -> Self {
-        self.references = Some(references);
-        self
+        Self { view }
     }
 
     pub fn plan(
@@ -52,23 +62,159 @@ impl<'view> ExtractionPlanner<'view> {
         request: ExtractionRequest,
         budget: &mut AssetLoadBudget,
     ) -> Result<ExtractionPlan, ExtractionPlanError> {
-        self.validate_reference_context()?;
+        let derived = self.derive_plan(&request, budget)?;
+        ExtractionPlan::new_budgeted(
+            self.view.workspace_id(),
+            self.view.revision(),
+            request,
+            derived.selection_witness,
+            derived.sources,
+            derived.artifacts,
+            budget,
+        )
+        .map_err(map_model_error)
+    }
 
-        let sources = self.view.sources(budget)?;
-        let mut representation_planner = RepresentationPlanner::new(
-            self.view,
-            self.references,
-            &sources,
-            request.representation(),
-        );
-        let handles = selected_handles(self.view, &request, &sources, budget)?;
-        let mut candidates = budgeted_vec(handles.len(), "extraction candidate addresses", budget)?;
-        for handle in handles {
-            let address = self.view.object_address(&handle, budget)?;
-            candidates.push((address, handle));
+    /// Re-derives feature-neutral selection and filter evidence before execution.
+    pub(in crate::extraction) fn verify<'plan>(
+        &self,
+        plan: &'plan ExtractionPlan,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<VerifiedExecutionPlan<'plan>, ExtractionPlanError> {
+        if plan.workspace_id() != self.view.workspace_id()
+            || plan.revision() != self.view.revision()
+        {
+            return Err(ExtractionPlanError::PlanContextMismatch);
         }
-        candidates.sort_by(|left, right| left.0.cmp(&right.0));
-        candidates.dedup_by(|left, right| left.0 == right.0);
+        #[cfg(feature = "decode")]
+        {
+            let derived = self.derive_plan(plan.request(), budget)?;
+            verify_derived_plan(plan, &derived)?;
+        }
+        #[cfg(not(feature = "decode"))]
+        {
+            let SelectionDerivation {
+                sources,
+                candidates,
+                witness,
+                ..
+            } = self.derive_selection(plan.request(), budget)?;
+            if witness != plan.selection_witness() {
+                return Err(ExtractionPlanError::PlanDerivationMismatch {
+                    kind: ExtractionPlanMismatchKind::SelectionWitness,
+                });
+            }
+            self.verify_artifact_projection(plan, &sources, candidates, budget)?;
+            verify_no_decode_representations(plan)?;
+        }
+        Ok(VerifiedExecutionPlan { plan })
+    }
+
+    #[cfg(not(feature = "decode"))]
+    fn verify_artifact_projection(
+        &self,
+        plan: &ExtractionPlan,
+        sources: &[WorkspaceSource],
+        candidates: Vec<(ObjectAddress, RevisionedObjectHandle)>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<(), ExtractionPlanError> {
+        let mut artifact_index = 0_usize;
+        for (address, handle) in candidates {
+            let object = self.view.read_object(&handle, budget)?;
+            if !plan
+                .request()
+                .filter()
+                .matches_class(object.class().class_id(), object.class().class_name())
+            {
+                continue;
+            }
+            let object_name = object_name(&object, budget)?;
+            if !plan
+                .request()
+                .filter()
+                .matches_object_name(object_name.as_deref())
+            {
+                continue;
+            }
+            if plan.request().filter().limit().is_some_and(|limit| {
+                u64::try_from(artifact_index).is_ok_and(|count| count >= limit)
+            }) {
+                break;
+            }
+            let Some(artifact) = plan.artifacts().get(artifact_index) else {
+                return Err(ExtractionPlanError::PlanDerivationMismatch {
+                    kind: ExtractionPlanMismatchKind::Artifacts,
+                });
+            };
+            if artifact.address() != &address
+                || artifact.class_id() != object.class().class_id()
+                || artifact.class_name() != object.class().class_name()
+                || artifact.object_name() != object_name.as_deref()
+            {
+                return Err(ExtractionPlanError::PlanDerivationMismatch {
+                    kind: ExtractionPlanMismatchKind::Artifacts,
+                });
+            }
+            let owner = source_for_id(handle.object().source(), sources)?;
+            let expected_preferred = allocate_path(
+                plan.request().prefix(),
+                &address,
+                owner.locator(),
+                object.class().class_id(),
+                object.class().class_name(),
+                object_name.as_deref(),
+                artifact.representation().preferred_extension(),
+                false,
+                budget,
+            )?;
+            let expected_fallback = artifact
+                .representation()
+                .fallback_extension()
+                .map(|extension| {
+                    allocate_path(
+                        plan.request().prefix(),
+                        &address,
+                        owner.locator(),
+                        object.class().class_id(),
+                        object.class().class_name(),
+                        object_name.as_deref(),
+                        extension,
+                        true,
+                        budget,
+                    )
+                })
+                .transpose()?;
+            if artifact.preferred_path() != &expected_preferred
+                || artifact.fallback_path() != expected_fallback.as_ref()
+            {
+                return Err(ExtractionPlanError::PlanDerivationMismatch {
+                    kind: ExtractionPlanMismatchKind::ArtifactPaths,
+                });
+            }
+            artifact_index += 1;
+        }
+        if artifact_index != plan.artifacts().len() {
+            return Err(ExtractionPlanError::PlanDerivationMismatch {
+                kind: ExtractionPlanMismatchKind::Artifacts,
+            });
+        }
+        Ok(())
+    }
+
+    fn derive_plan(
+        &self,
+        request: &ExtractionRequest,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<DerivedPlan, ExtractionPlanError> {
+        let SelectionDerivation {
+            sources,
+            references,
+            candidates,
+            witness: selection_witness,
+        } = self.derive_selection(request, budget)?;
+
+        let mut representation_planner =
+            RepresentationPlanner::new(self.view, references, &sources, request.representation());
 
         let mut source_expectations =
             budgeted_vec(sources.len(), "extraction source expectations", budget)?;
@@ -137,15 +283,35 @@ impl<'view> ExtractionPlanner<'view> {
         }
 
         source_expectations.sort_unstable_by(|left, right| left.locator().cmp(right.locator()));
-        ExtractionPlan::new_budgeted(
-            self.view.workspace_id(),
-            self.view.revision(),
-            request,
-            source_expectations,
+        Ok(DerivedPlan {
+            selection_witness,
+            sources: source_expectations,
             artifacts,
-            budget,
-        )
-        .map_err(map_model_error)
+        })
+    }
+
+    fn derive_selection(
+        &self,
+        request: &ExtractionRequest,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SelectionDerivation, ExtractionPlanError> {
+        let sources = self.view.sources(budget)?;
+        let references = reference_graph_for_request(self.view, request, budget)?;
+        let handles = selected_handles(self.view, request, &sources, references.as_ref(), budget)?;
+        let mut candidates = budgeted_vec(handles.len(), "extraction candidate addresses", budget)?;
+        for handle in handles {
+            let address = self.view.object_address(&handle, budget)?;
+            candidates.push((address, handle));
+        }
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        candidates.dedup_by(|left, right| left.0 == right.0);
+        let witness = selection_witness(&candidates)?;
+        Ok(SelectionDerivation {
+            sources,
+            references,
+            candidates,
+            witness,
+        })
     }
 
     pub fn plan_handles(
@@ -164,31 +330,6 @@ impl<'view> ExtractionPlanner<'view> {
         self.plan(request, budget)
     }
 
-    pub fn plan_traversal(
-        &self,
-        traversal: &ReferenceTraversal,
-        representation: ExtractionRepresentationPolicy,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<ExtractionPlan, ExtractionPlanError> {
-        if traversal.workspace_id() != self.view.workspace_id()
-            || traversal.revision() != self.view.revision()
-        {
-            return Err(ExtractionPlanError::ReferenceContextMismatch);
-        }
-        if !traversal.is_complete() {
-            return Err(ExtractionPlanError::IncompleteReferenceTraversal);
-        }
-        let mut addresses =
-            budgeted_vec(traversal.len(), "extraction traversal addresses", budget)?;
-        for handle in traversal.nodes() {
-            handle.validate_context(self.view.workspace_id(), self.view.revision())?;
-            addresses.push(self.view.object_address(handle, budget)?);
-        }
-        let request =
-            ExtractionRequest::addresses(addresses, representation).map_err(map_model_error)?;
-        self.plan(request, budget)
-    }
-
     pub fn plan_bundle_containers(
         &self,
         pattern: &str,
@@ -196,20 +337,8 @@ impl<'view> ExtractionPlanner<'view> {
         budget: &mut AssetLoadBudget,
     ) -> Result<ExtractionPlan, ExtractionPlanError> {
         let pattern = clone_string(pattern, "bundle container query pattern", budget)?;
-        let query = BundleContainerQuery::new(pattern)?;
-        let result = self.bundle_container_occurrences(query, budget)?;
-        if !result.is_complete() {
-            return Err(ExtractionPlanError::IncompleteReferenceGraph);
-        }
-        let addresses = resolved_addresses(&result, budget)?;
-        let request_pattern = clone_string(
-            result.query().pattern(),
-            "bundle container extraction pattern",
-            budget,
-        )?;
-        let request =
-            ExtractionRequest::bundle_container(request_pattern, addresses, representation)
-                .map_err(map_model_error)?;
+        let request = ExtractionRequest::bundle_container(pattern, representation)
+            .map_err(map_model_error)?;
         self.plan(request, budget)
     }
 
@@ -219,22 +348,158 @@ impl<'view> ExtractionPlanner<'view> {
         query: BundleContainerQuery,
         budget: &mut AssetLoadBudget,
     ) -> Result<BundleContainerResult, ExtractionPlanError> {
-        self.validate_reference_context()?;
-        let references = self
-            .references
-            .ok_or(ExtractionPlanError::ReferenceGraphRequired)?;
-        query_bundle_container_occurrences(self.view, references, query, budget)
-    }
-
-    fn validate_reference_context(&self) -> Result<(), ExtractionPlanError> {
-        if let Some(references) = self.references
-            && (references.workspace_id() != self.view.workspace_id()
-                || references.revision() != self.view.revision())
-        {
-            return Err(ExtractionPlanError::ReferenceContextMismatch);
+        let references =
+            ReferenceGraph::build(self.view, ReferenceGraphBuildOptions::unbounded(), budget)?;
+        if !references.is_complete() {
+            return Err(ExtractionPlanError::IncompleteReferenceGraph);
         }
-        Ok(())
+        query_bundle_container_occurrences(self.view, &references, query, budget)
     }
+}
+
+struct DerivedPlan {
+    selection_witness: ExtractionSelectionWitness,
+    sources: Vec<super::contract::ExtractionSourceExpectation>,
+    artifacts: Vec<PlannedArtifact>,
+}
+
+#[cfg(feature = "decode")]
+fn verify_derived_plan(
+    plan: &ExtractionPlan,
+    derived: &DerivedPlan,
+) -> Result<(), ExtractionPlanError> {
+    if derived.selection_witness != plan.selection_witness() {
+        return Err(ExtractionPlanError::PlanDerivationMismatch {
+            kind: ExtractionPlanMismatchKind::SelectionWitness,
+        });
+    }
+    if derived.sources != plan.sources() {
+        return Err(ExtractionPlanError::PlanDerivationMismatch {
+            kind: ExtractionPlanMismatchKind::SourceExpectations,
+        });
+    }
+    if derived.artifacts.len() != plan.artifacts().len() {
+        return Err(ExtractionPlanError::PlanDerivationMismatch {
+            kind: ExtractionPlanMismatchKind::Artifacts,
+        });
+    }
+    for (actual, expected) in plan.artifacts().iter().zip(&derived.artifacts) {
+        if actual.ordinal() != expected.ordinal()
+            || actual.address() != expected.address()
+            || actual.class_id() != expected.class_id()
+            || actual.class_name() != expected.class_name()
+            || actual.object_name() != expected.object_name()
+        {
+            return Err(ExtractionPlanError::PlanDerivationMismatch {
+                kind: ExtractionPlanMismatchKind::Artifacts,
+            });
+        }
+        if actual.preferred_path() != expected.preferred_path()
+            || actual.fallback_path() != expected.fallback_path()
+        {
+            return Err(ExtractionPlanError::PlanDerivationMismatch {
+                kind: ExtractionPlanMismatchKind::ArtifactPaths,
+            });
+        }
+        if actual.representation() != expected.representation() {
+            return Err(ExtractionPlanError::PlanDerivationMismatch {
+                kind: ExtractionPlanMismatchKind::Representations,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "decode"))]
+fn verify_no_decode_representations(plan: &ExtractionPlan) -> Result<(), ExtractionPlanError> {
+    for artifact in plan.artifacts() {
+        let representation = artifact.representation();
+        let content = representation.preferred_content();
+        let no_fallback = representation.fallback().is_none();
+        let no_diagnostics = representation.diagnostics().is_empty();
+        let exact = match artifact.address().kind() {
+            ObjectKind::Yaml => {
+                matches!(content, PlannedContent::Yaml) && no_fallback && no_diagnostics
+            }
+            ObjectKind::Binary => match plan.request().representation() {
+                ExtractionRepresentationPolicy::RawOnly => {
+                    matches!(content, PlannedContent::RawBinary) && no_fallback && no_diagnostics
+                }
+                ExtractionRepresentationPolicy::PreferDecoded
+                    if artifact.class_id() == class_ids::TEXT_ASSET =>
+                {
+                    matches!(content, PlannedContent::TextAsset)
+                        && representation.fallback_kind() == Some(ExtractionArtifactKind::BinaryRaw)
+                        && no_diagnostics
+                }
+                ExtractionRepresentationPolicy::RequireDecoded
+                    if artifact.class_id() == class_ids::TEXT_ASSET =>
+                {
+                    matches!(content, PlannedContent::TextAsset) && no_fallback && no_diagnostics
+                }
+                ExtractionRepresentationPolicy::PreferDecoded
+                    if is_media_class(artifact.class_id()) =>
+                {
+                    media_content_matches_class(content, artifact.class_id())
+                        && representation.fallback_kind() == Some(ExtractionArtifactKind::BinaryRaw)
+                        && no_diagnostics
+                }
+                ExtractionRepresentationPolicy::RequireDecoded
+                    if is_media_class(artifact.class_id()) =>
+                {
+                    if media_content_matches_class(content, artifact.class_id())
+                        && no_fallback
+                        && no_diagnostics
+                    {
+                        return Err(ExtractionPlanError::ExecutionCapabilityUnavailable {
+                            ordinal: artifact.ordinal(),
+                            capability: "media decode",
+                        });
+                    }
+                    false
+                }
+                ExtractionRepresentationPolicy::PreferDecoded => {
+                    matches!(content, PlannedContent::RawBinary)
+                        && no_fallback
+                        && representation.diagnostics().len() == 1
+                        && representation.diagnostics()[0].code()
+                            == ExtractionDiagnosticCode::UnsupportedClass
+                }
+                ExtractionRepresentationPolicy::RequireDecoded => false,
+            },
+        };
+        if !exact {
+            return Err(ExtractionPlanError::PlanDerivationMismatch {
+                kind: ExtractionPlanMismatchKind::Representations,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "decode"))]
+const fn is_media_class(class_id: i32) -> bool {
+    matches!(
+        class_id,
+        class_ids::AUDIO_CLIP | class_ids::TEXTURE_2D | class_ids::SPRITE
+    )
+}
+
+#[cfg(not(feature = "decode"))]
+const fn media_content_matches_class(content: &PlannedContent, class_id: i32) -> bool {
+    matches!(
+        (content, class_id),
+        (PlannedContent::Audio { .. }, class_ids::AUDIO_CLIP)
+            | (PlannedContent::TexturePng { .. }, class_ids::TEXTURE_2D)
+            | (PlannedContent::SpritePng { .. }, class_ids::SPRITE)
+    )
+}
+
+struct SelectionDerivation {
+    sources: Vec<WorkspaceSource>,
+    references: Option<ReferenceGraph>,
+    candidates: Vec<(ObjectAddress, RevisionedObjectHandle)>,
+    witness: ExtractionSelectionWitness,
 }
 
 fn map_model_error(error: ExtractionModelError) -> ExtractionPlanError {
@@ -265,7 +530,66 @@ fn map_model_error(error: ExtractionModelError) -> ExtractionPlanError {
             unit: ExtractionAllocationUnit::CapacityUnits,
             source,
         },
-        other => ExtractionPlanError::ModelValidation(other),
+        other => ExtractionPlanError::ModelValidation(Box::new(other)),
+    }
+}
+
+fn reference_graph_for_request(
+    view: &dyn WorkspaceView,
+    request: &ExtractionRequest,
+    budget: &mut AssetLoadBudget,
+) -> Result<Option<ReferenceGraph>, ExtractionPlanError> {
+    let required = matches!(
+        request.selection(),
+        ExtractionSelection::BundleContainer { .. }
+            | ExtractionSelection::ReferenceTraversal { .. }
+    );
+    if !required {
+        return Ok(None);
+    }
+    let references = ReferenceGraph::build(view, ReferenceGraphBuildOptions::unbounded(), budget)?;
+    if !references.is_complete() {
+        return Err(ExtractionPlanError::IncompleteReferenceGraph);
+    }
+    Ok(Some(references))
+}
+
+fn selection_witness(
+    candidates: &[(ObjectAddress, RevisionedObjectHandle)],
+) -> Result<ExtractionSelectionWitness, ExtractionPlanError> {
+    let candidate_count = usize_to_u64(candidates.len(), "extraction selection witness")?;
+    let candidate_digest = canonical_digest(&SelectionWitnessPayload {
+        contract: "unity_asset.extraction_selection_witness",
+        version: 1,
+        addresses: CandidateAddresses(candidates),
+    })
+    .map_err(ExtractionModelError::from)
+    .map_err(map_model_error)?;
+    Ok(ExtractionSelectionWitness::new(
+        candidate_count,
+        candidate_digest,
+    ))
+}
+
+#[derive(Serialize)]
+struct SelectionWitnessPayload<'candidate> {
+    contract: &'static str,
+    version: u8,
+    addresses: CandidateAddresses<'candidate>,
+}
+
+struct CandidateAddresses<'candidate>(&'candidate [(ObjectAddress, RevisionedObjectHandle)]);
+
+impl Serialize for CandidateAddresses<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for (address, _) in self.0 {
+            sequence.serialize_element(address)?;
+        }
+        sequence.end()
     }
 }
 
@@ -273,6 +597,7 @@ fn selected_handles(
     view: &dyn WorkspaceView,
     request: &ExtractionRequest,
     sources: &[WorkspaceSource],
+    references: Option<&ReferenceGraph>,
     budget: &mut AssetLoadBudget,
 ) -> Result<Vec<RevisionedObjectHandle>, ExtractionPlanError> {
     match request.selection() {
@@ -285,13 +610,59 @@ fn selected_handles(
             });
             Ok(handles)
         }
-        ExtractionSelection::Addresses { addresses }
-        | ExtractionSelection::BundleContainer { addresses, .. }
-        | ExtractionSelection::ReferenceTraversal { addresses } => {
+        ExtractionSelection::Addresses { addresses } => {
             let mut handles = budgeted_vec(addresses.len(), "extraction selected handles", budget)?;
             for address in addresses {
                 handles.push(resolve_required_handle(view, address, budget)?);
             }
+            Ok(handles)
+        }
+        ExtractionSelection::BundleContainer { pattern } => {
+            let references = references.ok_or(ExtractionPlanError::ReferenceInvariant(
+                "bundle-container selection graph was not constructed",
+            ))?;
+            let pattern = clone_string(pattern, "bundle container query pattern", budget)?;
+            let result = query_bundle_container_occurrences(
+                view,
+                references,
+                BundleContainerQuery::new(pattern)?,
+                budget,
+            )?;
+            if !result.is_complete() {
+                return Err(ExtractionPlanError::IncompleteReferenceGraph);
+            }
+            let addresses = resolved_addresses(&result, budget)?;
+            let mut handles =
+                budgeted_vec(addresses.len(), "bundle container selected handles", budget)?;
+            for address in addresses {
+                handles.push(resolve_required_handle(view, &address, budget)?);
+            }
+            Ok(handles)
+        }
+        ExtractionSelection::ReferenceTraversal {
+            roots,
+            direction,
+            limits,
+        } => {
+            let references = references.ok_or(ExtractionPlanError::ReferenceInvariant(
+                "reference-traversal selection graph was not constructed",
+            ))?;
+            let mut root_handles = budgeted_vec(roots.len(), "extraction traversal roots", budget)?;
+            for root in roots {
+                root_handles.push(resolve_required_handle(view, root, budget)?);
+            }
+            let traversal = references.closure(
+                &root_handles,
+                direction.as_reference(),
+                limits.as_reference(),
+                budget,
+            )?;
+            if !traversal.is_complete() {
+                return Err(ExtractionPlanError::IncompleteReferenceTraversal);
+            }
+            let mut handles =
+                budgeted_vec(traversal.len(), "extraction traversal handles", budget)?;
+            handles.extend(traversal.nodes().cloned());
             Ok(handles)
         }
     }
@@ -551,6 +922,53 @@ mod tests {
 
         assert!(plan.artifacts().len() > 1, "fixture must exercise a batch");
         assert_eq!(StreamedResourceResolver::test_build_count(), 1);
+    }
+
+    #[cfg(feature = "decode")]
+    #[test]
+    fn streamed_media_plan_persists_the_exact_resolved_source() {
+        let sample = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/samples/char_118_yuki.ab");
+        let mut workspace = crate::workspace::AssetWorkspace::new().unwrap();
+        workspace
+            .load_path(&sample, &mut AssetLoadBudget::default())
+            .unwrap();
+        let snapshot = workspace.snapshot();
+        let request = ExtractionRequest::all(ExtractionRepresentationPolicy::RequireDecoded)
+            .with_filter(
+                super::super::model::ExtractionFilter::new(
+                    [class_ids::AUDIO_CLIP],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+        let plan = ExtractionPlanner::new(&snapshot)
+            .plan(request, &mut AssetLoadBudget::default())
+            .unwrap();
+        let mut encoded = serde_json::to_value(&plan).unwrap();
+        let streamed_index = encoded["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|artifact| artifact["preferred_content"]["stream"].is_object())
+            .expect("fixture must contain a streamed AudioClip");
+        let streamed = encoded["artifacts"][streamed_index].clone();
+
+        assert!(
+            streamed["preferred_content"]["stream"]
+                .get("source")
+                .is_some(),
+            "streamed content must persist the exact resolved sidecar"
+        );
+
+        encoded["artifacts"][streamed_index]["preferred_content"]["stream"]
+            .as_object_mut()
+            .unwrap()
+            .remove("source");
+        let error = serde_json::from_value::<ExtractionPlan>(encoded).unwrap_err();
+        assert!(error.to_string().contains("missing field `source`"));
     }
 
     #[cfg(not(feature = "decode"))]

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
@@ -10,8 +10,8 @@ use unity_asset_write::artifact::{ArtifactNameError, LogicalArtifactName};
 use crate::workspace::commit::platform::{
     DirectoryIdentity, FileIdentity, acquire_private_lock_in_parent,
     atomic_replace_verified_tracked, create_private_file_in_parent, ensure_directory_no_follow,
-    observe_file_identity, open_readonly_regular_in_parent, opened_file_identity,
-    remove_owned_file_in_parent,
+    observe_directory_identity, observe_file_identity, open_readonly_regular_in_parent,
+    opened_file_identity, remove_owned_file_in_parent,
 };
 
 use super::model::paths_conflict;
@@ -25,6 +25,7 @@ const EXECUTION_LOCK_NAME: &str = ".unity-asset-extraction.lock";
 pub enum ExtractionOutputErrorKind {
     InvalidName,
     PortableCollision,
+    ReservedPath,
     MissingParent,
     UnplannedPath,
     ResolveCurrentDirectory,
@@ -50,6 +51,7 @@ impl ExtractionOutputErrorKind {
         match self {
             Self::InvalidName => "invalid_name",
             Self::PortableCollision => "portable_collision",
+            Self::ReservedPath => "reserved_path",
             Self::MissingParent => "missing_parent",
             Self::UnplannedPath => "unplanned_path",
             Self::ResolveCurrentDirectory => "resolve_current_directory",
@@ -89,6 +91,7 @@ impl std::fmt::Display for ExtractionOutputErrorKind {
             Self::DiscardTemporary => "remove temporary output",
             Self::InvalidName => "validate output name",
             Self::PortableCollision => "validate portable output names",
+            Self::ReservedPath => "validate reserved output names",
             Self::MissingParent => "resolve output parent",
             Self::UnplannedPath => "resolve planned output path",
             Self::TemporaryIdentityChanged => "verify temporary output identity",
@@ -103,6 +106,8 @@ pub(super) enum OutputArtifactError {
     InvalidName(#[from] ArtifactNameError),
     #[error("output names {first:?} and {second:?} cannot coexist on portable filesystems")]
     PortableCollision { first: String, second: String },
+    #[error("output path is reserved for extraction protocol state: {0:?}")]
+    ReservedPath(String),
     #[error("output path has no parent: {0:?}")]
     MissingParent(PathBuf),
     #[error("output layout does not contain planned path {0:?}")]
@@ -131,6 +136,7 @@ impl OutputArtifactError {
         match self {
             Self::InvalidName(_) => ExtractionOutputErrorKind::InvalidName,
             Self::PortableCollision { .. } => ExtractionOutputErrorKind::PortableCollision,
+            Self::ReservedPath(_) => ExtractionOutputErrorKind::ReservedPath,
             Self::MissingParent(_) => ExtractionOutputErrorKind::MissingParent,
             Self::UnplannedPath(_) => ExtractionOutputErrorKind::UnplannedPath,
             Self::Io { kind, .. } => *kind,
@@ -150,22 +156,113 @@ pub(super) struct OutputLayout {
     _execution_lock: File,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EvidenceReadBudget {
+    remaining: u64,
+}
+
+#[derive(Debug)]
+enum EvidenceReadError {
+    Limit { required: u64, remaining: u64 },
+    Io(io::Error),
+}
+
+impl EvidenceReadBudget {
+    pub(super) const fn new(limit: u64) -> Self {
+        Self { remaining: limit }
+    }
+
+    fn hash_reader(
+        &mut self,
+        reader: impl Read,
+        length: u64,
+    ) -> Result<DigestV1, EvidenceReadError> {
+        if length > self.remaining {
+            return Err(EvidenceReadError::Limit {
+                required: length,
+                remaining: self.remaining,
+            });
+        }
+        self.remaining -= length;
+        let mut bounded = reader.take(length);
+        DigestV1::hash_reader(&mut bounded, length).map_err(EvidenceReadError::Io)
+    }
+}
+
 impl OutputLayout {
+    pub(super) fn has_existing(root: &Path, relative: &str) -> Result<bool, OutputArtifactError> {
+        Self::open_existing_at(root, relative).map(|file| file.is_some())
+    }
+
+    pub(super) fn open_existing_at(
+        root: &Path,
+        relative: &str,
+    ) -> Result<Option<File>, OutputArtifactError> {
+        let name = LogicalArtifactName::new(relative)?;
+        let root = absolute_path(root)?;
+        let root_identity = match observe_directory_identity(&root) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(OutputArtifactError::Io {
+                    kind: ExtractionOutputErrorKind::ValidateRoot,
+                    path: root,
+                    source,
+                });
+            }
+        };
+        let path = root.join(logical_path(name.as_str()));
+        if path.parent() != Some(root.as_path()) {
+            return Err(OutputArtifactError::UnplannedPath(relative.to_owned()));
+        }
+        match open_readonly_regular_in_parent(&path, &root_identity) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(OutputArtifactError::Io {
+                kind: ExtractionOutputErrorKind::OpenExisting,
+                path,
+                source,
+            }),
+        }
+    }
+
     pub(super) fn prepare<'path>(
         root: &Path,
         relative_paths: impl IntoIterator<Item = &'path str>,
+    ) -> Result<Self, OutputArtifactError> {
+        Self::prepare_with_internal_paths(root, relative_paths, std::iter::empty::<&str>(), &[])
+    }
+
+    pub(super) fn prepare_with_internal_paths<'path, 'internal>(
+        root: &Path,
+        relative_paths: impl IntoIterator<Item = &'path str>,
+        internal_paths: impl IntoIterator<Item = &'internal str>,
+        reserved_root_prefixes: &[&str],
     ) -> Result<Self, OutputArtifactError> {
         let lock_name = LogicalArtifactName::new(EXECUTION_LOCK_NAME)?;
         let mut validated = Vec::new();
         for relative in relative_paths {
             let name = LogicalArtifactName::new(relative)?;
-            if paths_conflict(name.portability_key(), lock_name.portability_key()) {
-                return Err(OutputArtifactError::PortableCollision {
-                    first: EXECUTION_LOCK_NAME.to_owned(),
-                    second: name.as_str().to_owned(),
-                });
+            let root_component = name.portability_key().split('/').next().unwrap_or_default();
+            if reserved_root_prefixes
+                .iter()
+                .any(|prefix| root_component.starts_with(prefix))
+            {
+                return Err(OutputArtifactError::ReservedPath(name.as_str().to_owned()));
             }
             validated.push(name);
+        }
+        for relative in internal_paths {
+            validated.push(LogicalArtifactName::new(relative)?);
+        }
+        if let Some(name) = validated
+            .iter()
+            .find(|name| paths_conflict(name.portability_key(), lock_name.portability_key()))
+        {
+            return Err(OutputArtifactError::PortableCollision {
+                first: EXECUTION_LOCK_NAME.to_owned(),
+                second: name.as_str().to_owned(),
+            });
         }
         validated.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         if let Some(pair) = validated
@@ -313,7 +410,7 @@ impl PreparedOutputPath {
 
     pub(super) fn hash_existing_bounded(
         &self,
-        limit: u64,
+        budget: &mut EvidenceReadBudget,
     ) -> Result<Option<(u64, DigestV1)>, OutputArtifactError> {
         let Some(mut file) = self.open_existing()? else {
             return Ok(None);
@@ -326,19 +423,44 @@ impl PreparedOutputPath {
                 source,
             })?
             .len();
-        if length > limit {
-            return Err(OutputArtifactError::ExistingHashLimitExceeded {
-                path: self.final_path.clone(),
-                length,
-                limit,
-            });
-        }
-        let digest =
-            DigestV1::hash_reader(&mut file, length).map_err(|source| OutputArtifactError::Io {
+        let digest = match budget.hash_reader(&mut file, length) {
+            Ok(digest) => digest,
+            Err(EvidenceReadError::Limit {
+                required,
+                remaining,
+            }) => {
+                return Err(OutputArtifactError::ExistingHashLimitExceeded {
+                    path: self.final_path.clone(),
+                    length: required,
+                    limit: remaining,
+                });
+            }
+            Err(EvidenceReadError::Io(source)) => {
+                return Err(OutputArtifactError::Io {
+                    kind: ExtractionOutputErrorKind::HashExisting,
+                    path: self.final_path.clone(),
+                    source,
+                });
+            }
+        };
+        let observed_length = file
+            .metadata()
+            .map_err(|source| OutputArtifactError::Io {
                 kind: ExtractionOutputErrorKind::HashExisting,
                 path: self.final_path.clone(),
                 source,
-            })?;
+            })?
+            .len();
+        if observed_length != length {
+            return Err(OutputArtifactError::Io {
+                kind: ExtractionOutputErrorKind::HashExisting,
+                path: self.final_path.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "evidence file length changed while hashing",
+                ),
+            });
+        }
         Ok(Some((length, digest)))
     }
 }
@@ -453,6 +575,12 @@ pub(super) struct StagedOutput {
     released: bool,
 }
 
+#[derive(Debug)]
+pub(super) enum StagedPublishError {
+    NotPublished(OutputArtifactError),
+    Uncertain(OutputArtifactError),
+}
+
 impl StagedOutput {
     pub(super) const fn length(&self) -> u64 {
         self.length
@@ -462,7 +590,7 @@ impl StagedOutput {
         self.digest
     }
 
-    pub(super) fn publish(mut self, replace_existing: bool) -> Result<(), OutputArtifactError> {
+    pub(super) fn publish(mut self, replace_existing: bool) -> Result<(), StagedPublishError> {
         let result = atomic_replace_verified_tracked(
             &self.temporary_path,
             &self.final_path,
@@ -478,14 +606,20 @@ impl StagedOutput {
                 Ok(())
             }
             Err(error) => {
-                if error.moved_or_unknown_state() {
+                let uncertain = error.moved_or_unknown_state();
+                if uncertain {
                     self.released = true;
                 }
-                Err(OutputArtifactError::Io {
+                let error = OutputArtifactError::Io {
                     kind: ExtractionOutputErrorKind::Publish,
                     path: self.final_path.clone(),
                     source: error.into_error(),
-                })
+                };
+                if uncertain {
+                    Err(StagedPublishError::Uncertain(error))
+                } else {
+                    Err(StagedPublishError::NotPublished(error))
+                }
             }
         }
     }
@@ -548,9 +682,35 @@ fn logical_path(value: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{Cursor, Write};
 
-    use super::{OutputArtifactError, OutputLayout};
+    use super::{EvidenceReadBudget, EvidenceReadError, OutputArtifactError, OutputLayout};
+
+    #[test]
+    fn evidence_read_budget_is_consumed_before_hashing_and_not_refunded_on_failure() {
+        let mut budget = EvidenceReadBudget::new(4);
+        let error = budget
+            .hash_reader(Cursor::new(b"abc"), 4)
+            .expect_err("a short reader must fail after reserving its declared length");
+        assert!(matches!(
+            error,
+            EvidenceReadError::Io(error) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(budget.remaining, 0);
+
+        let mut one_short = EvidenceReadBudget::new(3);
+        let error = one_short
+            .hash_reader(Cursor::new(b"four"), 4)
+            .expect_err("an oversized read must be rejected before consuming bytes");
+        assert!(matches!(
+            error,
+            EvidenceReadError::Limit {
+                required: 4,
+                remaining: 3,
+            }
+        ));
+        assert_eq!(one_short.remaining, 3);
+    }
 
     #[test]
     fn layout_rejects_ancestor_and_descendant_paths_before_creating_them() {
@@ -581,6 +741,37 @@ mod tests {
         ));
         assert!(!directory.path().join("Assets").exists());
         assert!(!directory.path().join("assets").exists());
+    }
+
+    #[test]
+    fn layout_reserves_internal_namespaces_before_creating_directories() {
+        let directory = tempfile::tempdir().expect("temporary output root");
+        let error = OutputLayout::prepare_with_internal_paths(
+            directory.path(),
+            ["Protocol-State/attacker.json"],
+            ["protocol-state/00000000.json"],
+            &["protocol-state"],
+        )
+        .expect_err("user output must not occupy protocol state");
+
+        assert!(matches!(error, OutputArtifactError::ReservedPath(_)));
+        assert!(!directory.path().join("Protocol-State").exists());
+        assert!(!directory.path().join("protocol-state").exists());
+    }
+
+    #[test]
+    fn layout_prepares_declared_internal_paths() {
+        let directory = tempfile::tempdir().expect("temporary output root");
+        let layout = OutputLayout::prepare_with_internal_paths(
+            directory.path(),
+            ["objects/item.bin"],
+            ["protocol-state/00000000.json"],
+            &["protocol-state"],
+        )
+        .expect("declared internal paths bypass only the user namespace check");
+
+        assert!(layout.path("objects/item.bin").is_ok());
+        assert!(layout.path("protocol-state/00000000.json").is_ok());
     }
 
     #[test]

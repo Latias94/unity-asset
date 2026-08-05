@@ -1,14 +1,121 @@
 //! Validated representation lifecycle persisted by an extraction plan.
 
-use serde::{Deserialize, Serialize};
+#[cfg(feature = "decode")]
+use std::io;
+
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
+use unity_asset_binary::asset::class_ids;
+#[cfg(feature = "decode")]
+use unity_asset_core::AssetLoadBudget;
 use unity_asset_core::{ObjectAddress, ObjectKind, SourceKind, SourceLocator};
 use unity_asset_decode::descriptor::{MediaDescriptor, MediaFamily};
 
 use super::super::contract::{
-    ExtractionArtifactKind, ExtractionDiagnostic, ExtractionPath, ExtractionSourceExpectation,
+    ExtractionArtifactKind, ExtractionDiagnostic, ExtractionDiagnosticCode, ExtractionPath,
+    ExtractionRepresentationPolicy, ExtractionSourceExpectation,
 };
 use crate::workspace::StreamedResourceRequest;
+#[cfg(feature = "decode")]
+use crate::workspace::{
+    ResolvedStreamedResource, WorkspaceByteRange, WorkspaceError, WorkspaceLookup, WorkspaceView,
+};
+
+/// Exact sidecar and byte range selected while planning streamed media.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(in crate::extraction) struct PlannedStreamSource {
+    request: StreamedResourceRequest,
+    source: ExtractionSourceExpectation,
+}
+
+impl PlannedStreamSource {
+    pub(in crate::extraction) fn new(
+        request: StreamedResourceRequest,
+        source: ExtractionSourceExpectation,
+    ) -> Result<Self, RepresentationContractError> {
+        let actual = source.fingerprint().kind();
+        if actual != SourceKind::StreamedResource {
+            return Err(RepresentationContractError::SourceKindMismatch {
+                locator: source.locator().clone(),
+                expected: SourceKind::StreamedResource,
+                actual,
+            });
+        }
+        Ok(Self { request, source })
+    }
+
+    pub(in crate::extraction) const fn request(&self) -> &StreamedResourceRequest {
+        &self.request
+    }
+
+    pub(in crate::extraction) const fn source(&self) -> &ExtractionSourceExpectation {
+        &self.source
+    }
+
+    #[cfg(feature = "decode")]
+    pub(in crate::extraction) fn matches_resolution(
+        &self,
+        resource: &ResolvedStreamedResource,
+    ) -> bool {
+        resource.source().locator() == self.source.locator()
+            && resource.source().fingerprint() == self.source.fingerprint()
+            && resource.offset() == self.request.offset()
+            && resource.size() == self.request.size()
+    }
+
+    #[cfg(feature = "decode")]
+    pub(in crate::extraction) fn open(
+        &self,
+        view: &dyn WorkspaceView,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<WorkspaceByteRange, WorkspaceError> {
+        let source = match view.resolve_source(self.source.locator(), budget)? {
+            WorkspaceLookup::Resolved(source) => source,
+            WorkspaceLookup::Unloaded
+            | WorkspaceLookup::Missing
+            | WorkspaceLookup::Ambiguous { .. }
+            | WorkspaceLookup::Invalid { .. } => {
+                return Err(WorkspaceError::operation(
+                    "planned streamed-resource source validation",
+                    io::Error::other("planned streamed-resource source is unavailable"),
+                ));
+            }
+        };
+        if source.kind() != SourceKind::StreamedResource
+            || source.locator() != self.source.locator()
+            || source.fingerprint() != self.source.fingerprint()
+        {
+            return Err(WorkspaceError::ObservedSourceChanged {
+                source_id: Box::new(source.id()),
+                expected: self.source.fingerprint(),
+                actual: source.fingerprint(),
+            });
+        }
+        view.read_source_range(
+            source.id(),
+            self.request.offset(),
+            self.request.size(),
+            budget,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlannedStreamSourceWire {
+    request: StreamedResourceRequest,
+    source: ExtractionSourceExpectation,
+}
+
+impl<'de> Deserialize<'de> for PlannedStreamSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PlannedStreamSourceWire::deserialize(deserializer)?;
+        Self::new(wire.request, wire.source).map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::extraction) struct PlannedFallback {
@@ -58,16 +165,16 @@ pub(in crate::extraction) enum PlannedContent {
     Yaml,
     TextAsset,
     Audio {
-        stream: Option<StreamedResourceRequest>,
+        stream: Option<PlannedStreamSource>,
         descriptor: MediaDescriptor,
     },
     TexturePng {
-        stream: Option<StreamedResourceRequest>,
+        stream: Option<PlannedStreamSource>,
         descriptor: MediaDescriptor,
     },
     SpritePng {
         texture: ObjectAddress,
-        texture_stream: Option<StreamedResourceRequest>,
+        texture_stream: Option<PlannedStreamSource>,
         descriptor: MediaDescriptor,
     },
 }
@@ -100,6 +207,16 @@ impl PlannedContent {
                 expected,
                 actual,
             });
+        }
+        if let Some(stream) = self.stream_source() {
+            let actual = stream.source().fingerprint().kind();
+            if actual != SourceKind::StreamedResource {
+                return Err(RepresentationContractError::SourceKindMismatch {
+                    locator: stream.source().locator().clone(),
+                    expected: SourceKind::StreamedResource,
+                    actual,
+                });
+            }
         }
         Ok(())
     }
@@ -147,7 +264,7 @@ impl PlannedContent {
         }
     }
 
-    pub(in crate::extraction) const fn stream_request(&self) -> Option<&StreamedResourceRequest> {
+    pub(in crate::extraction) const fn stream_source(&self) -> Option<&PlannedStreamSource> {
         match self {
             Self::Audio { stream, .. } | Self::TexturePng { stream, .. } => stream.as_ref(),
             Self::SpritePng { texture_stream, .. } => texture_stream.as_ref(),
@@ -157,6 +274,62 @@ impl PlannedContent {
 
     const fn requires_write_budget(&self) -> bool {
         matches!(self, Self::Yaml)
+    }
+
+    fn validate_request(
+        &self,
+        object_kind: ObjectKind,
+        class_id: i32,
+        policy: ExtractionRepresentationPolicy,
+    ) -> Result<(), RepresentationContractError> {
+        let content_matches_object = match object_kind {
+            ObjectKind::Binary => !matches!(self, Self::Yaml),
+            ObjectKind::Yaml => matches!(self, Self::Yaml),
+        };
+        if !content_matches_object {
+            return Err(RepresentationContractError::ObjectKindContentMismatch {
+                object_kind,
+                artifact_kind: self.artifact_kind(),
+            });
+        }
+        let content_matches_class = match self {
+            Self::RawBinary | Self::Yaml => true,
+            Self::TextAsset => class_id == class_ids::TEXT_ASSET,
+            Self::Audio { .. } => class_id == class_ids::AUDIO_CLIP,
+            Self::TexturePng { .. } => class_id == class_ids::TEXTURE_2D,
+            Self::SpritePng { .. } => class_id == class_ids::SPRITE,
+        };
+        if !content_matches_class {
+            return Err(RepresentationContractError::ClassContentMismatch {
+                class_id,
+                artifact_kind: self.artifact_kind(),
+            });
+        }
+        let policy_matches = match policy {
+            ExtractionRepresentationPolicy::RawOnly => {
+                matches!(self, Self::RawBinary | Self::Yaml)
+            }
+            ExtractionRepresentationPolicy::PreferDecoded => true,
+            ExtractionRepresentationPolicy::RequireDecoded => !matches!(self, Self::RawBinary),
+        };
+        if !policy_matches {
+            return Err(RepresentationContractError::RepresentationPolicyMismatch {
+                policy,
+                artifact_kind: self.artifact_kind(),
+            });
+        }
+        Ok(())
+    }
+
+    const fn dependency_locator(&self) -> Option<&SourceLocator> {
+        match self {
+            Self::SpritePng { texture, .. } => Some(texture.source_locator()),
+            Self::RawBinary
+            | Self::Yaml
+            | Self::TextAsset
+            | Self::Audio { .. }
+            | Self::TexturePng { .. } => None,
+        }
     }
 }
 
@@ -281,10 +454,93 @@ impl RepresentationContract {
         validate_content_sources(sources, &self.preferred_content)
     }
 
-    #[cfg(feature = "decode")]
-    pub(in crate::extraction) fn requires_stream_resolution(&self) -> bool {
-        self.preferred_content.stream_request().is_some()
+    pub(in crate::extraction) fn validate_request(
+        &self,
+        object_kind: ObjectKind,
+        class_id: i32,
+        policy: ExtractionRepresentationPolicy,
+    ) -> Result<(), RepresentationContractError> {
+        self.preferred_content
+            .validate_request(object_kind, class_id, policy)?;
+        let decoded_preferred = !matches!(
+            self.preferred_kind(),
+            ExtractionArtifactKind::BinaryRaw | ExtractionArtifactKind::Yaml
+        );
+        if policy == ExtractionRepresentationPolicy::PreferDecoded
+            && decoded_preferred
+            && self.fallback.is_none()
+        {
+            return Err(RepresentationContractError::RepresentationPolicyMismatch {
+                policy,
+                artifact_kind: self.preferred_kind(),
+            });
+        }
+        if let Some(fallback) = self
+            .fallback
+            .as_ref()
+            .filter(|_| policy != ExtractionRepresentationPolicy::PreferDecoded)
+        {
+            return Err(RepresentationContractError::RepresentationPolicyMismatch {
+                policy,
+                artifact_kind: fallback.kind(),
+            });
+        }
+        if policy == ExtractionRepresentationPolicy::PreferDecoded
+            && self.preferred_kind() == ExtractionArtifactKind::BinaryRaw
+            && !self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| is_planning_fallback_reason(diagnostic.code()))
+        {
+            return Err(RepresentationContractError::MissingFallbackDiagnostic);
+        }
+        Ok(())
     }
+
+    #[cfg(feature = "decode")]
+    pub(in crate::extraction) const fn requires_stream_resolution(&self) -> bool {
+        self.preferred_content.stream_source().is_some()
+    }
+
+    pub(in crate::extraction) const fn dependency_locator(&self) -> Option<&SourceLocator> {
+        self.preferred_content.dependency_locator()
+    }
+
+    pub(in crate::extraction) const fn stream_source_expectation(
+        &self,
+    ) -> Option<&ExtractionSourceExpectation> {
+        match self.preferred_content.stream_source() {
+            Some(stream) => Some(stream.source()),
+            None => None,
+        }
+    }
+
+    #[cfg(not(feature = "decode"))]
+    pub(in crate::extraction) fn preferred_extension(&self) -> &'static str {
+        self.preferred_content.canonical_extension()
+    }
+
+    #[cfg(not(feature = "decode"))]
+    pub(in crate::extraction) fn fallback_extension(&self) -> Option<&'static str> {
+        self.fallback
+            .as_ref()
+            .map(|fallback| fallback.content().canonical_extension())
+    }
+}
+
+const fn is_planning_fallback_reason(code: ExtractionDiagnosticCode) -> bool {
+    matches!(
+        code,
+        ExtractionDiagnosticCode::DecodedUnavailable
+            | ExtractionDiagnosticCode::FeatureUnavailable
+            | ExtractionDiagnosticCode::UnsupportedClass
+            | ExtractionDiagnosticCode::UnsupportedMediaEncoding
+            | ExtractionDiagnosticCode::UnsupportedMediaLayout
+            | ExtractionDiagnosticCode::MissingResource
+            | ExtractionDiagnosticCode::UnresolvedDependency
+            | ExtractionDiagnosticCode::UnresolvedSpritePPtr
+            | ExtractionDiagnosticCode::SourceChanged
+    )
 }
 
 fn validate_content_sources(
@@ -294,8 +550,16 @@ fn validate_content_sources(
     if let PlannedContent::SpritePng { texture, .. } = content {
         validate_source_for_address(sources, texture)?;
     }
-    if let Some(stream) = content.stream_request() {
-        expectation_for(sources, stream.owner())?;
+    if let Some(stream) = content.stream_source() {
+        expectation_for(sources, stream.request().owner())?;
+        let actual = expectation_for(sources, stream.source().locator())?;
+        if actual.fingerprint() != stream.source().fingerprint() {
+            return Err(RepresentationContractError::SourceFingerprintMismatch {
+                locator: stream.source().locator().clone(),
+                expected: stream.source().fingerprint(),
+                actual: actual.fingerprint(),
+            });
+        }
     }
     Ok(())
 }
@@ -363,6 +627,29 @@ pub(in crate::extraction) enum RepresentationContractError {
         expected: SourceKind,
         actual: SourceKind,
     },
+    #[error("source {locator:?} has fingerprint {actual}; representation requires {expected}")]
+    SourceFingerprintMismatch {
+        locator: SourceLocator,
+        expected: unity_asset_core::SourceFingerprint,
+        actual: unity_asset_core::SourceFingerprint,
+    },
+    #[error("{object_kind:?} object cannot use {artifact_kind:?} extraction content")]
+    ObjectKindContentMismatch {
+        object_kind: ObjectKind,
+        artifact_kind: ExtractionArtifactKind,
+    },
+    #[error("class {class_id} cannot use {artifact_kind:?} extraction content")]
+    ClassContentMismatch {
+        class_id: i32,
+        artifact_kind: ExtractionArtifactKind,
+    },
+    #[error("{policy:?} extraction cannot use {artifact_kind:?} content")]
+    RepresentationPolicyMismatch {
+        policy: ExtractionRepresentationPolicy,
+        artifact_kind: ExtractionArtifactKind,
+    },
+    #[error("prefer-decoded raw fallback requires a deterministic planning diagnostic")]
+    MissingFallbackDiagnostic,
 }
 
 #[cfg(test)]

@@ -135,8 +135,11 @@ or open additional files while answering a query.
 
 ## Extraction
 
-An `ExtractionRequest` v1 selects objects and representation policy. A dry run emits the canonical
-`ExtractionPlan` v2 without writing artifacts:
+An `ExtractionRequest` v2 persists selection intent, filters, limits, and representation policy. A
+dry run resolves that intent against one immutable workspace revision and emits the canonical
+`ExtractionPlan` v4 without writing artifacts. Execution re-derives the selection before reading or
+writing artifacts. The planner owns any `ReferenceGraph` needed for bundle-container or reference
+traversal selection; callers do not construct or pass one:
 
 ```powershell
 cargo run -p unity-asset-cli --bin unity-asset -- export --input D:\GameProject --output D:\Exports --request extraction-request.json --dry-run
@@ -150,9 +153,12 @@ cargo run -p unity-asset-cli --bin unity-asset -- export --input D:\GameProject 
 cargo run -p unity-asset-cli --bin unity-asset -- export --input D:\GameProject --output D:\Exports --plan extraction-plan.json --resume D:\Exports\reports\manifest.json
 ```
 
+Readers reject `ExtractionRequest` v1, `ExtractionPlan` v3, and `ExtractionManifest` /
+`ExtractionReport` v2. Generate v3 resume evidence from a current v2 request and v4 plan.
+
 Output collision policy is `error`, `skip`, or `replace`. Failure policy is `collect-all` or
-`stop-in-plan-order`. Worker, in-flight byte, open-file, output-byte, and report-byte limits are
-explicit CLI options.
+`stop-in-plan-order`. Worker, in-flight byte, open-file, output-byte, evidence-verification-byte,
+and report-byte limits are explicit CLI options.
 
 ## Low-Level Parsers
 

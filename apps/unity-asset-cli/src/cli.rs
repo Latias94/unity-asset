@@ -307,9 +307,13 @@ pub(crate) struct ExportCommand {
     #[arg(long)]
     pub(crate) max_open_files: Option<usize>,
 
-    /// Cap both published bytes and existing-output bytes read for skip/resume evidence.
+    /// Cap total bytes published by this execution.
     #[arg(long)]
     pub(crate) max_output_bytes: Option<u64>,
+
+    /// Cap cumulative final-path bytes read to verify persisted evidence.
+    #[arg(long)]
+    pub(crate) max_evidence_verification_bytes: Option<u64>,
 
     #[arg(long)]
     pub(crate) max_report_bytes: Option<u64>,

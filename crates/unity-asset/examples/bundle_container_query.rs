@@ -11,7 +11,6 @@ use std::path::PathBuf;
 
 use unity_asset::AssetLoadBudget;
 use unity_asset::extraction::{BundleContainerQuery, ExtractionPlanner};
-use unity_asset::reference::ReferenceGraphBuildOptions;
 use unity_asset::workspace::AssetWorkspace;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,8 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut workspace = AssetWorkspace::new()?;
     workspace.load_path(&path, &mut budget)?;
     let snapshot = workspace.snapshot();
-    let graph = snapshot.reference_graph(ReferenceGraphBuildOptions::unbounded(), &mut budget)?;
-    let planner = ExtractionPlanner::new(&snapshot).with_reference_graph(&graph);
+    let planner = ExtractionPlanner::new(&snapshot);
     let result =
         planner.bundle_container_occurrences(BundleContainerQuery::new(pattern)?, &mut budget)?;
 

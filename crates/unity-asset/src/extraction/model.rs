@@ -26,9 +26,10 @@ use super::representation::{
     PlannedContent, PlannedFallback, RepresentationContract, RepresentationContractError,
     RepresentationContractParts,
 };
+use crate::reference::{ReferenceDirection, ReferenceTraversalLimits};
 
-pub const EXTRACTION_REQUEST_VERSION: u8 = 1;
-pub const EXTRACTION_PLAN_VERSION: u8 = 3;
+pub const EXTRACTION_REQUEST_VERSION: u8 = 2;
+pub const EXTRACTION_PLAN_VERSION: u8 = 4;
 pub const EXTRACTION_MANIFEST_VERSION: u8 = super::manifest::EXTRACTION_MANIFEST_VERSION;
 pub const EXTRACTION_REPORT_VERSION: u8 = super::manifest::EXTRACTION_REPORT_VERSION;
 pub const EXTRACTION_REQUEST_CONTRACT: &str = "unity_asset.extraction_request";
@@ -43,6 +44,92 @@ const MAX_SELECTION_PATTERN_BYTES: usize = 4_096;
 const MAX_FILTER_TEXT_BYTES: usize = 4_096;
 const MAX_METADATA_TEXT_BYTES: usize = 64 * 1_024;
 
+/// Direction persisted by an extraction-owned reference traversal intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionReferenceDirection {
+    Outgoing,
+    Incoming,
+}
+
+impl ExtractionReferenceDirection {
+    pub(crate) const fn as_reference(self) -> ReferenceDirection {
+        match self {
+            Self::Outgoing => ReferenceDirection::Outgoing,
+            Self::Incoming => ReferenceDirection::Incoming,
+        }
+    }
+}
+
+/// Extraction-owned soft limits for a reference selection closure.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ExtractionReferenceTraversalLimits {
+    max_depth: Option<u32>,
+    max_nodes: Option<u64>,
+    max_edges: Option<u64>,
+}
+
+impl ExtractionReferenceTraversalLimits {
+    #[must_use]
+    pub const fn unbounded() -> Self {
+        Self {
+            max_depth: None,
+            max_nodes: None,
+            max_edges: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_max_depth(mut self, maximum: u32) -> Self {
+        self.max_depth = Some(maximum);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_nodes(mut self, maximum: u64) -> Self {
+        self.max_nodes = Some(maximum);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_edges(mut self, maximum: u64) -> Self {
+        self.max_edges = Some(maximum);
+        self
+    }
+
+    #[must_use]
+    pub const fn max_depth(self) -> Option<u32> {
+        self.max_depth
+    }
+
+    #[must_use]
+    pub const fn max_nodes(self) -> Option<u64> {
+        self.max_nodes
+    }
+
+    #[must_use]
+    pub const fn max_edges(self) -> Option<u64> {
+        self.max_edges
+    }
+
+    pub(crate) const fn as_reference(self) -> ReferenceTraversalLimits {
+        let mut limits = ReferenceTraversalLimits::unbounded();
+        if let Some(maximum) = self.max_depth {
+            limits = limits.with_max_depth(maximum);
+        }
+        if let Some(maximum) = self.max_nodes {
+            limits = limits.with_max_nodes(maximum);
+        }
+        if let Some(maximum) = self.max_edges {
+            limits = limits.with_max_edges(maximum);
+        }
+        limits
+    }
+}
+
 /// A portable, normalized object selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtractionSelection {
@@ -55,10 +142,11 @@ pub enum ExtractionSelection {
     },
     BundleContainer {
         pattern: String,
-        addresses: Box<[ObjectAddress]>,
     },
     ReferenceTraversal {
-        addresses: Box<[ObjectAddress]>,
+        roots: Box<[ObjectAddress]>,
+        direction: ExtractionReferenceDirection,
+        limits: ExtractionReferenceTraversalLimits,
     },
 }
 
@@ -72,15 +160,17 @@ impl ExtractionSelection {
             Self::Addresses { addresses } => Ok(Self::Addresses {
                 addresses: normalize_values(addresses.into_vec()).into_boxed_slice(),
             }),
-            Self::BundleContainer { pattern, addresses } => {
-                let pattern = normalize_selection_pattern(pattern)?;
-                Ok(Self::BundleContainer {
-                    pattern,
-                    addresses: normalize_values(addresses.into_vec()).into_boxed_slice(),
-                })
-            }
-            Self::ReferenceTraversal { addresses } => Ok(Self::ReferenceTraversal {
-                addresses: normalize_values(addresses.into_vec()).into_boxed_slice(),
+            Self::BundleContainer { pattern } => Ok(Self::BundleContainer {
+                pattern: normalize_selection_pattern(pattern)?,
+            }),
+            Self::ReferenceTraversal {
+                roots,
+                direction,
+                limits,
+            } => Ok(Self::ReferenceTraversal {
+                roots: normalize_values(roots.into_vec()).into_boxed_slice(),
+                direction,
+                limits,
             }),
         }
     }
@@ -98,10 +188,11 @@ enum ExtractionSelectionRef<'value> {
     },
     BundleContainer {
         pattern: &'value str,
-        addresses: &'value [ObjectAddress],
     },
     ReferenceTraversal {
-        addresses: &'value [ObjectAddress],
+        roots: &'value [ObjectAddress],
+        direction: ExtractionReferenceDirection,
+        limits: ExtractionReferenceTraversalLimits,
     },
 }
 
@@ -117,10 +208,11 @@ enum ExtractionSelectionWire {
     },
     BundleContainer {
         pattern: String,
-        addresses: Vec<ObjectAddress>,
     },
     ReferenceTraversal {
-        addresses: Vec<ObjectAddress>,
+        roots: Vec<ObjectAddress>,
+        direction: ExtractionReferenceDirection,
+        limits: ExtractionReferenceTraversalLimits,
     },
 }
 
@@ -133,12 +225,18 @@ impl Serialize for ExtractionSelection {
             Self::All => ExtractionSelectionRef::All,
             Self::Sources { sources } => ExtractionSelectionRef::Sources { sources },
             Self::Addresses { addresses } => ExtractionSelectionRef::Addresses { addresses },
-            Self::BundleContainer { pattern, addresses } => {
-                ExtractionSelectionRef::BundleContainer { pattern, addresses }
+            Self::BundleContainer { pattern } => {
+                ExtractionSelectionRef::BundleContainer { pattern }
             }
-            Self::ReferenceTraversal { addresses } => {
-                ExtractionSelectionRef::ReferenceTraversal { addresses }
-            }
+            Self::ReferenceTraversal {
+                roots,
+                direction,
+                limits,
+            } => ExtractionSelectionRef::ReferenceTraversal {
+                roots,
+                direction: *direction,
+                limits: *limits,
+            },
         };
         selection.serialize(serializer)
     }
@@ -157,14 +255,17 @@ impl<'de> Deserialize<'de> for ExtractionSelection {
             ExtractionSelectionWire::Addresses { addresses } => Self::Addresses {
                 addresses: addresses.into_boxed_slice(),
             },
-            ExtractionSelectionWire::BundleContainer { pattern, addresses } => {
-                Self::BundleContainer {
-                    pattern,
-                    addresses: addresses.into_boxed_slice(),
-                }
+            ExtractionSelectionWire::BundleContainer { pattern } => {
+                Self::BundleContainer { pattern }
             }
-            ExtractionSelectionWire::ReferenceTraversal { addresses } => Self::ReferenceTraversal {
-                addresses: addresses.into_boxed_slice(),
+            ExtractionSelectionWire::ReferenceTraversal {
+                roots,
+                direction,
+                limits,
+            } => Self::ReferenceTraversal {
+                roots: roots.into_boxed_slice(),
+                direction,
+                limits,
             },
         };
         selection.normalize().map_err(serde::de::Error::custom)
@@ -348,13 +449,11 @@ impl ExtractionRequest {
 
     pub fn bundle_container(
         pattern: impl Into<String>,
-        addresses: impl IntoIterator<Item = ObjectAddress>,
         representation: ExtractionRepresentationPolicy,
     ) -> Result<Self, ExtractionModelError> {
         Self::with_selection(
             ExtractionSelection::BundleContainer {
                 pattern: pattern.into(),
-                addresses: addresses.into_iter().collect::<Vec<_>>().into_boxed_slice(),
             },
             representation,
             ExtractionFilter::default(),
@@ -362,19 +461,22 @@ impl ExtractionRequest {
         )
     }
 
-    #[must_use]
     pub fn reference_traversal(
-        addresses: impl IntoIterator<Item = ObjectAddress>,
+        roots: impl IntoIterator<Item = ObjectAddress>,
+        direction: ExtractionReferenceDirection,
+        limits: ExtractionReferenceTraversalLimits,
         representation: ExtractionRepresentationPolicy,
-    ) -> Self {
-        Self {
-            selection: ExtractionSelection::ReferenceTraversal {
-                addresses: normalize_values(addresses.into_iter().collect()).into_boxed_slice(),
+    ) -> Result<Self, ExtractionModelError> {
+        Self::with_selection(
+            ExtractionSelection::ReferenceTraversal {
+                roots: roots.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+                direction,
+                limits,
             },
             representation,
-            filter: ExtractionFilter::default(),
-            prefix: None,
-        }
+            ExtractionFilter::default(),
+            None,
+        )
     }
 
     #[must_use]
@@ -749,6 +851,33 @@ impl PlannedArtifactWire {
     }
 }
 
+/// Canonical proof of the normalized objects resolved by an extraction selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtractionSelectionWitness {
+    candidate_count: u64,
+    candidate_digest: DigestV1,
+}
+
+impl ExtractionSelectionWitness {
+    pub(crate) const fn new(candidate_count: u64, candidate_digest: DigestV1) -> Self {
+        Self {
+            candidate_count,
+            candidate_digest,
+        }
+    }
+
+    #[must_use]
+    pub const fn candidate_count(self) -> u64 {
+        self.candidate_count
+    }
+
+    #[must_use]
+    pub const fn candidate_digest(self) -> DigestV1 {
+        self.candidate_digest
+    }
+}
+
 /// An immutable, revision-bound extraction plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractionPlan {
@@ -756,6 +885,7 @@ pub struct ExtractionPlan {
     revision: WorkspaceRevision,
     request: ExtractionRequest,
     request_digest: DigestV1,
+    selection_witness: ExtractionSelectionWitness,
     sources: Box<[ExtractionSourceExpectation]>,
     artifacts: Box<[PlannedArtifact]>,
 }
@@ -765,17 +895,19 @@ impl ExtractionPlan {
         workspace_id: WorkspaceId,
         revision: WorkspaceRevision,
         request: ExtractionRequest,
+        selection_witness: ExtractionSelectionWitness,
         sources: Vec<ExtractionSourceExpectation>,
         artifacts: Vec<PlannedArtifact>,
     ) -> Result<Self, ExtractionModelError> {
         let request_digest = request.digest()?;
         let sources = normalize_source_expectations(sources)?;
-        validate_planned_artifacts(&sources, &artifacts)?;
+        validate_planned_artifacts(&request, selection_witness, &sources, &artifacts)?;
         Ok(Self {
             workspace_id,
             revision,
             request,
             request_digest,
+            selection_witness,
             sources: sources.into_boxed_slice(),
             artifacts: artifacts.into_boxed_slice(),
         })
@@ -785,18 +917,26 @@ impl ExtractionPlan {
         workspace_id: WorkspaceId,
         revision: WorkspaceRevision,
         request: ExtractionRequest,
+        selection_witness: ExtractionSelectionWitness,
         sources: Vec<ExtractionSourceExpectation>,
         artifacts: Vec<PlannedArtifact>,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, ExtractionModelError> {
         let request_digest = request.digest()?;
         let sources = normalize_source_expectations(sources)?;
-        validate_planned_artifacts_budgeted(&sources, &artifacts, budget)?;
+        validate_planned_artifacts_budgeted(
+            &request,
+            selection_witness,
+            &sources,
+            &artifacts,
+            budget,
+        )?;
         Ok(Self {
             workspace_id,
             revision,
             request,
             request_digest,
+            selection_witness,
             sources: sources.into_boxed_slice(),
             artifacts: artifacts.into_boxed_slice(),
         })
@@ -820,6 +960,11 @@ impl ExtractionPlan {
     #[must_use]
     pub const fn request_digest(&self) -> DigestV1 {
         self.request_digest
+    }
+
+    #[must_use]
+    pub const fn selection_witness(&self) -> ExtractionSelectionWitness {
+        self.selection_witness
     }
 
     #[must_use]
@@ -860,6 +1005,7 @@ struct ExtractionPlanRef<'value> {
     revision: WorkspaceRevision,
     request: &'value ExtractionRequest,
     request_digest: DigestV1,
+    selection_witness: ExtractionSelectionWitness,
     sources: &'value [ExtractionSourceExpectation],
     artifacts: &'value [PlannedArtifact],
 }
@@ -873,6 +1019,7 @@ struct ExtractionPlanWire {
     revision: WorkspaceRevision,
     request: ExtractionRequest,
     request_digest: DigestV1,
+    selection_witness: ExtractionSelectionWitness,
     sources: Vec<ExtractionSourceExpectation>,
     artifacts: Vec<PlannedArtifactWire>,
 }
@@ -889,6 +1036,7 @@ impl Serialize for ExtractionPlan {
             revision: self.revision,
             request: &self.request,
             request_digest: self.request_digest,
+            selection_witness: self.selection_witness,
             sources: &self.sources,
             artifacts: &self.artifacts,
         }
@@ -925,6 +1073,7 @@ impl<'de> Deserialize<'de> for ExtractionPlan {
             wire.workspace_id,
             wire.revision,
             wire.request,
+            wire.selection_witness,
             wire.sources,
             artifacts,
         )
@@ -959,31 +1108,61 @@ pub(crate) fn normalize_source_expectations(
 }
 
 fn validate_planned_artifacts(
+    request: &ExtractionRequest,
+    selection_witness: ExtractionSelectionWitness,
     sources: &[ExtractionSourceExpectation],
     artifacts: &[PlannedArtifact],
 ) -> Result<(), ExtractionModelError> {
-    validate_planned_artifacts_with_budget(sources, artifacts, None)
+    validate_planned_artifacts_with_budget(request, selection_witness, sources, artifacts, None)
 }
 
 fn validate_planned_artifacts_budgeted(
+    request: &ExtractionRequest,
+    selection_witness: ExtractionSelectionWitness,
     sources: &[ExtractionSourceExpectation],
     artifacts: &[PlannedArtifact],
     budget: &mut AssetLoadBudget,
 ) -> Result<(), ExtractionModelError> {
-    validate_planned_artifacts_with_budget(sources, artifacts, Some(budget))
+    validate_planned_artifacts_with_budget(
+        request,
+        selection_witness,
+        sources,
+        artifacts,
+        Some(budget),
+    )
 }
 
 fn validate_planned_artifacts_with_budget(
+    request: &ExtractionRequest,
+    selection_witness: ExtractionSelectionWitness,
     sources: &[ExtractionSourceExpectation],
     artifacts: &[PlannedArtifact],
     mut budget: Option<&mut AssetLoadBudget>,
 ) -> Result<(), ExtractionModelError> {
+    let artifact_count = u64::try_from(artifacts.len()).map_err(|_| {
+        ExtractionModelError::ArtifactCountOverflow {
+            count: artifacts.len(),
+        }
+    })?;
+    if artifact_count > selection_witness.candidate_count() {
+        return Err(ExtractionModelError::ArtifactCountExceedsSelectionWitness {
+            candidates: selection_witness.candidate_count(),
+            artifacts: artifact_count,
+        });
+    }
     let path_capacity =
         artifacts
             .len()
             .checked_mul(2)
             .ok_or(ExtractionModelError::ArithmeticOverflow {
                 resource: "extraction plan validation paths",
+            })?;
+    let source_capacity =
+        artifacts
+            .len()
+            .checked_mul(3)
+            .ok_or(ExtractionModelError::ArithmeticOverflow {
+                resource: "extraction plan validation source locators",
             })?;
     let mut addresses = validation_vec(
         artifacts.len(),
@@ -993,6 +1172,11 @@ fn validate_planned_artifacts_with_budget(
     let mut paths = validation_vec(
         path_capacity,
         "extraction plan validation paths",
+        reborrow_budget(&mut budget),
+    )?;
+    let mut expected_sources = validation_vec(
+        source_capacity,
+        "extraction plan validation source locators",
         reborrow_budget(&mut budget),
     )?;
     for (index, artifact) in artifacts.iter().enumerate() {
@@ -1007,6 +1191,27 @@ fn validate_planned_artifacts_with_budget(
         }
         validate_source_for_address(sources, &artifact.address)?;
         artifact.representation.validate_sources(sources)?;
+        artifact.representation.validate_request(
+            artifact.address.kind(),
+            artifact.class_id,
+            request.representation(),
+        )?;
+        if !path_is_within_prefix(request.prefix(), artifact.preferred_path())
+            || artifact
+                .fallback_path()
+                .is_some_and(|path| !path_is_within_prefix(request.prefix(), path))
+        {
+            return Err(ExtractionModelError::ArtifactOutsideRequestPrefix {
+                ordinal: artifact.ordinal,
+            });
+        }
+        expected_sources.push(artifact.address.source_locator());
+        if let Some(locator) = artifact.representation.dependency_locator() {
+            expected_sources.push(locator);
+        }
+        if let Some(source) = artifact.representation.stream_source_expectation() {
+            expected_sources.push(source.locator());
+        }
         paths.push(artifact.preferred_path());
         if let Some(path) = artifact.fallback_path() {
             paths.push(path);
@@ -1019,7 +1224,29 @@ fn validate_planned_artifacts_with_budget(
             (*pair[0]).clone(),
         ));
     }
+    expected_sources.sort_unstable();
+    expected_sources.dedup();
+    if expected_sources.len() != sources.len()
+        || expected_sources
+            .iter()
+            .zip(sources)
+            .any(|(expected, actual)| *expected != actual.locator())
+    {
+        return Err(ExtractionModelError::SourceExpectationSetMismatch {
+            expected: expected_sources.len(),
+            actual: sources.len(),
+        });
+    }
     validate_unique_paths(paths)
+}
+
+fn path_is_within_prefix(prefix: Option<&ExtractionPath>, path: &ExtractionPath) -> bool {
+    let Some(prefix) = prefix else {
+        return true;
+    };
+    path.as_str()
+        .strip_prefix(prefix.as_str())
+        .is_some_and(|suffix| suffix.len() > 1 && suffix.starts_with('/'))
 }
 
 fn reborrow_budget<'borrow>(
@@ -1258,8 +1485,39 @@ pub enum ExtractionModelError {
         expected: SourceKind,
         actual: SourceKind,
     },
+    #[error("source {locator:?} has fingerprint {actual}; representation requires {expected}")]
+    SourceFingerprintMismatch {
+        locator: SourceLocator,
+        expected: SourceFingerprint,
+        actual: SourceFingerprint,
+    },
+    #[error(
+        "extraction plan source expectations are not exact: expected {expected}, found {actual}"
+    )]
+    SourceExpectationSetMismatch { expected: usize, actual: usize },
+    #[error("{object_kind:?} object cannot use {artifact_kind:?} extraction content")]
+    ObjectKindContentMismatch {
+        object_kind: ObjectKind,
+        artifact_kind: ExtractionArtifactKind,
+    },
+    #[error("class {class_id} cannot use {artifact_kind:?} extraction content")]
+    ClassContentMismatch {
+        class_id: i32,
+        artifact_kind: ExtractionArtifactKind,
+    },
+    #[error("{policy:?} extraction cannot use {artifact_kind:?} content")]
+    RepresentationPolicyMismatch {
+        policy: ExtractionRepresentationPolicy,
+        artifact_kind: ExtractionArtifactKind,
+    },
+    #[error("prefer-decoded raw fallback requires a deterministic planning diagnostic")]
+    MissingFallbackDiagnostic,
     #[error("extraction plan contains too many artifacts: {count}")]
     ArtifactCountOverflow { count: usize },
+    #[error(
+        "extraction plan contains {artifacts} artifacts, but its selection witness contains only {candidates} candidates"
+    )]
+    ArtifactCountExceedsSelectionWitness { candidates: u64, artifacts: u64 },
     #[error(
         "planned artifact at index {index} has ordinal {actual}; expected consecutive ordinal {expected}"
     )]
@@ -1268,6 +1526,8 @@ pub enum ExtractionModelError {
         expected: u32,
         actual: u32,
     },
+    #[error("planned artifact {ordinal} is outside the extraction request prefix")]
+    ArtifactOutsideRequestPrefix { ordinal: u32 },
     #[error("extraction plan contains duplicate object address {0:?}")]
     DuplicateArtifactAddress(ObjectAddress),
     #[error("planned artifact {ordinal} contains a diagnostic for another object")]
@@ -1323,6 +1583,39 @@ impl From<RepresentationContractError> for ExtractionModelError {
                 expected,
                 actual,
             },
+            RepresentationContractError::SourceFingerprintMismatch {
+                locator,
+                expected,
+                actual,
+            } => Self::SourceFingerprintMismatch {
+                locator,
+                expected,
+                actual,
+            },
+            RepresentationContractError::ObjectKindContentMismatch {
+                object_kind,
+                artifact_kind,
+            } => Self::ObjectKindContentMismatch {
+                object_kind,
+                artifact_kind,
+            },
+            RepresentationContractError::ClassContentMismatch {
+                class_id,
+                artifact_kind,
+            } => Self::ClassContentMismatch {
+                class_id,
+                artifact_kind,
+            },
+            RepresentationContractError::RepresentationPolicyMismatch {
+                policy,
+                artifact_kind,
+            } => Self::RepresentationPolicyMismatch {
+                policy,
+                artifact_kind,
+            },
+            RepresentationContractError::MissingFallbackDiagnostic => {
+                Self::MissingFallbackDiagnostic
+            }
         }
     }
 }
@@ -1364,7 +1657,48 @@ mod tests {
     }
 
     #[test]
-    fn plan_v3_artifact_serializes_derived_kinds_in_the_existing_wire_shape() {
+    fn request_v2_persists_reference_intent_without_query_only_limits() {
+        let root = ObjectAddress::binary_direct(SourceLocator::path("content.assets").unwrap(), 41)
+            .unwrap();
+        let limits = ExtractionReferenceTraversalLimits::unbounded()
+            .with_max_depth(4)
+            .with_max_nodes(100)
+            .with_max_edges(250);
+        let request = ExtractionRequest::reference_traversal(
+            [root.clone()],
+            ExtractionReferenceDirection::Outgoing,
+            limits,
+            ExtractionRepresentationPolicy::RawOnly,
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(encoded["version"], serde_json::json!(2));
+        assert_eq!(
+            encoded["selection"]["direction"],
+            serde_json::json!("outgoing")
+        );
+        assert_eq!(encoded["selection"]["roots"], serde_json::json!([root]));
+        assert_eq!(encoded["selection"]["limits"]["max_depth"], 4);
+        assert_eq!(encoded["selection"]["limits"]["max_nodes"], 100);
+        assert_eq!(encoded["selection"]["limits"]["max_edges"], 250);
+        assert!(
+            encoded["selection"]["limits"]
+                .get("max_components")
+                .is_none()
+        );
+
+        let decoded: ExtractionRequest = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, request);
+
+        let mut legacy = encoded;
+        legacy["version"] = serde_json::json!(1);
+        let error = serde_json::from_value::<ExtractionRequest>(legacy).unwrap_err();
+        assert!(error.to_string().contains("version 1 is unsupported"));
+    }
+
+    #[test]
+    fn plan_v4_artifact_serializes_derived_kinds_in_the_existing_wire_shape() {
         let artifact = planned_text_artifact();
         let encoded = serde_json::to_value(&artifact).unwrap();
 
@@ -1384,7 +1718,75 @@ mod tests {
     }
 
     #[test]
-    fn plan_v3_artifact_rejects_tampered_preferred_and_fallback_kinds() {
+    fn require_decoded_rejects_a_raw_fallback() {
+        let artifact = planned_text_artifact();
+        let error = artifact
+            .representation
+            .validate_request(
+                ObjectKind::Binary,
+                49,
+                ExtractionRepresentationPolicy::RequireDecoded,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RepresentationContractError::RepresentationPolicyMismatch {
+                policy: ExtractionRepresentationPolicy::RequireDecoded,
+                artifact_kind: ExtractionArtifactKind::BinaryRaw,
+            }
+        ));
+    }
+
+    #[test]
+    fn prefer_decoded_requires_a_raw_fallback_for_decoded_content() {
+        let mut encoded = serde_json::to_value(planned_text_artifact()).unwrap();
+        encoded["fallback"] = serde_json::Value::Null;
+        let artifact = serde_json::from_value::<PlannedArtifactWire>(encoded)
+            .unwrap()
+            .into_artifact()
+            .unwrap();
+        let error = artifact
+            .representation
+            .validate_request(
+                ObjectKind::Binary,
+                49,
+                ExtractionRepresentationPolicy::PreferDecoded,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RepresentationContractError::RepresentationPolicyMismatch {
+                policy: ExtractionRepresentationPolicy::PreferDecoded,
+                artifact_kind: ExtractionArtifactKind::Text,
+            }
+        ));
+    }
+
+    #[test]
+    fn decoded_content_is_bound_to_its_unity_class() {
+        let artifact = planned_text_artifact();
+        let error = artifact
+            .representation
+            .validate_request(
+                ObjectKind::Binary,
+                unity_asset_binary::asset::class_ids::TEXTURE_2D,
+                ExtractionRepresentationPolicy::PreferDecoded,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RepresentationContractError::ClassContentMismatch {
+                class_id: unity_asset_binary::asset::class_ids::TEXTURE_2D,
+                artifact_kind: ExtractionArtifactKind::Text,
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_v4_artifact_rejects_tampered_preferred_and_fallback_kinds() {
         let encoded = serde_json::to_value(planned_text_artifact()).unwrap();
 
         let mut preferred = encoded.clone();

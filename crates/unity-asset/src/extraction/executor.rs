@@ -9,11 +9,13 @@ use std::thread;
 use serde::Serialize;
 use thiserror::Error;
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, DigestV1, SourceLocator, vec_allocation_bytes,
+    AssetLoadBudget, BudgetError, DigestV1, SourceLocator, WorkspaceId, vec_allocation_bytes,
 };
 
 use super::CheckedByteCounter;
-use super::artifact::{ExtractionOutputErrorKind, OutputArtifactError, OutputLayout, StagedOutput};
+use super::artifact::{
+    EvidenceReadBudget, ExtractionOutputErrorKind, OutputArtifactError, OutputLayout, StagedOutput,
+};
 use super::contract::{
     ExtractionAllocationUnit, ExtractionArtifactKind, ExtractionDiagnostic,
     ExtractionDiagnosticCode, ExtractionPath,
@@ -24,10 +26,16 @@ use super::manifest::{
     maximum_extraction_report,
 };
 use super::model::{ExtractionPlan, PlannedArtifact};
+use super::planning_contract::ExtractionPlanError;
+use super::publication::{
+    ArtifactPublication, ExtractionPublication, PUBLICATION_JOURNAL_PATH, PublicationParameters,
+    RECEIPT_SEGMENT_DIRECTORY, receipt_segment_paths,
+};
 use super::representation::{
     ExtractionReservationError, PreparedRepresentation, RepresentationPreparationError,
     RepresentationRuntime, RepresentationRuntimeContext, RepresentationWriteError,
 };
+use super::selection::ExtractionPlanner;
 #[cfg(feature = "decode")]
 use crate::reference::{ReferenceAllocationUnit, ReferenceGraphError};
 use crate::workspace::{WorkspaceError, WorkspaceLookup, WorkspaceView};
@@ -54,6 +62,7 @@ pub struct ExtractionExecutionLimits {
     max_in_flight_bytes: u64,
     max_open_files: usize,
     max_output_bytes: u64,
+    max_evidence_verification_bytes: u64,
     max_report_bytes: u64,
 }
 
@@ -78,6 +87,7 @@ impl ExtractionExecutionLimits {
         max_in_flight_bytes: u64,
         max_open_files: usize,
         max_output_bytes: u64,
+        max_evidence_verification_bytes: u64,
         max_report_bytes: u64,
     ) -> Result<Self, ExtractionExecutionError> {
         let limits = Self {
@@ -85,6 +95,7 @@ impl ExtractionExecutionLimits {
             max_in_flight_bytes,
             max_open_files,
             max_output_bytes,
+            max_evidence_verification_bytes,
             max_report_bytes,
         };
         limits.validate()?;
@@ -108,11 +119,17 @@ impl ExtractionExecutionLimits {
 
     #[must_use]
     /// Maximum total bytes published by one run.
-    ///
-    /// The same independent ceiling bounds the total existing-output bytes read
-    /// for skip and resume evidence, so preflight cannot perform unbounded I/O.
     pub const fn max_output_bytes(self) -> u64 {
         self.max_output_bytes
+    }
+
+    #[must_use]
+    /// Maximum cumulative bytes read from final paths to verify persisted evidence.
+    ///
+    /// Staging and atomic-publication integrity passes are bounded by
+    /// [`Self::max_output_bytes`] instead.
+    pub const fn max_evidence_verification_bytes(self) -> u64 {
+        self.max_evidence_verification_bytes
     }
 
     #[must_use]
@@ -129,6 +146,10 @@ impl ExtractionExecutionLimits {
             ),
             ("in_flight_bytes", self.max_in_flight_bytes),
             ("output_bytes", self.max_output_bytes),
+            (
+                "evidence_verification_bytes",
+                self.max_evidence_verification_bytes,
+            ),
             ("report_bytes", self.max_report_bytes),
         ] {
             if value == 0 {
@@ -158,12 +179,16 @@ impl Default for ExtractionExecutionLimits {
             max_in_flight_bytes: 512 * 1024 * 1024,
             max_open_files: 32,
             max_output_bytes: 16 * 1024 * 1024 * 1024,
+            max_evidence_verification_bytes: 33 * 1024 * 1024 * 1024,
             max_report_bytes: 64 * 1024 * 1024,
         }
     }
 }
 
-/// Runtime-only execution choices. None of these fields enter canonical evidence.
+/// Runtime-only execution choices.
+///
+/// These fields do not enter the extraction plan or report contracts. The
+/// publication journal separately binds the choices that affect recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtractionExecutionOptions {
     limits: ExtractionExecutionLimits,
@@ -279,8 +304,13 @@ impl ExecutionObserver {
     }
 
     #[cfg(all(test, feature = "decode"))]
-    fn record_existing_hash(&self, bytes: u64) {
-        super::test_probe::record_existing_hash(self.probe(), bytes);
+    fn record_preflight_hash(&self, bytes: u64) {
+        super::test_probe::record_preflight_hash(self.probe(), bytes);
+    }
+
+    fn before_publication_commit(&self) {
+        #[cfg(all(test, feature = "decode"))]
+        super::test_probe::before_publication_commit(self.probe());
     }
 
     #[cfg(all(test, feature = "decode"))]
@@ -315,6 +345,19 @@ impl ExtractionExecutor {
         Self {
             observer: ExecutionObserver::none(),
         }
+    }
+
+    /// Reads the workspace identity bound to an existing publication journal.
+    ///
+    /// Process frontends should use this read-only hint before reconstructing a
+    /// workspace for request-based recovery. The executor still verifies the
+    /// complete journal, plan, source, and revision identity under its output
+    /// lock before resuming publication.
+    pub fn publication_workspace_id(
+        output_root: &Path,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Option<WorkspaceId>, ExtractionExecutionError> {
+        super::publication::publication_workspace_id(output_root, budget)
     }
 
     #[cfg(all(test, feature = "decode"))]
@@ -368,17 +411,7 @@ impl ExtractionExecutor {
             resume,
         } = invocation;
         options.limits.validate()?;
-        validate_context(view, plan)?;
-        validate_sources(view, plan, budget)?;
         validate_resume(plan, resume)?;
-        let runtime_context = RepresentationRuntimeContext::load(
-            view,
-            plan.artifacts().iter().map(PlannedArtifact::representation),
-            budget,
-        )?;
-        let representation_runtime = runtime_context.bind(view, budget)?;
-        let working_sets =
-            prove_working_sets(&representation_runtime, plan, options.limits, budget)?;
         let manifest_output_reservation =
             validate_contract_bounds(plan, options.limits, manifest_path.is_some())?;
         let artifact_output_limit = options
@@ -386,7 +419,48 @@ impl ExtractionExecutor {
             .max_output_bytes
             .checked_sub(manifest_output_reservation)
             .expect("validated manifest reservation exceeds the output limit");
+        let parameters = PublicationParameters::new(
+            *options,
+            artifact_output_limit,
+            manifest_output_reservation,
+            manifest_path,
+            resume,
+        );
+        let journal_exists = OutputLayout::has_existing(output_root, PUBLICATION_JOURNAL_PATH)
+            .map_err(ExtractionExecutionError::output_layout)?;
+        let mut verified_plan = None;
+        #[cfg(feature = "decode")]
+        let preflight_working_sets = None;
+        #[cfg(not(feature = "decode"))]
+        let mut preflight_working_sets = None;
+        if !journal_exists {
+            validate_context(view, plan)?;
+            validate_sources(view, plan, budget)?;
+            let verified = ExtractionPlanner::new(view).verify(plan, budget)?;
+            #[cfg(feature = "decode")]
+            validate_planned_working_set_limits(&verified, options.limits)?;
+            #[cfg(not(feature = "decode"))]
+            {
+                let representation_context = RepresentationRuntimeContext::load(
+                    view,
+                    verified
+                        .artifacts()
+                        .iter()
+                        .map(|artifact| artifact.representation()),
+                    budget,
+                )?;
+                let representation_runtime = representation_context.bind(view, budget)?;
+                preflight_working_sets = Some(prove_working_sets(
+                    &representation_runtime,
+                    &verified,
+                    options.limits,
+                    budget,
+                )?);
+            }
+            verified_plan = Some(verified);
+        }
 
+        let receipt_segment_paths = receipt_segment_paths(plan.artifacts().len(), budget)?;
         let relative_paths = plan
             .artifacts()
             .iter()
@@ -395,18 +469,77 @@ impl ExtractionExecutor {
                     .chain(artifact.fallback_path().map(ExtractionPath::as_str))
             })
             .chain(manifest_path.into_iter().map(ExtractionPath::as_str));
-        let layout = OutputLayout::prepare(output_root, relative_paths)
-            .map_err(ExtractionExecutionError::output_layout)?;
+        let internal_paths = std::iter::once(PUBLICATION_JOURNAL_PATH)
+            .chain(receipt_segment_paths.iter().map(String::as_str));
+        let layout = OutputLayout::prepare_with_internal_paths(
+            output_root,
+            relative_paths,
+            internal_paths,
+            &[RECEIPT_SEGMENT_DIRECTORY],
+        )
+        .map_err(ExtractionExecutionError::output_layout)?;
         #[cfg(all(test, feature = "decode"))]
         let _execution_open_file = self.observer.reserve_open_files(EXECUTION_LOCK_OPEN_FILES);
 
+        let mut publication =
+            ExtractionPublication::open(&layout, &receipt_segment_paths, plan, parameters, budget)?;
+        if publication
+            .as_ref()
+            .is_some_and(|publication| publication.completed_artifacts() == plan.artifacts().len())
+        {
+            return finalize_publication(
+                &layout,
+                publication
+                    .take()
+                    .expect("completed publication was just observed"),
+                manifest_path,
+                manifest_output_reservation,
+                options.limits.max_report_bytes,
+                &self.observer,
+            );
+        }
+        if journal_exists {
+            validate_context(view, plan)?;
+            validate_sources(view, plan, budget)?;
+            verified_plan = Some(ExtractionPlanner::new(view).verify(plan, budget)?);
+        }
+        let verified_plan = verified_plan.expect("one verification branch always runs");
+        let plan = &*verified_plan;
+        let representation_context = RepresentationRuntimeContext::load(
+            view,
+            plan.artifacts()
+                .iter()
+                .map(|artifact| artifact.representation()),
+            budget,
+        )?;
+        let representation_runtime = representation_context.bind(view, budget)?;
+        let working_sets = match preflight_working_sets {
+            Some(working_sets) => working_sets,
+            None => prove_working_sets(&representation_runtime, plan, options.limits, budget)?,
+        };
+        let mut publication = match publication {
+            Some(publication) => publication,
+            None => ExtractionPublication::create(
+                &layout,
+                &receipt_segment_paths,
+                plan,
+                parameters,
+                budget,
+            )?,
+        };
+        let completed_artifacts = publication.completed_artifacts();
         let mut outcomes = (0..plan.artifacts().len())
             .map(|_| None)
             .collect::<Vec<Option<WorkOutcome>>>();
         let mut pending = Vec::new();
-        let mut preflight_stopped = false;
-        let mut remaining_existing_hash_bytes = options.limits.max_output_bytes;
-        for (index, artifact) in plan.artifacts().iter().enumerate() {
+        let mut preflight_stopped = publication.stopped();
+        let evidence_read_budget = publication.evidence_read_budget_mut();
+        for (index, artifact) in plan
+            .artifacts()
+            .iter()
+            .enumerate()
+            .skip(completed_artifacts)
+        {
             if preflight_stopped {
                 continue;
             }
@@ -414,7 +547,7 @@ impl ExtractionExecutor {
                 &layout,
                 artifact,
                 resume,
-                &mut remaining_existing_hash_bytes,
+                evidence_read_budget,
                 &self.observer,
             )? {
                 ResumeDecision::Complete(receipt) => {
@@ -426,9 +559,9 @@ impl ExtractionExecutor {
                         artifact.preferred_path(),
                         options.existing_output,
                         resume_evidence_for_slot(resume_evidence, PlannedOutputSlot::Preferred),
-                        &mut remaining_existing_hash_bytes,
+                        evidence_read_budget,
                         &self.observer,
-                    );
+                    )?;
                     if let Some(outcome) = prepared_target_outcome(
                         artifact,
                         artifact.preferred_kind(),
@@ -446,30 +579,22 @@ impl ExtractionExecutor {
                         outcomes[index] = Some(outcome);
                         continue;
                     }
-                    let fallback_target = artifact.fallback_path().map(|path| {
-                        prepare_target(
-                            &layout,
-                            path,
-                            options.existing_output,
-                            resume_evidence_for_slot(resume_evidence, PlannedOutputSlot::Fallback),
-                            &mut remaining_existing_hash_bytes,
-                            &self.observer,
-                        )
-                    });
                     pending.push(PendingWork {
                         artifact_index: index,
                         working_set_bytes: working_sets[index],
                         preferred_target,
-                        fallback_target,
+                        fallback_evidence: resume_evidence_for_slot(
+                            resume_evidence,
+                            PlannedOutputSlot::Fallback,
+                        ),
                     });
                 }
             }
         }
 
-        let mut publication = PublicationState::new(outcomes.len(), artifact_output_limit);
         let mut pending_cursor = 0;
-        let mut publish_cursor = 0;
-        while pending_cursor < pending.len() && !publication.stopped {
+        let mut publish_cursor = completed_artifacts;
+        while pending_cursor < pending.len() && !publication.stopped() {
             let batch = PendingBatch::select(options.limits, &pending, pending_cursor)?;
             let batch_end = batch.end;
             debug_assert!(batch.working_set_bytes <= options.limits.max_in_flight_bytes);
@@ -486,7 +611,18 @@ impl ExtractionExecutor {
                 &self.observer,
             );
             for (work, outcome) in pending[pending_cursor..batch_end].iter().zip(results) {
-                outcomes[work.artifact_index] = Some(outcome);
+                outcomes[work.artifact_index] = Some(resolve_fallback_outcome(
+                    &plan.artifacts()[work.artifact_index],
+                    work,
+                    outcome,
+                    FallbackResolution {
+                        layout: &layout,
+                        existing: options.existing_output,
+                        output_limit: remaining_output.min(work.working_set_bytes),
+                        evidence_read_budget: publication.evidence_read_budget_mut(),
+                        observer: &self.observer,
+                    },
+                ));
             }
             let ready_end = pending[batch_end - 1].artifact_index + 1;
             publish_ready(
@@ -509,19 +645,47 @@ impl ExtractionExecutor {
             &mut publication,
             &self.observer,
         )?;
-        let report = publication.finish(plan)?;
-        validate_actual_report(&report, options.limits.max_report_bytes)?;
-        if let Some(manifest_path) = manifest_path {
-            publish_manifest(
-                &layout,
-                manifest_path,
-                &report,
-                manifest_output_reservation,
-                &self.observer,
-            )?;
-        }
-        Ok(report)
+        finalize_publication(
+            &layout,
+            publication,
+            manifest_path,
+            manifest_output_reservation,
+            options.limits.max_report_bytes,
+            &self.observer,
+        )
     }
+}
+
+fn finalize_publication(
+    layout: &OutputLayout,
+    publication: ExtractionPublication<'_, '_>,
+    manifest_path: Option<&ExtractionPath>,
+    manifest_output_limit: u64,
+    report_limit: u64,
+    observer: &ExecutionObserver,
+) -> Result<ExtractionReport, ExtractionExecutionError> {
+    let mut publication = publication.finish()?;
+    validate_actual_report(publication.report(), report_limit)?;
+    if let Some(manifest_path) = manifest_path
+        && publication.needs_manifest_publication()
+    {
+        let staged = stage_manifest(
+            layout,
+            manifest_path,
+            publication.report(),
+            manifest_output_limit,
+            observer,
+        )?;
+        let publish_result = {
+            #[cfg(all(test, feature = "decode"))]
+            let _publish_open_files =
+                observer.reserve_open_files(SERIAL_OPEN_FILE_PEAK - EXECUTION_LOCK_OPEN_FILES);
+            publication.publish_manifest(staged)
+        };
+        publish_result?;
+    }
+    observer.before_publication_commit();
+    publication.commit()
 }
 
 #[non_exhaustive]
@@ -535,6 +699,8 @@ pub enum ExtractionExecutionError {
     Canonical(#[from] ExtractionCanonicalError),
     #[error(transparent)]
     Manifest(#[from] ExtractionManifestError),
+    #[error(transparent)]
+    PlanVerification(Box<ExtractionPlanError>),
     #[error("extraction limit {resource} must be nonzero")]
     InvalidLimit { resource: &'static str },
     #[error("open-file limit {limit} is below the safe extraction minimum {minimum}")]
@@ -590,14 +756,30 @@ pub enum ExtractionExecutionError {
     ReportSerialization(String),
     #[error("extraction output byte accounting overflowed")]
     OutputLengthOverflow,
+    #[error("invalid extraction publication journal: {message}")]
+    PublicationJournalInvalid { message: String },
+    #[error("canonical extraction publication journal requires {required} bytes, limit is {limit}")]
+    PublicationJournalLimitExceeded { required: u64, limit: u64 },
+    #[error("evidence verification requires {required} bytes, only {remaining} remain")]
+    EvidenceVerificationLimitExceeded { required: u64, remaining: u64 },
+    #[error("extraction publication journal conflict: {reason}")]
+    PublicationJournalConflict { reason: &'static str },
+    #[error("extraction publication requires recovery at stage {stage}")]
+    PublicationRecoveryRequired { stage: &'static str },
 }
 
 impl ExtractionExecutionError {
-    fn output_layout(error: OutputArtifactError) -> Self {
+    pub(super) fn output_layout(error: OutputArtifactError) -> Self {
         Self::OutputLayout {
             kind: error.kind(),
             message: error.to_string(),
         }
+    }
+}
+
+impl From<ExtractionPlanError> for ExtractionExecutionError {
+    fn from(error: ExtractionPlanError) -> Self {
+        Self::PlanVerification(Box::new(error))
     }
 }
 
@@ -606,7 +788,7 @@ struct PendingWork {
     artifact_index: usize,
     working_set_bytes: u64,
     preferred_target: PreparedTarget,
-    fallback_target: Option<PreparedTarget>,
+    fallback_evidence: Option<ExistingEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -666,7 +848,7 @@ enum PlannedOutputSlot {
 enum ExistingEvidence {
     Missing,
     Existing { length: u64, digest: DigestV1 },
-    HashLimitExceeded,
+    HashLimitExceeded { required: u64, remaining: u64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -801,6 +983,24 @@ fn prove_working_sets(
 }
 
 #[cfg(feature = "decode")]
+fn validate_planned_working_set_limits(
+    plan: &ExtractionPlan,
+    limits: ExtractionExecutionLimits,
+) -> Result<(), ExtractionExecutionError> {
+    for artifact in plan.artifacts() {
+        let required = artifact.working_set_bytes();
+        if required > limits.max_in_flight_bytes {
+            return Err(ExtractionExecutionError::WorkingSetExceedsLimit {
+                ordinal: artifact.ordinal(),
+                required,
+                limit: limits.max_in_flight_bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "decode")]
 fn map_reference_graph_error(ordinal: u32, error: ReferenceGraphError) -> ExtractionExecutionError {
     match error {
         ReferenceGraphError::Budget(error)
@@ -881,13 +1081,13 @@ fn validate_contract_bounds(
     Ok(required)
 }
 
-fn publish_manifest(
+fn stage_manifest(
     layout: &OutputLayout,
     path: &ExtractionPath,
     report: &ExtractionReport,
     output_limit: u64,
     _observer: &ExecutionObserver,
-) -> Result<(), ExtractionExecutionError> {
+) -> Result<StagedOutput, ExtractionExecutionError> {
     let required = canonical_length(report.manifest())?;
     if required > output_limit {
         return Err(ExtractionExecutionError::ManifestOutputLimitExceeded {
@@ -909,20 +1109,14 @@ fn publish_manifest(
             .finish()
             .map_err(ExtractionExecutionError::output_layout)?
     };
-    let result = {
-        #[cfg(all(test, feature = "decode"))]
-        let _publish_open_files =
-            _observer.reserve_open_files(SERIAL_OPEN_FILE_PEAK - EXECUTION_LOCK_OPEN_FILES);
-        staged.publish(true)
-    };
-    result.map_err(ExtractionExecutionError::output_layout)
+    Ok(staged)
 }
 
 fn resumed_artifact(
     layout: &OutputLayout,
     artifact: &PlannedArtifact,
     resume: Option<&ExtractionManifest>,
-    remaining_hash_bytes: &mut u64,
+    evidence_read_budget: &mut EvidenceReadBudget,
     observer: &ExecutionObserver,
 ) -> Result<ResumeDecision, ExtractionExecutionError> {
     let Some(candidate) =
@@ -952,14 +1146,14 @@ fn resumed_artifact(
         let output = layout
             .path(candidate.path().as_str())
             .map_err(ExtractionExecutionError::output_layout)?;
-        match hash_existing_bounded(output, remaining_hash_bytes, observer) {
+        match hash_existing_bounded(output, evidence_read_budget, observer) {
             Ok(Some(actual)) if actual == (expected_length, expected_digest) => {
                 let diagnostics = artifact_diagnostics_with(
                     artifact,
                     artifact
                         .fallback_path()
                         .filter(|path| *path == candidate.path())
-                        .map(|_| ExtractionDiagnosticCode::DecodeFailedRawFallback),
+                        .map(|_| runtime_fallback_diagnostic()),
                 );
                 return Ok(ResumeDecision::Complete(ExtractionManifestArtifact::new(
                     artifact.ordinal(),
@@ -984,10 +1178,13 @@ fn resumed_artifact(
                     existing: ExistingEvidence::Missing,
                 })));
             }
-            Err(OutputArtifactError::ExistingHashLimitExceeded { .. }) => {
+            Err(OutputArtifactError::ExistingHashLimitExceeded { length, limit, .. }) => {
                 return Ok(ResumeDecision::Execute(Some(ResumeEvidence {
                     slot,
-                    existing: ExistingEvidence::HashLimitExceeded,
+                    existing: ExistingEvidence::HashLimitExceeded {
+                        required: length,
+                        remaining: limit,
+                    },
                 })));
             }
             Err(error) => return Err(ExtractionExecutionError::output_layout(error)),
@@ -996,49 +1193,66 @@ fn resumed_artifact(
     Ok(ResumeDecision::Execute(None))
 }
 
+const fn runtime_fallback_diagnostic() -> ExtractionDiagnosticCode {
+    #[cfg(feature = "decode")]
+    {
+        ExtractionDiagnosticCode::DecodeFailedRawFallback
+    }
+    #[cfg(not(feature = "decode"))]
+    {
+        ExtractionDiagnosticCode::FeatureUnavailable
+    }
+}
+
 fn prepare_target(
     layout: &OutputLayout,
     path: &ExtractionPath,
     existing: ExistingOutputPolicy,
     evidence: Option<ExistingEvidence>,
-    remaining_hash_bytes: &mut u64,
+    evidence_read_budget: &mut EvidenceReadBudget,
     observer: &ExecutionObserver,
-) -> PreparedTarget {
+) -> Result<PreparedTarget, ExtractionExecutionError> {
     if let Some(evidence) = evidence {
         return target_from_existing_evidence(existing, evidence);
     }
     let output = match layout.path(path.as_str()) {
         Ok(output) => output,
-        Err(_) => return PreparedTarget::Failed(ExtractionDiagnosticCode::OutputFailed),
+        Err(_) => {
+            return Ok(PreparedTarget::Failed(
+                ExtractionDiagnosticCode::OutputFailed,
+            ));
+        }
     };
-    match existing {
+    Ok(match existing {
         ExistingOutputPolicy::Error => match output.exists() {
             Ok(true) => PreparedTarget::Failed(ExtractionDiagnosticCode::OutputExists),
             Ok(false) => PreparedTarget::Encode { replace: false },
             Err(_) => PreparedTarget::Failed(ExtractionDiagnosticCode::OutputFailed),
         },
-        ExistingOutputPolicy::Replace => match output.exists() {
-            Ok(exists) => PreparedTarget::Encode { replace: exists },
-            Err(_) => PreparedTarget::Failed(ExtractionDiagnosticCode::OutputFailed),
-        },
+        ExistingOutputPolicy::Replace => PreparedTarget::Encode { replace: true },
         ExistingOutputPolicy::Skip => {
-            match hash_existing_bounded(output, remaining_hash_bytes, observer) {
+            match hash_existing_bounded(output, evidence_read_budget, observer) {
                 Ok(Some((length, digest))) => PreparedTarget::Existing { length, digest },
                 Ok(None) => PreparedTarget::Encode { replace: false },
-                Err(OutputArtifactError::ExistingHashLimitExceeded { .. }) => {
-                    PreparedTarget::Failed(ExtractionDiagnosticCode::OutputLimitExceeded)
+                Err(OutputArtifactError::ExistingHashLimitExceeded { length, limit, .. }) => {
+                    return Err(
+                        ExtractionExecutionError::EvidenceVerificationLimitExceeded {
+                            required: length,
+                            remaining: limit,
+                        },
+                    );
                 }
                 Err(_) => PreparedTarget::Failed(ExtractionDiagnosticCode::OutputFailed),
             }
         }
-    }
+    })
 }
 
 fn target_from_existing_evidence(
     policy: ExistingOutputPolicy,
     evidence: ExistingEvidence,
-) -> PreparedTarget {
-    match evidence {
+) -> Result<PreparedTarget, ExtractionExecutionError> {
+    Ok(match evidence {
         ExistingEvidence::Missing => PreparedTarget::Encode { replace: false },
         ExistingEvidence::Existing { length, digest } => match policy {
             ExistingOutputPolicy::Error => {
@@ -1047,32 +1261,35 @@ fn target_from_existing_evidence(
             ExistingOutputPolicy::Replace => PreparedTarget::Encode { replace: true },
             ExistingOutputPolicy::Skip => PreparedTarget::Existing { length, digest },
         },
-        ExistingEvidence::HashLimitExceeded => match policy {
+        ExistingEvidence::HashLimitExceeded {
+            required,
+            remaining,
+        } => match policy {
             ExistingOutputPolicy::Error => {
                 PreparedTarget::Failed(ExtractionDiagnosticCode::OutputExists)
             }
             ExistingOutputPolicy::Replace => PreparedTarget::Encode { replace: true },
             ExistingOutputPolicy::Skip => {
-                PreparedTarget::Failed(ExtractionDiagnosticCode::OutputLimitExceeded)
+                return Err(
+                    ExtractionExecutionError::EvidenceVerificationLimitExceeded {
+                        required,
+                        remaining,
+                    },
+                );
             }
         },
-    }
+    })
 }
 
 fn hash_existing_bounded(
     output: &super::artifact::PreparedOutputPath,
-    remaining: &mut u64,
+    budget: &mut EvidenceReadBudget,
     _observer: &ExecutionObserver,
 ) -> Result<Option<(u64, DigestV1)>, OutputArtifactError> {
-    let result = output.hash_existing_bounded(*remaining)?;
-    if let Some((length, _)) = result {
-        *remaining = (*remaining)
-            .checked_sub(length)
-            .expect("bounded existing-output hash exceeded its remaining allowance");
-    }
+    let result = output.hash_existing_bounded(budget)?;
     #[cfg(all(test, feature = "decode"))]
     if let Some((length, _)) = result {
-        _observer.record_existing_hash(length);
+        _observer.record_preflight_hash(length);
     }
     Ok(result)
 }
@@ -1310,49 +1527,13 @@ fn encode_artifact(
             replace: preferred_replace,
             diagnostics: planned_diagnostics,
         },
-        Err(AttemptError::Decode) => {
-            let (Some(kind), Some(path)) = (artifact.fallback_kind(), artifact.fallback_path())
-            else {
-                return failed_outcome(artifact, ExtractionDiagnosticCode::DecodedUnavailable);
-            };
-            let diagnostics = artifact_diagnostics_with(
-                artifact,
-                Some(ExtractionDiagnosticCode::DecodeFailedRawFallback),
-            );
-            let target = work
-                .fallback_target
-                .expect("a planned fallback has a preflighted target");
-            let replace = match target {
-                PreparedTarget::Encode { replace } => replace,
-                target => {
-                    return prepared_target_outcome(artifact, kind, path, diagnostics, target)
-                        .expect("only an encoding target continues fallback extraction");
-                }
-            };
-            match stage_content(
-                layout,
-                path,
-                true,
-                &input,
-                artifact.ordinal(),
-                output_limit,
-                None,
-                observer,
-            ) {
-                Ok(staged) => WorkOutcome::Staged {
-                    kind,
-                    path: path.clone(),
-                    staged,
-                    replace,
-                    diagnostics,
-                },
-                Err(AttemptError::Fatal(error)) => WorkOutcome::Fatal(*error),
-                Err(AttemptError::Decode | AttemptError::Output) => {
-                    failed_outcome(artifact, ExtractionDiagnosticCode::OutputFailed)
-                }
-                Err(AttemptError::OutputLimit) => {
-                    failed_outcome(artifact, ExtractionDiagnosticCode::OutputLimitExceeded)
-                }
+        Err(AttemptError::PreferredUnavailable { terminal, fallback }) => {
+            if artifact.fallback_kind().is_none() || artifact.fallback_path().is_none() {
+                return failed_outcome(artifact, terminal);
+            }
+            WorkOutcome::FallbackRequired {
+                input,
+                diagnostic: fallback,
             }
         }
         Err(AttemptError::Output) => {
@@ -1362,6 +1543,74 @@ fn encode_artifact(
             failed_outcome(artifact, ExtractionDiagnosticCode::OutputLimitExceeded)
         }
         Err(AttemptError::Fatal(error)) => WorkOutcome::Fatal(*error),
+    }
+}
+
+struct FallbackResolution<'value> {
+    layout: &'value OutputLayout,
+    existing: ExistingOutputPolicy,
+    output_limit: u64,
+    evidence_read_budget: &'value mut EvidenceReadBudget,
+    observer: &'value ExecutionObserver,
+}
+
+fn resolve_fallback_outcome(
+    artifact: &PlannedArtifact,
+    work: &PendingWork,
+    outcome: WorkOutcome,
+    resolution: FallbackResolution<'_>,
+) -> WorkOutcome {
+    let WorkOutcome::FallbackRequired { input, diagnostic } = outcome else {
+        return outcome;
+    };
+    let (Some(kind), Some(path)) = (artifact.fallback_kind(), artifact.fallback_path()) else {
+        return WorkOutcome::Fatal(ExtractionExecutionError::PublicationJournalConflict {
+            reason: "worker requested an unplanned extraction fallback",
+        });
+    };
+    let diagnostics = artifact_diagnostics_with(artifact, Some(diagnostic));
+    let target = match prepare_target(
+        resolution.layout,
+        path,
+        resolution.existing,
+        work.fallback_evidence,
+        resolution.evidence_read_budget,
+        resolution.observer,
+    ) {
+        Ok(target) => target,
+        Err(error) => return WorkOutcome::Fatal(error),
+    };
+    let replace = match target {
+        PreparedTarget::Encode { replace } => replace,
+        target => {
+            return prepared_target_outcome(artifact, kind, path, diagnostics, target)
+                .expect("only an encoding target continues fallback extraction");
+        }
+    };
+    match stage_content(
+        resolution.layout,
+        path,
+        true,
+        &input,
+        artifact.ordinal(),
+        resolution.output_limit,
+        None,
+        resolution.observer,
+    ) {
+        Ok(staged) => WorkOutcome::Staged {
+            kind,
+            path: path.clone(),
+            staged,
+            replace,
+            diagnostics,
+        },
+        Err(AttemptError::Fatal(error)) => WorkOutcome::Fatal(*error),
+        Err(AttemptError::PreferredUnavailable { .. } | AttemptError::Output) => {
+            failed_outcome(artifact, ExtractionDiagnosticCode::OutputFailed)
+        }
+        Err(AttemptError::OutputLimit) => {
+            failed_outcome(artifact, ExtractionDiagnosticCode::OutputLimitExceeded)
+        }
     }
 }
 
@@ -1411,7 +1660,17 @@ fn stage_content(
 
 fn map_representation_write_error(error: RepresentationWriteError) -> AttemptError {
     match error {
-        RepresentationWriteError::InvalidContent => AttemptError::Decode,
+        RepresentationWriteError::InvalidContent => AttemptError::PreferredUnavailable {
+            terminal: ExtractionDiagnosticCode::DecodedUnavailable,
+            fallback: ExtractionDiagnosticCode::DecodeFailedRawFallback,
+        },
+        #[cfg(not(feature = "decode"))]
+        RepresentationWriteError::CapabilityUnavailable { .. } => {
+            AttemptError::PreferredUnavailable {
+                terminal: ExtractionDiagnosticCode::FeatureUnavailable,
+                fallback: ExtractionDiagnosticCode::FeatureUnavailable,
+            }
+        }
         RepresentationWriteError::Output => AttemptError::Output,
         RepresentationWriteError::Budget(error) => AttemptError::Fatal(Box::new(error.into())),
         #[cfg(feature = "decode")]
@@ -1427,7 +1686,10 @@ fn map_representation_write_error(error: RepresentationWriteError) -> AttemptErr
 }
 
 enum AttemptError {
-    Decode,
+    PreferredUnavailable {
+        terminal: ExtractionDiagnosticCode,
+        fallback: ExtractionDiagnosticCode,
+    },
     Output,
     OutputLimit,
     Fatal(Box<ExtractionExecutionError>),
@@ -1441,6 +1703,10 @@ enum WorkOutcome {
         staged: StagedOutput,
         replace: bool,
         diagnostics: Vec<ExtractionDiagnostic>,
+    },
+    FallbackRequired {
+        input: PreparedRepresentation,
+        diagnostic: ExtractionDiagnosticCode,
     },
     Fatal(ExtractionExecutionError),
 }
@@ -1482,49 +1748,22 @@ fn receipt_outcome(
     }
 }
 
-struct PublicationState {
-    receipts: Vec<ExtractionManifestArtifact>,
-    published_bytes: u64,
-    output_limit: u64,
-    stopped: bool,
-}
-
-impl PublicationState {
-    fn new(capacity: usize, output_limit: u64) -> Self {
-        Self {
-            receipts: Vec::with_capacity(capacity),
-            published_bytes: 0,
-            output_limit,
-            stopped: false,
-        }
-    }
-
-    const fn remaining_output(&self) -> u64 {
-        self.output_limit.saturating_sub(self.published_bytes)
-    }
-
-    fn finish(self, plan: &ExtractionPlan) -> Result<ExtractionReport, ExtractionExecutionError> {
-        let manifest = ExtractionManifest::new(plan, self.receipts)?;
-        Ok(ExtractionReport::new(manifest)?)
-    }
-}
-
 fn publish_ready(
     plan: &ExtractionPlan,
-    options: &ExtractionExecutionOptions,
+    _options: &ExtractionExecutionOptions,
     outcomes: &mut [Option<WorkOutcome>],
     artifact_offset: usize,
-    state: &mut PublicationState,
+    state: &mut ExtractionPublication<'_, '_>,
     _observer: &ExecutionObserver,
 ) -> Result<(), ExtractionExecutionError> {
     for (local_index, outcome) in outcomes.iter_mut().enumerate() {
         let artifact_index = artifact_offset + local_index;
         let artifact = &plan.artifacts()[artifact_index];
-        if state.stopped {
+        if state.stopped() {
             if let Some(WorkOutcome::Staged { staged, .. }) = outcome.take() {
                 let _ = staged.discard();
             }
-            state.receipts.push(stopped_receipt(artifact)?);
+            state.record(stopped_receipt(artifact)?)?;
             continue;
         }
 
@@ -1535,11 +1774,7 @@ fn publish_ready(
             })?;
         match outcome {
             WorkOutcome::Receipt(receipt) => {
-                let failed = receipt.status() == ExtractionArtifactStatus::Failed;
-                state.receipts.push(receipt);
-                if failed && options.failure == ExtractionFailurePolicy::StopInPlanOrder {
-                    state.stopped = true;
-                }
+                state.record(receipt)?;
             }
             WorkOutcome::Staged {
                 kind,
@@ -1548,51 +1783,47 @@ fn publish_ready(
                 replace,
                 diagnostics,
             } => {
-                let next = state.published_bytes.checked_add(staged.length());
-                if next.is_none_or(|next| next > state.output_limit) {
+                let next = state.remaining_output().checked_sub(staged.length());
+                if next.is_none() {
                     let _ = staged.discard();
-                    state.receipts.push(failed_receipt(
+                    state.record(failed_receipt(
                         artifact,
                         ExtractionDiagnosticCode::OutputLimitExceeded,
-                    )?);
-                    if options.failure == ExtractionFailurePolicy::StopInPlanOrder {
-                        state.stopped = true;
-                    }
+                    )?)?;
                     continue;
                 }
                 let length = staged.length();
                 let digest = staged.digest();
-                let publish_result = {
+                let receipt = ExtractionManifestArtifact::new(
+                    artifact.ordinal(),
+                    artifact.address().clone(),
+                    kind,
+                    path,
+                    ExtractionArtifactStatus::Written,
+                    Some(length),
+                    Some(digest),
+                    diagnostics,
+                )?;
+                let publication = {
                     #[cfg(all(test, feature = "decode"))]
                     let _open_files = _observer
                         .reserve_open_files(SERIAL_OPEN_FILE_PEAK - EXECUTION_LOCK_OPEN_FILES);
-                    staged.publish(replace)
+                    state.publish(receipt, staged, replace)
                 };
-                match publish_result {
-                    Ok(()) => {
-                        state.published_bytes =
-                            next.ok_or(ExtractionExecutionError::OutputLengthOverflow)?;
-                        state.receipts.push(ExtractionManifestArtifact::new(
-                            artifact.ordinal(),
-                            artifact.address().clone(),
-                            kind,
-                            path,
-                            ExtractionArtifactStatus::Written,
-                            Some(length),
-                            Some(digest),
-                            diagnostics,
-                        )?);
-                    }
-                    Err(_) => {
-                        state.receipts.push(failed_receipt(
+                match publication? {
+                    ArtifactPublication::Published => {}
+                    ArtifactPublication::NotPublished => {
+                        state.record(failed_receipt(
                             artifact,
                             ExtractionDiagnosticCode::OutputFailed,
-                        )?);
-                        if options.failure == ExtractionFailurePolicy::StopInPlanOrder {
-                            state.stopped = true;
-                        }
+                        )?)?;
                     }
                 }
+            }
+            WorkOutcome::FallbackRequired { .. } => {
+                return Err(ExtractionExecutionError::PublicationJournalConflict {
+                    reason: "unresolved extraction fallback reached publication",
+                });
             }
             WorkOutcome::Fatal(error) => return Err(error),
         }
@@ -1757,7 +1988,7 @@ mod resource_tests {
             artifact_index,
             working_set_bytes,
             preferred_target: PreparedTarget::Encode { replace: false },
-            fallback_target: None,
+            fallback_evidence: None,
         }
     }
 
@@ -1770,7 +2001,7 @@ mod resource_tests {
             pending(3, 3),
             pending(4, 10),
         ];
-        let limits = ExtractionExecutionLimits::new(8, 10, 5, 1024, 1024).unwrap();
+        let limits = ExtractionExecutionLimits::new(8, 10, 5, 1024, 1024, 1024).unwrap();
 
         let first = PendingBatch::select(limits, &pending, 0).unwrap();
         let second = PendingBatch::select(limits, &pending, first.end).unwrap();
@@ -1811,7 +2042,7 @@ mod resource_tests {
     #[test]
     fn open_file_budget_limits_a_batch_even_when_bytes_do_not() {
         let pending = [pending(0, 1), pending(1, 1), pending(2, 1), pending(3, 1)];
-        let limits = ExtractionExecutionLimits::new(8, 1024, 7, 1024, 1024).unwrap();
+        let limits = ExtractionExecutionLimits::new(8, 1024, 7, 1024, 1024, 1024).unwrap();
 
         let batch = PendingBatch::select(limits, &pending, 0).unwrap();
 
@@ -1826,12 +2057,12 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use super::super::publication::{PublicationCrashPoint, RECEIPT_SEGMENT_DIRECTORY, crash_once};
     use super::super::test_probe::ExecutionProbe;
     use super::*;
     use crate::extraction::{
         ExtractionFilter, ExtractionPlanner, ExtractionRepresentationPolicy, ExtractionRequest,
     };
-    use crate::reference::ReferenceGraphBuildOptions;
     use crate::schema::SchemaRecipePlanner;
     use crate::workspace::{
         AssetWorkspace, MutationPlanBuilder, MutationValue, PrepareOptions, PreparedView,
@@ -1845,7 +2076,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (snapshot, plan) = media_plan(&directory);
         let mut wire = serde_json::to_value(&plan).unwrap();
-        let (ordinal, stream) = wire["artifacts"]
+        let stream = wire["artifacts"]
             .as_array_mut()
             .unwrap()
             .iter_mut()
@@ -1853,17 +2084,15 @@ mod tests {
                 artifact["preferred_content"]["stream"]
                     .is_object()
                     .then(|| {
-                        (
-                            u32::try_from(artifact["ordinal"].as_u64().unwrap()).unwrap(),
-                            artifact["preferred_content"]["stream"]
-                                .as_object_mut()
-                                .unwrap(),
-                        )
+                        artifact["preferred_content"]["stream"]
+                            .as_object_mut()
+                            .unwrap()
                     })
             })
             .expect("media fixture must include a streamed artifact");
-        let offset = stream["offset"].as_u64().unwrap();
-        stream.insert("offset".to_owned(), serde_json::Value::from(offset + 1));
+        let request = stream["request"].as_object_mut().unwrap();
+        let offset = request["offset"].as_u64().unwrap();
+        request.insert("offset".to_owned(), serde_json::Value::from(offset + 1));
         let encoded = serde_json::to_vec(&wire).unwrap();
         let tampered =
             ExtractionPlan::read_json(encoded.as_slice(), &mut AssetLoadBudget::default()).unwrap();
@@ -1881,9 +2110,13 @@ mod tests {
 
         assert!(matches!(
             error,
-            ExtractionExecutionError::WorkingSetProofFailed {
-                ordinal: actual
-            } if actual == ordinal
+            ExtractionExecutionError::PlanVerification(source)
+                if matches!(
+                    source.as_ref(),
+                    ExtractionPlanError::PlanDerivationMismatch {
+                        kind: super::super::planning_contract::ExtractionPlanMismatchKind::Representations,
+                    }
+                )
         ));
         assert!(!output.exists());
     }
@@ -1892,8 +2125,6 @@ mod tests {
     fn executor_rejects_tampered_sprite_texture_proofs_before_creating_output() {
         let directory = tempfile::tempdir().unwrap();
         let (snapshot, plan, sprite_index) = sprite_plan();
-        let ordinal = plan.artifacts()[sprite_index].ordinal();
-
         let mut texture_wire = serde_json::to_value(&plan).unwrap();
         let texture = &mut texture_wire["artifacts"][sprite_index]["preferred_content"]["texture"];
         let path_id = texture["path_id"].as_i64().unwrap();
@@ -1903,11 +2134,10 @@ mod tests {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-        assert_working_set_proof_rejected(
+        assert_plan_representation_rejected(
             &snapshot,
             &texture_plan,
             &directory.path().join("tampered-texture"),
-            ordinal,
         );
     }
 
@@ -1922,18 +2152,21 @@ mod tests {
         let mut budget = AssetLoadBudget::default();
         let context = RepresentationRuntimeContext::load(
             &view,
-            plan.artifacts().iter().map(PlannedArtifact::representation),
+            plan.artifacts()
+                .iter()
+                .map(|artifact| artifact.representation()),
             &mut budget,
         )
         .unwrap();
         let runtime = context.bind(&view, &mut budget).unwrap();
         let exact_limits =
-            ExtractionExecutionLimits::new(1, declared, 5, u64::MAX, u64::MAX).unwrap();
+            ExtractionExecutionLimits::new(1, declared, 5, u64::MAX, u64::MAX, u64::MAX).unwrap();
         let proven = prove_working_sets(&runtime, &plan, exact_limits, &mut budget).unwrap();
         assert_eq!(proven, [declared]);
 
         let one_short =
-            ExtractionExecutionLimits::new(1, declared - 1, 5, u64::MAX, u64::MAX).unwrap();
+            ExtractionExecutionLimits::new(1, declared - 1, 5, u64::MAX, u64::MAX, u64::MAX)
+                .unwrap();
         let error = prove_working_sets(&runtime, &plan, one_short, &mut AssetLoadBudget::default())
             .unwrap_err();
         assert!(matches!(
@@ -2007,7 +2240,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rejected.counts().failed(), 1);
-        assert_eq!(error_probe.snapshot().existing_hash_bytes, 0);
+        assert_eq!(error_probe.snapshot().preflight_hash_bytes, 0);
 
         let replace_probe = ExecutionProbe::new([], []);
         let written = ExtractionExecutor::observing(Arc::clone(&replace_probe))
@@ -2024,7 +2257,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(written.counts().written(), 1);
-        assert_eq!(replace_probe.snapshot().existing_hash_bytes, 0);
+        assert_eq!(replace_probe.snapshot().preflight_hash_bytes, 0);
         let encoded_length = written.manifest().artifacts()[0].length().unwrap();
 
         let resume_probe = ExecutionProbe::new([], []);
@@ -2043,7 +2276,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resumed.counts().resumed(), 1);
-        assert_eq!(resume_probe.snapshot().existing_hash_bytes, encoded_length);
+        assert_eq!(resume_probe.snapshot().preflight_hash_bytes, encoded_length);
 
         let skip_probe = ExecutionProbe::new([], []);
         let skipped = ExtractionExecutor::observing(Arc::clone(&skip_probe))
@@ -2060,7 +2293,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(skipped.counts().skipped_existing(), 1);
-        assert_eq!(skip_probe.snapshot().existing_hash_bytes, encoded_length);
+        assert_eq!(skip_probe.snapshot().preflight_hash_bytes, encoded_length);
 
         let output_path = output.join(artifact.preferred_path().as_str());
         let mut corrupt = fs::read(&output_path).unwrap();
@@ -2084,31 +2317,729 @@ mod tests {
             .unwrap();
         assert_eq!(mismatched.counts().skipped_existing(), 1);
         assert_eq!(
-            mismatch_probe.snapshot().existing_hash_bytes,
+            mismatch_probe.snapshot().preflight_hash_bytes,
             encoded_length
         );
 
         fs::write(&output_path, b"too large").unwrap();
         let bounded_probe = ExecutionProbe::new([], []);
-        let bounded = ExtractionExecutor::observing(Arc::clone(&bounded_probe))
+        let error = ExtractionExecutor::observing(Arc::clone(&bounded_probe))
             .execute(
                 &snapshot,
                 &plan,
                 &output,
-                ExtractionRunOptions::new(output_options(&plan, 1, ExistingOutputPolicy::Skip)),
+                ExtractionRunOptions::new(output_options_with_verification(
+                    &plan,
+                    u64::MAX,
+                    1,
+                    ExistingOutputPolicy::Skip,
+                )),
                 &mut AssetLoadBudget::default(),
             )
-            .unwrap();
-        assert_eq!(bounded.counts().failed(), 1);
-        assert_eq!(
-            bounded.manifest().artifacts()[0].diagnostics()[0].code(),
-            ExtractionDiagnosticCode::OutputLimitExceeded
-        );
-        assert_eq!(bounded_probe.snapshot().existing_hash_bytes, 0);
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::EvidenceVerificationLimitExceeded {
+                required: 9,
+                remaining: 1,
+            }
+        ));
+        assert_eq!(bounded_probe.snapshot().preflight_hash_bytes, 0);
     }
 
     #[test]
-    fn existing_output_hash_limit_is_cumulative_across_the_run() {
+    fn replace_policy_overwrites_a_target_created_after_preflight() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = media_plan(&directory);
+        let artifact = &plan.artifacts()[0];
+        let artifact_path = artifact.preferred_path().clone();
+        let artifact_ordinal = artifact.ordinal();
+        let output = directory.path().join("replace-publication-race");
+        let probe = ExecutionProbe::new([artifact_ordinal], []);
+
+        let report = thread::scope(|scope| {
+            let _release_on_unwind = probe.release_on_drop();
+            let executor = ExtractionExecutor::observing(Arc::clone(&probe));
+            let worker_snapshot = &snapshot;
+            let worker_plan = &plan;
+            let worker_output = &output;
+            let worker_options = output_options(&plan, u64::MAX, ExistingOutputPolicy::Replace);
+            let worker = scope.spawn(move || {
+                executor.execute(
+                    worker_snapshot,
+                    worker_plan,
+                    worker_output,
+                    ExtractionRunOptions::new(worker_options),
+                    &mut AssetLoadBudget::default(),
+                )
+            });
+            probe.wait_for_waiters(1);
+            write_existing(&output, &artifact_path, b"racing output");
+            probe.release_writes();
+            worker.join().unwrap().unwrap()
+        });
+
+        let receipt = &report.manifest().artifacts()[usize::try_from(artifact_ordinal).unwrap()];
+        assert_eq!(receipt.status(), ExtractionArtifactStatus::Written);
+        let published = fs::read(output.join(artifact_path.as_str())).unwrap();
+        assert_ne!(published, b"racing output");
+        assert_eq!(
+            u64::try_from(published.len()).unwrap(),
+            receipt.length().unwrap()
+        );
+    }
+
+    #[test]
+    fn preferred_success_does_not_inspect_an_unused_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let (view, plan, artifact_index) = sprite_plan();
+        let artifact = &plan.artifacts()[artifact_index];
+        let fallback_path = artifact
+            .fallback_path()
+            .expect("prefer-decoded texture must retain a raw fallback");
+
+        let measured_output = directory.path().join("fallback-measurement");
+        let measured = ExtractionExecutor::new()
+            .execute(
+                &view,
+                &plan,
+                &measured_output,
+                ExtractionRunOptions::new(ExtractionExecutionOptions::default()),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let preferred_length = measured.manifest().artifacts()[0].length().unwrap();
+
+        let output = directory.path().join("unused-fallback");
+        let fallback_output = output.join(fallback_path.as_str());
+        fs::create_dir_all(fallback_output.parent().unwrap()).unwrap();
+        fs::File::create(&fallback_output)
+            .unwrap()
+            .set_len(preferred_length.checked_add(1).unwrap())
+            .unwrap();
+        let probe = ExecutionProbe::new([], []);
+        let options = output_options_with_verification(
+            &plan,
+            u64::MAX,
+            preferred_length,
+            ExistingOutputPolicy::Skip,
+        );
+
+        let report = ExtractionExecutor::observing(Arc::clone(&probe))
+            .execute(
+                &view,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        assert_eq!(report.counts().written(), 1);
+        assert_eq!(
+            report.manifest().artifacts()[0].path(),
+            artifact.preferred_path()
+        );
+        assert_eq!(probe.snapshot().preflight_hash_bytes, 0);
+    }
+
+    #[test]
+    fn artifact_move_without_ack_is_reconciled_without_republishing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = texture_plan();
+        let output = directory.path().join("artifact-move-recovery");
+        let options = ExtractionExecutionOptions::default();
+
+        let error = {
+            let _crash = crash_once(PublicationCrashPoint::ArtifactMoved(0));
+            ExtractionExecutor::new().execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+        }
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::PublicationRecoveryRequired {
+                stage: "artifact_publication"
+            }
+        ));
+        let artifact_path = output.join(plan.artifacts()[0].preferred_path().as_str());
+        let published = fs::read(&artifact_path).unwrap();
+
+        let report = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        assert_eq!(report.counts().written(), 1);
+        assert_eq!(fs::read(artifact_path).unwrap(), published);
+        assert!(output.join(PUBLICATION_JOURNAL_PATH).is_file());
+    }
+
+    #[test]
+    fn pending_existing_receipt_is_revalidated_before_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = texture_plan();
+        let output = directory.path().join("pending-existing-revalidation");
+        let artifact_path = plan.artifacts()[0].preferred_path();
+        write_existing(&output, artifact_path, b"four");
+        let options = output_options(&plan, u64::MAX, ExistingOutputPolicy::Skip);
+
+        let error = {
+            let _crash = crash_once(PublicationCrashPoint::ReceiptPersisted(0));
+            ExtractionExecutor::new().execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+        }
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::PublicationRecoveryRequired {
+                stage: "receipt_commit"
+            }
+        ));
+
+        fs::write(output.join(artifact_path.as_str()), b"five").unwrap();
+        let error = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::PublicationJournalConflict { .. }
+        ));
+    }
+
+    #[test]
+    fn recovered_failure_receipt_preserves_stop_in_plan_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = media_plan(&directory);
+        assert!(plan.artifacts().len() >= 2);
+        let output = directory.path().join("pending-failure-stop");
+        write_existing(&output, plan.artifacts()[0].preferred_path(), b"occupied");
+        let options = output_options(&plan, u64::MAX, ExistingOutputPolicy::Error);
+
+        {
+            let _crash = crash_once(PublicationCrashPoint::ReceiptPersisted(0));
+            let error = ExtractionExecutor::new()
+                .execute(
+                    &snapshot,
+                    &plan,
+                    &output,
+                    ExtractionRunOptions::new(options),
+                    &mut AssetLoadBudget::default(),
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ExtractionExecutionError::PublicationRecoveryRequired {
+                    stage: "receipt_commit"
+                }
+            ));
+        }
+
+        let report = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            report.manifest().artifacts()[0].status(),
+            ExtractionArtifactStatus::Failed
+        );
+        assert_eq!(
+            report.manifest().artifacts()[1].diagnostics()[0].code(),
+            ExtractionDiagnosticCode::StoppedAfterFailure
+        );
+    }
+
+    #[test]
+    fn recovered_receipts_and_preflight_share_the_evidence_verification_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = yaml_plan(&directory, 2);
+        let output = directory.path().join("recovered-existing-hash-limit");
+        for artifact in plan.artifacts().iter().take(2) {
+            write_existing(&output, artifact.preferred_path(), b"four");
+        }
+        let options =
+            output_options_with_verification(&plan, u64::MAX, 16, ExistingOutputPolicy::Skip);
+
+        {
+            let _crash = crash_once(PublicationCrashPoint::ReceiptPersisted(0));
+            ExtractionExecutor::new()
+                .execute(
+                    &snapshot,
+                    &plan,
+                    &output,
+                    ExtractionRunOptions::new(options),
+                    &mut AssetLoadBudget::default(),
+                )
+                .unwrap_err();
+        }
+
+        let report = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            report.manifest().artifacts()[0].status(),
+            ExtractionArtifactStatus::SkippedExisting
+        );
+        assert_eq!(
+            report.manifest().artifacts()[1].status(),
+            ExtractionArtifactStatus::SkippedExisting
+        );
+    }
+
+    #[test]
+    fn evidence_verification_limit_is_cumulative_and_can_be_raised_for_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = texture_plan();
+        let exact_output = directory.path().join("verification-exact");
+        write_existing(&exact_output, plan.artifacts()[0].preferred_path(), b"four");
+        let exact =
+            output_options_with_verification(&plan, u64::MAX, 8, ExistingOutputPolicy::Skip);
+        let report = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &exact_output,
+                ExtractionRunOptions::new(exact),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            report.manifest().artifacts()[0].status(),
+            ExtractionArtifactStatus::SkippedExisting
+        );
+
+        let one_short_output = directory.path().join("verification-one-short");
+        write_existing(
+            &one_short_output,
+            plan.artifacts()[0].preferred_path(),
+            b"four",
+        );
+        let one_short =
+            output_options_with_verification(&plan, u64::MAX, 7, ExistingOutputPolicy::Skip);
+        let error = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &one_short_output,
+                ExtractionRunOptions::new(one_short),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::EvidenceVerificationLimitExceeded {
+                required: 4,
+                remaining: 3,
+            }
+        ));
+
+        let recovered = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &one_short_output,
+                ExtractionRunOptions::new(exact),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered.manifest().artifacts()[0].status(),
+            ExtractionArtifactStatus::SkippedExisting
+        );
+    }
+
+    #[test]
+    fn skip_preflight_reports_evidence_verification_exhaustion_as_an_execution_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = texture_plan();
+        let output = directory.path().join("preflight-verification-limit");
+        write_existing(&output, plan.artifacts()[0].preferred_path(), b"four");
+        let options =
+            output_options_with_verification(&plan, u64::MAX, 3, ExistingOutputPolicy::Skip);
+
+        let error = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::EvidenceVerificationLimitExceeded {
+                required: 4,
+                remaining: 3,
+            }
+        ));
+    }
+
+    #[test]
+    fn manifest_move_without_ack_is_reconciled_as_committed() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = texture_plan();
+        let output = directory.path().join("manifest-move-recovery");
+        let manifest_path = ExtractionPath::new("manifest.json").unwrap();
+        let options = ExtractionExecutionOptions::default();
+
+        let error = {
+            let _crash = crash_once(PublicationCrashPoint::ManifestMoved);
+            ExtractionExecutor::new().execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options).with_manifest_path(&manifest_path),
+                &mut AssetLoadBudget::default(),
+            )
+        }
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::PublicationRecoveryRequired {
+                stage: "manifest_publication"
+            }
+        ));
+        let manifest_before = fs::read(output.join(manifest_path.as_str())).unwrap();
+
+        let report = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options).with_manifest_path(&manifest_path),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        assert_eq!(report.counts().written(), 1);
+        assert_eq!(
+            fs::read(output.join(manifest_path.as_str())).unwrap(),
+            manifest_before
+        );
+    }
+
+    #[test]
+    fn publication_commit_rejects_artifact_changed_after_manifest_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = texture_plan();
+        let output = directory.path().join("artifact-changed-before-commit");
+        let manifest_path = ExtractionPath::new("manifest.json").unwrap();
+        let probe = ExecutionProbe::new([], []);
+        probe.block_publication_commit();
+        let executor = ExtractionExecutor::observing(Arc::clone(&probe));
+
+        let error = std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                executor.execute(
+                    &snapshot,
+                    &plan,
+                    &output,
+                    ExtractionRunOptions::new(ExtractionExecutionOptions::default())
+                        .with_manifest_path(&manifest_path),
+                    &mut AssetLoadBudget::default(),
+                )
+            });
+            probe.wait_for_publication_commit();
+            assert!(output.join(manifest_path.as_str()).is_file());
+            fs::write(
+                output.join(plan.artifacts()[0].preferred_path().as_str()),
+                b"changed after manifest publication",
+            )
+            .unwrap();
+            probe.release_publication_commit();
+            run.join().unwrap().unwrap_err()
+        });
+
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::PublicationJournalConflict { .. }
+        ));
+    }
+
+    #[test]
+    fn publication_commit_rejects_manifest_changed_after_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = texture_plan();
+        let output = directory.path().join("manifest-changed-before-commit");
+        let manifest_path = ExtractionPath::new("manifest.json").unwrap();
+        let probe = ExecutionProbe::new([], []);
+        probe.block_publication_commit();
+        let executor = ExtractionExecutor::observing(Arc::clone(&probe));
+
+        let error = std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                executor.execute(
+                    &snapshot,
+                    &plan,
+                    &output,
+                    ExtractionRunOptions::new(ExtractionExecutionOptions::default())
+                        .with_manifest_path(&manifest_path),
+                    &mut AssetLoadBudget::default(),
+                )
+            });
+            probe.wait_for_publication_commit();
+            fs::write(
+                output.join(manifest_path.as_str()),
+                b"changed after manifest publication",
+            )
+            .unwrap();
+            probe.release_publication_commit();
+            run.join().unwrap().unwrap_err()
+        });
+
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::PublicationJournalConflict { .. }
+        ));
+    }
+
+    #[test]
+    fn committed_journal_replays_without_a_live_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = texture_plan();
+        let output = directory.path().join("committed-return-recovery");
+        let options = ExtractionExecutionOptions::default();
+
+        let error = {
+            let _crash = crash_once(PublicationCrashPoint::CommittedPersisted);
+            ExtractionExecutor::new().execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+        }
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::PublicationRecoveryRequired {
+                stage: "committed_return"
+            }
+        ));
+        let unrelated = AssetWorkspace::new().unwrap().snapshot();
+
+        let report = ExtractionExecutor::new()
+            .execute(
+                &unrelated,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        assert_eq!(report.counts().written(), 1);
+    }
+
+    #[test]
+    fn pending_publication_rejects_changed_bytes_and_execution_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = texture_plan();
+        let output = directory.path().join("pending-conflict");
+        let options = ExtractionExecutionOptions::default();
+
+        {
+            let _crash = crash_once(PublicationCrashPoint::ArtifactMoved(0));
+            ExtractionExecutor::new()
+                .execute(
+                    &snapshot,
+                    &plan,
+                    &output,
+                    ExtractionRunOptions::new(options),
+                    &mut AssetLoadBudget::default(),
+                )
+                .unwrap_err();
+        }
+        fs::write(
+            output.join(plan.artifacts()[0].preferred_path().as_str()),
+            b"changed after an uncertain move",
+        )
+        .unwrap();
+        let changed = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            changed,
+            ExtractionExecutionError::PublicationJournalConflict { .. }
+        ));
+
+        let changed_options = ExtractionExecutionOptions::new(
+            options.limits(),
+            options.existing_output(),
+            ExtractionFailurePolicy::StopInPlanOrder,
+        )
+        .unwrap();
+        let changed_intent = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(changed_options),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            changed_intent,
+            ExtractionExecutionError::PublicationJournalConflict { .. }
+        ));
+    }
+
+    #[test]
+    fn receipt_segments_preserve_a_committed_report_with_a_sealed_segment_and_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = yaml_plan(&directory, 65);
+        let output = directory.path().join("sealed-segment-and-tail");
+
+        let report = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(ExtractionExecutionOptions::default()),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        assert_eq!(report.manifest().artifacts().len(), 65);
+        assert_eq!(receipt_segment_count(&output), 1);
+
+        let unrelated = AssetWorkspace::new().unwrap().snapshot();
+        let replayed = ExtractionExecutor::new()
+            .execute(
+                &unrelated,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(ExtractionExecutionOptions::default()),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            replayed.canonical_manifest_json().unwrap(),
+            report.canonical_manifest_json().unwrap()
+        );
+    }
+
+    #[test]
+    fn segment_move_without_header_ack_is_rebuilt_from_the_authoritative_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = yaml_plan(&directory, 64);
+        let output = directory.path().join("segment-move-recovery");
+        let options = ExtractionExecutionOptions::default();
+
+        let error = {
+            let _crash = crash_once(PublicationCrashPoint::SegmentMoved(0));
+            ExtractionExecutor::new().execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+        }
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::PublicationRecoveryRequired {
+                stage: "receipt_segment_seal"
+            }
+        ));
+        assert_eq!(receipt_segment_count(&output), 1);
+
+        let report = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        assert_eq!(report.manifest().artifacts().len(), 64);
+        assert_eq!(receipt_segment_count(&output), 1);
+    }
+
+    #[test]
+    fn committed_publication_rejects_a_corrupt_receipt_segment() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, plan) = yaml_plan(&directory, 64);
+        let output = directory.path().join("corrupt-segment");
+        let options = ExtractionExecutionOptions::default();
+
+        ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        fs::write(
+            output.join(RECEIPT_SEGMENT_DIRECTORY).join("00000000.json"),
+            b"{}",
+        )
+        .unwrap();
+
+        let error = ExtractionExecutor::new()
+            .execute(
+                &snapshot,
+                &plan,
+                &output,
+                ExtractionRunOptions::new(options),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::PublicationJournalInvalid { .. }
+        ));
+    }
+
+    #[test]
+    fn evidence_verification_limit_is_cumulative_across_preflight() {
         let directory = tempfile::tempdir().unwrap();
         let (snapshot, plan) = media_plan(&directory);
         let output = directory.path().join("cumulative-existing-hash");
@@ -2117,25 +3048,29 @@ mod tests {
         }
         let probe = ExecutionProbe::new([], []);
 
-        let report = ExtractionExecutor::observing(Arc::clone(&probe))
+        let error = ExtractionExecutor::observing(Arc::clone(&probe))
             .execute(
                 &snapshot,
                 &plan,
                 &output,
-                ExtractionRunOptions::new(output_options(&plan, 7, ExistingOutputPolicy::Skip)),
+                ExtractionRunOptions::new(output_options_with_verification(
+                    &plan,
+                    u64::MAX,
+                    7,
+                    ExistingOutputPolicy::Skip,
+                )),
                 &mut AssetLoadBudget::default(),
             )
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(
-            report.manifest().artifacts()[0].status(),
-            ExtractionArtifactStatus::SkippedExisting
-        );
-        assert_eq!(
-            report.manifest().artifacts()[1].diagnostics()[0].code(),
-            ExtractionDiagnosticCode::OutputLimitExceeded
-        );
-        assert_eq!(probe.snapshot().existing_hash_bytes, 4);
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::EvidenceVerificationLimitExceeded {
+                required: 4,
+                remaining: 3,
+            }
+        ));
+        assert_eq!(probe.snapshot().preflight_hash_bytes, 4);
     }
 
     #[test]
@@ -2321,6 +3256,46 @@ mod tests {
         (snapshot, plan)
     }
 
+    fn yaml_plan(
+        directory: &tempfile::TempDir,
+        count: usize,
+    ) -> (WorkspaceSnapshot, ExtractionPlan) {
+        let mut source = String::from("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n");
+        for index in 1..=count {
+            source.push_str(&format!(
+                "--- !u!1 &{index}\nGameObject:\n  m_Name: Object{index}\n"
+            ));
+        }
+        let source_path = directory.path().join(format!("objects-{count}.prefab"));
+        fs::write(&source_path, source).unwrap();
+
+        let mut workspace = AssetWorkspace::new().unwrap();
+        workspace
+            .load_path(&source_path, &mut AssetLoadBudget::default())
+            .unwrap();
+        let snapshot = workspace.snapshot();
+        let plan = ExtractionPlanner::new(&snapshot)
+            .plan(
+                ExtractionRequest::all(ExtractionRepresentationPolicy::RawOnly),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(plan.artifacts().len(), count);
+        (snapshot, plan)
+    }
+
+    fn receipt_segment_count(output: &Path) -> usize {
+        let directory = output.join(RECEIPT_SEGMENT_DIRECTORY);
+        if !directory.exists() {
+            return 0;
+        }
+        fs::read_dir(directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .count()
+    }
+
     fn sprite_plan() -> (PreparedView, ExtractionPlan, usize) {
         let mut workspace = AssetWorkspace::new().unwrap();
         for name in [
@@ -2334,19 +3309,12 @@ mod tests {
                 .unwrap_or_else(|error| panic!("failed to load {name}: {error}"));
         }
         let snapshot = workspace.snapshot();
-        let graph = snapshot
-            .reference_graph(
-                ReferenceGraphBuildOptions::unbounded(),
-                &mut AssetLoadBudget::default(),
-            )
-            .unwrap();
         let request = ExtractionRequest::all(ExtractionRepresentationPolicy::PreferDecoded)
             .with_filter(
                 ExtractionFilter::new([class_ids::SPRITE], None, Some("banner_1".to_owned()), None)
                     .unwrap(),
             );
         let raw_plan = ExtractionPlanner::new(&snapshot)
-            .with_reference_graph(&graph)
             .plan(request, &mut AssetLoadBudget::default())
             .unwrap();
         let address = raw_plan
@@ -2416,7 +3384,6 @@ mod tests {
             ExtractionRequest::addresses([address], ExtractionRepresentationPolicy::PreferDecoded)
                 .unwrap();
         let plan = ExtractionPlanner::new(&view)
-            .with_reference_graph(view.reference_graph())
             .plan(request, &mut AssetLoadBudget::default())
             .unwrap();
         assert_eq!(plan.artifacts().len(), 1);
@@ -2453,11 +3420,10 @@ mod tests {
         (snapshot, plan)
     }
 
-    fn assert_working_set_proof_rejected(
+    fn assert_plan_representation_rejected(
         snapshot: &impl WorkspaceView,
         plan: &ExtractionPlan,
         output: &Path,
-        ordinal: u32,
     ) {
         let error = ExtractionExecutor::new()
             .execute(
@@ -2470,8 +3436,13 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            ExtractionExecutionError::WorkingSetProofFailed { ordinal: actual }
-                if actual == ordinal
+            ExtractionExecutionError::PlanVerification(source)
+                if matches!(
+                    source.as_ref(),
+                    ExtractionPlanError::PlanDerivationMismatch {
+                        kind: super::super::planning_contract::ExtractionPlanMismatchKind::Representations,
+                    }
+                )
         ));
         assert!(!output.exists());
     }
@@ -2487,6 +3458,15 @@ mod tests {
         output_limit: u64,
         existing: ExistingOutputPolicy,
     ) -> ExtractionExecutionOptions {
+        output_options_with_verification(plan, output_limit, u64::MAX, existing)
+    }
+
+    fn output_options_with_verification(
+        plan: &ExtractionPlan,
+        output_limit: u64,
+        evidence_verification_limit: u64,
+        existing: ExistingOutputPolicy,
+    ) -> ExtractionExecutionOptions {
         let in_flight = plan
             .artifacts()
             .iter()
@@ -2494,8 +3474,15 @@ mod tests {
             .max()
             .unwrap();
         ExtractionExecutionOptions::new(
-            ExtractionExecutionLimits::new(1, in_flight, 5, output_limit, 16 * 1024 * 1024)
-                .unwrap(),
+            ExtractionExecutionLimits::new(
+                1,
+                in_flight,
+                5,
+                output_limit,
+                evidence_verification_limit,
+                16 * 1024 * 1024,
+            )
+            .unwrap(),
             existing,
             ExtractionFailurePolicy::StopInPlanOrder,
         )
@@ -2513,6 +3500,7 @@ mod tests {
                 in_flight_bytes,
                 5,
                 2 * 1024 * 1024 * 1024,
+                u64::MAX,
                 16 * 1024 * 1024,
             )
             .unwrap(),

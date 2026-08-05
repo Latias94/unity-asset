@@ -174,6 +174,27 @@ pub(in crate::extraction) fn source_for_id(
         .ok_or(ExtractionPlanError::SourceMissing(id))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractionPlanMismatchKind {
+    SelectionWitness,
+    SourceExpectations,
+    Artifacts,
+    ArtifactPaths,
+    Representations,
+}
+
+impl std::fmt::Display for ExtractionPlanMismatchKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::SelectionWitness => "selection witness",
+            Self::SourceExpectations => "source expectations",
+            Self::Artifacts => "artifact contracts",
+            Self::ArtifactPaths => "artifact paths",
+            Self::Representations => "representations",
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ExtractionPlanError {
     #[error(transparent)]
@@ -183,7 +204,7 @@ pub enum ExtractionPlanError {
     #[error(transparent)]
     Budget(#[from] BudgetError),
     #[error(transparent)]
-    Reference(#[from] ReferenceGraphError),
+    Reference(Box<ReferenceGraphError>),
     #[error(transparent)]
     ContainerContract(#[from] super::container::BundleContainerContractError),
     #[error(transparent)]
@@ -201,7 +222,7 @@ pub enum ExtractionPlanError {
     #[error("extraction model rejected the plan: {0}")]
     Model(String),
     #[error(transparent)]
-    ModelValidation(#[from] super::model::ExtractionModelError),
+    ModelValidation(Box<super::model::ExtractionModelError>),
     #[cfg(feature = "decode")]
     #[error("strict media descriptor for {address:?} is invalid: {source}")]
     InvalidMediaDescriptor {
@@ -219,10 +240,20 @@ pub enum ExtractionPlanError {
     MediaPayloadChanged { resource: &'static str },
     #[error("reference graph violated an extraction invariant: {0}")]
     ReferenceInvariant(&'static str),
-    #[error("reference graph does not describe the extraction workspace revision")]
-    ReferenceContextMismatch,
-    #[error("bundle-container selection requires a caller-supplied ReferenceGraph")]
-    ReferenceGraphRequired,
+    #[error("extraction plan does not describe this workspace revision")]
+    PlanContextMismatch,
+    #[error("extraction plan {kind} does not match its re-derived request")]
+    PlanDerivationMismatch { kind: ExtractionPlanMismatchKind },
+    #[error("planned artifact {ordinal} requires unavailable execution capability {capability}")]
+    ExecutionCapabilityUnavailable {
+        ordinal: u32,
+        capability: &'static str,
+    },
+    #[error("class {class_id} planning requires unavailable capability {capability}")]
+    PlanningCapabilityUnavailable {
+        class_id: i32,
+        capability: &'static str,
+    },
     #[error("an incomplete reference graph cannot drive bundle-container extraction")]
     IncompleteReferenceGraph,
     #[error("an incomplete reference traversal cannot be used as an extraction selection")]
@@ -247,7 +278,7 @@ pub enum ExtractionPlanError {
     SourceMissing(SourceId),
     #[error("source {locator:?} has conflicting fingerprints {first} and {second}")]
     SourceFingerprintConflict {
-        locator: SourceLocator,
+        locator: Box<SourceLocator>,
         first: SourceFingerprint,
         second: SourceFingerprint,
     },
@@ -277,4 +308,16 @@ pub enum ExtractionPlanError {
     YamlSizing(String),
     #[error("arithmetic overflow while planning {resource}")]
     ArithmeticOverflow { resource: &'static str },
+}
+
+impl From<super::model::ExtractionModelError> for ExtractionPlanError {
+    fn from(error: super::model::ExtractionModelError) -> Self {
+        Self::ModelValidation(Box::new(error))
+    }
+}
+
+impl From<ReferenceGraphError> for ExtractionPlanError {
+    fn from(error: ReferenceGraphError) -> Self {
+        Self::Reference(Box::new(error))
+    }
 }
