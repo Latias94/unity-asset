@@ -66,7 +66,7 @@ fn search_response() -> SearchResponse {
 
 fn fixture_search_response() -> SearchResponse {
     let envelope: ResponseEnvelope = serde_json::from_str(include_str!(
-        "../../../integration/search-protocol/fixtures/responses/search-v3.json"
+        "../../../integration/search-protocol/fixtures/responses/search-v4.json"
     ))
     .unwrap();
     let ResponseOutcome::Success(operation) = envelope.into_outcome() else {
@@ -81,7 +81,7 @@ fn fixture_search_response() -> SearchResponse {
 
 fn fixture_references_response() -> ReferencesResponse {
     let envelope: ResponseEnvelope = serde_json::from_str(include_str!(
-        "../../../integration/search-protocol/fixtures/responses/references-v3.json"
+        "../../../integration/search-protocol/fixtures/responses/references-v4.json"
     ))
     .unwrap();
     let ResponseOutcome::Success(operation) = envelope.into_outcome() else {

@@ -44,10 +44,9 @@ use crate::generation::{
 use crate::generation_store::GenerationFailpoint;
 use crate::generation_store::{
     GenerationActivationEvidence, GenerationBuild, GenerationDiskEstimate,
-    GenerationPublishWarning, GenerationPublishWarningKind, GenerationSnapshot,
-    GenerationSourceState, GenerationStore, GenerationStoreError, GenerationStoreOptions,
-    SourceScanHint, SourceStateError, SourceStateSnapshot, TransactionReceiptMembership,
-    TransactionReceiptWindow,
+    GenerationPublishWarning, GenerationPublishWarningKind, GenerationSnapshot, GenerationStore,
+    GenerationStoreError, GenerationStoreOptions, SourceScanHint, SourceStateError,
+    SourceStateSnapshot, TransactionReceiptMembership, TransactionReceiptWindow,
 };
 use crate::path_semantics::{ProjectPath, ProjectPathError, compare_portable_paths};
 use crate::projection::{
@@ -120,7 +119,7 @@ impl fmt::Debug for ActiveGeneration {
 impl ActiveGeneration {
     fn open(
         snapshot: GenerationSnapshot,
-        source_state: &GenerationSourceState,
+        source_state: &SourceStateSnapshot,
         readers: &ProjectionReaders,
         projection: Option<&GenerationProjection>,
         options: SearchIndexOptions,
@@ -151,18 +150,13 @@ impl ActiveGeneration {
                     .map(|document| document.path.as_str()),
                 budget,
             ),
-            None if generation_current => {
-                let current_state = source_state.as_current().ok_or(PipelineError::Invariant(
-                    "current generation semantics require current source-state storage",
-                ))?;
-                QuerySnapshot::new(
-                    stamp.clone(),
-                    readers.search().reader().clone(),
-                    search_fields.clone(),
-                    suggestion_paths_from_state(current_state, options),
-                    budget,
-                )
-            }
+            None if generation_current => QuerySnapshot::new(
+                stamp.clone(),
+                readers.search().reader().clone(),
+                search_fields.clone(),
+                suggestion_paths_from_state(source_state, options),
+                budget,
+            ),
             None => {
                 let paths = readers
                     .search()
@@ -179,14 +173,12 @@ impl ActiveGeneration {
         };
         let query = QueryEngine::new(Arc::new(query_snapshot.map_err(PipelineError::Query)?));
 
-        let analysis_complete = source_state.analysis_complete();
+        let analysis_complete = source_state
+            .assets()
+            .iter()
+            .all(|analysis| analysis.complete);
         let projection_complete = projection.map_or_else(
-            || {
-                generation_current
-                    && source_state
-                        .as_current()
-                        .is_some_and(|state| projection_is_complete(state, options))
-            },
+            || generation_current && projection_is_complete(source_state, options),
             |projection| {
                 projection.truncations.iter().all(|truncation| {
                     !matches!(&truncation.category, ProjectionCategory::References)
@@ -200,23 +192,15 @@ impl ActiveGeneration {
                 projection.diagnostics.iter(),
                 budget,
             ),
-            None => match source_state.as_current() {
-                Some(state) => ReferenceQueryCompleteness::new(
-                    analysis_complete,
-                    projection_complete,
-                    state
-                        .assets()
-                        .iter()
-                        .flat_map(|analysis| analysis.diagnostics.iter()),
-                    budget,
-                ),
-                None => ReferenceQueryCompleteness::new(
-                    false,
-                    false,
-                    std::iter::empty::<&Diagnostic>(),
-                    budget,
-                ),
-            },
+            None => ReferenceQueryCompleteness::new(
+                analysis_complete,
+                projection_complete,
+                source_state
+                    .assets()
+                    .iter()
+                    .flat_map(|analysis| analysis.diagnostics.iter()),
+                budget,
+            ),
         }
         .map_err(|error| match error {
             ReferenceQueryCompletenessError::Budget(error) => PipelineError::Budget(error),
@@ -377,6 +361,39 @@ impl SearchGenerationPipeline {
         semantics: SearchSemantics,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, PipelineError> {
+        Self::open_configured(
+            paths,
+            options,
+            semantics,
+            budget,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_startup_recovery_failpoint(
+        paths: IndexPaths,
+        options: SearchIndexOptions,
+        failpoint: GenerationFailpoint,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, PipelineError> {
+        Self::open_configured(
+            paths,
+            options,
+            SearchSemantics::current(),
+            budget,
+            Some(failpoint),
+        )
+    }
+
+    fn open_configured(
+        paths: IndexPaths,
+        options: SearchIndexOptions,
+        semantics: SearchSemantics,
+        budget: &mut AssetLoadBudget,
+        #[cfg(test)] startup_recovery_failpoint: Option<GenerationFailpoint>,
+    ) -> Result<Self, PipelineError> {
         let options = options.validate().map_err(PipelineError::Configuration)?;
         let options_digest = paths
             .logical_configuration_digest(options)
@@ -386,54 +403,96 @@ impl SearchGenerationPipeline {
             .map_err(|error| PipelineError::Configuration(anyhow::Error::new(error)))?;
         let scanner = ProjectScanner::new(&paths, options, options.scan_limits())
             .map_err(PipelineError::Configuration)?;
-        let store = GenerationStore::open_private(
+        let store_options = GenerationStoreOptions {
+            retain_previous_generations: options.retain_previous_generations,
+        };
+        #[cfg(not(test))]
+        let opened = GenerationStore::open_private(
             paths.private_index_root().clone(),
-            GenerationStoreOptions {
-                retain_previous_generations: options.retain_previous_generations,
-            },
+            store_options,
             budget,
         )?;
+        #[cfg(test)]
+        let opened = match startup_recovery_failpoint {
+            Some(failpoint) => GenerationStore::open_private_with_startup_recovery_failpoint(
+                paths.private_index_root().clone(),
+                store_options,
+                budget,
+                failpoint,
+            )?,
+            None => GenerationStore::open_private(
+                paths.private_index_root().clone(),
+                store_options,
+                budget,
+            )?,
+        };
+        let (store, staging_recovery, startup_disposition) = opened.into_parts();
+        let generation_maintenance = match staging_recovery {
+            Ok(report) => GenerationMaintenanceStatus {
+                state: GenerationMaintenanceState::Clean,
+                last_recovered_entries: report.removed_entries(),
+                last_cleanup_failure: None,
+            },
+            Err(error) => GenerationMaintenanceStatus {
+                state: GenerationMaintenanceState::RecoveryRequired,
+                last_recovered_entries: 0,
+                last_cleanup_failure: Some(crate::wire::bounded_error_message(error.to_string())),
+            },
+        };
         scanner
             .validate_project_root_binding()
             .map_err(|error| PipelineError::Scan(error.into()))?;
         let recovered = store.active().cloned();
-        let source_state = recovered
-            .as_ref()
-            .map(|snapshot| snapshot.load_source_state(budget))
-            .transpose()?;
-        let workspace = match source_state.as_ref() {
-            Some(state) => {
-                AssetWorkspace::with_workspace_id(state.workspace(), WorkspaceOptions::lenient())?
-            }
-            None => AssetWorkspace::new()?,
-        };
-        let (
-            active_analysis_match,
-            active_semantics_match,
-            active_configuration_match,
-            mut active_compatibility_match,
-        ) = recovered.as_ref().zip(source_state.as_ref()).map_or(
-            (true, true, true, true),
-            |(snapshot, state)| {
+        let (active_semantics_match, active_configuration_match, active_source_state_layout_match) =
+            recovered.as_ref().map_or((true, true, true), |snapshot| {
+                let persisted_semantics = snapshot.manifest().semantics();
                 let configuration_match = snapshot.manifest().options_digest() == options_digest;
-                let analysis_match =
-                    state.analysis_cache_identity() == Some(analysis_cache_identity);
-                let semantics_match = snapshot.manifest().semantics() == Some(semantics);
                 (
-                    analysis_match,
-                    semantics_match,
+                    persisted_semantics == semantics,
                     configuration_match,
-                    semantics_match && configuration_match,
+                    persisted_semantics.source_state_layout_compatible_with(semantics),
                 )
-            },
-        );
+            });
+        // A semantic mismatch can include an incompatible source-state wire shape. The manifest
+        // remains sufficient to preserve the workspace identity, but no persisted analysis or
+        // projection is decoded under rules that did not create it.
+        let source_state = if active_source_state_layout_match {
+            recovered
+                .as_ref()
+                .map(|snapshot| snapshot.load_source_state(budget))
+                .transpose()?
+        } else {
+            None
+        };
+        let workspace = source_state
+            .as_ref()
+            .map(SourceStateSnapshot::workspace)
+            .or_else(|| {
+                recovered
+                    .as_ref()
+                    .map(|snapshot| snapshot.manifest().workspace())
+            })
+            .map_or_else(AssetWorkspace::new, |workspace| {
+                AssetWorkspace::with_workspace_id(workspace, WorkspaceOptions::lenient())
+            })?;
+        let active_analysis_match = match (recovered.as_ref(), source_state.as_ref()) {
+            (Some(_), Some(state)) => state.analysis_cache_identity() == analysis_cache_identity,
+            (Some(_), None) => false,
+            (None, None) => true,
+            (None, Some(_)) => {
+                return Err(PipelineError::Invariant(
+                    "source state exists without an activated generation",
+                ));
+            }
+        };
+        let mut active_compatibility_match = if recovered.is_some() {
+            active_semantics_match && active_configuration_match
+        } else {
+            startup_disposition.rebuild_required().is_none()
+        };
         let active = match (recovered, source_state.as_ref()) {
             (Some(snapshot), Some(state)) => {
-                match ProjectionReaders::open_for(
-                    snapshot.directory(),
-                    snapshot.storage_contract(),
-                    budget,
-                ) {
+                match ProjectionReaders::open(snapshot.directory(), budget) {
                     Ok(readers) => Some(Arc::new(ActiveGeneration::open(
                         snapshot,
                         state,
@@ -448,21 +507,27 @@ impl SearchGenerationPipeline {
                         // The source-state snapshot remains authoritative enough to preserve the
                         // workspace identity and incrementality baseline. Only this derived
                         // projection layout is obsolete, so force the next request through a
-                        // complete v3 rebuild instead of treating recovery as a corrupt store.
+                        // complete current-format rebuild instead of treating recovery as a
+                        // corrupt store.
                         active_compatibility_match = false;
                         None
                     }
                     Err(error) => return Err(PipelineError::Projection(error)),
                 }
             }
+            (Some(_), None) if !active_source_state_layout_match => None,
             (None, None) => None,
-            _ => {
+            (Some(_), None) => {
                 return Err(PipelineError::Invariant(
-                    "generation recovery produced only one half of the active state",
+                    "compatible activated generation is missing its source state",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(PipelineError::Invariant(
+                    "source state exists without an activated generation",
                 ));
             }
         };
-        let source_state = source_state.and_then(GenerationSourceState::into_current);
         Ok(Self {
             paths,
             options,
@@ -478,7 +543,7 @@ impl SearchGenerationPipeline {
             store,
             source_state,
             active,
-            generation_maintenance: GenerationMaintenanceStatus::clean(),
+            generation_maintenance,
             pending_publish_warnings: Vec::new(),
             pending_publish_warnings_omitted: false,
             #[cfg(test)]
@@ -1741,7 +1806,6 @@ impl SearchGenerationPipeline {
         let candidate_snapshot = prepared.snapshot().clone();
         let readers = ProjectionReaders::open(candidate_snapshot.directory(), budget)
             .map_err(PipelineError::Projection)?;
-        let source_state = GenerationSourceState::CurrentV2(source_state);
         let active = Arc::new(ActiveGeneration::open(
             candidate_snapshot,
             &source_state,
@@ -1765,7 +1829,7 @@ impl SearchGenerationPipeline {
         let report = prepared.activate_with_budget(budget)?;
         self.append_pending_publish_warnings(report.warnings);
         let warnings = self.take_pending_publish_warnings();
-        self.source_state = source_state.into_current();
+        self.source_state = Some(source_state);
         self.active = Some(Arc::clone(&active));
         self.active_analysis_match = true;
         self.active_compatibility_match = true;
@@ -2405,10 +2469,10 @@ impl CachedAssets {
 
 fn validate_projection_summary(
     summary: GenerationProjectionSummary,
-    state: &GenerationSourceState,
+    state: &SourceStateSnapshot,
     readers: &ProjectionReaders,
 ) -> Result<(), PipelineError> {
-    let actual_assets = u64::try_from(state.asset_count())
+    let actual_assets = u64::try_from(state.assets().len())
         .map_err(|_| PipelineError::ArithmeticOverflow("indexed asset count"))?;
     validate_summary_count("assets", summary.assets(), actual_assets)?;
     validate_summary_count(
@@ -2421,8 +2485,14 @@ fn validate_projection_summary(
         summary.reference_documents(),
         readers.references().reader().searcher().num_docs(),
     )?;
-    let actual_incomplete = u64::try_from(state.incomplete_asset_count())
-        .map_err(|_| PipelineError::ArithmeticOverflow("incomplete asset count"))?;
+    let actual_incomplete = u64::try_from(
+        state
+            .assets()
+            .iter()
+            .filter(|analysis| !analysis.complete)
+            .count(),
+    )
+    .map_err(|_| PipelineError::ArithmeticOverflow("incomplete asset count"))?;
     validate_summary_count(
         "incomplete assets",
         summary.incomplete_assets(),
@@ -4427,6 +4497,64 @@ mod tests {
         assert!(active.stamp.semantics_current);
         assert!(active.stamp.configuration_current);
         assert!(!active.stamp.stale);
+    }
+
+    #[test]
+    fn semantic_layout_mismatch_rebuilds_without_decoding_the_obsolete_source_state() {
+        let temporary = crate::secure_test_tempdir();
+        let project_root = temporary.path().join("project");
+        std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(
+            project_root,
+            Some(temporary.path().join("index")),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let mut current = SearchGenerationPipeline::open(
+            paths.clone(),
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let published = current
+            .reindex_filesystem(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let old_generation = published.active.unwrap().snapshot.generation();
+        let workspace = current.workspace.workspace_id();
+        drop(current);
+
+        let changed_semantics = SearchSemantics::current().with_analysis_version(
+            SearchSemantics::current()
+                .analysis_version()
+                .saturating_add(1),
+        );
+        let mut reopened = SearchGenerationPipeline::open_with_semantics(
+            paths,
+            SearchIndexOptions::default(),
+            changed_semantics,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        assert!(reopened.active.is_none());
+        assert!(reopened.source_state.is_none());
+        assert_eq!(reopened.workspace.workspace_id(), workspace);
+        assert!(!reopened.active_analysis_match);
+        assert!(!reopened.active_compatibility_match);
+
+        let rebuilt = reopened
+            .reindex_filesystem(
+                FilesystemReindexIntent::reconcile(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(rebuilt.disposition, PipelineBuildDisposition::Published);
+        assert!(rebuilt.metrics.forced_full_analysis);
+        let active = rebuilt.active.unwrap();
+        assert_ne!(active.snapshot.generation(), old_generation);
+        assert!(active.stamp.semantics_current);
     }
 
     #[test]

@@ -1,17 +1,18 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::source_state::{SOURCE_STATE_CONTRACT_VERSION, SOURCE_STATE_LOGICAL_IDENTITY_VERSION};
 use super::{
     GenerationActivationEvidence, GenerationBuild, GenerationFailpoint,
-    GenerationPublishWarningKind, GenerationStore, GenerationStoreError, GenerationStoreOptions,
-    TransactionReceiptWindow, activation_file_name, activation_staging_file_name,
-    quarantine_directory_name, staging_directory_name,
+    GenerationPublishWarningKind, GenerationStartupDisposition, GenerationStore,
+    GenerationStoreError, GenerationStoreOptions, IndexRebuildReason, TransactionReceiptWindow,
+    activation_file_name, activation_staging_file_name, quarantine_directory_name,
+    staging_directory_name,
 };
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
-    GenerationStorageContract, SEARCH_GENERATION_STORAGE_CONTRACT_VERSION, SearchGenerationId,
-    SearchGenerationIdentityV1, SearchGenerationManifestV1, StoredGenerationRef,
+    SEARCH_GENERATION_STORAGE_CONTRACT_VERSION, SearchGenerationId, SearchGenerationIdentityV1,
+    SearchGenerationManifestV1,
 };
 use crate::semantics::SearchSemantics;
 use serde::Serialize;
@@ -57,6 +58,53 @@ fn open_store(
     options: GenerationStoreOptions,
 ) -> Result<GenerationStore, GenerationStoreError> {
     GenerationStore::open(root, options, &mut AssetLoadBudget::default())
+}
+
+fn open_store_with_startup_disposition(
+    root: impl AsRef<Path>,
+    options: GenerationStoreOptions,
+) -> Result<super::OpenedGenerationStore, GenerationStoreError> {
+    let root = super::initialize_root(root.as_ref())?;
+    GenerationStore::open_at_root(
+        root,
+        super::GenerationStoreRootAuthority::Fixture,
+        options,
+        &mut AssetLoadBudget::default(),
+        None,
+    )
+}
+
+fn write_activation_record(
+    root: &Path,
+    ordinal: u64,
+    contract_version: u16,
+    storage_contract: Option<u16>,
+) -> (SearchGenerationId, PathBuf) {
+    let generation = SearchGenerationId::new(digest(&format!("generation-{ordinal}")));
+    let workspace = WorkspaceId::from_u128(0x9001).unwrap();
+    let revision = revision(&format!("revision-{ordinal}"));
+    let mut record = serde_json::json!({
+        "contract_version": contract_version,
+        "ordinal": ordinal,
+        "generation": generation,
+        "manifest_digest": digest(&format!("manifest-{ordinal}")),
+        "workspace": workspace,
+        "revision": revision,
+    });
+    if contract_version >= super::REVISIONED_ACTIVATION_CONTRACT_VERSION {
+        record["desired_revision"] = serde_json::to_value(revision).unwrap();
+    }
+    if contract_version == super::GENERATION_HEAD_CONTRACT_VERSION {
+        record["generation_storage_contract"] =
+            serde_json::json!(storage_contract.expect("v3 activation requires storage"));
+        record["transaction_receipts"] =
+            serde_json::to_value(TransactionReceiptWindow::empty()).unwrap();
+    }
+    let path = root
+        .join(super::ACTIVATIONS_DIRECTORY)
+        .join(activation_file_name(ordinal));
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    (generation, path)
 }
 
 fn budget_for_usage(usage: AssetLoadUsage, max_bytes: u64) -> AssetLoadBudget {
@@ -148,68 +196,6 @@ fn source_state_payload_for_workspace(label: &str, workspace: WorkspaceId) -> (V
     (serde_json::to_vec(&persisted).unwrap(), logical_digest)
 }
 
-struct LegacyGenerationFixture {
-    generation: SearchGenerationId,
-    workspace: WorkspaceId,
-    revision: WorkspaceRevision,
-    desired_revision: WorkspaceRevision,
-}
-
-fn install_frozen_legacy_generation(
-    root: &Path,
-    activation_contract_version: u16,
-    desired_revision: WorkspaceRevision,
-) -> LegacyGenerationFixture {
-    assert!((1..=3).contains(&activation_contract_version));
-    crate::legacy_storage_v1_fixture_tests::install_frozen_storage_v1_store(root);
-    let activation_path = root
-        .join(super::ACTIVATIONS_DIRECTORY)
-        .join(activation_file_name(1));
-    let mut activation: serde_json::Value =
-        serde_json::from_slice(&fs::read(&activation_path).unwrap()).unwrap();
-    let generation = serde_json::from_value(activation["generation"].clone()).unwrap();
-    let workspace = serde_json::from_value(activation["workspace"].clone()).unwrap();
-    let revision = serde_json::from_value(activation["revision"].clone()).unwrap();
-    let activation_fields = activation.as_object_mut().unwrap();
-    activation_fields.insert(
-        "contract_version".to_owned(),
-        serde_json::json!(activation_contract_version),
-    );
-    activation_fields.remove("generation_storage_contract");
-    activation_fields.remove("parent_generation");
-    activation_fields.remove("transaction_receipts");
-    if activation_contract_version >= 2 {
-        activation_fields.insert(
-            "desired_revision".to_owned(),
-            serde_json::to_value(desired_revision).unwrap(),
-        );
-    } else {
-        activation_fields.remove("desired_revision");
-    }
-    if activation_contract_version == 3 {
-        activation_fields.insert(
-            "generation_storage_contract".to_owned(),
-            serde_json::to_value(GenerationStorageContract::LegacyV1).unwrap(),
-        );
-        activation_fields.insert(
-            "transaction_receipts".to_owned(),
-            serde_json::to_value(TransactionReceiptWindow::empty()).unwrap(),
-        );
-    }
-    fs::write(activation_path, serde_json::to_vec(&activation).unwrap()).unwrap();
-
-    LegacyGenerationFixture {
-        generation,
-        workspace,
-        revision,
-        desired_revision: if activation_contract_version == 1 {
-            revision
-        } else {
-            desired_revision
-        },
-    }
-}
-
 fn write_artifacts_for_workspace(build: &GenerationBuild, label: &str, workspace: WorkspaceId) {
     fs::write(
         build.search_directory().join("segments"),
@@ -222,7 +208,7 @@ fn write_artifacts_for_workspace(build: &GenerationBuild, label: &str, workspace
     )
     .unwrap();
     fs::write(
-        build.source_state_directory().join("source-state-v2.json"),
+        build.source_state_directory().join("source-state-v3.json"),
         source_state_payload_for_workspace(label, workspace).0,
     )
     .unwrap();
@@ -463,133 +449,108 @@ fn corrupt_historical_head_does_not_hide_a_valid_latest_head() {
 }
 
 #[test]
-fn legacy_activation_v1_and_v2_open_exact_storage_v1_generations() {
-    for activation_contract_version in [1, 2] {
+fn obsolete_activation_contracts_require_rebuild_and_retire_the_cache_authority() {
+    for contract_version in [
+        super::LEGACY_ACTIVATION_CONTRACT_VERSION,
+        super::REVISIONED_ACTIVATION_CONTRACT_VERSION,
+    ] {
         let temporary = TempDir::new().unwrap();
         let options = GenerationStoreOptions::default();
         drop(open_store(temporary.path(), options).unwrap());
-        let fixture = install_frozen_legacy_generation(
-            temporary.path(),
-            activation_contract_version,
-            revision("legacy desired"),
-        );
-        let activation: serde_json::Value = serde_json::from_slice(
-            &fs::read(
-                temporary
-                    .path()
-                    .join(super::ACTIVATIONS_DIRECTORY)
-                    .join(activation_file_name(1)),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let activation = activation.as_object().unwrap();
-        assert!(!activation.contains_key("generation_storage_contract"));
-        assert!(!activation.contains_key("parent_generation"));
-        assert!(!activation.contains_key("transaction_receipts"));
-        assert_eq!(
-            activation.contains_key("desired_revision"),
-            activation_contract_version == 2
-        );
+        let (generation, _) = write_activation_record(temporary.path(), 1, contract_version, None);
+        let obsolete_generation =
+            temporary
+                .path()
+                .join(super::GENERATIONS_DIRECTORY)
+                .join(format!(
+                    "generation-v1-{}",
+                    hex::encode(generation.digest().as_bytes())
+                ));
+        fs::create_dir(&obsolete_generation).unwrap();
+        fs::write(obsolete_generation.join("sentinel"), b"obsolete").unwrap();
 
-        let reopened = open_store(temporary.path(), options).unwrap();
-        let active = reopened.active().unwrap();
-        assert_eq!(active.generation(), fixture.generation);
+        let opened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
+        let (store, recovery, disposition) = opened.into_parts();
+        assert_eq!(recovery.unwrap().removed_entries(), 2);
+        assert_eq!(store.active(), None);
         assert_eq!(
-            active.storage_contract(),
-            GenerationStorageContract::LegacyV1
+            disposition,
+            GenerationStartupDisposition::RebuildRequired(super::IndexRebuildRequired {
+                reason: IndexRebuildReason::ObsoleteActivationContract {
+                    actual: contract_version,
+                },
+                activation_ordinal: 1,
+                generation,
+            })
         );
-        assert_eq!(active.manifest().workspace(), fixture.workspace);
-        assert_eq!(active.manifest().revision(), fixture.revision);
-        assert_eq!(active.desired_revision(), fixture.desired_revision);
-        assert!(
-            active
-                .directory()
-                .file_name()
+        assert!(!obsolete_generation.exists());
+        assert_eq!(
+            fs::read_dir(temporary.path().join(super::ACTIVATIONS_DIRECTORY))
                 .unwrap()
-                .to_string_lossy()
-                .starts_with("generation-v1-")
+                .count(),
+            0
         );
-        assert!(matches!(
-            active
-                .load_source_state(&mut AssetLoadBudget::default())
-                .unwrap(),
-            super::GenerationSourceState::LegacyV1(_)
-        ));
     }
 }
 
 #[test]
-fn legacy_activation_contracts_reject_fields_outside_their_exact_wire() {
-    let cases = [
-        (1, "desired_revision", serde_json::Value::Null),
-        (1, "generation_storage_contract", serde_json::Value::Null),
-        (1, "parent_generation", serde_json::Value::Null),
-        (1, "transaction_receipts", serde_json::json!([])),
-        (1, "transaction_receipts", serde_json::Value::Null),
-        (2, "generation_storage_contract", serde_json::Value::Null),
-        (2, "parent_generation", serde_json::Value::Null),
-        (2, "transaction_receipts", serde_json::json!([])),
-        (2, "transaction_receipts", serde_json::Value::Null),
-    ];
-
-    for (contract_version, field, value) in cases {
-        let temporary = TempDir::new().unwrap();
-        drop(open_store(temporary.path(), GenerationStoreOptions::default()).unwrap());
-        install_frozen_legacy_generation(
-            temporary.path(),
-            contract_version,
-            revision("legacy desired"),
-        );
-        let activation_path = temporary
-            .path()
-            .join(super::ACTIVATIONS_DIRECTORY)
-            .join(activation_file_name(1));
-        let mut activation: serde_json::Value =
-            serde_json::from_slice(&fs::read(&activation_path).unwrap()).unwrap();
-        activation
-            .as_object_mut()
-            .unwrap()
-            .insert(field.to_owned(), value);
-        fs::write(&activation_path, serde_json::to_vec(&activation).unwrap()).unwrap();
-
-        let error = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap_err();
-        assert!(matches!(
-            error,
-            GenerationStoreError::InvalidGenerationHead { .. }
+fn storage_v1_activation_requires_rebuild_without_parsing_legacy_generation_bytes() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    drop(open_store(temporary.path(), options).unwrap());
+    let (generation, _) = write_activation_record(
+        temporary.path(),
+        1,
+        super::GENERATION_HEAD_CONTRACT_VERSION,
+        Some(1),
+    );
+    let obsolete_generation = temporary
+        .path()
+        .join(super::GENERATIONS_DIRECTORY)
+        .join(format!(
+            "generation-v1-{}",
+            hex::encode(generation.digest().as_bytes())
         ));
-    }
+    fs::create_dir(&obsolete_generation).unwrap();
+    fs::write(obsolete_generation.join("malformed"), b"not a generation").unwrap();
+
+    let opened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
+    let (store, recovery, disposition) = opened.into_parts();
+    assert_eq!(recovery.unwrap().removed_entries(), 2);
+    assert_eq!(store.active(), None);
+    assert_eq!(
+        disposition,
+        GenerationStartupDisposition::RebuildRequired(super::IndexRebuildRequired {
+            reason: IndexRebuildReason::ObsoleteGenerationStorage { actual: 1 },
+            activation_ordinal: 1,
+            generation,
+        })
+    );
+    assert!(!obsolete_generation.exists());
 }
 
 #[test]
-fn activation_v2_requires_a_non_null_desired_revision() {
-    for replacement in [None, Some(serde_json::Value::Null)] {
-        let temporary = TempDir::new().unwrap();
-        drop(open_store(temporary.path(), GenerationStoreOptions::default()).unwrap());
-        install_frozen_legacy_generation(temporary.path(), 2, revision("legacy desired"));
-        let activation_path = temporary
-            .path()
-            .join(super::ACTIVATIONS_DIRECTORY)
-            .join(activation_file_name(1));
-        let mut activation: serde_json::Value =
-            serde_json::from_slice(&fs::read(&activation_path).unwrap()).unwrap();
-        let fields = activation.as_object_mut().unwrap();
-        match replacement {
-            Some(value) => {
-                fields.insert("desired_revision".to_owned(), value);
-            }
-            None => {
-                fields.remove("desired_revision");
-            }
-        }
-        fs::write(&activation_path, serde_json::to_vec(&activation).unwrap()).unwrap();
+fn future_storage_contract_fails_closed_and_preserves_its_activation() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    drop(open_store(temporary.path(), options).unwrap());
+    let (_, activation) = write_activation_record(
+        temporary.path(),
+        1,
+        super::GENERATION_HEAD_CONTRACT_VERSION,
+        Some(SEARCH_GENERATION_STORAGE_CONTRACT_VERSION + 1),
+    );
 
-        let error = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap_err();
-        assert!(matches!(
-            error,
-            GenerationStoreError::InvalidGenerationHead { .. }
-        ));
-    }
+    let error = open_store_with_startup_disposition(temporary.path(), options).unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::UnsupportedVersion {
+            artifact: "generation storage",
+            actual,
+            expected: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+        } if actual == SEARCH_GENERATION_STORAGE_CONTRACT_VERSION + 1
+    ));
+    assert!(activation.is_file());
 }
 
 #[test]
@@ -634,24 +595,6 @@ fn activation_v3_requires_exact_non_null_current_fields() {
             GenerationStoreError::InvalidGenerationHead { .. }
         ));
     }
-}
-
-#[test]
-fn activation_v3_can_pin_legacy_storage_and_a_newer_desired_revision() {
-    let temporary = TempDir::new().unwrap();
-    let options = GenerationStoreOptions::default();
-    drop(open_store(temporary.path(), options).unwrap());
-    let desired_revision = revision("legacy-v3-desired");
-    let fixture = install_frozen_legacy_generation(temporary.path(), 3, desired_revision);
-
-    let reopened = open_store(temporary.path(), options).unwrap();
-    let active = reopened.active().unwrap();
-    assert_eq!(active.generation(), fixture.generation);
-    assert_eq!(
-        active.storage_contract(),
-        GenerationStorageContract::LegacyV1
-    );
-    assert_eq!(active.desired_revision(), desired_revision);
 }
 
 #[test]
@@ -831,20 +774,6 @@ fn logical_generation_id_is_independent_of_physical_layout() {
         SearchGenerationId::from_directory_name(&uppercase_alias),
         None
     );
-    let current = StoredGenerationRef::current(first.generation_id());
-    let legacy =
-        StoredGenerationRef::new(GenerationStorageContract::LegacyV1, first.generation_id());
-    assert_eq!(
-        StoredGenerationRef::from_directory_name(&current.directory_name()),
-        Some(current)
-    );
-    assert_eq!(
-        StoredGenerationRef::from_directory_name(&legacy.directory_name()),
-        Some(legacy)
-    );
-    assert!(current.directory_name().starts_with("generation-v2-"));
-    assert!(legacy.directory_name().starts_with("generation-v1-"));
-    assert_ne!(current.directory_name(), legacy.directory_name());
 }
 
 #[test]
@@ -1560,48 +1489,59 @@ fn retention_keeps_active_and_configured_previous_generations() {
 }
 
 #[test]
-fn retention_tracks_legacy_and_current_directories_as_distinct_generations() {
+fn newest_obsolete_activation_never_falls_back_to_an_older_current_generation() {
     let temporary = TempDir::new().unwrap();
-    let options = GenerationStoreOptions {
-        retain_previous_generations: 1,
-    };
-    drop(open_store(temporary.path(), options).unwrap());
-    let legacy =
-        install_frozen_legacy_generation(temporary.path(), 3, revision("legacy-retention"));
-    let legacy_ref =
-        StoredGenerationRef::new(GenerationStorageContract::LegacyV1, legacy.generation);
+    let options = GenerationStoreOptions::default();
     let mut store = open_store(temporary.path(), options).unwrap();
+    let current = publish_generation(&mut store, "current", None);
+    let current_directory = store.generation_directory(current);
+    drop(store);
+    let (obsolete, _) = write_activation_record(
+        temporary.path(),
+        2,
+        super::GENERATION_HEAD_CONTRACT_VERSION,
+        Some(1),
+    );
 
-    let first_current = publish_generation_for_workspace(
-        &mut store,
-        "first-current",
-        Some(legacy.generation),
-        legacy.workspace,
+    let opened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
+    let (store, recovery, disposition) = opened.into_parts();
+    assert_eq!(store.active(), None);
+    assert_eq!(recovery.unwrap().removed_entries(), 2);
+    assert_eq!(
+        disposition,
+        GenerationStartupDisposition::RebuildRequired(super::IndexRebuildRequired {
+            reason: IndexRebuildReason::ObsoleteGenerationStorage { actual: 1 },
+            activation_ordinal: 2,
+            generation: obsolete,
+        })
     );
-    assert!(
-        temporary
-            .path()
-            .join(super::GENERATIONS_DIRECTORY)
-            .join(legacy_ref.directory_name())
-            .is_dir()
-    );
-    assert!(store.generation_directory(first_current).is_dir());
+    assert!(!current_directory.exists());
+}
 
-    let second_current = publish_generation_for_workspace(
-        &mut store,
-        "second-current",
-        Some(first_current),
-        legacy.workspace,
+#[test]
+fn interrupted_obsolete_retirement_finishes_before_the_store_reopens() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let current = publish_generation(&mut store, "current", None);
+    let activation_ordinal = store.active().unwrap().activation_ordinal();
+    let current_directory = store.generation_directory(current);
+    drop(store);
+
+    let activations = temporary.path().join(super::ACTIVATIONS_DIRECTORY);
+    let retired = temporary.path().join(super::STAGING_DIRECTORY).join(
+        super::obsolete_activation_directory_name(activation_ordinal),
     );
-    assert!(
-        !temporary
-            .path()
-            .join(super::GENERATIONS_DIRECTORY)
-            .join(legacy_ref.directory_name())
-            .exists()
-    );
-    assert!(store.generation_directory(first_current).is_dir());
-    assert!(store.generation_directory(second_current).is_dir());
+    fs::rename(&activations, &retired).unwrap();
+    fs::create_dir(&activations).unwrap();
+
+    let opened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
+    let (store, recovery, disposition) = opened.into_parts();
+    assert_eq!(store.active(), None);
+    assert_eq!(disposition, GenerationStartupDisposition::Ready);
+    assert_eq!(recovery.unwrap().removed_entries(), 2);
+    assert!(!retired.exists());
+    assert!(!current_directory.exists());
 }
 
 #[test]

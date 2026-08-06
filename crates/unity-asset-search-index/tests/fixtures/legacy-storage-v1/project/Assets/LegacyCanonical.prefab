@@ -1,6 +1,0 @@
-%YAML 1.1
-%TAG !u! tag:unity3d.com,2011:
---- !u!1 &1001
-GameObject:
-  m_Name: LegacyBeacon
-  m_Target: {fileID: 2001, guid: aabbccddeeff00112233445566778899, type: 3}

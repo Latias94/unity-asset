@@ -333,10 +333,7 @@ pub(crate) struct ContainerEntryFact {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReferenceProjectionFact {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) source_object: Option<ObjectAddress>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) source_file_id: Option<i64>,
+    pub(crate) source_object: ObjectAddress,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source_class_id: Option<i32>,
     pub(crate) field_path: FieldPath,
@@ -349,12 +346,28 @@ pub(crate) struct ReferenceProjectionFact {
 }
 
 impl ReferenceProjectionFact {
+    /// Returns the protocol object number only when the source identity actually has one.
+    ///
+    /// Unanchored YAML document ordinals are deliberately excluded. They are selectors, not
+    /// Unity `fileID` values, and must remain distinguishable in every derived representation.
+    pub(crate) fn protocol_file_id(&self) -> Option<i64> {
+        protocol_object_file_id(&self.source_object)
+    }
+
     pub(crate) fn normalize(&mut self) {
         self.diagnostics.sort_unstable();
         self.diagnostics.dedup();
         self.dependency_keys.sort_unstable();
         self.dependency_keys.dedup();
     }
+}
+
+pub(crate) fn protocol_object_file_id(address: &ObjectAddress) -> Option<i64> {
+    address.binary_path_id().or_else(|| {
+        address
+            .yaml_file_id()
+            .map(unity_asset_core::YamlFileId::get)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

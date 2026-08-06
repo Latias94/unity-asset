@@ -7,7 +7,7 @@ namespace UnityAsset.SearchProtocol.Reference
     public static class ProtocolConstants
     {
         public const ushort BootstrapVersion = 2;
-        public const ushort BusinessProtocolRevision = 3;
+        public const ushort BusinessProtocolRevision = 4;
         public const uint CoreDiagnosticVersion = 2;
     }
 

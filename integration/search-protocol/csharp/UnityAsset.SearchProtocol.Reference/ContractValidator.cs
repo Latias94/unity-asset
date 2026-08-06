@@ -1087,17 +1087,45 @@ namespace UnityAsset.SearchProtocol.Reference
 
         private static void ValidateReferenceHit(JsonElement hit, string path)
         {
-            StrictJson.Properties(hit, path, "source_path", "source_kind", "stable_id", "location", "contexts", "objects");
-            StrictJson.PortablePath(StrictJson.Required(hit, "source_path", path), path + ".source_path");
+            StrictJson.Properties(
+                hit,
+                path,
+                "source_path",
+                "source_kind",
+                "stable_id",
+                "source_object",
+                "location",
+                "contexts",
+                "objects");
+            JsonElement sourcePathElement = StrictJson.Required(hit, "source_path", path);
+            StrictJson.PortablePath(sourcePathElement, path + ".source_path");
+            string sourcePath = StrictJson.String(sourcePathElement, path + ".source_path");
             StrictJson.String(StrictJson.Required(hit, "source_kind", path), path + ".source_kind");
             StrictJson.String(StrictJson.Required(hit, "stable_id", path), path + ".stable_id");
-            ValidateLocation(StrictJson.Required(hit, "location", path), path + ".location");
+            long? sourceFileId = ValidateObjectAddress(
+                StrictJson.Required(hit, "source_object", path),
+                path + ".source_object");
+            JsonElement location = StrictJson.Required(hit, "location", path);
+            ValidateLocation(location, path + ".location");
+            string locationPath = StrictJson.String(
+                StrictJson.Required(location, "path", path + ".location"),
+                path + ".location.path");
+            if (!string.Equals(sourcePath, locationPath, StringComparison.Ordinal)
+                || ReadOptionalInt64(location, "file_id", path + ".location") != sourceFileId)
+            {
+                throw new ProtocolValidationException(path + " contains inconsistent source identity");
+            }
             JsonElement[] contexts = StrictJson.Array(
                 StrictJson.Required(hit, "contexts", path),
                 path + ".contexts");
             for (int index = 0; index < contexts.Length; index++)
             {
-                ValidateReferenceContext(contexts[index], $"{path}.contexts[{index}]");
+                string contextPath = $"{path}.contexts[{index}]";
+                ValidateReferenceContext(contexts[index], contextPath);
+                if (ReadOptionalInt64(contexts[index], "doc_file_id", contextPath) != sourceFileId)
+                {
+                    throw new ProtocolValidationException(path + " contains inconsistent source identity");
+                }
             }
             JsonElement[] objects = StrictJson.Array(
                 StrictJson.Required(hit, "objects", path),
@@ -1623,7 +1651,7 @@ namespace UnityAsset.SearchProtocol.Reference
             }
         }
 
-        private static void ValidateObjectAddress(JsonElement address, string path)
+        private static long? ValidateObjectAddress(JsonElement address, string path)
         {
             string kind = StrictJson.String(StrictJson.Required(address, "kind", path), path + ".kind", allowEmpty: false);
             if (kind == "binary_direct" || kind == "binary_bundle_member")
@@ -1632,7 +1660,10 @@ namespace UnityAsset.SearchProtocol.Reference
                 RequireVersion(StrictJson.Required(address, "version", path), path + ".version", 1);
                 JsonElement source = StrictJson.Required(address, "source", path);
                 ValidateSourceLocator(source, path + ".source");
-                if (StrictJson.Int64(StrictJson.Required(address, "path_id", path), path + ".path_id") == 0)
+                long pathId = StrictJson.Int64(
+                    StrictJson.Required(address, "path_id", path),
+                    path + ".path_id");
+                if (pathId == 0)
                 {
                     throw new ProtocolValidationException(path + ".path_id must not be zero");
                 }
@@ -1645,15 +1676,16 @@ namespace UnityAsset.SearchProtocol.Reference
                 {
                     throw new ProtocolValidationException(path + " bundle address requires a bundle member");
                 }
-                return;
+                return pathId;
             }
             if (kind == "yaml")
             {
                 StrictJson.Properties(address, path, "kind", "version", "source", "selector");
                 RequireVersion(StrictJson.Required(address, "version", path), path + ".version", 2);
                 ValidateSourceLocator(StrictJson.Required(address, "source", path), path + ".source");
-                ValidateYamlSelector(StrictJson.Required(address, "selector", path), path + ".selector");
-                return;
+                return ValidateYamlSelector(
+                    StrictJson.Required(address, "selector", path),
+                    path + ".selector");
             }
             throw new ProtocolValidationException($"{path}.kind contains unsupported value '{kind}'");
         }
@@ -1693,23 +1725,26 @@ namespace UnityAsset.SearchProtocol.Reference
             }
         }
 
-        private static void ValidateYamlSelector(JsonElement selector, string path)
+        private static long? ValidateYamlSelector(JsonElement selector, string path)
         {
             string kind = StrictJson.String(StrictJson.Required(selector, "kind", path), path + ".kind", allowEmpty: false);
             if (kind == "file_id")
             {
                 StrictJson.Properties(selector, path, "kind", "file_id");
-                if (StrictJson.Int64(StrictJson.Required(selector, "file_id", path), path + ".file_id") == 0)
+                long fileId = StrictJson.Int64(
+                    StrictJson.Required(selector, "file_id", path),
+                    path + ".file_id");
+                if (fileId == 0)
                 {
                     throw new ProtocolValidationException(path + ".file_id must not be zero");
                 }
-                return;
+                return fileId;
             }
             if (kind == "unanchored")
             {
                 StrictJson.Properties(selector, path, "kind", "document_index");
                 StrictJson.UInt32(StrictJson.Required(selector, "document_index", path), path + ".document_index");
-                return;
+                return null;
             }
             throw new ProtocolValidationException($"{path}.kind contains unsupported value '{kind}'");
         }
@@ -1790,10 +1825,14 @@ namespace UnityAsset.SearchProtocol.Reference
 
         private static void ValidateOptionalInt64(JsonElement owner, string name, string path)
         {
-            if (StrictJson.Optional(owner, name, out JsonElement value))
-            {
-                StrictJson.Int64(value, path + "." + name);
-            }
+            ReadOptionalInt64(owner, name, path);
+        }
+
+        private static long? ReadOptionalInt64(JsonElement owner, string name, string path)
+        {
+            return StrictJson.Optional(owner, name, out JsonElement value)
+                ? StrictJson.Int64(value, path + "." + name)
+                : null;
         }
 
         private static void ValidateOptionalInt32(JsonElement owner, string name, string path)

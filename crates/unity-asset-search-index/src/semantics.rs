@@ -5,22 +5,22 @@ use unity_asset_core::{DigestBuildError, DigestV1, DigestV1Builder};
 pub(crate) const SEARCH_SEMANTICS_WIRE_VERSION: u16 = 1;
 
 /// Version of the analysis rules that produce persisted analysis values.
-pub(crate) const ANALYSIS_SEMANTICS_VERSION: u16 = 1;
+pub(crate) const ANALYSIS_SEMANTICS_VERSION: u16 = 2;
 
 /// Version of the search projection rules that produce Tantivy documents.
 pub(crate) const SEARCH_PROJECTION_SEMANTICS_VERSION: u16 = 1;
 
 /// Version of the reference projection rules that produce graph facts.
-pub(crate) const REFERENCE_PROJECTION_SEMANTICS_VERSION: u16 = 2;
+pub(crate) const REFERENCE_PROJECTION_SEMANTICS_VERSION: u16 = 3;
 
 /// Version of the persisted per-source analysis cache identity.
 pub(crate) const ANALYSIS_CACHE_IDENTITY_VERSION: u16 = 1;
 
-const ANALYSIS_SEMANTICS_DOMAIN: &[u8] = b"unity-asset:search:analysis-semantics:v1\0";
+const ANALYSIS_SEMANTICS_DOMAIN: &[u8] = b"unity-asset:search:analysis-semantics:v2\0";
 const SEARCH_PROJECTION_SEMANTICS_DOMAIN: &[u8] =
     b"unity-asset:search:search-projection-semantics:v1\0";
 const REFERENCE_PROJECTION_SEMANTICS_DOMAIN: &[u8] =
-    b"unity-asset:search:reference-projection-semantics:v2\0";
+    b"unity-asset:search:reference-projection-semantics:v3\0";
 const ANALYSIS_CACHE_IDENTITY_DOMAIN: &[u8] = b"unity-asset:search:analysis-cache-identity:v1\0";
 
 /// Exact identity required before persisted per-source analysis may be reused.
@@ -151,6 +151,18 @@ impl SearchSemantics {
         self.reference_projection_version
     }
 
+    /// Returns whether persisted source-state values have the same structural semantic shape.
+    ///
+    /// Digests may change while retaining the same wire layout; version changes are treated as
+    /// structural and require rebuilding without decoding the previous source-state payload.
+    #[must_use]
+    pub(crate) const fn source_state_layout_compatible_with(self, other: Self) -> bool {
+        self.contract_version == other.contract_version
+            && self.analysis_version == other.analysis_version
+            && self.search_projection_version == other.search_projection_version
+            && self.reference_projection_version == other.reference_projection_version
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) const fn with_analysis_digest(mut self, digest: DigestV1) -> Self {
@@ -260,5 +272,16 @@ mod tests {
                 .unwrap(),
             current_identity
         );
+    }
+
+    #[test]
+    fn source_state_layout_compatibility_tracks_versions_not_rule_digests() {
+        let current = SearchSemantics::current();
+        assert!(current.source_state_layout_compatible_with(
+            current.with_reference_projection_digest(digest("reference rules v-next"))
+        ));
+        assert!(!current.source_state_layout_compatible_with(
+            current.with_analysis_version(current.analysis_version().saturating_add(1))
+        ));
     }
 }

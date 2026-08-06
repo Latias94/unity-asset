@@ -18,20 +18,13 @@ use crate::analysis::{
     ReferenceDependencyKey, ReferenceProjectionFact, ReferenceResolutionProjection,
     WorkspaceObjectFact,
 };
-use crate::generation::{
-    ArtifactTreeEvidence, LegacySearchGenerationManifest, SearchGenerationManifestV1,
-};
-use crate::legacy_wire::{
-    LegacyAssetAnalysisV1, LegacyDiagnosticV1, LegacyObjectAddressV1,
-    LegacyReferenceDependencyKeyV1, LegacyReferenceProjectionFactV1, LegacySourceStateSnapshotV1,
-    LegacyWireError, LegacyWorkspaceObjectFactV1,
-};
+use crate::generation::{ArtifactTreeEvidence, SearchGenerationManifestV1};
 use crate::semantics::AnalysisCacheIdentityV1;
 #[cfg(test)]
 use crate::semantics::SearchSemantics;
 
-pub(super) const SOURCE_STATE_CONTRACT_VERSION: u16 = 2;
-pub(super) const SOURCE_STATE_LOGICAL_IDENTITY_VERSION: u16 = 1;
+pub(super) const SOURCE_STATE_CONTRACT_VERSION: u16 = 3;
+pub(super) const SOURCE_STATE_LOGICAL_IDENTITY_VERSION: u16 = 2;
 const MAX_SOURCE_STATE_ASSETS: usize = 1_000_000;
 const MAX_SOURCE_STATE_SCAN_HINTS: usize = 1_000_000;
 const MAX_TRANSACTION_RECEIPTS: usize = 4_096;
@@ -671,65 +664,6 @@ impl<'de> Deserialize<'de> for SourceStateSnapshot {
     }
 }
 
-/// Read-only view over the exact storage-v1 source-state wire.
-///
-/// The legacy contract keeps transaction receipts inside the source-state digest and has no
-/// analysis-semantics identity. It is never serialized back through the current writer and its
-/// analysis payload is not eligible for incremental reuse.
-pub(crate) type LegacySourceStateSnapshot = LegacySourceStateSnapshotV1;
-
-impl LegacySourceStateSnapshotV1 {
-    pub(super) fn validate_limits(
-        &self,
-        limits: SourceStateLimits,
-    ) -> Result<(), SourceStateError> {
-        self.transaction_receipts()
-            .validate_for_workspace(self.workspace())?;
-        validate_source_state_count("scan hints", self.scan_hints().len(), limits.max_scan_hints)?;
-        validate_source_state_count("assets", self.assets().len(), limits.max_assets)?;
-        for hint in self.scan_hints() {
-            validate_source_state_relative_path(
-                &hint.relative_path,
-                limits.max_relative_path_bytes,
-            )?;
-        }
-        for analysis in self.assets() {
-            validate_source_state_relative_path(
-                analysis.relative_path(),
-                limits.max_relative_path_bytes,
-            )?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn validate_manifest(
-        &self,
-        manifest: &LegacySearchGenerationManifest,
-    ) -> Result<(), SourceStateError> {
-        if self.workspace() != manifest.workspace() || self.revision() != manifest.revision() {
-            return Err(SourceStateError::GenerationContextMismatch {
-                expected_workspace: manifest.workspace(),
-                actual_workspace: self.workspace(),
-                expected_revision: manifest.revision(),
-                actual_revision: self.revision(),
-            });
-        }
-        if self.logical_digest() != manifest.source_state_digest() {
-            return Err(SourceStateError::ManifestDigestMismatch {
-                expected: manifest.source_state_digest(),
-                actual: self.logical_digest(),
-            });
-        }
-        if !self
-            .transaction_receipts()
-            .matches_canonical_ids(manifest.applied_transactions())
-        {
-            return Err(SourceStateError::ManifestTransactionsMismatch);
-        }
-        Ok(())
-    }
-}
-
 #[derive(Serialize)]
 struct SourceStateLogicalRef<'state> {
     identity_version: u16,
@@ -1078,14 +1012,6 @@ pub(super) fn source_state_entry_count(
     source_state_entry_count_parts(snapshot.scan_hints.len(), &snapshot.assets, 0)
 }
 
-pub(super) fn legacy_source_state_entry_count(
-    snapshot: &LegacySourceStateSnapshot,
-) -> Result<u64, SourceStateError> {
-    snapshot
-        .nested_collection_count()
-        .map_err(|error| SourceStateError::LegacyWire(Box::new(error)))
-}
-
 fn source_state_entry_count_parts(
     scan_hints: usize,
     assets: &[AssetAnalysis],
@@ -1330,12 +1256,6 @@ pub(super) fn source_state_owned_allocation_bound(
         std::mem::size_of::<AnalysisTruncation>(),
         std::mem::size_of::<ReferenceDependencyKey>(),
         std::mem::size_of::<ObjectAddress>(),
-        std::mem::size_of::<LegacyAssetAnalysisV1>(),
-        std::mem::size_of::<LegacyWorkspaceObjectFactV1>(),
-        std::mem::size_of::<LegacyReferenceProjectionFactV1>(),
-        std::mem::size_of::<LegacyDiagnosticV1>(),
-        std::mem::size_of::<LegacyReferenceDependencyKeyV1>(),
-        std::mem::size_of::<LegacyObjectAddressV1>(),
         std::mem::size_of::<String>(),
     ]
     .into_iter()
@@ -1384,7 +1304,6 @@ pub(crate) enum SourceStateError {
     Budget(BudgetedJsonError),
     Json(serde_json::Error),
     Digest(DigestBuildError),
-    LegacyWire(Box<LegacyWireError>),
     UnsupportedVersion {
         actual: u16,
         expected: u16,
@@ -1445,7 +1364,6 @@ pub(crate) enum SourceStateError {
         expected: AnalysisCacheIdentityV1,
         actual: AnalysisCacheIdentityV1,
     },
-    ManifestTransactionsMismatch,
     PhysicalEvidenceMismatch {
         expected: ArtifactTreeEvidence,
         actual: ArtifactTreeEvidence,
@@ -1487,7 +1405,6 @@ impl fmt::Display for SourceStateError {
             Self::Budget(error) => fmt::Display::fmt(error, formatter),
             Self::Json(error) => write!(formatter, "invalid source state JSON: {error}"),
             Self::Digest(error) => write!(formatter, "failed to digest source state: {error}"),
-            Self::LegacyWire(error) => write!(formatter, "invalid legacy source state: {error}"),
             Self::UnsupportedVersion { actual, expected } => write!(
                 formatter,
                 "source state version {actual} is unsupported; expected {expected}"
@@ -1571,9 +1488,6 @@ impl fmt::Display for SourceStateError {
                 formatter,
                 "source state analysis cache identity does not match generation manifest: expected {expected:?}, got {actual:?}"
             ),
-            Self::ManifestTransactionsMismatch => formatter.write_str(
-                "source state transaction receipts do not match the generation manifest",
-            ),
             Self::PhysicalEvidenceMismatch { expected, actual } => write!(
                 formatter,
                 "source state physical evidence mismatch: expected {expected:?}, got {actual:?}"
@@ -1621,7 +1535,6 @@ impl Error for SourceStateError {
             Self::Budget(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Digest(error) => Some(error),
-            Self::LegacyWire(error) => Some(error.as_ref()),
             Self::AllocationFailed { source, .. } => Some(source),
             _ => None,
         }
@@ -2211,7 +2124,7 @@ mod source_state_tests {
             .unwrap()
             .load_source_state(&mut budget)
             .unwrap();
-        assert_eq!(reopened, GenerationSourceState::CurrentV2(snapshot));
+        assert_eq!(reopened, snapshot);
 
         let low_limits = AssetLoadLimits {
             max_bytes: 1,

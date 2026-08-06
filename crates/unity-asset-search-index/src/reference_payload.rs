@@ -10,27 +10,21 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use unity_asset_core::{
     AssetLoadBudget, BudgetedJsonError, ContractJsonLimits, ContractJsonResourceModel,
-    DigestBuildError, DigestV1, DigestV1Builder, ObjectAddress, read_contract_json,
+    DigestBuildError, DigestV1, DigestV1Builder, read_contract_json,
 };
 
 use crate::analysis::ReferenceProjectionFact;
 use crate::anchored_fs::{AnchoredFsError as SecureReadError, RegularFile, RegularFileRange};
-use crate::generation::GenerationStorageContract;
-use crate::legacy_wire::{
-    ConvertedLegacyReferencePayloadV1, LegacyReferencePayloadV1, LegacyWireError,
-};
 use crate::projection::ReferenceDocument;
 
-pub(crate) const REFERENCE_PAYLOAD_FILE: &str = "reference-payload-v2.jsonl";
+pub(crate) const REFERENCE_PAYLOAD_FILE: &str = "reference-payload-v3.jsonl";
 pub(crate) const MAX_REFERENCE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REFERENCE_PAYLOAD_BYTES_U64: u64 = 4 * 1024 * 1024;
-const REFERENCE_PAYLOAD_CONTRACT_VERSION: u16 = 2;
+const REFERENCE_PAYLOAD_CONTRACT_VERSION: u16 = 3;
 const REFERENCE_PAYLOAD_JSON_MAX_DEPTH: u32 = 40;
 const REFERENCE_PAYLOAD_JSON_MAX_VALUES: u64 = 128 * 1024;
-// The fixed materialization reserve covers one complete second payload representation while a
-// storage-v1 value is converted. The per-entry reserve covers base conversion diagnostics and
-// vector growth; path clones created by legacy degradation are charged explicitly during
-// conversion because one path can be referenced by many legacy addresses.
+// The fixed materialization reserve covers the current payload envelope and parser scratch. The
+// per-entry reserve covers owned strings, vectors, and Serde temporaries in one decoded payload.
 const REFERENCE_PAYLOAD_JSON_RESOURCES: ContractJsonResourceModel =
     ContractJsonResourceModel::new(6, 4 * 1024, MAX_REFERENCE_PAYLOAD_BYTES_U64, 1024);
 const REFERENCE_PAYLOAD_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
@@ -72,12 +66,6 @@ struct BorrowedReferencePayload<'document> {
     source_kind: &'document str,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_guid: Option<&'document str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_object: Option<&'document ObjectAddress>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_file_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_class_id: Option<i32>,
     fact: &'document ReferenceProjectionFact,
 }
 
@@ -89,9 +77,6 @@ impl<'document> From<&'document ReferenceDocument> for BorrowedReferencePayload<
             source_path: &document.source_path,
             source_kind: &document.source_kind,
             source_guid: document.source_guid.as_deref(),
-            source_object: document.source_object.as_ref(),
-            source_file_id: document.source_file_id,
-            source_class_id: document.source_class_id,
             fact: &document.fact,
         }
     }
@@ -106,12 +91,6 @@ pub(crate) struct ReferencePayload {
     pub(crate) source_kind: String,
     #[serde(default)]
     pub(crate) source_guid: Option<String>,
-    #[serde(default)]
-    pub(crate) source_object: Option<ObjectAddress>,
-    #[serde(default)]
-    pub(crate) source_file_id: Option<i64>,
-    #[serde(default)]
-    pub(crate) source_class_id: Option<i32>,
     pub(crate) fact: ReferenceProjectionFact,
 }
 
@@ -132,27 +111,7 @@ impl ReferencePayload {
         if self.stable_id != expected_stable_id {
             return Err(ReferencePayloadValidationError::StableIdMismatch);
         }
-        if self.fact.source_object != self.source_object
-            || self.fact.source_file_id != self.source_file_id
-            || self.fact.source_class_id != self.source_class_id
-        {
-            return Err(ReferencePayloadValidationError::SourceIdentityMismatch);
-        }
         Ok(())
-    }
-
-    fn from_legacy(payload: ConvertedLegacyReferencePayloadV1) -> Self {
-        Self {
-            contract_version: REFERENCE_PAYLOAD_CONTRACT_VERSION,
-            stable_id: payload.stable_id,
-            source_path: payload.source_path,
-            source_kind: payload.source_kind,
-            source_guid: payload.source_guid,
-            source_object: payload.source_object,
-            source_file_id: payload.source_file_id,
-            source_class_id: payload.source_class_id,
-            fact: payload.fact,
-        }
     }
 
     #[cfg(test)]
@@ -163,9 +122,6 @@ impl ReferencePayload {
             source_path: document.source_path,
             source_kind: document.source_kind,
             source_guid: document.source_guid,
-            source_object: document.source_object,
-            source_file_id: document.source_file_id,
-            source_class_id: document.source_class_id,
             fact: document.fact,
         }
     }
@@ -176,7 +132,6 @@ pub(crate) enum ReferencePayloadValidationError {
     UnsupportedVersion { actual: u16, expected: u16 },
     EmptyStableId,
     StableIdMismatch,
-    SourceIdentityMismatch,
 }
 
 impl fmt::Display for ReferencePayloadValidationError {
@@ -189,9 +144,6 @@ impl fmt::Display for ReferencePayloadValidationError {
             Self::EmptyStableId => formatter.write_str("payload stable ID is empty"),
             Self::StableIdMismatch => {
                 formatter.write_str("payload stable ID differs from the fast-field stable ID")
-            }
-            Self::SourceIdentityMismatch => {
-                formatter.write_str("payload source identity differs from its reference fact")
             }
         }
     }
@@ -350,19 +302,12 @@ impl ValidatedReferencePayloadRange {
 #[derive(Clone)]
 pub(crate) struct ReferencePayloadReader {
     file: Arc<RegularFile>,
-    storage: GenerationStorageContract,
 }
 
 impl ReferencePayloadReader {
-    #[cfg(test)]
     pub(crate) fn new(file: RegularFile) -> Self {
-        Self::new_for(file, GenerationStorageContract::CurrentV2)
-    }
-
-    pub(crate) fn new_for(file: RegularFile, storage: GenerationStorageContract) -> Self {
         Self {
             file: Arc::new(file),
-            storage,
         }
     }
 
@@ -409,7 +354,6 @@ impl ReferencePayloadReader {
         &self,
         range: ValidatedReferencePayloadRange,
         expected_digest: DigestV1,
-        expected_stable_id: &str,
         budget: &mut AssetLoadBudget,
     ) -> Result<ReferencePayload, ReferencePayloadReadError> {
         let reader = self
@@ -417,20 +361,11 @@ impl ReferencePayloadReader {
             .range(range.offset, range.length)
             .map_err(ReferencePayloadReadError::SecureRead)?;
         let mut reader = DigestingReader::new(reader, range.length);
-        let decoded = match self.storage {
-            GenerationStorageContract::LegacyV1 => read_contract_json::<LegacyReferencePayloadV1>(
-                &mut reader,
-                budget,
-                REFERENCE_PAYLOAD_JSON_LIMITS,
-            )
-            .map(StoredReferencePayload::LegacyV1),
-            GenerationStorageContract::CurrentV2 => read_contract_json::<ReferencePayload>(
-                &mut reader,
-                budget,
-                REFERENCE_PAYLOAD_JSON_LIMITS,
-            )
-            .map(StoredReferencePayload::CurrentV2),
-        };
+        let decoded = read_contract_json::<ReferencePayload>(
+            &mut reader,
+            budget,
+            REFERENCE_PAYLOAD_JSON_LIMITS,
+        );
         let digest = reader.finalize();
         self.file
             .ensure_unchanged()
@@ -443,13 +378,7 @@ impl ReferencePayloadReader {
                 actual: digest,
             });
         }
-        match decoded {
-            StoredReferencePayload::LegacyV1(payload) => payload
-                .try_into_current(expected_stable_id, budget)
-                .map(ReferencePayload::from_legacy)
-                .map_err(map_legacy_payload_error),
-            StoredReferencePayload::CurrentV2(payload) => Ok(payload),
-        }
+        Ok(decoded)
     }
 
     #[cfg(test)]
@@ -463,22 +392,7 @@ impl fmt::Debug for ReferencePayloadReader {
         formatter
             .debug_struct("ReferencePayloadReader")
             .field("length", &self.file.length())
-            .field("storage", &self.storage)
             .finish_non_exhaustive()
-    }
-}
-
-enum StoredReferencePayload {
-    LegacyV1(LegacyReferencePayloadV1),
-    CurrentV2(ReferencePayload),
-}
-
-fn map_legacy_payload_error(error: LegacyWireError) -> ReferencePayloadReadError {
-    match error {
-        LegacyWireError::Budget(error) => {
-            ReferencePayloadReadError::Json(BudgetedJsonError::Budget(error))
-        }
-        error => ReferencePayloadReadError::LegacyWire(error),
     }
 }
 
@@ -505,7 +419,6 @@ pub(crate) enum ReferencePayloadReadError {
         actual: DigestV1,
     },
     Json(BudgetedJsonError),
-    LegacyWire(LegacyWireError),
 }
 
 impl fmt::Display for ReferencePayloadReadError {
@@ -538,9 +451,6 @@ impl fmt::Display for ReferencePayloadReadError {
                 "reference payload content digest differs from its anchored index binding: expected {expected}, got {actual}"
             ),
             Self::Json(source) => write!(formatter, "reference payload JSON is invalid: {source}"),
-            Self::LegacyWire(source) => {
-                write!(formatter, "legacy reference payload is invalid: {source}")
-            }
         }
     }
 }
@@ -551,7 +461,6 @@ impl Error for ReferencePayloadReadError {
             Self::SecureRead(source) => Some(source),
             Self::Digest(source) => Some(source),
             Self::Json(source) => Some(source),
-            Self::LegacyWire(source) => Some(source),
             Self::EmptyRange
             | Self::PayloadTooLarge { .. }
             | Self::RangeOverflow { .. }
@@ -671,7 +580,7 @@ mod tests {
     use std::fs;
 
     use tempfile::{TempDir, tempdir};
-    use unity_asset_core::{AssetLoadLimits, BudgetError, FieldPath, SourceLocator};
+    use unity_asset_core::{AssetLoadLimits, BudgetError, FieldPath, ObjectAddress, SourceLocator};
 
     use super::*;
     use crate::analysis::{RawReferenceProjection, ReferenceResolutionProjection};
@@ -686,12 +595,8 @@ mod tests {
             source_path: "Assets/Source.asset".to_owned(),
             source_kind: "SerializedAsset".to_owned(),
             source_guid: Some("abababababababababababababababab".to_owned()),
-            source_object: Some(source_object.clone()),
-            source_file_id: Some(7),
-            source_class_id: Some(1),
             fact: ReferenceProjectionFact {
-                source_object: Some(source_object),
-                source_file_id: Some(7),
+                source_object,
                 source_class_id: Some(1),
                 field_path: FieldPath::root().push_field("m_Target").unwrap(),
                 raw_target: RawReferenceProjection::Binary {
@@ -709,20 +614,13 @@ mod tests {
     }
 
     fn open_reader(bytes: &[u8]) -> (TempDir, ReferencePayloadReader) {
-        open_reader_for(bytes, GenerationStorageContract::CurrentV2)
-    }
-
-    fn open_reader_for(
-        bytes: &[u8],
-        storage: GenerationStorageContract,
-    ) -> (TempDir, ReferencePayloadReader) {
         let directory = tempdir().unwrap();
         fs::write(directory.path().join(REFERENCE_PAYLOAD_FILE), bytes).unwrap();
         let opened = ReadDirectory::open(directory.path(), OpenPolicy::PersistedState).unwrap();
         let file = opened
             .open_regular(OsStr::new(REFERENCE_PAYLOAD_FILE))
             .unwrap();
-        (directory, ReferencePayloadReader::new_for(file, storage))
+        (directory, ReferencePayloadReader::new(file))
     }
 
     fn open_written_reader(
@@ -764,84 +662,6 @@ mod tests {
             reader.validate_range(2, 3, 4).unwrap_err(),
             ReferencePayloadReadError::RangeOutOfBounds { file_length: 4, .. }
         ));
-    }
-
-    #[test]
-    fn legacy_payload_reader_degrades_only_the_unrepresentable_yaml_address() {
-        let encoded = br#"{
-            "contract_version":1,
-            "stable_id":"reference-v1:test",
-            "source_path":"Assets/Test.prefab",
-            "source_kind":"Prefab",
-            "source_object":{
-                "kind":"yaml",
-                "version":1,
-                "source":{"version":1,"outer_path":"Assets/Test.prefab","members":[]},
-                "selector":{"kind":"anchored","anchor":"01"}
-            },
-            "source_file_id":1,
-            "source_class_id":114,
-            "fact":{
-                "source_object":{
-                    "kind":"yaml",
-                    "version":1,
-                    "source":{"version":1,"outer_path":"Assets/Test.prefab","members":[]},
-                    "selector":{"kind":"anchored","anchor":"01"}
-                },
-                "source_file_id":1,
-                "source_class_id":114,
-                "field_path":[],
-                "raw_target":{"format":"yaml","file_id":1},
-                "resolution":{
-                    "state":"resolved",
-                    "target":{
-                        "kind":"yaml",
-                        "version":1,
-                        "source":{"version":1,"outer_path":"Assets/Test.prefab","members":[]},
-                        "selector":{"kind":"anchored","anchor":"01"}
-                    }
-                },
-                "diagnostics":[],
-                "dependency_keys":[{
-                    "kind":"object",
-                    "address":{
-                        "kind":"yaml",
-                        "version":1,
-                        "source":{"version":1,"outer_path":"Assets/Test.prefab","members":[]},
-                        "selector":{"kind":"anchored","anchor":"01"}
-                    }
-                }]
-            }
-        }"#;
-        let (_directory, reader) = open_reader_for(encoded, GenerationStorageContract::LegacyV1);
-        let encoded_length = u64::try_from(encoded.len()).unwrap();
-        let expected_digest =
-            "blake3-v1:4d4367b6f7b00f99077877f7cce54d9d9366ccc8532ae7946af03ba161c8e8b3"
-                .parse()
-                .unwrap();
-        let range = reader
-            .validate_range(0, encoded_length, encoded.len())
-            .unwrap();
-        let mut budget = AssetLoadBudget::default();
-        let payload = reader
-            .read(range, expected_digest, "reference-v1:test", &mut budget)
-            .unwrap();
-
-        assert!(payload.source_object.is_none());
-        assert!(payload.fact.source_object.is_none());
-        assert!(matches!(
-            payload.fact.resolution,
-            ReferenceResolutionProjection::Invalid
-        ));
-        assert!(payload.fact.dependency_keys.is_empty());
-        assert_eq!(payload.fact.diagnostics.len(), 3);
-        assert!(
-            payload
-                .fact
-                .diagnostics
-                .iter()
-                .all(|diagnostic| { diagnostic.code() == "LEGACY_YAML_ADDRESS_UNREPRESENTABLE" })
-        );
     }
 
     #[test]
@@ -900,7 +720,6 @@ mod tests {
             .read(
                 corrupt_range,
                 DigestV1::hash_bytes(corrupt),
-                "corrupt",
                 &mut AssetLoadBudget::default(),
             )
             .unwrap_err();
@@ -919,7 +738,6 @@ mod tests {
             .read(
                 deep_range,
                 DigestV1::hash_bytes(deep.as_bytes()),
-                "deep",
                 &mut AssetLoadBudget::default(),
             )
             .unwrap_err();
@@ -945,7 +763,7 @@ mod tests {
             .unwrap();
         let mut measured = AssetLoadBudget::default();
         let decoded = reader
-            .read(range, location.digest(), &document.stable_id, &mut measured)
+            .read(range, location.digest(), &mut measured)
             .unwrap();
         decoded.validate(&document.stable_id).unwrap();
         let usage = measured.usage();
@@ -958,7 +776,7 @@ mod tests {
         };
         let mut exact = AssetLoadBudget::new(exact_limits).unwrap();
         reader
-            .read(range, location.digest(), &document.stable_id, &mut exact)
+            .read(range, location.digest(), &mut exact)
             .unwrap();
         assert_eq!(exact.usage(), usage);
 
@@ -971,7 +789,6 @@ mod tests {
             .read(
                 range,
                 location.digest(),
-                &document.stable_id,
                 &mut one_short,
             )
             .unwrap_err();
@@ -1010,7 +827,6 @@ mod tests {
             .read(
                 range,
                 location.digest(),
-                &document.stable_id,
                 &mut AssetLoadBudget::default(),
             )
             .unwrap_err();

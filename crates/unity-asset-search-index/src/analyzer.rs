@@ -12,7 +12,6 @@ use unity_asset::{
     AssetLoadBudget, BudgetError, ContractError, Diagnostic, DiagnosticError, DiagnosticSeverity,
     FieldPath, FieldPathSegment, ObjectAddress, RevisionedObjectHandle, SourceFingerprint,
     SourceId, SourceKind, SourceLocator, UnityClass, UnityValue, WorkspaceId, WorkspaceRevision,
-    YamlFileId,
 };
 use unity_asset_search_core::{SearchKind, TryToTermsError, try_to_terms};
 
@@ -842,7 +841,7 @@ impl AssetAnalyzer {
         for fact in input.context.facts(input.root).take(reference_limit) {
             budget.consume_entries(1)?;
             let projected = project_reference(fact, input.context.graph, class_by_address, budget)?;
-            let source_address = projected.source_object.as_ref();
+            let source_address = &projected.source_object;
             let resolved_target = match &projected.resolution {
                 ReferenceResolutionProjection::Resolved { target } => Some(target),
                 ReferenceResolutionProjection::Null
@@ -854,19 +853,18 @@ impl AssetAnalyzer {
             let terminal_field = last_field(projected.field_path.segments());
 
             if matches!(projected.source_class_id, Some(4 | 224))
-                && let (Some(source), Some(target), Some(field)) =
-                    (source_address, resolved_target, terminal_field)
+                && let (Some(target), Some(field)) = (resolved_target, terminal_field)
             {
                 if field == "m_GameObject" {
                     charge_entry::<(ObjectAddress, ObjectAddress)>(budget)?;
                     transform_game_object.insert(
-                        clone_object_address(source, "transform source object", budget)?,
+                        clone_object_address(source_address, "transform source object", budget)?,
                         clone_object_address(target, "transform game object", budget)?,
                     );
                 } else if field == "m_Father" {
                     charge_entry::<(ObjectAddress, ObjectAddress)>(budget)?;
                     transform_parent.insert(
-                        clone_object_address(source, "transform source object", budget)?,
+                        clone_object_address(source_address, "transform source object", budget)?,
                         clone_object_address(target, "transform parent object", budget)?,
                     );
                 }
@@ -1285,7 +1283,6 @@ fn project_reference(
     budget: &mut AssetLoadBudget,
 ) -> Result<ReferenceProjectionFact, AnalysisError> {
     let source = graph.address(fact.source())?;
-    let source_file_id = address_file_id(source);
     let source_class_id = class_by_address.get(source).copied();
     let source = clone_object_address(source, "reference source object", budget)?;
     let field_path = clone_field_path(fact.field_path(), "reference field path", budget)?;
@@ -1319,8 +1316,7 @@ fn project_reference(
     };
     let dependency_keys = dependency_keys(&raw_target, &resolution, budget)?;
     Ok(ReferenceProjectionFact {
-        source_object: Some(source),
-        source_file_id,
+        source_object: source,
         source_class_id,
         field_path,
         raw_target,
@@ -1552,13 +1548,6 @@ fn script_guid_from_raw(
         RawReferenceProjection::Binary { external: None, .. }
         | RawReferenceProjection::Yaml { guid: None, .. } => None,
     })
-}
-
-fn address_file_id(address: &ObjectAddress) -> Option<i64> {
-    address
-        .binary_path_id()
-        .or_else(|| address.yaml_file_id().map(YamlFileId::get))
-        .or_else(|| address.yaml_document_ordinal().map(i64::from))
 }
 
 fn last_field(segments: &[FieldPathSegment]) -> Option<&str> {
@@ -2556,10 +2545,23 @@ mod tests {
     use tempfile::tempdir;
     use unity_asset::reference::ReferenceGraphBuildOptions;
     use unity_asset::workspace::{AssetWorkspace, SourceOpenRequest};
-    use unity_asset::{AssetLoadLimits, BudgetedSourceBytes, DigestV1, SourceAlias};
+    use unity_asset::{AssetLoadLimits, BudgetedSourceBytes, DigestV1, SourceAlias, YamlFileId};
 
     use super::*;
+    use crate::analysis::protocol_object_file_id;
     use crate::scan::{FileHint, SourceHints};
+
+    #[test]
+    fn protocol_file_ids_never_alias_yaml_document_ordinals() {
+        let locator = SourceLocator::path("Assets/Scene.unity").unwrap();
+        let binary = ObjectAddress::binary_direct(locator.clone(), -7).unwrap();
+        let yaml = ObjectAddress::yaml(locator.clone(), YamlFileId::new(7).unwrap()).unwrap();
+        let unanchored = ObjectAddress::yaml_document(locator, 7).unwrap();
+
+        assert_eq!(protocol_object_file_id(&binary), Some(-7));
+        assert_eq!(protocol_object_file_id(&yaml), Some(7));
+        assert_eq!(protocol_object_file_id(&unanchored), None);
+    }
 
     #[test]
     fn normalized_terms_use_exact_requested_layout_budget() {
@@ -3001,7 +3003,7 @@ MonoBehaviour:
             .iter()
             .find(|reference| path_contains_field(reference.field_path.segments(), "m_Script"))
             .expect("the supplied graph contributes the m_Script fact");
-        assert_eq!(script_reference.source_file_id, Some(-42));
+        assert_eq!(script_reference.protocol_file_id(), Some(-42));
         assert_eq!(script_reference.source_class_id, Some(114));
         assert!(matches!(
             &script_reference.raw_target,
@@ -3058,6 +3060,6 @@ MonoBehaviour:
         let address =
             ObjectAddress::binary_direct(SourceLocator::path("Assets/data.assets").unwrap(), -9)
                 .unwrap();
-        assert_eq!(address_file_id(&address), Some(-9));
+        assert_eq!(protocol_object_file_id(&address), Some(-9));
     }
 }

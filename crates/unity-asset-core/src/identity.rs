@@ -589,6 +589,43 @@ pub enum YamlDocumentSelector {
 }
 
 impl YamlDocumentSelector {
+    /// Derives the only valid typed selector for one parsed YAML document header.
+    ///
+    /// Parser-generated unanchored documents are recognized only by the exact canonical
+    /// `class_id = 0`, `class_name = "YamlDocument"`, `anchor = "doc_{document_index}"`
+    /// combination. Every other document must carry a canonical nonzero signed `fileID` anchor.
+    pub fn from_document_header(
+        document_index: usize,
+        class_id: i32,
+        class_name: &str,
+        anchor: &str,
+    ) -> Result<Self, ContractError> {
+        if class_id == 0
+            && class_name == "YamlDocument"
+            && anchor
+                .strip_prefix("doc_")
+                .is_some_and(|ordinal| canonical_usize_matches(ordinal, document_index))
+        {
+            let document_index = u32::try_from(document_index)
+                .map_err(|_| ContractError::YamlDocumentIndexOverflow { document_index })?;
+            Ok(Self::ordinal(document_index))
+        } else {
+            YamlFileId::parse_canonical(anchor).map(Self::file_id)
+        }
+    }
+
+    #[must_use]
+    pub fn matches_document_header(
+        &self,
+        document_index: usize,
+        class_id: i32,
+        class_name: &str,
+        anchor: &str,
+    ) -> bool {
+        Self::from_document_header(document_index, class_id, class_name, anchor).as_ref()
+            == Ok(self)
+    }
+
     #[must_use]
     pub const fn file_id(file_id: YamlFileId) -> Self {
         Self::FileId { file_id }
@@ -614,6 +651,13 @@ impl YamlDocumentSelector {
             Self::Unanchored { document_index } => Some(*document_index),
         }
     }
+}
+
+fn canonical_usize_matches(value: &str, expected: usize) -> bool {
+    !value.is_empty()
+        && (value == "0" || !value.starts_with('0'))
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<usize>() == Ok(expected)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1221,6 +1265,8 @@ pub enum ContractError {
     NullYamlFileId,
     #[error("invalid canonical YAML fileID")]
     InvalidYamlFileId,
+    #[error("YAML document index {document_index} exceeds the u32 selector range")]
+    YamlDocumentIndexOverflow { document_index: usize },
     #[error("source containment exceeds the maximum depth of {max_depth}")]
     ContainmentDepthExceeded { max_depth: usize },
     #[error("source locator text exceeds the maximum of {max_text_bytes} bytes")]

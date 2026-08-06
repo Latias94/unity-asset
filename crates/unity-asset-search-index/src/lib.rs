@@ -18,9 +18,6 @@ mod anchored_fs;
 mod config;
 mod generation;
 mod generation_store;
-#[cfg(test)]
-mod legacy_storage_v1_fixture_tests;
-mod legacy_wire;
 mod path_semantics;
 mod pipeline;
 mod project_root;
@@ -250,9 +247,34 @@ impl SearchIndex {
     ) -> Result<Self, SearchIndexError> {
         let pipeline = SearchGenerationPipeline::open(paths.clone(), options, budget)
             .map_err(|error| SearchIndexError::from_pipeline(error, None))?;
+        Ok(Self::from_pipeline(paths, options, pipeline))
+    }
+
+    #[cfg(test)]
+    fn open_or_create_with_startup_recovery_failpoint(
+        paths: IndexPaths,
+        failpoint: GenerationFailpoint,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, SearchIndexError> {
+        let options = SearchIndexOptions::default();
+        let pipeline = SearchGenerationPipeline::open_with_startup_recovery_failpoint(
+            paths.clone(),
+            options,
+            failpoint,
+            budget,
+        )
+        .map_err(|error| SearchIndexError::from_pipeline(error, None))?;
+        Ok(Self::from_pipeline(paths, options, pipeline))
+    }
+
+    fn from_pipeline(
+        paths: IndexPaths,
+        options: SearchIndexOptions,
+        pipeline: SearchGenerationPipeline,
+    ) -> Self {
         let active = pipeline.active();
         let generation_maintenance = pipeline.generation_maintenance();
-        Ok(Self {
+        Self {
             inner: Arc::new(SearchIndexInner {
                 paths,
                 options,
@@ -267,7 +289,7 @@ impl SearchIndex {
                 #[cfg(test)]
                 status_commit_hook: Mutex::new(None),
             }),
-        })
+        }
     }
 
     #[must_use]
@@ -897,7 +919,7 @@ GameObject:
             .analysis_cache_identity(stale_semantics_manifest.options_digest())
             .unwrap();
         let source_state_directory = generation_directory.join("state");
-        let source_state_path = source_state_directory.join("source-state-v2.json");
+        let source_state_path = source_state_directory.join("source-state-v3.json");
         let source_state: crate::generation_store::SourceStateSnapshot =
             serde_json::from_slice(&fs::read(&source_state_path).unwrap()).unwrap();
         let source_state = source_state
@@ -1265,6 +1287,89 @@ GameObject:
                 .is_none()
         );
         assert!(recovered.generation.last_failure.is_none());
+    }
+
+    #[test]
+    fn startup_staging_cleanup_failure_preserves_active_generation_until_reconcile() {
+        let temporary = crate::secure_test_tempdir();
+        let project = temporary.path().join("project");
+        write_generation_fixture(&project);
+        let paths =
+            IndexPaths::for_project(project, Some(temporary.path().join("index")), None).unwrap();
+        let index =
+            SearchIndex::open_or_create(paths.clone(), &mut AssetLoadBudget::default()).unwrap();
+        index
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(search_paths(&index, "Before"), vec![OWNER_PATH.to_owned()]);
+        drop(index);
+
+        let abandoned = paths
+            .index_root()
+            .join(".staging")
+            .join("build-00000000000000000099");
+        fs::create_dir(&abandoned).unwrap();
+        fs::write(abandoned.join("crash-residue"), b"incomplete").unwrap();
+
+        let reopened = SearchIndex::open_or_create_with_startup_recovery_failpoint(
+            paths,
+            GenerationFailpoint::StartupStagingCleanup,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            search_paths(&reopened, "Before"),
+            vec![OWNER_PATH.to_owned()]
+        );
+        let degraded = reopened.status().unwrap();
+        assert!(degraded.generation.active.is_some());
+        assert!(degraded.generation.last_failure.is_none());
+        assert_eq!(
+            degraded.daemon.generation_maintenance.state,
+            GenerationMaintenanceState::RecoveryRequired
+        );
+        assert!(
+            degraded
+                .daemon
+                .generation_maintenance
+                .last_cleanup_failure
+                .is_some()
+        );
+        assert!(abandoned.exists());
+
+        reopened
+            .reindex(
+                FilesystemReindexIntent::reconcile(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let recovered = reopened.status().unwrap();
+        assert_eq!(
+            recovered.daemon.generation_maintenance.state,
+            GenerationMaintenanceState::Clean
+        );
+        assert_eq!(
+            recovered
+                .daemon
+                .generation_maintenance
+                .last_recovered_entries,
+            1
+        );
+        assert!(
+            recovered
+                .daemon
+                .generation_maintenance
+                .last_cleanup_failure
+                .is_none()
+        );
+        assert!(!abandoned.exists());
+        assert_eq!(
+            search_paths(&reopened, "Before"),
+            vec![OWNER_PATH.to_owned()]
+        );
     }
 
     #[test]

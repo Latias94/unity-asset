@@ -19,7 +19,7 @@ use unity_asset_search_core::{
 use crate::validation::{ContractValidationError, ValidateContract, ensure_revision};
 use crate::{MAX_REFERENCE_RESULTS, QueryPolicyId};
 
-pub const SEARCH_PROTOCOL_REVISION: u16 = 3;
+pub const SEARCH_PROTOCOL_REVISION: u16 = 4;
 pub const MAX_API_ERROR_JSON_BYTES: u64 = 224 * 1024;
 pub const MAX_ERROR_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_PORTABLE_PATH_BYTES: usize = 32 * 1024;
@@ -1150,6 +1150,7 @@ pub struct ReferenceHit {
     pub source_path: PortablePath,
     pub source_kind: String,
     pub stable_id: String,
+    pub source_object: ObjectAddress,
     pub location: Location,
     pub contexts: Vec<ReferenceContext>,
     pub objects: Vec<ReferenceObject>,
@@ -1678,6 +1679,24 @@ impl ValidateContract for ReferencesResponse {
             return Err(ContractValidationError::Inconsistent {
                 field: "references response cursor binding",
             });
+        }
+        for hit in &self.hits {
+            let file_id = hit.source_object.binary_path_id().or_else(|| {
+                hit.source_object
+                    .yaml_file_id()
+                    .map(unity_asset_core::YamlFileId::get)
+            });
+            if hit.location.path != hit.source_path
+                || hit.location.file_id != file_id
+                || hit
+                    .contexts
+                    .iter()
+                    .any(|context| context.doc_file_id != file_id)
+            {
+                return Err(ContractValidationError::Inconsistent {
+                    field: "reference hit source identity",
+                });
+            }
         }
         Ok(())
     }

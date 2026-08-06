@@ -222,6 +222,54 @@ fn yaml_file_ids_require_canonical_nonzero_decimal_spelling() {
 }
 
 #[test]
+fn yaml_document_selector_derivation_is_canonical_and_type_aware() {
+    assert_eq!(
+        YamlDocumentSelector::from_document_header(0, 0, "YamlDocument", "doc_0").unwrap(),
+        YamlDocumentSelector::ordinal(0)
+    );
+    assert_eq!(
+        YamlDocumentSelector::from_document_header(1, 1, "GameObject", "-7").unwrap(),
+        YamlDocumentSelector::file_id(yaml_file_id(-7))
+    );
+    for (index, class_id, class_name, anchor) in [
+        (1, 0, "YamlDocument", "doc_01"),
+        (0, 0, "PlainDocument", "doc_0"),
+        (0, 1, "YamlDocument", "doc_0"),
+    ] {
+        assert_eq!(
+            YamlDocumentSelector::from_document_header(index, class_id, class_name, anchor),
+            Err(ContractError::InvalidYamlFileId)
+        );
+    }
+    assert!(YamlDocumentSelector::ordinal(0).matches_document_header(
+        0,
+        0,
+        "YamlDocument",
+        "doc_0"
+    ));
+    assert!(!YamlDocumentSelector::ordinal(0).matches_document_header(
+        0,
+        0,
+        "YamlDocument",
+        "doc_00"
+    ));
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn yaml_document_selector_rejects_ordinals_beyond_the_wire_range() {
+    let index = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+    let anchor = format!("doc_{index}");
+
+    assert_eq!(
+        YamlDocumentSelector::from_document_header(index, 0, "YamlDocument", &anchor),
+        Err(ContractError::YamlDocumentIndexOverflow {
+            document_index: index,
+        })
+    );
+}
+
+#[test]
 fn object_addresses_make_source_ownership_explicit() {
     let origin = SourceLocator::path("Library/mainData").unwrap();
     let direct = ObjectAddress::binary_direct(origin.clone(), -7).unwrap();

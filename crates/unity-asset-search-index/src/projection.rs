@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, Diagnostic, DiagnosticError, DigestBuildError, DigestV1,
     DigestV1Builder, FieldPath, FieldPathError, FieldPathSegment, ObjectAddress, SourceLocator,
-    YamlDocumentSelector, string_allocation_bytes, vec_allocation_bytes,
+    string_allocation_bytes, vec_allocation_bytes,
 };
 use unity_asset_search_core::{SearchKind, TryToTermsError, try_to_terms};
 
@@ -16,8 +16,6 @@ use crate::analysis::{
     GuidProjection, RawReferenceProjection, ReferenceDependencyKey, ReferenceProjectionFact,
     ReferenceResolutionProjection,
 };
-use crate::generation::GenerationStorageContract;
-
 #[derive(Debug)]
 pub(crate) enum ProjectionError {
     Budget(BudgetError),
@@ -159,12 +157,6 @@ pub(crate) struct ReferenceDocument {
     pub(crate) source_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source_guid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) source_object: Option<ObjectAddress>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) source_file_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) source_class_id: Option<i32>,
     pub(crate) fact: ReferenceProjectionFact,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) incoming_keys: Vec<String>,
@@ -553,16 +545,15 @@ fn project_reference_document(
     incoming_keys.sort_unstable();
     incoming_keys.dedup();
 
-    let outgoing_capacity = usize::from(fact.source_object.is_some())
-        + usize::from(fact.source_file_id.is_some())
+    let source_file_id = fact.protocol_file_id();
+    let outgoing_capacity = 1
+        + usize::from(source_file_id.is_some())
         + usize::from(asset.source.guid.is_some())
-        + usize::from(asset.source.guid.is_some() && fact.source_file_id.is_some());
+        + usize::from(asset.source.guid.is_some() && source_file_id.is_some());
     let mut outgoing_keys =
         reserve_retained_vec(outgoing_capacity, "reference outgoing keys", budget)?;
-    if let Some(address) = fact.source_object.as_ref() {
-        outgoing_keys.push(reference_object_key_budgeted(address, budget)?);
-    }
-    if let Some(file_id) = fact.source_file_id {
+    outgoing_keys.push(reference_object_key_budgeted(&fact.source_object, budget)?);
+    if let Some(file_id) = source_file_id {
         outgoing_keys.push(source_file_key(
             &asset.source.relative_path,
             file_id,
@@ -571,7 +562,7 @@ fn project_reference_document(
     }
     if let Some(guid) = asset.source.guid.as_deref() {
         outgoing_keys.push(reference_guid_key_budgeted(guid, None, budget)?);
-        if let Some(file_id) = fact.source_file_id {
+        if let Some(file_id) = source_file_id {
             outgoing_keys.push(reference_guid_key_budgeted(guid, Some(file_id), budget)?);
         }
     }
@@ -591,13 +582,6 @@ fn project_reference_document(
             "reference source GUID",
             budget,
         )?,
-        source_object: fact
-            .source_object
-            .as_ref()
-            .map(|address| clone_object_address(address, "reference source object", budget))
-            .transpose()?,
-        source_file_id: fact.source_file_id,
-        source_class_id: fact.source_class_id,
         fact: clone_reference_fact(fact, budget)?,
         incoming_keys,
         outgoing_keys,
@@ -613,15 +597,14 @@ fn reference_stable_id(
     let digest = streaming_json_digest(
         &(
             &asset.source.relative_path,
-            fact.source_object.as_ref(),
-            fact.source_file_id,
+            &fact.source_object,
             &fact.field_path,
             &fact.raw_target,
             ordinal,
         ),
         "reference stable ID",
     )?;
-    digest_key("reference-v2:", digest, "reference stable ID", budget)
+    digest_key("reference-v3:", digest, "reference stable ID", budget)
 }
 
 fn append_raw_target_keys(
@@ -689,95 +672,10 @@ fn append_dependency_keys(
     Ok(())
 }
 
-#[cfg(test)]
 pub(crate) fn reference_object_key(address: &ObjectAddress) -> String {
-    reference_object_key_for(GenerationStorageContract::CurrentV2, address)
-}
-
-pub(crate) fn reference_object_key_for(
-    storage: GenerationStorageContract,
-    address: &ObjectAddress,
-) -> String {
-    let digest = match storage {
-        GenerationStorageContract::LegacyV1 => legacy_object_address_digest(address)
-            .unwrap_or_else(|_| DigestV1::hash_bytes(b"invalid-legacy-query-object-key")),
-        GenerationStorageContract::CurrentV2 => streaming_json_digest(address, "query object key")
-            .unwrap_or_else(|_| DigestV1::hash_bytes(b"invalid-query-object-key")),
-    };
-    let prefix = match storage {
-        GenerationStorageContract::LegacyV1 => "object-v1:",
-        GenerationStorageContract::CurrentV2 => "object-v2:",
-    };
-    digest_key_unbudgeted(prefix, digest)
-}
-
-#[derive(Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum LegacyObjectAddressRef<'address> {
-    BinaryDirect {
-        version: u8,
-        source: &'address SourceLocator,
-        path_id: i64,
-    },
-    BinaryBundleMember {
-        version: u8,
-        source: &'address SourceLocator,
-        path_id: i64,
-    },
-    Yaml {
-        version: u8,
-        source: &'address SourceLocator,
-        selector: LegacyYamlSelector,
-    },
-}
-
-#[derive(Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum LegacyYamlSelector {
-    Anchored { anchor: String },
-    Unanchored { document_index: u32 },
-}
-
-fn legacy_object_address_digest(address: &ObjectAddress) -> Result<DigestV1, ProjectionError> {
-    let wire = match address.kind() {
-        unity_asset_core::ObjectKind::Binary => {
-            let path_id = address
-                .binary_path_id()
-                .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
-            if address.bundle_member().is_some() {
-                LegacyObjectAddressRef::BinaryBundleMember {
-                    version: 1,
-                    source: address.source_locator(),
-                    path_id,
-                }
-            } else {
-                LegacyObjectAddressRef::BinaryDirect {
-                    version: 1,
-                    source: address.source_locator(),
-                    path_id,
-                }
-            }
-        }
-        unity_asset_core::ObjectKind::Yaml => {
-            let selector = match address.yaml_selector() {
-                Some(YamlDocumentSelector::FileId { file_id }) => LegacyYamlSelector::Anchored {
-                    anchor: file_id.to_string(),
-                },
-                Some(YamlDocumentSelector::Unanchored { document_index }) => {
-                    LegacyYamlSelector::Unanchored {
-                        document_index: *document_index,
-                    }
-                }
-                None => return Err(BudgetError::ArithmeticOverflow { resource: "bytes" }.into()),
-            };
-            LegacyObjectAddressRef::Yaml {
-                version: 1,
-                source: address.source_locator(),
-                selector,
-            }
-        }
-    };
-    streaming_json_digest(&wire, "legacy query object key")
+    let digest = streaming_json_digest(address, "query object key")
+        .unwrap_or_else(|_| DigestV1::hash_bytes(b"invalid-query-object-key"));
+    digest_key_unbudgeted("object-v2:", digest)
 }
 
 fn reference_object_key_budgeted(
@@ -904,12 +802,11 @@ fn clone_reference_fact(
     budget: &mut AssetLoadBudget,
 ) -> Result<ReferenceProjectionFact, ProjectionError> {
     Ok(ReferenceProjectionFact {
-        source_object: fact
-            .source_object
-            .as_ref()
-            .map(|address| clone_object_address(address, "reference fact source object", budget))
-            .transpose()?,
-        source_file_id: fact.source_file_id,
+        source_object: clone_object_address(
+            &fact.source_object,
+            "reference fact source object",
+            budget,
+        )?,
         source_class_id: fact.source_class_id,
         field_path: clone_field_path(&fact.field_path, "reference fact field path", budget)?,
         raw_target: clone_raw_reference(&fact.raw_target, budget)?,
@@ -1623,11 +1520,15 @@ mod tests {
     }
 
     #[test]
-    fn streaming_reference_identity_uses_the_v2_prefix_and_exact_json_digest() {
+    fn streaming_reference_identity_uses_the_v3_prefix_and_exact_json_digest() {
         let asset = analyzed_asset(SearchFacts::default());
+        let source_object = ObjectAddress::binary_direct(
+            SourceLocator::path(asset.source.relative_path.clone()).unwrap(),
+            -1,
+        )
+        .unwrap();
         let fact = ReferenceProjectionFact {
-            source_object: None,
-            source_file_id: Some(-1),
+            source_object,
             source_class_id: Some(114),
             field_path: FieldPath::root(),
             raw_target: RawReferenceProjection::Yaml {
@@ -1642,15 +1543,14 @@ mod tests {
         let ordinal = 7;
         let identity = serde_json::to_vec(&(
             &asset.source.relative_path,
-            fact.source_object.as_ref(),
-            fact.source_file_id,
+            &fact.source_object,
             &fact.field_path,
             &fact.raw_target,
             ordinal,
         ))
         .unwrap();
         let expected = format!(
-            "reference-v2:{}",
+            "reference-v3:{}",
             hex::encode(DigestV1::hash_bytes(&identity).as_bytes())
         );
         let mut budget = AssetLoadBudget::default();
@@ -1670,6 +1570,47 @@ mod tests {
         assert_ne!(
             reference_object_key(&file_id),
             reference_object_key(&ordinal)
+        );
+    }
+
+    #[test]
+    fn unanchored_sources_never_emit_file_id_or_guid_file_id_keys() {
+        let asset = analyzed_asset(SearchFacts::default());
+        let source_object = ObjectAddress::yaml_document(
+            SourceLocator::path(asset.source.relative_path.clone()).unwrap(),
+            1,
+        )
+        .unwrap();
+        let fact = ReferenceProjectionFact {
+            source_object: source_object.clone(),
+            source_class_id: Some(0),
+            field_path: FieldPath::root(),
+            raw_target: RawReferenceProjection::Yaml {
+                file_id: None,
+                guid: None,
+                type_id: None,
+            },
+            resolution: ReferenceResolutionProjection::Null,
+            diagnostics: Vec::new(),
+            dependency_keys: Vec::new(),
+        };
+        let mut budget = AssetLoadBudget::default();
+
+        let document = project_reference_document(&asset, &fact, 0, &mut budget).unwrap();
+
+        assert_eq!(fact.protocol_file_id(), None);
+        assert_eq!(
+            document.outgoing_keys,
+            vec![
+                reference_guid_key("prefab-guid", None),
+                reference_object_key(&source_object),
+            ]
+        );
+        assert!(
+            document
+                .outgoing_keys
+                .iter()
+                .all(|key| !key.starts_with("source-file:"))
         );
     }
 

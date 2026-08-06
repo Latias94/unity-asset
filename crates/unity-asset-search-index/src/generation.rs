@@ -7,13 +7,6 @@ use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
 use crate::ProjectPathSet;
 use crate::semantics::SearchSemantics;
 
-mod legacy;
-
-pub(crate) use legacy::{
-    LEGACY_SEARCH_GENERATION_STORAGE_CONTRACT_VERSION, LegacySearchGenerationManifest,
-    legacy_generation_directory_name, parse_legacy_generation_directory_name,
-};
-
 pub(crate) const SEARCH_GENERATION_STORAGE_CONTRACT_VERSION: u16 = 2;
 const GENERATION_DIRECTORY_PREFIX: &str = "generation-v2-";
 const GENERATION_ID_DOMAIN: &[u8] = b"unity-asset:search-generation:logical:v2\0";
@@ -62,102 +55,6 @@ impl SearchGenerationId {
 impl fmt::Display for SearchGenerationId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.0, formatter)
-    }
-}
-
-/// Exact on-disk generation contract selected by an activation record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum GenerationStorageContract {
-    LegacyV1,
-    CurrentV2,
-}
-
-impl GenerationStorageContract {
-    #[must_use]
-    pub(crate) const fn wire_version(self) -> u16 {
-        match self {
-            Self::LegacyV1 => LEGACY_SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
-            Self::CurrentV2 => SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
-        }
-    }
-}
-
-impl Serialize for GenerationStorageContract {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_u16(self.wire_version())
-    }
-}
-
-impl<'de> Deserialize<'de> for GenerationStorageContract {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        match u16::deserialize(deserializer)? {
-            LEGACY_SEARCH_GENERATION_STORAGE_CONTRACT_VERSION => Ok(Self::LegacyV1),
-            SEARCH_GENERATION_STORAGE_CONTRACT_VERSION => Ok(Self::CurrentV2),
-            actual => Err(serde::de::Error::custom(format_args!(
-                "search generation storage version {actual} is unsupported"
-            ))),
-        }
-    }
-}
-
-/// Versioned reference to one immutable generation directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct StoredGenerationRef {
-    storage: GenerationStorageContract,
-    generation: SearchGenerationId,
-}
-
-impl StoredGenerationRef {
-    #[must_use]
-    pub(crate) const fn new(
-        storage: GenerationStorageContract,
-        generation: SearchGenerationId,
-    ) -> Self {
-        Self {
-            storage,
-            generation,
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn current(generation: SearchGenerationId) -> Self {
-        Self::new(GenerationStorageContract::CurrentV2, generation)
-    }
-
-    #[must_use]
-    pub(crate) const fn storage(self) -> GenerationStorageContract {
-        self.storage
-    }
-
-    #[must_use]
-    pub(crate) const fn generation(self) -> SearchGenerationId {
-        self.generation
-    }
-
-    #[must_use]
-    pub(crate) fn directory_name(self) -> String {
-        match self.storage {
-            GenerationStorageContract::LegacyV1 => {
-                legacy_generation_directory_name(self.generation)
-            }
-            GenerationStorageContract::CurrentV2 => self.generation.directory_name(),
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn from_directory_name(value: &str) -> Option<Self> {
-        SearchGenerationId::from_directory_name(value)
-            .map(Self::current)
-            .or_else(|| {
-                parse_legacy_generation_directory_name(value)
-                    .map(|generation| Self::new(GenerationStorageContract::LegacyV1, generation))
-            })
     }
 }
 
@@ -704,66 +601,6 @@ impl<'de> Deserialize<'de> for SearchGenerationManifestV1 {
     }
 }
 
-/// Read-only runtime view over every supported persisted generation manifest.
-///
-/// This wrapper deliberately does not implement `Serialize`. Current publication APIs accept only
-/// [`SearchGenerationManifestV1`], so a legacy manifest cannot be rewritten as a current one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StoredGenerationManifest {
-    LegacyV1(LegacySearchGenerationManifest),
-    CurrentV2(SearchGenerationManifestV1),
-}
-
-impl StoredGenerationManifest {
-    #[must_use]
-    pub(crate) const fn workspace(&self) -> WorkspaceId {
-        match self {
-            Self::LegacyV1(manifest) => manifest.workspace(),
-            Self::CurrentV2(manifest) => manifest.workspace(),
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn revision(&self) -> WorkspaceRevision {
-        match self {
-            Self::LegacyV1(manifest) => manifest.revision(),
-            Self::CurrentV2(manifest) => manifest.revision(),
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn projection_summary(&self) -> GenerationProjectionSummary {
-        match self {
-            Self::LegacyV1(manifest) => manifest.projection_summary(),
-            Self::CurrentV2(manifest) => manifest.projection_summary(),
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn semantics(&self) -> Option<SearchSemantics> {
-        match self {
-            Self::LegacyV1(_) => None,
-            Self::CurrentV2(manifest) => Some(manifest.semantics()),
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn options_digest(&self) -> DigestV1 {
-        match self {
-            Self::LegacyV1(manifest) => manifest.options_digest(),
-            Self::CurrentV2(manifest) => manifest.options_digest(),
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn artifacts(&self) -> GenerationArtifactEvidence {
-        match self {
-            Self::LegacyV1(manifest) => manifest.artifacts(),
-            Self::CurrentV2(manifest) => manifest.artifacts(),
-        }
-    }
-}
-
 fn validate_storage_contract_version<E>(contract: &'static str, actual: u16) -> Result<(), E>
 where
     E: serde::de::Error,
@@ -789,11 +626,6 @@ pub(crate) enum GenerationManifestError {
         assets: u64,
         incomplete_assets: u64,
     },
-    TooManyAppliedTransactions {
-        actual: usize,
-        maximum: usize,
-    },
-    NonCanonicalAppliedTransactions,
 }
 
 impl fmt::Display for GenerationManifestError {
@@ -814,13 +646,6 @@ impl fmt::Display for GenerationManifestError {
                 formatter,
                 "projection summary contains {incomplete_assets} incomplete assets but only {assets} assets"
             ),
-            Self::TooManyAppliedTransactions { actual, maximum } => write!(
-                formatter,
-                "generation records {actual} applied transactions; maximum is {maximum}"
-            ),
-            Self::NonCanonicalAppliedTransactions => {
-                formatter.write_str("applied transactions must be sorted and unique")
-            }
         }
     }
 }

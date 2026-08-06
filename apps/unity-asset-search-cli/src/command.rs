@@ -552,6 +552,25 @@ mod tests {
     }
 
     #[test]
+    fn removed_http_and_token_commands_stay_rejected() {
+        for arguments in [
+            &["--base-url", "http://127.0.0.1:7777", "status"][..],
+            &["--token", "obsolete", "status"][..],
+            &["health"][..],
+            &["bench"][..],
+            &["reindex", "--full"][..],
+        ] {
+            assert!(
+                Args::try_parse_from(
+                    std::iter::once("unity-asset-search-cli").chain(arguments.iter().copied())
+                )
+                .is_err(),
+                "removed command unexpectedly parsed: {arguments:?}"
+            );
+        }
+    }
+
+    #[test]
     fn changed_paths_are_canonicalized_before_protocol_validation() {
         let operation = lower_operation(&[
             "reindex",

@@ -16,23 +16,12 @@ env:
   CARGO_BUILD_JOBS: 2
 
 jobs:
-  unix-script-contracts:
-    name: Unix script contracts
+  workflow-contracts:
+    name: Workflow contracts
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
-
-    - name: Install zsh
-      run: |
-        sudo apt-get update
-        sudo apt-get install --no-install-recommends --yes zsh
-
-    - name: Validate zsh syntax
-      run: |
-        for script in scripts/*.zsh; do
-          zsh -n "$script"
-        done
 
     - name: Validate GitHub workflow semantics
       run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/*.yml

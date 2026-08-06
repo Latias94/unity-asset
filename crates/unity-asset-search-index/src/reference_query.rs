@@ -27,10 +27,8 @@ use unity_asset_search_protocol::{
 };
 
 use crate::analysis::{GuidProjection, RawReferenceProjection, ReferenceResolutionProjection};
-use crate::generation::{GenerationStamp, GenerationStorageContract};
-#[cfg(test)]
-use crate::projection::reference_object_key;
-use crate::projection::{reference_guid_key, reference_object_key_for};
+use crate::generation::GenerationStamp;
+use crate::projection::{reference_guid_key, reference_object_key};
 use crate::reference_payload::{
     MAX_REFERENCE_PAYLOAD_BYTES, ReferencePayload, ReferencePayloadReadError,
     ReferencePayloadReader,
@@ -471,7 +469,6 @@ pub(crate) struct ReferenceQuerySnapshot {
     reader: IndexReader,
     fields: ReferenceProjectionFields,
     payloads: ReferencePayloadReader,
-    storage: GenerationStorageContract,
     completeness: ReferenceQueryCompleteness,
 }
 
@@ -486,7 +483,6 @@ impl ReferenceQuerySnapshot {
             reader: projection.reader().clone(),
             fields: *projection.fields(),
             payloads: projection.payloads().clone(),
-            storage: projection.storage(),
             completeness,
         }
     }
@@ -635,12 +631,8 @@ impl ReferenceQueryEngine {
             usize::try_from(request.limit).map_err(|_| WireProjectionError::NumericOverflow {
                 field: "reference request limit",
             })?;
-        let (field, key) = selector_key(
-            &request.selector,
-            request.direction,
-            self.snapshot.fields,
-            self.snapshot.storage,
-        )?;
+        let (field, key) =
+            selector_key(&request.selector, request.direction, self.snapshot.fields)?;
         let query_binding = request
             .cursor_query_binding()
             .map_err(|_| ReferenceQueryError::InvalidCursorQueryBinding)?;
@@ -703,7 +695,7 @@ impl ReferenceQueryEngine {
             let mut stored = decoded.document;
 
             let fact_diagnostics = std::mem::take(&mut stored.fact.diagnostics);
-            let hit = reference_hit(stored, self.snapshot.storage)?;
+            let hit = reference_hit(stored)?;
             let encoded_hit_bytes = reference_hit_json_bytes(&hit)?;
             if encoded_hit_bytes > limits.max_hit_json_bytes {
                 return Err(ReferenceQueryError::ResponseHitTooLarge {
@@ -1066,14 +1058,13 @@ fn selector_key(
     selector: &ReferenceSelector,
     direction: ReferenceDirection,
     fields: ReferenceProjectionFields,
-    storage: GenerationStorageContract,
 ) -> Result<(Field, String), ReferenceQueryError> {
     let field = match direction {
         ReferenceDirection::Incoming => fields.incoming_key(),
         ReferenceDirection::Outgoing => fields.outgoing_key(),
     };
     let key = match selector {
-        ReferenceSelector::Object { address } => reference_object_key_for(storage, address),
+        ReferenceSelector::Object { address } => reference_object_key(address),
         ReferenceSelector::Guid { guid, file_id } => {
             if guid.is_empty() {
                 return Err(ReferenceQueryError::EmptyGuid);
@@ -1403,7 +1394,7 @@ fn decode_reference_payload(
     }
 
     let document = payloads
-        .read(range, selected.payload_digest, &selected.stable_id, budget)
+        .read(range, selected.payload_digest, budget)
         .map_err(|source| ReferenceQueryError::Payload {
             stable_id: selected.stable_id.clone(),
             source,
@@ -1449,10 +1440,9 @@ fn reference_hit_json_bytes(hit: &ReferenceHit) -> Result<usize, ReferenceQueryE
     })
 }
 
-fn reference_hit(
-    stored: ReferencePayload,
-    storage: GenerationStorageContract,
-) -> Result<ReferenceHit, ReferenceQueryError> {
+fn reference_hit(stored: ReferencePayload) -> Result<ReferenceHit, ReferenceQueryError> {
+    let source_file_id = stored.fact.protocol_file_id();
+    let source_class_id = stored.fact.source_class_id;
     let object_count = 1usize.saturating_add(resolution_object_count(&stored.fact.resolution));
     if object_count > MAX_REFERENCE_OBJECTS_PER_HIT {
         return Err(ReferenceQueryError::ResponseHitObjectLimitExceeded {
@@ -1463,30 +1453,31 @@ fn reference_hit(
     }
 
     let context = ReferenceContext {
-        doc_file_id: stored.source_file_id,
-        doc_class_id: stored.source_class_id,
+        doc_file_id: source_file_id,
+        doc_class_id: source_class_id,
         object_name: None,
         hierarchy_path: None,
         field_hint: Some(stored.fact.field_path.to_string()),
         source_line: None,
         source_column: None,
     };
-    let mut raw_object = raw_reference_object(&stored, storage)?;
+    let mut raw_object = raw_reference_object(&stored)?;
     raw_object
         .field_hints
         .push(resolution_hint(&stored.fact.resolution).to_owned());
     let mut objects = vec![raw_object];
-    objects.extend(resolution_objects(&stored, storage)?);
+    objects.extend(resolution_objects(&stored)?);
 
     Ok(ReferenceHit {
         source_path: wire::portable_path_string(stored.source_path.clone())?,
         source_kind: stored.source_kind,
         stable_id: stored.stable_id,
+        source_object: stored.fact.source_object,
         location: wire::location(
             stored.source_path,
             stored.source_guid,
-            stored.source_file_id,
-            stored.source_class_id,
+            source_file_id,
+            source_class_id,
         )?,
         contexts: vec![context],
         objects,
@@ -1517,10 +1508,7 @@ const fn resolution_hint(resolution: &ReferenceResolutionProjection) -> &'static
     }
 }
 
-fn raw_reference_object(
-    stored: &ReferencePayload,
-    storage: GenerationStorageContract,
-) -> Result<ReferenceObject, ReferenceQueryError> {
+fn raw_reference_object(stored: &ReferencePayload) -> Result<ReferenceObject, ReferenceQueryError> {
     match &stored.fact.raw_target {
         RawReferenceProjection::Binary {
             file_id,
@@ -1532,14 +1520,16 @@ fn raw_reference_object(
                 .and_then(|external| external.guid)
                 .map(hex::encode);
             let target_address = if external.is_none() && *path_id != 0 {
-                stored.source_object.as_ref().and_then(|source| {
-                    ObjectAddress::binary_at(source.source_locator().clone(), *path_id).ok()
-                })
+                ObjectAddress::binary_at(
+                    stored.fact.source_object.source_locator().clone(),
+                    *path_id,
+                )
+                .ok()
             } else {
                 None
             };
             let stable_id = if let Some(address) = &target_address {
-                reference_object_key_for(storage, address)
+                reference_object_key(address)
             } else if let Some(guid) = target_guid.as_deref() {
                 reference_guid_key(guid, Some(*path_id))
             } else {
@@ -1583,16 +1573,15 @@ fn raw_reference_object(
                 GuidProjection::Parsed(bytes) => hex::encode(bytes),
                 GuidProjection::Invalid(value) => value.clone(),
             });
-            let target_address = match (target_guid.as_ref(), file_id, &stored.source_object) {
-                (None, Some(file_id), Some(source)) => {
-                    YamlFileId::new(*file_id).ok().and_then(|file_id| {
-                        ObjectAddress::yaml(source.source_locator().clone(), file_id).ok()
-                    })
-                }
+            let target_address = match (target_guid.as_ref(), file_id) {
+                (None, Some(file_id)) => YamlFileId::new(*file_id).ok().and_then(|file_id| {
+                    ObjectAddress::yaml(stored.fact.source_object.source_locator().clone(), file_id)
+                        .ok()
+                }),
                 _ => None,
             };
             let stable_id = if let Some(address) = &target_address {
-                reference_object_key_for(storage, address)
+                reference_object_key(address)
             } else if let Some(guid) = target_guid.as_deref() {
                 reference_guid_key(guid, *file_id)
             } else {
@@ -1625,7 +1614,6 @@ fn raw_reference_object(
 
 fn resolution_objects(
     stored: &ReferencePayload,
-    storage: GenerationStorageContract,
 ) -> Result<Vec<ReferenceObject>, ReferenceQueryError> {
     let mut objects = Vec::new();
     match &stored.fact.resolution {
@@ -1633,18 +1621,18 @@ fn resolution_objects(
         | ReferenceResolutionProjection::Missing { target: None }
         | ReferenceResolutionProjection::Invalid => {}
         ReferenceResolutionProjection::Resolved { target } => {
-            objects.push(address_object(target, "resolution.resolved", storage)?);
+            objects.push(address_object(target, "resolution.resolved")?);
         }
         ReferenceResolutionProjection::Missing {
             target: Some(target),
         } => {
-            objects.push(address_object(target, "resolution.missing", storage)?);
+            objects.push(address_object(target, "resolution.missing")?);
         }
         ReferenceResolutionProjection::Ambiguous { candidates } => {
             objects.extend(
                 candidates
                     .iter()
-                    .map(|target| address_object(target, "resolution.ambiguous", storage))
+                    .map(|target| address_object(target, "resolution.ambiguous"))
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
@@ -1670,7 +1658,6 @@ fn resolution_objects(
 fn address_object(
     address: &ObjectAddress,
     resolution: &str,
-    storage: GenerationStorageContract,
 ) -> Result<ReferenceObject, ReferenceQueryError> {
     let file_id = address
         .binary_path_id()
@@ -1678,7 +1665,7 @@ fn address_object(
     Ok(ReferenceObject {
         doc_file_id: file_id,
         doc_class_id: None,
-        stable_id: reference_object_key_for(storage, address),
+        stable_id: reference_object_key(address),
         location: wire::locator_location(address.source_locator(), None, file_id, None)?,
         object_name: None,
         hierarchy_path: None,
@@ -1758,12 +1745,8 @@ mod tests {
             source_path: format!("Assets/Source{source_path_id}.asset"),
             source_kind: "SerializedAsset".to_owned(),
             source_guid: Some(format!("source-guid-{source_path_id}")),
-            source_object: Some(source_object.clone()),
-            source_file_id: Some(source_path_id),
-            source_class_id: Some(-3),
             fact: ReferenceProjectionFact {
-                source_object: Some(source_object.clone()),
-                source_file_id: Some(source_path_id),
+                source_object: source_object.clone(),
                 source_class_id: Some(-3),
                 field_path: FieldPath::root().push_field("m_Target").unwrap(),
                 raw_target: RawReferenceProjection::Binary {
@@ -2276,7 +2259,7 @@ mod tests {
     #[test]
     fn incoming_and_outgoing_use_their_respective_key_fields() {
         let document = projected_reference("reference-a", -7);
-        let source = document.source_object.clone().unwrap();
+        let source = document.fact.source_object.clone();
         let stamp = generation(b"two");
         let (_directory, engine) = engine(vec![document], stamp);
 
@@ -2301,6 +2284,46 @@ mod tests {
         assert_eq!(incoming.hits.len(), 1);
         assert_eq!(outgoing.hits.len(), 1);
         assert_eq!(incoming.hits[0].stable_id, outgoing.hits[0].stable_id);
+    }
+
+    #[test]
+    fn unanchored_source_identity_is_typed_and_never_exposed_as_file_id() {
+        let source_path = "Assets/Scene.unity";
+        let source =
+            ObjectAddress::yaml_document(SourceLocator::path(source_path).unwrap(), 1).unwrap();
+        let mut document = projected_reference("reference-unanchored", -7);
+        document.source_path = source_path.to_owned();
+        document.source_guid = Some("scene-guid".to_owned());
+        document.fact.source_object = source.clone();
+        document.fact.source_class_id = Some(0);
+        document.outgoing_keys = vec![
+            reference_guid_key("scene-guid", None),
+            reference_object_key(&source),
+        ];
+        document.outgoing_keys.sort_unstable();
+        let stamp = generation(b"unanchored-source");
+        let (_directory, engine) = engine(vec![document], stamp);
+
+        let response = engine
+            .references(
+                ReferenceRequest {
+                    direction: ReferenceDirection::Outgoing,
+                    selector: ReferenceSelector::Object {
+                        address: source.clone(),
+                    },
+                    limit: 10,
+                    cursor: None,
+                },
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+
+        assert_eq!(response.hits.len(), 1);
+        let hit = &response.hits[0];
+        assert_eq!(hit.source_object, source);
+        assert_eq!(hit.location.file_id, None);
+        assert_eq!(hit.contexts[0].doc_file_id, None);
+        response.validate().unwrap();
     }
 
     #[test]
@@ -2812,11 +2835,7 @@ mod tests {
             candidates: vec![source_address(-99); MAX_REFERENCE_OBJECTS_PER_HIT],
         };
 
-        let error = reference_hit(
-            stored_reference(projected),
-            GenerationStorageContract::CurrentV2,
-        )
-        .unwrap_err();
+        let error = reference_hit(stored_reference(projected)).unwrap_err();
 
         assert!(matches!(
             &error,

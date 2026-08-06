@@ -15,6 +15,8 @@ const FROZEN_BUSINESS_V1_INVENTORY_SHA256: &str =
     "13cf5971f83e9a608c504582a36c442e79a982c9eb9dbad8d447a41c7694022a";
 const FROZEN_BUSINESS_V2_INVENTORY_SHA256: &str =
     "6891e3190d36396e546989a0f55ac97766902aa37289993b5f4709ffa3ccf776";
+const FROZEN_BUSINESS_V3_INVENTORY_SHA256: &str =
+    "5774a6331cf7f560d389b86bd268639672304d4ad638dd9d8a5a6053b49a9d7a";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +84,22 @@ fn rust_and_csharp_share_canonical_nonempty_protocol_fixtures() {
     assert_eq!(manifest.protocol_revision, BUSINESS_PROTOCOL_REVISION);
     assert!(!manifest.valid.is_empty());
     assert!(!manifest.invalid.is_empty());
+    let valid_names = manifest
+        .valid
+        .iter()
+        .map(|fixture| fixture.name.as_str())
+        .collect::<BTreeSet<_>>();
+    for expected in [
+        "unanchored YAML document references response",
+        "semantics-stale status response",
+        "configuration-stale status response",
+        "recovery-required status response",
+    ] {
+        assert!(
+            valid_names.contains(expected),
+            "missing shared positive fixture: {expected}"
+        );
+    }
     assert_frozen_business(&root, &manifest.frozen_inventories);
 
     let project = ProjectId::from_str(&manifest.binding.project_id).unwrap();
@@ -174,6 +192,7 @@ fn assert_frozen_business(root: &Path, references: &[FrozenInventoryReference]) 
     let expected = [
         (1, FROZEN_BUSINESS_V1_INVENTORY_SHA256),
         (2, FROZEN_BUSINESS_V2_INVENTORY_SHA256),
+        (3, FROZEN_BUSINESS_V3_INVENTORY_SHA256),
     ];
     assert_eq!(references.len(), expected.len());
 
